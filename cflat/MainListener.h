@@ -3696,6 +3696,17 @@ public:
         bool isUnique = false);
 
     /*
+     * A brace list WITH VALUES on a declarator whose type is neither a struct/union/class nor a
+     * recognized container ('int x = {5};', 'I gi = { a = 1 };' on an interface). Shared by the
+     * local and global declarator paths so the two scopes give one identical diagnostic.
+     * Note LogErrorContext throws, so this never returns on the compile path.
+     */
+    void LogNonAggregateBraceInitReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& name,
+        const std::string& typeName);
+
+    /*
      * Render the declared type for a diagnostic - 'S*', 'S**', 'void*', 'S*[2]' - so a remedy is
      * never synthesized from the bare pointee name. A type ALIAS ('using PS = S*') is already
      * resolved away by ParseDeclarationSpecifiers, so this names the resolved type, not 'PS'.

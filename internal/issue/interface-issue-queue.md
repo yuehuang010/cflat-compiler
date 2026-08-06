@@ -294,7 +294,8 @@ this round, never caught because nothing had re-verified the table since). Net m
 round: one P1 fixed and deleted ([[global-struct-positional-init-silently-zeroes]]), and four
 new issues filed in its place - three P2 (`class-no-ctor-default-construct-returns-undef`,
 [[struct-field-default-brace-list-discarded]] (since FIXED and deleted - see the `fix/field-brace`
-landed record below), [[interface-typed-global-brace-init-discarded]])
+landed record below), `interface-typed-global-brace-init-discarded` (since FIXED and deleted - see
+the `fix/iface-global` landed record below))
 and one P3 ([[global-struct-no-initializer-ignores-field-defaults]]). All four were found by
 review of that P1's fix, not by the original investigation - the same pattern this file has
 recorded before (see the 2026-08-01 paragraph above).
@@ -521,7 +522,6 @@ produce a program.
 | [[shape-mismatched-funcptr-arg-binds-silently]] | miscompile | Silent miscompile then SIGBUS (exit 138), no diagnostic. A `function<T>*` binds where a plain `function<T>` value is expected; the scorer now detects the shape mismatch but still lowers the mismatched arm when no better-shaped candidate exists. Filed 2026-07-31. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
-| [[interface-typed-global-brace-init-discarded]] | miscompile | `I gi = { a = 1 };` on an interface-typed global compiles clean with the brace list silently dropped, no diagnostic. The `fix/global-positional` guard (that P1 is fixed and deleted; see its landed record below) cannot see it - `GetDataStructure("I").StructType` is null for an interface name, so this falls through unguarded. Found by review of that fix. Filed 2026-08-02. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
@@ -2486,8 +2486,9 @@ or the review rounds of this fix, all confirmed to reproduce identically on `mas
 default-constructs to `undef`, unrelated code path; FIXED by `fix/class-undef`, record below), [[struct-field-default-brace-list-discarded]]
 (a struct FIELD's own brace-list default is dropped, not a variable declarator; since FIXED by
 `fix/field-brace`, record below), and
-[[interface-typed-global-brace-init-discarded]] (an interface-typed global falls through this
-fix's guard entirely, since `GetDataStructure` has no entry for an interface name) - plus the
+`interface-typed-global-brace-init-discarded` (an interface-typed global falls through this
+fix's guard entirely, since `GetDataStructure` has no entry for an interface name; since FIXED by
+`fix/iface-global`, record below) - plus the
 pre-existing [[global-struct-no-initializer-ignores-field-defaults]] (a global with NO
 initializer at all zeroes instead of honoring field defaults; different code path again, the
 `right == nullptr` branch rather than the brace-list branch) and
@@ -5927,3 +5928,182 @@ the new wording post-fix.
 `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8 skipped.
 `bash example_mac.sh Release` - 35 passed, 0 failed. One commit, `git rev-list --count
 28ef745..HEAD` = 1.
+
+### fix/iface-global - a brace list with values on a NON-AGGREGATE global REJECTED, matching local (LANDED)
+
+Closes the P1 [[interface-typed-global-brace-init-discarded]] (file deleted). Branch
+`fix/iface-global`, one commit on `0a45763`.
+
+#### Root cause, as measured (the filed hypothesis was right, and understated the scope)
+
+The global declarator's brace-list reject added by `fix/global-positional` fires only when
+`compiler->GetDataStructure(scalarTypeName).StructType != nullptr`. An interface name is not in
+the struct table at all (interfaces live in `interfaceTable`), so `I gi = { a = 1 };` fell
+through unguarded into the pre-existing discard: `right` stays the type's zero default and the
+global lands as a Constant built from it. Measured with `--out-lli` as the issue file demanded
+rather than assumed: `@gi = global %__iface_fat_ptr zeroinitializer`, BYTE-IDENTICAL to the
+`I gi = default;` spelling, so `gi` reads back null (probe `gi == nullptr ? 5 : 6` exits 5 on
+`0a45763`). The interface-boxing machinery never runs, exactly as the issue file guessed: a
+brace list is an `initializerList`, not an `assignmentExpression`.
+
+What the issue file did NOT say is that the same hole swallows every other non-aggregate type.
+The predicate asks "is this a registered struct", and the answer is also no for primitives,
+`char*`, `function<>` and `simd` - all of which the LOCAL declarator has always rejected. So
+this was never an interface bug; it was a global-scope hole with an interface-shaped repro.
+
+#### Oracle, verified INDEPENDENTLY before being used as one
+
+The fix is specified as "make global agree with local", so the local path was measured on its
+own first rather than assumed correct: local rejects ALL of `I li = { a = 1 }`, `I li { a = 1 }`,
+`I li = { 1 }`, `int x = {5}`, `int x {5}`, `char* p = {1}`, `function<int(int)> f = {add}` and
+`simd<int,4> v = {1,2,3,4}` with one message
+(`brace initializer with values is not supported on 'X' - 'T' is not a struct/union/class or a
+recognized container; assign it after declaration instead`). The oracle has no hole on this
+axis - unlike `fix/global-positional`, where copying the local gating condition carried the
+bare-brace hole across with it. That earlier lesson is why the bare spelling is its own matrix
+row and its own test leg here.
+
+#### Fix shape
+
+`MainListener::LogNonAggregateBraceInitReject(ctx, name, typeName)` - a new helper next to
+`LogPointerBraceInitReject` in `MainListener_Expressions.cpp`, holding the one message text. The
+LOCAL site (`MainListener_Declarations.cpp`, the `!localIsContainer && StructType == nullptr` arm)
+now calls it instead of formatting inline, so the two scopes cannot drift. The GLOBAL guard hoists
+`isContainerType` and the `StructType != nullptr` test out of the `if`, keeps the three existing
+messages unchanged in the aggregate arm, and adds one `else if (!scalarElements.empty() &&
+!isContainerType)` arm that calls the same helper. Both global brace spellings reach it: the
+`scalarInitList` it reads was already `initializer->initializerList()` OR `barebraceList`.
+
+Deliberately NOT widened: an empty `{}` (no `fieldInit` elements - the grammar yields no
+`initializerList` at all, so both scopes accept it and `I gi = { };` is unchanged); containers,
+which keep their own global-scope message; and a container name whose `StructType` is somehow
+null, which still falls through silently as before (accept-on-doubt - the `!isContainerType` in
+the new arm). Fixed arrays and array views cannot reach the arm at all: both `continue` out
+several hundred lines earlier (`MainListener_Declarations.cpp` ~2758 / ~2773), which is why
+`int[3] ga = {7,8,9};` is untouched and still exits 9.
+
+#### Coverage matrix - 49 cells, every one run on `0a45763` and on this branch
+
+23 cells CHANGE (silent discard -> hard error; the last five rows were measured by review
+round 1, same PRE/POST method). Each "value" below is the probe's exit code, and
+each probe distinguishes discarded from applied (`gi == nullptr ? 5 : 6`, or the value itself):
+
+| Cell | PRE `0a45763` | POST |
+|---|---|---|
+| `I gi = { a = 1 };` (the filed repro) | compiles, exit 5 (gi null) | REJECT |
+| `I gi { a = 1 };` (bare-brace spelling) | compiles, exit 5 | REJECT |
+| `I gi = { 1 };` (positional) | compiles, exit 5 | REJECT |
+| `I gi { 1 };` (bare positional) | compiles, exit 5 | REJECT |
+| `namespace N { I gi = { a = 1 }; }` | compiles, exit 5 | REJECT (`'N.gi'`) |
+| `namespace N { I gi { a = 1 }; }` | compiles, exit 5 | REJECT (`'N.gi'`) |
+| `const I gi = { a = 1 };` | compiles, exit 5 | REJECT |
+| `static I gi = { a = 1 };` | compiles, exit 5 | REJECT |
+| `unique I gi = { a = 1 };` | compiles, exit 5 | REJECT |
+| `IB<int> gb = { b = 1 };` (generic interface) | compiles, exit 5 | REJECT (`'IB__i32'`) |
+| `int gx = {5};` | compiles, exit 0 (should be 5) | REJECT |
+| `int gx {5};` | compiles, exit 0 | REJECT |
+| `bool gb = {true};` | compiles, exit 0 | REJECT |
+| `float gf = {2.0};` | compiles, exit 0 | REJECT |
+| `thread_local int gx = {5};` | compiles, exit 0 | REJECT |
+| `char* gp = {1};` | compiles, exit 5 (null) | REJECT (`'char'`) |
+| `function<int(int)> gf = {add};` | compiles, exit 5 (null) | REJECT (`'__c_fn_ptr'`) |
+| `simd<int,4> gv = {1,2,3,4};` | compiles, exit 0 (lane 2 zero) | REJECT (message names the ELEMENT type `'int'` - pre-existing local wording, kept for scope consistency; `DescribePointerDeclType` could spell the vector out, but that edit changes two local-scope messages and belongs to its own round) |
+| `using MyI = I; MyI gi = { a = 1 };` (alias) | compiles, exit 5 | REJECT (names the underlying `'I'`, not `'MyI'`) |
+| `int ga = 5, gb = { 6 };` (multi-declarator) | compiles, exit 5 (gb dropped) | REJECT (`'gb'`) |
+| `extern int gx = { 5 };` (initializer defeats extern-only) | compiles, exit 0 | REJECT |
+| `if const (__MACOS__) { int gx = { 5 }; }` (file-scope const block) | compiles, discard | REJECT |
+| `namespace N { namespace M { I gi = { a = 1 }; } }` | compiles, exit 5 | REJECT (`'N.M.gi'`) |
+
+**Frozen ACCEPT SET - enumerated and measured BEFORE the guard was written, all byte-identical
+PRE and POST** (17 cells): `I gi = default;` (5), `I gi = { };` (5), `I gi { };` (5),
+`I gi = nullptr;` (5), `S gs = default; I gi = gs;` (6 - global boxing from another global still
+WORKS), `extern I gi;` (3), `I[2] gi = { };` (5), local boxing `S s; s.a=7; I li = s; li.foo()`
+(7), `int[3] ga = {7,8,9};` (9), `int[3] ga {7,8,9};` (9), `int gx = 5;` (5),
+`int gx = default;` (4), `simd<int,4> gv = default;` (3), `string gs = "hi";` (2), local
+`P p = { x = 3, y = 4 };` (7), local `S s = { a = 9 };` (9), local `list<int> l = {1,2,3};` (2).
+
+**Pre-existing rejections that keep their OWN message** (9 cells, verbatim-identical both
+binaries): global `P gp = { x = 1 };` and `C gc = { a = 1 };` (field-initializers-at-global-scope),
+global `P gp = { 1 };` (positional-for-struct-type), global `P* gp = { x = 1 };` (pointer to
+struct type), global `list<int> gl = {1,2,3};` (container), global `int[] gv = {1,2,3};`
+(array-view-at-global-scope), global `P[2] gp = { x = 3 };` (global array initializer must be
+positional), local `I li = { a = 1 };` and local `int x = {5};` (the oracle).
+
+Grammar-impossible cells, named and not probed: a `struct`/`union` cannot implement an interface
+(`CFlat.g4` gives the base-clause to `classDefinition` only), and `I*` is rejected earlier
+(`pointer '*' is not allowed on interface type 'I'`).
+
+#### No working program breaks
+
+Every cell the guard newly rejects compiled PRE with its brace values ALREADY DISCARDED - the
+table above measures each one and none carried a value through. There is no program that was
+getting the values and now errors. Two whole-corpus differential sweeps back this: 447
+`Test/**` + `example/**` files compiled with both binaries produced exactly ONE difference (the
+intended new test legs), and the 88 `core/**.cb` files - each compiled as a root against its own
+binary's core tree, so the comparison is like-for-like - produced ZERO.
+
+(Method note for the next round: a first attempt swept core with a COPIED PRE binary whose
+`.cflat` cache still pointed at the other tree, and produced 25 bogus "diffs" -
+circular-import vs. redeclaration messages that had nothing to do with the change. A copied exe
+is not a PRE binary; build a detached worktree at the merge base, which is what the numbers
+above come from.)
+
+#### Per-site audit - every site asking the same question
+
+`grep '\.StructType == nullptr'` finds six `== nullptr` sites; adding the `!= nullptr` site
+fixed here (`scalarIsAggregate`, `MainListener_Declarations.cpp:3463`) makes seven in total. The
+grep does not reach `EmitGlobalFixedArrayInit`, the GLOBAL sibling of the 2699/2719 element
+sites - it is what actually keeps `int[3] ga = {7,8,9};` working, and `I[2] gi = {gs1,gs1};`
+gives the same "must be compile-time constants" message on both binaries (review-verified).
+Of the seven, two are scalar-declarator brace-init routing:
+
+- `MainListener_Declarations.cpp:3888` (LOCAL scalar declarator) - same question, already
+  correct, now routed through the shared helper. This is the oracle.
+- `MainListener_Declarations.cpp:3463` (GLOBAL scalar declarator) - the defect; fixed.
+The other five:
+
+- `MainListener_Declarations.cpp:2699` / `:2719` (fixed-array ELEMENT brace init) - same
+  question, no defect: 2699 zero-inits an empty `{}` on a non-struct element (correct), and
+  2719 already rejects a non-empty list on a non-struct element type
+  (`array value-initializer '= {}' requires a struct element type`).
+- `MainListener_Expressions.cpp:4921` (winmd generic instantiation on demand in a cast),
+  `:6171` (`EmitFixedArrayDefaultInit` early-out), `MainListener_PostfixExpression.cpp:200`
+  (`operator->` walk) - not brace-init routing, unaffected.
+
+The FIELD-default path (`ParseFieldDefaultBraceInitializer`) asks the same question with a
+silent `return nullptr` and IS defective - see "Found, not fixed" below.
+
+#### Test legs
+
+`Test/errors/err_primitive_brace_init_with_values.cb` - 9 new `expect_error` blocks (8 at file
+scope for the globals, 1 local). Each of the 8 global legs was proven individually: put alone in
+a file it exits 1 on the `0a45763` binary (`FAIL: expected error ... did not occur`) and 0 on
+this branch. They pin the interface repro, the bare-brace spelling, the positional spelling, the
+generic instantiation `IB__i32`, the namespace-qualified name `N.gi`, both primitive spellings,
+and `char*`. The 9th (local `I li = { a = 1 };`) passes on BOTH binaries by design and is
+labelled as the oracle leg: it is the tripwire for the shared helper, so a wording drift fails
+both scopes' legs together. The file's header comment, which previously recorded the global gap
+as "pre-existing... unaffected by this fix", is rewritten with the measured PRE values.
+
+No new value legs: every cell this change touches goes from compiling to erroring, so a runtime
+leg could only assert the accept set, and each accept-set cell is byte-identical on both
+binaries - such a leg would pass with the fix reverted, which is the leg-that-cannot-fail
+pattern this file has banned. The accept set is frozen in the table above instead.
+
+#### Verification
+
+- `./test.sh Release`: 600 passed / 0 failed / 8 skipped (baseline 600/0/8 - the suite counts
+  FILES and the legs went into an existing one).
+- `bash example_mac.sh Release`: 35 passed / 0 failed.
+- Differential sweeps: 447 `Test`+`example` files, 1 intended difference; 88 `core` files, 0.
+- No new `TypeAndValue` / `StructData` / `AnnotationValue` field, so no `--init` cache
+  round-trip change is owed.
+
+#### Found, not fixed - filed
+
+The FIELD position has the identical hole and is NOT closed here: `ParseFieldDefaultBraceInitializer`
+bails with `if (fieldType == nullptr) return nullptr;`, so `struct H { I h = { a = 1 }; };` leaves
+`h.h` null and `struct H2 { int x = { 5 }; };` leaves `x` zero - measured identical on `0a45763`
+and on this branch (exit 5 / exit 0 both sides). Appended as a new neighbouring-cell section to
+[[fixed-array-field-brace-default-discarded]] (P2), which already owns the field-default family,
+rather than opening a fourth file for one emitter. Its fix is the same helper.

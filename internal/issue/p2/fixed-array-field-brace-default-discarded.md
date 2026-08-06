@@ -48,6 +48,29 @@ an array LOCAL, so it cannot be reused as-is - it needs a slot-taking variant (o
 field path needs its own constant/insertvalue builder). Also enumerate multi-dimensional
 (`int[2][2] a = {...}`) and `T[]` view fields before landing.
 
+## Neighbouring cell: a NON-AGGREGATE field type (interface / primitive)
+
+Added 2026-08-06 by `fix/iface-global`'s coverage matrix. `ParseFieldDefaultBraceInitializer`
+also bails when the field type is not a registered struct at all
+(`auto* fieldType = ...StructType; if (fieldType == nullptr) return nullptr;`), so an
+INTERFACE-typed or PRIMITIVE field silently drops its list:
+
+```cflat
+interface I { int foo(); };
+class S : I { int a = default; int foo() { return a; } };
+struct H { I h = { a = 1 }; };
+extern int main(){ H h = default; return h.h == nullptr ? 5 : 6; }   // exits 5: h.h is null
+struct H2 { int x = { 5 }; };                                        // h2.x reads 0
+```
+
+Measured identical (exit 5 / exit 0) on `0a45763` and on `fix/iface-global` - that branch
+fixed the DECLARATOR paths (global now rejects like local already did) and deliberately
+does not touch the field path. Both scopes of the declarator now REJECT this spelling, so
+the field position should get the same rejection, not a value: a brace list naming a
+concrete type's field on an interface-typed field is not meaningful, and primitive
+brace-value-init is not a language feature. Route it through
+`MainListener::LogNonAggregateBraceInitReject` (the helper the two declarator scopes share).
+
 ## Neighbouring cell, also out of scope and also silently wrong
 
 A POINTER field with a brace default - `struct Outer { Inner* p = { x = 1 }; };` - reads

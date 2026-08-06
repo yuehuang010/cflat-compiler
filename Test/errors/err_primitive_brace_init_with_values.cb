@@ -1,18 +1,62 @@
-// A brace initializer with values on a LOCAL PRIMITIVE-typed declaration ('int x {5};' /
-// 'int x = {5};') is not struct field-init and not a recognized container brace-init,
-// so it used to fall into EmitFieldInitializer's generic struct-field-init failure
-// message ("'int' is not a known struct type") - technically true but describing a
-// construct the user did not write. Found while routing the bare-brace spelling
-// ('int x {5};', no '=') through the same local declarator handling the '=' spelling
-// already used: PRE, the bare form silently read an uninitialized garbage value (rc 0,
-// e.g. "x=1876644176"); this reject is new and intentional for that spelling, and the
-// message must name the real situation for BOTH spellings rather than misdescribe it
-// as a struct problem (the '=' spelling already rejected before this fix, just with
-// the same misleading wording).
+// A brace initializer with values on a declarator whose type is neither a struct/union/class
+// nor a recognized container ('int x {5};' / 'int x = {5};', or an INTERFACE-typed declarator
+// 'I gi = { a = 1 };') is not struct field-init and not container brace-init, so it used to
+// fall into EmitFieldInitializer's generic struct-field-init failure message ("'int' is not a
+// known struct type") - technically true but describing a construct the user did not write.
+// Found while routing the bare-brace spelling ('int x {5};', no '=') through the same local
+// declarator handling the '=' spelling already used: PRE, the bare form silently read an
+// uninitialized garbage value (rc 0, e.g. "x=1876644176"); this reject is new and intentional
+// for that spelling, and the message must name the real situation for BOTH spellings rather
+// than misdescribe it as a struct problem (the '=' spelling already rejected before this fix,
+// just with the same misleading wording).
 // Not fixed here: making 'int x {5};' actually assign 5 - that is a language feature
 // (primitive brace-value-init), out of scope for this bug fix; file separately if wanted.
-// (A GLOBAL primitive brace-init like 'int x = {5};' at file scope is a different,
-// pre-existing silent-zero gap - unaffected by this fix, not covered by this leg.)
+//
+// GLOBAL legs (fix/iface-global): the same construct at FILE scope used to compile clean and
+// silently discard the list - the global declarator's brace-list reject only fired when
+// GetDataStructure(TypeName).StructType was non-null, which is false for an interface (they
+// live in interfaceTable, not the struct table) and for every primitive. Measured on 0a45763,
+// each global leg below compiled rc 0 with the value dropped: 'I gi = { a = 1 };' landed as
+// '@gi = global %__iface_fat_ptr zeroinitializer' (byte-identical to '= default', so gi read
+// back null), and 'int gx = {5};' returned 0. Both scopes now give this one message.
+interface I { int foo(); };
+class S : I { int a = default; int foo() { return a; } };
+interface IB<T> { T get(); };
+class B : IB<int> { int b = default; int get() { return b; } };
+
+// The filed repro: a field name of the CONCRETE type on an INTERFACE-typed global.
+expect_error("brace initializer with values is not supported on 'gi' - 'I' is not a struct/union/class or a recognized container") {
+    I gi = { a = 1 };
+}
+// Bare-brace spelling (no '='): a separate grammar path (initDeclarator's own list), so it
+// needs its own leg - the sibling global-struct fix shipped with this spelling still open.
+expect_error("brace initializer with values is not supported on 'gi2' - 'I' is not a struct/union/class or a recognized container") {
+    I gi2 { a = 1 };
+}
+// Positional list on the same interface-typed global.
+expect_error("brace initializer with values is not supported on 'gi3' - 'I' is not a struct/union/class or a recognized container") {
+    I gi3 = { 1 };
+}
+// Generic interface instantiation - the message names the mangled instantiation.
+expect_error("brace initializer with values is not supported on 'gb' - 'IB__i32' is not a struct/union/class or a recognized container") {
+    IB<int> gb = { b = 1 };
+}
+// Namespace scope: the global takes its qualified name into the diagnostic.
+expect_error("brace initializer with values is not supported on 'N.gi' - 'I' is not a struct/union/class or a recognized container") {
+    namespace N { I gi = { a = 1 }; }
+}
+// Non-interface siblings that fell through the same hole: a primitive global (both spellings).
+expect_error("brace initializer with values is not supported on 'gx' - 'int' is not a struct/union/class or a recognized container") {
+    int gx = { 5 };
+}
+expect_error("brace initializer with values is not supported on 'gx2' - 'int' is not a struct/union/class or a recognized container") {
+    int gx2 { 5 };
+}
+// A pointer-to-primitive global: TypeName is the pointee, so it is not a known struct either.
+expect_error("brace initializer with values is not supported on 'gp' - 'char' is not a struct/union/class or a recognized container") {
+    char* gp = { 1 };
+}
+
 extern int main()
 {
     expect_error("brace initializer with values is not supported on 'x' - 'int' is not a struct/union/class or a recognized container") {
@@ -20,6 +64,11 @@ extern int main()
     }
     expect_error("brace initializer with values is not supported on 'x' - 'int' is not a struct/union/class or a recognized container") {
         int x { 5 };
+    }
+    // Local counterpart of the interface legs above - this scope always rejected, and is the
+    // oracle the global legs were matched to.
+    expect_error("brace initializer with values is not supported on 'li' - 'I' is not a struct/union/class or a recognized container") {
+        I li = { a = 1 };
     }
     return 0;
 }

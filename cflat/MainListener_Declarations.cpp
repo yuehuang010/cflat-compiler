@@ -3473,12 +3473,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     {
                         auto scalarElements = scalarInitList->fieldInit();
                         const std::string& scalarTypeName = typeAndValue.TypeName;
-                        if (!scalarElements.empty()
-                            && compiler->GetDataStructure(scalarTypeName).StructType != nullptr)
+                        bool isContainerType = scalarTypeName.rfind("list__", 0) == 0
+                            || scalarTypeName.rfind("array__", 0) == 0
+                            || scalarTypeName.rfind("dictionary__", 0) == 0;
+                        bool scalarIsAggregate =
+                            compiler->GetDataStructure(scalarTypeName).StructType != nullptr;
+                        if (!scalarElements.empty() && scalarIsAggregate)
                         {
-                            bool isContainerType = scalarTypeName.rfind("list__", 0) == 0
-                                || scalarTypeName.rfind("array__", 0) == 0
-                                || scalarTypeName.rfind("dictionary__", 0) == 0;
                             bool hasPositional = false;
                             for (auto* fi : scalarElements)
                                 if (fi->Identifier() == nullptr) { hasPositional = true; break; }
@@ -3501,6 +3502,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     "field initializers ('{{field = value}}') are not supported for {} '{}' "
                                     "at global scope; assign fields individually after declaration, or use "
                                     "'= default' to zero-initialize", kindWord, scalarTypeName));
+                        }
+                        else if (!scalarElements.empty() && !isContainerType)
+                        {
+                            /*
+                             * The type is neither an aggregate nor a container, so the branch above
+                             * never fired and the list was silently DISCARDED: `right` stays the
+                             * type's zero default and the global lands as a zeroinitializer. That
+                             * covers INTERFACE-typed globals (`I gi = { a = 1 };` - the fat value's
+                             * boxing machinery is never reached, since a brace list is not an
+                             * assignmentExpression, and an interface is not in the StructData table
+                             * at all), and equally primitives, `char*`, `function<>` and `simd`.
+                             * The LOCAL declarator already rejects every one of these with this
+                             * message, so the two scopes now agree. Fixed arrays and array views
+                             * never reach here - both `continue` out earlier.
+                             */
+                            LogNonAggregateBraceInitReject(direct, name, scalarTypeName);
                         }
                     }
 
@@ -3895,10 +3912,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // whatever 'right' happened to be seeded to. A POINTER-typed declaration
                                 // ('S* p {a=1};') does NOT reach this branch: TypeName is the pointee
                                 // ('S'), which IS a known struct, so it takes the pointer reject below.
-                                LogErrorContext(direct, std::format(
-                                    "brace initializer with values is not supported on '{}' - '{}' is not "
-                                    "a struct/union/class or a recognized container; assign it after declaration instead",
-                                    name, typeAndValue.TypeName));
+                                LogNonAggregateBraceInitReject(direct, name, typeAndValue.TypeName);
                             }
                             else if (typeAndValue.Pointer)
                             {

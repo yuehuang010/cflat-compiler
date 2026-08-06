@@ -5812,6 +5812,16 @@ void MainListener::LogPointerBraceInitReject(
             what, typeText, typeName, remedy));
     }
 
+void MainListener::LogNonAggregateBraceInitReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& name,
+        const std::string& typeName) {
+        LogErrorContext(ctx, std::format(
+            "brace initializer with values is not supported on '{}' - '{}' is not "
+            "a struct/union/class or a recognized container; assign it after declaration instead",
+            name, typeName));
+    }
+
 std::string MainListener::DescribePointerDeclType(const LLVMBackend::TypeAndValue& tv) {
         if (tv.ConstArraySize > 0) return DescribeArrayShape(tv);
         // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out.
