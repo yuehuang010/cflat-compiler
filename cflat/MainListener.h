@@ -13011,12 +13011,13 @@ public:
      * implements. Then box per arm (each arm boxes in its own block with its own vtable, so
      * mixed-class arms work) and hand the scorer a genuine INTERFACE argument.
      *
-     * Deliberately NOT a bare TypeName stamp of the arms' class. `TypeAndValue::IsTypeMatch`
-     * compares TypeName and IGNORES Pointer, so stamping the CLASS made a by-value `f(Circle c)`
-     * parameter score a PERFECT match on a `Circle*` and lower a raw pointer into a struct slot -
-     * a module-verifier dump with no source location; and where an interface overload also existed,
-     * the by-value candidate displaced the very interface call this exists to enable. An
-     * interface-typed argument cannot match a by-value class parameter at all, which is correct.
+     * Deliberately NOT a bare TypeName stamp of the arms' class. Measured when this was written:
+     * stamping the CLASS made a by-value `f(Circle c)` parameter score a PERFECT match on a
+     * `Circle*` and lower a raw pointer into a struct slot - a module-verifier dump with no source
+     * location; and where an interface overload also existed, the by-value candidate displaced the
+     * very interface call this exists to enable. `TypeAndValue::IsTypeMatch` has since gained a
+     * pointer gate, which may cover the first half - the second half is reason enough on its own.
+     * An interface-typed argument cannot match a by-value class parameter at all, which is correct.
      *
      * Returns nullptr - leaving the argument untouched, so the ordinary LOCATED "no overload
      * matches" diagnostic stands - for every case it cannot prove: not a ledgered join, an arm

@@ -504,7 +504,6 @@ produce a program.
 | [[list-of-function-element-into-closure-param-fails-verifier]] | diagnostic | Hard compile failure with no source diagnostic - raw module-verifier dump. Passing a `list<function<>>` element to a closure parameter fails; building the list and invoking the element directly both work. Likely shares a root with [[generic-wrapper-over-function-type-llvm-fatal]]. Filed 2026-07-31. |
 | [[generic-funcptr-return-poisons-enclosing-return]] | false rejection | Legal code rejected with a P1-grade diagnostic: a raw module-verifier dump (`%thinret`) and NO source location. CALLING a generic function that returns `function<>` routes the ENCLOSING function's `return` through `CoerceToFuncPtrReturn`. `main` does NOT escape; `void` and POINTER returns escape (the latter by a no-op ptr-to-ptr bitcast, which is why this is P2 and not P1 - no spelling is silently wrong). A second, different failure on the no-value-parameter spelling is recorded in the file; do not conflate. Filed 2026-08-01. |
 | [[chained-nullcoalesce-not-boxed-into-interface]] | false rejection | `take(z ?? y ?? a)` and `IShape j = z ?? y ?? a;` do not compile - the outer join's arm is the inner join's LOAD, which names no class. Spans EVERY position that boxes a `??` (decl-init, assignment, return, argument), so it predates the return/argument work. Fix at the ledger by splicing a nested join's arms. Filed 2026-07-31. |
-| [[pointer-arg-binds-by-value-class-param]] | miscompile | `byVal(a)` with a `Circle*` and a by-value `Circle` parameter scores a PERFECT match and lowers a raw pointer into a struct slot - module-verifier dump, NO source location, exit 1. `IsTypeMatch` compares TypeName and ignores `Pointer`; the sibling `IsTypePromotion` does gate on it. PRE-EXISTING and language-wide, no join involved. Scorer change - wide blast radius, wants the corpus sweep. Filed 2026-07-31. |
 
 On the `crash/` bucket: only [[generic-wrapper-over-function-type-llvm-fatal]] is a true abort
 (LLVM fatal, exit 134). The other five exit 1 with a raw LLVM module-verifier dump and NO
@@ -557,6 +556,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[file-offsets-capped-at-2gb]] | silent wrong value | `core/filesystem.cb` narrows every offset through `int`, so `File.size()`/`tell()`/`seek()` truncate past 2 GB on ALL platforms - the public surface is `int` too, so widening the internals alone is not enough. Split out of `ftell-fseek-long-width-on-windows` when that P1 landed 2026-08-02; NOT the `long`-width defect, which is fixed. Had no row in this table until 2026-08-03 - it was filed in narrative only. |
 | [[simd-type-spelling-unusable-outside-declarations]] | feature gap | `simd<T,N>` is recognised only in `ParseDeclarationSpecifiers` and as a `primaryExpression`, so a cast target, a lambda parameter and a tuple/`function<>` signature component all say "unknown type 'simd<float,4>'", and `simd<T,N>[]` silently DROPS the empty bracket and compiles as a plain vector local. Measured identical on `904f026` and `fix/simdptr`. Wants one encoded-name mechanism (mirroring `BuildEncodedClosureName`), not four patches. Filed 2026-08-03. |
 | [[c-binder-misses-decorated-function-pointer-parameter]] | false rejection | A `const`-qualified C function-pointer parameter binds as `void*`, and the code-value gate then rejects the legal call. Found 2026-08-03 verifying the `void*` oracle for `fix/funcptr-rebind`; the file's first filing named the wrong qualifier and repro - the correction inside is the useful part. Had no row here until 2026-08-04. |
+| [[double-pointer-arg-binds-single-pointer-param]] | silent wrong value | `byPtr(pp)` with a `Circle**` and a `Circle*` parameter compiles, links and RUNS, returning the low bytes of the pointee address instead of the field (`2003` expected; the exit code is the pointee ADDRESS's low bytes, so it is ENVIRONMENT-dependent - the same binary gives 176 and 224 from two different output directories - and a change in it is NOT a change in behaviour). Opaque pointers make both sides one LLVM type, so unlike its `T*`-into-`T` sibling there is nothing for the module verifier to catch. Same predicate (`IsTypeMatch`), depth axis instead of the pointer-ness axis; held out of `fix/ptrarg-byval` because an `ElemPointer` rejection would reject programs that compile and run today, whereas that fix rejected a shape no compiling program can contain. Filed 2026-08-05 by `fix/ptrarg-byval`. |
 
 ### P3 - diagnostics, latent, deliberate deferrals (`p3/`)
 
@@ -4242,3 +4242,182 @@ as the issue predicted. `test.sh Release`: 598 passed, 0 failed, 8 skipped.
 Standing consequence worth keeping: leak counts measured before this change are NOT comparable with
 counts measured after it. The pre-fix warm numbers were taken under a false `sdk 11.0` stamp that
 opted every binary into legacy libSystem behaviour.
+
+## Landed: `fix/ptrarg-byval` (2026-08-05) - a POINTER argument no longer binds a by-value parameter
+
+Closes `p1/crash/pointer-arg-binds-by-value-class-param` and DELETES the file. The filed repro
+reproduced verbatim on the `f45c9ad` Release binary: `Circle* a; byVal(a);` against
+`int byVal(Circle c)` exits 1 with `Call parameter type does not match function signature!` and no
+`file(line,col):` prefix.
+
+**The filed root cause held exactly.** `TypeAndValue::IsTypeMatch` compared `TypeName` and never
+consulted `Pointer`, so `{Circle, Pointer}` scored a PERFECT 0 against `{Circle}`; the by-value arm
+of `CreateOverloadedFunctionCall` then lowered through `Upconvert`, which has no ptr-to-struct arm
+at all and returns the value unchanged, dropping a raw address into the struct slot. Two things the
+file did not say were measured and are what set the scope: `MatchFunction` does no type filtering
+whatsoever (it binds names to slots), so `IsTypeMatch` is the ONLY gate on the direct path; and
+virtual dispatch does not use that gate at all - `ResolveInterfaceMethodSlot`'s lone-slot arm picks
+by ARITY - so an interface method with a by-value class parameter fails identically and needs its
+own proof.
+
+**The end state is a LOCATED REJECTION, not an auto-dereference, and the choice was measured.**
+Every neighbouring shape the language already rejects rather than adjusts: `int*` into `int`,
+`int[]` into `int`, a pointer into a CONSTRUCTOR or an `operator+` parameter all give the located
+"no overload ... matches" today. Rejecting brings the class/struct case into that existing set.
+
+**The gate is ONE-SIDED and that is the whole safety argument.** `IsTypeMatch` refuses only
+`Pointer && !other.Pointer` - an ARGUMENT that is a pointer at a by-value PARAMETER. The reverse,
+`T` into a `T*` parameter, keeps matching, because it is a real working capability and not an
+accident: `--no-opt` IR for `Circle v; byPtr(v);` is `call i32 @_byPtr_i32_CirclePtr_(ptr %v)` - the
+caller's alloca, an implicit address-of. The predicate is therefore ASYMMETRIC and only correct at
+its one caller's operand order (`argument.IsTypeMatch(parameter)`); the comment says so.
+
+**What the rejection takes away, stated exactly - an earlier draft of this record claimed "nothing"
+and that was WRONG.** For a MEMORY-CLASS CFlat by-value struct parameter the claim does hold: such a
+parameter is an LLVM struct slot at EVERY size - a 16-field class was measured failing verification
+exactly like a 1-field one - so no program containing that shape ever built, on any platform, and
+the rejection cannot refuse working code. That is the argument for the Windows-only core the macOS
+sweep never compiles, and it is the only place the argument applies.
+
+Two measured shapes DID compile and run before and are now rejected, both reading wrong bytes:
+
+- **`string*` into a by-value `string`** (matrix cell `ptrarg_b4`) built and ran: `s.length()` reads
+  the length field out of a slot that only ever received the pointer, so the answer is whatever was
+  left in it. ENVIRONMENT-dependent again, and this one is a trap worth stating: changing only the
+  output FILENAME flips it between `1005` and `1003` on BOTH binaries, and `1003` is also the
+  CORRECT answer - so a single run of this shape can look like a working program. It is not; the
+  `*p` spelling is the one that computes `1003` on purpose.
+- **A C by-value struct through the C binder.** `struct RP { int x; }; int rp_by_val(struct RP p);`
+  called as `RP* p; rp_by_val(p)` builds, links and RUNS on the pre-fix binary, returning an
+  ENVIRONMENT-dependent wrong value - `200` and `216` both observed, from different output
+  directories - where `203` is correct. That is the same garbage class the deferred `T**` issue
+  describes: the coerced scalar carries address bytes, so the number tracks the process image and
+  must not be quoted as a fixed figure. A small C struct is lowered to a COERCED SCALAR by the C
+  ABI, so nothing structural is left for the module verifier to catch. The `*p` spelling gives
+  `203` on both binaries. This is the shape that matters for the Windows core, which passes by-value
+  `POINT` / `RECT` / `GUID` through the same binder: a call site there holding a pointer compiled and
+  ran before and is rejected now.
+
+Both are silent wrong values, so rejecting them is the intended outcome rather than a cost - but the
+blast radius is NOT zero and must not be described as such.
+
+**Virtual dispatch got its own proof rather than a share of the scorer's, in TWO forms.**
+`PointerArgIntoByValueParam` (`cflat/LLVMBackend.h`) proves a pointer argument whose TypeName IS the
+by-value parameter's type, at a registered data structure, excluding `IsInterface` and
+`IsFunctionPointer` parameters. The same-TypeName requirement is what keeps `char*` -> `string`
+coercion and the `Circle*` -> `IShape` upcast out of it. `PointerArgIntoByValuePrimitiveParam` is
+the second form and was added in round 2 after a review found the original verifier dump still live
+for a by-value PRIMITIVE slot (`interface ITaker { int take(int n); }` fed an `int*`): a primitive
+pointer argument carries an EMPTY CFlat TypeName, so the same-name test structurally cannot see it.
+It requires the type flag AND the lowered LLVM type to agree the argument is a pointer - a by-value
+struct's `Primary` is an alloca address, so the LLVM type alone would mistake one for a pointer -
+and it takes a bare `nullptr` from the null CONSTANT, which carries no flag at all. Both fire from
+`DiagnoseProvableInterfaceArgMismatch`, so BOTH slot-picking arms carry them: the lone-slot arm
+(arity-only), and the multi-slot fallback that runs when the scorer - now correctly - ranks nothing.
+
+**The INDIRECT call path needed a third site, also found by review.** Invoking a
+`function<int(Circle)>` VALUE with a `Circle*` goes through neither `ComputeOverloadFunction` nor
+`ResolveInterfaceMethodSlot` - `CreateIndirectCall` lowers the arguments itself - so it kept dumping
+the verifier unlocated. `CheckIndirectCallArgShape` runs in both of that function's argument loops
+(thin C-pointer and fat closure), AFTER the conversion attempt, so it judges a RESIDUE rather than
+predicting one: `Upconvert` has no ptr-to-struct or ptr-to-arithmetic arm and returns the value
+unchanged, and LLVM requires an exact per-argument type match, so a pointer left in a non-pointer
+slot always fails verification. Only that one direction is judged; every other residual mismatch is
+left exactly as it was. Scoped deliberately to argument checking so it stays disjoint from the
+concurrent `fix/genfp-return` work on return lowering in the same area.
+
+**Diagnostics render a mangled instantiation only when the rendering is PROVABLY writable source.**
+A generic slot's TypeName is mangled (`Box__i32`), and quoting that raw in "declare the parameter as
+'...'" is advice nobody can follow, so `DisplayNameOfMangledType` renders `Box<i32>` - verified
+writable and binding the same instantiation as the `Box<int>` the user wrote. But the mangling is
+AMBIGUOUS: `dictionary__string__int` is two sibling arguments and `Box__Box__i32` is one nested one,
+and the string cannot tell them apart - the naive render gave `Box<Box, i32>`, which names no type.
+So a name whose `__` segments include a TEMPLATE name (asked of `IsGenericTemplateKey`, plus a
+namespace-tail scan, deliberately over-broad since a false "ambiguous" costs only prettiness) keeps
+the RAW name and DROPS the advice clause entirely. Measured: `Box<i32>`, `Pair<i32, float>` and
+`dictionary<string, i32>` render with advice; `Box<Box<int>>` and `Pair<Box<int>, float>` print raw
+with no advice. Found by the round-2 review.
+
+Predicate audit, per site: `IsTypeMatch` has exactly ONE caller (`ComputeOverloadFunction`).
+`IsTypePromotion` was verified as an oracle before being imitated - its `Pointer != other.Pointer`
+gate is correct for ITS question (a numeric widening into a differently-shaped slot is never valid)
+and `int*`->`long`, `float*`->`double` were measured rejected on both binaries. The five other
+`Parameters[0].TypeName == typeName` sites (`HasUserCopyMethod`, `HasCopyOverloadFor`,
+`HasRealCopyOverloadFor`, `HasArrowOverloadFor`, and the member-exists probe) ask "does a method
+exist for this TYPE NAME" - a receiver lookup, whose `this` is legitimately `T` or `T*` for the same
+method - so adding a `Pointer` gate there would BREAK them; they are not the same defect.
+`CompareUpconvert` (the empty-TypeName arm) is unreached by these shapes: a primitive pointer
+argument arrives with no TypeName and was already rejected on both binaries.
+
+Coverage matrix, 46 probes in `scratch/p/ptrarg_*` plus the round-2 batteries in `scratch/r2/` and
+`scratch/verify/`, every cell measured pre and post. Fixed by this change: class, struct,
+`Box<int>` instantiation, `string`, array-view (`Circle[]`), 16-field class, a C by-value struct
+through the C binder;
+sources spelled bare, through a member (`h.p`), through a call result; call shapes direct, method,
+generic (`g<Circle>`); overload sets with the by-value candidate declared first (which used to
+verifier-dump, and now correctly picks the `Circle*` sibling, matching what the swapped declaration
+order already did); interface method, lone slot and two same-arity slots. Already rejected before
+and unchanged: `int*`->`int`, `int[]`->`int`, constructor argument, `operator+` argument, `A*`->`B`,
+raw `T*` into a `T[]` view. Accepted before and still accepted: `T*`->`T*`, `*a`->`T`, `&v`->`T*`,
+`T`->`T*`, `nullptr`, `void*`, `move T*`, an alias-spelled `T*`, `list<Circle*>`, `g<Circle*>`,
+`Circle*` into an `IShape` value parameter, `T[]`->`T*`, and the interface-method twins of the last
+several. Also fixed, found by the round-1 review: a by-value PRIMITIVE slot on the virtual path
+(`int*` and `nullptr` into an `int` parameter), and the indirect call through a `function<>` value
+in both spellings (invoked directly, and invoked inside a callee that received the lambda as a
+parameter) - all three were byte-identical unlocated verifier dumps before round 2.
+
+Differential corpus sweep, both binaries, real `-o` compile AND run, **446 `.cb` across `Test/` and
+`example/`: exactly ONE behavioural difference - `Test/test_basic.cb`, the new legs.** The harness
+was validated non-vacuous by running the PRE binary TWICE: that self-check reproduces 9 files whose
+stdout md5 varies run to run (timings, addresses, `hpc` and `macos` examples), and those same 9 are
+the entire md5-only residue of the pre/post diff. Exit codes are identical on all 446.
+
+The baseline is the VERIFIED MERGE-BASE, re-measured after the rebase: the figures above are from
+`3c90ab4`, built in a detached worktree and confirmed by `git log` on that worktree. The sweep was
+run once against `f45c9ad` before the rebase with the identical result, and the 46-cell coverage
+matrix was regenerated against `3c90ab4` too - every cell lands where it did against `f45c9ad`, so
+the intervening master commit moves none of them.
+
+Legs: SIX scoped `expect_error` blocks in the new `Test/errors/err_pointer_arg_byvalue_param.cb`
+(direct call, array-view source, interface dispatch on a class slot, interface dispatch on a
+primitive slot, the `nullptr` spelling of that slot, and the indirect call through a `function<>`
+value), each mutation-tested ALONE against the pre-fix binary and each flipping that file to exit 1.
+Eleven value legs in `Test/test_basic.cb::testOverloadResolution`: one FIX leg
+(`pab_ptr_arg_picks_ptr_overload` = 2003, which pre-fix took down the whole file with a verifier
+dump) and ten ACCEPT legs that pass on both binaries by construction and were mutation-tested
+against the COMPILER instead - each names the widening of the gate that would flip it (symmetric
+gate, value-arg preference, explicit deref, `IsInterface` ignored, and for the round-2 gates: a
+primitive value argument, a pointer PARAMETER, `nullptr` at a pointer parameter, and three
+indirect-call shapes).
+
+Round-2 accept set for the two new gates, 28 probes in `scratch/r2/` (`scratch/MATRIX_R2.txt`),
+every accept cell measured identical pre and post: virtual dispatch with
+`int`/`bool`/`double`/`string`/`char*`/`void*`/`int[]`/`int*` parameters, `nullptr` at `int*`,
+`void*` and `Circle*` parameters, and indirect calls with `Circle*`, `int*`, `void*`, `char*`,
+`string`, `int`, interface-value and dereferenced-value arguments, a named function assigned to a
+`function<>`, and a `function<>` copied into another (`r2_i_funcptr_copy_OK` - renamed from a
+misleading `thin_extern` label, which it never was).
+
+**Both arms of `CreateIndirectCall` are crossed, and the FAT arm alone would not have proved it.**
+Every `function<>` cell above lowers through the fat closure arm; the THIN arm needs a real C
+function-pointer typedef, so it is crossed by two dedicated cells built against a `.c`/`.h` pair
+(`r2_i_thinarm_value_OK`, `r2_i_thinarm_ptr_REJECT`, from the round-1 reviewer's probes): a by-value
+`RP` argument through `int (*)(struct RP)` runs `103` on BOTH binaries, and the same call with an
+`RP*` goes from an unlocated verifier dump to the located rejection. One further cell,
+`r2_i_list_of_lambda_PREEXISTING_REJECT`, is VACUOUS for this gate and labelled so: it is refused on
+both binaries at its declaration by an unrelated pre-existing rule and never reaches an indirect
+call at all.
+
+The only cells that moved are the intended rejections.
+
+Deliberately NOT fixed, filed as [[double-pointer-arg-binds-single-pointer-param]]: `Circle**` into
+a `Circle*` parameter still binds and returns garbage. Same predicate, DEPTH axis rather than
+pointer-ness. It is held out on the polarity argument above - that rejection would refuse programs
+that compile and run today, so it needs its own accept set - and because `ElemPointer`'s population
+is not uniform across producers.
+
+Bar: macOS arm64 Release `./test.sh` **600 passed / 0 failed / 8 skipped** (598 before the new
+legs), `example_mac.sh` **35 passed / 0 failed**, `test_lsp.sh` **152 passed / 0 failed**. No new
+serialized field, and every field the three guards read already round-trips in `LLVMBackend.cpp`
+(`Pointer` `p`, `IsInterface` `if`, `IsFunctionPointer` `fp`, `IsArrayView` `av`, `ConstArraySize`
+`as`); the error test was verified firing on a COLD cache and a warm one alike.

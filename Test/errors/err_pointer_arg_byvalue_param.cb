@@ -1,0 +1,65 @@
+// A pointer argument must not bind a by-value parameter of the same type. Before the fix the
+// overload scorer (TypeAndValue::IsTypeMatch) compared TypeName only, scored a PERFECT match,
+// and lowered the raw address into the struct slot - a module-verifier dump with no location.
+
+class Circle { int r = 0; };
+
+int byVal(Circle c) { return 1000 + c.r; }
+
+interface ITaker { int take(Circle c); };
+class Impl : ITaker { int take(Circle c) { return 1000 + c.r; } };
+
+interface ICounter { int bump(int n); };
+class Counter : ICounter { int bump(int n) { return 100 + n; } };
+
+extern int main()
+{
+    // Direct call: no candidate remains, so the located "no overload" diagnostic stands.
+    expect_error("no overload of 'byVal' matches the given arguments") {
+        Circle* a = new Circle();
+        int r = byVal(a);
+    }
+
+    // Array view: 'Circle[]' is a pointer too, same slot, same rejection.
+    expect_error("no overload of 'byVal' matches the given arguments") {
+        Circle[] v = new Circle[2];
+        int r = byVal(v);
+    }
+
+    // Virtual dispatch picks its slot by ARITY, so it needs its own proof and gets the
+    // specific wording. This leg reaches the LONE-SLOT arm: ITaker declares one 'take'.
+    expect_error("cannot pass a 'Circle*' to by-value parameter 'c' of type 'Circle'") {
+        Impl* im = new Impl();
+        ITaker t = im;
+        Circle* a = new Circle();
+        int r = t.take(a);
+    }
+
+    // A by-value PRIMITIVE slot needs a separate proof: a primitive pointer argument carries an
+    // EMPTY CFlat TypeName, so the same-name test the class leg above uses cannot see it.
+    expect_error("cannot pass a pointer to by-value parameter 'n' of type 'int'") {
+        Counter* cn = new Counter();
+        ICounter ic = cn;
+        int x = 3;
+        int* p = &x;
+        int r = ic.bump(p);
+    }
+
+    // Same slot, the 'nullptr' spelling - proven from the null CONSTANT, since a bare nullptr
+    // carries no pointer flag at all.
+    expect_error("cannot pass a pointer to by-value parameter 'n' of type 'int'") {
+        Counter* cn = new Counter();
+        ICounter ic = cn;
+        int r = ic.bump(nullptr);
+    }
+
+    // Indirect call: invoking a function<> VALUE goes through neither the overload scorer nor the
+    // vtable slot resolver, so the shape is judged at the argument lowering instead.
+    expect_error("call through a function value: cannot pass a pointer as argument 1") {
+        function<int(Circle)> f = (Circle c) => { return 1000 + c.r; };
+        Circle* a = new Circle();
+        int r = f(a);
+    }
+
+    return 0;
+}

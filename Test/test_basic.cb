@@ -1836,6 +1836,29 @@ int readBack(bool* flag)
     return 7;
 }
 
+// Regression: a POINTER argument must not bind a by-value parameter of the same type. The scorer
+// compared TypeName only, so 'Circle*' scored a PERFECT match on 'PabTake(PabCircle)' and lowered
+// a raw address into the struct slot - a module-verifier dump with no source location.
+// The by-value overload is declared FIRST on purpose: it is the one that used to win.
+class PabCircle { int r = 0; };
+
+int PabTake(PabCircle c)  { return 1000 + c.r; }
+int PabTake(PabCircle* c) { return 2000 + c->r; }
+
+int PabByPtrOnly(PabCircle* c) { return 3000 + c->r; }
+
+interface IPabShape { int area(); };
+class PabSquare : IPabShape { int s = 0; int area() { return this.s; } };
+int PabTakeIface(IPabShape s) { return 4000 + s.area(); }
+
+// Virtual dispatch picks its slot by ARITY, so it carries its own copy of the pointer-vs-value
+// proof - one for a by-value class slot, one for a by-value PRIMITIVE slot. These pin its accept
+// set: a pointer PARAMETER and a null argument at one must both keep binding.
+interface IPabTaker { int bump(int n); };
+class PabCounter : IPabTaker { int bump(int n) { return 5000 + n; } };
+interface IPabPtrTaker { int peek(int* p); };
+class PabPeeker : IPabPtrTaker { int peek(int* p) { if (p == nullptr) { return 6001; } return 6000 + *p; } };
+
 bool testOverloadResolution()
 {
     bool result = true;
@@ -1865,6 +1888,50 @@ bool testOverloadResolution()
     result &= Test("string mismatch detected",   Test("_str_mm",   s1, s3)        == 0, true);
     result &= Test("string vs literal",          s1, "hello");
     result &= Test("str/literal mismatch detect",Test("_str_lit_mm", s1, "world") == 0, true);
+
+    // FIX LEG: pre-fix this whole file failed module verification (the by-value overload,
+    // declared first, took the pointer). 2003 proves the POINTER overload won.
+    PabCircle* pc = new PabCircle();
+    pc->r = 3;
+    result &= Test("pab_ptr_arg_picks_ptr_overload", PabTake(pc), 2003);
+
+    // ACCEPT LEGS: these pass on the pre-fix binary too - the frozen accept set. Each names the
+    // widening of the new pointer gate that would flip it.
+    PabCircle vc = default;
+    vc.r = 5;
+    // Fails if the gate became symmetric (value into 'T*' is a working implicit address-of).
+    result &= Test("pab_value_into_ptr_param", PabByPtrOnly(vc), 3005);
+    // Fails if a value argument started preferring the pointer overload.
+    result &= Test("pab_value_arg_picks_value_overload", PabTake(vc), 1005);
+    // Fails if an explicit dereference stopped reaching the by-value overload.
+    result &= Test("pab_deref_arg_picks_value_overload", PabTake(*pc), 1003);
+    // Fails if the gate had ignored IsInterface: 'PabSquare*' upcasts to a by-value interface.
+    PabSquare* ps = new PabSquare();
+    ps->s = 7;
+    result &= Test("pab_class_ptr_into_iface_param", PabTakeIface(ps), 4007);
+
+    // Virtual-path accept set. Fails if the by-value PRIMITIVE gate stopped requiring a
+    // NON-pointer parameter, or started judging a plain value as a pointer.
+    PabCounter* pcn = new PabCounter();
+    IPabTaker ict = pcn;
+    result &= Test("pab_virtual_int_value_arg", ict.bump(4), 5004);
+    PabPeeker* ppk = new PabPeeker();
+    IPabPtrTaker ipt = ppk;
+    int px = 9;
+    result &= Test("pab_virtual_ptr_param_binds", ipt.peek(&px), 6009);
+    result &= Test("pab_virtual_nullptr_into_ptr_param", ipt.peek(nullptr), 6001);
+
+    // Indirect-call accept set. Fails if the argument-shape check at the indirect call site
+    // widened past "a pointer left in a non-pointer slot".
+    function<int(PabCircle*)> fptr = (PabCircle* c) => { return 7000 + c->r; };
+    result &= Test("pab_indirect_ptr_param", fptr(pc), 7003);
+    function<int(PabCircle)> fval = (PabCircle c) => { return 8000 + c.r; };
+    result &= Test("pab_indirect_deref_arg", fval(*pc), 8003);
+    function<int(int*)> fip = (int* p) => { return 9000 + *p; };
+    result &= Test("pab_indirect_intptr_param", fip(&px), 9009);
+
+    delete pc;
+    delete ps;
 
     return result;
 }

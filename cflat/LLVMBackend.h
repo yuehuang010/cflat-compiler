@@ -711,8 +711,21 @@ public:
                 || TypeName == "bool" || TypeName == "void";
         }
 
+        /*
+         * ASYMMETRIC by design: the sole caller (ComputeOverloadFunction) asks
+         * `argument.IsTypeMatch(parameter)`, so `this` is the ARGUMENT and `other` the PARAMETER,
+         * and the pointer gate below is one-sided on purpose. Do not add a caller that reverses
+         * the operands without revisiting it.
+         *
+         * That gate: a pointer ARGUMENT does not bind a by-value parameter - the raw address would
+         * land in the value slot and reach the LLVM verifier. `T` into a `T*` parameter is the
+         * working implicit address-of (the caller passes the alloca) and stays a match.
+         */
         bool IsTypeMatch(const TypeAndValue& other) const
         {
+            if (Pointer && !other.Pointer)
+                return false;
+
             if (TypeName == other.TypeName)
                 return true;
 
@@ -11656,6 +11669,88 @@ public:
         return pos == std::string::npos ? mangled : mangled.substr(0, pos);
     }
 
+    /*
+     * True when a "__" segment of an instantiation name is itself a TEMPLATE name, which makes the
+     * flat rendering below AMBIGUOUS: the separator is the same for a nested argument and for a
+     * sibling one, so "Box__Box__i32" (Box<Box<int>>) and a hypothetical two-argument Box read
+     * identically. Deliberately over-broad - it also scans for a namespace-qualified key whose tail
+     * matches, since the declaring namespace is not knowable here - because a false "ambiguous"
+     * only costs the pretty rendering, while a false "unambiguous" prints a type that does not
+     * exist. IsGenericTemplateKey is the one definition of the template key space.
+     */
+    bool MangledGenericNameIsAmbiguous(const std::string& mangled) const
+    {
+        size_t d = mangled.find("__");
+        if (d == std::string::npos) return false;
+
+        auto segmentNamesATemplate = [&](const std::string& seg)
+            {
+                if (seg.empty()) return false;
+                if (IsGenericTemplateKey(seg)) return true;
+                std::string tail = "." + seg;
+                for (const auto& kv : gts.genericStructTemplates)
+                    if (kv.first.ends_with(tail)) return true;
+                for (const auto& kv : gts.genericClassTemplates)
+                    if (kv.first.ends_with(tail)) return true;
+                for (const auto& kv : gts.genericInterfaceTemplates)
+                    if (kv.first.ends_with(tail)) return true;
+                for (const auto& n : gts.scannedGenericStructNames)
+                    if (n.ends_with(tail)) return true;
+                for (const auto& n : gts.scannedGenericInterfaceNames)
+                    if (n.ends_with(tail)) return true;
+                return false;
+            };
+
+        std::string args = mangled.substr(d + 2);
+        for (size_t pos = 0; pos <= args.size(); )
+        {
+            size_t sep = args.find("__", pos);
+            std::string seg = (sep == std::string::npos) ? args.substr(pos) : args.substr(pos, sep - pos);
+            if (segmentNamesATemplate(seg)) return true;
+            if (sep == std::string::npos) break;
+            pos = sep + 2;
+        }
+        return false;
+    }
+
+    /*
+     * "Box__i32" -> "Box<i32>", "dictionary__string__int" -> "dictionary<string, int>". DIAGNOSTICS
+     * ONLY - never a key. A message that quotes the raw mangled name gives advice the user cannot
+     * write, so the rendered form is used when - and ONLY when - it is provably writable source
+     * that binds the same instantiation ('Box<i32>*' and 'Box<int>*' mangle alike).
+     *
+     * A NESTED instantiation cannot be rendered from the string: "Box__Box__i32" would come out
+     * "Box<Box, i32>", which is not what the user wrote and does not name any type. Those return
+     * the RAW mangled name with *writable = false, and every caller must then DROP its "declare the
+     * parameter as 'T*'" advice rather than hand back a spelling that will not compile. A name with
+     * no "__" comes back unchanged and is always writable.
+     */
+    std::string DisplayNameOfMangledType(const std::string& mangled, bool* writable = nullptr) const
+    {
+        if (writable) *writable = true;
+
+        size_t d = mangled.find("__");
+        if (d == std::string::npos)
+            return mangled;
+
+        if (MangledGenericNameIsAmbiguous(mangled))
+        {
+            if (writable) *writable = false;
+            return mangled;
+        }
+
+        std::string args = mangled.substr(d + 2);
+        std::string joined;
+        for (size_t pos = 0; pos <= args.size(); )
+        {
+            size_t sep = args.find("__", pos);
+            if (sep == std::string::npos) { joined += args.substr(pos); break; }
+            joined += args.substr(pos, sep - pos) + ", ";
+            pos = sep + 2;
+        }
+        return mangled.substr(0, d) + "<" + joined + ">";
+    }
+
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
     // sentinel (a '?:' join whose two arms disagreed - see PropagateFatInterfaceJoin) always
@@ -14101,6 +14196,41 @@ public:
             && (arg.BaseType->isIntegerTy() || arg.BaseType->isFloatingPointTy());
     }
 
+    /*
+     * PROOF, not a heuristic: a pointer argument whose pointee type IS the by-value parameter's
+     * type has no conversion to that slot - the raw address lowers into a struct slot and fails
+     * module verification. An INTERFACE parameter is excluded: a 'Circle*' legitimately upcasts to
+     * an 'IShape' value. Same question the direct-call scorer answers in TypeAndValue::IsTypeMatch;
+     * virtual dispatch needs its own copy because the lone-slot arm picks by ARITY alone.
+     */
+    bool PointerArgIntoByValueParam(const NamedVariable& arg, const TypeAndValue& param) const
+    {
+        return arg.TypeAndValue.Pointer && !param.Pointer && !param.IsInterface
+            && !param.IsFunctionPointer && !param.TypeName.empty()
+            && arg.TypeAndValue.TypeName == param.TypeName
+            && IsDataStructure(param.TypeName);
+    }
+
+    /*
+     * The same proof for a by-value PRIMITIVE parameter, which needs its own form: a primitive
+     * pointer argument ('int* p') carries an EMPTY CFlat TypeName, so the same-name test above
+     * cannot see it. Both the type flag and the LOWERED LLVM type must agree the argument is a
+     * pointer - a by-value struct's Primary is an alloca address, so the LLVM type alone would
+     * mistake one for a pointer. No pointer converts to an arithmetic slot, so nothing is proven
+     * about the pointee: this is the same shape the direct path already rejects for 'int*'->'int'.
+     */
+    bool PointerArgIntoByValuePrimitiveParam(const NamedVariable& arg, const TypeAndValue& param) const
+    {
+        // A bare `nullptr` carries no type flag at all, so it is proven from the CONSTANT instead.
+        // Both proofs are confined to a by-value primitive slot, where no pointer is ever legal.
+        bool argIsPointer = (arg.TypeAndValue.Pointer && arg.BaseType && arg.BaseType->isPointerTy())
+            || (arg.Primary && llvm::isa<llvm::ConstantPointerNull>(arg.Primary));
+        return argIsPointer
+            && !param.Pointer && !param.IsInterface && !param.IsFunctionPointer
+            && !param.IsArrayView && param.ConstArraySize == 0
+            && param.IsPrimitive() && param.TypeName != "void";
+    }
+
     // Reject a virtual call whose argument provably cannot satisfy its parameter. Shared by both
     // slot-picking arms so a second same-arity overload cannot turn a clean error into a miscompile.
     bool DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
@@ -14114,6 +14244,31 @@ public:
                 std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
                 LogError(std::format("no method of '{}.{}' matches the given arguments{}",
                     ifaceName, methodName, why.empty() ? "" : " - " + why));
+                return true;
+            }
+            if (PointerArgIntoByValueParam(args[i], params[i]))
+            {
+                // Rendered when the rendering is provably writable source; a nested instantiation
+                // stays raw and loses the advice clause rather than naming a type that cannot exist.
+                bool writable = true;
+                std::string shown = DisplayNameOfMangledType(params[i].TypeName, &writable);
+                std::string advice = writable
+                    ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
+                LogError(std::format(
+                    "call to '{}.{}': cannot pass a '{}*' to by-value parameter '{}' of type '{}' - "
+                    "there is no implicit dereference. Write '*' at the call site to pass the "
+                    "pointee{}.",
+                    ifaceName, methodName, shown, params[i].VariableName, shown, advice));
+                return true;
+            }
+            if (PointerArgIntoByValuePrimitiveParam(args[i], params[i]))
+            {
+                LogError(std::format(
+                    "call to '{}.{}': cannot pass a pointer to by-value parameter '{}' of type '{}' - "
+                    "an address is not of type '{}'. Dereference it with '*' at the call site, or "
+                    "declare the parameter as '{}*'.",
+                    ifaceName, methodName, params[i].VariableName, params[i].TypeName,
+                    params[i].TypeName, params[i].TypeName));
                 return true;
             }
         }
@@ -16878,6 +17033,43 @@ public:
         return tv;
     }
 
+    /*
+     * A pointer VALUE left sitting in a non-pointer parameter slot of an indirect call. Checked
+     * AFTER the conversion attempt, so it is a residue, not a prediction: Upconvert has no
+     * ptr-to-struct or ptr-to-arithmetic arm and returns the value unchanged, and LLVM requires an
+     * EXACT type match per call argument - so this shape always fails module verification, with no
+     * source location. Rejecting it can therefore never refuse a program that builds. Only this one
+     * direction is judged; every other residual mismatch is left exactly as it was.
+     */
+    void CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy, size_t index,
+                                   const std::string& paramTypeName)
+    {
+        if (arg == nullptr || destTy == nullptr) return;
+        if (!arg->getType()->isPointerTy() || destTy->isPointerTy()) return;
+
+        // An unnamed slot gets the shorter message: naming a type it does not have, or advising a
+        // '*' spelling of it, would be advice the caller cannot follow.
+        bool writable = true;
+        std::string shown = DisplayNameOfMangledType(paramTypeName, &writable);
+        if (shown.empty())
+        {
+            LogError(std::format(
+                "call through a function value: cannot pass a pointer as argument {} - that "
+                "parameter is a by-value slot and there is no implicit dereference. Write '*' at "
+                "the call site to pass the pointee.", index + 1));
+            return;
+        }
+        // Same rule as the virtual site: a nested instantiation renders ambiguously, so it keeps
+        // the raw name and loses the advice clause.
+        std::string advice = writable
+            ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
+        LogError(std::format(
+            "call through a function value: cannot pass a pointer as argument {} - parameter {} is "
+            "the by-value type '{}' and there is no implicit dereference. Write '*' at the call "
+            "site to pass the pointee{}.",
+            index + 1, index + 1, shown, advice));
+    }
+
     // Emits an indirect call through a closure fat struct {i8* fnptr, i8* envptr}.
     llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr, std::vector<llvm::Value*> args)
     {
@@ -16906,6 +17098,7 @@ public:
                     args[i] = WrapStringLiteralAsString(args[i]);
                 else
                     args[i] = Upconvert(args[i], destTy);
+                CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
             }
             lastCallReturnType = retTV;
             auto* result = builder->CreateCall(cFnTy, fnPtr, args);
@@ -16950,6 +17143,7 @@ public:
                 args[i] = WrapStringLiteralAsString(args[i]);
             else
                 args[i] = Upconvert(args[i], destTy);
+            CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
         }
 
         // Append env to call args (env-last)
