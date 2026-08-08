@@ -138,6 +138,7 @@ std::string LLVMBackend::FindClangCl() const
         return "";
     }
 
+#if defined(__APPLE__)
 std::string LLVMBackend::FindBundledLd64Lld() const
 {
         if (!runtimeDir.empty())
@@ -149,6 +150,7 @@ std::string LLVMBackend::FindBundledLd64Lld() const
         if (auto p = llvm::sys::findProgramByName("ld64.lld")) return *p;
         return "";
     }
+#endif
 
 std::string LLVMBackend::FindCDriver() const
 {

@@ -2438,6 +2438,11 @@ void LLVMBackend::ResetForReanalysis()
 
     functionTable.clear();
     dataStructures.clear();
+    // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
+    // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
+    // file's registration early-return, leaving `Lambda<int(int)>` resolvable as an encoded name
+    // with no type behind it - it then reports as `unknown type '__fatfn_...'`.
+    encodedClosureTypes_.clear();
     // Body origins describe definitions in the module just discarded; a survivor would make the
     // next analysis of the same file report its own definition as a redefinition of itself.
     functionBodyOrigin_.clear();
