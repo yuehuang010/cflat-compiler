@@ -4843,6 +4843,82 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
         return {};
     }
 
+/*
+ * A cast operand can name no value at all, in which case ParseCastExpression used to reach
+ * CreateCast with a null llvm::Value and SIGSEGV the compiler with zero diagnostic output.
+ * Two outcomes are possible and both are handled here.
+ *
+ * A generic FUNCTION instantiation ('gid<double>') is the supportable one: the postfix walk
+ * publishes it as an empty NamedVariable carrying only the mangled instantiation name, the
+ * same convention the declarator and assignment paths already consume. It is a monomorphized
+ * function symbol, so resolving it to its llvm::Function makes the cast behave exactly like a
+ * cast of a plain named function - no gate is bypassed, the cast lands on the same
+ * ParameterStoresData / RegisterCodeValueDataCast tail as '(void*)plainFn'.
+ *
+ * Everything else that reaches here (a type name, a namespace, a generic function template
+ * with no type arguments) genuinely has no value, so it gets a located diagnostic.
+ */
+void MainListener::ResolveValuelessCastOperand(CFlatParser::CastExpressionContext* ctx,
+                                               CFlatParser::CastExpressionContext* operandCtx,
+                                               LLVMBackend::NamedVariable& namedVar,
+                                               const LLVMBackend::TypeAndValue& destTypeName) {
+        if (namedVar.Primary != nullptr || namedVar.Storage != nullptr)
+            return;
+
+        // Compiler() without a ctx: the ctx overload calls SetSourceLocation, which would move
+        // the caret of every later diagnostic from the operand to the cast's '('.
+        auto* compiler = Compiler();
+
+        // A monomorphized instantiation's mangled name is unique, so it resolves exactly the way
+        // a plain named function does (ParseIdentifier's GetFunctionForFuncPtr(name) arm).
+        if (!namedVar.CallerName.empty())
+        {
+            namedVar.Primary = compiler->GetFunctionForFuncPtr(namedVar.CallerName);
+            if (namedVar.Primary != nullptr)
+            {
+                // Instantiating the template left the caret inside the template BODY; point it at
+                // the operand, which is where the plain named-function spelling leaves it.
+                if (operandCtx != nullptr)
+                    Compiler(operandCtx);
+                return;
+            }
+        }
+
+        std::string operandText = operandCtx != nullptr ? operandCtx->getText() : std::string();
+        // The base name is the spelling before any type-argument list, so a template whose
+        // arguments failed to form an instantiation is still recognized as one.
+        std::string operandBase = operandText.substr(0, operandText.find('<'));
+        bool isTemplate = !operandBase.empty()
+            && genericFunctionTemplates.count(compiler->ResolveGenericFunctionBase(operandBase)) != 0;
+
+        // A bare generic function template resolves to nothing until it is instantiated; name the
+        // remedy, which the branch above compiles.
+        if (isTemplate && operandBase == operandText)
+        {
+            LogErrorContext(ctx, std::format(
+                "'{}' is a generic function template and has no value until it is instantiated; "
+                "give it explicit type arguments (e.g. '{}<int>').", operandText, operandText));
+        }
+        // Type arguments WERE written but no instantiation came of them - wrong count, or an
+        // argument that is not a type. Name that rather than claiming it is not a value.
+        else if (isTemplate)
+        {
+            LogErrorContext(ctx, std::format(
+                "'{}' did not instantiate the generic function template '{}', so it has no value; "
+                "check the number and spelling of its type arguments.", operandText, operandBase));
+        }
+        else
+        {
+            // Spell the destination from the source text; a synthesized rendering would have to
+            // guess at array-view, function-pointer and alias spellings.
+            std::string destText = ctx->typeName() != nullptr ? ctx->typeName()->getText() : destTypeName.TypeName;
+            LogErrorContext(ctx, std::format(
+                "'{}' does not name a value, so it cannot be cast to '{}' - a type name, a namespace "
+                "and an uninstantiated generic template are not values.",
+                operandText, destText));
+        }
+    }
+
 LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue,
                                                    bool discardResult) {
         auto* compiler = Compiler(ctx);
@@ -4885,6 +4961,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 }
                 nv.Storage = nullptr;
             };
+
+            ResolveValuelessCastOperand(ctx, castExp, namedVar, destTypeName);
 
             // If the destination is a struct VALUE type and an operator overload
             // exists, call it (e.g. (string)charPtr calls operator string(char*)).

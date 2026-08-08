@@ -1429,10 +1429,20 @@ void LLVMBackend::RejectBareFunctionValue(llvm::Value* value) const
             return;
         if (auto* fn = llvm::dyn_cast<llvm::Function>(value))
         {
+            // Gated on the instantiation REGISTRY, never on a bare '__': DisplayNameOfMangledType
+            // splits on the first '__', so '__error' / 'foo__bar' would be rewritten into nothing.
             std::string name = FindFunctionSourceName(fn);
-            LogError(std::format(
-                "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
-                name, name));
+            bool writable = true;
+            if (gts.instantiatedGenericFunctions.count(name) != 0)
+                name = DisplayNameOfMangledType(name, &writable);
+            if (!writable)
+                LogError(std::format(
+                    "'{}' is a function used as a value - did you mean to call it? (a bare function name is only valid as a function<T> value)",
+                    name));
+            else
+                LogError(std::format(
+                    "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
+                    name, name));
         }
     }
 

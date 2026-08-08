@@ -3679,6 +3679,16 @@ public:
     LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
                                                    bool discardResult = false);
 
+    /*
+     * Give a cast operand that carries no llvm::Value a value or a diagnostic, so CreateCast is
+     * never handed a null operand (which SIGSEGV'd the compiler with no output). See the
+     * definition in MainListener_Expressions.cpp for which operands are resolved vs rejected.
+     */
+    void ResolveValuelessCastOperand(CFlatParser::CastExpressionContext* ctx,
+                                     CFlatParser::CastExpressionContext* operandCtx,
+                                     LLVMBackend::NamedVariable& namedVar,
+                                     const LLVMBackend::TypeAndValue& destTypeName);
+
     LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx);
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,

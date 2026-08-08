@@ -2311,6 +2311,22 @@ bool testGenericFnAsValue()
     function<int(int)> fp = dbl<int>;   // generic fn instantiated as a value
     result &= Test("genfn_value_call",  fp(21), 42);
     result &= Test("genfn_value_call2", fp(0), 0);
+
+    // A CAST of a generic instantiation used to hand CreateCast a null operand and SIGSEGV
+    // the compiler with no output. The legs assert the cast reaches the RIGHT monomorphized
+    // symbol, not merely a non-null address: it must equal the address of the same
+    // instantiation taken through a function<> value, and must DIFFER from dbl<double>'s.
+    void* castVoid  = (void*)dbl<int>;
+    void* viaValue  = (void*)fp;
+    void* otherInst = (void*)dbl<double>;
+    result &= Test("genfn_cast_void_same_symbol",  castVoid == viaValue, true);
+    result &= Test("genfn_cast_void_distinct_inst", castVoid != otherInst, true);
+    char* castChar = (char*)dbl<int>;
+    result &= Test("genfn_cast_char_same_symbol", castChar == (char*)viaValue, true);
+
+    // The cast result must still be CALLABLE as the instantiation it names.
+    function<int(int)> castFn = (function<int(int)>)dbl<int>;
+    result &= Test("genfn_cast_fnptr_call", castFn(21), 42);
     return result;
 }
 

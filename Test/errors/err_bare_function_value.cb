@@ -97,6 +97,45 @@ expect_error("'toString' is a method of 'int'") {
     }
 }
 
+// A function name that merely CONTAINS '__' must be quoted VERBATIM. The generic-instantiation
+// unmangling here is gated on the instantiation registry; gating it on a bare '__' occurrence
+// instead rewrote 'dunder__name' to 'dunder<name>' and libc's '__error' to '<error>', neither of
+// which is source text of any kind. The message must therefore name 'dunder__name' exactly, and
+// the remedy it advises ('dunder__name()') must be the spelling the user actually wrote.
+double dunder__name() { return 2.5; }
+
+// Scalar conversion path (CreateCast).
+expect_error("'dunder__name' is a function used as a value - did you mean 'dunder__name()'?") {
+    int test_dunder_name_decl()
+    {
+        double d = dunder__name;
+        return 0;
+    }
+}
+
+// Arithmetic path (CreateOperation) - the other RejectBareFunctionValue caller.
+expect_error("'dunder__name' is a function used as a value - did you mean 'dunder__name()'?") {
+    int test_dunder_name_arith()
+    {
+        double d = dunder__name * 0.5;
+        return 0;
+    }
+}
+
+// The other side of that gate: a REAL generic instantiation must still be spelled back as
+// source. Its functionTable key is the mangled 'bfvGid__i32'; quoting the key raw would print
+// a name no user wrote and advise 'bfvGid__i32()'. (The type argument is rendered canonically,
+// so 'int' comes back as 'i32' - that spelling compiles and names the same instantiation.)
+T bfvGid<T>(T x) { return x; }
+
+expect_error("'bfvGid<i32>' is a function used as a value - did you mean 'bfvGid<i32>()'?") {
+    int test_generic_instantiation_as_scalar()
+    {
+        long v = (long)bfvGid<int>;
+        return 0;
+    }
+}
+
 extern int main()
 {
     return 0;

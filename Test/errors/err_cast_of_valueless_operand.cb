@@ -1,0 +1,52 @@
+// A cast operand that names no VALUE - a type name, a namespace, a generic struct
+// instantiation, or a generic function template with no type arguments - used to reach
+// LLVMBackend::CreateCast with a null llvm::Value* and SIGSEGV the compiler (exit 139,
+// zero diagnostic output). Each shape now gets a located diagnostic instead.
+//
+// The sibling that IS supported (a generic FUNCTION instantiation such as
+// '(void*)dbl<int>') is covered by value legs in Test/test_generics.cb.
+
+struct CvoS { int a = default; };
+struct CvoBox<T> { T v = default; };
+namespace CvoNs { int k = 3; }
+T cvoGid<T>(T x) { return x; }
+
+expect_error("'CvoS' does not name a value") {
+    void* castStructTypeName()
+    {
+        return (void*)CvoS;
+    }
+}
+
+expect_error("'CvoNs' does not name a value") {
+    void* castNamespaceName()
+    {
+        return (void*)CvoNs;
+    }
+}
+
+expect_error("'CvoBox<int>' does not name a value") {
+    void* castGenericStructName()
+    {
+        return (void*)CvoBox<int>;
+    }
+}
+
+expect_error("'cvoGid' is a generic function template and has no value until it is instantiated") {
+    void* castUninstantiatedTemplate()
+    {
+        return (void*)cvoGid;
+    }
+}
+
+// Type arguments WERE written but form no instantiation (too few for cvoPair<T,U>). This must
+// name the arity problem rather than falling to the generic "does not name a value" wording,
+// which would be misleading - the template does exist.
+T cvoPair<T,U>(T a, U b) { return a; }
+
+expect_error("'cvoPair<int>' did not instantiate the generic function template 'cvoPair'") {
+    void* castWrongTypeArgCount()
+    {
+        return (void*)cvoPair<int>;
+    }
+}
