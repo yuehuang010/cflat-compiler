@@ -526,7 +526,6 @@ produce a program.
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
 | [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
-| [[coalesce-join-null-local-arm-erases-owner-proof]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `Ci* n = nullptr; Ci* b = n ?? c; delete b;` and its BOXED twin both double-free. The BOTH-ARMS join rule skips a null LITERAL arm as neutral but counts a LOCAL that merely HOLDS null as a non-proving arm, so the whole join is dropped. The raw and boxed spellings AGREE here, so this is a pre-existing hole in the arm CLASSIFICATION, not an asymmetry `fix/ptrcopy` introduced - its `?:` twins reject on both binaries. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. Filed 2026-08-05 by `fix/ptrcopy`. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -622,6 +621,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 | [[sizeof-steals-discarded-tuple-comparison-spelling]] | deliberate deferral | `fix/sizeof-closure`'s admission of `(` `)` `,` inside generic brackets also classifies the tuple-comparison text `a<b,c>d` as a type. Measured cost is ONE spelling: the value-DISCARDED statement `sizeof(a<b,c>d);` went from rc 0 (a no-op that printed `ok`) to `unknown type 'a<b,c>d'`. Every CONSUMING form was already rejected on PRE with a different message (`cannot cast an aggregate value`; `no overload of 'operator+' ... tuple__bool__bool`, which is what proves the tuple reading), and the tuple WITHOUT `sizeof` (`tuple<bool, bool> t = (a<b, c>d);`) is accepted identically on both binaries - nothing outside the `sizeof` operand was taken. The POST message also calls a tuple expression a "type". NOT fixed by an expression fallback: that is exactly the fallthrough that reached `CreateCast` with a null `Primary` and SIGSEGVed. Take it with [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]], whose fix makes the parser (not a character test) decide. Filed 2026-08-06 by review round 1 of `fix/sizeof-closure`. |
 | [[inline-deref-of-container-call-result-has-no-storage]] | diagnostic | False rejection with a LOCATED but internal-sounding message: `(*ls.get(0))(2)` on a `list<function<int(int)>*>` gives `Unable to dereference an object without a Storage.` while the two-line form (`function<int(int)>* e0 = ls.get(0); (*e0)(2)`) compiles and runs - that two-line spelling is what `Test/test_function_ptr.cb` already covers. A deref wants an addressable `Storage`; a call RESULT has only `Primary`. Element type is probably incidental - check `*someCall()` on a plain `int*` return before scoping it as a container issue. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Filed 2026-08-05 by `fix/genfn-lowering`. |
 | [[implied-move-store-boxed-spelling-false-rejects]] | diagnostic | PRE-EXISTING false rejection, identical on `d93c359` and on the merged `fix/ptrcopy`. A plain `p = c;` store between two pointer locals is an IMPLIED MOVE, so the raw `delete p;` is correct and accepted - but `MarkPointerRebound` runs BEFORE the transfer and records `InheritedKeepsOwner` naming `c`, which is null by then. Nothing reads that in the raw-delete guard; `BindingKeepsOwnershipOfBoxedObject` does, so the BOXED twin is rejected with a message that is false at that site. P3: working remedy, mis-blamed rather than dangerous. Recorded because it is why `fix/ptrcopy` introduced `JoinKeepsOwner` as a SEPARATE field. Filed 2026-08-05 by `fix/ptrcopy`. |
+| [[boxed-join-proof-never-retires-a-rebound-arm]] | diagnostic | PRE-EXISTING false rejection, measured identical on `19d8727` and after `fix/join-nullarm` for every arm spelling the latter did not touch. The RAW join proof records each arm's SLOT and re-asks it (`JoinArmsStillKeepOwner`), so `Ci* b = nullptr ?? c; c = nullptr; delete b;` is accepted and runs at one free. The BOXED path folds `SourceKeepsOwner` into one bool at the DECLARATION and never re-asks, so `IS s = nullptr ?? c; c = nullptr; delete s;` is rejected with a remedy (`let 'c' release it`) that does not exist - `c` is null, so satisfying the compiler means leaking. `fix/join-nullarm` changed only the POPULATION: the null-valued-LOCAL arm spelling now joins the literal ones here, which is parity with the pre-existing behaviour rather than a new class. P3: working remedy (do not null the arm, or box a `new`), and the direction is a visible leak, not a silent double free. Filed 2026-08-07 by `fix/join-nullarm`. |
 | [[interface-boxing-keyed-on-source-binding]] | deliberate deferral | RE-BUCKETED P1 -> P3 2026-08-04, on the file's own text: the live double free it was filed for was CLOSED 2026-08-02 (borrowed-interface-box delete diagnosed via the positive keeps-owner proof; landed record below), and only the preventive remainder is left - `RegisterInterfaceBox` dedupes on `FatValue` alone, harmless today. The file kept its name and moved to `p3/`, so existing links still resolve. |
 | [[owning-temp-parent-misroutes-chained-alias-access]] | diagnostic | RE-RANKED P1 -> P3 2026-08-02, on the file's own "re-rank freely" and on a re-measurement: the VERDICT is right (two `unique` owners really is an error) and only the WORDING is wrong, so no program's accept/reject status changes. A wrong message is P3 by this table's own rubric; it sat at P1 only for visibility to whoever next touched the `unique` field-store routing, and that work has landed. Still live on `ca5a02a`: the call-result message fires on a container-element shape, stating a false mechanism and naming a remedy that aborts 134. |
 | [[return-dangle-missed-when-slot-has-extra-user]] | deliberate deferral | RECLASSIFIED P1 -> P3 2026-08-02 by the maintainer, rationale kept intact. Missed dangle, no diagnostic - but the shapes were ALL accepted before `2bcc5a0` too, so this is residue, not a regression, and its own file rules out the obvious remedy (widening the extra-user whitelist re-introduces false rejections). Stays open as a record of what the pass cannot see. |
@@ -990,8 +990,85 @@ which a future session must not "fix" back without reopening the decision.
 | Overload identity canonicalized (`f(int)`/`f(i32)` are ONE overload); duplicate definitions diagnosed; function-pointer POINTER DEPTH carried; NAMED functions proved at the argument and declaration sites (RATIFIED) | 2026-08-02, uncommitted |
 | A pure-rename `using` alias folded at MONOMORPHIZATION, so `list<MyInt>` and `list<int>` are ONE instantiation; the alias set pre-registered ahead of BOTH passes (RATIFIED) | fix/alias-mangling, uncommitted |
 | The four ownership facts a plain pointer COPY drops - `unique`-field store, container-element borrow, `move`, and a `?:` / `??` JOIN; `move` of a provable borrow rejected into ANY destination (RATIFIED) | fix/ptrcopy (branch, not yet merged) |
+| A join arm PROVABLY parked at null is NEUTRAL in both the raw pointer proof and the per-arm interface boxing ledger (RATIFIED) | fix/join-nullarm (branch, not yet merged) |
 
 Suite trajectory across the whole sequence: 522 -> 530 -> 536 -> 538 -> 540.
+
+### fix/join-nullarm - a join arm PROVABLY parked at null is neutral (RATIFIED)
+
+Closes `coalesce-join-null-local-arm-erases-owner-proof`. `fix/ptrcopy` above settled the
+BOTH-ARMS rule and the neutrality of a null LITERAL arm; this closes the classification hole it
+left. A LOCAL that merely HOLDS null is not a literal, so it resolved to a live binding that proved
+nothing, counted as a blocking arm, and dropped the whole fact - in BOTH the raw pointer proof
+(`JoinArmsKeepOwner`) and the per-arm interface boxing ledger, which is why the two spellings
+AGREED on the bug and why the classification had to change in both places at once.
+
+**One shared positive predicate, `JoinArmIsProvablyNull`.** An arm is neutral when it is the null
+literal, or a load off a NON-ESCAPING alloca whose every store parks a null (recursively: a stored
+load off another such slot, bounded at depth 3). Everything else BLOCKS. The three refusals are the
+guard, not decoration: a slot with NO store is "unknown" and blocks (a parameter slot); a slot that
+escapes blocks, because the store survey is then not a survey of every reaching definition
+(`AllocaIsLoadStoreOnly`, measured: `setp(&n)` leaves the arm blocking); and a slot with any
+non-null store blocks, which is what keeps a CONDITIONALLY null arm out. Widening any of the three
+to "we could not tell" would make a join of two unresolvable arms provable and reject
+`join_owner_new_*` - the polarity this family pays for repeatedly. The new
+`join_condnull_arm_blocks_*` legs are that tripwire in the `??` spelling.
+
+**The boxed site needed a THIRD state, not a flipped bool.** `InterfaceBoxRecord::SourceKeepsOwner`
+is false both for "this arm owns nothing" and for "this arm proves no other owner", and the
+join-wide consumer (`InterfaceBoxValueIsProvablyBorrowed`) reads false as blocking. A separate
+`SourceProvablyNull` carries neutrality, exactly as the fat-value NULL arm is skipped one line
+above. The IR is untouched: the arm keeps its real vtable and its box record; only the ledger calls
+it neutral.
+
+**Sites audited and deliberately NOT changed.** `CollectJoinArmClasses`, `NestedJoinArmsBoxable`,
+`BoxInterfaceJoinArms`'s first loop and `ResolveTernaryArmClasses` all skip a null CONSTANT arm for
+a TYPE question - a provably-null local's declared class is right and skipping it would lose
+nothing. `TernaryArmJoinsOwning` treats a null constant as owning for the temp-release quantifier;
+that is a different QUESTION (does the join own the temp) and widening it would ADD frees, so it
+was left alone on the sibling rule that a predicate must not be reused across a change of question.
+The per-arm `transferArmOwnership` reject (`IsProvablyNonOwningPointerLoad`) is also unchanged: it
+is a transfer gate, and skipping arms there LOOSENS.
+
+**One RATIFIED behaviour change, and one residue it makes visible.** `IS s = n ?? c; c = nullptr;
+delete s;` compiled and ran at one free on `19d8727` and is now rejected. It is not the null-arm
+rule that rejects it - it is the boxed proof having no arm RETIREMENT at all, which rejects the
+literal spellings `nullptr ?? c`, `c ?? c` and `idb(true) ? c : nullptr` identically on both
+binaries (measured). The raw twin is accepted on both. So this is parity with every other arm
+spelling, and the underlying raw/boxed asymmetry is filed as
+[[boxed-join-proof-never-retires-a-rebound-arm]] (P3) with its own accept set. Two further shapes
+stay accepted BY DESIGN, both measured identical on both binaries: an arm null on only SOME paths
+(the polarity trap - blocking is correct), and an arm whose slot ESCAPES. A join-of-joins whose
+inner join holds the owner is unchanged too - the outer arm resolves to no binding, which is the
+pre-existing nesting limit the `fix/ptrcopy` record documents, not this classification.
+
+**A round-1 review found the axis this fix's corpus never probed: a `move` ARM.** With the
+null-parked arm neutral, the owner-proving branch runs on the SURVIVING arm, and neither proof
+asked whether that arm's value had been consumed by a `move`. Witness, correct on `f3a45ff` at one
+alloc / one free: `Ci* n = nullptr; Ci* c = new Ci(); Ci* b = idb(false) ? n : move c; delete b;` -
+rejected with "'c' already frees", which is FALSE (`c` is null after the move) and whose only
+remedy is to leak. It reproduced in `n ?? move c` and in the boxed `IS s = n ?? move c;` too, and
+the binary's own inconsistency proved it without a baseline: it ACCEPTED the literal twin
+`idb(false) ? nullptr : move c` while rejecting the local spelling. **The demotion rule:** a
+PROVEN move on the arm - `IsMovedOutPtrValue` on the arm VALUE, the same ledger the per-arm
+transfer gate already consults - drops the whole join fact in `JoinArmsKeepOwner` and clears
+`SourceKeepsOwner` in the boxed ledger. It is keyed on the value and never on the source binding,
+which keeps its `IsOwning` flag and would otherwise be blamed for freeing a pointer that is now
+null. Polarity unchanged: only a PROVEN move demotes; "could not tell" still proves an owner, so
+the double-free rejections stand. The `??` LITERAL spelling `nullptr ?? move c` was false-rejected
+on master too and is closed by the same rule. The accept half is the twelve
+`join_movearm_*` legs, each proven to false-reject INDIVIDUALLY on the pre-demotion binary.
+
+The reject half is four legs in `Test/errors/err_delete_borrowed_interface_box.cb` (raw `??`, the
+one-hop copy chain, boxed `??`, boxed `?:`) and one in
+`Test/errors/err_unique_alias_into_field.cb` (the `unique`-field store consumer), each pinning its
+own binding name and each verified non-vacuous INDIVIDUALLY against a `19d8727` binary. The accept
+half is twenty-one new legs in `testCopyFactPropagationAccepts` (51 -> 72). The nine null-arm ones
+pass on master and here by design - they are the frozen accept set, and what discriminates for the
+null-arm rule is the reject legs. The twelve `join_movearm_*` ones also pass on master, and they
+DO discriminate: each false-rejects on the intermediate pre-demotion binary, which is the baseline
+their non-vacuity was measured against. `leaks --atExit` on `Test/test_move.cb` is unchanged at
+16 leaks / 320 bytes.
 
 ### 2026-08-02 - one TYPE IDENTITY for overloads, and the four sites a funcptr signature is read from
 

@@ -3925,6 +3925,103 @@ int testCopyFactPropagationAccepts()
         passed += Test("join_arm_nulled_coalesce_freed_once", dtorCount, 1);
     }
 
+    // A join arm that is a LOCAL provably parked at null is NEUTRAL - it owns nothing, exactly as
+    // the null literal owns nothing. These three legs are the accept half of that classification:
+    // every one compiles and runs identically before and after it, and each would LEAK if the
+    // neutral arm were allowed to make an unprovable join provable.
+    // First: the other arm is a fresh `new`, which resolves to no binding at all, so the join still
+    // proves nothing and `nullNewJoin` is the sole owner.
+    dtorCount = 0;
+    {
+        Resource* parkedNullA = nullptr;
+        Resource* nullNewJoin = parkedNullA ?? new Resource();
+        nullNewJoin->id = 90;
+        passed += Test("join_nullarm_new_value", nullNewJoin->id, 90);
+        delete nullNewJoin;
+        passed += Test("join_nullarm_new_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_nullarm_new_no_second_free", dtorCount, 1);
+
+    // Second: the PROVING arm is retired after the join, so the join holds the only reference and
+    // the delete is the only release. The arm re-ask retires the fact exactly as it does for the
+    // literal-arm spelling; rejecting here would leak.
+    dtorCount = 0;
+    {
+        Resource* retiredArm = new Resource();
+        retiredArm->id = 91;
+        Resource* parkedNullB = nullptr;
+        Resource* nullRetiredJoin = parkedNullB ?? retiredArm;
+        retiredArm = nullptr;
+        passed += Test("join_nullarm_retired_value", nullRetiredJoin->id, 91);
+        delete nullRetiredJoin;
+        passed += Test("join_nullarm_retired_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_nullarm_retired_no_second_free", dtorCount, 1);
+
+    // Third, and the POLARITY tripwire: an arm that is null on only SOME paths is NOT provably
+    // null, so it still BLOCKS and the join proves nothing. Widening "provably null" to "we could
+    // not tell" would make `borrowedOther` the sole prover and reject this delete - which is a
+    // false rejection, because at runtime the join holds `condArm`'s object and nothing else frees
+    // it. The sibling tripwire on the same polarity is join_owner_new_* above.
+    dtorCount = 0;
+    {
+        Resource* condArm = nullptr;
+        if (identityBool(true)) { condArm = new Resource(); condArm->id = 96; }
+        Resource* borrowedOther = new Resource();
+        borrowedOther->id = 97;
+        Resource* condJoin = condArm ?? borrowedOther;
+        condArm = nullptr;
+        passed += Test("join_condnull_arm_blocks_value", condJoin->id, 96);
+        delete condJoin;
+        passed += Test("join_condnull_arm_blocks_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_condnull_arm_blocks_freed_twice", dtorCount, 2);
+
+    // A join arm consumed by a proven `move`. The move DETACHES its source at the join, so no
+    // other binding frees the object and the join's own `delete` is the only release - rejecting
+    // any of these three is a false rejection whose only remedy is to leak. The demotion is keyed
+    // on the arm VALUE (the moved-out ledger), never on the source binding, which keeps its
+    // IsOwning flag and would otherwise be blamed for freeing a pointer that is now null.
+    dtorCount = 0;
+    {
+        Resource* parkedNullC = nullptr;
+        Resource* moveSrcTern = new Resource();
+        moveSrcTern->id = 98;
+        Resource* moveTernJoin = identityBool(false) ? parkedNullC : move moveSrcTern;
+        passed += Test("join_movearm_tern_value", moveTernJoin->id, 98);
+        passed += Test("join_movearm_tern_source_nulled", moveSrcTern == nullptr ? 1 : 0, 1);
+        delete moveTernJoin;
+        passed += Test("join_movearm_tern_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_movearm_tern_no_second_free", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        Resource* parkedNullD = nullptr;
+        Resource* moveSrcCoal = new Resource();
+        moveSrcCoal->id = 99;
+        Resource* moveCoalJoin = parkedNullD ?? move moveSrcCoal;
+        passed += Test("join_movearm_coalesce_value", moveCoalJoin->id, 99);
+        passed += Test("join_movearm_coalesce_source_nulled", moveSrcCoal == nullptr ? 1 : 0, 1);
+        delete moveCoalJoin;
+        passed += Test("join_movearm_coalesce_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_movearm_coalesce_no_second_free", dtorCount, 1);
+
+    // The BOXED spelling of the same move arm: the per-arm boxing ledger applies the identical
+    // demotion, or the raw and boxed spellings disagree on a correct program.
+    dtorCount = 0;
+    {
+        Sq7Move* parkedNullE = nullptr;
+        Sq7Move* moveSrcBoxed = new Sq7Move();
+        IShapeMove moveBoxJoin = parkedNullE ?? move moveSrcBoxed;
+        passed += Test("join_movearm_boxed_value", moveBoxJoin.area(), 49);
+        passed += Test("join_movearm_boxed_source_nulled", moveSrcBoxed == nullptr ? 1 : 0, 1);
+        delete moveBoxJoin;
+        passed += Test("join_movearm_boxed_freed_once", dtorCount, 1);
+    }
+    passed += Test("join_movearm_boxed_no_second_free", dtorCount, 1);
+
     // A join arm REBOUND to a fresh object rather than nulled: the join holds the original alone
     // and the arm owns the new one, so both deletes are correct and there are two distinct frees.
     dtorCount = 0;
@@ -5167,7 +5264,7 @@ extern int main()
     total += 15;
 
     passed += testCopyFactPropagationAccepts();
-    total += 51;
+    total += 72;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

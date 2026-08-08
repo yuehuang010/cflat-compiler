@@ -359,7 +359,11 @@ std::string MainListener::JoinArmsKeepOwner(llvm::Value* joined,
         for (auto* arm : arms)
         {
             if (arm == nullptr) return {};
-            if (llvm::isa<llvm::ConstantPointerNull>(arm)) continue;
+            // The literal and a binding PROVABLY parked at null are the same neutral arm.
+            if (JoinArmIsProvablyNull(arm)) continue;
+            // A PROVEN `move` arm detached its source, so that binding frees nothing and cannot be
+            // the other owner. Keyed on the arm VALUE - the source NamedVariable keeps IsOwning.
+            if (compilerLLVM->IsMovedOutPtrValue(arm)) return {};
             auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
             if (load == nullptr || !load->getType()->isPointerTy()) return {};
             const auto* nv = compilerLLVM->FindVariableByStorage(load->getPointerOperand());
@@ -370,6 +374,28 @@ std::string MainListener::JoinArmsKeepOwner(llvm::Value* joined,
         }
         if (!proved) return {};
         return owner.empty() ? std::string("the binding each arm was joined from") : owner;
+    }
+
+bool MainListener::JoinArmIsProvablyNull(llvm::Value* arm, int depth) const {
+        if (arm == nullptr) return false;
+        if (llvm::isa<llvm::ConstantPointerNull>(arm)) return true;
+        if (depth > 3) return false;
+        auto* load = llvm::dyn_cast<llvm::LoadInst>(arm);
+        if (load == nullptr || !load->getType()->isPointerTy()) return false;
+        auto* slot = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand());
+        // An escaping slot can be written through a pointer no store here accounts for, so the
+        // store survey below would not be a survey of every reaching definition.
+        if (slot == nullptr || !compilerLLVM->AllocaIsLoadStoreOnly(slot)) return false;
+        bool sawStore = false;
+        for (llvm::User* u : slot->users())
+        {
+            auto* store = llvm::dyn_cast<llvm::StoreInst>(u);
+            if (store == nullptr || store->getPointerOperand() != slot) continue;
+            sawStore = true;
+            if (!JoinArmIsProvablyNull(store->getValueOperand(), depth + 1)) return false;
+        }
+        // No store at all is "unknown", not "null" - a parameter slot or an unwritten alloca.
+        return sawStore;
     }
 
 bool MainListener::JoinArmsStillKeepOwner(const LLVMBackend::NamedVariable& nv, int depth) const {
@@ -429,7 +455,11 @@ bool MainListener::InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
                 constant != nullptr && constant->isNullValue())
                 continue;
             const auto* record = compiler->FindInterfaceBoxByFatValue(arm);
-            if (record == nullptr || !record->SourceKeepsOwner) return false;
+            if (record == nullptr) return false;
+            // Neutral, exactly like the null-literal arm skipped above: it owns nothing, so it
+            // neither proves another owner nor blocks the arms that do.
+            if (record->SourceProvablyNull) continue;
+            if (!record->SourceKeepsOwner) return false;
             sawBox = true;
             const std::string& name = record->SourceDisplayName;
             if (!name.empty()
@@ -680,7 +710,13 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
             record.InterfaceName = interfaceName;
             record.Source = ClassifyInterfaceBoxSource(armData, nullptr, transferred);
             record.OwnershipTransferred = transferred;
-            record.SourceKeepsOwner = ClassifyBoxedSourceKeepsOwner(armData, nullptr, transferred);
+            // A PROVEN `move` arm detached its source here, so no other binding frees it. Same
+            // demotion, and the same value keying, JoinArmsKeepOwner applies to the raw spelling.
+            bool armMovedOut = compiler->IsMovedOutPtrValue(armData);
+            record.SourceKeepsOwner = !armMovedOut
+                && ClassifyBoxedSourceKeepsOwner(armData, nullptr, transferred);
+            // The arm keeps its real vtable (the IR is unchanged); only the LEDGER calls it neutral.
+            record.SourceProvablyNull = JoinArmIsProvablyNull(armData);
             if (record.SourceKeepsOwner) record.SourceDisplayName = DescribeBoxedSourceOwner(armData, nullptr);
             compiler->RegisterInterfaceBox(record);
         }

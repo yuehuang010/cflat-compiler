@@ -47,5 +47,17 @@ extern int main()
         Res* joined = identityBoolRes(true) ? ownerThree : ownerThree;
         f.p = joined;
     }
+
+    // The same arm-keyed proof reaching this consumer through a '??' whose LHS arm is a LOCAL
+    // provably parked at null. That arm owns nothing, exactly as the null LITERAL owns nothing, so
+    // it is NEUTRAL and 'ownerFour' alone decides. Before the neutral classification the local arm
+    // counted as an arm proving no owner, the whole fact was dropped, and this store compiled.
+    expect_error("cannot store 'nullArmJoin' into unique field 'Box.p' - every arm of the join") {
+        Box g = default;
+        Res* ownerFour = new Res();
+        Res* parkedNull = nullptr;
+        Res* nullArmJoin = parkedNull ?? ownerFour;
+        g.p = nullArmJoin;
+    }
     return 0;
 }

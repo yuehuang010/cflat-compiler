@@ -1340,6 +1340,9 @@ public:
         // PROVEN at the boxing site: a nameable OTHER owner frees this object anyway, so deleting
         // the box double-frees. See BindingKeepsOwnershipOfBoxedObject for what does and does not count.
         bool SourceKeepsOwner = false;
+        // A join ARM boxed off a binding PROVABLY parked at null. It owns nothing, so the join-wide
+        // ledger skips it as NEUTRAL instead of reading SourceKeepsOwner=false as a blocking arm.
+        bool SourceProvablyNull = false;
         // The AST spelling of that other owner, resolved where the binding was still in hand.
         std::string SourceDisplayName;
     };

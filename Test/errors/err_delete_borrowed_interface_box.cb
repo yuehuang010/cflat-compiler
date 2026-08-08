@@ -385,6 +385,63 @@ expect_error("cannot delete 'pJoinAssigned' - every arm of the join it was bound
     }
 }
 
+// A join arm that is a LOCAL provably parked at null. Such an arm owns nothing - statically, in
+// exactly the way the null LITERAL owns nothing - so it is NEUTRAL and the remaining arm decides.
+// Counting it as an arm that proves no owner dropped the whole fact and let these four compile
+// into a silent double free. "Provably null" is a POSITIVE proof (every store into a
+// non-escaping slot parks a null); an arm whose value cannot be determined still BLOCKS, which is
+// what keeps a join of two unresolvable arms unprovable - join_owner_new_* and
+// join_condnull_arm_blocks_* in Test/test_move.cb are that accept half.
+expect_error("cannot delete 'bNullArm' - every arm of the join it was bound from") {
+    int deleteJoinNullLocalArm()
+    {
+        CircleB* cNullArmOwner = new CircleB();
+        CircleB* parkedNull = nullptr;
+        CircleB* bNullArm = parkedNull ?? cNullArmOwner;
+        delete bNullArm;
+        return 1;
+    }
+}
+
+// The null arm reached one hop through another local. The proof follows a stored LOAD to the slot
+// it came from, so a chain of null-only bindings is still null - bounded, and still positive.
+expect_error("cannot delete 'bHopArm' - every arm of the join it was bound from") {
+    int deleteJoinNullLocalArmHop()
+    {
+        CircleB* cHopOwner = new CircleB();
+        CircleB* parkedHopA = nullptr;
+        CircleB* parkedHopB = parkedHopA;
+        CircleB* bHopArm = parkedHopB ?? cHopOwner;
+        delete bHopArm;
+        return 1;
+    }
+}
+
+// The BOXED spelling of the same join. The interface path keeps its own per-arm ledger, so the
+// classification had to change in both places or the two spellings would disagree.
+expect_error("cannot delete interface 'sNullArm' - it boxes an object that 'cBoxNullOwner'") {
+    int deleteBoxedJoinNullLocalArm()
+    {
+        CircleB* cBoxNullOwner = new CircleB();
+        CircleB* parkedBoxNull = nullptr;
+        IShapeB sNullArm = parkedBoxNull ?? cBoxNullOwner;
+        delete sNullArm;
+        return 1;
+    }
+}
+
+// The boxed '?:' spelling: same ledger, arms taken off the PHI instead of the coalesce record.
+expect_error("cannot delete interface 'sTernNullArm' - it boxes an object that 'cTernNullOwner'") {
+    int deleteBoxedTernaryNullLocalArm()
+    {
+        CircleB* cTernNullOwner = new CircleB();
+        CircleB* parkedTernNull = nullptr;
+        IShapeB sTernNullArm = identityBoolB(true) ? cTernNullOwner : parkedTernNull;
+        delete sTernNullArm;
+        return 1;
+    }
+}
+
 extern int main()
 {
     return 0;

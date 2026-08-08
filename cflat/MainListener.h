@@ -3083,6 +3083,16 @@ public:
                                   std::vector<llvm::Value*>* slotsOut = nullptr) const;
 
     /*
+     * POSITIVE proof that a join ARM holds null: the null literal, or a load off a non-escaping
+     * alloca whose every store parks a null (or a load off another such slot). Such an arm owns
+     * nothing, exactly as the literal owns nothing, so both join proofs skip it as NEUTRAL rather
+     * than counting it as an arm that proves no owner. "We could not tell what it holds" must NEVER
+     * answer true here: that would make a join of two unresolvable arms provable and false-reject.
+     * A slot with no store at all, an escaping slot, or any non-null store answers false.
+     */
+    bool JoinArmIsProvablyNull(llvm::Value* arm, int depth = 0) const;
+
+    /*
      * Re-ask a recorded join proof at a CONSUMER: EVERY arm slot must STILL resolve to a binding
      * that proves another owner. Recording alone is not enough - nulling or rebinding an ARM
      * (`c = nullptr;` after `T* b = cond ? c : c;`) makes the join's receiver the sole owner, and a
