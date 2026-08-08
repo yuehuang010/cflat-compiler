@@ -225,8 +225,11 @@ into the main session.
 
 ## Step 3 - Review loop (max 3 rounds)
 
-After the fix agent reports success, spawn a code-review agent at **opus** in the
-same worktree. Prompt it to review `git diff master...HEAD` in that worktree for
+After the fix agent reports success, spawn ONE code-review agent at **opus** in
+the same worktree. **One reviewer per issue, total**: every later round continues
+this same reviewer via SendMessage so it keeps its context - never spawn a second
+or parallel reviewer for the same issue. Prompt it to review
+`git diff master...HEAD` in that worktree for
 correctness bugs, and for the CLAUDE.md constraints listed above. Give it the fix
 agent's coverage matrix and ask it to audit the matrix, not re-derive it:
 
@@ -265,8 +268,9 @@ is not clean.
   re-run of the full verification bar (`./test.sh Release` and the example gate).
   Review fixes must be folded into the single
   commit with `git commit --amend`, never stacked as follow-up commits. Then
-  re-review, scoping the next round to what the last round CHANGED and saying
-  what not to re-verify - narrowly-scoped rounds found the worst defects.
+  re-review with the SAME reviewer (SendMessage), scoping the next round to what
+  the last round CHANGED and saying what not to re-verify - narrowly-scoped
+  rounds found the worst defects.
 - **Carry cosmetic findings as a punch-list into the next SUBSTANTIVE round**
   rather than spending a round-trip on each. A comment with a wrong example, an
   over-long comment, a message that mis-describes a declaration - none of these

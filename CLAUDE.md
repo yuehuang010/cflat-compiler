@@ -21,6 +21,8 @@ Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` re
 
 The main session runs on the most expensive model tier. Implementation work should be delegated to a subagent (Agent tool) at the cheapest tier that can do the job reliably; the main session plans, coordinates, and reviews the results.
 
+This section addresses the MAIN SESSION only. A spawned implementation agent does the work itself in its own session; it must never re-delegate to another agent, regardless of how it judges the task's tier - if it believes it is the wrong tier for the job, it should say so in its report instead of spawning a sub-agent.
+
 | Tier | Relative cost | Right for |
 |------|---------------|-----------|
 | `sonnet` (`general-purpose-sonnet`) | Low | Mechanical and routine implementation: renames, running builds/tests and reporting output, well-specified single-area changes, straightforward features from a clear plan, doc updates, writing regression tests |
