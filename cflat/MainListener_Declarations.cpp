@@ -4819,17 +4819,45 @@ llvm::Value* MainListener::ClassifyOwningAssignSource(
         return right;
     }
 
+bool MainListener::SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& nv) {
+        return (nv.TypeAndValue.IsAlias || nv.IsAliasBorrow)
+            && nv.TypeAndValue.TypeName != "string"
+            && nv.TypeAndValue.TypeName != "__closure_fat_ptr"
+            && (nv.TypeAndValue.Pointer
+                || compiler->IsOwningValueType(nv.TypeAndValue.TypeName));
+    }
+
+bool MainListener::BorrowAdoptionIsUnsound(LLVMBackend* compiler,
+        const LLVMBackend::NamedVariable& nv) {
+        if (!SourceIsDanglingAliasBorrow(compiler, nv)) return false;
+        return nv.Storage == nullptr
+            || llvm::isa<llvm::AllocaInst>(nv.Storage)
+            || llvm::isa<llvm::GlobalVariable>(nv.Storage);
+    }
+
+bool MainListener::RejectAliasBorrowAdoption(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        const char* destKind,
+        antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (right == nullptr || !BorrowAdoptionIsUnsound(compiler, rightNV)) return false;
+
+        LogErrorContext(ctx, std::format(
+            "cannot store an 'alias' value '{}' into {}; it borrows storage it does not own and "
+            "would dangle. Use '.copy()' for an independent owned copy.",
+            rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName,
+            destKind));
+        return true;
+    }
+
 bool MainListener::RejectAliasStoreIntoField(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* right,
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
-        if (!(right
-            && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
-            && rightNV.TypeAndValue.TypeName != "string"
-            && rightNV.TypeAndValue.TypeName != "__closure_fat_ptr"
-            && (rightNV.TypeAndValue.Pointer
-                || compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))))
+        if (!(right && SourceIsDanglingAliasBorrow(compiler, rightNV)))
             return false;
 
         LogErrorContext(ctx, std::format(

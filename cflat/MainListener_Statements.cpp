@@ -951,12 +951,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         // pointee is freed) or an owning value type (its destructor frees buffers the
                         // real owner still holds). An alias of a primitive or a POD struct hands back a
                         // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
-                        if ((returnNV.TypeAndValue.IsAlias || returnNV.IsAliasBorrow)
-                            && returnNV.TypeAndValue.TypeName != "string"
-                            && returnNV.TypeAndValue.TypeName != "__closure_fat_ptr"
-                            && !compiler->currentFunctionReturnTV.IsAlias
-                            && (returnNV.TypeAndValue.Pointer
-                                || compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)))
+                        if (!compiler->currentFunctionReturnTV.IsAlias
+                            && SourceIsDanglingAliasBorrow(compiler, returnNV))
                         {
                             LogErrorContext(jump, std::format(
                                 "cannot return an 'alias' value '{}'; it borrows storage it does not own and "

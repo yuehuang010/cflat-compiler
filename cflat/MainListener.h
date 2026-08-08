@@ -2883,6 +2883,38 @@ public:
         antlr4::ParserRuleContext* ctx);
 
     /*
+     * ONE question for every PERSIST site (field store, brace-init field, return slot, owning-local
+     * store, `move` argument): is this source a borrow of storage it does not own, in a shape whose
+     * new destroyer could dangle? An `alias` call result (TypeAndValue.IsAlias) or a local bound
+     * from one (IsAliasBorrow), excluding `string`/`__closure_fat_ptr` (they carry a runtime owned
+     * bit) and POD structs (nothing to free). The three original sites open-coded this identically.
+     */
+    static bool SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
+                                            const LLVMBackend::NamedVariable& nv);
+
+    /*
+     * The ADOPTING sites (owning-local store, `move` argument) additionally require the borrow to
+     * live in its OWN slot - a named local/global alloca, or a bare `alias` call result with no
+     * storage at all. A by-reference lambda capture is also IsAliasBorrow, but its Storage IS the
+     * outer owner's address (a load of the env field, never an alloca), so consuming it really does
+     * move out of the one owner - measured correct on master and must keep working.
+     */
+    static bool BorrowAdoptionIsUnsound(LLVMBackend* compiler,
+                                        const LLVMBackend::NamedVariable& nv);
+
+    /*
+     * Same hazard as RejectAliasStoreIntoField with an owning LOCAL/GLOBAL destination (`other = k`)
+     * instead of a field: the destination's always-run destructor would free storage the real owner
+     * still holds. The caller gates that the destination destructs (an owning value type).
+     * Returns true when an error was logged.
+     */
+    bool RejectAliasBorrowAdoption(
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        const char* destKind,
+        antlr4::ParserRuleContext* ctx);
+
+    /*
      * A MIXED '?:' join of an owning-value STRUCT (`c ? makeBox() : borrowed`) may carry a live
      * borrow's bits on the path actually taken, so PropagateTernaryOwnership suppressed the join
      * and ledgered it non-owning. A DECLARATION can receive it (the new local is marked a borrow

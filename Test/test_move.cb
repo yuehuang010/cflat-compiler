@@ -3336,6 +3336,16 @@ alias UniqueBox pickBorrowedBox(UniqueBox borrowed, bool c)
     return c ? makeUniqueBox(7) : borrowed;
 }
 
+// A plain by-value parameter READS a borrow without persisting it - no destructor of its own runs
+// over the borrowed storage, so passing an `alias`-return local here must stay legal.
+int readBoxId(UniqueBox b) { return b.item->id; }
+
+// Handing a borrow LOCAL onward through an `alias` return: the sanctioned way to pass one along.
+alias UniqueBox handBorrow(BoxWrap* w) { UniqueBox k = w->borrow(); return k; }
+
+// A real `move` sink: the callee owns the value and frees it on return.
+void sinkUniqueBox(move UniqueBox b) { }
+
 /*
  * A '?:' joining an OWNING-VALUE STRUCT (a `unique` field, so a full field-deleting destructor is
  * synthesized) runs the same strict all-arms-owning rule the interface fat pointer does. A MIXED
@@ -3466,6 +3476,93 @@ int testOwningStructTernaryJoin()
         passed += Test("struct_ternary_alias_return_no_adoption", dtorCount, 0);
     }
     passed += Test("struct_ternary_alias_return_owner_freed_once", dtorCount, 1);
+
+    /*
+     * ACCEPT SET for the borrow-laundering rejects (Test/errors/err_move.cb `aliasBorrow*` legs).
+     * A borrow local may be declared, chained into another DECLARATION, read, passed by value, and
+     * handed on through an `alias` return - none of those hands a second destroyer to the owner's
+     * storage. Each leg asserts the VALUE and the resource (dtorCount inside and after the scope).
+     */
+    // Chained borrow DECLARATION off an `alias`-return local: k2 propagates the borrow, adopts
+    // nothing, and the wrapper still frees its value exactly once.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            UniqueBox k2 = k;
+            passed += Test("alias_borrow_chain_decl_value", k2.item->id, 5);
+            passed += Test("alias_borrow_chain_decl_no_free", dtorCount, 0);
+        }
+        passed += Test("alias_borrow_chain_decl_no_adoption", dtorCount, 0);
+        passed += Test("alias_borrow_chain_decl_owner_alive", w.b.item->id, 5);
+    }
+    passed += Test("alias_borrow_chain_decl_owner_freed_once", dtorCount, 1);
+
+    // Same chain off a MIXED-join local (the second way to become a borrow).
+    dtorCount = 0;
+    {
+        UniqueBox owner = makeUniqueBox(6);
+        {
+            UniqueBox k = identityBool(false) ? makeUniqueBox(9) : owner;
+            UniqueBox k2 = k;
+            passed += Test("alias_borrow_join_chain_value", k2.item->id, 6);
+            passed += Test("alias_borrow_join_chain_no_free", dtorCount, 0);
+        }
+        passed += Test("alias_borrow_join_chain_no_adoption", dtorCount, 0);
+        passed += Test("alias_borrow_join_chain_owner_alive", owner.item->id, 6);
+    }
+    passed += Test("alias_borrow_join_chain_owner_freed_once", dtorCount, 1);
+
+    // Read-only uses: a field read and a plain by-value argument. Neither persists the borrow.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(8);
+        {
+            UniqueBox k = w.borrow();
+            passed += Test("alias_borrow_field_read", k.item->id, 8);
+            passed += Test("alias_borrow_byvalue_arg", readBoxId(k), 8);
+        }
+        passed += Test("alias_borrow_read_no_adoption", dtorCount, 0);
+    }
+    passed += Test("alias_borrow_read_owner_freed_once", dtorCount, 1);
+
+    // Handing the borrow onward through an `alias` return - the sanctioned escape hatch.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(3);
+        {
+            UniqueBox k = handBorrow(&w);
+            passed += Test("alias_borrow_passthrough_value", k.item->id, 3);
+            passed += Test("alias_borrow_passthrough_no_free", dtorCount, 0);
+        }
+        passed += Test("alias_borrow_passthrough_no_adoption", dtorCount, 0);
+    }
+    passed += Test("alias_borrow_passthrough_owner_freed_once", dtorCount, 1);
+
+    // The guards sit in front of the owning-value MOVE and `move`-argument paths, so the plain
+    // OWNER spellings they share a site with must still transfer: `dest = ownedLocal` releases the
+    // old destination and consumes the source, and `move ownedLocal` into a sink transfers once.
+    dtorCount = 0;
+    {
+        UniqueBox a = makeUniqueBox(11);
+        UniqueBox b = makeUniqueBox(12);
+        b = a;
+        passed += Test("alias_guard_owning_assign_value", b.item->id, 11);
+        passed += Test("alias_guard_owning_assign_old_freed", dtorCount, 1);
+    }
+    passed += Test("alias_guard_owning_assign_total", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox a = makeUniqueBox(13);
+        sinkUniqueBox(move a);
+        passed += Test("alias_guard_owning_move_freed_once", dtorCount, 1);
+    }
+    passed += Test("alias_guard_owning_move_total", dtorCount, 1);
 
     return passed;
 }
@@ -5246,7 +5343,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 35;
+    total += 58;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

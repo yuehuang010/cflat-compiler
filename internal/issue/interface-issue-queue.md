@@ -525,7 +525,6 @@ produce a program.
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 | [[same-statement-cast-launders-join-code-evidence]] | memory-unsafe accept | Silent exit 138: `two((void*)ro, c ? ro : n)` - a data cast of a NAMED function anywhere in a statement launders every other mention of that function in the SAME statement, because the launder is keyed on `llvm::Value*` alone and a named function is one shared constant. Cross-statement and cross-function are closed (`fix/joinledger`); only the same-statement window remains. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]) - the spelling was accepted before the fix too; re-rank to P1 if the memory-unsafe-accept rubric wins. Fix direction: occurrence keying (value + syntactic cast site). Filed 2026-08-05 by review round 2 of `fix/joinledger`. |
 | [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
-| [[alias-borrow-local-launder-gaps]] | ownership | An `IsAliasBorrow` owning-struct local launders its borrow through `=` and through `move`. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -566,6 +565,8 @@ cost ~6 suite failures plus the core UI framework, and the latter needs cross-fu
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[alias-borrow-remaining-launder-sites]] | ownership | rc 133 (double free), no diagnostic, identical on `86f929b` and on the merged `fix/aliaslaunder`. Three shapes the five-site borrow predicate does not reach, each needing a DIFFERENT question than "is the source a borrow": re-binding the borrow LOCAL itself (`k = makeBox(2)`) destructs the borrowed old destination; an alias-borrowed POINTER into a `unique T*` local (the reject gates its destination on an owning VALUE type, and `alias T*` has a second sanctioned hand-off meaning that a source-only rule would false-reject); and `move k.item`, the local twin of the already-rejected borrowed-PARAMETER field move. Filed 2026-08-07 by `fix/aliaslaunder`; P2 under the residue-not-regression precedent - all three are accepted by the PRE binary too. |
+| [[owning-struct-copy-from-indirect-source-double-frees]] | ownership | rc 133 (double free), no diagnostic, identical on `86f929b` and on the merged `fix/aliaslaunder`. Copying an owning struct out of an INDIRECT source - `other = *ap`, `o = w.b`, an array element - into an owning local bits-copies without nulling the true source, so both destruct the same `unique` pointee. NO alias involved: found by round-1 review of `fix/aliaslaunder` probing its storage-shape gate; the alias family that fix closed is the special case, this is the general one. Filed 2026-08-07; P2 under the residue-not-regression precedent - accepted by the PRE binary too. |
 | [[conditional-store-retires-borrow-facts-unconditionally]] | ownership | rc 133 (double free), no diagnostic, identical on `152728c` and on the merged `fix/coalesce-tail`. The store tail's three RETIREMENTS (`ClearVariableBond`, `SetVariableBorrowsOwnedString`, `SetVariableBorrowsOwnedElement`) are walk-order, not control flow, so an `=` inside a branch that is NEVER TAKEN still clears the fact: `R* g = l.get(0); if (g == nullptr) { g = new R(); } delete g;` compiles and double-frees the list's element, while the same `delete g` without the `if` is a hard error. Split out of `coalesce-assign-skips-store-bookkeeping` - `fix/coalesce-tail` answered the `??=` spelling by taking the JOIN (conservative, matches master), which does NOT generalize: joining would false-reject the always-taken `if (c) { g = new R(); } delete g;`. Needs a real MAY/MUST fact, so it is a feature, not a clause. Filed 2026-08-06 by `fix/coalesce-tail`. |
 | [[as-is-does-not-recognize-nullcoalesce-join]] | false rejection | `(z ?? a) as IShape` / `is IShape` gives "requires an interface value or a class instance ... this expression is neither". NOT a chaining defect - it reproduces at chain length 1, and the `?:` spelling of the same construct WORKS. `ClassifyCastSource` in `MainListener.h` recognizes a pointer join only as a `PHINode`, and a `??` joins through a slot so its result is a `LoadInst`. Arms are recoverable via `CollectPointerJoinArms`. Note `ResolveTernaryArmClasses` does `llvm::cast<llvm::PHINode>` and must move onto the same collector in the SAME change or it asserts on the newly-admitted load. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[nested-join-arm-unresolved-in-is-as-and-mixed-ternary]] | false rejection | The named residue of `fix/chain-coalesce`: that fix taught the two BOXING sites to recurse into a join arm that is itself a join; two other sites asking the same question were left. `ResolveTernaryArmClasses` - `is`/`as` against a CONCRETE class over a nested `?:` - and `BoxTernaryThinArmToInterface` - the thin arm of a MIXED fat/thin `?:` when that arm is a join (both in `MainListener.h`). Neither is a drop-in recursion: the first folds one i1 answer per arm and a nested arm has a SET of leaf answers; the second is called with the builder already positioned in the caller's block. Contrast that localizes it: the same chain through `as <Interface>` now works. Measured identical on `4c06cce` and the chain fix. Filed 2026-08-05 by `fix/chain-coalesce`. |
@@ -720,6 +721,58 @@ tests - now live in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). 
 out of this file because they outlive every issue in it.
 
 ## Landed design records
+
+### fix/aliaslaunder - ONE borrow predicate for all five persist sites (RATIFIED)
+
+Closes `alias-borrow-local-launder-gaps` (deleted with this commit). An `IsAliasBorrow` owning-struct
+LOCAL - one bound from an `alias` return, or from a mixed `?:` join - is a shallow copy of storage
+another binding still frees. Its own scope-exit destructor is suppressed, but only THREE persist
+sites asked whether a source was such a borrow (the `=` field store, the brace-init field store, the
+return slot). The owning-LOCAL store (`other = k`) and the `move` ARGUMENT (`sink(move k)`) did not,
+and both transferred the borrow's bits to a second destroyer: compile 0, then rc 133 at the real
+owner's scope exit, with no diagnostic.
+
+**The predicate.** `MainListener::SourceIsDanglingAliasBorrow` is now the single question -
+`TypeAndValue.IsAlias || IsAliasBorrow`, minus `string` / `__closure_fat_ptr` (they carry a runtime
+owned bit) and minus POD structs (nothing to free). The three original sites had open-coded exactly
+this three times; they now call it. Two new rejects were added on top of it, both with the existing
+alias-store wording family, and the `move` one rejects AT THE ARGUMENT so the diagnostic can name the
+borrowed local - `ApplyMoveParamTransfer` sees only the bound parameter.
+
+**The carve-out that the accept set forced.** A by-reference lambda capture is ALSO `IsAliasBorrow`
+(`MainListener_PostfixExpression.cpp`), and `other = a;` inside a lambda body over two by-ref
+captures compiles, runs clean, and frees each box exactly once on master (measured: dtor=2, `leaks`
+0). The reason is that a by-ref capture's `Storage` IS the outer owner's address - a load of the env
+field, never an alloca - so consuming it really does move out of the ONE owner. The two ADOPTING
+sites therefore go through `BorrowAdoptionIsUnsound`, which additionally requires the borrow to live
+in its own slot (`Storage` is an `AllocaInst`/`GlobalVariable`, or null for a bare `alias` call
+result). This is the same gate the owning-value reassignment block already used, so the carve-out
+is not a special case bolted on - it is the shape the fixed site was already keyed to.
+
+**What must keep working, and does** (value + resource legs in `Test/test_move.cb`
+`testOwningStructTernaryJoin`, 23 new legs): the chained borrow DECLARATION `Box k2 = k;` off both
+an `alias`-return local and a mixed-join local - a declaration PROPAGATES the borrow rather than
+adopting it, and is the sanctioned way to pass one along; a field read; a plain by-value argument;
+an `alias` return handing the borrow onward; and the two OWNER spellings that share a site with the
+new guards (`dest = ownedLocal` still transfers, `move ownedLocal` into a sink still transfers).
+
+**Reject legs** (`Test/errors/err_move.cb`, SCOPED `expect_error` form, 8 legs): the two uncovered
+sites crossed with three source spellings - the `alias`-return local, its chained copy `k2`, the
+bare `alias` call result with no local at all - plus the mixed-join local laundered one statement
+after its declaration (the pre-existing join reject covers only a DIRECT store of the join). Each
+leg was split into its own file and proven to FAIL on a verified `86f929b` Release build and to fire
+on the fix, and each was separately mutation-tested inside the tracked file.
+
+**Deliberately NOT closed**, measured and filed as [[alias-borrow-remaining-launder-sites]]: the
+DESTINATION-side twin (`k = makeBox(2)` destructs the borrowed old value), an alias-borrowed POINTER
+into a `unique T*` local, and `move k.item`. Each needs a different question than the one this
+predicate asks, and the pointer one would false-reject the sanctioned `alias T*` hand-off idiom that
+`BindingKeepsOwnershipOfBoxedObject` documents.
+
+**Verification.** `./cmake_build.sh release && ./test.sh Release` - 600 passed, 0 failed, 8 skipped.
+`bash example_mac.sh Release` - 35 passed, 0 failed. `leaks --atExit` on `Test/test_move.cb`:
+16 leaks / 320 bytes on PRE with the master file, 16 / 320 on PRE with the new file, 16 / 320 on
+POST - the fix and the new legs each add zero. One commit.
 
 ### fix/uniq-global - two distinct STACK-or-GLOBAL roots proved different (RATIFIED)
 

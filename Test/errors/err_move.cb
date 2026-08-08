@@ -306,6 +306,99 @@ expect_error("mixes an owning and a borrowed 'JoinBox' arm into a return slot") 
 }
 
 /*
+ * An `alias`-return LOCAL (or a mixed-join local, or a bare `alias` call result) is a BORROW of
+ * storage it does not own. The field store, the brace-init field and the return slot already
+ * rejected it; the OWNING-LOCAL store and the `move` ARGUMENT did not, and each transferred the
+ * borrow's bits to a second destroyer that ran over the owner's live storage (abort). All five
+ * sites now ask one predicate, so these legs pin the two that were uncovered plus the source
+ * spellings - chained borrow and no-local-at-all - that reach the same predicate.
+ * The DECLARATION spelling (`JoinBox k2 = k;`) is the sanctioned way to pass a borrow along and
+ * stays legal - its value/resource legs are in Test/test_move.cb.
+ */
+struct AliasWrap
+{
+    JoinBox b;
+    alias JoinBox borrow() { return this.b; }
+};
+
+void aliasBoxSink(move JoinBox b) { }
+
+expect_error("cannot store an 'alias' value 'k' into an owning variable") {
+    void aliasBorrowIntoOwningLocal(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        JoinBox other = makeJoinBox();
+        other = k;
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'k'") {
+    void aliasBorrowAsMoveArgument(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        aliasBoxSink(move k);
+    }
+}
+
+// The CHAINED borrow is the shape the accepted declaration produces, so it must be rejected at the
+// same two sites - otherwise one extra `=` launders the borrow right back out.
+expect_error("cannot store an 'alias' value 'k2' into an owning variable") {
+    void aliasBorrowChainIntoOwningLocal(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        JoinBox k2 = k;
+        JoinBox other = makeJoinBox();
+        other = k2;
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'k2'") {
+    void aliasBorrowChainAsMoveArgument(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        JoinBox k2 = k;
+        aliasBoxSink(move k2);
+    }
+}
+
+// No local at all: the bare `alias` call result carries TypeAndValue.IsAlias and never reaches the
+// named-slot arm of the assignment path, so it is a distinct spelling of the same hazard.
+expect_error("cannot store an 'alias' value 'JoinBox' into an owning variable") {
+    void aliasCallResultIntoOwningLocal(AliasWrap* w)
+    {
+        JoinBox other = makeJoinBox();
+        other = w->borrow();
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'JoinBox'") {
+    void aliasCallResultAsMoveArgument(AliasWrap* w)
+    {
+        aliasBoxSink(move w->borrow());
+    }
+}
+
+// A borrow that came from a mixed '?:' JOIN, laundered one statement later. The join's own reject
+// covers only a DIRECT store of the join; once it is bound to a local, this predicate is the only
+// thing standing between the borrow and a second destroyer.
+expect_error("cannot store an 'alias' value 'k' into an owning variable") {
+    void joinBorrowIntoOwningLocal(JoinBox borrowed, bool c)
+    {
+        JoinBox k = c ? makeJoinBox() : borrowed;
+        JoinBox other = makeJoinBox();
+        other = k;
+    }
+}
+
+expect_error("cannot 'move' the 'alias' value 'k'") {
+    void joinBorrowAsMoveArgument(JoinBox borrowed, bool c)
+    {
+        JoinBox k = c ? makeJoinBox() : borrowed;
+        aliasBoxSink(move k);
+    }
+}
+
+/*
  * `move` of an interface-TYPED local (already fat, {vtable,data}) paired with a THIN arm whose
  * concrete class cannot be recovered - a FIELD read, same shape as fieldArmIntoIface above but
  * with the fat side coming from `move` instead of a second `new`. Exercises the fat-vs-thin case

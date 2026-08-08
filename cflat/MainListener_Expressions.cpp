@@ -1788,6 +1788,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && RejectAliasStoreIntoField(rightNV, right, ctx))
                 return finishStore(right);
 
+            // Same hazard with an owning LOCAL/GLOBAL destination (`other = k`): it destructs, so
+            // it must sit ahead of the move/destruct blocks below, which only ask for a named slot.
+            if (operatorText == "=" && !destIsStructField && namedVar.FieldName.empty()
+                && destination != nullptr
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && destination != rightNV.Storage
+                && RejectAliasBorrowAdoption(rightNV, right, "an owning variable", ctx))
+                return finishStore(right);
+
             // Copying a named owning value into a struct field by value. THE FLIP copies a copyable
             // owner in place (proceeds); a non-copyable owner is rejected. A self-assign is a no-op
             // (no copy - copying would leak the old buffer the self-store never frees). `rejectCopied`
@@ -7779,6 +7791,19 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             && !argNV.CallerName.empty() && !IsDirectCallArgument(ctx)
             && compiler->IsVariableBorrowedOwningValue(argNV.CallerName))
             return argNV;
+
+        // 'move' of a whole borrow zeroes only the borrow's OWN slot, so the receiver destroys
+        // storage the real owner still frees. Rejected at the argument so it can name the local.
+        if (argNV.FieldName.empty() && !argNV.IsElementAccess
+            && BorrowAdoptionIsUnsound(compiler, argNV))
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' the 'alias' value '{}'; it borrows storage it does not own, so the "
+                "move transfers nothing and the receiver would free storage the real owner still "
+                "holds. Use '.copy()' for an independent owned copy.",
+                argNV.CallerName.empty() ? argNV.TypeAndValue.TypeName : argNV.CallerName));
+            return {};
+        }
 
         llvm::Value* ptrVal = LoadNamedVariable(argNV);
 
