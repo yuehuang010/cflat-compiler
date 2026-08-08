@@ -1147,7 +1147,7 @@ llvm::Value* LLVMBackend::CoerceArgToInterface(const NamedVariable& arg, llvm::V
         auto* vtable = GetOrCreateVTable(structName, ifaceName);
         llvm::Value* dataPtr = nullptr;
         if (arg.TypeAndValue.Pointer)
-            dataPtr = arg.Primary != nullptr ? arg.Primary : CreateLoad(arg.Storage);
+            dataPtr = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
         else if (arg.Storage != nullptr)
             dataPtr = arg.Storage;
         else

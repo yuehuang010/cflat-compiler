@@ -1,0 +1,30 @@
+// A union's members all live at offset 0, so at most ONE of them may carry an explicit default
+// initializer - a second one would have to overwrite the first's bytes. Before the union default
+// constructor applied ANY field initializer it silently discarded all of them, so this ambiguity
+// had no diagnostic and every union field default read back as zero.
+//
+// A bare `= default` is NOT an explicit initializer here: it is the repo-wide convention and only
+// contributes the field type's own default value, so a union with `= default` on every member
+// stays legal (see the accept legs in Test/test_function_ptr.cb::testUnionClosureMember).
+
+expect_error("members of a union share storage, so at most one may be initialized") {
+    union TwoDefaults
+    {
+        int   i = 5;
+        float f = 2.5;
+    };
+}
+
+expect_error("members of a union share storage, so at most one may be initialized") {
+    union ThreeDefaults
+    {
+        int   a = 1;
+        int   b = 2;
+        int   c = 3;
+    };
+}
+
+extern int main()
+{
+    return 0;
+}

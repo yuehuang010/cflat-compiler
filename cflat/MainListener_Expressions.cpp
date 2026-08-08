@@ -1749,6 +1749,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     auto* base = destGep->getPointerOperand()->stripPointerCasts();
                     destSlotInitialized = llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
                 }
+                // A UNION member is NOT a known-initialized closure slot: every arm names the same
+                // bytes, so the current contents may be an unrelated arm's value. Read as a closure
+                // an odd integer arm looks like an OWNED (tagged) env and the dtor makes a wild
+                // indirect call through it. Suppress the free here; the arm's old env leaks.
+                if (namedVar.UnionFieldType != nullptr)
+                    destSlotInitialized = false;
                 if (destSlotInitialized)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor("__closure_fat_ptr"))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });

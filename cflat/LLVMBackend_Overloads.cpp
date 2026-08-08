@@ -660,7 +660,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (arg.Primary != nullptr)
                 return arg.Primary;
             if (arg.Storage != nullptr)
-                return arg.BaseType ? CreateLoad(arg.BaseType, arg.Storage) : CreateLoad(arg.Storage);
+                return arg.BaseType && arg.UnionFieldType == nullptr
+                    ? static_cast<llvm::Value*>(CreateLoad(arg.BaseType, arg.Storage))
+                    : LoadArgStorage(arg);
         }
 
         auto funcSym = functionTable.find(functionName);
@@ -919,7 +921,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (arg.TypeAndValue.Pointer)
                 {
                     // struct* -> interface*: data ptr IS the pointer value (not the alloca of the pointer).
-                    dataPtr = arg.Primary != nullptr ? arg.Primary : CreateLoad(arg.Storage);
+                    dataPtr = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
                 }
                 else if (arg.Storage != nullptr)
                 {
@@ -948,7 +950,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             else if (!inVariadicRange && candParamItr->IsInterface && arg.TypeAndValue.IsInterface)
             {
                 // Interface -> interface: pass fat struct by value, re-boxing on an upcast
-                llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
+                llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
                 argList.push_back(ReboxInterfaceIfNeeded(val, arg.TypeAndValue.TypeName, candParamItr->TypeName));
             }
             else if (!inVariadicRange && candParamItr->Pointer)
@@ -995,7 +997,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // (promoted param). Load through it to get the actual pointer value.
                     if (arg.Primary == nullptr && arg.Storage != nullptr
                         && llvm::isa<llvm::AllocaInst>(arg.Storage))
-                        argList.push_back(CreateLoad(arg.Storage));
+                        argList.push_back(LoadArgStorage(arg));
                     else
                         argList.push_back(arg.GetValue());
                 }
@@ -1022,7 +1024,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             else if (!inVariadicRange && candParamItr->IsFunctionPointer)
             {
                 // function<T> parameter - dispatch depends on whether the callee is extern C.
-                llvm::Value* val = arg.Primary ? arg.Primary : CreateLoad(arg.Storage);
+                llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
                 // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
                 auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType((unsigned)argList.size());
                 if (llvmParamTy->isStructTy())
@@ -1089,7 +1091,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 llvm::Value* value = nullptr;
                 if (arg.Primary == nullptr)
                 {
-                    value = CreateLoad(arg.Storage);
+                    value = LoadArgStorage(arg);
                 }
                 else
                 {

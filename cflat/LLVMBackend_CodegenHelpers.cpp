@@ -1076,6 +1076,10 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         llvm::Function* userDtor = dsIt->second.Destructor;
 
+        // A UNION's members all start at offset 0, so a destructible arm is destructed through
+        // `self` itself - never a per-field GEP, which walks off the single-slot union body.
+        const bool isUnion = dsIt->second.IsUnion;
+
         // Collect member fields that need destruction.
         struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; bool IsUniqueIface = false; };
         std::vector<MemberWork> work;
@@ -1142,6 +1146,20 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             return userDtor;
         }
 
+        /*
+         * A union destructs at most its FIRST field, and only when that is the sole destructible
+         * arm. Nothing here knows which arm is live, so running an arm's destructor over bytes the
+         * program last wrote through another arm is a wild free. That hazard is pre-existing at
+         * field 0 (the merge base emitted exactly this call, `CreateStructGEP(unionTy, self, 0)`
+         * being `self`), so keeping it is parity, not new exposure - and it is what makes an owning
+         * first member, a union inside a struct, an array of unions and a union returned by value
+         * release at all. For any OTHER field the merge base did not compile the program at all
+         * ("Invalid indices for GEP pointer type!"), so emitting there would be NEW reachability
+         * for a wild free; those arms leak instead. See internal/issue/p3/union-destruction-residues.md.
+         */
+        if (isUnion && (work.size() > 1 || work.front().Index != 0))
+            return userDtor;
+
         // Synthesize a wrapper: user dtor first (so hand-written free-and-null logic runs
         // before member teardown), then each member's full destructor.
         auto* structTy = dsIt->second.StructType;
@@ -1162,17 +1180,21 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         for (const auto& w : work)
         {
-            auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
+            // Union arm: the member IS `self` (offset 0) and its storage type is the member's own
+            // type - the union body is one slot, so a per-field GEP/element type is out of range.
+            auto* fieldPtr = isUnion ? self : b.CreateStructGEP(structTy, self, w.Index, "fld");
+            auto* fieldTy  = isUnion ? GetType(dsIt->second.StructFields[w.Index])
+                                     : structTy->getElementType(w.Index);
             if (w.IsUniqueIface)
                 EmitUniqueInterfaceFieldRelease(b, fieldPtr, w.TypeName);
             else if (w.IsUniqueArray)
-                EmitUniqueArrayFieldRelease(b, fieldPtr, structTy->getElementType(w.Index),
+                EmitUniqueArrayFieldRelease(b, fieldPtr, fieldTy,
                                             w.TypeName, w.IsIface, w.AllocAlign);
             else if (w.IsUniquePtr)
                 EmitUniqueFieldDelete(b, fieldPtr, w.Dtor, w.TypeName, w.AllocAlign);
             else
                 // Scalar field: one call; owning fixed-array field: one call per element.
-                EmitFullDestructorOverStorage(b, fieldPtr, structTy->getElementType(w.Index), w.Dtor);
+                EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor);
         }
 
         b.CreateRetVoid();

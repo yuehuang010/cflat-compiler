@@ -397,9 +397,12 @@ void LLVMBackend::RegisterThisPointer(const TypeAndValue& tv, llvm::Value* stora
         stackNamedVariable.back().functionArgument["this"] = thisVar;
     }
 
-llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType)
+llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType,
+                                          llvm::Type* loadType)
 {
-        llvm::LoadInst* loadInst = CreateLoad(destination);
+        // `loadType` is set only for a UNION member, whose Storage is the union alloca - inferring
+        // the type off that storage reads (and would write back) the whole union.
+        llvm::LoadInst* loadInst = loadType ? CreateLoad(loadType, destination) : CreateLoad(destination);
 
         if (loadInst->getType()->isPointerTy())
         {
@@ -492,6 +495,14 @@ llvm::LoadInst* LLVMBackend::CreateLoad(llvm::Value* value)
 llvm::LoadInst* LLVMBackend::CreateLoad(llvm::Type* type, llvm::Value* value)
 {
         return builder->CreateLoad(type, value);
+    }
+
+llvm::Value* LLVMBackend::LoadArgStorage(const NamedVariable& arg)
+{
+        if (arg.Storage == nullptr)
+            return nullptr;
+        return arg.UnionFieldType ? CreateLoad(arg.UnionFieldType, arg.Storage)
+                                  : static_cast<llvm::Value*>(CreateLoad(arg.Storage));
     }
 
 llvm::Value* LLVMBackend::Upconvert(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned) const

@@ -2640,6 +2640,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // a.copy() instead of a shallow alias. srcStorage non-null + !srcIsMove + a
                 // CallerName marks a named lvalue source whose buffer is still owned elsewhere.
                 llvm::Value* srcStorage = nullptr;
+                // Non-null when the source is a UNION member: Storage is the union alloca, so any
+                // type-inferred load off it reads the whole union instead of the member.
+                llvm::Type* srcUnionFieldType = nullptr;
                 llvm::Type* srcBaseType = nullptr;
                 // The initializer's RESULT VALUE, before any decl-site coercion. Ownership
                 // adoption is answered from this by value identity, never from a sticky flag.
@@ -3037,6 +3040,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcIsSimd = rightNV.TypeAndValue.IsSimd;
                                 srcIsArrayShaped = srcConstArraySize > 0 || srcIsArrayView;
                                 srcStorage = rightNV.Storage;
+                                srcUnionFieldType = rightNV.UnionFieldType;
                                 srcBaseType = rightNV.BaseType;
                                 srcPrimary = rightNV.Primary;
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
@@ -3697,8 +3701,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && typeAndValue.TypeName == "__closure_fat_ptr")
                         {
                             LLVMBackend::NamedVariable srcNV;
-                            srcNV.Storage  = srcStorage;
                             srcNV.BaseType = compiler->GetClosureFatPtrType();
+                            if (srcUnionFieldType != nullptr)
+                                srcNV.Primary = compiler->CreateLoad(srcNV.BaseType, srcStorage);
+                            else
+                                srcNV.Storage = srcStorage;
                             srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
                             if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
                                 right = cloned;
@@ -3733,8 +3740,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // valid (no use-after-move). `right` is replaced with the clone so
                                 // the CreateAssignment below stores an independent env into b.
                                 LLVMBackend::NamedVariable srcNV;
-                                srcNV.Storage  = srcStorage;
                                 srcNV.BaseType = compiler->GetClosureFatPtrType();
+                                if (srcUnionFieldType != nullptr)
+                                    srcNV.Primary = compiler->CreateLoad(srcNV.BaseType, srcStorage);
+                                else
+                                    srcNV.Storage = srcStorage;
                                 srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
                                 if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
                                     right = cloned;
@@ -4787,8 +4797,13 @@ llvm::Value* MainListener::CloneClosureFromNamedSource(
         // Fresh arg NV (Storage + closure type only) so the user-side CallerName /
         // named-argument metadata on rightNV does not confuse copy() overload resolution.
         LLVMBackend::NamedVariable cloneArg;
-        cloneArg.Storage  = rightNV.Storage;
         cloneArg.BaseType = compiler->GetClosureFatPtrType();
+        // A union member's Storage is the union alloca, so a type-inferred load off it reads the
+        // whole union; hand the copy a value loaded with the closure type instead.
+        if (rightNV.UnionFieldType != nullptr)
+            cloneArg.Primary = compiler->CreateLoad(cloneArg.BaseType, rightNV.Storage);
+        else
+            cloneArg.Storage = rightNV.Storage;
         cloneArg.TypeAndValue.TypeName = "__closure_fat_ptr";
         if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { cloneArg }))
             return cloned;

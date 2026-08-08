@@ -254,9 +254,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
             if (isUnion)
             {
-                // Union: zero-initialize all storage. Fields share the same memory, so we
-                // can't insert individual field values - just return a zeroed union value.
-                compiler->CreateReturnCall(llvm::Constant::getNullValue(structType));
+                EmitUnionDefaultConstructorBody(ctx, structName, structType, declList);
             }
             else
             {
@@ -521,6 +519,82 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // ProcessPendingInstantiations();
 
         structScopeStack.pop_back();
+    }
+
+void MainListener::EmitUnionDefaultConstructorBody(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& structName,
+        llvm::StructType* structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& declList) {
+        auto* compiler = Compiler(ctx);
+
+        // All members alias at offset 0, so only ONE default can be applied. Prefer the first
+        // field carrying an EXPLICIT initializer; a bare `= default` is the repo-wide convention
+        // and only contributes that field type's own default value.
+        size_t chosen = declList.size();
+        bool sawExplicit = false;
+        for (size_t i = 0; i < declList.size(); i++)
+        {
+            auto& tv = declList[i];
+            if (tv.TypeName == "auto" || tv.IsBitfieldStorage) continue;
+            bool explicitInit = FieldDefaultBraceList(tv) != nullptr
+                || (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr);
+            if (!explicitInit) continue;
+            if (sawExplicit)
+            {
+                // Point the caret at the OFFENDING field's own initializer, not at the `union`
+                // keyword. LogErrorContext throws, so nothing after this runs.
+                antlr4::ParserRuleContext* at = tv.Initializer != nullptr
+                    ? static_cast<antlr4::ParserRuleContext*>(tv.Initializer)
+                    : static_cast<antlr4::ParserRuleContext*>(FieldDefaultBraceList(tv));
+                LogErrorContext(at != nullptr ? at : ctx, std::format(
+                    "union '{}' gives field '{}' a default initializer, but field '{}' already has "
+                    "one - members of a union share storage, so at most one may be initialized. "
+                    "Write '= default' on all but one.",
+                    structName, tv.VariableName, declList[chosen].VariableName));
+            }
+            sawExplicit = true;
+            chosen = i;
+        }
+        if (!sawExplicit)
+        {
+            for (size_t i = 0; i < declList.size(); i++)
+            {
+                auto& tv = declList[i];
+                if (tv.TypeName == "auto" || tv.IsBitfieldStorage) continue;
+                if (tv.Initializer != nullptr && tv.Initializer->Default() != nullptr) { chosen = i; break; }
+            }
+        }
+
+        llvm::Value* rvalue = nullptr;
+        llvm::Type* fieldType = nullptr;
+        if (chosen < declList.size())
+        {
+            auto& tv = declList[chosen];
+            // Emitting a real function body; clear the stale file-scope global_scope so the
+            // initializer's stores and calls lower as ordinary instructions.
+            GlobalScopeGuard defaultCtorScope(global_scope);
+            if (auto* braceList = FieldDefaultBraceList(tv))
+                rvalue = ParseFieldDefaultBraceInitializer(structName, tv, braceList);
+            else if (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr)
+                rvalue = ParseFieldDefaultInitializer(structName, tv, tv.Initializer->assignmentExpression());
+            else
+                rvalue = GenerateDefaultValue(tv);
+            fieldType = compiler->GetType(tv);
+        }
+
+        // A zero value covers every byte the chosen field does not; the field is then written at
+        // offset 0 through a union-typed temp so its own LLVM type drives the store.
+        if (rvalue == nullptr || fieldType == nullptr || !fieldType->isSized()
+            || rvalue->getType() == structType)
+        {
+            compiler->CreateReturnCall(llvm::Constant::getNullValue(structType));
+            return;
+        }
+        auto* slot = compiler->AllocaAtEntry(structType, nullptr, "uniondef");
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(structType), slot);
+        compiler->CreateAssignment(rvalue, slot, false, fieldType);
+        compiler->CreateReturnCall(compiler->CreateLoad(structType, slot));
     }
 
 std::string MainListener::GetLockArgCanonical(CFlatParser::ExpressionContext* expr) {

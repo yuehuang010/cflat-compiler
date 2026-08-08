@@ -411,8 +411,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[namedVar.Storage].first++;
-                            PlusPlus[namedVar.Storage].second = et;
+                            PlusPlus[namedVar.Storage].Amount++;
+                            PlusPlus[namedVar.Storage].ElemType = et;
+                            PlusPlus[namedVar.Storage].LoadType = namedVar.UnionFieldType;
                         }
                         else
                         {
@@ -439,8 +440,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[namedVar.Storage].first--;
-                            PlusPlus[namedVar.Storage].second = et;
+                            PlusPlus[namedVar.Storage].Amount--;
+                            PlusPlus[namedVar.Storage].ElemType = et;
+                            PlusPlus[namedVar.Storage].LoadType = namedVar.UnionFieldType;
                         }
                         else
                         {
@@ -1672,7 +1674,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                         {
                             auto* compiler = Compiler(ctx);
                             llvm::Value* fatVal = structVar.Storage
-                                ? compiler->CreateLoad(structVar.Storage)
+                                ? (structVar.UnionFieldType
+                                    ? compiler->CreateLoad(structVar.UnionFieldType, structVar.Storage)
+                                    : compiler->CreateLoad(structVar.Storage))
                                 : structVar.Primary;
 
                             LLVMBackend::TypeAndValue thinTV = structVar.TypeAndValue;
@@ -2906,7 +2910,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                             LLVMBackend::TypeAndValue funcPtrTV =
                                 encClosure ? *encClosure : namedVar.TypeAndValue;
                             llvm::Value* funcPtr = nullptr;
-                            if (namedVar.Storage != nullptr)
+                            // A union member's Storage is the union alloca (all fields alias at
+                            // offset 0), so the load needs the FIELD type or it reads the union.
+                            if (namedVar.Storage != nullptr && namedVar.UnionFieldType != nullptr)
+                                funcPtr = Compiler(ctx)->CreateLoad(namedVar.UnionFieldType, namedVar.Storage);
+                            else if (namedVar.Storage != nullptr)
                                 funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
                             else if (namedVar.Primary != nullptr)
                                 funcPtr = namedVar.Primary;
@@ -3454,8 +3462,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // a char* receiver loads its stored pointer value.
                                     llvm::Value* charPtr = charArrRecv
                                         ? namedVar.Storage
-                                        : (namedVar.Storage ? Compiler(ctx)->CreateLoad(namedVar.Storage)
-                                                            : namedVar.Primary);
+                                        : (namedVar.Storage
+                                            ? (namedVar.UnionFieldType
+                                                ? Compiler(ctx)->CreateLoad(namedVar.UnionFieldType, namedVar.Storage)
+                                                : Compiler(ctx)->CreateLoad(namedVar.Storage))
+                                            : namedVar.Primary);
                                     if (charPtr != nullptr)
                                     {
                                         // Mirror a normal char* argument: leave TypeName empty so
@@ -3477,8 +3488,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                             //   integer:      x.to_i32(), n.to_u64(), etc.
                             if (!structVar.BaseType && !primaryIdentifier.empty())
                             {
+                                // A union member's Storage is the union alloca; load the MEMBER type
+                                // or the receiver value is the whole union.
                                 llvm::Value* primVal = namedVar.Storage
-                                    ? Compiler(ctx)->CreateLoad(namedVar.Storage)
+                                    ? (namedVar.UnionFieldType
+                                        ? Compiler(ctx)->CreateLoad(namedVar.UnionFieldType, namedVar.Storage)
+                                        : Compiler(ctx)->CreateLoad(namedVar.Storage))
                                     : namedVar.Primary;
 
                                 if (primVal != nullptr && primVal->getType()->isFloatingPointTy())
@@ -5892,8 +5907,8 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
 void MainListener::ProcessPlusPlus() {
         if (PlusPlus.size() > 0)
         {
-            for (auto& [destination, amountAndElem] : PlusPlus)
-                Compiler()->CreateIncrement(destination, amountAndElem.first, amountAndElem.second);
+            for (auto& [destination, w] : PlusPlus)
+                Compiler()->CreateIncrement(destination, w.Amount, w.ElemType, w.LoadType);
 
             PlusPlus.clear();
         }

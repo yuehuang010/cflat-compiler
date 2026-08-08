@@ -4725,7 +4725,8 @@ public:
 
     void RegisterThisPointer(const TypeAndValue& tv, llvm::Value* storage, llvm::Type* baseType);
 
-    llvm::Value* CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType = nullptr);
+    llvm::Value* CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType = nullptr,
+                                 llvm::Type* loadType = nullptr);
 
     llvm::Value* CreateInsertValue(llvm::Value* structInstance, llvm::Value* newValue, unsigned int index);
 
@@ -4740,6 +4741,11 @@ public:
     llvm::LoadInst* CreateLoad(llvm::Value* value);
 
     llvm::LoadInst* CreateLoad(llvm::Type* type, llvm::Value* value);
+
+    // Load an argument/receiver out of its Storage. A UNION member's Storage is the union alloca
+    // (every arm aliases at offset 0), so the type must come from UnionFieldType, not from the
+    // storage. Identical to CreateLoad(Storage) for every non-union NamedVariable.
+    llvm::Value* LoadArgStorage(const NamedVariable& arg);
 
     llvm::Value* Upconvert(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned = false) const;
 

@@ -1821,7 +1821,10 @@ private:
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
 
-    std::unordered_map<llvm::Value*, std::pair<int, llvm::Type*>> PlusPlus;
+    // amount, pointer-stride element type, and (union member only) the type to load/store the
+    // storage as - a union member's Storage is the union alloca, so the inferred type is wrong.
+    struct IncrementWork { int Amount = 0; llvm::Type* ElemType = nullptr; llvm::Type* LoadType = nullptr; };
+    std::unordered_map<llvm::Value*, IncrementWork> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
 
     // RAII guard: sets global_scope to false on entry and restores the saved value on exit.
@@ -3805,6 +3808,17 @@ public:
         const std::string& structName,
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list);
+
+    /*
+     * The union arm of the default-constructor emitter. Fields alias at offset 0, so at most ONE
+     * field default can apply: the first field carrying an explicit initializer, else the first
+     * field's `= default`. A second explicit initializer is ambiguous and is rejected.
+     */
+    void EmitUnionDefaultConstructorBody(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& structName,
+        llvm::StructType* structType,
+        std::vector<LLVMBackend::DeclTypeAndValue>& declList);
 
     /*
      * Code-value store gate for the AGGREGATE spellings the declarator, assignment and return

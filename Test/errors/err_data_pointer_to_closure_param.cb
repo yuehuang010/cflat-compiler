@@ -2256,3 +2256,20 @@ expect_error("only a named function, a 'function<>' value or a lambda converts t
         return occTwoLambda((function<int(int)>)&occGlobal, c > 0 ? &occGlobal : nn);
     }
 }
+
+/*
+ * The UNION member-default site. A union's default constructor used to discard every field
+ * initializer, so a data pointer parked in a union closure member ran NEITHER assign-provenance
+ * gate - it was ungated, and only unreachable because calling the member crashed the compiler
+ * first. Now that the union ctor applies the chosen field's initializer through
+ * ParseFieldDefaultInitializer, both gates fire exactly as they do for the struct twin.
+ */
+void* ucGvp = nullptr;
+
+expect_error("destination 'UcThinDataDefault.f': only a named function, a 'function<>' value or a non-capturing lambda converts to a function pointer") {
+    union UcThinDataDefault { function<int(int)> f = ucGvp; int i; };
+}
+
+expect_error("only a named function, a 'function<>' value or a lambda converts to a closure") {
+    union UcFatDataDefault { Lambda<int(int)> f = ucGvp; int i; };
+}

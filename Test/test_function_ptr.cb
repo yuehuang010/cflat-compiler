@@ -3212,6 +3212,146 @@ bool testFatFieldDefaultWidensLegalSource()
     return result;
 }
 
+// Calling a CLOSURE member of a `union`. Pre-fix the member call loaded the whole union value
+// where a closure was expected: the fat arm SIGSEGVed the compiler (exit 139) and the thin arm
+// died in module verification ("Invalid bitcast %cfn_ptr = bitcast %UT %2 to ptr"). Separately
+// the union default ctor discarded every field initializer, so a union field default read 0, and
+// the synthesized full destructor walked a union PER FIELD - a GEP past the one-slot union body,
+// destructing the `int` arm as a closure. That last one is why these locals must reach SCOPE EXIT:
+// removing the capturing leg below hides it (the crash is in teardown, after every leg passes).
+union UcThin { function<int(int)> f = fwAddOne; int i; };
+union UcFat  { Lambda<int(int)> f = fwAddOne;   int i; };
+union UcNoDefault { Lambda<int(int)> f = default; int i; };
+union UcInt  { int i = 41; float x; };
+// A union's FIRST member, when it is the only destructible arm, must still be destructed -
+// members alias at offset 0, so the arm is destructed through the union pointer itself.
+// Suppressing this wholesale (an intermediate version of the union fix did) is invisible to any
+// "it compiled" leg: assert the dtor COUNT. A destructible arm at any OTHER index is deliberately
+// NOT destructed: master does not compile such a union at all, so emitting there would newly
+// expose a wild free when a different arm is live (internal/issue/p3/union-destruction-residues.md).
+// Second axis: a `unique` pointer laundered one struct deep into a union - the direct spelling
+// `union { unique T* p; }` is rejected, this wrapper is not, so the release has to happen here.
+int ucmDtorCount = 0;
+int ucmNodeDtors = 0;
+struct UcOwner { int tag = default; ~UcOwner() { ucmDtorCount = ucmDtorCount + 1; } };
+struct UcNode  { int v = default;   ~UcNode()  { ucmNodeDtors = ucmNodeDtors + 1; } };
+struct UcUniqueBox { unique UcNode* p = default; };
+union UcOwnerFirst  { UcOwner o = default; int i; };
+union UcOwnerSecond { int i = default; UcOwner o; };
+union UcLaunderUnique { UcUniqueBox b = default; int i; };
+struct UcOwnerHolder { UcOwnerFirst u = default; int n = default; };
+
+void ucmScopedOwner()      { UcOwnerFirst u = default;  u.o.tag = 7; }
+void ucmScopedOwnerSecond(){ UcOwnerSecond u = default; u.o.tag = 7; }
+void ucmScopedInStruct()   { UcOwnerHolder h = default; h.u.o.tag = 3; }
+void ucmScopedArray()      { UcOwnerFirst[3] a = default; a[0].o.tag = 1; }
+UcOwnerFirst ucmMakeOwner(){ UcOwnerFirst u = default; u.o.tag = 4; return u; }
+void ucmScopedReturn()     { UcOwnerFirst v = ucmMakeOwner(); v.o.tag = 5; }
+void ucmScopedUnique()     { UcLaunderUnique u = default; u.b.p = new UcNode(); }
+
+// WRONG-ARM-LIVE at scope exit, destructible arm at index >= 1. The program writes the i64 arm
+// and leaves it live; if the union destructed its index-1 arm anyway it would `delete` 12345
+// (rc 134) or, for the closure arm, read 12345 as an OWNED tagged env and make a wild indirect
+// call through it (rc 139). Master refuses both unions outright, so compiling them AND
+// destructing would be new reachability for a wild free. These must simply run.
+struct UcWrongArmBox { unique UcNode* p = default; };
+union UcWrongArmUnique  { i64 raw; UcWrongArmBox b; };
+union UcWrongArmClosure { i64 raw; Lambda<int(int)> f; };
+// Bind through a local: returning `u.raw` directly elides the scope-exit destruct, which
+// would make these legs vacuous - the whole point is to reach the union's scope exit.
+i64 ucmWrongArmUnique()  { UcWrongArmUnique u = default;  u.raw = (i64)12345; i64 r = u.raw; return r; }
+i64 ucmWrongArmClosure() { UcWrongArmClosure u = default; u.raw = (i64)12345; i64 r = u.raw; return r; }
+struct UcPoint { int px = 7; int py = 9; };
+union UcStructArm { UcPoint p = default; int i; };
+struct UcNested { UcThin u = default; int tag = default; };
+
+int ucmDoublePx(UcPoint p) { return p.px * 2; }
+
+bool testUnionClosureMember()
+{
+    bool result = true;
+
+    // The filed repro, both arms: a named-function default called straight off the member.
+    UcThin ut = default;
+    result &= Test("ucm_thin_call", ut.f(1), 2);
+    UcFat uf = default;
+    result &= Test("ucm_fat_call", uf.f(1), 2);
+
+    // Assigned (not defaulted) member, then called - the same mis-typed load.
+    UcNoDefault un = default;
+    un.f = fwAddOne;
+    result &= Test("ucm_fat_assign_call", un.f(1), 2);
+
+    // Member read into a local: the fat arm went through the closure-clone path, which handed
+    // `copy()` the union alloca and failed verification.
+    Lambda<int(int)> g = uf.f;
+    result &= Test("ucm_fat_copy_call", g(10), 11);
+    function<int(int)> h = ut.f;
+    result &= Test("ucm_thin_copy_call", h(10), 11);
+
+    // A capturing lambda into a fat union member.
+    int cap = 5;
+    un.f = (int x) => x + cap;
+    result &= Test("ucm_fat_capturing_call", un.f(1), 6);
+
+    // Receiver spellings that reach the same member-call lowering.
+    UcThin* pt = &ut;
+    result &= Test("ucm_thin_ptr_call", pt.f(1), 2);
+    result &= Test("ucm_thin_paren_call", (ut).f(1), 2);
+    UcNested nested = default;
+    result &= Test("ucm_nested_call", nested.u.f(1), 2);
+    UcFat[2] arr = default;
+    arr[0].f = fwAddOne;
+    result &= Test("ucm_array_call", arr[0].f(1), 2);
+
+    // The union default ctor now applies one field initializer instead of zeroing everything.
+    UcInt ui = default;
+    result &= Test("ucm_union_int_default", ui.i, 41);
+    UcStructArm us = default;
+    result &= Test("ucm_union_struct_default_x", us.p.px, 7);
+    result &= Test("ucm_union_struct_default_y", us.p.py, 9);
+
+    // A destructible union arm is destructed exactly once per instance, in every containment.
+    // Each of these read 0 while union member destruction was suppressed wholesale.
+    ucmDtorCount = 0; ucmScopedOwner();
+    result &= Test("ucm_dtor_arm_index0", ucmDtorCount, 1);
+    // Index >= 1: NOT destructed by design - the arm leaks rather than risk a wrong-arm free.
+    ucmDtorCount = 0; ucmScopedOwnerSecond();
+    result &= Test("ucm_dtor_arm_index1_suppressed", ucmDtorCount, 0);
+    ucmDtorCount = 0; ucmScopedInStruct();
+    result &= Test("ucm_dtor_union_in_struct", ucmDtorCount, 1);
+    ucmDtorCount = 0; ucmScopedArray();
+    result &= Test("ucm_dtor_union_array", ucmDtorCount, 3);
+    ucmDtorCount = 0; ucmScopedReturn();
+    result &= Test("ucm_dtor_union_return", ucmDtorCount, 1);
+    ucmNodeDtors = 0; ucmScopedUnique();
+    result &= Test("ucm_dtor_laundered_unique", ucmNodeDtors, 1);
+
+    // The wrong-arm-live witnesses. These are VALUE legs only incidentally: what they really
+    // assert is that the process is still alive to compare - an index >= 1 destructor would have
+    // aborted (rc 134) or segfaulted (rc 139) inside the call, taking the whole suite with it.
+    result &= Test("ucm_wrongarm_unique_survives",  (int)ucmWrongArmUnique(),  12345);
+    result &= Test("ucm_wrongarm_closure_survives", (int)ucmWrongArmClosure(), 12345);
+    ucmNodeDtors = 0; ucmWrongArmUnique();
+    result &= Test("ucm_wrongarm_no_wrong_free", ucmNodeDtors, 0);
+
+    // A UFCS free-function call whose receiver is a union member takes the receiver BY VALUE:
+    // pre-fix the whole union value was handed to a member-typed parameter (verifier failure).
+    UcPoint recv = default;
+    UcStructArm ur = default;
+    ur.p.px = 6;
+    result &= Test("ucm_byvalue_receiver", ucmDoublePx(ur.p), 12);
+    result &= Test("ucm_byvalue_receiver_ufcs", ur.p.ucmDoublePx(), 12);
+    result &= Test("ucm_unused_recv", recv.px, 7);
+
+    // '++' on a union member: the read-modify-write must use the MEMBER type, not the union's.
+    UcInt ui2 = default;
+    ui2.i++;
+    result &= Test("ucm_member_increment", ui2.i, 42);
+
+    return result;
+}
+
 bool testGenericFuncPtrProducer()
 {
     bool result = true;
@@ -3392,6 +3532,10 @@ extern int main()
     // Fat Lambda<> FIELD default widening: a legal bare/thin source is stored {code, null},
     // not the raw pointer that crashed the call (fix/fat-widen).
     total++; passed += testFatFieldDefaultWidensLegalSource() ? 1 : 0;
+
+    // A closure member of a UNION: calling it crashed the compiler (fat) / failed module
+    // verification (thin), and union field defaults were discarded entirely.
+    total++; passed += testUnionClosureMember()            ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;
