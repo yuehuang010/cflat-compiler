@@ -949,6 +949,17 @@ public:
         // compile-time: this POINTER binding was reassigned by a plain '='. Every "someone else
         // frees this" fact established at its declaration is stale from here on.
         bool PointerRebound = false;
+        /*
+         * PointerRebound means "was assigned to", NEVER "now holds an owner": the plain '=' sets it
+         * for `b = q;` between two borrows and for a self-assign alike. A consumer that RETIRES a
+         * safety fact must ask these two instead - the RHS was a provably OWNED value (the '=' path's
+         * srcIsOwnedPtrRhs), and the store sat in the same BASIC BLOCK the consumer is reached from,
+         * which is what keeps a never-taken `if (b == nullptr) { b = new T(); }` from retiring
+         * anything (see internal/issue/p2/conditional-store-retires-borrow-facts-unconditionally.md).
+         */
+        bool ReboundToOwnedValue = false;
+        llvm::BasicBlock* ReboundBlock = nullptr;
+        llvm::Function* ReboundFunction = nullptr;   // paired with ReboundBlock; see BorrowProofRetiredByRebind
         // Set by that same '=' when the RHS binding itself proved another owner, so the proof is
         // carried across the store instead of retired. Refreshed on every '='; see MarkPointerRebound.
         bool InheritedKeepsOwner = false;
@@ -982,6 +993,9 @@ public:
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
+        // Set alongside IsBorrowed when the borrow was read out of a FIELD of the origin rather
+        // than being the origin itself, so no diagnostic prescribes `move <origin>` (another object).
+        bool BorrowedThroughField = false;
         // compile-time: true for a plain by-value OWNING-VALUE parameter (string / owning struct /
         // fat closure) that is NOT a sink (no `move` in body, not `move`/unique). Such a param
         // bitwise-aliases the caller's value - the caller keeps ownership - so feeding it into a
@@ -1782,6 +1796,7 @@ private:
     // paths). Carried through a '?:' join whose arms are all borrowed moves or null, so the
     // laundered spelling is rejected exactly like the direct one. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
+    std::vector<llvm::Value*> movedBorrowedThroughFieldValues_;
 
     // '?:' joins of an OWNING-VALUE STRUCT whose arms did not all provably own, keyed by value
     // identity. Such a phi may carry a live borrow's bits, so every receiver that would otherwise
@@ -2735,6 +2750,10 @@ private:
 
     // Ledger a pointer value a `move` of a BORROWED source produced (see movedBorrowedPtrValues_).
     void RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName);
+    // Same value, narrowed: the borrow was read out of a FIELD of that origin, so a diagnostic
+    // must not prescribe `move <origin>` (see NamedVariable::BorrowedThroughField).
+    void RegisterMovedBorrowedThroughField(llvm::Value* value);
+    bool IsMovedBorrowedThroughField(llvm::Value* value) const;
 
     // True when `value` provably owns nothing because a `move` of a borrow produced it. `originOut`
     // receives the borrow's origin name so the diagnostic can name the real owner.
@@ -3479,6 +3498,7 @@ public:
         size_t savedCastOccurrence = 0;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
+        std::vector<llvm::Value*> movedBorrowedThroughFieldValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
     };
 
@@ -5438,7 +5458,7 @@ public:
      * '??=' left behind.
      */
     void MarkPointerRebound(const std::string& name, const std::string& inheritedOwner = {},
-                            bool coalesceJoin = false);
+                            bool coalesceJoin = false, bool reboundToOwnedValue = false);
 
     // Re-arm the join proof on a pointer binding a '?:' / '??' join was just stored into. Always
     // called AFTER MarkPointerRebound, which clears it; empty `owner` leaves it retired.
@@ -5791,6 +5811,20 @@ public:
     // The binding behind a slot, for guards that need its ownership flags and not just its name.
     // Same search order as FindVariableNameByStorage; null when the slot is not a live binding.
     const NamedVariable* FindVariableByStorage(const llvm::Value* slot) const;
+
+    /*
+     * Has a plain `=` since the declaration made this binding the SOLE owner of what it now holds, so
+     * the "someone else frees this" proof no longer applies? Two things must hold, and PointerRebound
+     * on its own is NEITHER of them - it means "was assigned to", so it is equally set by `b = q;`
+     * between two borrows and by a self-assign. (1) The store's RHS was a provably OWNED value, which
+     * is the `=` path's own srcIsOwnedPtrRhs, recorded by MarkPointerRebound. (2) The store was in the
+     * SAME basic block this move is being emitted into - within one block, walk order IS execution
+     * order, so the store certainly ran. Across blocks it is unprovable (a never-taken
+     * `if (b == nullptr) { b = new T(); }` is the standing counterexample, tracked as
+     * conditional-store-retires-borrow-facts-unconditionally), so the proof is kept and the move stays
+     * rejected - the safe direction, since declining to retire can only reject, never launder.
+     */
+    bool BorrowProofRetiredByRebind(const NamedVariable& nv) const;
 
     /*
      * True when a plain copy of an owning local (BorrowsOwningLocal) STILL aliases a live binding

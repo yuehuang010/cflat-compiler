@@ -35,4 +35,54 @@ expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
 // A 'move' parameter transfers ownership - initializing a unique local from it is valid.
 void goodInit(move Payload* b) { unique Payload* k = move b; }
 
+/*
+ * The borrow proof must survive a REBIND that does not hand the binding an owner. A plain '=' sets
+ * PointerRebound for any store at all - `b = c` between two borrows, a self-assign, a store inside a
+ * never-taken branch - so retiring on that bit alone laundered every shape below back into a silent
+ * double free. Retirement now needs the RHS to be a provably OWNED value AND the store to sit in the
+ * same basic block as the move, which is what each leg here pins.
+ */
+
+// Rebound to ANOTHER BORROW: still nobody's to give away.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundToBorrow(Payload* b, Payload* c) { Payload* t = b; t = c; unique Payload* k = move t; }
+}
+
+// Rebound via `move` OF A BORROW. The `move` token is SYNTAX, not a proof of ownership: the moved
+// value owns nothing (the real owner still frees it), so the binding is still a borrow afterwards.
+// Reading the token alone is how a store that transfers nothing retired the proof.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundToMovedBorrow(Payload* b) { Payload* t = b; t = move b; unique Payload* k = move t; }
+}
+
+// SELF-assignment is a store like any other, and proves nothing at all.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundSelf(Payload* b) { Payload* t = b; t = t; unique Payload* k = move t; }
+}
+
+// The PARAMETER's own binding rebound to another borrow.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundParam(Payload* b, Payload* c) { b = c; unique Payload* k = move b; }
+}
+
+// '??=' keeps the OLD referent when the arm is not taken, so no store through it can prove an owner.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundCoalesce(Payload* b, Payload* c) { Payload* t = b; t ??= c; unique Payload* k = move t; }
+}
+
+// The rebind IS to a fresh owner, but sits in a branch that never runs. The walk is not
+// control-flow-aware, so a same-block test is what separates this from the accepted form below.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+    void reboundDeadBranch(Payload* b) {
+        Payload* t = b;
+        if (t == nullptr) { t = new Payload(); }
+        unique Payload* k = move t;
+    }
+}
+
+// The accepted counterpart: an UNCONDITIONAL rebind to a fresh owner in the same block. `t` is then
+// the sole owner of what it holds, so the move transfers and the unique local may adopt. Rejecting
+// this would leak the fresh Payload.
+void reboundToNew(Payload* b) { Payload* t = b; t = new Payload(); unique Payload* k = move t; }
+
 extern int main() { return 0; }

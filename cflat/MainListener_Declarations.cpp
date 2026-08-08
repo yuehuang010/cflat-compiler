@@ -4013,14 +4013,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 || compiler->IsOwnedNewTemp(srcPrimary)
                                 || compiler->IsOwningPtrTempValue(srcPrimary)
                                 || compiler->IsMovedOutPtrValue(srcPrimary));
+                        /*
+                         * `move` of a BORROWED pointer transfers nothing - the real owner still frees
+                         * the pointee, so a destination that ADOPTS here frees it twice. A `unique`
+                         * destination is rejected below; a PLAIN `T*` destination carries no ownership
+                         * assertion at all, so it simply must not adopt - it stays the borrow it was,
+                         * and the srcIsBorrowed clause further down tags it so a later `delete` is
+                         * rejected exactly as `T* d = p; delete d;` already is. An element-SLOT move
+                         * (`move n->values[i]`) nulls the one real slot even through a borrowed base,
+                         * so it does transfer; ownership is re-derived below.
+                         */
+                        bool borrowMoveKeepsBorrow = srcIsBorrowed && !srcMovedFromSlot
+                            && typeAndValue.Pointer && !typeAndValue.ElemPointer
+                            && !typeAndValue.IsUnique;
                         if (initResultOwns)
                         {
-                            // `move` of a BORROWED pointer transfers nothing - the real owner still
-                            // frees the pointee, so adopting it here frees it twice. ParseMoveExpression
-                            // sets lastOwningResult unconditionally and records the true provenance in
-                            // IsBorrowed, so consult that; the `=` path has the same gate.
-                            // An element-SLOT move (`move n->values[i]`) nulls the one real slot even
-                            // through a borrowed base, so it transfers; ownership is re-derived below.
+                            // ParseMoveExpression sets lastOwningResult unconditionally and records the
+                            // true provenance in IsBorrowed, so consult that; the `=` path has the same gate.
                             if (srcIsBorrowed && !srcMovedFromSlot && typeAndValue.IsUnique
                                 && typeAndValue.Pointer && !typeAndValue.ElemPointer)
                             {
@@ -4031,11 +4040,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(srcBorrowedOrigin),
                                                             srcIsField, name, true, initDecl);
                             }
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
-                            nv.IsOwning = true;
-                            nv.IsNewAllocated = true;
-                            // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
-                            nv.AllocAlignment = compiler->lastAllocAlignment;
+                            if (!borrowMoveKeepsBorrow)
+                            {
+                                auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                                nv.IsOwning = true;
+                                nv.IsNewAllocated = true;
+                                // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
+                                nv.AllocAlignment = compiler->lastAllocAlignment;
+                            }
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
                         }
@@ -4129,6 +4141,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 nv.IsBorrowed = true;
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
                                 nv.BorrowedUniqueField = srcBorrowedUniqueField;
+                                nv.BorrowedThroughField = !srcBorrowedField.empty();
                             }
                         }
 

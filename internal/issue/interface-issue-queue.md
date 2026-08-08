@@ -537,7 +537,6 @@ produce a program.
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
 | [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
-| [[move-of-borrowed-pointer-adopts-into-plain-destination]] | ownership | Exit 134, no diagnostic, identical on `d93c359` and on the merged `fix/ptrcopy`. `move` of an `IsBorrowed` source is gated only on a `unique` DESTINATION, so `Ci* d = move p;` off a borrowed pointer PARAMETER (and its one-hop copy, and the `move`-returning-wrapper spelling) adopts ownership the borrow never had. `fix/ptrcopy` added the destination-agnostic move guard next to this and deliberately left `IsBorrowed` out of it: `MainListener.h` carries an explicit ratified policy that forwarding an ordinary borrow as `move` stays legal, so closing this means REOPENING that policy with its own accept set, not adding a clause. Filed 2026-08-05 by `fix/ptrcopy`. Silent double free, so P1 by the bare rubric; filed P2 under the residue-not-regression precedent (`unique-field-to-field-interface-receiver-residues`, `return-dangle-missed-when-slot-has-extra-user`) - accepted by the PRE binary too, so residue rather than regression. Re-rank to P1 if the maintainer rules the silent-double-free rubric wins. |
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -580,6 +579,9 @@ cost ~6 suite failures plus the core UI framework, and the latter needs cross-fu
 |---|---|---|
 | [[join-arm-cast-launders-sibling-arm]] | memory-unsafe accept | Exit 138, no diagnostic, identical on `f1b8116` and on the merged `fix/cast-launder-occurrence`. `one(argc > 100 ? (Rec*)ro : ro)` - both arms of ONE `?:`/`??` join share the SAME occurrence (the enclosing argument/field slot), so a cast on one arm still launders the bare sibling arm; occurrence keying is structurally one level too coarse to separate two arms of one join. P2 under the residue-not-regression precedent - accepted before the fix too. Filed 2026-08-08 by review round 1 of `fix/cast-launder-occurrence`. |
 | [[interface-dispatch-argument-ungated-for-code-values]] | memory-unsafe accept | Exit 138, no diagnostic, identical on `f1b8116` and on the merged `fix/cast-launder-occurrence`. `i.take((void*)ro, argc > 0 ? ro : n)` through an `ITake` interface value - and the same shape with NO cast at all - both compile clean. Interface dispatch binds through the vtable slot's declared signature, not the overload scorer the code-value gate is wired into, so the gate never runs on this path regardless of occurrence keying. Pre-existing hole, not a regression. Filed 2026-08-08 by review round 1 of `fix/cast-launder-occurrence`. |
+| [[assign-path-does-not-propagate-borrow-taint]] | ownership | rc 133 (double free), no diagnostic, identical on `f1b8116` and on the merged `fix/move-borrowed-plain-dest`. The DECLARATION path propagates `IsBorrowed` from a borrowed source, which is what lets the raw-`delete` guard reject `T* d = p; delete d;`. The plain `=` store tail has no counterpart, so `T* d = nullptr; d = p; delete d;` compiles and double-frees with no `move` anywhere. The `move` spellings of the same store (`d = move p`, `d ??= move p`) ride on this gap and are not separate bugs, which is why `fix/move-borrowed-plain-dest` closed the declaration destination only. Fix direction: record the borrow on the `=` using the `srcIsOwnedPtrRhs` discriminator already computed at that site. Filed 2026-08-08 by `fix/move-borrowed-plain-dest`. |
+| [[join-of-borrows-then-move-adopts]] | ownership | rc 133 (double free), no diagnostic, identical on `f1b8116` and on the merged `fix/move-borrowed-plain-dest`. `T* j = k > 0 ? p : q; T* d = move j;` off two borrowed parameters adopts, while the no-`move` twin (`delete j;`) is correctly rejected off `JoinKeepsOwner` - the same delete/move disagreement the copy members closed, on the join axis. `fix/ptrcopy` set `JoinKeepsOwner`'s consumers as raw delete / boxed delete / unique-field store and deliberately not `move`; a join result carries no `IsBorrowed`, so the plain-destination non-adoption does not reach it. Fix direction: carry the join proof into the move RESULT, reusing `JoinArmsStillKeepOwner` and the BOTH-ARMS rule unchanged so a MIXED join stays accepted. Filed 2026-08-08 by `fix/move-borrowed-plain-dest`. |
+| [[move-of-borrow-into-move-sink-parameter]] | ownership | rc 133 (double free), no diagnostic, identical on `f1b8116` and on the merged `fix/move-borrowed-plain-dest`. `void sink(move Ci* q){delete q;} void f(Ci* p){ sink(move p); }` - the last destination that still ADOPTS a moved borrow, and the one row of that table left open on purpose. `cflat/core/hpc/btree.cb`'s `_rebalanceFrom` (929 / 952) does exactly this and is CORRECT, with no remedy available (it cannot declare `node` a `move` parameter - it only conditionally hands the node off and rebinds it each loop turn), so a blanket rejection breaks `core/` for every program importing btree. Fix direction: NOT a guard - an opt-in `--sanitize=ownership` site, or a way to declare a forwardable borrow parameter. Do not retry a destination-agnostic rejection; that was measured and disproved. Filed 2026-08-08 by `fix/move-borrowed-plain-dest`. |
 | [[alias-borrow-remaining-launder-sites]] | ownership | rc 133 (double free), no diagnostic, identical on `86f929b` and on the merged `fix/aliaslaunder`. Three shapes the five-site borrow predicate does not reach, each needing a DIFFERENT question than "is the source a borrow": re-binding the borrow LOCAL itself (`k = makeBox(2)`) destructs the borrowed old destination; an alias-borrowed POINTER into a `unique T*` local (the reject gates its destination on an owning VALUE type, and `alias T*` has a second sanctioned hand-off meaning that a source-only rule would false-reject); and `move k.item`, the local twin of the already-rejected borrowed-PARAMETER field move. Filed 2026-08-07 by `fix/aliaslaunder`; P2 under the residue-not-regression precedent - all three are accepted by the PRE binary too. |
 | [[owning-struct-copy-from-indirect-source-double-frees]] | ownership | rc 133 (double free), no diagnostic, identical on `86f929b` and on the merged `fix/aliaslaunder`. Copying an owning struct out of an INDIRECT source - `other = *ap`, `o = w.b`, an array element - into an owning local bits-copies without nulling the true source, so both destruct the same `unique` pointee. NO alias involved: found by round-1 review of `fix/aliaslaunder` probing its storage-shape gate; the alias family that fix closed is the special case, this is the general one. Filed 2026-08-07; P2 under the residue-not-regression precedent - accepted by the PRE binary too. |
 | [[conditional-store-retires-borrow-facts-unconditionally]] | ownership | rc 133 (double free), no diagnostic, identical on `152728c` and on the merged `fix/coalesce-tail`. The store tail's three RETIREMENTS (`ClearVariableBond`, `SetVariableBorrowsOwnedString`, `SetVariableBorrowsOwnedElement`) are walk-order, not control flow, so an `=` inside a branch that is NEVER TAKEN still clears the fact: `R* g = l.get(0); if (g == nullptr) { g = new R(); } delete g;` compiles and double-frees the list's element, while the same `delete g` without the `if` is a hard error. Split out of `coalesce-assign-skips-store-bookkeeping` - `fix/coalesce-tail` answered the `??=` spelling by taking the JOIN (conservative, matches master), which does NOT generalize: joining would false-reject the always-taken `if (c) { g = new R(); } delete g;`. Needs a real MAY/MUST fact, so it is a feature, not a clause. Filed 2026-08-06 by `fix/coalesce-tail`. |
@@ -634,6 +636,7 @@ deleted 2026-08-05), which closed the four decidable spellings and named this on
 
 | Issue | Family | Severity |
 |---|---|---|
+| [[raw-delete-guard-does-not-retire-a-rebound-borrow]] | false rejection | Hard error on programs that are correct and free once, identical on `f1b8116` and on the merged `fix/move-borrowed-plain-dest`. The raw-`delete` guard's borrow legs carry NO retirement test, so `T* b = raw; b = new T(); delete b;` (and the direct `raw = new T(); delete raw;`) are rejected with a remedy that does not describe the program. `fix/move-borrowed-plain-dest` gave the `move` spelling a retirement test (`BorrowProofRetiredByRebind` - RHS provably owned AND same basic block), so `move`+`delete` now accepts what plain `delete` still rejects. Left open as the SAFE direction; it also records why `IsOwning` cannot serve as that discriminator (the plain `=` path never sets it). Fix direction: reuse `BorrowProofRetiredByRebind` at both borrow legs and the boxed twin. Filed 2026-08-08 by `fix/move-borrowed-plain-dest`. |
 | [[sizeof-steals-discarded-tuple-comparison-spelling]] | deliberate deferral | `fix/sizeof-closure`'s admission of `(` `)` `,` inside generic brackets also classifies the tuple-comparison text `a<b,c>d` as a type. Measured cost is ONE spelling: the value-DISCARDED statement `sizeof(a<b,c>d);` went from rc 0 (a no-op that printed `ok`) to `unknown type 'a<b,c>d'`. Every CONSUMING form was already rejected on PRE with a different message (`cannot cast an aggregate value`; `no overload of 'operator+' ... tuple__bool__bool`, which is what proves the tuple reading), and the tuple WITHOUT `sizeof` (`tuple<bool, bool> t = (a<b, c>d);`) is accepted identically on both binaries - nothing outside the `sizeof` operand was taken. The POST message also calls a tuple expression a "type". NOT fixed by an expression fallback: that is exactly the fallthrough that reached `CreateCast` with a null `Primary` and SIGSEGVed. Take it with [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]], whose fix makes the parser (not a character test) decide. Filed 2026-08-06 by review round 1 of `fix/sizeof-closure`. |
 | [[inline-deref-of-container-call-result-has-no-storage]] | diagnostic | False rejection with a LOCATED but internal-sounding message: `(*ls.get(0))(2)` on a `list<function<int(int)>*>` gives `Unable to dereference an object without a Storage.` while the two-line form (`function<int(int)>* e0 = ls.get(0); (*e0)(2)`) compiles and runs - that two-line spelling is what `Test/test_function_ptr.cb` already covers. A deref wants an addressable `Storage`; a call RESULT has only `Primary`. Element type is probably incidental - check `*someCall()` on a plain `int*` return before scoping it as a container issue. Identical on `8c5a860` and on the merged `fix/genfn-lowering`. Filed 2026-08-05 by `fix/genfn-lowering`. |
 | [[implied-move-store-boxed-spelling-false-rejects]] | diagnostic | PRE-EXISTING false rejection, identical on `d93c359` and on the merged `fix/ptrcopy`. A plain `p = c;` store between two pointer locals is an IMPLIED MOVE, so the raw `delete p;` is correct and accepted - but `MarkPointerRebound` runs BEFORE the transfer and records `InheritedKeepsOwner` naming `c`, which is null by then. Nothing reads that in the raw-delete guard; `BindingKeepsOwnershipOfBoxedObject` does, so the BOXED twin is rejected with a message that is false at that site. P3: working remedy, mis-blamed rather than dangerous. Recorded because it is why `fix/ptrcopy` introduced `JoinKeepsOwner` as a SEPARATE field. Filed 2026-08-05 by `fix/ptrcopy`. |
@@ -977,7 +980,9 @@ pointer PARAMETER, its one-hop copy, and the `move`-returning-wrapper spelling) 
 double free - filed as [[move-of-borrowed-pointer-adopts-into-plain-destination]] (P2). It was left
 out because `MainListener.h` carries an explicit policy directly above the new guard - "Forwarding an
 ordinary borrow as 'move' stays legal (the programmer asserts the borrow is dead)" - so closing it
-means REOPENING a ratified decision with its own accept set, not adding a clause. A `??` join whose
+means REOPENING a ratified decision with its own accept set, not adding a clause. **Closed by
+`fix/move-borrowed-plain-dest`; its record at the bottom of this file supersedes this paragraph, and
+records why the third-proof direction proposed here was disproved rather than taken.** A `??` join whose
 LHS arm is a null-VALUED LOCAL (rather than the null literal) still drops the proof in BOTH the raw
 and the boxed spelling; filed as [[coalesce-join-null-local-arm-erases-owner-proof]] (P2), and the
 agreement between the two spellings is why it is a pre-existing classification hole rather than an
@@ -7206,3 +7211,142 @@ guarded-shape probes and leg 55 above are what actually cover the containment lo
 skipped. `bash example_mac.sh Release` - 35 passed, 0 failed. One commit,
 `git rev-list --count 08328cd..HEAD` = 1. Round 1 review fix (control-dependence suppression) applied
 and re-verified against the same two commands with the same result.
+
+### fix/move-borrowed-plain-dest - the borrow-forward policy, narrowed to explicit contracts (RATIFIED)
+
+Closes `move-of-borrowed-pointer-adopts-into-plain-destination`, the member `fix/ptrcopy` scoped out
+above. All three filed repros reproduced verbatim on `f1b8116` (abort, no diagnostic; the file says
+134, this host reports 133 - the same cold-vs-warm abort-code property the sibling record notes).
+
+**The filed fix direction was DISPROVED by measurement and deliberately not taken.** The issue asked
+for `IsBorrowed && !BorrowedOrigin.empty()` as a third proof in `ParseMoveExpression`'s
+destination-agnostic move guard. That guard is destination-agnostic, so it would also fire on
+`cflat/core/hpc/btree.cb`'s `_rebalanceFrom` (lines 929 / 952 hand a borrowed `btree_node<K,V>*`
+parameter to `_collapseEmptyRoot` / `_mergeWithLeft`, both of which declare it `move`) and on the six
+ratified `borrowedMove*` join legs in `Test/test_move.cb`. `_rebalanceFrom` has NO remedy - it cannot
+declare `node` a `move` parameter, because it only conditionally hands the node off and rebinds it
+(`node = parent;`) each turn of the loop - and "a rejection whose remedy does not exist" is the exact
+failure mode the sibling record names.
+
+**The policy that replaces it: the DESTINATION decides.** A `move` of a provable borrow transfers
+nothing, so:
+
+| Destination | Rule | Site |
+|---|---|---|
+| plain `T*` local | does NOT adopt - stays a borrow, frees nothing, and the existing `srcIsBorrowed` clause tags it so a later `delete` is rejected exactly as `T* d = p; delete d;` already is | `borrowMoveKeepsBorrow`, `MainListener_Declarations.cpp` |
+| `unique` local / field | rejected (unchanged, pre-existing) | `RejectBorrowIntoUniqueLocal` and its twins |
+| `move` RETURN type | rejected - the ledger's borrow provenance discriminates, because `move b` sets the same sticky ownership channel a real transfer does | `MainListener_Statements.cpp`, beside the existing "not owned" check |
+| `move` PARAMETER of a callee | still LEGAL - the programmer's explicit assertion, and what `btree.cb` relies on | unchanged |
+
+Non-adoption rather than rejection is what makes the plain-destination row free of accept cost: the
+program keeps compiling and simply stops double-freeing.
+
+**The borrow proof RETIRES only on a rebind to a PROVABLY OWNED value, in the SAME BASIC BLOCK.**
+Round 1 of this change used bare `PointerRebound` and was WRONG - a review found and measured the
+regression. `MarkPointerRebound` sets that bit on EVERY plain `=`/`??=` store into a pointer local,
+unconditionally and flow-insensitively: it means "was assigned to", never "now holds an owner". The
+comment 30 lines above the setter says exactly this (`p = q;` between two borrowed parameters leaves
+p a borrow; retiring there laundered a double free) and it was read and not applied. On the bare
+bit, seven shapes that `f1b8116` hard-errors on became silent double frees: rebind to ANOTHER borrow,
+SELF-assignment, rebind via `??=`, `b = nullptr; b = q;`, a rebind in a NEVER-TAKEN branch, the
+unique-field store spelling, and a direct parameter rebind. Worse, the headline bug itself survived a
+one-line perturbation - `T* b = p; if (b==nullptr){b=new T();} T* d = move b; delete d;` was 133 on
+both binaries, because the dead-branch store retired the proof and defeated the delete guard.
+
+`LLVMBackend::BorrowProofRetiredByRebind` is the corrected predicate, and it asks two things:
+`ReboundToOwnedValue` (recorded by `MarkPointerRebound` from the `=` path's OWN `srcIsOwnedPtrRhs`
+discriminator - direct `new`, owning temp, owning return, moved-out ledger) and `ReboundBlock ==
+builder->GetInsertBlock()` (within one basic block, walk order IS execution order, so the store
+certainly ran; across blocks it is unprovable, which is the standing
+[[conditional-store-retires-borrow-facts-unconditionally]] hazard). `??=` never sets the bit at all:
+it keeps the OLD referent when the arm is not taken, so no store through it can prove anything.
+`IsOwning` alone will NOT serve - the plain `=` path never sets it.
+
+**Which half is safe, precisely.** Declining to retire can only REJECT, never launder - but that is
+a property of the SAME-BLOCK test alone. The `ReboundToOwnedValue` half is a positive claim about
+ownership, and it laundered TWICE: once on bare `PointerRebound` (round 1), and again in round 2,
+where `srcIsOwnedPtrRhs` was carried across whole and its purely SYNTACTIC leg
+(`TopLevelMoveExpression`) fired on the `move` token alone. `b = move p` off a BORROW carries that
+token and owns nothing - `ParseMoveExpression` ledgers it in `movedBorrowedPtrValues_`, not
+`movedOutPtrValues_` - so the proof retired on a value that transfers nothing and four more shapes
+became silent double frees (`rev2_rebind_to_moved_borrow_unique`, `rev2_selfmove_rebind_unique`,
+`rev2_rebind_moved_borrow_field`, `rev2_hole_min`). The rule the third round settles on: an
+ownership claim used for a RETIREMENT must be VALUE-IDENTITY grounded, never syntactic. The
+MarkPointerRebound call now passes `srcIsOwnedPtrRhs && !IsMovedBorrowedPtrValue(rightNV.Primary)`,
+narrowed at the call rather than in `srcIsOwnedPtrRhs` itself - its OTHER consumer, the `unique T*`
+local reassignment adopt, sits behind its own `rightNV.IsBorrowed` gate and so never sees a moved
+borrow (measured: `unique R* u = nullptr; u = move p;` and its one-hop copy are rejected on all
+three binaries, while the owning-local and `move`-parameter sources still adopt and free once). The
+`??=` path passes `false` unconditionally and is unaffected.
+
+**Robustness caveat.** `ReboundBlock` is paired with `ReboundFunction` so a recycled block address
+cannot match across functions. Within a single function's emit no block is deleted, so there is no
+recycling window; if that ever changes, the pair needs a generation counter.
+
+The accept side is still real: `T* b = p; b = new T(); T* d = move b; delete d;` - which master compiles and
+frees correctly at two frees - must keep working, and a mutant build with the retirement removed
+rejects `bpmCopyRebound` in `Test/test_move.cb` and `valid_move_after_rebind` in
+`Test/errors/err_delete_borrowed_via_cast.cb`, which is what those two legs exist to catch. The
+seven reject shapes above have their own legs now (five in
+`Test/errors/err_move_borrowed_ptr_into_unique_field.cb`, one in
+`err_delete_borrowed_via_cast.cb`), each measured failing against the round-1 binary - without
+them the over-broad rule would re-open invisibly. Because the retirement also reaches the move
+RESULT's carried `IsBorrowed`, four shapes that were FALSE REJECTIONS on master (a rebound copy
+moved into a `unique` local, a `unique` field, a `unique` local by `=`, and a brace-init field) now
+compile and free once each - measured `dtor=2`, rc 0, all four.
+
+**TWO accepted behaviour changes on programs master ran to completion.** Both need a GLOBAL source,
+which is the one caller-side binding that is not auto-freed at scope exit.
+
+The SECOND one is silent, and round 1 of this record failed to name it: `Ci* g = ...;
+void consume(Ci* p) { Ci* d = move p; }` with NO `delete` anywhere gave `dtor=1` on master and gives
+`dtor=0` now. Master's adopting destination freed the pointee out from under a global that keeps
+pointing at it - dead while reachable - so declining to adopt is the safer end, but it IS a change
+and the object now lives until the global releases it. `leaks --atExit` reports 0 on both sides
+(the object stays reachable through `g`). Corpus cell `scratch/rev/rev_global_nodelete.cb`; test
+legs `bpm_global_nodelete_*` in `Test/test_move.cb`.
+
+The FIRST is a hard error. `Ci* pool = ...; void consume(Ci* p) { Ci* d = move p;
+delete d; }` ran correctly on master (the caller's binding was a GLOBAL, so nothing auto-freed) and
+is now rejected. It is the only cell in the corpus that went correct -> rejected. It is
+accepted because the DELETE spelling of the identical program (`void consume(Ci* p) { delete p; }`)
+is already a hard error on master with the same message, so this makes `move`+`delete` agree with
+plain `delete` instead of disagreeing; and because the remedy the message states really works
+(declaring `move Ci* p` compiles and frees once, measured).
+
+**Scoped out, with reasons, not silently - and FILED, one issue file and one queue row each.** Still
+silent double frees, all pre-existing and all accepted by the PRE binary too:
+- `move` of a borrow into a `move` SINK PARAMETER (`sink(move p)`, `l.add(move p)`). Deliberate: this
+  is the row `btree.cb` needs, and it is the one place the borrow-forward assertion survives. Filed
+  as [[move-of-borrow-into-move-sink-parameter]] (P2), with the btree constraint and the
+  do-not-retry note.
+- The `=`-path borrow-propagation gap. `T* d = nullptr; d = p; delete d;` double-frees with NO `move`
+  anywhere, so `d = move p; delete d;` and the `??=` spelling are that gap, not this one. The
+  DECLARATION path propagates the borrow; the plain `=` store does not. Filed as
+  [[assign-path-does-not-propagate-borrow-taint]] (P2).
+- A `?:` join of two borrowed parameters bound to a local, then moved. The join records
+  `JoinKeepsOwner`, whose consumers `fix/ptrcopy` set as raw delete / boxed delete / unique-field
+  store - deliberately not `move`. The no-move twin (`T* d = k ? p : q; delete d;`) IS rejected.
+  Filed as [[join-of-borrows-then-move-adopts]] (P2).
+- The raw-`delete` guard OVER-rejects a rebound borrow (`T* b = p; b = new T(); delete b;`) on master
+  and still does. Left alone: it is the safe direction, and widening it is a separate change. Filed
+  as [[raw-delete-guard-does-not-retire-a-rebound-borrow]] (P3), which also records why `IsOwning`
+  cannot be the retirement discriminator.
+
+**A third rejection worth naming**, found by the review round: `move Ci* f(Hold* h) { Ci* b = h->u;
+return move b; }` - a `move`-return of a borrow taken through a `unique` FIELD of a borrowed
+parameter - compiled on master and is now rejected. It is the move-return class above, but its
+diagnostic needed its own remedy: the origin recorded in the ledger is the PARAMETER `h`, while the
+value borrows `Hold.u`, so prescribing `move h` names a different object and produces a different
+(and correct) hard error. `NamedVariable::BorrowedThroughField` carries the field hop to the return
+site, which picks the field remedy instead. The direct and cast spellings keep the working
+`move <param>` advice.
+
+**Verification.** `./cmake_build.sh release && bash test.sh Release` - 600 passed, 0 failed, 8
+skipped. `bash example_mac.sh Release` - 35 passed, 0 failed. `leaks --atExit` unchanged pre/post on
+`Test/test_move.cb` (16 leaks / 320 bytes both sides, pre-existing) and 0 leaks on the newly-fixed
+programs. Three binaries were kept for the review round - `f1b8116` (PRE), the round-1 commit
+(MID, the over-broad retirement), and the branch head - and every leg added in round 2 was measured
+failing against MID as well as PRE. Probe corpora and their verbatim tables: `scratch/mbp/` (fix
+agent) and `scratch/rev/` (review round 1); the F1 regression set is `rev_rebind_*`,
+`rev_coalesce_rebind_unique`, `rev_deadbranch_*`, all of which reject again on the head.

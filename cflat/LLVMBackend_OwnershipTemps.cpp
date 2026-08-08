@@ -1056,6 +1056,11 @@ void LLVMBackend::PropagateMovedBorrowedPtrValue(llvm::Value* trueValue, llvm::V
         if (!trueBorrowMove && !isNullArm(trueValue)) return;
         if (!falseBorrowMove && !isNullArm(falseValue)) return;
         RegisterMovedBorrowedPtrValue(joined, origin);
+        // Mirror for the field-hop narrowing, off the SAME arm `origin` was taken from, or a
+        // diagnostic downstream prescribes `move <param>` for a value that is a field of it.
+        if (trueBorrowMove ? IsMovedBorrowedThroughField(trueValue)
+                           : IsMovedBorrowedThroughField(falseValue))
+            RegisterMovedBorrowedThroughField(joined);
     }
 
 bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined)
@@ -1463,6 +1468,22 @@ void LLVMBackend::RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::s
         movedBorrowedPtrValues_.push_back({ value, originName });
     }
 
+void LLVMBackend::RegisterMovedBorrowedThroughField(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        for (auto* v : movedBorrowedThroughFieldValues_)
+            if (v == value) return;
+        movedBorrowedThroughFieldValues_.push_back(value);
+    }
+
+bool LLVMBackend::IsMovedBorrowedThroughField(llvm::Value* value) const
+{
+        if (value == nullptr) return false;
+        for (auto* v : movedBorrowedThroughFieldValues_)
+            if (v == value) return true;
+        return false;
+    }
+
 bool LLVMBackend::IsMovedBorrowedPtrValue(llvm::Value* value, std::string* originOut) const
 {
         if (value == nullptr) return false;
@@ -1774,6 +1795,7 @@ void LLVMBackend::FlushOwnedTemps()
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
+        movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
     }
 

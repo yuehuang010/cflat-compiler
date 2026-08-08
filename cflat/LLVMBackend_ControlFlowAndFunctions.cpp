@@ -163,6 +163,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         currentCastOccurrence_ = 0;
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
+        s.movedBorrowedThroughFieldValues = std::move(movedBorrowedThroughFieldValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
@@ -184,6 +185,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
+        movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
         return s;
     }
@@ -219,6 +221,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         currentCastOccurrence_  = state.savedCastOccurrence;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
+        movedBorrowedThroughFieldValues_ = state.movedBorrowedThroughFieldValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
     }
 

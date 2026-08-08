@@ -1075,6 +1075,15 @@ const LLVMBackend::NamedVariable* LLVMBackend::FindVariableByStorage(const llvm:
         return nullptr;
     }
 
+bool LLVMBackend::BorrowProofRetiredByRebind(const NamedVariable& nv) const
+{
+        if (!nv.ReboundToOwnedValue || nv.ReboundBlock == nullptr) return false;
+        auto* here = builder->GetInsertBlock();
+        // Parent pairing so a recycled block address cannot match across functions.
+        if (here == nullptr || nv.ReboundFunction != here->getParent()) return false;
+        return nv.ReboundBlock == here;
+    }
+
 bool LLVMBackend::OwningLocalCopyStillAliases(const NamedVariable& nv) const
 {
         if (!nv.BorrowsOwningLocal || nv.OwningLocalOrigin.empty()) return false;

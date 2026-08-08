@@ -31,6 +31,45 @@ expect_error("cannot delete 'q' - it aliases borrowed parameter 'raw'") {
     }
 }
 
+// `move` of the borrow launders it no further: `move raw` nulls only this frame's copy, so the
+// destination stays a borrow (it no longer ADOPTS) and deleting through it is the same double-free.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void laundered_move(Payload* raw) {
+        Payload* p = move raw;
+        delete p;
+    }
+}
+
+// Same one hop out, so the borrow reaches the `move` through a copy rather than off the parameter.
+expect_error("cannot delete 'q' - it aliases borrowed parameter 'raw'") {
+    void laundered_copy_move(Payload* raw) {
+        Payload* p = raw;
+        Payload* q = move p;
+        delete q;
+    }
+}
+
+// The same delete after a rebind that sits in a NEVER-TAKEN branch. The walk is not control-flow
+// aware, so the store must not retire anything unless it is in the same block as the move.
+expect_error("cannot delete 'd' - it aliases borrowed parameter 'raw'") {
+    void laundered_dead_branch(Payload* raw) {
+        Payload* p = raw;
+        if (p == nullptr) { p = new Payload(); }
+        Payload* d = move p;
+        delete d;
+    }
+}
+
+// Sanity: the borrow proof RETIRES on an UNCONDITIONAL rebind to a fresh owner in the same block -
+// `p` is then the sole owner of what it holds, so moving it TRANSFERS and this delete is correct
+// (one free). Rejecting it would leak.
+void valid_move_after_rebind(Payload* raw) {
+    Payload* p = raw;
+    p = new Payload();
+    Payload* q = move p;
+    delete q;
+}
+
 // Sanity: move param can still be deleted through a cast local.
 void valid_move_via_cast(move void* raw) {
     Payload* p = (Payload*)raw;

@@ -1202,6 +1202,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
             compiler->pendingInitAllocAlign = 0;  // one-shot; consumed by the `new` above if direct
             lambdaExpectedType = {};
+            /*
+             * Hoisted above the rebind block below, which records it: this is the ONLY discriminator
+             * that separates "pointed at a fresh owner" from "pointed at another borrow", and
+             * PointerRebound alone cannot tell those apart. Full rationale at the `unique T*`
+             * reassignment further down, which reads the same bool.
+             */
+            bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
+                || TopLevelMoveExpression(assignCtx) != nullptr
+                || compiler->IsOwningPtrTempValue(rightNV.Primary)
+                || compiler->IsOwnedNewTemp(rightNV.Primary)
+                || compiler->IsMovedOutPtrValue(rightNV.Primary);
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
             if (operatorText == "=")
@@ -1248,11 +1259,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             if (assignedOwner != coalesceLhsOwner) owners.push_back(assignedOwner);
                             joined = DescribeInterfaceBoxOwners(owners);
                         }
+                        // '??=' keeps the OLD referent when the arm is not taken, so no store
+                        // through it can prove the binding now holds an owner - never retire.
                         compiler->MarkPointerRebound(namedVar.CallerName, joined,
-                                                     /*coalesceJoin*/ true);
+                                                     /*coalesceJoin*/ true,
+                                                     /*reboundToOwnedValue*/ false);
                     }
                     else
-                        compiler->MarkPointerRebound(namedVar.CallerName, assignedOwner);
+                    {
+                        /*
+                         * srcIsOwnedPtrRhs minus its purely SYNTACTIC leg. `b = move p` off a BORROW
+                         * carries the `move` token and owns nothing - ParseMoveExpression ledgers it
+                         * in movedBorrowedPtrValues_, not movedOutPtrValues_ - so trusting the token
+                         * here retired the borrow proof on a value that transfers nothing. Only the
+                         * value-identity legs may prove ownership for a RETIREMENT; narrowed here
+                         * rather than in srcIsOwnedPtrRhs, whose other consumer sits behind its own
+                         * IsBorrowed gate and must keep the syntactic leg for a genuine transfer.
+                         */
+                        bool reboundToOwnedValue = srcIsOwnedPtrRhs
+                            && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
+                        compiler->MarkPointerRebound(namedVar.CallerName, assignedOwner,
+                                                     /*coalesceJoin*/ false, reboundToOwnedValue);
+                    }
                     // A JOIN RHS carries no source binding, so no clause above can see it; ask its
                     // arms directly. After MarkPointerRebound, which retires any earlier join.
                     std::vector<llvm::Value*> storeJoinSlots;
@@ -1300,11 +1328,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // '?:' join of `move` arms owns, but is in no other ledger, so `b = c ? move a : nullptr;`
             // left the moved-out object owned by nobody (leak). A MIXED join never reaches the
             // ledger, so it still borrows here.
-            bool srcIsOwnedPtrRhs = AsDirectNew(assignCtx) != nullptr
-                || TopLevelMoveExpression(assignCtx) != nullptr
-                || compiler->IsOwningPtrTempValue(rightNV.Primary)
-                || compiler->IsOwnedNewTemp(rightNV.Primary)
-                || compiler->IsMovedOutPtrValue(rightNV.Primary);
             compiler->lastOwningResult = false;
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
@@ -7730,11 +7753,17 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             return {};
         }
 
-        // Reject 'move' of a local that aliases a `unique` field - Trap B in its original
-        // spelling. Moving the alias nulls the LOCAL, never the field, so the field's
-        // synthesized destructor still frees the pointee. Forwarding an ordinary borrow as
-        // 'move' stays legal (the programmer asserts the borrow is dead); for a `unique` field
-        // that assertion cannot hold, because the field's destructor is synthesized and will run.
+        /*
+         * Reject 'move' of a local that aliases a `unique` field - Trap B in its original spelling.
+         * Moving the alias nulls the LOCAL, never the field, so the field's synthesized destructor
+         * still frees the pointee. Forwarding an ordinary borrow as 'move' across an EXPLICIT
+         * ownership contract - a `move` parameter of a callee - stays legal (the programmer asserts
+         * the borrow is dead, which core/hpc/btree.cb relies on); for a `unique` field that
+         * assertion cannot hold, because the field's destructor is synthesized and will run. A
+         * plain `T*` destination asserts nothing, so it does not adopt at all (see
+         * borrowMoveKeepsBorrow in ParseDeclaration), and a `move` RETURN type is rejected at the
+         * return statement rather than forwarded.
+         */
         if (!argNV.BorrowedUniqueField.empty())
         {
             std::string name = argNV.CallerName.empty() ? argNV.BorrowedOrigin : argNV.CallerName;
@@ -7767,6 +7796,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
          * Destination-agnostic on purpose: a plain `T*` destination double-freed just as a `unique`
          * one did. Only these two proofs, re-asked for liveness - an ordinary borrow forwarded as
          * `move` stays legal by the rule stated above, and a rebound copy is the sole owner.
+         * An ordinary `IsBorrowed` source is deliberately NOT a third proof here: it is handled by
+         * non-adoption at the destination instead, because rejecting it destination-agnostically
+         * false-rejects core/hpc/btree.cb's `_rebalanceFrom` and six ratified join legs.
          */
         if (argNV.TypeAndValue.Pointer && argNV.FieldName.empty() && !argNV.IsElementAccess
             && llvm::isa_and_nonnull<llvm::AllocaInst>(argNV.Storage))
@@ -7974,11 +8006,25 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // frees a live pointee. The ledger thus carries provenance: membership means "owns".
         // The other side of that provenance: a borrowed source is ledgered as provably NON-owning,
         // so a receiver that must own the value rejects it even after a '?:' join laundered it.
-        if (!argNV.IsBorrowed)
+        bool srcBorrowLive = argNV.IsBorrowed;
+        bool srcBorrowThroughField = false;
+        if (srcBorrowLive && argNV.FieldName.empty() && !argNV.IsElementAccess
+            && llvm::isa_and_nonnull<llvm::AllocaInst>(argNV.Storage))
+        {
+            const auto* srcBorrowBind = compiler->FindVariableByStorage(argNV.Storage);
+            if (srcBorrowBind != nullptr
+                && (srcBorrowBind->IsOwning || compiler->BorrowProofRetiredByRebind(*srcBorrowBind)))
+                srcBorrowLive = false;
+            if (srcBorrowBind != nullptr) srcBorrowThroughField = srcBorrowBind->BorrowedThroughField;
+        }
+        if (!srcBorrowLive)
             compiler->RegisterMovedOutPtrValue(ptrVal);
         else
+        {
             compiler->RegisterMovedBorrowedPtrValue(ptrVal,
                 argNV.BorrowedOrigin.empty() ? argNV.CallerName : argNV.BorrowedOrigin);
+            if (srcBorrowThroughField) compiler->RegisterMovedBorrowedThroughField(ptrVal);
+        }
         compiler->lastAllocAlignment = argNV.AllocAlignment;
         // Element-slot source (`move _data[i]`): the pointer read demoted `unique` to a bare borrow,
         // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own
@@ -7995,9 +8041,10 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         result.AllocAlignment = argNV.AllocAlignment;
         // A 'move' of a BORROWED pointer parameter transfers nothing - the caller still owns the
         // pointee. Carry the provenance so a store into a `unique` field (a deferred delete, exactly
-        // like the already-blocked `delete b`) is rejected instead of double-freeing.
-        result.IsBorrowed     = argNV.IsBorrowed;
-        result.BorrowedOrigin = argNV.BorrowedOrigin;
+        // like the already-blocked `delete b`) is rejected, and so a PLAIN `T*` destination declines
+        // to adopt, instead of double-freeing.
+        result.IsBorrowed     = srcBorrowLive;
+        result.BorrowedOrigin = srcBorrowLive ? argNV.BorrowedOrigin : std::string();
         return result;
     }
 

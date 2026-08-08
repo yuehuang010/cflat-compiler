@@ -1720,7 +1720,7 @@ void LLVMBackend::SetInterfaceBoxIsBorrowed(const std::string& name, bool borrow
     }
 
 void LLVMBackend::MarkPointerRebound(const std::string& name, const std::string& inheritedOwner,
-                            bool coalesceJoin)
+                            bool coalesceJoin, bool reboundToOwnedValue)
 {
         if (name.empty()) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1732,6 +1732,11 @@ void LLVMBackend::MarkPointerRebound(const std::string& name, const std::string&
                 nv = &it2->second;
             if (nv == nullptr) continue;
             nv->PointerRebound = true;
+            // Recorded, not consulted, here: a retiring consumer must also prove the store was
+            // reached (same basic block), which is why the block travels with the bit.
+            nv->ReboundToOwnedValue = reboundToOwnedValue;
+            nv->ReboundBlock = reboundToOwnedValue ? builder->GetInsertBlock() : nullptr;
+            nv->ReboundFunction = nv->ReboundBlock != nullptr ? nv->ReboundBlock->getParent() : nullptr;
             nv->InheritedKeepsOwner = !inheritedOwner.empty();
             nv->InheritedKeepsOwnerSource = inheritedOwner;
             nv->CoalesceRebound = coalesceJoin;

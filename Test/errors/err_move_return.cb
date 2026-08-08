@@ -25,4 +25,33 @@ move Widget* argNewLeak(Widget* w)
     return nullptr;
 }
 
+// A `move` RETURN type is an explicit ownership contract, but `move` of a BORROWED pointer
+// parameter owns nothing: it nulls only this frame's copy while the caller still owns the pointee,
+// so the caller's result and the caller's own binding both free it. `move w` sets the same sticky
+// ownership channel a real transfer does, so the check above passes it - the ledger's borrow
+// provenance is what discriminates. Measured a silent abort before this rejection existed.
+move Widget* borrowMoveLeak(Widget* w)
+{
+    expect_error("moves a value that only borrows through parameter 'w'") {
+        return move w;
+    }
+    return nullptr;
+}
+
+// One hop out: the copy carries the borrow, so the same rejection must fire off `b`, not just `w`.
+move Widget* borrowMoveCopyLeak(Widget* w)
+{
+    expect_error("moves a value that only borrows through parameter 'w'") {
+        Widget* b = w;
+        return move b;
+    }
+    return nullptr;
+}
+
+// Sanity: a `move` parameter really does own its pointee, so forwarding it stays legal.
+move Widget* forwardOwned(move Widget* w)
+{
+    return move w;
+}
+
 extern int main() { return 0; }

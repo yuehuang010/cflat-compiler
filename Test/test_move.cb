@@ -3803,6 +3803,155 @@ GlobStrHolder gGS2 = default;
  * aliased (zero destructs) and aborted at teardown, where the local spelling destructs once.
  */
 /*
+ * `move` of a BORROWED pointer parameter into a PLAIN `T*` destination. The move transfers
+ * nothing - it nulls only this frame's copy while the caller still owns the pointee - so a plain
+ * destination, which asserts no ownership at all, must NOT adopt. It stays the borrow it was and
+ * frees nothing; the caller's single free is the only one. Every helper below aborted the process
+ * on a double free before this change, so the free counts are what these legs are really pinning.
+ */
+int bpmBareParam(Resource* p) { Resource* d = move p; return d->id; }
+int bpmOneHopCopy(Resource* p) { Resource* b = p; Resource* d = move b; return d->id; }
+int bpmTwoHopCopy(Resource* p) { Resource* b = p; Resource* b2 = b; Resource* d = move b2; return d->id; }
+void bpmDropped(Resource* p) { Resource* d = move p; }
+void bpmGenericDropped<T>(T* p) { T* d = move p; }
+int bpmPrimitivePtr(int* p) { int* d = move p; return d[0]; }
+Resource* bpmGlobalOwner = nullptr;
+void bpmDroppedNoDelete(Resource* p) { Resource* d = move p; }
+
+// The borrow proof RETIRES on rebinding: the binding is then the SOLE owner of the fresh object it
+// holds, so the move really does transfer and the destination must adopt. Rejecting these leaks.
+int bpmCopyRebound(Resource* p)
+{
+    Resource* b = p;
+    b = new Resource();
+    b->id = 91;
+    Resource* d = move b;
+    int v = d->id;
+    delete d;
+    return v;
+}
+
+int bpmParamRebound(Resource* p)
+{
+    p = new Resource();
+    p->id = 92;
+    Resource* d = move p;
+    int v = d->id;
+    delete d;
+    return v;
+}
+
+int testBorrowedPointerMoveNoAdopt()
+{
+    int passed = 0;
+
+    // Bare parameter. The callee reads the right object and frees nothing; the caller frees once.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 81;
+        passed += Test("bpm_bare_param_value", bpmBareParam(owner), 81);
+        passed += Test("bpm_bare_param_callee_freed_nothing", dtorCount, 0);
+        delete owner;
+    }
+    passed += Test("bpm_bare_param_freed_once", dtorCount, 1);
+
+    // One hop: the copy carries the borrow, so the move off the COPY must not adopt either.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 82;
+        passed += Test("bpm_one_hop_value", bpmOneHopCopy(owner), 82);
+        passed += Test("bpm_one_hop_callee_freed_nothing", dtorCount, 0);
+        delete owner;
+    }
+    passed += Test("bpm_one_hop_freed_once", dtorCount, 1);
+
+    // Two hops: the borrow must survive an intermediate copy, not just the first one.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 83;
+        passed += Test("bpm_two_hop_value", bpmTwoHopCopy(owner), 83);
+        delete owner;
+    }
+    passed += Test("bpm_two_hop_freed_once", dtorCount, 1);
+
+    // The destination is never read, so only the free count can see this one.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 84;
+        bpmDropped(owner);
+        passed += Test("bpm_dropped_callee_freed_nothing", dtorCount, 0);
+        delete owner;
+    }
+    passed += Test("bpm_dropped_freed_once", dtorCount, 1);
+
+    // The generic instantiation runs the same declaration path after substitution.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 85;
+        bpmGenericDropped<Resource>(owner);
+        passed += Test("bpm_generic_callee_freed_nothing", dtorCount, 0);
+        delete owner;
+    }
+    passed += Test("bpm_generic_freed_once", dtorCount, 1);
+
+    // A dtor-less pointee has no free count, so pin the value: adopting used to free the array
+    // out from under the caller and the read below returned garbage (or aborted).
+    {
+        int* nums = new int[3];
+        nums[0] = 86;
+        passed += Test("bpm_primitive_ptr_value", bpmPrimitivePtr(nums), 86);
+        passed += Test("bpm_primitive_ptr_still_readable", nums[0], 86);
+        delete[] nums;
+    }
+
+    // Retirement, copy end: `b` was rebound to a fresh object, so the move TRANSFERS and the
+    // callee's delete is correct. Two frees total - the fresh object and the caller's own.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 87;
+        passed += Test("bpm_copy_rebound_value", bpmCopyRebound(owner), 91);
+        passed += Test("bpm_copy_rebound_fresh_freed", dtorCount, 1);
+        delete owner;
+    }
+    passed += Test("bpm_copy_rebound_total_frees", dtorCount, 2);
+
+    // Retirement, parameter end: the same on the PARAMETER's own binding.
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 88;
+        passed += Test("bpm_param_rebound_value", bpmParamRebound(owner), 92);
+        passed += Test("bpm_param_rebound_fresh_freed", dtorCount, 1);
+        delete owner;
+    }
+    passed += Test("bpm_param_rebound_total_frees", dtorCount, 2);
+
+    /*
+     * A GLOBAL source and no `delete` anywhere - the one shape where the old adopting behaviour
+     * ran to completion instead of aborting, because a global is not auto-freed and nothing freed
+     * it twice. It still freed the pointee out from under a global that keeps pointing at it, so
+     * the object was dead while reachable. Non-adoption leaves it alive and owned by the global.
+     */
+    dtorCount = 0;
+    bpmGlobalOwner = new Resource();
+    bpmGlobalOwner->id = 89;
+    bpmDroppedNoDelete(bpmGlobalOwner);
+    passed += Test("bpm_global_nodelete_not_freed", dtorCount, 0);
+    passed += Test("bpm_global_nodelete_still_alive", bpmGlobalOwner->id, 89);
+    delete bpmGlobalOwner;
+    bpmGlobalOwner = nullptr;
+    passed += Test("bpm_global_nodelete_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
+/*
  * The ACCEPT SET of the copy-fact propagation (the fix/ptrcopy landed design record in
  * internal/issue/interface-issue-queue.md; the issue file itself is deleted, per convention).
  * Four ownership facts now cross a plain pointer DECLARATION - a copy of an owning local into a
@@ -5362,6 +5511,9 @@ extern int main()
 
     passed += testCopyFactPropagationAccepts();
     total += 72;
+
+    passed += testBorrowedPointerMoveNoAdopt();
+    total += 23;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

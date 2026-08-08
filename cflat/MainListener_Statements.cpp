@@ -776,6 +776,27 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             bool returnIsOwned = compiler->IsOwningValue(right)
                                 || compiler->lastCallReturnsOwned
                                 || compiler->lastOwningResult;
+                            // A `move` of a BORROW sets lastOwningResult like any real transfer, so
+                            // the test above passes it; the ledger is the surviving provenance.
+                            std::string returnedBorrowOrigin;
+                            if (compiler->IsMovedBorrowedPtrValue(right, &returnedBorrowOrigin))
+                            {
+                                // `move <origin>` is the remedy only when the value IS the parameter
+                                // (possibly copied). Through a FIELD it names a different object.
+                                std::string remedy = compiler->IsMovedBorrowedThroughField(right)
+                                    ? std::format("Move the FIELD itself once '{}' is owned here, or "
+                                                  "drop 'move' from the return type.",
+                                                  returnedBorrowOrigin)
+                                    : std::format("Declare the source parameter 'move {}' to take "
+                                                  "ownership, or drop 'move' from the return type.",
+                                                  returnedBorrowOrigin);
+                                LogErrorContext(jump, std::format(
+                                    "function declares a 'move' return type, but the returned expression "
+                                    "moves a value that only borrows through parameter '{}' - the move "
+                                    "nulls this frame's copy while the caller still owns the pointee, so "
+                                    "the caller would free it twice. {}",
+                                    returnedBorrowOrigin, remedy));
+                            }
                             if (!returnIsOwned)
                                 LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
                         }
