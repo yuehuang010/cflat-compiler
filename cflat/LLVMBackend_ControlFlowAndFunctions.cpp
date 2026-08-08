@@ -159,6 +159,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
         s.dataValueCodeCasts  = std::move(dataValueCodeCasts_);
+        s.savedCastOccurrence = currentCastOccurrence_;
+        currentCastOccurrence_ = 0;
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
@@ -214,6 +216,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         codeValueDataCasts_     = state.codeValueDataCasts;
         owningTempUniqueFields_ = state.owningTempUniqueFields;
         dataValueCodeCasts_     = state.dataValueCodeCasts;
+        currentCastOccurrence_  = state.savedCastOccurrence;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;

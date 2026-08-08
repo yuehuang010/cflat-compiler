@@ -2559,6 +2559,8 @@ void LLVMBackend::ResetForReanalysis()
     codeValues_.clear();
     dataValues_.clear();
     codeValueDataCasts_.clear();
+    currentCastOccurrence_ = 0;
+    nextCastOccurrence_ = 1;
     owningTempUniqueFields_.clear();
     dataValueCodeCasts_.clear();
     movedOutPtrValues_.clear();

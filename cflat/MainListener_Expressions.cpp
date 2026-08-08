@@ -2596,7 +2596,9 @@ llvm::Value* MainListener::BoxTernaryThinArmToInterface(llvm::Value* thinValue, 
 bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpressionContext* ctx,
                                          llvm::Value* armValue) {
         auto* compiler = Compiler(ctx);
-        if (!compiler->JoinArmCarriesCodeValue(armValue)) return false;
+        // Synchronous check, run while still inside whatever occurrence (a call argument, or the
+        // statement's ambient 0) this arm was evaluated under - see currentCastOccurrence_.
+        if (!compiler->JoinArmCarriesCodeValue(armValue, compiler->CurrentCastOccurrence())) return false;
         LogErrorContext(ctx, "cannot convert a function-pointer or closure VALUE in a '?:' arm to "
             "'string' - code is not a NUL-terminated buffer; write an explicit '(char*)' cast if "
             "the raw code address is what you want");
@@ -4453,9 +4455,9 @@ llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVa
         if (result != nullptr && namedVar.TypeAndValue.IsFatInterfaceValue()
             && !namedVar.TypeAndValue.Pointer)
             compiler->RegisterFatInterfaceValueTypeName(result, namedVar.TypeAndValue.TypeName);
-        // Ledger a CODE value by the same value identity, for the same reason: a '?:' / '??' join
-        // erases the declared facts every code-value gate reads (see codeValues_).
-        if (result != nullptr && compiler->ArgumentIsCodeValue(namedVar))
+        // Ledger a CODE value by the same value identity (see codeValues_). Synchronous check:
+        // namedVar is not a stamped argument, so ask under the ambient occurrence.
+        if (result != nullptr && compiler->ArgumentIsCodeValue(namedVar, compiler->CurrentCastOccurrence()))
             compiler->RegisterCodeValue(result);
         // Mirror ledger for the closure-widen gate, which asks the opposite question: a join of
         // values PROVEN to be data must not widen into a fat closure's code slot (see dataValues_).
@@ -6024,6 +6026,11 @@ void MainListener::EmitFieldInitializer(
                 continue;
             }
 
+            // Occurrence-scope this ONE field initializer (see codeValueDataCasts_): a brace list
+            // evaluates multiple fields in one statement, the same collision shape as call args.
+            size_t savedCastOcc = compiler->BeginCastOccurrence();
+            size_t thisCastOcc = compiler->CurrentCastOccurrence();
+
             // Bitfield seeded-init: `Point p = {ready: 1}`. Resolve through the
             // side-table; emit a RMW into the storage slot. No address-of, no GEP
             // of the field name itself.
@@ -6034,6 +6041,7 @@ void MainListener::EmitFieldInitializer(
             {
                 auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
                 llvm::Value* val = LoadNamedVariable(rightNV);
+                compiler->EndCastOccurrence(savedCastOcc);
                 if (!val) continue;
 
                 const auto& storageField = sd.StructFields[bfHit->StorageFieldIndex];
@@ -6067,6 +6075,8 @@ void MainListener::EmitFieldInitializer(
             }
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             lambdaExpectedType = {};
+            rightNV.CastOccurrenceId = thisCastOcc;
+            compiler->EndCastOccurrence(savedCastOcc);
             EmitOneFieldInit(structPtr, sd, typeName, fieldName, rightNV, fi);
         }
     }
@@ -7005,11 +7015,17 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 for (auto* namedArg : argList->argumentNamedExpression())
                 {
+                    // Occurrence-scope this ONE constructor argument (see codeValueDataCasts_),
+                    // same as the direct-call argument loop.
+                    size_t savedCastOcc = compiler->BeginCastOccurrence();
+                    size_t thisCastOcc = compiler->CurrentCastOccurrence();
                     llvm::Value* argVal = ParseAssignmentExpression(namedArg->assignmentExpression());
+                    compiler->EndCastOccurrence(savedCastOcc);
                     if (!argVal) break;
                     LLVMBackend::NamedVariable argVar;
                     argVar.Primary = argVal;
                     argVar.BaseType = argVal->getType();
+                    argVar.CastOccurrenceId = thisCastOcc;
                     ctorArgs.push_back(argVar);
                 }
             }

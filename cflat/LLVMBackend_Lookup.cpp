@@ -625,12 +625,12 @@ bool LLVMBackend::ArgumentIsFunctionPointerish(const NamedVariable& arg) const
             || (arg.Primary && llvm::isa<llvm::Function>(arg.Primary));
     }
 
-bool LLVMBackend::ArgumentIsCodeValue(const NamedVariable& arg) const
+bool LLVMBackend::ArgumentIsCodeValue(const NamedVariable& arg, size_t occurrence) const
 {
         if (FunctionPointerShapeOf(arg.TypeAndValue, &arg) != 0) return false;
         // A join is the one shape carrying no declared facts at all - resolve it through the
-        // per-value ledger, which only ever recorded reads that were shape-0 code themselves.
-        return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary);
+        // per-value ledger, keyed by the caller's occurrence (see the header comment).
+        return ArgumentIsFunctionPointerish(arg) || JoinCarriesCodeValue(arg.Primary, occurrence);
     }
 
 bool LLVMBackend::ArgumentIsDataValue(const NamedVariable& arg) const
@@ -654,7 +654,7 @@ bool LLVMBackend::ParameterAcceptsCodeValue(const TypeAndValue& param) const
 
 bool LLVMBackend::CodeValueIntoDataDestination(const NamedVariable& src, const TypeAndValue& dest) const
 {
-        return ArgumentIsCodeValue(src) && ParameterStoresData(dest);
+        return ArgumentIsCodeValue(src, src.CastOccurrenceId) && ParameterStoresData(dest);
     }
 
 std::string LLVMBackend::DescribeCodeValueIntoData(const std::string& spelling, const std::string& role,

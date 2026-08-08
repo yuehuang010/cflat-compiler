@@ -80,6 +80,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         codeValues_.clear();
         dataValues_.clear();
         codeValueDataCasts_.clear();
+        currentCastOccurrence_ = 0;
         owningTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
 

@@ -3188,6 +3188,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(p.TypeName))
                                             lambdaExpectedType = *enc;
                                     }
+                                    // Occurrence-scope this argument (see codeValueDataCasts_): a
+                                    // cast here must not launder a sibling argument's join arm.
+                                    size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
+                                    size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                     lambdaExpectedType = {};
                                     // Use-after-move check: a field access carries a populated Primary, so the
@@ -3206,7 +3210,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         }
                                     }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
-                                    if (!argValue) break;
+                                    if (!argValue) { Compiler(ctx)->EndCastOccurrence(savedCastOcc); break; }
                                     // An owned-string CALL result passed as a by-value (borrow) argument
                                     // has no named owner and must be freed at end-of-full-expression -
                                     // same rule as the direct-call arg loop. string.dtor's owned-bit
@@ -3321,6 +3325,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         }
                                     }
 
+                                    argVar.CastOccurrenceId = thisCastOcc;
+                                    Compiler(ctx)->EndCastOccurrence(savedCastOcc);
                                     extraArgs.emplace_back(argVar);
                                 }
                             }
@@ -3721,6 +3727,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         }
                                     }
                                     auto argName = namedArgument->Identifier();
+                                    // Occurrence-scope this argument (see codeValueDataCasts_): a
+                                    // cast here must not launder a sibling argument's join arm.
+                                    size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
+                                    size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
@@ -3740,7 +3750,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // Load from storage if Primary isn't populated (simple variable reference)
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                     lambdaExpectedType = {};
-                                    if (!argValue) break; // caller's block was terminated (e.g. return-block inline)
+                                    // caller's block was terminated (e.g. return-block inline)
+                                    if (!argValue) { Compiler(ctx)->EndCastOccurrence(savedCastOcc); break; }
                                     LLVMBackend::NamedVariable argVar;
 
                                     if (argName)
@@ -3875,6 +3886,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                                *Compiler(ctx)->context, "string"))
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
 
+                                    argVar.CastOccurrenceId = thisCastOcc;
+                                    Compiler(ctx)->EndCastOccurrence(savedCastOcc);
                                     arguments.emplace_back(argVar);
                                 }
                             }
@@ -5220,6 +5233,10 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
         {
             std::string fieldName = attr->Identifier()->getText();
             LLVMBackend::NamedVariable rightNV = {};
+            // Occurrence-scope this ONE attribute's evaluation - same multi-field-in-one-statement
+            // collision as brace-init (see codeValueDataCasts_).
+            size_t savedCastOcc = compiler->BeginCastOccurrence();
+            size_t thisCastOcc = compiler->CurrentCastOccurrence();
             if (auto* sl = attr->StringLiteral())
             {
                 // attr="literal" is a static string; use attr={expr} for interpolation
@@ -5245,6 +5262,8 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
                 rightNV = ParseAssignmentExpressionNamed(attr->assignmentExpression());
                 lambdaExpectedType = {};
             }
+            rightNV.CastOccurrenceId = thisCastOcc;
+            compiler->EndCastOccurrence(savedCastOcc);
             EmitOneFieldInit(structPtr, sd, tagName, fieldName, rightNV, attr);
         }
 

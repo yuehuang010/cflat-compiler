@@ -2177,3 +2177,82 @@ expect_error("cannot pass a closure view to closure parameter 'f'") {
         return spOnlyView(v);
     }
 }
+
+/*
+ * SAME-STATEMENT occurrence collision (was memory-unsafe, exit 138): codeValueDataCasts_ used
+ * to be keyed on llvm::Value* identity alone. A NAMED FUNCTION is one module-level llvm::Function
+ * constant, so an explicit data cast in ONE call argument used to launder a completely unrelated,
+ * uncast mention of the SAME function in a SIBLING argument of the same call - two different
+ * argument expressions, evaluated separately, that happen to read the same shared constant.
+ * Argument order is irrelevant (the gate runs after every argument in the call is already
+ * evaluated), so both orderings are pinned. The hoisted-cast control (cast on its own statement,
+ * one line earlier) was already diagnosed before this fix and stays diagnosed after it - it is
+ * not repeated here, only the two same-statement orderings that used to slip through.
+ */
+struct OccRec { int a = default; int b = default; };
+double occRo(double x) { return x + 1000.0; }
+int occTwo(void* v, OccRec* p) { p->a = 7; return p->a; }
+
+expect_error("code does not convert to a data pointer") {
+    int sameStatementCastLaundersSiblingArg_castFirst(int c)
+    {
+        OccRec* n = nullptr;
+        return occTwo((void*)occRo, c > 0 ? occRo : n);
+    }
+}
+
+expect_error("code does not convert to a data pointer") {
+    int occTwoSwapped(OccRec* p, void* v) { p->a = 7; return p->a; }
+
+    int sameStatementCastLaundersSiblingArg_bareFirst(int c)
+    {
+        OccRec* n = nullptr;
+        return occTwoSwapped(c > 0 ? occRo : n, (void*)occRo);
+    }
+}
+
+// A cast in a NESTED call's own argument list must not launder the ENCLOSING call's sibling
+// argument - occurrence ids are per call-argument slot, not per statement, so nesting must not
+// re-open the same collision one level up.
+expect_error("code does not convert to a data pointer") {
+    void* occOne(void* v) { return v; }
+
+    int sameStatementCastLaundersSiblingArg_nestedCall(int c)
+    {
+        OccRec* n = nullptr;
+        return occTwo(occOne((void*)occRo), c > 0 ? occRo : n);
+    }
+}
+
+// Brace-init is a SECOND independently-gated-expressions-per-statement site with the identical
+// collision shape: multiple field values are evaluated before any of them is store-gated.
+struct OccPair { void* v = default; OccRec* p = default; };
+
+expect_error("code does not convert to a data pointer") {
+    OccPair sameStatementCastLaundersSiblingField(int c)
+    {
+        OccRec* n = nullptr;
+        OccPair q = { v = (void*)occRo, p = c > 0 ? occRo : n };
+        return q;
+    }
+}
+
+/*
+ * The MIRROR ledger (dataValueCodeCasts_, guarding the closure-widen gate) has the same
+ * value-identity collision shape: a GLOBAL VARIABLE's address is the data-pointer analogue of a
+ * named function's shared llvm::Function* - one module-level constant, so a cast-to-code in one
+ * argument used to launder an unrelated bare mention of the SAME global's address in a sibling
+ * argument's join. Both closure parameters are FAT (Lambda<>); the cast asserts "this address is
+ * code", and the sibling argument's join must still be judged on its own occurrence.
+ */
+struct OccRec2 { int a = default; int b = default; };
+OccRec2 occGlobal = default;
+int occTwoLambda(Lambda<int(int)> f1, Lambda<int(int)> f2) { return f2(3); }
+
+expect_error("only a named function, a 'function<>' value or a lambda converts to a closure") {
+    int sameStatementCastLaundersSiblingArg_mirrorGlobal(int c)
+    {
+        OccRec2* nn = nullptr;
+        return occTwoLambda((function<int(int)>)&occGlobal, c > 0 ? &occGlobal : nn);
+    }
+}

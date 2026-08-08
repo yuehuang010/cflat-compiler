@@ -1738,12 +1738,12 @@ bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedV
         // The only declared evidence available here: the type is a pointer. A call result with no
         // recorded shape, or a bare identifier, leaves this false.
         if (arg.TypeAndValue.Pointer) return true;
-        // An explicit cast to a code type is the user's own assertion, and it is the escape hatch
-        // this gate's message advises - honour it here as the bare spelling already does.
-        if (IsDataValueCodeCast(value)) return false;
+        // An explicit cast to a code type is the user's own assertion - honour it here, scoped to
+        // THIS argument's own occurrence (see codeValueDataCasts_'s comment on the collision).
+        if (IsDataValueCodeCast(value, arg.CastOccurrenceId)) return false;
         // A JOIN carries no declared facts at all - resolve it through the per-value DATA ledger,
         // which answers yes only when EVERY arm is proven data (see JoinDeliversDataValue).
-        return JoinDeliversDataValue(value);
+        return JoinDeliversDataValue(value, arg.CastOccurrenceId);
     }
 
 std::string LLVMBackend::DescribeNonFunctionArgument(const NamedVariable& arg) const

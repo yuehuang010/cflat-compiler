@@ -176,8 +176,9 @@ void LLVMBackend::RegisterCodeValue(llvm::Value* value)
 void LLVMBackend::RegisterCodeValueDataCast(llvm::Value* value)
 {
         if (value == nullptr) return;
-        for (auto* entry : codeValueDataCasts_) if (entry == value) return;
-        codeValueDataCasts_.push_back(value);
+        for (auto& entry : codeValueDataCasts_)
+            if (entry.first == value && entry.second == currentCastOccurrence_) return;
+        codeValueDataCasts_.push_back({ value, currentCastOccurrence_ });
     }
 
 bool LLVMBackend::IsLedgeredCodeValue(const llvm::Value* value) const
@@ -186,9 +187,10 @@ bool LLVMBackend::IsLedgeredCodeValue(const llvm::Value* value) const
         return false;
     }
 
-bool LLVMBackend::IsCodeValueDataCast(const llvm::Value* value) const
+bool LLVMBackend::IsCodeValueDataCast(const llvm::Value* value, size_t occurrence) const
 {
-        for (auto* entry : codeValueDataCasts_) if (entry == value) return true;
+        for (auto& entry : codeValueDataCasts_)
+            if (entry.first == value && entry.second == occurrence) return true;
         return false;
     }
 
@@ -197,52 +199,54 @@ void LLVMBackend::RegisterDataValueCodeCast(llvm::Value* value)
         if (value == nullptr) return;
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return;
         if (llvm::isa<llvm::Function>(value)) return;
-        for (auto* entry : dataValueCodeCasts_) if (entry == value) return;
-        dataValueCodeCasts_.push_back(value);
+        for (auto& entry : dataValueCodeCasts_)
+            if (entry.first == value && entry.second == currentCastOccurrence_) return;
+        dataValueCodeCasts_.push_back({ value, currentCastOccurrence_ });
     }
 
-bool LLVMBackend::IsDataValueCodeCast(const llvm::Value* value) const
+bool LLVMBackend::IsDataValueCodeCast(const llvm::Value* value, size_t occurrence) const
 {
-        for (auto* entry : dataValueCodeCasts_) if (entry == value) return true;
+        for (auto& entry : dataValueCodeCasts_)
+            if (entry.first == value && entry.second == occurrence) return true;
         return false;
     }
 
-bool LLVMBackend::JoinArmCarriesCodeValue(const llvm::Value* value, int depth) const
+bool LLVMBackend::JoinArmCarriesCodeValue(const llvm::Value* value, size_t occurrence, int depth) const
 {
         if (value == nullptr || depth > kMaxJoinArmDepth) return false;
-        if (IsCodeValueDataCast(value)) return false;
+        if (IsCodeValueDataCast(value, occurrence)) return false;
         if (llvm::isa<llvm::Function>(value)) return true;
         if (IsLedgeredCodeValue(value)) return true;
-        return JoinCarriesCodeValue(value, depth);
+        return JoinCarriesCodeValue(value, occurrence, depth);
     }
 
-bool LLVMBackend::JoinCarriesCodeValue(const llvm::Value* value, int depth) const
+bool LLVMBackend::JoinCarriesCodeValue(const llvm::Value* value, size_t occurrence, int depth) const
 {
         if (value == nullptr || depth > kMaxJoinArmDepth) return false;
-        if (IsCodeValueDataCast(value)) return false;
+        if (IsCodeValueDataCast(value, occurrence)) return false;
         if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
         {
             for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-                if (JoinArmCarriesCodeValue(phi->getIncomingValue(i), depth + 1)) return true;
+                if (JoinArmCarriesCodeValue(phi->getIncomingValue(i), occurrence, depth + 1)) return true;
             return false;
         }
         if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
             for (const auto& arm : join->Arms)
-                if (JoinArmCarriesCodeValue(arm.Value, depth + 1)) return true;
+                if (JoinArmCarriesCodeValue(arm.Value, occurrence, depth + 1)) return true;
         return false;
     }
 
-int LLVMBackend::JoinArmDataKind(const llvm::Value* value, int depth) const
+int LLVMBackend::JoinArmDataKind(const llvm::Value* value, size_t occurrence, int depth) const
 {
         if (value == nullptr) return -1;
-        if (IsDataValueCodeCast(value)) return -1;   // the user cast this arm to a code type
+        if (IsDataValueCodeCast(value, occurrence)) return -1;   // the user cast this arm to a code type
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return 0;
         if (llvm::isa<llvm::Function>(value)) return -1;
         if (IsLedgeredDataValue(value)) return 1;
-        return JoinDeliversDataValue(value, depth) ? 1 : -1;
+        return JoinDeliversDataValue(value, occurrence, depth) ? 1 : -1;
     }
 
-bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, int depth) const
+bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurrence, int depth) const
 {
         if (value == nullptr || depth > kMaxJoinArmDepth) return false;
         bool proven = false;
@@ -251,7 +255,7 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, int depth) con
             if (phi->getNumIncomingValues() == 0) return false;
             for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
             {
-                const int kind = JoinArmDataKind(phi->getIncomingValue(i), depth + 1);
+                const int kind = JoinArmDataKind(phi->getIncomingValue(i), occurrence, depth + 1);
                 if (kind < 0) return false;
                 if (kind > 0) proven = true;
             }
@@ -262,7 +266,7 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, int depth) con
             if (join->Arms.empty()) return false;
             for (const auto& arm : join->Arms)
             {
-                const int kind = JoinArmDataKind(arm.Value, depth + 1);
+                const int kind = JoinArmDataKind(arm.Value, occurrence, depth + 1);
                 if (kind < 0) return false;
                 if (kind > 0) proven = true;
             }
@@ -1762,6 +1766,9 @@ void LLVMBackend::FlushOwnedTemps()
         // A named function is one shared llvm::Function constant, so a cast's launder must not
         // outlive its statement (see codeValueDataCasts_). codeValues_ deliberately survives.
         codeValueDataCasts_.clear();
+        // Reset the ambient occurrence for the next statement (see currentCastOccurrence_'s
+        // comment) - a call-argument's bumped id must never survive past its own statement.
+        currentCastOccurrence_ = 0;
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();

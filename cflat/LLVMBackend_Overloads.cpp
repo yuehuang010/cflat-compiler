@@ -86,7 +86,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 for (const auto& arg : arguments)
                 {
                     if (varParamItr == candidate.Parameters.end()) break;
-                    if (ArgumentIsCodeValue(arg) && !ParameterAcceptsCodeValue(*varParamItr))
+                    if (ArgumentIsCodeValue(arg, arg.CastOccurrenceId) && !ParameterAcceptsCodeValue(*varParamItr))
                         codeIntoDataParam = true;
                     ++varParamItr;
                 }
@@ -235,7 +235,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                      * arm uses: a `function<T>*` is the ADDRESS of a slot and a `function<T>[N]`
                      * decays to one, and both are plain data pointers that must keep converting.
                      */
-                    bool argIsCodeValue = ArgumentIsCodeValue(arg);
+                    bool argIsCodeValue = ArgumentIsCodeValue(arg, arg.CastOccurrenceId);
 
                     // The pointee is never itself a function-pointer type here: the funcptr arm
                     // above claims every such parameter whenever the argument is code.
@@ -828,7 +828,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
                 {
                     if (!c.Variadic && !arguments[i].TypeAndValue.TypeName.empty()) continue;
-                    if (!ArgumentIsCodeValue(arguments[i])) continue;
+                    if (!ArgumentIsCodeValue(arguments[i], arguments[i].CastOccurrenceId)) continue;
                     bool refused = c.Variadic ? !ParameterAcceptsCodeValue(*pi) : ParameterStoresData(*pi);
                     if (!refused) continue;
                     // Per-shape wording: "data type" is false at the scalar cell the variadic arm

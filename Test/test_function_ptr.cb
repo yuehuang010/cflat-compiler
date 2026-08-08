@@ -2650,6 +2650,14 @@ JoinAcc* joinAccMake(int v) { JoinAcc* r = new JoinAcc(); r->a = v; return r; }
 double joinAccRo(double x) { return x + 1000.0; }
 double joinAccR2(double x) { return x + 2000.0; }
 double joinAccApply(function<double(double)> f) { return f(1.0); }
+// TWO-argument sibling for the occurrence-keying accept legs: proves a cast at one argument
+// position keeps laundering ITS OWN argument even when a sibling argument in the same call
+// ALSO carries an explicit cast of the same shared function constant.
+JoinAcc* joinAccTwoCast(JoinAcc* a, JoinAcc* b) { return a; }
+// Non-dereferencing probe: the nested-join accept legs cast a CODE value to JoinAcc*, so the
+// result is not a valid struct - only pointer identity may be tested, never a field read.
+int joinAccOne(JoinAcc* p) { return p == nullptr ? 0 : 1; }
+struct JoinAccNested { JoinAcc* p = default; int k = default; };
 // An overload SET the join argument is scored against. The code-value rule is read by the
 // scorer's refute arm, so a set is the shape where it can change WHICH candidate is chosen.
 int joinAccPickOv(JoinAcc* p) { return p == nullptr ? 0 : p->a; }
@@ -2778,6 +2786,30 @@ bool testCodeValueJoinAccepts()
     result &= Test("cvj_cast_over_join_nonnull", castOverJoin   == nullptr ? 0 : 1, 1);
     result &= Test("cvj_cast_void_in_arm",       castVoidInArm  == nullptr ? 0 : 1, 1);
     result &= Test("cvj_cast_paren_in_arm",      castParenInArm == nullptr ? 0 : 1, 1);
+
+    // OCCURRENCE-KEYED accept legs: each call argument's cast launders ONLY its own occurrence,
+    // never a sibling argument's - these two DO carry their own explicit cast at every position,
+    // so they must stay accepted even though they read the SAME shared function constant twice
+    // in one statement. Distinct from the reject legs in err_data_pointer_to_closure_param.cb,
+    // which use a BARE (uncast) sibling mention - that is the collision this fix closes.
+    JoinAcc* twoCastArgsSameStmt = joinAccTwoCast((JoinAcc*)joinAccRo, (JoinAcc*)joinAccRo);
+    JoinAcc* castArgPlusCastJoinArm =
+        joinAccTwoCast((JoinAcc*)joinAccRo, c > 0 ? (JoinAcc*)joinAccRo : nullptr);
+    result &= Test("cvj_two_cast_args_same_stmt",     twoCastArgsSameStmt    == nullptr ? 0 : 1, 1);
+    result &= Test("cvj_cast_arg_plus_cast_join_arm", castArgPlusCastJoinArm == nullptr ? 0 : 1, 1);
+
+    // NESTED-JOIN accept legs: the cast sits on the INNERMOST arm of a join nested two levels
+    // deep, itself passed as a call argument or brace-init field. The gate that reads a call
+    // argument's own value mid-evaluation (LoadNamedVariable -> ArgumentIsCodeValue) must ask
+    // under the AMBIENT occurrence, not an unstamped 0, or the inner join's own load wrongly
+    // poisons the value-only codeValues_ ledger and the outer join is false-rejected.
+    JoinAcc* nn = nullptr;
+    int nestedJoinInArg = joinAccOne(c > 0 ? (c > 0 ? (JoinAcc*)(w) : nn) : nn);
+    int nestedNamedInArg = joinAccOne(c > 0 ? (c > 0 ? (JoinAcc*)joinAccRo : nn) : nn);
+    JoinAccNested nestedBox = { p = c > 0 ? (c > 0 ? (JoinAcc*)(w) : nn) : nn, k = 3 };
+    result &= Test("cvj_nested_join_in_call_arg",   nestedJoinInArg  == 0 ? 0 : 1, 1);
+    result &= Test("cvj_nested_named_in_call_arg",  nestedNamedInArg == 0 ? 0 : 1, 1);
+    result &= Test("cvj_nested_join_brace_field",   nestedBox.p == nullptr ? 0 : 1, 1);
 
     // A join of two DATA pointers into a data pointer - the control proving the resolution is not
     // simply refusing pointer joins. Both join spellings, decl-init and argument.

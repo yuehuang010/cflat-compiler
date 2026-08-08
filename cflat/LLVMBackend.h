@@ -922,6 +922,18 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // compile-time: the occurrence id (see currentCastOccurrence_) this argument's own value
+        // was produced under, stamped when a call-argument's evaluation finishes. Lets a DEFERRED
+        // gate (ArgumentIsCodeValue / ArgumentIsProvablyDataPointer, run after every sibling
+        // argument in the same call is already evaluated) ask the launder "was THIS occurrence's
+        // cast the one that produced this value", instead of "was this value ever cast anywhere in
+        // the statement" - the latter is exactly the same-statement collision this field closes.
+        // 0 means "not stamped" (never evaluated inside a call-argument slot) and can never match a
+        // real registration (currentCastOccurrence_ is reset to 0 between statements too, so an
+        // unstamped argument correctly falls back to the old whole-statement behaviour). Live
+        // compile-time state derived from llvm::Value* identity - not part of the --init cache
+        // round-trip, same rule as IsExplicitMove above.
+        size_t CastOccurrenceId = 0;
         bool MovedIntoInterface = false; // compile-time: ownership was boxed into an interface local ('IFace x = ptr'); 'delete ptr' is a no-op that leaks - delete the interface instead
         // compile-time: this array-view LOCAL's DECLARATION bound it from fixed-array storage
         // (proven, never reassigned since); 'delete' would hand free() a non-heap address.
@@ -1411,13 +1423,59 @@ public:
      * Value. Held for the whole function, one `(void*)ro` would launder `ro` for every later gate
      * in that function - measured, memory-unsafe. FlushOwnedTemps (the block-item boundary) retires
      * it, which is strictly later than every gate that reads it and no later than the next
-     * statement. Residual, inherent to keying the launder on value identity ALONE: a laundering
-     * cast and a bare join of the SAME named function inside ONE statement still launder each
-     * other, e.g. `two((void*)ro, c ? ro : n)` compiles clean and exits 138. Occurrence keying
-     * (value + syntactic cast site) would distinguish them; tracked in
-     * internal/issue/p2/same-statement-cast-launders-join-code-evidence.md.
+     * statement.
+     *
+     * OCCURRENCE-KEYED: each entry pairs the value with the currentCastOccurrence_ id live when the
+     * cast was registered, not the value alone. A statement-scoped, value-only ledger still let a
+     * laundering cast and a BARE join of the SAME named function inside ONE statement launder each
+     * other when they are two DIFFERENT call arguments - `two((void*)ro, c ? ro : n)` compiled clean
+     * and exited 138, because argument 0's cast registered `ro`'s Function* and argument 1's join
+     * arm (an unrelated, uncast mention of the same shared constant) matched it by value identity
+     * alone. currentCastOccurrence_ is bumped fresh for the duration of evaluating each independently
+     * -gated call argument (BeginCastOccurrence/EndCastOccurrence in the argument-evaluation loops),
+     * so a cast in one argument's occurrence can never satisfy a lookup made under a sibling
+     * argument's occurrence. A value evaluated OUTSIDE any call-argument slot (a plain assignment,
+     * decl-init, return, ...) is never re-occurrence'd mid-statement, so it keeps the prior
+     * whole-statement value-only behaviour (both sides of the comparison share the ambient id, 0
+     * unless nested inside a call argument) - correct because a single-target store site never has a
+     * sibling independently-gated expression to collide with in the same statement.
+     *
+     * NOT FULLY CLOSED: two residuals remain, filed rather than fixed here. (1) Both arms of ONE
+     * join share a single occurrence (the argument/field slot that contains the join), so a cast on
+     * one arm still launders its sibling arm - argument granularity is structurally one level too
+     * coarse to separate them (see join-arm-cast-launders-sibling-arm.md). (2) Interface-method
+     * dispatch never consults this ledger at all, cast or bare - it binds through the vtable slot's
+     * declared signature, not the overload scorer this gate is wired into (see
+     * interface-dispatch-argument-ungated-for-code-values.md).
      */
-    std::vector<llvm::Value*> codeValueDataCasts_;
+    std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts_;
+
+    // See codeValueDataCasts_'s occurrence-keying note. currentCastOccurrence_ is the AMBIENT
+    // occurrence id: 0 between statements and for any expression evaluated outside a call-argument
+    // slot, and a fresh id for the duration of evaluating one call argument (BeginCastOccurrence
+    // saves the caller's id and returns a new one; EndCastOccurrence restores it, so nested calls
+    // compose correctly without a real occurrence stack). nextCastOccurrence_ is the monotonic
+    // generator; it is never reused and never needs resetting mid-compile, only at ResetForReanalysis
+    // for hygiene between files. 0 is reserved and never handed out by BeginCastOccurrence, so an
+    // un-stamped NamedVariable::CastOccurrenceId (default 0) can only ever match the ambient state,
+    // never a real call-argument occurrence - the safe default.
+    size_t nextCastOccurrence_ = 1;
+    size_t currentCastOccurrence_ = 0;
+
+public:
+    // Bump to a fresh occurrence id for the duration of evaluating ONE independently-gated
+    // expression (today: one call argument). Returns the PRIOR (caller's) occurrence id - save it
+    // and pass it to EndCastOccurrence once that expression's evaluation is complete, to restore
+    // the caller's (possibly ambient, possibly outer-call) occurrence so nested calls compose
+    // correctly. Read CurrentCastOccurrence() right after calling this to get the fresh id to stamp
+    // onto the resulting NamedVariable::CastOccurrenceId.
+    size_t BeginCastOccurrence() { size_t saved = currentCastOccurrence_; currentCastOccurrence_ = nextCastOccurrence_++; return saved; }
+
+    void EndCastOccurrence(size_t saved) { currentCastOccurrence_ = saved; }
+
+    size_t CurrentCastOccurrence() const { return currentCastOccurrence_; }
+
+private:
 
     /*
      * Values read out of a `unique` field of an owning TEMPORARY this statement destructs
@@ -1476,7 +1534,11 @@ public:
 
     bool IsLedgeredCodeValue(const llvm::Value* value) const;
 
-    bool IsCodeValueDataCast(const llvm::Value* value) const;
+    // occurrence: the caller's CurrentCastOccurrence() (a synchronous check, e.g.
+    // RejectCodeValueTernaryStringArm) or a deferred caller's own NamedVariable::CastOccurrenceId
+    // (ArgumentIsCodeValue, run after every sibling argument has already been evaluated). See
+    // codeValueDataCasts_'s comment for why value identity alone is unsound here.
+    bool IsCodeValueDataCast(const llvm::Value* value, size_t occurrence) const;
 
     /*
      * The MIRROR launder: values an EXPLICIT cast to a CODE type produced. `(function<int(int)>)x`
@@ -1485,8 +1547,15 @@ public:
      * whole JOIN would be refused while casting each ARM (which carries the declared flag) is
      * accepted, an asymmetry of exactly the kind this fix removes. STATEMENT-SCOPED like
      * codeValueDataCasts_, retired by FlushOwnedTemps, so one cast cannot launder a later gate.
+     *
+     * OCCURRENCE-KEYED for the same reason as codeValueDataCasts_ (see its comment): a data pointer
+     * mentioned bare twice in one statement, once inside a call argument that also casts a DIFFERENT
+     * data value to code, must not have the bare mention misread as "cast to code" just because it
+     * shares a statement with an unrelated cast. Ordinary (non-Function, non-null) pointer values are
+     * usually distinct SSA values per read, but a raw pointer PARAMETER used bare twice without an
+     * intervening load is not - same collision shape as a named function, just rarer to trigger.
      */
-    std::vector<llvm::Value*> dataValueCodeCasts_;
+    std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts_;
 
     /*
      * A SHARED CONSTANT must never enter this ledger. `(function<>)nullptr` casts the one shared
@@ -1497,13 +1566,14 @@ public:
      */
     void RegisterDataValueCodeCast(llvm::Value* value);
 
-    bool IsDataValueCodeCast(const llvm::Value* value) const;
+    bool IsDataValueCodeCast(const llvm::Value* value, size_t occurrence) const;
 
     static constexpr int kMaxJoinArmDepth = 8;
 
     // One ARM of a join: code when it is a function symbol, a ledgered read, or itself a join
-    // carrying one. An explicitly data-cast arm is laundered and stops the walk.
-    bool JoinArmCarriesCodeValue(const llvm::Value* value, int depth = 0) const;
+    // carrying one. An explicitly data-cast arm is laundered and stops the walk. occurrence: see
+    // IsCodeValueDataCast - held fixed across the whole recursive arm walk of ONE gated expression.
+    bool JoinArmCarriesCodeValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
     /*
      * Does a '?:' / '??' JOIN deliver a code value down at least one arm? The '?:' arms are the
@@ -1511,11 +1581,11 @@ public:
      * nullCoalesceJoins_. ANY code arm answers yes - one arm is enough to write a code address
      * into the destination - and a join of two data pointers answers no.
      */
-    bool JoinCarriesCodeValue(const llvm::Value* value, int depth = 0) const;
+    bool JoinCarriesCodeValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
     // One ARM of a join, for the DATA question: 1 = proven data, 0 = neutral (a null constant can
     // never be code), -1 = unproven, which alone makes the whole join unproven.
-    int JoinArmDataKind(const llvm::Value* value, int depth) const;
+    int JoinArmDataKind(const llvm::Value* value, size_t occurrence, int depth) const;
 
     /*
      * Does a '?:' / '??' JOIN deliver a value proven to be DATA? The mirror of
@@ -1524,7 +1594,7 @@ public:
      * unproven arm can still be code at runtime. ANY-arm here would false-reject every mixed
      * code/data join - shapes master compiles and runs correctly.
      */
-    bool JoinDeliversDataValue(const llvm::Value* value, int depth = 0) const;
+    bool JoinDeliversDataValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
     /*
      * Deferred interface-return-dangle check (the "existential" attempt - see
@@ -3400,9 +3470,13 @@ public:
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
         std::vector<llvm::Value*> codeValues;
         std::vector<llvm::Value*> dataValues;
-        std::vector<llvm::Value*> codeValueDataCasts;
+        std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
-        std::vector<llvm::Value*> dataValueCodeCasts;
+        std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts;
+        // The enclosing statement's ambient occurrence id (see currentCastOccurrence_) - a nested
+        // emission (lambda invoker, global init, program shim) starts its own from 0, same as the
+        // per-function reset, and this restores the outer one when we return to it.
+        size_t savedCastOccurrence = 0;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
@@ -5146,7 +5220,9 @@ public:
      * shape check is load-bearing: a `function<T>*` is the ADDRESS of a slot and a `function<T>[N]`
      * decays to one, and both are real DATA pointers that must keep converting.
      */
-    bool ArgumentIsCodeValue(const NamedVariable& arg) const;
+    // occurrence: a stamped argument passes arg.CastOccurrenceId; LoadNamedVariable's
+    // synchronous mid-evaluation check passes CurrentCastOccurrence() instead.
+    bool ArgumentIsCodeValue(const NamedVariable& arg, size_t occurrence) const;
 
     /*
      * Is this ARGUMENT a value PROVEN to be data - a pointer whose declared type is not code? The
