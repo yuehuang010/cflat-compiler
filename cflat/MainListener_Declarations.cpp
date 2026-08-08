@@ -4397,10 +4397,7 @@ std::string MainListener::ExactUniqueFieldAccess(const LLVMBackend::NamedVariabl
     }
 
 std::string MainListener::DescribeUniqueFieldAccess(const LLVMBackend::NamedVariable& nv) {
-        std::string field = nv.FieldName.empty() ? nv.TypeAndValue.VariableName : nv.FieldName;
-        if (field.empty()) return nv.CallerName;
-        if (nv.FieldName.empty() || nv.CallerName.empty()) return field;
-        return nv.CallerName + "." + field;
+        return LLVMBackend::DescribeUniqueFieldAccess(nv);
     }
 
 bool MainListener::IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv) {

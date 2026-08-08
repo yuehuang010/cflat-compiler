@@ -1,0 +1,38 @@
+/*
+ * The ORDER leg for the plain-`T*` parameter guard, and the reason that guard is
+ * record-then-resolve rather than a call-site check. cflat emits IR as it walks, so a callee
+ * defined BELOW its call site is still a bare declaration when the call is emitted: the
+ * callee-side escape fact is not answerable yet, and ParameterProvablyRetainsArgument
+ * correctly reports "no proof" (unknown accepts, by design). The call is therefore RECORDED
+ * and re-asked at end of module, where every body is complete.
+ *
+ * The offending call is in an IMPORTED module (Test/library/temp_uniq_plain_param_mod.cb), not
+ * here, which is the second half of what this leg covers: by the time the deferred pass runs,
+ * the compiler's own sourceFileName is THIS file, so the record has to carry the file the call
+ * was written in. Measured before that was fixed: the module's call at
+ * `temp_uniq_plain_param_mod.cb(14,4)` was reported as a location in the IMPORTING file. Note
+ * `expect_error` matches the message TEXT, never the `file(line,col):` prefix, so this leg pins
+ * the deferred resolution and the cross-module reach; the file attribution itself is checked by
+ * reading the diagnostic (scratch/rvw_mainimp.cb + scratch/rvwmod/ hold the reviewer's probe).
+ *
+ * This leg lives in its own file because the diagnostic is DEFERRED: a scoped
+ * `expect_error(...) { }` block closes before end-of-module resolution runs and would print
+ * "expected error ... did not occur", i.e. exactly the opposite of the truth. The bare
+ * file-scope form is the one that stays armed to the end of the compile, and it covers the
+ * rest of the scope - so one leg per file is a structural constraint here, not a style choice.
+ * The immediate-path legs for the same guard live in err_unique_borrow_into_field.cb.
+ *
+ * Measured before the guard (-o + run): `v=99 same=1 dtors=1` - the temp's destructor freed
+ * the pointee and the read aliased a freshly reallocated block. Mutation-tested: deleting
+ * the ResolveTempUniqueFieldArgEscapes call at the end of the walk makes this file exit 1
+ * with "expected error ... did not occur", while every leg in the sibling file still passes.
+ */
+expect_error("call to 'keepModGlobal': cannot pass unique field 'makeModBox.t' of a temporary to plain pointer parameter 'n' - 'keepModGlobal' stores that pointer into a global");
+
+import "temp_uniq_plain_param_mod.cb";
+
+extern int main()
+{
+    offendFromImportedModule();
+    return 0;
+}

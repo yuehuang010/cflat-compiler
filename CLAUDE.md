@@ -325,7 +325,7 @@ out\test_operators.exe
 
 Current tests (all in `Test/`, all CFlat with `-i Test\library`) (`test_helper.cb` is a shared helper, not run directly.)
 
-test.bat uses wildcard `Test/*.*` to locate tests. Remember to remove debug tests or else they would be picked up by the wildcard expansion.
+test.bat and test.sh glob `Test/test_*.cb` plus `Test/errors/err_*.cb` (non-recursive) to locate tests; `Test/library/` and other prefixes are never picked up. Remember to remove debug tests matching those prefixes or they would be picked up by the wildcard expansion.
 
 ### Error tests
 

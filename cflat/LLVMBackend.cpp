@@ -829,6 +829,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // did-not-occur check so a file-scope expect_error catches it.
         CheckPoisonedFunctionCalls();
 
+        // Every callee body is complete now, so a call whose callee was still a declaration
+        // during the walk can finally be answered (record-then-resolve; see tempUniqueFieldArgs_).
+        ResolveTempUniqueFieldArgEscapes();
+
         // Every generic instantiation has been drained by now, so interfaceTable is COMPLETE:
         // resolve the materialisation records captured during the walk. Inside the try so a
         // negative test can expect_error it.
@@ -2571,6 +2575,8 @@ void LLVMBackend::ResetForReanalysis()
     DropModuleEscapeMemo();
     poisonedFunctions.clear();
     firstCallLocation_.clear();
+    // Holds llvm::Function* into a module a rebuild invalidates.
+    tempUniqueFieldArgs_.clear();
     lastAllocAlignment = 0;
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;

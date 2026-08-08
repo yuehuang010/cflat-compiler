@@ -4717,6 +4717,43 @@ int readResourceId(Resource* r) { return r->id; }
 void sinkResourceUnique(unique Resource* r) { }
 void sinkResourceMove(move Resource* r) { delete r; }
 
+// Callee shapes the PLAIN-`T*` guard must NOT reject. ParameterProvablyRetainsArgument answers
+// "no proof" for every one of them, which is the unknown-accepts polarity the guard is built on:
+// a forwarding read, a store that lands only in a LOCAL, recursion (the walk's cycle guard),
+// a vararg callee (no named parameter to judge), and a plain `return n`, which does not by
+// itself outlive the call. `keepResourceGlobal` DOES store and is the polarity twin - it stays
+// legal for an ordinary heap pointer, proving the guard reads the temp ledger and not the
+// callee fact alone.
+struct ResourceSlot { Resource* p = nullptr; };
+Resource* gKeptResource = nullptr;
+int forwardReadResourceId(Resource* r) { return readResourceId(r); }
+int storeIntoLocalThenRead(Resource* r) { ResourceSlot s = default; s.p = r; return s.p->id; }
+int recursiveReadResourceId(Resource* r, int d) { if (d > 0) { return recursiveReadResourceId(r, d - 1); } return r->id; }
+void printResourcePointer(Resource* r) { snprintf(nullptr, 0, "%p", r); }
+Resource* passthruResource(Resource* r) { return r; }
+void keepResourceGlobal(Resource* r) { gKeptResource = r; }
+void ownResourceGlobal(move Resource* r) { gKeptResource = r; }
+
+// The RECEIVER shape: `makeSelfBox().t->m()`. A method whose body only READS `this` must keep
+// working off a temp's unique field, and a method that DOES store `this` must keep working off
+// a BORROWED container element, where nothing is freed at end of statement. The storing
+// spelling off a temp is the reject leg in Test/errors/err_unique_borrow_into_field.cb.
+SelfResource* gSelfResource = nullptr;
+struct SelfResource
+{
+    int id = 0;
+    ~SelfResource() { dtorCount = dtorCount + 1; }
+    int readId() { return this.id; }
+    void parkSelf() { gSelfResource = this; }
+};
+MoveBox<unique SelfResource*> makeSelfBox()
+{
+    MoveBox<unique SelfResource*> b = default;
+    b.t = new SelfResource();
+    b.t->id = 45;
+    return b;
+}
+
 int testTempUniqueFieldBorrowAccepts()
 {
     int passed = 0;
@@ -4861,6 +4898,89 @@ int testTempUniqueFieldBorrowAccepts()
         sinkResourceMove(move owned);
     }
     passed += Test("temp_uniq_accept_sink_move_local_freed_once", dtorCount, 1);
+
+    // The ACCEPT SET of the plain-`T*` callee-side guard, frozen before the guard was written.
+    // Each cell is a callee the escape walk cannot PROVE stores, so each must keep compiling and
+    // keep the same `dtors == 1` shape as the read-only cell above: value consumed inside the
+    // statement, pointee freed exactly once at the end of it.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_forwarding_read",
+                   forwardReadResourceId(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_plain_param_forwarding_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_local_store",
+                   storeIntoLocalThenRead(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_plain_param_local_store_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_recursive_read",
+                   recursiveReadResourceId(makeMoveBox().t, 2), 44);
+    passed += Test("temp_uniq_accept_plain_param_recursive_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    printResourcePointer(makeMoveBox().t);
+    passed += Test("temp_uniq_accept_plain_param_vararg_freed_once", dtorCount, 1);
+    // `return n` alone is not proof that the pointee outlives the call, so the passthru is
+    // accepted and the whole chain is still consumed inside the statement.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_plain_param_passthru_read",
+                   readResourceId(passthruResource(makeMoveBox().t)), 44);
+    passed += Test("temp_uniq_accept_plain_param_passthru_freed_once", dtorCount, 1);
+    // The POLARITY twin: the same STORING callee that the reject legs pin, fed an ordinary heap
+    // pointer instead of a temp's unique field. Nothing is ledgered, so nothing is judged - and
+    // the caller still owns the pointee, which is why dtorCount is 0 until the delete below.
+    dtorCount = 0;
+    {
+        Resource* plain = new Resource();
+        plain->id = 76;
+        keepResourceGlobal(plain);
+        passed += Test("temp_uniq_accept_plain_ptr_into_storing_callee", gKeptResource->id, 76);
+        passed += Test("temp_uniq_accept_plain_ptr_into_storing_callee_not_freed", dtorCount, 0);
+        gKeptResource = nullptr;
+        delete plain;
+    }
+    passed += Test("temp_uniq_accept_plain_ptr_into_storing_callee_freed_once", dtorCount, 1);
+
+    // BOTH remedies the reject's message names, measured - a rejection may only recommend
+    // something that actually compiles. Binding the call result to a LOCAL makes the pointee
+    // outlive the statement (dtors stays 0 while the borrow is live, 1 at scope exit); a `move`
+    // parameter hands ownership over instead, so the local's scope exit frees nothing.
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> tmp = makeMoveBox();
+        keepResourceGlobal(tmp.t);
+        passed += Test("temp_uniq_remedy_local_borrow_live", gKeptResource->id, 44);
+        passed += Test("temp_uniq_remedy_local_borrow_not_yet_freed", dtorCount, 0);
+    }
+    gKeptResource = nullptr;
+    passed += Test("temp_uniq_remedy_local_borrow_freed_at_scope_exit", dtorCount, 1);
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> tmp = makeMoveBox();
+        ownResourceGlobal(move tmp.t);
+        passed += Test("temp_uniq_remedy_move_param_live", gKeptResource->id, 44);
+    }
+    passed += Test("temp_uniq_remedy_move_param_not_freed_at_scope_exit", dtorCount, 0);
+    delete gKeptResource;
+    gKeptResource = nullptr;
+    passed += Test("temp_uniq_remedy_move_param_freed_once", dtorCount, 1);
+
+    // RECEIVER accepts. A read-only method off a temp's unique field is consumed inside the
+    // statement (freed once at the end of it); a STORING method off a BORROWED container
+    // element is legal because the list owns the pointee and nothing is freed here.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_receiver_read_only_method", makeSelfBox().t->readId(), 45);
+    passed += Test("temp_uniq_accept_receiver_read_only_freed_once", dtorCount, 1);
+    {
+        list<MoveBox<unique SelfResource*>> sl;
+        MoveBox<unique SelfResource*> sb = default;
+        sb.t = new SelfResource();
+        sb.t->id = 46;
+        sl.add(move sb);
+        dtorCount = 0;
+        sl.get(0).t->parkSelf();
+        passed += Test("temp_uniq_accept_receiver_borrowed_elem_store", gSelfResource->id, 46);
+        passed += Test("temp_uniq_accept_receiver_borrowed_elem_not_freed", dtorCount, 0);
+        gSelfResource = nullptr;
+    }
 
     return passed;
 }
@@ -5501,7 +5621,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 24;
+    total += 46;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

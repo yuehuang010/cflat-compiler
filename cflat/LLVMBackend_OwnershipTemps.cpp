@@ -10,6 +10,7 @@
 #include <llvm/Linker/Linker.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Analysis/ValueTracking.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
@@ -964,6 +965,10 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         if (fn == nullptr) return;
         std::erase_if(paramRetainsMemo_, [&](const auto& kv) { return kv.first.first == fn; });
         std::erase_if(paramRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase_if(provableRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        // The record ledger holds this raw Function*, which LLVM may hand back to a later
+        // Function::Create; an entry outliving its callee would be resolved against a stranger.
+        std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) { return e.Callee == fn; });
         std::erase(suspendedFunctions_, fn);
     }
 
@@ -971,6 +976,8 @@ void LLVMBackend::DropModuleEscapeMemo()
 {
         paramRetainsMemo_.clear();
         paramRetainsInProgress_.clear();
+        provableRetainsInProgress_.clear();
+        tempUniqueFieldArgs_.clear();
         suspendedFunctions_.clear();
     }
 
@@ -1128,9 +1135,15 @@ bool LLVMBackend::ParameterRetainsArgument(const llvm::Function* fn, unsigned ar
 
 bool LLVMBackend::FunctionBodyIsComplete(const llvm::Function* fn) const
 {
-        if (fn == nullptr || fn->isDeclaration() || fn == currentFunction) return false;
+        if (fn == nullptr || fn == currentFunction) return false;
         if (std::find(suspendedFunctions_.begin(), suspendedFunctions_.end(), fn)
             != suspendedFunctions_.end()) return false;
+        return FunctionBodyIsReadable(fn);
+    }
+
+bool LLVMBackend::FunctionBodyIsReadable(const llvm::Function* fn) const
+{
+        if (fn == nullptr || fn->isDeclaration()) return false;
         for (const auto& bb : *fn)
             if (bb.getTerminator() == nullptr) return false;
         return true;
@@ -1222,6 +1235,235 @@ bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth)
             }
         }
         return false;
+    }
+
+bool LLVMBackend::MemoryOutlivesCall(const llvm::Value* ptr, std::string& destKind, int depth) const
+{
+        if (ptr == nullptr || depth > kMaxRetainDepth) return false;
+        const llvm::Value* obj = llvm::getUnderlyingObject(ptr);
+        if (llvm::isa<llvm::GlobalVariable>(obj))
+        {
+            destKind = "a global";
+            return true;
+        }
+        if (const auto* arg = llvm::dyn_cast<llvm::Argument>(obj))
+        {
+            destKind = std::format("memory the caller supplied through {}",
+                DescribeCalleeParameter(arg->getParent(), arg->getArgNo()));
+            return true;
+        }
+        if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(obj))
+            return MemoryOutlivesCall(ld->getPointerOperand(), destKind, depth + 1)
+                || SlotHoldsOutlivingPointer(ld->getPointerOperand(), destKind, depth + 1);
+        return false;   // alloca, fresh allocation, unrecognized: no proof, so accept
+    }
+
+bool LLVMBackend::SlotHoldsOutlivingPointer(const llvm::Value* ptr, std::string& destKind,
+                                            int depth) const
+{
+        const auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(ptr);
+        if (slot == nullptr || depth > kMaxRetainDepth || !AllocaIsLoadStoreOnly(slot)) return false;
+        for (const llvm::User* u : slot->users())
+        {
+            const auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+            if (st == nullptr || st->getPointerOperand() != slot) continue;
+            const llvm::Value* sv = st->getValueOperand();
+            if (const auto* arg = llvm::dyn_cast<llvm::Argument>(sv))
+            {
+                destKind = std::format("memory the caller supplied through {}",
+                    DescribeCalleeParameter(arg->getParent(), arg->getArgNo()));
+                return true;
+            }
+            if (llvm::isa<llvm::GlobalVariable>(sv))
+            {
+                destKind = "a global";
+                return true;
+            }
+            if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(sv))
+                if (MemoryOutlivesCall(ld->getPointerOperand(), destKind, depth + 1)) return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::ParameterProvablyRetainsArgument(const llvm::Function* fn, unsigned argIndex,
+                                                   std::string& destKind, int depth)
+{
+        if (fn == nullptr || argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return false;
+        // A vararg index past the declared parameters never lands on a named parameter, and the
+        // arity test above already rejected it - printf-family callees therefore always accept.
+        if (!FunctionBodyIsReadable(fn)) return false;
+        auto key = std::make_pair(fn, argIndex);
+        if (!provableRetainsInProgress_.insert(key).second) return false;   // cycle: no proof
+        bool proven = OwningPtrProvablyEscapes(fn->getArg(argIndex), destKind, depth);
+        provableRetainsInProgress_.erase(key);
+        return proven;
+    }
+
+bool LLVMBackend::OwningPtrProvablyEscapes(const llvm::Value* root, std::string& destKind, int depth)
+{
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        visited.insert(root);
+        work.push_back(root);
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return false;   // gave up: no proof
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) continue;
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    // Writing THROUGH the tracked pointer stores something else; only the
+                    // tracked value landing in memory can prove the escape.
+                    if (st->getValueOperand() != v) continue;
+                    const llvm::Value* dest = st->getPointerOperand();
+                    if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(dest))
+                    {
+                        if (visited.insert(slot).second) work.push_back(slot);
+                        continue;
+                    }
+                    if (MemoryOutlivesCall(dest, destKind, 0)) return true;
+                    continue;
+                }
+                if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    // Only follow a read back out of a slot this walk PARKED the value in, and
+                    // only while nothing else was ever stored there - otherwise a later
+                    // `p = other` would be blamed on the parameter.
+                    const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(v);
+                    if (slot == nullptr) continue;
+                    bool onlyTracked = true;
+                    for (const llvm::User* su : slot->users())
+                        if (const auto* s2 = llvm::dyn_cast<llvm::StoreInst>(su);
+                            s2 != nullptr && s2->getPointerOperand() == slot
+                            && !visited.contains(s2->getValueOperand())) onlyTracked = false;
+                    if (onlyTracked && visited.insert(ld).second) work.push_back(ld);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr) continue;                 // indirect / virtual: no proof
+                    if (CallIsPointerOpaqueIntrinsic(callee)) continue;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                        if (call->getArgOperand(i) == v
+                            && ParameterProvablyRetainsArgument(callee, i, destKind, depth + 1))
+                            return true;
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    if (visited.insert(inst).second) work.push_back(inst);
+                    continue;
+                }
+                continue;   // return, ptrtoint, anything unmodelled: no proof, so accept
+            }
+        }
+        return false;
+    }
+
+std::string LLVMBackend::DescribeUniqueFieldAccess(const NamedVariable& nv)
+{
+        std::string field = nv.FieldName.empty() ? nv.TypeAndValue.VariableName : nv.FieldName;
+        if (field.empty()) return nv.CallerName;
+        if (nv.FieldName.empty() || nv.CallerName.empty()) return field;
+        return nv.CallerName + "." + field;
+    }
+
+void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
+                                            const std::vector<NamedVariable>& args)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        if (call == nullptr) return;
+        const llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr) return;
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+        {
+            llvm::Value* argVal = call->getArgOperand(i);
+            if (!JoinCarriesOwningTempUniqueField(argVal)) continue;
+            std::string access;
+            for (const auto& nv : args)
+                if (nv.Primary == argVal) { access = DescribeUniqueFieldAccess(nv); break; }
+            TempUniqueFieldArg entry{ callee, i, functionName, access, sourceFileName,
+                                      currentLine, currentColumn,
+                                      !IsLedgeredOwningTempUniqueField(argVal) };
+            std::string destKind;
+            // Answer NOW when the body already proves it, so the diagnostic lands at the call
+            // site inside any enclosing statement scope; otherwise defer (callee defined below).
+            if (FunctionBodyIsComplete(callee)
+                && ParameterProvablyRetainsArgument(callee, i, destKind))
+                RejectTempUniqueFieldArgEscape(entry, destKind);
+            tempUniqueFieldArgs_.push_back(entry);
+        }
+    }
+
+void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
+{
+        std::vector<TempUniqueFieldArg> pending;
+        pending.swap(tempUniqueFieldArgs_);
+        // ONE diagnostic per compile, not one per site: LogError throws out of this loop. The
+        // loop shape is about finding the first proven entry, not about reporting them all.
+        for (const auto& entry : pending)
+        {
+            std::string destKind;
+            if (!ParameterProvablyRetainsArgument(entry.Callee, entry.ArgIndex, destKind)) continue;
+            // The walk is over, so sourceFileName is the MAIN file again; a call written in an
+            // imported module must be reported against the file it was written in. LogError
+            // THROWS, so the restore has to be RAII or it never runs.
+            ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+            RejectTempUniqueFieldArgEscape(entry, destKind);
+        }
+    }
+
+bool LLVMBackend::ArgumentIsMethodReceiver(const llvm::Function* fn, unsigned argIndex) const
+{
+        if (fn == nullptr || argIndex != 0) return false;
+        const FunctionSymbol* sym = FindSymbolForFunction(fn);
+        return sym != nullptr && sym->IsMethod && fn->arg_size() == sym->Parameters.size();
+    }
+
+std::string LLVMBackend::DescribeCalleeParameter(const llvm::Function* fn, unsigned argIndex) const
+{
+        if (ArgumentIsMethodReceiver(fn, argIndex)) return "the receiver object";
+        if (const FunctionSymbol* sym = FindSymbolForFunction(fn);
+            sym != nullptr && argIndex < sym->Parameters.size()
+            && !sym->Parameters[argIndex].VariableName.empty())
+            return std::format("parameter '{}'", sym->Parameters[argIndex].VariableName);
+        return std::format("parameter #{}", argIndex + 1);
+    }
+
+void LLVMBackend::RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry,
+                                                 const std::string& destKind)
+{
+        std::string what = entry.Access.empty()
+            ? std::string("a unique field of a temporary")
+            : std::format("unique field '{}' of a temporary", entry.Access);
+        if (entry.Access.empty() && entry.ThroughJoin)
+            what += ", reached through a '?:' / '??' join";
+        // A method RECEIVER is not a parameter the caller can re-declare, so `move` is not a
+        // remedy for it and the message must not offer one.
+        if (ArgumentIsMethodReceiver(entry.Callee, entry.ArgIndex))
+        {
+            LogError(std::format(
+                "call to method '{}': the receiver is {} - '{}' stores the receiver into {}, "
+                "which outlives the call, and the temporary's synthesized destructor frees the "
+                "pointee at the end of this statement. Bind the whole call result to a local "
+                "first and call '{}' on that local.",
+                entry.CalleeName, what, entry.CalleeName, destKind, entry.CalleeName));
+            return;   // LogError throws; this only says so
+        }
+        LogError(std::format(
+            "call to '{}': cannot pass {} to plain pointer {} - '{}' stores that "
+            "pointer into {}, which outlives the call, and the temporary's synthesized destructor "
+            "frees the pointee at the end of this statement. Bind the whole call result to a local "
+            "first and pass the field off that local, so the pointee outlives the statement - or "
+            "declare the parameter 'move' and pass 'move <local>.<field>' to hand ownership over.",
+            entry.CalleeName, what, DescribeCalleeParameter(entry.Callee, entry.ArgIndex),
+            entry.CalleeName, destKind));
     }
 
 bool LLVMBackend::StoredValueMayBeCallerOwned(const llvm::Value* val, int depth) const

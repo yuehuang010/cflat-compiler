@@ -1,0 +1,17 @@
+// Helper module for Test/errors/err_temp_unique_field_plain_param_deferred.cb. The offending
+// call lives HERE, not in the importing file, and `keepModGlobal` is defined BELOW it - so the
+// diagnostic must be both DEFERRED to end of module and attributed to THIS file. By the time
+// the deferred pass runs, the compiler's own sourceFileName is the importing file again.
+struct ModNode { int v = 0; };
+struct ModBox<T> { T t = default; };
+ModBox<unique ModNode*> makeModBox() { ModBox<unique ModNode*> b = default; b.t = new ModNode(); return b; }
+
+ModNode* gModKept = nullptr;
+void keepModGlobal(ModNode* n);
+
+void offendFromImportedModule()
+{
+    keepModGlobal(makeModBox().t);
+}
+
+void keepModGlobal(ModNode* n) { gModKept = n; }

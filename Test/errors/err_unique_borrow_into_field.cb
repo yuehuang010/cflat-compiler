@@ -355,6 +355,74 @@ expect_error("call to 'sinkMove': cannot pass a unique field of a temporary to p
     void tempDtorlessCastIntoMoveParam() { sinkMove((Node*)makeBox().t); }
 }
 
+// ---------------------------------------------------------------------------------------
+// A PLAIN `T*` parameter. The claim is NOT stated at the call site, so these are answered by
+// a CALLEE-side fact - ParameterProvablyRetainsArgument, which walks the callee body and
+// reports true ONLY when the parameter provably reaches memory that outlives the call. Every
+// unmodelled shape answers false, so the read-only `rd(makeBox().t)` and its neighbours in
+// Test/test_move.cb stay legal. That is what tells these legs from the two sink-parameter
+// legs above: the message quotes the DESTINATION KIND the walk proved, which the sink
+// legs' message has no way to know. All six were silent use-after-free before this guard
+// (measured -o + run: `v=99 same=1 dtors=1`, the allocator-reuse witness).
+Node* gStore = nullptr;
+void keepGlobal(Node* n) { gStore = n; }
+void keepOut(Node* n, Node** out) { *out = n; }
+void keepForward(Node* n) { keepGlobal(n); }
+struct NodeKeeper { Node* p = nullptr; void take(Node* n) { this.p = n; } };
+
+expect_error("call to 'keepGlobal': cannot pass unique field 'makeBox.t' of a temporary to plain pointer parameter 'n' - 'keepGlobal' stores that pointer into a global") {
+    void tempDtorlessIntoStoringPlainParam() { keepGlobal(makeBox().t); }
+}
+
+// A DIFFERENT destination kind, so this leg cannot pass for the global leg's reason: the
+// store lands in memory the CALLER supplied through a NAMED parameter, and the message quotes
+// that parameter's source name - the raw llvm index would have printed a number.
+expect_error("'keepOut' stores that pointer into memory the caller supplied through parameter 'out'") {
+    void tempDtorlessIntoOutParamCallee() { Node* o = nullptr; keepOut(makeBox().t, &o); }
+}
+
+// TRANSITIVE: `keepForward` itself only forwards; the proof comes from recursing into
+// `keepGlobal`. Quotes the OUTER callee, which is where the argument was passed.
+expect_error("call to 'keepForward': cannot pass unique field 'makeBox.t' of a temporary to plain pointer parameter 'n'") {
+    void tempDtorlessIntoForwardingCallee() { keepForward(makeBox().t); }
+}
+
+// A METHOD, where the store lands in memory reached through the implicit receiver rather
+// than a global. ForwardRefScanner puts the receiver INTO FunctionSymbol::Parameters (named
+// `<Struct>__`), so the llvm arity and the cflat parameter list line up 1:1 - what this leg
+// proves is that BOTH halves of the message name the receiver correctly: the offending
+// parameter is still 'n', and the DESTINATION is described as the receiver object, not as
+// "parameter 1", which is what the raw llvm index would have printed.
+expect_error("call to 'take': cannot pass unique field 'makeBox.t' of a temporary to plain pointer parameter 'n' - 'take' stores that pointer into memory the caller supplied through the receiver object") {
+    void tempDtorlessIntoStoringMethod() { NodeKeeper k = default; k.take(makeBox().t); }
+}
+
+// The RECEIVER itself is the temp's unique field: `makeBox().t->park()` where `park` stores
+// `this`. Zero coverage before review round 1, and a live use-after-free on the PRE binary
+// (`v=99 same=1 dtors=1`). It gets its OWN wording - a receiver is not a parameter the caller
+// can re-declare, so `move` is not a remedy for it and the message must not offer one, and the
+// no-name fallback must not claim a cast or a join it did not go through.
+NodeSelf* gSelfKept = nullptr;
+struct NodeSelf { int v = 0; void park() { gSelfKept = this; } };
+struct SelfBox<T> { T t = default; };
+SelfBox<unique NodeSelf*> makeSelfBox() { SelfBox<unique NodeSelf*> b = default; b.t = new NodeSelf(); return b; }
+
+expect_error("call to method 'park': the receiver is a unique field of a temporary - 'park' stores the receiver into a global") {
+    void tempDtorlessAsMethodReceiver() { makeSelfBox().t->park(); }
+}
+
+// The CAST and JOIN spellings reach the same callee-side fact through the value ledger, and
+// carry the no-name wording because neither survives with a NamedVariable to quote.
+expect_error("cannot pass a unique field of a temporary, reached through a '?:' / '??' join to plain pointer parameter 'n' - 'keepGlobal' stores") {
+    void tempDtorlessJoinIntoStoringPlainParam() { int c = 1; keepGlobal(c > 0 ? makeBox().t : nullptr); }
+}
+
+// The CAST spelling keeps the quoted name (the NamedVariable survives), which is the
+// discriminator between the two wordings - so this leg cannot pass for the join leg's reason.
+expect_error("call to 'keepGlobal': cannot pass unique field 'makeBox.t' of a temporary to plain pointer parameter 'n'") {
+    void tempDtorlessCastIntoStoringPlainParam() { keepGlobal((Node*)makeBox().t); }
+}
+
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
 // rejected as of 2026-08-05 - two different boxed receivers still both carry an empty CallerName,
 // so they are told apart by the OBJECT each box wraps. Its legs live in

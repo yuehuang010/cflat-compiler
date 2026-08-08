@@ -1258,6 +1258,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Null out caller's storage for move parameters; mark the source moved (shared helper).
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched);
 
+        // A temp's `unique` field handed to a PLAIN `T*` parameter. Runs AFTER the sink reject
+        // above, so `unique` / `move` parameters never reach the callee-side question.
+        RecordTempUniqueFieldArgs(result, functionName, matched);
+
         // Register a closure-returning call RESULT as an owned closure temp (lambda Option A),
         // mirroring how a lambda LITERAL is tracked at creation. A binding site (decl-init /
         // assignment / field store / return) calls UnregisterOwnedClosureTemp so only the owner

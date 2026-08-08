@@ -536,7 +536,6 @@ produce a program.
 |---|---|---|
 | [[string-literal-containing-braces-retyped-as-string]] | miscompile + false rejection | A string literal whose CONTENT contains a brace pair (`"a = {} b"`) is typed `string` instead of `char*`. At a call it stops every `char*` overload matching and the diagnostic blames the call; at a VARIADIC it is a SILENT MISCOMPILE - `printf("a = {} b\n");` compiles and runs rc 0 printing binary garbage, and the dedicated `cannot pass 'string' to the variadic '...'` guard does not fire. Identical on both binaries. Filed 2026-08-02 in `p2/` for the rejection face; the miscompile face may warrant P1. |
 | [[extern-decl-drops-fixed-array-return-size]] | silent wrong ABI | `extern char[8] extmk();` compiles clean on BOTH `ca5a02a` and `fix/array-storage` - the `[8]` is dropped and the declaration binds to a symbol returning one `char`. The by-value fixed-array-return reject landed on the DEFINITION path only; this is the one remaining spelling of that axis. Not a regression. Filed 2026-08-02. |
-| [[temp-unique-field-escapes-through-a-plain-pointer-parameter]] | memory-unsafe accept | Silent use-after-free, compiles clean and exits 0, identical on `14097e1` and on the merged `fix/tempuniq`. `keep(makeBox().t)` where `void keep(Node* n) { g = n; }` reads a freed block (proven by dtor count + reallocation aliasing; the `MallocScribble` fill shows only on ld64.lld-linked builds`. The DECLARED remainder of `temp-unique-field-escapes-through-unguarded-spellings` (closed and
 
 #### P1 / crash - dies with no usable diagnostic (`p1/crash/`)
 
@@ -590,7 +589,7 @@ cost ~6 suite failures plus the core UI framework, and the latter needs cross-fu
 | [[join-arm-from-call-result-not-boxed-into-interface]] | false rejection | `take(mk(0) ?? mk(3))` and `IShape j = mk(0) ?? mk(3);` do not compile - a join arm that is a direct CALL RESULT resolves to no class. NOT a chaining defect: reproduces at chain length 1, so `fix/chain-coalesce` neither caused nor closed it. `ResolvePointerElementTypeName` answers an arm from the declared type of the binding a LOAD reads, and a call result is not a load. Fix direction: answer a `CallInst` from the callee's registered return type - a widening of a RESOLUTION helper, so a miss degrades to today's bail; audit `JoinArmsKeepOwner` and the `as`/`is` readers first, where a newly-resolvable arm changes an OWNERSHIP verdict. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[move-interface-return-of-nullcoalesce-join-not-owned]] | false rejection | `move IShape f() { unique T* a = new T(); T* z = nullptr; return z ?? a; }` is rejected "returned expression is not owned". NOT a chaining defect - reproduces at chain length 1. The whole-expression owned-return check runs BEFORE the per-arm machinery and `IsOwningValue` answers only a load off a NamedVariable, so the coalesce-SLOT load answers false. The existing `transferArmOwnership` path would answer correctly and is never consulted. Contrast: the passing `ownJoinNC` leg returns a join of two `unique` locals, which the whole-expression check does prove. Fix must WIDEN the accept side while keeping a genuinely borrowed arm rejected - build the accept-set first. Filed 2026-08-05 by `fix/chain-coalesce`. |
 | [[owning-temp-in-coalesce-fallback-arm-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `14097e1` and on the merged `fix/tempuniq`. `p ?? makeBox().t` measures `dtors=0` and reads the LIVE value: the `??` right operand is evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm `FlushOwnedTempsSince` the `?:` arms get, so the owning temp is never destructed. The `?:` twins measure `dtors=1` and dangle, which is what makes this specific to `??`'s fallback arm rather than to joins generally. **Coupled**: `fix/tempuniq`'s join walk EXCLUDES this arm (rejecting it would refuse a correct program), so fixing the leak turns the shape into a use-after-free and must delete the arm-0-only restriction in `JoinCarriesOwningTempUniqueField` in the same change - both halves together. Same root as [[lambda-body-owning-temp-never-destructed]]; the `??=` half (`coalesce-assign-skips-store-bookkeeping`) is closed by `fix/coalesce-tail`, which makes that spelling a hard error. Filed 2026-08-05 by `fix/tempuniq`. |
-deleted 2026-08-05), which closed the four decidable spellings and named this one undecidable at the call site: the store happens in the CALLEE, and the read-only `rd(makeBox().t)` is CORRECT code that must keep working (frozen as `temp_uniq_accept_plain_param_read` with a destructor count). `unique T*` / `move T*` parameters ARE closed - those state the claim at the call site. All four reachable shapes (free function, `list.add`, constructor argument, global-storing callee) are the one plain-`T*` parameter. Fix direction: a CALLEE-side escape fact, not a call-site predicate - `RegisterNonEscapingOwningPtrArgs` answers a close question already. P2 under the residue-not-regression precedent ([[unique-field-to-field-interface-receiver-residues]]); re-rank to P1 if the memory-unsafe-accept rubric wins. Filed 2026-08-05 by `fix/tempuniq`. |
+| [[temp-unique-field-escapes-through-a-returning-or-indirect-callee]] | memory-unsafe accept | Silent use-after-free, no diagnostic, identical on `0047297` and on the merged `fix/temp-uniq-plain-param`. The exact complement of the plain-`T*` guard that fix landed, and TWO mechanisms filed in one file: (a) the escape is through the RETURN VALUE, not a store - a by-value CONSTRUCTOR `insertvalue`s the parameter into the returned aggregate, so `Slot s = Slot(makeBox().t);` and `new Slot(makeBox().t)` both measure `v=99 same=1 dtors=1`; closing it needs a callee fact PLUS a call-site result-lifetime fact, because `readSlotQ(Slot(makeBox().t))` is correct code. (b) there is no callee to ask - `function<void(Node*)> f = keep; f(makeBox().t)` and an interface-method `it.take(makeBox().t)` both give `dtors=1`; `getCalledFunction()` is null and unknown-accepts is the guard's chosen polarity. The interface half is the closable one (`interfaceTable` is a closed world at end of module, where `ResolveMaterializedInterfaceUses` already runs). P2 under the residue-not-regression precedent - accepted by the PRE binary too. Filed 2026-08-08 by `fix/temp-uniq-plain-param`. |
 | [[lambda-body-owning-temp-never-destructed]] | ownership hole | LEAK, no diagnostic, identical on `6e9ab46` and the merged fix. `Lambda<Dt*()> f = () => makeDt().t;` prints `dtors=0` - the owning `Box` temp inside a lambda BODY is never registered/flushed, so its destructor never runs at all. The same body as a free function is rejected by the temp-escape gate. Not a missed guard: the lambda body does not run the statement-boundary owned-temp machinery, so the read carries no temp provenance for any guard to see. Fixing it will likely turn the leak into a use-after-free the gate then rejects - land both halves together. Filed 2026-08-04 by the round-1 review of `fix/temp-uniq-borrow`. |
 | [[multidim-fixed-array-has-no-brace-initializer]] | feature gap | A multi-dimensional fixed array has no working brace initializer on either binary: nested braces are a PARSE error, a flat list counts against the OUTER dimension only (`int[2][3] a = {1,2,3,4,5,6}` -> "too many initializers for 'int[2]'"), and string-literal elements hit the fixed-array pointer-store reject. `= default` plus element assignment works. Matters because `fix/mdview`'s diagnostic points at `T[N][M]`. Fix the FLAT list first (multiply through `ConstInnerDimensions`); nested braces need a grammar change. Filed 2026-08-02. |
 | [[auto-binding-of-fixed-array-loses-shape]] | feature gap | RESTORED and narrowed, re-ranked P1 -> P2. The non-pointer half is fixed; `auto v = <T*[N]>` now REJECTS because `T*[]` collapses to `T[]` in both parser copies. Representation is free - no new field needed. |
@@ -739,6 +738,134 @@ tests - now live in [`internal/fix-issue-lessons.md`](../fix-issue-lessons.md). 
 out of this file because they outlive every issue in it.
 
 ## Landed design records
+
+### fix/temp-uniq-plain-param - a CALLEE-side escape fact for the plain `T*` parameter (RATIFIED)
+
+Closes `p1/codegen/temp-unique-field-escapes-through-a-plain-pointer-parameter` and DELETES the
+file. That issue was the declared remainder of `fix/tempuniq`: 40 of its 150 cells, all four call
+shapes, one plain `T*` parameter, silent use-after-free. Re-measured on a verified `0047297` PRE
+binary kept OUTSIDE the repo before any guard was written - all 17 reject cells (16 written
+before the guard, the storing METHOD RECEIVER added by review round 1) give
+`v=99 same=1 dtors=1` (a destructor counter proving the free, plus an allocator-reuse witness
+proving the read aliases the reallocated block), and all 12 accept cells give the correct value.
+
+THE FACT. `ParameterProvablyRetainsArgument(fn, i)` - "is parameter `i` PROVABLY stored into
+memory that outlives the call?" It is a SEPARATE walk from `ParameterRetainsArgument`, not a
+reuse, and the reason is a measured one: that helper answers the opposite question and reports
+TRUE for everything it cannot model. Driven through `RegisterNonEscapingOwningPtrArgs` with
+destructor counts (`scratch/tup_oracle.cb`), it calls a LOCAL struct-field store, a plain
+`return n`, RECURSION and a VARARG callee (`printf("%p", n)`) all "retaining". Every one of
+those would have been a false rejection - the single highest-cost failure mode here - so the
+oracle was verified before being trusted, and then not used. The new walk proves an escape only
+from a STORE whose destination `MemoryOutlivesCall` resolves to a global, to memory the caller
+supplied through a parameter (`this` included), or to memory reached by dereferencing either;
+everything unmodelled answers FALSE. `FunctionBodyIsComplete` was split so its two TRANSIENT
+gates (being emitted / suspended) stay out of the end-of-module resolve, which must read the
+permanent half only - one predicate, `FunctionBodyIsReadable`, two polarities of gating.
+
+UNKNOWN = ACCEPT, stated as policy. A declaration, an indirect or virtual call, a vararg index,
+recursion, a give-up on the visited cap: all answer "no proof" and compile. The residual that
+leaves is filed, measured, as
+[[temp-unique-field-escapes-through-a-returning-or-indirect-callee]].
+
+RECORD-THEN-RESOLVE, the fourth use of the shape in this repo. cflat emits IR as it walks, so a
+callee defined BELOW its call site is a bare declaration when the call is emitted - an
+immediate-only check would silently accept it. `RecordTempUniqueFieldArgs` (one site, right
+after `ApplyMoveParamTransfer` in `CreateOverloadedFunctionCall`, so the `unique`/`move` sink
+reject still runs first and those two parameter kinds never reach the callee-side question)
+reads the CallInst's own argument list, which makes the `this`/sret index shift free, records
+`{callee, argIndex, name, access, FILE, line, col, throughJoin}`, and answers IMMEDIATELY when
+the body is already complete. `ResolveTempUniqueFieldArgEscapes`, called beside
+`CheckPoisonedFunctionCalls`, re-asks the rest. Recording cannot reject, so a missed record
+degrades to no diagnostic.
+
+The record carries the FILE, and that is not bookkeeping. By the time the deferred pass runs the
+compiler's `sourceFileName` is the MAIN file again, so an offending call written in an imported
+module was reported against the importing file at a line number belonging to something else
+entirely (measured by review round 1: `rvwmod/rvw_mod.cb(8,4)` printed as `rvw_mainimp.cb(8,4)`,
+a comment line). `ReportingFileScope` is RAII rather than a save/restore because `LogError`
+throws. The deferred pass reports ONE diagnostic per COMPILE, not one per site, for the same
+reason - `LogError` throws out of the resolve loop; the loop finds the first proven entry, it
+does not report them all.
+
+
+BOTH ARMS ARE PROVEN REACHED, not merely non-vacuous. The six legs in
+`err_unique_borrow_into_field.cb` take the IMMEDIATE arm and the one leg in the new
+`err_temp_unique_field_plain_param_deferred.cb` takes the DEFERRED arm: commenting out the
+`ResolveTempUniqueFieldArgEscapes` call and rebuilding flips ONLY the deferred file to exit 1
+while all six siblings still pass. The deferred leg needs its own file because an end-of-compile
+diagnostic cannot be caught by a scoped `expect_error` block - the block closes first and prints
+the opposite of the truth - and the bare file-scope form covers the rest of the scope, so one
+leg per file is a structural constraint there, not a style choice.
+
+THE MESSAGE WAS WRONG ON ITS FIRST CUT AND THAT WAS CAUGHT BY RUNNING IT. It inherited the sink
+parameter's remedy - "bind the call result to a local first and 'move' the field out of that
+local" - which for a BORROWING parameter is rejected outright: `keep(move tmp.t)` gives
+"parameter 'n' BORROWS its argument, so 'move tmp' transfers nothing". The two remedies that do
+work were measured and are now both named in the message AND frozen as value legs with
+destructor counts (`temp_uniq_remedy_local_borrow_*`, `temp_uniq_remedy_move_param_*`): pass the
+field off a NAMED local, so the pointee outlives the statement, or declare the parameter `move`
+and hand ownership over. A rejection may only recommend something that compiles.
+
+RELATION TO THE SIBLING GUARD. `RejectOwningTempUniqueFieldIntoSinkParam` and this path read the
+SAME evidence (`JoinCarriesOwningTempUniqueField`) and cannot disagree, because they are ordered
+and disjoint: the sink guard runs first inside `ApplyMoveParamTransfer` and fires only for
+`param.Pointer && !param.IsAlias && (IsMove || IsUnique || IsUniqueTypeArg)`; the record site
+runs after it and asks a question about the callee BODY, which a sink parameter never reaches
+(LogError throws before it). Their two messages are told apart by the destination kind, which
+only the callee-side walk can know.
+
+THE RECEIVER IS A CALL ARGUMENT TOO, and it needed its own wording. `makeBox().t->park()`
+where `park` stores `this` is a live use-after-free on PRE (`v=99 same=1 dtors=1`) and the
+guard tightens it - but the first cut printed the internal receiver slot name (`Node3__`) as if
+it were a user parameter, claimed the value arrived "through a cast or a '?:' / '??' join" when
+it had not, and prescribed `move` on a receiver, which is not a remedy. All three are fixed:
+`DescribeCalleeParameter` is the ONE place an llvm argument index is turned into source
+spelling ("the receiver object" / "parameter 'x'"), and it is used by BOTH halves of the message
+- the offending parameter and the destination description, where `list.add` used to say
+"parameter 1" for what is actually `this`. The no-name clause now says "reached through a
+'?:' / '??' join" only when the value was NOT ledgered directly, which is exactly the join case:
+a plain read and a cast RESULT are both ledgered, so both keep their quoted name.
+`ForwardRefScanner` puts the receiver INTO `FunctionSymbol::Parameters`, so the llvm arity and
+the cflat parameter list line up 1:1 - the `+1` shift branch the first cut carried was DEAD and
+was deleted rather than left with documentation that was wrong about it.
+
+CONSERVATISM, measured and accepted. The walk is path-INSENSITIVE, so three contrived programs
+that PRE runs correctly are now rejected: a store the callee immediately overwrites
+(`void keepnull(Node* n) { g = n; g = nullptr; }`), a conditional store on the NOT-TAKEN path
+(`keepcond(makeBox().t, 0)` where the body stores only when `c > 0`), and a storing method whose
+RECEIVER is itself a same-statement temporary (`makeKeeper().take(makeBox().t)` - the receiver
+dies at the same statement end, so nothing outlives, but the callee-side fact cannot see that).
+All three measure `dtors=1` and run correctly on PRE. This is the accepted trade: a MAY-store
+fact keeps the guard simple and the alternative is a MUST/MAY dataflow, which
+[[conditional-store-retires-borrow-facts-unconditionally]] already records as a feature rather
+than a clause. Adding a path-sensitive refinement here would also have to keep the conditional
+store on the TAKEN path rejected, which is the shape that actually dangles.
+
+MATRIX - 28 cells in `scratch/tup_*` on the fix worktree, every one measured on the PRE binary
+first. 16 reject candidates: free function to a global, to a global struct field, through a
+global pointer's field, through an out-parameter, `list.add`, a global container, a conditional
+store, a transitive forwarder, and the cast / `?:` / `??` / parenthesized spellings of the
+headline, plus a method through `this`, a callee defined AFTER main, and (added by review round
+1) a storing method RECEIVER. **15 changed** from `v=99 same=1 dtors=1` to a diagnostic. The 2 unchanged are the by-value CONSTRUCTOR spellings,
+filed. 12 accept cells: read-only, cast-read, transitive read, local-only store, recursion,
+vararg, passthru-return, an ordinary heap pointer into the SAME storing callee, a borrowed
+container element, the `??` fallback arm, a function-pointer call and an interface method - all
+**12 unchanged**, byte-identical on both binaries.
+
+EVIDENCE. `Test/test_move.cb` gains 22 accept legs (808/808, and byte-identical output on the
+PRE and POST binaries - the right non-vacuity pairing for an accept set, which discriminates
+against an over-broad guard rather than against master). `leaks --atExit` on it is **16 leaks /
+320 bytes on BOTH binaries measured COLD**. `Test/errors/err_unique_borrow_into_field.cb` gains
+7 reject legs including the receiver shape (43 PASS legs, file exits 0); each was extracted standalone and run on PRE, where
+all six report `expected error ... did not occur`, and each was mutation-tested individually in
+place - poison one expectation and the file flips to exit 1 (all seven). WARM CACHE: `--init-local` then
+re-run - all seven reject legs still fire (including `list.add`, whose body comes back from
+cached bitcode) and every accept leg keeps its destructor counts. The `--init` serializer rule is
+NOT engaged: the fact is derived from llvm IR present in the module either way, and no field was
+added to `TypeAndValue` / `StructData` / `AnnotationValue`. Bar: macOS arm64 Release `./test.sh`
+**602 / 0 / 8** and `example_mac.sh` **35 / 0**.
+
 
 ### fix/aliaslaunder - ONE borrow predicate for all five persist sites (RATIFIED)
 

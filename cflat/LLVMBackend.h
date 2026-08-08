@@ -1324,6 +1324,9 @@ public:
     static constexpr size_t kMaxRetainUses = 256;
     std::map<std::pair<const llvm::Function*, unsigned>, bool> paramRetainsMemo_;
     std::set<std::pair<const llvm::Function*, unsigned>> paramRetainsInProgress_;
+    // Separate cycle guard for ParameterProvablyRetainsArgument: the two analyses answer opposite
+    // questions, so a key left by one must never terminate the other's walk.
+    std::set<std::pair<const llvm::Function*, unsigned>> provableRetainsInProgress_;
     // Functions whose emission is SUSPENDED while a nested one is emitted (lambda invoker,
     // generic instantiation, global-array initializer). Pushed/popped by Save/RestoreBuilderState.
     std::vector<const llvm::Function*> suspendedFunctions_;
@@ -1841,6 +1844,31 @@ private:
     // Source location of the FIRST emitted call to each function, by mangled name. Lets an
     // end-of-module diagnostic (CheckPoisonedFunctionCalls) point at the real call site.
     std::unordered_map<std::string, std::pair<size_t, size_t>> firstCallLocation_;
+
+    /*
+     * A call that handed a temp's `unique` field to a PLAIN `T*` parameter, recorded where the
+     * ledger fact is still live and resolved at end of module, where every callee body is
+     * complete. A callee defined BELOW its call site is still a declaration during the walk, so
+     * an immediate-only check would silently accept it - the record-then-resolve shape
+     * (codeValues_, owningTempUniqueFields_) is what makes the answer order-independent.
+     */
+    struct TempUniqueFieldArg
+    {
+        const llvm::Function* Callee = nullptr;
+        unsigned ArgIndex = 0;
+        std::string CalleeName;
+        std::string Access;
+        // The FILE the call was written in. By end of module sourceFileName is the main file
+        // again, so a call in an imported module would otherwise be reported against the wrong
+        // file at a line number that belongs to something else entirely.
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+        // The value was not ledgered directly, so it arrived through a '?:' / '??' join. Only
+        // then may the diagnostic say so - a plain read and a cast are both ledgered directly.
+        bool ThroughJoin = false;
+    };
+    std::vector<TempUniqueFieldArg> tempUniqueFieldArgs_;
 
     // Depth counter, not a bool: '?:' arms can nest (a ? (b ? c : d) : e), so a plain flag would
     // clear early on the inner ternary's exit. Non-zero while lowering either arm of a '?:' in the
@@ -2653,6 +2681,92 @@ private:
      * no block still open for appending (the belt-and-braces catch for any un-paired path).
      */
     bool FunctionBodyIsComplete(const llvm::Function* fn) const;
+
+    // The permanent half of FunctionBodyIsComplete: a body that exists and has no block still
+    // open for appending. Excludes the two TRANSIENT gates (being emitted / suspended), which an
+    // end-of-module resolve must not consult - by then they say nothing about the body.
+    bool FunctionBodyIsReadable(const llvm::Function* fn) const;
+
+    /*
+     * The OPPOSITE polarity of ParameterRetainsArgument, and a separate walk for that reason.
+     * ParameterRetainsArgument answers "may this escape?" and reports TRUE for everything it
+     * cannot model - a vararg callee, a declaration, recursion, a local struct field - which is
+     * right for suppressing a free and wrong for raising a rejection. This one answers "is this
+     * parameter PROVABLY stored into memory that outlives the call?" and reports FALSE for
+     * everything unmodelled, so an unknown callee accepts. `destKind` receives a description of
+     * the proof for the diagnostic; it is only written when the answer is true.
+     */
+    bool ParameterProvablyRetainsArgument(const llvm::Function* fn, unsigned argIndex,
+                                          std::string& destKind, int depth = 0);
+
+    // Worklist half of ParameterProvablyRetainsArgument. Deliberately NOT memoized: the query is
+    // gated by the temp-unique-field ledger and so is rare, and a memo taken while a body was
+    // still growing would be read back after it finished.
+    bool OwningPtrProvablyEscapes(const llvm::Value* root, std::string& destKind, int depth);
+
+    // True when `ptr` names memory that survives the call: a global, memory the CALLER supplied
+    // through a parameter (`this` included), or memory reached by dereferencing either. A local
+    // alloca, a fresh allocation and anything unrecognized answer false.
+    bool MemoryOutlivesCall(const llvm::Value* ptr, std::string& destKind, int depth) const;
+
+    // Does a load/store-only stack slot hold a pointer that outlives the call? This is the
+    // parameter-prologue shape: `store ptr %this, ptr %this.addr` parks a caller pointer in a
+    // slot every later dereference reads back.
+    bool SlotHoldsOutlivingPointer(const llvm::Value* ptr, std::string& destKind, int depth) const;
+
+    /*
+     * Record every argument of the just-emitted call that reads a temp's `unique` field and lands
+     * on a PLAIN `T*` parameter, and reject immediately when the callee body already proves the
+     * store. `unique` / `move` parameters are NOT handled here - they state the claim at the call
+     * site and are rejected by RejectOwningTempUniqueFieldIntoSinkParam.
+     */
+    void RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
+                                   const std::vector<NamedVariable>& args);
+
+    // Name a unique-field access for a diagnostic: "b.t", or the bare field / caller when a cast
+    // or a join has already dropped half the provenance. MainListener delegates to this copy.
+    static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
+
+    // Point diagnostics at a file/line recorded earlier, and put the compiler's own reporting
+    // position back on the way out - LogError throws, so this cannot be a plain save/restore.
+    struct ReportingFileScope
+    {
+        LLVMBackend* backend_;
+        std::string file_;
+        size_t line_;
+        size_t column_;
+        ReportingFileScope(LLVMBackend* backend, const std::string& file, size_t line, size_t column)
+            : backend_(backend), file_(backend->sourceFileName), line_(backend->currentLine),
+              column_(backend->currentColumn)
+        {
+            if (!file.empty()) backend_->sourceFileName = file;
+            backend_->SetSourceLocation(line, column);
+        }
+        ~ReportingFileScope()
+        {
+            backend_->sourceFileName = file_;
+            backend_->currentLine = line_;
+            backend_->currentColumn = column_;
+        }
+        ReportingFileScope(const ReportingFileScope&) = delete;
+        ReportingFileScope& operator=(const ReportingFileScope&) = delete;
+    };
+
+    // Re-ask the recorded questions now that every body is complete, and reject what is proven.
+    void ResolveTempUniqueFieldArgEscapes();
+
+    void RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry, const std::string& destKind);
+
+    /*
+     * Name one llvm argument of `fn` the way the SOURCE spells it: "the receiver object" for a
+     * method's implicit `this`, "parameter 'x'" otherwise. ForwardRefScanner puts the receiver
+     * INTO FunctionSymbol::Parameters (named `<Struct>__`), so the llvm arity and the cflat
+     * parameter list line up 1:1 and the raw index would print an internal slot name.
+     */
+    std::string DescribeCalleeParameter(const llvm::Function* fn, unsigned argIndex) const;
+
+    // True when llvm argument `argIndex` of `fn` is a method's implicit receiver.
+    bool ArgumentIsMethodReceiver(const llvm::Function* fn, unsigned argIndex) const;
 
     // Worklist half of ParameterRetainsArgument: true when `root`, any pointer derived from it, or
     // any pointer read out of its pointee can outlive the call. An unrecognized user escapes.
