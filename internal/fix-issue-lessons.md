@@ -9,8 +9,10 @@ file is deleted when its bug is fixed; a lesson that changed an outcome more tha
 not be deleted with it. Every note below cost at least one confirmed defect to learn, and most
 of them cost the same defect twice.
 
-`internal/issue/interface-issue-queue.md` holds the live index and the landed design records for
-the work these came out of. `internal/testing-notes.md` holds the mechanics of the suites.
+Active issues live one file per issue under `internal/issue/` (`p2/`, `p3/`, `ui/`). The old
+`internal/issue/interface-issue-queue.md` index was retired on 2026-08-08; its durable lessons
+were folded in below and its landed design records survive as the digest at the bottom of this
+file. `internal/testing-notes.md` holds the mechanics of the suites.
 
 ---
 
@@ -86,8 +88,8 @@ the work these came out of. `internal/testing-notes.md` holds the mechanics of t
 
 - **"Pre-existing" / "unchanged" / "not a regression" is a MEASUREMENT, and it must be taken in
   the exact spelling the claim is about.** Two such claims were wrong in a single 2026-08-02
-  issue. A filed P1 said its repro was "identical on both `58d5d27` and `26d1fe2`" using the
-  bare spelling; measured, `S* p = {a=1}` really was identical (`0x1` both sides) while
+  issue. A filed P1 said its repro was "identical on both the pre-change and post-change
+  commits" using the bare spelling; measured, `S* p = {a=1}` really was identical (`0x1` both sides) while
   `S* p {a=1}` went from `ptr undef` to `inttoptr (i64 1 to ptr)` - changed by the very commit
   filing the issue. Separately a coverage cell reported as "now deep-copies exactly like the
   named-local spelling" in fact leaked 16 bytes the named-local form does not.
@@ -105,8 +107,8 @@ the work these came out of. `internal/testing-notes.md` holds the mechanics of t
   facts are local, resolve once where the tables are complete. Recording cannot reject, so a
   MISSED site degrades to "no diagnostic" instead of to a false rejection.
 - **Defer the decision to where the facts are complete, but capture location and role where you
-  have them.** Two independent fixes (`2bcc5a0`, `09f1d56`) converged on this from opposite
-  directions.
+  have them.** Two independent fixes (the return-dangle record and the generic-interface
+  registration record) converged on this from opposite directions.
 - **Check whether your precondition is TRANSIENT before rejecting on it.** "In
   `genericInterfaceInstances`, not in `interfaceTable`" reads like a bug state and is the normal
   state during monomorphization (`LLVMBackend.h:16301`). Deferring turned three legitimate
@@ -153,7 +155,7 @@ The recurring failure mode of this whole family, stated once:
   programs in the same neighbourhood that master compiles and runs correctly, then write the
   rejection. Reviewed on 2026-08-02 across five issues: false rejections are the single largest
   consumer of rounds in this repo. Two issues were parked having landed nothing after three rounds
-  each (`fix/funcptr-sig`, four false rejections; `fix/delete-borrowed-box`, five), and a third
+  each (the funcptr-signature round, four false rejections; the delete-borrowed-box round, five), and a third
   spent a full fix+review round adding a rejection site and taking it back out. The accept-set gets
   built either way - the reviewer cannot judge a guard without it. Building it first costs a
   fraction of building it as review findings.
@@ -458,7 +460,7 @@ The recurring failure mode of this whole family, stated once:
 - **Pin the baseline to a binary you verified is the merge-base, in the configuration you name.**
   On 2026-08-02 the main session filed a P1 whose headline was "the compiler SIGSEGVs, exit 139,
   zero output" for `char[2][8] b = default; b[0] = "hello";`. A review re-measured it against a
-  verified `ca5a02a` Release build: the compiler exits 0, links, and the program RUNS to exit 0
+  verified merge-base Release build: the compiler exits 0, links, and the program RUNS to exit 0
   printing garbage. It is a SILENT MISCOMPILE, not a crash. The 139 came from a stale binary, and
   a stale Debug binary in the same tree asserts with rc 134 - three different "baselines", three
   different severities, one program.
@@ -484,7 +486,8 @@ The recurring failure mode of this whole family, stated once:
   has to carry both. A guard that turns a crash into a hard error looks like progress in the suite
   and is not, if the programs it rejects are correct ones.
 - **The mirror: UNBLOCKING compilation moves a program onto runtime paths a rejection was hiding,
-  and those paths can be keyed on a spelling your fix just changed.** `fix/genfn-lowering` made a
+  and those paths can be keyed on a spelling your fix just changed.** The generic-closure-element
+  lowering fix made a
   lambda literal into a generic-substituted field compile for the first time (it had died in the
   module verifier), and the program promptly ran onto the `=` path's closure OWNERSHIP-transfer
   arm - which tested `TypeName == "__closure_fat_ptr"` and therefore skipped the encoded name. The
@@ -499,3 +502,785 @@ The recurring failure mode of this whole family, stated once:
   destinations where they are rejected before any ownership path runs. The miscompile lived exactly
   in the missing cross. Freezing an accept set per axis is not the same as covering the product;
   before declaring a matrix complete, name the crosses you are NOT taking and say why.
+
+---
+
+# Additions distilled from the retired issue queue (2026-08-08)
+
+Everything below was extracted from `internal/issue/interface-issue-queue.md` when it was
+retired. The lessons extend the sections above; the digest at the end is the permanent record
+of the landed design records - every "do not retry" in it is a settled decision, measured and
+in most cases already attempted and reverted once.
+
+## On issue files and root causes (additions)
+
+- **"The compiler has no way to know X" in an issue file is a claim about the CODEBASE, and it
+  is often already false - probe whether the signal exists before designing one.** The
+  temp-source unique field stores issue file said the temp-source provenance was missing;
+  `MovableTempField` / `FromOwningTempField` already rode the exact spellings, and the only
+  blocker was an unrelated gate. Two other records repeat it (the stack-or-global roots record:
+  "globals have no `NamedVariable`" was false; the aliased-copy-at-declaration record: the filed
+  direction would have false-rejected three correct programs). A filed fix DIRECTION is a
+  hypothesis about the code, and it is wrong more often than the filed repro is.
+- **Driving a queue's P1 COUNT to zero does not converge; scope the next campaign on the
+  SEVERITY MIX.** Two campaigns each fixed six P1s and ended with the count unmoved, because an
+  adversarial review in this area reliably splits out neighbouring defects. What converged was
+  severity: closed items were silent double frees and zero-output crashes; the replacements were
+  narrower and diagnosed. Ask "are there silent wrong values left", not "is the count zero".
+- **An LLVM assert/fatal/verifier failure reachable from plain source is P1 whether or not it
+  aborts** - a raw verifier dump with no `file(line,col):` prefix is "dies with no usable
+  diagnostic", and a LOCATED diagnostic is the floor for such a row even when the underlying
+  feature gap stays open.
+- **The single largest source of entries in the retired queue was bookkeeping duplicated across
+  sites, each copy carrying a different subset of the guards** (interface boxing at four sites,
+  overload scoring as three hand-copied probe/replay pairs, generic name resolution with three
+  disagreeing key conventions). And every fix in the boxing family was blocked on PLUMBING -
+  getting the source `NamedVariable` to the guard - not on guard logic. **Look for the missing
+  INPUT before writing a new check.**
+
+## On where a gate has to be installed (repo inventories)
+
+- **A value reaching a DESTINATION has at least nine distinct lowering paths in this codebase,
+  and none of them share code.** The code-value-into-data-destination store fix needed nine gate
+  sites, the closure-provenance assignment-leg fix
+  seven, and each round found more by review, not by reasoning. The standing checklist: the `=`
+  operator (`ParseAssignmentExpression` - alone covers local / field / nested field /
+  through-pointer / array element / global), the declarator initializer, `return`,
+  `EmitOneFieldInit` (brace field init - also the funnel for `new T{...}` and the `<Tag attr=>`
+  sugar), `EmitPositionalFixedArrayInit`, `EmitArrayViewInferredInit`,
+  `EmitGlobalFixedArrayInit`, `ParseFieldDefaultInitializer` (shared by FIVE default-ctor
+  emitters; the union arm of `ParseStructDefinition` reads no field initializers at all), and
+  `GenerateDefaultParamOverloads` (a parameter default - the call-site gate structurally cannot
+  see it, because the wrapper rebuilds the forwarding `NamedVariable` with the DESTINATION's
+  TypeName and launders provenance). `??=` used to be a tenth until the `??=`-shared-store-tail
+  record routed it through the shared tail.
+- **An ARGUMENT-position gate has four doors, and `CreateOverloadedFunctionCall` is only one.**
+  `LLVMBackend::CallInterfaceMethod` (virtual dispatch) and `CreateIndirectCall` (a `function<>`
+  value, thin and fat arms) lower their own argument lists and enter neither the scorer nor
+  `ResolveInterfaceMethodSlot`; a monomorphized generic closure parameter is not
+  `IsFunctionPointer` at all, so a gate keyed on that flag alone misses `list<function<>>::add`.
+  the shape-mismatched-funcptr-argument record and the pointer-argument-by-value-parameter
+  record each shipped a first cut covering only the direct path
+  and each had a live SIGSEGV face found by review.
+- **Count the registration sites empirically before applying the both-copies rule.**
+  `ForwardRefScanner::ScanExternalDeclaration` has no `declaration()` dispatch arm, so a
+  bodyless prototype never reaches the pre-pass and a mirrored guard there is dead code
+  (the bodyless-prototype fixed-array-return record). The opposite also happened: the
+  unresolved-generic-name-opaque-shell record's filed citation named
+  one site, and a SECOND ungated copy lived in `ForwardRefScanner::ParseDeclarationSpecifiers` -
+  gating the first left the headline repro compiling. Read the dispatch arms; assume neither
+  "one site" nor "two copies".
+- **An end-of-body deferred check runs only in the named-function path.** `RunNullDerefDataflow`,
+  `RunInterfaceReturnDangleCheck`, `RunNullIfaceDispatchCheck` and
+  `RunUniqueIfaceFieldStoreCheck` all share this: a flagged store inside a LAMBDA body is never
+  settled. Record it as known residue rather than re-deriving it each round.
+
+## On ledgers keyed by `llvm::Value` identity
+
+- **Before keying a ledger on `llvm::Value*` identity, ask whether that value is a shared
+  module-level constant.** A named function is ONE `llvm::Function` for every mention in a body,
+  and `nullptr` is ONE `ConstantPointerNull` for the whole module. The code-value-evidence
+  join-ledger record held its
+  launder ledger for a whole function and one `void* v = (void*)ro;` laundered `ro` for every
+  later gate in that function; the closure-widen-gate join record created and closed the mirror
+  of the same hole
+  when `(function<>)nullptr` made an unrelated join's null arm read as user-asserted code.
+  Statement scope helps and is not sufficient - `RegisterDataValueCodeCast` had to STRUCTURALLY
+  refuse `ConstantPointerNull` and `llvm::Function`. Contrast the temp-unique-field-escape record, where each
+  temp-field read is a distinct `ExtractValue` and value identity is safe by construction; that
+  difference is the thing to check, not the pattern to copy.
+- **A statement-scoped ledger's retire point is `FlushOwnedTemps` at the block-item boundary**,
+  which is also where an owning temp's destructor runs - an entry can never outlive the dangle
+  it describes. Reuse that boundary rather than inventing a scope.
+
+## On mirror gates and quantifiers
+
+- **Two gates asking opposite questions need OPPOSITE quantifiers, and copying the sibling's
+  polarity is a false-rejection generator.** `JoinCarriesCodeValue` (proving CODE) is correct as
+  "ANY arm answers yes"; `JoinDeliversDataValue` (proving DATA) must be "EVERY arm proven, at
+  least one proven, unproven means fail-open". The closure-widen-gate join record proved it by mutation: flipping
+  every-arm to any-arm turned three mixed-arm legs into hard rejections of programs the merge
+  base runs correctly.
+- **ARM POSITION is its own axis, and `?:` / `??` arms are not symmetric.** A `?:` arm gets an
+  explicit `FlushOwnedTempsSince` inside the arm block; the `??` path makes no such call, so its
+  fallback-arm temps are never destructed. Measured in the temp-unique-field-escape record: `makeBox().t ?? nullptr`
+  dangles (reject) while `p ?? makeBox().t` is never freed (accept - rejecting it would refuse a
+  working program). The walk follows `Arms[0]` only; when the leak is fixed the exclusion must
+  be deleted in the same change, with a leg pinning `dtors == 0` so it goes red at that moment.
+
+## On diagnostics (additions)
+
+- **A diagnostic's stated mechanism and its REMEDY are factual claims - compile the remedy
+  before shipping the message, per destination spelling.** This cost a round at least six times:
+  the temp-source unique-field-store fix shipped three messages whose remedies were invalid
+  syntax, a closed loop, or an
+  abort; the plain-`T*`-parameter escape-fact record inherited a remedy the compiler rejects;
+  the code-value-into-data-destination store record had to drop the `(T*)` cast advice for `T[]` and `string` destinations
+  because the advice sent the user into a second error; the shape-mismatched-funcptr-argument record hit the identical thing
+  with `&` on a VIEW parameter. Freeze the working remedies as VALUE legs, not just as message
+  text. A remedy named inside a generic body must be valid at EVERY instantiation
+  (the empty-brace-split-by-target-type record names `= default` first for exactly this reason).
+- **Never recover a user-facing name from a lowered LLVM artifact.** The array-view
+  delete-guard record read a source
+  name off an `llvm::GlobalVariable`, which carries LLVM's `.N` uniquifying suffix on collision
+  with a runtime symbol - an ordinary `int[3] read;` was reported as `'read.1'`. Take identifier
+  text from the AST. Same family: a message may not quote a mangled symbol unless the rendering
+  is provably writable source - `Box__Box__i32` and `dictionary__string__int` are
+  indistinguishable as strings, so `DisplayNameOfMangledType` returns the raw name with
+  `writable = false` and the caller DROPS the advice clause rather than emit a half-demangled
+  hybrid (repeated across the pointer-argument-by-value-parameter record, the closure-pointer
+  generic-type-argument record, and the generic-closure-element lowering record).
+- **A DEFERRED (end-of-compile) diagnostic must carry the FILE it was recorded in, not just
+  line/col.** By resolve time `sourceFileName` is the MAIN file again, so
+  the plain-`T*`-parameter escape-fact record's first cut blamed the importing file at a line belonging to a
+  comment. Record `{file, line, col}` at the site; wrap the reporting scope in RAII, since
+  `LogError` throws.
+- **At a shared reject site, LEG ORDER decides which wording fires, and reordering is a
+  behaviour change.** The temp's-`unique`-field-may-not-escape-the-statement record placed a new leg before the existing type-name leg
+  and broke three legs of an existing error file. Place the new leg last and measure exactly
+  which cells change wording.
+
+## On the code (additions)
+
+- **`""` / `0` on a newly-recorded field means NOT RECORDED, never "not a pointer" / "not a
+  thing".** Established twice: `PointerDepth == 0` and `FuncPtrParam::ResolvedTypeKey == ""`.
+  Only source-parse sites fill them; C interop, WinRT and synthesized signatures leave them
+  empty and must keep binding. Any consumer reading the empty value as a negative claim is a
+  false rejection waiting to happen.
+- **When a call site reads a signature or parameter fact, it reads the one `ForwardRefScanner`
+  registered - the SCANNER copy is the load-bearing one.** The last-two-funcptr-signature-items record filled only the
+  three `MainListener` sites and the fix was a complete no-op for its own repro. A plan that
+  says "codegen sites only" for anything the function table holds is wrong.
+- **A new per-function field must join `BuilderState`'s snapshot in the same change, exactly as
+  a new `TypeAndValue` field must join the `--init` round-trip.** `currentFunctionReturnTV` was
+  added beside three snapshotted siblings and never joined them; a monomorphized instantiation
+  mid-body then leaked its return shape into the enclosing function (`return 42;` came out as
+  `ret ptr bitcast (i8 42 to ptr)`; a struct-value enclosing return was a compiler SIGSEGV).
+  Take `createFunctionBlock`'s clear-list as the definition of "per-function state" and check
+  each entry against `BuilderState`. That audit found a second, still-open instance:
+  `aliasDomain_` / `aliasScopes_` / `viewScopeByOrigin_`, where `NoaliasScopeId` is a vector
+  index that a nested emission renumbers.
+- **Only `FullBuilderStateScope` is RAII; the other nine `SaveBuilderState()` call sites leak
+  their bracket on a `LogError` unwind.** Such fixes belong in the shared struct, not in a
+  hand-rolled save at the affected path.
+- **Parentheses are a provenance-erasing token in this compiler.** A parenthesized primary is
+  rebuilt in `ParsePostfixExpression` from a side channel carrying only type and storage, so
+  every provenance flag is dropped - `q.p = (makeBox().t);` defeated a whole gate. Separately,
+  `(T*)w` and `(T*)(w)` are DIFFERENT programs: the bare spelling materializes its own
+  unledgered load inside `ParseCastExpression`. Probe both spellings; the bare one alone
+  certifies dead checks.
+
+## On changing approach vs. patching (additions)
+
+- **When you decide "we cannot implement this, so carve it out", check whether REJECTING the
+  carved-out shape was blocked by the same constraint - usually it is not.** Round 1 of
+  the brace-list-globals-rejected record exempted `list`/`array`/`dictionary` globals because IMPLEMENTING
+  global container construction was out of scope - and thereby preserved the exact filed
+  silent-discard bug for those three types. Rejecting needed nothing the struct case lacked.
+- **Prove completeness by ENUMERATING two sets and intersecting them, not by sampling.** The
+  implied-move pointer guard lived in three copies and three successive rounds each fixed N-1
+  of them (each unguarded copy a zero-output compiler SIGSEGV). What ended it: enumerating all
+  19 `ConstantAggregateZero::get` sites against all 12 `MovableTempField` readers and showing
+  exactly three intersect.
+
+## On tests and measurement (additions)
+
+- **When a fix corrects a TYPE whose wrong value is merely ABI-PERMITTED rather than
+  guaranteed, assert the TYPE.** The `ftell`/`fseek` re-bound-to-`long` record's first regression test asserted
+  `ftell(f) == 4` and was vacuous - the UCRT happened to zero the upper half.
+  `typeof(rawEnd) == "long"` is what discriminates. This is the one documented exception to
+  "assert VALUES, never it compiled".
+- **An accept leg that passes on both binaries must be mutation-tested against the COMPILER,
+  not against master.** Rebuild with the guard's polarity flipped, or the record site deleted,
+  and confirm the specific legs go red (the closure-widen-gate join record and the
+  boxed-object receiver-identity record both did).
+  This is the only non-vacuity evidence available for a frozen accept set, and it names the
+  defect the leg exists to prevent.
+- **Leak counts and abort codes are functions of CACHE STATE, not just of the diff.**
+  `Test/test_move.cb` is 13 leaks / 256 bytes warm and 15 / 304 cold, on pre- AND post-fix
+  binaries alike; the recurring 2-leak "bitcode cache changes codegen" alarm was investigated
+  and REFUTED - the real variable is the harvested libSystem stub flipping the
+  `LC_BUILD_VERSION` sdk stamp (patching those 4 bytes reproduces the whole delta). Quote the
+  cache state with every leak number; the `LC_BUILD_VERSION`-sdk-cache-independence record makes pre-2026-08-05 figures
+  incomparable with later ones.
+- **A runtime discriminator can be a property of the LINK, not of the program.**
+  `MallocScribble=1`'s `1431655765` (0x55 fill) shows only in an `ld64.lld`-linked build; a PRE
+  binary linked another way shows allocator-reuse values instead. Do not compare the fill
+  across differently-linked binaries - re-prove a UAF with destructor counts plus a
+  reallocation-aliasing witness. (When it applies, `MallocScribble=1` turns the temp-uniq
+  family into a one-bit discriminator.)
+- **Refinement of the deferred-diagnostic `expect_error` bullet:** the SCOPED form works for an
+  end-of-body deferred check if the block wraps the ENTIRE function - it is a scoped block
+  inside the function that closes first. Both spellings are in use
+  (`err_unique_field_to_field.cb` wraps whole functions; `err_iface_field_missing.cb` uses
+  scoped blocks because the check resolves at end-of-body inside the same hook).
+- **The second brace SPELLING, cited so the next reader does not re-derive it:** `CFlat.g4:286`
+  `initDeclarator: declarator '{' initializerList? ','? '}'` hangs its list on `initDeclarator`
+  where `typeValue.Initializer` is null, so gating on `initializer->initializerList()` alone
+  leaves it reproducing. Sprung three times (the brace-list-globals-rejected record, the
+  struct-field-default-brace-list record, the non-aggregate-global-brace-list record); fixed
+  structurally by `DeclTypeAndValue::BraceInitializer` +
+  `FieldDefaultBraceList()`.
+
+## On the differential corpus sweep (additions)
+
+- **Both binaries must be in the SAME `--init-local` cache state, and cold is the state to
+  compare in.** A warm POST against a cold PRE produced SEVEN phantom `core/*.cb` diffs, all
+  "redeclaration of global" - which is what a warm core cache produces, not a rejection. Hit
+  independently by four separate fix rounds (the multi-dimensional-bracket record, the
+  code-VALUE-into-ANY-data-parameter record, the code-value-evidence join-ledger record, and the
+  temp-unique-field-escape record).
+  Equalize (or freshly rebuild) the cache on both sides before reading a single diff.
+- **A COPIED exe is not a PRE binary.** The non-aggregate-global-brace-list record's first core sweep used a copied PRE
+  binary whose `.cflat` cache still pointed at the other tree and produced 25 bogus
+  circular-import/redeclaration diffs. Build a detached worktree at the merge base.
+- **Capture rc into a variable BEFORE any command substitution.** `echo "$(basename $f) rc=$?"`
+  reads `basename`'s exit code, reported a clean zero, and looked exactly like the answer the
+  change wanted (recurred twice: the code-value-evidence join-ledger record and the
+  closure-pointer generic-type-argument record, with `grep` at the end
+  of a pipe). Same mistake as the `head` pipe, in a new costume.
+- **Establish the noise floor by running the PRE binary TWICE before diffing PRE against
+  POST.** Every reliable sweep did it (8-10 inherently nondeterministic rows: timings,
+  addresses, pids). It doubles as the harness's non-vacuity check and is what lets a residue be
+  dismissed honestly rather than assumed.
+- **Report the sweep's COMPOSITION, not its file count.** One 447-file sweep broke down as 157
+  compile-rejections, 208 `Test/errors/` fixtures (53 producing no binary at all), and roughly
+  SIXTY programs that actually ran. The zero-difference conclusion was real and covered far
+  less than "447 files" suggests.
+- **The cheap detector for a non-crossing corpus is an INSTRUMENTED build that prints a marker
+  whenever the new path fires.** A marker count of ~0 means the sweep proved nothing about the
+  change, not that the change is safe (the value-keyed-boxing record's marker fired in exactly one file).
+
+## Refinements to earlier bullets
+
+- Refines "When a widely-read type flag changes, audit every guard that READS it": the trigger
+  is not only a flag changing VALUE but a field becoming newly NON-NULL or a carve-out becoming
+  newly REACHABLE. The simd-slot-splat record's recording of the simd array dimension sprang two such traps in
+  one commit, one of which turned a clean hard error into a silent miscompile. Re-audit readers
+  under the NEW conditions - a site classified from master's conditions is not audited.
+- Refines "Do not reuse a predicate across a change of QUESTION": the mirror case is refusing
+  to UNIFY two rules that look identical. The funcptr BIND site legitimately uses a looser
+  arity rule than the ARGUMENT sites (`Test/test_program.cb` depends on it); the first attempt
+  unified them and broke that test. **Do not unify the two arity rules.**
+- Refines "Y is an ORACLE and must be verified": the same applies to reusing an existing HELPER
+  as the oracle. `ParameterRetainsArgument` looks like the escape question
+  the plain-`T*`-parameter escape-fact record needed; driven through a destructor-count oracle it called a
+  local field store, `return n`, recursion and a vararg callee all "retaining" - every one a
+  false rejection. Verified, then deliberately not used.
+- Refines "A test that pins a PATH in `expect_error` breaks on the other platform": the
+  mangled-NAME twin is the same hazard and it FIRED - two unrelated `expect_error` legs broke
+  when `MangleTypeArg` changed. Prefix-pin, or pin the source spelling, until
+  [[mangled-generic-name-leaks-into-diagnostics]] is fixed.
+
+---
+
+# Landed design records digest (from the retired interface-issue-queue.md)
+
+One entry per landed/ratified record. Each captures the ratified behaviour and any approach
+that was tried and must NOT be retried. Roughly chronological; entries are keyed by date and
+description rather than by commit hash or branch name. The full records - with the original
+branch names and commit hashes, coverage matrices, and verbatim witnesses - survive in git
+history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 deletion.
+
+- **The 2026-07-28 session**: `as`/`is` fall-through replaced by `ClassifyCastSource`, a
+  positive routing decision - the two fall-through shapes needed OPPOSITE answers (ternary must
+  BOX, array must be REJECTED). Filed severity was wrong: `--run` JITs in-process, so the
+  PROGRAM's SIGSEGV looked like the compiler's. Fixing named arguments on the interface path
+  made call-site and declared-parameter indices diverge, exposing three downstream sites plus a
+  false rejection and a `u8 200 -> -56` miscompile.
+- **The 2026-07-29 session**: primitive-element array boxing - the mechanism was UNREACHABILITY
+  behind a `StructImplementsInterface` early-out; the global/local divergence is purely
+  Constant-vs-Instruction (a ConstantExpr bitcast verifies clean and detonates in
+  SelectionDAG). `?:`-join interface return: boxing alone is not enough - each arm must be
+  LEDGERED and each owning arm's source nulled in its own block. Duplicate-constructor crash:
+  the filed "runaway recursion" guess was WRONG; the message's noun is picked by "declares a
+  typeSpecifier" - do not "simplify" that back. Closure param widening must REJECT ONLY WHAT IT
+  CAN PROVE IS DATA, never key off `isPointerTy()`. The `as`-boxing prerequisite (plumbing the
+  source `NamedVariable` into `ParseTypeCheckExpression`) was built and verified
+  behaviour-neutral BEFORE any guard was added - do it in that order.
+- **Consolidation record (2026-07-30)**: 64 -> 58 issues, merged only where files named a
+  shared ROOT and a shared fix vehicle, never a shared symptom; the four "namespace" gaps were
+  deliberately NOT merged (registration scope, dispatch, lookup order, parser gap share only
+  the word).
+- **The return dangle, resolved on the fourth attempt**: never asks REACHABILITY; deferred
+  to the end-of-body hook where the CFG is complete, an existential question over the returned
+  local's use-list; every unrecognised user ACCEPTS. The null-store knob is `true` (null store
+  = ACCEPT evidence) - `false` produced four confirmed false rejections. Rejected alternative,
+  do not retry: a source-level "tainted binding" property (a missed assignment site becomes a
+  FALSE REJECTION). Widening the extra-user whitelist is the direction that produced the
+  earlier false rejections.
+- **Generic-interface registration, resolved by record-then-resolve**: recording CANNOT reject,
+  so a missed site degrades to no diagnostic. Four earlier shapes must not be retried: reject
+  at end-of-compile over every syntactic occurrence (false-rejects uninstantiated template
+  bodies); reject at each materialisation site (site enumeration failed twice, each miss a
+  SIGSEGV); delete the check (reopens vtable laundering); and any at-site check at all, because
+  "in `genericInterfaceInstances`, not in `interfaceTable`" is a legitimately TRANSIENT state.
+  The struct-wins tiebreak must allow COEXISTENCE - the suggested "name in both maps" backstop
+  `LogError` was deliberately NOT shipped.
+- **Namespace key space, layer 1 (the template BASE)**: five ratified behaviour
+  changes T1-T5 (bare spelling of a namespaced generic interface no longer reaches outside;
+  inner scope wins for bare generic names; a namespaced generic struct no longer vetoes a
+  global generic interface; templates nested in a struct now work; use-before-declaration now
+  fails). Step 4 (key the struct-wins tie-break on the declaring module) was implemented,
+  REVERTED and re-filed - "different module -> interface wins" contradicts ratified
+  `Test/test_interface.cb` assertions; it needs a disambiguating spelling or a collision
+  diagnostic, not a tie-break.
+- **Namespace key space, layers 2, 3 and 4**: the one rule - a name must be
+  RESOLVED once where its scope is current and the result RECORDED; never re-derive a scope
+  from a key and never re-resolve a spelling downstream. Layer 2 resolves type ARGUMENTS
+  through `ResolveTypeArgBaseName` whose accept set is TYPES ONLY; layer 3 resolves a
+  substituted name from the ROOT (`forceRoot`), including six field-initializer sites found
+  only in review; layer 4 adds `genericFunctionTemplates` to `IsGenericTemplateKey`.
+- **The two P1s of 2026-07-31**: `IsProvableNonHeapAddress` is
+  one-sided BY CONSTRUCTION - do not widen it. The array-element leg is keyed on GEP SHAPE, not
+  on `ElementOwningUnique` (written in exactly one place, matches nothing here). DO NOT RETRY
+  rejecting `function<T>*` wholesale - round 2 did, on the false premise that master's support
+  was a constant-folding coincidence; the out-parameter has genuine store-through IR and the
+  rejection was alias-bypassable. RATIFIED: `Pointer` is set on the function-pointer parser
+  branch; `Lambda<T>[]` rejected while `Lambda<T>[N]` WORKS; `unique` on a funcptr/closure
+  field rejected. Any `ParseDeclarationSpecifiers` fix touches four sites (direct + alias
+  branch, in BOTH copies).
+- **Non-heap addresses rejected at call sites, not just store sites**: a GLOBAL
+  address is exactly as un-`free()`-able and as provable as a stack address, so
+  `IsProvableStackAddress` became `IsProvableNonHeapAddress` in `LLVMBackend`; the check also
+  runs on call arguments gated on `IsMove` or `uniqueAutoSink`.
+- **Generic-substituted `unique` field ownership, and its destination gate**: STANDING HAZARD - `IsUnique`
+  (written) and `IsUniqueTypeArg` (substituted) are two flags while destructor synthesis ORs
+  them; any new ownership check written against `IsUnique` alone must be checked against
+  `IsUniqueTypeArg`. Fix is `IsOwningUniquePointerField` re-keying the DESTINATION gate in BOTH
+  field-store paths.
+- **The SOURCE gate re-keyed onto `IsOwningUniquePointerField`**: closes what
+  the destination-gate record left open. Ratified: reading a generic `unique` field out of a `move` PARAMETER now
+  REJECTS instead of silently double-freeing - do not "fix" it back; `move other.t` is the
+  correct spelling. Do NOT reflexively widen `IsUniqueFieldRead`'s GEP-shape test to reach the
+  temp/call-result and container-element residues - each needs its own provenance signal, and
+  widening over-matches a borrow read through a cast.
+- **Separating `function<T>` from `function<T>*`; rejecting `Lambda<T>*`**: the
+  scorer compares a three-state indirection SHAPE (`FunctionPointerShapeOf`: array / pointer /
+  value); the promotion tier prefers fewer shape mismatches before the old move-score rule.
+  `Lambda<T>*` (pointer to a FAT closure) is rejected at the declarator in both funcptr
+  branches; thin `function<T>*` is unaffected. The shape marker rides the generated PREFIX
+  (`cfuncptrPtr_`), not the tail, where it collided with a trailing pointer parameter.
+- **Closure widening gated on the direct call path; interface argument slots
+  type-gated**: the gate proves a MISMATCH; it does not require proof of a match. An earlier
+  revision gated on "the scorer found no match" - WRONG POLARITY; scorer silence is absence of
+  a rule, not proof of incompatibility. Both interface slot-picking arms must share the gate.
+- **The fixed-array shape on the decl-init path**: TWO RATIFIED LANGUAGE
+  DECISIONS, do not "fix" back - (1) `auto x = <fixed array>` deduces the VIEW `T[]`, a
+  borrow, because `auto` introduces no storage; (2) `T[N] b = a;` IS a copy, lowered as a
+  memcpy. The interface symptom was fixed by the DEDUCTION, not by widening the boxing guard
+  (considered and rejected). The copy branch only INTERCEPTS an array-shaped source. On a fixed
+  array the element's pointer-ness lives on `Pointer`, not `ElemPointer`. Whole fixed-array
+  ASSIGNMENT is rejected; pointer-element `auto` is rejected rather than implemented.
+- **Boxing keyed on the VALUE; the `??` join boxed per arm**:
+  `RetireOwningSourceOfBoxedValue` is keyed on VALUE identity; widening `SoleCastOperandOf` to
+  see through parentheses was explicitly REJECTED (a syntactic walk closes one spelling and the
+  next binding-eraser reopens it). RATIFIED: the paren and `as`-through-paren spellings now
+  MOVE their source. DO NOT RETRY a per-arm ownership transfer for the `?:` join -
+  implemented, measured, reverted, and independently re-measured: it trades a double free for a
+  use-after-null, and is unfixable IN PRINCIPLE because the consume-vs-borrow fact lives on the
+  DESTINATION (a join into a plain interface local is a borrow by design).
+- **`??` joins in RETURN and CALL-ARGUMENT position**: the
+  return site reroutes through `UpcastPointerJoinToInterface` with
+  `transferArmOwnership`/`armNotOwned` THREADED (dropping them silently regresses the working
+  `?:` leg). For the ARGUMENT half there is no upcast site to reroute; failure is at SCORING.
+  Do not retry the bare TypeName stamp: `IsTypeMatch` ignores `Pointer`, so a by-value class
+  parameter scored a perfect match on a `Circle*`. The reviewer's suggested INVERSION ("bail
+  unless every candidate is an interface") was evaluated and REJECTED. The pointer bail must be
+  plain `param->Pointer`; narrowed to class-pointers it silently STOLE `f(void*)` / `f(char*)`
+  / `f(int*)` calls.
+- **Callee-side escape fact for the plain `T*` parameter
+  (RATIFIED)**: `ParameterProvablyRetainsArgument` proves an escape only from a store whose
+  destination outlives the call (global, caller-supplied memory incl. `this`, or a deref of
+  either); UNKNOWN = ACCEPT is stated policy, and the walk is deliberately path-INSENSITIVE
+  (three contrived correct programs now reject, accepted as the trade). Do NOT reuse
+  `ParameterRetainsArgument` as the oracle (four measured false rejections).
+  Record-then-resolve with `{callee, argIndex, name, access, FILE, line, col}`; one diagnostic
+  per compile because `LogError` throws.
+- **ONE borrow predicate for all five persist sites (RATIFIED)**:
+  `SourceIsDanglingAliasBorrow` (`IsAlias || IsAliasBorrow`, minus `string`/closure/POD) is the
+  single question at all five persist sites. A source-only rule must NOT be applied blindly: a
+  by-reference lambda capture is also `IsAliasBorrow` and consuming it is CORRECT, so the two
+  ADOPTING sites additionally require `BorrowAdoptionIsUnsound` (borrow lives in its own
+  alloca/global slot).
+- **Two distinct STACK-or-GLOBAL roots proved different (RATIFIED)**:
+  `ProvablyDifferentObjects` strips the GEP chain and answers true only when both roots are
+  DISTINCT `AllocaInst`/`GlobalVariable` - keyed on root KIND, never on `Value*` inequality.
+  The issue file's preferred step 1 (give a global receiver a `CallerName`) was tried and
+  REJECTED: the empty `CallerName` is load-bearing at several "this is a call result" checks
+  and a dozen diagnostics.
+- **The copy of an owning local aliased at its DECLARATION (RATIFIED)**:
+  records `BorrowsOwningLocal` + `OwningLocalOrigin` + source slot at the declaration, decided
+  by STORAGE IDENTITY not spelling; deliberately NOT `IsBorrowed` (~30 readers). The filed
+  direction - arm it on the `alias` spelling - was measured and MUST NOT be retried: it
+  false-rejects three programs master frees correctly, each with a LEAKING remedy. The proof
+  retires at BOTH ends (`OwningLocalCopyStillAliases`); checking only the copy's own rebind
+  false-rejected a correct program.
+- **The four ownership facts a plain pointer COPY drops (RATIFIED)**:
+  unique-field store (a store-side re-ask), container-element borrow (retires COPY-END ONLY,
+  deliberately), `move` (destination-agnostic guard in `ParseMoveExpression`), and `?:`/`??`
+  JOIN (`JoinKeepsOwner`, BOTH-ARMS rule, null literal arm neutral, MIXED join accepted).
+  Reusing `InheritedKeepsOwner` for the join fact was tried and MUST NOT be retried -
+  `MarkPointerRebound` also sets it on an implied-move store, which false-rejects a correct
+  program. The arm proof records each arm's SLOT and re-asks it; recording only the NAME
+  false-rejected seven correct programs.
+- **A join arm PROVABLY parked at null is neutral (RATIFIED)**:
+  `JoinArmIsProvablyNull` (null literal, or a load off a non-escaping alloca whose every store
+  parks null, depth 3); its three refusals - no store, escaping slot, any non-null store - are
+  the guard, and widening any to "could not tell" reopens the false-rejection direction. The
+  boxed ledger needed a THIRD state (`SourceProvablyNull`), not a flipped bool; a PROVEN `move`
+  on the surviving arm drops the whole fact.
+- **2026-08-02 - one TYPE IDENTITY for overloads; the four sites a funcptr signature is read
+  from**: `int` and `i32` are ONE overload, so declaring both is a redefinition error; canon
+  lives only in `CanonicalPrimitiveSpelling`. Duplicate detection discriminates on source LINE
+  and deliberately not on file (`currentSourceFilePath_` is unstable across LSP re-analysis).
+  Do not unify the bind-site arity rule with the argument-site one. Do not trust a "this path
+  is closed" claim that names a PATH rather than a SITE - all four sites read the signature
+  independently.
+- **Temp-source `unique` field stores; the implied-move guard in THREE copies**:
+  the guard is required at the assignment, decl-init AND return paths; each unguarded copy is a
+  zero-output compiler SIGSEGV, and three rounds each fixed N-1. Completeness was proved by
+  enumerating all 19 `ConstantAggregateZero::get` sites against all 12 `MovableTempField`
+  readers. `interface-field-self-assign-false-positive` was ATTEMPTED AND REVERTED - three
+  discriminators must not be retried: variable NAMES, the interface locals' STORAGE, and a bare
+  LLVM `Value` compare of the field address (each fat access re-loads, so even a true
+  self-assign yields two distinct `LoadInst`s). Splitting the two-owner message on
+  `MovableTempField` does not work; the discriminator is `OwningTempParent`.
+- **Null interface access rejected at COMPILE TIME; runtime guard
+  REJECTED**: RATIFIED BY THE MAINTAINER - reject as far as is provable, NO per-dispatch
+  runtime null-vtable check, in debug builds or otherwise; `?.` is the language's answer. Zero
+  codegen change, proved by byte-identical `--out-lli`. Rejection requires all three of: named
+  local's own frame slot with plain `.`, address never leaves the frame, last write in the
+  ACCESS'S OWN BASIC BLOCK is a whole-slot null store. Anyone widening the field axis must
+  carry `Primary`'s defining `LoadInst` and require same-block - widening the anchor is a false
+  rejection.
+- **The array-view delete guard tracks the DECLARATION ONLY**:
+  `ViewOfFixedArrayStorage` is set at the declaration only and ANY later plain `=` clears it
+  permanently. Do not re-propose recomputing on reassignment (walk-order, not flow-sensitive -
+  it false-rejected a correct program) and do not attempt full flow-sensitivity. Safe because
+  `int[]*` is not a legal type, so `=` is the only rebind path. Cost accepted: one true
+  positive stays accepted (`reassignHeapToStackNotDiagnosed`).
+- **The thin `function<>` accept set; signature-aware binding**:
+  the thin data-pointer hole is a LOWERING bug, not a scorer bug - the scorer's pointer clause
+  STAYS permissive on purpose. The comparison is TYPE-CLASS level (`FuncPtrTypeClass`: i/f/p/v,
+  0 = unknown), never SPELLING-level: a name-equality comparison was tried and hard-errored on
+  six programs master runs correctly, and a corpus sweep structurally cannot see it.
+  Signatures compare only at EQUAL indirection shape. A class-mismatched signature errors ONLY
+  when no same-arity sibling can absorb the call.
+- **The `CallerName` re-resolve only fires on a NAMED FUNCTION**: one
+  condition, `llvm::isa<llvm::Function>(val)`, mirroring the two sibling re-resolve sites.
+  Clearing `CallerName` on call results was NOT taken (it feeds `ScoreMoveAgreement`, the bond
+  ledger and move tracking). A re-resolve test needs TWO OVERLOADS of the name to escape the
+  single-overload early return.
+- **`if const` leaf emission gated on insert-block LIVENESS**:
+  `IsInsertBlockLive()` (non-null AND unterminated) replaces a non-null test; nothing clears
+  the insert point at end-of-function, so at declaration scope the builder points at the
+  previous function's terminated block. One predicate at the single leaf site covers all four
+  `DecideIfConstCondition` callers; the tempting one-line "clear the insert point at
+  end-of-function" is recorded as the wrong first move
+  ([[insert-block-liveness-not-audited-repo-wide]]).
+- **Brace-list globals rejected, both scopes and both brace spellings
+  (RATIFIED)**: rejects a non-empty brace list on a struct/union/class/container global in
+  BOTH spellings (`= {...}` and bare `{...}`, which live on different grammar nodes); bare
+  NAMED local brace-init now works like the `=` form. Reject rather than implement: a global's
+  initializer must be an LLVM `Constant` and neither the field-init nor the container path has
+  a global counterpart. The round-1 container carve-out was wrong and was reverted. Ride-along:
+  a primitive local with a value brace list now rejects (PRE read stack garbage); empty
+  bare-brace zero-inits.
+- **A brace initializer on a POINTER target rejected at four of five call
+  sites (RATIFIED)**: four `EmitFieldInitializer` callers were broken (local declarator,
+  fixed-array seed, default-parameter wrapper, `new T{...}` via generic substitution). The
+  fifth - the named-argument site - was audited and found CORRECT; a first cut rejected there
+  and removed a working feature. The tell: broken sites return packed FIELD BYTES (`0x1`,
+  `0x900000001`), the correct one returns an ADDRESS. Rejection is role-named via
+  `LogPointerBraceInitReject` so a test can prove which site fired; `int[] v = {1,2,3}` is
+  `IsArrayView + Pointer`, so a bare `Pointer` test one branch earlier false-rejects it. Its
+  `S*[N] a = {}` zero-init row is SUPERSEDED by the later empty-brace record.
+- **Every unsized multi-dimensional bracket form REJECTED (RATIFIED)**: root
+  cause is a dropped BRACKET (the grammar folds all pairs into one context, so empty pairs are
+  invisible), not a dropped stride. The filed direction - carry `ConstInnerDimensions` on the
+  view - cannot work and was NOT taken: a `T[][]` parameter has a per-call extent and a
+  return/field/global has none; it fixes 2 of 11 miscompiling cells. One predicate at six
+  sites. TWO working shapes are deliberately removed (`int[][] v = new int[10]`, and a 1-D
+  array through an `int[][]` parameter) - they worked only because the bracket was dropped.
+- **Empty `{}` split by TARGET TYPE (RATIFIED)**: `{}` yields a NULL
+  `initializerList()`, so gates written on the list missed it. A NON-pointer `{}` seeds; a
+  POINTER `{}` is REJECTED on an AMBIGUITY argument (null vs pointer-to-empty), which REVERSES
+  the pointer-target brace-initializer record's ratified `S*[N] a = {}` zero-init row. Intended collateral, ruled on by
+  the maintainer: a generic body's validity can now depend on its type argument (`T x = {}`
+  with `T=S*` hard-errors); the rejection STAYS, since `T x = default;` works at every
+  instantiation. `IsArrayView` is the ONLY exemption; a first cut also exempted `IsSimd` and
+  stored a whole vector into an 8-byte pointer slot, aborting the compiler.
+- **`ftell`/`fseek` re-bound to C's `long` (RATIFIED)**: Windows/LLP64-only
+  defect; all three decl sites now say `long`. The fix is invisible in observed VALUES, so the
+  test asserts `typeof(rawEnd) == "long"`. Standing notes: declaring the same extern twice
+  with DIFFERENT types compiles clean and silently keeps the first (winner is import order),
+  and `File` is capped at 2 GB on every platform.
+- **A pure-rename `using` alias folded at MONOMORPHIZATION (RATIFIED)**:
+  `list<MyInt>` and `list<int>` are ONE instantiation. The alias set is PRE-REGISTERED ahead of
+  BOTH passes into a dedicated `manglingAliases_` map - a walk-populated map cannot work
+  (`ScanGenericTypeUses` mangles before `ScanExternalDeclaration` sees the first `using`), and
+  `typeAliases` is deliberately not consulted. `if const` arms and function bodies are
+  deliberately NOT swept (`core/os.posix.cb` binds `win_size` to two widths). The new map is in
+  the `--init` round-trip. PURE RENAMES only. Ratified tightening: `f(list<MyInt>)` +
+  `f(list<int>)` now collides as a redefinition.
+- **The last two funcptr-signature items (RATIFIED)**: the "make
+  `FuncPtrParam.TypeName` qualified" direction was WRONG (that string feeds
+  `BuildEncodedClosureName` and both passes must agree byte-for-byte); the resolved key went
+  into SEPARATE fields and no mangled name moved. Narrowing is MEMBERSHIP-ONLY, and the
+  ABI-canon hop must stay inside it or `Box<int>` vs `Box<i32>` false-rejects again. Inside a
+  namespace, a bare spelling the walk could not qualify records NOTHING. The SCANNER copy is
+  load-bearing. The `void*` gate keys on the ARGUMENT being code at
+  `FunctionPointerShapeOf == 0` - a first cut keyed on "carries function evidence" and rejected
+  `function<T>*` / `function<T>[N]` into `void*`, which are plain DATA pointers. Ratified:
+  passing a `function<>`/`Lambda<>` VALUE to `void*` is an error.
+- **A `simd<T,N>` slot that is NOT a vector no longer takes the splat
+  (RATIFIED)**: "is `simd<T,N>*` supported?" is answered YES on measured evidence - answering
+  NO (as `internal/simd-type.md` and a zero-hit grep suggested) would have false-rejected
+  working parameter/global/field code. The decl-init splat is gated on the SLOT
+  (`isa_and_nonnull<FixedVectorType>`), a ROUTING predicate not a rejection;
+  `RecordSimdPointerAndDims` is shared by BOTH `ParseDeclarationSpecifiers` copies. Ratified:
+  `simd<T,N>[N]` is real storage and `a[i]` is an ELEMENT (struct layout changes, `sizeof`
+  16 -> 32); a scalar assigned into vector storage SPLATS every lane; a `simd<T,N>[N]` return
+  is rejected like any by-value fixed-array return; `srcIsUnsigned` threads at all THREE splat
+  sites.
+- **A code VALUE no longer converts to ANY data
+  parameter (2026-08-03)**: the gate is on the ARGUMENT being code (`ArgumentIsCodeValue`) and covers every
+  data parameter the branch reaches, plus the implicit `char*`->`string` coercion. The oracle
+  had two holes: variadic candidates are taken with NO per-argument scoring, so the gate is
+  repeated in the variadic short-circuit over DECLARED parameters only; and
+  `ParameterAcceptsCodeValue` must MIRROR the argument side's code shapes and must NOT be
+  spelled from `IsEncodedClosureType` alone - that omits the literal `__closure_fat_ptr` a
+  monomorphized generic parameter carries, which false-rejected a correct generic with a
+  self-refuting message.
+- **Name the guarding `if const` in the zero-implementor
+  rebox error (2026-08-04)**: the conversion stays a HARD ERROR and the message names the class and the
+  guarding arm chain; making it legal was considered and REJECTED (turns a compile error into a
+  null-vtable segfault). Must not be retried: propagating uncertainty up the interface
+  inheritance chain (tried and reverted); blaming classes under a generic TEMPLATE body
+  (suppression only); using the last-component fallback of a qualified base spelling for BLAME
+  (fabricated an implements-claim against an unrelated same-named interface). Twice-proven rule
+  of thumb: over-broad candidate sets are SAFE for suppression and FABRICATE CLAIMS for blame.
+  The registry is diagnostic-only and never serialized.
+- **A temp's `unique` field may not escape the
+  statement (2026-08-04)**: `IsOwningTempUniqueFieldEscape` at FIVE persist sites; `OwningTempParent` is the
+  load-bearing half of the polarity (`FromOwningTempField` alone is also set for a BORROWED
+  element - a gate keyed on it alone false-rejects correct code). The interface decl-init
+  branch was missed on the first pass (its own ELSE), and PARENTHESES defeated the whole gate -
+  fixed by widening the paren side channel, not the gate. Global scope is excluded on purpose
+  so the truer pre-existing diagnostic survives. New leg sits AFTER the existing type-name leg.
+- **A code VALUE no longer converts to a data pointer at a
+  store (2026-08-04)**: nine gate sites along two axes read one shared destination-side predicate
+  `CodeValueIntoDataDestination`. RATIFIED: `void* v = w;` is an error, agreeing with the
+  `void*` PARAMETER rule. Do NOT retry the claim that three sites are "the whole set"
+  (field/element/nested/global stores reach them only through the `=` OPERATOR; brace init,
+  field default and parameter default are four more spellings); do NOT reuse the array-VIEW
+  element-type derivation on the FIXED path (it silently disarms the guard for every `T*[N]`).
+  Compound `+=` gets its own wording ("a code address is not an offset").
+- **Receiver identity taken from the BOXED OBJECT,
+  settled at end of body (2026-08-05)**: resolve each side's fat pointer back to the object its box wraps
+  (`ResolveBoxedObjectOfInterfaceField` + `SoleStoreIntoSlot`) and feed the existing
+  `ProvablyDifferentObjects`; RECORD at the store, settle at the end-of-body hook. Do NOT retry
+  comparing variable NAMES (reverted; two names can denote one object), a bare `Value` compare
+  of the field address (false-rejects the true self-assign - each access re-loads the fat
+  pointer), or an at-site verdict (a loop can rebind the receiver afterwards).
+- **A temp's `unique` field no longer escapes through a cast, a
+  join, an array aggregate or a sink parameter (2026-08-05, RATIFIED)**: record-then-resolve keyed by value identity
+  (`owningTempUniqueFields_`), read by the one predicate all five persist sites share. Do NOT
+  retry "ANY arm answers yes" for `??` - the FALLBACK arm is never freed and rejecting it
+  refuses a working program; do NOT gate on `FromOwningTempField` alone; do NOT touch
+  `EmitGlobalFixedArrayInit` (a global keeps the truer pre-existing message). 40
+  plain-`T*`-parameter cells and 10 `??=` cells left open by decision, not oversight.
+- **A `?:` / `??` JOIN no longer erases the code-value
+  evidence (2026-08-05)**: `codeValues_` + `codeValueDataCasts_`, read through `ArgumentIsCodeValue` so all
+  nine store sites, the argument gate and the return gate are served from one source of truth.
+  Do NOT hold the launder ledger for a whole function (round 1 did); do NOT "fix" it by
+  reordering `isa<Function>` ahead of the launder check - mutation-tested, it false-rejects
+  `c ? (Rec*)ro : n`. Widening was confined to `ArgumentIsCodeValue` and kept OUT of
+  `ArgumentIsFunctionPointerish`, which the scorer's accept arm reads. RATIFIED:
+  `void* v = c ? w : n;` is an error.
+- **A `?:` / `??` JOIN no longer defeats the CLOSURE-WIDEN
+  gate (2026-08-05)**: the declared mirror of the code-value-evidence join-ledger record; `dataValues_` + `JoinDeliversDataValue` with
+  the OPPOSITE quantifier (every arm proven data, null neutral, unproven = fail-open). Do NOT
+  copy `JoinCarriesCodeValue`'s any-arm polarity (mutation-proven to false-reject mixed joins).
+  `RegisterDataValueCodeCast` must structurally refuse `ConstantPointerNull` and
+  `llvm::Function` - statement scope alone was NOT enough. RATIFIED tightening: a `void*`
+  holding a code address, joined, is refused; the remedy is the explicit `(function<...>)value`
+  cast, and the message names it.
+- **The emitted `LC_BUILD_VERSION` sdk no longer depends
+  on cache state (2026-08-05)**: `sdkVer` resolved on BOTH branches, from `<cacheDir>/macsdk/SDKVersion`
+  (written by `HarvestMacSystemStub` from `sysctlbyname("kern.osproductversion")`, NOT `xcrun`,
+  so self-containment does not regress), trimmed to major.minor. `minos` stays `11.0.0`.
+  Standing consequence: leak counts measured before this change are NOT comparable with counts
+  after it.
+- **A POINTER argument no longer binds a by-value
+  parameter (2026-08-05)**: `IsTypeMatch` now refuses `Pointer && !other.Pointer` only - deliberately
+  ASYMMETRIC and correct only at its one caller's operand order; `T` into `T*` keeps matching
+  (a real capability, an implicit address-of proven from IR). Three doors, not one: the scorer,
+  `DiagnoseProvableInterfaceArgMismatch` (virtual dispatch picks by ARITY and never consults
+  the scorer; a by-value PRIMITIVE slot needed a second predicate because a primitive pointer
+  argument carries an EMPTY TypeName), and `CheckIndirectCallArgShape` in both loops of
+  `CreateIndirectCall`. Do NOT retry "the blast radius is zero" - `string*` into by-value
+  `string` and a C by-value struct through the C binder both compiled and RAN before. Do NOT
+  add a `Pointer` gate to the five `Parameters[0].TypeName == typeName` receiver-lookup sites.
+  `Circle**` into `Circle*` deliberately left open
+  ([[double-pointer-arg-binds-single-pointer-param]]).
+- **Generic instantiation leaked its return TypeAndValue
+  into the caller (2026-08-05)**: one-liner - add `TypeAndValue returnTV` to `BuilderState` and save/restore
+  it with its three siblings. The filed "P2, nothing silently wrong" severity was wrong: a
+  struct-value enclosing return is a compiler SIGSEGV and a `string` / owning-container
+  enclosing return is a FALSE REJECTION blaming the user. The alias-scope registry
+  (`aliasDomain_`, `aliasScopes_`, `viewScopeByOrigin_`) has the identical defect and was
+  deliberately NOT folded in - it changes emitted alias metadata and needs an `-O2`
+  verification pass neither suite performs.
+- **A closure POINTER as a generic type argument: fat
+  rejected, thin supported (2026-08-05)**: `ResolveTypeArgEntry`'s `functionPointerSpecifier` branch was
+  dropping the `*` entirely (so `Box<Lambda<T>*>` and `Box<Lambda<T>>` resolved to ONE
+  instantiation); three sites fixed, including the `functionTypeAliases` arm re-gated from
+  `!hasPointer && !hasArrayView` to `!hasArrayView`, plus `RejectFatEncodedClosurePointerArg`
+  at the pointer-suffix funnel. The filed repro had DRIFTED. `ClosureArgSpelling` is
+  all-or-nothing about writability: a nested generic in the signature falls back to the raw
+  encoded name rather than a hybrid.
+- **Chained and nested joins boxed into an interface (2026-08-05)**:
+  the filed direction - FLATTEN the chain at the ledger, splicing an inner join's arms into the
+  outer entry - was measured WRONG and must not be retried: the inner arms' blocks are not
+  predecessors of the outer join point, so the flat phi is invalid IR. What landed is RECURSION
+  - box the nested join at its own join point (`CollectPointerJoinArms`,
+  `NestedJoinArmsBoxable`, recursive `UpcastPointerJoinToInterface`). Flattening would also
+  have silently changed four other ledger consumers, `JoinArmsKeepOwner` most sharply. Every
+  cell moves reject -> accept; no accept-set cell changed (an earlier contrary claim is
+  retracted as sibling inference).
+- **A generic instantiated over a closure type lowers its
+  element like the spelling it encodes (2026-08-05)**: the thin encoded closure's `{ i8* }` STRUCT backing
+  was DELETED rather than patched at a third and fourth boundary; `GetType` resolves the
+  encoded name straight to `BuildThinFnPtrType`. Do NOT re-introduce a wrapper representation.
+  The `=` path's closure ownership-transfer arm is re-keyed on the REPRESENTATION
+  (`IsFatEncodedClosureType`), not on `TypeName == "__closure_fat_ptr"` - the spelling key
+  caused a review-caught miscompile strictly worse than the PRE rejection. One deliberate
+  loosening (`Box<function<>>.item = vp` now matches its non-generic control) with the real
+  hole filed as [[data-pointer-assigned-to-thin-function-value]].
+- **A `sizeof` operand that looks like a generic type
+  stays on the TYPE path (2026-08-06)**: `ParseUnaryExpression`'s character whitelist now admits `(`, `)`
+  and `,` at generic-bracket depth >= 1 with balanced brackets. The filed framing was NARROWER
+  than the truth - `sizeof(Pair<int,float>)` SIGSEGVs with no closure anywhere; the
+  discriminator is the CHARACTER. Do NOT retry the obvious repair for the one cost cell
+  (`sizeof(a<b,c>d)`): falling back to the expression path when the type lookup fails is
+  precisely the fallthrough that reached `CreateCast` with a null `Primary` and SIGSEGVed.
+- **A `class` with no user-written constructor
+  default-constructs to zero, not `undef` (2026-08-06)**: one token, `Constant::getNullValue` instead of
+  `UndefValue::get` at the class synthetic-ctor seed. The filed root cause (struct and class
+  take different paths) was WRONG - same path, different seed. Shape 1 (do not register the
+  ctor at all) was rejected on measurement: a generic container's own default ctor calls
+  `_CNoCtor_CNoCtor__`.
+- **The RETURN leg of the closure provenance gate (LANDED)**:
+  `CheckClosureReturnProvenance` reuses `ArgumentIsProvablyDataPointer` so "pass" and "return"
+  accept sets cannot drift; the THIN return arm had the identical hole and was not named in
+  the issue file. Ratified tightening: a data-TYPED pointer provably holding a code address,
+  returned as a closure, now hard-errors - matching the argument site, `(function<...>)value`
+  escape hatch intact.
+- **A struct FIELD's own `= { ... }` default brace list is
+  applied, not discarded (2026-08-06)**: the issue file named `GenerateDefaultValue`, which is never
+  reached; the five default-ctor emitters ask only `assignmentExpression()` / `Default()` and
+  the grammar's third `initializer` alternative matched neither. Do NOT gate on
+  `initializer->initializerList()` alone - the bare `Inner i { x = 1 }` spelling hangs its
+  list on `initDeclarator`; `DeclTypeAndValue::BraceInitializer` + `FieldDefaultBraceList()`
+  resolve both spellings. Step 3 (seed with the field type's OWN default ctor result) is what
+  makes a PARTIAL list correct rather than merely non-zero.
+- **The ASSIGNMENT leg of the closure provenance gate (LANDED)**:
+  `CheckThinFnPtrAssignProvenance`, same shared predicate, SEVEN separate lowering paths -
+  four of them found by review, not by the first round. The parameter-default gap can only be
+  closed at the default-value site: the wrapper rebuilds the forwarding `NamedVariable` with
+  the destination's TypeName, laundering provenance before the call-site gate runs.
+  Guard-polarity bug caught by `./test.sh`: the new branches were missing the
+  `!typeAndValue.Pointer` guard their pre-existing siblings carry, and false-rejected a
+  POINTER to a thin slot.
+- **The FAT twin of the default-value closure provenance gate (LANDED)**:
+  `CheckFatClosureAssignProvenance` is check-only and does NOT widen. Widening was
+  deliberately NOT implemented here: a LEGAL fat field default was measured already crashing
+  on the PRE binary, so widening would have silently "fixed" a separate pre-existing bug
+  without measuring its blast radius. Closed by the later record widening the field-default
+  site to a legal fat closure source.
+- **A brace list with values on a NON-AGGREGATE global REJECTED, matching
+  local (LANDED)**: the guard was gated on `GetDataStructure(name).StructType != nullptr`, and
+  an interface is not in the struct table - but the same hole swallowed primitives, `char*`,
+  `function<>` and `simd` too; never an interface bug. The ORACLE (the local path) was
+  verified independently on all eight spellings before being matched. No working program
+  breaks: every newly-rejected cell already discarded its values. Deliberately not widened:
+  empty `{}`, containers, and a container whose `StructType` is null (accept-on-doubt).
+- **The FIELD-default site now widens a legal fat closure source (LANDED)**:
+  `CheckFatClosureAssignProvenance` runs FIRST (throws on a provable data pointer) and
+  `WidenBareOrThinToClosureFat` follows - two calls rather than one, so the existing reject
+  wording and its legs stay byte-identical. Measured side effect recorded per the equivalence
+  rule: the `(function<...>)` escape hatch's IR is NOT identical - PRE silently dropped the
+  asserted address (`ret %D zeroinitializer`), POST emits the real `insertvalue` pair. Filed
+  in passing: `S[2] a = default;` skips every field initializer while `new S[2]` runs them.
+- **A bodyless PROTOTYPE no longer drops a fixed-array
+  return size (2026-08-06)**: a bodyless prototype is not a `functionDefinition` at all (the grammar always
+  requires a body), so it registers through `ParseDeclaration` and the definition-path reject
+  structurally cannot see it. The guard is deliberately NOT keyed on `external` -
+  namespace-scope, statement-scope and plain non-`extern` prototypes all reach the same arm. C
+  interop is structurally unreachable (verified from source twice over, not from a passing
+  probe): `RegisterCSignatures` calls `CreateFunctionDeclaration` directly, and
+  `MapCTypeToTypeAndValueImpl` decays `[` and never writes `ArraySize`. The gate was NOT put
+  inside `CreateFunctionDeclaration` - that layer cannot tell a user prototype from an
+  internal wrapper registration.
+- **An EMPTY brace pair is not an interpolation; a `string` reaching a
+  `char*` parameter is diagnosed (LANDED)**: `HasInterpolation` and `ParseFormatString`
+  disagreed about what a brace pair means; they are now one function (`ClassifyBrace`). Do NOT
+  also move JSON-ish content (matched braces starting with `"` or `\`) to the plain literal
+  path - the first cut did and broke `Test/test_reflect.cb::toJson_nested`; JSON-ish keeps
+  `BraceKind::Verbatim`. Face 2 was NOT in the variadic guard as the issue file claimed - an
+  interpolated argument 0 binds printf's declared `char* fmt` and a variadic candidate is
+  taken without per-argument scoring; the guard is keyed on the REPRESENTATION (the named
+  `string` struct type), never on `TypeName == "string"`.
+- **An unresolved generic name no longer gets an opaque shell
+  (LANDED)**: `AnyGenericTypeTemplateNamed`, accept-on-doubt, gating TWO copies -
+  `ScanGenericTypeUses::tryPreDeclare` and `ForwardRefScanner::ParseDeclarationSpecifiers`;
+  gating only the first leaves the headline repro compiling. The last-dotted-segment clause is
+  load-bearing (without it three ratified `err_namespaced_generic_iface_*.cb` messages move)
+  and is why the silent-accept face is NOT fully closed
+  ([[last-segment-collision-still-shells-unknown-generic]]).
+  `gts.scannedGenericStructNamesUncertain` is required and deliberately OUTSIDE the key space
+  (an invented key is a false rejection); the shape that needs it is a function SIGNATURE. The
+  filed claim about [[incomplete-layout-message-blames-c-interop]] causes was measured FALSE -
+  it was a fourth, unlisted funnel.
+- **A SELECTED shape-mismatched funcptr argument now rejects instead of
+  lowering**: one shared `RejectFuncPtrShapeMismatch` running AFTER candidate selection, so
+  multi-arm ranking is untouched. The parameter predicate mirrors the SCORER's
+  (`IsFunctionPointer || IsEncodedClosureType`). Do NOT widen the shape-0-parameter face to
+  `!= 0` - a shape-1 argument is already caught by `ArgumentIsProvablyDataPointer` with its
+  own frozen wording. Do NOT re-derive an argument's shape from its symbol-table entry by
+  `CallerName` - tried, and it false-rejected `arr[i]` (`CallerName` names the base array for
+  both spellings); the fix is propagating `ConstArraySize` alongside `IsArrayView` in the two
+  METHOD call-argument loops.
+- **`??=` routed through the shared store tail (LANDED)**: `??=` now
+  emits only the null test and branch, rewrites `operatorText` to `"="`, and falls through the
+  shared tail (29 return sites via a `finishStore` lambda), so its RHS is a real
+  `NamedVariable`. The desugaring `if (x == null) x = rhs;` is the ORACLE, but an UNSOUND one
+  for facts that RETIRE a restriction: `ClearVariableBond` and `SetVariableBorrowsOwnedElement`
+  take the JOIN under `??=`, deliberately diverging from `=`. `CoalesceRebound` is RETAINED
+  and load-bearing. Do NOT derive the RHS owner from `DescribeAssignedSourceOwner(rightNV)`
+  alone - it bails unless the RHS binding's storage is an alloca, and a CAST erases that; the
+  first cut did and ran memory-unsafe (double free, rc 133).
+- **A bare interface local with no initializer, genuinely uninitialised
+  (LANDED)**: the discriminator is a whole-function existential fact - this (Base, empty Path)
+  location has ZERO stores anywhere in F - reported with its own diagnostic
+  (`ReportNullIfaceUninitAccess`), not the existing "last set to null" one, which would be
+  false. Two conservatism axes: any-path-store disqualifier, and control-dependence
+  containment (`cfg.Cd[accessBlock]` empty) - the latter added after review found the first
+  cut REJECTED a guarded access that PRE accepted. Recorded fragility: the check infers "no
+  initializer" from the absence of stores, and an interface PARAMETER's slot is structurally
+  identical - it survives only because parameter lowering emits an entry store.
+- **The borrow-forward policy, narrowed to explicit contracts
+  (RATIFIED)**: the filed direction (`IsBorrowed && !BorrowedOrigin.empty()` as a third proof
+  in the destination-agnostic move guard) was DISPROVED and must not be retried - it fires on
+  `core/hpc/btree.cb::_rebalanceFrom`, which has no available remedy. The ratified policy is
+  that the DESTINATION decides: a plain `T*` local does NOT adopt (keeps compiling, stops
+  double-freeing), `unique` destinations and `move` RETURNS reject, and a `move` PARAMETER of
+  a callee stays LEGAL. The borrow proof retires only via `BorrowProofRetiredByRebind` =
+  `ReboundToOwnedValue && ReboundBlock == current block`. Two rejected retirement
+  discriminators: bare `PointerRebound` (means "was assigned to", never "now holds an owner" -
+  seven shapes became silent double frees) and `srcIsOwnedPtrRhs` carried whole (its syntactic
+  `TopLevelMoveExpression` leg fires on the `move` token alone - four more silent double
+  frees). Settled rule: **an ownership claim used for a RETIREMENT must be value-identity
+  grounded, never syntactic.**
