@@ -3,10 +3,12 @@
 // the call compiled, linked and ran, reading the low bytes of the heap address as the pointee.
 // No verifier complaint: under opaque pointers 'ptr' and 'ptr' are the same LLVM type.
 //
-// The gate is ONE-SIDED. ElemPointer is recorded only by source parsing and C interop, so its
-// absence means "depth not recorded", never "depth 1" - only a PROVEN 'T**' argument at a
-// PROVEN 'T*' parameter is refused. The accept set (including the reverse direction, void*,
-// and array-of-pointer slots) is frozen as value legs in Test/test_basic.cb ("pd_*").
+// Both sides must be PROVEN. ElemPointer is recorded only by source parsing and C interop, so its
+// absence means "depth not recorded", never "depth 1"; the positive TypeAndValue::PointerDepth is
+// the other half of the proof, and is what makes an inline '&' refusable here. The accept set
+// (void*, array-of-pointer slots, generic type arguments) is frozen as value legs in
+// Test/test_basic.cb ("pd_*"); the mirror direction lives in
+// err_single_pointer_arg_double_pointer_param.cb.
 
 class DpCircle { int r = 0; };
 
@@ -70,6 +72,21 @@ extern int main()
         DpCircle* a = new DpCircle();
         DpCircle** pp = &a;
         DpWrap w = DpWrap(pp);
+    }
+
+    // An inline '&' over a RECORDED depth-1 value now proves depth 2, so it is refused here too.
+    // Before PointerDepth existed the address-of result recorded no depth and bound silently.
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        int r = dpByPtr(&a);
+    }
+
+    // Same through a fixed array's SLOT address: the element's depth is recorded, so '&' over it
+    // is a proven 'T**'. The ARRAY itself still proves nothing (Test/test_basic.cb "pd_*").
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle*[2] arr = default;
+        arr[0] = new DpCircle();
+        int r = dpByPtr(&arr[0]);
     }
 
     return 0;

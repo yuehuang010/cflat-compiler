@@ -2179,6 +2179,8 @@ int pdPick(PdCircle* c)  { return 1; }
 int pdPick(PdCircle** c) { return 2; }
 int pdByPtrPtr(PdCircle** c) { return 1000 + (*c)->r; }
 int pdByVoid(void* p) { return p == nullptr ? 0 : 1; }
+int pdNullOk(PdCircle** c) { return c == nullptr ? 9 : 8; }
+void pdFill(PdCircle** c, int v) { (*c)->r = v; }
 
 bool testOverloadResolution()
 {
@@ -2264,9 +2266,9 @@ bool testOverloadResolution()
     result &= Test("pd_deref_ptrptr_arg_picks_ptr_overload", pdPick(*pdPP), 1);
     // Fails if the gate stopped being one-sided: a lone 'T**' parameter still takes a 'T**'.
     result &= Test("pd_ptrptr_arg_into_ptrptr_param", pdByPtrPtr(pdPP), 1003);
-    // REVERSE direction, deliberately NOT gated - ElemPointer=false means "depth not recorded",
-    // never "depth 1". Measured: this leg goes red only when the gate is made symmetric AND the
-    // fixed-array exclusion is dropped, so it is the one that pins that exclusion.
+    // REVERSE direction through a FIXED ARRAY: Pointer/ElemPointer/PointerDepth on a 'T*[N]'
+    // describe its ELEMENT, so the array proves nothing about its own depth and still binds.
+    // Measured: this leg goes red when the fixed-array exclusion is dropped from the gate.
     PdCircle*[2] pdArr = default;
     pdArr[0] = new PdCircle();
     pdArr[0]->r = 4;
@@ -2276,8 +2278,28 @@ bool testOverloadResolution()
     // exists for the DIAGNOSTIC, which without it falsely blamed a 'void*' parameter.
     result &= Test("pd_ptrptr_arg_into_voidptr_param", pdByVoid(pdPP), 1);
     result &= Test("pd_ptr_arg_into_voidptr_param", pdByVoid(pdA), 1);
-    // Goes red the moment the gate is made symmetric: '&pdArr[0]' records no depth at all.
     result &= Test("pd_ptrptr_from_array_elem_addr", pdByPtrPtr(&pdArr[0]), 1004);
+
+    // ---- The MIRROR gate (a 'T*' argument must not bind a 'T**' parameter) ----
+    // FIX LEG: pre-fix '&pdA' recorded no depth, so it scored a PERFECT match on the 'T*'
+    // overload and won by declaration order, reading the low bytes of the stack slot. 2 proves
+    // the '&' now carries depth 2 and the 'T**' overload wins.
+    result &= Test("pd_addrof_ptr_arg_picks_ptrptr_overload", pdPick(&pdA), 2);
+    // The '&' remedy the new diagnostic names, compiled and run: this is how a 'T*' reaches a
+    // 'T**' parameter. Goes red if '&' stopped adding a level to a recorded depth.
+    result &= Test("pd_addrof_into_ptrptr_param", pdByPtrPtr(&pdA), 1003);
+    // Out-parameter WRITE-BACK through the same spelling: the callee stores through the pointer
+    // and the caller's object sees it. Asserts the write, not just that the call bound.
+    pdFill(&pdA, 42);
+    result &= Test("pd_outparam_writeback_through_addrof", pdA->r, 42);
+    pdA->r = 3;
+    // nullptr records no depth, so it keeps binding a 'T**' parameter. Goes red if the mirror
+    // started reading an UNRECORDED depth as a claim of depth 1.
+    result &= Test("pd_nullptr_into_ptrptr_param", pdNullOk(nullptr), 9);
+    // OVER THE CAP: a 'T***' declarator records NO depth (0), because a clamped 2 stepped down by
+    // the '*' below would falsely prove depth 1 and reject this correct 'T**' argument.
+    PdCircle*** pdPPP = &pdPP;
+    result &= Test("pd_deref_of_triple_ptr_into_ptrptr_param", pdByPtrPtr(*pdPPP), 1003);
 
     delete pc;
     delete ps;

@@ -1,0 +1,77 @@
+// The MIRROR of err_double_pointer_arg_single_pointer_param.cb: a 'T*' argument must not bind a
+// 'T**' parameter. Before the fix the call compiled, linked and SEGFAULTED at the callee's '(*c)',
+// which loaded the first 8 bytes of the pointee as if they were a pointer.
+//
+// The mirror needs a POSITIVE depth proof on the argument, because 'ElemPointer == false' means
+// "depth not recorded", never "depth 1" - so it reads TypeAndValue::PointerDepth, which only a
+// declarator, an '&' over a recorded depth and a '*' over one ever set. Everything that cannot
+// prove depth 1 (a 'T*[N]' slot, a generic type argument, an interop pointer) still binds; that
+// accept set is frozen as value legs in Test/test_basic.cb ("pd_*").
+
+class SpCircle { int r = 0; };
+
+int spByPtrPtr(SpCircle** c) { return 3000 + (*c)->r; }
+
+int spByTriple(SpCircle*** c) { return 4000; }
+
+class SpBox { int take(SpCircle** c) { return 3000 + (*c)->r; } };
+
+class SpWrap { SpCircle** pp = nullptr; SpWrap(SpCircle** p) { pp = p; } };
+
+class SpHolder { SpCircle* p = nullptr; };
+
+SpCircle* spForward(SpCircle* s) { return s; }
+
+extern int main()
+{
+    // The filed repro: a declared 'T*' local. The note names both types and the '&' remedy.
+    expect_error("parameter 0 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        int r = spByPtrPtr(a);
+    }
+
+    // A 'T*' RETURN value carries the declared depth of the return type.
+    expect_error("parameter 0 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        int r = spByPtrPtr(spForward(a));
+    }
+
+    // A 'T*' FIELD read: the depth rides the field type, not the declaration statement.
+    expect_error("parameter 0 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        SpHolder h = default;
+        h.p = a;
+        int r = spByPtrPtr(h.p);
+    }
+
+    // A '*' over a recorded depth-2 value proves depth 1 on the RESULT - the dereference site is
+    // the only producer here, so this leg goes red if '*' stops decrementing the recorded depth.
+    expect_error("parameter 0 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        SpCircle** pp = &a;
+        int r = spByPtrPtr(*pp);
+    }
+
+    // 'T*' into 'T***'. Over the 2-level cap the declarator records NO depth, so the parameter is
+    // proven double by ElemPointer alone and the note spells it 'T**' - understated, not wrong.
+    expect_error("parameter 0 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        int r = spByTriple(a);
+    }
+
+    // A METHOD call scores through the same scorer, with 'this' occupying parameter 0 - so the
+    // note names parameter 1. Pins that the index is the PARAMETER index, not the argument index.
+    expect_error("parameter 1 'c' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        SpBox b = default;
+        int r = b.take(a);
+    }
+
+    // A CONSTRUCTOR call resolves through the same overload set.
+    expect_error("parameter 0 'p' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        SpWrap w = SpWrap(a);
+    }
+
+    return 0;
+}

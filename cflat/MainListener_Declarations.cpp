@@ -701,6 +701,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             declType.TypeName, totalPtr));
                     declType.Pointer = totalPtr >= 1;
                     declType.ElemPointer = totalPtr >= 2;
+                    declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
                 }
                 else
                 {
@@ -708,7 +709,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (hasDblPointer || (declType.Pointer && hasExplicitPointer))
                         declType.ElemPointer = true;
                     declType.Pointer = hasExplicitPointer || declType.Pointer;
+                    int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
+                    // Over the 2-level cap the exact depth is LOST, so claim nothing (0): a clamped
+                    // 2 stepped down by a '*' would falsely prove depth 1 for a `T***` dereference.
+                    declType.PointerDepth = declStars > 2 ? 0 : declStars;
                 }
+                // A substituted type argument's stars are a LOWER BOUND (PeelTypeArgSuffix collapses
+                // them), so this declarator proves nothing about the total depth - claim nothing.
+                if (declType.PointerDepthUnknown) declType.PointerDepth = 0;
                 if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
                     auto dims = dimSpec->assignmentExpression();

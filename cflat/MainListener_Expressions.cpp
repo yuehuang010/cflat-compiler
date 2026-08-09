@@ -5428,6 +5428,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // the noalias contract must keep one-way). Mark a scalar operand's address as a
                 // pointer so the array-view bind gate sees `&a[i]` as the raw `int*` it is.
                 namedVar.TypeAndValue.IsArrayView = false;
+                // Depth: `&` adds one level to an ALREADY-RECORDED depth, capped at 2. An operand
+                // whose depth was never recorded stays unrecorded - `&` cannot invent a claim.
+                if (namedVar.TypeAndValue.PointerDepth >= 1)
+                    namedVar.TypeAndValue.PointerDepth =
+                        namedVar.TypeAndValue.PointerDepth >= 2 ? 2 : namedVar.TypeAndValue.PointerDepth + 1;
                 if (!namedVar.TypeAndValue.Pointer)
                     namedVar.TypeAndValue.Pointer = true;
                 // The address of an element borrows, it does not own - clear IsOwning so taking
@@ -5455,6 +5460,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // Strip one pointer level from the CFlat type to get the pointee type.
                 // For char** (ElemPointer=true): deref gives char* (keep Pointer, clear ElemPointer).
                 // For char* (ElemPointer=false): deref gives char (clear Pointer).
+                // Depth: `*` removes one level from an already-recorded depth; an unrecorded
+                // operand stays unrecorded.
+                if (namedVar.TypeAndValue.PointerDepth >= 1)
+                    namedVar.TypeAndValue.PointerDepth--;
                 if (namedVar.TypeAndValue.ElemPointer)
                     namedVar.TypeAndValue.ElemPointer = false;
                 else

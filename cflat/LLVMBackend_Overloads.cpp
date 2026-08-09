@@ -52,12 +52,13 @@
 
 // ---- Definitions moved out of LLVMBackend.h (Overloads) ----
 
-// The '*' count a diagnostic prints for a value type. ElemPointer is the only depth a
-// TypeAndValue records, and array/view/simd/fat shapes spell it about their ELEMENT.
+// The '*' count a diagnostic prints for a value type. Depth caps at 2, and array/view/simd/fat
+// shapes spell it about their ELEMENT rather than themselves.
 static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
 {
     if (!tv.Pointer) return "";
-    return (tv.ElemPointer && tv.DepthIsAboutThisValue()) ? "**" : "*";
+    bool deep = tv.ElemPointer || tv.PointerDepth >= 2;
+    return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
@@ -895,19 +896,34 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto pi = c.Parameters.begin();
                 for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
                 {
-                    if (!arguments[i].TypeAndValue.IsProvenDoublePointer()
-                        || !pi->IsProvenSinglePointer()) continue;
+                    bool tooDeep = arguments[i].TypeAndValue.IsProvenDoublePointer()
+                                && pi->IsProvenSinglePointer();
+                    bool tooShallow = arguments[i].TypeAndValue.IsProvenSinglePointerDepth()
+                                   && pi->IsProvenDoublePointer();
+                    if (!tooDeep && !tooShallow) continue;
                     // A mangled instantiation name is not writable source, so the advice clause is
                     // dropped rather than naming a type the user cannot spell.
                     bool writable = true;
                     std::string shown = DisplayNameOfMangledType(pi->TypeName, &writable);
-                    std::string advice = writable
-                        ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
-                    msg += std::format("  [{}] parameter {} '{}' has type '{}*' and the argument has "
-                        "type '{}**' - there is no implicit dereference. Dereference it with '*' at "
-                        "the call site{}.\n",
-                        c.UniqueName, i, pi->VariableName, shown,
-                        DisplayNameOfMangledType(arguments[i].TypeAndValue.TypeName), advice);
+                    std::string argShown = DisplayNameOfMangledType(arguments[i].TypeAndValue.TypeName);
+                    if (tooDeep)
+                    {
+                        std::string advice = writable
+                            ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
+                        msg += std::format("  [{}] parameter {} '{}' has type '{}*' and the argument has "
+                            "type '{}**' - there is no implicit dereference. Dereference it with '*' at "
+                            "the call site{}.\n",
+                            c.UniqueName, i, pi->VariableName, shown, argShown, advice);
+                    }
+                    else
+                    {
+                        std::string advice = writable
+                            ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
+                        msg += std::format("  [{}] parameter {} '{}' has type '{}**' and the argument has "
+                            "type '{}*' - there is no implicit address-of. Take its address with '&' at "
+                            "the call site{}.\n",
+                            c.UniqueName, i, pi->VariableName, shown, argShown, advice);
+                    }
                     break;
                 }
             }

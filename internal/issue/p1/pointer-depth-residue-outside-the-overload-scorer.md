@@ -11,25 +11,17 @@ the only correct answers where they are named.
 
 Repro corpus: the `pd_r*` files in the fix branch's `scratch/pd/`, reproduced inline here.
 
-## 1. Argument-side depth is NOT RECORDED for an inline `&`
+## 1. Argument-side depth is NOT RECORDED for an inline `&` - CLOSED
 
-`ElemPointer` is set on a declared `T**` local, a `T**` field, a `T**` return - but not on the
-value an inline address-of produces. Measured at the `IsTypeMatch` call with a temporary probe:
-`arg{Circle p=1 ep=0}` for both spellings below, versus `ep=1` for `Circle** pp = &a; byPtr(pp)`.
+Closed by the `TypeAndValue::PointerDepth` change that landed the mirror gate. `&` now adds one
+level to an ALREADY-RECORDED depth, so `&a` over a declared `Circle*` is a proven `Circle**`.
+Both cells were re-measured on the post-fix binary and now hard-error with the depth note
+(`pd_r01` / `pd_r05`, previously rc 176 each); both are frozen as `expect_error` legs in
+`Test/errors/err_double_pointer_arg_single_pointer_param.cb`. Selection changed with them:
+`pdPick(&a)` over `{f(T*), f(T**)}` now picks the `T**` overload (`pd_addrof_ptr_arg_picks_ptrptr_overload`,
+2 where it used to read garbage through the `T*` body).
 
-```cflat
-class Circle { int r = 0; };
-int byPtr(Circle* c) { return 2000 + c->r; }
-extern int main() { Circle* a = new Circle(); a->r = 3; return byPtr(&a); }   // pd_r01, rc 176
-```
-
-```cflat
-extern int main() { Circle*[2] arr = default; arr[0] = new Circle(); arr[0]->r = 3;
-                    return byPtr(&arr[0]); }                                  // pd_r05, rc 176
-```
-
-Fix direction: record depth on the address-of result (`&` of a value already `Pointer`), which is
-the missing INPUT - the guard itself already exists and is one-sided.
+Everything below was re-measured on that same binary and is STILL OPEN.
 
 ## 2. A PRIMITIVE pointer argument never reaches `IsTypeMatch` at all
 
@@ -38,7 +30,7 @@ A primitive pointer argument carries an EMPTY CFlat `TypeName`, so the scorer ta
 
 ```cflat
 int deref(int* p) { return 100 + *p; }
-extern int main() { int x = 3; int* p = &x; int** pp = &p; return deref(pp); } // pd_r15, rc 96
+extern int main() { int x = 3; int* p = &x; int** pp = &p; return deref(pp); } // pd_r15, garbage rc
 ```
 
 Same shape as the by-value family's `PointerArgIntoByValuePrimitiveParam`, which exists for
@@ -71,11 +63,15 @@ understated rather than wrong-signed); `T***` into `T**` is indistinguishable fr
 ```cflat
 int byPP(Circle** c) { return 2000 + (*c)->r; }
 extern int main() { Circle* a = new Circle(); Circle** pp = &a; Circle*** ppp = &pp;
-                    return byPP(ppp); }                                        // pd_r07, rc 16
+                    return byPP(ppp); }                                     // pd_r07, garbage rc
 ```
 
-Fix direction: a real `PointerDepth` int on `TypeAndValue` (one already exists on `FuncPtrParam`),
-which must join the `--init` cache round-trip in the same change.
+`TypeAndValue::PointerDepth` now exists but the model still CAPS at 2, so a `Circle*** ppp`
+declarator records `0` (NOT RECORDED) rather than a clamped 2 - a clamped value stepped down by a
+`*` would falsely prove depth 1 and reject the correct `byPP(*ppp)` (frozen as the value leg
+`pd_deref_of_triple_ptr_into_ptrptr_param`). So this hole is unchanged: over the cap the model
+claims nothing. Lifting the cap means lifting it in `Pointer`/`ElemPointer` and `GetType` too, and
+needs its own accept set - see section 6.
 
 ## 5. Generic substitution collapses depth, so the gate is blind through templates
 
@@ -109,9 +105,11 @@ using CP3 = C**;  CP3* x;
 Because of that asymmetry BOTH of the overload dump's remedies are wrong advice for a `T***`
 argument, and each was measured on the post-fix binary rather than reasoned about. "Declare the
 parameter as `T**`" (`byPP(ppp)`) compiles and exits 240. "Dereference it with `*` at the call
-site" (`byPtr(*ppp)`) also compiles, and exits 16 - the deref clears `ElemPointer`, so the still-
-`T**` value scores as a clean `T*` and NO error is re-raised. The correct answer is 2003 (rc 211)
-in both cases. The message cannot currently tell the two apart, because nothing in the type model
+site" (`byPtr(*ppp)`) also compiles - the deref clears `ElemPointer` over an unrecorded depth (the
+`T***` declarator records none), so the still-`T**` value scores as a clean `T*` and NO error is
+re-raised. (Both re-measured after `PointerDepth` landed; both unchanged in kind. Both exit codes
+are the environment-dependent garbage of section 7 and are deliberately not quoted.) The correct
+answer is 2003 (rc 211) in both cases. The message cannot currently tell the two apart, because nothing in the type model
 can. Making the plain branch reject
 3+ stars the way the alias branch already does would fix both this and the `T***`-into-`T**` hole
 in section 4, and needs its own accept set (`C***` locals compile today).
@@ -124,8 +122,9 @@ ELEMENT (`MainListener.h:3891`), which is why the landed gate excludes arrays an
 ```cflat
 int firstR(Circle* c) { return 90 + c->r; }
 extern int main() { Circle*[2] arr = default; arr[0] = new Circle(); arr[0]->r = 7;
-                    return firstR(arr); }         // pd_a27; correct 97, measured 26/154/186/218
+                    return firstR(arr); }         // pd_a27; correct 97, measured 122 here
 ```
 
-The four values are the SAME program on ONE binary with the executable written to four different
-paths - the standing warning about environment-dependent garbage, demonstrated.
+The measured value is garbage that tracks the process image, not the build: the same program on
+ONE binary written to four different paths produced 26/154/186/218 when this was first filed, and
+122 when re-measured. The standing warning about environment-dependent exit codes, demonstrated.

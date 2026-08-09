@@ -547,8 +547,15 @@ public:
         // The Pointer/ElemPointer bits came (partly) from a GENERIC TYPE-ARGUMENT string, which
         // PeelTypeArgSuffix collapses to one bool - `Box<C*>` and `Box<C**>` both record Pointer=1,
         // ElemPointer=0. So the recorded depth is a LOWER BOUND here, not the depth. Read only by
-        // IsProvenSinglePointer / IsProvenDoublePointer, which decline to claim proof when it is set.
+        // the IsProven* depth predicates, which decline to claim proof when it is set.
         bool PointerDepthUnknown = false;
+        // The '*' count POSITIVELY recorded for this value; 0 means NOT RECORDED, never "depth 0"
+        // (same convention as FuncPtrParam::PointerDepth). The model caps at 2, and a declarator
+        // OVER the cap records 0 - a clamped 2 stepped down by '*' would falsely prove depth 1.
+        // Written at five producers only: both ParseDeclarationSpecifiers declarator branches, and
+        // the '&' (+1), '*' (-1) and pointer-subscript (-1) steps over an ALREADY-RECORDED depth.
+        // A new producer that CHANGES depth must step it too, or it falsely proves the old one.
+        int PointerDepth = 0;
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         // True when this type IS one bare interface fat value ({vtable,data} by value). DERIVED,
@@ -709,12 +716,12 @@ public:
          * land in the value slot and reach the LLVM verifier. `T` into a `T*` parameter is the
          * working implicit address-of (the caller passes the alloca) and stays a match.
          *
-         * The DEPTH gate below is one-sided for the same reason and one more: ElemPointer is
-         * recorded only by source parsing and C interop, so its absence is "not recorded", never
-         * "depth 1". Only a PROVEN `T**` argument at a PROVEN `T*` parameter is refused; the
-         * reverse direction (`T*` / a `T*[N]` slot into a `T**` parameter) is a working spelling
-         * and must keep binding. Arrays, views, simd, interfaces and function pointers spell
-         * ElemPointer about their ELEMENT rather than their own depth, so they are excluded.
+         * The two DEPTH gates below refuse only what BOTH sides PROVE. `ElemPointer == false` is
+         * "not recorded", never "depth 1", so the reverse direction reads the positive
+         * `PointerDepth` instead - which a `T*[N]` slot, an `&x` over an unrecorded operand and a
+         * generic substitution all decline to claim, keeping those working spellings bound.
+         * Arrays, views, simd, interfaces and function pointers spell depth about their ELEMENT
+         * rather than their own value, so they are excluded from both.
          */
         bool IsTypeMatch(const TypeAndValue& other) const
         {
@@ -722,6 +729,11 @@ public:
                 return false;
 
             if (IsProvenDoublePointer() && other.IsProvenSinglePointer())
+                return false;
+
+            // The mirror: a POSITIVELY depth-1 argument does not bind a proven `T**` parameter.
+            // Both sides must be proven, so an unrecorded depth (0) still accepts.
+            if (IsProvenSinglePointerDepth() && other.IsProvenDoublePointer())
                 return false;
 
             if (TypeName == other.TypeName)
@@ -812,14 +824,27 @@ public:
         }
 
         // '*' count this VALUE carries, for copying into a signature component's PointerDepth.
-        // ElemPointer is the only depth a TypeAndValue records, so 2 is the ceiling here.
-        int ValuePointerDepth() const { return ElemPointer ? 2 : (Pointer ? 1 : 0); }
+        // The model caps at 2, so that is the ceiling here.
+        int ValuePointerDepth() const
+        {
+            return (ElemPointer || PointerDepth >= 2) ? 2 : (Pointer ? 1 : 0);
+        }
 
-        // A plain `T**` value: ElemPointer means "pointer to pointer" only when nothing else on
-        // the type claims it for an ELEMENT (array/view/simd) or a fat shape (interface/funcptr).
+        // A plain `T**` value, proven either by the ElemPointer bit or by a recorded depth >= 2
+        // (which is how an inline `&x` over a `T*` proves itself). Both readings hold only when
+        // nothing else on the type claims depth for an ELEMENT (array/view/simd) or a fat shape.
         bool IsProvenDoublePointer() const
         {
-            return Pointer && ElemPointer && !PointerDepthUnknown && DepthIsAboutThisValue();
+            return Pointer && (ElemPointer || PointerDepth >= 2)
+                && !PointerDepthUnknown && DepthIsAboutThisValue();
+        }
+
+        // A POSITIVELY recorded depth-1 pointer. Unlike !ElemPointer (which is "not recorded"),
+        // PointerDepth == 1 is a claim, so this is the proof the reverse-direction gate needs.
+        bool IsProvenSinglePointerDepth() const
+        {
+            return Pointer && PointerDepth == 1 && !ElemPointer && !PointerDepthUnknown
+                && TypeName != "void" && DepthIsAboutThisValue();
         }
 
         // A plain `T*` value. `void*` is excluded because every pointer converts to it: without

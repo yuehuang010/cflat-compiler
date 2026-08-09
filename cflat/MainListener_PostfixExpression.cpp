@@ -1516,6 +1516,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                             // An indexed element is a single slot, never a whole-allocation view -
                             // drop the array-view flag so `&a[i]` cannot be bound back into a `T[]`.
                             elementTypeAndValue.IsArrayView = false;
+                            // Indexing strips one level, so a recorded depth must step down with it -
+                            // left alone, a `T**` buffer's element falsely proves depth 2.
+                            if (elementTypeAndValue.PointerDepth >= 1)
+                                elementTypeAndValue.PointerDepth--;
                             if (elementTypeAndValue.ElemPointer)
                             {
                                 // Double-pointer (e.g. T* where T=Employee*): element type is T* (Employee*).
@@ -3277,6 +3281,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // Propagate the pointer SHAPE flags: without them a `T**` or a
                                     // `T[]` looks like a thin `T*` and gets boxed into an interface param.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
+                                    // The POSITIVE depth is the argument-side proof the depth gates
+                                    // read; dropped here every argument looks depth-unrecorded.
+                                    argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
                                     argVar.TypeAndValue.IsArrayView = argNV.TypeAndValue.IsArrayView;
                                     // Same for a FIXED `T[N]`: LoadNamedVariable already decayed argValue
                                     // to the element-0 address, so ConstArraySize is the only surviving
@@ -3828,6 +3835,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // Same for `T**`: without it the argument looks like a plain `T*` and a
                                     // pointer-to-pointer would be boxed into an interface parameter.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
+                                    // The POSITIVE depth is the argument-side proof the depth gates
+                                    // read; dropped here every argument looks depth-unrecorded.
+                                    argVar.TypeAndValue.PointerDepth = argNV.TypeAndValue.PointerDepth;
                                     // Same for a FIXED `T[N]`: argValue is already the decayed element-0
                                     // address (LoadNamedVariable), so ConstArraySize is the only surviving
                                     // signal that this was an array - needed by the funcptr shape gate

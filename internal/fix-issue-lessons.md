@@ -1507,3 +1507,26 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   resolved; leg `rvbAliasClosure` in `err_return_void_from_value.cb`, mutation-proven. Note the
   accept side (`void f() { return g(); }` through the alias) passes either way - it works
   because `right` is already null - so only the REJECT leg discriminates that line.
+- **The 2026-08-09 pointer-depth mirror**: `TypeAndValue::PointerDepth` (an int, `0` = NOT
+  RECORDED, model caps at 2) is the POSITIVE half of the proof the boolean `ElemPointer` could never
+  give, and it is what lets the mirror gate refuse a `T*` argument at a `T**` parameter.
+  **Do NOT retry the mirror on `!ElemPointer`** - a `T*[N]` slot, an inline `&a` and a generic
+  substitution all carry byte-identical `arg{Circle p=1 ep=0}` to the broken call, measured. It is
+  written at exactly five producers - both `ParseDeclarationSpecifiers` declarator branches, `&`
+  (+1 over an ALREADY-RECORDED depth, never inventing one), `*` (-1), and the pointer-buffer
+  subscript (-1) - and rides both `--init` round-trips as `"pd"`. **Every DEPTH-REDUCING producer
+  must be found before the gate ships**: the subscript one was missed on the first cut and
+  false-rejected `byPtr(buf[0])` over a `T** buf`, a program master runs correctly; the suite was
+  green (630/0) with that false rejection in it, and only a hand-written probe caught it. Recording
+  depth on `&` also changed OVERLOAD SELECTION, not just post-selection validation: `pdPick(&a)`
+  over `{f(T*), f(T**)}` moved from the `T*` body (garbage) to the `T**` one, which closed section
+  1 of the residue issue. `IsProvenSinglePointer` (the landed gate's PARAMETER side) was
+  deliberately NOT switched to read the new field: params synthesized by C interop and WinRT never
+  set it, so requiring it there would silently retire existing rejections.
+  **A CLAMPED depth is a FALSE claim, so over the cap record `0`, not the cap**: the first cut
+  wrote `min(stars, 2)`, which made a `T*** ppp` declarator claim 2; the `*` producer then stepped
+  it down to a positive 1 and HARD-REJECTED `byPP(*ppp)`, a program master runs correctly. The
+  whole suite AND the fix's own 30-file corpus were green with that false rejection in them - the
+  same shape as the missed subscript producer, caught only by a reviewer probe. Any approximation
+  that feeds a POSITIVE proof must degrade to "not recorded", never to a nearby number (frozen as
+  the value leg `pd_deref_of_triple_ptr_into_ptrptr_param`).

@@ -257,6 +257,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     int totalPtr = aliasPtrDepth + declStars;
                     if (totalPtr >= 1) declType.Pointer = true;
                     if (totalPtr >= 2) declType.ElemPointer = true;
+                    // A POSITIVE depth claim (0 = none written here). Over the 2-level cap the depth
+                    // is LOST, so claim nothing: a clamped 2 stepped down by '*' would falsely prove 1.
+                    declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
                 }
                 if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
