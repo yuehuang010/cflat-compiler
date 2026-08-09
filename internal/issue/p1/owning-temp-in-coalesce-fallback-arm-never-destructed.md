@@ -58,8 +58,10 @@ comment at that function points back here.
 Not the same issue, but the same "an owning temp in a block that never gets flushed is never
 destructed" shape, so a fix here should be probed against both:
 
-- [[lambda-body-owning-temp-never-destructed]] - a lambda BODY runs no statement-boundary
-  owned-temp machinery at all.
+- `lambda-body-owning-temp-never-destructed` (fixed and deleted by `fix/lamtemp`, 2026-08-09) -
+  an EXPRESSION-BODY lambda emitted its `ret` directly and so ran neither the return path's
+  owned-temp flush nor its escape gates; a block-body lambda always did. Fixed by routing
+  `=> expr` through the shared `MainListener::EmitReturnExpression`.
 - `coalesce-assign-skips-store-bookkeeping` (fixed and deleted by `fix/coalesce-tail`) -
   `raw ??= makeBox().t` measured `dtors=0` for the same reason plus its own skipped store tail;
   that spelling is a hard error now, so this `??` fallback-arm leak is the surviving half.

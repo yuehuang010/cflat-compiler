@@ -423,6 +423,622 @@ void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, cons
             "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
     }
 
+/*
+ * The whole `return <expr>;` lowering: ownership classification, the escape / dangle
+ * gates, owned-temp flushing and the interface upcast. An expression-body lambda
+ * (`=> expr`) is `=> { return expr; }`, so it calls this instead of a bare
+ * CreateReturnCall - otherwise none of the above runs inside its body.
+ */
+void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
+                                        CFlatParser::AssignmentExpressionContext* assignExpr,
+                                        const std::string& retText) {
+        auto* compiler = Compiler(errCtx);
+        // Evaluate via NV path so we can inspect bond info alongside ownership.
+        LLVMBackend::NamedVariable returnNV;
+        // Thread a function<> return type into a returned lambda literal so the
+        // lambda's invoker is typed from the function's declared return type
+        // (`return () => {...};`) instead of defaulting to void. Mirrors the
+        // declaration/argument lambda-context threading.
+        // Capture the function-pointer return type BEFORE parsing the return
+        // expression - lowering a returned lambda calls createFunctionBlock, which
+        // overwrites currentFunctionReturnTV with the lambda's own return type.
+        LLVMBackend::TypeAndValue returnFnPtrTV;
+        if (compiler->currentFunctionReturnTV.IsFunctionPointer)
+        {
+            lambdaExpectedType = compiler->currentFunctionReturnTV;
+            returnFnPtrTV = compiler->currentFunctionReturnTV;
+        }
+        // Inbound alloc-align channel for `return new T[n];`: a function whose return
+        // type declares `alignas(_, N)` hands the allocation alignment down to a DIRECT
+        // `new` in the return, exactly as a decl-init does. Indirect return shapes are
+        // rejected by the check below rather than silently under-aligned.
+        if (assignExpr != nullptr
+            && compiler->currentFunctionReturnTV.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+            && AsDirectNew(assignExpr) != nullptr)
+            compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
+        if (assignExpr != nullptr)
+            returnNV = ParseAssignmentExpressionNamed(assignExpr);
+        compiler->pendingInitAllocAlign = 0;  // one-shot
+        lambdaExpectedType = {};
+
+        // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
+        // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
+        // whose owning value-struct type matches the function's return type; then it is
+        // treated exactly as `return move <local>;` - snapshot the value, zero the source
+        // so its scope-exit destructor is a no-op, and hand ownership to the caller. A
+        // borrowing local (alias / borrowed field / borrowed by-value param) is excluded so
+        // the alias path still wins and no second owner is created (which would double-free).
+        if (assignExpr != nullptr)
+        {
+            std::string retName = retText;
+            LLVMBackend::NamedVariable localNV = compiler->GetScopedLocalOrArgument(retName);
+            bool movableLocalReturn =
+                !retName.empty()
+                && !localNV.TypeAndValue.TypeName.empty()
+                && !localNV.TypeAndValue.Pointer && !localNV.TypeAndValue.ElemPointer
+                && localNV.Storage != nullptr
+                && compiler->IsDataStructure(localNV.TypeAndValue.TypeName)
+                && compiler->IsOwningValueType(localNV.TypeAndValue.TypeName)
+                && localNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
+                && !compiler->currentFunctionReturnTV.Pointer
+                && !localNV.IsAliasBorrow && !localNV.BorrowsOwnedString
+                && localNV.BorrowedUniqueField.empty()
+                && !compiler->IsBorrowStringParamStorage(localNV.Storage)
+                && !IsBorrowedStructParameter(compiler, retName);
+            if (movableLocalReturn)
+            {
+                llvm::Value* snapshot = LoadNamedVariable(localNV);
+                if (llvm::Type* st = compiler->GetType(localNV.TypeAndValue))
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(st), localNV.Storage);
+                compiler->lastOwningResult = true;
+                returnNV.Primary = snapshot;
+                returnNV.Storage = nullptr;
+                returnNV.CallerName.clear();
+                returnNV.IdentifierLine = 0;
+            }
+        }
+
+        // Returning a raw `T*` as a `T[]` return type would forge the noalias
+        // contract (a view must span a whole allocation). Decay T[]->T* is fine.
+        if (compiler->currentFunctionReturnIsArrayView
+            && returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsArrayView)
+            LogErrorContext(errCtx, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
+                "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
+                "the 'T[] -> T*' decay is one-way");
+        // Return leg of the code-value store gate: `return w;` from a `Rec*`
+        // function handed the caller a code address to write through.
+        if (compiler->CodeValueIntoDataDestination(
+                returnNV, compiler->currentFunctionReturnTV))
+        {
+            const auto& retTV = compiler->currentFunctionReturnTV;
+            LogErrorContext(errCtx, compiler->DescribeCodeValueIntoData(
+                CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
+        }
+        auto right = LoadNamedVariable(returnNV);
+        // Coerce the returned value to the function-pointer return type (thin vs
+        // fat): a named function, a thin function<> value, or a fat closure value.
+        if (right && returnFnPtrTV.IsFunctionPointer)
+            right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV, returnNV);
+        ProcessPlusPlus();
+
+        /*
+         * A '?:' join of concrete implementer pointers carries no NamedVariable
+         * TypeName, so the interface-return upcast further down cannot see a class
+         * to box and a bare `ptr` would reach the `ret`. Box each arm in its own
+         * branch HERE - before the ownership and dangle checks - so every one of
+         * them inspects the fat pointer, exactly as they already do for the
+         * `return c ? (x as I) : (y as I);` spelling. The helper bails to nullptr
+         * for anything that is not a pointer '?:' targeting this interface, so the
+         * normal path is untouched; it only reports an armFailure for a join that
+         * genuinely targets the interface and cannot be boxed, which today reaches
+         * the verifier as a raw type mismatch with no source location.
+         */
+        if (auto* fatTy = compiler->GetFatPtrType();
+            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType() == fatTy
+            && right->getType()->isPointerTy()
+            && !returnNV.TypeAndValue.IsInterface
+            && ReturnUpcastStructName(returnNV).empty())
+        {
+            std::string ternaryArmFailure;
+            std::string joinSpelling = "?:";
+            bool ternaryArmNotOwned = false;
+            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+            if (auto* fat = UpcastPointerJoinToInterface(
+                    right, ifaceName, &ternaryArmFailure, &joinSpelling,
+                    compiler->currentFunctionReturnsOwned, &ternaryArmNotOwned))
+                right = fat;
+            else if (ternaryArmNotOwned)
+                LogErrorContext(errCtx, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+            else if (!ternaryArmFailure.empty())
+                LogErrorContext(errCtx, std::format(
+                    "cannot convert '{}' arm to interface '{}': {}",
+                    joinSpelling, ifaceName, ternaryArmFailure));
+        }
+
+        // String ownership transfer (runtime-bit model). Classify the returned
+        // value once, before the owned-return flags below are cleared.
+        //  - A whole string LOCAL read (its NamedVariable.Storage is an alloca, not
+        //    a field/element GEP) that does not itself borrow an owned field is
+        //    MOVED to the caller by CreateReturnCall (which zeroes the source), so
+        //    its OWNED bit must stay set.
+        //  - A genuinely-owned temp / new / owned call result keeps its bit too.
+        //  - Anything else returned by a plain (non-`move`) string function is a
+        //    BORROW of a location someone else owns (a field/element read such as
+        //    list.get's `return _data[i]`, or a local that borrows an owned field).
+        //    Clear the OWNED bit so the caller's always-run string destructor does
+        //    not free a buffer the real owner still holds.
+        bool returnExprOwned = compiler->IsOwningValue(right)
+            || compiler->lastCallReturnsOwned
+            || compiler->lastOwningResult
+            || returnNV.IsOwningString;
+        bool returnIsWholeLocal = returnNV.FieldName.empty()
+            && returnNV.Storage != nullptr
+            && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+            && !returnNV.BorrowsOwnedString;
+        // A direct call result carries an authoritative runtime OWNED bit: the callee
+        // already cleared it for a borrow return (list.get's `return _data[i]`) or left
+        // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
+        // a buffer the caller must free - the leak in `return makeOwned();`. Genuine
+        // borrows are loads from storage (field/element GEP), never a CallInst.
+        bool returnIsCallResult = right != nullptr && llvm::isa<llvm::CallInst>(right);
+        // A borrow string PARAMETER (`string echo(string s){return s;}`) has an
+        // alloca Storage so it looks like a movable whole-local, but the frame does
+        // not own its buffer - returning it must clear the OWNED bit so the caller
+        // gets a BORROW, not a second owner of the caller's buffer (double-free).
+        bool returnIsBorrowStringParam =
+            compiler->IsBorrowStringParamStorage(returnNV.Storage);
+        bool clearReturnedStringBorrowBit =
+            NamedVarIsString(returnNV)
+            && !compiler->currentFunctionReturnsOwned
+            && !returnExprOwned
+            && (!returnIsWholeLocal || returnIsBorrowStringParam)
+            && !returnIsCallResult;
+        // Same borrow classification for a STRUCT taken from a collection the
+        // function does not own (e.g. `alias T get` returning `_data[i]`). The
+        // shallow copy handed back carries the OWNED bit of every owning string
+        // (or nested-struct) field; a copy that escapes alias compile-time tracking
+        // - notably a for-in loop variable - is destructed and would free buffers
+        // the container still owns. Clear those field bits so any such destruct is
+        // a no-op (the container keeps its single owner). A whole-local move-out or
+        // a `move`-returning function keeps its bits so ownership transfers.
+        bool clearReturnedStructBorrowBits =
+            right != nullptr && right->getType()->isStructTy()
+            && !NamedVarIsString(returnNV)
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+            && !compiler->currentFunctionReturnsOwned
+            && !returnExprOwned
+            && !returnIsWholeLocal
+            && !returnIsCallResult;
+
+        if (compiler->currentFunctionReturnsOwned && right != nullptr
+            && !llvm::isa<llvm::Constant>(right)
+            && right->getType()->isPointerTy())
+        {
+            bool returnIsOwned = compiler->IsOwningValue(right)
+                || compiler->lastCallReturnsOwned
+                || compiler->lastOwningResult;
+            // A `move` of a BORROW sets lastOwningResult like any real transfer, so
+            // the test above passes it; the ledger is the surviving provenance.
+            std::string returnedBorrowOrigin;
+            if (compiler->IsMovedBorrowedPtrValue(right, &returnedBorrowOrigin))
+            {
+                // `move <origin>` is the remedy only when the value IS the parameter
+                // (possibly copied). Through a FIELD it names a different object.
+                std::string remedy = compiler->IsMovedBorrowedThroughField(right)
+                    ? std::format("Move the FIELD itself once '{}' is owned here, or "
+                                  "drop 'move' from the return type.",
+                                  returnedBorrowOrigin)
+                    : std::format("Declare the source parameter 'move {}' to take "
+                                  "ownership, or drop 'move' from the return type.",
+                                  returnedBorrowOrigin);
+                LogErrorContext(errCtx, std::format(
+                    "function declares a 'move' return type, but the returned expression "
+                    "moves a value that only borrows through parameter '{}' - the move "
+                    "nulls this frame's copy while the caller still owns the pointee, so "
+                    "the caller would free it twice. {}",
+                    returnedBorrowOrigin, remedy));
+            }
+            if (!returnIsOwned)
+                LogErrorContext(errCtx, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+        }
+
+        // Same ownership rule as above, widened to BY-VALUE STRUCT returns. A
+        // borrowed by-value struct parameter is not owned, so handing it back as a
+        // 'move' result makes the caller a second owner of the same unique pointee.
+        // A 'move S' struct-VALUE return is deliberately not `currentFunctionReturnsOwned`
+        // (see the NOTE on ComputeReturnsOwned), so key off the declared return type.
+        if (compiler->currentFunctionReturnTV.IsMove
+            && !compiler->currentFunctionReturnTV.Pointer
+            && right != nullptr
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+            && IsBorrowedStructParameter(compiler, returnNV.CallerName))
+        {
+            LogErrorContext(errCtx, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
+        }
+
+        // Plain 'return h' of a 'move' owning-struct PARAMETER copies its owning bits
+        // into the caller's return slot without releasing the parameter, so both the
+        // returned value and the expiring parameter free the same storage (double-free).
+        // An explicit 'return move h' detaches the source (returnExprOwned, empty
+        // CallerName), so it is not flagged. An owned LOCAL returned plain transfers
+        // correctly and is not a parameter, so it is excluded too.
+        if (compiler->currentFunctionReturnTV.IsMove
+            && !compiler->currentFunctionReturnTV.Pointer
+            && right != nullptr
+            && !returnExprOwned
+            && IsMoveOwningStructParameter(compiler, returnNV.CallerName))
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return 'move' parameter '{}' by a plain 'return' - it copies the "
+                "parameter's owning fields without releasing it, so both the returned value "
+                "and the expiring parameter free the same storage (double-free). Write "
+                "'return move {}' to transfer ownership to the caller.",
+                returnNV.CallerName, returnNV.CallerName));
+        }
+
+        // `return new T();` where the declared return type is the VALUE struct 'T'.
+        // The operand is a 'T*' against a struct return type - LLVM rejects the
+        // module with no source location, so diagnose it here instead.
+        if (right != nullptr && returnNV.TypeAndValue.Pointer
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()->isStructTy()
+            && !returnNV.TypeAndValue.TypeName.empty()
+            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName)
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return pointer '{}*' from a function declared to return value type '{}' - "
+                "declare the return type '{}*' (or 'move {}*' to transfer ownership to the caller), "
+                "or dereference the pointer to return a copy.",
+                returnNV.TypeAndValue.TypeName, compiler->currentFunctionReturnTypeName,
+                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+        }
+
+        if (ReturnLeaksOwnershipIntoInterface(right, compiler))
+        {
+            LogErrorContext(errCtx, std::format(
+                "returning a heap object boxed into interface '{}' from a non-'move' function "
+                "transfers ownership the caller cannot see - it will leak. Declare the return "
+                "type 'move {}' so the caller knows to 'delete' it.",
+                compiler->currentFunctionReturnTypeName,
+                compiler->currentFunctionReturnTypeName));
+        }
+
+        // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
+        // caller no signal that it owns the result, so a forgotten 'delete' is a silent
+        // leak. Require the intent to be explicit: 'move T*' transfers ownership (the
+        // caller adopts with `unique T* x = f();`), 'alias T*' opts out of ownership
+        // tracking and the caller frees by hand. Scoped to the DIRECT `return new T();`
+        // form - indirect provenance (`T* h = new T(); return h;`) is not tracked here.
+        if (assignExpr != nullptr && AsDirectNew(assignExpr) != nullptr
+            && compiler->currentFunctionReturnTV.Pointer
+            && !compiler->currentFunctionReturnTV.IsMove
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->currentFunctionReturnsOwned
+            && !compiler->currentFunctionReturnIsArrayView
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()->isPointerTy())
+        {
+            LogErrorContext(errCtx, std::format(
+                "returning a fresh allocation from a function whose return type is the bare "
+                "pointer '{}*' gives the caller no signal that it owns the result - a forgotten "
+                "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "
+                "ownership to the caller (which adopts it with 'unique {}* x = f();'), or "
+                "'alias {}*' to opt out of ownership tracking and manage the lifetime by hand.",
+                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName,
+                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+        }
+
+        // The mirror image: an INTERFACE VALUE returned from a function whose declared
+        // return type is not that interface (e.g. a `View*` factory whose body now
+        // returns an `IView`). The ret operand would be a fat pointer against a
+        // pointer return type - LLVM module verification fails with no source location.
+        if (right != nullptr && compiler->GetFatPtrType() != nullptr
+            && right->getType() == compiler->GetFatPtrType()
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType() != compiler->GetFatPtrType())
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return interface value '{}' from a function declared to return '{}' - "
+                "declare the return type as the interface (e.g. 'move {}')",
+                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName,
+                compiler->currentFunctionReturnTypeName,
+                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
+        }
+
+        // Bond return check: bonded value may only be returned if all its sources
+        // are 'bond' parameters of the current function (not locals).
+        auto checkBondSources = [&](const std::vector<std::string>& sources) {
+            for (const auto& source : sources)
+            {
+                auto funcArg = compiler->GetFunctionArgument(source);
+                if (funcArg.GetValue() == nullptr || !funcArg.TypeAndValue.IsBond)
+                    LogErrorContext(errCtx, std::format("returning bonded value whose source '{}' is not a 'bond' parameter - bonded values cannot escape their source's scope", source));
+            }
+        };
+        if (returnNV.IsBonded)
+            checkBondSources(returnNV.BondedSources);
+        if (compiler->lastCallIsBonded)
+            checkBondSources(compiler->lastCallBondedSources);
+
+        // Returning an owning field of a by-value temp (`return makeToken().text;`).
+        if (returnNV.FromOwningTempField
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
+        {
+            // A `move`-temp OWNS the field: move it out as the return value (Phase B).
+            // Keep the owned bit (ownership transfers to the caller) and zero the source
+            // field so the temp's full-dtor (FlushOwnedStructTemps below) skips it. Works
+            // for a string field (clears its owned bit) or an owning struct field (the
+            // aggregate-zero recursively clears every owning subfield's owned bit). An
+            // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
+            // POINTER fields are excluded here as at the two sibling implied-move sites:
+            // the aggregate-zero store below emits IR that crashes codegen on one.
+            if (returnNV.MovableTempField && right != nullptr
+                && !returnNV.TypeAndValue.Pointer
+                && right->getType() == returnNV.BaseType)
+            {
+                clearReturnedStringBorrowBit = false;
+                // Same exclusion for a moved-out owning STRUCT field (e.g.
+                // `return makeOuterTok(n).inner;`): the buffer's ownership transfers
+                // to the caller, so its owning-field bits must stay set, not be
+                // cleared as a borrow - clearing would orphan the buffer (leak).
+                clearReturnedStructBorrowBits = false;
+                auto* srcGep = compiler->builder->CreateStructGEP(
+                    returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
+                    returnNV.MoveTempFieldIndex, "movedfld");
+                compiler->builder->CreateStore(
+                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
+            }
+            else
+            {
+                LogErrorContext(errCtx, std::format(
+                    "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
+                    "would be freed. Use '.copy()' for an independent copy.",
+                    returnNV.OwningStructName, returnNV.FieldName));
+            }
+        }
+
+        // Same escape with a dtor-LESS pointee, which the type-name gate above
+        // cannot see. After it, so a dtor-bearing pointee keeps its wording.
+        if (IsOwningTempUniqueFieldEscape(returnNV))
+            RejectOwningTempUniqueFieldEscape(returnNV, "the return value", errCtx);
+
+        // Returning a whole `alias` (borrow) value from a non-`alias` function hands
+        // the caller a value whose always-run destructor frees a buffer the real owner
+        // still holds. Allowed only when the function itself is declared `alias` (the
+        // borrow passes through). `.copy()` makes an independent owned value. `string`
+        // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
+        // already clears on a borrow return (the string-redesign borrow path), so the
+        // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
+        // A borrow can only dangle when the caller could destruct it: a pointer (the
+        // pointee is freed) or an owning value type (its destructor frees buffers the
+        // real owner still holds). An alias of a primitive or a POD struct hands back a
+        // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
+        if (!compiler->currentFunctionReturnTV.IsAlias
+            && SourceIsDanglingAliasBorrow(compiler, returnNV))
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
+                "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
+                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
+        }
+
+        // Same hazard through a suppressed (mixed) '?:' join of an owning-value
+        // struct: the caller adopts and destroys bits a live borrow still owns.
+        // An `alias` function passes the borrow through, exactly as above.
+        if (!compiler->currentFunctionReturnTV.IsAlias)
+            RejectNonOwningStructJoinStore(right, compiler->currentFunctionReturnTypeName,
+                                           "a return slot", errCtx);
+
+        // The allocation alignment of an over-aligned `new T[n]` is not in the element
+        // type, so the caller recovers it only when the RETURN TYPE declares the same
+        // `alignas(_, N)` clause (threaded to the caller via lastCallReturnsAllocAlign).
+        // A matching clause is allowed; a missing/mismatched one would free the block
+        // wrong. (Alignment carried by the TYPE returns freely, untagged, as in C++.)
+        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
+            && compiler->currentFunctionReturnTV.AllocAlignValue != returnNV.AllocAlignment)
+        {
+            if (compiler->currentFunctionReturnTV.AllocAlignValue == 0)
+                LogErrorContext(errCtx, std::format(
+                    "cannot return the over-aligned buffer '{}' ('new T[n] alignas(0, {})'): that "
+                    "alignment is a property of the allocation, not of the type, so the caller cannot "
+                    "recover it from the return type and would free the block as an ordinary "
+                    "allocation. Declare the return type 'alignas(0, {})' so the block alignment is "
+                    "recorded, or over-align the ELEMENT TYPE instead.",
+                    returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
+                    returnNV.AllocAlignment, returnNV.AllocAlignment));
+            else
+                LogErrorContext(errCtx, std::format(
+                    "allocation alignment mismatch on return: the return type is declared "
+                    "'alignas(0, {})' but the returned buffer was allocated {}-aligned. The two must "
+                    "agree so the caller frees with the correct alignment.",
+                    compiler->currentFunctionReturnTV.AllocAlignValue, returnNV.AllocAlignment));
+        }
+
+        /*
+         * Returning a closure read from a FIELD / ELEMENT (`return p->get;`), the
+         * mirror of the decl-init clone. A whole-variable closure local returns by
+         * move (its storage is handed to the caller and its dtor suppressed), but a
+         * field read has no such transfer: the raw TAGGED OWNED env would be handed
+         * to the caller while the struct still owns it, and both free it. Clone so
+         * the caller gets an independent env; a `move` source already transferred.
+         */
+        if (right != nullptr
+            && right->getType()->isStructTy()
+            && returnNV.TypeAndValue.TypeName == "__closure_fat_ptr"
+            && !returnNV.TypeAndValue.IsMove
+            && returnNV.Storage != nullptr
+            && !llvm::isa<llvm::AllocaInst>(returnNV.Storage)
+            && !llvm::isa<llvm::GlobalVariable>(returnNV.Storage))
+        {
+            LLVMBackend::NamedVariable srcNV;
+            srcNV.Storage  = returnNV.Storage;
+            srcNV.BaseType = compiler->GetClosureFatPtrType();
+            srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
+            if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+                right = cloned;
+        }
+
+        // Clear flags consumed by the return check.
+        compiler->lastOwningResult = false;
+        compiler->lastAllocAlignment = 0;
+        compiler->lastCallReturnsAllocAlign = 0;
+        compiler->lastCallReturnsOwned = false;
+        compiler->lastCallIsBonded = false;
+        compiler->lastCallBondByAddress = false;
+        compiler->lastCallBondedSources.clear();
+        // The returned value (e.g. the final string of `return a + b + c;`)
+        // is moved to the caller - drop it from the temporary cleanup list
+        // so we do not free a buffer the caller now owns. Any other owned-
+        // string intermediates of the return expression must be freed before
+        // the ret terminates the block.
+        compiler->UnregisterOwnedStringTemp(right);
+        compiler->FlushOwnedStringTemps();
+        // Same for a returned closure literal (`return () => {...};`): the closure
+        // env is moved to the caller, so drop it from the temp list before flushing
+        // or we would free an env the caller now owns (double free on its teardown).
+        compiler->UnregisterOwnedClosureTemp(right);
+        compiler->FlushOwnedClosureTemps();
+        // Owning temp whose field was extracted in the return expr (returning an OWNING
+        // field is rejected upstream, so this never frees a buffer the caller now owns).
+        compiler->FlushOwnedStructTemps();
+        // Borrow returns: hand the caller a non-owning copy (see the classification
+        // above). Done after the temp-flush so the unregister logic above still sees
+        // the original loaded value; a borrow is never a registered owned temp.
+        if (clearReturnedStringBorrowBit)
+            right = compiler->ClearStringOwnedBit(right);
+        else if (clearReturnedStructBorrowBits)
+            right = compiler->ClearStructOwnedBits(right, returnNV.TypeAndValue.TypeName);
+        // Pass the returned local's storage so a by-value struct return whose
+        // full-destructor frees members (e.g. owned string fields) moves
+        // ownership to the caller instead of being destructed here. The struct
+        // return value is materialized field-wise (and a struct read leaves
+        // Storage null, keeping the value in Primary), so resolve the alloca by
+        // name - CreateReturnCall's LoadInst-based detection cannot see it.
+        llvm::Value* retStorage = returnNV.Storage;
+        if (retStorage == nullptr && !returnNV.CallerName.empty())
+            retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
+
+        // Interface return upcast. When the function's declared return type is an
+        // interface (LLVM { ptr vtable, ptr data } fat pointer), box a concrete
+        // implementer here - mirroring the assignment/parameter upcast. Without
+        // this the `ret` operand is a bare pointer and module verification fails.
+        // An operand that is ALREADY a fat pointer still enters when its data half
+        // is this frame's storage (`return sq as IShape;`): the boxing happened
+        // upstream, but the dangle it creates is this path's to reject.
+        std::string interfaceReturnStructName;
+        llvm::AllocaInst* returnedFatFrameSlot =
+            right != nullptr && right->getType() == compiler->GetFatPtrType()
+                ? FrameLocalDataOfFatValue(right) : nullptr;
+        /*
+         * DEFERRED existential check for the shape the walk above cannot see:
+         * `IShape r = loc as IShape; return r;` arrives here as a plain load of
+         * r's slot, with returnedFatFrameSlot null (the walk stops at loads by
+         * design). Record the slot now - the answer is resolved once this
+         * function's body is fully lowered and its CFG is complete
+         * (RunInterfaceReturnDangleCheck, called from the same hook as
+         * RunNullDerefDataflow), not here.
+         */
+        if (right != nullptr && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
+            && right->getType() == compiler->GetFatPtrType()
+            && returnedFatFrameSlot == nullptr)
+        {
+            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
+                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
+                        load->getPointerOperand()->stripPointerCasts()))
+                    compiler->RecordPendingReturnDangleCheck(
+                        slot, static_cast<int>(errCtx->getStart()->getLine()),
+                        static_cast<int>(errCtx->getStart()->getCharPositionInLine()),
+                        compiler->currentFunctionReturnTypeName);
+        }
+        if (auto* fatTy = compiler->GetFatPtrType();
+            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType() == fatTy
+            && ((right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
+                || returnedFatFrameSlot != nullptr))
+        {
+            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
+            std::string structName = ReturnUpcastStructName(returnNV);
+
+            if (returnedFatFrameSlot != nullptr)
+            {
+                // Already boxed against this frame's storage. The implements/shape
+                // checks below cannot apply (the operand is no longer the class),
+                // and returnNV describes the fat pointer rather than what was boxed
+                // - so name the class from the vtable the value carries, or say
+                // nothing about it when no single class answers.
+                LogInterfaceReturnDangle(errCtx, BoxedStructNameOfFatValue(right, compiler), ifaceName);
+            }
+            else if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
+            {
+                LogErrorContext(errCtx, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
+            }
+            else if (!structName.empty()
+                     && RejectPointerShapedInterfaceUpcast(
+                            errCtx, returnNV.TypeAndValue, ifaceName))
+            {
+                // Diagnosed: a pointer/view-shaped binding cannot carry the vtable.
+                // Empty body only because LogErrorContext throws; otherwise this
+                // must not fall through to CreateReturnCall with an unboxed ptr.
+            }
+            else if (!structName.empty())
+            {
+                if (returnNV.TypeAndValue.Pointer)
+                {
+                    // Concrete implementer pointer: defer the boxing to
+                    // CreateReturnCall so the owning local's scope-exit free is
+                    // suppressed (ownership moves to the caller).
+                    interfaceReturnStructName = structName;
+                }
+                else
+                {
+                    // Concrete implementer VALUE: the interface fat pointer must
+                    // carry a data pointer that outlives this call. A by-value
+                    // local lives in this frame, so boxing it would return a
+                    // dangling pointer. Reject with a clear diagnostic steering to
+                    // a heap allocation (rather than emitting UB / a verifier dump).
+                    LogInterfaceReturnDangle(errCtx, structName, ifaceName);
+                }
+            }
+            else if (llvm::isa<llvm::Constant>(right) && right->getType()->isPointerTy())
+            {
+                // `return nullptr;` for an interface return -> null fat pointer.
+                right = llvm::ConstantAggregateZero::get(fatTy);
+            }
+            else if (right->getType()->isPointerTy())
+            {
+                // Backstop against a raw pointer reaching the module verifier.
+                // Any nameless pointer expression (`c + 0`) gets here, not just a join.
+                LogErrorContext(errCtx, std::format(
+                    "cannot convert this expression to interface '{}': its concrete "
+                    "class cannot be determined; bind it to a local variable of the "
+                    "class type first", ifaceName));
+            }
+        }
+
+        // Derived-interface -> parent-interface RETURN (`IElement f(){ IButton b = ...;
+        // return b; }`). The returned value is already a fat pointer, but a derived
+        // vtable is not layout-compatible with the parent's once field-offset slots
+        // exist, so rebuild it through the typedesc chain - the same rebox the
+        // assignment and call-argument paths do. A same-interface return is a no-op.
+        // The ownership checks above are untouched: they fire on a returned concrete
+        // POINTER (the boxing case), which this is not.
+        if (auto* fatTy = compiler->GetFatPtrType();
+            right != nullptr && fatTy != nullptr && right->getType() == fatTy)
+        {
+            // A '?:' result carries no NamedVariable TypeName; fall back to the
+            // per-value ledger a ternary join stamps (PropagateFatInterfaceJoin).
+            std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
+                returnNV.TypeAndValue.IsInterface ? returnNV.TypeAndValue.TypeName : std::string());
+            right = compiler->ReboxInterfaceIfNeeded(
+                right, srcIface, compiler->currentFunctionReturnTypeName);
+        }
+
+        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
+    }
+
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
         auto* compiler = Compiler(statement);
         compiler->SetCurrentDebugLocation(statement->getStart()->getLine());
@@ -588,613 +1204,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 {
                     auto express = jump->expression();
                     if (express != nullptr)
-                    {
-                        // Evaluate via NV path so we can inspect bond info alongside ownership.
-                        auto assignExpr = express->assignmentExpression();
-                        LLVMBackend::NamedVariable returnNV;
-                        // Thread a function<> return type into a returned lambda literal so the
-                        // lambda's invoker is typed from the function's declared return type
-                        // (`return () => {...};`) instead of defaulting to void. Mirrors the
-                        // declaration/argument lambda-context threading.
-                        // Capture the function-pointer return type BEFORE parsing the return
-                        // expression - lowering a returned lambda calls createFunctionBlock, which
-                        // overwrites currentFunctionReturnTV with the lambda's own return type.
-                        LLVMBackend::TypeAndValue returnFnPtrTV;
-                        if (compiler->currentFunctionReturnTV.IsFunctionPointer)
-                        {
-                            lambdaExpectedType = compiler->currentFunctionReturnTV;
-                            returnFnPtrTV = compiler->currentFunctionReturnTV;
-                        }
-                        // Inbound alloc-align channel for `return new T[n];`: a function whose return
-                        // type declares `alignas(_, N)` hands the allocation alignment down to a DIRECT
-                        // `new` in the return, exactly as a decl-init does. Indirect return shapes are
-                        // rejected by the check below rather than silently under-aligned.
-                        if (assignExpr != nullptr
-                            && compiler->currentFunctionReturnTV.AllocAlignValue > LLVMBackend::kDefaultNewAlign
-                            && AsDirectNew(assignExpr) != nullptr)
-                            compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
-                        if (assignExpr != nullptr)
-                            returnNV = ParseAssignmentExpressionNamed(assignExpr);
-                        compiler->pendingInitAllocAlign = 0;  // one-shot
-                        lambdaExpectedType = {};
-
-                        // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
-                        // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
-                        // whose owning value-struct type matches the function's return type; then it is
-                        // treated exactly as `return move <local>;` - snapshot the value, zero the source
-                        // so its scope-exit destructor is a no-op, and hand ownership to the caller. A
-                        // borrowing local (alias / borrowed field / borrowed by-value param) is excluded so
-                        // the alias path still wins and no second owner is created (which would double-free).
-                        if (assignExpr != nullptr && express != nullptr)
-                        {
-                            std::string retName = express->getText();
-                            LLVMBackend::NamedVariable localNV = compiler->GetScopedLocalOrArgument(retName);
-                            bool movableLocalReturn =
-                                !retName.empty()
-                                && !localNV.TypeAndValue.TypeName.empty()
-                                && !localNV.TypeAndValue.Pointer && !localNV.TypeAndValue.ElemPointer
-                                && localNV.Storage != nullptr
-                                && compiler->IsDataStructure(localNV.TypeAndValue.TypeName)
-                                && compiler->IsOwningValueType(localNV.TypeAndValue.TypeName)
-                                && localNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName
-                                && !compiler->currentFunctionReturnTV.Pointer
-                                && !localNV.IsAliasBorrow && !localNV.BorrowsOwnedString
-                                && localNV.BorrowedUniqueField.empty()
-                                && !compiler->IsBorrowStringParamStorage(localNV.Storage)
-                                && !IsBorrowedStructParameter(compiler, retName);
-                            if (movableLocalReturn)
-                            {
-                                llvm::Value* snapshot = LoadNamedVariable(localNV);
-                                if (llvm::Type* st = compiler->GetType(localNV.TypeAndValue))
-                                    compiler->builder->CreateStore(
-                                        llvm::ConstantAggregateZero::get(st), localNV.Storage);
-                                compiler->lastOwningResult = true;
-                                returnNV.Primary = snapshot;
-                                returnNV.Storage = nullptr;
-                                returnNV.CallerName.clear();
-                                returnNV.IdentifierLine = 0;
-                            }
-                        }
-
-                        // Returning a raw `T*` as a `T[]` return type would forge the noalias
-                        // contract (a view must span a whole allocation). Decay T[]->T* is fine.
-                        if (compiler->currentFunctionReturnIsArrayView
-                            && returnNV.TypeAndValue.Pointer && !returnNV.TypeAndValue.IsArrayView)
-                            LogErrorContext(jump, "cannot return a raw pointer 'T*' as an array-view 'T[]' - "
-                                "a view must span a whole allocation (from 'new T[n]' or another 'T[]'); "
-                                "the 'T[] -> T*' decay is one-way");
-                        // Return leg of the code-value store gate: `return w;` from a `Rec*`
-                        // function handed the caller a code address to write through.
-                        if (compiler->CodeValueIntoDataDestination(
-                                returnNV, compiler->currentFunctionReturnTV))
-                        {
-                            const auto& retTV = compiler->currentFunctionReturnTV;
-                            LogErrorContext(jump, compiler->DescribeCodeValueIntoData(
-                                CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
-                        }
-                        auto right = LoadNamedVariable(returnNV);
-                        // Coerce the returned value to the function-pointer return type (thin vs
-                        // fat): a named function, a thin function<> value, or a fat closure value.
-                        if (right && returnFnPtrTV.IsFunctionPointer)
-                            right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV, returnNV);
-                        ProcessPlusPlus();
-
-                        /*
-                         * A '?:' join of concrete implementer pointers carries no NamedVariable
-                         * TypeName, so the interface-return upcast further down cannot see a class
-                         * to box and a bare `ptr` would reach the `ret`. Box each arm in its own
-                         * branch HERE - before the ownership and dangle checks - so every one of
-                         * them inspects the fat pointer, exactly as they already do for the
-                         * `return c ? (x as I) : (y as I);` spelling. The helper bails to nullptr
-                         * for anything that is not a pointer '?:' targeting this interface, so the
-                         * normal path is untouched; it only reports an armFailure for a join that
-                         * genuinely targets the interface and cannot be boxed, which today reaches
-                         * the verifier as a raw type mismatch with no source location.
-                         */
-                        if (auto* fatTy = compiler->GetFatPtrType();
-                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType() == fatTy
-                            && right->getType()->isPointerTy()
-                            && !returnNV.TypeAndValue.IsInterface
-                            && ReturnUpcastStructName(returnNV).empty())
-                        {
-                            std::string ternaryArmFailure;
-                            std::string joinSpelling = "?:";
-                            bool ternaryArmNotOwned = false;
-                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
-                            if (auto* fat = UpcastPointerJoinToInterface(
-                                    right, ifaceName, &ternaryArmFailure, &joinSpelling,
-                                    compiler->currentFunctionReturnsOwned, &ternaryArmNotOwned))
-                                right = fat;
-                            else if (ternaryArmNotOwned)
-                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
-                            else if (!ternaryArmFailure.empty())
-                                LogErrorContext(jump, std::format(
-                                    "cannot convert '{}' arm to interface '{}': {}",
-                                    joinSpelling, ifaceName, ternaryArmFailure));
-                        }
-
-                        // String ownership transfer (runtime-bit model). Classify the returned
-                        // value once, before the owned-return flags below are cleared.
-                        //  - A whole string LOCAL read (its NamedVariable.Storage is an alloca, not
-                        //    a field/element GEP) that does not itself borrow an owned field is
-                        //    MOVED to the caller by CreateReturnCall (which zeroes the source), so
-                        //    its OWNED bit must stay set.
-                        //  - A genuinely-owned temp / new / owned call result keeps its bit too.
-                        //  - Anything else returned by a plain (non-`move`) string function is a
-                        //    BORROW of a location someone else owns (a field/element read such as
-                        //    list.get's `return _data[i]`, or a local that borrows an owned field).
-                        //    Clear the OWNED bit so the caller's always-run string destructor does
-                        //    not free a buffer the real owner still holds.
-                        bool returnExprOwned = compiler->IsOwningValue(right)
-                            || compiler->lastCallReturnsOwned
-                            || compiler->lastOwningResult
-                            || returnNV.IsOwningString;
-                        bool returnIsWholeLocal = returnNV.FieldName.empty()
-                            && returnNV.Storage != nullptr
-                            && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
-                            && !returnNV.BorrowsOwnedString;
-                        // A direct call result carries an authoritative runtime OWNED bit: the callee
-                        // already cleared it for a borrow return (list.get's `return _data[i]`) or left
-                        // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
-                        // a buffer the caller must free - the leak in `return makeOwned();`. Genuine
-                        // borrows are loads from storage (field/element GEP), never a CallInst.
-                        bool returnIsCallResult = right != nullptr && llvm::isa<llvm::CallInst>(right);
-                        // A borrow string PARAMETER (`string echo(string s){return s;}`) has an
-                        // alloca Storage so it looks like a movable whole-local, but the frame does
-                        // not own its buffer - returning it must clear the OWNED bit so the caller
-                        // gets a BORROW, not a second owner of the caller's buffer (double-free).
-                        bool returnIsBorrowStringParam =
-                            compiler->IsBorrowStringParamStorage(returnNV.Storage);
-                        bool clearReturnedStringBorrowBit =
-                            NamedVarIsString(returnNV)
-                            && !compiler->currentFunctionReturnsOwned
-                            && !returnExprOwned
-                            && (!returnIsWholeLocal || returnIsBorrowStringParam)
-                            && !returnIsCallResult;
-                        // Same borrow classification for a STRUCT taken from a collection the
-                        // function does not own (e.g. `alias T get` returning `_data[i]`). The
-                        // shallow copy handed back carries the OWNED bit of every owning string
-                        // (or nested-struct) field; a copy that escapes alias compile-time tracking
-                        // - notably a for-in loop variable - is destructed and would free buffers
-                        // the container still owns. Clear those field bits so any such destruct is
-                        // a no-op (the container keeps its single owner). A whole-local move-out or
-                        // a `move`-returning function keeps its bits so ownership transfers.
-                        bool clearReturnedStructBorrowBits =
-                            right != nullptr && right->getType()->isStructTy()
-                            && !NamedVarIsString(returnNV)
-                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
-                            && !compiler->currentFunctionReturnsOwned
-                            && !returnExprOwned
-                            && !returnIsWholeLocal
-                            && !returnIsCallResult;
-
-                        if (compiler->currentFunctionReturnsOwned && right != nullptr
-                            && !llvm::isa<llvm::Constant>(right)
-                            && right->getType()->isPointerTy())
-                        {
-                            bool returnIsOwned = compiler->IsOwningValue(right)
-                                || compiler->lastCallReturnsOwned
-                                || compiler->lastOwningResult;
-                            // A `move` of a BORROW sets lastOwningResult like any real transfer, so
-                            // the test above passes it; the ledger is the surviving provenance.
-                            std::string returnedBorrowOrigin;
-                            if (compiler->IsMovedBorrowedPtrValue(right, &returnedBorrowOrigin))
-                            {
-                                // `move <origin>` is the remedy only when the value IS the parameter
-                                // (possibly copied). Through a FIELD it names a different object.
-                                std::string remedy = compiler->IsMovedBorrowedThroughField(right)
-                                    ? std::format("Move the FIELD itself once '{}' is owned here, or "
-                                                  "drop 'move' from the return type.",
-                                                  returnedBorrowOrigin)
-                                    : std::format("Declare the source parameter 'move {}' to take "
-                                                  "ownership, or drop 'move' from the return type.",
-                                                  returnedBorrowOrigin);
-                                LogErrorContext(jump, std::format(
-                                    "function declares a 'move' return type, but the returned expression "
-                                    "moves a value that only borrows through parameter '{}' - the move "
-                                    "nulls this frame's copy while the caller still owns the pointee, so "
-                                    "the caller would free it twice. {}",
-                                    returnedBorrowOrigin, remedy));
-                            }
-                            if (!returnIsOwned)
-                                LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
-                        }
-
-                        // Same ownership rule as above, widened to BY-VALUE STRUCT returns. A
-                        // borrowed by-value struct parameter is not owned, so handing it back as a
-                        // 'move' result makes the caller a second owner of the same unique pointee.
-                        // A 'move S' struct-VALUE return is deliberately not `currentFunctionReturnsOwned`
-                        // (see the NOTE on ComputeReturnsOwned), so key off the declared return type.
-                        if (compiler->currentFunctionReturnTV.IsMove
-                            && !compiler->currentFunctionReturnTV.Pointer
-                            && right != nullptr
-                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
-                            && IsBorrowedStructParameter(compiler, returnNV.CallerName))
-                        {
-                            LogErrorContext(jump, "function declares 'move' return type but returned expression is not owned - value must come from 'new', a move parameter, or another move-returning function");
-                        }
-
-                        // Plain 'return h' of a 'move' owning-struct PARAMETER copies its owning bits
-                        // into the caller's return slot without releasing the parameter, so both the
-                        // returned value and the expiring parameter free the same storage (double-free).
-                        // An explicit 'return move h' detaches the source (returnExprOwned, empty
-                        // CallerName), so it is not flagged. An owned LOCAL returned plain transfers
-                        // correctly and is not a parameter, so it is excluded too.
-                        if (compiler->currentFunctionReturnTV.IsMove
-                            && !compiler->currentFunctionReturnTV.Pointer
-                            && right != nullptr
-                            && !returnExprOwned
-                            && IsMoveOwningStructParameter(compiler, returnNV.CallerName))
-                        {
-                            LogErrorContext(jump, std::format(
-                                "cannot return 'move' parameter '{}' by a plain 'return' - it copies the "
-                                "parameter's owning fields without releasing it, so both the returned value "
-                                "and the expiring parameter free the same storage (double-free). Write "
-                                "'return move {}' to transfer ownership to the caller.",
-                                returnNV.CallerName, returnNV.CallerName));
-                        }
-
-                        // `return new T();` where the declared return type is the VALUE struct 'T'.
-                        // The operand is a 'T*' against a struct return type - LLVM rejects the
-                        // module with no source location, so diagnose it here instead.
-                        if (right != nullptr && returnNV.TypeAndValue.Pointer
-                            && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType()->isStructTy()
-                            && !returnNV.TypeAndValue.TypeName.empty()
-                            && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName)
-                        {
-                            LogErrorContext(jump, std::format(
-                                "cannot return pointer '{}*' from a function declared to return value type '{}' - "
-                                "declare the return type '{}*' (or 'move {}*' to transfer ownership to the caller), "
-                                "or dereference the pointer to return a copy.",
-                                returnNV.TypeAndValue.TypeName, compiler->currentFunctionReturnTypeName,
-                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
-                        }
-
-                        if (ReturnLeaksOwnershipIntoInterface(right, compiler))
-                        {
-                            LogErrorContext(jump, std::format(
-                                "returning a heap object boxed into interface '{}' from a non-'move' function "
-                                "transfers ownership the caller cannot see - it will leak. Declare the return "
-                                "type 'move {}' so the caller knows to 'delete' it.",
-                                compiler->currentFunctionReturnTypeName,
-                                compiler->currentFunctionReturnTypeName));
-                        }
-
-                        // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
-                        // caller no signal that it owns the result, so a forgotten 'delete' is a silent
-                        // leak. Require the intent to be explicit: 'move T*' transfers ownership (the
-                        // caller adopts with `unique T* x = f();`), 'alias T*' opts out of ownership
-                        // tracking and the caller frees by hand. Scoped to the DIRECT `return new T();`
-                        // form - indirect provenance (`T* h = new T(); return h;`) is not tracked here.
-                        if (assignExpr != nullptr && AsDirectNew(assignExpr) != nullptr
-                            && compiler->currentFunctionReturnTV.Pointer
-                            && !compiler->currentFunctionReturnTV.IsMove
-                            && !compiler->currentFunctionReturnTV.IsAlias
-                            && !compiler->currentFunctionReturnsOwned
-                            && !compiler->currentFunctionReturnIsArrayView
-                            && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType()->isPointerTy())
-                        {
-                            LogErrorContext(jump, std::format(
-                                "returning a fresh allocation from a function whose return type is the bare "
-                                "pointer '{}*' gives the caller no signal that it owns the result - a forgotten "
-                                "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "
-                                "ownership to the caller (which adopts it with 'unique {}* x = f();'), or "
-                                "'alias {}*' to opt out of ownership tracking and manage the lifetime by hand.",
-                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName,
-                                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
-                        }
-
-                        // The mirror image: an INTERFACE VALUE returned from a function whose declared
-                        // return type is not that interface (e.g. a `View*` factory whose body now
-                        // returns an `IView`). The ret operand would be a fat pointer against a
-                        // pointer return type - LLVM module verification fails with no source location.
-                        if (right != nullptr && compiler->GetFatPtrType() != nullptr
-                            && right->getType() == compiler->GetFatPtrType()
-                            && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType() != compiler->GetFatPtrType())
-                        {
-                            LogErrorContext(jump, std::format(
-                                "cannot return interface value '{}' from a function declared to return '{}' - "
-                                "declare the return type as the interface (e.g. 'move {}')",
-                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName,
-                                compiler->currentFunctionReturnTypeName,
-                                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
-                        }
-
-                        // Bond return check: bonded value may only be returned if all its sources
-                        // are 'bond' parameters of the current function (not locals).
-                        auto checkBondSources = [&](const std::vector<std::string>& sources) {
-                            for (const auto& source : sources)
-                            {
-                                auto funcArg = compiler->GetFunctionArgument(source);
-                                if (funcArg.GetValue() == nullptr || !funcArg.TypeAndValue.IsBond)
-                                    LogErrorContext(jump, std::format("returning bonded value whose source '{}' is not a 'bond' parameter - bonded values cannot escape their source's scope", source));
-                            }
-                        };
-                        if (returnNV.IsBonded)
-                            checkBondSources(returnNV.BondedSources);
-                        if (compiler->lastCallIsBonded)
-                            checkBondSources(compiler->lastCallBondedSources);
-
-                        // Returning an owning field of a by-value temp (`return makeToken().text;`).
-                        if (returnNV.FromOwningTempField
-                            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
-                        {
-                            // A `move`-temp OWNS the field: move it out as the return value (Phase B).
-                            // Keep the owned bit (ownership transfers to the caller) and zero the source
-                            // field so the temp's full-dtor (FlushOwnedStructTemps below) skips it. Works
-                            // for a string field (clears its owned bit) or an owning struct field (the
-                            // aggregate-zero recursively clears every owning subfield's owned bit). An
-                            // ALIAS temp (plain accessor) is still rejected - you cannot move out of a borrow.
-                            // POINTER fields are excluded here as at the two sibling implied-move sites:
-                            // the aggregate-zero store below emits IR that crashes codegen on one.
-                            if (returnNV.MovableTempField && right != nullptr
-                                && !returnNV.TypeAndValue.Pointer
-                                && right->getType() == returnNV.BaseType)
-                            {
-                                clearReturnedStringBorrowBit = false;
-                                // Same exclusion for a moved-out owning STRUCT field (e.g.
-                                // `return makeOuterTok(n).inner;`): the buffer's ownership transfers
-                                // to the caller, so its owning-field bits must stay set, not be
-                                // cleared as a borrow - clearing would orphan the buffer (leak).
-                                clearReturnedStructBorrowBits = false;
-                                auto* srcGep = compiler->builder->CreateStructGEP(
-                                    returnNV.MoveTempStructType, returnNV.MoveTempStructAlloca,
-                                    returnNV.MoveTempFieldIndex, "movedfld");
-                                compiler->builder->CreateStore(
-                                    llvm::ConstantAggregateZero::get(right->getType()), srcGep);
-                            }
-                            else
-                            {
-                                LogErrorContext(jump, std::format(
-                                    "cannot return '{}.{}' taken from a temporary; its buffer is owned elsewhere and "
-                                    "would be freed. Use '.copy()' for an independent copy.",
-                                    returnNV.OwningStructName, returnNV.FieldName));
-                            }
-                        }
-
-                        // Same escape with a dtor-LESS pointee, which the type-name gate above
-                        // cannot see. After it, so a dtor-bearing pointee keeps its wording.
-                        if (IsOwningTempUniqueFieldEscape(returnNV))
-                            RejectOwningTempUniqueFieldEscape(returnNV, "the return value", jump);
-
-                        // Returning a whole `alias` (borrow) value from a non-`alias` function hands
-                        // the caller a value whose always-run destructor frees a buffer the real owner
-                        // still holds. Allowed only when the function itself is declared `alias` (the
-                        // borrow passes through). `.copy()` makes an independent owned value. `string`
-                        // and `__closure_fat_ptr` are excluded - they carry a runtime owned bit that
-                        // already clears on a borrow return (the string-redesign borrow path), so the
-                        // `alias` compile-time machinery is only for owning STRUCTS with no runtime bit.
-                        // A borrow can only dangle when the caller could destruct it: a pointer (the
-                        // pointee is freed) or an owning value type (its destructor frees buffers the
-                        // real owner still holds). An alias of a primitive or a POD struct hands back a
-                        // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
-                        if (!compiler->currentFunctionReturnTV.IsAlias
-                            && SourceIsDanglingAliasBorrow(compiler, returnNV))
-                        {
-                            LogErrorContext(jump, std::format(
-                                "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
-                                "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
-                                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
-                        }
-
-                        // Same hazard through a suppressed (mixed) '?:' join of an owning-value
-                        // struct: the caller adopts and destroys bits a live borrow still owns.
-                        // An `alias` function passes the borrow through, exactly as above.
-                        if (!compiler->currentFunctionReturnTV.IsAlias)
-                            RejectNonOwningStructJoinStore(right, compiler->currentFunctionReturnTypeName,
-                                                           "a return slot", jump);
-
-                        // The allocation alignment of an over-aligned `new T[n]` is not in the element
-                        // type, so the caller recovers it only when the RETURN TYPE declares the same
-                        // `alignas(_, N)` clause (threaded to the caller via lastCallReturnsAllocAlign).
-                        // A matching clause is allowed; a missing/mismatched one would free the block
-                        // wrong. (Alignment carried by the TYPE returns freely, untagged, as in C++.)
-                        if (returnNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
-                            && compiler->currentFunctionReturnTV.AllocAlignValue != returnNV.AllocAlignment)
-                        {
-                            if (compiler->currentFunctionReturnTV.AllocAlignValue == 0)
-                                LogErrorContext(jump, std::format(
-                                    "cannot return the over-aligned buffer '{}' ('new T[n] alignas(0, {})'): that "
-                                    "alignment is a property of the allocation, not of the type, so the caller cannot "
-                                    "recover it from the return type and would free the block as an ordinary "
-                                    "allocation. Declare the return type 'alignas(0, {})' so the block alignment is "
-                                    "recorded, or over-align the ELEMENT TYPE instead.",
-                                    returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
-                                    returnNV.AllocAlignment, returnNV.AllocAlignment));
-                            else
-                                LogErrorContext(jump, std::format(
-                                    "allocation alignment mismatch on return: the return type is declared "
-                                    "'alignas(0, {})' but the returned buffer was allocated {}-aligned. The two must "
-                                    "agree so the caller frees with the correct alignment.",
-                                    compiler->currentFunctionReturnTV.AllocAlignValue, returnNV.AllocAlignment));
-                        }
-
-                        /*
-                         * Returning a closure read from a FIELD / ELEMENT (`return p->get;`), the
-                         * mirror of the decl-init clone. A whole-variable closure local returns by
-                         * move (its storage is handed to the caller and its dtor suppressed), but a
-                         * field read has no such transfer: the raw TAGGED OWNED env would be handed
-                         * to the caller while the struct still owns it, and both free it. Clone so
-                         * the caller gets an independent env; a `move` source already transferred.
-                         */
-                        if (right != nullptr
-                            && right->getType()->isStructTy()
-                            && returnNV.TypeAndValue.TypeName == "__closure_fat_ptr"
-                            && !returnNV.TypeAndValue.IsMove
-                            && returnNV.Storage != nullptr
-                            && !llvm::isa<llvm::AllocaInst>(returnNV.Storage)
-                            && !llvm::isa<llvm::GlobalVariable>(returnNV.Storage))
-                        {
-                            LLVMBackend::NamedVariable srcNV;
-                            srcNV.Storage  = returnNV.Storage;
-                            srcNV.BaseType = compiler->GetClosureFatPtrType();
-                            srcNV.TypeAndValue.TypeName = "__closure_fat_ptr";
-                            if (auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
-                                right = cloned;
-                        }
-
-                        // Clear flags consumed by the return check.
-                        compiler->lastOwningResult = false;
-                        compiler->lastAllocAlignment = 0;
-                        compiler->lastCallReturnsAllocAlign = 0;
-                        compiler->lastCallReturnsOwned = false;
-                        compiler->lastCallIsBonded = false;
-                        compiler->lastCallBondByAddress = false;
-                        compiler->lastCallBondedSources.clear();
-                        // The returned value (e.g. the final string of `return a + b + c;`)
-                        // is moved to the caller - drop it from the temporary cleanup list
-                        // so we do not free a buffer the caller now owns. Any other owned-
-                        // string intermediates of the return expression must be freed before
-                        // the ret terminates the block.
-                        compiler->UnregisterOwnedStringTemp(right);
-                        compiler->FlushOwnedStringTemps();
-                        // Same for a returned closure literal (`return () => {...};`): the closure
-                        // env is moved to the caller, so drop it from the temp list before flushing
-                        // or we would free an env the caller now owns (double free on its teardown).
-                        compiler->UnregisterOwnedClosureTemp(right);
-                        compiler->FlushOwnedClosureTemps();
-                        // Owning temp whose field was extracted in the return expr (returning an OWNING
-                        // field is rejected upstream, so this never frees a buffer the caller now owns).
-                        compiler->FlushOwnedStructTemps();
-                        // Borrow returns: hand the caller a non-owning copy (see the classification
-                        // above). Done after the temp-flush so the unregister logic above still sees
-                        // the original loaded value; a borrow is never a registered owned temp.
-                        if (clearReturnedStringBorrowBit)
-                            right = compiler->ClearStringOwnedBit(right);
-                        else if (clearReturnedStructBorrowBits)
-                            right = compiler->ClearStructOwnedBits(right, returnNV.TypeAndValue.TypeName);
-                        // Pass the returned local's storage so a by-value struct return whose
-                        // full-destructor frees members (e.g. owned string fields) moves
-                        // ownership to the caller instead of being destructed here. The struct
-                        // return value is materialized field-wise (and a struct read leaves
-                        // Storage null, keeping the value in Primary), so resolve the alloca by
-                        // name - CreateReturnCall's LoadInst-based detection cannot see it.
-                        llvm::Value* retStorage = returnNV.Storage;
-                        if (retStorage == nullptr && !returnNV.CallerName.empty())
-                            retStorage = compiler->FindVariableStorage(returnNV.CallerName).Storage;
-
-                        // Interface return upcast. When the function's declared return type is an
-                        // interface (LLVM { ptr vtable, ptr data } fat pointer), box a concrete
-                        // implementer here - mirroring the assignment/parameter upcast. Without
-                        // this the `ret` operand is a bare pointer and module verification fails.
-                        // An operand that is ALREADY a fat pointer still enters when its data half
-                        // is this frame's storage (`return sq as IShape;`): the boxing happened
-                        // upstream, but the dangle it creates is this path's to reject.
-                        std::string interfaceReturnStructName;
-                        llvm::AllocaInst* returnedFatFrameSlot =
-                            right != nullptr && right->getType() == compiler->GetFatPtrType()
-                                ? FrameLocalDataOfFatValue(right) : nullptr;
-                        /*
-                         * DEFERRED existential check for the shape the walk above cannot see:
-                         * `IShape r = loc as IShape; return r;` arrives here as a plain load of
-                         * r's slot, with returnedFatFrameSlot null (the walk stops at loads by
-                         * design). Record the slot now - the answer is resolved once this
-                         * function's body is fully lowered and its CFG is complete
-                         * (RunInterfaceReturnDangleCheck, called from the same hook as
-                         * RunNullDerefDataflow), not here.
-                         */
-                        if (right != nullptr && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType() == compiler->GetFatPtrType()
-                            && right->getType() == compiler->GetFatPtrType()
-                            && returnedFatFrameSlot == nullptr)
-                        {
-                            if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
-                                if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
-                                        load->getPointerOperand()->stripPointerCasts()))
-                                    compiler->RecordPendingReturnDangleCheck(
-                                        slot, static_cast<int>(jump->getStart()->getLine()),
-                                        static_cast<int>(jump->getStart()->getCharPositionInLine()),
-                                        compiler->currentFunctionReturnTypeName);
-                        }
-                        if (auto* fatTy = compiler->GetFatPtrType();
-                            right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr
-                            && compiler->currentFunction->getReturnType() == fatTy
-                            && ((right->getType() != fatTy && !returnNV.TypeAndValue.IsInterface)
-                                || returnedFatFrameSlot != nullptr))
-                        {
-                            const std::string& ifaceName = compiler->currentFunctionReturnTypeName;
-                            std::string structName = ReturnUpcastStructName(returnNV);
-
-                            if (returnedFatFrameSlot != nullptr)
-                            {
-                                // Already boxed against this frame's storage. The implements/shape
-                                // checks below cannot apply (the operand is no longer the class),
-                                // and returnNV describes the fat pointer rather than what was boxed
-                                // - so name the class from the vtable the value carries, or say
-                                // nothing about it when no single class answers.
-                                LogInterfaceReturnDangle(jump, BoxedStructNameOfFatValue(right, compiler), ifaceName);
-                            }
-                            else if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
-                            {
-                                LogErrorContext(jump, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
-                            }
-                            else if (!structName.empty()
-                                     && RejectPointerShapedInterfaceUpcast(
-                                            jump, returnNV.TypeAndValue, ifaceName))
-                            {
-                                // Diagnosed: a pointer/view-shaped binding cannot carry the vtable.
-                                // Empty body only because LogErrorContext throws; otherwise this
-                                // must not fall through to CreateReturnCall with an unboxed ptr.
-                            }
-                            else if (!structName.empty())
-                            {
-                                if (returnNV.TypeAndValue.Pointer)
-                                {
-                                    // Concrete implementer pointer: defer the boxing to
-                                    // CreateReturnCall so the owning local's scope-exit free is
-                                    // suppressed (ownership moves to the caller).
-                                    interfaceReturnStructName = structName;
-                                }
-                                else
-                                {
-                                    // Concrete implementer VALUE: the interface fat pointer must
-                                    // carry a data pointer that outlives this call. A by-value
-                                    // local lives in this frame, so boxing it would return a
-                                    // dangling pointer. Reject with a clear diagnostic steering to
-                                    // a heap allocation (rather than emitting UB / a verifier dump).
-                                    LogInterfaceReturnDangle(jump, structName, ifaceName);
-                                }
-                            }
-                            else if (llvm::isa<llvm::Constant>(right) && right->getType()->isPointerTy())
-                            {
-                                // `return nullptr;` for an interface return -> null fat pointer.
-                                right = llvm::ConstantAggregateZero::get(fatTy);
-                            }
-                            else if (right->getType()->isPointerTy())
-                            {
-                                // Backstop against a raw pointer reaching the module verifier.
-                                // Any nameless pointer expression (`c + 0`) gets here, not just a join.
-                                LogErrorContext(jump, std::format(
-                                    "cannot convert this expression to interface '{}': its concrete "
-                                    "class cannot be determined; bind it to a local variable of the "
-                                    "class type first", ifaceName));
-                            }
-                        }
-
-                        // Derived-interface -> parent-interface RETURN (`IElement f(){ IButton b = ...;
-                        // return b; }`). The returned value is already a fat pointer, but a derived
-                        // vtable is not layout-compatible with the parent's once field-offset slots
-                        // exist, so rebuild it through the typedesc chain - the same rebox the
-                        // assignment and call-argument paths do. A same-interface return is a no-op.
-                        // The ownership checks above are untouched: they fire on a returned concrete
-                        // POINTER (the boxing case), which this is not.
-                        if (auto* fatTy = compiler->GetFatPtrType();
-                            right != nullptr && fatTy != nullptr && right->getType() == fatTy)
-                        {
-                            // A '?:' result carries no NamedVariable TypeName; fall back to the
-                            // per-value ledger a ternary join stamps (PropagateFatInterfaceJoin).
-                            std::string srcIface = compiler->ResolveFatInterfaceSrcName(right,
-                                returnNV.TypeAndValue.IsInterface ? returnNV.TypeAndValue.TypeName : std::string());
-                            right = compiler->ReboxInterfaceIfNeeded(
-                                right, srcIface, compiler->currentFunctionReturnTypeName);
-                        }
-
-                        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
-                    }
+                        EmitReturnExpression(jump, express->assignmentExpression(), express->getText());
                     else
                     {
                         compiler->CreateReturnCall(nullptr);

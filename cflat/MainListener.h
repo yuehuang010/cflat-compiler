@@ -2428,6 +2428,12 @@ public:
     void LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, const std::string& structName,
                                   const std::string& ifaceName);
 
+    // The shared `return <expr>;` lowering, used by the return statement and by an
+    // expression-body lambda (`=> expr`, which is `=> { return expr; }`).
+    void EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
+                              CFlatParser::AssignmentExpressionContext* assignExpr,
+                              const std::string& retText);
+
     void ParseStatement(CFlatParser::StatementContext* statement);
 
     void GenerateDefaultParamOverloads(

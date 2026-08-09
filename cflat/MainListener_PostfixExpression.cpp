@@ -4959,9 +4959,10 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             }
             else if (auto* expr = body->assignmentExpression())
             {
-                auto* val = ParseAssignmentExpression(expr);
-                if (val && !compiler->IsBlockTerminated())
-                    compiler->CreateReturnCall(val);
+                // `=> expr` is `=> { return expr; }`: go through the shared return lowering so
+                // the body runs the same ownership gates and owned-temp flush a block body does.
+                if (!compiler->IsBlockTerminated())
+                    EmitReturnExpression(expr, expr, expr->getText());
             }
         }
 

@@ -3464,6 +3464,77 @@ bool testGenericFuncPtrProducer()
     return result;
 }
 
+// An owning struct temp produced inside an EXPRESSION-BODY lambda (`=> expr`) must be
+// destructed at the end of that body, exactly as the block-body twin and the free-function
+// twin already were. Pre-fix the expression body called CreateReturnCall directly and never
+// reached the return path's owned-temp flush, so every *_destructed leg below read 0 and the
+// program leaked (16 bytes for the box cell, 32 for the string cell).
+int lamTempDtors = 0;
+class LamDt { int v = default; ~LamDt() { lamTempDtors = lamTempDtors + 1; } };
+struct LamBox<T> { T t = default; };
+LamBox<unique LamDt*> lamMakeBox(int v)
+{
+    LamBox<unique LamDt*> b = default;
+    b.t = new LamDt();
+    b.t->v = v;
+    return b;
+}
+
+int lamSDtors = 0;
+class LamSBox { string s = default; ~LamSBox() { lamSDtors = lamSDtors + 1; } };
+int lamN = 3;
+LamSBox lamMakeS() { LamSBox b = default; b.s = "hello" + "world" + lamN.toString(); return b; }
+
+struct LamPlain { string s = default; };
+LamPlain lamMakePlain() { LamPlain p = default; p.s = "own" + lamN.toString(); return p; }
+
+list<int> lamMakeList() { list<int> l = default; l.add(7); l.add(9); return l; }
+
+bool testLambdaExprBodyOwnedTemp()
+{
+    bool result = true;
+
+    // The filed shape, made legal by reading an int THROUGH the temp's unique field rather
+    // than letting the pointer escape (the escaping spelling is err_lambda_expr_temp_escape.cb).
+    lamTempDtors = 0;
+    Lambda<int()> f = () => lamMakeBox(70).t->v;
+    int v = f();
+    result &= Test("lamexpr_temp_value",      v,            70);
+    result &= Test("lamexpr_temp_destructed", lamTempDtors,  1);
+
+    // Block-body twin - already correct pre-fix; frozen so the two spellings cannot drift.
+    lamTempDtors = 0;
+    Lambda<int()> g = () => { return lamMakeBox(8).t->v; };
+    result &= Test("lamblock_temp_value",      g(),          8);
+    result &= Test("lamblock_temp_destructed", lamTempDtors, 1);
+
+    lamSDtors = 0;
+    Lambda<int()> s = () => lamMakeS().s.length();
+    result &= Test("lamexpr_string_temp_len",        s(),      11);
+    result &= Test("lamexpr_string_temp_destructed", lamSDtors, 1);
+
+    // A nested expression-body lambda: the inner body owns the temp, and the outer body's
+    // flush must not be what frees it (the inner invoker is a separate function).
+    lamSDtors = 0;
+    Lambda<int()> n = () => (() => lamMakeS().s.length())();
+    result &= Test("lamexpr_nested_len",        n(),      11);
+    result &= Test("lamexpr_nested_destructed", lamSDtors, 1);
+
+    // Accept set: shapes that already worked and must keep working.
+    Lambda<int()> l = () => lamMakeList().get(1);
+    result &= Test("lamexpr_list_elem", l(), 9);
+
+    Lambda<LamPlain()> p = () => lamMakePlain();
+    LamPlain got = p();
+    result &= Test("lamexpr_returns_owning_value", got.s, "own3");
+
+    string cap = "hello";
+    Lambda<int()> c = () => cap.length();
+    result &= Test("lamexpr_captures_owning_local", c(), 5);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3507,6 +3578,7 @@ extern int main()
     total++; passed += testNestedClosureTransitiveCapture() ? 1 : 0;
     total++; passed += testLambdaParamShadowsEnclosing()  ? 1 : 0;
     total++; passed += testInterfaceReturnWithLambda()  ? 1 : 0;
+    total++; passed += testLambdaExprBodyOwnedTemp()    ? 1 : 0;
 
     // Generic function pointer tests
     total++; passed += testGenericFuncPtrBasic()       ? 1 : 0;

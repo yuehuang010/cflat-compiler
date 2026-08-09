@@ -1,0 +1,23 @@
+// An owning temp's `unique` field escaping through the RETURN of an EXPRESSION-BODY lambda
+// (`=> expr`). Pre-fix this compiled with exit 0 and leaked: the expression body called
+// CreateReturnCall directly, so it reached neither the temp-field escape gate nor the
+// owned-temp flush, and the pointee was never freed ("v=70 dtors=0", 16 bytes under
+// `leaks --atExit`). The free-function twin `Dt* ff() { return makeDt().t; }` and the
+// block-body twin `() => { return makeDt().t; }` were BOTH already rejected with the message
+// below - this leg pins the expression body onto the same answer.
+// Scoped-block form: the escape is diagnosed at the return site, inside the block.
+
+class LamEscDt { int v = default; ~LamEscDt() { } };
+struct LamEscBox<T> { T t = default; };
+LamEscBox<unique LamEscDt*> lamEscMake()
+{
+    LamEscBox<unique LamEscDt*> b = default;
+    b.t = new LamEscDt();
+    return b;
+}
+
+expect_error("taken from a temporary") {
+    Lambda<LamEscDt*()> f = () => lamEscMake().t;
+}
+
+extern int main() { return 0; }
