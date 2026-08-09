@@ -1430,6 +1430,40 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   INVARIANT (list `sort`/`_partition` bit-shuffles and dictionary rehash depend on it); decl-init
   from a single-index GEP is excluded for exactly that reason, which is why
   `T tmp = _data[i];` still borrows.
+
+- **The 2026-08-09 fixed-array-element DESTINATION session** (`fix/arrslot`), the destination-side
+  twin of the bullet above. `dst[i] = src` on a fixed array of owning structs was a plain bit
+  store for every source shape (rc 133 for an lvalue source, a silent leak of the old element for
+  a temp/call-result source). The classification is the whole fix: a FIXED-array subscript is a
+  **TWO-index GEP over `[N x T]`**, so it is neither `destIsStructField` (2-index over a STRUCT)
+  nor `destIsLocalOwningVar` (alloca/global) nor Part 6's SINGLE-index container slot - it needs
+  its own accept set (`destIsFixedArrayElem`), and Part 6's gate stayed untouched per the plan's
+  LOAD-BEARING INVARIANT. A fixed array's slots are LIVE default-constructed values, so this
+  destination DOES drop-old; a container slot must not. That difference is the reason the two
+  gates can never be merged, however similar the spelling looks.
+- **Zero the SOURCE before destructing the DESTINATION - the ordering IS the self-assign fix.**
+  `dst[i] = dst[i]` cannot be ruled out at compile time for a runtime index, and pointer-identity
+  guards (`destination != rightNV.Storage`) see two different GEPs / a loaded pointer. Producing
+  the value, zeroing the source, and only THEN running the destination dtor makes every aliasing
+  spelling degenerate safely: the dtor finds a zeroed slot, frees nothing, and the store puts the
+  value back. Measured on `dst[i] = dst[j]` with `i == j` at runtime, `dst[0] = *p` with
+  `p == &dst[0]`, `base[0] = v[0]` through a `T[]` view, and `m[1][1] = m[1][1]` - all keep the
+  value with zero frees. This is exactly the ordering
+  [[self-assign-through-a-pointer-to-the-destination-drops-the-value]] needs: the LOCAL arm's
+  dtor -> store -> zero order is what loses the value there, and the element arm shows the cheap
+  fix is to reorder rather than to build a same-object proof.
+- **An arm that RETURNS EARLY inherits responsibility for every diagnostic downstream of it.**
+  Review of this fix found the new element arm gated on `IsOwningValueType(source)` with no
+  type-equality check, so `Nest[2] arr; arr[0] = aBox;` (an `ArrElemBox` value into an
+  `ArrElemNest` slot) went from a clean master reject to compiling into a mismatched store - the
+  arm returned before the cast diagnostic could fire. The drop-old arm did NOT regress, because it
+  falls through. Fixed in review by requiring
+  `ResolveTypeAlias(src) == ResolveTypeAlias(dest)` (alias-resolved, per the `using` lesson) and
+  pinned by an `expect_error("cannot cast an aggregate value")` leg in `err_move.cb`. **When an
+  arm ends in `return`, the accept-set corpus must include the ILL-TYPED neighbours, not just the
+  well-typed ones** - a positive corpus of 28 same-type cells cannot see a lost rejection. Note
+  the whole-LOCAL arm has the same hole (`Nest m; m = n.inner;` compiles on master too); it was
+  left alone as pre-existing rather than absorbed.
 - **A call that yields NO llvm::Value must be refused at the CALL, not at each consumer**
   ([[void-closure-call-result-consumed-reads-garbage]], fix/voidcall). `CreateIndirectCall`
   already returned `nullptr` for a void invoker and the result `NamedVariable` already carried

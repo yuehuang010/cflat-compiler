@@ -1715,6 +1715,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && destGep->getSourceElementType()->isStructTy())
                 || namedVar.IsInterfaceField;  // reached via the interface's byte-offset slot
 
+            // A subscript of a FIXED array is a TWO-index GEP over `[N x T]`, so it is neither a
+            // struct field nor an alloca/global - and not Part 6's SINGLE-index container slot
+            // either. Its elements are LIVE default-constructed values, so an owning store here
+            // must drop the old one (a container slot must not); keep the two accept sets apart.
+            bool destIsFixedArrayElem = destGep && destGep->getNumIndices() == 2
+                && destGep->getSourceElementType()->isArrayTy()
+                && namedVar.IsElementAccess
+                && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
+                && !namedVar.UnionFieldType;
+
             if (operatorText == "=" && destIsStructField)
                 RejectFieldAllocAlignMismatch(
                     namedVar.TypeAndValue, namedVar.AllocAlignment, rightNV, right,
@@ -2157,6 +2167,55 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(toStore);
             }
 
+            /*
+             * Same transfer into a FIXED-ARRAY ELEMENT (`dst[0] = a`, `w.arr[0] = *bp`). The
+             * two-index array GEP is neither an alloca/global nor a struct field, so every arm
+             * above skipped it and the plain store below aliased the source (double free) and
+             * orphaned the old element (leak). The element IS live - a fixed array default- or
+             * zero-constructs every slot - so drop-old applies here, unlike Part 6's container slot.
+             * `string` elements keep their own owned-bit machinery and are excluded.
+             */
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsFixedArrayElem
+                && srcIsOwningAssignLvalue
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
+                && !rightNV.TypeAndValue.Pointer
+                && !rightNV.TypeAndValue.IsArrayView
+                && !rightNV.TypeAndValue.IsInterfacePointer
+                && !rightNV.TypeAndValue.IsFunctionPointer
+                && destination != rightNV.Storage
+                && namedVar.TypeAndValue.TypeName != "string"
+                // Same type on both sides (alias-resolved, per the `using` lesson). This arm
+                // returns early, so a mismatch must fall through to the existing diagnostic.
+                && compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName)
+                    == compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName)
+                && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
+            {
+                // Ordered for SELF-ASSIGN safety (`dst[i] = dst[i]`, which no compile-time proof
+                // can rule out for a runtime index): produce the value, zero the source, and only
+                // then destruct the destination. When the two addresses coincide the destructor
+                // sees the already-zeroed slot and frees nothing, so the value survives the store.
+                AssignSourceKind kind;
+                llvm::Value* toStore = ClassifyOwningAssignSource(
+                    right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Move)
+                {
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
+                    // Only a named slot has a spelling to report a later use of; an indirect
+                    // lvalue (field/element/deref) is consumed silently, as `move w.b` already is.
+                    if (srcIsNamedSlot)
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                }
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(toStore, destination);
+                return finishStore(toStore);
+            }
+
             // Owning-value MOVE through a pointer-deref destination (`*pc = *pa`): a shallow store
             // would alias owned buffers (double-free) and orphan the destination's old value (leak).
             // A deref lvalue is neither an alloca/global (destIsLocalOwningVar) nor a 2-index
@@ -2209,13 +2268,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // for a local/global variable it covers `r = f()` where f returns an owned temp (the named-
             // variable-RHS move is already handled and returned above at the MOVE path, and an explicit
             // `move` RHS is nulled below, so only a temp/call-result RHS reaches here for a local dest).
-            // Container element stores are excluded (would double-free if touched here).
+            // Container element stores are excluded (would double-free if touched here). A FIXED
+            // array element joins the same set: an lvalue source already returned from the element
+            // transfer arm above, so only a temp / call-result RHS reaches here, and its old element
+            // would otherwise be orphaned. `string` elements keep their own owned-bit machinery.
             bool destIsLocalOwningVar = namedVar.FieldName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination));
+            bool destIsDropOldElem = destIsFixedArrayElem
+                && namedVar.TypeAndValue.TypeName != "string"
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsArrayView;
             // sameFieldStore, not selfFieldAssign: this EMITS a destruct, so it may only treat two
             // elements as distinct when both root in known-initialized stack/global storage.
             if (operatorText == "=" && right && right->getType()->isStructTy()
-                && (destIsStructField || destIsLocalOwningVar)
+                && (destIsStructField || destIsLocalOwningVar || destIsDropOldElem)
                 && destination != rightNV.Storage
                 && !sameFieldStore
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))

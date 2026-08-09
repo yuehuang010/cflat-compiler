@@ -4190,6 +4190,260 @@ int testOwningAssignFromIndirectSource()
     return passed;
 }
 
+/*
+ * The DESTINATION-side twin of the block above: storing an owning struct into a FIXED-ARRAY
+ * ELEMENT. A subscript of a fixed array is a two-index GEP over `[N x T]`, so it matched none of
+ * the owning-store arms and fell to a plain bit store - the old element was never destructed
+ * (leak) and the source was never consumed (double free at teardown, run rc 133 for every source
+ * shape, including a plain named local). A fixed array's slots are LIVE default-constructed
+ * values, so drop-old applies here - the opposite of a container's single-index slot, which
+ * writes only into slots it has already released. The transfer itself defers to T exactly as the
+ * whole-local store does: a copyable owner COPIES, a non-copyable owner MOVES.
+ * Every leg pins the dtor COUNT as well as the value: the value alone is already correct on the
+ * broken binary, so only the counts falsify the ownership change.
+ */
+struct AelsArrWrap  { OaiBox[2] arr; };
+OaiBox[2] gAelsArr;
+
+int aelsIndex(int n) { return n; }
+
+int testOwningAssignIntoFixedArrayElement()
+{
+    int passed = 0;
+
+    // 1. NAMED source into a LIVE element (filed repro (a)): drop the old element, move the source.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = a;
+        passed += Test("aels_named_value", dst[0].item->id, 5);
+        passed += Test("aels_named_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("aels_named_freed_once_each", dtorCount, 2);
+
+    // 2. INDIRECT (field) source: same transfer, and the consumed source lvalue is left null.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = w.b;
+        passed += Test("aels_field_value", dst[0].item->id, 5);
+        passed += Test("aels_field_old_elem_freed", dtorCount, 1);
+        passed += Test("aels_field_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("aels_field_freed_once_each", dtorCount, 2);
+
+    // 3. DEREF source.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox* ap = &a;
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = *ap;
+        passed += Test("aels_deref_value", dst[0].item->id, 5);
+        passed += Test("aels_deref_old_elem_freed", dtorCount, 1);
+        passed += Test("aels_deref_source_nulled", ap->item == nullptr, true);
+    }
+    passed += Test("aels_deref_freed_once_each", dtorCount, 2);
+
+    // 4. CALL-RESULT source. This one never aborted - it LEAKED the old element instead, so the
+    // drop-old count is the only thing that falsifies it.
+    dtorCount = 0;
+    {
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = oaiMake(5);
+        passed += Test("aels_call_value", dst[0].item->id, 5);
+        passed += Test("aels_call_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("aels_call_freed_once_each", dtorCount, 2);
+
+    // 5. Explicit `move` source: the move machinery already nulled the source, but the old
+    // element was still orphaned.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = move a;
+        passed += Test("aels_move_value", dst[0].item->id, 5);
+        passed += Test("aels_move_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("aels_move_freed_once_each", dtorCount, 2);
+
+    // 6. The array is a struct FIELD - reached on the stack and through the heap.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        AelsArrWrap w;
+        w.arr[0] = oaiMake(1);
+        w.arr[0] = a;
+        passed += Test("aels_arrfield_value", w.arr[0].item->id, 5);
+        passed += Test("aels_arrfield_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("aels_arrfield_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        AelsArrWrap* wp = new AelsArrWrap();
+        wp->arr[0] = oaiMake(1);
+        wp->arr[0] = a;
+        passed += Test("aels_heaparrfield_value", wp->arr[0].item->id, 5);
+        passed += Test("aels_heaparrfield_old_elem_freed", dtorCount, 1);
+        delete wp;
+    }
+    passed += Test("aels_heaparrfield_freed_once_each", dtorCount, 2);
+
+    // 7. A file-scope GLOBAL fixed array. Globals are never torn down, so only the drop-old
+    // count is observable here.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        gAelsArr[0] = oaiMake(1);
+        gAelsArr[0] = a;
+        passed += Test("aels_global_value", gAelsArr[0].item->id, 5);
+        passed += Test("aels_global_old_elem_freed", dtorCount, 1);
+    }
+
+    // 8. ELEMENT-to-ELEMENT within one array, distinct indices - a genuine transfer.
+    dtorCount = 0;
+    {
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[1] = oaiMake(2);
+        dst[0] = dst[1];
+        passed += Test("aels_crossindex_value", dst[0].item->id, 2);
+        passed += Test("aels_crossindex_old_elem_freed", dtorCount, 1);
+        passed += Test("aels_crossindex_source_nulled", dst[1].item == nullptr, true);
+    }
+    passed += Test("aels_crossindex_freed_once_each", dtorCount, 2);
+
+    // 9. SELF-assign, constant and RUNTIME index. No compile-time proof can rule the runtime one
+    // out, so the arm zeroes the source BEFORE destructing the destination: when the two
+    // addresses coincide the destructor sees a zeroed slot, frees nothing, and the store puts the
+    // value straight back. Both spellings must keep the value and free nothing.
+    dtorCount = 0;
+    {
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        dst[0] = dst[0];
+        passed += Test("aels_selfassign_const_value", dst[0].item->id, 1);
+        passed += Test("aels_selfassign_const_freed_nothing", dtorCount, 0);
+    }
+    passed += Test("aels_selfassign_const_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        int i = aelsIndex(0);
+        dst[i] = dst[i];
+        passed += Test("aels_selfassign_runtime_value", dst[i].item->id, 1);
+        passed += Test("aels_selfassign_runtime_freed_nothing", dtorCount, 0);
+    }
+    passed += Test("aels_selfassign_runtime_freed_once", dtorCount, 1);
+
+    // 10. Old-element STATES. A never-assigned slot and a moved-from slot are both null, so the
+    // drop-old must be a no-op on them rather than a second free.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst;
+        dst[0] = a;
+        passed += Test("aels_freshold_value", dst[0].item->id, 5);
+        passed += Test("aels_freshold_freed_nothing", dtorCount, 0);
+    }
+    passed += Test("aels_freshold_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst;
+        dst[0] = oaiMake(1);
+        OaiBox t = move dst[0];
+        dst[0] = a;
+        passed += Test("aels_movedold_value", dst[0].item->id, 5);
+        passed += Test("aels_movedold_freed_nothing", dtorCount, 0);
+    }
+    passed += Test("aels_movedold_freed_twice", dtorCount, 2);
+
+    // 11. A MULTI-unique-field element: both of the old element's resources are dropped.
+    dtorCount = 0;
+    {
+        OaiBox2 a;
+        a.a = new Resource(); a.a->id = 5;
+        a.b = new Resource(); a.b->id = 6;
+        OaiBox2[2] dst;
+        dst[0].a = new Resource();
+        dst[0].b = new Resource();
+        dst[0] = a;
+        passed += Test("aels_multiuniq_value", dst[0].a->id, 5);
+        passed += Test("aels_multiuniq_old_elem_freed_both", dtorCount, 2);
+    }
+    passed += Test("aels_multiuniq_freed_once_each", dtorCount, 4);
+
+    // 12. A NESTED owning element (the owned resource sits one struct down).
+    dtorCount = 0;
+    {
+        OaiNest a;
+        a.inner = oaiMake(5);
+        OaiNest[2] dst;
+        dst[0].inner = oaiMake(1);
+        dst[0] = a;
+        passed += Test("aels_nested_value", dst[0].inner.item->id, 5);
+        passed += Test("aels_nested_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("aels_nested_freed_once_each", dtorCount, 2);
+
+    // 13. A COPYABLE owner copies - the source stays live and both are freed at teardown.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource(); a.item->id = 5;
+        OaiCopyBox[2] dst;
+        dst[0].item = new Resource();
+        dst[0] = a;
+        passed += Test("aels_copyable_value", dst[0].item->id, 5);
+        passed += Test("aels_copyable_old_elem_freed", dtorCount, 1);
+        passed += Test("aels_copyable_source_live", a.item->id, 5);
+        passed += Test("aels_copyable_independent", dst[0].item != a.item, true);
+    }
+    passed += Test("aels_copyable_freed_once_each", dtorCount, 3);
+
+    // 14. An owning struct whose resource is a STRING (the axis a pointer dtor count cannot see).
+    // A bare `string` ELEMENT keeps its own owned-bit machinery and is deliberately not routed
+    // through this arm.
+    {
+        string aelsSeed = "ab";
+        OaiSBox a;
+        a.s = aelsSeed + "cd";
+        OaiSBox[2] dst;
+        dst[0].s = aelsSeed + "ef";
+        dst[0] = a;
+        passed += Test("aels_stringowner_value", dst[0].s, "abcd");
+        passed += Test("aels_stringowner_source_live", a.s, "abcd");
+    }
+
+    // 15. ACCEPT SET: a POD element owns nothing, so it stays a plain bit copy with a live source.
+    {
+        OaiPod a;
+        a.x = 5;
+        OaiPod[2] dst;
+        dst[0].x = 1;
+        dst[0] = a;
+        passed += Test("aels_pod_value", dst[0].x, 5);
+        passed += Test("aels_pod_source_live", a.x, 5);
+    }
+
+    return passed;
+}
+
 int testBorrowedPointerMoveNoAdopt()
 {
     int passed = 0;
@@ -5986,6 +6240,9 @@ extern int main()
 
     passed += testOwningAssignFromIndirectSource();
     total += 75;
+
+    passed += testOwningAssignIntoFixedArrayElement();
+    total += 56;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

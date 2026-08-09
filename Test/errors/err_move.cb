@@ -7,6 +7,10 @@ void consume(move MoveResource* r) { delete r; }
 struct Holder { MoveResource* item = nullptr; };
 void Holder(Holder* self) {}
 
+// An owning value struct, for the fixed-array-element store below.
+struct ArrElemBox { unique MoveResource* item = nullptr; };
+struct ArrElemNest { ArrElemBox inner = default; };
+
 // Dereference-of-explicitly-moved-pointer coverage. Explicit 'move' of a thin `unique`
 // pointer/interface local nulls it but, by design, leaves it plain-readable (a == nullptr,
 // passing it along, etc. stay legal - see test_move.cb's explicit_move_local_* cases); only a
@@ -490,6 +494,27 @@ extern int main()
     unique UniqueThing* ut10 = move ut9;
     expect_error("dereference of moved variable 'ut9'") {
         int y = ut9->v;
+    }
+
+    // Storing an owning struct into a FIXED-ARRAY element consumes a NAMED source, exactly as
+    // the whole-local store does, so a later read of that source is a use after move. Before the
+    // fix the store was a plain bit copy: this compiled and double-freed at teardown (rc 133).
+    expect_error("use of moved variable 'ael'") {
+        ArrElemBox ael;
+        ael.item = new MoveResource();
+        ArrElemBox[2] aelDst;
+        aelDst[0] = ael;
+        int aelId = ael.item->id;
+    }
+
+    // The element transfer arm RETURNS EARLY, so it must not swallow a type mismatch: an
+    // `ArrElemBox` value stored into an `ArrElemNest` element still has to reach the existing
+    // diagnostic. Review found the arm accepted this and emitted a mismatched store.
+    expect_error("cannot cast an aggregate value") {
+        ArrElemBox aelSrc;
+        aelSrc.item = new MoveResource();
+        ArrElemNest[2] aelNest;
+        aelNest[0] = aelSrc;
     }
 
     // use after move - move happens inside an if, read happens after the if
