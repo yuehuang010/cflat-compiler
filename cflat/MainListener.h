@@ -3843,6 +3843,27 @@ public:
         CFlatParser::InitializerListContext* list);
 
     /*
+     * The fixed-array arm of the above. The list is POSITIONAL, so the value has to be built
+     * as an '[N x T]' aggregate for the CreateInsertValue into the containing struct - the
+     * named field-init path cannot express it. Mirrors the local declarator's array-brace
+     * split arm for arm (positional / pointer-element reject / non-struct-element reject /
+     * seed-and-splat), writing into a slot instead of registering a local.
+     */
+    llvm::Value* EmitFieldDefaultFixedArrayBrace(
+        const std::string& structName,
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list);
+
+    // Seed-once value-init of an array field: default-construct one element, apply the
+    // named overrides, memcpy it into every slot of `slot`.
+    void EmitFieldDefaultArraySplat(
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list,
+        llvm::Value* slot,
+        llvm::ArrayType* arrTy,
+        llvm::StructType* elemTy);
+
+    /*
      * The union arm of the default-constructor emitter. Fields alias at offset 0, so at most ONE
      * field default can apply: the first field carrying an explicit initializer, else the first
      * field's `= default`. A second explicit initializer is ambiguous and is rejected.
@@ -3913,6 +3934,14 @@ public:
         llvm::Value* arraySize,
         size_t line,
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
+
+    // The slot-taking half of the above: everything after the array storage exists. Shared
+    // with the field-default path, which owns an alloca rather than a registered local.
+    void EmitPositionalFixedArrayIntoSlot(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        llvm::Value* arrAlloc);
 
     // Name the initializer for a diagnostic hint: "a", "h.d", or a neutral placeholder.
     static std::string DescribeInitializerPath(const std::string& callerName,

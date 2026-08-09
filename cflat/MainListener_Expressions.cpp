@@ -6082,11 +6082,26 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list) {
         auto* compiler = Compiler(list);
-        // Only a by-value struct/union/class/container field can hold a brace list here. A
-        // pointer, view or fixed-array field keeps its existing handling untouched.
-        if (field.Pointer || field.ElemPointer || field.IsArrayView || field.ConstArraySize > 0)
-            return nullptr;
+        // A 'T[]' VIEW field keeps its existing (discarding) handling: the local spelling
+        // infers backing storage, which a field cannot outlive - array-view-field-brace-default-discarded.
+        if (field.IsArrayView) return nullptr;
+        if (field.ConstArraySize > 0)
+            return EmitFieldDefaultFixedArrayBrace(structName, field, list);
+
+        bool isContainer = field.TypeName.rfind("list__", 0) == 0
+            || field.TypeName.rfind("array__", 0) == 0
+            || field.TypeName.rfind("dictionary__", 0) == 0;
         auto* fieldType = compiler->GetDataStructure(field.TypeName).StructType;
+        // Mirrors the two declarator scopes, in their order: a non-struct non-container type
+        // first (a POINTER's TypeName is the pointee, so it is a struct and falls through).
+        if (!isContainer && fieldType == nullptr)
+            LogNonAggregateBraceInitReject(list,
+                std::format("{}.{}", structName, field.VariableName), field.TypeName);
+        if (field.Pointer || field.ElemPointer)
+            LogPointerBraceInitReject(list,
+                std::format("field '{}.{}'", structName, field.VariableName),
+                field.TypeName, DescribePointerDeclType(field),
+                CanSuggestAllocation(list, field), field.IsUnique);
         if (fieldType == nullptr) return nullptr;
 
         llvm::Value* slot = compiler->CreateAlloca(fieldType);
@@ -6103,6 +6118,91 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
             EmitFieldInitializer(slot, field.TypeName, list);
         return compiler->builder->CreateLoad(
             fieldType, slot, structName + "_" + field.VariableName + "_braceinit");
+    }
+
+/*
+ * The fixed-array arm of a field default's brace list. Mirrors the LOCAL declarator's
+ * array-brace split (MainListener_Declarations.cpp ~2828) arm for arm, but writes into a
+ * slot alloca and hands the loaded '[N x T]' aggregate back for the CreateInsertValue.
+ */
+llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
+        const std::string& structName,
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list) {
+        auto* compiler = Compiler(list);
+        auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(field));
+        if (arrTy == nullptr) return nullptr;
+
+        // Positional ({v0, v1}) vs value-init ({} / {field=v}) - an element carrying no
+        // field name is what distinguishes them, exactly as the declarator decides it.
+        bool positional = false;
+        for (auto* fi : list->fieldInit())
+            if (fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
+            { positional = true; break; }
+        bool emptyList = list->fieldInit().empty();
+
+        std::string path = std::format("{}.{}", structName, field.VariableName);
+        auto* slot = compiler->AllocaAtEntry(arrTy, nullptr, path + "_arrbrace");
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), slot);
+
+        auto structData = compiler->GetDataStructure(field.TypeName);
+        if (positional)
+        {
+            EmitPositionalFixedArrayIntoSlot(path, field, list, slot);
+        }
+        else if (!emptyList && field.Pointer)
+        {
+            // 'S*[N] a = {f=v}' - the seed is an 'S' memcpy'd over each POINTER slot, so the
+            // field values would become the element addresses.
+            LogPointerBraceInitReject(list, std::format("array element of field '{}'", path),
+                field.TypeName, DescribePointerDeclType(field),
+                CanSuggestAllocation(list, field), field.IsUnique);
+        }
+        else if (!emptyList && structData.StructType == nullptr)
+        {
+            LogErrorContext(list, std::format(
+                "array value-initializer '= {{}}' requires a struct element type, '{}' is not a struct",
+                field.TypeName));
+        }
+        else if (!field.Pointer && structData.StructType != nullptr)
+        {
+            // Value-init: build one default-constructed element, apply the named field
+            // overrides onto it, then memcpy that seed into every slot.
+            EmitFieldDefaultArraySplat(field, list, slot, arrTy, structData.StructType);
+        }
+        return compiler->builder->CreateLoad(arrTy, slot, path + "_braceinit");
+    }
+
+void MainListener::EmitFieldDefaultArraySplat(
+        const LLVMBackend::DeclTypeAndValue& field,
+        CFlatParser::InitializerListContext* list,
+        llvm::Value* slot,
+        llvm::ArrayType* arrTy,
+        llvm::StructType* elemTy) {
+        auto* compiler = Compiler(list);
+        if (elemTy == nullptr) return;
+        auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "fieldarrayseed");
+        compiler->builder->CreateStore(llvm::Constant::getNullValue(elemTy), seedAlloc);
+        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here
+        // would call a same-named sibling type's constructor.
+        if (compiler->GetFunction(field.TypeName))
+        {
+            llvm::Value* seedVal = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+            if (seedVal && seedVal->getType() == elemTy)
+                compiler->builder->CreateStore(seedVal, seedAlloc);
+        }
+        if (!list->fieldInit().empty())
+            EmitFieldInitializer(seedAlloc, field.TypeName, list);
+
+        const auto& dl = compiler->module->getDataLayout();
+        uint64_t elemBytes = dl.getTypeAllocSize(elemTy);
+        llvm::Value* zero = compiler->builder->getInt32(0);
+        for (uint64_t i = 0; i < field.ConstArraySize; i++)
+        {
+            llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+            auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, slot, { zero, idx }, "arrelem");
+            compiler->builder->CreateMemCpy(elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+        }
     }
 
 void MainListener::RejectCodeValueIntoDataSlot(antlr4::ParserRuleContext* ctx,
@@ -6270,6 +6370,17 @@ void MainListener::EmitPositionalFixedArrayInit(
         size_t line,
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList) {
         auto* compiler = Compiler(initList);
+        auto* arrAlloc = compiler->CreateLocalVariable(tv, nullptr, arraySize, line);
+        allocList.push_back(std::pair(name, arrAlloc));
+        EmitPositionalFixedArrayIntoSlot(name, tv, initList, arrAlloc);
+    }
+
+void MainListener::EmitPositionalFixedArrayIntoSlot(
+        const std::string& name,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* initList,
+        llvm::Value* arrAlloc) {
+        auto* compiler = Compiler(initList);
         auto elements = initList->fieldInit();
         uint64_t n = tv.ConstArraySize;
 
@@ -6279,9 +6390,6 @@ void MainListener::EmitPositionalFixedArrayInit(
                 "too many initializers for '{}[{}]': got {} elements", tv.TypeName, n, elements.size()));
             return;
         }
-
-        auto* arrAlloc = compiler->CreateLocalVariable(tv, nullptr, arraySize, line);
-        allocList.push_back(std::pair(name, arrAlloc));
 
         auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
         auto* elemTy = arrTy->getElementType();

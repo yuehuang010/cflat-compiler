@@ -1,0 +1,58 @@
+// A brace list as a FIELD DEFAULT, in the positions where the two DECLARATOR scopes already
+// reject the same spelling. Pre-fix every leg below compiled and silently produced a zero /
+// null / discarded value, which is why each is a rejection rather than a value.
+//
+// All legs use the SCOPED-block form: each block is armed and checked independently, so one
+// leg's diagnostic cannot stand in for another's. Every message below is pinned by its
+// ROLE-specific wording ("field 'S.f'", "array element of field 'S.a'") so a test cannot pass
+// on a diagnostic raised by a neighbouring site.
+
+
+struct FbrIn { int x = default; int y = default; };
+interface FbrI { int fbrFoo(); };
+class FbrC : FbrI { int a = default; int fbrFoo() { return a; } };
+
+// An INTERFACE-typed field has no aggregate layout of its own to brace-init: the list names
+// a concrete class's fields, and the slot holds a fat {object, vtable} pair.
+expect_error("brace initializer with values is not supported on 'FbrHIface.h'") {
+    struct FbrHIface { FbrI h = { a = 1 }; };
+}
+
+// Brace-VALUE-init on a primitive is not a language feature in any scope.
+expect_error("brace initializer with values is not supported on 'FbrHPrim.x'") {
+    struct FbrHPrim { int x = { 5 }; };
+}
+
+// A POINTER field: the braces would write into the pointer's own 8 bytes, so the field values
+// would become the address. The remedy named here compiles as a field default.
+expect_error("cannot apply a brace initializer to the POINTER field 'FbrHPtr.p'") {
+    struct FbrHPtr { FbrIn* p = { x = 1 }; };
+}
+
+// The 'unique' qualifier has to survive into the remedy, or the suggestion is not a legal
+// declaration of THIS field.
+expect_error("allocate one first ('unique FbrIn* p = new FbrIn();')") {
+    struct FbrHUniq { unique FbrIn* p = { x = 1 }; };
+}
+
+// A NAMED list over a POINTER ELEMENT array: the seed is an 'FbrIn' memcpy'd over each pointer
+// slot, so the field values would become the element addresses. Role names the ELEMENT.
+expect_error("cannot apply a brace initializer to the POINTER array element of field 'FbrHPElem.a'") {
+    struct FbrHPElem { FbrIn*[2] a = { x = 1 }; };
+}
+
+// A NAMED list needs a struct element to apply the names to; 'int' has no field 'q'.
+expect_error("array value-initializer '= {}' requires a struct element type, 'int' is not a struct") {
+    struct FbrHNamedPrim { int[3] a = { q = 1 }; };
+}
+
+// The positional array arm's own bound check, now reachable from the field position too.
+expect_error("too many initializers for 'int[3]': got 4 elements") {
+    struct FbrHLong { int[3] a = { 1, 2, 3, 4 }; };
+}
+
+extern int main()
+{
+    printf("PASS: expected error received\n");
+    return 0;
+}

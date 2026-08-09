@@ -80,6 +80,25 @@ int fbBump() { fbBumped = fbBumped + 1; return 41; }
 struct FbSide  { FbIn i = { x = fbBump(), y = 2 }; };      // the call must run exactly once
 FbEq fbGlobal = default;                                   // globals skip the ctor - still zero
 
+// ===== a FIXED-ARRAY field whose OWN default is a brace list =====
+// The brace-list field arm above bailed on ConstArraySize > 0, so an array field fell back to
+// the zero seed. Every value leg below reads 0 (or "") on the pre-fix binary. The list is
+// POSITIONAL, so the value is built as an [N x T] aggregate for the insertvalue - the named
+// field-init path the struct case uses cannot express it.
+struct FbaHost   { int[3] a = { 1, 2, 3 }; int z; };        // the headline repro
+struct FbaShort  { int[3] a = { 4 }; };                     // short list: trailing slots zero
+struct FbaChar   { char[4] c = { 'a', 'b', 'c' }; };        // char element, NUL-terminated tail
+struct FbaPtr    { FbIn*[2] p = { nullptr, nullptr }; };    // pointer ELEMENT, positional
+struct FbaNamed  { FbSeed[2] s = { x = 5 }; };              // NAMED list: seed once, splat over N
+struct FbaStr    { string[2] s = { "ab", "cd" }; };         // OWNING element: value + no leak
+class  FbaClass  { int[3] a = { 7, 8, 9 }; int z; };        // class twin
+struct FbaBox<T> { T[3] a = { 1, 2, 3 }; };                 // generic owner
+struct FbaCtor   { int[3] a = { 1, 2, 3 }; int z; FbaCtor() { z = 6; } };  // user no-arg ctor
+int fbaBumped = 0;
+int fbaBump() { fbaBumped = fbaBumped + 1; return 4; }
+struct FbaSide   { int[3] a = { fbaBump(), 2, 3 }; };       // NON-constant element, runs once
+struct FbaEmpty  { int[3] a = {}; };                        // accept cell: '{}' stays zero
+
 // ===== 'S[N] a = default;' on the STACK: types for the per-element seeding legs =====
 // PRE, this one spelling zero-filled the whole array and skipped every field initializer, while
 // the bare 'S[N] a;' spelling and the heap 'new S[N]' both ran them. POST it is byte-identical
@@ -97,7 +116,7 @@ struct FadDtor   { int k = 7; ~FadDtor() { fadDtors = fadDtors + 1; } };
 int fadAddOne(int x) { return x + 1; }
 struct FadClo    { Lambda<int(int)> f = fadAddOne; };            // PRE: the zeroed slot was CALLED
 FadS[2] fadGlobal = default;                       // frozen: a global still skips the ctor
-struct FadHost   { FadS[2] a; int z = 3; };        // frozen: the fixed-array FIELD is a separate issue
+struct FadHost   { FadS[2] a; int z = 3; };        // frozen: no initializer at all - separate residue
 
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
@@ -480,6 +499,68 @@ extern int main()
     }
     total++; passed += Test("fixed-array '= default' destructs each element once", fadDtors, 3);
 
+    // ===== fixed-array FIELD brace-list defaults =====
+    // Each expected value is positional (d0*100 + d1*10 + d2), so a zero fill, a reversed
+    // order, or a splat of one element cannot produce it.
+    FbaHost fbah;
+    total++; passed += Test("fixed-array field brace positional",
+                            fbah.a[0] * 100 + fbah.a[1] * 10 + fbah.a[2], 123);
+    // Accept set - identical on both binaries: the list names 'a', so 'z' must stay zero.
+    total++; passed += Test("fixed-array field brace leaves sibling zero", fbah.z, 0);
+
+    // Short list: named slots take their values, trailing slots zero-fill. 400 is unreachable
+    // both from a zero fill (0) and from a splat of the one element (444).
+    FbaShort fbas;
+    total++; passed += Test("fixed-array field brace short list zero-fills tail",
+                            fbas.a[0] * 100 + fbas.a[1] * 10 + fbas.a[2], 400);
+
+    // char element: the unwritten 4th slot is the NUL a C string needs, so this reads back
+    // through strlen as a real 3-char string, not just three ints.
+    FbaChar fbac;
+    total++; passed += Test("fixed-array field brace char element", fbac.c[1], 'b');
+    total++; passed += Test("fixed-array field brace char tail is NUL", (int)fbac.c[3], 0);
+
+    // Pointer ELEMENT with a POSITIONAL list is legal (the named form is rejected - see
+    // Test/errors/err_field_brace_reject.cb); nullptr must land as a real null store.
+    FbaPtr fbap;
+    total++; passed += Test("fixed-array field brace pointer element", (i64)fbap.p[1], (i64)0);
+
+    // NAMED entries over a struct element type: build one element, apply 'x = 5', memcpy it
+    // into all N. 5858 proves BOTH slots got the override AND kept FbSeed's own y default.
+    FbaNamed fban;
+    total++; passed += Test("fixed-array field brace named splats every element",
+                            fban.s[0].x * 1000 + fban.s[0].y * 100 + fban.s[1].x * 10 + fban.s[1].y,
+                            5858);
+
+    // OWNING element type: the values must survive, and the strings must not leak. Pre-fix
+    // both slots read as the empty string.
+    FbaStr fbast;
+    total++; passed += Test("fixed-array field brace owning string element 0", fbast.s[0], "ab");
+    total++; passed += Test("fixed-array field brace owning string element 1", fbast.s[1], "cd");
+
+    // Owner axis: class, generic and user-no-arg-ctor are three separate default-ctor emitters.
+    FbaClass fbacl;
+    total++; passed += Test("fixed-array field brace class twin",
+                            fbacl.a[0] * 100 + fbacl.a[1] * 10 + fbacl.a[2], 789);
+    FbaBox<int> fbab;
+    total++; passed += Test("fixed-array field brace inside generic",
+                            fbab.a[0] * 100 + fbab.a[1] * 10 + fbab.a[2], 123);
+    FbaCtor fbact;
+    total++; passed += Test("fixed-array field brace user no-arg ctor",
+                            fbact.a[0] * 100 + fbact.a[1] * 10 + fbact.a[2] + fbact.z, 129);
+
+    // A NON-constant element must still be emitted (the value cannot be constant-folded into
+    // the aggregate) and must run exactly once per construction.
+    FbaSide fbasi;
+    total++; passed += Test("fixed-array field brace non-constant element",
+                            fbasi.a[0] * 100 + fbasi.a[1] * 10 + fbasi.a[2], 423);
+    total++; passed += Test("fixed-array field brace non-constant element runs once", fbaBumped, 1);
+
+    // Accept set - identical on both binaries: an empty list on a primitive element is zero.
+    FbaEmpty fbae;
+    total++; passed += Test("fixed-array field brace empty list stays zero",
+                            fbae.a[0] + fbae.a[1] + fbae.a[2], 0);
+
     // ----- Accept cells, frozen: correct before the fix and must not move -----
     // Value freeze only: a regression here emits no store at all, and the undef read still came
     // back zero under a polarity-flipped build. The discriminating evidence for this cell is the
@@ -493,8 +574,9 @@ extern int main()
     total++; passed += Test("frozen: pointer element stays null", (i64)fadP[0], (i64)0);
     total++; passed += Test("frozen: fixed-array '= default' at global scope still zero",
                             fadGlobal[0].k + fadGlobal[1].k, 0);
-    // A fixed-array FIELD is fixed-array-field-brace-default-discarded, deliberately NOT absorbed
-    // here; this leg pins that the local-declarator fix leaves that cell exactly where it was.
+    // A fixed-array FIELD with NO initializer is a separate residue from the brace-list one
+    // fixed above (fixed-array-field-skips-element-default-construction); this leg pins that
+    // neither the local-declarator fix nor the field-brace fix moved that cell.
     FadHost fadH = default;
     total++; passed += Test("frozen: fixed-array FIELD still skips element defaults",
                             fadH.a[0].k + fadH.a[1].k, 0);
