@@ -3535,6 +3535,154 @@ bool testLambdaExprBodyOwnedTemp()
     return result;
 }
 
+// A VOID lambda's `=> expr` is a DISCARDED full expression, not a return. Pre-fix the arm
+// emitted a `ret <value>` into a void function and every cell below died in the module
+// verifier ("Found return instr that returns non-void ...") with no source location.
+int vebHits = 0;
+int vebCalls = 0;
+void vebBump()          { vebHits = vebHits + 1; }
+void vebBumpN(int n)    { vebHits = vebHits + n; }
+int  vebGives(int n)    { vebCalls = vebCalls + 1; return n * 2; }
+void vebInvoke(Lambda<void(int)> f, int v) { f(v); }
+int vebSeen = 0;
+void vebShow(int len)   { vebSeen = len; }
+int vebPlainCalls = 0;
+int vebStore = 7;
+void* vebGiveP() { return (void*)&vebStore; }
+using VebVoid = void;
+using VebVoidP = void*;
+struct VebPod { int a = default; int b = default; };
+VebPod vebMakePod() { vebPlainCalls = vebPlainCalls + 1; VebPod p = default; p.a = 4; return p; }
+
+// A void expression-body lambda inside a GENERIC function body, instantiated twice.
+int vebGeneric<T>(T v)
+{
+    Lambda<void()> g = () => vebBumpN(1);
+    g();
+    return vebHits;
+}
+
+bool testLambdaVoidExprBody()
+{
+    bool result = true;
+
+    vebHits = 0;
+    Lambda<void()> g = () => vebBump();
+    g();
+    result &= Test("veb_void_callee", vebHits, 1);
+
+    // Block-body twin - correct pre-fix; frozen so the two spellings cannot drift.
+    vebHits = 0;
+    Lambda<void()> gb = () => { vebBump(); };
+    gb();
+    result &= Test("veb_block_twin", vebHits, 1);
+
+    vebHits = 0;
+    Lambda<void(int)> h = (int n) => vebBumpN(n);
+    h(5);
+    result &= Test("veb_param_form", vebHits, 5);
+
+    // A NON-void callee in a void body: the value is discarded like an expression statement,
+    // but the call must still run (vebCalls is the discriminator, not the returned value).
+    vebCalls = 0;
+    Lambda<void()> d = () => vebGives(4);
+    d();
+    result &= Test("veb_int_callee_discarded", vebCalls, 1);
+
+    // An owning temp CONSUMED inside a void body must be destructed by the body's own flush,
+    // exactly as in the block-body and expression-statement spellings.
+    lamSDtors = 0; vebSeen = 0;
+    Lambda<void()> o = () => vebShow(lamMakeS().s.length());
+    o();
+    result &= Test("veb_owning_temp_value",      vebSeen,    11);
+    result &= Test("veb_owning_temp_destructed", lamSDtors,   1);
+
+    lamSDtors = 0; vebSeen = 0;
+    Lambda<void()> ob = () => { vebShow(lamMakeS().s.length()); };
+    ob();
+    result &= Test("veb_owning_temp_block_twin", lamSDtors, 1);
+
+    // A POD struct (no destructor, no owning field) discarded in a void body: the call still runs.
+    vebPlainCalls = 0;
+    Lambda<void()> pl = () => vebMakePod();
+    pl();
+    result &= Test("veb_plain_struct_discarded", vebPlainCalls, 1);
+
+    // Thin `function<void()>` (funcptr) versus the fat Lambda<> spelling.
+    vebHits = 0;
+    function<void()> t = () => vebBump();
+    t();
+    result &= Test("veb_thin_funcptr", vebHits, 1);
+
+    // Nested void expression bodies: the inner invoker is its own function.
+    vebHits = 0;
+    Lambda<void()> n = () => (() => vebBump())();
+    n();
+    result &= Test("veb_nested", vebHits, 1);
+
+    // A capturing void body - the capture is read, not returned.
+    vebSeen = 0;
+    string cap = "hello";
+    Lambda<void()> c = () => vebShow(cap.length());
+    c();
+    result &= Test("veb_capture", vebSeen, 5);
+
+    // Passed as an argument and invoked in the callee.
+    vebHits = 0;
+    vebInvoke((int n) => vebBumpN(n), 4);
+    result &= Test("veb_passed_as_argument", vebHits, 4);
+
+    // A non-call expression body: evaluated and discarded, like `x + 1;`.
+    vebHits = 7;
+    Lambda<void()> e = () => vebHits + 1;
+    e();
+    result &= Test("veb_noncall_expr_discarded", vebHits, 7);
+
+    // A parenthesized ASSIGNMENT body is a real side effect, not a discard.
+    vebHits = 0;
+    Lambda<void()> a = () => (vebHits = 5);
+    a();
+    result &= Test("veb_assignment_body", vebHits, 5);
+
+    // ACCEPT SET, and the guard's exact boundary: `void*` shares the "void" TypeName but
+    // returns a real value, so it must stay on the RETURN lowering. Both spellings worked
+    // pre-fix; a discard arm keyed on the TypeName alone silently returns nothing here.
+    Lambda<void*()> vp = () => vebGiveP();
+    result &= Test("veb_voidptr_expr_body_returns",  vebGiveP() == vp()  ? 1 : 0, 1);
+    Lambda<void*()> vb = () => { return vebGiveP(); };
+    result &= Test("veb_voidptr_block_body_returns", vebGiveP() == vb()  ? 1 : 0, 1);
+
+    // Two instantiations of the same generic body: each gets its own lowered invoker.
+    vebHits = 0;
+    result &= Test("veb_generic_inst_int",    vebGeneric<int>(1),    1);
+    result &= Test("veb_generic_inst_double", vebGeneric<double>(2.0), 2);
+
+    // The ALIAS spelling of the return type reaches the same arm. Unresolved, `Lambda<VebVoid()>`
+    // died in the module verifier on the expression body and got a false "missing return
+    // statement" on the block body; both spellings must behave as plain `void`.
+    vebHits = 0;
+    Lambda<VebVoid()> av = () => vebBump();
+    av();
+    result &= Test("veb_alias_void_expr_body", vebHits, 1);
+    vebHits = 0;
+    Lambda<VebVoid()> ab = () => { vebBump(); };
+    ab();
+    result &= Test("veb_alias_void_block_body", vebHits, 1);
+
+    // An alias whose TARGET spells a pointer keeps the return lowering - it is not "void".
+    Lambda<VebVoidP()> ap = () => vebGiveP();
+    result &= Test("veb_alias_voidptr_returns", vebGiveP() == ap() ? 1 : 0, 1);
+
+    // An immediately-invoked literal has no expected type; a VOID-yielding body is still a
+    // genuine discard and must run (the value-yielding form is rejected - see
+    // Test/errors/err_lambda_expr_temp_escape.cb).
+    vebHits = 0;
+    (() => vebBump())();
+    result &= Test("veb_iife_void_body", vebHits, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3579,6 +3727,7 @@ extern int main()
     total++; passed += testLambdaParamShadowsEnclosing()  ? 1 : 0;
     total++; passed += testInterfaceReturnWithLambda()  ? 1 : 0;
     total++; passed += testLambdaExprBodyOwnedTemp()    ? 1 : 0;
+    total++; passed += testLambdaVoidExprBody()         ? 1 : 0;
 
     // Generic function pointer tests
     total++; passed += testGenericFuncPtrBasic()       ? 1 : 0;

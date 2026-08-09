@@ -20,4 +20,11 @@ expect_error("taken from a temporary") {
     Lambda<LamEscDt*()> f = () => lamEscMake().t;
 }
 
+// An IMMEDIATELY-INVOKED literal gets no expected type, so the return type falls back to "void".
+// That fallback must not be read as a declared void: the value-yielding body would be discarded
+// and the caller would read garbage (measured `((int x) => x * 2)(4)` printing -16).
+expect_error("cannot infer the return type of lambda") {
+    int lamInferUse() { return ((int x) => x * 2)(4); }
+}
+
 extern int main() { return 0; }

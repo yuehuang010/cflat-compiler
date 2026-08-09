@@ -65,3 +65,11 @@ expect_error("owning return value of 'makePtr5' must not be discarded") {
     move R5* makePtr5() { return new R5; }
     void useIt5() { int i = 0; for (makePtr5(); i < 0; i = i + 1) { } }
 }
+
+// A VOID lambda's `=> expr` body is a DISCARD position too, so the same check runs there. Pre-fix
+// the arm emitted a return into the void invoker and this shape died in the module verifier.
+expect_error("owning return value of 'makePtr9' must not be discarded") {
+    class R9 { int id = default; };
+    move R9* makePtr9() { return new R9; }
+    void useIt9() { Lambda<void()> g = () => makePtr9(); g(); }
+}

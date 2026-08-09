@@ -4700,11 +4700,21 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             }
         }
 
-        // Return type from lambdaExpectedType (threaded from declaration or argument context)
+        // Return type from lambdaExpectedType (threaded from declaration or argument context).
+        // Resolve a plain alias, so `using V = void; Lambda<V()>` is the same type as
+        // `Lambda<void()>` to every TypeName check below. A target spelling a pointer
+        // (`using VP = void*`) is left alone - Pointer rides a separate field here.
         LLVMBackend::TypeAndValue returnType;
         returnType.TypeName = lambdaExpectedType.FuncPtrReturnTypeName;
+        if (std::string resolved = compiler->ResolveTypeAlias(returnType.TypeName);
+            resolved.find('*') == std::string::npos)
+            returnType.TypeName = resolved;
         returnType.Pointer = lambdaExpectedType.FuncPtrReturnPointer;
-        if (returnType.TypeName.empty())
+        // An EMPTY expected return type means no context supplied one (e.g. an immediately-invoked
+        // literal). "void" is a fallback, not a declaration, and the two must not be confused: a
+        // declared void discards its expression body, an inferred one cannot.
+        bool returnTypeInferred = returnType.TypeName.empty();
+        if (returnTypeInferred)
             returnType.TypeName = "void";
 
         // Keep lambda counter in sync: closure name matches lambda name index.
@@ -4959,10 +4969,39 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             }
             else if (auto* expr = body->assignmentExpression())
             {
-                // `=> expr` is `=> { return expr; }`: go through the shared return lowering so
-                // the body runs the same ownership gates and owned-temp flush a block body does.
                 if (!compiler->IsBlockTerminated())
-                    EmitReturnExpression(expr, expr, expr->getText());
+                {
+                    if (returnType.TypeName == "void" && !returnType.Pointer)
+                    {
+                        // On a VOID lambda `=> expr` is a DISCARDED full expression, not a return:
+                        // mirror ParseStatement's expression-statement arm exactly. The void arm
+                        // below then emits the CreateRetVoid. FlushOwnedTemps stands in for the
+                        // block-item boundary flush an expression body never reaches. `void*`
+                        // returns a real value and stays on the return lowering.
+                        bool bareExpr = expr->assignmentOperator() == nullptr;
+                        auto resultNV = ParseAssignmentExpressionNamed(expr, true);
+                        // No context declared the return type, so "void" here is a fallback. A body
+                        // that yields a VALUE would be silently dropped and the caller would read
+                        // garbage - say so instead (a void-yielding body is a genuine discard).
+                        if (returnTypeInferred && resultNV.Primary != nullptr
+                            && !resultNV.Primary->getType()->isVoidTy())
+                            LogErrorContext(expr, std::format(
+                                "cannot infer the return type of lambda '{}': its body yields a value "
+                                "but no 'function<...>' or 'Lambda<...>' type reaches it here; bind the "
+                                "lambda to a typed variable or parameter and call it through that",
+                                lambdaName));
+                        if (bareExpr) DiagnoseDiscardedOwningReturn(expr, resultNV);
+                        ProcessPlusPlus();
+                        RegisterDiscardedOwningStructTemp(resultNV);
+                        compiler->FlushOwnedTemps();
+                    }
+                    else
+                    {
+                        // `=> expr` is `=> { return expr; }`: go through the shared return lowering
+                        // so the body runs the same ownership gates a block body does.
+                        EmitReturnExpression(expr, expr, expr->getText());
+                    }
+                }
             }
         }
 

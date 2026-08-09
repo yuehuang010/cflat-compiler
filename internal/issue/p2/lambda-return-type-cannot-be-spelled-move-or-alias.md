@@ -77,4 +77,4 @@ Two independent halves; the first is cheap and the second is the real one.
    `move` / `alias` / `unique` the closure ABI can actually honour, since the invoker is
    synthesized.
 
-Related: [[nodiscard-residual-gaps]], [[void-expression-body-lambda-fails-module-verification]].
+Related: [[nodiscard-residual-gaps]], [[return-value-void-mismatch-fails-module-verification]].
