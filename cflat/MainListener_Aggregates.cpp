@@ -3288,7 +3288,24 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
         returnType.TypeName = "void";
 
         int line = static_cast<int>(ctx->getStart()->getLine());
-        auto fn = compiler->CreateFunctionDefinition("~" + structName, returnType, params, false, false, line);
+        std::string fullName = "~" + structName;
+
+        // A destructor can never be compiler-synthesized with a body, so an occupied slot here is
+        // always a genuine user duplicate. Check BEFORE CreateFunctionDefinition: its own early
+        // return for an already-defined body pushes no function scope, and continuing on would
+        // pop a scope frame that was never pushed (the same-line underflow this guards against).
+        std::string clashFile;
+        size_t clashLine = 0;
+        if (compiler->OverloadSlotIsDefined(fullName, returnType, params, false, &clashFile, &clashLine))
+        {
+            LogErrorContext(ctx, std::format(
+                "redefinition of '{}' - the same overload is already defined at "
+                "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
+                "'i32' name the same type) are one overload, not two.",
+                fullName, clashFile, clashLine));
+        }
+
+        auto fn = compiler->CreateFunctionDefinition(fullName, returnType, params, false, false, line);
         compiler->RegisterDestructor(structName, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
@@ -3319,7 +3336,22 @@ void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefin
         returnType.TypeName = "void";
 
         int line = static_cast<int>(ctx->getStart()->getLine());
-        auto fn = compiler->CreateFunctionDefinition("~" + name, returnType, params, false, false, line);
+        std::string fullName = "~" + name;
+
+        // Same guard as the struct/class destructor path: a destructor body can never be
+        // compiler-synthesized, so an occupied slot here is always a genuine user duplicate.
+        std::string clashFile;
+        size_t clashLine = 0;
+        if (compiler->OverloadSlotIsDefined(fullName, returnType, params, false, &clashFile, &clashLine))
+        {
+            LogErrorContext(ctx, std::format(
+                "redefinition of '{}' - the same overload is already defined at "
+                "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
+                "'i32' name the same type) are one overload, not two.",
+                fullName, clashFile, clashLine));
+        }
+
+        auto fn = compiler->CreateFunctionDefinition(fullName, returnType, params, false, false, line);
         compiler->RegisterDestructor(name, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
