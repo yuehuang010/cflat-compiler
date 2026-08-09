@@ -67,6 +67,31 @@ program FieldBraceDefault {
     }
 };
 
+// NoInitFieldConfig: a struct-typed field with NO initializer at all. Regression for
+// program-field-no-initializer-skips-default-ctor: the synthesized ctor must call the
+// field type's own default constructor (running Deep's field initializer) instead of
+// zero-filling, exactly like the identical field inside a struct or class.
+struct NoInitDeep { int w = 42; };
+struct NoInitInner { int v = 7; NoInitDeep d; };
+program NoInitFieldConfig {
+    NoInitInner nested;
+
+    int main(move list<string> args) {
+        return nested.v * 100 + nested.d.w;
+    }
+};
+
+// NarrowFieldConfig: a mismatched SCALAR field default (int i = 3.7 has a double literal).
+// Regression for the same issue's scalar arm: the synthesized ctor must CreateCast the
+// mismatched default instead of feeding it unconverted into CreateInsertValue.
+program NarrowFieldConfig {
+    int i = 3.7;
+
+    int main(move list<string> args) {
+        return i;
+    }
+};
+
 // UserDtor: a program with an explicit ~UserDtor(). The compiler emits exactly ONE
 // destructor - the user body runs first, then the builtin field teardown (allocator,
 // stop_source, inbox) is appended at the end. The user body bumps a global counter so
@@ -301,6 +326,28 @@ bool testProgramFieldBraceDefault() {
     p.run(args);
     p.WaitForExit();
     result &= Test("program config field brace default", p.exitCode, 1008);
+    return result;
+}
+
+bool testProgramFieldNoInitializerDefaultCtor() {
+    bool result = true;
+    // No initializer at all on `nested` - fails pre-fix (reads 0*100+0 = 0 instead of 742).
+    NoInitFieldConfig p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("program struct field with no initializer runs its default ctor", p.exitCode, 742);
+    return result;
+}
+
+bool testProgramFieldNarrowingScalarDefault() {
+    bool result = true;
+    // int i = 3.7 - fails pre-fix (unconverted double bits read back as a garbage int).
+    NarrowFieldConfig p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("program scalar field default narrows via CreateCast", p.exitCode, 3);
     return result;
 }
 
@@ -1505,6 +1552,8 @@ extern int main() {
     total++; passed += testProgramMultipleFields()       ? 1 : 0;
     total++; passed += testProgramFieldDefaultValues()   ? 1 : 0;
     total++; passed += testProgramFieldBraceDefault()    ? 1 : 0;
+    total++; passed += testProgramFieldNoInitializerDefaultCtor() ? 1 : 0;
+    total++; passed += testProgramFieldNarrowingScalarDefault()   ? 1 : 0;
     total++; passed += testProgramHeapAllocationsFreed() ? 1 : 0;
     total++; passed += testProgramMultipleRuns()         ? 1 : 0;
     total++; passed += testProgramArgsManyItems()        ? 1 : 0;

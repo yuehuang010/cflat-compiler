@@ -2252,20 +2252,44 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             unsigned int idx = 0;
             for (auto* rvalue : initializers)
             {
+                auto* destType = structType->getTypeAtIndex(idx);
+                // No explicit initializer on a struct-typed USER field - call its default ctor
+                // (same fallback as ParseStructDefinition). Synthetic fields are written below.
+                if (rvalue == nullptr && idx < exitCodeFieldIndex && destType->isStructTy())
+                {
+                    std::string fieldTypeName = declList[idx].TypeName;
+                    // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                    // here would call a same-named sibling type's ctor (layer 3).
+                    if (compiler->GetFunction(fieldTypeName))
+                        rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
+                    else
+                        rvalue = llvm::Constant::getNullValue(destType);
+                }
                 if (rvalue)
                 {
-                    auto* destType = structType->getTypeAtIndex(idx);
                     rvalue = compiler->Upconvert(rvalue, destType);
-                    if (rvalue->getType() != destType && destType->isStructTy())
+                    if (rvalue->getType() != destType)
                     {
-                        // Initializer type doesn't match struct field type (same fallback as ParseStructDefinition).
-                        std::string fieldTypeName = declList[idx].TypeName;
-                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                        // here would call a same-named sibling type's ctor (layer 3).
-                        if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
+                        if (destType->isStructTy())
+                        {
+                            // Initializer type doesn't match struct field type (same fallback as ParseStructDefinition).
+                            std::string fieldTypeName = declList[idx].TypeName;
+                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                            // here would call a same-named sibling type's ctor (layer 3).
+                            if (compiler->GetFunction(fieldTypeName))
+                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
+                            else
+                                rvalue = llvm::Constant::getNullValue(destType);
+                        }
                         else
-                            rvalue = llvm::Constant::getNullValue(destType);
+                        {
+                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                            compiler->LogWarning(std::format(
+                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                declList[idx].TypeName,
+                                declList[idx].VariableName));
+                            rvalue = compiler->CreateCast(rvalue, destType);
+                        }
                     }
                     structVal = compiler->CreateInsertValue(structVal, rvalue, idx);
                 }
