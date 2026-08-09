@@ -366,6 +366,37 @@ struct SeedZeroNoCtor<T> { T val = 0; int p = 1; };
 struct SeedZeroBare<T> { T val = 0; int p = 1; SeedZeroBare() { } };
 struct SeedZeroAllDefaulted<T> { T val = 0; int p = 1; SeedZeroAllDefaulted(int x = 3) { } };
 
+/*
+ * Regression: ParseClassDefinition's synthesized default ctor gated its type-mismatch handling
+ * on `destType->isStructTy()`, so a mismatched SCALAR field default reached CreateInsertValue
+ * unconverted and the ctor returned a struct constant whose element types did not match the
+ * struct type (`%C = type { i8, i32 }` with `ret %C { i16 200, i32 1 }` - rejected by llvm-as,
+ * accepted by verifyModule). The struct twins above are the oracle.
+ * Discriminators: only the three float-to-integer cells below change value across the fix
+ * (pre-fix i=-1717986918, r8=154, (int)g=-1717986918). The u8/i16 cells are oracle PINS,
+ * not discriminators - the malformed constant's low bits happened to be the truncation, so
+ * they read the same value on both binaries. What discriminates them is the emitted IR and the
+ * narrowing warning, neither of which this suite can observe.
+ */
+class SeedCastClassNoCtor
+{
+    u8 r = 200;
+    i16 s = 40000;
+    int i = 3.7;
+    u8 r8 = 3.7;
+    i64 g = 3.7;
+};
+
+// A parameterized user ctor does NOT suppress the synthetic no-arg ctor - it DELEGATES to it,
+// so this shape reaches the same emitter as the ctor-less class above.
+class SeedCastClassUserCtor
+{
+    int i = 3.7;
+    u8 r8 = 3.7;
+    int p = 1;
+    SeedCastClassUserCtor(int q) { p = q; }
+};
+
 bool testNoArgCtorFieldSeedingCasts()
 {
     bool result = true;
@@ -397,6 +428,19 @@ bool testNoArgCtorFieldSeedingCasts()
     SeedZeroAllDefaulted<SeedZeroInner> gd;
     result &= Test("seedzero_alldef_v", gd.val.v, 7);
     result &= Test("seedzero_alldef_p", gd.p, 1);
+
+    // Class twins. Same expected values as SeedCastNoCtor - the class emitter now runs the
+    // struct emitter's scalar arm. See the block comment above SeedCastClassNoCtor.
+    SeedCastClassNoCtor c;
+    result &= Test("seedcast_class_u8", (int)c.r, 200);          // pin, not a discriminator
+    result &= Test("seedcast_class_i16", (int)c.s, -25536);      // pin, not a discriminator
+    result &= Test("seedcast_class_fptosi", c.i, 3);             // pre-fix: -1717986918
+    result &= Test("seedcast_class_fptoui8", (int)c.r8, 3);      // pre-fix: 154
+    result &= Test("seedcast_class_fptosi64", (int)c.g, 3);      // pre-fix: -1717986918
+    SeedCastClassUserCtor u = SeedCastClassUserCtor(9);
+    result &= Test("seedcast_class_userctor_fptosi", u.i, 3);    // pre-fix: -1717986918
+    result &= Test("seedcast_class_userctor_fptoui8", (int)u.r8, 3);
+    result &= Test("seedcast_class_userctor_p", u.p, 9);
     return result;
 }
 

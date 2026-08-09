@@ -2786,15 +2786,27 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 if (rvalue != nullptr)
                 {
                     rvalue = compiler->Upconvert(rvalue, destType);
-                    if (rvalue->getType() != destType && destType->isStructTy())
+                    if (rvalue->getType() != destType)
                     {
-                        std::string fieldTypeName = declList[structIndex].TypeName;
-                        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
-                        // here would call a same-named sibling type's ctor (layer 3).
-                        if (compiler->GetFunction(fieldTypeName))
-                            rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
+                        if (destType->isStructTy())
+                        {
+                            std::string fieldTypeName = declList[structIndex].TypeName;
+                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                            // here would call a same-named sibling type's ctor (layer 3).
+                            if (compiler->GetFunction(fieldTypeName))
+                                rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
+                            else
+                                rvalue = llvm::Constant::getNullValue(destType);
+                        }
                         else
-                            rvalue = llvm::Constant::getNullValue(destType);
+                        {
+                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                            compiler->LogWarning(std::format(
+                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                declList[structIndex].TypeName,
+                                declList[structIndex].VariableName));
+                            rvalue = compiler->CreateCast(rvalue, destType);
+                        }
                     }
                     structVal = compiler->CreateInsertValue(structVal, rvalue, structIndex);
                 }

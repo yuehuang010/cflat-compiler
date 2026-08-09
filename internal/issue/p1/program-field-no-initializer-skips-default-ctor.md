@@ -107,8 +107,10 @@ r=200 s=-25536 i=3            plain=5      struct     (three narrowing warnings)
 So the integer cells agree by accident (the mismatched constant's low bits are the truncation),
 and `int i = 3.7;` is a silent wrong value. Probe: `scratch/au_prog_narrow.cb`. A fix here should
 copy BOTH missing arms - the no-initializer struct arm this file is named for and this scalar
-`else` arm. The same scalar gap in `ParseClassDefinition` is filed separately as
-`class-synthetic-ctor-drops-scalar-narrowing-arm.md`.
+`else` arm. The same scalar gap in `ParseClassDefinition` was fixed on 2026-08-09 (the class
+emitter now runs the struct emitter's scalar arm); the `program` emitter is the last site
+without it. Re-measured on that fix's binary: the two blocks above are byte-identical before and
+after it, so this file's values still stand.
 
 Not affected: `ParseImportedProgramDefinition` (`:1882-1935`). `import program "x.cb"` wraps a
 standalone file whose entry point is a free `main`; the program body has no user field list at
