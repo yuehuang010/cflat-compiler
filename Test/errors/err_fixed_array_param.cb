@@ -1,0 +1,71 @@
+// A parameter list reads its types from declarationSpecifiers alone and never evaluates a
+// fixed dimension, so `T[N] p` used to become a scalar `T p`: the body indexed a scalar, no
+// `T[N]` argument could bind, and `pick(dbl)` reached a parameter spelled as an array. Every
+// spelling of a fixed-size array parameter is rejected now - bracketed `T[N] p`, an array
+// alias, and the C-style `T p[N]` - and `T[]` (an array view) is the supported way to take an
+// array. A POINTER element gets the decay remedy instead: `T*[]` is unfeedable (no expression
+// produces one), while `T**` takes a `T*[N]` argument. Each leg's suggested remedy is a value
+// leg in Test/test_function_ptr.cb or compiles as written.
+//
+// Pre-fix all eight legs COMPILED and ran with the dimension silently dropped, so these are
+// scoped-block legs against a diagnostic raised during the MainListener walk (not the
+// ForwardRefScanner pre-pass and not deferred), which is why the scoped form catches them.
+import "function.cb";
+
+// Plain function, primitive element. Pre-fix `sum3(7)` returned 7 - a scalar parameter.
+expect_error("fixed-size array parameter 'a' of type 'int[3]' is not supported; declare it as an array view 'int[]' instead.") {
+    int sum3(int[3] a) { return a[0]; }
+}
+
+// The spelling from the original issue: the `function<T>[N]` overload was a VALUE parameter in
+// disguise, so `pick(dbl)` bound to it while `pick(arr)` went to the `function<T>[]` overload.
+expect_error("fixed-size array parameter 'fns' of type 'function<int(int)>[3]' is not supported; declare it as an array view 'function<int(int)>[]' instead.") {
+    int pickFixed(function<int(int)>[3] fns) { return 10 + fns(1); }
+}
+
+// A struct METHOD parameter reaches the same ParseParameterTypeList.
+expect_error("fixed-size array parameter 'fns' of type 'function<int(int)>[2]' is not supported; declare it as an array view 'function<int(int)>[]' instead.") {
+    struct FixedArrayParamHost {
+        int take(function<int(int)>[2] fns) { return fns(1); }
+    };
+}
+
+// A CONSTRUCTOR parameter, same path.
+expect_error("fixed-size array parameter 'b' of type 'char[4]' is not supported; declare it as an array view 'char[]' instead.") {
+    struct FixedArrayCtorHost {
+        int v = default;
+        FixedArrayCtorHost(char[4] b) { v = (int)b; }
+    };
+}
+
+// An array ALIAS carries the dimension with no brackets in the spelling, so the remedy names
+// the peeled element type rather than the alias.
+expect_error("fixed-size array parameter 'v' of type 'AliasVec3' is not supported; declare it as an array view 'float[]' instead.") {
+    using AliasVec3 = float[3];
+    float firstOf(AliasVec3 v) { return v[0]; }
+}
+
+// A FAT closure gets no view remedy: 'Lambda<T>[]' and 'Lambda<T>*' are both rejected too, so
+// suggesting one would send the user into a second error.
+expect_error("fixed-size array parameter 'fns' of type 'Lambda<int(int)>[2]' is not supported; a closure array cannot be passed in any spelling - take one closure by value instead.") {
+    int callFatArray(Lambda<int(int)>[2] fns) { return 7; }
+}
+
+// The C-style declarator spelling. Pre-fix the parameter bound under the literal name "v[3]",
+// so `v` inside the body was an undefined variable and the argument was a plain scalar.
+expect_error("fixed-size array parameter 'v' of type 'int[3]' is not supported; declare it as an array view 'int[]' instead.") {
+    int sumCStyle(int v[3]) { return 11; }
+}
+
+// A POINTER element: the type spelling carries the star, and the remedy is the decay, not a
+// view - `int*[] p` compiles but no expression can be passed to it, while `int** p` takes an
+// `int*[N]` argument and reads through it.
+expect_error("fixed-size array parameter 'v' of type 'int*[2]' is not supported; pass 'int**' instead (a fixed array decays to a pointer to its first element).") {
+    int firstPtr(int*[2] v) { return 0; }
+}
+
+extern int main()
+{
+    printf("PASS: fixed-size array parameter legs\n");
+    return 0;
+}

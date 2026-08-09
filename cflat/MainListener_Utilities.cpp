@@ -1,5 +1,78 @@
 #include "MainListener.h"
 
+/*
+ * A parameter list reads its types from declarationSpecifiers alone and never evaluates a
+ * fixed dimension, so `T[N] p` would silently become a scalar `T p` - the body then indexes a
+ * scalar and no `T[N]` argument can bind. Reject the spelling instead of decaying it. Three
+ * spellings carry a dimension: bracketed `T[N] p`, an array alias, and the C-style `T p[N]`
+ * (whose parameter name would otherwise bind as the text "p[N]"). Returns the diagnostic, or ""
+ * when the parameter is not a fixed array. `T[]` never reaches here: empty brackets leave
+ * ArraySize null and set IsArrayView.
+ */
+static std::string FixedArrayParamMessage(CFlatParser::ParameterDeclarationContext* paramDecl,
+    const LLVMBackend::DeclTypeAndValue& paramType)
+{
+    auto* declarer = paramDecl->declarator();
+    auto* direct = declarer != nullptr ? declarer->directDeclarator() : nullptr;
+    bool bracketed = paramType.ArraySize != nullptr;
+    bool aliased = !bracketed && paramType.AliasArraySize > 0;
+    bool cstyle = !bracketed && !aliased && direct != nullptr && direct->assignmentExpression() != nullptr;
+    if (!bracketed && !aliased && !cstyle)
+        return {};
+
+    // The spelling comes from the AST, never from TypeName: a funcptr lowers to "__c_fn_ptr".
+    // An element pointer lives on the declarationSpecifier, beside the type, not in TypeName.
+    std::string element;
+    std::string stars;
+    std::string dims;
+    if (auto* specs = paramDecl->declarationSpecifiers())
+    {
+        for (auto* s : specs->declarationSpecifier())
+        {
+            if (s->typeSpecifier() == nullptr)
+                continue;
+            auto* dimSpec = ArrayDimsOf(s);
+            if (bracketed && (dimSpec == nullptr || dimSpec->assignmentExpression().empty()))
+                continue;
+            element = s->typeSpecifier()->getText();
+            stars = s->pointer() != nullptr ? s->pointer()->getText() : "";
+            if (bracketed)
+                dims = dimSpec->getText();
+            break;
+        }
+    }
+    if (element.empty())
+        return {};
+    if (cstyle)
+        dims = "[" + direct->assignmentExpression()->getText() + "]";
+    std::string spelled = element + stars + dims;
+    std::string name = cstyle ? getDirectDeclName(direct) : paramType.VariableName;
+
+    // An array ALIAS spells no brackets and no stars, so both come off the peeled element type.
+    if (aliased && !paramType.IsFunctionPointer)
+    {
+        element = paramType.TypeName;
+        stars = paramType.ElemPointer ? "**" : (paramType.Pointer ? "*" : "");
+    }
+
+    // A fat closure has no passable array spelling at all: 'Lambda<T>[]' and 'Lambda<T>*' are
+    // both rejected, so offering a view here would send the user into a second error.
+    if (paramType.IsFunctionPointer && !paramType.IsThinFnPtr())
+        return std::format("fixed-size array parameter '{}' of type '{}' is not supported; a "
+            "closure array cannot be passed in any spelling - take one closure by value instead.",
+            name, spelled);
+
+    // A view over a POINTER element ('T*[]') is unfeedable - no expression produces one - so a
+    // pointer-element array gets the decay remedy the 'T[N]*' diagnostic already names.
+    if (!stars.empty())
+        return std::format("fixed-size array parameter '{}' of type '{}' is not supported; pass "
+            "'{}{}*' instead (a fixed array decays to a pointer to its first element).",
+            name, spelled, element, stars);
+
+    return std::format("fixed-size array parameter '{}' of type '{}' is not supported; declare it "
+        "as an array view '{}[]' instead.", name, spelled, element);
+}
+
 std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList) {
         std::vector<LLVMBackend::DeclTypeAndValue> params;
 
@@ -31,6 +104,10 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
 
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
+
+            // Fires before the body is walked, so no decayed signature reaches codegen.
+            if (std::string fixedArray = FixedArrayParamMessage(paramDecl, paramType); !fixedArray.empty())
+                LogErrorContext(paramDecl, fixedArray);
 
             // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
             // (prefix): ParseDeclarationSpecifiers above already set paramType.AllocAlignValue. The
