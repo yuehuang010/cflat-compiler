@@ -3841,6 +3841,355 @@ int bpmParamRebound(Resource* p)
     return v;
 }
 
+/*
+ * Owning-struct assignment from an INDIRECT source - a deref (`*ap`), a field (`w.b`), or an
+ * ELEMENT (`arr[i]`). `=` and decl-init defer to T exactly as they already do for a named local
+ * source: a non-copyable owner MOVES (the source lvalue is zeroed, so exactly one owner frees), a
+ * copyable owner COPIES (the source stays live), a POD bit-copies. Before the fix every
+ * indirect-source leg below bit-copied without consuming the source and double-freed at teardown
+ * (compile 0, run SIGABRT). Only a NAMED slot source is marked moved-from; an indirect lvalue is
+ * consumed silently, exactly as `move w.b` already was.
+ */
+struct OaiBox
+{
+    unique Resource* item = nullptr;
+};
+
+OaiBox oaiMake(int id)
+{
+    OaiBox b;
+    b.item = new Resource();
+    b.item->id = id;
+    return b;
+}
+
+struct OaiWrap  { OaiBox b; };
+struct OaiInner { OaiBox b; };
+struct OaiOuter { OaiInner inner; };
+struct OaiArrWrap { OaiBox[2] arr; };
+struct OaiNest  { OaiBox inner; };
+
+struct OaiBox2
+{
+    unique Resource* a = nullptr;
+    unique Resource* b = nullptr;
+};
+
+struct OaiBox2Wrap { OaiBox2 b; };
+
+// Copyable owner: a hand-written copy() makes `=` from any source a COPY, not a move.
+struct OaiCopyBox
+{
+    unique Resource* item = nullptr;
+    OaiCopyBox copy()
+    {
+        OaiCopyBox r;
+        r.item = new Resource();
+        r.item->id = (item == nullptr) ? -1 : item->id;
+        return r;
+    }
+};
+
+struct OaiCopyWrap { OaiCopyBox b; };
+
+// POD - no owned resource, so every source shape stays a plain bit copy.
+struct OaiPod    { int x = 0; };
+struct OaiPodWrap { OaiPod p; };
+
+// Owning but not unique: a string field (the axis a pointer-only dtor count cannot see).
+struct OaiSBox   { string s = ""; };
+struct OaiSWrap  { OaiSBox b; };
+
+OaiBox oaiGlobal;
+
+int oaiId(OaiBox b)
+{
+    if (b.item == nullptr) return -1;
+    return b.item->id;
+}
+
+int testOwningAssignFromIndirectSource()
+{
+    int passed = 0;
+
+    // 1. Deref source, reassign over a live destination (filed repro (a)).
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox* ap = &a;
+        OaiBox o = oaiMake(1);
+        o = *ap;
+        passed += Test("oai_deref_value", oaiId(o), 5);
+        passed += Test("oai_deref_old_dest_freed", dtorCount, 1);
+        passed += Test("oai_deref_source_nulled", ap->item == nullptr, true);
+    }
+    passed += Test("oai_deref_freed_once_each", dtorCount, 2);
+
+    // 2. Field source, reassign (filed repro (b)).
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = w.b;
+        passed += Test("oai_field_value", oaiId(o), 5);
+        passed += Test("oai_field_old_dest_freed", dtorCount, 1);
+        passed += Test("oai_field_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("oai_field_freed_once_each", dtorCount, 2);
+
+    // 3. Nested field source.
+    dtorCount = 0;
+    {
+        OaiOuter ot;
+        ot.inner.b = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = ot.inner.b;
+        passed += Test("oai_nestfield_value", oaiId(o), 5);
+        passed += Test("oai_nestfield_source_nulled", ot.inner.b.item == nullptr, true);
+    }
+    passed += Test("oai_nestfield_freed_once_each", dtorCount, 2);
+
+    // 4. Fixed-array element source (filed repro (c)).
+    dtorCount = 0;
+    {
+        OaiBox[2] arr;
+        arr[0] = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = arr[0];
+        passed += Test("oai_elem_value", oaiId(o), 5);
+        passed += Test("oai_elem_old_dest_freed", dtorCount, 1);
+        passed += Test("oai_elem_source_nulled", arr[0].item == nullptr, true);
+    }
+    passed += Test("oai_elem_freed_once_each", dtorCount, 2);
+
+    // 5. Array-VIEW element source (the view spelling of the same slot).
+    dtorCount = 0;
+    {
+        OaiBox[2] arr;
+        arr[0] = oaiMake(5);
+        OaiBox[] v = arr;
+        OaiBox o = oaiMake(1);
+        o = v[0];
+        passed += Test("oai_view_value", oaiId(o), 5);
+        passed += Test("oai_view_source_nulled", arr[0].item == nullptr, true);
+    }
+    passed += Test("oai_view_freed_once_each", dtorCount, 2);
+
+    // 6. Deref-then-field (`wp->b`) and element-of-field / field-of-element.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiWrap* wp = &w;
+        OaiBox o = oaiMake(1);
+        o = wp->b;
+        passed += Test("oai_arrowfield_value", oaiId(o), 5);
+        passed += Test("oai_arrowfield_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("oai_arrowfield_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiArrWrap wa;
+        wa.arr[0] = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = wa.arr[0];
+        passed += Test("oai_elemoffield_value", oaiId(o), 5);
+        passed += Test("oai_elemoffield_source_nulled", wa.arr[0].item == nullptr, true);
+    }
+    passed += Test("oai_elemoffield_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiWrap[2] wa;
+        wa[0].b = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = wa[0].b;
+        passed += Test("oai_fieldofelem_value", oaiId(o), 5);
+        passed += Test("oai_fieldofelem_source_nulled", wa[0].b.item == nullptr, true);
+    }
+    passed += Test("oai_fieldofelem_freed_once_each", dtorCount, 2);
+
+    // 7. GLOBAL source. GetGlobalVariableNV carries no CallerName, so the named-slot leg never
+    // saw a file-scope global - it took the indirect leg and now transfers like every other slot.
+    dtorCount = 0;
+    {
+        oaiGlobal = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = oaiGlobal;
+        passed += Test("oai_global_value", oaiId(o), 5);
+        passed += Test("oai_global_source_nulled", oaiGlobal.item == nullptr, true);
+    }
+    passed += Test("oai_global_freed_once_each", dtorCount, 2);
+
+    // 8. DECL-INIT is a separate hand-mirrored path - same three source shapes.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiBox o = w.b;
+        passed += Test("oai_declinit_field_value", oaiId(o), 5);
+        passed += Test("oai_declinit_field_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("oai_declinit_field_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox* ap = &a;
+        OaiBox o = *ap;
+        passed += Test("oai_declinit_deref_value", oaiId(o), 5);
+        passed += Test("oai_declinit_deref_source_nulled", ap->item == nullptr, true);
+    }
+    passed += Test("oai_declinit_deref_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox[2] arr;
+        arr[0] = oaiMake(5);
+        OaiBox o = arr[0];
+        passed += Test("oai_declinit_elem_value", oaiId(o), 5);
+        passed += Test("oai_declinit_elem_source_nulled", arr[0].item == nullptr, true);
+    }
+    passed += Test("oai_declinit_elem_freed_once", dtorCount, 1);
+
+    // 9. Multiple unique fields, and an owning struct nested inside an owning struct.
+    dtorCount = 0;
+    {
+        OaiBox2Wrap w;
+        w.b.a = new Resource();
+        w.b.a->id = 5;
+        w.b.b = new Resource();
+        w.b.b->id = 6;
+        OaiBox2 o;
+        o = w.b;
+        passed += Test("oai_multiunique_first", o.a->id, 5);
+        passed += Test("oai_multiunique_second", o.b->id, 6);
+        passed += Test("oai_multiunique_src_first_nulled", w.b.a == nullptr, true);
+        passed += Test("oai_multiunique_src_second_nulled", w.b.b == nullptr, true);
+    }
+    passed += Test("oai_multiunique_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiNest n;
+        n.inner = oaiMake(1);
+        OaiNest o;
+        o = n;
+        passed += Test("oai_nestowner_value", oaiId(o.inner), 1);
+        passed += Test("oai_nestowner_freed_none_yet", dtorCount, 0);
+        OaiBox inner2 = o.inner;
+        passed += Test("oai_nestowner_innerfield_value", oaiId(inner2), 1);
+        passed += Test("oai_nestowner_innerfield_nulled", o.inner.item == nullptr, true);
+    }
+    passed += Test("oai_nestowner_freed_once_each", dtorCount, 2);
+
+    // 10. COPYABLE owner: every source shape COPIES and leaves the source live and independent.
+    dtorCount = 0;
+    {
+        OaiCopyWrap w;
+        w.b.item = new Resource();
+        w.b.item->id = 5;
+        OaiCopyBox o;
+        o.item = new Resource();
+        o.item->id = 1;
+        o = w.b;
+        passed += Test("oai_copyable_field_value", o.item->id, 5);
+        passed += Test("oai_copyable_field_old_dest_freed", dtorCount, 1);
+        passed += Test("oai_copyable_field_source_live", w.b.item->id, 5);
+        passed += Test("oai_copyable_field_independent", o.item != w.b.item, true);
+    }
+    passed += Test("oai_copyable_field_freed_once_each", dtorCount, 3);
+
+    dtorCount = 0;
+    {
+        OaiCopyBox[2] arr;
+        arr[0].item = new Resource();
+        arr[0].item->id = 5;
+        OaiCopyBox o = arr[0];
+        passed += Test("oai_copyable_declinit_elem_value", o.item->id, 5);
+        passed += Test("oai_copyable_declinit_elem_source_live", arr[0].item->id, 5);
+        passed += Test("oai_copyable_declinit_elem_independent", o.item != arr[0].item, true);
+    }
+    passed += Test("oai_copyable_declinit_elem_freed_once_each", dtorCount, 2);
+
+    // 11. ACCEPT SET, unchanged by the fix: an explicit `.copy()` off an indirect source is still
+    // one copy (never a copy of a copy), and `move w.b` still transfers.
+    dtorCount = 0;
+    {
+        OaiCopyWrap w;
+        w.b.item = new Resource();
+        w.b.item->id = 5;
+        OaiCopyBox o;
+        o = w.b.copy();
+        passed += Test("oai_explicit_copy_value", o.item->id, 5);
+        passed += Test("oai_explicit_copy_source_live", w.b.item->id, 5);
+    }
+    passed += Test("oai_explicit_copy_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiBox o = oaiMake(1);
+        o = move w.b;
+        passed += Test("oai_explicit_move_value", oaiId(o), 5);
+        passed += Test("oai_explicit_move_old_dest_freed", dtorCount, 1);
+        passed += Test("oai_explicit_move_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("oai_explicit_move_freed_once_each", dtorCount, 2);
+
+    // 12. ACCEPT SET: a POD source owns nothing, so every shape stays a plain bit copy that
+    // leaves the source readable and unmodified.
+    {
+        OaiPodWrap pw;
+        pw.p.x = 5;
+        OaiPod o;
+        o = pw.p;
+        passed += Test("oai_pod_field_value", o.x, 5);
+        passed += Test("oai_pod_field_source_intact", pw.p.x, 5);
+
+        OaiPod[2] arr;
+        arr[0].x = 9;
+        OaiPod o2 = arr[0];
+        passed += Test("oai_pod_elem_value", o2.x, 9);
+        passed += Test("oai_pod_elem_source_intact", arr[0].x, 9);
+
+        OaiPod src;
+        src.x = 7;
+        OaiPod* sp = &src;
+        OaiPod o3;
+        o3 = *sp;
+        passed += Test("oai_pod_deref_value", o3.x, 7);
+        passed += Test("oai_pod_deref_source_intact", sp->x, 7);
+    }
+
+    // 13. Owning-but-not-unique: a struct whose only owned resource is a HEAP string. A dtor
+    // counter cannot see this axis - the assertion is that BOTH sides still read their value
+    // (a bit-copy alias would leave the source dangling once the destination frees the buffer).
+    {
+        OaiSWrap w;
+        string seed = "ab";
+        w.b.s = seed + "cd";
+        OaiSBox o;
+        o = w.b;
+        passed += Test("oai_stringowner_field_value", o.s, "abcd");
+        passed += Test("oai_stringowner_field_source_live", w.b.s, "abcd");
+
+        OaiSBox a2;
+        a2.s = seed + "ef";
+        OaiSBox* ap2 = &a2;
+        OaiSBox o2 = *ap2;
+        passed += Test("oai_stringowner_declinit_deref_value", o2.s, "abef");
+        passed += Test("oai_stringowner_declinit_deref_source_live", ap2->s, "abef");
+    }
+
+    return passed;
+}
+
 int testBorrowedPointerMoveNoAdopt()
 {
     int passed = 0;
@@ -5634,6 +5983,9 @@ extern int main()
 
     passed += testBorrowedPointerMoveNoAdopt();
     total += 23;
+
+    passed += testOwningAssignFromIndirectSource();
+    total += 75;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

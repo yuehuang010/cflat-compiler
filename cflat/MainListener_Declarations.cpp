@@ -4041,16 +4041,27 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // destructor is suppressed and any later use of a is rejected. `b = a.copy()`
                         // is the explicit way to duplicate. Excludes move/temporary sources (a move
                         // already transfers; a call result / .copy() owns an independent buffer with
-                        // null srcStorage) and non-variable sources (field/element accesses, whose
-                        // Storage is a GEP not an alloca/global) - those are not whole-variable moves.
+                        // null srcStorage). An INDIRECT lvalue source (field / deref / fixed-array
+                        // element) takes the same decision - see srcIsIndirectOwningLvalue below.
                         bool didDeepCopyBorrowString = false;
-                        if (right->getType()->isStructTy()
-                            && srcStorage != nullptr
+                        auto* srcInitGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(srcStorage);
+                        bool srcIsNamedSlot = srcStorage != nullptr
                             && (llvm::isa<llvm::AllocaInst>(srcStorage)
                                 || llvm::isa<llvm::GlobalVariable>(srcStorage))
+                            && !srcCallerName.empty();
+                        // Excluded: a SINGLE-index GEP (container/view slot - `T tmp = _data[i]` is
+                        // the borrow list sort shuffles), and string/closure (own paths run below).
+                        bool srcIsIndirectOwningLvalue = srcStorage != nullptr && !srcIsNamedSlot
+                            && typeAndValue.TypeName != "__closure_fat_ptr"
+                            && typeAndValue.TypeName != "string"
+                            && (srcInitGep == nullptr
+                                || (srcInitGep->getNumIndices() == 2
+                                    && (srcInitGep->getSourceElementType()->isStructTy()
+                                        || srcInitGep->getSourceElementType()->isArrayTy())));
+                        if (right->getType()->isStructTy()
+                            && (srcIsNamedSlot || srcIsIndirectOwningLvalue)
                             && !srcIsMove
                             && !srcIsAlias
-                            && !srcCallerName.empty()
                             && srcInferredTypeName == typeAndValue.TypeName
                             && compiler->IsOwningValueType(typeAndValue.TypeName))
                         {
@@ -4085,7 +4096,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     compiler->builder->CreateStore(
                                         llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
-                                    compiler->MarkVariableMoved(srcCallerName);
+                                    // Only a named slot has a spelling to report a later use of; an
+                                    // indirect lvalue is consumed silently, as `move w.b` already is.
+                                    if (srcIsNamedSlot)
+                                        compiler->MarkVariableMoved(srcCallerName);
                                 }
                                 // `string` frees its local via the IsOwningString gate; a copied or
                                 // moved-in local owns its buffer, so mark it owning.

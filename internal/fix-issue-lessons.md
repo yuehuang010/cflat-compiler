@@ -1405,3 +1405,28 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `leaks --atExit` (100000 leaks / 6.4 MB on `scratch/rev_p2_sf_loop.cb`, 2 leaks / 32 bytes on
   the test file itself). This is the 2026-08-02 unique-field lesson recurring exactly: rigorous
   value legs beside an ownership change that only a resource count can falsify.
+
+- **The 2026-08-09 indirect owning-source session** (`fix/owncopy`): `dest = src` and
+  `T dest = src;` now defer to T for an INDIRECT owning source - `*ap`, `w.b`, `ot.inner.b`,
+  `arr[i]` (fixed array AND view), `wp->b`, `wa.arr[i]`, `wa[i].b`, and a file-scope GLOBAL -
+  exactly as they already did for a named local: copyable owner COPIES, non-copyable owner MOVES
+  by zeroing the source lvalue. 30 measured corpus cells went rc 133 -> rc 0 with correct dtor
+  counts. Ratified semantics: TRANSFER, not a `.copy()` rejection - `move w.b` already nulled a
+  field lvalue, and the deref-DESTINATION arm already consumed a field SOURCE, so rejecting would
+  have contradicted two shipped behaviours and the plan's "`=` is total over T". Only a NAMED
+  slot is `MarkVariableMoved`; an indirect lvalue is consumed silently (there is no spelling to
+  report a later use of). The global cell was a separate miss inside the same arm:
+  `GetGlobalVariableNV` sets no `CallerName`, so the old `!CallerName.empty()` slot test never
+  matched a file-scope global - a static local (a module global WITH a name) always worked.
+  **Do NOT route `string` through the widened arm.** The first cut did, preempting the dedicated
+  `srcBorrowsOwnedString` deep-copy-on-borrow branch in decl-init; every suite stayed green and
+  `Test/test_move.cb` still passed 831/831, while `leaks --atExit` on the UNCHANGED master test
+  file went 16 leaks/320 bytes -> 17/336. `string` ownership is a RUNTIME owned bit with its own
+  machinery; the family here is owning STRUCTS. Two destination-side twins were measured and
+  deliberately left out, with issue files: a FIXED-ARRAY element destination is broken for every
+  source shape including a named local (its slot is LIVE, so it needs drop-old - the opposite of
+  Part 6's container slot, which must not), and `o = *op` with `op == &o` self-consumes to null.
+  The container single-index-GEP source/dest gate was NOT widened, per the plan's LOAD-BEARING
+  INVARIANT (list `sort`/`_partition` bit-shuffles and dictionary rehash depend on it); decl-init
+  from a single-index GEP is excluded for exactly that reason, which is why
+  `T tmp = _data[i];` still borrows.

@@ -2106,12 +2106,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // ownership and frees at scope exit (heap-`new` is the way to hand an interface an
             // independently-owned object). This mirrors the pointer source case, which is likewise
             // excluded by `!rightNV.TypeAndValue.Pointer`.
+            // A source with STORAGE is an lvalue: a named slot (alloca/global) or an INDIRECT one
+            // (`*ap`, `w.b`, `arr[i]`) whose Storage is the GEP / loaded address, and has no name.
+            bool srcIsNamedSlot = rightNV.Storage != nullptr
+                && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                    || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
+                && !rightNV.CallerName.empty();
+            // Both are writable, so both are consumable. Excluded: an `alias`/borrow binding (the
+            // separate alias-launder family) and an indirect `string` (its own owned-bit paths).
+            bool srcIsOwningAssignLvalue = rightNV.Storage != nullptr
+                && !SourceIsDanglingAliasBorrow(compiler, rightNV)
+                && (srcIsNamedSlot || rightNV.TypeAndValue.TypeName != "string");
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && !namedVar.TypeAndValue.IsInterface
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
-                && rightNV.Storage != nullptr
-                && (llvm::isa<llvm::AllocaInst>(rightNV.Storage) || llvm::isa<llvm::GlobalVariable>(rightNV.Storage))
-                && !rightNV.CallerName.empty()
+                && srcIsOwningAssignLvalue
                 // A `move` PARAMETER is an owner (IsOwningStruct) and destructs at function exit,
                 // so assigning it into an owning slot must TRANSFER just like an owned local.
                 && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
@@ -2137,7 +2146,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 {
                     compiler->builder->CreateStore(
                         llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
-                    compiler->MarkVariableMoved(rightNV.CallerName);
+                    // Only a named slot has a spelling to report a later use of; an indirect lvalue
+                    // (field/element/deref) is consumed silently, exactly as `move w.b` already is.
+                    if (srcIsNamedSlot)
+                        compiler->MarkVariableMoved(rightNV.CallerName);
                 }
                 // The destination is now live again (it may have been moved-from earlier).
                 if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
