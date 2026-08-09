@@ -1365,3 +1365,43 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   post-fix all three spellings behave alike. Nothing in the 454-file sweep declares one. A
   brace-list array default (`u8 a[3] = {1,2,300};`) is a separate pre-existing hole and is
   genuinely unchanged - all zeros in every spelling, both binaries.
+- **A lambda's by-value capture is owned by the ENV; the body's unpacked local is a borrow at
+  runtime too (2026-08-09)**: the filed direction ("make the capture a real owning COPY at
+  capture time") was already DONE and is not the bug - `--no-opt` IR shows
+  `_copy_string_string_` at the capture store and a `__closure_cleanup_N` free arm, so the env
+  genuinely owns its copy. The defect is that the INVOKER's unpacked local shallow-copied that
+  value with its runtime OWNED bit still set, while the compile-time side already declared the
+  local a borrow (`IsAliasBorrow`). Two halves, both load-bearing and mutation-proven separately:
+  `ClearStringOwnedBit` / `ClearStructOwnedBits` on the unpacked value (fixes the REBIND face -
+  `s = "abc"` inside the body freed the env's buffer, a double free with no return anywhere in
+  sight), and a `copy` at the return when `NamedVariable::IsClosureValueCapture` is set (fixes
+  the RETURN face, and is what makes the result INDEPENDENT rather than merely non-owning).
+  Clearing the bit alone was measured and is NOT enough: it turns the abort into a SILENT WRONG
+  VALUE wherever the env dies first (a closure local inside the returning function, a nested
+  inner closure) - a crash traded for an empty string, the worse severity category. The
+  discriminator that hid the whole thing is `llvm::isa<AllocaInst>(returnNV.Storage)` in
+  `clearReturnedStringBorrowBit`'s `returnIsWholeLocal`: a capture's unpacked local IS an alloca,
+  so it read as a movable whole-local. The same misread was already patched once for the borrow
+  string PARAMETER (`IsBorrowStringParamStorage`) - a third instance should become a predicate,
+  not a fourth disjunct. Sibling scope, measured not assumed: `list<T>` / `dictionary<K,V>`
+  captured and returned are REJECTED by `SourceIsDanglingAliasBorrow` and never reach this path;
+  a capturing lambda can never be thin (`function<T>` hard-errors), so there is exactly ONE
+  capture-unpack site and one `EmitReturnExpression`. The `__closure_fat_ptr` carve-out twin
+  (capture a closure, return it - rc 138/139) fell out of the same return arm via
+  `IsOwningValueType`. Accepted trade, filed as
+  [[rebound-lambda-capture-leaks-its-new-value]]: rebinding the capture inside the body now
+  LEAKS the new value where it used to double-free it. Review caught the arm the fix did not
+  measure: the flag rides through a FIELD read of the capture (`() => box.s`), where the copy
+  fires but `clearReturnedStringBorrowBit` was already true (a field read is not a whole-local),
+  so the freshly-copied buffer was re-tagged as a borrow and leaked - 64 bytes per call, 6.4 MB
+  over a 100k loop, against 0 on the pre binary. An inserted copy must ALWAYS retire the borrow
+  classification computed before it; the two arms are computed 300 lines apart and applied in the
+  opposite order. The field arm is worth keeping: pre-fix it returned the EMPTY STRING once the
+  env died first, so the copy converts a silent wrong value into a correct owned one.
+  **The suite cannot see a regression of that retirement.** Verification mutation-tested it:
+  with the two retirement lines deleted, `Test/test_function_ptr.cb` still passes 78/78 - the
+  field-arm legs assert the VALUE and the buffer DISTINCTNESS, both of which the copy alone
+  already provides, so they read as coverage they do not give. The only discriminator is
+  `leaks --atExit` (100000 leaks / 6.4 MB on `scratch/rev_p2_sf_loop.cb`, 2 leaks / 32 bytes on
+  the test file itself). This is the 2026-08-02 unique-field lesson recurring exactly: rigorous
+  value legs beside an ownership change that only a resource count can falsify.

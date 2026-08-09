@@ -4930,7 +4930,17 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 {
                     // Load copied value; store into a local alloca so the body can modify it.
                     auto* capTy  = compiler->GetType(cap.TV);
-                    auto* capVal = compiler->builder->CreateLoad(capTy, fieldGEP, cap.Name + "_val");
+                    llvm::Value* capVal = compiler->builder->CreateLoad(capTy, fieldGEP, cap.Name + "_val");
+                    // The env owns the capture; this unpacked local only BORROWS it, so its
+                    // runtime OWNED bits must be clear - see the IsAliasBorrow note below, of
+                    // which this is the runtime half. Without it the local reads as a second
+                    // owner of the env's buffer, and every consumer that trusts the bit (a
+                    // `return` handing it to the caller, a rebind freeing the old value)
+                    // frees storage the env's cleanup fn frees again.
+                    if (isOwningCap(cap))
+                        capVal = cap.TV.TypeName == "string"
+                            ? compiler->ClearStringOwnedBit(capVal)
+                            : compiler->ClearStructOwnedBits(capVal, cap.TV.TypeName);
                     auto* capAlloca = compiler->builder->CreateAlloca(capTy, nullptr, cap.Name);
                     compiler->builder->CreateStore(capVal, capAlloca);
                     captureNV.Storage = capAlloca;
@@ -4940,7 +4950,10 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     // the body's unpacked local only BORROWS it, so suppress its scope-exit
                     // destructor - otherwise it would free the env's buffer (a double-free).
                     if (isOwningCap(cap))
+                    {
                         captureNV.IsAliasBorrow = true;
+                        captureNV.IsClosureValueCapture = true;
+                    }
                 }
             }
         }

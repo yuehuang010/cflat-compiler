@@ -1038,6 +1038,10 @@ public:
         // CONSUMING param (sink/`move`/unique) or moving it out would launder ownership and double-free.
         bool IsBorrowedOwningValue = false;
         bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
+        // compile-time: this local is a lambda body's unpacked BY-VALUE capture of an owning value
+        // type. The closure ENV owns the buffer; this local only borrows it, so handing it to a
+        // caller (a `return`) must hand over an independent copy, not the env's storage.
+        bool IsClosureValueCapture = false;
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).

@@ -537,6 +537,126 @@ bool testCaptureString()
     return result;
 }
 
+// A lambda's by-value capture of an OWNING value type lives in the closure env, which owns it
+// and frees it exactly once through its cleanup fn. The body's unpacked local therefore only
+// BORROWS that buffer, so `return <capture>` must hand the caller an INDEPENDENT copy. Before
+// the fix the local carried the env's OWNED bit and was returned raw: the caller and the env
+// both freed one buffer (rc 133 after printing the right text), and where the env died first
+// the caller read freed memory (the empty-string legs below).
+string capturedThroughFrame(string p)
+{
+    Lambda<string()> g = () => p;
+    return g();      // g (and its env) is destructed on the way out - the result must survive
+}
+
+// The same borrow reached through a FIELD of a captured owning struct.
+class CapFieldBox { string s = default; ~CapFieldBox() { } };
+string capturedFieldThroughFrame(string p)
+{
+    CapFieldBox b = default;
+    b.s = p;
+    Lambda<string()> g = () => b.s;
+    return g();
+}
+
+bool testReturnCapturedOwningValue()
+{
+    bool result = true;
+
+    // The filed repro, both spellings. Both strings must be alive and correct afterwards.
+    {
+        string s = "xyz";
+        Lambda<string()> g = () => s;
+        string r = g();
+        result &= Test("captured string returned (expr body)", r, "xyz");
+        result &= Test("captured string source intact",        s, "xyz");
+    }
+    {
+        string s = "xyz";
+        Lambda<string()> g = () => { return s; };
+        string r = g();
+        result &= Test("captured string returned (block body)", r, "xyz");
+        result &= Test("captured string source intact 2",       s, "xyz");
+    }
+
+    // Independence, the fact the values alone cannot show: two calls must yield two distinct
+    // buffers, and neither may be the env's or the source's. Pre-fix all four pointers aliased.
+    {
+        string s = "xyz";
+        Lambda<string()> g = () => s;
+        string r1 = g();
+        string r2 = g();
+        result &= Test("double call value 1",       r1, "xyz");
+        result &= Test("double call value 2",       r2, "xyz");
+        result &= Test("double call distinct bufs", r1.data() != r2.data(), true);
+        result &= Test("returned buf not source",   r1.data() != s.data(),  true);
+    }
+
+    // Capture SEMANTICS anchor - a by-value capture is a COPY: writes inside the lambda are
+    // invisible outside, and each call re-reads the env's own copy. This must not change.
+    {
+        string s = "xyz";
+        Lambda<int()> g = () => { s = "abcd"; return s.length(); };
+        result &= Test("mutated capture inner len", g(),        4);
+        result &= Test("mutated capture outer len", s.length(), 3);
+        result &= Test("mutated capture outer val", s,          "xyz");
+        result &= Test("mutated capture is per-call", g(),      4);
+    }
+
+    // The env dies BEFORE the result is read. Pre-fix these returned freed storage and
+    // printed the empty string - a silent wrong value, not only the double free.
+    {
+        string s = "xyz";
+        result &= Test("capture returned past its frame", capturedThroughFrame(s), "xyz");
+        result &= Test("capture arg intact",              s,                       "xyz");
+    }
+    {
+        string s = "xyz";
+        Lambda<string()> outer = () => { Lambda<string()> inner = () => s; return inner(); };
+        result &= Test("nested capture returned outward", outer(), "xyz");
+    }
+
+    // A FIELD of a captured owning STRUCT is the same borrow one level down: the returned copy
+    // must be an owned, independent buffer. Pre-fix the env's frame-death leg read freed storage
+    // and yielded the empty string; a copy left classified as a borrow would leak instead.
+    {
+        string s = "xyz";
+        CapFieldBox b = default;
+        b.s = s;
+        Lambda<string()> g = () => b.s;
+        string r = g();
+        // These four assert the VALUE and the buffer distinctness, which the inserted copy
+        // gives on its own - they do NOT discriminate the borrow-bit retirement beside it
+        // (mutation-tested: delete it and this file still passes 78/78, leaking 32 bytes).
+        // The retirement's only tripwire is `leaks --atExit` on scratch/rev_p2_sf_loop.cb.
+        result &= Test("captured struct field returned",       r, "xyz");
+        result &= Test("captured struct field src intact",     b.s, "xyz");
+        result &= Test("captured struct field buf distinct",   r.data() != b.s.data(), true);
+        result &= Test("captured struct field past its frame", capturedFieldThroughFrame(s), "xyz");
+    }
+
+    // A captured CLOSURE (__closure_fat_ptr, the other owned-bit carve-out) returned the same
+    // way: pre-fix the raw tagged env escaped and the program died in the allocator.
+    {
+        string s = "xyz";
+        Lambda<string()> inner = () => s;
+        Lambda<Lambda<string()>()> outer = () => inner;
+        Lambda<string()> got = outer();
+        result &= Test("captured closure returned", got(), "xyz");
+    }
+
+    // Owning CONTAINER siblings are not this bug: list<T>/dictionary<K,V> captured and returned
+    // are rejected outright by the alias-borrow return gate (no string/closure carve-out), so
+    // they never reach the runtime owned-bit path. Reading them stays legal.
+    {
+        list<int> v = default; v.add(4); v.add(6);
+        Lambda<int()> total = () => { int t = 0; for (int i = 0; i < v.count(); i = i + 1) t = t + v.get(i); return t; };
+        result &= Test("captured list read not returned", total(), 10);
+    }
+
+    return result;
+}
+
 bool testCaptureStructRef()
 {
     bool result = true;
@@ -3824,6 +3944,10 @@ extern int main()
     // A closure member of a UNION: calling it crashed the compiler (fat) / failed module
     // verification (thin), and union field defaults were discarded entirely.
     total++; passed += testUnionClosureMember()            ? 1 : 0;
+
+    // Returning a lambda's BY-VALUE capture of an owning value type must hand the caller an
+    // independent copy: the env owns its capture and frees it exactly once (fix/lamcap).
+    total++; passed += testReturnCapturedOwningValue()     ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

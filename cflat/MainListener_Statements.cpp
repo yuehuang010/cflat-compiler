@@ -880,6 +880,37 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 right = cloned;
         }
 
+        /*
+         * Returning a lambda body's unpacked BY-VALUE capture of an owning value type. The
+         * closure ENV owns that buffer and its cleanup fn frees it exactly once, so the local
+         * is only a borrow (IsClosureValueCapture, set at the capture unpack). Handing it back
+         * raw makes the caller a second owner of the env's buffer - or, once the owned bit is
+         * cleared, a borrower of storage the env may free first. Copy so the caller gets an
+         * independent owner, which is what `.copy()` did by hand. An `alias` function passes
+         * the borrow through deliberately, and a `move` source already transferred.
+         */
+        if (right != nullptr
+            && returnNV.IsClosureValueCapture
+            && !returnNV.TypeAndValue.IsMove
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && returnNV.Storage != nullptr
+            && right->getType()->isStructTy()
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
+        {
+            LLVMBackend::NamedVariable srcNV;
+            srcNV.Storage  = returnNV.Storage;
+            srcNV.BaseType = right->getType();
+            srcNV.TypeAndValue.TypeName = returnNV.TypeAndValue.TypeName;
+            if (auto* copied = compiler->CreateOverloadedFunctionCall("copy", { srcNV }))
+            {
+                right = copied;
+                // The copy is a fresh buffer nobody else owns, so the caller must own it: a
+                // FIELD read (`() => box.s`) classified as a borrow above and would leak it.
+                clearReturnedStringBorrowBit = false;
+                clearReturnedStructBorrowBits = false;
+            }
+        }
+
         // Clear flags consumed by the return check.
         compiler->lastOwningResult = false;
         compiler->lastAllocAlignment = 0;
