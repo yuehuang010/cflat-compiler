@@ -2509,6 +2509,36 @@ public:
     // aligned free then reads a header that was never written - heap corruption. Require `unique`.
     void ValidateAllocAlignField(const LLVMBackend::DeclTypeAndValue& f, antlr4::ParserRuleContext* ctx);
 
+    /*
+     * Run-once guard around a `static` local's initializer. Opened BEFORE the declarator emits any
+     * IR, so the whole initializer (constructor calls, brace inits, array seeding) sits inside it,
+     * and closed when the declarator is done - including on an early `continue`, via the RAII scope
+     * below. A constant initializer is folded into the global's own initializer and the guard is
+     * erased again, so `static int c = 5;` costs nothing at run time.
+     */
+    struct StaticLocalGuard
+    {
+        llvm::GlobalVariable* Flag = nullptr;
+        llvm::BasicBlock* PreBB = nullptr;
+        llvm::BasicBlock* InitBB = nullptr;
+        llvm::BasicBlock* ContBB = nullptr;
+        llvm::Instruction* FlagLoad = nullptr;
+        llvm::Instruction* FlagCmp = nullptr;
+        llvm::Instruction* CondBr = nullptr;
+        llvm::Instruction* FlagStore = nullptr;
+    };
+    void OpenStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);
+    void CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName);
+
+    // Closes the guard at the end of the declarator, on every path out of it.
+    struct StaticLocalGuardScope
+    {
+        MainListener* Owner = nullptr;
+        StaticLocalGuard Guard;
+        std::string Name;
+        ~StaticLocalGuardScope();
+    };
+
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseForDeclaration(CFlatParser::ForDeclarationContext* ctx);
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName = {});

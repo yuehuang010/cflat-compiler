@@ -293,7 +293,36 @@ void LLVMBackend::EmitOwnDerefGuard(llvm::Value* storage, llvm::Value* loadedPtr
         builder->SetInsertPoint(contBB);
     }
 
-llvm::AllocaInst* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
+void LLVMBackend::RequestStaticLocalStorage(const std::string& varName, const std::string& typeName)
+{
+        pendingStaticLocalName_ = varName;
+        pendingStaticLocalType_ = typeName;
+        auto* bb = builder->GetInsertBlock();
+        pendingStaticLocalFn_ = bb != nullptr ? bb->getParent() : nullptr;
+        pendingStaticLocalDepth_ = stackNamedVariable.size();
+    }
+
+void LLVMBackend::ClearStaticLocalRequest()
+{
+        pendingStaticLocalName_.clear();
+        pendingStaticLocalType_.clear();
+        pendingStaticLocalFn_ = nullptr;
+        pendingStaticLocalDepth_ = 0;
+    }
+
+// The declaration that asked for static storage is the only one allowed to take it: same name,
+// same type, same enclosing function, same scope depth.
+bool LLVMBackend::MatchesStaticLocalRequest(const TypeAndValue& typeValue) const
+{
+        if (pendingStaticLocalName_.empty()) return false;
+        if (pendingStaticLocalName_ != typeValue.VariableName) return false;
+        if (pendingStaticLocalType_ != typeValue.TypeName) return false;
+        if (pendingStaticLocalDepth_ != stackNamedVariable.size()) return false;
+        auto* bb = builder->GetInsertBlock();
+        return pendingStaticLocalFn_ == (bb != nullptr ? bb->getParent() : nullptr);
+    }
+
+llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
 {
         // No enclosing scope means a file-scope declaration reached the local path (a stale
         // global_scope). back() on the empty scope stack is UB - diagnose instead of corrupting.
@@ -321,6 +350,38 @@ llvm::AllocaInst* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm:
         // Effective alignment: max(decl-level alignas, struct-level alignas, ABI).
         uint64_t effAlign = GetEffectiveAlignmentForType(typeValue.TypeName, type);
         if (userAlign > effAlign) effAlign = userAlign;
+
+        // `static` local: storage is an internal module global (program lifetime), not an alloca.
+        // The declaration path already opened the run-once guard around the initializer.
+        if (MatchesStaticLocalRequest(typeValue))
+        {
+            ClearStaticLocalRequest();
+            // A run-time length has no meaning for storage created once at module scope; rejecting
+            // beats emitting a mis-sized global (which fails module verification downstream).
+            if (arraySize != nullptr)
+                LogError(std::format(
+                    "a 'static' local array must have a compile-time constant length; '{}' is sized "
+                    "by a run-time value, which cannot be given program lifetime", typeValue.VariableName));
+            std::string owner;
+            if (auto* bb = builder->GetInsertBlock(); bb != nullptr && bb->getParent() != nullptr)
+                owner = bb->getParent()->getName().str();
+            // LLVM uniquifies a repeated name, so two same-named statics in one function (or in
+            // separate blocks) still get distinct storage.
+            auto* gv = new llvm::GlobalVariable(
+                *module, type, false, llvm::GlobalValue::InternalLinkage,
+                llvm::Constant::getNullValue(type), owner + ".static." + typeValue.VariableName);
+            if (effAlign > 0) gv->setAlignment(llvm::Align(effAlign));
+            auto& staticVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+            staticVariable.Storage = gv;
+            staticVariable.TypeAndValue = typeValue;
+            staticVariable.BaseType = type;
+            staticVariable.IsStaticLocal = true;
+            RecordMoveGenBind(typeValue.VariableName);
+            if (symbolSink_ && !typeValue.VariableName.empty())
+                symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
+                                              GetSourceFilePath(), (int)line, 0);
+            return gv;
+        }
         // Only annotate when above the natural ABI alignment - otherwise LLVM's
         // default is already correct and we avoid noisy IR.
         uint64_t abiAlign = (type && type->isSized())

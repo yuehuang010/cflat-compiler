@@ -2529,6 +2529,7 @@ void LLVMBackend::ResetForReanalysis()
     fileScopeExpectedError_.clear();
     currentFunction = nullptr;
     autoVaListAlloca = nullptr;
+    ClearStaticLocalRequest();
     autoReturnCapture = std::nullopt;
 
     // Transient per-call / per-expression result state. These are normally produced and
@@ -4433,6 +4434,7 @@ static llvm::json::Object SerializeDtav(const DTAV& d)
     auto o = SerializeTav(d);
     if (d.external)    o["ext"] = true;
     if (d.threadLocal) o["tl"]  = true;
+    if (d.staticStorage) o["sta"] = true;
     if (d.IsBitfield)
     {
         o["bf"]   = true;
@@ -4455,6 +4457,7 @@ static DTAV DeserializeDtav(const llvm::json::Object& o)
     static_cast<TAV&>(d) = DeserializeTav(o);
     if (auto v = o.getBoolean("ext")) d.external = *v;
     if (auto v = o.getBoolean("tl"))  d.threadLocal = *v;
+    if (auto v = o.getBoolean("sta")) d.staticStorage = *v;
     if (auto v = o.getBoolean("bf"))
     {
         d.IsBitfield = *v;

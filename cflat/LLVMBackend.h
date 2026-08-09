@@ -918,6 +918,9 @@ public:
 
         bool external = false;
         bool threadLocal = false;
+        // `static` storage class as written. On a LOCAL it selects module-global storage with a
+        // run-once initializer; on a file-scope global it is accepted and carries no meaning yet.
+        bool staticStorage = false;
 
         // User-requested alignment from `alignas(N)`. 0 means unset; honored only when
         // greater than the type's ABI alignment. Power of two, validated at parse time.
@@ -1022,6 +1025,9 @@ public:
         llvm::BasicBlock* ExplicitNullBlock = nullptr; // the block the move was recorded in - the deref guard only fires inside this same block
         bool AddressEscaped = false; // '&name' was taken - the pointee may have been rewritten through it, so the deref guard is latched off for good
         std::unordered_set<std::string> MovedFields; // compile-time: field names moved out of this variable via a 'move' of a sub-path (e.g. `node->left`) - the base stays usable
+        // compile-time: `static` local - Storage is a module global with program lifetime, not an
+        // alloca. Never destructed at scope exit (see DropValue); it outlives every call.
+        bool IsStaticLocal = false;
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
@@ -4807,7 +4813,21 @@ public:
     // report a generic null deref. A null-COMPARE never reaches here (only real deref sites call this).
     void EmitOwnDerefGuard(llvm::Value* storage, llvm::Value* loadedPtr, size_t useLine, size_t useCol);
 
-    llvm::AllocaInst* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
+    // Returns the variable's STORAGE: an alloca normally, or an internal module global when the
+    // pending-static request below matches this declaration (a `static` local).
+    llvm::Value* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
+
+    // Set by the declaration path just before it creates a `static` local's storage; consumed by
+    // the first CreateLocalVariable whose name, type, enclosing FUNCTION and scope depth all match.
+    // The function+depth pair is what stops a local declared while the initializer is evaluated -
+    // a lambda body's own local, an inlined return-block parameter - from claiming the storage.
+    void RequestStaticLocalStorage(const std::string& varName, const std::string& typeName);
+    void ClearStaticLocalRequest();
+    bool MatchesStaticLocalRequest(const TypeAndValue& typeValue) const;
+    std::string pendingStaticLocalName_;
+    std::string pendingStaticLocalType_;
+    llvm::Function* pendingStaticLocalFn_ = nullptr;
+    size_t pendingStaticLocalDepth_ = 0;
 
     // Register a value directly as a named variable without an alloca.
     // Used for pointer-type params in return-block inlining so GetValue() returns the pointer itself.

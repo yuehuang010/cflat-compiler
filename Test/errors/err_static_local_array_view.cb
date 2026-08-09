@@ -1,0 +1,36 @@
+// A `static` array view initialized from a brace list: the backing array is a stack
+// alloca in the first call's frame, so the global view would dangle from the second
+// call on. Rejected instead of silently emitting the dangling view.
+struct StatP { int a = default; };
+
+extern int main()
+{
+    expect_error("a 'static' array view cannot be initialized from a brace list") {
+        static int[] v = {1, 2, 3};
+    }
+    // A run-time length cannot be given program lifetime: the global's size is fixed when the
+    // module is built, so a per-call length would silently mis-size it (invalid IR downstream).
+    int n = 4;
+    expect_error("must have a compile-time constant length") {
+        static int[n] a = default;
+    }
+    // A `static` local outlives the frame, so it may not be pointed at a non-static local.
+    // Each leg is a distinct value shape reaching the same root-at-an-alloca check.
+    expect_error("may not hold the address of a non-static local") {
+        int local = 11;
+        static int* p = &local;
+    }
+    expect_error("may not hold the address of a non-static local") {
+        int[3] backing = {1, 2, 3};
+        static int[] v = backing;
+    }
+    expect_error("may not hold the address of a non-static local") {
+        StatP lp = default;
+        static int* pf = &lp.a;
+    }
+    expect_error("may not hold the address of a non-static local") {
+        int[3] la = {7, 8, 9};
+        static int* pe = &la[1];
+    }
+    return 0;
+}

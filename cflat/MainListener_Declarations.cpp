@@ -792,6 +792,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             {
                 declType.external = storageSpec->Extern() != nullptr;
                 declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
+                // `static` on a LOCAL selects module-global storage + a run-once initializer.
+                if (storageSpec->Static() != nullptr) declType.staticStorage = true;
             }
             else if (auto funcSpec = declSpec->functionSpecifier())
             {
@@ -2382,6 +2384,112 @@ void MainListener::ValidateAllocAlignField(const LLVMBackend::DeclTypeAndValue& 
             f.AllocAlignValue, owner, f.VariableName));
     }
 
+// True when a pointer value roots at a stack allocation - the address of a local, of one of its
+// fields, or of an element of a local array. Globals, heap results and loads root elsewhere.
+static bool PointsIntoStackFrame(llvm::Value* value)
+{
+        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+        value = value->stripPointerCasts();
+        while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
+            value = gep->getPointerOperand()->stripPointerCasts();
+        return llvm::isa<llvm::AllocaInst>(value);
+    }
+
+void MainListener::OpenStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName) {
+        auto* compiler = Compiler();
+        auto* bb = compiler->builder->GetInsertBlock();
+        auto* fn = bb != nullptr ? bb->getParent() : nullptr;
+        if (fn == nullptr) return;
+
+        auto* i8Ty = compiler->builder->getInt8Ty();
+        // A plain (non-atomic) once flag: `static` locals are single-thread-initialized by design;
+        // no __cxa_guard-style machinery is built here.
+        guard.Flag = new llvm::GlobalVariable(
+            *compiler->module, i8Ty, false, llvm::GlobalValue::InternalLinkage,
+            compiler->builder->getInt8(0), fn->getName().str() + ".once." + varName);
+        guard.PreBB = bb;
+        guard.InitBB = llvm::BasicBlock::Create(*compiler->context, "statinit", fn);
+        guard.ContBB = llvm::BasicBlock::Create(*compiler->context, "statdone", fn);
+        guard.FlagLoad = compiler->builder->CreateLoad(i8Ty, guard.Flag, "statflag");
+        guard.FlagCmp = llvm::cast<llvm::Instruction>(compiler->builder->CreateICmpEQ(
+            guard.FlagLoad, compiler->builder->getInt8(0), "statfirst"));
+        guard.CondBr = compiler->builder->CreateCondBr(guard.FlagCmp, guard.InitBB, guard.ContBB);
+        compiler->builder->SetInsertPoint(guard.InitBB);
+        // Set BEFORE the initializer runs, so a call that recurses into this function observes
+        // "already initialized" instead of re-entering the initializer.
+        guard.FlagStore = compiler->builder->CreateStore(compiler->builder->getInt8(1), guard.Flag);
+    }
+
+void MainListener::CloseStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName) {
+        auto* compiler = Compiler();
+        compiler->ClearStaticLocalRequest();
+        if (guard.Flag == nullptr) return;
+
+        llvm::GlobalVariable* storage = nullptr;
+        if (!compiler->stackNamedVariable.empty())
+        {
+            auto& frame = compiler->stackNamedVariable.back().namedVariable;
+            auto it = frame.find(varName);
+            if (it != frame.end() && it->second.IsStaticLocal)
+                storage = llvm::dyn_cast_or_null<llvm::GlobalVariable>(it->second.Storage);
+        }
+
+        // Constant fast path: the whole initializer folded to a single store of a Constant (or to
+        // nothing at all), so it becomes the global's own initializer and the guard is unwound.
+        bool fold = false;
+        llvm::StoreInst* valueStore = nullptr;
+        if (storage != nullptr && compiler->builder->GetInsertBlock() == guard.InitBB
+            && guard.InitBB->getTerminator() == nullptr)
+        {
+            if (guard.InitBB->size() == 1)
+            {
+                fold = true;
+            }
+            else if (guard.InitBB->size() == 2)
+            {
+                auto* st = llvm::dyn_cast<llvm::StoreInst>(&guard.InitBB->back());
+                auto* c = st != nullptr ? llvm::dyn_cast<llvm::Constant>(st->getValueOperand()) : nullptr;
+                if (st != nullptr && c != nullptr && st->getPointerOperand() == storage
+                    && c->getType() == storage->getValueType())
+                {
+                    valueStore = st;
+                    fold = true;
+                }
+            }
+        }
+
+        if (fold)
+        {
+            if (valueStore != nullptr)
+            {
+                storage->setInitializer(llvm::cast<llvm::Constant>(valueStore->getValueOperand()));
+                valueStore->eraseFromParent();
+            }
+            guard.FlagStore->eraseFromParent();
+            guard.CondBr->eraseFromParent();
+            guard.InitBB->eraseFromParent();
+            guard.ContBB->eraseFromParent();
+            guard.FlagCmp->eraseFromParent();
+            guard.FlagLoad->eraseFromParent();
+            guard.Flag->eraseFromParent();
+            compiler->builder->SetInsertPoint(guard.PreBB);
+        }
+        else
+        {
+            if (compiler->IsInsertBlockLive())
+                compiler->builder->CreateBr(guard.ContBB);
+            compiler->builder->SetInsertPoint(guard.ContBB);
+        }
+        guard = StaticLocalGuard{};
+    }
+
+MainListener::StaticLocalGuardScope::~StaticLocalGuardScope() {
+        // Closed even while unwinding from a LogError throw: an expect_error compile keeps going
+        // and verifies the module, so an unclosed guard would strand a terminator-less block.
+        if (Owner == nullptr) return;
+        try { Owner->CloseStaticLocalGuard(Guard, Name); } catch (...) { }
+    }
+
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseForDeclaration(CFlatParser::ForDeclarationContext* ctx) {
         auto declSpec = ctx->declarationSpecifiers();
         auto initDecl = ctx->initDeclaratorList();
@@ -2725,6 +2833,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
                 typeAndValue.VariableName = name;
 
+                // `static` local: module-global storage, initializer runs at most once. The guard
+                // opens HERE - before this declarator's IR - and closes on every path out of it.
+                StaticLocalGuardScope staticScope;
+                if (typeAndValue.staticStorage && !global_scope && compiler->IsInsertBlockLive())
+                {
+                    staticScope.Owner = this;
+                    staticScope.Name = name;
+                    OpenStaticLocalGuard(staticScope.Guard, name);
+                    compiler->RequestStaticLocalStorage(name, typeAndValue.TypeName);
+                }
+                bool isStaticLocal = staticScope.Owner != nullptr;
+
                 if (identList != nullptr)
                 {
                     // TODO
@@ -2855,7 +2975,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // Empty `{}` on a primitive/pointer element type is zero-init,
                         // equivalent to `= default`. (Struct empty-{} still seeds below.)
                         auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
-                        allocList.push_back(std::pair(name, arrAlloc));
+                        allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
                         auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
                         compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
                     }
@@ -2887,7 +3007,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // and double-frees at teardown. Same rule and same walk as the
                                 // `= default` / no-initializer arm (EmitFixedArrayDefaultInit).
                                 auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
-                                allocList.push_back(std::pair(name, arrAlloc));
+                                allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
                                 EmitOwningArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false);
                             }
                             else
@@ -2906,7 +3026,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                                 // Create the array alloca and register it.
                                 auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
-                                allocList.push_back(std::pair(name, arrAlloc));
+                                allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
 
                                 // Memcpy seed into every element.
                                 auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
@@ -2936,6 +3056,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                       : initializer->initializerList();
                     if (global_scope)
                         LogErrorContext(initDecl, "array-view initializer '= {}' is not allowed at global scope");
+                    else if (isStaticLocal)
+                        // The brace list's backing array is a stack alloca, so the static view would
+                        // dangle after the first call. A sized 'T[N]' static owns its own storage.
+                        LogErrorContext(initDecl, std::format(
+                            "a 'static' array view cannot be initialized from a brace list - its "
+                            "backing storage is the stack frame of the first call, so '{}' would "
+                            "dangle afterwards. Declare it with an explicit size ('{}[N] {}') so the "
+                            "static owns the elements.", name, typeAndValue.TypeName, name));
                     else
                         EmitArrayViewInferredInit(name, typeAndValue, arrInitList, line, allocList);
                     continue;
@@ -3795,7 +3923,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         LogErrorContext(direct, std::format(
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
-                    allocList.push_back(std::pair(name, alloc));
+                    allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
+
+                    /*
+                     * A `static` local outlives the frame, so a pointer / array view it holds must
+                     * not address a non-static local. Only the DIRECTLY enumerable shapes are
+                     * rejected (the initializer value roots at an alloca): `&local`, `&local.f`,
+                     * `&local[i]`, and a view of a local fixed array. A copy destination
+                     * (`static T[N] c = src;`) is unaffected - it owns its own storage.
+                     * Best-effort by construction: an address that reaches the static through a
+                     * parameter, through `this`, or as a call result roots at a load or a call,
+                     * not at an alloca, and is NOT detected. Closing that needs escape analysis.
+                     */
+                    if (isStaticLocal && right != nullptr && typeAndValue.Pointer
+                        && typeAndValue.ConstArraySize == 0 && PointsIntoStackFrame(right))
+                        LogErrorContext(direct, std::format(
+                            "a 'static' local may not hold the address of a non-static local - it "
+                            "outlives the frame, so '{}' would dangle once the first call returns. "
+                            "Point it at a global, at another 'static' local, or at a heap "
+                            "allocation ('new').", name));
 
                     // A view bound directly from a fixed array's decayed storage (ConstArraySize
                     // proves it - 'new T[n]' and another 'T[]' both carry IsArrayView instead)

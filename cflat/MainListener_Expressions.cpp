@@ -6435,7 +6435,7 @@ void MainListener::EmitPositionalFixedArrayInit(
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList) {
         auto* compiler = Compiler(initList);
         auto* arrAlloc = compiler->CreateLocalVariable(tv, nullptr, arraySize, line);
-        allocList.push_back(std::pair(name, arrAlloc));
+        allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
         EmitPositionalFixedArrayIntoSlot(name, tv, initList, arrAlloc);
     }
 
@@ -7039,7 +7039,7 @@ void MainListener::EmitArrayViewInferredInit(
 
         // Create the T* local and point it at element 0 of the backing array.
         auto* alloc = compiler->CreateLocalVariable(tv, nullptr, nullptr, line);
-        allocList.push_back(std::pair(name, alloc));
+        allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
         auto* elem0 = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, zero }, "arrview_data");
         compiler->builder->CreateStore(elem0, alloc);
     }

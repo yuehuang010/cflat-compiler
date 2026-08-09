@@ -3812,6 +3812,7 @@ extern int main()
     total++; passed += testFixedArrayDefaultInit()        ? 1 : 0;
     total++; passed += testFixedArrayDefaultInitDirtied() ? 1 : 0;
     total++; passed += testFixedArrayDestruction()        ? 1 : 0;
+    total++; passed += testStaticLocals()                  ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -5066,6 +5067,215 @@ bool testFixedArrayDestruction()
     arrDtorCount = 0;
     { ArrDtor[64] big; }
     result &= Test("arrdtor_loop", arrDtorCount, 64);
+
+    return result;
+}
+
+// =============================================================
+// static locals - storage is a module global with program lifetime, and the
+// initializer runs at most once. Pre-fix `static` was ignored on a local: the
+// variable was a plain alloca and its initializer re-ran on every call, so every
+// accumulate-across-calls leg below returned the first call's value forever.
+// =============================================================
+int slCtorCalls = 0;
+int slDtorCalls = 0;
+int slComputeCalls = 0;
+int slAllocs = 0;
+
+int slCompute() { slComputeCalls = slComputeCalls + 1; return 100; }
+
+struct SlSeed
+{
+    int n = default;
+    SlSeed() { n = 7; slCtorCalls = slCtorCalls + 1; }
+};
+
+struct SlDtor
+{
+    int n = default;
+    ~SlDtor() { slDtorCalls = slDtorCalls + 1; }
+};
+
+struct SlPlain { int n = default; };
+
+struct SlHolder
+{
+    int base = default;
+    int tick() { static int m = 100; m = m + 1; return m + base; }
+};
+
+int slConstInit()    { static int c = 5; c = c + 1; return c; }
+int slRuntimeInit()  { static int c = slCompute(); c = c + 1; return c; }
+int slNoInit()       { static int c; c = c + 1; return c; }
+int slTwoDeclarators() { static int a = 1, b = 10; a = a + 1; b = b + 10; return a * 100 + b; }
+int slTwoStatements()  { static int a = 1; static int b = 10; a = a + 1; b = b + 10; return a * 100 + b; }
+int slCtorOnce()     { static SlSeed s = default; s.n = s.n + 1; return s.n; }
+int slDtorNever()    { static SlDtor d = default; d.n = d.n + 1; return d.n; }
+int slArrayDefault() { static SlPlain[2] a = default; a[0].n = a[0].n + 1; a[1].n = a[1].n + 2; return a[0].n * 10 + a[1].n; }
+int slArrayValues()  { static int[3] a = {1, 2, 3}; a[0] = a[0] + 1; return a[0] * 100 + a[1] * 10 + a[2]; }
+int slStringGrows()  { static string s = "a"; s = s + "b"; return (int)s.length(); }
+int slCollide1()     { static int c = 0; c = c + 1; return c; }
+int slCollide2()     { static int c = 100; c = c + 1; return c; }
+int slGeneric<T>(T seed) { static int g = 0; g = g + (int)seed; return g; }
+
+int slApply(Lambda<int()> f) { return f(); }
+
+// Accept side of the static-dangle reject: a static may address a global, another static, or
+// the heap. Values, not just compilation, so a wrong target would be visible.
+int slGlobalInt = 41;
+int[4] slGlobalArr = {10, 20, 30, 40};
+int slAddrOfGlobal()    { static int* p = &slGlobalInt; return *p; }
+int slAddrOfStatic()    { static int s = 77; static int* p = &s; p[0] = p[0] + 1; return *p; }
+int slViewOfGlobalArr() { static int[] v = slGlobalArr; return v[1]; }
+int slViewOfStaticArr() { static int[3] sa = {5, 6, 7}; static int[] v = sa; v[2] = v[2] + 1; return v[2]; }
+int slFixedArrCopy()    { int[3] src = {4, 5, 6}; static int[3] c = src; c[0] = c[0] + 1; return c[0]; }
+int slConstLenArith()   { static int[2 + 1] a = default; a[2] = a[2] + 1; return a[2]; }
+
+// The initializer emits a whole lambda body before the static's own storage is created. That
+// body declares a local with the SAME name and type as the static: it must not claim the
+// static's storage (which would leave the static a per-call alloca and make the lambda's local
+// a module global).
+int slNestedShadow()
+{
+    static int c = slApply(() => { int c = 5; return c; });
+    c = c + 1;
+    return c;
+}
+
+int slPointerOnce()
+{
+    static SlPlain* p = nullptr;
+    if (p == nullptr) { p = new SlPlain(); slAllocs = slAllocs + 1; }
+    p->n = p->n + 1;
+    return p->n;
+}
+
+int slLoopBody(int n)
+{
+    int total = 0;
+    for (int i = 0; i < n; i++) { static int k = 0; k = k + 1; total = total + k; }
+    return total;
+}
+
+int slRecurse(int n)
+{
+    static int c = 0;
+    c = c + 1;
+    if (n > 0) slRecurse(n - 1);
+    return c;
+}
+
+bool testStaticLocals()
+{
+    bool result = true;
+
+    // Constant initializer: folded into the global's own initializer (no runtime store),
+    // and the value ACCUMULATES. Pre-fix all three legs returned 6.
+    result &= Test("static_const_init_1", slConstInit(), 6);
+    result &= Test("static_const_init_2", slConstInit(), 7);
+    result &= Test("static_const_init_3", slConstInit(), 8);
+
+    // Non-constant initializer runs exactly once, under the once flag. Pre-fix the
+    // call count was one per invocation.
+    result &= Test("static_runtime_init_1", slRuntimeInit(), 101);
+    result &= Test("static_runtime_init_2", slRuntimeInit(), 102);
+    result &= Test("static_runtime_init_calls", slComputeCalls, 1);
+
+    // No initializer: zero-initialized once. Pre-fix this read a fresh stack slot per call.
+    result &= Test("static_no_init_1", slNoInit(), 1);
+    result &= Test("static_no_init_2", slNoInit(), 2);
+
+    // Both declarators of one statement, and two separate static statements, get their
+    // own storage and their own guard.
+    result &= Test("static_two_declarators_1", slTwoDeclarators(), 220);
+    result &= Test("static_two_declarators_2", slTwoDeclarators(), 330);
+    result &= Test("static_two_statements_1", slTwoStatements(), 220);
+    result &= Test("static_two_statements_2", slTwoStatements(), 330);
+
+    // A constructor with side effects runs ONCE (pre-fix: once per call).
+    result &= Test("static_ctor_once_1", slCtorOnce(), 8);
+    result &= Test("static_ctor_once_2", slCtorOnce(), 9);
+    result &= Test("static_ctor_count", slCtorCalls, 1);
+
+    // Destruction policy: a static local is destructed NEVER - it outlives every scope
+    // exit. Pre-fix the destructor ran on each call (a live value destructed under it).
+    result &= Test("static_dtor_never_1", slDtorNever(), 1);
+    result &= Test("static_dtor_never_2", slDtorNever(), 2);
+    result &= Test("static_dtor_count", slDtorCalls, 0);
+
+    // Aggregate statics: '= default' seeding and a positional brace list both persist.
+    result &= Test("static_array_default_1", slArrayDefault(), 12);
+    result &= Test("static_array_default_2", slArrayDefault(), 24);
+    result &= Test("static_array_values_1", slArrayValues(), 223);
+    result &= Test("static_array_values_2", slArrayValues(), 323);
+
+    // Lazily allocated static pointer: the 'new' happens once and the pointee survives
+    // the scope exit that would otherwise free an owning local.
+    result &= Test("static_pointer_1", slPointerOnce(), 1);
+    result &= Test("static_pointer_2", slPointerOnce(), 2);
+    result &= Test("static_pointer_allocs", slAllocs, 1);
+
+    // An owning static (string) keeps its heap buffer across calls.
+    result &= Test("static_string_1", slStringGrows(), 2);
+    result &= Test("static_string_2", slStringGrows(), 3);
+
+    // The guard is per VARIABLE, not per function entry: a static in a loop body
+    // initializes on the first iteration of the first call only (pre-fix: every iteration).
+    result &= Test("static_in_loop_1", slLoopBody(3), 6);
+    result &= Test("static_in_loop_2", slLoopBody(3), 15);
+
+    // Each generic instantiation gets its OWN static. The float leg is the collision
+    // discriminator: if both instantiations shared one global it would read 4, not 2.
+    result &= Test("static_generic_int_1", slGeneric<int>(1), 1);
+    result &= Test("static_generic_int_2", slGeneric<int>(1), 2);
+    result &= Test("static_generic_float", slGeneric<float>(2.0f), 2);
+
+    // A same-named, same-typed local inside the initializer's lambda body does not steal the
+    // static's storage: the static still accumulates (a steal reproduces the pre-fix 6, 6, 6).
+    result &= Test("static_nested_shadow_1", slNestedShadow(), 6);
+    result &= Test("static_nested_shadow_2", slNestedShadow(), 7);
+    result &= Test("static_nested_shadow_3", slNestedShadow(), 8);
+
+    // Same static name in two different functions: distinct storage.
+    result &= Test("static_collide_a1", slCollide1(), 1);
+    result &= Test("static_collide_b1", slCollide2(), 101);
+    result &= Test("static_collide_a2", slCollide1(), 2);
+    result &= Test("static_collide_b2", slCollide2(), 102);
+
+    // Recursion: the flag is set BEFORE the initializer, so nested calls skip it and all
+    // four levels increment the one variable.
+    result &= Test("static_recursion", slRecurse(3), 4);
+
+    // A static local in a method is per-method, not per-instance.
+    SlHolder h1 = SlHolder();
+    SlHolder h2 = SlHolder();
+    h1.base = 1;
+    h2.base = 2;
+    result &= Test("static_method_1", h1.tick(), 102);
+    result &= Test("static_method_2", h2.tick(), 104);
+
+    // A static may hold the address of a global, of another static, or of the heap (the
+    // rejected shape is the address of a NON-static local - see err_static_local_array_view.cb).
+    result &= Test("static_addr_of_global", slAddrOfGlobal(), 41);
+    result &= Test("static_addr_of_static_1", slAddrOfStatic(), 78);
+    result &= Test("static_addr_of_static_2", slAddrOfStatic(), 79);
+    result &= Test("static_view_of_global_arr", slViewOfGlobalArr(), 20);
+    result &= Test("static_view_of_static_arr_1", slViewOfStaticArr(), 8);
+    result &= Test("static_view_of_static_arr_2", slViewOfStaticArr(), 9);
+
+    // A fixed-array static COPIES its source, so a local source is not an aliasing hazard
+    // and stays accepted; the copy itself persists across calls.
+    result &= Test("static_fixed_arr_copy_1", slFixedArrCopy(), 5);
+    result &= Test("static_fixed_arr_copy_2", slFixedArrCopy(), 6);
+
+    // A constant-expression length is accepted (only genuinely run-time lengths are rejected).
+    result &= Test("static_const_len_arith_1", slConstLenArith(), 1);
+    result &= Test("static_const_len_arith_2", slConstLenArith(), 2);
+
+    // A static local in a lambda body.
+    Lambda<int()> lam = () => { static int L = 0; L = L + 1; return L; };
+    result &= Test("static_lambda_1", lam(), 1);
+    result &= Test("static_lambda_2", lam(), 2);
 
     return result;
 }

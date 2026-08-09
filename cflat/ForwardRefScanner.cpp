@@ -312,6 +312,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             {
                 declType.external = storageSpec->Extern() != nullptr;
                 declType.threadLocal = storageSpec->ThreadLocal() != nullptr;
+                // `static` on a LOCAL selects module-global storage + a run-once initializer.
+                if (storageSpec->Static() != nullptr) declType.staticStorage = true;
             }
             else if (auto funcSpec = declSpec->functionSpecifier())
             {

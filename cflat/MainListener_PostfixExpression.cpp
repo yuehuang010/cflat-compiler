@@ -3664,7 +3664,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                             LLVMBackend::TypeAndValue vaTv;
                                             vaTv.TypeName = "va_list";
                                             vaTv.VariableName = "__va_forward";
-                                            Compiler(ctx)->autoVaListAlloca = Compiler(ctx)->CreateLocalVariable(vaTv);
+                                            Compiler(ctx)->autoVaListAlloca = llvm::cast<llvm::AllocaInst>(Compiler(ctx)->CreateLocalVariable(vaTv));
                                             Compiler(ctx)->CreateVaStart(Compiler(ctx)->autoVaListAlloca);
                                         }
                                         llvm::Value* vaValue = Compiler(ctx)->CreateLoad(Compiler(ctx)->autoVaListAlloca);
