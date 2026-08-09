@@ -2158,6 +2158,7 @@ private:
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
+    llvm::Constant* SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType);
 
 public:
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);

@@ -17,6 +17,7 @@ import "string.cb";
 import "list.cb";
 import "array.cb";
 import "dictionary.cb";
+import "function.cb";
 import "test_helper.cb";
 
 // Seed struct for the empty-brace legs below. Its fields default to NON-ZERO values on purpose:
@@ -78,6 +79,25 @@ int fbBumped = 0;
 int fbBump() { fbBumped = fbBumped + 1; return 41; }
 struct FbSide  { FbIn i = { x = fbBump(), y = 2 }; };      // the call must run exactly once
 FbEq fbGlobal = default;                                   // globals skip the ctor - still zero
+
+// ===== 'S[N] a = default;' on the STACK: types for the per-element seeding legs =====
+// PRE, this one spelling zero-filled the whole array and skipped every field initializer, while
+// the bare 'S[N] a;' spelling and the heap 'new S[N]' both ran them. POST it is byte-identical
+// to the bare spelling (only __FILE__ differs in the emitted IR).
+struct FadS      { int k = 7; };
+struct FadInner  { int w = 42; };
+struct FadDeep   { int k = 7; FadInner d; };                     // struct-typed field, no initializer
+struct FadFd     { FadInner d = default; int k = 7; };           // the field's own '= default'
+struct FadNone   { int k; int j; };                              // no field defaults - accept cell
+struct FadCtor   { int k = 1; FadCtor() { k = 9; } };            // user no-arg ctor
+struct FadAllDef { int k = 1; FadAllDef(int v = 5) { k = v; } }; // all-defaulted ctor
+struct FadBox<T> { T v; int tag = 5; };                          // generic element
+int fadDtors = 0;
+struct FadDtor   { int k = 7; ~FadDtor() { fadDtors = fadDtors + 1; } };
+int fadAddOne(int x) { return x + 1; }
+struct FadClo    { Lambda<int(int)> f = fadAddOne; };            // PRE: the zeroed slot was CALLED
+FadS[2] fadGlobal = default;                       // frozen: a global still skips the ctor
+struct FadHost   { FadS[2] a; int z = 3; };        // frozen: the fixed-array FIELD is a separate issue
 
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
@@ -414,6 +434,71 @@ extern int main()
     // That is global-struct-no-initializer-ignores-field-defaults, identical on both binaries.
     total++; passed += Test("field brace default at global scope still zero",
                             fbGlobal.i.x * 1000 + fbGlobal.i.y, 0);
+
+    // ===== 'S[N] a = default;' runs the element's field initializers per element =====
+    // Every leg in this block read 0 (or crashed) on the pre-fix binary.
+    FadS[2] fadA = default;
+    total++; passed += Test("fixed-array '= default' element 0", fadA[0].k, 7);
+    total++; passed += Test("fixed-array '= default' element 1", fadA[1].k, 7);
+
+    FadDeep[2] fadD = default;
+    total++; passed += Test("fixed-array '= default' depth-2 struct field", fadD[1].d.w, 42);
+    total++; passed += Test("fixed-array '= default' depth-2 scalar field", fadD[1].k, 7);
+
+    FadFd[2] fadF = default;
+    total++; passed += Test("fixed-array '= default' field's own '= default'", fadF[1].d.w, 42);
+
+    FadCtor[2] fadC = default;
+    total++; passed += Test("fixed-array '= default' user no-arg ctor", fadC[0].k + fadC[1].k, 18);
+
+    FadAllDef[2] fadAd = default;
+    total++; passed += Test("fixed-array '= default' all-defaulted ctor", fadAd[0].k + fadAd[1].k, 10);
+
+    FadBox<int>[2] fadG = default;
+    total++; passed += Test("fixed-array '= default' generic element", fadG[0].tag + fadG[1].tag, 10);
+
+    FadS[2][2] fadN = default;
+    total++; passed += Test("fixed-array '= default' nested dimensions", fadN[0][0].k + fadN[1][1].k, 14);
+
+    FadS[1] fadOne = default;
+    total++; passed += Test("fixed-array '= default' N=1", fadOne[0].k, 7);
+
+    // N=64 is past kMaxUnrolledArrayElements, so this is the only leg on the LOOP arm of
+    // EmitFixedArrayElementWalk; every other leg here exercises the unrolled arm.
+    FadS[64] fadBig = default;
+    total++; passed += Test("fixed-array '= default' N=64 loop arm", fadBig[0].k + fadBig[63].k, 14);
+
+    // A closure field default. PRE the zeroed slot was called and the program SIGSEGV'd, so this
+    // leg cannot report a wrong value on the old binary - it takes the whole process down.
+    FadClo[2] fadL = default;
+    total++; passed += Test("fixed-array '= default' closure element", fadL[1].f(30), 31);
+
+    // Seeding must not change destruction: exactly one destructor call per element.
+    {
+        FadDtor[3] fadT = default;
+        total++; passed += Test("fixed-array '= default' dtor element value", fadT[2].k, 7);
+    }
+    total++; passed += Test("fixed-array '= default' destructs each element once", fadDtors, 3);
+
+    // ----- Accept cells, frozen: correct before the fix and must not move -----
+    // Value freeze only: a regression here emits no store at all, and the undef read still came
+    // back zero under a polarity-flipped build. The discriminating evidence for this cell is the
+    // pre/post IR being identical, recorded with the fix, not this leg.
+    int[4] fadInt = default;
+    total++; passed += Test("frozen: 'int[N] = default' stays all zero", fadInt[0] + fadInt[3], 0);
+    FadNone[2] fadNo = default;
+    total++; passed += Test("frozen: element with no field defaults stays zero",
+                            fadNo[0].k + fadNo[1].j, 0);
+    FadS*[2] fadP = default;
+    total++; passed += Test("frozen: pointer element stays null", (i64)fadP[0], (i64)0);
+    total++; passed += Test("frozen: fixed-array '= default' at global scope still zero",
+                            fadGlobal[0].k + fadGlobal[1].k, 0);
+    // A fixed-array FIELD is fixed-array-field-brace-default-discarded, deliberately NOT absorbed
+    // here; this leg pins that the local-declarator fix leaves that cell exactly where it was.
+    FadHost fadH = default;
+    total++; passed += Test("frozen: fixed-array FIELD still skips element defaults",
+                            fadH.a[0].k + fadH.a[1].k, 0);
+    total++; passed += Test("frozen: fixed-array FIELD sibling scalar default", fadH.z, 3);
 
     if (passed == total)
     {

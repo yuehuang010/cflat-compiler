@@ -1001,6 +1001,22 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(const LLVMBackend
         return folded;
     }
 
+// Replicates one element constant across a fixed-array type, recursing through every inner
+// dimension. Returns null when the shapes do not line up, so the caller falls back to seeding.
+llvm::Constant* MainListener::SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType) {
+        auto* arrTy = llvm::dyn_cast_or_null<llvm::ArrayType>(arrType);
+        if (elemConst == nullptr || arrTy == nullptr) return nullptr;
+
+        llvm::Type* inner = arrTy->getElementType();
+        llvm::Constant* fill = (inner == elemConst->getType())
+            ? elemConst
+            : SplatConstantOverFixedArray(elemConst, inner);
+        if (fill == nullptr) return nullptr;
+
+        std::vector<llvm::Constant*> elems((size_t)arrTy->getNumElements(), fill);
+        return llvm::ConstantArray::get(arrTy, elems);
+    }
+
 llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue) {
         auto* compiler = Compiler();
         // Apply active type-parameter substitutions as a fallback in case the caller
@@ -3374,7 +3390,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
                     else if (initializer->Default() != nullptr)
                     {
-                        right = GenerateDefaultValue(typeAndValue);
+                        // `S[N] a = default;` must default-CONSTRUCT each element:
+                        // GenerateDefaultValue hands back a zeroinitializer for the whole ARRAY
+                        // type, skipping every field initializer the element declares.
+                        bool fixedArrayOfStruct = !global_scope && !typeAndValue.Pointer
+                            && typeAndValue.ConstArraySize > 0
+                            && compiler->GetDataStructure(typeAndValue.TypeName).StructType != nullptr;
+                        if (fixedArrayOfStruct)
+                        {
+                            // Preferred: fold one element's construction and replicate it as a
+                            // CONSTANT array, keeping the single whole-array store this spelling
+                            // has always emitted. The null-interface dataflow proof reads that
+                            // stored aggregate, so a per-element memcpy would hide a null element.
+                            auto elemTypeAndValue = typeAndValue;
+                            elemTypeAndValue.ConstArraySize = 0;
+                            elemTypeAndValue.ConstInnerDimensions.clear();
+                            if (auto* elemConst = TryFoldGlobalDefaultConstruction(elemTypeAndValue))
+                                right = SplatConstantOverFixedArray(
+                                    elemConst, compiler->GetType(typeAndValue));
+                            // A construction that does not fold - an allocation is never constant,
+                            // so an owned resource per slot lands here - falls through to seeding.
+                        }
+                        else
+                        {
+                            right = GenerateDefaultValue(typeAndValue);
+                        }
                     }
                     else if (initializer->LeftBrace() != nullptr)
                     {
