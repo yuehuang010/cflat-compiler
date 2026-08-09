@@ -3981,6 +3981,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue);
 
+                    /*
+                     * An owning pointer local with no initializer left its slot uninitialized, so a
+                     * later assignment's drop-old and the scope-exit release both freed garbage.
+                     * Zero it, exactly as the `= nullptr` spelling does; the array type's own zero
+                     * value covers every slot of `unique T*[N]`. A `static` local's storage is a
+                     * module global zeroed once at definition and must not be re-zeroed per call,
+                     * and a run-time-sized allocation has no constant whole-slot zero.
+                     */
+                    if (right == nullptr && typeAndValue.IsUnique && typeAndValue.Pointer
+                        && !isStaticLocal
+                        && (arraySize == nullptr || typeAndValue.ConstArraySize > 0))
+                    {
+                        if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(alloc))
+                            compiler->builder->CreateStore(
+                                llvm::Constant::getNullValue(slot->getAllocatedType()), slot);
+                    }
+
                     // Record an unused-local candidate. RAII locals (a type with a
                     // destructor, e.g. `lock`) are exempt: the declaration itself is the
                     // point even when the name is never read again.

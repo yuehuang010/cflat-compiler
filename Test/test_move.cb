@@ -5134,6 +5134,104 @@ int testUniqueArrayElementFieldStore()
     return passed;
 }
 
+// A generic body's `unique T*` local with no initializer: the monomorphized copy runs the same
+// declarator path, so it must be zeroed there too.
+int uqiGenericMake<T>(int seed)
+{
+    unique T* p;
+    p = new T();
+    p->id = seed;
+    return p->id;
+}
+
+/*
+ * An owning pointer local declared with NO initializer (`unique T* p;` / `unique T*[N] a;`). The
+ * slot used to be left uninitialized, so the next assignment's drop-old and the scope-exit release
+ * both read garbage and called free() on it - rc 134 at --no-opt, and silently SKIPPED statements
+ * once the optimizer folded the undef load, which is the face this suite sees. Every leg therefore
+ * asserts a VALUE the skipped statements compute plus the destructor COUNT, so neither face can
+ * pass. `unique T* p = nullptr;` was always correct; the fix makes the bare spelling emit the
+ * identical IR.
+ */
+int testUninitializedUniqueLocalDecl()
+{
+    int passed = 0;
+
+    // Scalar. The first assignment must free NOTHING (the slot is null now, not garbage); the
+    // reassignment frees exactly the first value.
+    dtorCount = 0;
+    {
+        unique Resource* p;
+        p = new Resource();
+        p->id = 71;
+        passed += Test("uqi_scalar_first_value", p->id, 71);
+        passed += Test("uqi_scalar_first_no_free", dtorCount, 0);
+        p = new Resource();
+        p->id = 72;
+        passed += Test("uqi_scalar_reassign_value", p->id, 72);
+        passed += Test("uqi_scalar_reassign_frees_old", dtorCount, 1);
+    }
+    passed += Test("uqi_scalar_freed_twice", dtorCount, 2);
+
+    // `= nullptr` into the uninitialized slot is a no-op release, not a free of garbage.
+    dtorCount = 0;
+    {
+        unique Resource* p;
+        p = nullptr;
+        passed += Test("uqi_null_assign_is_null", p == nullptr ? 1 : 0, 1);
+        passed += Test("uqi_null_assign_no_free", dtorCount, 0);
+    }
+    passed += Test("uqi_null_assign_none_freed", dtorCount, 0);
+
+    // `move` from another owner into the uninitialized slot: source nulled, one owner, one free.
+    dtorCount = 0;
+    {
+        unique Resource* src = new Resource();
+        src->id = 73;
+        unique Resource* p;
+        p = move src;
+        passed += Test("uqi_move_value", p->id, 73);
+        passed += Test("uqi_move_source_nulled", src == nullptr ? 1 : 0, 1);
+        passed += Test("uqi_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqi_move_freed_once", dtorCount, 1);
+
+    // `unique T*[N]`: every slot is zeroed, so the scope-exit walk frees the two that were
+    // assigned and skips the untouched one instead of freeing garbage out of it.
+    dtorCount = 0;
+    {
+        unique Resource*[3] arr;
+        arr[0] = new Resource();
+        arr[0]->id = 74;
+        arr[2] = new Resource();
+        arr[2]->id = 75;
+        passed += Test("uqi_array_slot0_value", arr[0]->id, 74);
+        passed += Test("uqi_array_slot2_value", arr[2]->id, 75);
+        passed += Test("uqi_array_untouched_slot_null", arr[1] == nullptr ? 1 : 0, 1);
+        passed += Test("uqi_array_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqi_array_freed_twice", dtorCount, 2);
+
+    // Loop re-entry: the declaration is re-executed per iteration, so the slot is re-zeroed each
+    // time - the previous iteration's value was already released at its own scope exit.
+    dtorCount = 0;
+    int loopTotal = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        unique Resource* p;
+        p = new Resource();
+        p->id = i + 1;
+        loopTotal = loopTotal + p->id;
+    }
+    passed += Test("uqi_loop_total", loopTotal, 6);
+    passed += Test("uqi_loop_freed_each_iteration", dtorCount, 3);
+
+    // The generic instantiation reaches the same declarator path.
+    passed += Test("uqi_generic_local_value", uqiGenericMake<Resource>(76), 76);
+
+    return passed;
+}
+
 /*
  * The shapes deliberately left LEGAL by the `unique` field-store rejects in
  * Test/errors/err_unique_borrow_into_field.cb. Each asserts a value and a free COUNT, so a
@@ -6228,6 +6326,9 @@ extern int main()
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
+
+    passed += testUninitializedUniqueLocalDecl();
+    total += 20;
 
     passed += testUniqueGlobalReceiverFieldStore();
     total += 15;
