@@ -254,9 +254,16 @@ struct Thread {
         return true;
     }
 
-    // Blocks until the thread exits. Returns the thread's exit code.
+    // Blocks until the thread exits. Returns the thread's exit code, or returns
+    // immediately with the last exit code if the thread was never started or is joined.
     i32 join() {
         if (__fuzz_hook != nullptr) { __fuzz_hook(42); }  // thread-fuzz sched-point
+        // No packet means never started, start() failed, or already joined - there
+        // is nothing to wait for, and the packet read below would deref nullptr.
+        if (_args == nullptr) {
+            _handle = nullptr;
+            return _exitCode;
+        }
         // os.thread_join frees the os handle, so null _handle to avoid a later
         // double-free. The user exit code lives in our packet, not the OS code.
         os.thread_join(_handle);
