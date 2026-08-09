@@ -2152,8 +2152,12 @@ private:
 
     // Returns the default value for a type:
     //   - struct types (local scope): calls the default constructor.
-    //   - everything else (or global scope): zero-initializes.
+    //   - struct types (global scope): the constant value of that same construction, if it has one.
+    //   - everything else: zero-initializes.
     llvm::Value* GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue);
+
+    // Constant value of a type's default construction, or nullptr when it is not constant.
+    llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
 
 public:
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);

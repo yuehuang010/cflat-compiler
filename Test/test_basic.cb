@@ -466,6 +466,85 @@ bool testNoArgCtorFieldSeeding()
     return result;
 }
 
+/*
+ * Regression: a GLOBAL of a struct/class type ignored its fields' own default expressions.
+ * The local declarator calls the type's default constructor; the global path left the
+ * initializer null and CreateGlobalVariable emitted a plain zeroinitializer, so every field
+ * read 0 - a SILENT WRONG VALUE against the identical local spelling. A global now takes the
+ * CONSTANT VALUE of that same construction. The three global spellings (no initializer,
+ * '= default', '= {}') all went through the same zeroing hole and are all covered.
+ * Every leg below pairs the global with its LOCAL twin, which is the oracle.
+ */
+struct GSeedPlain { int a = 91; int b = 92; };
+struct GSeedTrunc { u8 r = 200; i16 s = 300; bool t = 5; };
+class GSeedClass { int a = 93; SeedInner nested; };
+namespace GSeedNS { struct GSeedNsType { int a = 94; }; }
+struct GSeedUserCtor { int a = 95; GSeedUserCtor() { a = 96; } };
+
+GSeedPlain gSeedPlain;
+SeedInner gSeedNested;
+SeedInner gSeedDefault = default;
+SeedInner gSeedBrace = {};
+GSeedTrunc gSeedTrunc;
+GSeedClass gSeedClass;
+GSeedNS.GSeedNsType gSeedNs;
+GSeedUserCtor gSeedUserCtor;
+
+bool testGlobalDefaultSeeding()
+{
+    bool result = true;
+    // Scalar field defaults. Pre-fix: every global leg read 0, every local leg was correct.
+    GSeedPlain lPlain;
+    result &= Test("gseed_plain_local_a", lPlain.a, 91);
+    result &= Test("gseed_plain_local_b", lPlain.b, 92);
+    result &= Test("gseed_plain_global_a", gSeedPlain.a, 91);
+    result &= Test("gseed_plain_global_b", gSeedPlain.b, 92);
+
+    // A struct-typed field with no initializer, two levels deep - the nested default ctor
+    // has to be folded through as well, not just the leaf constants.
+    SeedInner lNested;
+    result &= Test("gseed_nested_local_v", lNested.v, 7);
+    result &= Test("gseed_nested_local_deep_w", lNested.d.w, 42);
+    result &= Test("gseed_nested_global_v", gSeedNested.v, 7);
+    result &= Test("gseed_nested_global_deep_w", gSeedNested.d.w, 42);
+
+    // The other two global spellings of the same construction.
+    result &= Test("gseed_default_global_v", gSeedDefault.v, 7);
+    result &= Test("gseed_default_global_deep_w", gSeedDefault.d.w, 42);
+    result &= Test("gseed_brace_global_v", gSeedBrace.v, 7);
+    result &= Test("gseed_brace_global_deep_w", gSeedBrace.d.w, 42);
+
+    // Defaults needing a CONVERSION - the value has to come through the ctor's cast arm.
+    GSeedTrunc lTrunc;
+    result &= Test("gseed_trunc_local_u8", (int)lTrunc.r, 200);
+    result &= Test("gseed_trunc_global_u8", (int)gSeedTrunc.r, 200);
+    result &= Test("gseed_trunc_local_i16", (int)lTrunc.s, 300);
+    result &= Test("gseed_trunc_global_i16", (int)gSeedTrunc.s, 300);
+    result &= Test("gseed_trunc_local_bool", lTrunc.t ? 1 : 0, 1);
+    result &= Test("gseed_trunc_global_bool", gSeedTrunc.t ? 1 : 0, 1);
+
+    // class, and a namespaced type.
+    GSeedClass lClass;
+    result &= Test("gseed_class_local_a", lClass.a, 93);
+    result &= Test("gseed_class_local_nested_v", lClass.nested.v, 7);
+    result &= Test("gseed_class_global_a", gSeedClass.a, 93);
+    result &= Test("gseed_class_global_nested_v", gSeedClass.nested.v, 7);
+    GSeedNS.GSeedNsType lNs;
+    result &= Test("gseed_ns_local_a", lNs.a, 94);
+    result &= Test("gseed_ns_global_a", gSeedNs.a, 94);
+
+    /*
+     * Policy pin, not a discriminator: a user-written constructor BODY runs statements, and a
+     * global initializer has to be a compile-time constant, so that construction does not fold
+     * and the global stays zeroed (with a located note saying so). The local twin below is the
+     * value the global deliberately does NOT get.
+     */
+    GSeedUserCtor lUser;
+    result &= Test("gseed_userctor_local_a", lUser.a, 96);
+    result &= Test("gseed_userctor_global_a", gSeedUserCtor.a, 0);
+    return result;
+}
+
 extern int strcmp(const char* a, const char* b);
 
 bool Test(const char* testName, const char* actual, const char* expected)
@@ -3654,6 +3733,7 @@ extern int main()
     total++; passed += testAllDefaultedConstructor()     ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeedingCasts()  ? 1 : 0;
+    total++; passed += testGlobalDefaultSeeding()        ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;
     total++; passed += testTypeof()                      ? 1 : 0;

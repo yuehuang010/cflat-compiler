@@ -897,6 +897,110 @@ LLVMBackend::DeclTypeAndValue MainListener::getFunctionReturnType(CFlatParser::F
         return ParseDeclarationSpecifiers(declSpecs);
     }
 
+/*
+ * Reduce a just-emitted default-construction value to a compile-time Constant by replaying
+ * the constructor's own body. A synthesized (or constant-bodied user) no-arg constructor is a
+ * single block that builds its result out of `insertvalue` over constants and calls to the
+ * field types' own constructors, so a global can carry the same value its local twin gets.
+ * Anything the walk does not recognise (a load, an allocation, a runtime call) yields nullptr
+ * and the caller keeps the zero default.
+ */
+static llvm::Constant* FoldConstructedValueToConstant(
+    llvm::Value* value,
+    const llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameArgs,
+    int depth)
+{
+    if (value == nullptr || depth > 16) return nullptr;
+    if (auto* c = llvm::dyn_cast<llvm::Constant>(value)) return c;
+
+    if (auto* arg = llvm::dyn_cast<llvm::Argument>(value))
+    {
+        auto it = frameArgs.find(arg);
+        return it == frameArgs.end() ? nullptr : it->second;
+    }
+
+    if (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(value))
+    {
+        auto* agg = FoldConstructedValueToConstant(iv->getAggregateOperand(), frameArgs, depth + 1);
+        auto* elem = FoldConstructedValueToConstant(iv->getInsertedValueOperand(), frameArgs, depth + 1);
+        if (agg == nullptr || elem == nullptr) return nullptr;
+        return llvm::ConstantFoldInsertValueInstruction(agg, elem, iv->getIndices());
+    }
+
+    if (auto* ev = llvm::dyn_cast<llvm::ExtractValueInst>(value))
+    {
+        auto* agg = FoldConstructedValueToConstant(ev->getAggregateOperand(), frameArgs, depth + 1);
+        if (agg == nullptr) return nullptr;
+        return llvm::ConstantFoldExtractValueInstruction(agg, ev->getIndices());
+    }
+
+    if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))
+    {
+        llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return nullptr;
+        if (callee->size() != 1) return nullptr;
+        if (call->arg_size() != callee->arg_size()) return nullptr;
+        auto* ret = llvm::dyn_cast<llvm::ReturnInst>(callee->back().getTerminator());
+        if (ret == nullptr || ret->getReturnValue() == nullptr) return nullptr;
+        // Every argument must itself fold, and it folds in the CALLER's frame.
+        llvm::DenseMap<const llvm::Value*, llvm::Constant*> calleeArgs;
+        unsigned i = 0;
+        for (llvm::Argument& formal : callee->args())
+        {
+            auto* actual = FoldConstructedValueToConstant(call->getArgOperand(i), frameArgs, depth + 1);
+            if (actual == nullptr) return nullptr;
+            calleeArgs[&formal] = actual;
+            i++;
+        }
+        return FoldConstructedValueToConstant(ret->getReturnValue(), calleeArgs, depth + 1);
+    }
+
+    return nullptr;
+}
+
+/*
+ * Global counterpart of the local declarator's default-construction call. The call itself
+ * cannot stand as a global initializer, so emit it into a throwaway function (the same guard
+ * the `= <expr>` global path uses), fold the result, and discard the IR either way.
+ */
+llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue) {
+        auto* compiler = Compiler();
+        if (compiler->GetDataStructure(typeValue.TypeName).StructType == nullptr) return nullptr;
+        if (compiler->GetFunction(typeValue.TypeName) == nullptr) return nullptr;
+
+        auto savedState = compiler->SaveBuilderState();
+        auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
+        auto* tempFn = llvm::Function::Create(
+            voidTy, llvm::Function::PrivateLinkage, "__global_default_init_tmp", compiler->module.get());
+        auto* tempBB = llvm::BasicBlock::Create(*compiler->context, "entry", tempFn);
+        compiler->builder->SetInsertPoint(tempBB);
+
+        llvm::Constant* folded = nullptr;
+        try
+        {
+            // The constructor call must lower as an ordinary instruction, not as file-scope IR.
+            GlobalScopeGuard defaultCtorScope(global_scope);
+            // forceRoot: an exact-key lookup, so a namespace walk cannot pick a sibling's ctor.
+            llvm::Value* constructed = compiler->CreateOverloadedFunctionCall(typeValue.TypeName, {}, true);
+            llvm::DenseMap<const llvm::Value*, llvm::Constant*> noArgs;
+            folded = FoldConstructedValueToConstant(constructed, noArgs, 0);
+        }
+        catch (...)
+        {
+            // LogError THROWS and expect_error resumes the walk, so the temp IR must go and the
+            // builder must be restored here or the next statement emits into an erased block.
+            tempFn->eraseFromParent();
+            compiler->RestoreBuilderState(savedState);
+            throw;
+        }
+
+        tempFn->eraseFromParent();
+        compiler->RestoreBuilderState(savedState);
+        // A fold that produced the wrong shape is not usable as this global's initializer.
+        if (folded != nullptr && folded->getType() != compiler->GetType(typeValue)) return nullptr;
+        return folded;
+    }
+
 llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndValue& typeValue) {
         auto* compiler = Compiler();
         // Apply active type-parameter substitutions as a fallback in case the caller
@@ -917,13 +1021,19 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
         auto* llvmType = compiler->GetType(resolved);
         if (!llvmType) return nullptr;
 
-        if (!resolved.Pointer && llvmType->isStructTy() && !global_scope)
+        if (!resolved.Pointer && llvmType->isStructTy())
         {
             auto structData = compiler->GetDataStructure(resolved.TypeName);
             // forceRoot: the guards above are EXACT-key lookups, so the default ctor must be the
             // one of that exact type - a namespace walk here would call a same-named sibling's.
             if (structData.StructType != nullptr && compiler->GetFunction(resolved.TypeName))
-                return compiler->CreateOverloadedFunctionCall(resolved.TypeName, {}, true);
+            {
+                if (!global_scope)
+                    return compiler->CreateOverloadedFunctionCall(resolved.TypeName, {}, true);
+                // At global scope the call is not an initializer; take its constant value if it has one.
+                if (auto* folded = TryFoldGlobalDefaultConstruction(resolved))
+                    return folded;
+            }
         }
 
         return llvm::Constant::getNullValue(llvmType);
@@ -3332,9 +3442,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                     if (structData.StructType != nullptr)
                     {
-                        // Auto-initialize using the default constructor when available.
+                        // Auto-initialize using the default constructor when available. A global
+                        // takes the constant value of that same construction when it has one; the
+                        // note below is reserved for the cases that genuinely stay zeroed.
                         if (!global_scope && compiler->GetFunction(typeAndValue.TypeName))
                             right = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
+                        else if (global_scope)
+                        {
+                            right = TryFoldGlobalDefaultConstruction(typeAndValue);
+                            if (right == nullptr)
+                                LogWarningContext(direct, std::format(
+                                    "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
+                                    typeAndValue.TypeName));
+                        }
                         else
                             LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
                     }
