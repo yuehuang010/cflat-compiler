@@ -3795,6 +3795,19 @@ public:
         const std::string& typeName);
 
     /*
+     * A brace list WITH VALUES on a 'T[]' VIEW field ('int[] v = {1,2,3};'). The local
+     * declarator spelling can infer backing storage for the list (EmitArrayViewInferredInit),
+     * but a field has no such storage to point at: it would need a lifetime tied to the
+     * containing object, which nothing here allocates. An empty '{}' stays accepted as a null
+     * view (unchanged); only a non-empty list reaches this. LogErrorContext throws.
+     */
+    void LogArrayViewFieldBraceInitReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& name,
+        const std::string& typeName,
+        bool elemPointer);
+
+    /*
      * Render the declared type for a diagnostic - 'S*', 'S**', 'void*', 'S*[2]' - so a remedy is
      * never synthesized from the bare pointee name. A type ALIAS ('using PS = S*') is already
      * resolved away by ParseDeclarationSpecifiers, so this names the resolved type, not 'PS'.

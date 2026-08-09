@@ -51,6 +51,34 @@ expect_error("too many initializers for 'int[3]': got 4 elements") {
     struct FbrHLong { int[3] a = { 1, 2, 3, 4 }; };
 }
 
+// A 'T[]' VIEW field: the local declarator infers backing storage for the list, but a field
+// has no storage of its own to point at (array-view-field-brace-default-discarded). A positional
+// list on a primitive-element view.
+expect_error("cannot apply a brace initializer with values to view field 'FbrHViewInt.v' of type 'int[]'") {
+    struct FbrHViewInt { int[] v = { 1, 2, 3 }; };
+}
+
+// Same view-field reject, string element - proves the guard is not primitive-only.
+expect_error("cannot apply a brace initializer with values to view field 'FbrHViewStr.v' of type 'string[]'") {
+    struct FbrHViewStr { string[] v = { "a", "b" }; };
+}
+
+// A NAMED list on a view field routes through the same IsArrayView bail as the positional one -
+// the crash this guards against (array-view-field-brace-default-discarded) reproduced from both
+// spellings, so both must reject.
+expect_error("cannot apply a brace initializer with values to view field 'FbrHViewNamed.v' of type 'int[]'") {
+    struct FbrHViewNamed { int[] v = { x = 1 }; };
+}
+
+// An EMPTY '{}' on a view field must stay accepted as a null view - this is the frozen behaviour
+// the reject above must NOT disturb. No expect_error: a compile failure here would be the guard
+// over-firing on the accept set.
+struct FbrHViewEmpty { int[] v = { }; };
+
+// The remedy the reject points at: a fixed-size 'T[N]' field brace-inits correctly (the fldarr
+// fix, commit 4565f1e) - this is the reject's own honesty proof, not a defect probe.
+struct FbrHViewRemedy { int[3] v = { 1, 2, 3 }; };
+
 extern int main()
 {
     printf("PASS: expected error received\n");

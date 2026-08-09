@@ -6015,6 +6015,20 @@ void MainListener::LogNonAggregateBraceInitReject(
             name, typeName));
     }
 
+void MainListener::LogArrayViewFieldBraceInitReject(
+        antlr4::ParserRuleContext* ctx,
+        const std::string& name,
+        const std::string& typeName,
+        bool elemPointer) {
+        std::string star = elemPointer ? "*" : "";
+        LogErrorContext(ctx, std::format(
+            "cannot apply a brace initializer with values to view field '{}' of type '{}{}[]' - "
+            "a view field owns no storage for the list to write into, and storage built for it "
+            "would need a lifetime tied to the containing object, which a field cannot provide; "
+            "declare it as '{}{}[N]' with a fixed size instead",
+            name, typeName, star, typeName, star));
+    }
+
 std::string MainListener::DescribePointerDeclType(const LLVMBackend::TypeAndValue& tv) {
         if (tv.ConstArraySize > 0) return DescribeArrayShape(tv);
         // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out.
@@ -6082,9 +6096,15 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list) {
         auto* compiler = Compiler(list);
-        // A 'T[]' VIEW field keeps its existing (discarding) handling: the local spelling
-        // infers backing storage, which a field cannot outlive - array-view-field-brace-default-discarded.
-        if (field.IsArrayView) return nullptr;
+        // A 'T[]' VIEW field: the local spelling infers backing storage a field cannot outlive,
+        // so a list with values is rejected ('{}' parses to no initializerList and never gets here).
+        if (field.IsArrayView) {
+            if (!list->fieldInit().empty())
+                LogArrayViewFieldBraceInitReject(list,
+                    std::format("{}.{}", structName, field.VariableName),
+                    field.TypeName, field.ElemPointer);
+            return nullptr;
+        }
         if (field.ConstArraySize > 0)
             return EmitFieldDefaultFixedArrayBrace(structName, field, list);
 
