@@ -1063,6 +1063,27 @@ static bool isFunctionStatic(CFlatParser::FunctionDefinitionContext* func)
     return false;
 }
 
+/*
+ * True when a parameter list is callable with ZERO arguments: every parameter carries an
+ * '= initializer' default and there is no '...' pack. Such a constructor IS the type's no-arg
+ * constructor (its cutoff-0 default-parameter wrapper mangles to the same symbol), so the
+ * synthetic one must not also be emitted. A null list means "no parameters at all" and is
+ * NOT this case - callers test that separately.
+ */
+static bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramTypeList)
+{
+    if (paramTypeList == nullptr) return false;
+    if (paramTypeList->Ellipsis() != nullptr) return false;
+    auto* list = paramTypeList->parameterList();
+    if (list == nullptr) return false;
+    auto decls = list->parameterDeclaration();
+    if (decls.empty()) return false;
+    for (auto* d : decls)
+        if (d->initializer() == nullptr)
+            return false;
+    return true;
+}
+
 // Detect functions that heap-allocate and return a new owned value, so call sites
 // register the result as an owned temp and free it. operator+ always allocates;
 // operator string(i32) uses malloc; user functions opt in via 'move string' /
@@ -4370,7 +4391,7 @@ public:
         const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& constraintMap,
         antlr4::ParserRuleContext* ctx);
 
-    void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName);
+    void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor = false);
 
     void ParseDestructorDefinition(CFlatParser::DestructorDefinitionContext* ctx, const std::string& structName);
 

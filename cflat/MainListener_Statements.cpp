@@ -2295,6 +2295,28 @@ void MainListener::GenerateDefaultParamOverloads(
         {
             std::vector<LLVMBackend::TypeAndValue> wrapperParams(params.begin(), params.begin() + cutoff);
 
+            /*
+             * The slot this wrapper needs can already hold a body. CreateFunctionDefinition would
+             * take its !fn->empty() early return, which pushes NO function scope - and the emission
+             * below would then write into a foreign, terminated block and pop a scope frame it never
+             * pushed, corrupting the scope stack (nondeterministic SIGABRT / SIGSEGV / "declared with
+             * no enclosing scope"). Decide BEFORE the call instead.
+             */
+            std::string clashFile;
+            size_t clashLine = 0;
+            if (compiler->OverloadSlotIsDefined(name, returnType, wrapperParams, false, &clashFile, &clashLine))
+            {
+                // Line 0 is a compiler-synthesized definition (e.g. a union's default constructor):
+                // yield to it silently, exactly as a duplicate synthesized body does elsewhere.
+                if (clashLine == 0)
+                    continue;
+                compiler->LogError(std::format(
+                    "'{}' with its parameter defaults filled in matches an overload that is already "
+                    "defined at {}({}) - a call could mean either. Remove one of the two definitions, "
+                    "or drop the default from a parameter so the two no longer overlap.",
+                    name, clashFile, clashLine));
+            }
+
             auto wrapperFn = compiler->CreateFunctionDefinition(name, returnType, wrapperParams, false, false, line);
             compiler->InitializeBlock(&wrapperFn->front(), false);
             // Fresh straight-line for the wrapper body; restore the enclosing walk's flag on exit.

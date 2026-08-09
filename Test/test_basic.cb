@@ -248,6 +248,107 @@ bool testDefaultParamNameCollision()
     return result;
 }
 
+/*
+ * Regression: a constructor whose parameters are ALL defaulted IS the type's no-arg
+ * constructor - its cutoff-0 default-param wrapper mangles to the same symbol as the
+ * synthesized one. Emitting both made the wrapper re-enter an already-defined function
+ * with no scope frame pushed, so its scope-exit popped the CALLER's frame: the compiler
+ * died nondeterministically (SIGABRT / SIGSEGV / "declared with no enclosing scope") on
+ * the DECLARATION alone, before any construction. The synthetic ctor is now suppressed
+ * and the all-defaulted ctor seeds fields itself instead of self-delegating.
+ */
+class AllDefaultedCtor
+{
+    int a;
+    int b = 7;
+    AllDefaultedCtor(int x = 3, int y = 4) { a = x; b = b + y; }
+};
+
+struct AllDefaultedStruct
+{
+    int a;
+    AllDefaultedStruct(int x = 5) { a = x; }
+};
+
+bool testAllDefaultedConstructor()
+{
+    bool result = true;
+    AllDefaultedCtor d;
+    // Field initializer (b = 7) seeds first, then the ctor body runs with the defaults.
+    result &= Test("alldef_ctor_bare_a", d.a, 3);
+    result &= Test("alldef_ctor_bare_b", d.b, 11);
+    AllDefaultedCtor e = AllDefaultedCtor(20);
+    result &= Test("alldef_ctor_one_arg_a", e.a, 20);
+    result &= Test("alldef_ctor_one_arg_b", e.b, 11);
+    AllDefaultedCtor f = AllDefaultedCtor(20, 30);
+    result &= Test("alldef_ctor_two_arg_a", f.a, 20);
+    result &= Test("alldef_ctor_two_arg_b", f.b, 37);
+    AllDefaultedStruct s;
+    result &= Test("alldef_struct_bare", s.a, 5);
+    AllDefaultedStruct s2 = AllDefaultedStruct(9);
+    result &= Test("alldef_struct_arg", s2.a, 9);
+    AllDefaultedCtor* h = new AllDefaultedCtor();
+    result &= Test("alldef_ctor_new", h->a, 3);
+    delete h;
+    return result;
+}
+
+/*
+ * Regression: a user-written no-arg constructor seeds its own fields in line instead of
+ * delegating, and that in-line seeding used to honour only brace-list and '= expr' field
+ * defaults. A struct-typed field with NO initializer, and a '= default' field, were left
+ * zeroed - a SILENT WRONG VALUE against the synthesized default constructor, which
+ * default-constructs both. Covers the all-defaulted ctor (the shape widened onto this path)
+ * and the bare T() ctor (where the divergence was pre-existing).
+ */
+struct SeedDeep { int w = 42; };
+struct SeedInner { int v = 7; SeedDeep d; };
+
+class SeededAllDefaulted
+{
+    SeedInner nested;
+    SeedInner dn = default;
+    int plain = 5;
+    SeededAllDefaulted(int x = 3) { plain = plain + x; nested.v = nested.v + 100; }
+};
+
+class SeededBareCtor
+{
+    SeedInner nested;
+    SeedInner dn = default;
+    int plain = 5;
+    SeededBareCtor() { }
+};
+
+struct SeedBox<T>
+{
+    SeedInner nested;
+    T val = default;
+    SeedBox(int x = 3) { }
+};
+
+bool testNoArgCtorFieldSeeding()
+{
+    bool result = true;
+    SeededAllDefaulted a;
+    // Seeding runs BEFORE the body, so the body reads 7 and writes 107 (was 100: unseeded).
+    result &= Test("seed_alldef_nested_v", a.nested.v, 107);
+    result &= Test("seed_alldef_nested_deep_w", a.nested.d.w, 42);
+    result &= Test("seed_alldef_default_v", a.dn.v, 7);
+    result &= Test("seed_alldef_default_deep_w", a.dn.d.w, 42);
+    result &= Test("seed_alldef_plain", a.plain, 8);
+    SeededBareCtor b;
+    result &= Test("seed_bare_nested_v", b.nested.v, 7);
+    result &= Test("seed_bare_nested_deep_w", b.nested.d.w, 42);
+    result &= Test("seed_bare_default_v", b.dn.v, 7);
+    result &= Test("seed_bare_default_deep_w", b.dn.d.w, 42);
+    result &= Test("seed_bare_plain", b.plain, 5);
+    SeedBox<int> g;
+    result &= Test("seed_generic_nested_v", g.nested.v, 7);
+    result &= Test("seed_generic_nested_deep_w", g.nested.d.w, 42);
+    return result;
+}
+
 extern int strcmp(const char* a, const char* b);
 
 bool Test(const char* testName, const char* actual, const char* expected)
@@ -3396,6 +3497,8 @@ extern int main()
     total++; passed += testDefaultMultipleParams()       ? 1 : 0;
     total++; passed += testDefaultExpression()           ? 1 : 0;
     total++; passed += testDefaultParamNameCollision()   ? 1 : 0;
+    total++; passed += testAllDefaultedConstructor()     ? 1 : 0;
+    total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;
     total++; passed += testTypeof()                      ? 1 : 0;

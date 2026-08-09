@@ -1,0 +1,54 @@
+/*
+ * A parameter default generates a forwarding overload for every shorter argument list. When one
+ * of those generated signatures is a slot a user definition already holds, a call could mean
+ * either, so the definition is rejected.
+ *
+ * Before this check the wrapper walked into CreateFunctionDefinition's duplicate early return -
+ * which pushes no function scope - and the emission that followed popped a scope frame it never
+ * pushed. The all-defaulted CONSTRUCTOR form of that corrupted the compiler's scope stack and
+ * died nondeterministically (SIGABRT / SIGSEGV / "declared with no enclosing scope").
+ *
+ * Scoped-block form: each leg is armed and checked independently.
+ */
+
+// A bare no-arg constructor plus one whose every parameter is defaulted: both are 'C()'.
+expect_error("with its parameter defaults filled in matches an overload that is already defined") {
+    class DpClashCtor
+    {
+        int a;
+        DpClashCtor() { a = 1; }
+        DpClashCtor(int x = 3) { a = x; }
+    };
+}
+
+// Two constructors that are each callable with no arguments.
+expect_error("with its parameter defaults filled in matches an overload that is already defined") {
+    class DpClashTwoDefaulted
+    {
+        int a;
+        DpClashTwoDefaulted(int x = 3) { a = x; }
+        DpClashTwoDefaulted(double y = 1.5) { a = 50; }
+    };
+}
+
+// The free-function twin: 'dpClashFree()' is written and also generated.
+expect_error("with its parameter defaults filled in matches an overload that is already defined") {
+    int dpClashFree() { return 1; }
+    int dpClashFree(int x = 3) { return x; }
+}
+
+// The method twin, where the clashing slot is 'this' plus zero user arguments.
+expect_error("with its parameter defaults filled in matches an overload that is already defined") {
+    struct DpClashMethod
+    {
+        int a;
+        int get() { return a; }
+        int get(int x = 3) { return a + x; }
+    };
+}
+
+extern int main()
+{
+    printf("PASS\n");
+    return 0;
+}

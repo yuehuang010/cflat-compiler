@@ -5169,6 +5169,20 @@ public:
     void DiagnoseDuplicateFunctionBody(const std::string& functionName,
         const std::string& mangledName, size_t line) const;
 
+    /*
+     * Is this overload slot already occupied by a BODY? Answers the exact question
+     * CreateFunctionDefinition's `!fn->empty()` early return answers, but BEFORE the call, for a
+     * caller that must not enter that early return at all: it pushes no function scope, so a
+     * caller that goes on emitting pops a scope frame it never pushed.
+     *
+     * Out param 'originLine' is 0 for a COMPILER-SYNTHESIZED definition (created with no line),
+     * which a synthesized caller should quietly yield to, and a real line for a user-written one,
+     * which is a genuine clash worth reporting. Returns false when the slot is free or only declared.
+     */
+    bool OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,
+        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs,
+        std::string* originFile, size_t* originLine);
+
     llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0);
 
     // True when 'name' resolves to a type in the current compilation: a scalar

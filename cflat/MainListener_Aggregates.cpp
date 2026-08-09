@@ -240,12 +240,21 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         }
         // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
         // ParseConstructorDefinition will handle it later in the member function loop.
-        bool hasExplicitNoArgCtor = !isUnion && [&]() {
+        bool hasBareNoArgCtor = [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
                 if (getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
         }();
+        // An all-defaulted ctor is ALSO a no-arg ctor: its cutoff-0 wrapper claims the same
+        // symbol, so emitting the synthetic one too collides (see AllParametersDefaulted).
+        bool hasAllDefaultedCtor = !hasBareNoArgCtor && [&]() {
+            for (auto* f : MemberFunctionDefinitions(ctx))
+                if (getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
+                    return true;
+            return false;
+        }();
+        bool hasExplicitNoArgCtor = !isUnion && (hasBareNoArgCtor || hasAllDefaultedCtor);
 
         // Create default constructor (skipped when user provides an explicit no-arg ctor)
         if (!hasExplicitNoArgCtor)
@@ -433,7 +442,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 // Constructor - same name as struct (no-arg or with parameters)
                 if (funcName == baseName)
                 {
-                    ParseConstructorDefinition(func, structName);
+                    // This ctor IS the type's no-arg ctor when every parameter is defaulted and
+                    // no bare 'T()' was written - it must seed fields itself, not self-delegate.
+                    bool suppliesNoArgCtor = !isUnion && !hasBareNoArgCtor
+                        && AllParametersDefaulted(func->parameterTypeList());
+                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -2688,12 +2701,21 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             activeTypeSubstitutions = savedSubst;
         }
         // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
-        bool hasExplicitNoArgCtor = [&]() {
+        bool hasBareNoArgCtor = [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
                 if (getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
         }();
+        // An all-defaulted ctor is ALSO a no-arg ctor: its cutoff-0 wrapper claims the same
+        // symbol, so emitting the synthetic one too collides (see AllParametersDefaulted).
+        bool hasAllDefaultedCtor = !hasBareNoArgCtor && [&]() {
+            for (auto* f : MemberFunctionDefinitions(ctx))
+                if (getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
+                    return true;
+            return false;
+        }();
+        bool hasExplicitNoArgCtor = hasBareNoArgCtor || hasAllDefaultedCtor;
 
         // Create default constructor (skipped when user provides an explicit no-arg ctor)
         if (!hasExplicitNoArgCtor)
@@ -2900,7 +2922,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 // Constructor - same name as class (no-arg or with parameters)
                 if (funcName == baseName)
                 {
-                    ParseConstructorDefinition(func, structName);
+                    // This ctor IS the type's no-arg ctor when every parameter is defaulted and
+                    // no bare 'T()' was written - it must seed fields itself, not self-delegate.
+                    bool suppliesNoArgCtor = !hasBareNoArgCtor
+                        && AllParametersDefaulted(func->parameterTypeList());
+                    ParseConstructorDefinition(func, structName, suppliesNoArgCtor);
                     continue;
                 }
                 // A generic member method - static or instance - is stored as a template keyed by
@@ -3084,7 +3110,7 @@ bool MainListener::CheckConstraints(
         return true;
     }
 
-void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName) {
+void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor) {
         auto* compiler = Compiler(func);
         auto params = ParseParameterTypeList(func->parameterTypeList());
         size_t line = func->getStart()->getLine();
@@ -3121,50 +3147,65 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
         // Alloca the struct so we can GEP into fields via 'this'
         auto* thisAlloca = compiler->AllocaAtEntry(structLLVMType, nullptr, structName + "__");
 
-        if (allParams.empty())
+        // suppliesNoArgCtor: this ctor's own cutoff-0 wrapper IS structName(), so delegating to
+        // it would be self-recursive exactly as in the bare no-arg case. Seed fields in line.
+        if (allParams.empty() || suppliesNoArgCtor)
         {
             // No-arg constructor: calling structName() would be self-recursive.
             // Zero-initialize the struct, then apply field defaults from the data structure.
             compiler->builder->CreateStore(llvm::Constant::getNullValue(structLLVMType), thisAlloca);
             auto structData = compiler->GetDataStructure(structName);
             unsigned fieldIdx = 0;
+            // Every field-default form the synthesized default constructors seed must be seeded
+            // here too, or a user-written no-arg ctor silently leaves fields zeroed (see :271).
             for (const auto& field : structData.StructFields)
             {
+                // A union's members all alias one storage slot, so StructFields outnumbers the
+                // LLVM elements; indexing past the end would be out of range.
+                if (fieldIdx >= structLLVMType->getNumElements())
+                    break;
+                auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
+                llvm::Value* fieldVal = nullptr;
+                bool fromBraceList = false;
                 if (auto* braceList = FieldDefaultBraceList(field))
                 {
                     // Same brace-list field default the synthesized ctors honour; a user-written
                     // no-arg ctor must seed its fields identically before its own body runs.
-                    llvm::Value* fieldVal =
-                        ParseFieldDefaultBraceInitializer(structName, field, braceList);
-                    if (fieldVal)
-                    {
-                        auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
-                        if (fieldVal->getType() == destType)
-                        {
-                            auto* fieldPtr = compiler->builder->CreateStructGEP(
-                                structLLVMType, thisAlloca, fieldIdx, field.VariableName);
-                            compiler->builder->CreateStore(fieldVal, fieldPtr);
-                        }
-                    }
+                    fieldVal = ParseFieldDefaultBraceInitializer(structName, field, braceList);
+                    fromBraceList = true;
                 }
                 else if (field.Initializer != nullptr)
                 {
                     auto* assignExpr = field.Initializer->assignmentExpression();
                     if (assignExpr != nullptr)
                     {
-                        llvm::Value* fieldVal = ParseFieldDefaultInitializer(
-                            structName, field, assignExpr);
-                        if (fieldVal)
-                        {
-                            auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
-                            fieldVal = compiler->Upconvert(fieldVal, destType);
-                            if (fieldVal->getType() == destType)
-                            {
-                                auto* fieldPtr = compiler->builder->CreateStructGEP(
-                                    structLLVMType, thisAlloca, fieldIdx, field.VariableName);
-                                compiler->builder->CreateStore(fieldVal, fieldPtr);
-                            }
-                        }
+                        fieldVal = ParseFieldDefaultInitializer(structName, field, assignExpr);
+                    }
+                    else if (field.Initializer->Default() != nullptr)
+                    {
+                        // `= default` on a struct-typed field runs that field type's own default
+                        // constructor (its field initializers), exactly as the synthetic ctor does.
+                        fieldVal = GenerateDefaultValue(field);
+                    }
+                }
+                // No initializer at all on a struct-typed field - call its default ctor, matching
+                // the synthetic default-ctor path.
+                if (fieldVal == nullptr && destType->isStructTy())
+                {
+                    // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                    // here would call a same-named sibling type's ctor (layer 3).
+                    if (compiler->GetFunction(field.TypeName))
+                        fieldVal = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+                }
+                if (fieldVal != nullptr)
+                {
+                    if (!fromBraceList)
+                        fieldVal = compiler->Upconvert(fieldVal, destType);
+                    if (fieldVal->getType() == destType)
+                    {
+                        auto* fieldPtr = compiler->builder->CreateStructGEP(
+                            structLLVMType, thisAlloca, fieldIdx, field.VariableName);
+                        compiler->builder->CreateStore(fieldVal, fieldPtr);
                     }
                 }
                 fieldIdx++;

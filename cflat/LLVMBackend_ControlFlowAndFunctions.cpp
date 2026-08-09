@@ -1085,6 +1085,19 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
             functionName, firstFile, firstLine));
     }
 
+bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,
+        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs,
+        std::string* originFile, size_t* originLine)
+{
+        std::string mangledName = ComputeMangledName(functionName, returnType, arguments, varargs);
+        auto* fn = module->getFunction(mangledName);
+        if (fn == nullptr || fn->empty()) return false;
+        auto it = functionBodyOrigin_.find(mangledName);
+        if (originFile) *originFile = it != functionBodyOrigin_.end() ? it->second.first : std::string();
+        if (originLine) *originLine = it != functionBodyOrigin_.end() ? it->second.second : 0;
+        return true;
+    }
+
 llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
 {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);

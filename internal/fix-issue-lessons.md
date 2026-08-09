@@ -1284,3 +1284,55 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `TopLevelMoveExpression` leg fires on the `move` token alone - four more silent double
   frees). Settled rule: **an ownership claim used for a RETIREMENT must be value-identity
   grounded, never syntactic.**
+- **An ALL-DEFAULTED constructor is the type's no-arg constructor
+  (2026-08-08)**: the filed root cause ("the declaration-site resolution between the user ctor
+  and the synthetic no-arg ctor") was a hypothesis; measured, the crash needs no construction
+  site at all - the DECLARATION alone kills the compiler, and every construction spelling was
+  a red herring. `hasExplicitNoArgCtor` was spelled `!f->parameterTypeList()`, so `C(int x=3)`
+  got a synthetic `C()` AND a cutoff-0 default-param wrapper claiming the same mangled symbol.
+  `CreateFunctionDefinition`'s duplicate early return pushes NO function scope, and
+  `GenerateDefaultParamOverloads` emitted anyway - so its `CreateBlockBreak(nullptr, true)`
+  popped the CALLER's `stackNamedVariable` frame. That is the whole nondeterminism: SIGABRT /
+  SIGSEGV / "declared with no enclosing scope" are three faces of one scope-stack underflow,
+  and WHICH face appears depends only on what the freed frame held. Three parts landed:
+  `AllParametersDefaulted` (grammar-level, `Ellipsis` excluded) widens both
+  `hasExplicitNoArgCtor` sites; `ParseConstructorDefinition` takes the field-seeding branch
+  instead of self-delegating when it IS the no-arg ctor (delegating would now be infinite
+  recursion through its own wrapper); and `OverloadSlotIsDefined` decides BEFORE
+  `CreateFunctionDefinition` rather than after. The pre-check is the load-bearing shape: an
+  after-the-fact guard cannot work because `DiagnoseDuplicateFunctionBody` THROWS from inside
+  the call whenever the two origins carry different lines - which is why the same program was
+  a hard error written on two lines and a compiler crash written on one. `originLine == 0`
+  (compiler-synthesized) yields silently; a real line is a genuine clash and gets its own
+  message. Do NOT reuse the "redefinition ... type spellings" wording here: it is factually
+  false when a default argument produced the overlap.
+- **Widening WHICH types take an alternative lowering path means the alternative must be
+  audited arm-by-arm against the one it displaces (2026-08-08, same commit)**: the
+  all-defaulted-ctor fix routed a new population of types onto
+  `ParseConstructorDefinition`'s in-line field-seeding branch. That branch honoured only
+  brace-list and `= expr` field defaults; the synthesized default constructors it now stands in
+  for ALSO default-construct a struct-typed field with no initializer and run
+  `GenerateDefaultValue` for `= default`. The gap was a SILENT WRONG VALUE (`nested.v == 0`
+  where the synthetic path gives 7), pre-existing for a bare `C() { }` and merely widened by the
+  fix - reviews found it, the suite could not, because no in-repo type crossed the cell. Rule:
+  when a routing predicate widens, diff the destination path's arms against the source path's
+  arms as an enumeration, not by reading the one arm the bug report named. The oracle here is
+  `ParseStructDefinition` :271-380; it was verified independently (a no-ctor probe prints
+  `nested.v=7 nested.d.w=42` on master) before being copied, per "On the reference you are
+  matching". **And the enumeration was STILL short by one arm** - the round-3 review found the
+  synthetic path's type-MISMATCH arm (:342-369, narrow a scalar with `CreateCast`,
+  default-construct a struct-typed destination) had no counterpart in the in-line branch, which
+  silently drops the store instead: `u8 r = 200;` reads 200 with no ctor and 0 with one, and a
+  generic `T val = 0;` instantiated at a struct reads 7 versus 0
+  ([[inline-noarg-ctor-drops-mismatched-field-default]]). It stayed invisible through a whole
+  round because the values people reach for first (`u8 r = 7`, `i16 s = 300`, `float f = 1.5`)
+  all survive `Upconvert` unchanged - only a value needing a TRUNCATION crosses the cell. When
+  the two paths are "the same arms", enumerate the destination path's arms from the SOURCE, and
+  pick probe values that force each conversion the arm exists to perform.
+- **`StructFields` is NOT index-parallel with the LLVM struct type for a UNION.** Every union
+  member aliases one slot, so `%U = type { [1 x i64] }` has ONE element while `StructFields`
+  has one entry per member. A field loop that computes `getTypeAtIndex(fieldIdx)` up front
+  therefore indexes out of range on the second member - silent UB in a Release build. The
+  pre-existing code was accidentally safe only because it reached `getTypeAtIndex` inside an
+  `if (initializer)` that unions rarely satisfy. Bound any such loop by
+  `structLLVMType->getNumElements()`.
