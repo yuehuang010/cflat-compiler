@@ -817,7 +817,33 @@ void MainListener::EmitProgramSyntheticTeardown(const std::string& name, llvm::V
         }
     }
 
-void MainListener::EmitProgramRunWrapper(const std::string& name) {
+// A synthesized program member whose exact overload slot a user definition already filled would
+// make CreateFunctionDefinition take its already-defined early return, which pushes no function
+// scope; the emit that follows then pops a stackNamedVariable frame that was never pushed.
+void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinitionContext* ctx,
+        const std::string& progName, const std::string& member, const std::string& signature,
+        const LLVMBackend::TypeAndValue& returnType,
+        const std::vector<LLVMBackend::TypeAndValue>& params) {
+        auto* compiler = compilerLLVM;
+
+        std::string clashFile;
+        size_t clashLine = 0;
+        if (!compiler->OverloadSlotIsDefined(member, returnType, params, false, &clashFile, &clashLine))
+            return;
+
+        std::string message = std::format(
+            "program '{}': '{}' is a reserved program member - the compiler synthesizes it, and the "
+            "definition at {}({}) already has that exact signature. Rename it, or give it a "
+            "different signature.",
+            progName, signature, clashFile, clashLine);
+
+        if (ctx != nullptr)
+            LogErrorContext(ctx, std::move(message));
+        else
+            compiler->LogError(std::move(message));
+    }
+
+void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = compilerLLVM;
 
         // Resolve types - all must be concrete by this point (ProcessPendingInstantiations ran)
@@ -992,6 +1018,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
             LLVMBackend::TypeAndValue intReturn;   intReturn.TypeName = "int";
             LLVMBackend::DeclTypeAndValue ctxParam;
             ctxParam.TypeName = "void";  ctxParam.VariableName = "ctx";  ctxParam.Pointer = true;
+            RejectIfProgramMemberSlotTaken(ctx, name, "__program_run_" + name,
+                "int __program_run_" + name + "(void*)", intReturn, {ctxParam});
             auto* trampolineFn = compiler->CreateFunctionDefinition(
                 "__program_run_" + name, intReturn, {ctxParam}, false, false, 0, false, false);
             compiler->programTable[name].TrampolineFunction = trampolineFn;
@@ -1478,6 +1506,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
             argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
 
+            RejectIfProgramMemberSlotTaken(ctx, name, "run", "bool run(move list<string>)",
+                boolReturn, {thisParam, argsParam});
             auto* runFn = compiler->CreateFunctionDefinition("run", boolReturn, {thisParam, argsParam});
             compiler->programTable[name].RunFunction = runFn;
 
@@ -1559,6 +1589,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
             LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
+            RejectIfProgramMemberSlotTaken(ctx, name, "WaitForExit", "void WaitForExit()",
+                voidReturn, {thisParam});
             compiler->CreateFunctionDefinition("WaitForExit", voidReturn, {thisParam});
 
             auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
@@ -1592,6 +1624,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
                 LLVMBackend::DeclTypeAndValue tokenParam;
                 tokenParam.TypeName = "stop_token";  tokenParam.VariableName = "token";
 
+                RejectIfProgramMemberSlotTaken(ctx, name, "WaitForExit", "bool WaitForExit(stop_token)",
+                    boolReturn, {thisParam, tokenParam});
                 auto* waitFn = compiler->CreateFunctionDefinition("WaitForExit", boolReturn, {thisParam, tokenParam});
 
                 auto* thisArg  = waitFn->getArg(0);
@@ -1624,6 +1658,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
                 LLVMBackend::DeclTypeAndValue msParam;
                 msParam.TypeName = "int";  msParam.VariableName = "timeoutMs";
 
+                RejectIfProgramMemberSlotTaken(ctx, name, "WaitForExit", "bool WaitForExit(int)",
+                    boolReturn, {thisParam, msParam});
                 auto* waitFn = compiler->CreateFunctionDefinition("WaitForExit", boolReturn, {thisParam, msParam});
 
                 auto* thisArg = waitFn->getArg(0);
@@ -1653,6 +1689,8 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
                 LLVMBackend::DeclTypeAndValue thisParam;
                 thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
+                RejectIfProgramMemberSlotTaken(ctx, name, "RequestStop", "void RequestStop()",
+                    voidReturn, {thisParam});
                 compiler->CreateFunctionDefinition("RequestStop", voidReturn, {thisParam});
 
                 auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
@@ -1680,6 +1718,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
                 LLVMBackend::DeclTypeAndValue thisParam;
                 thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
+                RejectIfProgramMemberSlotTaken(ctx, name, "Kill", "void Kill()", voidReturn, {thisParam});
                 compiler->CreateFunctionDefinition("Kill", voidReturn, {thisParam});
 
                 auto* thisArg = compiler->builder->GetInsertBlock()->getParent()->getArg(0);
@@ -1738,6 +1777,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name) {
             LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
 
+            RejectIfProgramMemberSlotTaken(ctx, name, "exitCode", "int exitCode()", intReturn, {thisParam});
             auto* exitCodeFn = compiler->CreateFunctionDefinition("exitCode", intReturn, {thisParam});
 
             auto* thisArg = exitCodeFn->getArg(0);
@@ -2475,7 +2515,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
         ProcessPendingInstantiations();
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
-        EmitProgramRunWrapper(name);
+        EmitProgramRunWrapper(name, ctx);
     }
 
 void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {

@@ -1,0 +1,147 @@
+import "list.cb";
+import "thread.cb";
+
+// A user definition that exactly matches a SYNTHESIZED program member's overload slot used to
+// crash the compiler nondeterministically (SIGSEGV/SIGABRT mix, zero output, no diagnostic):
+// EmitProgramRunWrapper called CreateFunctionDefinition unconditionally, that call took its
+// "already defined" early return - which pushes NO function scope - and the synth walked on,
+// emitting a second body into the terminated function and then popping a stackNamedVariable
+// frame that was never pushed. Same underflow the duplicate-destructor fix closed; the synth
+// emitters pass line 0, so DiagnoseDuplicateFunctionBody's line check yields and says nothing.
+// Every expect_error leg below CRASHED the compiler before this fix, so none of them can be
+// vacuous - a pre-fix run of this file never reaches an exit code the suite accepts.
+//
+// The check is SIGNATURE-SCOPED on purpose. A reserved NAME with a different signature is a
+// distinct overload that compiles and runs correctly today (see the accept legs at the bottom
+// and the ReservedNameArity / ReservedNameTimeout legs in Test/test_program.cb); rejecting on
+// the name alone would refuse working programs.
+
+// run(): bool run(move list<string>) - the exact synthesized signature.
+expect_error("'bool run(move list<string>)' is a reserved program member")
+{
+    program PResRun {
+        bool run(move list<string> args) { return false; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// WaitForExit(): void WaitForExit()
+expect_error("'void WaitForExit()' is a reserved program member")
+{
+    program PResWait {
+        void WaitForExit() { }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// WaitForExit(int): bool WaitForExit(int timeoutMs) - the try_join overload.
+expect_error("'bool WaitForExit(int)' is a reserved program member")
+{
+    program PResWaitMs {
+        bool WaitForExit(int timeoutMs) { return false; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// WaitForExit(stop_token): bool WaitForExit(stop_token token) - the cancellable overload.
+expect_error("'bool WaitForExit(stop_token)' is a reserved program member")
+{
+    program PResWaitTok {
+        bool WaitForExit(stop_token token) { return false; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// RequestStop(): void RequestStop()
+expect_error("'void RequestStop()' is a reserved program member")
+{
+    program PResStop {
+        void RequestStop() { }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// Kill(): void Kill()
+expect_error("'void Kill()' is a reserved program member")
+{
+    program PResKill {
+        void Kill() { }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// exitCode(): int exitCode() - the IProcess contract method. Distinct from the pre-existing
+// FIELD check ("field name 'exitCode' is reserved"), which this must not duplicate or reword.
+expect_error("'int exitCode()' is a reserved program member")
+{
+    program PResExit {
+        int exitCode() { return 7; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// Overload set where only ONE member collides: exitCode(int) is a legal distinct overload, and
+// the no-argument spelling beside it is the one that takes the reserved slot. Proves the guard
+// discriminates per overload, not per name.
+expect_error("'int exitCode()' is a reserved program member")
+{
+    program PResExitOvl {
+        int exitCode(int k) { return k + 1; }
+        int exitCode() { return 9; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// The trampoline is reachable too, but only from FILE scope: the synthesized
+// int __program_run_<Name>(void*) takes no `this` parameter, so a program METHOD of that name
+// can never fill its slot (that spelling is an accept leg below). A free function declared
+// before the program can, and did crash the compiler identically.
+expect_error("'int __program_run_PResTramp(void*)' is a reserved program member")
+{
+    int __program_run_PResTramp(void* ctx) { return 21; }
+
+    program PResTramp {
+        int main(move list<string> args) { return 0; }
+    };
+}
+
+// Accept control legs - no expect_error. A reserved NAME whose signature differs is a separate
+// overload and must keep compiling: if the guard ever widened to a name-only match, this block
+// alone would fail the file. Values are asserted in Test/test_program.cb; here the point is
+// only that the definitions are not rejected.
+program PResOkArity {
+    int run() { return 13; }
+    int helper(int k) { return k * 2; }
+    int main(move list<string> args) { return 0; }
+};
+
+program PResOkTimeout {
+    int marker = 0;
+    void WaitForExit(int timeoutMs) { marker = timeoutMs; }
+    int main(move list<string> args) { return 0; }
+};
+
+// A program METHOD spelled like the trampoline carries an implicit `this`, so it is a different
+// overload from the synthesized free function and must still compile.
+program PResOkTramp {
+    int __program_run_PResOkTramp(void* ctx) { return 21; }
+    int main(move list<string> args) { return 0; }
+};
+
+// A single user destructor is emitted by ParseProgramDestructorDefinition, which sets
+// Destructor and makes EmitProgramRunWrapper skip its ~Name() block entirely - the new guard
+// must not fire here, and must not double-report with the duplicate-destructor check.
+program PResOkDtor {
+    int v = 0;
+    ~PResOkDtor() { v = 0; }
+    int main(move list<string> args) { return 0; }
+};
+
+extern int main()
+{
+    PResOkArity a;
+    PResOkTimeout t;
+    PResOkTramp r;
+    PResOkDtor d;
+    return 0;
+}

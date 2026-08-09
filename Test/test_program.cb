@@ -1538,6 +1538,69 @@ bool testProgramInterfaceField() {
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
+// Reserved synthesized-member names with a DIFFERENT signature
+// ---------------------------------------------------------------------------
+
+// The reserved-program-member guard (Test/errors/err_program_reserved_method.cb) matches on the
+// exact overload slot, not on the name. These two programs are the frozen accept set for that
+// decision: both spellings compile and run correctly, so a name-only rejection would refuse
+// working programs. Each leg asserts the USER member's own value AND the synthesized machinery
+// (run -> WaitForExit -> exitCode) in the same program, so neither half can break unnoticed.
+
+// int run() - a different arity from the synthesized bool run(move list<string>).
+program ReservedNameArity {
+    int seed = 0;
+
+    int run() { return seed + 13; }
+
+    int main(move list<string> args) {
+        return seed + 3;
+    }
+};
+
+bool testReservedNameDifferentArity() {
+    bool result = true;
+    ReservedNameArity p;
+    p.seed = 100;
+    // The user's own run() - picked by arity, does NOT start the program thread.
+    result &= Test("reserved name run() different arity returns user value", p.run(), 113);
+    list<string> args;
+    // The synthesized run(move list<string>) still starts the thread from the same object.
+    p.run(args);
+    p.WaitForExit();
+    result &= Test("reserved name run() leaves synth run working", p.exitCode, 103);
+    return result;
+}
+
+// void WaitForExit(int) - the same parameter list as the synthesized bool WaitForExit(int),
+// but a different return type, so a different overload slot.
+program ReservedNameTimeout {
+    int marker = 0;
+    int seed   = 0;
+
+    void WaitForExit(int timeoutMs) { marker = timeoutMs + 70; }
+
+    int main(move list<string> args) {
+        return seed + 5;
+    }
+};
+
+bool testReservedNameDifferentReturn() {
+    bool result = true;
+    ReservedNameTimeout p;
+    p.seed = 20;
+    list<string> args;
+    p.run(args);
+    // The user's own WaitForExit(int) - writes marker, does not join.
+    p.WaitForExit(7);
+    result &= Test("reserved name WaitForExit(int) different return runs user body", p.marker, 77);
+    // The synthesized no-argument WaitForExit() still joins the program thread.
+    p.WaitForExit();
+    result &= Test("reserved name WaitForExit(int) leaves synth wait working", p.exitCode, 25);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 
 extern int main() {
     int passed = 0;
@@ -1598,6 +1661,8 @@ extern int main() {
     total++; passed += testImportedCProgram()            ? 1 : 0;
     total++; passed += testChildThreadInheritsAllocator() ? 1 : 0;
     total++; passed += testProgramInterfaceField()        ? 1 : 0;
+    total++; passed += testReservedNameDifferentArity()   ? 1 : 0;
+    total++; passed += testReservedNameDifferentReturn()  ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

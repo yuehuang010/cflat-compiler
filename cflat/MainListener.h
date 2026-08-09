@@ -4378,7 +4378,14 @@ public:
     // so it works from both the user-destructor path and the synthetic-destructor path.
     void EmitProgramSyntheticTeardown(const std::string& name, llvm::Value* thisArg);
 
-    void EmitProgramRunWrapper(const std::string& name);
+    void EmitProgramRunWrapper(const std::string& name, CFlatParser::ProgramDefinitionContext* ctx = nullptr);
+
+    // Reject a user definition that already occupies a synthesized program member's exact overload
+    // slot. Called before each synth CreateFunctionDefinition in EmitProgramRunWrapper.
+    void RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinitionContext* ctx,
+        const std::string& progName, const std::string& member, const std::string& signature,
+        const LLVMBackend::TypeAndValue& returnType,
+        const std::vector<LLVMBackend::TypeAndValue>& params);
 
     void ParseImportedProgramDefinition(const std::string& name);
 
