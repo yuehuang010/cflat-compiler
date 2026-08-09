@@ -99,6 +99,28 @@ int fbaBump() { fbaBumped = fbaBumped + 1; return 4; }
 struct FbaSide   { int[3] a = { fbaBump(), 2, 3 }; };       // NON-constant element, runs once
 struct FbaEmpty  { int[3] a = {}; };                        // accept cell: '{}' stays zero
 
+// ===== An OWNING element under a NAMED value-init list ('T[N] a = { field = v }') =====
+// PRE, both the local declarator arm and the field arm built ONE seed element and memcpy'd it
+// into every slot, so every element's `string` pointed at the SAME heap buffer: correct values,
+// then a double free at teardown (rc 133). POST each slot is constructed on its own. The
+// ctor-count legs are the discriminator - the count moves from 1 to N, converging on the
+// '= default' and no-initializer spellings, which already build per slot.
+int sviCtors = 0;
+string sviMk()   { sviCtors = sviCtors + 1; string a = "he"; string b = "llo"; return a + b; }
+struct SviE      { string s = sviMk(); int v = default; };
+struct SviHost   { SviE[2] e = { v = 5 }; };                 // FIELD spelling of the same shape
+int sviDtors = 0;
+struct SviD      { int v = default; ~SviD() { sviDtors = sviDtors + 1; } };  // dtor, owns nothing
+int sviNews = 0;
+struct SviT      { int x = default; };
+SviT* sviMkT()   { sviNews = sviNews + 1; SviT* p = new SviT(); p.x = 9; return p; }
+struct SviU      { unique SviT* p = sviMkT(); int v = default; };
+struct SviPod    { int a = 1; int b = 2; };                  // POD anchor: keeps seed + memcpy
+// The override EXPRESSION's own side effects: re-evaluated per slot on the owning arm, evaluated
+// once on the POD arm. Pinned, not endorsed - see internal/issue/p3/.
+int sviOv = 0;
+int sviBump()    { sviOv = sviOv + 1; return sviOv; }
+
 // ===== 'S[N] a = default;' on the STACK: types for the per-element seeding legs =====
 // PRE, this one spelling zero-filled the whole array and skipped every field initializer, while
 // the bare 'S[N] a;' spelling and the heap 'new S[N]' both ran them. POST it is byte-identical
@@ -560,6 +582,59 @@ extern int main()
     FbaEmpty fbae;
     total++; passed += Test("fixed-array field brace empty list stays zero",
                             fbae.a[0] + fbae.a[1] + fbae.a[2], 0);
+
+    // ----- Owning element under a named value-init list: one seed per SLOT, not one per array -----
+    // The buffer-identity legs are the load-bearing ones: PRE the values were already correct and
+    // only the shared pointer (then the rc 133 double free) gave the bug away.
+    SviE[2] svil = { v = 5 };
+    total++; passed += Test("owning value-init local override applied", svil[0].v + svil[1].v, 10);
+    total++; passed += Test("owning value-init local value", svil[1].s, "hello");
+    total++; passed += Test("owning value-init local buffers distinct",
+                            (svil[0].s.data() != svil[1].s.data()) ? 1 : 0, 1);
+    total++; passed += Test("owning value-init local constructs per slot", sviCtors, 2);
+
+    SviHost svih;
+    total++; passed += Test("owning value-init field override applied", svih.e[0].v + svih.e[1].v, 10);
+    total++; passed += Test("owning value-init field value", svih.e[1].s, "hello");
+    total++; passed += Test("owning value-init field buffers distinct",
+                            (svih.e[0].s.data() != svih.e[1].s.data()) ? 1 : 0, 1);
+    total++; passed += Test("owning value-init field constructs per slot", sviCtors, 4);
+
+    // A `unique` pointer field is the second owning shape the same slot must not share.
+    SviU[2] sviu = { v = 5 };
+    total++; passed += Test("owning value-init unique field allocates per slot", sviNews, 2);
+    total++; passed += Test("owning value-init unique pointers distinct",
+                            (sviu[0].p != sviu[1].p) ? 1 : 0, 1);
+    total++; passed += Test("owning value-init unique pointee intact", sviu[0].p.x + sviu[1].p.x, 18);
+
+    // A destructor that owns nothing still routes to the per-slot arm, so the count has to be
+    // exactly N - a leaked seed alloca would make it N+1, the old splat made it N with one
+    // shared resource. Scoped so the destructors run before the leg reads the counter.
+    {
+        SviD[3] svid = { v = 5 };
+        total++; passed += Test("owning value-init dtor element values",
+                                svid[0].v + svid[1].v + svid[2].v, 15);
+    }
+    total++; passed += Test("owning value-init destructs exactly once per element", sviDtors, 3);
+
+    // POD anchor: no destructor anywhere in the element type, so the seed-and-memcpy fast path
+    // still runs. Its IR is byte-identical pre/post; this leg pins the observable half.
+    SviPod[3] svip = { b = 5 };
+    total++; passed += Test("POD value-init splat unchanged",
+                            svip[0].a + svip[0].b + svip[2].a + svip[2].b, 12);
+
+    // The override EXPRESSION is evaluated once per SLOT on the owning arm and once per ARRAY on
+    // the POD arm, so one spelling has two evaluation counts. These legs pin the measured split.
+    sviOv = 0;
+    SviE[3] svio = { v = sviBump() };
+    total++; passed += Test("owning value-init override expression runs per slot", sviOv, 3);
+    total++; passed += Test("owning value-init override values differ per slot",
+                            svio[0].v + svio[1].v + svio[2].v, 6);
+    sviOv = 0;
+    SviPod[3] svipo = { b = sviBump() };
+    total++; passed += Test("POD value-init override expression runs once", sviOv, 1);
+    total++; passed += Test("POD value-init override value splatted",
+                            svipo[0].b + svipo[1].b + svipo[2].b, 3);
 
     // ----- Accept cells, frozen: correct before the fix and must not move -----
     // Value freeze only: a regression here emits no store at all, and the undef read still came

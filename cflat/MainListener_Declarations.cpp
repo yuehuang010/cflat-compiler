@@ -2876,36 +2876,50 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         else
                         {
-                            // Build a single-element seed alloca and default-construct it.
                             auto* elemTy = structData.StructType;
-                            auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "arrayseed");
-                            if (compiler->GetFunction(typeAndValue.TypeName))
-                            {
-                                llvm::Value* seedVal = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
-                                if (seedVal) compiler->CreateAssignment(seedVal, seedAlloc);
-                            }
-
-                            // Apply field overrides onto the seed (= {} or bare {} form).
                             auto* initList = barebraceInit ? barebraceList
                                            : initializer->initializerList();
-                            if (initList)
-                                EmitFieldInitializer(seedAlloc, typeAndValue.TypeName, initList);
 
-                            // Create the array alloca and register it.
-                            auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
-                            allocList.push_back(std::pair(name, arrAlloc));
-
-                            // Memcpy seed into every element.
-                            auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
-                            const auto& dl = compiler->module->getDataLayout();
-                            uint64_t elemBytes = dl.getTypeAllocSize(elemTy);
-                            llvm::Value* zero = compiler->builder->getInt32(0);
-                            uint64_t n = typeAndValue.ConstArraySize;
-                            for (uint64_t i = 0; i < n; i++)
+                            if (compiler->IsOwningValueType(typeAndValue.TypeName))
                             {
-                                llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
-                                auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, {zero, idx}, "arrelem");
-                                compiler->builder->CreateMemCpy(elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+                                // An OWNING element must be built independently in each slot: one
+                                // seed replicated bitwise aliases the same resource into every slot
+                                // and double-frees at teardown. Same rule and same walk as the
+                                // `= default` / no-initializer arm (EmitFixedArrayDefaultInit).
+                                auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
+                                allocList.push_back(std::pair(name, arrAlloc));
+                                EmitOwningArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false);
+                            }
+                            else
+                            {
+                                // Build a single-element seed alloca and default-construct it.
+                                auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "arrayseed");
+                                if (compiler->GetFunction(typeAndValue.TypeName))
+                                {
+                                    llvm::Value* seedVal = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
+                                    if (seedVal) compiler->CreateAssignment(seedVal, seedAlloc);
+                                }
+
+                                // Apply field overrides onto the seed (= {} or bare {} form).
+                                if (initList)
+                                    EmitFieldInitializer(seedAlloc, typeAndValue.TypeName, initList);
+
+                                // Create the array alloca and register it.
+                                auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
+                                allocList.push_back(std::pair(name, arrAlloc));
+
+                                // Memcpy seed into every element.
+                                auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
+                                const auto& dl = compiler->module->getDataLayout();
+                                uint64_t elemBytes = dl.getTypeAllocSize(elemTy);
+                                llvm::Value* zero = compiler->builder->getInt32(0);
+                                uint64_t n = typeAndValue.ConstArraySize;
+                                for (uint64_t i = 0; i < n; i++)
+                                {
+                                    llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
+                                    auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, {zero, idx}, "arrelem");
+                                    compiler->builder->CreateMemCpy(elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+                                }
                             }
                         }
                     }

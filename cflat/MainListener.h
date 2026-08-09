@@ -3854,8 +3854,18 @@ public:
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list);
 
+    // Per-slot value-init of an array whose element type owns a resource: construct each slot
+    // independently and re-apply the named overrides there, instead of splatting one seed.
+    void EmitOwningArrayValueInitSlots(
+        llvm::Value* arrAlloc,
+        llvm::StructType* elemTy,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* list,
+        bool forceRoot);
+
     // Seed-once value-init of an array field: default-construct one element, apply the
-    // named overrides, memcpy it into every slot of `slot`.
+    // named overrides, memcpy it into every slot of `slot`. POD elements only - an owning
+    // element type routes to EmitOwningArrayValueInitSlots instead.
     void EmitFieldDefaultArraySplat(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list,

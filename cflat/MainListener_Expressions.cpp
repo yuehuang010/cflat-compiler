@@ -6173,6 +6173,43 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         return compiler->builder->CreateLoad(arrTy, slot, path + "_braceinit");
     }
 
+/*
+ * Value-init an array whose element type OWNS a resource, one slot at a time. A single seed
+ * memcpy'd over every slot aliases one resource into all N and double-frees at teardown, so
+ * each slot gets its own construction and its own copy of the named overrides. Shared by the
+ * local declarator arm and the field-default arm; the walk is the one the `= default` arm and
+ * the destruction path already use, so the traversals cannot drift.
+ */
+void MainListener::EmitOwningArrayValueInitSlots(
+        llvm::Value* arrAlloc,
+        llvm::StructType* elemTy,
+        const LLVMBackend::TypeAndValue& tv,
+        CFlatParser::InitializerListContext* list,
+        bool forceRoot) {
+        auto* compiler = Compiler();
+        if (arrAlloc == nullptr || elemTy == nullptr) return;
+
+        // Total slots: the outer extent times every inner dimension (T[N][M] is N*M elements).
+        uint64_t n = tv.ConstArraySize;
+        for (uint64_t d : tv.ConstInnerDimensions) n *= d;
+        if (n == 0) return;
+
+        compiler->EmitFixedArrayElementWalk(
+            *compiler->builder, arrAlloc, elemTy, n,
+            [&](llvm::Value* elemPtr)
+            {
+                llvm::Value* elem = compiler->GetFunction(tv.TypeName)
+                    ? compiler->CreateOverloadedFunctionCall(tv.TypeName, {}, forceRoot)
+                    : nullptr;
+                if (elem != nullptr)
+                    compiler->CreateAssignment(elem, elemPtr);
+                else
+                    compiler->builder->CreateStore(llvm::Constant::getNullValue(elemTy), elemPtr);
+                if (list != nullptr && !list->fieldInit().empty())
+                    EmitFieldInitializer(elemPtr, tv.TypeName, list);
+            });
+    }
+
 void MainListener::EmitFieldDefaultArraySplat(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list,
@@ -6181,6 +6218,13 @@ void MainListener::EmitFieldDefaultArraySplat(
         llvm::StructType* elemTy) {
         auto* compiler = Compiler(list);
         if (elemTy == nullptr) return;
+
+        if (compiler->IsOwningValueType(field.TypeName))
+        {
+            EmitOwningArrayValueInitSlots(slot, elemTy, field, list, true);
+            return;
+        }
+
         auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "fieldarrayseed");
         compiler->builder->CreateStore(llvm::Constant::getNullValue(elemTy), seedAlloc);
         // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here

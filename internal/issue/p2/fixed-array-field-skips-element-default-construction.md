@@ -33,6 +33,16 @@ array-typed field. `fix/fldarr` routed only the BRACE-LIST arm of the field defa
 real array builder (`EmitFieldDefaultFixedArrayBrace`), so `= default` and the bare
 no-initializer spelling still zero-fill.
 
+## A third spelling in the same residue (added 2026-08-09)
+
+`struct Holder { E[2] e = {}; };` - the EMPTY brace list as a field default - belongs here too,
+not to the value-init splat: `{}` yields a NULL `initializerList()`, so it never reaches
+`EmitFieldDefaultFixedArrayBrace` at all and zero-fills like the two spellings above. Measured
+on `c7d5978` and on `fix/splatseed` alike: over an owning element it prints empty strings with
+the element constructor called ZERO times, rc 0, 0 leaks. The LOCAL twin `E[2] e = {};` does
+seed and was one of the double frees `fix/splatseed` fixed, so this is the same
+local-works/field-skips split the file already describes, in one more spelling.
+
 ## Fix direction
 
 The array builder the brace arm now owns is the natural home: give the `= default` /
