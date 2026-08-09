@@ -1,0 +1,213 @@
+// A function-pointer or closure VALUE bound to a DATA parameter of an INTERFACE method.
+// Virtual dispatch binds through the vtable slot's declared signature and consults no overload
+// scorer, so the scorer's code-value gate never ran on this path: every crossing below compiled
+// clean and the callee then wrote through a code address (SIGBUS, exit 138, no diagnostic).
+// The identical spelling on a plain call, a struct method, a struct extension function and an
+// interface EXTENSION function was already rejected - those all reach the scorer. This file pins
+// the vtable path to the same answer its siblings already gave.
+//
+// The accept-set that must survive (an explicit cast, a 'function<>' parameter, a real data
+// pointer, 'function<>*' and 'function<>[N]' shapes) is asserted with VALUES in
+// Test/test_interface.cb testIfaceCodeValueArgAcceptSet.
+
+import "function.cb";
+
+struct IcvRec { int a = default; int b = default; };
+double icvRo(double x) { return x + 1000.0; }
+double icvRo2(double x) { return x + 2000.0; }
+
+interface IIcv { int take(void* v, IcvRec* p); };
+class IcvTaker : IIcv { int take(void* v, IcvRec* p) { p->a = 7; return p->a; } };
+
+// A '?:' join of a function and a data pointer - the filed repro. The join carries no declared
+// type at all, so only the per-value ledger can answer, and the vtable path never asked it.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvJoin(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        return i.take(nullptr, argc > 0 ? icvRo : n);
+    }
+}
+
+// Both arms code: no data arm to disguise it, and still accepted before this fix.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvJoinBothCode(int argc)
+    {
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        return i.take(nullptr, argc > 0 ? icvRo : icvRo2);
+    }
+}
+
+// The bare spelling - a function NAME straight into the data parameter, no join and no cast.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvBareName()
+    {
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        return i.take(nullptr, icvRo);
+    }
+}
+
+// A stored 'function<>' VALUE, not a name: a different NamedVariable shape reaching the same slot.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvFnValue(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        function<double(double)> f = icvRo;
+        return i.take(nullptr, argc > 0 ? f : n);
+    }
+}
+
+// A capturing LAMBDA value - the fat-closure shape - into the same data parameter. No join here:
+// a '?:' of a fat closure and a pointer is refused EARLIER, by the ternary's own type check, so a
+// join spelling would pin a different site than this one.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvLambdaValue()
+    {
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        int cap = 3;
+        Lambda<int(int)> f = (int x) => { return x + cap; };
+        return i.take(nullptr, f);
+    }
+}
+
+// Argument POSITION 0, so the gate is not keyed to a trailing argument.
+interface IIcvFirst { int take(IcvRec* p, int k); };
+class IcvFirstTaker : IIcvFirst { int take(IcvRec* p, int k) { p->a = 7; return p->a + k; } };
+
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcvFirst.take' data type 'IcvRec*'") {
+    int icvFirstArg(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvFirstTaker* t = new IcvFirstTaker();
+        IIcvFirst i = t;
+        return i.take(argc > 0 ? icvRo : n, 3);
+    }
+}
+
+// NAMED-argument spelling: the call-site index diverges from the declared one, and the gate must
+// judge the argument against the parameter it actually BINDS to, not the one in its own position.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvNamedArg(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        return i.take(p: argc > 0 ? icvRo : n, v: nullptr);
+    }
+}
+
+// '?.' null-conditional dispatch reaches the same vtable call with a guarded receiver.
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcv.take' data type 'IcvRec*'") {
+    int icvNullConditional(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvTaker* t = new IcvTaker();
+        IIcv i = t;
+        return i?.take(nullptr, argc > 0 ? icvRo : n);
+    }
+}
+
+// A 'move' parameter: ownership transfer must not exempt the argument from the gate.
+interface IIcvMove { int take(move IcvRec* p); };
+class IcvMoveTaker : IIcvMove { int take(move IcvRec* p) { p->a = 7; return p->a; } };
+
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 'p' of 'IIcvMove.take' data type 'IcvRec*'") {
+    int icvMoveParam(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvMoveTaker* t = new IcvMoveTaker();
+        IIcvMove i = t;
+        return i.take(argc > 0 ? icvRo : n);
+    }
+}
+
+// A 'string' parameter is reached by the char* coercion, not by a pointer parameter, and is data
+// all the same. No cast advice is offered here: '(string)' of a raw value is itself rejected.
+interface IIcvStr { int take(string s); };
+class IcvStrTaker : IIcvStr { int take(string s) { return s.length(); } };
+
+expect_error("cannot pass a function-pointer or closure VALUE into parameter 's' of 'IIcvStr.take' data type 'string' - code does not convert to a data pointer") {
+    int icvStringParam(int argc)
+    {
+        char* n = nullptr;
+        IcvStrTaker* t = new IcvStrTaker();
+        IIcvStr i = t;
+        return i.take(argc > 0 ? icvRo : n);
+    }
+}
+
+// A GENERIC interface: its vtable key is the mangled 'IIcvG__i32'. The diagnostic must spell the
+// interface back as source. The unmangling is gated on the instantiation REGISTRY - the leg below
+// proves the other side of that gate.
+interface IIcvG<T> { int take(T v, IcvRec* p); };
+class IcvGTaker : IIcvG<int> { int take(int v, IcvRec* p) { p->a = 7; return p->a; } };
+
+expect_error("parameter 'p' of 'IIcvG<i32>.take' data type 'IcvRec*'") {
+    int icvGenericIface(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvGTaker* t = new IcvGTaker();
+        IIcvG<int> i = t;
+        return i.take(1, argc > 0 ? icvRo : n);
+    }
+}
+
+// An interface whose plain, user-written name merely CONTAINS '__'. It is in no instantiation
+// registry, so it must be quoted VERBATIM; unmangling on a bare '__' instead would print
+// 'IIcv<dunder>', a name no user wrote and one that names no type.
+interface IIcv__dunder { int take(IcvRec* p); };
+class IcvDunderTaker : IIcv__dunder { int take(IcvRec* p) { p->a = 7; return p->a; } };
+
+expect_error("parameter 'p' of 'IIcv__dunder.take' data type 'IcvRec*'") {
+    int icvDunderIface(int argc)
+    {
+        IcvRec* n = nullptr;
+        IcvDunderTaker* t = new IcvDunderTaker();
+        IIcv__dunder i = t;
+        return i.take(argc > 0 ? icvRo : n);
+    }
+}
+
+// A 'void*' parameter is the spelling C-interop reaches for, and it is the one this gate
+// tightens against source that compiled before - so pin both value forms explicitly.
+interface IIcvV { int take(void* v); };
+class IcvVTaker : IIcvV { int take(void* v) { return 5; } };
+
+expect_error("parameter 'v' of 'IIcvV.take' data type 'void*'") {
+    int icvVoidBareName()
+    {
+        IcvVTaker* t = new IcvVTaker();
+        IIcvV i = t;
+        return i.take(icvRo);
+    }
+}
+
+expect_error("parameter 'v' of 'IIcvV.take' data type 'void*'") {
+    int icvVoidVariable()
+    {
+        IcvVTaker* t = new IcvVTaker();
+        IIcvV i = t;
+        function<double(double)> f = icvRo;
+        return i.take(f);
+    }
+}
+
+// The explicit '(void*)' cast is the escape the diagnostic advises, and it must still compile.
+int icvVoidCastAccepted()
+{
+    IcvVTaker* t = new IcvVTaker();
+    IIcvV i = t;
+    return i.take((void*)icvRo);
+}
+
+extern int main()
+{
+    return 0;
+}

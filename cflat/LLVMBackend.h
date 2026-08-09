@@ -5183,6 +5183,19 @@ public:
     bool RejectFuncPtrShapeMismatch(const NamedVariable& arg, const TypeAndValue& param);
 
     /*
+     * The code-value gate for a call that binds through a DECLARED signature instead of overload
+     * resolution - virtual dispatch (CallInterfaceMethod). The scorer refuses a code value against
+     * a data parameter (LLVMBackend_Overloads.cpp), and every non-interface dispatch kind therefore
+     * rejects `i.take(c ? fn : dataPtr)`; the vtable path consults no scorer, so the same crossing
+     * bound and the callee wrote through a code address (SIGBUS, no diagnostic). Same predicate
+     * (CodeValueIntoDataDestination) and same per-argument cast occurrence as every other site, so
+     * an explicit '(Rec*)' cast still launders exactly what it launders on a direct call.
+     * Returns true, having reported, when the argument must not bind.
+     */
+    bool RejectCodeValueIntoDataParam(const NamedVariable& arg, const TypeAndValue& param,
+                                      const std::string& ifaceName, const std::string& methodName);
+
+    /*
      * Canonical DESCRIPTOR of one component of a function-pointer signature. A function pointer's
      * type is tracked in the type system rather than inferred from the LLVM value, which under
      * opaque pointers carries no signature at all - so the proof below is made on the DECLARED

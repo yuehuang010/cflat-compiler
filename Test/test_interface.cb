@@ -4797,6 +4797,88 @@ bool testSizeofClosureTypeSpellings()
     return result;
 }
 
+// Accept-set for the interface-dispatch code-value gate (Test/errors/err_iface_code_value_arg.cb).
+// That gate ADDS rejections on the path every virtual call flows through, so each shape it must
+// keep binding is asserted with a VALUE here: an explicit cast, a real data pointer, nullptr, a
+// 'function<>' parameter, and the 'function<>*' / 'function<>[N]' shapes, which are data pointers
+// to a code slot and not code values themselves.
+double icvasRo(double x) { return x + 1000.0; }
+int icvasPlus(int x) { return x + 1; }
+struct IcvasRec { int a = default; int b = default; };
+
+interface IIcvasVoid { long take(void* v); };
+class IcvasVoidTaker : IIcvasVoid { long take(void* v) { return (long)v; } };
+interface IIcvasRec { int take(void* v, IcvasRec* p); };
+class IcvasRecTaker : IIcvasRec { int take(void* v, IcvasRec* p) { return p == nullptr ? -1 : p->a; } };
+interface IIcvasFn { int lam(function<int(int)> f); };
+class IcvasFnTaker : IIcvasFn { int lam(function<int(int)> f) { return f(5); } };
+interface IIcvasStr { int take(string s); };
+class IcvasStrTaker : IIcvasStr { int take(string s) { return s.length(); } };
+
+bool testIfaceCodeValueArgAcceptSet()
+{
+    bool result = true;
+
+    IcvasVoidTaker* vt = new IcvasVoidTaker();
+    IIcvasVoid iv = vt;
+
+    // The sanctioned escape: an explicit cast launders the code value and the callee receives the
+    // FUNCTION's own address. Two different functions must arrive as two different addresses - a
+    // collapse onto one, or onto null, is what a broken laundering path would produce.
+    long roAddr = iv.take((void*)icvasRo);
+    long plusAddr = iv.take((void*)icvasPlus);
+    result &= Test("icvas_cast_nonzero", roAddr != 0 && plusAddr != 0, true);
+    result &= Test("icvas_cast_distinct_fns", roAddr != plusAddr, true);
+    result &= Test("icvas_cast_stable", iv.take((void*)icvasRo) == roAddr, true);
+    // A double cast is still one laundered code value, and still the same address.
+    result &= Test("icvas_double_cast", iv.take((void*)(char*)icvasRo) == roAddr, true);
+
+    // 'function<>*' is the ADDRESS of a slot and 'function<>[N]' decays to one; both are plain
+    // data pointers and must keep converting to 'void*'. What arrives must be the SLOT, so it
+    // differs from the code address the cast leg produced and from a second slot's address.
+    function<int(int)> slot = icvasPlus;
+    function<int(int)> slot2 = icvasPlus;
+    long slotAddr = iv.take(&slot);
+    result &= Test("icvas_funcptr_slot_is_data", slotAddr != 0 && slotAddr != plusAddr, true);
+    result &= Test("icvas_funcptr_slot_distinct", iv.take(&slot2) != slotAddr, true);
+    function<int(int)>[2] arr;
+    arr[0] = icvasPlus;
+    arr[1] = icvasPlus;
+    long arrAddr = iv.take(arr);
+    result &= Test("icvas_funcptr_array_decay", arrAddr != 0 && arrAddr != plusAddr, true);
+
+    // A real data pointer, including through a '?:' join of two data arms, and nullptr.
+    IcvasRecTaker* rt = new IcvasRecTaker();
+    IIcvasRec ir = rt;
+    IcvasRec rec;
+    rec.a = 41;
+    IcvasRec* np = nullptr;
+    result &= Test("icvas_real_data_arg", ir.take(nullptr, &rec), 41);
+    result &= Test("icvas_data_join_arg", ir.take(nullptr, rec.a > 0 ? &rec : np), 41);
+    result &= Test("icvas_nullptr_arg", ir.take(nullptr, nullptr), -1);
+
+    // A 'function<>' PARAMETER is not a data destination: a named function and a stored
+    // 'function<>' value both still bind, and the callee calls what it was handed.
+    IcvasFnTaker* ft = new IcvasFnTaker();
+    IIcvasFn ifn = ft;
+    result &= Test("icvas_named_fn_into_fn_param", ifn.lam(icvasPlus), 6);
+    result &= Test("icvas_fn_value_into_fn_param", ifn.lam(slot), 6);
+
+    // A 'string' parameter still takes a literal and a char* through the coercion.
+    IcvasStrTaker* st = new IcvasStrTaker();
+    IIcvasStr istr = st;
+    char* cp = "abcd";
+    result &= Test("icvas_string_literal_arg", istr.take("hello"), 5);
+    result &= Test("icvas_char_ptr_arg", istr.take(cp), 4);
+
+    // Ownership was boxed into the interface value, so the interface is what releases it.
+    delete iv;
+    delete ir;
+    delete ifn;
+    delete istr;
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4861,6 +4943,7 @@ extern int main()
     total++; passed += testNamespacedInterfaceShadowsCoreName()   ? 1 : 0;
     total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
     total++; passed += testNullIfaceDispatchAcceptSet()             ? 1 : 0;
+    total++; passed += testIfaceCodeValueArgAcceptSet()             ? 1 : 0;
 
     total++; passed += testGiParamAfterMain()                            ? 1 : 0;
     total++; passed += testGiParamDefinedBeforeUse()                     ? 1 : 0;

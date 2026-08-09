@@ -592,6 +592,33 @@ bool LLVMBackend::RejectFuncPtrShapeMismatch(const NamedVariable& arg, const Typ
         return false;
     }
 
+bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const TypeAndValue& param,
+        const std::string& ifaceName, const std::string& methodName)
+{
+        // An interface parameter is left to the boxing path, exactly as the shape gate above is.
+        if (param.IsInterface) return false;
+        if (!CodeValueIntoDataDestination(arg, param)) return false;
+
+        // Spelled from the DECLARED parameter, the only type the vtable slot knows.
+        std::string spelling = param.IsArrayView
+            ? param.TypeName + std::string(param.ElemPointer ? 1 : 0, '*') + "[]"
+            : param.TypeName + std::string(param.Pointer ? 1 : 0, '*');
+        // The cast escape is advised only where it compiles - a view rejects a raw 'T*' by its own
+        // rule, and '(string)' of a raw value is itself refused.
+        std::string advice = (param.Pointer && !param.IsArrayView && param.ConstArraySize == 0)
+            ? spelling : std::string();
+        // Unmangle the callee only on the instantiation REGISTRY, never on a bare '__' in the name:
+        // DisplayNameOfMangledType splits unconditionally and would rewrite a plain 'I__x'.
+        std::string callee = gts.genericInterfaceInstances.count(ifaceName) > 0
+            ? DisplayNameOfMangledType(ifaceName) : ifaceName;
+        callee += "." + methodName;
+        std::string what = param.VariableName.empty()
+            ? std::format("parameter of '{}'", callee)
+            : std::format("parameter '{}' of '{}'", param.VariableName, callee);
+        LogError(DescribeCodeValueIntoData(spelling, "pass", advice, what));
+        return true;
+    }
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot)
 {
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);

@@ -2260,6 +2260,10 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (!param.IsInterface && RejectFuncPtrShapeMismatch(nv, param))
                 return nullptr;
 
+            // Code value into a DATA parameter: the scorer's gate, which this path never runs.
+            if (RejectCodeValueIntoDataParam(nv, param, ifaceName, methodName))
+                return nullptr;
+
             if (param.IsInterface && !nv.TypeAndValue.IsInterface)
             {
                 // Concrete struct/pointer -> interface fat ptr upconversion.
