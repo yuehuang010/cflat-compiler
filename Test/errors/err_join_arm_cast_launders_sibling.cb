@@ -1,0 +1,92 @@
+/*
+ * A cast written on ONE arm of a '?:' / '??' join must not launder its SIBLING arm.
+ *
+ * Both arms of one join used to be evaluated inside the same cast occurrence (the enclosing
+ * argument / field / statement slot), so `(Rec*)ro` and a bare `ro` formed one identical
+ * (value, occurrence) ledger key - a named function is a single shared llvm::Function constant,
+ * and under opaque pointers the cast is a no-op, so the two arms were literally the same value.
+ * The cast therefore excused the bare arm as well, and the bare arm's raw code address reached a
+ * data slot: `one(argc > 100 ? (Rec*)ro : ro)` compiled clean and died writing through it.
+ *
+ * Each arm now evaluates under its OWN occurrence id, so the launder covers only the arm the cast
+ * is written on. The accept twins - both arms cast, a whole-join cast, plain data joins, joins in
+ * loops / generics / owning slots - are pinned in test_function_ptr.cb's testCodeValueJoinAccepts.
+ */
+
+import "function.cb";
+
+struct JalRec { int a = default; int b = default; };
+struct JalHolder { JalRec* p = default; int k = default; };
+interface IJalOne { int one(JalRec* p); };
+class JalIface : IJalOne { int one(JalRec* p) { return p == nullptr ? 0 : p->a; } };
+
+double jalRo(double x) { return x + 1000.0; }
+int jalOne(JalRec* p) { return p == nullptr ? 0 : p->a; }
+int jalCall(function<double(double)> f) { return (int)f(1.0); }
+
+// The RETURN slot, at file scope: the cast on the true arm must not launder the bare false arm.
+expect_error("cannot return a function-pointer or closure VALUE into data type") {
+    JalRec* jalPickReturn(int c) { return c > 100 ? (JalRec*)jalRo : jalRo; }
+}
+
+extern int main(int argc, char** argv)
+{
+    JalRec* nothing = nullptr;
+
+    // Call ARGUMENT, cast on the TRUE arm. Overload resolution refutes the only candidate.
+    expect_error("no overload of 'jalOne' matches the given arguments") {
+        jalOne(argc > 100 ? (JalRec*)jalRo : jalRo);
+    }
+
+    // Order-independent: the same join with the cast on the FALSE arm.
+    expect_error("no overload of 'jalOne' matches the given arguments") {
+        jalOne(argc > 100 ? jalRo : (JalRec*)jalRo);
+    }
+
+    // '??' carries the same collision: a cast on the left operand, bare on the right.
+    expect_error("no overload of 'jalOne' matches the given arguments") {
+        jalOne(((JalRec*)jalRo) ?? jalRo);
+    }
+
+    // A join NESTED inside another join - the inner arm's cast reaches no further than itself.
+    expect_error("no overload of 'jalOne' matches the given arguments") {
+        jalOne(argc > 100 ? (argc > 200 ? (JalRec*)jalRo : jalRo) : nothing);
+    }
+
+    // Declaration INITIALIZER.
+    expect_error("cannot initialize a function-pointer or closure VALUE into data type") {
+        JalRec* p = argc > 100 ? (JalRec*)jalRo : jalRo;
+    }
+
+    // Plain ASSIGNMENT.
+    expect_error("cannot assign a function-pointer or closure VALUE into data type") {
+        JalRec* q = nullptr;
+        q = argc > 100 ? (JalRec*)jalRo : jalRo;
+    }
+
+    // BRACE-INIT of a struct field.
+    expect_error("cannot brace-initialize a function-pointer or closure VALUE into field") {
+        JalHolder h = { p = argc > 100 ? (JalRec*)jalRo : jalRo, k = 1 };
+    }
+
+    // INTERFACE dispatch runs the same gate as a plain call.
+    expect_error("cannot pass a function-pointer or closure VALUE into parameter") {
+        JalIface impl;
+        IJalOne io = impl;
+        io.one(argc > 100 ? (JalRec*)jalRo : jalRo);
+    }
+
+    /*
+     * The MIRROR direction: a DATA value in one arm, laundered by the cast-to-code on the other.
+     * The join reaches a `function<>` parameter, so the bare `&gk` arm would bind a data address
+     * into a code slot and be CALLED. Only the cast arm is excused, so the sibling still proves
+     * the join carries data and the widen is refused.
+     */
+    expect_error("cannot pass a non-function pointer value to 'function<>' parameter") {
+        int gk = 5;
+        jalCall(argc > 100 ? (function<double(double)>)(&gk) : &gk);
+    }
+
+    printf("unreachable\n");
+    return 0;
+}

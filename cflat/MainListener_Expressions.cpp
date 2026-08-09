@@ -2623,11 +2623,11 @@ llvm::Value* MainListener::BoxTernaryThinArmToInterface(llvm::Value* thinValue, 
     }
 
 bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpressionContext* ctx,
-                                         llvm::Value* armValue) {
+                                         llvm::Value* armValue, size_t armOccurrence) {
         auto* compiler = Compiler(ctx);
-        // Synchronous check, run while still inside whatever occurrence (a call argument, or the
-        // statement's ambient 0) this arm was evaluated under - see currentCastOccurrence_.
-        if (!compiler->JoinArmCarriesCodeValue(armValue, compiler->CurrentCastOccurrence())) return false;
+        // Runs after both arms are parsed, so the ambient id is the enclosing slot's again - the
+        // arm answers under the id IT evaluated under (see joinArmOccurrences_).
+        if (!compiler->JoinArmCarriesCodeValue(armValue, armOccurrence)) return false;
         LogErrorContext(ctx, "cannot convert a function-pointer or closure VALUE in a '?:' arm to "
             "'string' - code is not a NUL-terminated buffer; write an explicit '(char*)' cast if "
             "the raw code address is what you want");
@@ -2637,7 +2637,8 @@ bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpre
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
                               const std::function<void()>& atTrue,
-                              const std::function<void()>& atFalse) {
+                              const std::function<void()>& atFalse,
+                              size_t trueOccurrence, size_t falseOccurrence) {
         auto* compiler = Compiler(ctx);
         if (!trueValue || !falseValue || trueValue->getType() == falseValue->getType())
             return true;
@@ -2675,13 +2676,13 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
         {
             // string vs char* literal (e.g. cond ? prefix : "0"): wrap the raw
             // pointer into a non-owning string so both branches are `string`.
-            if (RejectCodeValueTernaryStringArm(ctx, falseValue)) return false;
+            if (RejectCodeValueTernaryStringArm(ctx, falseValue, falseOccurrence)) return false;
             atFalse();
             falseValue = compiler->WrapStringLiteralAsString(falseValue);
         }
         else if (strTy && ft == strTy && tt->isPointerTy())
         {
-            if (RejectCodeValueTernaryStringArm(ctx, trueValue)) return false;
+            if (RejectCodeValueTernaryStringArm(ctx, trueValue, trueOccurrence)) return false;
             atTrue();
             trueValue = compiler->WrapStringLiteralAsString(trueValue);
         }
@@ -2782,16 +2783,28 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         bool falseOwnedString = false;
         LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
         LLVMBackend::OwnedTempMark falseMark = trueMark;
+        // Give each arm its OWN cast occurrence: both arms share the enclosing argument slot, so
+        // without this a cast on one arm launders a bare sibling naming the same constant.
+        size_t trueOcc  = compiler->CurrentCastOccurrence();
+        size_t falseOcc = trueOcc;
         try
         {
-            trueValue = ParseExpression(expressionTrueCtx);
-            FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString);
+            {
+                LLVMBackend::CastOccurrenceScope armScope(compiler);
+                trueOcc   = armScope.Id;
+                trueValue = ParseExpression(expressionTrueCtx);
+                FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString);
+            }
             trueBr    = compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(falseBlock);
             falseMark  = compiler->MarkOwnedTemps();
-            falseValue = ParseConditionalExpression(expressionFalseCtx);
-            FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString);
+            {
+                LLVMBackend::CastOccurrenceScope armScope(compiler);
+                falseOcc   = armScope.Id;
+                falseValue = ParseConditionalExpression(expressionFalseCtx);
+                FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString);
+            }
             falseBr    = compiler->CreateJump(resumeBlock);
         }
         catch (...)
@@ -2819,7 +2832,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         {
             compiler->SwitchToBlock(resumeBlock);
             if (trueBr == nullptr && falseBr == nullptr) return {};
-            return { trueBr != nullptr ? trueValue : falseValue, false };
+            llvm::Value* only = trueBr != nullptr ? trueValue : falseValue;
+            compiler->PromoteCastOccurrence(only, trueBr != nullptr ? trueOcc : falseOcc);
+            return { only, false };
         }
 
         if (trueValue == nullptr || falseValue == nullptr)
@@ -2830,7 +2845,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueBr); };
         auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseBr); };
-        if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse))
+        if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse, trueOcc, falseOcc))
         {
             compiler->SwitchToBlock(resumeBlock);
             return {};
@@ -2860,6 +2875,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         auto* phi = compiler->builder->CreatePHI(trueValue->getType(), 2, "ternary");
         phi->addIncoming(trueValue,  trueEnd);
         phi->addIncoming(falseValue, falseEnd);
+        compiler->RegisterJoinArmCastOccurrence(phi, 0, trueOcc);
+        compiler->RegisterJoinArmCastOccurrence(phi, 1, falseOcc);
 
         if (ownedString)
         {
@@ -2886,7 +2903,14 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
         if (ctx->QuestionQuestion())
         {
             // Null-coalescing: lhs ?? rhs  ->  (lhs != null) ? lhs : rhs
-            llvm::Value* lhs = ParseLogicalOrExpression(logicCtx);
+            // Per-arm cast occurrence, exactly as ParseTernaryBranches scopes its two arms.
+            llvm::Value* lhs = nullptr;
+            size_t lhsOcc = compiler->CurrentCastOccurrence();
+            {
+                LLVMBackend::CastOccurrenceScope armScope(compiler);
+                lhsOcc = armScope.Id;
+                lhs = ParseLogicalOrExpression(logicCtx);
+            }
             if (!lhs) return {};
 
             auto* resultAlloca = compiler->CreateAlloca(lhs->getType());
@@ -2901,7 +2925,13 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
             auto* lhsBr = compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(nullBlock);
-            llvm::Value* rhs = ParseConditionalExpression(ctx->conditionalExpression());
+            llvm::Value* rhs = nullptr;
+            size_t rhsOcc = compiler->CurrentCastOccurrence();
+            {
+                LLVMBackend::CastOccurrenceScope armScope(compiler);
+                rhsOcc = armScope.Id;
+                rhs = ParseConditionalExpression(ctx->conditionalExpression());
+            }
             compiler->CreateAssignment(rhs, resultAlloca);
             auto* rhsBr = compiler->CreateJump(resumeBlock);
 
@@ -2912,8 +2942,12 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
             if (joined != nullptr && lhsBr != nullptr && rhsBr != nullptr
                 && rhs != nullptr && joined->getType()->isPointerTy()
                 && lhs->getType()->isPointerTy() && rhs->getType()->isPointerTy())
+            {
                 compiler->RegisterNullCoalesceJoin(
                     joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
+                compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
+            }
             return { joined, false };
         }
 
@@ -2967,7 +3001,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
                 RegisterBorrowedStringOperandTemp(compiler, falseValue);
 
                 auto here = []() {};   // eager form: both arms already live in the current block
-                if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, here, here))
+                if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, here, here,
+                        compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence()))
                     return {};
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition

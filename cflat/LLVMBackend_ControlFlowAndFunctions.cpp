@@ -154,6 +154,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
         s.nullCoalesceJoins   = std::move(nullCoalesceJoins_);
+        s.joinArmOccurrences  = std::move(joinArmOccurrences_);
         s.codeValues          = std::move(codeValues_);
         s.dataValues          = std::move(dataValues_);
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
@@ -178,6 +179,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         fatInterfaceValueTypeNames_.clear();
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
+        joinArmOccurrences_.clear();
         codeValues_.clear();
         dataValues_.clear();
         codeValueDataCasts_.clear();
@@ -213,6 +215,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
         interfaceBoxRecords_    = state.interfaceBoxRecords;
         nullCoalesceJoins_      = state.nullCoalesceJoins;
+        joinArmOccurrences_     = state.joinArmOccurrences;
         codeValues_             = state.codeValues;
         dataValues_             = state.dataValues;
         codeValueDataCasts_     = state.codeValueDataCasts;

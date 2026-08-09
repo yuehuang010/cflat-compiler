@@ -2669,6 +2669,20 @@ double joinAccPick(int c, function<double(double)> a, function<double(double)> b
     function<double(double)> p = c > 0 ? a : b;
     return p(1.0);
 }
+// PER-ARM occurrence accept fixtures. Each '?:' / '??' arm now evaluates under its OWN cast
+// occurrence id, so these shapes are the ones an over-eager per-arm scope would false-reject.
+class JoinAccRes  { int v = default; ~JoinAccRes() { } };
+class JoinAccNode { int v = default; int get() { return v; } };
+// Instantiated more than once below: the arm ids are minted fresh on every monomorphization,
+// so identical join SYNTAX must keep resolving the same way in each instantiation.
+int joinAccGenJoin<T>(T seed, int c)
+{
+    JoinAcc* castJoin = c > 0 ? (JoinAcc*)joinAccRo : (JoinAcc*)joinAccR2;
+    JoinAcc gx = default; gx.a = 11;
+    JoinAcc gy = default; gy.a = 12;
+    JoinAcc* dataJoin = c > 0 ? &gx : &gy;
+    return (castJoin == nullptr ? 0 : 1) + dataJoin->a;
+}
 
 /*
  * ACCEPT SET for the MIRROR resolution: a '?:' / '??' join into a fat `Lambda<>` or thin
@@ -2879,6 +2893,59 @@ bool testCodeValueJoinAccepts()
     string ternRaw = c > 0 ? raw : sa;
     result &= Test("cvj_tern_string_literal_arm", (int)ternStr.length(), 2);
     result &= Test("cvj_tern_string_charptr_arm", (int)ternRaw.length(), 3);
+
+    /*
+     * PER-ARM OCCURRENCE accept legs. Each join arm is now evaluated under its own cast
+     * occurrence id so a cast on one arm stops laundering its BARE sibling (the reject legs live
+     * in err_join_arm_cast_launders_sibling.cb). Everything below is a legal join that the
+     * per-arm scope must NOT refuse - all of it was measured accepted on the pre-fix binary too.
+     */
+
+    // A generic instantiated THREE times over two type arguments. The occurrence ids are minted
+    // fresh per monomorphization, so identical join syntax must resolve identically every time.
+    result &= Test("cvj_arm_generic_inst_int",    joinAccGenJoin<int>(1, c),      12);
+    result &= Test("cvj_arm_generic_inst_double", joinAccGenJoin<double>(1.5, c), 12);
+    result &= Test("cvj_arm_generic_inst_again",  joinAccGenJoin<int>(2, c),      12);
+
+    // A join off OWNING pointers, and a join feeding a `move` sink through list.add.
+    JoinAccRes* ra = new JoinAccRes(); ra.v = 3;
+    JoinAccRes* rb = new JoinAccRes(); rb.v = 4;
+    JoinAccRes* rpick = c > 0 ? ra : rb;
+    result &= Test("cvj_arm_join_owning_ptrs", rpick->v, 3);
+    delete ra;
+    delete rb;
+    string js1 = "one";
+    string js2 = "twos";
+    list<string> jl = default;
+    jl.add(c > 0 ? js1 : js2);
+    result &= Test("cvj_arm_join_string_move_sink", (int)jl.get(0).length(), 3);
+
+    // The `?.` null-safe form feeding `??` - both are join shapes the arm scope also wraps.
+    JoinAccNode* jn = new JoinAccNode(); jn.v = 7;
+    JoinAccNode? jnq = jn;
+    JoinAccNode? jnn = nullptr;
+    result &= Test("cvj_arm_qdot_join",      jnq?.get() ?? -1, 7);
+    result &= Test("cvj_arm_qdot_join_null", jnn?.get() ?? -1, -1);
+    delete jn;
+
+    // A LOOP-carried join whose value differs per iteration, plus an all-cast join in the same
+    // body: the ledger is re-consulted on every iteration's codegen of one syntactic arm.
+    int loopTotal = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        JoinAcc* lp = i % 2 == 0 ? px : py;
+        JoinAcc* lc = i > 0 ? (JoinAcc*)w : (JoinAcc*)w2;
+        loopTotal += lp->a + (lc == nullptr ? 0 : 1);
+    }
+    result &= Test("cvj_arm_loop_carried_join", loopTotal, 19);
+
+    // Two independently-gated argument slots in one call, one a plain data join and one an
+    // all-cast join: neither slot's arm ids may leak into the other's.
+    JoinAcc* twoSlotA = joinAccTwoCast(c > 0 ? px : py,
+                                       c > 0 ? (JoinAcc*)joinAccRo : (JoinAcc*)joinAccRo);
+    JoinAcc* twoSlotB = joinAccTwoCast(c > 1 ? py : px, nothing);
+    result &= Test("cvj_arm_two_slots_plain_and_cast", twoSlotA->a, 5);
+    result &= Test("cvj_arm_two_slots_data_only",      twoSlotB->a, 5);
 
     return result;
 }

@@ -125,6 +125,29 @@ const LLVMBackend::NullCoalesceJoin* LLVMBackend::FindNullCoalesceJoin(const llv
         return nullptr;
     }
 
+void LLVMBackend::RegisterJoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t occurrence)
+{
+        if (joined == nullptr) return;
+        for (auto& entry : joinArmOccurrences_)
+            if (entry.Joined == joined && entry.Index == index) { entry.Occurrence = occurrence; return; }
+        joinArmOccurrences_.push_back({ joined, index, occurrence });
+    }
+
+size_t LLVMBackend::JoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t fallback) const
+{
+        if (joined == nullptr) return fallback;
+        for (const auto& entry : joinArmOccurrences_)
+            if (entry.Joined == joined && entry.Index == index) return entry.Occurrence;
+        return fallback;
+    }
+
+void LLVMBackend::PromoteCastOccurrence(llvm::Value* value, size_t from)
+{
+        if (value == nullptr || from == currentCastOccurrence_) return;
+        if (IsCodeValueDataCast(value, from)) RegisterCodeValueDataCast(value);
+        if (IsDataValueCodeCast(value, from)) RegisterDataValueCodeCast(value);
+    }
+
 void LLVMBackend::RegisterOwningTempUniqueField(llvm::Value* value)
 {
         if (value == nullptr) return;
@@ -225,22 +248,28 @@ bool LLVMBackend::JoinCarriesCodeValue(const llvm::Value* value, size_t occurren
 {
         if (value == nullptr || depth > kMaxJoinArmDepth) return false;
         if (IsCodeValueDataCast(value, occurrence)) return false;
+        // Each arm answers under the occurrence IT evaluated under, so a cast written on one arm
+        // launders only that arm (see joinArmOccurrences_).
         if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
         {
             for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-                if (JoinArmCarriesCodeValue(phi->getIncomingValue(i), occurrence, depth + 1)) return true;
+                if (JoinArmCarriesCodeValue(phi->getIncomingValue(i),
+                        JoinArmCastOccurrence(phi, i, occurrence), depth + 1)) return true;
             return false;
         }
         if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
-            for (const auto& arm : join->Arms)
-                if (JoinArmCarriesCodeValue(arm.Value, occurrence, depth + 1)) return true;
+            for (unsigned i = 0; i < join->Arms.size(); i++)
+                if (JoinArmCarriesCodeValue(join->Arms[i].Value,
+                        JoinArmCastOccurrence(value, i, occurrence), depth + 1)) return true;
         return false;
     }
 
 int LLVMBackend::JoinArmDataKind(const llvm::Value* value, size_t occurrence, int depth) const
 {
         if (value == nullptr) return -1;
-        if (IsDataValueCodeCast(value, occurrence)) return -1;   // the user cast this arm to a code type
+        // The user cast THIS arm to a code type: their assertion covers this arm and no other, so
+        // it is neutral here rather than blocking a sibling arm's own proof.
+        if (IsDataValueCodeCast(value, occurrence)) return 0;
         if (llvm::isa<llvm::ConstantPointerNull>(value)) return 0;
         if (llvm::isa<llvm::Function>(value)) return -1;
         if (IsLedgeredDataValue(value)) return 1;
@@ -256,7 +285,8 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
             if (phi->getNumIncomingValues() == 0) return false;
             for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
             {
-                const int kind = JoinArmDataKind(phi->getIncomingValue(i), occurrence, depth + 1);
+                const int kind = JoinArmDataKind(phi->getIncomingValue(i),
+                    JoinArmCastOccurrence(phi, i, occurrence), depth + 1);
                 if (kind < 0) return false;
                 if (kind > 0) proven = true;
             }
@@ -265,9 +295,10 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
         if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
         {
             if (join->Arms.empty()) return false;
-            for (const auto& arm : join->Arms)
+            for (unsigned i = 0; i < join->Arms.size(); i++)
             {
-                const int kind = JoinArmDataKind(arm.Value, occurrence, depth + 1);
+                const int kind = JoinArmDataKind(join->Arms[i].Value,
+                    JoinArmCastOccurrence(value, i, occurrence), depth + 1);
                 if (kind < 0) return false;
                 if (kind > 0) proven = true;
             }

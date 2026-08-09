@@ -77,6 +77,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         // answer a lookup here (see interfaceBoxRecords_).
         interfaceBoxRecords_.clear();
         nullCoalesceJoins_.clear();
+        joinArmOccurrences_.clear();
         codeValues_.clear();
         dataValues_.clear();
         codeValueDataCasts_.clear();

@@ -1421,6 +1421,37 @@ public:
     const NullCoalesceJoin* FindNullCoalesceJoin(const llvm::Value* value) const;
 
     /*
+     * The cast occurrence (see codeValueDataCasts_) each ARM of a join was evaluated under, keyed
+     * by the joined value and the arm's INDEX - not its value, since the two arms of one join are
+     * routinely the same shared llvm::Function* / GlobalVariable constant. Both arms otherwise sit
+     * inside the SAME argument slot and therefore the same occurrence, so a cast on one arm and a
+     * bare mention on the other form one identical (value, occurrence) ledger key and the cast
+     * launders both. Same lifetime and the same park/clear points as nullCoalesceJoins_.
+     */
+    struct JoinArmOccurrence
+    {
+        const llvm::Value* Joined = nullptr;
+        unsigned Index = 0;
+        size_t Occurrence = 0;
+    };
+
+    std::vector<JoinArmOccurrence> joinArmOccurrences_;
+
+    void RegisterJoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t occurrence);
+
+    // The occurrence arm `index` of `joined` evaluated under, or `fallback` when unrecorded (a
+    // join built by a path that does not scope its arms, or one whose record has been retired).
+    size_t JoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t fallback) const;
+
+    /*
+     * Re-register `value`'s launder from occurrence `from` under the CURRENT ambient occurrence.
+     * An arm-scoped cast is invisible outside its arm by construction; when a ternary collapses to
+     * one arm and hands that arm's value out directly there is no join left to consult the
+     * per-arm record, so the launder has to be carried up to the slot the value now occupies.
+     */
+    void PromoteCastOccurrence(llvm::Value* value, size_t from);
+
+    /*
      * Values PROVEN to be code - a function pointer or closure in its plain VALUE shape - keyed by
      * value identity and recorded at the read where the declared facts are still in hand
      * (LoadNamedVariable, beside the fat-interface ledger). A join carries none of those facts: the
@@ -1489,6 +1520,23 @@ public:
     size_t BeginCastOccurrence() { size_t saved = currentCastOccurrence_; currentCastOccurrence_ = nextCastOccurrence_++; return saved; }
 
     void EndCastOccurrence(size_t saved) { currentCastOccurrence_ = saved; }
+
+    // RAII form of the pair above. LogError THROWS, so a hand-rolled restore is skipped on the
+    // unwind path and the bumped id leaks into the next expression.
+    struct CastOccurrenceScope
+    {
+        LLVMBackend* Backend = nullptr;
+        size_t Saved = 0;
+        size_t Id = 0;
+        explicit CastOccurrenceScope(LLVMBackend* backend) : Backend(backend)
+        {
+            Saved = Backend->BeginCastOccurrence();
+            Id = Backend->CurrentCastOccurrence();
+        }
+        ~CastOccurrenceScope() { Backend->EndCastOccurrence(Saved); }
+        CastOccurrenceScope(const CastOccurrenceScope&) = delete;
+        CastOccurrenceScope& operator=(const CastOccurrenceScope&) = delete;
+    };
 
     size_t CurrentCastOccurrence() const { return currentCastOccurrence_; }
 
@@ -1601,15 +1649,18 @@ private:
     bool JoinCarriesCodeValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
     // One ARM of a join, for the DATA question: 1 = proven data, 0 = neutral (a null constant can
-    // never be code), -1 = unproven, which alone makes the whole join unproven.
+    // never be code; an arm the user explicitly cast TO a code type is their own assertion about
+    // that arm alone), -1 = unproven, which alone makes the whole join unproven.
     int JoinArmDataKind(const llvm::Value* value, size_t occurrence, int depth) const;
 
     /*
      * Does a '?:' / '??' JOIN deliver a value proven to be DATA? The mirror of
-     * JoinCarriesCodeValue, over dataValues_ and with the OPPOSITE quantifier: EVERY arm must be
-     * proven data (a null arm is neutral) and at least one must be proven, because a single
-     * unproven arm can still be code at runtime. ANY-arm here would false-reject every mixed
-     * code/data join - shapes master compiles and runs correctly.
+     * JoinCarriesCodeValue, over dataValues_ and with the OPPOSITE quantifier: no arm may be
+     * unproven and at least one must be proven, because a single unproven arm can still be code at
+     * runtime. ANY-arm here would false-reject every mixed code/data join - shapes master compiles
+     * and runs correctly. A NEUTRAL arm (null, or one the user cast to a code type) neither proves
+     * nor blocks: the cast excuses the arm it is written on, never its sibling, which is still
+     * bound into the code slot on its own branch.
      */
     bool JoinDeliversDataValue(const llvm::Value* value, size_t occurrence, int depth = 0) const;
 
@@ -3601,6 +3652,7 @@ public:
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;
         std::vector<NullCoalesceJoin> nullCoalesceJoins;
+        std::vector<JoinArmOccurrence> joinArmOccurrences;
         std::vector<llvm::Value*> codeValues;
         std::vector<llvm::Value*> dataValues;
         std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;

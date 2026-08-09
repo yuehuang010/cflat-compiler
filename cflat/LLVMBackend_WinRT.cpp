@@ -1742,7 +1742,7 @@ bool LLVMBackend::ArgumentIsProvablyDataPointer(llvm::Value* value, const NamedV
         // THIS argument's own occurrence (see codeValueDataCasts_'s comment on the collision).
         if (IsDataValueCodeCast(value, arg.CastOccurrenceId)) return false;
         // A JOIN carries no declared facts at all - resolve it through the per-value DATA ledger,
-        // which answers yes only when EVERY arm is proven data (see JoinDeliversDataValue).
+        // which answers yes when an arm is proven data and none is unproven (JoinDeliversDataValue).
         return JoinDeliversDataValue(value, arg.CastOccurrenceId);
     }
 

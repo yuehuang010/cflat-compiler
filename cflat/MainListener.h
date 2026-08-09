@@ -3372,7 +3372,7 @@ public:
      * literal, a `char*`) keeps wrapping exactly as before.
      */
     bool RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpressionContext* ctx,
-                                         llvm::Value* armValue);
+                                         llvm::Value* armValue, size_t armOccurrence);
 
     /*
      * Align the two '?:' arm values onto one LLVM type so the join (a PHI, or a select in the
@@ -3384,7 +3384,8 @@ public:
     bool UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
                               const std::function<void()>& atTrue,
-                              const std::function<void()>& atFalse);
+                              const std::function<void()>& atFalse,
+                              size_t trueOccurrence, size_t falseOccurrence);
 
     /*
      * Make one '?:' arm's string value an INDEPENDENT owned buffer inside the arm's own block.

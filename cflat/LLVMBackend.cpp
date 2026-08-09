@@ -2560,6 +2560,7 @@ void LLVMBackend::ResetForReanalysis()
     fatInterfaceValueTypeNames_.clear();
     interfaceBoxRecords_.clear();
     nullCoalesceJoins_.clear();
+    joinArmOccurrences_.clear();
     codeValues_.clear();
     dataValues_.clear();
     codeValueDataCasts_.clear();
