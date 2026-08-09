@@ -3201,6 +3201,30 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 {
                     if (!fromBraceList)
                         fieldVal = compiler->Upconvert(fieldVal, destType);
+                    // Same type-mismatch arms the synthetic default ctor runs (:342-369); without
+                    // them the store is dropped and the field keeps the seeding zero.
+                    if (fieldVal->getType() != destType)
+                    {
+                        if (destType->isStructTy())
+                        {
+                            // Initializer type doesn't match a struct-typed field (e.g. integer 0 for
+                            // a struct-typed generic field) - default-construct it instead.
+                            // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
+                            // here would call a same-named sibling type's ctor (layer 3).
+                            if (compiler->GetFunction(field.TypeName))
+                                fieldVal = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
+                            else
+                                fieldVal = llvm::Constant::getNullValue(destType);
+                        }
+                        else
+                        {
+                            // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
+                            compiler->LogWarning(std::format(
+                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                field.TypeName, field.VariableName));
+                            fieldVal = compiler->CreateCast(fieldVal, destType);
+                        }
+                    }
                     if (fieldVal->getType() == destType)
                     {
                         auto* fieldPtr = compiler->builder->CreateStructGEP(

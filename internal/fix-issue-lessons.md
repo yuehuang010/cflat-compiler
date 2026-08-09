@@ -1336,3 +1336,32 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   pre-existing code was accidentally safe only because it reached `getTypeAtIndex` inside an
   `if (initializer)` that unions rarely satisfy. Bound any such loop by
   `structLLVMType->getNumElements()`.
+- **The in-line seeding branch's type-MISMATCH arm, and what the six-site audit found
+  (2026-08-09)**: `ParseConstructorDefinition`'s in-line branch now runs the same two arms as
+  `ParseStructDefinition:342-369` - struct destination -> forceRoot exact-key `GetFunction` then
+  `CreateOverloadedFunctionCall(TypeName, {}, true)` else `getNullValue`; scalar destination ->
+  the existing narrowing `LogWarning` plus `CreateCast`. `LogWarning` (not `LogError`) is the
+  right call here: it prints and RETURNS, and it already existed on the arm being mirrored.
+  The oracle's casts were measured before copying, and one of them is counter-intuitive:
+  int -> `bool` is a TRUNC, not `!= 0`, so `bool b = 5;` is `1` and `bool b = 6;` is `0`. The
+  accept set was empty by measurement, not by argument: `core/` contains ZERO types with a
+  user-written no-arg or all-defaulted constructor (an exhaustive body-scoped scan), and so does
+  `example/`; the 454-file `Test/` + `example/` compile-and-run A/B found 39 raw diffs, all 39
+  explained (31 = the compiler's own install path quoted inside "imported file not found",
+  8 = wall-clock / concurrency counters / pid). The six-site audit's live findings: the CLASS
+  synthetic emitter (`:2789`) and `ParseProgramDefinition` (`:2259`) both gate the mismatch on
+  `&& destType->isStructTy()` and so have NO scalar arm - a mismatched scalar reaches
+  `CreateInsertValue` unconverted and the ctor returns a struct constant whose element type does
+  not match the struct type. `int i = 3.7;` reads `3` in a `struct` and `-1717986918` in a
+  `class`. Filed as [[class-synthetic-ctor-drops-scalar-narrowing-arm]] and appended to
+  [[program-field-no-initializer-skips-default-ctor]] rather than absorbed: their population is
+  every type with NO constructor, a strictly larger accept set needing its own sweep.
+  One cell is NOT a pure silent-wrong-to-right conversion, and review measured it: a SCALAR
+  default on a FIXED-ARRAY field (`u8 a[4] = 200;`) inside a type with a user no-arg /
+  all-defaulted ctor used to compile (store dropped, `a[0]` read 0) and now reaches the scalar
+  arm's `CreateCast`, whose aggregate guard is a `LogError` - so it is a COMPILE ERROR, exit 1
+  ("cannot store a single scalar value into fixed-array storage ..."). That is the convergence
+  the fix is for, not a regression: the ctor-less twin already emitted the identical error, so
+  post-fix all three spellings behave alike. Nothing in the 454-file sweep declares one. A
+  brace-list array default (`u8 a[3] = {1,2,300};`) is a separate pre-existing hole and is
+  genuinely unchanged - all zeros in every spelling, both binaries.

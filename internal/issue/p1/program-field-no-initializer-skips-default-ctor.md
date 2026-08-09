@@ -65,6 +65,51 @@ Copy the struct emitter's `rvalue == nullptr && destType->isStructTy()` arm into
 `GetFunction` guard. The synthetic program fields (`exitCode`, `_thread`, `_allocator`,
 `onStdout`, ... ) are all written explicitly AFTER that loop, so they are unaffected.
 
+## The SCALAR type-mismatch arm diverges here too (measured 2026-08-09)
+
+Noted while auditing the six field-seeding sites for
+`inline-noarg-ctor-drops-mismatched-field-default`; NOT fixed by that change, and the
+measurements below are identical before and after it.
+
+`MainListener_Aggregates.cpp:2259` reads `rvalue->getType() != destType &&
+destType->isStructTy()`, so - exactly like the class emitter - it has no `else` arm for a
+mismatched SCALAR (`ParseStructDefinition:360-368`: narrowing `LogWarning` +
+`CreateCast(rvalue, destType)`). A mismatched scalar reaches `CreateInsertValue` unconverted.
+
+```cflat
+import "list.cb";
+program P
+{
+    u8 r = 200; i16 s = 40000; int i = 3.7; int plain = 5;
+    int main(move list<string> args)
+    { printf("r=%d s=%d i=%d plain=%d\n", (int)r, (int)s, i, plain); return 0; }
+};
+extern int main()
+{
+    P p;
+    list<string> args;
+    p.run(args);
+    p.WaitForExit();
+    return 0;
+}
+```
+
+The driver is load-bearing: a `program` body's `main` is not the image entry point, so the
+snippet without it fails to link (`undefined symbol: _main`).
+
+Measured (macOS arm64 Release, `-i Test/library`), identical on both binaries:
+
+```
+r=200 s=-25536 i=-1718026240 plain=5      program    (no narrowing warning)
+r=200 s=-25536 i=3            plain=5      struct     (three narrowing warnings)
+```
+
+So the integer cells agree by accident (the mismatched constant's low bits are the truncation),
+and `int i = 3.7;` is a silent wrong value. Probe: `scratch/au_prog_narrow.cb`. A fix here should
+copy BOTH missing arms - the no-initializer struct arm this file is named for and this scalar
+`else` arm. The same scalar gap in `ParseClassDefinition` is filed separately as
+`class-synthetic-ctor-drops-scalar-narrowing-arm.md`.
+
 Not affected: `ParseImportedProgramDefinition` (`:1882-1935`). `import program "x.cb"` wraps a
 standalone file whose entry point is a free `main`; the program body has no user field list at
 all, so that emitter's `declList` really is entirely synthetic (its in-code comment says so, and
