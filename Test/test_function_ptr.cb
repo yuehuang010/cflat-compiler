@@ -3907,6 +3907,137 @@ bool testReturnVoidExprFromVoid()
     return result;
 }
 
+/*
+ * ACCEPT SET of the void-closure-call gate (fix/voidcall). Consuming a void closure call's
+ * result is now a diagnostic (Test/errors/err_void_closure_call_consumed.cb); every DISCARD
+ * position below must keep compiling and running. These are the positions the gate's
+ * `ResultUse` threading has to reach - a discard forwarding that stops one level short turns
+ * any of them into a false rejection, which is the failure mode these legs exist to catch.
+ * All of them ran correctly pre-fix, so they discriminate against the fix's own polarity, not
+ * against master.
+ */
+int vdcHits = 0;
+void vdcBump()             { vdcHits = vdcHits + 1; }
+void vdcRun(Lambda<void()> f) { f(); }
+void vdcRunG<T>(T v, Lambda<void()> f) { f(); }
+struct VdcHold { Lambda<void()> f = default; };
+using VdcVoid = void;
+Lambda<VdcVoid()> vdcAliasCrossing = default;
+// The one legal void crossing, spelled through the alias: EmitReturnExpression resolves it.
+void vdcAliasReturn() { return vdcAliasCrossing(); }
+
+bool testVoidClosureCallDiscarded()
+{
+    bool result = true;
+
+    vdcHits = 0;
+    Lambda<void()> g = () => { vdcBump(); };
+    g();
+    result &= Test("vdc_bare_statement", vdcHits, 1);
+
+    // Thin `function<>` is the OTHER arm of CreateIndirectCall; it has to discard too.
+    vdcHits = 0;
+    function<void()> t = () => { vdcBump(); };
+    t();
+    result &= Test("vdc_bare_statement_thin", vdcHits, 1);
+
+    // A for-INCREMENT is a discard position reached by its own ParseAssignmentExpressionNamed
+    // call, not by the expression-statement one.
+    vdcHits = 0;
+    for (int i = 0; i < 3; g()) { i = i + 1; }
+    result &= Test("vdc_for_increment", vdcHits, 3);
+
+    // Loop body / nested lambda body: the discard has to survive one more block level.
+    vdcHits = 0;
+    while (vdcHits < 4) { g(); }
+    result &= Test("vdc_while_body", vdcHits, 4);
+
+    vdcHits = 0;
+    Lambda<void()> twice = () => { g(); g(); };
+    twice();
+    result &= Test("vdc_nested_lambda_body", vdcHits, 2);
+
+    // A void `=> expr` body whose expression IS a void closure call - the discard path landed
+    // by the void-expression-body fix, routed through the new ResultUse::Discard spelling.
+    vdcHits = 0;
+    Lambda<void()> fwd = () => g();
+    fwd();
+    result &= Test("vdc_void_expr_body_forwards", vdcHits, 1);
+
+    // Through a PARAMETER and through a FIELD - the two non-local closure spellings whose
+    // value-position twins are rejected legs.
+    vdcHits = 0;
+    vdcRun(g);
+    result &= Test("vdc_through_parameter", vdcHits, 1);
+
+    vdcHits = 0;
+    vdcRunG<int>(1, g);
+    result &= Test("vdc_through_generic_parameter", vdcHits, 1);
+
+    vdcHits = 0;
+    {
+        VdcHold h = default;
+        h.f = () => { vdcBump(); };
+        h.f();
+        result &= Test("vdc_through_field", vdcHits, 1);
+    }
+
+    // A NON-void closure call discarded as a statement must still run - the gate keys on
+    // void-ness, so an int-returning closure has to be untouched in the very same position.
+    vdcHits = 0;
+    Lambda<int()> gi = () => { vdcBump(); return 9; };
+    gi();
+    result &= Test("vdc_nonvoid_discarded_still_runs", vdcHits, 1);
+    result &= Test("vdc_nonvoid_value_still_consumable", gi(), 9);
+
+    // PARENTHESES are not an operator, so a discard behind them is still a discard. Review found
+    // all three newly rejected by the first cut of the gate - the ResultUse rode only the
+    // single-child chain and a '(' expression ')' primary re-entered at the Value default.
+    vdcHits = 0;
+    (g());
+    result &= Test("vdc_paren_statement", vdcHits, 1);
+
+    vdcHits = 0;
+    ((g()));
+    result &= Test("vdc_double_paren_statement", vdcHits, 1);
+
+    vdcHits = 0;
+    Lambda<void()> pw = () => (g());
+    pw();
+    result &= Test("vdc_void_expr_body_paren", vdcHits, 1);
+
+    // A chained call: the parenthesized producer is consumed as a VALUE (it yields a closure),
+    // and only the outer call is the discard. The `childLimit == 1` guard that stops the thread
+    // at a suffix admits nothing either way - dropping it leaves `(g())();`, `(g())[0];` and
+    // `(g()).n;` rejected - but it decides WHICH message they get: with the guard they name the
+    // void consumption, without it they misreport as "unknown function '(g())'" / "Undefined
+    // variable n". So this leg freezes the chained shape; the guard's own value is diagnostic.
+    vdcHits = 0;
+    Lambda<Lambda<void()>()> mk = () => { return g; };
+    (mk())();
+    result &= Test("vdc_paren_then_call", vdcHits, 1);
+
+    // `void` reached through a `using` ALIAS - the discard side of the alias resolution whose
+    // reject side is vccAlias/vccAliasThin in the error file.
+    vdcHits = 0;
+    Lambda<VdcVoid()> av = () => { vdcBump(); };
+    av();
+    result &= Test("vdc_alias_void_discarded", vdcHits, 1);
+
+    vdcHits = 0;
+    vdcAliasCrossing = () => { vdcBump(); };
+    vdcAliasReturn();
+    result &= Test("vdc_alias_void_return_crossing", vdcHits, 1);
+
+    // `void*` shares the "void" TypeName but returns a real value: consuming it is legal and
+    // must NOT be rejected. This is the gate's exact boundary.
+    Lambda<void*()> vp = () => vebGiveP();
+    void* pv = vp();
+    result &= Test("vdc_voidptr_result_consumable", pv == vebGiveP() ? 1 : 0, 1);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4056,6 +4187,10 @@ extern int main()
     // `void f() { return g(); }` on a VOID g - the one void-ness crossing that stays legal
     // now that a disagreeing `return` is a diagnostic instead of a verifier dump (fix/retvoid).
     total++; passed += testReturnVoidExprFromVoid()        ? 1 : 0;
+
+    // Accept set of the void-closure-call gate: every DISCARD position keeps working
+    // now that consuming a void closure call's result is a diagnostic (fix/voidcall).
+    total++; passed += testVoidClosureCallDiscarded()      ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

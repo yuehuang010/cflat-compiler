@@ -1,7 +1,7 @@
 #include "MainListener.h"
 
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
-                                                       size_t dropTrailingChildren, bool discardResult) {
+                                                       size_t dropTrailingChildren, ResultUse use) {
         /*
         * postfixExpression
             : primaryExpression
@@ -1169,7 +1169,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                         }
                         else
                         {
-                            namedVar.Primary = ParsePrimaryExpression(prevPrimary);
+                            // A parenthesized primary that IS the whole postfix expression keeps the
+                            // caller's position; a suffix (`(g())(x)`, `(p).f`) consumes it as a value.
+                            namedVar.Primary = ParsePrimaryExpression(
+                                prevPrimary, childLimit == 1 ? use : ResultUse::Value);
                             namedVar.Storage = nullptr;
                             // If the primary is a parenthesized cast expression, propagate its type
                             // so that chained member access (e.g. ((Struct*)ptr)->field) works.
@@ -3007,6 +3010,32 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                 namedVar.Primary = result;
                                 namedVar.BaseType = result ? result->getType() : nullptr;
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                /*
+                                 * A VOID call through a function value yields no LLVM value at all
+                                 * (CreateIndirectCall returns nullptr for a void invoker), so every
+                                 * consumer downstream would read an unwritten slot, drop the argument,
+                                 * or dereference the null - silently on some paths, as a locationless
+                                 * verifier dump or a compiler SIGSEGV on others. Reject at the CALL,
+                                 * where the position is still known, rather than at each consumer.
+                                 * Discard positions want exactly this, and `return <call>;` is settled
+                                 * by EmitReturnExpression (a void crossing out of a void function is
+                                 * legal), so both defer.
+                                 */
+                                // Resolve through `using V = void;` - the spelling is aliasable, so
+                                // matching the literal "void" would leave the alias reading garbage.
+                                if (result == nullptr && use == ResultUse::Value
+                                    && !namedVar.TypeAndValue.Pointer
+                                    && Compiler(ctx)->ResolveTypeAlias(namedVar.TypeAndValue.TypeName) == "void")
+                                {
+                                    // Past the first call in a chain (`make()()`, `fns.get(0)()`),
+                                    // primaryIdentifier still names the PRODUCER - drop it instead.
+                                    std::string subject = functionArgCounter > 0
+                                        ? std::string("the call result")
+                                        : std::format("function value '{}'", functionName);
+                                    LogErrorContext(ctx, std::format(
+                                        "call through {} returns 'void', so it produces "
+                                        "no value to consume - call it as a statement", subject));
+                                }
                                 functionArgCounter++;
                                 break;
                             }
@@ -3020,7 +3049,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                             // 'return' emits a ret that exits the CALLER, so there is no SSA value to
                             // consume. Reject before inlining (emitting after the ret would leave a
                             // terminator mid-block -> module verification failure).
-                            if (!discardResult)
+                            if (use != ResultUse::Discard)
                             {
                                 LogErrorContext(ctx, std::format(
                                     "return-block function '{}' cannot be called in a value context (its "
@@ -5013,7 +5042,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         // block-item boundary flush an expression body never reaches. `void*`
                         // returns a real value and stays on the return lowering.
                         bool bareExpr = expr->assignmentOperator() == nullptr;
-                        auto resultNV = ParseAssignmentExpressionNamed(expr, true);
+                        auto resultNV = ParseAssignmentExpressionNamed(expr, ResultUse::Discard);
                         // No context declared the return type, so "void" here is a fallback. A body
                         // that yields a VALUE would be silently dropped and the caller would read
                         // garbage - say so instead (a void-yielding body is a genuine discard).
@@ -5411,7 +5440,7 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
         return structPtr;
     }
 
-llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx) {
+llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
 
         if (auto* tupleCtx = ctx->tupleExpression())
@@ -5560,7 +5589,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
         {
             // Use ParseAssignmentExpressionNamed to preserve TypeAndValue (e.g. cast type)
             // for ((Struct*)ptr)->field member-access chains that follow this primary.
-            auto nv = ParseAssignmentExpressionNamed(expressionCtx->assignmentExpression());
+            auto nv = ParseAssignmentExpressionNamed(expressionCtx->assignmentExpression(), use);
             ProcessPlusPlus();
             lastParenExprType = nv.TypeAndValue;
             lastParenExprStorage = nv.Storage;

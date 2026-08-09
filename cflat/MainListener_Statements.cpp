@@ -473,7 +473,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && AsDirectNew(assignExpr) != nullptr)
             compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
         if (assignExpr != nullptr)
-            returnNV = ParseAssignmentExpressionNamed(assignExpr);
+            returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
@@ -557,10 +557,12 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // CONSTANT folds to LLVM's token 'none' (`ret token none`) rather than to a void-typed
         // value - the only token that can reach a user `return`. The Win64 SEH trampoline also
         // builds tokens (a catchswitch/catchpad), but in a synthesized function with no body.
+        // The NamedVariable arm resolves through `using V = void;` - the mirror of the call-site
+        // gate, which would otherwise see the alias spelling and hand a null operand to the ret.
         bool returnExprIsVoid =
             (right != nullptr && (right->getType()->isVoidTy() || right->getType()->isTokenTy()))
-            || (right == nullptr && returnNV.TypeAndValue.TypeName == "void"
-                && !returnNV.TypeAndValue.Pointer);
+            || (right == nullptr && !returnNV.TypeAndValue.Pointer
+                && compiler->ResolveTypeAlias(returnNV.TypeAndValue.TypeName) == "void");
         if (fnReturnsVoid && returnExprIsVoid)
         {
             right = nullptr;
@@ -1348,7 +1350,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 if (auto* assign = express->assignmentExpression())
                 {
                     bool bareExpr = assign->assignmentOperator() == nullptr;
-                    auto resultNV = ParseAssignmentExpressionNamed(assign, true);
+                    auto resultNV = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                     if (bareExpr) DiagnoseDiscardedOwningReturn(assign, resultNV);
                     ProcessPlusPlus();
                     RegisterDiscardedOwningStructTemp(resultNV);
@@ -1506,7 +1508,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         // and any owned temp must be freed here (mirrors the statement/for-update).
                         auto* initAssign = expressionCtx->assignmentExpression();
                         bool bareExpr = initAssign->assignmentOperator() == nullptr;
-                        auto nv = ParseAssignmentExpressionNamed(initAssign, true);
+                        auto nv = ParseAssignmentExpressionNamed(initAssign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
                         ProcessPlusPlus();
                         compiler->FlushOwnedTemps();
@@ -1543,7 +1545,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     {
                         // A for-update is a discard position too (its value is unused).
                         bool bareExpr = assign->assignmentOperator() == nullptr;
-                        auto nv = ParseAssignmentExpressionNamed(assign, true);
+                        auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
                         ProcessPlusPlus();
                     }

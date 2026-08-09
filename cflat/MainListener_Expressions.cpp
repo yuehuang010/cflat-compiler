@@ -1,7 +1,7 @@
 #include "MainListener.h"
 
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
-                                                              bool discardResult) {
+                                                              ResultUse use) {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
         // can tell whether THIS expression (not a stale prior call) ended in an
         // owned-string-returning call.
@@ -64,10 +64,10 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                         // Pure single-child passthrough all the way down:
                                                         // this fast path IS the only shape where a bare
                                                         // return-block call reaches the inliner, so forward
-                                                        // discardResult unchanged. Any operator/value context
-                                                        // takes the fallback below with discardResult=false.
+                                                        // the use unchanged. Any operator/value context
+                                                        // takes the fallback below with ResultUse::Value.
                                                         return FinishAssignmentExpressionNamed(
-                                                            ParseCastExpression(muls[0], false, discardResult), savedOwned);
+                                                            ParseCastExpression(muls[0], false, use), savedOwned);
                                                     }
                                                 }
                                             }
@@ -4973,7 +4973,7 @@ void MainListener::ResolveValuelessCastOperand(CFlatParser::CastExpressionContex
     }
 
 LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue,
-                                                   bool discardResult) {
+                                                   ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto unaryCtx = ctx->unaryExpression();
         auto castExp = ctx->castExpression();
@@ -4981,8 +4981,8 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
 
         if (unaryCtx != nullptr)
         {
-            // Single-child passthrough: forward discardResult unchanged.
-            return ParseUnaryExpression(unaryCtx, discardResult);
+            // Single-child passthrough: forward the use unchanged.
+            return ParseUnaryExpression(unaryCtx, use);
         }
         else if (castExp && typeName)
         {
@@ -5217,7 +5217,7 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
     }
 
 LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
-                                                    bool discardResult) {
+                                                    ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto postFixCtx = ctx->postfixExpression();
         auto castExpCtx = ctx->castExpression();
@@ -5368,8 +5368,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 }
             }
 
-            // Single-child passthrough: forward discardResult unchanged.
-            return ParsePostfixExpression(postFixCtx, false, 0, discardResult);
+            // Single-child passthrough: forward the use unchanged.
+            return ParsePostfixExpression(postFixCtx, false, 0, use);
         }
         else if (auto* newCtx = ctx->newExpression())
         {

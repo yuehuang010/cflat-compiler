@@ -1430,3 +1430,80 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   INVARIANT (list `sort`/`_partition` bit-shuffles and dictionary rehash depend on it); decl-init
   from a single-index GEP is excluded for exactly that reason, which is why
   `T tmp = _data[i];` still borrows.
+- **A call that yields NO llvm::Value must be refused at the CALL, not at each consumer**
+  ([[void-closure-call-result-consumed-reads-garbage]], fix/voidcall). `CreateIndirectCall`
+  already returned `nullptr` for a void invoker and the result `NamedVariable` already carried
+  `TypeName == "void"` - the defect was entirely downstream, and it wore five different faces on
+  the SAME construct: silent garbage (declarator init `r=-16`, `?:` arm, variadic arg, thin
+  `function<>` `r=-77135616`), a silently skipped call (`int gr = gg();` at global scope printed
+  `gr=0` with the closure never invoked), a dropped argument reported as the false "no overload
+  of 'take' matches ... Call arguments (0)", a locationless `Module verification failed: Operand
+  is null` (condition position), and a COMPILER SIGSEGV with no output at all (assignment, field
+  store, element store, binary operand, call through a closure parameter). Enumerating consumers
+  would have needed the nine-site destination checklist plus the four argument doors and still
+  left the unenumerated ones silent; gating the producer is ONE site
+  (`MainListener_PostfixExpression.cpp`, the sole `CreateIndirectCall` caller in the listener)
+  and no consumption position can escape it, because the value never comes into existence.
+- **The exemption set for a value-less result is a closed language rule, so name the POSITION
+  rather than the site.** `ResultUse { Value, Discard, ReturnOperand }` replaced the old
+  `bool discardResult` and rides the same pure single-child passthrough chain
+  (`ParseAssignmentExpressionNamed` -> `ParseCastExpression` -> `ParseUnaryExpression` ->
+  `ParsePostfixExpression`), which resets to `Value` in every operator context - so
+  `return g();` defers to `EmitReturnExpression` while `return g() + 1;` does not. Both
+  exemptions are mutation-proven: flipping `ReturnOperand` back to `Value` falsely rejects
+  `void f() { return g(); }` (the `rvx_closure_void_crossing` accept leg) AND breaks
+  `err_return_void_from_value.cb`'s `rvbClosure` leg by changing its message; flipping either
+  `Discard` site to `Value` falsely rejects a for-increment call and a void `=> expr` body.
+  The [[return-value-void-mismatch-fails-module-verification]] closure detection in
+  `EmitReturnExpression` (`right == nullptr && TypeName == "void"`) is NOT made redundant by
+  this - deleting it still breaks the `rvbClosure` leg, because the call site now hands that
+  position through untouched.
+- **The DIRECT spelling is a different defect and was left alone deliberately.** `int r = f();`
+  on a void `f` yields a real void-typed `llvm::Value`, builds its result `NamedVariable` at a
+  dozen `lastCallReturnType` sites rather than one, and still fails as `Module verification
+  failed: Invalid bitcast` (declarator), `Both operands to a binary operator are not of the same
+  type!` (arithmetic) or rc 133 (`auto r = f();`). Measured pre and post, byte-identical. Do not
+  read those dumps as the oracle the closure path was converged onto - they are the same
+  defect shape in the direct path, and converging them needs its own gate. Filed in review as
+  [[direct-void-call-result-consumed-fails-verifier]] (P1: six of eleven positions are
+  locationless verifier dumps, `auto r = f();` is rc 133 with no output, and a void INTERFACE
+  method through the vtable lands there too).
+- **A `ResultUse`/discard thread that rides only the single-child chain stops at a
+  parenthesis.** Review of the same fix found `(g());`, `((g()));`, `cond ? g() : h();` and
+  `() => (g())` newly rejected - all four compiled and ran on the base. The pre-existing
+  return-block gate has the identical hole (`(RbA(1));` is rejected on master), which is what
+  makes it one issue rather than a regression class:
+  [[discard-position-not-threaded-through-parens-and-ternary]]. When a gate keys on a threaded
+  position, probe the WRAPPERS (parens, `?:`, cast) as well as the positions - the wrapper is
+  where the thread is dropped, and the accept-set corpus will not show it if every leg is
+  spelled without one.
+- **A gate keyed on a literal TypeName misses the `using` alias, again.** The same review found
+  `using V = void; Lambda<V()> g = ...; int r = g();` still returning garbage (`r=586762112`)
+  with the gate in place, because it compared `TypeName == "void"`. Fixed in review by comparing
+  `ResolveTypeAlias(TypeName) == "void"`, with `vccAlias` / `vccAliasThin` legs added to
+  `err_void_closure_call_consumed.cb`. This is the 2026-08-02 `using Cb = ...` lesson recurring
+  verbatim: whenever an acceptance or rejection rule matches a type SPELLING, the alias spelling
+  is a required leg of the corpus, not an exotic one.
+- **Round 2 of the same fix: the paren half of that thread was closed, the `?:` half was not,
+  and the stopping point was the API boundary.** `ParsePrimaryExpression` now carries the
+  `ResultUse` and forwards it through `'(' expression ')'` only, with
+  `ParsePostfixExpression` handing its own `use` down when the primary IS the whole postfix
+  (`childLimit == 1`). That restored `(g());`, `((g()));` and `() => (g())` to the base's rc 0.
+  The `?:` arms live behind a different API (`ParseConditionalExpression` /
+  `ParseTernaryBranches` / `ParseExpression`, all `TypedValue`, plus the eager constant-context
+  fallback and the join ledger), so threading a position into them is four more signatures and a
+  semantic decision about what a discarded arm means to the join - the re-enumeration shape, and
+  it was stopped rather than forced. **The paren threading also closed the pre-existing
+  return-block paren hole** (`(RbA(1));`, rc 1 on the base, rc 0 now). That was shipped only
+  after checking SEMANTICS against the plain spelling as oracle, not the exit code: a trace
+  counter over both polarities shows `(RbA(a));` behaves identically to `RbA(a);`, i.e. the
+  inlined `return` still exits the caller.
+- **A mirror predicate needs the alias fix at the same time as its twin.** Review fixed the
+  call-site gate to compare `ResolveTypeAlias(TypeName)`; the mirror in `EmitReturnExpression`
+  (cd6533c's `right == nullptr && TypeName == "void"`) still compared the literal, so
+  `int f(Lambda<V()> g) { return g(); }` under `using V = void;` was a locationless
+  `Module verification failed` on the base AND after the review fix. Found by probing the ALIAS
+  axis across POSITIONS rather than only at the site that had just been patched. Both are now
+  resolved; leg `rvbAliasClosure` in `err_return_void_from_value.cb`, mutation-proven. Note the
+  accept side (`void f() { return g(); }` through the alias) passes either way - it works
+  because `right` is already null - so only the REJECT leg discriminates that line.

@@ -45,6 +45,22 @@ with no binary and no source location before and after - but it is why
 `void f(int x) { return (void)x; }` is NOT in that commit's accept set while
 `void f() { return (void)0; }` is.
 
+## The `(void)<void call>` leg, and what `fix/voidcall` changed about it
+
+Added 2026-08-09 during the review of `fix/voidcall`. `(void)g()` on a `Lambda<void()>` is
+rejected on BOTH binaries, so it is not a regression, but the message changed
+(`scratch/rev_p08_voidcast_stmt.cb`):
+
+| binary | `(void)g();` as a statement |
+|---|---|
+| base `75b4275` | `'g()' does not name a value, so it cannot be cast to 'void' ...` |
+| `fix/voidcall` | `call through function value 'g' returns 'void', so it produces no value to consume - call it as a statement` |
+
+The new message arrives because the cast parses its operand at `ResultUse::Value`. That is a
+CONSTRAINT on the fix below, not a separate defect: the `void` destination arm must parse its
+operand in a DISCARD position, or the void-closure gate rejects it before the arm is reached and
+`(void)g()` stays unusable even after this issue is closed.
+
 ## Root cause
 
 `MainListener::ParseCastExpression` (`MainListener_Expressions.cpp:4963`) has no arm for a

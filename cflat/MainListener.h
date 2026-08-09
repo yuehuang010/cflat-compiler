@@ -1842,6 +1842,20 @@ private:
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
     inline LLVMBackend* Compiler() { return compilerLLVM; }
 
+public:
+    // What the CALLER of an expression parse will do with the result. Threaded down the pure
+    // single-child passthrough chain only; any operator context resets it to Value.
+    //  Value        - the result is consumed (stored, passed, joined, tested). A void call here
+    //                 produces nothing, so consuming it is an error.
+    //  Discard      - an expression statement / for-increment / void `=> expr` body. Nothing is
+    //                 consumed, so a void call is exactly right.
+    //  ReturnOperand- the WHOLE operand of a `return`. EmitReturnExpression owns the void-ness
+    //                 decision there (a void crossing is legal out of a void function), so the
+    //                 call site defers to it rather than rejecting first.
+    enum class ResultUse { Value, Discard, ReturnOperand };
+
+private:
+
     // amount, pointer-stride element type, and (union member only) the type to load/store the
     // storage as - a union member's Storage is the union alloca, so the inferred type is wrong.
     struct IncrementWork { int Amount = 0; llvm::Type* ElemType = nullptr; llvm::Type* LoadType = nullptr; };
@@ -3055,7 +3069,7 @@ public:
     // Used by ParseDeclaration to get the struct TypeName for struct->interface upcasting.
     // Falls back to value-only for complex expressions (ternary, binary ops, etc.).
     LLVMBackend::NamedVariable ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
-                                                              bool discardResult = false);
+                                                              ResultUse use = ResultUse::Value);
 
     /*
      * Provable shape mismatch on a DIRECT class->interface upcast (decl-init, '=', return, and
@@ -3752,7 +3766,7 @@ public:
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx);
 
     LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
-                                                   bool discardResult = false);
+                                                   ResultUse use = ResultUse::Value);
 
     /*
      * Give a cast operand that carries no llvm::Value a value or a diagnostic, so CreateCast is
@@ -3767,7 +3781,7 @@ public:
     LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx);
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
-                                                    bool discardResult = false);
+                                                    ResultUse use = ResultUse::Value);
 
     std::string ParseTypeSpecifierName(CFlatParser::TypeSpecifierContext* ctx);
 
@@ -4225,7 +4239,8 @@ public:
     //   [PFX-6]   argument assembly + implicit-this prepend
     //   [PFX-7]   call lowering: [winrt] vtable dispatch | null-conditional | overloaded call
     LLVMBackend::NamedVariable ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue = false,
-                                                       size_t dropTrailingChildren = 0, bool discardResult = false);
+                                                       size_t dropTrailingChildren = 0,
+                                                       ResultUse use = ResultUse::Value);
 
     // Walk down single-child rule nodes to find a UnaryExpressionContext.
     // Returns nullptr if the path branches or never reaches a unaryExpression.
@@ -4297,7 +4312,10 @@ public:
     // like a factory pointer (NOT a `new` local), so `return <View/>` is allowed.
     llvm::Value* ParseElementExpression(CFlatParser::ElementExpressionContext* ctx);
 
-    llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx);
+    // `use` is forwarded ONLY through the '(' expression ')' alternative: parentheses are not
+    // an operator, so a discarded `(g());` is still a discard. Every other alternative ignores it.
+    llvm::Value* ParsePrimaryExpression(CFlatParser::PrimaryExpressionContext* ctx,
+                                        ResultUse use = ResultUse::Value);
 
     LLVMBackend::NamedVariable ParseIdentifier(antlr4::tree::TerminalNode* node);
 

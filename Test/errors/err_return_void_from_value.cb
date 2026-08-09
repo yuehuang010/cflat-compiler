@@ -45,6 +45,14 @@ expect_error("cannot return a 'void' expression from a function that returns 'in
     int rvbClosureCall() { return rvbClosure(); }
 }
 
+// The same detection through a `using` ALIAS. The NamedVariable carries the alias SPELLING, so
+// a literal "void" comparison misses it - pre-fix this leg was a locationless
+// `Module verification failed`, the exact shape this gate exists to remove.
+using RvbVoid = void;
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
+    int rvbAliasClosure(Lambda<RvbVoid()> g) { return g(); }
+}
+
 // The quoted return type must carry the user's DECORATION. The bare TypeName of a `void*`
 // function is "void", which would print the self-contradictory "returns 'void'" on the very
 // message that complains about a void expression.

@@ -1,0 +1,135 @@
+// A VOID call through a function value yields no LLVM value at all, so consuming its result is
+// an error at the CALL, not at each consumer. Pre-fix every leg below compiled and ran: the
+// declarator/ternary/printf forms printed an uninitialised register (exit 0, silent wrong
+// value), the assignment/field/element/binary forms SIGSEGV'd the compiler with no output, and
+// the condition form died in the module verifier with no source location. So every leg here
+// fails on the pre-fix binary for the same reason - no error occurs (or the compiler crashes
+// before one can) - which is exactly what makes them non-vacuous.
+//
+// The RETURN position is deliberately NOT here: `return g();` is settled by EmitReturnExpression
+// (a void crossing out of a VOID function is legal C), and its rejection leg lives in
+// Test/errors/err_return_void_from_value.cb with a different message.
+
+int vccHits = 0;
+void vccBump() { vccHits = vccHits + 1; }
+void vccTake(int v) { vccHits = vccHits + v; }
+int  vccId(int v) { return v; }
+
+struct VccBox { int n = default; };
+struct VccHold { Lambda<void()> f = default; };
+
+// Declarator initializer - the headline repro.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccDecl() { Lambda<void()> g = () => { vccBump(); }; int r = g(); return r; }
+}
+
+// Assignment to an existing local.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccAssign() { Lambda<void()> g = () => { vccBump(); }; int r = 3; r = g(); return r; }
+}
+
+// Function argument.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    void vccArg() { Lambda<void()> g = () => { vccBump(); }; vccTake(g()); }
+}
+
+// NAMED argument - a separate argument-assembly door from the positional one.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    void vccNamedArg() { Lambda<void()> g = () => { vccBump(); }; vccTake(v: g()); }
+}
+
+// Field store.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccField() { Lambda<void()> g = () => { vccBump(); }; VccBox b = default; b.n = g(); return b.n; }
+}
+
+// Array element store.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccElem() { Lambda<void()> g = () => { vccBump(); }; int* a = new int[2]; a[0] = g(); return a[0]; }
+}
+
+// '?:' arm - an operator context, so the discard forwarding must NOT reach it.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccTernary() { Lambda<void()> g = () => { vccBump(); }; return vccHits == 0 ? g() : 5; }
+}
+
+// Binary operand.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccBinop() { Lambda<void()> g = () => { vccBump(); }; int r = g() + 1; return r; }
+}
+
+// Condition position.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    void vccCond() { Lambda<void()> g = () => { vccBump(); }; if (g()) vccBump(); }
+}
+
+// Nested call argument.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    void vccNested() { Lambda<void()> g = () => { vccBump(); }; vccTake(vccId(g())); }
+}
+
+// Variadic argument (printf) - no parameter type to mismatch against, so nothing else catches it.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    void vccVariadic() { Lambda<void()> g = () => { vccBump(); }; printf("%d\n", g()); }
+}
+
+// '??' arm.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccCoalesce() { Lambda<void()> g = () => { vccBump(); }; int r = g() ?? 5; return r; }
+}
+
+// 'auto' declarator - pre-fix this reported the unrelated "unknown type 'auto'".
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccAuto() { Lambda<void()> g = () => { vccBump(); }; auto r = g(); return r; }
+}
+
+// THIN 'function<>' spelling: a bare C function pointer, a different arm of CreateIndirectCall
+// from the fat closure above (pre-fix the two read different garbage).
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccThin() { function<void()> g = () => { vccBump(); }; int r = g(); return r; }
+}
+
+// The closure arrives as a PARAMETER rather than a local.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccParam(Lambda<void()> g) { return 1 + g(); }
+}
+
+// The closure is a struct FIELD, called through the field.
+expect_error("call through function value 'f' returns 'void', so it produces no value to consume") {
+    int vccHold() { VccHold h = default; h.f = () => { vccBump(); }; int r = h.f(); return r; }
+}
+
+// Immediately-invoked lambda literal: void-yielding body, result consumed. The literal has no
+// name, so the message quotes the spelling.
+expect_error("returns 'void', so it produces no value to consume") {
+    int vccIife() { int r = (() => vccBump())(); return r; }
+}
+
+// `void` reached through a `using` ALIAS: the gate resolves the alias, so the alias spelling
+// cannot keep reading garbage after the literal one is closed.
+using VccVoid = void;
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccAlias() { Lambda<VccVoid()> g = () => { vccBump(); }; int r = g(); return r; }
+}
+
+// The THIN alias spelling - the other CreateIndirectCall arm, same alias resolution.
+expect_error("call through function value 'g' returns 'void', so it produces no value to consume") {
+    int vccAliasThin() { function<VccVoid()> g = () => { vccBump(); }; int r = g(); return r; }
+}
+
+// Past the FIRST call in a chain the primary identifier still names the PRODUCER, so the
+// message drops the name rather than blaming `make` for what its result returns.
+Lambda<void()> vccMake() { return () => { vccBump(); }; }
+expect_error("call through the call result returns 'void', so it produces no value to consume") {
+    int vccChained() { int r = vccMake()(); return r; }
+}
+
+// GLOBAL initializer - pre-fix this silently produced 0 and never called the closure at all.
+Lambda<void()> vccGlobal = () => { vccHits = vccHits + 1; };
+expect_error("call through function value 'vccGlobal' returns 'void', so it produces no value to consume");
+int vccGlobalResult = vccGlobal();
+
+extern int main()
+{
+    return 0;
+}
