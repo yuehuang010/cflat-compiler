@@ -1868,6 +1868,15 @@ private:
     std::string lambdaLockThisReceiver;
     // The mode lambdaLockThisReceiver is granted in - lock(this.optimistic) grants read-only.
     LockMode lambdaLockThisMode = LockMode::Exclusive;
+    // True while emitting the body of a lambda whose "void" return type is the INFERRED
+    // fallback (no function<>/Lambda<> context reached it), not a declared one. A `return
+    // <expr>;` there is an inference failure, not a return-type violation - see
+    // EmitReturnExpression. Saved/restored per lambda so nesting works.
+    // The invoker it applies to: a function emitted mid-body (a generic instantiation) has its
+    // own declared return type and must not read this lambda's inference state.
+    llvm::Function* lambdaReturnInferredFn_ = nullptr;
+    // The lambda whose body is being emitted, for that diagnostic. Empty in a named function.
+    std::string lambdaReturnInferredName_;
 
     // Side-channel from ParsePrimaryExpression to ParsePostfixExpression:
     // carries the cast TypeAndValue when the primary is a parenthesized cast expression,

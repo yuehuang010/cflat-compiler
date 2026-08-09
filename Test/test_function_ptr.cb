@@ -3803,6 +3803,110 @@ bool testLambdaVoidExprBody()
     return result;
 }
 
+/*
+ * `void f() { return g(); }` on a VOID g - the one void-ness crossing C keeps legal. It
+ * evaluates the call for its effects and then returns nothing. Every spelling below died in
+ * the LLVM module verifier before fix/retvoid ("Found return instr that returns non-void in
+ * Function of void return type!"), with no source location, so these are value legs for a gate
+ * whose whole job is to admit them; the rejections are in Test/errors/err_return_*.cb.
+ */
+int rvxHits = 0;
+void rvxBump()           { rvxHits = rvxHits + 1; }
+void rvxNamed()          { return rvxBump(); }
+Lambda<void()> rvxClosure = default;
+// A void CLOSURE call yields no LLVM value at all - a different void-ness detection than the
+// direct call above, and the only spelling that exercises it on the accept side.
+void rvxThroughClosure() { return rvxClosure(); }
+
+void rvxSink<T>(T v)     { rvxHits = rvxHits + (int)v; }
+void rvxGeneric()        { return rvxSink<int>(2); }
+int  rvxId<T>(T v)       { return v; }
+
+struct RvxBox
+{
+    int n = default;
+    void bump() { n = n + 1; }
+    void go()   { return bump(); }
+};
+
+// A `(void)` CAST is the third way void-ness reaches the return. On a CONSTANT operand it folds
+// to LLVM's token 'none' rather than to a void-typed value, so it needs its own detection - the
+// `(void)voidCall()` twin arrives as an ordinary void value. (`(void)<non-constant>` is a
+// separate pre-existing defect - see internal/issue/p3.)
+void rvxCastConst()    { rvxHits = rvxHits + 1; return (void)0; }
+void rvxCastVoidCall() { return (void)rvxBump(); }
+
+bool testReturnVoidExprFromVoid()
+{
+    bool result = true;
+
+    rvxHits = 0;
+    rvxNamed();
+    result &= Test("rvx_named_void_crossing", rvxHits, 1);
+
+    rvxHits = 0;
+    rvxClosure = () => { rvxHits = rvxHits + 5; };
+    rvxThroughClosure();
+    result &= Test("rvx_closure_void_crossing", rvxHits, 5);
+
+    rvxHits = 0;
+    rvxGeneric();
+    result &= Test("rvx_generic_void_crossing", rvxHits, 2);
+
+    {
+        RvxBox b = default;
+        b.go();
+        b.go();
+        result &= Test("rvx_method_void_crossing", b.n, 2);
+    }
+
+    // `return (void)<constant>;` and `return (void)<void call>;` from a void function. The
+    // counter proves the body ran and the function returned normally, not merely that it built.
+    rvxHits = 0;
+    rvxCastConst();
+    rvxCastConst();
+    result &= Test("rvx_cast_const_void_crossing", rvxHits, 2);
+
+    rvxHits = 0;
+    rvxCastVoidCall();
+    result &= Test("rvx_cast_voidcall_void_crossing", rvxHits, 1);
+
+    // The same cast inside a DECLARED-void lambda body.
+    rvxHits = 0;
+    {
+        Lambda<void()> g = () => { rvxHits = rvxHits + 3; return (void)0; };
+        g();
+        result &= Test("rvx_cast_const_in_lambda", rvxHits, 3);
+    }
+
+    // The same crossing inside a DECLARED-void lambda's block body.
+    rvxHits = 0;
+    {
+        Lambda<void()> g = () => { return rvxBump(); };
+        g();
+        g();
+        g();
+        result &= Test("rvx_lambda_block_void_crossing", rvxHits, 3);
+    }
+
+    // An INFERRED-void lambda (immediately-invoked, no expected type) holding a TYPED inner
+    // lambda that returns a value: the inner `return 4;` must be judged against the inner
+    // invoker, not against the outer literal's inferred void. Discriminates against a
+    // mid-work regression (leaked inference state), not against master - master compiles it.
+    rvxHits = 0;
+    (() => { Lambda<int()> inner = () => { return 4; }; rvxHits = inner(); })();
+    result &= Test("rvx_iife_void_body_inner_lambda_value", rvxHits, 4);
+
+    // Same question for a GENERIC instantiated mid-body: its `return v;` belongs to its own
+    // declared int return type, not to the enclosing inferred-void literal. Also a mid-work
+    // tripwire rather than a master-discriminating leg.
+    rvxHits = 0;
+    (() => { rvxHits = rvxId<int>(6); })();
+    result &= Test("rvx_iife_generic_body_value", rvxHits, 6);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3948,6 +4052,10 @@ extern int main()
     // Returning a lambda's BY-VALUE capture of an owning value type must hand the caller an
     // independent copy: the env owns its capture and frees it exactly once (fix/lamcap).
     total++; passed += testReturnCapturedOwningValue()     ? 1 : 0;
+
+    // `void f() { return g(); }` on a VOID g - the one void-ness crossing that stays legal
+    // now that a disagreeing `return` is a diagnostic instead of a verifier dump (fix/retvoid).
+    total++; passed += testReturnVoidExprFromVoid()        ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

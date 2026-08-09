@@ -4972,6 +4972,27 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             currentLockSet[consumedLockThisReceiver] = consumedLockThisMode;
         }
 
+        // A `return <expr>;` in this body must know whether "void" was DECLARED or inferred.
+        // RAII because LogError throws; saved/restored so a nested lambda restores ours.
+        struct InferredReturnScope
+        {
+            MainListener* self; llvm::Function* savedFn; std::string savedName;
+            InferredReturnScope(MainListener* s, llvm::Function* fn, const std::string& name)
+                : self(s), savedFn(s->lambdaReturnInferredFn_),
+                  savedName(s->lambdaReturnInferredName_)
+            {
+                self->lambdaReturnInferredFn_ = fn;
+                self->lambdaReturnInferredName_ = name;
+            }
+            ~InferredReturnScope()
+            {
+                self->lambdaReturnInferredFn_ = savedFn;
+                self->lambdaReturnInferredName_ = savedName;
+            }
+        } inferredReturnScope(this,
+                              returnTypeInferred ? compiler->currentFunction : nullptr,
+                              lambdaName);
+
         // Parse body
         if (auto* body = ctx->lambdaBody())
         {

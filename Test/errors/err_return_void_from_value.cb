@@ -1,0 +1,82 @@
+// The mirror of Test/errors/err_return_value_from_void.cb: a return that produces NOTHING in a
+// function that returns a value. Every leg used to die in the module verifier with no
+// file(line,col): prefix - the value-less `return;` because it lowers to CreateRetVoid, and
+// `return <void-expr>;` because the operand is a void-typed value.
+//
+// Which verifier line they printed depends on the DECLARED return type, not on the spelling:
+// the concrete-typed legs got "Function return type does not match operand type of return
+// inst!", while the 'auto' leg got "Found return instr that returns non-void in Function of
+// void return type!" - by verification time that function's lowered return type was already
+// void, so it was the operand that read as wrong (measured on the merge base,
+// scratch/prefix_bin), which is the opposite half of the same disagreement.
+//
+// Two distinct messages, deliberately: the value-less form is fixed by writing a value (or
+// `return default;`), while the void-expression form is fixed by calling the expression as a
+// statement. `return default;` itself is a separate arm and is NOT touched - its accept leg is
+// Test/test_basic.cb.
+
+void rvbBump() { }
+
+// Value-less `return;` in a named int function.
+expect_error("cannot 'return' without a value from a function that returns 'int'") {
+    int rvbValueless() { return; }
+}
+
+// Value-less `return;` in a METHOD.
+expect_error("cannot 'return' without a value from a function that returns 'int'") {
+    struct RvbBox { int n = default; int get() { return; } };
+}
+
+// A void CALL as the return expression.
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
+    int rvbVoidCall() { return rvbBump(); }
+}
+
+// An EXPRESSION-body lambda whose body is a void call: `=> expr` is `=> { return expr; }`, so
+// it reaches the same gate through a different syntax.
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
+    int rvbLamExpr() { Lambda<int()> k = () => rvbBump(); return k(); }
+}
+
+// A void CLOSURE call yields no LLVM value at all, so its void-ness has to be read off the
+// NamedVariable rather than off a value - this leg is the only one that exercises that path.
+Lambda<void()> rvbClosure = default;
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
+    int rvbClosureCall() { return rvbClosure(); }
+}
+
+// The quoted return type must carry the user's DECORATION. The bare TypeName of a `void*`
+// function is "void", which would print the self-contradictory "returns 'void'" on the very
+// message that complains about a void expression.
+expect_error("cannot return a 'void' expression from a function that returns 'void*'") {
+    void* rvbVoidPtr() { return rvbBump(); }
+}
+expect_error("cannot 'return' without a value from a function that returns 'int[]'") {
+    int[] rvbViewValueless() { return; }
+}
+
+// A closure return type is stored under its LOWERED name ("__closure_fat_ptr"), which is not
+// writable source - the message names the writable KIND instead.
+expect_error("cannot 'return' without a value from a function that returns 'Lambda<...>'") {
+    Lambda<int()> rvbClosureRet() { return; }
+}
+
+// A `(void)` cast of a CONSTANT folds to LLVM's token 'none', not to a void-typed value, so it
+// reaches the gate carrying its void-ness in the TYPE of the operand rather than in a call
+// result. This leg is the only one that exercises that detection.
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
+    int rvbCastConst() { return (void)0; }
+}
+
+// An 'auto' return type is emitted against an i64 PLACEHOLDER and unified after the body, so
+// the function's LLVM return type proves nothing - but a void OPERAND is still proven, and the
+// message must say 'auto' rather than quote the placeholder. Instantiated inside the block.
+auto rvbAuto<T>(T x) { return rvbBump(); }
+expect_error("cannot return a 'void' expression from a function that returns 'auto'") {
+    void rvbAutoUse() { rvbAuto<int>(1); }
+}
+
+extern int main()
+{
+    return 0;
+}

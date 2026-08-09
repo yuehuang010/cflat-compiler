@@ -403,6 +403,22 @@ std::string MainListener::BoxedStructNameOfFatValue(llvm::Value* fatValue, LLVMB
         return found;
     }
 
+// The declared return type as the USER spelled it, for a return diagnostic. The bare
+// TypeName drops the pointer / array-view suffix, which reads as a contradiction on `void*`.
+static std::string CurrentReturnTypeSpelling(const LLVMBackend* compiler)
+{
+        if (compiler->currentFunctionReturnTypeName.empty()) return "a value";
+        const auto& tv = compiler->currentFunctionReturnTV;
+        // A closure/function-pointer return type is stored under its LOWERED name
+        // ("__closure_fat_ptr"), which is not writable source - name the writable KIND instead,
+        // the same elided spelling the lambda-inference diagnostic uses.
+        if (tv.IsFunctionPointer) return tv.IsThinFnPtr() ? "function<...>" : "Lambda<...>";
+        std::string suffix = compiler->currentFunctionReturnIsArrayView ? "[]"
+            : tv.ElemPointer ? "**"
+            : tv.Pointer ? "*" : "";
+        return compiler->currentFunctionReturnTypeName + suffix;
+    }
+
 std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv) {
         if (!nv.TypeAndValue.TypeName.empty()) return nv.TypeAndValue.TypeName;
         if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType)) return st->getName().str();
@@ -521,6 +537,57 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         if (right && returnFnPtrTV.IsFunctionPointer)
             right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV, returnNV);
         ProcessPlusPlus();
+
+        /*
+         * VOID-ness of the `ret` operand and of the function must agree, or the module
+         * verifier rejects the whole module with no source location at all. C keeps exactly
+         * one crossing legal - `void f() { return g(); }` on a VOID g - which evaluates the
+         * call for its effects and then returns nothing; right is nulled so the CreateRetVoid
+         * at the bottom emits it, while every flush below still runs for the argument temps.
+         * Only a PROVEN mismatch is rejected. An 'auto' return type is emitted against an i64
+         * PLACEHOLDER and unified after the body, so its LLVM return type answers nothing -
+         * the void-typed expression is still proven, but the message must say 'auto'.
+         */
+        bool autoReturn = compiler->IsAutoReturnCaptureActive();
+        bool fnReturnsVoid = !autoReturn && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()->isVoidTy();
+        // Void-ness reaches here three ways. A void CALL is a void-typed value. A void CLOSURE
+        // call yields no LLVM value at all, so its void-ness rides the NamedVariable instead
+        // (`int f() { return g(); }` on a `Lambda<void()>` g). And a `(void)` cast of a
+        // CONSTANT folds to LLVM's token 'none' (`ret token none`) rather than to a void-typed
+        // value - the only token that can reach a user `return`. The Win64 SEH trampoline also
+        // builds tokens (a catchswitch/catchpad), but in a synthesized function with no body.
+        bool returnExprIsVoid =
+            (right != nullptr && (right->getType()->isVoidTy() || right->getType()->isTokenTy()))
+            || (right == nullptr && returnNV.TypeAndValue.TypeName == "void"
+                && !returnNV.TypeAndValue.Pointer);
+        if (fnReturnsVoid && returnExprIsVoid)
+        {
+            right = nullptr;
+        }
+        else if (fnReturnsVoid && right != nullptr)
+        {
+            // A lambda that no function<>/Lambda<> context reached has "void" as an INFERRED
+            // fallback, not a declaration - saying it "returns void" would be false. This
+            // LogErrorContext throws, so the specialized wording wins over the general one.
+            if (lambdaReturnInferredFn_ != nullptr
+                && lambdaReturnInferredFn_ == compiler->currentFunction)
+                LogErrorContext(errCtx, std::format(
+                    "cannot infer the return type of lambda '{}': its body returns a value "
+                    "but no 'function<...>' or 'Lambda<...>' type reaches it here; bind the "
+                    "lambda to a typed variable or parameter and call it through that",
+                    lambdaReturnInferredName_));
+            LogErrorContext(errCtx,
+                "cannot return a value from a function whose return type is 'void' - "
+                "drop the value ('return;'), or declare a non-void return type");
+        }
+        else if (returnExprIsVoid)
+        {
+            LogErrorContext(errCtx, std::format(
+                "cannot return a 'void' expression from a function that returns '{}' - "
+                "the expression produces no value; call it as a statement and return a value",
+                autoReturn ? "auto" : CurrentReturnTypeSpelling(compiler)));
+        }
 
         /*
          * A '?:' join of concrete implementer pointers carries no NamedVariable
@@ -1238,6 +1305,18 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         EmitReturnExpression(jump, express->assignmentExpression(), express->getText());
                     else
                     {
+                        // Mirror of the void-ness check in EmitReturnExpression: a value-less
+                        // `return;` emits a CreateRetVoid, which the module verifier rejects
+                        // (with no source location) in a function that returns a value.
+                        // An 'auto' function is emitted against an i64 placeholder and can still
+                        // infer void, so its LLVM return type proves nothing here.
+                        if (compiler->currentFunction != nullptr
+                            && !compiler->IsAutoReturnCaptureActive()
+                            && !compiler->currentFunction->getReturnType()->isVoidTy())
+                            LogErrorContext(jump, std::format(
+                                "cannot 'return' without a value from a function that returns "
+                                "'{}' - return a value, or 'return default;' for a zeroed one",
+                                CurrentReturnTypeSpelling(compiler)));
                         compiler->CreateReturnCall(nullptr);
                     }
                 }

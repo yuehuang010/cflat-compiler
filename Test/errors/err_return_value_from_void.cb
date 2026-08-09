@@ -1,0 +1,52 @@
+// A `return <value>;` whose value disagrees with a VOID return type used to reach
+// CreateReturnCall unchecked and die in the LLVM module verifier ("Found return instr that
+// returns non-void in Function of void return type!") - a raw dump with no file(line,col):
+// prefix at all. Each leg below is one SPELLING that reaches the same gate in
+// EmitReturnExpression; the accept side of the gate (the C-legal `void f() { return g(); }`
+// on a VOID g, in all its spellings) is pinned as VALUE legs in
+// Test/test_function_ptr.cb::testReturnVoidExprFromVoid.
+//
+// The last leg pins a DIFFERENT message: a block-body lambda literal that no
+// `function<...>`/`Lambda<...>` type reaches falls back to a void invoker, so its
+// `return <expr>;` is an INFERENCE failure, not a user writing a value into a declared void.
+
+int rvvVal() { return 7; }
+
+// Plain literal in a named void function.
+expect_error("cannot return a value from a function whose return type is 'void'") {
+    void rvvLiteral() { return 5; }
+}
+
+// The value comes from a call - proves the gate looks at the VALUE, not at the syntax.
+expect_error("cannot return a value from a function whose return type is 'void'") {
+    void rvvCall() { return rvvVal(); }
+}
+
+// A void METHOD.
+expect_error("cannot return a value from a function whose return type is 'void'") {
+    struct RvvBox { int n = default; void set(int v) { n = v; return 5; } };
+}
+
+// A GENERIC void function. Its body is codegen'd where it is INSTANTIATED, so the use has to
+// sit inside the armed block - in main() it would fire after the block has closed.
+void rvvSink<T>(T v) { return v; }
+expect_error("cannot return a value from a function whose return type is 'void'") {
+    void rvvSinkUse() { rvvSink<int>(3); }
+}
+
+// A DECLARED-void lambda: `Lambda<void()>` reached the literal, so "void" is the user's word.
+expect_error("cannot return a value from a function whose return type is 'void'") {
+    void rvvLam() { Lambda<void()> h = () => { return 5; }; h(); }
+}
+
+// An INFERRED-void lambda (immediately-invoked literal, no expected type). Same arm, different
+// wording, because calling that void a "return type" would be false - nobody declared it.
+// "returns a value" is the BLOCK-body phrasing; the expression-body twin says "yields a value".
+expect_error("cannot infer the return type of lambda") {
+    int rvvIife() { return ((int x) => { return x * 2; })(4); }
+}
+
+extern int main()
+{
+    return 0;
+}
