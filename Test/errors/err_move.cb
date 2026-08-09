@@ -507,6 +507,31 @@ extern int main()
         int aelId = ael.item->id;
     }
 
+    // The BRACE-INIT spelling of the same store, `T[N] dst = { a };`, consumes its named source
+    // too. Before the fix it was a plain bit copy: this compiled and double-freed (rc 133).
+    expect_error("use of moved variable 'abr'") {
+        ArrElemBox abr;
+        abr.item = new MoveResource();
+        ArrElemBox[2] abrDst = { abr };
+        int abrId = abr.item->id;
+    }
+
+    // The SAME source twice in one brace list: the first element consumes it, so the second is
+    // a use after move rather than a second alias of one resource.
+    expect_error("use of moved variable 'abrTwice'") {
+        ArrElemBox abrTwice;
+        abrTwice.item = new MoveResource();
+        ArrElemBox[2] abrDup = { abrTwice, abrTwice };
+    }
+
+    // The brace element decision must not swallow a type mismatch either: an `ArrElemBox` value
+    // in an `ArrElemNest` list still has to reach the existing cast diagnostic.
+    expect_error("cannot cast an aggregate value") {
+        ArrElemBox abrBad;
+        abrBad.item = new MoveResource();
+        ArrElemNest[2] abrNest = { abrBad };
+    }
+
     // The element transfer arm RETURNS EARLY, so it must not swallow a type mismatch: an
     // `ArrElemBox` value stored into an `ArrElemNest` element still has to reach the existing
     // diagnostic. Review found the arm accepted this and emitted a mismatched store.

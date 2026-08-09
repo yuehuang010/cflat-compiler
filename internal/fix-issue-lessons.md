@@ -1464,6 +1464,53 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   well-typed ones** - a positive corpus of 28 same-type cells cannot see a lost rejection. Note
   the whole-LOCAL arm has the same hole (`Nest m; m = n.inner;` compiles on master too); it was
   left alone as pre-existing rather than absorbed.
+
+- **The 2026-08-09 fixed-array BRACE-INIT session** (`fix/bracown`), the decl-init twin of the two
+  bullets above. `T[N] dst = { a, b };` bit-copied every owning lvalue element into the slot (rc
+  133). The whole fix is one new helper, `ConsumeOwningBraceElementSource`, and one call at the end
+  of `EmitPositionalFixedArrayIntoSlot` - which is why BOTH of the emitter's callers (the local
+  declarator, for `= {...}` and the bare `{...}` spelling, and `EmitFieldDefaultFixedArrayBrace`)
+  were measured independently broken and independently fixed by it. RATIFIED: the brace element is
+  CONSTRUCTED, so it takes the CONTAINER-slot decision, **no drop-old** - the emitter zero-fills the
+  whole array first, and the freed-once-each dtor counts are the only thing that discriminates a
+  transfer from an alias. Otherwise it is the same decision as the two siblings: copyable owner
+  COPIES (distinct buffers, sources live), non-copyable MOVES and zeroes the source lvalue, and only
+  a NAMED slot is `MarkVariableMoved`. The repeated-source list `{ a, a }` therefore resolves as
+  `use of moved variable 'a'` on the second element - that is the answer, not a special case. The
+  INDIRECT repeated list `{ w.b, w.b }` is the documented silent half of the same rule: the first
+  element consumes, the second stores a null item, rc 0 and leak-clean, with no diagnostic, because
+  an indirect lvalue has no spelling to report.
+- **A `return`-ing arm needs its ill-typed neighbours in the corpus - and the review has to probe
+  them in the ARM'S OWN SPELLING.** The arrslot bullet above learned this for `dst[i] = src`; the
+  brace arm shipped with `ResolveTypeAlias(src) == ResolveTypeAlias(dest)` already in place because
+  of it, and review confirmed by probe that `Nest[2] arr = { aBox };` still reaches "cannot cast an
+  aggregate value" identically on both binaries. The `using` alias and generic-instantiation
+  spellings (`BAlias[2] dst = { a };` in both alias directions, `GBox<int>[2] dst = { g };`, and the
+  ill-typed `GBox<float>[2] dst = { g };`) were probed as well and are all correct - alias-resolved
+  comparison is what buys this, and it is now the third fix in a row where it was load-bearing.
+- **A field DEFAULT that names a global owner is a one-shot.** `struct W { Box[2] arr = { gSeed };
+  }` consumes `gSeed` at the FIRST default construction; a second `W w2 = default;` gets a null
+  element (rc 0, leak-clean; rc 134 before this fix). Memory safety gained, value silently lost -
+  recorded on [[implicit-consume-of-a-global-owner-loses-the-value-on-the-second-run]] as the third
+  and worst-reading spelling of that defect, because a field default is written once and runs per
+  instance, so nothing in the source hints that it is one-shot. It also means a test leg that reads
+  such a field default goes VACUOUS the moment a second construction of the type is added to the
+  file - `Test/test_move.cb`'s `abri_fielddefault_*` legs depend on being the only one.
+- **The by-value owning PARAMETER was the shape the accept-set matrix missed.**
+  `void f(UBox p) { UBox[2] d = { p }; }` double-frees (rc 134) while `d[0] = p;` is clean, on BOTH
+  binaries - not a regression, but the one source shape a 30-cell corpus of locals, fields, derefs,
+  elements and call results never reached. The two halves disagree: the arm consumes the parameter,
+  the pre-pass that decides a parameter is a CONSUMING parameter does not know the brace-list site,
+  so the caller is never told and destructs a resource the callee already freed. Filed as
+  [[brace-init-element-consumes-a-by-value-parameter-the-caller-still-owns]]. The general lesson:
+  when an ownership arm is added to a new lowering, the corpus must include a source whose OWNER IS
+  ANOTHER FRAME - consuming it is only half a transfer.
+- **A brace element and an assignment can be the same store and still not be the same path.** Both
+  string-element spellings were measured broken and, being one defect, the two issue files were
+  merged into [[fixed-array-string-element-store-double-frees]] at the higher severity (the p2
+  assign-only file from `fix/arrslot` was deleted). `string` stays excluded from all three arms:
+  routing it through `ClassifyOwningAssignSource` is what `fix/owncopy` measured as silently
+  leak-adding while every suite stayed green.
 - **A call that yields NO llvm::Value must be refused at the CALL, not at each consumer**
   ([[void-closure-call-result-consumed-reads-garbage]], fix/voidcall). `CreateIndirectCall`
   already returned `nullptr` for a void invoker and the result `NamedVariable` already carried

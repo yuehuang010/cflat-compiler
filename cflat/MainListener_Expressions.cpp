@@ -6597,8 +6597,66 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
 
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
+            ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
             compiler->CreateAssignment(val, elemPtr, false, elemTy);
         }
+    }
+
+/*
+ * The element-CONSTRUCTION twin of the fixed-array-element assignment arm. A positional brace
+ * list bit-copied an owning lvalue source into the slot, so the source and the new element both
+ * destructed one resource (double free). Defer to T through the shared decision: a copyable owner
+ * COPIES (source stays live), a non-copyable one MOVES and the source lvalue is zeroed, with
+ * MarkVariableMoved for a named slot. NO drop-old - the slot was zero-filled by the caller and is
+ * being constructed, not overwritten; that is the container-slot decision, not the assignment one.
+ * `string` elements keep their own runtime owned-bit machinery and are excluded, exactly as in the
+ * assignment arm.
+ */
+void MainListener::ConsumeOwningBraceElementSource(
+        const LLVMBackend::NamedVariable& nv,
+        llvm::Value*& val,
+        llvm::Value* elemPtr,
+        const LLVMBackend::TypeAndValue& elemTV,
+        const std::string& elemTypeName,
+        antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (val == nullptr || !val->getType()->isStructTy()) return;
+        if (elemTV.Pointer || elemTV.ElemPointer || elemTV.IsArrayView) return;
+        if (elemTypeName == "string") return;
+        if (compiler->IsInterfaceType(elemTypeName)) return;
+
+        // A source with STORAGE is an lvalue: a named slot (alloca/global) or an INDIRECT one
+        // (`*ap`, `w.b`, `arr[i]`) whose Storage is the GEP / loaded address, and has no name.
+        bool srcIsNamedSlot = nv.Storage != nullptr
+            && (llvm::isa<llvm::AllocaInst>(nv.Storage)
+                || llvm::isa<llvm::GlobalVariable>(nv.Storage))
+            && !nv.CallerName.empty();
+        bool srcIsOwningAssignLvalue = nv.Storage != nullptr
+            && !SourceIsDanglingAliasBorrow(compiler, nv)
+            && (srcIsNamedSlot || nv.TypeAndValue.TypeName != "string");
+        if (!srcIsOwningAssignLvalue) return;
+        // An explicit `move` source keeps its existing lowering (it already nulls the source), so
+        // it is excluded here on the same predicate the assignment arm uses.
+        if (nv.TypeAndValue.IsMove && !nv.IsOwningStruct) return;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsArrayView
+            || nv.TypeAndValue.IsInterfacePointer || nv.TypeAndValue.IsFunctionPointer) return;
+        if (elemPtr == nv.Storage) return;
+        // Same type on both sides (alias-resolved, per the `using` lesson): a mismatch must fall
+        // through untouched to the existing cast diagnostic.
+        if (compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName)
+            != compiler->ResolveTypeAlias(elemTypeName)) return;
+        if (!compiler->IsOwningValueType(nv.TypeAndValue.TypeName)) return;
+
+        AssignSourceKind kind;
+        val = ClassifyOwningAssignSource(val, nv.TypeAndValue.TypeName,
+                                         nv.TypeAndValue.IsMove, ctx, kind);
+        if (kind != AssignSourceKind::Move) return;
+        compiler->builder->CreateStore(
+            llvm::ConstantAggregateZero::get(val->getType()), nv.Storage);
+        // Only a named slot has a spelling to report a later use of; an indirect lvalue
+        // (field/element/deref) is consumed silently, exactly as `move w.b` already is.
+        if (srcIsNamedSlot)
+            compiler->MarkVariableMoved(nv.CallerName);
     }
 
 std::string MainListener::DescribeInitializerPath(const std::string& callerName,

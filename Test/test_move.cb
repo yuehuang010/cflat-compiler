@@ -3902,6 +3902,11 @@ struct OaiSWrap  { OaiSBox b; };
 
 OaiBox oaiGlobal;
 
+// The FIELD-DEFAULT brace path (EmitFieldDefaultFixedArrayBrace -> the same slot emitter as the
+// local declarator). Its source has to outlive the struct declaration, so it is a global.
+OaiBox oaiFdSeed;
+struct OaiFdWrap { OaiBox[2] arr = { oaiFdSeed }; };
+
 int oaiId(OaiBox b)
 {
     if (b.item == nullptr) return -1;
@@ -4440,6 +4445,192 @@ int testOwningAssignIntoFixedArrayElement()
         passed += Test("aels_pod_value", dst[0].x, 5);
         passed += Test("aels_pod_source_live", a.x, 5);
     }
+
+    return passed;
+}
+
+/*
+ * The DECL-INIT twin of the arm above: a positional brace list, `OaiBox[2] dst = { a, b };`.
+ * Every owning lvalue source below bit-copied into the slot and aborted (rc 133) before the fix.
+ * The slot is CONSTRUCTED here (the emitter zero-fills the array first), so there is no old
+ * element to drop - the freed-once-each counts are what discriminate a transfer from an alias.
+ */
+int testOwningBraceInitFixedArray()
+{
+    int passed = 0;
+
+    // 1. NAMED sources (the filed repro). A named source is MarkVariableMoved, so its
+    // use-after-move is pinned in Test/errors/err_move.cb rather than read back here.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox b = oaiMake(6);
+        OaiBox[2] dst = { a, b };
+        passed += Test("abri_named_value0", dst[0].item->id, 5);
+        passed += Test("abri_named_value1", dst[1].item->id, 6);
+        passed += Test("abri_named_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_named_freed_once_each", dtorCount, 2);
+
+    // 2. INDIRECT (field) source: same transfer, consumed source lvalue left null.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(5);
+        OaiBox[2] dst = { w.b };
+        passed += Test("abri_field_value", dst[0].item->id, 5);
+        passed += Test("abri_field_source_nulled", w.b.item == nullptr, true);
+        passed += Test("abri_field_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_field_freed_once_each", dtorCount, 1);
+
+    // 3. DEREF source.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox* ap = &a;
+        OaiBox[2] dst = { *ap };
+        passed += Test("abri_deref_value", dst[0].item->id, 5);
+        passed += Test("abri_deref_source_nulled", ap->item == nullptr, true);
+    }
+    passed += Test("abri_deref_freed_once_each", dtorCount, 1);
+
+    // 4. ELEMENT source out of another fixed array.
+    dtorCount = 0;
+    {
+        OaiBox[2] src;
+        src[0] = oaiMake(5);
+        OaiBox[2] dst = { src[0] };
+        passed += Test("abri_elem_value", dst[0].item->id, 5);
+        passed += Test("abri_elem_source_nulled", src[0].item == nullptr, true);
+    }
+    passed += Test("abri_elem_freed_once_each", dtorCount, 1);
+
+    // 5. ACCEPT SET, unchanged by the fix: a CALL-RESULT element is a temp that already owned
+    // its resource, so it was never aliased and must not be copied or consumed.
+    dtorCount = 0;
+    {
+        OaiBox[2] dst = { oaiMake(5), oaiMake(6) };
+        passed += Test("abri_call_value0", dst[0].item->id, 5);
+        passed += Test("abri_call_value1", dst[1].item->id, 6);
+        passed += Test("abri_call_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_call_freed_once_each", dtorCount, 2);
+
+    // 6. ACCEPT SET, unchanged: an explicit `move` element keeps its own lowering.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst = { move a };
+        passed += Test("abri_move_value", dst[0].item->id, 5);
+    }
+    passed += Test("abri_move_freed_once_each", dtorCount, 1);
+
+    // 7. MIXED list: a consumed lvalue beside an untouched temp.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst = { a, oaiMake(7) };
+        passed += Test("abri_mixed_value0", dst[0].item->id, 5);
+        passed += Test("abri_mixed_value1", dst[1].item->id, 7);
+        passed += Test("abri_mixed_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_mixed_freed_once_each", dtorCount, 2);
+
+    // 8. TWO unique fields in one element - both handles transfer, neither is double-freed.
+    dtorCount = 0;
+    {
+        OaiBox2 a;
+        a.a = new Resource(); a.a->id = 5;
+        a.b = new Resource(); a.b->id = 6;
+        OaiBox2[2] dst = { a };
+        passed += Test("abri_two_value_a", dst[0].a->id, 5);
+        passed += Test("abri_two_value_b", dst[0].b->id, 6);
+        passed += Test("abri_two_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_two_freed_once_each", dtorCount, 2);
+
+    // 9. NESTED owner (the owned resource is one level down).
+    dtorCount = 0;
+    {
+        OaiNest a;
+        a.inner = oaiMake(5);
+        OaiNest[2] dst = { a };
+        passed += Test("abri_nested_value", dst[0].inner.item->id, 5);
+        passed += Test("abri_nested_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_nested_freed_once_each", dtorCount, 1);
+
+    // 10. A COPYABLE owner COPIES: both sources stay live with their own buffers, so teardown
+    // frees four distinct resources.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource(); a.item->id = 5;
+        OaiCopyBox b;
+        b.item = new Resource(); b.item->id = 6;
+        OaiCopyBox[2] dst = { a, b };
+        passed += Test("abri_copyable_value0", dst[0].item->id, 5);
+        passed += Test("abri_copyable_value1", dst[1].item->id, 6);
+        passed += Test("abri_copyable_source_live", a.item->id, 5);
+        passed += Test("abri_copyable_independent0", dst[0].item != a.item, true);
+        passed += Test("abri_copyable_independent1", dst[1].item != b.item, true);
+        passed += Test("abri_copyable_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_copyable_freed_once_each", dtorCount, 4);
+
+    // 11. An owning struct whose resource is a STRING. A bare `string` ELEMENT keeps its own
+    // owned-bit machinery and is deliberately NOT routed through this arm.
+    {
+        string abriSeed = "ab";
+        OaiSBox a;
+        a.s = abriSeed + "cd";
+        OaiSBox[2] dst = { a };
+        passed += Test("abri_stringowner_value", dst[0].s, "abcd");
+        passed += Test("abri_stringowner_source_live", a.s, "abcd");
+    }
+
+    // 12. ACCEPT SET: a POD element owns nothing, so it stays a plain bit copy, source live.
+    {
+        OaiPod a;
+        a.x = 5;
+        OaiPod[2] dst = { a };
+        passed += Test("abri_pod_value", dst[0].x, 5);
+        passed += Test("abri_pod_source_live", a.x, 5);
+    }
+
+    // 13. PARTIAL list: the trailing slot keeps its zero-fill (the value-init splat is untouched).
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst = { a };
+        passed += Test("abri_partial_value", dst[0].item->id, 5);
+        passed += Test("abri_partial_tail_zeroed", dst[1].item == nullptr, true);
+    }
+    passed += Test("abri_partial_freed_once_each", dtorCount, 1);
+
+    // 14. The BARE-BRACE spelling of the same declaration, which reaches the emitter by a
+    // different route in the declarator (initDecl->LeftBrace(), not initializer->LeftBrace()).
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] dst { a };
+        passed += Test("abri_barebrace_value", dst[0].item->id, 5);
+        passed += Test("abri_barebrace_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_barebrace_freed_once_each", dtorCount, 1);
+
+    // 15. The FIELD-DEFAULT brace path, the emitter's second caller. The global source is
+    // consumed by the default construction exactly as a local source is.
+    dtorCount = 0;
+    {
+        oaiFdSeed = oaiMake(5);
+        OaiFdWrap w = default;
+        passed += Test("abri_fielddefault_value", w.arr[0].item->id, 5);
+        passed += Test("abri_fielddefault_source_nulled", oaiFdSeed.item == nullptr, true);
+        passed += Test("abri_fielddefault_no_early_free", dtorCount, 0);
+    }
+    passed += Test("abri_fielddefault_freed_once_each", dtorCount, 1);
 
     return passed;
 }
@@ -6344,6 +6535,9 @@ extern int main()
 
     passed += testOwningAssignIntoFixedArrayElement();
     total += 56;
+
+    passed += testOwningBraceInitFixedArray();
+    total += 52;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

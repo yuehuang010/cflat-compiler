@@ -4011,6 +4011,19 @@ public:
         size_t line,
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList);
 
+    /*
+     * Per-element owning-source decision for a positional fixed-array brace list. Constructs the
+     * slot: a copyable owner copies, a non-copyable owner moves (source zeroed + MarkVariableMoved
+     * for a named slot). No drop-old - the slot is fresh. `val` is replaced by the value to store.
+     */
+    void ConsumeOwningBraceElementSource(
+        const LLVMBackend::NamedVariable& nv,
+        llvm::Value*& val,
+        llvm::Value* elemPtr,
+        const LLVMBackend::TypeAndValue& elemTV,
+        const std::string& elemTypeName,
+        antlr4::ParserRuleContext* ctx);
+
     // The slot-taking half of the above: everything after the array storage exists. Shared
     // with the field-default path, which owns an alloca rather than a registered local.
     void EmitPositionalFixedArrayIntoSlot(
