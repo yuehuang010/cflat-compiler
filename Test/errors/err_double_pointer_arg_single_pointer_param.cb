@@ -1,0 +1,76 @@
+// A 'T**' argument must not bind a 'T*' parameter. Before the fix the overload scorer
+// (TypeAndValue::IsTypeMatch) gated on the BOOLEAN Pointer and never on indirection depth, so
+// the call compiled, linked and ran, reading the low bytes of the heap address as the pointee.
+// No verifier complaint: under opaque pointers 'ptr' and 'ptr' are the same LLVM type.
+//
+// The gate is ONE-SIDED. ElemPointer is recorded only by source parsing and C interop, so its
+// absence means "depth not recorded", never "depth 1" - only a PROVEN 'T**' argument at a
+// PROVEN 'T*' parameter is refused. The accept set (including the reverse direction, void*,
+// and array-of-pointer slots) is frozen as value legs in Test/test_basic.cb ("pd_*").
+
+class DpCircle { int r = 0; };
+
+int dpByPtr(DpCircle* c) { return 2000 + c->r; }
+
+class DpBox { int take(DpCircle* c) { return 2000 + c->r; } };
+
+class DpWrap { DpCircle* c = nullptr; DpWrap(DpCircle* p) { c = p; } };
+
+class DpHolder { DpCircle** pp = nullptr; };
+
+DpCircle** dpForward(DpCircle** s) { return s; }
+
+extern int main()
+{
+    // Declared 'T**' local: the filed repro. The depth note names both types and both remedies.
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        int r = dpByPtr(pp);
+    }
+
+    // A 'T**' RETURN value carries the same depth as a declared local.
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        int r = dpByPtr(dpForward(pp));
+    }
+
+    // A 'T**' FIELD read: the depth rides the field type, not the declaration statement.
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpHolder h = default;
+        h.pp = &a;
+        int r = dpByPtr(h.pp);
+    }
+
+    // 'T***' into 'T*'. ElemPointer caps the recorded depth at 2, so a triple pointer is
+    // refused as a proven 'T**'. This leg pins the GENERIC wording on purpose: at the cap the
+    // note would spell a 'T***' argument 'T**', so only the refusal is pinned, not the text.
+    // ('T***' into 'T**' is NOT refused at all - same cap - and that residue is filed.)
+    expect_error("no overload of 'dpByPtr' matches the given arguments") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpCircle*** ppp = &pp;
+        int r = dpByPtr(ppp);
+    }
+
+    // A METHOD call scores through the same scorer, with 'this' occupying parameter 0 - so the
+    // note must name parameter 1 here. Pins that the index is the PARAMETER index, not the
+    // user-visible argument index.
+    expect_error("parameter 1 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpBox b = default;
+        int r = b.take(pp);
+    }
+
+    // A CONSTRUCTOR call resolves through the same overload set.
+    expect_error("parameter 0 'p' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpWrap w = DpWrap(pp);
+    }
+
+    return 0;
+}

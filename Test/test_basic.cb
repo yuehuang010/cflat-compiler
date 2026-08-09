@@ -2092,6 +2092,15 @@ class PabCounter : IPabTaker { int bump(int n) { return 5000 + n; } };
 interface IPabPtrTaker { int peek(int* p); };
 class PabPeeker : IPabPtrTaker { int peek(int* p) { if (p == nullptr) { return 6001; } return 6000 + *p; } };
 
+// Pointer DEPTH gate: the scorer compared the boolean Pointer, so a 'T**' argument scored a
+// perfect match on a 'T*' parameter. The overload pair is the discriminating shape - both
+// candidates have the same arity, so the depth is the only thing that can separate them.
+class PdCircle { int r = 0; };
+int pdPick(PdCircle* c)  { return 1; }
+int pdPick(PdCircle** c) { return 2; }
+int pdByPtrPtr(PdCircle** c) { return 1000 + (*c)->r; }
+int pdByVoid(void* p) { return p == nullptr ? 0 : 1; }
+
 bool testOverloadResolution()
 {
     bool result = true;
@@ -2162,6 +2171,34 @@ bool testOverloadResolution()
     result &= Test("pab_indirect_deref_arg", fval(*pc), 8003);
     function<int(int*)> fip = (int* p) => { return 9000 + *p; };
     result &= Test("pab_indirect_intptr_param", fip(&px), 9009);
+
+    // ---- Pointer DEPTH gate (a 'T**' argument must not bind a 'T*' parameter) ----
+    // FIX LEG: pre-fix both `pdPick` overloads scored a PERFECT match for a 'PdCircle**'
+    // (IsTypeMatch compared the boolean Pointer only), so the 'T*' one won by declaration
+    // order and read the low bytes of the heap address. 2 proves the 'T**' overload wins.
+    PdCircle* pdA = new PdCircle();
+    pdA->r = 3;
+    PdCircle** pdPP = &pdA;
+    result &= Test("pd_ptrptr_arg_picks_ptrptr_overload", pdPick(pdPP), 2);
+    result &= Test("pd_ptr_arg_still_picks_ptr_overload", pdPick(pdA), 1);
+    // The remedy the new diagnostic names: an explicit '*' reaches the 'T*' overload.
+    result &= Test("pd_deref_ptrptr_arg_picks_ptr_overload", pdPick(*pdPP), 1);
+    // Fails if the gate stopped being one-sided: a lone 'T**' parameter still takes a 'T**'.
+    result &= Test("pd_ptrptr_arg_into_ptrptr_param", pdByPtrPtr(pdPP), 1003);
+    // REVERSE direction, deliberately NOT gated - ElemPointer=false means "depth not recorded",
+    // never "depth 1". Measured: this leg goes red only when the gate is made symmetric AND the
+    // fixed-array exclusion is dropped, so it is the one that pins that exclusion.
+    PdCircle*[2] pdArr = default;
+    pdArr[0] = new PdCircle();
+    pdArr[0]->r = 4;
+    result &= Test("pd_ptr_array_slot_into_ptrptr_param", pdByPtrPtr(pdArr), 1004);
+    // A 'T**' still converts to 'void*'. Measured: these two survive both mutations, because the
+    // "any pointer -> void*" rule downstream re-accepts what the gate refuses; the void exclusion
+    // exists for the DIAGNOSTIC, which without it falsely blamed a 'void*' parameter.
+    result &= Test("pd_ptrptr_arg_into_voidptr_param", pdByVoid(pdPP), 1);
+    result &= Test("pd_ptr_arg_into_voidptr_param", pdByVoid(pdA), 1);
+    // Goes red the moment the gate is made symmetric: '&pdArr[0]' records no depth at all.
+    result &= Test("pd_ptrptr_from_array_elem_addr", pdByPtrPtr(&pdArr[0]), 1004);
 
     delete pc;
     delete ps;

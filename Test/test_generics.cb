@@ -4111,6 +4111,59 @@ bool testGnUnresolvedGenericShellGate()
     return result;
 }
 
+
+// ---------------------------------------------------------------
+// Pointer-depth gate vs generic substitution
+// ---------------------------------------------------------------
+// PeelTypeArgSuffix collapses a type argument's stars into ONE bool, so the substituted `T x`
+// parameter of Pdg<C**> records Pointer=1/ElemPointer=0 - identical to a hand-written `C* x`.
+// The overload depth gate therefore must NOT read that as proof of depth 1 (PointerDepthUnknown).
+class PdgC { int r = 0; };
+class PdgBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; } };
+int pdgId<T>(T x) { return 7; }
+int pdgThin(PdgC* c) { return 100 + c->r; }
+
+bool testGnPointerDepthSubstitution()
+{
+    bool result = true;
+
+    PdgC* a = new PdgC();
+    a->r = 3;
+    PdgC** pp = &a;
+
+    // A 'C**' argument into a substituted 'T' parameter. Rejected before PointerDepthUnknown
+    // existed, because the parameter looked like a proven 'C*'.
+    PdgBox<PdgC**> deep = default;
+    result &= Test("pdg_ptrptr_typearg_put", deep.put(pp), 1);
+    PdgC** back = deep.get();
+    result &= Test("pdg_ptrptr_typearg_roundtrip", (*back)->r, 3);
+
+    // The depth-1 instantiation of the same template keeps working.
+    PdgBox<PdgC*> thin = default;
+    result &= Test("pdg_ptr_typearg_put", thin.put(a), 1);
+    result &= Test("pdg_ptr_typearg_roundtrip", thin.get()->r, 3);
+
+    // A generic FUNCTION's substituted parameter, same collapse.
+    result &= Test("pdg_ptrptr_generic_fn", pdgId<PdgC**>(pp), 7);
+    result &= Test("pdg_ptr_generic_fn", pdgId<PdgC*>(a), 7);
+
+    // Core containers reach the same substitution path.
+    list<PdgC**> lst = default;
+    lst.add(pp);
+    PdgC** lback = lst.get(0);
+    result &= Test("pdg_ptrptr_list_roundtrip", (*lback)->r, 3);
+    dictionary<int, PdgC**> dict = default;
+    dict.add(1, pp);
+    PdgC** dback = dict.get(1);
+    result &= Test("pdg_ptrptr_dict_roundtrip", (*dback)->r, 3);
+
+    // A substituted value flowing OUT of a template into a plain 'C*' parameter also carries
+    // unknown depth, so it must keep binding exactly as it does on master.
+    result &= Test("pdg_typearg_value_into_thin_param", pdgThin(thin.get()), 103);
+
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4253,6 +4306,7 @@ extern int main()
 
     total++; passed += testGnCanonicalPrimitiveTypeArg()          ? 1 : 0;
     total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;
+    total++; passed += testGnPointerDepthSubstitution()            ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

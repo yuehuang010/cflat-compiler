@@ -756,6 +756,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         j["t"] = tv.TypeName;
         if (tv.Pointer)        j["p"]   = true;
         if (tv.ElemPointer)    j["ep"]  = true;
+        if (tv.PointerDepthUnknown) j["pdu"] = true;
         if (tv.IsMove)         j["mv"]  = true;
         if (tv.CallConv != CallingConv::Default) j["cc"] = static_cast<int>(tv.CallConv);
         if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
@@ -787,6 +788,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         tv.TypeName       = j.value("t",   std::string{});
         tv.Pointer        = j.value("p",   false);
         tv.ElemPointer    = j.value("ep",  false);
+        tv.PointerDepthUnknown = j.value("pdu", false);
         tv.IsMove         = j.value("mv",  false);
         tv.CallConv = static_cast<CallingConv>(j.value("cc", 0));
         tv.ConstArraySize = j.value("arr", uint64_t{0});

@@ -664,7 +664,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     aliasPtrDepth = PeelAliasPointerStars(typeName);  // using Handle = void* -> depth 1
                     declType.TypeName = typeName;
-                    if (substPointer) declType.Pointer = true;
+                    // A type-arg string carries its stars as ONE bool (PeelTypeArgSuffix), so from
+                    // here the recorded depth is a lower bound - `Box<C*>` and `Box<C**>` agree.
+                    if (substPointer) { declType.Pointer = true; declType.PointerDepthUnknown = true; }
                     if (substArrayView)
                     {
                         // T bound to a `T[]` arg: the field/local is a noalias array-view (a thin

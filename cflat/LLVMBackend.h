@@ -544,6 +544,11 @@ public:
         std::string VariableName;
         bool Pointer = false;
         bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
+        // The Pointer/ElemPointer bits came (partly) from a GENERIC TYPE-ARGUMENT string, which
+        // PeelTypeArgSuffix collapses to one bool - `Box<C*>` and `Box<C**>` both record Pointer=1,
+        // ElemPointer=0. So the recorded depth is a LOWER BOUND here, not the depth. Read only by
+        // IsProvenSinglePointer / IsProvenDoublePointer, which decline to claim proof when it is set.
+        bool PointerDepthUnknown = false;
         bool IsInterface = false;
         bool IsInterfacePointer = false; // true when T is interface AND this is a pointer TO that fat-ptr (e.g. T* field where T=IMessage, or channel<IMessage*>)
         // True when this type IS one bare interface fat value ({vtable,data} by value). DERIVED,
@@ -703,10 +708,20 @@ public:
          * That gate: a pointer ARGUMENT does not bind a by-value parameter - the raw address would
          * land in the value slot and reach the LLVM verifier. `T` into a `T*` parameter is the
          * working implicit address-of (the caller passes the alloca) and stays a match.
+         *
+         * The DEPTH gate below is one-sided for the same reason and one more: ElemPointer is
+         * recorded only by source parsing and C interop, so its absence is "not recorded", never
+         * "depth 1". Only a PROVEN `T**` argument at a PROVEN `T*` parameter is refused; the
+         * reverse direction (`T*` / a `T*[N]` slot into a `T**` parameter) is a working spelling
+         * and must keep binding. Arrays, views, simd, interfaces and function pointers spell
+         * ElemPointer about their ELEMENT rather than their own depth, so they are excluded.
          */
         bool IsTypeMatch(const TypeAndValue& other) const
         {
             if (Pointer && !other.Pointer)
+                return false;
+
+            if (IsProvenDoublePointer() && other.IsProvenSinglePointer())
                 return false;
 
             if (TypeName == other.TypeName)
@@ -799,6 +814,27 @@ public:
         // '*' count this VALUE carries, for copying into a signature component's PointerDepth.
         // ElemPointer is the only depth a TypeAndValue records, so 2 is the ceiling here.
         int ValuePointerDepth() const { return ElemPointer ? 2 : (Pointer ? 1 : 0); }
+
+        // A plain `T**` value: ElemPointer means "pointer to pointer" only when nothing else on
+        // the type claims it for an ELEMENT (array/view/simd) or a fat shape (interface/funcptr).
+        bool IsProvenDoublePointer() const
+        {
+            return Pointer && ElemPointer && !PointerDepthUnknown && DepthIsAboutThisValue();
+        }
+
+        // A plain `T*` value. `void*` is excluded because every pointer converts to it: without
+        // that the overload dump claimed a `T**` cannot reach a `void*` param, which is false.
+        bool IsProvenSinglePointer() const
+        {
+            return Pointer && !ElemPointer && !PointerDepthUnknown
+                && TypeName != "void" && DepthIsAboutThisValue();
+        }
+
+        bool DepthIsAboutThisValue() const
+        {
+            return !IsArrayView && !IsSimd && ConstArraySize == 0 && AliasArraySize == 0
+                && !IsInterface && !IsInterfacePointer && !IsFunctionPointer;
+        }
 
         /*
          * The overload IDENTITY of this type: two parameters are the same overload slot exactly

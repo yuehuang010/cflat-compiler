@@ -52,6 +52,14 @@
 
 // ---- Definitions moved out of LLVMBackend.h (Overloads) ----
 
+// The '*' count a diagnostic prints for a value type. ElemPointer is the only depth a
+// TypeAndValue records, and array/view/simd/fat shapes spell it about their ELEMENT.
+static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
+{
+    if (!tv.Pointer) return "";
+    return (tv.ElemPointer && tv.DepthIsAboutThisValue()) ? "**" : "*";
+}
+
 std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
 {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
@@ -781,7 +789,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     name = arg.TypeAndValue.VariableName;
                 }
-                msg += std::format("    [{}] {}{} {}\n", i, typeName, arg.TypeAndValue.Pointer ? "*" : "", name);
+                msg += std::format("    [{}] {}{} {}\n", i, typeName, PointerStars(arg.TypeAndValue), name);
             }
 
             // Candidates
@@ -793,7 +801,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     if (i > 0) paramList += ", ";
                     const auto& p = c.Parameters[i];
-                    paramList += std::format("{}{} {}", p.TypeName, p.Pointer ? "*" : "", p.VariableName);
+                    paramList += std::format("{}{} {}", p.TypeName, PointerStars(p), p.VariableName);
                 }
                 msg += std::format("    {}({})\n", c.UniqueName, paramList);
             }
@@ -814,10 +822,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         resolvedArgs[i].BaseType->print(rso);
                         argDesc = typeStr;
                     }
-                    bool argPtr = i < resolvedArgs.size() && resolvedArgs[i].TypeAndValue.Pointer;
+                    std::string argPtr = i < resolvedArgs.size() ? PointerStars(resolvedArgs[i].TypeAndValue) : "";
                     std::string paramDesc = i < resolvedSym.Parameters.size() ? resolvedSym.Parameters[i].TypeName : "<missing>";
-                    bool paramPtr = i < resolvedSym.Parameters.size() && resolvedSym.Parameters[i].Pointer;
-                    msg += std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr ? "*" : "", paramDesc, paramPtr ? "*" : "");
+                    std::string paramPtr = i < resolvedSym.Parameters.size() ? PointerStars(resolvedSym.Parameters[i]) : "";
+                    msg += std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr, paramDesc, paramPtr);
                 }
             }
 
@@ -870,6 +878,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         msg += std::format("  [{}] parameter {} has type '{}' and the argument is a "
                             "function-pointer or closure VALUE - code does not convert to a "
                             "non-pointer type.\n", c.UniqueName, i, pi->TypeName);
+                    break;
+                }
+            }
+
+            /*
+             * Name the mechanism when a candidate was dropped for pointer DEPTH. Fires only where
+             * the depth gate is what refused - both sides proven, which is the same condition
+             * TypeAndValue::IsTypeMatch tests - so the wording is true wherever it appears.
+             */
+            for (const auto& c : candidates)
+            {
+                bool arityFits = c.Variadic ? arguments.size() >= c.Parameters.size()
+                                            : arguments.size() == c.Parameters.size();
+                if (!arityFits) continue;
+                auto pi = c.Parameters.begin();
+                for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
+                {
+                    if (!arguments[i].TypeAndValue.IsProvenDoublePointer()
+                        || !pi->IsProvenSinglePointer()) continue;
+                    // A mangled instantiation name is not writable source, so the advice clause is
+                    // dropped rather than naming a type the user cannot spell.
+                    bool writable = true;
+                    std::string shown = DisplayNameOfMangledType(pi->TypeName, &writable);
+                    std::string advice = writable
+                        ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
+                    msg += std::format("  [{}] parameter {} '{}' has type '{}*' and the argument has "
+                        "type '{}**' - there is no implicit dereference. Dereference it with '*' at "
+                        "the call site{}.\n",
+                        c.UniqueName, i, pi->VariableName, shown,
+                        DisplayNameOfMangledType(arguments[i].TypeAndValue.TypeName), advice);
                     break;
                 }
             }
