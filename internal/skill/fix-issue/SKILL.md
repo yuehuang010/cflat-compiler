@@ -1,6 +1,6 @@
 ---
 name: fix-issue
-description: Fix a known issue holistically in an isolated git worktree with a delegated agent - the issue is a pointer to a problem area, so the agent enumerates coverage axes and builds a pre-fix behaviour matrix before fixing - then review with an opus code-review agent until clean and merge back to master as a single-parent commit. Use when the user says "fix issue X", names a file in internal/issue/, or asks to work an issue end-to-end in a worktree.
+description: Fix a known issue holistically in an isolated git worktree with a delegated agent - the issue is a pointer to a problem area, so the agent enumerates coverage axes and builds a pre-fix behaviour matrix before fixing - then review with an opus code-review agent that may apply small fixes itself, loop until clean, and merge back to master as a single-parent commit. Use when the user says "fix issue X", names a file in internal/issue/, or asks to work an issue end-to-end in a worktree.
 ---
 
 # Fix Issue
@@ -263,20 +263,60 @@ collide with the fix agent's files, to report findings as a ranked list with
 file:line, and to state plainly if the diff is clean - "safe with listed fixes"
 is not clean.
 
-- If findings exist: send them back to the fix agent (same worktree; continue the
-  existing agent via SendMessage so it keeps its context) and ask for fixes plus a
-  re-run of the full verification bar (`./test.sh Release` and the example gate).
-  Review fixes must be folded into the single
-  commit with `git commit --amend`, never stacked as follow-up commits. Then
-  re-review with the SAME reviewer (SendMessage), scoping the next round to what
-  the last round CHANGED and saying what not to re-verify - narrowly-scoped
-  rounds found the worst defects.
-- **Carry cosmetic findings as a punch-list into the next SUBSTANTIVE round**
-  rather than spending a round-trip on each. A comment with a wrong example, an
-  over-long comment, a message that mis-describes a declaration - none of these
-  justify their own agent invocation and bar re-run. Accumulate them and attach
-  them to the next round that has real work in it. Correctness findings and
-  false claims in a tracked record still go back immediately.
+**The reviewer MAY apply fixes directly.** It is in the worktree and already
+holds the context; bouncing a one-line correction back to the fix agent costs a
+full invocation plus a bar re-run for nothing. Grant it that authority in its
+prompt, with these rules:
+
+- It applies the fix, folds it into the single commit with `git commit --amend`
+  (never a follow-up commit), re-runs the full verification bar
+  (`./cmake_build.sh release && ./test.sh Release` plus the host example gate),
+  and reports what it changed as a diff summary alongside its findings.
+- It must still REPORT every finding it fixed. A silently-applied fix is a
+  finding nobody reviewed.
+- It must NOT weaken, delete, or loosen a regression leg to make something pass,
+  and must not narrow the fix's scope. Those go back to the fix agent as
+  findings instead.
+- If a finding is large enough to need re-enumeration - a missing coverage axis,
+  a guard whose accept-set was never built, a root cause the diff does not
+  actually address - it does NOT apply it. That is fix-agent work; report it.
+- It classifies each fix it applied as **trivial** or **non-trivial**. Trivial
+  means it cannot change compiled behaviour or test strength: comments, message
+  wording, ASCII/formatting, dead code removal, a test comment that misnames the
+  arm it reaches. Everything else - any `.h`/`.cpp` logic edit, any new or
+  changed assertion, anything touching a guard predicate or a diagnostic's
+  firing condition - is non-trivial, however small the diff.
+
+Then, depending on what happened:
+
+- **Reviewer applied only trivial fixes and found nothing else**: the round is
+  clean. No extra round. Verify the amend yourself
+  (`git rev-list --count master..HEAD` is still 1, and read the amended diff).
+- **Reviewer applied a non-trivial fix**: one more round is REQUIRED - nobody
+  has reviewed that code. Run it as an independent check, not a self-review:
+  send the reviewer's applied diff to the fix agent (SendMessage, same worktree,
+  existing context) and ask it to verify that diff specifically - does it hold
+  under the coverage matrix, does every leg still fail pre-fix for its stated
+  reason, did the bar actually run green. If the fix agent disputes it, the
+  reviewer and fix agent are both wrong until one of them measures; make them
+  measure rather than arbitrating yourself.
+- **Findings the reviewer did not apply**: send them back to the fix agent (same
+  worktree; continue the existing agent via SendMessage so it keeps its context)
+  and ask for fixes plus a re-run of the full verification bar. Fixes must be
+  folded into the single commit with `git commit --amend`, never stacked as
+  follow-up commits. Then re-review with the SAME reviewer (SendMessage),
+  scoping the next round to what the last round CHANGED and saying what not to
+  re-verify - narrowly-scoped rounds found the worst defects.
+
+Reviewer-applied fixes and their verification rounds count against the same
+3-round budget below.
+- **Cosmetic findings are the reviewer's to fix, not a punch-list.** A comment
+  with a wrong example, an over-long comment, a message that mis-describes a
+  declaration - the reviewer amends these itself and reports them. Do not spend
+  a round-trip on any of them. If such a fix is provably doc-only
+  (`git diff --stat` shows no `.h`/`.cpp`/`.cb` touched), the bar re-run is
+  skipped, same as in Step 2 - say so in the report. Correctness findings and
+  false claims in a tracked record follow the non-trivial path above.
 - Repeat until the review is clean or 3 rounds have elapsed.
 - If still not clean after 3 rounds, STOP. Do not merge. Report the outstanding
   findings and leave the worktree in place for the user.
