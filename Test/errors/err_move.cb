@@ -11,6 +11,13 @@ void Holder(Holder* self) {}
 struct ArrElemBox { unique MoveResource* item = nullptr; };
 struct ArrElemNest { ArrElemBox inner = default; };
 
+// A by-value owning PARAMETER used as a positional brace element is consumed by the callee, so
+// the owning-sink inference must make it a sink and the CALLER must surrender its argument. Both
+// brace spellings, plus the assignment spelling that is the oracle for them.
+void bpsBraceParam(ArrElemBox p)     { ArrElemBox[2] d = { p }; }
+void bpsBraceBareParam(ArrElemBox p) { ArrElemBox[2] d { p }; }
+void bpsAssignParam(ArrElemBox p)    { ArrElemBox[2] d; d[0] = p; }
+
 // Dereference-of-explicitly-moved-pointer coverage. Explicit 'move' of a thin `unique`
 // pointer/interface local nulls it but, by design, leaves it plain-readable (a == nullptr,
 // passing it along, etc. stay legal - see test_move.cb's explicit_move_local_* cases); only a
@@ -522,6 +529,32 @@ extern int main()
         ArrElemBox abrTwice;
         abrTwice.item = new MoveResource();
         ArrElemBox[2] abrDup = { abrTwice, abrTwice };
+    }
+
+    // CALLER half of the brace element store. Passing a named owner to a parameter the callee
+    // consumes surrenders it, so a later read is a use after move. Before the fix the caller was
+    // never told, so this compiled and both sides freed one resource (rc 134).
+    expect_error("use of moved variable 'bpsA'") {
+        ArrElemBox bpsA;
+        bpsA.item = new MoveResource();
+        bpsBraceParam(bpsA);
+        int bpsAId = bpsA.item->id;
+    }
+
+    // The bare-brace spelling hangs its list off the declarator, a second syntactic site.
+    expect_error("use of moved variable 'bpsB'") {
+        ArrElemBox bpsB;
+        bpsB.item = new MoveResource();
+        bpsBraceBareParam(bpsB);
+        int bpsBId = bpsB.item->id;
+    }
+
+    // The ORACLE the two above must match: the assignment spelling of the same callee store.
+    expect_error("use of moved variable 'bpsC'") {
+        ArrElemBox bpsC;
+        bpsC.item = new MoveResource();
+        bpsAssignParam(bpsC);
+        int bpsCId = bpsC.item->id;
     }
 
     // The brace element decision must not swallow a type mismatch either: an `ArrElemBox` value

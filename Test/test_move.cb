@@ -4635,6 +4635,128 @@ int testOwningBraceInitFixedArray()
     return passed;
 }
 
+/*
+ * The CALLER half of the arm above. A by-value owning PARAMETER used as a positional brace
+ * element is consumed by the callee, so the owning-sink inference must see the brace-list site
+ * and make the parameter a sink - otherwise the caller keeps its argument live and both sides
+ * free one resource (rc 134). Every leg below is measured against the `dst[0] = p;` spelling,
+ * which was already a sink and is carried alongside as the oracle.
+ */
+int bpsBrace(OaiBox p)          { OaiBox[2] dst = { p }; return dst[0].item->id; }
+int bpsBraceBare(OaiBox p)      { OaiBox[2] dst { p }; return dst[0].item->id; }
+int bpsAssign(OaiBox p)         { OaiBox[2] dst; dst[0] = p; return dst[0].item->id; }
+int bpsBraceCond(OaiBox p, int c)
+{
+    if (c != 0) { OaiBox[2] dst = { p }; return dst[0].item->id; }
+    return -1;
+}
+int bpsGenericBrace<T>(T p)     { T[2] dst = { p }; return dst[0].item->id; }
+// A COPYABLE owner stays a borrow: the structural sink flag is filtered by the concrete
+// copyability gate, so the caller's source must still be live after the call.
+int bpsCopyBrace(OaiCopyBox p)  { OaiCopyBox[2] dst = { p }; return dst[0].item->id; }
+int bpsPodBrace(OaiPod p)       { OaiPod[2] dst = { p }; return dst[0].x; }
+// A field reached through a BORROWED POINTER parameter: an indirect source, consumed silently,
+// and the pointer parameter itself is not sink-eligible.
+int bpsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { wp->b }; return dst[0].item->id; }
+
+int testBraceInitConsumesParameter()
+{
+    int passed = 0;
+
+    // 1. The filed repro: the callee's element consumes the parameter, so the caller's
+    // argument must be surrendered and freed exactly once, by the callee.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("bps_brace_value", bpsBrace(a), 5);
+        passed += Test("bps_brace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_brace_freed_once_total", dtorCount, 1);
+
+    // 2. The assignment ORACLE, same shape: the counts must match leg 1 exactly.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("bps_assign_value", bpsAssign(a), 5);
+        passed += Test("bps_assign_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_assign_freed_once_total", dtorCount, 1);
+
+    // 3. The bare-brace spelling hangs its list off the declarator, a second syntactic site.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("bps_barebrace_value", bpsBraceBare(a), 5);
+        passed += Test("bps_barebrace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_barebrace_freed_once_total", dtorCount, 1);
+
+    // 4. A TEMP argument has no named source to null, and must still be freed once.
+    dtorCount = 0;
+    passed += Test("bps_temp_value", bpsBrace(oaiMake(7)), 7);
+    passed += Test("bps_temp_freed_once", dtorCount, 1);
+
+    // 5. CONDITIONAL consumption. The sink is unconditional (the scan descends into the
+    // branch), so the not-taken path still frees in the callee - the oracle's behaviour.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("bps_cond_taken_value", bpsBraceCond(a, 1), 5);
+        passed += Test("bps_cond_taken_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_cond_taken_freed_once_total", dtorCount, 1);
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("bps_cond_skipped_value", bpsBraceCond(a, 0), -1);
+        passed += Test("bps_cond_skipped_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_cond_skipped_freed_once_total", dtorCount, 1);
+
+    // 6. A GENERIC function's monomorphized parameter runs the same inference.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(9);
+        passed += Test("bps_generic_value", bpsGenericBrace<OaiBox>(a), 9);
+        passed += Test("bps_generic_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("bps_generic_freed_once_total", dtorCount, 1);
+
+    // 7. ACCEPT SET: a copyable owner's element is a COPY, so the parameter stays a borrow
+    // and the caller's source is still readable and freed on its own.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 11;
+        passed += Test("bps_copyable_value", bpsCopyBrace(a), 11);
+        passed += Test("bps_copyable_source_live", a.item->id, 11);
+    }
+    passed += Test("bps_copyable_freed_all", dtorCount, 2);
+
+    // 8. ACCEPT SET: a POD parameter owns nothing, so it is never a sink.
+    {
+        OaiPod a;
+        a.x = 4;
+        passed += Test("bps_pod_value", bpsPodBrace(a), 4);
+        passed += Test("bps_pod_source_live", a.x, 4);
+    }
+
+    // 9. ACCEPT SET: the element source is a FIELD reached through a POINTER parameter, not
+    // the parameter itself. The field is consumed silently (indirect lvalue), the pointer
+    // parameter is not sink-eligible, and the resource is still freed exactly once.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(3);
+        passed += Test("bps_ptrfieldsrc_value", bpsPtrFieldBrace(&w), 3);
+        passed += Test("bps_ptrfieldsrc_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("bps_ptrfieldsrc_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
 int testBorrowedPointerMoveNoAdopt()
 {
     int passed = 0;
@@ -6538,6 +6660,9 @@ extern int main()
 
     passed += testOwningBraceInitFixedArray();
     total += 52;
+
+    passed += testBraceInitConsumesParameter();
+    total += 28;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

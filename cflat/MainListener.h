@@ -1307,9 +1307,23 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
     }
 }
 
+// Collect the bare source name of each POSITIONAL element of a brace list (`{ p, q }`). The
+// fixed-array lowering consumes an owning element source exactly as a slot store does
+// (ConsumeOwningBraceElementSource), so those names are consumed too. Named (`f = v`) and
+// dictionary (`k: v`) forms are skipped - neither reaches that arm.
+inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListContext* list,
+                                               std::unordered_set<std::string>& out)
+{
+    if (list == nullptr) return;
+    for (auto* fi : list->fieldInit())
+        if (fi != nullptr && fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
+            out.insert(fi->assignmentExpression(0)->getText());
+}
+
 // Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
 // the RHS of a plain `=` assignment (`X = value`, incl. a slot store `_data[i] = value`), a decl
-// initializer (`T x = value`), or a `move <name>` (conditional too). Unlike
+// initializer (`T x = value`, incl. its brace-list form `T[N] d = { p };` / `T[N] d { p };`), or a
+// `move <name>` (conditional too). Unlike
 // CollectUnconditionalMovedNames this DESCENDS into runtime conditionals/loops - 8a's total
 // scope-exit drop makes a not-taken path sound. Lambdas / nested functions are a different scope
 // and are not descended into. The caller intersects with the param list; a non-bare RHS (`v.f`,
@@ -1324,8 +1338,16 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
             && asn->assignmentExpression() != nullptr)
             out.insert(asn->assignmentExpression()->getText());
     if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
-        if (auto* iz = init->initializer(); iz != nullptr && iz->assignmentExpression() != nullptr)
-            out.insert(iz->assignmentExpression()->getText());
+    {
+        if (auto* iz = init->initializer(); iz != nullptr)
+        {
+            if (iz->assignmentExpression() != nullptr)
+                out.insert(iz->assignmentExpression()->getText());
+            CollectPositionalBraceElementNames(iz->initializerList(), out);
+        }
+        // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
+        CollectPositionalBraceElementNames(init->initializerList(), out);
+    }
     if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
         if (auto* u = mv->unaryExpression())
             out.insert(u->getText());

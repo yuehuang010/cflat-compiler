@@ -1611,3 +1611,37 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   same shape as the missed subscript producer, caught only by a reviewer probe. Any approximation
   that feeds a POSITIVE proof must degrade to "not recorded", never to a nearby number (frozen as
   the value leg `pd_deref_of_triple_ptr_into_ptrptr_param`).
+- **The 2026-08-09 owning-sink SITE lesson (`fix/parmbrace`)**: a callee-side consume arm and the
+  caller-side sink inference are TWO halves that must be extended together. `fix/bracown` taught
+  the fixed-array brace element to consume its source; the caller half lives in
+  `CollectConsumedStoreNames` (`cflat/MainListener.h`), a purely SYNTACTIC scan that fed
+  `ApplyOwningSinkInference`, and it only knew three source spellings - an `=` RHS, a decl
+  initializer's `assignmentExpression`, and `move <name>`. A brace list is an `initializer` with
+  NO `assignmentExpression`, so `void f(UBox p) { UBox[2] d = { p }; }` consumed the parameter in
+  the callee and never made it a sink: caller kept `a` live, both freed, rc 134, while the
+  assignment spelling `d[0] = p;` was clean. Fix is one small helper - collect the POSITIONAL
+  `fieldInit` texts of a brace list, from BOTH `initDeclarator` alternatives (`= { ... }` and the bare
+  `d { ... }`, which hangs its list off the declarator). **Whenever a new consuming lowering lands,
+  grep `CollectConsumedStoreNames` and ask whether the new source spelling is one of the three it
+  recognizes.**
+  Two properties made the one-line-per-site fix safe and are worth reusing: (a) the scan is
+  deliberately OVER-approximate - marking a sink that the body does not actually consume is sound,
+  because 8a's total scope-exit drop frees the callee's copy anyway (proven by the conditional cell:
+  `if (c) { UBox[2] d = { p }; }` with `c == 0` now frees in the callee, exactly as the assignment
+  oracle already did); and (b) the STRUCTURAL flag `IsConsumeInferredSink` is filtered later by
+  `OwningSinkConsumesConcrete`, so a copyable owner stays a borrow with no extra guard here.
+  `osk`/`cis` already ride the `--init` round-trip, so no serializer change was needed - cold and
+  warm cache measured identical on the repro.
+  Named struct brace-init (`Pair s = { b = p };`) is NOT in this family: it already REJECTS with the
+  "copying owning value ... into a struct field" diagnostic, and positional struct brace-init does
+  not exist. Only the positional form is collected, for that reason.
+  Two neighbours were measured broken in BOTH spellings and filed rather than fixed: a field of a
+  by-VALUE struct parameter (`{ w.b }`, rc 134 - the explicit `move w.b` already rejects it, the
+  implicit stores do not) and lambda parameters, which never reach `ApplyOwningSinkInference` at
+  all. **When the oracle spelling fails the same way, the cell is a different bug** - mirroring it
+  would have propagated the abort, not fixed it.
+  The review found a THIRD such neighbour and filed it: a PARENTHESIZED source `(p)` records the
+  text `"(p)"`, misses the parameter-name intersection, and aborts in all FOUR spellings on both
+  binaries (`p1/parenthesized-consume-source-defeats-owning-sink-inference.md`). That is the
+  over-approximation running the UNSOUND way - over-collecting a name is safe, MISSING one is a
+  double free - so any future edit to these collectors must be checked in that direction too.
