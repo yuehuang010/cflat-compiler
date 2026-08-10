@@ -2502,6 +2502,27 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 }
             }
 
+            /*
+             * Reading a fixed-array `string` element into an EXISTING whole string local/global
+             * (`q = dst[0];`) - the assignment twin of the decl-init element arm. The element owns
+             * its buffer (the store-side arm made sure of that), so a bit copy left both the local
+             * and the element owning it and both freed it (rc 133). Deep-copy BEFORE the drop-old
+             * below, so the destination's destructor cannot free a buffer this copy is reading.
+             * Destination gated by representation (a `%string` alloca/global, whole variable).
+             */
+            if (operatorText == "=" && right
+                && NamedVarIsString(namedVar)
+                && namedVar.FieldName.empty()
+                && !namedVar.TypeAndValue.Pointer
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && IsFixedArrayStringElementRead(rightNV, right))
+            {
+                right = compiler->EmitOwnedStringDeepCopy(right);
+                if (!namedVar.CallerName.empty())
+                    compiler->MarkVariableOwningString(namedVar.CallerName);
+            }
+
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
             // reassignment leak where a pre-declared string local reassigned in a loop
             // (`last = name.copy();`) dropped each prior owned buffer. The string dtor checks the

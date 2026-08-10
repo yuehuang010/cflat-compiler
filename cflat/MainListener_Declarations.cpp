@@ -2914,6 +2914,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // owns, so storing it into another field would double-free - tracked so the
                 // field-store reject can catch the laundered field-to-field copy.
                 bool srcBorrowsOwnedString = false;
+                // True when the initializer READS a `string` element of a fixed array
+                // (`string q = dst[0];`). Such a source has no FieldName, so the field-borrow
+                // taint above never sees it, yet the element owns its buffer just as a field does.
+                bool srcIsFixedArrayStringElem = false;
                 // True when the initializer is an `alias` (borrow) return (`Token t = toks.get(0)`).
                 // The local shallow-aliases storage it does not own, so its scope-exit destructor
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
@@ -3369,6 +3373,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !rightNV.TypeAndValue.IsMove
                                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
                                         || rightNV.BorrowsOwnedString);
+                                srcIsFixedArrayStringElem =
+                                    IsFixedArrayStringElementRead(rightNV, right);
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
@@ -4198,6 +4204,27 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             right = compiler->EmitOwnedStringDeepCopy(right);
                             compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                             didDeepCopyBorrowString = true;
+                        }
+                        // The ELEMENT twin of the field arm above (`string q = dst[0];`). A fixed-array
+                        // `string` element has no FieldName, so srcBorrowsOwnedString is false and the
+                        // plain store bit-copied the {ptr,len,owned} pair: the local and the element both
+                        // owned - and freed - the same buffer (rc 133). Deep-copy so the local owns an
+                        // independent one, exactly as a field source is deep-copied. Both halves are
+                        // gated on the REPRESENTATION: the `%string` named type on the destination
+                        // ALLOCA and on the source value, never on a spelled TypeName.
+                        else if (right->getType()->isStructTy()
+                            && initializer != nullptr
+                            && initializer->assignmentExpression() != nullptr
+                            && !srcIsMove
+                            && !srcIsAlias
+                            && !srcMovableTempField
+                            && srcIsFixedArrayStringElem
+                            && !typeAndValue.Pointer
+                            && compiler->GetTypeFromStorage(alloc)
+                                == llvm::StructType::getTypeByName(*compiler->context, "string"))
+                        {
+                            right = compiler->EmitOwnedStringDeepCopy(right);
+                            compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                         }
 
                         /*
@@ -5388,6 +5415,26 @@ bool MainListener::NamedVarIsString(const LLVMBackend::NamedVariable& nv) {
         if (auto* st = llvm::dyn_cast_or_null<llvm::StructType>(nv.BaseType))
             return st->getName() == "string";
         return false;
+    }
+
+// The READ twin of `destIsFixedArrayElem`: a `string` element of a FIXED array (`dst[0]`,
+// `dst[0][0]`, `w.arr[0]`, a global's element) is a TWO-index GEP over an array type - never
+// Part 6's single-index container/view slot, which stays a borrow. Keyed on the REPRESENTATION
+// (the `%string` named type by identity), because an element read off a temp-producing
+// expression carries no TypeName at all. A `move` source already transferred its buffer.
+bool MainListener::IsFixedArrayStringElementRead(
+        const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
+        if (value == nullptr || nv.Storage == nullptr || !nv.IsElementAccess) return false;
+        if (nv.TypeAndValue.IsMove || nv.TypeAndValue.Pointer || nv.TypeAndValue.IsArrayView)
+            return false;
+        // GEPOperator, not GetElementPtrInst: a constant index off a GLOBAL array folds the
+        // access into a ConstantExpr GEP that the instruction cast would miss.
+        auto* gep = llvm::dyn_cast<llvm::GEPOperator>(nv.Storage);
+        if (gep == nullptr || gep->getNumIndices() != 2
+            || !gep->getSourceElementType()->isArrayTy())
+            return false;
+        return value->getType()
+            == llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
     }
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(

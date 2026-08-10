@@ -1850,3 +1850,41 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   call gate now sees it first. `Test/errors/err_ternary_incompatible_types.cb` was updated to the
   new wording with a comment naming why, and the join's own diagnostic was PROVEN still live
   (`c ? (void)f() : (void)f()` still hits it) rather than left to rot as dead code.
+
+- **`fix/strread` - the READ side of the fixed-array `string` element, and where the same shape
+  stops being reachable.** With the store side landed (`fix/strelem`), the element genuinely owned
+  its buffer, so every READ of one handed a second owner the same `{ptr,len,owned}` pair. Three
+  positions were broken and are fixed by one predicate,
+  `MainListener::IsFixedArrayStringElementRead` - Storage is a TWO-index GEP over an array type,
+  `IsElementAccess` set, and the loaded value is the `%string` NAMED TYPE by identity: the
+  declaration initializer (`string q = dst[0];`, a new `else if` beside the field-borrow
+  deep-copy), a plain assignment into an existing whole string local/global (`q = dst[0];`,
+  deep-copy placed BEFORE the existing drop-old dtor), and `return dst[0];` (deep-copy plus
+  `clearReturnedStringBorrowBit = false`, so the caller owns the copy instead of leaking it).
+  **The return position is the one that proves a value leg is worth writing**: it was rc 133 AND
+  `r=0`, because the frame destroys the array before the caller reads the handed-back pointer.
+  A double-free-only symptom would have been invisible to a value assertion.
+  **Use `GEPOperator`, not `GetElementPtrInst`, on the READ side.** A constant index off a GLOBAL
+  array folds into a ConstantExpr GEP, so the instruction cast misses it - and the global spelling
+  is the one that never aborts (a global is never torn down), so it aliased silently with rc 0 and
+  only a `.data() !=` leg can see it. The store-side twin uses the instruction cast and is not
+  known to be wrong there, but a global destination is worth re-probing if that arm is touched.
+  The representation gate earned its keep again: `using S = string; S[2] dst; S q = dst[0];`
+  reaches the new arm ONLY because the preceding owning-value arm bails on
+  `srcInferredTypeName == typeAndValue.TypeName` (the alias spells a different name) and the new
+  arm asks the LLVM type instead. A `TypeName == "string"` gate would have dropped the cell.
+  A struct-FIELD array element (`w.arr[0]`) was measured ALREADY correct pre-fix - it carries a
+  FieldName, so `srcBorrowsOwnedString` was true and the field deep-copy arm already fired. Its
+  legs are coverage, not discriminators, and the test comment says so.
+  **Two neighbours reproduce the identical symptom and were filed rather than fixed, each for a
+  reason that is about MECHANISM, not effort.** An array VIEW element read (`string[] v;
+  string q = v[0];`, rc 133) is a SINGLE-index GEP, indistinguishable in shape from the
+  container-internal slot access that Part 6's gate exists to protect - widening the arm there
+  would change `list`/`dictionary` element reads. And `for (string s in arr)` (rc 133) never
+  builds a `NamedVariable` at all: its fixed-array leg emits GEP/load/store by hand, AND its loop
+  variable's `string.dtor` is emitted ONCE in `forRangeResume`, so a per-iteration deep copy would
+  trade the double free for an N-1 leak. **When the fix's own predicate cannot reach a cell, say
+  which mechanism blocks it - that sentence is the whole fix direction for the follow-up.**
+  A raw `new string[n]` element read stays a borrow deliberately: that allocation does not take
+  ownership of assigned strings (its own `delete` diagnostic says so), so copying there would
+  orphan the slot instead of fixing anything - measured rc 0 with a shared buffer, both binaries.

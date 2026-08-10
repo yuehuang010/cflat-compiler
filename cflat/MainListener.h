@@ -3127,6 +3127,7 @@ public:
 
     // True when the NamedVariable's value is the `string` value type.
     bool NamedVarIsString(const LLVMBackend::NamedVariable& nv);
+    bool IsFixedArrayStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
 
     // Stamp owned-string ownership onto an expression result and restore the
     // "last call returns owned" flag for downstream consumers. `savedOwned` is the

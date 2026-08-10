@@ -980,6 +980,26 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
         }
 
+        /*
+         * Returning a fixed-array `string` element (`return dst[0];`). The frame destroys the
+         * array on the way out, so handing the caller the element's own {ptr,len,owned} pair both
+         * double-freed the buffer (rc 133) and left the caller reading freed bytes - a WRONG VALUE,
+         * not merely a double free. Deep-copy so the caller owns an independent buffer, and keep
+         * the OWNED bit set (the borrow classification above would otherwise clear it and leak the
+         * copy). An `alias` function passes the borrow through deliberately. Representation-gated
+         * on both halves: the `%string` named type on the value and on the function's return type.
+         */
+        if (right != nullptr
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()
+                == llvm::StructType::getTypeByName(*compiler->context, "string")
+            && IsFixedArrayStringElementRead(returnNV, right))
+        {
+            right = compiler->EmitOwnedStringDeepCopy(right);
+            clearReturnedStringBorrowBit = false;
+        }
+
         // Clear flags consumed by the return check.
         compiler->lastOwningResult = false;
         compiler->lastAllocAlignment = 0;

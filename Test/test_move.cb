@@ -4229,6 +4229,21 @@ int abriStrElemParam(string p)
     return dst[0] == "abcd" ? 1 : 0;
 }
 
+// Read-side fixtures (legs 18-19). Once the store side made the element a real owner, every
+// READ of one had to hand out an independent buffer instead of the {ptr,len,owned} pair.
+string[2] gAelsStrArr;
+struct AelsStrArrWrap { string[2] arr = default; };
+using AelsStrAlias = string;
+
+// The RETURN position - the only one with a wrong-VALUE symptom: the frame destroys the array
+// on the way out, so the caller read freed bytes back (r=0) as well as double-freeing (rc 133).
+string aelsStrElemReturn()
+{
+    string[2] dst;
+    dst[0] = "ab" + "cd";
+    return dst[0];
+}
+
 int testOwningAssignIntoFixedArrayElement()
 {
     int passed = 0;
@@ -4499,6 +4514,102 @@ int testOwningAssignIntoFixedArrayElement()
         passed += Test("aels_strelem_field_value", dst[0], "efgh");
         passed += Test("aels_strelem_field_source_live", src.s, "efgh");
         passed += Test("aels_strelem_field_independent", dst[0].data() != src.s.data(), true);
+    }
+
+    // 18. The READ side of the same element. Handing a local the element's own {ptr,len,owned}
+    // pair made both of them owners, so both freed the buffer: rc 133 at teardown for every
+    // spelling below except the GLOBAL one, which aliased silently (a global is never torn
+    // down). Each leg pins the VALUE and the buffer DISTINCTNESS - the value alone already read
+    // back correctly on the broken binary, so only the distinctness leg falsifies the aliasing.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        string q = dst[0];
+        passed += Test("aelsr_decl_value", q, "abcd");
+        passed += Test("aelsr_decl_independent", q.data() != dst[0].data(), true);
+        passed += Test("aelsr_decl_source_live", dst[0], "abcd");
+
+        // A named-local source for the element store, and a RUNTIME index on the read.
+        string aelsrT = "ef" + "gh";
+        dst[1] = aelsrT;
+        int i = aelsIndex(1);
+        string qi = dst[i];
+        passed += Test("aelsr_runtime_index_value", qi, "efgh");
+        passed += Test("aelsr_runtime_index_independent", qi.data() != dst[i].data(), true);
+    }
+
+    // The `using` alias spelling. The arm is keyed on the `%string` named type, not on the
+    // spelled TypeName, so the alias must route through it exactly as the bare spelling does.
+    {
+        AelsStrAlias[2] dst;
+        dst[0] = "ab" + "cd";
+        AelsStrAlias q = dst[0];
+        passed += Test("aelsr_alias_value", q, "abcd");
+        passed += Test("aelsr_alias_independent", q.data() != dst[0].data(), true);
+    }
+
+    // MULTI-DIM (`md[0][0]`) and a struct-FIELD array (`w.arr[0]`): both are still two-index GEPs
+    // over an array type, so both reach the same arm. Only the multi-dim leg discriminates - a
+    // field-array element read already carried a FieldName and took the field deep-copy arm, so
+    // its two legs pin behaviour that was already correct rather than falsifying the aliasing.
+    {
+        string[2][2] md;
+        md[0][0] = "ab" + "cd";
+        string q = md[0][0];
+        passed += Test("aelsr_multidim_value", q, "abcd");
+        passed += Test("aelsr_multidim_independent", q.data() != md[0][0].data(), true);
+
+        AelsStrArrWrap w;
+        w.arr[0] = "ef" + "gh";
+        string f = w.arr[0];
+        passed += Test("aelsr_arrfield_value", f, "efgh");
+        passed += Test("aelsr_arrfield_independent", f.data() != w.arr[0].data(), true);
+    }
+
+    // A file-scope GLOBAL fixed array: this spelling never aborted, it aliased silently, so the
+    // distinctness leg is the only thing that can falsify it.
+    {
+        gAelsStrArr[0] = "ab" + "cd";
+        string q = gAelsStrArr[0];
+        passed += Test("aelsr_global_value", q, "abcd");
+        passed += Test("aelsr_global_independent", q.data() != gAelsStrArr[0].data(), true);
+    }
+
+    // 19. The other two read POSITIONS: assignment into an EXISTING local, and `return`.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        string q = "seed";
+        q = dst[0];
+        passed += Test("aelsr_assign_value", q, "abcd");
+        passed += Test("aelsr_assign_independent", q.data() != dst[0].data(), true);
+        passed += Test("aelsr_assign_source_live", dst[0], "abcd");
+
+        // Round-trip: read the element out, then store the local back into it. The LOCAL's value
+        // did not survive that store while the read still aliased - it read back empty.
+        string r = dst[0];
+        dst[0] = r;
+        passed += Test("aelsr_roundtrip_local", r, "abcd");
+        passed += Test("aelsr_roundtrip_elem", dst[0], "abcd");
+    }
+
+    passed += Test("aelsr_return_value", aelsStrElemReturn(), "abcd");
+
+    // ACCEPT SET for the read arm: an explicit `move` out of an element, an explicit `.copy()`,
+    // and a BORROWED (literal) element all already worked and must keep working.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        string m = move dst[0];
+        passed += Test("aelsr_move_value", m, "abcd");
+        dst[1] = "ef" + "gh";
+        string c = dst[1].copy();
+        passed += Test("aelsr_copy_value", c, "efgh");
+        passed += Test("aelsr_copy_independent", c.data() != dst[1].data(), true);
+        string[2] lit;
+        lit[0] = "lit";
+        string lq = lit[0];
+        passed += Test("aelsr_literal_value", lq, "lit");
     }
 
     return passed;
@@ -7337,7 +7448,7 @@ extern int main()
     total += 75;
 
     passed += testOwningAssignIntoFixedArrayElement();
-    total += 69;
+    total += 92;
 
     passed += testOwningBraceInitFixedArray();
     total += 63;
