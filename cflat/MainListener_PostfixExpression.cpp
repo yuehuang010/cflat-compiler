@@ -4841,7 +4841,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // the body consumes a by-value owning param the caller still owns, and both free it.
         {
             std::vector<LLVMBackend::TypeAndValue> sinkParams(params.begin(), params.end());
-            ApplyOwningSinkInferenceToBody(ctx->lambdaBody(), sinkParams, SinkIfConstEvaluator());
+            ApplyOwningSinkInferenceToBody(compiler, ctx->lambdaBody(), sinkParams, SinkIfConstEvaluator());
             for (size_t i = 0; i < params.size(); i++)
             {
                 params[i].IsOwningSink = sinkParams[i].IsOwningSink;

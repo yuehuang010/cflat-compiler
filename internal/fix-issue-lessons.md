@@ -2212,3 +2212,72 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   (its hoist target sits inside the guarded region), +1 leak / +16 bytes on `Test/test_move.cb`
   (17/336 -> 18/352), recorded in `p2/owning-temp-in-null-conditional-arm-never-destructed.md`
   and pinned by `null_conditional_join_arm_not_freed`.
+- **`fix/aliascast` - the peel compared a SPELLING with a CANONICAL NAME, and "alias" was only one
+  of four ways to spell a type non-canonically.** (Closes and deletes
+  `p1/alias-spelled-redundant-cast-defeats-owning-sink-inference.md`, the one cell `fix/wrapprov`
+  left open.) The filed bug was `using UB = UBox; void f(UBox p) { UBox o = (UB)p; }` - a double
+  free that ABORTS. **Record the exit code with the MODE that produced it**: every isolated repro
+  here is rc 133 as a native exe (macOS malloc's double-free guard) and rc 134 under `--run`, and
+  the review round opened a finding on exactly that mismatch because this entry's first draft
+  inherited a bare "rc 134" from older entries without saying which. The measured root cause was
+  broader than the file: `AllWrapperTypesName` compared the cast's raw `typeName()->getText()` with
+  the parameter's already-canonicalized `TypeName` by exact string equality, so EVERY non-canonical
+  spelling of the parameter's own type missed. Phase A found three families, not one: an ALIAS
+  (`(UB)p`), a NAMESPACE-RELATIVE name inside its own namespace (`(NBox)p` where the parameter is
+  `nsw.NBox` - no `using` anywhere), and a GENERIC INSTANTIATION (`(Box<int>)p` against the mangled
+  `Box__int` - also no `using`). Thirteen shapes aborted pre-fix, rc 0 post. **A bug filed as an
+  alias bug was two-thirds not about aliases**; the axis to enumerate was "ways to spell a type",
+  not "does the file mention `using`".
+  The landed fix is one helper - `CanonicalWrapperTypeName` (namespace resolve, alias fold, generic
+  mangle through the existing `MangleTypeArg` funnel) - applied to BOTH sides of the comparison so
+  it is idempotent on an already-canonical name. Both copies of the predicate needed it:
+  `ApplyOwningSinkInferenceToBody` (the caller-side sink) and `ClassifyValueStructReturns` (the
+  `alias`-return inference, which double-freed identically under `return (UB)p`). The `compiler`
+  argument was made REQUIRED rather than defaulted, so the compiler itself enforced that all seven
+  call sites were updated - scanner, definition, generic ctor, generic decl, lambda body.
+  **The FOURTH family was found by the reviewer, and it is a depth axis, not a spelling axis.**
+  `MangleTypeArg` does not recurse, so the first cut canonicalized a NESTED instantiation
+  `(GBox<Inner<int>>)p` to `GBox__Inner<int>` and still missed the declared `GBox__Inner__i32` - the
+  double free survived that one spelling on the fix's own first commit (measured: base 133,
+  first-commit 133, recursed 0), while the flat `(GBox<int>)p` beside it was already rc 0. An
+  enumeration that walks "alias / namespace / generic" and stops has still only walked ONE LEVEL;
+  when the fix mirrors a recursive lowering, the probe corpus has to nest too. `GBox<Inner<int>>`,
+  `GBox<Inner<Inner2<int>>>`, `GBox<NsG.NInner<int>>` and `GPair<Inner<int>,int>` are all rc 0 now;
+  a DECORATED nested arg (`GBox<Inner<int>*>`) still fails closed, identically to base, because the
+  recursion guard requires the arg to END in '>'. Two neighbours are hard errors on ALL binaries and
+  never reach the predicate at all: a cast between two different instantiations (`(GBox<long>)p` on
+  a `GBox<int>`) and an alias used as a type ARGUMENT (`using II = Inner<int>; (GBox<II>)p`) both
+  hit "cannot cast an aggregate value" - the strongest accept-set answer available, since the
+  type-changing generic cast cannot become a false sink even in principle.
+  **A predicate can be right and the fix still not land: check what the value CARRIES afterwards.**
+  Making `IsRedundantCastOfSource` canonical fixed the predicate for `(NBox)p`, and the program still
+  double-freed, because `ParseCastExpression` then assigns `namedVar.TypeAndValue = destTypeName` -
+  handing the result the CAST'S OWN spelling ("NBox"), which a later whole-value-consume arm compares
+  against the declared local's canonical type. The redundant-cast restore now also restores the
+  operand's `TypeName`. Diagnosing this took an IR read: the caller's IR was already correct and
+  identical to the working twin, and only the CALLEE's parameter copy was left un-nulled - the same
+  "when only one side's IR differs, look for the fact derived from the other side" move as
+  `fix/wrapprov`'s `getText()` finding, one level down.
+  Accept-set held and re-measured: `wcp_typechanging_*` and `okTypeChanging` still refuse the sink;
+  a POD and a copyable owner under an alias cast are unchanged; the un-aliased `(UBox)p`,
+  `(nsq.NBox)p` and bare `Box<int> o = p` twins are byte-identical. A 457-file differential `--check`
+  sweep over `Test/` + `example/` shows exactly ONE semantic difference, the error test this commit
+  edits; the other 29 differing files differ only in the runtime-core PATH printed by an
+  "imported file not found" message (two exes in two directories) - **filter your sweep on the
+  message text, not on `diff -q`, or a path echo reads as 30 regressions.**
+  Left open, both fail-CLOSED (no sink inferred, exactly as before): a `using` declared BELOW the
+  function and a FUNCTION-LOCAL `using`, filed as
+  `p2/forward-or-local-alias-in-cast-defeats-owning-sink-inference.md`. Both need the alias to be
+  invisible to the ForwardRefScanner, and the caller-side flag only ever comes from the scanner -
+  the main pass re-runs the inference but the symbol is already declared, so its answer reaches
+  nobody. Separately filed: `using NB = NBox;` inside a namespace naming a SIBLING type is never
+  registered at all (`unknown type 'NB'`, both binaries) -
+  `p3/namespace-local-using-alias-of-a-sibling-type-is-not-registered.md`.
+  `Test/test_move.cb` under `leaks --atExit`: this change's own legs add ZERO. Measured with one
+  compiler across three sources - base `06eb203` 16 leaks / 320 bytes, `master` `b220d54` 18 / 352,
+  and the rebased file (master's legs plus this change's) also 18 / 352, so the whole +2 / +32 is
+  `fix/aliasres`'s deliberate `?.`-join leak, not this one. **Measuring a leak DELTA means holding
+  the compiler fixed and varying only the source, or vice versa - never both.** The baseline also
+  had to be pinned to the commit the worktree is based on: `git show master:<path>` in a worktree
+  whose `master` had moved on returned a NEWER test file and manufactured a "+1 leak regression"
+  that cost a full bisect to disprove. **Pin a baseline by hash, not by branch name.**

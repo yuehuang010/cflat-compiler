@@ -5326,6 +5326,9 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             if (redundantCast)
             {
                 namedVar.Storage = redundantStorage;
+                // Keep the OPERAND's canonical type name: the cast's spelling can be
+                // namespace-relative, and a later consume arm compares it with a declared type's.
+                namedVar.TypeAndValue.TypeName = redundantCastSource.TypeAndValue.TypeName;
                 namedVar.TypeAndValue.VariableName = redundantCastSource.TypeAndValue.VariableName;
                 namedVar.TypeAndValue.ParentVariableName = redundantCastSource.TypeAndValue.ParentVariableName;
                 AdoptWrapperProvenance(namedVar, redundantCastSource);
@@ -8413,7 +8416,10 @@ bool MainListener::IsRedundantCastOfSource(const LLVMBackend::TypeAndValue& src,
                                            const LLVMBackend::TypeAndValue& dest) {
         auto* compiler = compilerLLVM;
         if (src.TypeName.empty() || dest.TypeName.empty()) return false;
-        if (compiler->ResolveTypeAlias(src.TypeName) != compiler->ResolveTypeAlias(dest.TypeName))
+        // Canonicalized, not merely alias-resolved: a namespace-relative cast spelling ('(NBox)p'
+        // inside NBox's own namespace) names the same type its operand already has.
+        if (CanonicalWrapperTypeName(compiler, src.TypeName)
+            != CanonicalWrapperTypeName(compiler, dest.TypeName))
             return false;
         // Every shape decoration must agree too: `(T*)t`, `(T[])p` and `(IFace)v` all CHANGE the
         // value's shape even when the base name matches, so none of them is a pass-through.

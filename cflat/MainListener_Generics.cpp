@@ -477,7 +477,7 @@ void MainListener::PreDeclareInstantiationMembers(
                 // instantiation registers its FunctionSymbol, so ParseFunctionDefinition (which
                 // sees alreadyDeclared) cannot set the flag later. The if-const evaluator lets a
                 // move inside a live if-const branch mark the param a sink for this instantiation.
-                ApplyOwningSinkInference(func, ctorAllParams, SinkIfConstEvaluator());
+                ApplyOwningSinkInference(compiler, func, ctorAllParams, SinkIfConstEvaluator());
                 compiler->CreateFunctionDeclaration(structName, returnType, ctorAllParams, false, declVarargs);
                 continue;
             }
@@ -508,7 +508,7 @@ void MainListener::PreDeclareInstantiationMembers(
             // generic-class instantiation registers its FunctionSymbol HERE, so the flag must be
             // set now (ParseFunctionDefinition sees alreadyDeclared and does not re-register). The
             // if-const evaluator lets a move inside a live if-const branch mark the param a sink.
-            ApplyOwningSinkInference(func, declAllParams, SinkIfConstEvaluator());
+            ApplyOwningSinkInference(compiler, func, declAllParams, SinkIfConstEvaluator());
             bool declReturnsOwned = ComputeReturnsOwned(declReturnType, declName, declAllParams);
             compiler->CreateFunctionDeclaration(declName, declReturnType, declAllParams, declReturnType.external, declVarargs, declReturnsOwned, !isStaticLike);
         }

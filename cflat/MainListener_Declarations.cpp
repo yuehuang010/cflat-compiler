@@ -1938,7 +1938,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // so this is redundant there; for a generic-CLASS-method instantiation it is the ONLY
         // place the sink flag reaches the emitted FunctionSymbol (no forward-scan pre-declaration).
         // Pass the if-const evaluator so a move inside a LIVE if-const branch marks the param a sink.
-        ApplyOwningSinkInference(func, allParams, SinkIfConstEvaluator());
+        ApplyOwningSinkInference(Compiler(), func, allParams, SinkIfConstEvaluator());
 
         // Record unused-parameter candidates. Restricted to free, non-extern functions:
         // a method's params are constrained by interface/override conformance, and an
@@ -1996,7 +1996,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         if (compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
-            auto returnKind = ClassifyValueStructReturns(func, returnType, allParams, &borrowedParam);
+            auto returnKind = ClassifyValueStructReturns(Compiler(), func, returnType, allParams, &borrowedParam);
             if (returnKind == ValueStructReturnKind::Mixed)
             {
                 LogErrorContext(func, std::format(

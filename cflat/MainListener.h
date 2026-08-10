@@ -1141,15 +1141,68 @@ inline std::string BareSourceText(antlr4::tree::ParseTree* node,
 // is admitted only where the wrapper is proven REDUNDANT.
 using WrappedSourceNames = std::unordered_map<std::string, std::vector<std::string>>;
 
+// Split a generic argument list's inner text ("int,list<int>") at TOP-LEVEL commas only, so a
+// nested instantiation stays one argument. Whitespace-free input (a parse tree's getText()).
+inline std::vector<std::string> SplitTopLevelTypeArgs(const std::string& args)
+{
+    std::vector<std::string> out;
+    int depth = 0;
+    size_t start = 0;
+    for (size_t i = 0; i < args.size(); i++)
+    {
+        if (args[i] == '<') depth++;
+        else if (args[i] == '>') depth--;
+        else if (args[i] == ',' && depth == 0)
+        {
+            out.push_back(args.substr(start, i - start));
+            start = i + 1;
+        }
+    }
+    out.push_back(args.substr(start));
+    return out;
+}
+
+// Canonical name for a TYPE SPELLING as written in a cast / `as`, so it can be compared with a
+// declaration's already-canonical TypeName. Mirrors the declaration path: namespace resolution,
+// then alias folding, and a generic instantiation through the MangleTypeArg funnel. Idempotent on
+// an already-canonical name, so BOTH sides of the comparison run through it.
+inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const std::string& spelled)
+{
+    if (compiler == nullptr || spelled.empty()) return spelled;
+    if (size_t lt = spelled.find('<');
+        lt != std::string::npos && lt > 0 && spelled.back() == '>')
+    {
+        std::string base = compiler->ResolveTypeAlias(
+            compiler->ResolveQualifiedName(spelled.substr(0, lt)));
+        base = compiler->ResolveGenericBaseAlias(base);
+        std::string mangled = base;
+        for (const auto& arg : SplitTopLevelTypeArgs(spelled.substr(lt + 1, spelled.size() - lt - 2)))
+        {
+            // A NESTED instantiation goes through this same funnel: MangleTypeArg does not recurse,
+            // so "GBox<Inner<int>>" would meet the declared "GBox__Inner__i32" as "GBox__Inner<int>".
+            if (!arg.empty() && arg.back() == '>' && arg.find('<') != std::string::npos)
+                mangled += "__" + CanonicalWrapperTypeName(compiler, arg);
+            else
+                mangled += "__" + MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, arg));
+        }
+        return mangled;
+    }
+    return compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(spelled));
+}
+
 // Every peeled wrapper names exactly `typeName`, so the whole wrapper chain is redundant and the
-// source is a whole-value consume of the bare name. Exact spellings: an alias or a decorated
-// target ("UBox*") does not match, which is the conservative direction (no new consume inferred).
-inline bool AllWrapperTypesName(const std::vector<std::string>& wrapperTypes,
+// source is a whole-value consume of the bare name. Both sides are canonicalized first, so an
+// alias ("UB"), a namespace-relative spelling ("NBox" inside its own namespace) and a generic
+// instantiation ("Box<int>") each meet the declared type they name. A decorated target ("UBox*")
+// still does not match, which is the conservative direction (no new consume inferred).
+inline bool AllWrapperTypesName(const LLVMBackend* compiler,
+                                const std::vector<std::string>& wrapperTypes,
                                 const std::string& typeName)
 {
     if (wrapperTypes.empty() || typeName.empty()) return false;
+    const std::string want = CanonicalWrapperTypeName(compiler, typeName);
     for (const auto& t : wrapperTypes)
-        if (t != typeName) return false;
+        if (t != typeName && CanonicalWrapperTypeName(compiler, t) != want) return false;
     return true;
 }
 
@@ -1225,6 +1278,7 @@ enum class ValueStructReturnKind { NotApplicable, AllBorrowedParam, Mixed };
 // or do the paths disagree? The unique-ownership gate lives in the callers - a copyable struct
 // has nothing to duplicate, so mixed returns stay legal for it.
 static ValueStructReturnKind ClassifyValueStructReturns(
+    const LLVMBackend* compiler,
     CFlatParser::FunctionDefinitionContext* func,
     const LLVMBackend::DeclTypeAndValue& returnType,
     const std::vector<LLVMBackend::TypeAndValue>& allParams,
@@ -1246,7 +1300,7 @@ static ValueStructReturnKind ClassifyValueStructReturns(
         // wrappers; a peeled CAST counts only when it names the return type itself (below).
         std::vector<std::string> wrapperTypes;
         const std::string text = BareSourceText(expr, &wrapperTypes);
-        if (!wrapperTypes.empty() && !AllWrapperTypesName(wrapperTypes, returnType.TypeName))
+        if (!wrapperTypes.empty() && !AllWrapperTypesName(compiler, wrapperTypes, returnType.TypeName))
         {
             ++other;
             continue;
@@ -1491,7 +1545,8 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
 //      instantiations too - ParseFunctionDefinition calls it on the monomorphized param list.
 // Body-taking core. A lambda literal has no FunctionDefinitionContext but is a function all the
 // same, so its parameter list runs the identical inference against its own body.
-inline void ApplyOwningSinkInferenceToBody(antlr4::tree::ParseTree* body,
+inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
+                                     antlr4::tree::ParseTree* body,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
                                      const IfConstEvaluator& evalIfConst = {})
 {
@@ -1508,7 +1563,7 @@ inline void ApplyOwningSinkInferenceToBody(antlr4::tree::ParseTree* body,
         // type - a TYPE-CHANGING cast is not a whole-value consume of the parameter.
         bool wrappedConsume = false;
         if (auto it = wrappedConsumed.find(p.VariableName); it != wrappedConsumed.end())
-            wrappedConsume = AllWrapperTypesName(it->second, p.TypeName);
+            wrappedConsume = AllWrapperTypesName(compiler, it->second, p.TypeName);
         if (movedNames.count(p.VariableName))
             p.IsOwningSink = true;
         else if (consumedNames.count(p.VariableName) || wrappedConsume)
@@ -1536,11 +1591,12 @@ inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
     }
 }
 
-inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* func,
+inline void ApplyOwningSinkInference(const LLVMBackend* compiler,
+                                     CFlatParser::FunctionDefinitionContext* func,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
                                      const IfConstEvaluator& evalIfConst = {})
 {
-    ApplyOwningSinkInferenceToBody(func->compoundStatement(), allParams, evalIfConst);
+    ApplyOwningSinkInferenceToBody(compiler, func->compoundStatement(), allParams, evalIfConst);
 }
 
 // True when the function declares a RETURN TYPE, which is what separates an ordinary member

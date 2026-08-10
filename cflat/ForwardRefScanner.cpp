@@ -436,7 +436,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
-        ApplyOwningSinkInference(func, allParams);
+        ApplyOwningSinkInference(compiler, func, allParams);
 
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
 
@@ -447,7 +447,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         // free the result. The unique-ownership gate is applied when the queue is resolved.
         {
             std::string borrowedParam;
-            if (ClassifyValueStructReturns(func, returnType, allParams, &borrowedParam)
+            if (ClassifyValueStructReturns(compiler, func, returnType, allParams, &borrowedParam)
                 == ValueStructReturnKind::AllBorrowedParam)
                 compiler->QueueAliasReturnInference(name, returnType.TypeName, allParams);
         }

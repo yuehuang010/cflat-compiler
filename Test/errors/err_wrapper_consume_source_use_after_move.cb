@@ -65,6 +65,58 @@ expect_error("use of moved variable 'a'") {
 }
 
 /*
+ * SPELLING CANONICALIZATION. The peel compared the cast's raw TYPE SPELLING with the parameter's
+ * canonical TypeName, so a `using` alias, a namespace-relative name inside its own namespace and a
+ * generic instantiation all missed - the sink was never inferred and each of these programs
+ * COMPILED, then double-freed and aborted (measured rc 133 as a native exe, 134 under `--run`).
+ * Each is now the same rejection its canonical twin above is.
+ */
+using UBAlias  = UBox;
+using UBAlias2 = UBAlias;
+void sinkAliasCast(UBox p)    { UBox o = (UBAlias)p; }
+void sinkAliasCast2(UBox p)   { UBox o = (UBAlias2)p; }
+void sinkAliasAs(UBox p)      { UBox o = p as UBAlias; }
+void sinkAliasParam(UBAlias p){ UBox o = (UBAlias)p; }
+
+expect_error("use of moved variable 'a'") {
+    int callAliasCast() { UBox a = umk(13); sinkAliasCast(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callAliasCast2() { UBox a = umk(14); sinkAliasCast2(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callAliasAs() { UBox a = umk(15); sinkAliasAs(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callAliasParam() { UBox a = umk(16); sinkAliasParam(a); return a.item->id; }
+}
+
+// A GENERIC instantiation carries no alias at all: the parameter's TypeName is the MANGLED name,
+// so even the bare `(GBox<int>)` spelling missed.
+struct GBox<T> { unique Res* item = nullptr; T tag = default; };
+GBox<int> gmk(int n) { GBox<int> b; b.item = new Res(); b.item->id = n; return b; }
+void sinkGenericCast(GBox<int> p) { GBox<int> o = (GBox<int>)p; }
+
+expect_error("use of moved variable 'a'") {
+    int callGenericCast() { GBox<int> a = gmk(17); sinkGenericCast(a); return a.item->id; }
+}
+
+// A NAMESPACE-relative spelling inside its own namespace.
+namespace ErrNs
+{
+    struct NBox { unique Res* item = nullptr; };
+    void sinkNsCast(NBox p) { NBox o = (NBox)p; }
+}
+ErrNs.NBox emk(int n) { ErrNs.NBox b; b.item = new Res(); b.item->id = n; return b; }
+
+expect_error("use of moved variable 'a'") {
+    int callNsCast() { ErrNs.NBox a = emk(18); ErrNs.sinkNsCast(a); return a.item->id; }
+}
+
+/*
  * ACCEPT SET. A TYPE-CHANGING cast is NOT a whole-value consume of the named variable, so the
  * parameter stays a borrow and the caller keeps ownership - reading the argument afterwards must
  * still be legal. Same for a wrapped source that peels to no name at all.
