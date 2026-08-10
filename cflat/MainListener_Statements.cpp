@@ -1679,14 +1679,35 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         collNV.Primary = nullptr;
                     }
 
+                    // Parsed once for every leg below (WinRT, fixed array, interface, container)
+                    // so the by-value ownership guard that follows covers all of them.
+                    auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
+                    elemType.VariableName = varName;
+
+                    // A by-value loop var bit-copies the element; an owning raw pointer has no
+                    // owned bit to clear, so the once-only dtor at forRangeResume double-frees.
+                    std::string ownedFieldPath;
+                    if (!elemType.Pointer && !elemType.IsArrayView && !elemType.IsInterface
+                        && !compiler->IsInterfaceType(elemType.TypeName)
+                        && compiler->TypeOwnsUniquePointer(elemType.TypeName, &ownedFieldPath))
+                    {
+                        LogErrorContext(iterationStatement, std::format(
+                            "cannot bind loop variable '{}' of '{}' by value in a range 'for': field "
+                            "'{}.{}' is 'unique', so '{}' owns a raw pointer that a by-value copy would "
+                            "share. The loop variable is destructed once when the loop exits and would "
+                            "free the pointee the collection still owns. Iterate by index and read the "
+                            "element in place instead (for (int i = 0; i < N; i++) ... coll[i]).",
+                            varName, elemType.TypeName, elemType.TypeName, ownedFieldPath,
+                            elemType.TypeName));
+                        return;
+                    }
+
                     // Imported winmd interface receiver -> iterate through the WinRT IIterable<T> /
                     // IIterator<T> COM protocol instead of the count()/get() index path below.
                     if (compiler->IsWinrtThinInterface(collNV.TypeAndValue.TypeName))
                     {
                         std::string collTypeName = collNV.TypeAndValue.TypeName;
 
-                        auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
-                        elemType.VariableName = varName;
                         std::string elemArg = elemType.TypeName;
 
                         // Synthesize IIterable<T> and IIterator<T> (COM vtable + thin ptr + PIID).
@@ -1824,8 +1845,6 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     compiler->builder->CreateStore(compiler->builder->getInt32(0), indexAlloca);
 
                     // Pre-allocate the element variable in the init block (one alloca for all iterations)
-                    auto elemType = ParseDeclarationSpecifiers(declSpecCtx);
-                    elemType.VariableName = varName;
                     auto elemAlloca = compiler->CreateLocalVariable(elemType);
 
                     compiler->CreateBlockBreak(blockCond, false);

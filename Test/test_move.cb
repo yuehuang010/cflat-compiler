@@ -9192,6 +9192,10 @@ int testReturnOfOwningField()
 struct ForInBag { string[2] arr; };
 struct ForInPod { int a = 0; int b = 0; };
 struct ForInWide { int id = 0; string s = default; };
+struct ForInBorrow { ForInPod* p = nullptr; };
+int forInOwnerDtors = 0;
+struct ForInRes { int id = 0; ~ForInRes() { forInOwnerDtors = forInOwnerDtors + 1; } };
+struct ForInOwner { unique ForInRes* p = nullptr; };
 interface IForInShape { int area(); };
 class ForInSquare : IForInShape { int side = 0; int area() { return side * side; } };
 string[2] forInGlobalArr;
@@ -9392,6 +9396,48 @@ int testForInOverFixedArrayElement()
         forInChurn();
         passed += Test("forin_accept_list_matches", n, 2);
         passed += Test("forin_accept_list_last_intact", l.get(1) == "efgh" ? 1 : 0, 1);
+    }
+    // A non-'unique' pointer FIELD is a borrow the element already shallow-shares by design,
+    // so the by-value loop variable stays legal (the reject only covers owning pointers).
+    {
+        ForInPod p0; p0.a = 7;
+        ForInPod p1; p1.a = 9;
+        ForInBorrow[2] arr;
+        arr[0].p = &p0;
+        arr[1].p = &p1;
+        int sum = 0;
+        for (ForInBorrow b in arr) sum = sum + b.p->a;
+        passed += Test("forin_accept_borrow_ptr_field", sum, 16);
+    }
+
+    // The REMEDY named by the by-value rejection: index the collection and read the element
+    // in place. Both spellings double-freed as `for (ForInOwner o in ...)` before the reject.
+    // Dtor counts are the discriminator - a shared pointee would free twice (and abort).
+    {
+        forInOwnerDtors = 0;
+        {
+            ForInOwner[2] arr;
+            arr[0].p = new ForInRes(); arr[0].p->id = 7;
+            arr[1].p = new ForInRes(); arr[1].p->id = 9;
+            int sum = 0;
+            for (int i = 0; i < 2; i++) sum = sum + arr[i].p->id;
+            passed += Test("forin_remedy_fixed_index_sum", sum, 16);
+            passed += Test("forin_remedy_fixed_no_early_free", forInOwnerDtors, 0);
+        }
+        passed += Test("forin_remedy_fixed_freed_once", forInOwnerDtors, 2);
+    }
+    {
+        forInOwnerDtors = 0;
+        {
+            list<ForInOwner> l;
+            ForInOwner a; a.p = new ForInRes(); a.p->id = 7; l.add(move a);
+            ForInOwner c; c.p = new ForInRes(); c.p->id = 9; l.add(move c);
+            int sum = 0;
+            for (int i = 0; i < l.count(); i++) sum = sum + l[i].p->id;
+            passed += Test("forin_remedy_list_index_sum", sum, 16);
+            passed += Test("forin_remedy_list_no_early_free", forInOwnerDtors, 0);
+        }
+        passed += Test("forin_remedy_list_freed_once", forInOwnerDtors, 2);
     }
 
     return passed;
@@ -9720,7 +9766,7 @@ extern int main()
     passed += testReturnOfOwningField();
     total += 92;
     passed += testForInOverFixedArrayElement();
-    total += 34;
+    total += 41;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

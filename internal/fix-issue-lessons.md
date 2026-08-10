@@ -2447,3 +2447,30 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   Also confirmed: a nested function definition does NOT parse inside a statement-scope
   `expect_error` block; a leg that declares a function or a `using` alias must use the FILE-scope
   block form.
+- **The 2026-08-10 `fix/forinown` round** (`for (T x in coll)` over an owning-POINTER struct):
+  **RULING - a by-value range-`for` loop variable whose element type transitively owns a
+  `unique` raw pointer is now a hard compile error, on every leg.** The loop variable's alloca
+  is hoisted once and its destructor emitted once, at `forRangeResume`; the borrow mechanism the
+  rest of the family relies on is an OWNED BIT, and a `unique T*` field has none
+  (`ClearStructOwnedBits` skips pointer fields), so the copy always frees a pointee the
+  collection still owns. Candidates 1 (per-iteration destruct scope) and 2 (a never-destruct
+  flag) were not attempted - candidate 3 was chosen because the rejected program ALWAYS double
+  frees. Measured pre-fix on `421e3ce`, all rc 134 (SIGABRT, not the filed rc 133): fixed array,
+  `list<T>` container `alias T get`, interface `count`/`get`, generic-body `for (T e in src)` at
+  a `Box` instantiation, `using B = Box` alias, `NS.Box` qualified, transitive through a nested
+  by-value field AND through a fixed-array-of-struct field, mixed `string`+`unique` element,
+  loop variable UNUSED, and an EMPTY container (zero iterations still runs the once-only dtor
+  on the uninitialized loop slot). A user-written `copy()` method does NOT save it - the loop
+  never calls `copy()`. Two things that look like escape hatches and are not: `for (alias Box b
+  in arr)` PARSES today and still aborted, so it is rejected too and deliberately NOT named as
+  a remedy; and the guard must exclude INTERFACE element types (`IsInterfaceType`) - an
+  interface field can carry a `unique` contract, but the loop variable there is a fat pointer
+  that owns nothing. **The remedy in the message is index-and-read-in-place (`coll[i]`),
+  verified as value legs for both a fixed array and a `list<T>` (dtor=2, rc 0, 0 leaks); the
+  earlier draft named `coll[i].<fieldpath>`, which is FALSE when the path crosses a fixed-array
+  field (`coll[i].cells.p` should be `cells[0].p`), so the field path stays in the diagnosis
+  clause only.** Sweep first: no `.cb` in `Test/`, `example/` or `core/` iterates such a type
+  (`Holder`/`Person`/`ProcInfo`/`ForInWide`/`ForInPod` are int/string only), so the rejection
+  broke nothing. One shared guard, placed where `ParseDeclarationSpecifiers` for the element is
+  now hoisted ABOVE the WinRT branch, so all four legs share it and the type is parsed once.
+  WinRT is covered by construction but unmeasurable on macOS.

@@ -12,6 +12,45 @@ expect_error("cannot copy 'Holder': its field 'Holder.slot' is 'unique'") {
     Holder duplicate(Holder h) { Holder c = h.copy(); return move c; }
 }
 
+// A range-`for` binds its loop variable BY VALUE from a hoisted alloca whose destructor runs
+// once, at loop exit - the same shallow share, so it is refused at the loop instead. Before
+// this rejection both spellings compiled and aborted at teardown (double free). The remedy
+// (index the collection and read the element in place) is a value leg in Test/test_move.cb.
+expect_error("cannot bind loop variable 'b' of 'Holder' by value in a range 'for': field 'Holder.slot' is 'unique'") {
+    int sumFixed()
+    {
+        Holder[2] arr;
+        int n = 0;
+        for (Holder b in arr) n = n + (b.slot == nullptr ? 0 : 1);
+        return n;
+    }
+}
+
+// The container leg: `alias T get` hands back a borrow, but the loop variable is still a
+// by-value bit-copy with the same once-only destructor.
+expect_error("cannot bind loop variable 'b' of 'Holder' by value in a range 'for': field 'Holder.slot' is 'unique'") {
+    int sumList(list<Holder> src)
+    {
+        int n = 0;
+        for (Holder b in src) n = n + (b.slot == nullptr ? 0 : 1);
+        return n;
+    }
+}
+
+// Transitive: the owning pointer is reached through a by-value struct FIELD, so the loop
+// variable's copy shares it just the same. The message names the whole field path.
+struct NestHolder { int tag = 0; Holder inner = default; };
+
+expect_error("field 'NestHolder.inner.slot' is 'unique'") {
+    int sumNested()
+    {
+        NestHolder[2] arr;
+        int n = 0;
+        for (NestHolder h in arr) n = n + h.tag;
+        return n;
+    }
+}
+
 extern int main()
 {
     return 0;
