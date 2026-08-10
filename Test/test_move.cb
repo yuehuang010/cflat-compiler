@@ -19,6 +19,8 @@ struct Resource
     Resource* self() { return this; }
     // A method that only READS through `this`: the receiver provably cannot outlive the call.
     int idOf() { return id; }
+    // Reads an argument only; used as the '?.' guarded-chain receiver in the arm-flush legs.
+    int readId(int v) { return v; }
 };
 
 struct Container
@@ -7320,6 +7322,8 @@ PodPair makePodPair()
 // Helpers for the accept set below. `readResourceId` is the read-only plain-`T*` parameter the
 // call-site reject deliberately leaves alone; the two sinks state the ownership claim it reads.
 int readResourceId(Resource* r) { return r->id; }
+// An OWNING call result for the '??' fallback arm: the arm flush must keep the value it yields.
+unique Resource* makeArmOwnedResource() { Resource* r = new Resource(); r->id = 52; return r; }
 void sinkResourceUnique(unique Resource* r) { }
 void sinkResourceMove(move Resource* r) { delete r; }
 
@@ -7475,19 +7479,74 @@ int testTempUniqueFieldBorrowAccepts()
                    readResourceId((Resource*)makeMoveBox().t), 44);
     passed += Test("temp_uniq_accept_plain_param_cast_freed_once", dtorCount, 1);
 
-    // The '??' FALLBACK arm is the ONE join position that does not dangle, and it is excluded
-    // from the arm walk for that measured reason rather than out of caution. Its operand is
-    // evaluated in `nullcoal_null`, which neither dominates the join nor gets the per-arm
-    // FlushOwnedTempsSince the '?:' arms get, so the temp is never destructed at all - the '?:'
-    // twins measure dtors=1 and ARE rejected. `dtors == 0` below pins that LEAK on purpose: see
-    // internal/issue/p2/owning-temp-in-coalesce-fallback-arm-never-destructed.md, whose fix has to
-    // flip BOTH halves - this leg and the arm-0-only restriction in the walk - in one change.
+    // FLIPPED by the '??' fallback-arm fix. The old pair here pinned `dtors == 0` on
+    // `nul ?? makeMoveBox().t` - a deliberate tripwire on a LEAK: that arm got no per-arm
+    // FlushOwnedTempsSince, so its temp was never destructed and the arm walk had to exclude it
+    // to avoid a false rejection. The arm now flushes like a '?:' arm, so that store shape
+    // dangles and is REJECTED - it moved to Test/errors/err_coalesce_fallback_arm_escape.cb.
+    // The legs below are what stays legal, with the dtor counts the flush now produces.
+
+    // The temp is CONSUMED inside the arm (the deref happens before the arm flush), so the value
+    // is right and the temp is destructed exactly once. Pre-fix this measured dtors == 0.
     dtorCount = 0;
     {
         Resource* nul = nullptr;
-        Resource* fallback = nul ?? makeMoveBox().t;
-        passed += Test("temp_uniq_accept_coalesce_fallback_arm_live", fallback->id, 44);
-        passed += Test("temp_uniq_accept_coalesce_fallback_arm_not_freed", dtorCount, 0);
+        int got = nul?.id ?? makeMoveBox().t->id;
+        passed += Test("coalesce_fallback_arm_consumed_value", got, 44);
+        passed += Test("coalesce_fallback_arm_freed_once", dtorCount, 1);
+    }
+
+    // The arm is NOT taken: the flush lives inside `nullcoal_null`, so an unexecuted fallback
+    // must free nothing. This is the polarity twin of the leg above.
+    dtorCount = 0;
+    {
+        Resource* live = new Resource();
+        live->id = 51;
+        int got = live?.id ?? makeMoveBox().t->id;
+        passed += Test("coalesce_fallback_arm_untaken_value", got, 51);
+        passed += Test("coalesce_fallback_arm_untaken_no_free", dtorCount, 0);
+        delete live;
+    }
+
+    // ACCEPT-SET freeze: an owning call result handed out of the fallback arm compiles and runs
+    // correctly on both binaries and must stay that way - the arm flush passes it as `keep`, and
+    // the value plus the single dtor prove the join yields a live pointee the caller frees once.
+    dtorCount = 0;
+    {
+        Resource* nul = nullptr;
+        Resource* kept = nul ?? makeArmOwnedResource();
+        passed += Test("coalesce_fallback_arm_kept_result_live", kept->id, 52);
+        passed += Test("coalesce_fallback_arm_kept_result_not_freed_in_arm", dtorCount, 0);
+        delete kept;
+        passed += Test("coalesce_fallback_arm_kept_result_freed_once", dtorCount, 1);
+    }
+
+    // The same root cause in the SHORT-CIRCUIT blocks: `falseOR` / `trueAND` do not dominate the
+    // resume block either, so an owning temp in a short-circuited operand used to leak
+    // (both measured dtors == 0 pre-fix). The bool result borrows nothing, so the arm frees it.
+    dtorCount = 0;
+    {
+        Resource* live = new Resource();
+        bool anyOr = (live == nullptr) || (makeMoveBox().t != nullptr);
+        passed += Test("shortcircuit_or_rhs_value", anyOr ? 1 : 0, 1);
+        passed += Test("shortcircuit_or_rhs_temp_freed_once", dtorCount, 1);
+        dtorCount = 0;
+        bool bothAnd = (live != nullptr) && (makeMoveBox().t != nullptr);
+        passed += Test("shortcircuit_and_rhs_value", bothAnd ? 1 : 0, 1);
+        passed += Test("shortcircuit_and_rhs_temp_freed_once", dtorCount, 1);
+        delete live;
+    }
+
+    // TRIPWIRE, same shape and still unfixed: the '?.' guarded chain is the third block that
+    // registers owning temps without a flush. `dtors == 0` pins that LEAK on purpose - see
+    // internal/issue/p2/owning-temp-in-null-conditional-arm-never-destructed.md.
+    dtorCount = 0;
+    {
+        Resource* live = new Resource();
+        int got = live?.readId(makeMoveBox().t->id);
+        passed += Test("null_conditional_arm_temp_value", got, 44);
+        passed += Test("null_conditional_arm_temp_not_freed", dtorCount, 0);
+        delete live;
     }
 
     // A `unique` / `move` SINK parameter fed a genuinely OWNED argument - a fresh allocation and
@@ -8857,7 +8916,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 46;
+    total += 57;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

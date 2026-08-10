@@ -179,8 +179,11 @@ bool LLVMBackend::JoinCarriesOwningTempUniqueField(const llvm::Value* value, int
             return false;
         }
         if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
-            if (!join->Arms.empty())
-                return JoinCarriesOwningTempUniqueField(join->Arms[0].Value, depth + 1);
+        {
+            for (const auto& arm : join->Arms)
+                if (JoinCarriesOwningTempUniqueField(arm.Value, depth + 1)) return true;
+            return false;
+        }
         return false;
     }
 

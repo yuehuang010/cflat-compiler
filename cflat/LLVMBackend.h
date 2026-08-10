@@ -1651,17 +1651,11 @@ private:
      * at freed memory - and a join of two ordinary reads answers no because neither arm was ever
      * ledgered. Mirrors JoinCarriesCodeValue, including the depth cap that terminates a PHI cycle.
      *
-     * THE '??' FALLBACK ARM IS EXCLUDED, and that is a measured accept, not caution. A '?:' arm
-     * gets an explicit FlushOwnedTempsSince inside the arm block, so its temp really is destructed
-     * and the read really does dangle (measured `dtors=1` for both the true and the taken false
-     * arm). The '??' right-hand operand is evaluated in `nullcoal_null`, which neither dominates
-     * the join nor gets that per-arm flush, so its temp is NEVER destructed: `p ?? makeBox().t`
-     * measures `dtors=0` and reads the LIVE value. Rejecting it would refuse a program master
-     * runs correctly. The underlying LEAK is filed as
-     * internal/issue/p2/owning-temp-in-coalesce-fallback-arm-never-destructed.md; when it is
-     * fixed the shape becomes a real dangle and this exclusion must be removed with it.
-     * Arm 0 is the left operand at the one RegisterNullCoalesceJoin call site (MainListener.h,
-     * `{ { lhs, ... }, { rhs, ... } }`).
+     * BOTH '??' arms count. The fallback arm was once excluded because `nullcoal_null` got no
+     * per-arm flush, so its temp was never destructed and rejecting it would have refused a
+     * program that ran correctly. That arm now gets the same FlushOwnedTempsSince the '?:' arms
+     * get (ParseConditionalExpression), so its temp really is destructed inside the arm and the
+     * read really does dangle - the exclusion had to be deleted in the same change.
      */
     bool JoinCarriesOwningTempUniqueField(const llvm::Value* value, int depth = 0) const;
 

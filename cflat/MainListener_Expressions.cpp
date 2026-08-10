@@ -3091,11 +3091,15 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
             compiler->SwitchToBlock(nullBlock);
             llvm::Value* rhs = nullptr;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
+            LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 rhsOcc = armScope.Id;
                 rhs = ParseConditionalExpression(ctx->conditionalExpression());
             }
+            // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
+            // would skip its temps; mirror FinishTernaryArm and keep the yielded value.
+            compiler->FlushOwnedTempsSince(rhsMark, rhs);
             compiler->CreateAssignment(rhs, resultAlloca);
             auto* rhsBr = compiler->CreateJump(resumeBlock);
 
@@ -3241,8 +3245,12 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
                     auto branch = compiler->CreateConditionJump(left, resumeBlock, falseBlock);
 
                     compiler->InitializeBlock(falseBlock, false);
+                    LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     llvm::Value* right = ParseLogicalAndExpression(logicCtx);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
+                    // The short-circuit block does not dominate resumeOR, so the end-of-statement
+                    // flush would skip its temps; the operands are already reduced to a bool here.
+                    compiler->FlushOwnedTempsSince(rhsMark, nullptr);
                     compiler->CreateAssignment(left, resultStorage);
                 }
             }
@@ -3290,8 +3298,12 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
                     auto branch = compiler->CreateConditionJump(left, trueBlock, resumeBlock);
 
                     compiler->InitializeBlock(trueBlock, false);
+                    LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
                     llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
+                    // The short-circuit block does not dominate resumeAND, so the end-of-statement
+                    // flush would skip its temps; the operands are already reduced to a bool here.
+                    compiler->FlushOwnedTempsSince(rhsMark, nullptr);
                     compiler->CreateAssignment(left, resultStorage);
                 }
             }

@@ -1,0 +1,43 @@
+// The '??' FALLBACK arm now gets the same per-arm FlushOwnedTempsSince a '?:' arm gets, so a
+// unique field read out of an owning temp THERE really is freed before the join is used. Both
+// spellings below are the '??' twins of shapes the '?:' path already rejects; before the arm
+// flush landed they compiled and leaked instead (dtors == 0), which is why the escape walk
+// used to look at arm 0 only.
+
+struct Res
+{
+    int id = 0;
+    ~Res() { }
+};
+
+struct Box<T> { T t = default; };
+
+Box<unique Res*> makeBox()
+{
+    Box<unique Res*> b = default;
+    b.t = new Res();
+    b.t->id = 44;
+    return b;
+}
+
+void sinkRes(unique Res* r) { }
+
+extern int main()
+{
+    // Storing the join into a local: the fallback arm's temp is destructed at the end of the
+    // arm, so the local would name freed memory.
+    expect_error("cannot store a unique field of a temporary") {
+        Res* nul = nullptr;
+        Res* escaped = nul ?? makeBox().t;
+    }
+
+    // The round-1 addendum shape: an ownership-taking parameter fed the fallback arm. This was
+    // ACCEPTED and measured dtors == 1 (the callee's free was the only free); with the arm now
+    // freeing too it would be a DOUBLE free, so it has to be rejected like its '?:' twin.
+    expect_error("which takes ownership") {
+        Res* nul2 = nullptr;
+        sinkRes(nul2 ?? makeBox().t);
+    }
+
+    return 0;
+}

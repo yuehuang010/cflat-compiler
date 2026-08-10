@@ -2079,3 +2079,34 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   restore at the tail of `ParseCastExpression` is unreachable from them; the `as` spelling is the
   reachable one and is fixed. `(UBox[])v` on an owning view returns through the `IsArrayView`
   early exit, and indexing it is a hard error on both binaries.
+- **The 2026-08-10 `??` fallback-arm round** (`fix/coalarm`): a block that does not dominate the
+  join is a LEAK SITE, and this repo has four of them. `nullcoal_null` now gets the same
+  `FlushOwnedTempsSince` a `?:` arm gets, and the `Arms[0]`-only exclusion in
+  `JoinCarriesOwningTempUniqueField` was deleted in the same commit - the two halves are one
+  change, because the exclusion existed only because the temp was never destructed. The
+  round-1 addendum shape `sink(p ?? makeBox().t)` resolved ITSELF once the exclusion went: the
+  measured `?:` twin `sink(c ? makeBox().t : p)` is already rejected by
+  `RejectOwningTempUniqueFieldIntoSinkParam` on master, so widening the walk made the `??`
+  spelling reject identically - no double-free suppression logic was needed, and the accepted
+  `dtors=1` reading was the callee's free with the caller's missing one, not a working transfer.
+  `&&` / `||` short-circuit RHS blocks (`falseOR` / `trueAND`) had the SAME root cause and were
+  fixed with the same two lines; their result is a bool that borrows nothing, so the arm flush is
+  unconditionally correct there. The `?.` guarded chain is the fourth site and was measured
+  (`dtors=0` vs `1`) and FILED rather than fixed - it threads through the postfix walker and needs
+  one mark/flush per exit edge.
+  **The oracle was NOT correct, and checking it was the whole value of Phase A.** `?:` measures
+  `dtors=1` but frees INSIDE the arm, which is earlier than the end of the full expression: from
+  `--no-opt` IR, `readV(c ? makeBox().t : n)` calls `Box.dtorfull` in `ternary_true` and `readV`
+  in `ternary_resume`, i.e. a compiling use-after-free on master. Mirroring the mechanism gave
+  `??` the same hole for the consumers the escape guards deliberately accept (a plain-`T*`
+  parameter read, a value laundered through a borrowing callee) - filed as
+  `p1/join-arm-flush-frees-before-the-join-result-is-used.md` with both spellings' measurements
+  and the two candidate fixes. Do not "fix" it by widening the guard on a probe alone: a CAST is
+  not a join and does not move the free earlier, so `!IsLedgeredOwningTempUniqueField` is the
+  WRONG predicate for "reached through a join".
+  The `temp_uniq_accept_coalesce_fallback_arm_not_freed` tripwire did its job exactly as designed
+  - it was the only thing that failed the suite - and the leg could not merely be renumbered:
+  the shape it pinned is now REJECTED, so it moved to
+  `Test/errors/err_coalesce_fallback_arm_escape.cb` and the value legs were rewritten around the
+  shapes that stay legal. A new tripwire pinning `dtors == 0` was planted for the `?.` site.
+  `Test/test_move.cb` under `leaks --atExit` went 19 leaks / 368 bytes -> 16 / 320.
