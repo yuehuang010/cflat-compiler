@@ -1107,6 +1107,13 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
+        // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
+        // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
+        std::string FieldPathRoot;
+        // Answered at the field-access site, where the root's binding is RESOLVED: that root is the
+        // current function's borrowed (non-`move`) by-value struct parameter. Re-asking downstream by
+        // NAME cannot distinguish the parameter from an inner local that shadows it.
+        bool RootIsBorrowedByValueParam = false;
         // Field reached THROUGH an interface value (data ptr + the vtable's byte-offset slot). The
         // address is a byte GEP, not a 2-index struct GEP, so field-store rules must be told.
         bool IsInterfaceField = false;

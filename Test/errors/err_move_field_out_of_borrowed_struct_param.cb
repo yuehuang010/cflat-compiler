@@ -14,4 +14,72 @@ expect_error("cannot 'move' field 'Holder.p' out of borrowed by-value parameter 
 // The same field move out of an OWNED ('move') parameter is the sanctioned transfer.
 void goodFieldMove(move Holder h) { stash.p = move h.p; }
 
+/*
+ * The IMPLICIT consuming stores of the same field. Every one of these used to compile and
+ * abort with a double free at the caller's teardown (rc 133): the store zeroed the callee's
+ * bit copy of `w.b` while the caller's `Wrap` still owned - and freed - the same Res.
+ * `UBox` is a NON-copyable owner (it holds a `unique`), so each store below classifies as a
+ * MOVE; that is the discriminator that reaches the consume arm the guard sits in. The
+ * copyable-field and 'move'-parameter twins in Test/test_move.cb pin the accept side.
+ */
+struct Res  { int id = 0; };
+struct UBox { unique Res* item = nullptr; };
+struct Wrap { UBox b; };
+struct Mid  { UBox b; };
+struct Nest { Mid a; };
+
+UBox gsink = default;
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badDeclInit(Wrap w) { UBox o = w.b; return o.item->id; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badAssign(Wrap w) { UBox o = default; o = w.b; return o.item->id; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badArrayElement(Wrap w) { UBox[2] dst = default; dst[0] = w.b; return dst[0].item->id; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badBraceElement(Wrap w) { UBox[2] dst = { w.b }; return dst[0].item->id; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badDerefDest(Wrap w) { UBox o = default; UBox* dp = &o; *dp = w.b; return o.item->id; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badGlobalDest(Wrap w) { gsink = w.b; return gsink.item->id; }
+}
+
+// A NESTED field path roots at the same borrowed parameter: 'w' owns nothing here either.
+expect_error("cannot consume field 'Mid.b' out of borrowed by-value parameter 'w'") {
+    int badNestedPath(Nest w) { UBox o = w.a.b; return o.item->id; }
+}
+
+// The explicit spelling of the nested path, which used to slip past the 'move' guard
+// because the immediate parent of `.b` is the field `a`, not the parameter.
+expect_error("cannot 'move' field 'Mid.b' out of borrowed by-value parameter 'w'") {
+    int badNestedMove(Nest w) { UBox o = move w.a.b; return o.item->id; }
+}
+
+// An ELEMENT of an owning ARRAY field of the same borrowed parameter. The message names the
+// owning array field, not the slot: IsElementAccess is not set on the source here, and the
+// field / parameter / remedy it does name are all correct.
+struct AWrap { UBox[2] arr; };
+
+expect_error("cannot consume field 'AWrap.arr' out of borrowed by-value parameter 'w'") {
+    int badArrayFieldElement(AWrap w) { UBox o = w.arr[0]; return o.item->id; }
+}
+
+/*
+ * NOT rejected, and pinned here so the guard's polarity stays visible next to its reject legs:
+ * an inner local SHADOWING the parameter owns its own storage, so consuming its field is legal.
+ * The value legs (caller's resource still live, two frees) are in Test/test_move.cb as
+ * cbvf_shadow_* / cbvf_shadowmove_* / cbvf_shadowloop_*.
+ */
+int okShadowedLocal(Wrap w) { { Wrap w; w.b.item = new Res(); UBox o = w.b; return o.item == nullptr ? 0 : 1; } }
+
 extern int main() { return 0; }

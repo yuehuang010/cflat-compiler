@@ -4843,6 +4843,184 @@ int testBraceInitConsumesParameter()
 }
 
 /*
+ * ACCEPT SET for the borrowed-by-value-parameter FIELD consume guard. The reject side lives in
+ * Test/errors/err_move_field_out_of_borrowed_struct_param.cb: consuming `w.b` where `w` is a
+ * BORROWED by-value struct parameter used to null only the callee's bit copy and double-free at
+ * the caller's teardown. Every leg below is in the same syntactic neighbourhood and must KEEP
+ * compiling and running - they are what a guard with the wrong polarity would take out. The
+ * discriminators are named per leg: the guard fires only when the store MOVES (a non-copyable
+ * owner), the source is a FIELD PATH, and that path's ROOT is a non-'move' by-value parameter.
+ */
+// Non-'move' by-value param, COPYABLE field: classifies as Copy, so no consume, no reject.
+int cbvCopyField(OaiCopyWrap w)  { OaiCopyBox o = w.b; return o.item->id; }
+// Non-'move' by-value param, POD field: not an owning value type at all.
+int cbvPodField(OaiPodWrap w)    { OaiPod o = w.p; return o.x; }
+// Non-'move' by-value param, STRING field: string takes its own deep-copy arm, not the move arm.
+int cbvStringField(OaiSWrap w)   { string t = w.b.s; return t.length(); }
+// Non-'move' by-value param, owning field READ (never stored): a borrow, not a consume.
+int cbvReadField(OaiWrap w)      { return w.b.item->id; }
+// Non-'move' by-value param, NESTED owning field read: the reject twin is `OaiBox o = w.inner.b`.
+int cbvReadNested(OaiOuter w)    { return w.inner.b.item->id; }
+// 'move' param: the callee OWNS its copy, so consuming the field is the sanctioned transfer.
+int cbvMoveParamField(move OaiWrap w) { OaiBox o = w.b; return o.item->id; }
+// Field of a LOCAL struct - the root is not a parameter, so the consume stays legal.
+int cbvLocalField()              { OaiWrap w; w.b = oaiMake(6); OaiBox o = w.b; return o.item->id; }
+// Field through a BORROWED POINTER parameter: filed separately (p2, memory-safe today) and
+// deliberately NOT covered by this guard, which keys on a by-VALUE struct parameter.
+int cbvPtrParamField(OaiWrap* w) { OaiBox o = w.b; return o.item->id; }
+// Whole by-value param consumed (no field path): the owning-sink inference's job, not this guard.
+int cbvWholeParam(OaiBox p)      { OaiBox o = p; return o.item->id; }
+/*
+ * SHADOWING. An inner block declares a local with the parameter's name; the local owns its own
+ * storage and none of the parameter's borrow contract, so consuming ITS field is legal. The
+ * guard settles this against the RESOLVED binding (storage identity) rather than the name -
+ * a name-only test answers "parameter" here and false-rejects both spellings below. The
+ * discriminator is that the caller's own resource must survive the call: dtorCount is 2 after
+ * the block, one for the inner local's and one for the caller's, and the return value is the
+ * INNER 4, proving the shadowing local (not the parameter) is what was read.
+ *
+ * BASELINES these legs discriminate against (measured, they are not vacuous):
+ *  - cbvShadowedMove is a hard error on 6c2302c, the commit BEFORE this guard existed: the
+ *    name-only defect was already live in the explicit 'move' path and is repaired here.
+ *  - cbvShadowedLocal / cbvShadowedInLoop compile on 6c2302c but are hard errors on c324b09,
+ *    this fix's own first round, which extended the name-only test to the implicit stores.
+ */
+int cbvShadowedLocal(OaiWrap w)  { { OaiWrap w; w.b = oaiMake(4); OaiBox o = w.b; return o.item->id; } }
+int cbvShadowedMove(OaiWrap w)   { { OaiWrap w; w.b = oaiMake(4); OaiBox o = move w.b; return o.item->id; } }
+int cbvShadowedInLoop(OaiWrap w)
+{
+    int s = 0;
+    for (int i = 0; i < 1; i = i + 1) { OaiWrap w; w.b = oaiMake(4); OaiBox o = w.b; s = s + o.item->id; }
+    return s;
+}
+
+int testConsumeOfBorrowedByValueParamField()
+{
+    int passed = 0;
+
+    // 1. A copyable owner's field COPIES: the caller's source is still live afterwards, and
+    // both the copy and the original are freed (2 dtors).
+    dtorCount = 0;
+    {
+        OaiCopyWrap w;
+        w.b.item = new Resource();
+        w.b.item->id = 11;
+        passed += Test("cbvf_copyable_value", cbvCopyField(w), 11);
+        passed += Test("cbvf_copyable_source_live", w.b.item->id, 11);
+    }
+    passed += Test("cbvf_copyable_freed_all", dtorCount, 2);
+
+    // 2. A POD field owns nothing.
+    {
+        OaiPodWrap w;
+        w.p.x = 4;
+        passed += Test("cbvf_pod_value", cbvPodField(w), 4);
+        passed += Test("cbvf_pod_source_live", w.p.x, 4);
+    }
+
+    // 3. A string field: the owning axis a pointer dtor count cannot see.
+    {
+        OaiSWrap w;
+        w.b.s = "hello";
+        passed += Test("cbvf_string_value", cbvStringField(w), 5);
+        passed += Test("cbvf_string_source_live", w.b.s.length(), 5);
+    }
+
+    // 4. Reading an owning field of a borrowed by-value param never stores it, so the caller
+    // keeps ownership and frees exactly once.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(3);
+        passed += Test("cbvf_read_value", cbvReadField(w), 3);
+        passed += Test("cbvf_read_source_live", w.b.item->id, 3);
+    }
+    passed += Test("cbvf_read_freed_once", dtorCount, 1);
+
+    // 5. The NESTED read, whose consuming twin is now rejected on the path ROOT.
+    dtorCount = 0;
+    {
+        OaiOuter w;
+        w.inner.b = oaiMake(7);
+        passed += Test("cbvf_readnested_value", cbvReadNested(w), 7);
+        passed += Test("cbvf_readnested_source_live", w.inner.b.item->id, 7);
+    }
+    passed += Test("cbvf_readnested_freed_once", dtorCount, 1);
+
+    // 6. A 'move' parameter owns its copy: the field consume transfers, and the resource is
+    // freed exactly once - by the callee, not by the surrendered caller source.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(8);
+        passed += Test("cbvf_moveparam_value", cbvMoveParamField(move w), 8);
+        passed += Test("cbvf_moveparam_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("cbvf_moveparam_freed_once_total", dtorCount, 1);
+
+    // 7. A LOCAL struct's field: the consume nulls the one real object, so exactly one free.
+    dtorCount = 0;
+    passed += Test("cbvf_local_value", cbvLocalField(), 6);
+    passed += Test("cbvf_local_freed_once", dtorCount, 1);
+
+    // 8. The POINTER-parameter spelling stays green (filed as p2, out of this guard's scope):
+    // the caller's field is nulled and the resource freed once.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(9);
+        passed += Test("cbvf_ptrparam_value", cbvPtrParamField(&w), 9);
+        passed += Test("cbvf_ptrparam_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("cbvf_ptrparam_freed_once", dtorCount, 1);
+
+    // 9. A WHOLE by-value parameter consume has no field path, so the guard cannot see it and
+    // the owning-sink inference keeps handing the callee ownership.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(10);
+        passed += Test("cbvf_wholeparam_value", cbvWholeParam(a), 10);
+        passed += Test("cbvf_wholeparam_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("cbvf_wholeparam_freed_once_total", dtorCount, 1);
+
+    // 10. A local SHADOWING the parameter: the consume is of the local's field, so it is legal
+    // and the caller's own resource must still be alive after the call (2 frees, not 1).
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(1);
+        passed += Test("cbvf_shadow_value", cbvShadowedLocal(w), 4);
+        passed += Test("cbvf_shadow_caller_live", w.b.item->id, 1);
+        passed += Test("cbvf_shadow_inner_freed", dtorCount, 1);
+    }
+    passed += Test("cbvf_shadow_freed_both", dtorCount, 2);
+
+    // 11. The EXPLICIT 'move' spelling of the same shadow, which the name-only test rejected
+    // even before this guard existed.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(1);
+        passed += Test("cbvf_shadowmove_value", cbvShadowedMove(w), 4);
+        passed += Test("cbvf_shadowmove_caller_live", w.b.item->id, 1);
+    }
+    passed += Test("cbvf_shadowmove_freed_both", dtorCount, 2);
+
+    // 12. The shadow declared in a LOOP body - a scope the guard reaches by a different route.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(1);
+        passed += Test("cbvf_shadowloop_value", cbvShadowedInLoop(w), 4);
+        passed += Test("cbvf_shadowloop_caller_live", w.b.item->id, 1);
+    }
+    passed += Test("cbvf_shadowloop_freed_both", dtorCount, 2);
+
+    return passed;
+}
+
+/*
  * A LAMBDA literal is lowered on its own path, so it never reached ApplyOwningSinkInference: its
  * body consumed a by-value owning parameter while the caller kept the argument live, and both
  * freed one resource (rc 133). The inference now runs over the lambda's own parameter list, the
@@ -7169,6 +7347,9 @@ extern int main()
 
     passed += testLambdaParamOwningSink();
     total += 60;
+
+    passed += testConsumeOfBorrowedByValueParamField();
+    total += 34;
 
     passed += testParenConsumeSourceSink();
     total += 35;

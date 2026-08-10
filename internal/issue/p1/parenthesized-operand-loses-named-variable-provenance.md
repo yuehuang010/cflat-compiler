@@ -76,8 +76,11 @@ here: these arms need the resolved variable, not its spelling.
 - `internal/fix-issue-lessons.md` - the `fix/parenmv` record (the syntactic half).
 - `internal/issue/p3/discard-position-not-threaded-through-parens-and-ternary.md` - same
   parenthesization family, cosmetic.
-- `internal/issue/p1/owning-field-of-a-by-value-struct-parameter-double-frees-on-consume.md` -
-  independent; `UBox o = w.b;` on a by-value `Wrap` parameter is rc 134 with AND without parens
-  (`scratch/pm_c1`/`pm_c2`), so it is not a parenthesization bug.
-</content>
-</invoke>
+- The by-value-parameter field consume (that issue file was deleted by `fix/bvfield`, which
+  rejected it). It was correctly filed as independent - `UBox o = w.b;` on a by-value `Wrap`
+  parameter was rc 133 with AND without parens - but the two are now COUPLED in the other
+  direction: after `fix/bvfield` the bare spelling is a hard error and the parenthesized one
+  (`UBox o = (w.b);`, `UBox o = move (w.b);` - `scratch/bv_13`/`bv_o2`) still compiles and still
+  double-frees, because the guard reads `OwningStructName` / `FieldName` / `FieldPathRoot` and the
+  parenthesized primary carries none of them. This is the concrete hole a fix here closes, and it
+  is a cell of THIS issue, not of that one.

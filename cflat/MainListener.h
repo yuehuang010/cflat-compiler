@@ -4235,6 +4235,11 @@ public:
      */
     bool IsBorrowedStructParameter(LLVMBackend* compiler, const std::string& name);
 
+    // The same question asked of a RESOLVED binding rather than a name. Storage identity is what
+    // separates the parameter from an inner local declared with the parameter's name.
+    bool IsBorrowedByValueParamBinding(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv);
+
     // A 'move' by-value struct parameter whose type owns storage (e.g. `move Holder h` where
     // Holder holds a unique pointer). Returning such a parameter by a PLAIN `return h` copies
     // its owning bits without releasing the parameter, so both the returned value and the
@@ -4244,6 +4249,20 @@ public:
     // The variable an alias-origin description like "h.p" was reached through ("h"); the whole
     // string when there is no dot.
     static std::string BorrowedOriginRoot(const std::string& origin);
+
+    // The ROOT variable of a field-path NamedVariable ("w" for `w.b` and for `w.a.b`).
+    static std::string FieldPathRootName(const LLVMBackend::NamedVariable& nv);
+
+    /*
+     * Reject an IMPLICIT consuming store (`o = w.b`, `dst[0] = w.b`, `UBox o = w.b`, a brace
+     * element) whose source is a field path rooted at a BORROWED by-value struct parameter.
+     * The consume zeroes only the callee's bit copy of the field, so the caller's struct still
+     * frees the same pointee. This is the ruling ParseMoveExpression applies to `move w.b`.
+     * Returns true (and has already reported) when the store must not be lowered.
+     */
+    bool RejectConsumeOfBorrowedByValueParamField(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        antlr4::ParserRuleContext* ctx);
 
     LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx);
 

@@ -866,6 +866,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    // Carry the path's ROOT variable forward: on `w.a.b` the parent
+                                    // of `.b` is the field `a`, whose own root is still `w`.
+                                    namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
+                                        ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
+                                    // Settle the borrowed-parameter question HERE, against the
+                                    // RESOLVED parent binding, and record it (see FieldPathRoot).
+                                    namedVar.RootIsBorrowedByValueParam = structVar.FieldPathRoot.empty()
+                                        ? IsBorrowedByValueParamBinding(Compiler(ctx), structVar)
+                                        : structVar.RootIsBorrowedByValueParam;
                                     // A cast off this read (`(Res*)b.p`, `free((void*)b.p)`) severs
                                     // Storage and rewrites the type; carry the unique provenance so
                                     // the borrow rules still fire (see IsUniqueFieldRead / Trap B).

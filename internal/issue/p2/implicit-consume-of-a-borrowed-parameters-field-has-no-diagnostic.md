@@ -47,6 +47,41 @@ Pick ONE reading and apply it to both spellings:
 Do NOT simply narrow the `fix/owncopy` arm back: the sources it consumes here used to DOUBLE-FREE
 (rc 133), so a plain narrowing trades a silent value loss for memory unsafety.
 
+## Deliberately left open by `fix/bvfield` (2026-08-09)
+
+`fix/bvfield` closed the BY-VALUE twin of this issue (that file is deleted) by rejecting every
+implicit consume whose source field path roots at a non-`move` by-value struct parameter. It did
+NOT extend that guard to the pointer-parameter spelling here, and the reason is a measurement:
+`Test/test_move.cb`'s `bps_ptrfieldsrc_*` legs and the new `cbvf_ptrparam_*` legs pin the pointer
+spelling GREEN - it compiles, nulls the caller's field, and frees once (rc 0). Rejecting it would
+turn a program the compiler runs correctly into a hard error, which is a BEHAVIOUR CHANGE to
+working code and a maintainer design decision, not a bug fix.
+
+The two spellings are therefore no longer symmetric, and that asymmetry is now the visible face of
+this issue: `int f(Wrap w) { UBox o = w.b; }` is rejected, `int f(Wrap* w) { UBox o = w.b; }` is
+accepted and silently takes the caller's value. Whichever ruling is picked, it has to be applied to
+the explicit `move w.b` spelling in the same change - that one is already rejected here.
+
+Note for whoever takes it: the by-value guard answers the question against the RESOLVED binding
+(`NamedVariable::RootIsBorrowedByValueParam`, settled at the field-access site), not against the
+root's NAME. A pointer-parameter version must do the same - a name-only test false-rejects an inner
+local that shadows the parameter, which is exactly what the review of `fix/bvfield` caught.
+
+### A worse neighbour: `&w` on a BY-VALUE parameter (measured, still open)
+
+Taking the address of the by-value parameter launders the field consume past the new guard, and
+unlike the pointer-PARAMETER spelling above it is not memory-safe:
+
+```cflat
+int f(Wrap w) { Wrap* p = &w; UBox o = p->b; return o.item->id; }   // scratch/rev_45
+```
+
+-> compiles 0, prints `v=3`, then ABORTS (rc 133). Measured identical on `6c2302c`, on
+`fix/bvfield`'s first round, and on its final commit - so it is pre-existing and untouched, not a
+regression. The guard structurally cannot see it: the field path roots at the pointer LOCAL `p`,
+not at `w`, so `RootIsBorrowedByValueParam` is false. Whichever ruling is picked for this issue has
+to cover the address-of spelling too, since it is the double-freeing member of the family.
+
 ## Related
 
 `internal/plan/ownership-transparent-assignment.md` (`=` is total over T); the landed

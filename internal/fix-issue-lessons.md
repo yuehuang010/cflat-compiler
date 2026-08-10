@@ -1753,3 +1753,64 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   makes it structurally impossible for the adopted facts and the called body to disagree. Frozen as
   legs 17-19 of `testLambdaParamOwningSink`, with the two overload pairs declared in OPPOSITE
   orders so neither accept leg can pass by being the first-registered one.
+
+- **`fix/bvfield` - one ruling for six consume arms, and an ORACLE with two holes in it.**
+  Consuming a field of a BORROWED by-value struct parameter (`UBox o = w.b;` inside
+  `int f(Wrap w)`) zeroed only the callee's bit copy while the caller's `Wrap` still owned and
+  freed the same `Res` - rc 133 in every implicit store spelling, while the explicit `move w.b`
+  had rejected it since it was written. The fix routes all six `ClassifyOwningAssignSource` consume
+  arms - local/global destination, fixed-array element, deref destination, container element slot,
+  the brace/array slot emitter, and the decl-initializer - through one
+  `RejectConsumeOfBorrowedByValueParamField` placed immediately after the classify and gated on
+  `kind == Move`. That gate IS the polarity: a COPYABLE owner classifies Copy and never reaches the
+  guard, which is why `OaiCopyWrap`, `OaiPodWrap` and `OaiSWrap` field consumes stayed green with
+  no exclusion written for them.
+  **Following the issue file's "use the same test the explicit spelling uses" instruction verbatim
+  would have shipped that test's own two holes.** Running the oracle against itself first - the
+  `internal/skill/fix-issue` oracle caution, applied - found `move w.a.b` (NESTED path) and
+  `move (w.b)` (parenthesized) both compiling and double-freeing on the base commit. The nested one
+  was a missing INPUT, not a missing check: `TypeAndValue.ParentVariableName` names only the
+  IMMEDIATE parent, which on `w.a.b` is the field `a`, so `IsBorrowedStructParameter` was being
+  asked about a field name. A new `NamedVariable::FieldPathRoot`, set once at the field-access site
+  from the parent's own root, fixed the implicit AND the explicit spelling together. The
+  parenthesized one is provenance loss upstream and stays open as a cell of
+  `p1/parenthesized-operand-loses-named-variable-provenance.md`.
+  **Two more spellings looked like this bug and were proved NOT to be, by a control with a LOCAL
+  source.** `return w.b` (rc 133) and `v[0] = w.b` into a `T[]` VIEW (rc 133) both reproduce with
+  no parameter anywhere - `Wrap w2; return w2.b;` and `v[0] = w2.b;` abort identically - so neither
+  is a borrowed-parameter fault: the return path has no consume arm at all, and the view-element
+  destination has none for an INDIRECT source. Filed as
+  `p1/return-of-an-owning-struct-field-copies-instead-of-consuming.md` and as a re-measurement that
+  promoted `array-view-element-store-orphans-the-old-element` from a p2 LEAK to a p1 double free.
+  **The one-line control is what separates "my area" from "the neighbouring bug", and it is cheaper
+  than either fixing or excusing the cell.**
+  The POINTER-parameter twin (`p2/implicit-consume-of-a-borrowed-parameters-field-has-no-diagnostic`)
+  was deliberately left open: `bps_ptrfieldsrc_*` pins it GREEN, so extending the guard there would
+  hard-error a program master runs correctly. **"Both spellings want the same single ruling" in an
+  issue file is a design preference; when one of them is pinned green, applying it is a maintainer
+  decision, not a fix.**
+
+  **Round 2 (review) found the axis the round had not enumerated: SHADOWING, and the defect was in
+  the predicate the issue file told the fix to reuse.** `IsBorrowedStructParameter` asked
+  `IsFunctionParameter(name)` and then resolved the binding with `GetScopedLocalOrArgument(name)` -
+  two lookups that DISAGREE when an inner block declares a local of the parameter's name. The name
+  says parameter; the binding is the local, which carries none of the parameter's borrow contract.
+  `int f(Wrap w) { { Wrap w; w.b = umk(4); UBox o = w.b; } }` is rc 0 with two allocations and two
+  frees on the base commit and became a hard error - a false rejection of a correct program, in the
+  most ordinary shape there is. The same defect was ALREADY LIVE in the explicit `move` path it was
+  copied from (`scratch/rev_24`), which false-rejects on the base commit too. **Reusing a predicate
+  inherits its bugs as well as its answer - the oracle caution applies to the predicate, not only to
+  the behaviour.** The fix is the standing rule from "On the code": resolve the name ONCE where the
+  scope that gives it meaning is current, and RECORD the answer -
+  `NamedVariable::RootIsBorrowedByValueParam`, settled at the field-access site against the resolved
+  parent binding, plus a STORAGE-identity check inside `IsBorrowedStructParameter` itself so its
+  remaining name-based callers stop being name-only. That second half repaired the pre-existing
+  `move` false rejection in the same change.
+  Two smaller review findings worth keeping. The reject message advised "or 'alias w' to borrow
+  explicitly", and `alias Wrap w` is rc 133 on the base commit - the same double free - so the
+  REMEDY WAS A LIE while the rejection it decorated was correct; the clause was dropped from all
+  three messages rather than the guard being loosened. And a cosmetic request to name the ELEMENT on
+  `w.arr[0]` was attempted, measured (`IsElementAccess` is not set on that source), and REVERTED
+  rather than plumbed - the leg was re-pinned to the wording the compiler actually emits. **A
+  cosmetic finding that turns out to need new plumbing stops being cheap, and the honest move is to
+  pin the real behaviour, not to grow the diff.**

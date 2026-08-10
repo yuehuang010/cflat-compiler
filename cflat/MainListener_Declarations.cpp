@@ -2865,6 +2865,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 std::string srcBorrowedOrigin;
                 std::string srcBorrowedUniqueField; // "Struct.field" when the borrow came from a `unique` field
                 std::string srcBorrowedField;       // RHS field name, when the borrow came through a field read
+                // Field-path provenance of the RHS, kept past rightNV's scope so the decl-init
+                // consume arm can ask whether the source roots at a borrowed by-value parameter.
+                LLVMBackend::NamedVariable srcFieldPathNV;
                 bool srcIsOwningMove = false;       // RHS is an owning pointer (move param or alias thereof via cast)
                 std::string srcOwningName;          // name of the original owning source, for nulling on transfer
                 // RHS is a plain read of a live OWNING local (or of another such copy). See
@@ -3253,6 +3256,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     : rightNV.BorrowedOrigin;
                                 srcBorrowedUniqueField = rightNV.BorrowedUniqueField;
                                 srcBorrowedField = rightNV.FieldName;
+                                srcFieldPathNV.OwningStructName = rightNV.OwningStructName;
+                                srcFieldPathNV.FieldName = rightNV.FieldName;
+                                srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
+                                srcFieldPathNV.RootIsBorrowedByValueParam =
+                                    rightNV.RootIsBorrowedByValueParam;
+                                srcFieldPathNV.TypeAndValue.ParentVariableName =
+                                    rightNV.TypeAndValue.ParentVariableName;
                                 // Trap B: a plain copy of a `unique` field does not null the field, so the
                                 // field's synthesized destructor still frees the pointee. Treat the local as
                                 // a borrow of the field, which routes a later `delete` into the existing
@@ -4141,7 +4151,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // and a is marked moved for the use-after-move diagnostic.
                                 AssignSourceKind kind;
                                 right = ClassifyOwningAssignSource(right, typeAndValue.TypeName, false, direct, kind);
-                                if (kind == AssignSourceKind::Move)
+                                // Bails like the five sibling sites rather than relying on
+                                // LogErrorContext's throw to skip the consume below.
+                                bool rejectedBorrowedField = kind == AssignSourceKind::Move
+                                    && RejectConsumeOfBorrowedByValueParamField(
+                                        compiler, srcFieldPathNV, direct);
+                                if (kind == AssignSourceKind::Move && !rejectedBorrowedField)
                                 {
                                     compiler->builder->CreateStore(
                                         llvm::ConstantAggregateZero::get(right->getType()), srcStorage);

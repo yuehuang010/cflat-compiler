@@ -2149,6 +2149,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 compiler->builder->CreateStore(toStore, destination);
@@ -2201,6 +2204,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 if (kind == AssignSourceKind::Move)
                 {
                     compiler->builder->CreateStore(
@@ -2274,6 +2280,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, namedVar.TypeAndValue.TypeName, false, ctx, kind);
+                if (kind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 auto* assignResult = derefAssign(toStore, rhsUnsigned);
@@ -2601,6 +2610,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 AssignSourceKind slotKind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, slotElemType, rightNV.TypeAndValue.IsMove, ctx, slotKind);
+                if (slotKind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 compiler->builder->CreateStore(toStore, destination);
                 if (slotKind == AssignSourceKind::Move && rightNV.Storage != nullptr)
                 {
@@ -6693,6 +6705,7 @@ void MainListener::ConsumeOwningBraceElementSource(
         val = ClassifyOwningAssignSource(val, nv.TypeAndValue.TypeName,
                                          nv.TypeAndValue.IsMove, ctx, kind);
         if (kind != AssignSourceKind::Move) return;
+        if (RejectConsumeOfBorrowedByValueParamField(compiler, nv, ctx)) return;
         compiler->builder->CreateStore(
             llvm::ConstantAggregateZero::get(val->getType()), nv.Storage);
         // Only a named slot has a spelling to report a later use of; an indirect lvalue
@@ -8162,12 +8175,27 @@ bool MainListener::IsDirectCallArgument(antlr4::ParserRuleContext* ctx) {
         return false;
     }
 
+bool MainListener::IsBorrowedByValueParamBinding(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv) {
+        if (compiler == nullptr || nv.Storage == nullptr) return false;
+        const std::string& name = nv.TypeAndValue.VariableName;
+        if (name.empty() || !compiler->IsFunctionParameter(name)) return false;
+        // STORAGE identity, not the name: an inner block may declare a local of the parameter's
+        // name, and that local carries none of the parameter's borrow contract.
+        auto arg = compiler->GetFunctionArgument(name);
+        if (arg.Storage == nullptr || arg.Storage != nv.Storage) return false;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove || nv.IsOwningStruct) return false;
+        return compiler->IsDataStructure(nv.TypeAndValue.TypeName);
+    }
+
 bool MainListener::IsBorrowedStructParameter(LLVMBackend* compiler, const std::string& name) {
         if (compiler == nullptr || name.empty()) return false;
         if (!compiler->IsFunctionParameter(name)) return false;
         auto nv = compiler->GetScopedLocalOrArgument(name);
-        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove || nv.IsOwningStruct) return false;
-        return compiler->IsDataStructure(nv.TypeAndValue.TypeName);
+        // Resolve the NAME to a binding, then judge the BINDING. A shadowing local answers
+        // IsFunctionParameter (the name is a parameter's) while owning its own storage.
+        nv.TypeAndValue.VariableName = name;
+        return IsBorrowedByValueParamBinding(compiler, nv);
     }
 
 bool MainListener::IsMoveOwningStructParameter(LLVMBackend* compiler, const std::string& name) {
@@ -8182,6 +8210,31 @@ bool MainListener::IsMoveOwningStructParameter(LLVMBackend* compiler, const std:
 std::string MainListener::BorrowedOriginRoot(const std::string& origin) {
         auto dot = origin.find('.');
         return dot == std::string::npos ? origin : origin.substr(0, dot);
+    }
+
+std::string MainListener::FieldPathRootName(const LLVMBackend::NamedVariable& nv) {
+        return nv.FieldPathRoot.empty()
+            ? BorrowedOriginRoot(nv.TypeAndValue.ParentVariableName) : nv.FieldPathRoot;
+    }
+
+bool MainListener::RejectConsumeOfBorrowedByValueParamField(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        antlr4::ParserRuleContext* ctx) {
+        // Only a FIELD PATH can be rooted at a parameter without naming it; a whole-value
+        // consume of the parameter itself is the owning-sink inference's job, not this guard.
+        if (srcNV.OwningStructName.empty() || srcNV.FieldName.empty()) return false;
+        // The RECORDED answer from the field-access site, not a fresh lookup of the root's name.
+        if (!srcNV.RootIsBorrowedByValueParam) return false;
+        const std::string root = FieldPathRootName(srcNV);
+        // On `w.arr[0]` this names the owning ARRAY field rather than the slot: coarse, but the
+        // field, the parameter and the remedy are all correct. IsElementAccess is not set here.
+        LogErrorContext(ctx, std::format(
+            "cannot consume field '{}.{}' out of borrowed by-value parameter '{}' - the store nulls "
+            "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
+            "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
+            "field without storing it (a read borrows, a store consumes).",
+            srcNV.OwningStructName, srcNV.FieldName, root, root));
+        return true;
     }
 
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
@@ -8203,15 +8256,17 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // Reject 'move h.p' where `h` is a BORROWED by-value struct parameter: the move nulls the
         // callee's copy of the field, but the caller's original still holds the pointer, so both
         // synthesized destructors free it. Declaring the parameter 'move' makes the callee the owner.
-        if (!argNV.OwningStructName.empty()
-            && IsBorrowedStructParameter(compiler, argNV.TypeAndValue.ParentVariableName))
+        // Uses the answer RECORDED at the field-access site, which is also what makes a NESTED path
+        // (`move w.a.b`) reach this leg: ParentVariableName names the intermediate field, not `w`.
+        if (!argNV.OwningStructName.empty() && argNV.RootIsBorrowedByValueParam)
         {
-            const std::string& parent = argNV.TypeAndValue.ParentVariableName;
+            const std::string parent = FieldPathRootName(argNV);
             LogErrorContext(ctx, std::format(
                 "cannot 'move' field '{}.{}' out of borrowed by-value parameter '{}' - the move nulls "
                 "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
-                "Declare the parameter 'move {}' to take ownership, or 'alias {}' to borrow explicitly.",
-                argNV.OwningStructName, argNV.FieldName, parent, parent, parent));
+                "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
+                "field without moving it (a read borrows, a move consumes).",
+                argNV.OwningStructName, argNV.FieldName, parent, parent));
             return {};
         }
 
@@ -8255,8 +8310,8 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                     "null the field, so the field's synthesized destructor still frees the pointee. "
                     "'move {}' is not a remedy here either: '{}' is a borrowed by-value parameter, so "
                     "it would null only the callee's copy. Declare the parameter 'move {}' to take "
-                    "ownership, or 'alias {}' to borrow explicitly.",
-                    name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin, root, root, root));
+                    "ownership of the caller's struct.",
+                    name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin, root, root));
             else
                 LogErrorContext(ctx, std::format(
                     "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "

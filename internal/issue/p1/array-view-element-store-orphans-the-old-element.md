@@ -2,7 +2,8 @@
 
 Filed 2026-08-09 by `fix/arrslot`, which measured this as the boundary of its own accept set.
 
-Severity: leak (no abort).
+Severity: double free (abort, rc 133) for an INDIRECT source; leak (no abort) for a named one.
+Re-measured 2026-08-09 by `fix/bvfield` - see "Worse than filed" below.
 
 ## Repro
 
@@ -50,3 +51,29 @@ time the ELEMENT NamedVariable is built (the Part 6 gate tests it and it is fals
 first step is to carry the base binding's view-ness onto the element access, then give the
 view-element case the drop-old the fixed-array case now has. Re-probe both invariant paths on any
 change here.
+
+## Worse than filed (re-measured 2026-08-09, `fix/bvfield`)
+
+The filed repro uses a NAMED local source (`v[0] = a`), which reaches a consume arm and only
+orphans the old element - a leak, as recorded. An INDIRECT source (a field path or any other
+lvalue with no name) reaches NO consume arm at all: the plain store aliases the source's owning
+bits, and both the element and the source free them.
+
+```cflat
+// scratch/bv_c4 - LOCAL struct field source
+extern int main() {
+    { Wrap w; w.b = umk(3); UBox[] v = new UBox[2]; v[0] = w.b;
+      printf("v=%d\n", v[0].item->id); }
+    printf("d=%d\n", dtor); return 0; }
+```
+
+-> compiles 0, prints `v=3`, then ABORTS (rc 133). Measured identical on `6c2302c` and on
+`fix/bvfield`. The named-source control (`v[0] = b`, `scratch/bv_c5`) is rc 0 / `d=1` on both, so
+the difference is the source's indirectness, not the view destination alone.
+
+Consequence for the fix: the view-element destination needs the owning-value CONSUME arm the
+fixed-array element destination has (`MainListener_Expressions.cpp` ~2205), not only a drop-old.
+When it gets one, `fix/bvfield`'s `RejectConsumeOfBorrowedByValueParamField` must be installed at
+that arm too - `int f(Wrap w) { UBox[] v = new UBox[2]; v[0] = w.b; ... }` (`scratch/bv_19`) is
+the borrowed-by-value-parameter shape, and it is the one store spelling of `w.b` that this round
+could not close because there is no arm to hang the guard on.
