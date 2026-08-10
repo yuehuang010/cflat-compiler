@@ -657,6 +657,10 @@ public:
             std::string TypeName;
             bool Pointer = false;
             bool IsMove = false;
+            // Inferred owning sink (never spelled): lets the indirect call site transfer like
+            // ApplyMoveParamTransfer. OwningSinkConsumesConcrete filters the structural half.
+            bool IsOwningSink = false;
+            bool IsConsumeInferredSink = false;
             int PointerDepth = 0;   // 0 = not recorded; see FuncPtrReturnPointerDepth
             std::string ResolvedTypeKey;  // "" = not recorded; see FuncPtrReturnResolvedKey
         };
@@ -4614,6 +4618,17 @@ public:
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args);
 
+    // Indirect-call twin: a lambda literal's inferred owning sinks ride the funcptr TYPE
+    // (FuncPtrParam::IsOwningSink), so the caller's source must be transferred exactly as a direct
+    // call does. A no-op unless some parameter carries the inferred flag.
+    void ApplyFuncPtrSinkTransfer(const std::string& functionName,
+        const std::vector<TypeAndValue::FuncPtrParam>& params,
+        const std::vector<NamedVariable>& args);
+
+    // The synthesized TypeAndValue a funcptr parameter's per-param facts stand for. Only the
+    // fields the sink/ownership machinery reads are filled.
+    static TypeAndValue FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p, size_t index);
+
     // Is this argument PROVABLY a data pointer being passed to a closure parameter? Deliberately
     // one-sided: it answers yes only when the frontend positively recorded a pointer that is not
     // a closure. Anything it cannot prove (a ternary join, a `??` load, a future spelling whose
@@ -5455,6 +5470,12 @@ public:
 
     // The function-pointer signature of ONE registered overload.
     TypeAndValue FuncPtrSigOfSymbol(const FunctionSymbol& sym) const;
+
+    // The signature of the overload GetFunctionForFuncPtr actually BOUND. A by-NAME re-lookup
+    // returns the first non-method entry, which is declaration-order dependent - use this instead
+    // whenever per-parameter facts are read off a named-function initializer.
+    TypeAndValue FuncPtrSigOfBoundFunction(const std::string& functionName,
+        const llvm::Function* fn) const;
 
     /*
      * PROOF that a NAMED function cannot satisfy a function-pointer parameter. A named function

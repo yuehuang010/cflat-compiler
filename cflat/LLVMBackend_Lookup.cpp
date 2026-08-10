@@ -524,10 +524,25 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
             fp.IsMove = p.IsMove;
+            // The function's INFERRED owning sinks are part of what a funcptr bound to it must
+            // honour at the indirect call; a declared spelling cannot restate them.
+            fp.IsOwningSink = p.IsOwningSink;
+            fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
             sig.FuncPtrParams.push_back(fp);
         }
         return sig;
+    }
+
+LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfBoundFunction(const std::string& functionName,
+        const llvm::Function* fn) const
+{
+        if (fn == nullptr) return {};
+        auto it = functionTable.find(ResolveQualifiedName(functionName));
+        if (it == functionTable.end()) return {};
+        for (const auto& sym : it->second)
+            if (sym.Function == fn) return FuncPtrSigOfSymbol(sym);
+        return {};
     }
 
 bool LLVMBackend::NamedFunctionProvablyMismatchesFuncPtr(const std::string& functionName,

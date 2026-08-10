@@ -371,6 +371,9 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
             fp.IsMove = p.IsMove;
+            // Same as the Lookup twin: an inferred sink belongs to the function's signature.
+            fp.IsOwningSink = p.IsOwningSink;
+            fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
             fp.PointerDepth = p.ValuePointerDepth();
             tv.FuncPtrParams.push_back(fp);
         }

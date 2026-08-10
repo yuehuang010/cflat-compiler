@@ -1,3 +1,4 @@
+import "function.cb";
 import "list.cb";
 import "stack.cb";
 import "queue.cb";
@@ -4842,6 +4843,272 @@ int testBraceInitConsumesParameter()
 }
 
 /*
+ * A LAMBDA literal is lowered on its own path, so it never reached ApplyOwningSinkInference: its
+ * body consumed a by-value owning parameter while the caller kept the argument live, and both
+ * freed one resource (rc 133). The inference now runs over the lambda's own parameter list, the
+ * flags ride the closure TYPE (FuncPtrParam::IsOwningSink), and the indirect call site transfers
+ * like a direct one. Every leg below is measured against the identical FUNCTION spelling
+ * (bpsBrace / bpsAssign above), which was already a sink and is the oracle.
+ */
+using LpsAliasFn = Lambda<int(OaiBox)>;
+int lpsCond = 0;
+int lpsSeen = 0;
+
+/*
+ * Overload pairs for the by-NAME adoption hazard. A funcptr initialized with an overloaded
+ * function name must adopt the sinks of the overload actually BOUND (shape-matched), never of
+ * the first entry in the table - the two differ, and which one is first is declaration order.
+ * Each pair is one BORROWING and one CONSUMING same-arity overload; the pairs are declared in
+ * OPPOSITE orders so neither leg can pass by being the first-registered one.
+ */
+struct LpsBorrowBox { unique Resource* item = nullptr; };
+struct LpsSinkBox   { unique Resource* item = nullptr; };
+LpsBorrowBox lpsBorrowMake(int id) { LpsBorrowBox b; b.item = new Resource(); b.item->id = id; return b; }
+LpsSinkBox   lpsSinkMake(int id)   { LpsSinkBox b;   b.item = new Resource(); b.item->id = id; return b; }
+// Borrowing overload FIRST.
+int lpsOv(LpsBorrowBox p) { return p.item->id; }
+int lpsOv(LpsSinkBox p)   { LpsSinkBox[2] dst = { p }; return dst[0].item->id; }
+
+struct LpsRevBorrowBox { unique Resource* item = nullptr; };
+struct LpsRevSinkBox   { unique Resource* item = nullptr; };
+LpsRevBorrowBox lpsRevBorrowMake(int id) { LpsRevBorrowBox b; b.item = new Resource(); b.item->id = id; return b; }
+// Consuming overload FIRST - the order that turned into a false rejection.
+int lpsRevOv(LpsRevSinkBox p)   { LpsRevSinkBox[2] dst = { p }; return dst[0].item->id; }
+int lpsRevOv(LpsRevBorrowBox p) { return p.item->id; }
+
+int testLambdaParamOwningSink()
+{
+    int passed = 0;
+
+    // 1. The filed repro: a brace element in the lambda body, invoked through a declared
+    // Lambda<> local. Pre-fix this aborted on the caller's second free.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox[2] dst = { p }; return dst[0].item->id; };
+        passed += Test("lps_brace_value", f(a), 5);
+        passed += Test("lps_brace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_brace_freed_once_total", dtorCount, 1);
+
+    // 2. The ASSIGNMENT element spelling reaches the same consume arm; counts must match leg 1.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox[2] dst; dst[0] = p; return dst[0].item->id; };
+        passed += Test("lps_assign_value", f(a), 5);
+        passed += Test("lps_assign_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_assign_freed_once_total", dtorCount, 1);
+
+    // 3. The bare-brace declarator spelling - a second syntactic site for the same list.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox[2] dst { p }; return dst[0].item->id; };
+        passed += Test("lps_barebrace_value", f(a), 5);
+        passed += Test("lps_barebrace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_barebrace_freed_once_total", dtorCount, 1);
+
+    // 4. A plain whole-value slot store into a local is the same consume, without any array.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(6);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox q; q = p; return q.item->id; };
+        passed += Test("lps_localstore_value", f(a), 6);
+        passed += Test("lps_localstore_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_localstore_freed_once_total", dtorCount, 1);
+
+    // 5. The EXPLICIT opt-out `move p` - the unconditional-move trigger, not the consume scan.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(7);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox q; q = move p; return q.item->id; };
+        passed += Test("lps_move_value", f(a), 7);
+        passed += Test("lps_move_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_move_freed_once_total", dtorCount, 1);
+
+    // 6. An IMMEDIATELY-INVOKED literal: the call reads the literal's own type, never a
+    // declared one, so it is the leg that discriminates the type-carried flags from adoption.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(8);
+        lpsSeen = 0;
+        ((OaiBox p) => { OaiBox[2] dst = { p }; lpsSeen = dst[0].item->id; })(a);
+        passed += Test("lps_immediate_value", lpsSeen, 8);
+        passed += Test("lps_immediate_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_immediate_freed_once_total", dtorCount, 1);
+
+    // 7. A declared TYPE ALIAS for the closure type - the alias branch adopts identically.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(9);
+        LpsAliasFn f = (OaiBox p) => { OaiBox[2] dst = { p }; return dst[0].item->id; };
+        passed += Test("lps_alias_value", f(a), 9);
+        passed += Test("lps_alias_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_alias_freed_once_total", dtorCount, 1);
+
+    // 8. CONDITIONAL consumption, branch NOT taken. The consume scan descends into runtime
+    // conditionals, so the sink is unconditional and the callee still frees - the oracle's
+    // behaviour (bpsBraceCond leg 5 of testBraceInitConsumesParameter).
+    dtorCount = 0;
+    lpsCond = 0;
+    {
+        OaiBox a = oaiMake(5);
+        Lambda<int(OaiBox)> f = (OaiBox p) => {
+            if (lpsCond != 0) { OaiBox[2] dst = { p }; return dst[0].item->id; }
+            return -1;
+        };
+        passed += Test("lps_cond_skipped_value", f(a), -1);
+        passed += Test("lps_cond_skipped_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_cond_skipped_freed_once_total", dtorCount, 1);
+
+    // 9. A THIN function<> destination bound to a lambda literal: a different destination
+    // representation reading the same adopted flags.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(4);
+        function<int(OaiBox)> f = (OaiBox p) => { OaiBox[2] dst = { p }; return dst[0].item->id; };
+        passed += Test("lps_thin_value", f(a), 4);
+        passed += Test("lps_thin_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_thin_freed_once_total", dtorCount, 1);
+
+    // 10. A funcptr bound to a NAMED function whose parameter the inference already made a
+    // sink: the flags have to survive the function-symbol -> funcptr-type conversion too.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(3);
+        function<int(OaiBox)> f = bpsBrace;
+        passed += Test("lps_namedfn_value", f(a), 3);
+        passed += Test("lps_namedfn_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_namedfn_freed_once_total", dtorCount, 1);
+
+    // 11. ACCEPT SET (already correct pre-fix): a TEMP argument has no named source to null,
+    // and must still be freed exactly once now that the parameter became a sink.
+    dtorCount = 0;
+    {
+        Lambda<int(OaiBox)> f = (OaiBox p) => { OaiBox[2] dst = { p }; return dst[0].item->id; };
+        passed += Test("lps_temp_value", f(oaiMake(2)), 2);
+    }
+    passed += Test("lps_temp_freed_once", dtorCount, 1);
+
+    // 12. ACCEPT SET: a BORROWING body never consumes, so the parameter stays a borrow, the
+    // caller keeps its argument readable after the call, and the caller frees it.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(12);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { return p.item->id; };
+        passed += Test("lps_borrow_value", f(a), 12);
+        passed += Test("lps_borrow_no_callee_free", dtorCount, 0);
+        passed += Test("lps_borrow_source_live", a.item->id, 12);
+    }
+    passed += Test("lps_borrow_freed_once_by_caller", dtorCount, 1);
+
+    // 13. ACCEPT SET: a COPYABLE owner's store is a copy, so the concrete gate keeps the
+    // parameter a borrow and the caller's source is still live.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 13;
+        Lambda<int(OaiCopyBox)> f = (OaiCopyBox p) => { OaiCopyBox[2] dst = { p }; return dst[0].item->id; };
+        passed += Test("lps_copyable_value", f(a), 13);
+        passed += Test("lps_copyable_source_live", a.item->id, 13);
+    }
+    passed += Test("lps_copyable_freed_all", dtorCount, 2);
+
+    // 14. ACCEPT SET: a POD parameter owns nothing and is never sink-eligible.
+    {
+        OaiPod a;
+        a.x = 14;
+        Lambda<int(OaiPod)> f = (OaiPod p) => { OaiPod[2] dst = { p }; return dst[0].x; };
+        passed += Test("lps_pod_value", f(a), 14);
+        passed += Test("lps_pod_source_live", a.x, 14);
+    }
+
+    // 15. Only the CONSUMED parameter becomes a sink: the second one stays a borrow, so its
+    // caller-side source survives the call and is freed by the caller.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(15);
+        OaiBox b = oaiMake(16);
+        Lambda<int(OaiBox,OaiBox)> f = (OaiBox p, OaiBox r) => {
+            OaiBox[2] dst = { p };
+            return dst[0].item->id + r.item->id;
+        };
+        passed += Test("lps_two_params_value", f(a, b), 31);
+        passed += Test("lps_two_params_first_freed", dtorCount, 1);
+        passed += Test("lps_two_params_second_live", b.item->id, 16);
+    }
+    passed += Test("lps_two_params_freed_twice_total", dtorCount, 2);
+
+    // 16. ACCEPT SET: an owning CAPTURE is untouched by parameter-sink inference. OaiBox has no
+    // copy(), so the capture is a shallow borrow (IsAliasBorrow) the env never frees: the sink
+    // parameter is freed by the callee and the captured source only by its own scope - two total.
+    dtorCount = 0;
+    {
+        OaiBox held = oaiMake(17);
+        {
+            OaiBox a = oaiMake(18);
+            Lambda<int(OaiBox)> f = (OaiBox p) => {
+                OaiBox[2] dst = { p };
+                return dst[0].item->id + held.item->id;
+            };
+            passed += Test("lps_capture_value", f(a), 35);
+            passed += Test("lps_capture_param_freed", dtorCount, 1);
+        }
+        passed += Test("lps_capture_source_live", held.item->id, 17);
+    }
+    passed += Test("lps_capture_freed_all", dtorCount, 2);
+
+    // 17. ACCEPT SET: the BORROWING overload is bound, so no sink is adopted from its consuming
+    // sibling. Reading the sinks off a by-name re-lookup instead made this a hard error
+    // ("use of moved variable") as soon as the consuming overload was registered first.
+    dtorCount = 0;
+    {
+        LpsBorrowBox a = lpsBorrowMake(21);
+        function<int(LpsBorrowBox)> f = lpsOv;
+        passed += Test("lps_ovl_borrow_value", f(a), 21);
+        passed += Test("lps_ovl_borrow_no_callee_free", dtorCount, 0);
+        passed += Test("lps_ovl_borrow_source_live", a.item->id, 21);
+    }
+    passed += Test("lps_ovl_borrow_freed_by_caller", dtorCount, 1);
+
+    // 18. The same accept-set cell with the pair declared in the OPPOSITE order (the consuming
+    // overload is registered first), which is the order the by-name lookup got wrong.
+    dtorCount = 0;
+    {
+        LpsRevBorrowBox a = lpsRevBorrowMake(22);
+        function<int(LpsRevBorrowBox)> f = lpsRevOv;
+        passed += Test("lps_ovl_rev_borrow_value", f(a), 22);
+        passed += Test("lps_ovl_rev_borrow_no_callee_free", dtorCount, 0);
+        passed += Test("lps_ovl_rev_borrow_source_live", a.item->id, 22);
+    }
+    passed += Test("lps_ovl_rev_borrow_freed_by_caller", dtorCount, 1);
+
+    // 19. The mirror: the CONSUMING overload is bound, so the shape-matched lookup must find its
+    // sink even though the borrowing overload is registered first. Pre-fix this double-freed.
+    dtorCount = 0;
+    {
+        LpsSinkBox a = lpsSinkMake(23);
+        function<int(LpsSinkBox)> f = lpsOv;
+        passed += Test("lps_ovl_sink_value", f(a), 23);
+        passed += Test("lps_ovl_sink_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("lps_ovl_sink_freed_once_total", dtorCount, 1);
+
+    return passed;
+}
+
+/*
  * Owning-sink inference through REDUNDANT PARENTHESES. The two collectors that feed
  * ApplyOwningSinkInference record the source subtree's raw text, so `(p)` used to spell "(p)"
  * and never match the parameter name `p` - the callee's semantic consume arms saw straight
@@ -6899,6 +7166,9 @@ extern int main()
 
     passed += testBraceInitConsumesParameter();
     total += 28;
+
+    passed += testLambdaParamOwningSink();
+    total += 60;
 
     passed += testParenConsumeSourceSink();
     total += 35;

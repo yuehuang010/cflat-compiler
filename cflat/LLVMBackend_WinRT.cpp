@@ -1536,6 +1536,34 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
             functionName, param.VariableName));
     }
 
+LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p,
+        size_t index)
+{
+        TypeAndValue tv;
+        tv.TypeName = p.TypeName;
+        tv.Pointer  = p.Pointer;
+        tv.PointerDepth = p.PointerDepth;
+        tv.IsOwningSink = p.IsOwningSink;
+        tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
+        // 0-based, matching the indirect call site's own DiagnoseExplicitMoveToBorrowParam.
+        tv.VariableName = std::to_string(index);
+        return tv;
+}
+
+void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
+        const std::vector<TypeAndValue::FuncPtrParam>& params, const std::vector<NamedVariable>& args)
+{
+        bool anySink = false;
+        for (const auto& p : params) anySink = anySink || p.IsOwningSink;
+        if (!anySink) return;
+        // IsMove stays false on the synthesized params: the `move` half of an indirect call is
+        // already handled at the call site, and re-running it here would double the transfer.
+        std::vector<TypeAndValue> synth;
+        for (size_t i = 0; i < params.size(); i++)
+            synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
+        ApplyMoveParamTransfer(functionName, synth, args);
+}
+
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
 {

@@ -2984,6 +2984,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         std::format("function pointer '{}'", functionName));
                                 }
                                 auto result = Compiler(ctx)->CreateIndirectCall(funcPtrTV, funcPtr, callArgs);
+                                // A lambda literal's INFERRED owning sinks ride the funcptr type;
+                                // transfer the caller's source exactly as a direct call does.
+                                Compiler(ctx)->ApplyFuncPtrSinkTransfer(
+                                    functionName, funcPtrTV.FuncPtrParams, argNVs);
                                 // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
                                 for (size_t i = 0; i < pcount; i++)
                                 {
@@ -2991,7 +2995,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::Pos
                                         Compiler(ctx)->DiagnoseExplicitMoveToBorrowParam(
                                             functionName, std::format("{}", i),
                                             funcPtrTV.FuncPtrParams[i].TypeName,
-                                            funcPtrTV.FuncPtrParams[i].IsMove, argNVs[i]);
+                                            funcPtrTV.FuncPtrParams[i].IsMove
+                                                || funcPtrTV.FuncPtrParams[i].IsOwningSink,
+                                            argNVs[i]);
                                     if (!funcPtrTV.FuncPtrParams[i].IsMove) continue;
                                     auto& argNV = argNVs[i];
                                     if (argNV.Storage != nullptr && argNV.TypeAndValue.Pointer)
@@ -4739,6 +4745,19 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             }
         }
 
+        // A lambda literal is a function definition on a different parse path, so run the same
+        // owning-value sink inference over its parameter list against its own body. Without this
+        // the body consumes a by-value owning param the caller still owns, and both free it.
+        {
+            std::vector<LLVMBackend::TypeAndValue> sinkParams(params.begin(), params.end());
+            ApplyOwningSinkInferenceToBody(ctx->lambdaBody(), sinkParams, SinkIfConstEvaluator());
+            for (size_t i = 0; i < params.size(); i++)
+            {
+                params[i].IsOwningSink = sinkParams[i].IsOwningSink;
+                params[i].IsConsumeInferredSink = sinkParams[i].IsConsumeInferredSink;
+            }
+        }
+
         // Return type from lambdaExpectedType (threaded from declaration or argument context).
         // Resolve a plain alias, so `using V = void; Lambda<V()>` is the same type as
         // `Lambda<void()>` to every TypeName check below. A target spelling a pointer
@@ -5115,6 +5134,10 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             fp.TypeName = p.TypeName;
             fp.Pointer  = p.Pointer;
             fp.PointerDepth = p.ValuePointerDepth();
+            // Carry the inferred sink onto the TYPE so the indirect call site can null the
+            // caller's source; a declared Lambda<...> spelling never sets these.
+            fp.IsOwningSink = p.IsOwningSink;
+            fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
             tv.FuncPtrParams.push_back(fp);
         }
 

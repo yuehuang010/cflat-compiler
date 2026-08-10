@@ -3416,6 +3416,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
+                            // The overload actually BOUND below, kept so the inferred-sink adoption
+                            // reads the same one the call will run (never a by-name re-lookup).
+                            const llvm::Function* boundNamedFn = nullptr;
+                            std::string boundNamedFnName;
                             // Wrap named function in closure fat struct when declaring function<T>.
                             if (right && typeAndValue.IsFunctionPointer && !right->getType()->isStructTy())
                             {
@@ -3431,6 +3435,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         right = correctFn;
                                 if (auto* fn = llvm::dyn_cast<llvm::Function>(right))
                                 {
+                                    boundNamedFn = fn;
+                                    boundNamedFnName = funcName;
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = typeAndValue.IsThinFnPtr()
@@ -3446,6 +3452,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 llvm::Function* genericFn = compiler->GetFunctionForFuncPtr(genericFuncCallerName, expectedParams, &typeAndValue.FuncPtrParams, &typeAndValue);
                                 if (genericFn)
                                 {
+                                    boundNamedFn = genericFn;
+                                    boundNamedFnName = genericFuncCallerName;
                                     VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
                                     right = typeAndValue.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(genericFn, typeAndValue)
@@ -3503,6 +3511,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                             i + 1));
                                         break;
                                     }
+                                }
+                            }
+                            // The declared spelling carries no INFERRED sink, so adopt the
+                            // initializer's - otherwise the call site never nulls the caller.
+                            if (right && typeAndValue.IsFunctionPointer)
+                            {
+                                if (rhsIsFuncPtr)
+                                    AdoptInferredParamSinks(typeAndValue, rhsFuncPtrParams);
+                                else if (boundNamedFn != nullptr)
+                                {
+                                    // A bare NAMED function initializer carries its facts in the
+                                    // function table; read them off the overload actually bound.
+                                    auto named = compiler->FuncPtrSigOfBoundFunction(
+                                        boundNamedFnName, boundNamedFn);
+                                    if (named.IsFunctionPointer)
+                                        AdoptInferredParamSinks(typeAndValue, named.FuncPtrParams);
                                 }
                             }
 

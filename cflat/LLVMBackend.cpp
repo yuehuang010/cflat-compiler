@@ -4307,6 +4307,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
             po["t"] = p.TypeName;
             if (p.Pointer) po["p"] = true;
             if (p.IsMove)  po["mv"] = true;
+            if (p.IsOwningSink) po["osk"] = true;
+            if (p.IsConsumeInferredSink) po["cis"] = true;
             if (p.PointerDepth > 1) po["pd"] = static_cast<int64_t>(p.PointerDepth);
             if (!p.ResolvedTypeKey.empty()) po["rk"] = p.ResolvedTypeKey;
             fps.push_back(std::move(po));
@@ -4376,6 +4378,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (auto v = po->getString("t"))  p.TypeName = v->str();
                     if (auto v = po->getBoolean("p")) p.Pointer = *v;
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
+                    if (auto v = po->getBoolean("osk")) p.IsOwningSink = *v;
+                    if (auto v = po->getBoolean("cis")) p.IsConsumeInferredSink = *v;
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();

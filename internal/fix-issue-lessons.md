@@ -1715,3 +1715,41 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `p1/cast-wrapped-consume-source-defeats-owning-sink-inference.md`. **When a fix normalizes a
   SPELLING before comparing it to a name, enumerate every wrapper that changes the spelling
   without changing the value, not just the one in the issue title.**
+- **The 2026-08-09 lambda owning-sink SITE lesson (`fix/lamsink`)**: `ApplyOwningSinkInference` ran
+  only on a `FunctionDefinitionContext`, so a LAMBDA literal's parameter list never got it while
+  the callee-side consume arms (brace element, bare-brace declarator, slot store, decl init, and
+  even an unconditional `move p`) were already shared with functions - callee freed, caller freed,
+  rc 133 in all six spellings. This is the same two-halves shape as the `fix/parmbrace` entry
+  above, one level out: the callee half was complete and the CALLER half had no door at all.
+  The landed shape: inference runs over the lambda's own params against `ctx->lambdaBody()`; the
+  result rides the funcptr TYPE as `FuncPtrParam::IsOwningSink` / `IsConsumeInferredSink` (both on
+  the `--init` round-trip inside `fpp`, and on the C-header `TvToJson` pair); the indirect call
+  site delegates to `ApplyMoveParamTransfer` through a synthesized param list that leaves `IsMove`
+  false, so a program with no inferred sink stays bit-identical on the old path. A funcptr bound
+  to a NAMED function carries that function's inferred sinks too (`FuncPtrSigOfSymbol` /
+  `MakeFuncPtrTypeAndValue`), which is what fixed `function<void(UBox)> f = sinkfn; f(a);`.
+  **A declared type cannot SPELL an inferred fact, so it has to be ADOPTED, and adoption has
+  doors.** Only ONE was closed - the declarator initializer, next to the pre-existing per-param
+  `IsMove` agreement check. The `IsMove` check's own polarity is the wrong model to copy here:
+  REJECTING on disagreement would refuse the filed repro, because the LHS spelling can never state
+  the flag. Adoption is a UNION that never clears, because over-approximating a sink leaks at worst
+  while missing one double-frees. The remaining doors (closure-typed parameter, `return` through a
+  declared closure return type, closure-typed struct field, plain `=` rebind) are filed as
+  `p1/inferred-owning-sink-is-lost-when-a-closure-crosses-a-declared-boundary.md`; the parameter
+  and return doors probably cannot be closed this way at all, since the fact does not travel in the
+  closure fat struct.
+- **A by-NAME re-lookup of a function symbol returns the FIRST non-method overload, so adopting
+  per-parameter facts from it is declaration-order dependent - `GetFunctionForFuncPtr` is the
+  shape-matched twin and the only safe source.** The first cut of the above read the initializer's
+  sinks with `MakeFuncPtrTypeAndValue(assignmentExpression->getText())`, which walks straight to
+  `functionTable.find(name)->second.front()`. With `ov(UBox)` (borrowing) and `ov(VBox)`
+  (consuming) declared same-arity, that produced BOTH failure directions from one bug: with the
+  consuming overload first, `function<void(UBox)> f = ov; f(a);` became a hard "use of moved
+  variable" on a program the base runs correctly, and with the borrowing one first the consuming
+  bind silently kept its rc 133 double free. The suite was green and the fix's own 38-file corpus
+  was green with both in it - no cell declared two same-arity overloads, so nothing could see it.
+  The fix is to adopt from the overload the surrounding code ALREADY resolved and is about to
+  call (`FuncPtrSigOfBoundFunction(name, boundFn)` keyed on the returned `llvm::Function*`), which
+  makes it structurally impossible for the adopted facts and the called body to disagree. Frozen as
+  legs 17-19 of `testLambdaParamOwningSink`, with the two overload pairs declared in OPPOSITE
+  orders so neither accept leg can pass by being the first-registered one.

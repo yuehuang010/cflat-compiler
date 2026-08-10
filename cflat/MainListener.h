@@ -1415,11 +1415,12 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
 //      where the monomorphized type is fully known. A copyable owner's store is a COPY, so it stays
 //      a borrow there. Both scans are structural (independent of T), so this runs on generic-class
 //      instantiations too - ParseFunctionDefinition calls it on the monomorphized param list.
-inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* func,
+// Body-taking core. A lambda literal has no FunctionDefinitionContext but is a function all the
+// same, so its parameter list runs the identical inference against its own body.
+inline void ApplyOwningSinkInferenceToBody(antlr4::tree::ParseTree* body,
                                      std::vector<LLVMBackend::TypeAndValue>& allParams,
                                      const IfConstEvaluator& evalIfConst = {})
 {
-    auto* body = func->compoundStatement();
     if (body == nullptr) return;
     std::unordered_set<std::string> movedNames;
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst);
@@ -1436,6 +1437,30 @@ inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* fun
             p.IsConsumeInferredSink = true;
         }
     }
+}
+
+// A declared `Lambda<...>` / `function<...>` spelling cannot express an INFERRED owning sink, so a
+// funcptr destination adopts the flags of the lambda literal (or funcptr value) it is bound to.
+// Union, never clear: over-approximating a sink leaks at worst, missing one double-frees, and a
+// destination rebound to a differently-inferred value must keep the stronger claim.
+inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
+                                    const std::vector<LLVMBackend::TypeAndValue::FuncPtrParam>& src)
+{
+    if (dest.FuncPtrParams.size() != src.size()) return;
+    for (size_t i = 0; i < src.size(); i++)
+    {
+        dest.FuncPtrParams[i].IsOwningSink =
+            dest.FuncPtrParams[i].IsOwningSink || src[i].IsOwningSink;
+        dest.FuncPtrParams[i].IsConsumeInferredSink =
+            dest.FuncPtrParams[i].IsConsumeInferredSink || src[i].IsConsumeInferredSink;
+    }
+}
+
+inline void ApplyOwningSinkInference(CFlatParser::FunctionDefinitionContext* func,
+                                     std::vector<LLVMBackend::TypeAndValue>& allParams,
+                                     const IfConstEvaluator& evalIfConst = {})
+{
+    ApplyOwningSinkInferenceToBody(func->compoundStatement(), allParams, evalIfConst);
 }
 
 // True when the function declares a RETURN TYPE, which is what separates an ordinary member
