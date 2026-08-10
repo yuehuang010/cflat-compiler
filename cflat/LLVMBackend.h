@@ -1142,6 +1142,10 @@ public:
         // Move-dataflow treats index/deref lvalues as untracked (permissive), so USE-recording
         // skips these - moving out of a container slot is neither checked nor flagged.
         bool IsElementAccess = false;
+        // True when the subscript's BASE binding was a user-visible `T[]` array VIEW. The element
+        // GEP has a container buffer's single-index shape, so this is the only positive signal
+        // separating a view's LIVE slots from a container's internal `T*` slot.
+        bool IsViewElement = false;
         // compile-time: Storage points at a SPILL of a by-value temporary (an inline array field
         // extracted out of a returned temp). The copy is shallow and dies with the full expression,
         // so reads are fine but 'move' and stores through it are rejected.

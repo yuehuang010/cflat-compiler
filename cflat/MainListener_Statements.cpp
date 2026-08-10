@@ -994,7 +994,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunction != nullptr
             && compiler->currentFunction->getReturnType()
                 == llvm::StructType::getTypeByName(*compiler->context, "string")
-            && IsFixedArrayStringElementRead(returnNV, right))
+            && IsOwningArrayStringElementRead(returnNV, right))
         {
             right = compiler->EmitOwnedStringDeepCopy(right);
             clearReturnedStringBorrowBit = false;

@@ -45,3 +45,21 @@ copy. Then the borrowed-by-value-parameter guard added by `fix/bvfield`
 (`RejectConsumeOfBorrowedByValueParamField`) has to run at that new site too, since `mk4` above is
 exactly the shape that guard rejects everywhere else - it is currently the one consume spelling of
 `w.b` that still compiles.
+
+## Sibling spelling: the ARRAY ELEMENT return (measured 2026-08-10, `fix/viewelem`)
+
+The same gap covers `return arr[0]` of an owning-struct element, in BOTH array spellings:
+
+```cflat
+Box take(Box[] v)  { return v[0]; }                                  // rc 133 (scratch/ve_r13)
+Box take2() { Box[2] base; base[0] = makeBox(1); return base[0]; }   // rc 133, q=3 (scratch/ve_r13b)
+```
+
+Both are rc 133 on `0cfd9f7` AND on `fix/viewelem`; the second also hands back a WRONG value
+(`q=4` as measured, but it is freed-memory garbage - do not treat the number as an oracle),
+because the frame destroys the array on the way out. The `fix/viewelem` round left them alone
+deliberately: the fixed-array spelling is the oracle for the view spelling and it fails the same
+way, so this is the return path's missing consume arm, not the view-provenance bug that round
+fixed. The element source has no `NamedVariable` name to `MarkVariableMoved`, so the new arm must
+consume it silently, exactly as the element STORE arms already do for an indirect lvalue.
+

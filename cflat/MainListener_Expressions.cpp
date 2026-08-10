@@ -1719,11 +1719,22 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // struct field nor an alloca/global - and not Part 6's SINGLE-index container slot
             // either. Its elements are LIVE default-constructed values, so an owning store here
             // must drop the old one (a container slot must not); keep the two accept sets apart.
-            bool destIsFixedArrayElem = destGep && destGep->getNumIndices() == 2
+            // A `T[]` VIEW subscript is a SINGLE-index GEP over the element type - the same shape a
+            // container's internal `T*` buffer slot has, so the GEP alone cannot separate them and
+            // Part 6's gate must stay untouched (the plan's LOAD-BEARING INVARIANT). IsViewElement
+            // is the positive signal: the base binding was a user-visible `T[]`, whose viewed slots
+            // are LIVE (a fixed array, a `new T[n]` allocation, or the caller's storage behind a
+            // `T[]` parameter), so the destination joins the fixed-array accept set below.
+            bool destIsViewElem = destGep && destGep->getNumIndices() == 1
+                && namedVar.IsElementAccess && namedVar.IsViewElement
+                && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
+                && !namedVar.UnionFieldType;
+            bool destIsFixedArrayElem = (destGep && destGep->getNumIndices() == 2
                 && destGep->getSourceElementType()->isArrayTy()
                 && namedVar.IsElementAccess
                 && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
-                && !namedVar.UnionFieldType;
+                && !namedVar.UnionFieldType)
+                || destIsViewElem;
 
             if (operatorText == "=" && destIsStructField)
                 RejectFieldAllocAlignMismatch(
@@ -2516,7 +2527,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.Pointer
                 && (llvm::isa<llvm::AllocaInst>(destination)
                     || llvm::isa<llvm::GlobalVariable>(destination))
-                && IsFixedArrayStringElementRead(rightNV, right))
+                && IsOwningArrayStringElementRead(rightNV, right))
             {
                 right = compiler->EmitOwnedStringDeepCopy(right);
                 if (!namedVar.CallerName.empty())
@@ -4653,6 +4664,11 @@ LLVMBackend::NamedVariable MainListener::LowerSpanElementAccess(
         elem.Storage = compiler->CreateGEP(elementType, bufPtr, indexValue);
         elem.BaseType = elementType;
         elem.TypeAndValue = elementTV;
+        // The buffer field IS a user `T[]` view, so its slots are live - same provenance the plain
+        // `v[i]` subscript records. Today's sole caller (the span get/set fast path) reads only
+        // Storage/BaseType, so no ownership arm consumes it yet; recording it keeps a future
+        // caller from inheriting a FALSE negative, which is the unsound direction here.
+        elem.IsViewElement = true;
         return elem;
     }
 

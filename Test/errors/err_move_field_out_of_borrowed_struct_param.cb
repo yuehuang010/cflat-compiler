@@ -46,6 +46,13 @@ expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter '
     int badBraceElement(Wrap w) { UBox[2] dst = { w.b }; return dst[0].item->id; }
 }
 
+// The `T[]` VIEW element destination. It is a single-index GEP - a container slot's shape - so
+// before the view-element arm existed there was no consume arm here to hang the guard on, and the
+// store silently aliased the caller's field (rc 133). The fixed-array spelling is two lines above.
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badViewElement(Wrap w) { UBox[] v = new UBox[2]; v[0] = w.b; return v[0].item->id; }
+}
+
 expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
     int badDerefDest(Wrap w) { UBox o = default; UBox* dp = &o; *dp = w.b; return o.item->id; }
 }

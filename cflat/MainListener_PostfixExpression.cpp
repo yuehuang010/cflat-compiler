@@ -1449,6 +1449,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             LogErrorContext(expressCtx, "Expecting be an integer type.");
                         }
 
+                        // Remember the BASE's view-ness before the element branches clear it; the
+                        // element slot of a user `T[]` view is LIVE storage, unlike a container's.
+                        bool baseWasArrayView = namedVar.TypeAndValue.IsArrayView;
+
                         // Widen the index to the pointer width (i64) with the extension that
                         // matches its declared signedness. LLVM treats GEP indices as signed
                         // and would implicitly sign-extend a narrow index; an unsigned narrow
@@ -1646,6 +1650,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // A subscript result is an element (container slot): move-dataflow leaves
                         // index/deref lvalues untracked, so mark it so USE-recording skips it.
                         namedVar.IsElementAccess = true;
+                        // Positive provenance for the ownership arms: only an addressable element
+                        // of a `T[]` view qualifies (a simd lane has no Storage).
+                        namedVar.IsViewElement = baseWasArrayView && namedVar.Storage != nullptr;
                         break;
                     }
                     case CFlatParser::RuleGenericTypeParameters:

@@ -4244,6 +4244,297 @@ string aelsStrElemReturn()
     return dst[0];
 }
 
+/*
+ * The `T[]` VIEW spelling of the two fixed-array element blocks below. A view subscript is a
+ * SINGLE-index GEP over the element type - the same shape a container's internal `T*` buffer slot
+ * has - so it landed in Part 6's container-slot arm, which deliberately does NOT drop the old
+ * element (a container releases a slot before writing it) and reaches no consume arm at all for an
+ * INDIRECT source. A view's slots are LIVE, so the store orphaned the old element (leak, rc 0) for
+ * a named source and aliased the source's owning bits (double free, rc 133) for an indirect one;
+ * the READ handed a second owner the element's own {ptr,len,owned} pair (rc 133). The GEP cannot
+ * separate the two, so the discriminator is NamedVariable::IsViewElement - the base binding was a
+ * user-visible `T[]`. A container's raw `T*` buffer never carries it, which is what keeps the
+ * list `sort`/`_partition` bit-shuffles and the dictionary rehash on their existing borrow path.
+ */
+OaiBox[]  aveViewOfGlobal = default;
+string[2] gAveStrArr;
+
+// A `T[]` PARAMETER views the CALLER's storage: those slots are live in another frame.
+void aveStoreThroughParam(OaiBox[] v, OaiBox src) { v[0] = src; }
+int aveReadThroughParam(string[] v) { string q = v[0]; return q == "abcd" ? 1 : 0; }
+string aveReturnThroughParam(string[] v) { return v[0]; }
+
+int testOwningAssignIntoArrayViewElement()
+{
+    int passed = 0;
+
+    // 1. NAMED source through a view over a FIXED array (the filed repro). The old element was
+    // never destructed: dtorCount stayed 1 for two allocations, and `leaks` saw 16 orphaned bytes.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        OaiBox[] v = base;
+        v[0] = a;
+        passed += Test("avel_named_value", v[0].item->id, 5);
+        // A named source is MarkVariableMoved, so its use-after-move is pinned in
+        // Test/errors/err_move.cb rather than read back here.
+        passed += Test("avel_named_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("avel_named_freed_once_each", dtorCount, 2);
+
+    // 2. INDIRECT (field) source - the double-free half: no consume arm ran, so the element and
+    // the field both owned the same Res and both freed it (rc 133).
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(3);
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        OaiBox[] v = base;
+        v[0] = w.b;
+        passed += Test("avel_field_value", v[0].item->id, 3);
+        passed += Test("avel_field_source_nulled", w.b.item == nullptr, true);
+        passed += Test("avel_field_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("avel_field_freed_once_each", dtorCount, 2);
+
+    // 3. A view over `new T[n]` storage, and a CALL-RESULT source (the leak-only shape - it never
+    // aborted, so only the count falsifies it).
+    dtorCount = 0;
+    {
+        OaiBox[] v = new OaiBox[2];
+        v[0] = oaiMake(1);
+        v[0] = oaiMake(7);
+        passed += Test("avel_heapview_call_value", v[0].item->id, 7);
+        passed += Test("avel_heapview_call_old_elem_freed", dtorCount, 1);
+        v[0] = oaiMake(8);
+        passed += Test("avel_heapview_call_freed_again", dtorCount, 2);
+    }
+
+    // 4. ELEMENT-to-ELEMENT and the SELF-assign. `v[0] = v[0]` cannot be ruled out at compile time
+    // for a runtime index; the zero-source-then-drop-old order makes it degenerate safely.
+    dtorCount = 0;
+    {
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        base[1] = oaiMake(2);
+        OaiBox[] v = base;
+        v[0] = v[1];
+        passed += Test("avel_elem_elem_value", v[0].item->id, 2);
+        passed += Test("avel_elem_elem_src_nulled", v[1].item == nullptr, true);
+        passed += Test("avel_elem_elem_old_freed", dtorCount, 1);
+    }
+    passed += Test("avel_elem_elem_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        OaiBox[] v = base;
+        v[0] = v[0];
+        passed += Test("avel_self_value_survives", v[0].item->id, 1);
+        passed += Test("avel_self_no_free", dtorCount, 0);
+    }
+    passed += Test("avel_self_freed_once", dtorCount, 1);
+
+    // 5. A view PARAMETER (the callee's window on the caller's live storage) and a VIEW OF A VIEW.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        aveStoreThroughParam(base, a);
+        passed += Test("avel_param_value", base[0].item->id, 5);
+        passed += Test("avel_param_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("avel_param_freed_once_each", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        OaiBox[] v = base;
+        OaiBox[] v2 = v;
+        v2[0] = a;
+        passed += Test("avel_viewofview_value", v2[0].item->id, 5);
+        passed += Test("avel_viewofview_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("avel_viewofview_freed_once_each", dtorCount, 2);
+
+    // 6. A GLOBAL view bound to a fixed array - a global is never torn down, so the count inside
+    // the block is the only thing that can see the dropped old element.
+    dtorCount = 0;
+    {
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        aveViewOfGlobal = base;
+        aveViewOfGlobal[0] = oaiMake(6);
+        passed += Test("avel_globalview_value", aveViewOfGlobal[0].item->id, 6);
+        passed += Test("avel_globalview_old_elem_freed", dtorCount, 1);
+    }
+
+    // 7. THE FLIP, in the view spelling: a COPYABLE owner COPIES (source stays live, two
+    // independent resources), and the old element is still dropped.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 5;
+        OaiCopyBox[2] base;
+        base[0].item = new Resource();
+        base[0].item->id = 1;
+        OaiCopyBox[] v = base;
+        v[0] = a;
+        passed += Test("avel_copyable_value", v[0].item->id, 5);
+        passed += Test("avel_copyable_source_live", a.item->id, 5);
+        passed += Test("avel_copyable_independent", v[0].item != a.item, true);
+        passed += Test("avel_copyable_old_elem_freed", dtorCount, 1);
+    }
+
+    // 8. ACCEPT SET: a POD element owns nothing, so it stays a plain bit copy through the view,
+    // and the view still writes THROUGH to the array it borrows.
+    {
+        OaiPod p;
+        p.x = 9;
+        OaiPod[2] base;
+        base[0].x = 1;
+        OaiPod[] v = base;
+        v[0] = p;
+        passed += Test("avel_pod_value", v[0].x, 9);
+        passed += Test("avel_pod_source_live", p.x, 9);
+        passed += Test("avel_pod_writes_through", base[0].x, 9);
+
+        int[2] ibase;
+        ibase[0] = 1;
+        int[] iv = ibase;
+        iv[0] = 9;
+        passed += Test("avel_int_writes_through", ibase[0], 9);
+    }
+
+    // 9. A NESTED owning element (the owned resource sits one struct down).
+    dtorCount = 0;
+    {
+        OaiNest a;
+        a.inner = oaiMake(5);
+        OaiNest[2] base;
+        base[0].inner = oaiMake(1);
+        OaiNest[] v = base;
+        v[0] = a;
+        passed += Test("avel_nested_value", v[0].inner.item->id, 5);
+        passed += Test("avel_nested_old_elem_freed", dtorCount, 1);
+    }
+    passed += Test("avel_nested_freed_once_each", dtorCount, 2);
+
+    // 10. A bare `string` element STORE through a view. Part 6's slot arm already deep-copied a
+    // named source, so every leg below reads back correctly on the PRE-fix binary too - they are
+    // coverage, not discriminators. What the slot arm never did was drop the OLD element, and a
+    // `string` has no destructor count, so the only oracle for that half is `leaks --atExit`:
+    // this store shape went 1 leak / 16 bytes -> 0 leaks / 0 bytes.
+    {
+        string a = "ab" + "cd";
+        string[2] base;
+        base[0] = "xy" + "zw";
+        string[] v = base;
+        v[0] = a;
+        passed += Test("avel_str_value", v[0], "abcd");
+        passed += Test("avel_str_source_live", a, "abcd");
+        passed += Test("avel_str_independent", v[0].data() != a.data(), true);
+        passed += Test("avel_str_writes_through", base[0], "abcd");
+
+        // A temp source (no Storage) hands its buffer over directly; the old element still drops.
+        v[1] = "ef" + "gh";
+        v[1] = "ij" + "kl";
+        passed += Test("avel_str_temp_value", v[1], "ijkl");
+    }
+
+    // 11. The READ side (the second filed issue). Both view provenances abort on the pre-fix
+    // binary; the distinctness leg is what falsifies the aliasing, since the value already read
+    // back correctly while both owners still pointed at one buffer.
+    {
+        string[2] base;
+        base[0] = "ab" + "cd";
+        string[] v = base;
+        string q = v[0];
+        passed += Test("avelr_decl_value", q, "abcd");
+        passed += Test("avelr_decl_independent", q.data() != v[0].data(), true);
+        passed += Test("avelr_decl_source_live", base[0], "abcd");
+
+        string[] hv = new string[2];
+        hv[0] = "ef" + "gh";
+        string hq = hv[0];
+        passed += Test("avelr_heapview_value", hq, "efgh");
+        passed += Test("avelr_heapview_independent", hq.data() != hv[0].data(), true);
+
+        // The brace-initialized view spelling from the filed repro.
+        string bs = "mn" + "op";
+        string[] bv = { bs, "q" };
+        string bq = bv[0];
+        passed += Test("avelr_braceview_value", bq, "mnop");
+        passed += Test("avelr_braceview_independent", bq.data() != bv[0].data(), true);
+    }
+
+    // 12. The other read POSITIONS: assignment into an existing local, a read inside a `T[]`
+    // callee, and `return` of a view element.
+    {
+        string[2] base;
+        base[0] = "ab" + "cd";
+        string[] v = base;
+        string q = "seed";
+        q = v[0];
+        passed += Test("avelr_assign_value", q, "abcd");
+        passed += Test("avelr_assign_independent", q.data() != v[0].data(), true);
+        passed += Test("avelr_assign_source_live", base[0], "abcd");
+
+        passed += Test("avelr_param_read", aveReadThroughParam(base), 1);
+        passed += Test("avelr_return_value", aveReturnThroughParam(base), "abcd");
+        passed += Test("avelr_return_source_live", base[0], "abcd");
+
+        gAveStrArr[0] = "ef" + "gh";
+        string[] gv = gAveStrArr;
+        string gq = gv[0];
+        passed += Test("avelr_globalview_value", gq, "efgh");
+        passed += Test("avelr_globalview_independent", gq.data() != gv[0].data(), true);
+    }
+
+    // 13. Reading an OWNING STRUCT element out of a view. The fixed-array oracle already MOVED
+    // (source nulled, freed once); the view spelling aliased and freed twice (rc 133).
+    dtorCount = 0;
+    {
+        OaiBox[2] base;
+        base[0] = oaiMake(1);
+        OaiBox[] v = base;
+        OaiBox q = v[0];
+        passed += Test("avelr_owning_value", q.item->id, 1);
+        passed += Test("avelr_owning_source_nulled", v[0].item == nullptr, true);
+        passed += Test("avelr_owning_no_early_free", dtorCount, 0);
+    }
+    passed += Test("avelr_owning_freed_once", dtorCount, 1);
+
+    // 14. ACCEPT SET for the read arm, and the LOAD-BEARING INVARIANT next to it. A raw heap
+    // `string*` is not a view - `new string[n]` does not take ownership of assigned strings, so
+    // its element read must stay a borrow - and a container's internal slot must keep sharing the
+    // buffer through `get`, which is the contract list `sort`/`_partition` and the dictionary
+    // rehash bit-shuffles depend on. Both are byte-identical before and after the fix.
+    {
+        string* h = new string[2];
+        h[0] = "lit";
+        string rq = h[0];
+        passed += Test("avelr_rawheap_value", rq, "lit");
+        passed += Test("avelr_rawheap_still_borrows", rq.data() == h[0].data(), true);
+
+        list<string> ls = default;
+        ls.add("aa" + "bb");
+        string lq = ls.get(0);
+        passed += Test("avelr_list_get_value", lq, "aabb");
+        passed += Test("avelr_list_get_still_borrows", lq.data() == ls.get(0).data(), true);
+    }
+
+    return passed;
+}
+
 int testOwningAssignIntoFixedArrayElement()
 {
     int passed = 0;
@@ -7555,6 +7846,9 @@ extern int main()
 
     passed += testOwningAssignIntoFixedArrayElement();
     total += 92;
+
+    passed += testOwningAssignIntoArrayViewElement();
+    total += 64;
 
     passed += testOwningBraceInitFixedArray();
     total += 63;

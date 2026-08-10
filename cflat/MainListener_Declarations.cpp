@@ -2917,7 +2917,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // True when the initializer READS a `string` element of a fixed array
                 // (`string q = dst[0];`). Such a source has no FieldName, so the field-borrow
                 // taint above never sees it, yet the element owns its buffer just as a field does.
-                bool srcIsFixedArrayStringElem = false;
+                bool srcIsOwningArrayStringElem = false;
+                // True when the initializer reads an element of a user `T[]` VIEW. The GEP has a
+                // container slot's single-index shape, so only this provenance separates them.
+                bool srcIsViewElem = false;
                 // True when the initializer is an `alias` (borrow) return (`Token t = toks.get(0)`).
                 // The local shallow-aliases storage it does not own, so its scope-exit destructor
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
@@ -3332,6 +3335,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcIsSimd = rightNV.TypeAndValue.IsSimd;
                                 srcIsArrayShaped = srcConstArraySize > 0 || srcIsArrayView;
                                 srcStorage = rightNV.Storage;
+                                srcIsViewElem = rightNV.IsViewElement;
                                 srcUnionFieldType = rightNV.UnionFieldType;
                                 srcBaseType = rightNV.BaseType;
                                 srcPrimary = rightNV.Primary;
@@ -3373,8 +3377,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !rightNV.TypeAndValue.IsMove
                                     && ((!rightNV.FieldName.empty() && !rightNV.OwningStructName.empty())
                                         || rightNV.BorrowsOwnedString);
-                                srcIsFixedArrayStringElem =
-                                    IsFixedArrayStringElementRead(rightNV, right);
+                                srcIsOwningArrayStringElem =
+                                    IsOwningArrayStringElementRead(rightNV, right);
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
@@ -4127,13 +4131,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !srcCallerName.empty();
                         // Excluded: a SINGLE-index GEP (container/view slot - `T tmp = _data[i]` is
                         // the borrow list sort shuffles), and string/closure (own paths run below).
+                        // A `T[]` VIEW element (single-index GEP + srcIsViewElem) joins the set:
+                        // its slot is LIVE storage the new local does not own, exactly like a
+                        // fixed-array element. A container's raw `T*` slot carries no such
+                        // provenance and keeps its borrow (the plan's LOAD-BEARING INVARIANT).
                         bool srcIsIndirectOwningLvalue = srcStorage != nullptr && !srcIsNamedSlot
                             && typeAndValue.TypeName != "__closure_fat_ptr"
                             && typeAndValue.TypeName != "string"
                             && (srcInitGep == nullptr
                                 || (srcInitGep->getNumIndices() == 2
                                     && (srcInitGep->getSourceElementType()->isStructTy()
-                                        || srcInitGep->getSourceElementType()->isArrayTy())));
+                                        || srcInitGep->getSourceElementType()->isArrayTy()))
+                                || (srcInitGep->getNumIndices() == 1 && srcIsViewElem));
                         if (right->getType()->isStructTy()
                             && (srcIsNamedSlot || srcIsIndirectOwningLvalue)
                             && !srcIsMove
@@ -4216,7 +4225,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                             didDeepCopyBorrowString = true;
                         }
-                        // The ELEMENT twin of the field arm above (`string q = dst[0];`). A fixed-array
+                        // The ELEMENT twin of the field arm above (`string q = dst[0];`). A fixed-array or view
                         // `string` element has no FieldName, so srcBorrowsOwnedString is false and the
                         // plain store bit-copied the {ptr,len,owned} pair: the local and the element both
                         // owned - and freed - the same buffer (rc 133). Deep-copy so the local owns an
@@ -4229,7 +4238,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && !srcIsMove
                             && !srcIsAlias
                             && !srcMovableTempField
-                            && srcIsFixedArrayStringElem
+                            && srcIsOwningArrayStringElem
                             && !typeAndValue.Pointer
                             && compiler->GetTypeFromStorage(alloc)
                                 == llvm::StructType::getTypeByName(*compiler->context, "string"))
@@ -5428,12 +5437,15 @@ bool MainListener::NamedVarIsString(const LLVMBackend::NamedVariable& nv) {
         return false;
     }
 
-// The READ twin of `destIsFixedArrayElem`: a `string` element of a FIXED array (`dst[0]`,
-// `dst[0][0]`, `w.arr[0]`, a global's element) is a TWO-index GEP over an array type - never
-// Part 6's single-index container/view slot, which stays a borrow. Keyed on the REPRESENTATION
-// (the `%string` named type by identity), because an element read off a temp-producing
-// expression carries no TypeName at all. A `move` source already transferred its buffer.
-bool MainListener::IsFixedArrayStringElementRead(
+// The READ twin of `destIsFixedArrayElem`: a `string` element whose slot is LIVE storage the
+// reader does not own. Two shapes qualify. A FIXED array (`dst[0]`, `dst[0][0]`, `w.arr[0]`, a
+// global's element) is a TWO-index GEP over an array type. A `T[]` VIEW element is a SINGLE-index
+// GEP, identical in shape to Part 6's container slot - which must stay a borrow - so it is
+// admitted only on the positive `IsViewElement` provenance, never on the GEP alone. A raw `T*`
+// heap array carries neither and keeps its borrow. Keyed on the REPRESENTATION (the `%string`
+// named type by identity), because an element read off a temp-producing expression carries no
+// TypeName at all. A `move` source already transferred its buffer.
+bool MainListener::IsOwningArrayStringElementRead(
         const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
         if (value == nullptr || nv.Storage == nullptr || !nv.IsElementAccess) return false;
         if (nv.TypeAndValue.IsMove || nv.TypeAndValue.Pointer || nv.TypeAndValue.IsArrayView)
@@ -5441,8 +5453,11 @@ bool MainListener::IsFixedArrayStringElementRead(
         // GEPOperator, not GetElementPtrInst: a constant index off a GLOBAL array folds the
         // access into a ConstantExpr GEP that the instruction cast would miss.
         auto* gep = llvm::dyn_cast<llvm::GEPOperator>(nv.Storage);
-        if (gep == nullptr || gep->getNumIndices() != 2
-            || !gep->getSourceElementType()->isArrayTy())
+        if (gep == nullptr) return false;
+        bool fixedArrayElem = gep->getNumIndices() == 2
+            && gep->getSourceElementType()->isArrayTy();
+        bool viewElem = gep->getNumIndices() == 1 && nv.IsViewElement;
+        if (!fixedArrayElem && !viewElem)
             return false;
         return value->getType()
             == llvm::StructType::getTypeByName(*compilerLLVM->context, "string");

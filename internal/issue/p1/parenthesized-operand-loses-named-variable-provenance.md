@@ -66,10 +66,26 @@ that is now empty.
 
 ## Fix direction
 
-Thread the operand's `NamedVariable` (at minimum `CallerName`, `Storage`, and the borrow flags)
-out through the parenthesized-primary lowering, instead of peeling text at each consumer. A
+Thread the operand's `NamedVariable` (at minimum `CallerName`, `Storage`, the borrow flags, and
+`IsViewElement`) out through the parenthesized-primary lowering, instead of peeling text at each
+consumer. A
 text-level peel was the right fix for the two purely syntactic collectors, but it cannot help
 here: these arms need the resolved variable, not its spelling.
+
+### (d) A parenthesized `T[]` VIEW element loses `IsViewElement` (measured 2026-08-10)
+
+`fix/viewelem` added `NamedVariable::IsViewElement`, so the flag list above now has a fourth member
+and a fourth cell. The fixed-array oracle is CORRECT in both spellings; only the view spelling
+diverges under parens:
+
+```cflat
+Box[2] base; base[0] = umk(1); Box q = (base[0]);              // rc 0, source nulled - MOVES
+Box[] v = base;               Box q = (v[0]);                  // rc 133, source NOT nulled
+Box[] v = base;               (v[0]) = a;                      // old element orphaned (leak)
+```
+
+(The `string` element read is rc 133 under parens in BOTH array spellings, so that one is a plain
+instance of this issue rather than a view/fixed asymmetry.)
 
 ## Related
 
