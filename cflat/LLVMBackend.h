@@ -1953,7 +1953,9 @@ private:
 
     // Spilled allocas of unbound owning-struct `move`-return temps (`makeToken().text`), freed by
     // FlushOwnedStructTemps. Struct analog of the string/closure temp lists. Block = dominance guard.
-    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; };
+    // LiveFlag (hoisted join-arm temps only): an i1 slot cleared at the branch and set in the arm,
+    // so the later destructor runs ONLY when the arm ran - a user dtor body is not null-safe.
+    struct PendingOwnedStructTemp { llvm::Value* Alloca; std::string TypeName; llvm::BasicBlock* Block; llvm::Value* LiveFlag = nullptr; };
     std::vector<PendingOwnedStructTemp> pendingOwnedStructTemps;
 
     // Owning-POINTER call results (`move R*`) consumed as a SUBEXPRESSION operand, so no named
@@ -3107,8 +3109,26 @@ private:
      * the end-of-full-expression flush cannot reach: a '?:' arm registers its temps in the arm's
      * own block, which does not dominate the join, so FlushOwnedTemps would silently skip them
      * (OwnedTempDominatesHere) and every one of those buffers would leak.
+     *
+     * `hoistTo` (a block that dominates the join, i.e. the one holding the arm branch) opts the
+     * ALLOCA-based struct temps out of that early free: each is zeroed there instead and re-keyed
+     * to it, so the end-of-statement flush destructs it AFTER the joined value is consumed, and
+     * the zeroed record makes that destructor a no-op on the path where the arm did not run.
+     * Freeing them in the arm is a use-after-free whenever the join yields a pointer INTO the
+     * temp. The string / closure / ptr ledgers hold SSA values that the resume block cannot name,
+     * so they always take the early free.
      */
-    void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep);
+    void FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
+                              llvm::BasicBlock* hoistTo = nullptr);
+
+    // Zero `temp`'s storage in `hoistTo` (before its terminator) and re-key it there. False when
+    // the temp is not an entry-block alloca of that function, i.e. cannot be hoisted.
+    bool HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::BasicBlock* hoistTo);
+
+    // Emit one struct temp's destructor. A hoisted temp (LiveFlag set) is guarded on that flag,
+    // which OPENS BLOCKS - after one, the caller must re-read the insert block and drop any
+    // cached dominator tree before judging the next temp.
+    void EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp);
 
     // Drop the ledger entries registered since `mark` WITHOUT emitting any free. For an aborted
     // region (an arm whose lowering threw): those entries are keyed to blocks that no longer

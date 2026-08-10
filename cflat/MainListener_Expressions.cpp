@@ -2933,9 +2933,10 @@ llvm::Value* MainListener::AdoptTernaryStringArm(LLVMBackend* compiler, llvm::Va
     }
 
 void MainListener::FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
-                          const LLVMBackend::OwnedTempMark& mark, bool& deepCopied) {
+                          const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
+                          llvm::BasicBlock* hoistTo) {
         value = AdoptTernaryStringArm(compiler, value, deepCopied);
-        compiler->FlushOwnedTempsSince(mark, deepCopied ? nullptr : value);
+        compiler->FlushOwnedTempsSince(mark, deepCopied ? nullptr : value, hoistTo);
     }
 
 LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
@@ -2952,6 +2953,9 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         // Coerces a non-bool condition to i1; leaves the insert point in trueBlock.
         compiler->CreateConditionJump(condTv.value, trueBlock, falseBlock);
+        // The block holding the branch dominates both arms AND the resume block - the one place
+        // an arm's owning struct temp can be zeroed so it can outlive the arm (FinishTernaryArm).
+        auto* branchBlock = trueBlock->getSinglePredecessor();
 
         llvm::Value* trueValue  = nullptr;
         llvm::Value* falseValue = nullptr;
@@ -2971,7 +2975,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 trueOcc   = armScope.Id;
                 trueValue = ParseExpression(expressionTrueCtx);
-                FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString);
+                FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
             }
             trueBr    = compiler->CreateJump(resumeBlock);
 
@@ -2981,7 +2985,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 falseOcc   = armScope.Id;
                 falseValue = ParseConditionalExpression(expressionFalseCtx);
-                FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString);
+                FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
             }
             falseBr    = compiler->CreateJump(resumeBlock);
         }
@@ -3112,8 +3116,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
                 rhs = ParseConditionalExpression(ctx->conditionalExpression());
             }
             // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
-            // would skip its temps; mirror FinishTernaryArm and keep the yielded value.
-            compiler->FlushOwnedTempsSince(rhsMark, rhs);
+            // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
+            // branch block does dominate the resume, so struct temps hoist there instead.
+            compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
             compiler->CreateAssignment(rhs, resultAlloca);
             auto* rhsBr = compiler->CreateJump(resumeBlock);
 

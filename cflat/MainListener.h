@@ -3676,10 +3676,13 @@ public:
      * copying at all would leak the parent. Then flush what the arm registered: those entries are
      * keyed to the arm's block, which does not dominate the join, so the end-of-statement flush
      * would skip them (OwnedTempDominatesHere) and every buffer would leak. The yielded value is
-     * kept unless the copy above already consumed it.
+     * kept unless the copy above already consumed it. `hoistTo` is the block holding the arm
+     * branch: an alloca-based struct temp is zeroed and re-keyed there instead of freed here, so
+     * a joined pointer INTO it stays live until the statement ends (see FlushOwnedTempsSince).
      */
     void FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
-                          const LLVMBackend::OwnedTempMark& mark, bool& deepCopied);
+                          const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
+                          llvm::BasicBlock* hoistTo);
 
     /*
      * Lower `cond ? a : b` as a real branch, mirroring the '??' lowering directly below: the true

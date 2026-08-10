@@ -2161,3 +2161,54 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `other = kw.b`, or `sinkBox(kw.b)` into a `move` parameter - still double-frees on both binaries; it is
   filed as `p2/implicit-consume-of-a-field-of-a-borrow-local-double-frees`, and the reason it escapes is
   that the two implicit-consume sites ask `RootIsBorrowedByValueParam` only.
+- **A join ARM must not destruct its owning temp: zero at the branch, destruct at the statement
+  boundary (RATIFIED, 2026-08-10, `fix/joinlife`)**: a `?:` arm (pre-existing) and a `??` fallback
+  arm (since `fix/coalarm`) ran `FlushOwnedTempsSince` INSIDE the arm, which is earlier than the
+  end of the full expression - `readV(c > 0 ? makeBox().t : n)` called `Box.dtorfull` in
+  `ternary_true` and `readV` in `ternary_resume`, a compiling use-after-free that measured
+  garbage with `dtors=1`. **The arm flush was never the problem; the arm being the DESTRUCTION
+  SITE was.** The fix is the redesign the p1 file called for and it is smaller than it sounds,
+  because every `RegisterOwnedStructTemp` site already spills to an `AllocaAtEntry` alloca that
+  dominates the resume block - only the ledger's dominance KEY (`PendingOwnedStructTemp::Block`,
+  the registration block) said otherwise. `FlushOwnedTempsSince` gained an optional `hoistTo`
+  block: an alloca-based struct temp registered since the mark is zeroed there, re-keyed there,
+  pulled out of the free loop and out of `TrimOwnedTempsSince`, then pushed back on the ledger so
+  the end-of-statement `FlushOwnedTemps` destructs it after the join is consumed. **Zeroing the
+  record is NOT enough to make that later destructor safe on the path the arm did not take** -
+  the first review round of this very fix caught a SIGSEGV on
+  `readV(c < 0 ? makeUBox().t : live)` where `~UBox()` is a USER destructor that dereferences its
+  owning field with no null check, a shape the pre-fix binary ran cleanly because the arm's own
+  flush never reached it. `PendingOwnedStructTemp::LiveFlag` is the fix: an i1 entry alloca
+  cleared at `hoistTo` and set inside the arm (once, on the FIRST hoist - re-hoisting to an
+  enclosing branch must not re-arm it, since a `??` fallback nested in a taken `?:` arm can be
+  skipped while the outer arm runs), and `EmitOwnedStructTempFree` branches on it. **A guarded
+  free OPENS BLOCKS, and the obvious way to cope with that - batching the flagged temps and
+  emitting them last - silently reverses two temps' destruction order inside one statement**
+  (`makeOrdA().t->id` unflagged next to a flagged join temp went A-then-B on master and dd7b5b5,
+  B-then-A after the batching; caught by a two-user-destructor order probe, pinned by nothing in
+  the suite). Both flush sites therefore stay in ONE ledger-order pass, re-reading the insert
+  block per temp and dropping the cached `DominatorTree` after each guarded free - the stale tree,
+  not the ordering, is the thing that actually had to be handled.
+  `hoistTo` is
+  `trueBlock->getSinglePredecessor()` for `?:` and `nullBlock->getSinglePredecessor()` for `??`,
+  i.e. the block holding the branch, never the function entry block.
+  **Zeroing at the BRANCH and not at function entry is load-bearing and was probed, not assumed**:
+  a loop runs the statement twice off one entry-block alloca, so entry-only zeroing would
+  re-destruct iteration 1's record on an untaken iteration 2 (`join_loop_alternating_*`, 51 with
+  `dtors == 1`). The string / closure / ptr ledgers hold SSA values the resume block cannot name
+  and keep the early free unchanged - verified by leaving `&&` / `||` alone (their result is a
+  bool, and a join NESTED in a short-circuit RHS is picked up correctly by that block's own
+  unhoisted flush).
+  **The escape-guard accept/reject matrix from `fix/coalarm` is untouched** - all seven reject
+  shapes (store a `?:` or `??` join into a local, into a `unique` or `move` sink parameter, a
+  chained join, a join in return position) still fire with the same diagnostics, because the
+  temp still dies at the statement boundary and a local still outlives it. What the fix changes
+  is only the shapes those guards ACCEPT: a plain-`T*` parameter read and a value laundered
+  through a borrowing callee, both now reading live memory. **A launder into a LOCAL is a
+  different, pre-existing hole**: `Resource* b = passthruResource(makeMoveBox().t);` with no join
+  at all is garbage on both binaries, so `Resource* b = c ? passthruResource(makeMoveBox().t) : n;`
+  staying garbage post-fix is the join agreeing with its direct spelling, not a residue of this bug.
+  Cost: a join inside the still-unfixed `?.` guarded arm now LEAKS instead of use-after-freeing
+  (its hoist target sits inside the guarded region), +1 leak / +16 bytes on `Test/test_move.cb`
+  (17/336 -> 18/352), recorded in `p2/owning-temp-in-null-conditional-arm-never-destructed.md`
+  and pinned by `null_conditional_join_arm_not_freed`.

@@ -37,8 +37,27 @@ doubt: the guarded region is threaded through the 4000-line postfix walker acros
 link kinds, so the mark/flush pair has to be placed once per exit edge rather than once per
 lowering function, and each exit needs its own measurement.
 
+## Widened by `fix/joinlife` (2026-08-10): a JOIN inside a `?.` arm now leaks too
+
+`fix/joinlife` stopped `?:` / `??` arms from destructing an alloca-based owning struct temp
+INSIDE the arm - it is zeroed at the branch and destructed at the statement boundary instead.
+A join nested in a `?.` guarded arm therefore re-keys its temp to the join's own branch block,
+which still sits inside the guarded region, so this leak now swallows it as well:
+
+```cflat
+Resource* live = new Resource();
+int got = live?.readId(readResourceId(c > 0 ? makeMoveBox().t : nul));
+// pre-joinlife: got = GARBAGE (freed in the arm, read in the resume), dtors = 1
+// now:          got = 44 (correct),                                   dtors = 0  - LEAK
+```
+
+That is a use-after-free traded for a leak, the direction this repo takes deliberately, and it
+disappears with this issue. It is worth exactly +1 leak / +16 bytes on `Test/test_move.cb` under
+`leaks --atExit` (17/336 -> 18/352), all of it the one `null_conditional_join_arm` leg.
+
 ## Tripwire
 
 `Test/test_move.cb` pins the leak on purpose:
-`null_conditional_arm_temp_not_freed` asserts `dtorCount == 0`. It MUST flip to `1` when this is
-fixed; that flip is the leg doing its job, not a weakened assertion.
+`null_conditional_arm_temp_not_freed` and `null_conditional_join_arm_not_freed` both assert
+`dtorCount == 0`. Both MUST flip to `1` when this is fixed; that flip is the legs doing their
+job, not a weakened assertion.

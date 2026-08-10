@@ -1905,18 +1905,19 @@ void LLVMBackend::FlushOwnedStructTemps()
 {
         if (pendingOwnedStructTemps.empty()) return;
 
-        auto* curBlock = builder->GetInsertBlock();
-        if (IsInsertBlockLive())
-        {
-            std::optional<llvm::DominatorTree> domTree;
-            for (auto& t : pendingOwnedStructTemps)
-            {
-                if (t.Alloca == nullptr || !OwnedTempDominatesHere(t.Block, curBlock, domTree)) continue; // dominance safety
-                if (auto* dtor = GetOrCreateFullDestructor(t.TypeName))
-                    builder->CreateCall(dtor->getFunctionType(), dtor, { t.Alloca });
-            }
-        }
+        auto temps = std::move(pendingOwnedStructTemps);
         pendingOwnedStructTemps.clear();
+        // ONE pass in ledger order. A guarded free opens blocks, so the insert block is re-read
+        // per temp and the dominator tree is dropped after one - batching the guarded temps last
+        // instead would silently reverse two temps' destruction order within a statement.
+        std::optional<llvm::DominatorTree> domTree;
+        for (auto& t : temps)
+        {
+            if (t.Alloca == nullptr || !IsInsertBlockLive()) continue;
+            if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue; // dominance safety
+            EmitOwnedStructTempFree(t);
+            if (t.LiveFlag != nullptr) domTree.reset();   // new blocks invalidate the cached tree
+        }
     }
 
 void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName, uint64_t allocAlign)
@@ -1988,8 +1989,77 @@ LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const
                  pendingOwnedStructTemps.size(), pendingOwnedPtrTemps.size() };
     }
 
-void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep)
+void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
 {
+        auto* dtor = GetOrCreateFullDestructor(temp.TypeName);
+        if (dtor == nullptr || temp.Alloca == nullptr) return;
+        if (temp.LiveFlag == nullptr)
+        {
+            builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+            return;
+        }
+        // A hoisted temp is destructed here on EVERY path, so the flag is what says the arm
+        // actually ran: a user destructor body dereferences its fields without a null check.
+        auto* fn      = builder->GetInsertBlock()->getParent();
+        auto* liveBB  = llvm::BasicBlock::Create(*context, "owntemp.live",  fn);
+        auto* afterBB = llvm::BasicBlock::Create(*context, "owntemp.after", fn);
+        auto* flag    = builder->CreateLoad(builder->getInt1Ty(), temp.LiveFlag);
+        builder->CreateCondBr(flag, liveBB, afterBB);
+        builder->SetInsertPoint(liveBB);
+        builder->CreateCall(dtor->getFunctionType(), dtor, { temp.Alloca });
+        builder->CreateBr(afterBB);
+        builder->SetInsertPoint(afterBB);
+    }
+
+bool LLVMBackend::HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::BasicBlock* hoistTo)
+{
+        if (hoistTo == nullptr || hoistTo->getTerminator() == nullptr) return false;
+        if (!IsInsertBlockLive()) return false;   // no live point in the arm to set the flag from
+        auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(temp.Alloca);
+        if (alloca == nullptr || alloca->getFunction() != hoistTo->getParent()) return false;
+        // Only an ENTRY-block alloca provably dominates the join; anything else (a loop-body
+        // alloca) would name storage the resume block cannot reach.
+        if (alloca->getParent() != &alloca->getFunction()->getEntryBlock()) return false;
+        if (temp.Block == hoistTo) return true;
+
+        auto* saveBlock = builder->GetInsertBlock();
+        auto savePoint  = builder->GetInsertPoint();
+        // First hoist only - re-hoisting to an ENCLOSING branch must not re-arm the flag, since
+        // that arm can run without this one (a '??' fallback nested in a taken '?:' arm).
+        if (temp.LiveFlag == nullptr)
+        {
+            temp.LiveFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "owntemp.livef");
+            builder->CreateStore(builder->getInt1(true), temp.LiveFlag);
+        }
+        builder->SetInsertPoint(hoistTo->getTerminator());
+        builder->CreateStore(llvm::Constant::getNullValue(alloca->getAllocatedType()), alloca);
+        builder->CreateStore(builder->getInt1(false), temp.LiveFlag);
+        if (saveBlock != nullptr) builder->SetInsertPoint(saveBlock, savePoint);
+        temp.Block = hoistTo;
+        return true;
+    }
+
+void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
+                                       llvm::BasicBlock* hoistTo)
+{
+        // Struct temps that can outlive the arm are pulled out of the range FIRST, then re-added
+        // below, so neither the free loop nor the trim can retire them here.
+        std::vector<PendingOwnedStructTemp> hoisted;
+        if (hoistTo != nullptr)
+        {
+            for (size_t i = mark.Structs; i < pendingOwnedStructTemps.size(); )
+            {
+                auto& t = pendingOwnedStructTemps[i];
+                if (t.Alloca != nullptr && t.Alloca != keep && HoistOwnedStructTempTo(t, hoistTo))
+                {
+                    hoisted.push_back(t);
+                    pendingOwnedStructTemps.erase(pendingOwnedStructTemps.begin() + i);
+                    continue;
+                }
+                ++i;
+            }
+        }
+
         // Value-based frees first: they emit plain calls into the current block, while the
         // pointer free below opens new blocks and moves the insert point out from under them.
         {
@@ -2010,13 +2080,17 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
                 if (!OwnedTempDominatesHere(bb, curBlock, domTree)) continue;
                 EmitOwnedClosureTempFree(value);
             }
+            // Ledger order, guarded and unguarded alike. A guarded free opens blocks, so the
+            // insert block is re-read per temp and the cached tree dropped after one; batching
+            // the guarded ones last instead would reverse two temps' destruction order.
             for (size_t i = mark.Structs; live && i < pendingOwnedStructTemps.size(); ++i)
             {
                 auto& t = pendingOwnedStructTemps[i];
                 if (t.Alloca == nullptr || t.Alloca == keep) continue;
-                if (!OwnedTempDominatesHere(t.Block, curBlock, domTree)) continue;
-                if (auto* dtor = GetOrCreateFullDestructor(t.TypeName))
-                    builder->CreateCall(dtor->getFunctionType(), dtor, { t.Alloca });
+                if (!IsInsertBlockLive()) break;
+                if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
+                EmitOwnedStructTempFree(t);
+                if (t.LiveFlag != nullptr) domTree.reset();
             }
         }
         auto pairValue   = [](const std::pair<llvm::Value*, llvm::BasicBlock*>& e) { return e.first; };
@@ -2041,6 +2115,10 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
             if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
             EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign);
         }
+
+        // Back on the ledger, now keyed to a dominating block: the end-of-statement flush frees
+        // them, and an enclosing join's own hoist can re-key them further out.
+        for (auto& h : hoisted) pendingOwnedStructTemps.push_back(h);
     }
 
 void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)

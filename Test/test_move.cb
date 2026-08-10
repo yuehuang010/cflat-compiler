@@ -7538,6 +7538,18 @@ int recursiveReadResourceId(Resource* r, int d) { if (d > 0) { return recursiveR
 void printResourcePointer(Resource* r) { snprintf(nullptr, 0, "%p", r); }
 Resource* passthruResource(Resource* r) { return r; }
 void keepResourceGlobal(Resource* r) { gKeptResource = r; }
+// A join in RETURN position: the arm's temp must still be live when readResourceId reads it.
+int returnJoinResourceId(int c) { Resource* nul = nullptr; return readResourceId(c > 0 ? makeMoveBox().t : nul); }
+// A USER destructor that dereferences its owning field with no null check: a hoisted arm temp is
+// destructed on the untaken path too, so zeroing the record alone would crash here.
+int joinUserDtorCount = 0;
+int joinUserDtorSaw = 0;
+struct JoinUserBox
+{
+    unique Resource* t = nullptr;
+    ~JoinUserBox() { joinUserDtorCount = joinUserDtorCount + 1; joinUserDtorSaw = joinUserDtorSaw + t->id; }
+};
+JoinUserBox makeJoinUserBox() { JoinUserBox b = default; b.t = new Resource(); b.t->id = 44; return b; }
 void ownResourceGlobal(move Resource* r) { gKeptResource = r; }
 
 // The RECEIVER shape: `makeSelfBox().t->m()`. A method whose body only READS `this` must keep
@@ -7733,6 +7745,143 @@ int testTempUniqueFieldBorrowAccepts()
         delete live;
     }
 
+    // JOIN LIFETIME. The per-arm flush ran INSIDE the arm block, which is BEFORE the joined
+    // value is consumed in the resume block, so every cell below read FREED memory on the
+    // pre-fix binary (garbage, with dtorCount already 1 at the read - see the `--no-opt` IR in
+    // the issue this replaced). An alloca-based struct temp is now zeroed at the branch and
+    // destructed at the statement boundary, exactly like the direct spelling above.
+    {
+        int c = 1;
+        Resource* nul = nullptr;
+
+        dtorCount = 0;
+        int jt = readResourceId(c > 0 ? makeMoveBox().t : nul);
+        passed += Test("join_ternary_true_arm_value", jt, 44);
+        passed += Test("join_ternary_true_arm_freed_once", dtorCount, 1);
+
+        dtorCount = 0;
+        int jf = readResourceId(c < 0 ? nul : makeMoveBox().t);
+        passed += Test("join_ternary_false_arm_value", jf, 44);
+        passed += Test("join_ternary_false_arm_freed_once", dtorCount, 1);
+
+        dtorCount = 0;
+        int jc = readResourceId(nul ?? makeMoveBox().t);
+        passed += Test("join_coalesce_arm_value", jc, 44);
+        passed += Test("join_coalesce_arm_freed_once", dtorCount, 1);
+
+        // Laundered through a BORROWING callee - the shape the escape guards accept by design,
+        // and the reason the guard could not be widened instead.
+        dtorCount = 0;
+        int jw = readResourceId(passthruResource(c > 0 ? makeMoveBox().t : nul));
+        passed += Test("join_laundered_arm_value", jw, 44);
+        passed += Test("join_laundered_arm_freed_once", dtorCount, 1);
+
+        // BOTH arms owning: only the taken arm's record is non-zero, so the untaken one's
+        // destructor must no-op - `1`, not `2`.
+        dtorCount = 0;
+        int jb = readResourceId(c > 0 ? makeMoveBox().t : makeMoveBox().t);
+        passed += Test("join_both_arms_owning_value", jb, 44);
+        passed += Test("join_both_arms_owning_freed_once", dtorCount, 1);
+
+        // POLARITY (passes on both binaries by design): the arm is not taken, so the zeroed
+        // record's destructor must free nothing. Every `_freed_once` leg above is likewise the
+        // RESOURCE half of a discriminating value leg - it pins that moving the destructor later
+        // neither doubled it nor dropped it.
+        dtorCount = 0;
+        {
+            Resource* live = new Resource();
+            live->id = 51;
+            int ju = readResourceId(c < 0 ? makeMoveBox().t : live);
+            passed += Test("join_arm_untaken_value", ju, 51);
+            passed += Test("join_arm_untaken_no_free", dtorCount, 0);
+            delete live;
+        }
+
+        // A LOOP runs the statement twice off ONE entry-block alloca: the zeroing has to happen
+        // at the branch, per execution. Zeroing only at function entry would re-destruct
+        // iteration 1's record on an untaken iteration 2 (the alternating leg is that probe).
+        dtorCount = 0;
+        {
+            int sum = 0;
+            for (int i = 0; i < 2; i = i + 1)
+                sum = sum + readResourceId(c > 0 ? makeMoveBox().t : nul);
+            passed += Test("join_in_loop_value", sum, 88);
+            passed += Test("join_in_loop_freed_twice", dtorCount, 2);
+        }
+        dtorCount = 0;
+        {
+            Resource* live = new Resource();
+            live->id = 7;
+            int sum = 0;
+            for (int i = 0; i < 2; i = i + 1)
+                sum = sum + readResourceId(i == 0 ? makeMoveBox().t : live);
+            passed += Test("join_loop_alternating_value", sum, 51);
+            passed += Test("join_loop_alternating_freed_once", dtorCount, 1);
+            delete live;
+        }
+
+        // NESTED joins: the inner hoist re-keys the temp into a block the OUTER join then
+        // re-keys again, so the ledger entry has to survive both arm flushes.
+        dtorCount = 0;
+        int jn = readResourceId((nul ?? makeMoveBox().t) ?? nul);
+        passed += Test("join_nested_coalesce_value", jn, 44);
+        passed += Test("join_nested_coalesce_freed_once", dtorCount, 1);
+        dtorCount = 0;
+        int jn2 = readResourceId(c > 0 ? (nul ?? makeMoveBox().t) : nul);
+        passed += Test("join_coalesce_in_ternary_value", jn2, 44);
+        passed += Test("join_coalesce_in_ternary_freed_once", dtorCount, 1);
+
+        // A join nested in a SHORT-CIRCUIT RHS: that block does not dominate the join either,
+        // so its own flush must pick the hoisted temp up rather than leave it.
+        dtorCount = 0;
+        {
+            Resource* live = new Resource();
+            int jsv = 0;
+            // Compares against 44, not `> 0`: a freed read is garbage of either sign.
+            if ((live != nullptr) && (readResourceId(c > 0 ? makeMoveBox().t : nul) == 44)) { jsv = 1; }
+            passed += Test("join_in_shortcircuit_rhs_value", jsv, 1);
+            passed += Test("join_in_shortcircuit_rhs_freed_once", dtorCount, 1);
+            delete live;
+        }
+
+        // A join in RETURN position, where the statement boundary is the return itself.
+        dtorCount = 0;
+        int jr = returnJoinResourceId(1);
+        passed += Test("join_in_return_value", jr, 44);
+        passed += Test("join_in_return_freed_once", dtorCount, 1);
+
+        // USER DESTRUCTOR. A hoisted temp is destructed on the path the arm did NOT take, so a
+        // zeroed record alone is not enough: `~JoinUserBox` dereferences its field with no null
+        // check and SEGFAULTED. A liveness flag set in the arm is what gates the call.
+        {
+            Resource* live = new Resource();
+            live->id = 9;
+            joinUserDtorCount = 0; joinUserDtorSaw = 0;
+            int ua = readResourceId(c < 0 ? makeJoinUserBox().t : live);
+            passed += Test("join_user_dtor_untaken_value", ua, 9);
+            passed += Test("join_user_dtor_untaken_not_run", joinUserDtorCount, 0);
+
+            joinUserDtorCount = 0; joinUserDtorSaw = 0;
+            int ub = readResourceId(live ?? makeJoinUserBox().t);
+            passed += Test("join_user_dtor_coalesce_untaken_value", ub, 9);
+            passed += Test("join_user_dtor_coalesce_untaken_not_run", joinUserDtorCount, 0);
+
+            // Outer arm TAKEN, inner '??' fallback NOT taken: the re-hoist must not re-arm the flag.
+            joinUserDtorCount = 0; joinUserDtorSaw = 0;
+            int uc = readResourceId(c > 0 ? (live ?? makeJoinUserBox().t) : nul);
+            passed += Test("join_user_dtor_nested_inner_untaken_value", uc, 9);
+            passed += Test("join_user_dtor_nested_inner_untaken_not_run", joinUserDtorCount, 0);
+
+            // Taken: the destructor runs exactly once, after the read, on a LIVE record.
+            joinUserDtorCount = 0; joinUserDtorSaw = 0;
+            int ud = readResourceId(c > 0 ? makeJoinUserBox().t : nul);
+            passed += Test("join_user_dtor_taken_value", ud, 44);
+            passed += Test("join_user_dtor_taken_ran_once", joinUserDtorCount, 1);
+            passed += Test("join_user_dtor_taken_saw_live_field", joinUserDtorSaw, 44);
+            delete live;
+        }
+    }
+
     // TRIPWIRE, same shape and still unfixed: the '?.' guarded chain is the third block that
     // registers owning temps without a flush. `dtors == 0` pins that LEAK on purpose - see
     // internal/issue/p2/owning-temp-in-null-conditional-arm-never-destructed.md.
@@ -7742,6 +7891,20 @@ int testTempUniqueFieldBorrowAccepts()
         int got = live?.readId(makeMoveBox().t->id);
         passed += Test("null_conditional_arm_temp_value", got, 44);
         passed += Test("null_conditional_arm_temp_not_freed", dtorCount, 0);
+        delete live;
+    }
+
+    // A JOIN inside that same unflushed '?.' arm: the join hoists its temp to its own branch
+    // block, which still sits inside the arm, so the value is now RIGHT (it was garbage
+    // pre-fix) and the temp leaks instead - the p2 gap above, not a new one.
+    dtorCount = 0;
+    {
+        int c = 1;
+        Resource* nul = nullptr;
+        Resource* live = new Resource();
+        int got = live?.readId(readResourceId(c > 0 ? makeMoveBox().t : nul));
+        passed += Test("null_conditional_join_arm_value", got, 44);
+        passed += Test("null_conditional_join_arm_not_freed", dtorCount, 0);
         delete live;
     }
 
@@ -9112,7 +9275,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 57;
+    total += 92;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
