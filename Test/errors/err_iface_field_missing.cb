@@ -163,6 +163,17 @@ expect_error("member access on uninitialized interface value 'fv' - 'fv' is neve
     int fvNeverInitFieldRead() { PTagged fv; return fv.tag; }
 }
 
+/*
+ * The `unique` spelling of the same declaration. Its slot IS zero-splatted at the declaration now
+ * (otherwise the next assignment's drop-old released through a garbage vtable - see
+ * testUninitializedUniqueIfaceLocalDecl in Test/test_move.cb), so this leg pins that the splat
+ * carries the decl-witness tag: an untagged store would flip the wording to the "last set to null"
+ * variant, which is FALSE here - nothing in the source set it to null.
+ */
+expect_error("method call on uninitialized interface value 'quv' - 'quv' is never assigned an implementation before this call, so 'quv.kind()' would dispatch through an uninitialized 'PTagged' vtable") {
+    int quvUniqueNeverInitCall() { unique PTagged quv; return quv.kind(); }
+}
+
 extern int main()
 {
     return 0;

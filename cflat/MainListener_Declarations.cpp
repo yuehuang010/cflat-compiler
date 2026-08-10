@@ -4025,17 +4025,28 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                      * An owning pointer local with no initializer left its slot uninitialized, so a
                      * later assignment's drop-old and the scope-exit release both freed garbage.
                      * Zero it, exactly as the `= nullptr` spelling does; the array type's own zero
-                     * value covers every slot of `unique T*[N]`. A `static` local's storage is a
-                     * module global zeroed once at definition and must not be re-zeroed per call,
-                     * and a run-time-sized allocation has no constant whole-slot zero.
+                     * value covers every slot of `unique T*[N]` and of `unique I[N]`. The fat
+                     * interface value `unique I` has the same defect and the same remedy - its zero
+                     * is a null { vtable, data } pair, and the store carries the decl-splat witness
+                     * tag so the never-initialised interface diagnostic still sees no initializer.
+                     * A `static` local's storage is a module global zeroed once at definition and
+                     * must not be re-zeroed per call, and a run-time-sized allocation has no
+                     * constant whole-slot zero.
                      */
-                    if (right == nullptr && typeAndValue.IsUnique && typeAndValue.Pointer
-                        && !isStaticLocal
+                    if (right == nullptr && typeAndValue.IsUnique && !isStaticLocal
+                        && (typeAndValue.Pointer || typeAndValue.IsFatInterfaceValue())
+                        && !needsArrayDefaultInit
                         && (arraySize == nullptr || typeAndValue.ConstArraySize > 0))
                     {
                         if (auto* slot = llvm::dyn_cast_or_null<llvm::AllocaInst>(alloc))
-                            compiler->builder->CreateStore(
+                        {
+                            auto* splat = compiler->builder->CreateStore(
                                 llvm::Constant::getNullValue(slot->getAllocatedType()), slot);
+                            // Witness tag: the null-interface proofs must not read this
+                            // compiler-emitted splat as an initialization. See StoreWritesInterfaceLoc.
+                            splat->setMetadata(LLVMBackend::kIfaceDeclSplatMD,
+                                               llvm::MDNode::get(*compiler->context, {}));
+                        }
                     }
 
                     // Record an unused-local candidate. RAII locals (a type with a

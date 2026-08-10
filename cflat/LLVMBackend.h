@@ -5908,6 +5908,14 @@ public:
                                         llvm::SmallVectorImpl<uint64_t>& storePath);
 
     /*
+     * Metadata tag on the compiler-emitted zero splat of an uninitialized `unique` interface
+     * local's slot. That store exists so the drop-old and the scope-exit release do not run
+     * through garbage; it is NOT a user initialization, so every null-interface proof skips it
+     * and the declaration keeps witnessing "never assigned an implementation".
+     */
+    static constexpr const char* kIfaceDeclSplatMD = "cflat.iface.declsplat";
+
+    /*
      * The constant a store's value operand provably lands in memory: the value itself, or the
      * single constant `ret` of a directly-called DEFINED function - which is how a synthesized
      * default constructor supplies a struct's null interface field. Anything else answers null,

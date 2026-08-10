@@ -6337,6 +6337,109 @@ int testUninitializedUniqueLocalDecl()
     return passed;
 }
 
+// The generic body's `unique <interface>` local with no initializer: the monomorphized copy runs
+// the same declarator path, so its fat slot must be zeroed there too.
+int uqiIfaceGenericMake<T>(int seed)
+{
+    unique IShapeMove p;
+    p = new T();
+    return p.area() + seed;
+}
+
+/*
+ * The FAT INTERFACE VALUE sibling of testUninitializedUniqueLocalDecl. `unique IShapeMove p;` used
+ * to leave the { vtable, data } pair uninitialized, so the next assignment's drop-old dispatched
+ * the release through a garbage vtable - rc 139 at --no-opt, and silently SKIPPED statements at
+ * default opt. Every leg asserts a VALUE the skipped statements compute plus the destructor COUNT,
+ * so neither face can pass. The declaration's zero splat carries a witness tag, so the
+ * never-initialised diagnostic still fires on the `unique` spelling (err_iface_field_missing.cb).
+ */
+int testUninitializedUniqueIfaceLocalDecl()
+{
+    int passed = 0;
+
+    // Scalar. The first assignment frees NOTHING (the slot is null now, not garbage); the
+    // reassignment frees exactly the first value.
+    dtorCount = 0;
+    {
+        unique IShapeMove p;
+        p = new Sq7Move();
+        passed += Test("uqif_scalar_first_value", p.area(), 49);
+        passed += Test("uqif_scalar_first_no_free", dtorCount, 0);
+        p = new Sq7Move();
+        passed += Test("uqif_scalar_reassign_value", p.area(), 49);
+        passed += Test("uqif_scalar_reassign_frees_old", dtorCount, 1);
+    }
+    passed += Test("uqif_scalar_freed_twice", dtorCount, 2);
+
+    // A NESTED block's declaration: same declarator path, its own scope-exit release.
+    dtorCount = 0;
+    int nested = 0;
+    {
+        {
+            unique IShapeMove p;
+            p = new Sq7Move();
+            nested = p.area() + 1;
+        }
+        passed += Test("uqif_nested_freed_at_inner_exit", dtorCount, 1);
+    }
+    passed += Test("uqif_nested_value", nested, 50);
+
+    // Two locals, one initialized at the declaration and one not: the bare one must not disturb
+    // its neighbour's owner, and both are freed exactly once.
+    dtorCount = 0;
+    {
+        unique IShapeMove a = new Sq7Move();
+        unique IShapeMove b;
+        b = new Sq7Move();
+        passed += Test("uqif_pair_value", a.area() + b.area(), 98);
+        passed += Test("uqif_pair_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqif_pair_freed_twice", dtorCount, 2);
+
+    // `move` from another owner into the uninitialized slot: one owner, one free.
+    dtorCount = 0;
+    {
+        unique IShapeMove src = new Sq7Move();
+        unique IShapeMove p;
+        p = move src;
+        passed += Test("uqif_move_value", p.area(), 49);
+        passed += Test("uqif_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqif_move_freed_once", dtorCount, 1);
+
+    // `unique I[N]`: every slot is zeroed, so the scope-exit walk frees the one that was assigned
+    // and skips the untouched one instead of releasing garbage through its vtable.
+    dtorCount = 0;
+    {
+        unique IShapeMove[2] arr;
+        arr[0] = new Sq7Move();
+        passed += Test("uqif_array_slot0_value", arr[0].area(), 49);
+        passed += Test("uqif_array_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqif_array_freed_once", dtorCount, 1);
+
+    // Loop re-entry: the declaration re-zeroes the slot each iteration, and each iteration's value
+    // is released at its own scope exit.
+    dtorCount = 0;
+    int loopTotal = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        unique IShapeMove p;
+        p = new Sq7Move();
+        loopTotal = loopTotal + p.area();
+    }
+    passed += Test("uqif_loop_total", loopTotal, 147);
+    passed += Test("uqif_loop_freed_each_iteration", dtorCount, 3);
+
+    // The generic instantiation reaches the same declarator path.
+    dtorCount = 0;
+    passed += Test("uqif_generic_local_value", uqiIfaceGenericMake<Sq7Move>(3), 52);
+    passed += Test("uqif_generic_freed_once", dtorCount, 1);
+
+    return passed;
+}
+
 /*
  * The shapes deliberately left LEGAL by the `unique` field-store rejects in
  * Test/errors/err_unique_borrow_into_field.cb. Each asserts a value and a free COUNT, so a
@@ -7433,6 +7536,9 @@ extern int main()
     total += 24;
 
     passed += testUninitializedUniqueLocalDecl();
+    total += 20;
+
+    passed += testUninitializedUniqueIfaceLocalDecl();
     total += 20;
 
     passed += testUniqueGlobalReceiverFieldStore();

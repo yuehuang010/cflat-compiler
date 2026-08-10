@@ -256,6 +256,9 @@ bool LLVMBackend::StoreWritesInterfaceLoc(const llvm::StoreInst* st, const llvm:
                                         llvm::ArrayRef<uint64_t> path,
                                         llvm::SmallVectorImpl<uint64_t>& storePath)
 {
+        // The declaration's zero splat is compiler-emitted storage hygiene, not an assignment of
+        // an implementation; hiding it keeps every proof answering what it answered without it.
+        if (st->getMetadata(kIfaceDeclSplatMD) != nullptr) return false;
         auto* dest = const_cast<llvm::Value*>(st->getPointerOperand());
         if (ResolveIfaceStorageLoc(dest, storePath) != base) return false;
         const size_t common = std::min(storePath.size(), path.size());

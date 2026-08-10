@@ -1888,3 +1888,19 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   A raw `new string[n]` element read stays a borrow deliberately: that allocation does not take
   ownership of assigned strings (its own `delete` diagnostic says so), so copying there would
   orphan the slot instead of fixing anything - measured rc 0 with a shared buffer, both binaries.
+- **A compiler-emitted zero splat can be hidden from a proof with an IR METADATA witness.** The
+  fat-interface sibling of the uninitialized-`unique`-local defect (`unique IThing p;` then
+  `p = new Res();` - drop-old released through a garbage vtable, rc 139 at `--no-opt`, silently
+  dropped statements at default opt) was fixed by zeroing the `{ vtable, data }` slot at the
+  declaration, the same remedy the pointer spelling got. The blocker recorded in the issue file -
+  that the store would read as an initialization to `ReportNullIfaceUninitAccess`, whose
+  discriminator is "this (Base, empty Path) location has ZERO stores in F" - was resolved WITHOUT
+  moving that discriminator: the splat carries `LLVMBackend::kIfaceDeclSplatMD` and
+  `StoreWritesInterfaceLoc` answers false for a tagged store, so every null-interface proof sees
+  exactly the IR it saw before the splat existed and all 21 legs of
+  `Test/errors/err_iface_field_missing.cb` keep their EXACT wording. Metadata beat a per-function
+  side set: nothing to clear in `ResetForReanalysis`, nothing to add to the `--init` round-trip.
+  The rejected alternative - letting the splat be VISIBLE and checking never-init before the
+  null proof - would have converted two crashing shapes (use-before-assign, guarded first assign)
+  into diagnostics, but it manufactures a null witness for every such declaration and so can only
+  ADD rejections; that is guard-polarity work with its own accept-set, not a ride-along.
