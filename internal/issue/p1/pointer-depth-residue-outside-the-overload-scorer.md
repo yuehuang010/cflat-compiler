@@ -54,24 +54,27 @@ change because WinRT synthesizes interface parameters without ever setting `Elem
 path cannot be exercised on a macOS host: a parameter that is truly `T**` but recorded
 `ElemPointer=false` would be a Windows-only false rejection. Verify on Windows before gating there.
 
-## 4. Depth caps at 2, so `T***` into `T**` is invisible
+## 4. Depth caps at 2, so `T***` into `T**` is invisible - DECLARATOR HALF CLOSED
 
-`ValuePointerDepth()` documents the cap: `ElemPointer` is one bit. `T***` into `T*` IS refused (it
-is a proven `T**` as far as the model can see, and the diagnostic spells it `T**`, which is
-understated rather than wrong-signed); `T***` into `T**` is indistinguishable from a correct call.
+The WRITTEN half is closed together with section 6, by REMOVING the spelling rather than lifting
+the cap: a written depth of 3+ is now a hard error at the site where the stars appear.
+`byPP(ppp)` no longer compiles - `Circle*** ppp` is refused at its declarator. The old value leg
+`pd_deref_of_triple_ptr_into_ptrptr_param` is gone with it (replaced by
+`pd_ptrptr_local_at_cap_reads_through` in `Test/test_basic.cb`); the refusals are frozen in
+`Test/errors/err_double_pointer_arg_single_pointer_param.cb` and its mirror.
+
+Still open: a depth-3 VALUE needs no declarator. `&pp` over a `Circle** pp` produces one, and the
+value side still proves it as `Circle**`, so it binds a `Circle**` parameter silently:
 
 ```cflat
 int byPP(Circle** c) { return 2000 + (*c)->r; }
-extern int main() { Circle* a = new Circle(); Circle** pp = &a; Circle*** ppp = &pp;
-                    return byPP(ppp); }                                     // pd_r07, garbage rc
+extern int main() { Circle c = default; Circle* a = &c; Circle** pp = &a;
+                    return byPP(&pp); }        // compiles; garbage rc (2007 expected)
 ```
 
-`TypeAndValue::PointerDepth` now exists but the model still CAPS at 2, so a `Circle*** ppp`
-declarator records `0` (NOT RECORDED) rather than a clamped 2 - a clamped value stepped down by a
-`*` would falsely prove depth 1 and reject the correct `byPP(*ppp)` (frozen as the value leg
-`pd_deref_of_triple_ptr_into_ptrptr_param`). So this hole is unchanged: over the cap the model
-claims nothing. Lifting the cap means lifting it in `Pointer`/`ElemPointer` and `GetType` too, and
-needs its own accept set - see section 6.
+Measured identically on the pre- and post-guard binaries, so this is untouched residue, not a
+regression. `Circle** q = &pp;` is accepted the same way. Closing it is value-side depth work
+(`ValuePointerDepth` over address-of), not another written-star guard.
 
 ## 5. Generic substitution collapses depth, so the gate is blind through templates
 
@@ -86,33 +89,43 @@ merge base runs correctly - `Box<C**>.put(pp)`, `list<C**>.add(pp)`, `dictionary
 and a generic function `idput<C**>(pp)` (found by review, not by the suite; now frozen as the
 `pdg_*` value legs in `Test/test_generics.cb`).
 
+The section-6 cap guard deliberately does NOT extend to the type-ARGUMENT spelling: `Box<C***>`
+still compiles and still collapses to `Box<C*>`, because `typeParameterEntry`'s stars are already
+collapsed to one bool for `C**` too, so rejecting only three stars there would fix nothing while
+adding a guard to every walker of that rule. Measured post-guard (probe `a7_generic`): accepts.
+
 Consequence: a genuine `T**`-into-`T*` mistake is INVISIBLE anywhere a generic type argument is the
 parameter's type. Closing it means carrying a real depth int through substitution, which changes
 the monomorphization key (`Box<C*>` and `Box<C**>` would stop being the same instantiation) - a
 much larger change than this issue, and the reason the one-sided decline was taken instead.
 
-## 6. Depth 3 truncates SILENTLY in the plain spelling, so BOTH remedies can be wrong
+## 6. Depth 3 truncates SILENTLY in the plain spelling - CLOSED
 
-Measured on the post-fix binary: `C*** x = nullptr;` compiles (rc 0) - the plain declarator branch
-clamps to `**` with no diagnostic - while the same depth reached through an alias hard-errors:
+Ruling: **3+ written stars are a hard error at every spelling that counts stars**, matching what
+the alias branch already did. The type model holds two levels (`Pointer` + `ElemPointer`); anything
+deeper could only be clamped, and a clamped value is worse than no value - it is the thing that
+made both of the overload dump's remedies wrong advice. The cap is now enforced instead of
+silently applied, so the asymmetry between the plain and alias spellings is gone.
 
-```
-using CP3 = C**;  CP3* x;
-  -> pointer alias resolving to 'C' produces pointer depth 3, but the type model caps at 2
-     levels ('*'/'**'); use fewer indirections
-```
+Sites (all in `cflat/MainListener_Declarations.cpp`, message built by `PointerDepthCapMessage` in
+`cflat/MainListener.h`):
 
-Because of that asymmetry BOTH of the overload dump's remedies are wrong advice for a `T***`
-argument, and each was measured on the post-fix binary rather than reasoned about. "Declare the
-parameter as `T**`" (`byPP(ppp)`) compiles and exits 240. "Dereference it with `*` at the call
-site" (`byPtr(*ppp)`) also compiles - the deref clears `ElemPointer` over an unrecorded depth (the
-`T***` declarator records none), so the still-`T**` value scores as a clean `T*` and NO error is
-re-raised. (Both re-measured after `PointerDepth` landed; both unchanged in kind. Both exit codes
-are the environment-dependent garbage of section 7 and are deliberately not quoted.) The correct
-answer is 2003 (rc 211) in both cases. The message cannot currently tell the two apart, because nothing in the type model
-can. Making the plain branch reject
-3+ stars the way the alias branch already does would fix both this and the `T***`-into-`T**` hole
-in section 4, and needs its own accept set (`C***` locals compile today).
+- a pre-loop guard at the head of `MainListener::ParseDeclarationSpecifiers` - fires before any
+  branch consumes the stars, so it covers local / parameter / field / global / return-type / cast
+  and the simd and generic branches at once (each of those clamped silently before);
+- both `function<>`/`Lambda<>` signature sites (return and parameter), whose stars ride the
+  signature rather than a declarator;
+- the `using` alias RHS, so an alias naming an unspellable type is refused at its declaration and
+  not only at a use site that may never be written.
+
+`ForwardRefScanner::ParseDeclarationSpecifiers` deliberately keeps clamping silently, exactly as it
+already did for the alias cap: the pre-pass is opportunistic and must not pre-empt the codegen
+pass's diagnostic ordering. Consequence: a `T***` inside a template that is never instantiated is
+not reported (uninstantiated template bodies are not checked at all).
+
+Accept set re-measured after the guard, all unchanged: `C*`, `C**`, `int**`, `void**`,
+`using CP = C*; CP* x;` (depth 2), `C*[N]` slots and `&arr[0]`, `Box<C**>`, plus the whole suite
+(650/0/8) and `example_mac.sh` (35/0).
 
 ## 7. A `T*[N]` fixed array binds a `T*` parameter
 

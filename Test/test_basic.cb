@@ -2296,10 +2296,10 @@ bool testOverloadResolution()
     // nullptr records no depth, so it keeps binding a 'T**' parameter. Goes red if the mirror
     // started reading an UNRECORDED depth as a claim of depth 1.
     result &= Test("pd_nullptr_into_ptrptr_param", pdNullOk(nullptr), 9);
-    // OVER THE CAP: a 'T***' declarator records NO depth (0), because a clamped 2 stepped down by
-    // the '*' below would falsely prove depth 1 and reject this correct 'T**' argument.
-    PdCircle*** pdPPP = &pdPP;
-    result &= Test("pd_deref_of_triple_ptr_into_ptrptr_param", pdByPtrPtr(*pdPPP), 1003);
+    // AT THE CAP: 'T**' is the deepest type the model can spell, and a '&' over one is no longer
+    // reachable - a 'T***' declarator is now REJECTED outright (this leg used to read '*pdPPP'
+    // through one). The rejection is frozen in err_double_pointer_arg_single_pointer_param.cb.
+    result &= Test("pd_ptrptr_local_at_cap_reads_through", (*pdPP)->r, 3);
 
     delete pc;
     delete ps;

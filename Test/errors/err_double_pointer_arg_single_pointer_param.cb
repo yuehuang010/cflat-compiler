@@ -22,6 +22,29 @@ class DpHolder { DpCircle** pp = nullptr; };
 
 DpCircle** dpForward(DpCircle** s) { return s; }
 
+// The 3-star cap applies to every spelling that counts WRITTEN stars, not only a local
+// declarator: a parameter, a struct field, a function-type signature component and a `using`
+// alias RHS. The declarator spellings share one guard at the head of ParseDeclarationSpecifiers;
+// the function-type parameter has its own, because its stars ride the signature, not a declarator.
+expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    int dpTriple(DpCircle*** c) { return 0; }
+}
+expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    class DpTripleHolder { DpCircle*** ppp = nullptr; };
+}
+expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    DpCircle*** dpTripleRet() { return nullptr; }
+}
+expect_error("function type parameter 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    int dpTakesFn(function<int(DpCircle***)> f) { return 0; }
+}
+// An ALIAS reaching the same depth was already refused at its USE site; it now shares the one
+// message family, and the alias DECLARATION is refused too rather than only a use that may
+// never be written.
+expect_error("using alias 'DpCP3' = 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    using DpCP3 = DpCircle***;
+}
+
 extern int main()
 {
     // Declared 'T**' local: the filed repro. The depth note names both types and both remedies.
@@ -46,15 +69,26 @@ extern int main()
         int r = dpByPtr(h.pp);
     }
 
-    // 'T***' into 'T*'. ElemPointer caps the recorded depth at 2, so a triple pointer is
-    // refused as a proven 'T**'. This leg pins the GENERIC wording on purpose: at the cap the
-    // note would spell a 'T***' argument 'T**', so only the refusal is pinned, not the text.
-    // ('T***' into 'T**' is NOT refused at all - same cap - and that residue is filed.)
-    expect_error("no overload of 'dpByPtr' matches the given arguments") {
+    // 'T***' is no longer a spellable type at all: the declarator is refused where it is WRITTEN,
+    // before any call scores. That closes the old residue where 'T***' into 'T**' was invisible
+    // (the clamped declarator was byte-identical to a correct 'T**' argument).
+    expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
         DpCircle* a = new DpCircle();
         DpCircle** pp = &a;
         DpCircle*** ppp = &pp;
         int r = dpByPtr(ppp);
+    }
+
+    // A CAST spelling counts the same written stars, so it is refused at the cast.
+    expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpCircle*** ppp = (DpCircle***)pp;
+    }
+
+    // FOUR stars report the real written depth, not a clamped 3.
+    expect_error("declared type 'DpCircle' produces pointer depth 4, but the type model caps at 2 levels") {
+        DpCircle**** q = nullptr;
     }
 
     // A METHOD call scores through the same scorer, with 'this' occupying parameter 0 - so the

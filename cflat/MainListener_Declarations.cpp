@@ -269,6 +269,11 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
         bool retPtr = fpSpec->pointer() != nullptr;
         int retStars = PointerDepthOf(fpSpec->pointer());
         std::string retName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+        // A signature component over the cap can never be matched: no function may declare a
+        // 3-star return or parameter, so the closure type would be unpopulatable.
+        if (retStars > PointerDepthCap)
+            LogErrorContext(fpSpec, PointerDepthCapMessage(
+                std::format("function type return '{}'", retName), retStars));
         sig.FuncPtrReturnTypeName = retName;
         sig.FuncPtrReturnPointer  = retPtr;
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
@@ -280,6 +285,9 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 bool pPtr = param->pointer() != nullptr;
                 int pStars = PointerDepthOf(param->pointer());
                 std::string pName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                if (pStars > PointerDepthCap)
+                    LogErrorContext(param, PointerDepthCapMessage(
+                        std::format("function type parameter '{}'", pName), pStars));
                 int pDepth = ReconcilePointerDepth(pPtr, pStars);
                 encParams.push_back({ pName, pDepth });
                 LLVMBackend::TypeAndValue::FuncPtrParam fp;
@@ -320,6 +328,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             if (HasUnsizedMultiDim(declSpec))
                 LogErrorContext(declSpec, UnsizedMultiDimMessage(
                     declSpec->typeSpecifier() != nullptr ? declSpec->typeSpecifier()->getText() : "T"));
+        // Reject a written 3+ star declarator before any branch consumes the stars - the plain,
+        // simd and generic branches would each clamp it to '**' with no diagnostic.
+        for (auto declSpec : declSpecList)
+        {
+            int writtenStars = PointerDepthOf(declSpec->pointer());
+            if (writtenStars > PointerDepthCap)
+                LogErrorContext(declSpec, PointerDepthCapMessage(
+                    std::format("declared type '{}'", declSpec->typeSpecifier() != nullptr
+                        ? declSpec->typeSpecifier()->getText() : "T"), writtenStars));
+        }
         // `long long` arrives as two `long` typeSpecifiers; count them before the loop breaks
         // out on the first one, so the pair can canonicalize to i64.
         int longSpecCount = 0;
@@ -444,6 +462,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         bool retPtr = fpSpec->pointer() != nullptr;
                         int retStars = PointerDepthOf(fpSpec->pointer());
                         declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+                        // Over the cap here too: no declarable function can supply this signature.
+                        if (retStars > PointerDepthCap)
+                            LogErrorContext(fpSpec, PointerDepthCapMessage(
+                                std::format("function type return '{}'", declType.FuncPtrReturnTypeName), retStars));
                         declType.FuncPtrReturnPointer  = retPtr;
                         declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
                         declType.FuncPtrReturnResolvedKey = SigComponentResolvedKey(declType.FuncPtrReturnTypeName);
@@ -455,6 +477,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 bool pPtr = param->pointer() != nullptr;
                                 int pStars = PointerDepthOf(param->pointer());
                                 p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                                if (pStars > PointerDepthCap)
+                                    LogErrorContext(param, PointerDepthCapMessage(
+                                        std::format("function type parameter '{}'", p.TypeName), pStars));
                                 p.Pointer  = pPtr;
                                 p.IsMove   = param->Move() != nullptr;
                                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
@@ -694,11 +719,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // model caps at 2 levels - 3+ is a hard error (no silent truncation).
                     int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
                     int totalPtr = aliasPtrDepth + declStars + (substPointer ? 1 : 0);
-                    if (totalPtr >= 3)
-                        LogErrorContext(declSpec, std::format(
-                            "pointer alias resolving to '{}' produces pointer depth {}, but the type "
-                            "model caps at 2 levels ('*'/'**'); use fewer indirections",
-                            declType.TypeName, totalPtr));
+                    if (totalPtr > PointerDepthCap)
+                        LogErrorContext(declSpec, PointerDepthCapMessage(
+                            std::format("pointer alias resolving to '{}'", declType.TypeName), totalPtr));
                     declType.Pointer = totalPtr >= 1;
                     declType.ElemPointer = totalPtr >= 2;
                     declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
@@ -1226,6 +1249,11 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
         std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
+        // An alias RHS over the cap names a type no declarator could ever spell; reject it here
+        // rather than only at the (possibly absent) use site.
+        if ((int)suffix.size() > PointerDepthCap)
+            LogErrorContext(ctx, PointerDepthCapMessage(
+                std::format("using alias '{}' = '{}'", alias, target), (int)suffix.size()));
 
         // An array alias (using Vec3 = float[3]) folds each bracketed size NOW (the alias string
         // cannot keep a live parse node) and bakes the integers into the stored string ("float[3]").

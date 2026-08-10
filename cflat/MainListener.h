@@ -433,6 +433,15 @@ static int PointerDepthOf(CFlatParser::PointerContext* p)
     return p == nullptr ? 0 : (int)p->Star().size();
 }
 
+// The type model holds two pointer levels (Pointer + ElemPointer), so a written depth of 3+ can
+// only be clamped. Every spelling that counts stars rejects it with this one message family.
+static const int PointerDepthCap = 2;
+static std::string PointerDepthCapMessage(const std::string& subject, int depth)
+{
+    return std::format("{} produces pointer depth {}, but the type model caps at {} levels "
+                       "('*'/'**'); use fewer indirections", subject, depth, PointerDepthCap);
+}
+
 // Reconcile a written '*' count with the pointer flag ResolveSigComponent* may have CHANGED - a
 // `string` component resolves to char* with no '*' written. The FLAG wins; the count only adds
 // precision when the two agree.

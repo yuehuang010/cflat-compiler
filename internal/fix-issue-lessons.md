@@ -2414,3 +2414,36 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   STRUCT twin (`Box* h = new Box[2]; h[0] = b; Box q = h[0];`) stays rc 133: a struct has no
   runtime owned bit to mask, and the second destruction there is the READ's statement-end temp
   (`printf("%d", h[0].p->v)` alone already runs one dtor), which is a different fix.
+
+- `[[pointer-depth-residue]]` sections 4 + 6, `fix/ptrdepth3`: **when a type model CANNOT represent
+  a spelling, reject the spelling instead of clamping it - and reject it where the stars are
+  WRITTEN, not where the clamped value is later used.** `Pointer` + `ElemPointer` hold two pointer
+  levels; the plain declarator branch silently clamped `C*** x` to `C**`, while the alias branch
+  (`using CP3 = C**; CP3* x;`) already hard-errored on the same depth. That asymmetry was not a
+  cosmetic inconsistency: the clamped value made `byPP(ppp)` score as a correct call, and made BOTH
+  remedies the overload dump prints wrong advice for a triple pointer. Ruling: 3+ written stars are
+  a hard error at every star-counting spelling, sharing one message family
+  (`PointerDepthCapMessage`, `cflat/MainListener.h`). The load-bearing placement detail is that ONE
+  guard at the HEAD of `MainListener::ParseDeclarationSpecifiers` - before any branch consumes
+  `declSpec->pointer()` - covers local, parameter, field, global, return type, cast, simd and
+  generic at once (the same pre-loop position the `T[][]` guard already used); the branches
+  themselves would have needed five separate guards, and each of them clamped. Two spellings do not
+  reach that loop and needed their own: `function<>`/`Lambda<>` signature components, whose stars
+  ride the signature, and the `using` alias RHS, so an alias naming an unspellable type dies at its
+  declaration rather than only at a use that may never be written.
+  The ForwardRefScanner copy deliberately stays silent-clamping, matching the precedent the alias
+  cap already set - the pre-pass is opportunistic and must not pre-empt codegen's diagnostic
+  order. This is a documented exception to the both-copies rule, not an oversight.
+  **The accept set cost three existing legs, and finding them was the sweep, not the fix**: a plain
+  `grep -rn '\*\*\*' Test/ example/ core/` before writing any guard found a VALUE leg
+  (`pd_deref_of_triple_ptr_into_ptrptr_param` in `Test/test_basic.cb`, which the ruling deletes),
+  an `expect_error` leg pinning the old scorer wording, and a file-scope helper
+  `int spByTriple(SpCircle*** c)` in `err_single_pointer_arg_double_pointer_param.cb` that a
+  rejection turns into an unconditional compile error - a whole err file going red for a reason
+  unrelated to its subject. Grep the corpus for the literal SPELLING you are about to outlaw.
+  Left open with a reason: the type-ARGUMENT spelling `Box<C***>` still compiles, because
+  `typeParameterEntry` collapses stars to one bool for `C**` too - rejecting only three stars there
+  would fix nothing and add a guard to every walker of that rule (that collapse is section 5).
+  Also confirmed: a nested function definition does NOT parse inside a statement-scope
+  `expect_error` block; a leg that declares a function or a `using` alias must use the FILE-scope
+  block form.

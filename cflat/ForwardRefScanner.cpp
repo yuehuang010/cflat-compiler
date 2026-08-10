@@ -251,7 +251,9 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 }
                 // Combine alias pointer depth (using Handle = void*) with the declarator's stars.
                 // The Pointer + ElemPointer model caps at 2 levels; the authoritative over-cap
-                // error is emitted by the MainListener copy (this forward-ref copy clamps silently).
+                // error is emitted by the MainListener copy (this forward-ref copy clamps silently)
+                // for the written-star spellings too - the pre-pass is opportunistic and must not
+                // pre-empt the codegen pass's diagnostic ordering.
                 {
                     int declStars = declSpec->pointer() != nullptr ? (int)declSpec->pointer()->Star().size() : 0;
                     int totalPtr = aliasPtrDepth + declStars;
