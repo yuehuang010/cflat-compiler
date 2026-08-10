@@ -1774,11 +1774,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // the scope to the RECEIVER (y vs x), exactly as the lowered `y[i]` and the
                         // local-`T[]` form do - restoring the contract for the natural method calls.
                         // Matched structurally (a struct with an IsArrayView `_ptr` field), so the
-                        // may-alias sibling view<T> is excluded and keeps method dispatch.
-                        if ((functionName == "get" || functionName == "set")
+                        // may-alias sibling view<T> is excluded and keeps method dispatch. Restricted to
+                        // an element type that OWNS NOTHING: this raw load/store bit-copies the element
+                        // and skips every ownership arm, so an owning element (string, owning struct,
+                        // interface, `unique` pointer) must fall through to the real method body instead.
+                        int spanBufIndex = (functionName == "get" || functionName == "set")
                             && structVar.BaseType && structVar.BaseType->isStructTy()
                             && !structVar.TypeAndValue.Pointer
-                            && Compiler(ctx)->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName) >= 0)
+                            ? Compiler(ctx)->ArrayViewBufferFieldIndex(structVar.TypeAndValue.TypeName)
+                            : -1;
+                        if (spanBufIndex >= 0
+                            && Compiler(ctx)->ArrayViewElementOwnsNothing(
+                                   Compiler(ctx)->GetDataStructure(structVar.TypeAndValue.TypeName).StructFields[spanBufIndex]))
                         {
                             auto namedArgCtx = argumentList.size() > 0
                                 ? argumentList[functionArgCounter]->argumentNamedExpression()

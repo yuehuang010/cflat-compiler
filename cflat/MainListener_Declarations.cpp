@@ -5465,9 +5465,12 @@ bool MainListener::IsOwningArrayStringElementRead(
 
 /*
  * A `return` source that reads an owning VALUE out of another object's storage: a FIELD path
- * (`w.b`, `w.a.b`, `arr[0].b`) or a fixed-array ELEMENT (a two-index GEP over an array type).
- * A container / view slot is a single-index GEP and deliberately stays a borrow, exactly as on
- * the fixed-array element READ side. `string` has its own runtime owned bit and its own arm.
+ * (`w.b`, `w.a.b`, `arr[0].b`), a fixed-array ELEMENT (a two-index GEP over an array type), or a
+ * `T[]` VIEW element (a single-index GEP, admitted only on the positive `IsViewElement`
+ * provenance - never on the GEP shape alone, since the WHOLE view field is also a single-index
+ * GEP and must stay a borrow). Mirrors `IsOwningArrayStringElementRead`'s view-element arm, but
+ * for an owning STRUCT return type instead of `string`, which has its own runtime owned bit and
+ * its own arm above.
  */
 bool MainListener::ReturnSourceIsIndirectOwningLvalue(
         const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
@@ -5492,11 +5495,12 @@ bool MainListener::ReturnSourceIsIndirectOwningLvalue(
         if (!nv.FieldName.empty()) return true;
         // An IMPLICIT self-field read (`return b;` inside a method) carries no FieldName at all -
         // GetMemberVariable deliberately omits it - so admit by GEP SHAPE as the store arms do by
-        // Storage alone: a two-index access into a struct (a field) or an array (an element). A
-        // container / view slot is a SINGLE-index GEP and still stays a borrow.
-        return gep->getNumIndices() == 2
+        // Storage alone: a two-index access into a struct (a field) or an array (an element).
+        if (gep->getNumIndices() == 2
             && (gep->getSourceElementType()->isStructTy()
-                || gep->getSourceElementType()->isArrayTy());
+                || gep->getSourceElementType()->isArrayTy()))
+            return true;
+        return gep->getNumIndices() == 1 && nv.IsViewElement;
     }
 
 // Walks a field / element GEP chain down to the object it addresses, and answers true only when

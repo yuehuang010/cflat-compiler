@@ -1934,7 +1934,9 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   FieldName and OwningStructName, so an admission test asking for a FieldName saw `return this.b;`
   and missed `return b;` in the same method - one consumed, one double-freed. The arm admits by
   GEP SHAPE instead (a two-index struct or array access; a container / view slot is single-index
-  and still borrows), which is how the store arms already admitted it. `this` is always a POINTER
+  and still borrows - **superseded for the VIEW half by `fix/spanown` below, which admits a
+  single-index GEP when `nv.IsViewElement` is true; a raw-`T*` CONTAINER slot still borrows**),
+  which is how the store arms already admitted it. `this` is always a POINTER
   (`RegisterThisPointer`), so no implicit self-field read can root at a borrowed by-value
   parameter and the reject guard is structurally unreachable from that spelling.
   Side effect worth knowing: shape-based admission also fixed `return (w.b);`, which the
@@ -1967,3 +1969,50 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   now return an independent copy with the source live - `rfldc_strlist_*` / `rfldc_intlist_*`.
   Those legs' VALUES were already correct on the merge base; only the process surviving teardown
   discriminates, so the comment says so rather than letting them read as stronger than they are.
+
+- **`fix/spanown` - the `span<T>` get/set noalias fast path is now gated on an element type that
+  OWNS NOTHING, and the RETURN position admits a `T[]` VIEW element.** The fast path in
+  `MainListener_PostfixExpression.cpp` lowers `s.get(i)` / `s.set(i, v)` to a raw load/store
+  through the `_ptr` element GEP, which reaches NONE of the ownership arms: `span<string>.get`
+  handed back a second owner (rc 133) and `span<string>.set` of an OWNED TEMP dropped the write
+  entirely. The gate is `ArrayViewElementOwnsNothing` on the `_ptr` field - false for
+  `IsInterface`, for `Pointer && IsUnique`, and for `IsOwningValueOrClosureType(TypeName)` - so an
+  owning element falls through to the real `span<T>` method body. `IsOwningValueType` is
+  "`GetOrCreateFullDestructor` != nullptr", i.e. exactly what dtor emission keys on, which is the
+  right conservative test here; the cost is that a POD-with-a-plain-dtor element type ALSO loses
+  the fast path (measured: 0 `get` calls before, a real call after, same values, same dtor count).
+  Only the noalias metadata is lost there, and only for that shape - the HPC path is `double` /
+  `i64` / POD and stayed byte-identical (`scratch/rev_h2_getset.cb` at `-O2`: 20 `alias.scope`,
+  12 `!noalias`, 8 vector loads on BOTH binaries, the whole `.ll` differing only in the cache-path
+  ModuleID). The sibling `s[i]` fast path is deliberately NOT gated: it rewrites the subscript to
+  an lvalue index of `_ptr` and lets the normal view-element arms run, so it was already correct
+  (`rev_e_bracket.cb`, identical on both binaries).
+  **RATIFIED: `return v[0]` out of a `T[]` view CONSUMES the slot, and that is the CONSISTENT
+  completion, not new policy.** `ReturnSourceIsIndirectOwningLvalue` now admits a single-index GEP
+  when `nv.IsViewElement` is true (never on the GEP shape alone - the whole `T[]` field is also a
+  single-index GEP). The justification is decl-init parity, measured on the pre-fix binary:
+  `UBox q = v[0];` ALREADY consumed (`srcnull=1`, rc 0) since `fix/viewelem`, while
+  `UBox f(UBox[] v) { return v[0]; }` was rc 133 with the slot still live. After the widening the
+  two agree (`rev_a_ret_viewelem` / `rev_a2_declinit`). A copyable owner COPIES with the source
+  live (`rev_c_copyable`: `distinct=1 srclive=1`, rc 133 -> rc 0), exactly as at the store position.
+  **The container is untouched, and the discriminator is the PROVENANCE flag, not the shape.**
+  `list.get`'s `return _data[i]` reads a raw `T*`, so `baseWasArrayView` is false, `IsViewElement`
+  is false, and the borrow survives: `list<string>.get` still hands back a SHARED buffer, and
+  `list<int>`, `dictionary` reads and `list.sort` are byte-identical pre/post (`rev_b_list.cb`,
+  and the hand-written raw-`T*` container `rev_b2_rawptr.cb`).
+  **Consequence to know before "fixing" it back: `span<T>.get` of a NON-COPYABLE owning element
+  GUTS the viewed array slot.** Two `s.get(0)` calls on the same index return the value once and
+  a null-item struct the second time (`rev_d_double.cb`: `a=11 srcnull=1`, then `b=-1`), with no
+  crash and 0 leaks. That is the only non-double-free answer available - there is no copy for a
+  non-copyable owner - and it mirrors both the ratified "getters gut the object" field-return
+  semantics and the decl-init behaviour of `v[0]`. `string` does NOT behave this way: it has its
+  own deep-copy arm, so `span<string>.get` is repeatable and leaves the source intact
+  (`rev_d2_str.cb`: `a=1 b=1 base0=1`). Note the span header comment's "a span never frees `_ptr`"
+  is about the BUFFER, not about the elements - reading an owning element still moves it out.
+  Known gap left in place, unchanged by this round: a view bound off a BY-VALUE struct parameter
+  (`UBox f(Holder h) { UBox[] v = h.arr; return v[0]; }`) does not reach
+  `RejectConsumeOfBorrowedByValueParamField` and is rc 133 on BOTH binaries - and the decl-init
+  spelling in the same shape is rc 133 on both too, so the two positions still agree. The direct
+  spelling `return h.arr[0]` is correctly REJECTED on both. The `IsInterface` and
+  `Pointer && IsUnique` arms of the new predicate are defensive: neither `span<IThing>` nor
+  `span<unique T*>` compiles today (identical pre-existing errors on both binaries).

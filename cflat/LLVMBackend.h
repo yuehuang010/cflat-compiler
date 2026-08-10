@@ -3296,6 +3296,12 @@ private:
 
     bool IsOwningValueType(const std::string& typeName);
 
+    // True when the array-view element described by `elemField` owns nothing, so bit-copying it
+    // (the get/set noalias fast path) is safe: no string, no owning-dtor struct/closure, no
+    // interface fat value, no owning (`unique`) raw pointer. Anything unproven falls through to
+    // the real method body, which already handles every ownership arm correctly.
+    bool ArrayViewElementOwnsNothing(const TypeAndValue& elemField);
+
     // True when `typeName` owns a raw pointer via `unique` - directly, or through a by-value
     // member that does. Such a type has no memberwise copy: cloning a `unique` field would need a
     // generic deep-clone of the pointee, which does not exist, and a shallow copy would hand the

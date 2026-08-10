@@ -24,6 +24,11 @@ import "view.cb";
 // Non-owning: a span never frees _ptr. The buffer's owner (an array<T>, a `new T[n]`, ...) must
 // outlive every span over it. Obtaining a span from a raw `T*` is a compile error at `wrap` (the
 // `T* -> T[]` bind is forbidden) - a span comes only from a `new T[n]` view or another `T[]`.
+//
+// "Non-owning" is about the BUFFER, not the elements. Reading an OWNING element out (get(i), s[i])
+// takes the same ownership decision a plain `T[]` element read takes: a `string` is deep-copied,
+// a copyable owner is `copy()`d, and a NON-COPYABLE owner is MOVED - so a second get(i) of that
+// same index hands back a gutted (null) value. Bind and read through a `T[]` if you need a borrow.
 struct span<T>
 {
     // `= default` zeroes the array-view field (a null window), matching the project convention that

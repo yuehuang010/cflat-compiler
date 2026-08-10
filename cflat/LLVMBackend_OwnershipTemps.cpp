@@ -71,6 +71,13 @@ int LLVMBackend::ArrayViewBufferFieldIndex(const std::string& typeName)
         return -1;
     }
 
+bool LLVMBackend::ArrayViewElementOwnsNothing(const TypeAndValue& elemField)
+{
+        if (elemField.IsInterface) return false;
+        if (elemField.Pointer && elemField.IsUnique) return false;
+        return !IsOwningValueOrClosureType(elemField.TypeName);
+    }
+
 void LLVMBackend::NoteVectorizeSpanAccessor(int loopLine, const std::string& accessor,
                                    const std::string& receiver, int line, int col)
 {

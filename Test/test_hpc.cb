@@ -878,6 +878,11 @@ void span_axpy(double k, span<double> y, span<double> x)
     while (i < n) { yv[i] = yv[i] + k * xv[i]; i = i + 1; }
 }
 
+// An owning element type for the span<T> get/set regression legs below: `unique int*` gives
+// SpanOwnBox a synthesized destructor, so IsOwningValueOrClosureType(SpanOwnBox) is true and
+// the get/set noalias fast path must fall through to the real span<T> method body.
+struct SpanOwnBox { unique int* item = default; };
+
 int testSpanView()
 {
     int passed = 0;
@@ -897,6 +902,37 @@ int testSpanView()
     passed += Test("span set",    (float)sy.get(0), 7.0f);
     passed += Test("span operator[]", (float)sx[1], 1.0f);
     sy.set(0, 0.0);   // restore da[0]
+
+    // span<T> get/set with an OWNING element type must fall through to the real method body
+    // instead of the get/set noalias fast path (which bit-copies through the buffer GEP and
+    // reaches none of the ownership arms). string is the primary repro from the filed issue.
+    {
+        string[2] strBase; strBase[0] = "ab" + "cd"; strBase[1] = "aa";
+        string[] strView = strBase;
+        span<string> sstr; sstr.wrap(strView, 2);
+        string sq = sstr.get(0);
+        passed += Test("span string get value", sq == "abcd" ? 1 : 0, 1);
+        // A second independent owner, not an aliased second reference to strBase[0]'s buffer.
+        passed += Test("span string get not aliased", sq.data() == strBase[0].data() ? 1 : 0, 0);
+        // An OWNED TEMPORARY argument ("ij" + "kl") must write through, not be lost.
+        sstr.set(1, "ij" + "kl");
+        passed += Test("span string set owned temp writes through", strBase[1] == "ijkl" ? 1 : 0, 1);
+        // A string LITERAL argument must still write through (the always-correct case).
+        sstr.set(1, "zz");
+        passed += Test("span string set literal writes through", strBase[1] == "zz" ? 1 : 0, 1);
+    }
+    // An owning-struct element (a `unique` pointer member) must not double-free: get() must
+    // hand back an independent value the caller can read without the source's destructor
+    // reaching the same pointee a second time.
+    {
+        SpanOwnBox[2] boxBase;
+        boxBase[0].item = new int; *boxBase[0].item = 11;
+        boxBase[1].item = new int; *boxBase[1].item = 22;
+        SpanOwnBox[] boxView = boxBase;
+        span<SpanOwnBox> sbox; sbox.wrap(boxView, 2);
+        SpanOwnBox bq = sbox.get(0);
+        passed += Test("span owning-struct get value", *bq.item, 11);
+    }
 
     span_axpy(2.0, sy, sx);     // da[i] += 2 * db[i]  ->  {2, 3, 4, 5}
     passed += Test("span axpy first", (float)da[0], 2.0f);
@@ -1808,7 +1844,7 @@ extern int main(int argc, char** argv)
     passed += testSimdPointerStorage();    total += 34;
 
     // ---- span<T> / view<T> ----
-    passed += testSpanView(); total += 24;
+    passed += testSpanView(); total += 29;
 
     // ---- explicit (T[]) array-view cast escape ----
     passed += testArrayViewCast(); total += 3;
