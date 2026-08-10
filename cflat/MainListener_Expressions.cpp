@@ -1260,6 +1260,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     if (coalesceResume != nullptr && assignedOwner.empty()
                         && ProvingBindingForBoxedSource(rightNV.Primary, nullptr) != nullptr)
                         assignedOwner = DescribeBoxedSourceOwner(rightNV.Primary, nullptr);
+                    bool reboundToOwnedStore = false;
                     if (coalesceResume != nullptr)
                     {
                         std::string joined;
@@ -1290,7 +1291,37 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
                         compiler->MarkPointerRebound(namedVar.CallerName, assignedOwner,
                                                      /*coalesceJoin*/ false, reboundToOwnedValue);
+                        reboundToOwnedStore = reboundToOwnedValue;
                     }
+                    /*
+                     * Record the borrow the RHS carries, which MarkPointerRebound above does not:
+                     * it retires the declaration-time facts and re-arms only the OWNER-side proofs,
+                     * so a local that BECOMES a borrow by '=' was untracked and `delete` through it
+                     * double-freed. Mirrors the declaration path's srcIsBorrowed clause (including
+                     * its Trap-B `unique`-field leg), so `d = p;` and `T* d = p;` reject alike.
+                     */
+                    std::string storeBorrowOrigin = rightNV.BorrowedOrigin.empty()
+                        ? rightNV.CallerName : rightNV.BorrowedOrigin;
+                    std::string storeBorrowUniqueField = rightNV.BorrowedUniqueField;
+                    bool storeSrcIsBorrow = rightNV.IsBorrowed;
+                    // Trap B: a plain copy of a `unique` field borrows the field - its synthesized
+                    // destructor is still the owner. `move b.p` extracts instead and carries IsMove.
+                    if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove
+                        && ((rightNV.TypeAndValue.IsUnique && rightNV.TypeAndValue.Pointer
+                                && rightNV.Storage != nullptr)
+                            || rightNV.IsUniqueFieldAlias))
+                    {
+                        storeSrcIsBorrow = true;
+                        storeBorrowUniqueField = DescribeUniqueFieldOwner(rightNV);
+                        storeBorrowOrigin = DescribeUniqueFieldAccess(rightNV);
+                    }
+                    if (storeSrcIsBorrow && !reboundToOwnedStore)
+                        compiler->RecordAssignBorrow(namedVar.CallerName, storeBorrowOrigin,
+                                                     storeBorrowUniqueField,
+                                                     !rightNV.FieldName.empty(),
+                                                     /*keepExistingOrigin*/ coalesceResume != nullptr);
+                    else if (reboundToOwnedStore)
+                        compiler->RetireAssignBorrow(namedVar.CallerName);
                     // A JOIN RHS carries no source binding, so no clause above can see it; ask its
                     // arms directly. After MarkPointerRebound, which retires any earlier join.
                     std::vector<llvm::Value*> storeJoinSlots;

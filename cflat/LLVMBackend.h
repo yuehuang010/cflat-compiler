@@ -1081,6 +1081,9 @@ public:
         // type. The closure ENV owns the buffer; this local only borrows it, so handing it to a
         // caller (a `return`) must hand over an independent copy, not the env's storage.
         bool IsClosureValueCapture = false;
+        // The block a plain '=' recorded this borrow in (null when the borrow came from the
+        // DECLARATION). An owned rebind in that same block retires it; see RetireAssignBorrow.
+        llvm::BasicBlock* AssignBorrowBlock = nullptr;
         std::string BorrowedOrigin;      // name of the borrowed parameter this value transitively aliases (for diagnostics)
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
@@ -5865,6 +5868,27 @@ public:
     // called AFTER MarkPointerRebound, which clears it; empty `owner` leaves it retired.
     void SetJoinKeepsOwner(const std::string& name, const std::string& owner,
                            const std::vector<llvm::Value*>& slots);
+
+    /*
+     * Record on a pointer binding that a plain '=' just stored a BORROW into it, so a later
+     * `delete` (or a store into an owning slot) is rejected exactly as the declaration spelling
+     * `T* d = p;` already is. The declaration path records the same four facts; this is its '='
+     * counterpart, and the recording direction is the safe one - a conditional store may
+     * over-record and reject, which is preferable to laundering a double free.
+     */
+    void RecordAssignBorrow(const std::string& name, const std::string& origin,
+                            const std::string& uniqueField, bool throughField,
+                            bool keepExistingOrigin = false);
+
+    /*
+     * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='
+     * stores a provably OWNED value into the same binding from the SAME basic block. Same-block is
+     * the whole proof: any path that ran the borrow store also ran this one, so the binding cannot
+     * still hold the borrow. Across blocks the borrow stands - `d = p; if (c) { d = new T(); }`
+     * leaves a path where it does not, the hazard tracked as
+     * conditional-store-retires-borrow-facts-unconditionally.
+     */
+    void RetireAssignBorrow(const std::string& name);
 
     // True when `slot` IS a function argument's own storage. Identity, never spelling: a local that
     // merely SHARES a parameter's name is a different binding and must not be classified as one.

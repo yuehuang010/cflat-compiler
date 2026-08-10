@@ -1855,6 +1855,56 @@ void LLVMBackend::SetJoinKeepsOwner(const std::string& name, const std::string& 
         }
     }
 
+void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string& origin,
+                           const std::string& uniqueField, bool throughField, bool keepExistingOrigin)
+{
+        if (name.empty() || origin.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            // A binding that already owns what it holds is not made a borrow by this store; the
+            // declaration path skips the same two cases for the same reason.
+            if (nv->IsOwning || nv->IsNewAllocated) return;
+            // A '??=' keeps the OLD referent when its arm is not taken, so it may not overwrite the
+            // origin an existing borrow names - only supply one where there was none.
+            if (keepExistingOrigin && nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return;
+            nv->IsBorrowed = true;
+            nv->BorrowedOrigin = origin;
+            nv->BorrowedUniqueField = uniqueField;
+            nv->BorrowedThroughField = throughField;
+            nv->AssignBorrowBlock = builder->GetInsertBlock();
+            return;
+        }
+    }
+
+void LLVMBackend::RetireAssignBorrow(const std::string& name)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            if (nv->AssignBorrowBlock == nullptr
+                || nv->AssignBorrowBlock != builder->GetInsertBlock())
+                return;
+            nv->IsBorrowed = false;
+            nv->BorrowedOrigin.clear();
+            nv->BorrowedUniqueField.clear();
+            nv->BorrowedThroughField = false;
+            nv->AssignBorrowBlock = nullptr;
+            return;
+        }
+    }
+
 bool LLVMBackend::IsFunctionParameterStorage(const llvm::Value* slot) const
 {
         if (slot == nullptr) return false;

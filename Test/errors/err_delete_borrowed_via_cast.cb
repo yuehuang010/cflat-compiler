@@ -60,6 +60,99 @@ expect_error("cannot delete 'd' - it aliases borrowed parameter 'raw'") {
     }
 }
 
+/*
+ * The same laundering through a plain '=' instead of a declaration. The store path retires the
+ * declaration-time facts and re-arms only the owner-side proofs, so a local that BECOMES a borrow
+ * by assignment used to be untracked entirely and every leg below compiled into a double free.
+ */
+
+// Assigned alias: 'p = raw' after a null declaration is the declaration form's twin.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_direct(Payload* raw) {
+        Payload* p = nullptr;
+        p = raw;
+        delete p;
+    }
+}
+
+// Cast on the assignment's RHS: the cast severs Storage, the borrow rides IsBorrowed across it.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_cast(void* raw) {
+        Payload* p = nullptr;
+        p = (Payload*)raw;
+        delete p;
+    }
+}
+
+// `move` on the assignment's RHS transfers nothing off a borrow, exactly as in the decl form.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_move(Payload* raw) {
+        Payload* p = nullptr;
+        p = move raw;
+        delete p;
+    }
+}
+
+// '??=' is a store too: the taken arm leaves the binding holding the borrow.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_coalesce(Payload* raw) {
+        Payload* p = nullptr;
+        p ??= raw;
+        delete p;
+    }
+}
+
+// Chained through a second local that is ALSO assigned rather than declared from the borrow.
+expect_error("cannot delete 'q' - it aliases borrowed parameter 'raw'") {
+    void assigned_chain(Payload* raw) {
+        Payload* p = nullptr;
+        p = raw;
+        Payload* q = nullptr;
+        q = p;
+        delete q;
+    }
+}
+
+// The origin refreshes to the source of the LAST store: 'p' aliases 'two' here, not 'one'.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'two'") {
+    void assigned_reorigin(Payload* one, Payload* two) {
+        Payload* p = nullptr;
+        p = one;
+        p = two;
+        delete p;
+    }
+}
+
+// Recording is the SAFE direction on a conditional store: the walk is not control-flow aware, so a
+// borrow stored in a branch is recorded and the delete rejected even though the branch may not run.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_conditional(Payload* raw, int c) {
+        Payload* p = nullptr;
+        if (c > 0) { p = raw; }
+        delete p;
+    }
+}
+
+// An owned rebind in a DIFFERENT block does not retire an assigned borrow either - the branch may
+// not run, leaving the borrow live at the delete.
+expect_error("cannot delete 'p' - it aliases borrowed parameter 'raw'") {
+    void assigned_owned_other_block(Payload* raw, int c) {
+        Payload* p = nullptr;
+        p = raw;
+        if (c > 0) { p = new Payload(); }
+        delete p;
+    }
+}
+
+// Sanity: an assigned borrow followed by an owned rebind in the SAME block retires - `p` is the
+// sole owner of what it holds, so this delete is correct (one free). Rejecting it would leak.
+void valid_assigned_then_owned(Payload* raw) {
+    Payload* p = nullptr;
+    p = raw;
+    p = new Payload();
+    delete p;
+}
+
 // Sanity: the borrow proof RETIRES on an UNCONDITIONAL rebind to a fresh owner in the same block -
 // `p` is then the sole owner of what it holds, so moving it TRANSFERS and this delete is correct
 // (one free). Rejecting it would leak.

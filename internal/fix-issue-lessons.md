@@ -2474,3 +2474,41 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   broke nothing. One shared guard, placed where `ParseDeclarationSpecifiers` for the element is
   now hoisted ABOVE the WinRT branch, so all four legs share it and the type is parsed once.
   WinRT is covered by construction but unmeasurable on macOS.
+- **A plain `=` RECORDS the borrow it stores; retirement is same-block only (RATIFIED, 2026-08-10,
+  `fix/assigntaint`)**: `Ci* d = nullptr; d = p; delete d;` (p a borrowed parameter) double-freed
+  because `MarkPointerRebound` retires the declaration-time facts and re-arms only the OWNER-side
+  proofs - nothing re-established `IsBorrowed`. The `=` path now mirrors the declaration path's
+  `srcIsBorrowed` clause verbatim, INCLUDING its Trap-B `unique`-field leg, so `d = p`, `d = (Ci*)p`,
+  `d = move p`, `d ??= p`, `d = b.p`, and the chained `e = d` all reject exactly as their `T* d = ...`
+  twins do (all eight shapes were rc 134 before). Recording is deliberately the OVER-approximating
+  direction: the walk is not control-flow aware, so `if (c) { d = p; } delete d;` is REJECTED even on
+  the path where the store never ran - a false rejection with an available remedy is preferable to
+  laundering a double free, and that polarity is the ruling, not an accident.
+  Retirement is the dangerous half and is gated to ONE case: a provably owned rebind
+  (`reboundToOwnedValue`, i.e. `srcIsOwnedPtrRhs` minus its syntactic `move` leg) emitted in the
+  SAME basic block as the store that recorded the borrow (`NamedVariable::AssignBorrowBlock`, the
+  same latch `AliasBorrowDeclBlock` uses). That block equality is the whole proof: any path that ran
+  the borrow store also ran the owned store. Retiring across blocks was NOT implemented and must not
+  be - `d = p; if (c) { d = new Ci(); } delete d;` has a path where the borrow is live. A
+  DECLARATION-time borrow is never retired by this path (`AssignBorrowBlock` is null there), so
+  `T* d = p; d = new Ci(); delete d;` stays rejected exactly as on master - that frozen behaviour was
+  measured, not assumed. It is only frozen while nothing re-records it: one intervening borrow-to-borrow
+  store makes the binding an ASSIGN borrow, and `T* d = p; d = q; d = new Ci(); delete d;` then retires
+  and is ACCEPTED where master rejected it (measured; the accept is correct - one free at the delete).
+  The recorded-block latch also costs correct code that master compiled, in exactly the cases the
+  DECLARATION spelling already rejected: `d = p;` before a loop or `if` whose body does the owned
+  rebind AND the delete (`d = p; for (...) { d = new Ci(); delete d; }`) is now rejected, because the
+  owned store is not in the block that recorded the borrow. Master accepted the `=` spelling and
+  already rejected the `T* d = p;` twin, so the fix aligns the two on the safe side; the remedy is to
+  declare the local in the loop or to drop the pre-loop borrow store.
+  Two diagnostics changed origin and the change is the TRUER one: after `t = b; t = c;` the named
+  origin is now `c` (the current source), which cost two expectation updates in
+  `err_move_borrowed_ptr_into_unique_field.cb`. `??=` is the exception - it keeps the OLD referent on
+  the untaken arm, so `RecordAssignBorrow`'s `keepExistingOrigin` refuses to overwrite an origin that
+  is already there and only supplies one where there was none.
+  Left open with a reason: a GLOBAL pointer destination (`g = p; delete g;`) still launders,
+  unchanged pre and post. The whole rebind block is gated on `isa<AllocaInst>` storage, and a global
+  binding is program-wide - recording a borrow on it would poison every later `delete` of that global
+  in any function. Filed as `p2/global-pointer-destination-does-not-propagate-borrow-taint.md`.
+  Field destinations (`h.f = p`) are out of scope too: `delete h.f` is already rejected by the
+  delete-a-field-from-outside guard.

@@ -15,5 +15,14 @@ extern int main()
         Res* alias = b.p;
         delete alias;
     }
+    // Same Trap B reached by a plain '=' rather than a declaration: the store path records the
+    // field borrow too, so the copy is not laundered into a deletable local.
+    expect_error("cannot delete 'alias' - it aliases unique field 'Box.p'") {
+        Box b2 = default;
+        b2.p = new Res();
+        Res* alias = nullptr;
+        alias = b2.p;
+        delete alias;
+    }
     return 0;
 }

@@ -43,8 +43,9 @@ void goodInit(move Payload* b) { unique Payload* k = move b; }
  * same basic block as the move, which is what each leg here pins.
  */
 
-// Rebound to ANOTHER BORROW: still nobody's to give away.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+// Rebound to ANOTHER BORROW: still nobody's to give away. The '=' now RECORDS the borrow it
+// stored, so the origin named is the current source 'c', not the declaration-time 'b'.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'c'") {
     void reboundToBorrow(Payload* b, Payload* c) { Payload* t = b; t = c; unique Payload* k = move t; }
 }
 
@@ -60,8 +61,9 @@ expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
     void reboundSelf(Payload* b) { Payload* t = b; t = t; unique Payload* k = move t; }
 }
 
-// The PARAMETER's own binding rebound to another borrow.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+// The PARAMETER's own binding rebound to another borrow. The store records the borrow it stored,
+// so the origin named is the current source 'c'.
+expect_error("cannot initialize unique local 'k' from borrowed parameter 'c'") {
     void reboundParam(Payload* b, Payload* c) { b = c; unique Payload* k = move b; }
 }
 

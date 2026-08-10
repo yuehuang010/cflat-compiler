@@ -9443,6 +9443,65 @@ int testForInOverFixedArrayElement()
     return passed;
 }
 
+/*
+ * The ACCEPT set around the borrow taint a plain '=' now records (the rejects live in
+ * Test/errors/err_delete_borrowed_via_cast.cb). Recording a borrow on the store must not cost the
+ * programs that legally read through an assigned borrow, nor the one that re-arms ownership with
+ * an owned rebind in the same block - rejecting that would leak the new object.
+ */
+int assignBorrowReadThrough(Resource* p)
+{
+    Resource* d = nullptr;
+    d = p;
+    return d->id;
+}
+
+int assignBorrowThenOwned(Resource* p)
+{
+    Resource* d = nullptr;
+    d = p;                    // records the borrow of 'p'
+    d = new Resource();       // same block: retires it, 'd' is now the sole owner
+    d->id = 7;
+    int got = d->id;
+    delete d;                 // frees the new object only; 'p' stays alive for the caller
+    return got;
+}
+
+int assignBorrowThenOwnedInBranch(Resource* p, int c)
+{
+    Resource* d = nullptr;
+    if (c > 0)
+    {
+        d = p;
+        d = new Resource();   // both stores in ONE block, so the retirement still holds
+        d->id = 5;
+        delete d;
+    }
+    return c;
+}
+
+int testAssignBorrowTaint()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        owner->id = 42;
+        passed += Test("assign_borrow_read_through", assignBorrowReadThrough(owner), 42);
+        passed += Test("assign_borrow_read_no_free", dtorCount, 0);
+        passed += Test("assign_borrow_then_owned_value", assignBorrowThenOwned(owner), 7);
+        // Exactly the new object was freed - the borrowed one is untouched and still readable.
+        passed += Test("assign_borrow_then_owned_freed_once", dtorCount, 1);
+        passed += Test("assign_borrow_source_intact", owner->id, 42);
+        passed += Test("assign_borrow_branch_ret", assignBorrowThenOwnedInBranch(owner, 1), 1);
+        passed += Test("assign_borrow_branch_freed_once", dtorCount, 2);
+        passed += Test("assign_borrow_source_still_intact", owner->id, 42);
+        delete owner;
+    }
+    passed += Test("assign_borrow_owner_freed_once", dtorCount, 3);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -9767,6 +9826,9 @@ extern int main()
     total += 92;
     passed += testForInOverFixedArrayElement();
     total += 41;
+
+    passed += testAssignBorrowTaint();
+    total += 9;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
