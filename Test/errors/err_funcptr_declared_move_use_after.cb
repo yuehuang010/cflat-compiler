@@ -1,0 +1,19 @@
+// A `move`-declared funcptr parameter consumes the caller's argument at the INDIRECT call, so
+// reading the source afterward is a use-of-moved error, exactly as at the direct call. Vacuity
+// note: this rejection also held before the declared-move transfer fix (the call site marked the
+// source moved without zeroing it - which is why the program still double-freed at run time). The
+// leg is a tripwire for the marking now that the transfer runs through ApplyMoveParamTransfer.
+import "function.cb";
+class Res { int id = default; };
+struct UBox { unique Res* item = default; };
+void sink(move UBox p) { int k = p.item->id; }
+expect_error("use of moved variable 'a'");
+extern int main()
+{
+    UBox a = default;
+    a.item = new Res();
+    function<void(move UBox)> f = sink;
+    f(a);
+    int k = a.item == nullptr ? 0 : 1;
+    return k;
+}

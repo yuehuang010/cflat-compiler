@@ -5689,6 +5689,206 @@ int testLambdaParamOwningSink()
 }
 
 /*
+ * A funcptr parameter DECLARED `move` in the funcptr TYPE did not transfer at the INDIRECT call:
+ * ApplyFuncPtrSinkTransfer early-outed unless some FuncPtrParam carried IsOwningSink (an INFERRED
+ * sink) and synthesized its params with IsMove = false, so nothing mapped the declared flag onto
+ * the ApplyMoveParamTransfer path a direct call takes. The callee consumed and the caller's slot
+ * was never zeroed - the direct oracle emits `store %OaiBox zeroinitializer` and the indirect one
+ * emitted nothing - so both freed (rc 134). Every leg is measured against the identical DIRECT
+ * call spelling, which is the oracle, and each aborted before the fix unless marked ACCEPT SET.
+ */
+int dmfSink(move OaiBox p)        { return p.item->id; }
+int dmfBorrow(OaiBox p)           { return p.item->id; }
+int dmfTwo(OaiBox p, move OaiBox q) { return p.item->id + q.item->id; }
+// p is an INFERRED sink (a consuming store), q is a DECLARED move: both paths in one signature.
+int dmfBoth(OaiBox p, move OaiBox q) { OaiBox[2] dst = { p }; return dst[0].item->id + q.item->id; }
+int dmfInt(move int p)            { return p + 1; }
+int dmfStr(move string s)         { return s.length(); }
+int dmfAligned(move alignas(0, 64) int* p) { int v = p[0]; delete[] p; return v + 1; }
+struct DmfHolder { function<int(move OaiBox)> f = nullptr; };
+int dmfCallThrough(function<int(move OaiBox)> g, move OaiBox x) { return g(x); }
+function<int(move OaiBox)> dmfGet() { return dmfSink; }
+int dmfGeneric<T>(Lambda<int(move T)> g, move T x) { return g(x); }
+
+int testDeclaredMoveFuncPtrParam()
+{
+    int passed = 0;
+
+    // 1. The filed repro: a `function<>` local holding a named function whose parameter is
+    // declared `move`. The callee frees once and the caller must NOT free again at scope exit.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        function<int(move OaiBox)> f = dmfSink;
+        passed += Test("dmf_fn_value", f(a), 5);
+        passed += Test("dmf_fn_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_fn_freed_once_total", dtorCount, 1);
+
+    // 2. The direct-call ORACLE the leg above is measured against - identical counts.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("dmf_direct_value", dmfSink(a), 5);
+        passed += Test("dmf_direct_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_direct_freed_once_total", dtorCount, 1);
+
+    // 3. The FAT `Lambda<>` destination - a different closure representation, same flags.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(6);
+        Lambda<int(move OaiBox)> f = dmfSink;
+        passed += Test("dmf_lambda_value", f(a), 6);
+        passed += Test("dmf_lambda_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_lambda_freed_once_total", dtorCount, 1);
+
+    // 4. A funcptr STRUCT FIELD invoked as `h.f(a)` - the call reads the field's declared type.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(7);
+        DmfHolder h;
+        h.f = dmfSink;
+        passed += Test("dmf_field_value", h.f(a), 7);
+        passed += Test("dmf_field_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_field_freed_once_total", dtorCount, 1);
+
+    // 5. The funcptr arrives as a PARAMETER and is invoked in the callee, so the declared type
+    // travels through a call boundary rather than an initializer.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(8);
+        passed += Test("dmf_param_value", dmfCallThrough(dmfSink, a), 8);
+        passed += Test("dmf_param_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_param_freed_once_total", dtorCount, 1);
+
+    // 6. The funcptr is RETURNED from a function and invoked through the returned value.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(9);
+        function<int(move OaiBox)> f = dmfGet();
+        passed += Test("dmf_returned_value", f(a), 9);
+        passed += Test("dmf_returned_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_returned_freed_once_total", dtorCount, 1);
+
+    // 7. A GENERIC `Lambda<int(move T)>` instantiated at OaiBox.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(10);
+        passed += Test("dmf_generic_value", dmfGeneric<OaiBox>(dmfSink, a), 10);
+        passed += Test("dmf_generic_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_generic_freed_once_total", dtorCount, 1);
+
+    // 8. The explicit `move a` spelling of the argument at an indirect call.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(11);
+        function<int(move OaiBox)> f = dmfSink;
+        passed += Test("dmf_movearg_value", f(move a), 11);
+        passed += Test("dmf_movearg_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_movearg_freed_once_total", dtorCount, 1);
+
+    // 9. A FIELD-PATH argument: only the field is consumed, and the wrapper's teardown of the
+    // zeroed field must be a no-op. Mirrors the direct call `dmfSink(w.b)`, which is rc 0.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(12);
+        function<int(move OaiBox)> f = dmfSink;
+        passed += Test("dmf_fieldpath_value", f(w.b), 12);
+        passed += Test("dmf_fieldpath_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("dmf_fieldpath_freed_once_total", dtorCount, 1);
+
+    // 10. MIXED signature: only the `move` parameter transfers. The borrowed one stays readable
+    // in the caller after the call and is freed by the caller - two frees in total, not one.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(1);
+        OaiBox b = oaiMake(2);
+        function<int(OaiBox, move OaiBox)> f = dmfTwo;
+        passed += Test("dmf_mixed_value", f(a, b), 3);
+        passed += Test("dmf_mixed_move_freed_by_callee", dtorCount, 1);
+        passed += Test("dmf_mixed_borrow_source_live", a.item->id, 1);
+    }
+    passed += Test("dmf_mixed_freed_twice_total", dtorCount, 2);
+
+    // 11. A DECLARED `move` param and an INFERRED sink param in ONE signature: the declared one
+    // takes the IsMove path, the inferred one keeps IsMove false, and neither doubles the other.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(1);
+        OaiBox b = oaiMake(2);
+        function<int(OaiBox, move OaiBox)> f = dmfBoth;
+        passed += Test("dmf_both_value", f(a, b), 3);
+        passed += Test("dmf_both_freed_by_callee", dtorCount, 2);
+    }
+    passed += Test("dmf_both_freed_twice_total", dtorCount, 2);
+
+    // 12. ACCEPT SET (rc 0 before the fix): a TEMP argument has no named source to null and must
+    // still be freed exactly once.
+    dtorCount = 0;
+    {
+        function<int(move OaiBox)> f = dmfSink;
+        passed += Test("dmf_temp_value", f(oaiMake(13)), 13);
+    }
+    passed += Test("dmf_temp_freed_once", dtorCount, 1);
+
+    // 13. ACCEPT SET: a plain NON-move funcptr param is untouched - the caller keeps ownership
+    // and its source is still readable after the call.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(14);
+        function<int(OaiBox)> f = dmfBorrow;
+        passed += Test("dmf_nonmove_value", f(a), 14);
+        passed += Test("dmf_nonmove_no_callee_free", dtorCount, 0);
+        passed += Test("dmf_nonmove_source_live", a.item->id, 14);
+    }
+    passed += Test("dmf_nonmove_freed_by_caller", dtorCount, 1);
+
+    // 14. ACCEPT SET: `move` on a POD parameter owns no resource; the call yields the right value.
+    // (Reading the source after it is a pre-existing indirect-vs-direct divergence - see p3.)
+    {
+        int x = 20;
+        function<int(move int)> f = dmfInt;
+        passed += Test("dmf_int_value", f(x), 21);
+    }
+
+    // 15. A `move string` funcptr param: the owning-string arm of the same transfer.
+    {
+        string s = "hello";
+        function<int(move string)> f = dmfStr;
+        passed += Test("dmf_string_value", f(s), 5);
+    }
+
+    // 16. A concat TEMP into a `move string` funcptr param: the transfer's
+    // UnregisterOwnedStringTemp drops the caller's free, else both free (rc 134 pre-fix).
+    {
+        string p = "ab";
+        string q = "cde";
+        function<int(move string)> f = dmfStr;
+        passed += Test("dmf_string_temp_value", f(p + q), 5);
+    }
+
+    // 17. An OVER-ALIGNED block into a `move` funcptr param: a funcptr TYPE cannot spell
+    // `alignas`, so a synthesized param's 0 is "not recorded" - the direct oracle accepts too.
+    {
+        alignas(0, 64) int* b = new int[4] alignas(0, 64);
+        b[0] = 9;
+        function<int(move int*)> f = dmfAligned;
+        passed += Test("dmf_align_accepted", f(b), 10);
+    }
+
+    return passed;
+}
+
+/*
  * Owning-sink inference through REDUNDANT PARENTHESES. The two collectors that feed
  * ApplyOwningSinkInference record the source subtree's raw text, so `(p)` used to spell "(p)"
  * and never match the parameter name `p` - the callee's semantic consume arms saw straight
@@ -8488,6 +8688,8 @@ extern int main()
 
     passed += testLambdaParamOwningSink();
     total += 60;
+    passed += testDeclaredMoveFuncPtrParam();
+    total += 44;
 
     passed += testConsumeOfBorrowedByValueParamField();
     total += 34;

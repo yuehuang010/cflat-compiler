@@ -4632,8 +4632,11 @@ public:
     void RejectOwningTempUniqueFieldIntoSinkParam(const std::string& functionName,
         const TypeAndValue& param, const NamedVariable& arg);
 
+    // paramsCarryAllocAlign=false when the params were synthesized from a funcptr TYPE, which has
+    // no `alignas` clause to record - see ApplyFuncPtrSinkTransfer.
     void ApplyMoveParamTransfer(const std::string& functionName,
-        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args);
+        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
+        bool paramsCarryAllocAlign = true);
 
     // Indirect-call twin: a lambda literal's inferred owning sinks ride the funcptr TYPE
     // (FuncPtrParam::IsOwningSink), so the caller's source must be transferred exactly as a direct

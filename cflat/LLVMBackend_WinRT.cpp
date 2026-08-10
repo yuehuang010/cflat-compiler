@@ -1545,6 +1545,9 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         tv.PointerDepth = p.PointerDepth;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
+        // A param whose funcptr TYPE spells `move` takes the DECLARED move path, exactly as a
+        // direct call does. An INFERRED sink leaves IsMove false - see ApplyFuncPtrSinkTransfer.
+        tv.IsMove = p.IsMove;
         // 0-based, matching the indirect call site's own DiagnoseExplicitMoveToBorrowParam.
         tv.VariableName = std::to_string(index);
         return tv;
@@ -1554,18 +1557,21 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         const std::vector<TypeAndValue::FuncPtrParam>& params, const std::vector<NamedVariable>& args)
 {
         bool anySink = false;
-        for (const auto& p : params) anySink = anySink || p.IsOwningSink;
+        for (const auto& p : params) anySink = anySink || p.IsOwningSink || p.IsMove;
         if (!anySink) return;
-        // IsMove stays false on the synthesized params: the `move` half of an indirect call is
-        // already handled at the call site, and re-running it here would double the transfer.
+        // A DECLARED `move` param takes the same ApplyMoveParamTransfer path a direct call takes
+        // (FuncPtrParamAsTypeAndValue carries IsMove); an INFERRED sink keeps IsMove false.
         std::vector<TypeAndValue> synth;
         for (size_t i = 0; i < params.size(); i++)
             synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
-        ApplyMoveParamTransfer(functionName, synth, args);
+        // A funcptr TYPE cannot spell `alignas` (parse error), so FuncPtrParam records no
+        // allocation alignment and a synthesized param's 0 is "unknown", not "unaligned".
+        ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ false);
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
-        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args)
+        const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
+        bool paramsCarryAllocAlign)
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
@@ -1620,7 +1626,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // it only when the PARAMETER declares the same `alignas(_, N)` clause. A matching clause
                 // is allowed; a missing/mismatched one would free the block wrong and corrupt the heap.
                 // Alignment carried by the TYPE is not tagged and passes through freely.
-                if (args[i].AllocAlignment != params[i].AllocAlignValue
+                if (paramsCarryAllocAlign
+                    && args[i].AllocAlignment != params[i].AllocAlignValue
                     && (args[i].AllocAlignment > kDefaultNewAlign
                         || params[i].AllocAlignValue > kDefaultNewAlign))
                 {

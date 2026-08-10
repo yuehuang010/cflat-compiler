@@ -1,0 +1,24 @@
+// A funcptr parameter DECLARED `move` now runs the same caller-side transfer a direct call runs,
+// so it also inherits the direct call's ownership-laundering guard: the argument is a field of a
+// by-value (borrowed) struct parameter, whose true owner is the caller further up, so transferring
+// it would null this function's alias while that owner still frees. The DIRECT spelling
+// `sink(w.b)` has always been rejected here; before the fix the indirect spelling compiled and
+// double-freed at run time (rc 134), which is what this leg pins.
+import "function.cb";
+class Res { int id = default; };
+struct UBox { unique Res* item = default; };
+void sink(move UBox p) { int k = p.item->id; }
+expect_error("takes ownership of a value this function only borrows");
+struct Wrap { UBox b = default; };
+void outer(Wrap w)
+{
+    function<void(move UBox)> f = sink;
+    f(w.b);
+}
+extern int main()
+{
+    Wrap w = default;
+    w.b.item = new Res();
+    outer(w);
+    return 0;
+}

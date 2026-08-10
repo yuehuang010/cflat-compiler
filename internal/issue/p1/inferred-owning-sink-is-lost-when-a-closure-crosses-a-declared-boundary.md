@@ -80,3 +80,39 @@ Two candidate directions, neither free:
 Do NOT reach for a blanket rejection of consuming lambda bodies: `f(umk(5))` with a TEMP argument
 is rc 0 on both binaries (`ls_e2_rvalue_arg.cb`) and the direct-function twin is rc 0 too, so a
 rejection keyed on the body alone would refuse programs that work.
+
+## Re-measured 2026-08-10 after the DECLARED-move indirect-call fix (`fix/fpmove`)
+
+`fix/fpmove` closed the declared-flag twin
+(`p1/declared-move-funcptr-param-does-not-transfer-at-the-indirect-call.md`) by mapping
+`FuncPtrParam::IsMove` onto `ApplyFuncPtrSinkTransfer`'s early-out predicate and onto the
+synthesized `TypeAndValue`. **That shared call-site change moved nothing here.** Every cell was
+re-created in `scratch/` and re-run on both binaries (pre = detached worktree at `d1b95fe`,
+post = `fix/fpmove`), `--run`, macOS arm64 Release:
+
+| Cell | pre | post | verdict |
+|------|-----|------|---------|
+| `ls_b2_passed_as_argument` | rc 134, `elem=5 dtor=1` | rc 134, `elem=5 dtor=1` | unchanged |
+| `ls_b3_named_then_arg` | rc 134, `elem=5 dtor=1` | rc 134, `elem=5 dtor=1` | unchanged |
+| `ls_d10_generic_call_helper` | rc 134, `elem=5 dtor=1` | rc 134, `elem=5 dtor=1` | unchanged |
+| `ls_d3_returned_lambda` | rc 134, `elem=5 dtor=1` | rc 134, `elem=5 dtor=1` | unchanged |
+| `ls_d9_lambda_in_struct_field` | rc 134, `elem=5 dtor=1` | rc 134, `elem=5 dtor=1` | unchanged |
+| `ls_b5_function_oracle` (oracle) | rc 0, `elem=5 dtor=1` | rc 0, `elem=5 dtor=1` | unchanged |
+| `ls_e1_move_spelled` (pinned) | rejected: "parameter 1 differs in 'move' modifier" | same | unchanged |
+| `ls_e2_rvalue_arg` (accept) | rc 0, `elem=5 dtor=1` | rc 0, `elem=5 dtor=1` | unchanged |
+| `ls_f1_inferred_via_named` (accept) | rc 0, `elem=5 dtor=1` | rc 0, `elem=5 dtor=1` | unchanged |
+
+Why the shared fix does not reach these: the call site is indeed shared, but this issue is an
+ADOPTION gap, not a call-site gap. At each of these crossings `FuncPtrParams[i].IsOwningSink` is
+already `false` by the time the call is emitted - the fact never made it onto the type - so
+widening the early-out predicate to `IsOwningSink || IsMove` sees `false || false`. A declared
+`Lambda<void(UBox)>` spelling has no `move`, so the new disjunct is never the one that fires.
+The fix's own accept-set requirement (the inferred path must keep `IsMove = false`) is confirmed
+by `ls_e2` and `ls_f1` staying rc 0 and by leg 11 of `testDeclaredMoveFuncPtrParam`
+(`Test/test_move.cb`), where a declared-move param and an inferred-sink param share one signature
+and each frees exactly once.
+
+`ls_e1` also still pins direction 2 of the fix directions above as blocked: a lambda parameter
+cannot SPELL `move` at all - `(move UBox p) => {...}` is an ANTLR parse error ("no viable
+alternative at input '(move UBox p) =>'"), measured on both binaries. So the `move` spelling
+remains statable only on the funcptr TYPE and on a named function, never on a lambda literal.
