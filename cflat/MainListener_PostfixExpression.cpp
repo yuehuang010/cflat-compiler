@@ -1238,10 +1238,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if ((prevPrimary->expression() != nullptr || prevPrimary->elementExpression() != nullptr)
                                 && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
-                            // A parenthesized lvalue keeps its storage so postfix ++/-- can write
-                            // back to it (e.g. '(*p)++' increments the pointee, not a temp copy).
+                            // A parenthesized lvalue keeps its storage so a STORE writes through to
+                            // the object ('(*p) = 9'). Postfix '(*p)++' is still a no-op - see
+                            // internal/issue/p2/paren-deref-increment-is-a-silent-no-op.md.
                             if (prevPrimary->expression() != nullptr)
                                 namedVar.Storage = lastParenExprStorage;
+                            // Parentheses change the spelling, never the value: hand the ownership
+                            // arms the SAME provenance the bare operand would have carried.
+                            if (prevPrimary->expression() != nullptr)
+                                AdoptWrapperProvenance(namedVar, lastParenExprNamed);
                             // Restore the owning-temp provenance only when the inner expression
                             // carried it, so no other parenthesized shape gains names it lacked.
                             if (prevPrimary->expression() != nullptr && lastParenExprFromOwningTempField)
@@ -1259,6 +1264,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprOwningStructName.clear();
                             lastParenExprFieldName.clear();
                             lastParenExprCallerName.clear();
+                            auto parenInnerNamed = lastParenExprNamed;
+                            lastParenExprNamed = {};
 
                             // A parenthesized expression yielding a known struct publishes its type
                             // and (for an lvalue) its storage through the side channel above, but
@@ -1291,6 +1298,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
                             }
+                            // A parenthesized POINTER lvalue keeps its element type too: the
+                            // delete-retire null store pairs Storage with BaseType, and without it
+                            // `delete (r)` left the local live and freed it a second time at exit.
+                            if (prevPrimary->expression() != nullptr
+                                && namedVar.BaseType == nullptr
+                                && namedVar.Storage != nullptr
+                                && namedVar.Storage == parenInnerNamed.Storage)
+                                namedVar.BaseType = parenInnerNamed.BaseType;
                         }
 
                         // If the primary was a lambda, propagate its function-pointer type.
@@ -5532,6 +5547,7 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
         lastParenExprOwningStructName.clear();
         lastParenExprFieldName.clear();
         lastParenExprCallerName.clear();
+        lastParenExprNamed = {};
 
         // Launder ownership: the result is an unowned-by-tracker heap pointer the
         // caller manages (add to a parent or deleteTree), exactly like a factory such
@@ -5702,6 +5718,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             lastParenExprOwningStructName = nv.OwningStructName;
             lastParenExprFieldName = nv.FieldName;
             lastParenExprCallerName = nv.CallerName;
+            lastParenExprNamed = nv;
             return LoadNamedVariable(nv);
         }
         else if (stringLiteral.size() > 0)

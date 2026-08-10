@@ -1,0 +1,78 @@
+/*
+ * A parenthesis and a REDUNDANT same-type cast (`(T)x`, `x as T`) change the SPELLING of a
+ * consume source, never its value. Both the SEMANTIC moved-from marking (a local store source)
+ * and the SYNTACTIC owning-sink inference (which intersects a source's text with the parameter
+ * names) used to see the wrapper instead of the name, so every leg here COMPILED: the local one
+ * was a null deref at rc 139 and the parameter ones double-freed at rc 134, where each bare twin
+ * beside it was already this rejection. The value/resource legs are wcp_* in Test/test_move.cb.
+ */
+struct Res  { int id = 0; };
+struct UBox { unique Res* item = nullptr; };
+
+UBox umk(int n) { UBox b; b.item = new Res(); b.item->id = n; return b; }
+
+// The bare ORACLE for the local store, so the wrapped legs below are read against a rejection
+// that is known to be correct rather than assumed.
+expect_error("use of moved variable 'x'") {
+    int bareLocal() { UBox x = umk(1); UBox o = x; return x.item->id; }
+}
+
+expect_error("use of moved variable 'x'") {
+    int parenLocal() { UBox x = umk(2); UBox o = (x); return x.item->id; }
+}
+
+// Depth axis: the peel is a loop, not one unwrap.
+expect_error("use of moved variable 'x'") {
+    int parenLocalDepth3() { UBox x = umk(3); UBox o = (((x))); return x.item->id; }
+}
+
+expect_error("use of moved variable 'x'") {
+    int castLocal() { UBox x = umk(4); UBox o = (UBox)x; return x.item->id; }
+}
+
+expect_error("use of moved variable 'x'") {
+    int asLocal() { UBox x = umk(5); UBox o = x as UBox; return x.item->id; }
+}
+
+// Mixed nesting of the two wrappers, in both orders.
+expect_error("use of moved variable 'x'") {
+    int castParenLocal() { UBox x = umk(6); UBox o = ((UBox)(x)); return x.item->id; }
+}
+
+expect_error("use of moved variable 'x'") {
+    int parenAsLocal() { UBox x = umk(7); UBox o = (x as UBox); return x.item->id; }
+}
+
+/*
+ * The CALLER side. The callee consumes its by-value parameter through a wrapper, so the owning-sink
+ * inference must make the parameter a sink and the caller must surrender its argument. Without it
+ * the callee freed and the caller read (and freed) the same Res.
+ */
+void sinkCast(UBox p)  { UBox o = (UBox)p; }
+void sinkAs(UBox p)    { UBox o = p as UBox; }
+void sinkBrace(UBox p) { UBox[2] d = { (UBox)p }; }
+
+expect_error("use of moved variable 'a'") {
+    int callCast() { UBox a = umk(8); sinkCast(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callAs() { UBox a = umk(9); sinkAs(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callBrace() { UBox a = umk(10); sinkBrace(a); return a.item->id; }
+}
+
+/*
+ * ACCEPT SET. A TYPE-CHANGING cast is NOT a whole-value consume of the named variable, so the
+ * parameter stays a borrow and the caller keeps ownership - reading the argument afterwards must
+ * still be legal. Same for a wrapped source that peels to no name at all.
+ */
+int typeChangingCast(UBox p) { long v = (long)p.item; return v != 0 ? 1 : 0; }
+int okTypeChanging() { UBox a = umk(11); typeChangingCast(a); return a.item->id; }
+
+int borrowOnly(UBox p) { return p.item->id; }
+int okParenArgOnly() { UBox a = umk(12); borrowOnly((a)); return a.item->id; }
+
+extern int main() { return 0; }

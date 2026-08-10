@@ -122,6 +122,16 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 result.Primary = ParseAssignmentExpression(ctx);
                 if (result.Primary) result.BaseType = result.Primary->getType();
             }
+            // A bare `x as T` whose T is x's own type reached here as a raw value. Restore the
+            // operand's storage and provenance, matched on the exact node so `x as T + 1` cannot.
+            if (condCtx != nullptr && lastRedundantAsCtx_ != nullptr
+                && SoleTypeCheckExpressionOf(condCtx) == lastRedundantAsCtx_)
+            {
+                result.Storage = lastRedundantAsNamed_.Storage;
+                result.TypeAndValue = lastRedundantAsNamed_.TypeAndValue;
+                AdoptWrapperProvenance(result, lastRedundantAsNamed_);
+            }
+            lastRedundantAsCtx_ = nullptr;
             return FinishAssignmentExpressionNamed(result, savedOwned);
         }
     }
@@ -3469,6 +3479,21 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
         llvm::Value* result = tv.value;
         llvm::Type* srcElemType = tv.elemType;
 
+        // A REDUNDANT `x as T` (T is x's own value type) is a spelling of x, not a conversion:
+        // publish the operand binding so the whole-expression consumer can adopt its provenance.
+        lastRedundantAsCtx_ = nullptr;
+        if (typeSpecs.size() == 1 && srcBinding != nullptr && ctx->children.size() >= 2
+            && ctx->children[1]->getText() == "as")
+        {
+            LLVMBackend::TypeAndValue asTarget;
+            asTarget.TypeName = ParseTypeSpecifierName(typeSpecs[0]);
+            if (IsRedundantCastOfSource(srcNV.TypeAndValue, asTarget))
+            {
+                lastRedundantAsCtx_ = ctx;
+                lastRedundantAsNamed_ = srcNV;
+            }
+        }
+
         if (typeSpecs.size() > 0)
         {
             for (size_t i = 0; i < typeSpecs.size(); i++)
@@ -5168,6 +5193,11 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
 
             ResolveValuelessCastOperand(ctx, castExp, namedVar, destTypeName);
 
+            // Answered on the OPERAND's own type, before any of the lowering below rewrites it.
+            bool redundantCastOfSource = IsRedundantCastOfSource(namedVar.TypeAndValue, destTypeName);
+            llvm::Value* redundantCastStorage = redundantCastOfSource ? namedVar.Storage : nullptr;
+            LLVMBackend::NamedVariable redundantCastSource = namedVar;
+
             // If the destination is a struct VALUE type and an operator overload
             // exists, call it (e.g. (string)charPtr calls operator string(char*)).
             // A POINTER (or array-view) destination is a pure reinterpret, never a
@@ -5240,6 +5270,12 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 return namedVar;
             }
 
+            // A REDUNDANT `(T)x` names x's own type, so it is a spelling, not a conversion: hand
+            // the result x's own storage and provenance back. Captured before materialize() and
+            // CreateCast() drop them. A type-CHANGING cast keeps today's behaviour untouched.
+            bool redundantCast = redundantCastOfSource;
+            llvm::Value* redundantStorage = redundantCastStorage;
+
             bool srcIsSigned = namedVar.TypeAndValue.IsUnsignedInteger() == -1;
             // A cast off a temp's `unique` field is the "I mean this" spelling, and it drops the
             // ownership facts with the type; carry them to the RESULT so persist sites still see it.
@@ -5256,6 +5292,13 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             // gate advises, and the no-op cast result is still the ledgered data value.
             else if (destTypeName.IsFunctionPointer)
                 compiler->RegisterDataValueCodeCast(namedVar.Primary);
+            if (redundantCast)
+            {
+                namedVar.Storage = redundantStorage;
+                namedVar.TypeAndValue.VariableName = redundantCastSource.TypeAndValue.VariableName;
+                namedVar.TypeAndValue.ParentVariableName = redundantCastSource.TypeAndValue.ParentVariableName;
+                AdoptWrapperProvenance(namedVar, redundantCastSource);
+            }
             return namedVar;
         }
 
@@ -8279,6 +8322,94 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
             "field without storing it (a read borrows, a store consumes).",
             srcNV.OwningStructName, srcNV.FieldName, root, root));
         return true;
+    }
+
+void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
+                                          const LLVMBackend::NamedVariable& src) {
+        // The name the move-dataflow, the owning-sink inference and the diagnostics key on.
+        dst.CallerName      = src.CallerName;
+        dst.IdentifierLine  = src.IdentifierLine;
+        dst.IdentifierColumn = src.IdentifierColumn;
+        // The field-path provenance the six consume arms, the return arm and the
+        // borrowed-by-value-parameter reject guard read.
+        dst.OwningStructName = src.OwningStructName;
+        dst.FieldName        = src.FieldName;
+        dst.FieldPathRoot    = src.FieldPathRoot;
+        dst.RootIsBorrowedByValueParam = src.RootIsBorrowedByValueParam;
+        dst.IsInterfaceField = src.IsInterfaceField;
+        // Element provenance: a view slot is LIVE storage, a container's internal slot is not.
+        dst.IsElementAccess = src.IsElementAccess;
+        dst.IsViewElement   = src.IsViewElement;
+        dst.IsTempSpillStorage = src.IsTempSpillStorage;
+        // Borrow origin, so a wrapped source is refused wherever the bare one is.
+        dst.IsBorrowed             = src.IsBorrowed;
+        dst.BorrowedThroughField   = src.BorrowedThroughField;
+        dst.BorrowedOrigin         = src.BorrowedOrigin;
+        dst.BorrowedUniqueField    = src.BorrowedUniqueField;
+        dst.IsUniqueFieldAlias     = src.IsUniqueFieldAlias;
+        dst.IsBorrowedOwningValue  = src.IsBorrowedOwningValue;
+        dst.IsAliasBorrow          = src.IsAliasBorrow;
+        dst.BorrowsOwnedString     = src.BorrowsOwnedString;
+        dst.IsClosureValueCapture  = src.IsClosureValueCapture;
+        dst.IsMoved                = src.IsMoved;
+        // OWNERSHIP state. These travel together with the borrow facts above: a guard that reads
+        // one and not the other reports the opposite of the truth - `delete (n)` on a `move`
+        // parameter was rejected as "borrowed" when only CallerName came across.
+        dst.IsOwning         = src.IsOwning;
+        dst.IsNewAllocated   = src.IsNewAllocated;
+        dst.IsOwningString   = src.IsOwningString;
+        dst.IsOwningStruct   = src.IsOwningStruct;
+        dst.AllocAlignment   = src.AllocAlignment;
+        dst.IsStaticLocal    = src.IsStaticLocal;
+        dst.MovedIntoInterface = src.MovedIntoInterface;
+        dst.ExplicitlyMovedNull = src.ExplicitlyMovedNull;
+        dst.ExplicitNullBlock   = src.ExplicitNullBlock;
+        // The element / view / owning-local borrow proofs the delete guards consult.
+        dst.BorrowsOwnedElement            = src.BorrowsOwnedElement;
+        dst.BorrowedElementExternallyOwned = src.BorrowedElementExternallyOwned;
+        dst.OwnedElementContainer          = src.OwnedElementContainer;
+        dst.BorrowsOwningLocal             = src.BorrowsOwningLocal;
+        dst.OwningLocalOrigin              = src.OwningLocalOrigin;
+        dst.OwningLocalStorage             = src.OwningLocalStorage;
+        dst.ViewOfFixedArrayStorage        = src.ViewOfFixedArrayStorage;
+        dst.ViewOfFixedArraySourceName     = src.ViewOfFixedArraySourceName;
+        dst.BorrowedInterfaceBox           = src.BorrowedInterfaceBox;
+        dst.BorrowedInterfaceBoxSource     = src.BorrowedInterfaceBoxSource;
+    }
+
+bool MainListener::IsRedundantCastOfSource(const LLVMBackend::TypeAndValue& src,
+                                           const LLVMBackend::TypeAndValue& dest) {
+        auto* compiler = compilerLLVM;
+        if (src.TypeName.empty() || dest.TypeName.empty()) return false;
+        if (compiler->ResolveTypeAlias(src.TypeName) != compiler->ResolveTypeAlias(dest.TypeName))
+            return false;
+        // Every shape decoration must agree too: `(T*)t`, `(T[])p` and `(IFace)v` all CHANGE the
+        // value's shape even when the base name matches, so none of them is a pass-through.
+        return src.Pointer == dest.Pointer
+            && src.ElemPointer == dest.ElemPointer
+            && src.IsArrayView == dest.IsArrayView
+            && src.IsInterface == dest.IsInterface
+            && src.IsFunctionPointer == dest.IsFunctionPointer;
+    }
+
+CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf(
+        CFlatParser::ConditionalExpressionContext* ctx) {
+        if (ctx == nullptr || ctx->Question() != nullptr || ctx->QuestionQuestion() != nullptr)
+            return nullptr;
+        auto* lor = ctx->logicalOrExpression();
+        if (lor == nullptr) return nullptr;
+        auto las = lor->logicalAndExpression();
+        if (las.size() != 1) return nullptr;
+        auto ios = las[0]->inclusiveOrExpression();
+        if (ios.size() != 1) return nullptr;
+        auto eos = ios[0]->exclusiveOrExpression();
+        if (eos.size() != 1) return nullptr;
+        auto ands = eos[0]->andExpression();
+        if (ands.size() != 1) return nullptr;
+        auto eqs = ands[0]->equalityExpression();
+        if (eqs.size() != 1) return nullptr;
+        auto tcs = eqs[0]->typeCheckExpression();
+        return tcs.size() == 1 ? tcs[0] : nullptr;
     }
 
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {

@@ -8,7 +8,17 @@ expect_error("cannot delete borrowed parameter 'n'") {
     void badDelete(Node* n) { delete n; }
 }
 
+// The PARENTHESIZED spelling. The parenthesized primary dropped the operand's borrow origin, so
+// this compiled and double-freed (rc 134) while the bare twin above was already this rejection.
+expect_error("cannot delete borrowed parameter 'n'") {
+    void badDeleteParen(Node* n) { delete (n); }
+}
+
 // move param: ownership transferred - delete is valid
 void goodDelete(move Node* n) { delete n; }
+
+// The `move` param under the same wrapper stays legal - the peel must not turn an owner into a
+// borrow. Its value/resource legs are wcp_delete_paren_* in Test/test_move.cb.
+void goodDeleteParen(move Node* n) { delete (n); }
 
 extern int main() { return 0; }

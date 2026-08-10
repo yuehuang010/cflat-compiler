@@ -3836,6 +3836,7 @@ extern int main()
     total++; passed += testFixedArrayDestruction()        ? 1 : 0;
     total++; passed += testStaticLocals()                  ? 1 : 0;
     total++; passed += testDirectVoidCallDiscarded()       ? 1 : 0;
+    total++; passed += testParenLvalueStore()              ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -5455,6 +5456,101 @@ bool testDirectVoidCallDiscarded()
         it.slot = 0;
         result &= Test("dva_bool_call_in_alias_generic", it.valid() ? 1 : 0, 1);
     }
+
+    return result;
+}
+
+/*
+ * A PARENTHESIZED LVALUE on the left of a store writes through to the same object the bare
+ * spelling does. `(*p) = v` used to land in a temp copy and was a SILENT NO-OP (the write was
+ * simply lost, no diagnostic); the parenthesized-lvalue restore in ParsePostfixExpressionInner
+ * pairs the paren's Storage with its element type again, so the store reaches the pointee.
+ * Pinned here because the failure mode is lost data rather than a crash, so nothing else catches it.
+ */
+void plvWriteThrough(int* p) { (*p) = 9; }
+
+int plvStoreThroughParam()
+{
+    int v = 1;
+    plvWriteThrough(&v);
+    return v;
+}
+
+bool testParenLvalueStore()
+{
+    bool result = true;
+
+    // DISCRIMINATORS. These three are the bug: on the merge base each write landed in a temp and
+    // the variable kept its old value (all three reported `got 1`).
+    int x = 1;
+    int* p = &x;
+    (*p) = 9;
+    result &= Test("plv_paren_deref_store", x, 9);
+
+    (*p) += 1;
+    result &= Test("plv_paren_deref_compound_store", x, 10);
+
+    ((*p)) = 20;
+    result &= Test("plv_double_paren_deref_store", x, 20);
+
+    // The same store through a pointer PARAMETER rather than a local - a different storage shape.
+    // COVERAGE: this value is already correct on the merge base as a compiled exe, so the leg does
+    // not discriminate here. It is kept because the merge base DID diverge on the same program
+    // under `--run` (rc 139 in the JIT, where the bare `*p = 9` twin was rc 0;
+    // `scratch/wp_lw_borrowparam_paren2.cb`, reproduced three times), and `test.sh` builds exes.
+    result &= Test("plv_paren_deref_param_store", plvStoreThroughParam(), 9);
+
+    // COVERAGE from here down, not discriminators: every leg below produces these same values on
+    // the merge base. They are the accept set - the restore must not disturb the spellings that
+    // already worked - and the bare oracle the three legs above are read against.
+    *p = 3;
+    result &= Test("plv_bare_deref_store_oracle", x, 3);
+
+    (x) = 11;
+    result &= Test("plv_paren_name_store", x, 11);
+
+    int y = 2;
+    int* q = &y;
+    *(q) = 7;
+    result &= Test("plv_paren_inside_deref_store", y, 7);
+
+    MyStruct1 s;
+    s.num = 1;
+    MyStruct1* sp = &s;
+    (*sp).num = 5;
+    result &= Test("plv_paren_deref_field_store", s.num, 5);
+
+    (sp)->num = 6;
+    result &= Test("plv_paren_receiver_arrow_store", s.num, 6);
+
+    int[3] arr;
+    arr[0] = 0;
+    (arr[0]) = 4;
+    result &= Test("plv_paren_element_store", arr[0], 4);
+
+    // NOT fixed, and pinned so the gap stays visible next to its repaired sibling: `(*p)++` still
+    // writes the incremented value to a temp and drops it - identical on both binaries, while the
+    // compound `(*p) += 1` above was repaired. Filed as
+    // internal/issue/p2/paren-deref-increment-is-a-silent-no-op.md. The three `++` spellings that
+    // DO work are pinned beside it so a fix there has its accept set.
+    int inc = 5;
+    int* ip = &inc;
+    (*ip)++;
+    result &= Test("plv_paren_deref_increment_known_noop", inc, 5);
+
+    int nm = 5;
+    (nm)++;
+    result &= Test("plv_paren_name_increment", nm, 6);
+
+    int[2] ia;
+    ia[0] = 5;
+    (ia[0])++;
+    result &= Test("plv_paren_element_increment", ia[0], 6);
+
+    MyStruct1 t;
+    t.num = 5;
+    (t.num)++;
+    result &= Test("plv_paren_field_increment", t.num, 6);
 
     return result;
 }

@@ -1084,6 +1084,97 @@ static bool AllParametersDefaulted(CFlatParser::ParameterTypeListContext* paramT
     return true;
 }
 
+// The source text of `node` with REDUNDANT PARENTHESES peeled off, so a parenthesized whole-value
+// source `(p)` / `((p))` records the bare name `p` and matches a parameter name. Only the
+// `'(' expression ')'` primaryExpression alternative is peeled - descending through single-child
+// nodes never changes the text, so a non-bare source (`v.f`, `v + 1`, `(a, b)`, `f(1)`) is
+// returned unchanged and keeps failing every name comparison, as it must.
+// When `outWrapperTypes` is supplied, a `(T)x` cast and an `x as T` are peeled too and each
+// peeled target type's SPELLING is appended. The peel is unconditional here because the scanner
+// cannot resolve the operand's type; the CALLER makes it type-aware by demanding every recorded
+// spelling name the type it is matching against (see AllWrapperTypesName).
+inline std::string BareSourceText(antlr4::tree::ParseTree* node,
+                                  std::vector<std::string>* outWrapperTypes = nullptr)
+{
+    while (node != nullptr)
+    {
+        if (node->children.size() == 1)
+        {
+            node = node->children[0];
+            continue;
+        }
+        auto* prim = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        // 3 children with a leading '(' is exactly `'(' expression ')'` - nameof/typeof/sizeof
+        // spell 4, and a tuple `(a, b)` is its own context reached as a single child.
+        if (prim != nullptr && prim->children.size() == 3 && prim->expression() != nullptr
+            && prim->children[0]->getText() == "(")
+        {
+            node = prim->expression();
+            continue;
+        }
+        if (outWrapperTypes != nullptr)
+        {
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+                if (cast->typeName() != nullptr && cast->castExpression() != nullptr)
+                {
+                    outWrapperTypes->push_back(cast->typeName()->getText());
+                    node = cast->castExpression();
+                    continue;
+                }
+            // `x as T` - a single trailing operator, and it must be 'as' (an `is` yields a bool).
+            if (auto* tc = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
+                if (tc->typeSpecifier().size() == 1 && tc->children.size() == 3
+                    && tc->children[1]->getText() == "as" && tc->relationalExpression() != nullptr)
+                {
+                    outWrapperTypes->push_back(tc->typeSpecifier(0)->getText());
+                    node = tc->relationalExpression();
+                    continue;
+                }
+        }
+        break;
+    }
+    return node == nullptr ? std::string() : node->getText();
+}
+
+// Bare consume-source names that were reached only by peeling a CAST / `as` wrapper, mapped to
+// every peeled wrapper type spelling. Kept apart from the plain name set so the wrapped spelling
+// is admitted only where the wrapper is proven REDUNDANT.
+using WrappedSourceNames = std::unordered_map<std::string, std::vector<std::string>>;
+
+// Every peeled wrapper names exactly `typeName`, so the whole wrapper chain is redundant and the
+// source is a whole-value consume of the bare name. Exact spellings: an alias or a decorated
+// target ("UBox*") does not match, which is the conservative direction (no new consume inferred).
+inline bool AllWrapperTypesName(const std::vector<std::string>& wrapperTypes,
+                                const std::string& typeName)
+{
+    if (wrapperTypes.empty() || typeName.empty()) return false;
+    for (const auto& t : wrapperTypes)
+        if (t != typeName) return false;
+    return true;
+}
+
+// Record one consume source: the plain set when only parentheses were peeled, the wrapped map
+// when a cast / `as` had to be peeled as well.
+inline void RecordConsumeSourceName(antlr4::tree::ParseTree* node,
+                                    std::unordered_set<std::string>& out,
+                                    WrappedSourceNames* wrapped)
+{
+    if (wrapped == nullptr)
+    {
+        out.insert(BareSourceText(node));
+        return;
+    }
+    std::vector<std::string> wrapperTypes;
+    std::string name = BareSourceText(node, &wrapperTypes);
+    if (wrapperTypes.empty())
+        out.insert(name);
+    else
+    {
+        auto& slot = (*wrapped)[name];
+        slot.insert(slot.end(), wrapperTypes.begin(), wrapperTypes.end());
+    }
+}
+
 // Detect functions that heap-allocate and return a new owned value, so call sites
 // register the result as an owned temp and free it. operator+ always allocates;
 // operator string(i32) uses malloc; user functions opt in via 'move string' /
@@ -1151,7 +1242,15 @@ static ValueStructReturnKind ClassifyValueStructReturns(
     int other = 0;
     for (auto* expr : returns)
     {
-        const std::string text = expr->getText();
+        // `return (p);` / `return (T)p;` hand back the same borrow `return p;` does. Peel the
+        // wrappers; a peeled CAST counts only when it names the return type itself (below).
+        std::vector<std::string> wrapperTypes;
+        const std::string text = BareSourceText(expr, &wrapperTypes);
+        if (!wrapperTypes.empty() && !AllWrapperTypesName(wrapperTypes, returnType.TypeName))
+        {
+            ++other;
+            continue;
+        }
         bool isBorrowedParam = false;
         for (const auto& p : allParams)
         {
@@ -1253,33 +1352,6 @@ inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node)
     return false;
 }
 
-// The source text of `node` with REDUNDANT PARENTHESES peeled off, so a parenthesized whole-value
-// source `(p)` / `((p))` records the bare name `p` and matches a parameter name. Only the
-// `'(' expression ')'` primaryExpression alternative is peeled - descending through single-child
-// nodes never changes the text, so a non-bare source (`v.f`, `v + 1`, `(a, b)`, `f(1)`) is
-// returned unchanged and keeps failing every name comparison, as it must.
-inline std::string BareSourceText(antlr4::tree::ParseTree* node)
-{
-    while (node != nullptr)
-    {
-        if (node->children.size() == 1)
-        {
-            node = node->children[0];
-            continue;
-        }
-        auto* prim = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
-        // 3 children with a leading '(' is exactly `'(' expression ')'` - nameof/typeof/sizeof
-        // spell 4, and a tuple `(a, b)` is its own context reached as a single child.
-        if (prim != nullptr && prim->children.size() == 3 && prim->expression() != nullptr
-            && prim->children[0]->getText() == "(")
-        {
-            node = prim->expression();
-            continue;
-        }
-        break;
-    }
-    return node == nullptr ? std::string() : node->getText();
-}
 
 // Tri-state evaluator for an `if const` condition under the CURRENT monomorphization:
 // returns 1 (branch taken / live), 0 (not taken / dead), or -1 (cannot decide at all).
@@ -1340,12 +1412,13 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
 // (ConsumeOwningBraceElementSource), so those names are consumed too. Named (`f = v`) and
 // dictionary (`k: v`) forms are skipped - neither reaches that arm.
 inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListContext* list,
-                                               std::unordered_set<std::string>& out)
+                                               std::unordered_set<std::string>& out,
+                                               WrappedSourceNames* wrapped = nullptr)
 {
     if (list == nullptr) return;
     for (auto* fi : list->fieldInit())
         if (fi != nullptr && fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
-            out.insert(BareSourceText(fi->assignmentExpression(0)));
+            RecordConsumeSourceName(fi->assignmentExpression(0), out, wrapped);
 }
 
 // Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
@@ -1356,7 +1429,8 @@ inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListConte
 // scope-exit drop makes a not-taken path sound. Lambdas / nested functions are a different scope
 // and are not descended into. The caller intersects with the param list; a non-bare RHS (`v.f`,
 // `v + 1`) never equals a param name, so it is naturally excluded (only a whole-value move counts).
-inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out)
+inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
+                                      WrappedSourceNames* wrapped = nullptr)
 {
     if (node == nullptr) return;
     if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return;
@@ -1364,23 +1438,23 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
     if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
         if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
             && asn->assignmentExpression() != nullptr)
-            out.insert(BareSourceText(asn->assignmentExpression()));
+            RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
     if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
     {
         if (auto* iz = init->initializer(); iz != nullptr)
         {
             if (iz->assignmentExpression() != nullptr)
-                out.insert(BareSourceText(iz->assignmentExpression()));
-            CollectPositionalBraceElementNames(iz->initializerList(), out);
+                RecordConsumeSourceName(iz->assignmentExpression(), out, wrapped);
+            CollectPositionalBraceElementNames(iz->initializerList(), out, wrapped);
         }
         // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
-        CollectPositionalBraceElementNames(init->initializerList(), out);
+        CollectPositionalBraceElementNames(init->initializerList(), out, wrapped);
     }
     if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
         if (auto* u = mv->unaryExpression())
             out.insert(BareSourceText(u));
     for (auto* child : node->children)
-        CollectConsumedStoreNames(child, out);
+        CollectConsumedStoreNames(child, out, wrapped);
 }
 
 // A parameter shape that can carry an owning VALUE (a value struct or `string`). Excludes
@@ -1425,13 +1499,19 @@ inline void ApplyOwningSinkInferenceToBody(antlr4::tree::ParseTree* body,
     std::unordered_set<std::string> movedNames;
     CollectUnconditionalMovedNames(body, movedNames, evalIfConst);
     std::unordered_set<std::string> consumedNames;
-    CollectConsumedStoreNames(body, consumedNames);
+    WrappedSourceNames wrappedConsumed;
+    CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed);
     for (auto& p : allParams)
     {
         if (p.VariableName.empty() || !ParamIsOwningSinkEligible(p)) continue;
+        // A cast-wrapped source counts only when every peeled wrapper names the parameter's own
+        // type - a TYPE-CHANGING cast is not a whole-value consume of the parameter.
+        bool wrappedConsume = false;
+        if (auto it = wrappedConsumed.find(p.VariableName); it != wrappedConsumed.end())
+            wrappedConsume = AllWrapperTypesName(it->second, p.TypeName);
         if (movedNames.count(p.VariableName))
             p.IsOwningSink = true;
-        else if (consumedNames.count(p.VariableName))
+        else if (consumedNames.count(p.VariableName) || wrappedConsume)
         {
             p.IsOwningSink = true;
             p.IsConsumeInferredSink = true;
@@ -1981,6 +2061,13 @@ private:
     std::string lastParenExprOwningStructName;
     std::string lastParenExprFieldName;
     std::string lastParenExprCallerName;
+    // Fourth companion: the whole inner NamedVariable. Parentheses are not an operator, so
+    // `(x)` must reach the ownership arms with the SAME provenance `x` does - see AdoptWrapperProvenance.
+    LLVMBackend::NamedVariable lastParenExprNamed;
+    // Set by ParseTypeCheckExpression when the chain was a single REDUNDANT `as` (target type ==
+    // operand type); the operand binding it names, so the whole-expression consumer can adopt it.
+    CFlatParser::TypeCheckExpressionContext* lastRedundantAsCtx_ = nullptr;
+    LLVMBackend::NamedVariable lastRedundantAsNamed_;
 
     // Variadic forwarding: true when the current function being codegen'd accepts '...'
     bool currentFunctionIsVariadic = false;
@@ -4267,6 +4354,27 @@ public:
     bool RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         antlr4::ParserRuleContext* ctx);
+
+    /*
+     * Copy the OWNERSHIP PROVENANCE of a wrapped operand onto the wrapper's result. A
+     * parenthesis and a REDUNDANT same-type cast are not operators - they change the spelling,
+     * never the value - so `(x)` / `(T)x` must reach the consume arms, the reject guards and the
+     * moved-from marking with exactly the facts `x` reaches them with. Only provenance is copied;
+     * the wrapper keeps its own Primary / TypeAndValue / Storage decisions.
+     */
+    static void AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
+                                       const LLVMBackend::NamedVariable& src);
+
+    // True when `dest` names exactly `src`'s own type, so the cast is a whole-value pass-through.
+    // A TYPE-CHANGING cast (interface boxing, a numeric conversion, a pointer reinterpret) is NOT
+    // a consume of the named variable and must keep failing every provenance-keyed test.
+    bool IsRedundantCastOfSource(const LLVMBackend::TypeAndValue& src,
+                                 const LLVMBackend::TypeAndValue& dest);
+
+    // The sole typeCheckExpression of a conditional expression, or null when the descent passes
+    // through any operator. Lets the whole-expression consumer tell a bare `p as T` from `p as T + 1`.
+    static CFlatParser::TypeCheckExpressionContext* SoleTypeCheckExpressionOf(
+        CFlatParser::ConditionalExpressionContext* ctx);
 
     LLVMBackend::NamedVariable ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx);
 

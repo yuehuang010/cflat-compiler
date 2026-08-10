@@ -96,4 +96,50 @@ expect_error("cannot consume field 'AWrap.arr' out of borrowed by-value paramete
  */
 int okShadowedLocal(Wrap w) { { Wrap w; w.b.item = new Res(); UBox o = w.b; return o.item == nullptr ? 0 : 1; } }
 
+/*
+ * WRAPPER SPELLINGS of the same consume. A parenthesis and a REDUNDANT same-type cast change the
+ * spelling, never the value, but the parenthesized primary dropped the operand's OwningStructName
+ * / FieldName / FieldPathRoot / RootIsBorrowedByValueParam, so this guard could not see the source
+ * at all: every leg below COMPILED and double-freed (rc 133/134) while its bare twin above was
+ * already a hard error. A TYPE-CHANGING cast is not a whole-value consume and is not covered here
+ * (its accept legs are wcp_typechanging_* in Test/test_move.cb).
+ */
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badDeclInitParen(Wrap w) { UBox o = (w.b); return o.item->id; }
+}
+
+expect_error("cannot 'move' field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badMoveParen(Wrap w) { UBox o = move (w.b); return o.item->id; }
+}
+
+// The paren around the RECEIVER rather than the whole path - a different parse (the postfix
+// chain's base is the parenthesized primary). COVERAGE, not a discriminator: this spelling
+// already rejected before the fix (the field access still ran against the resolved parent), and
+// the leg is here so the provenance threading cannot silently LOSE that rejection.
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    int badDeclInitParenRecv(Wrap w) { UBox o = (w).b; return o.item->id; }
+}
+
+// The RETURN position under a paren. The GEP-shape return arm already CONSUMED this spelling, so
+// it was the worst of the set: a silent consume with the guard blind, rc 133 with no diagnostic.
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    UBox badReturnParen(Wrap w) { return (w.b); }
+}
+
+// The redundant CAST and `as` spellings of that same return. The `(UBox)` form already rejected
+// before the fix (the cast kept FieldName, only Storage was lost, and the return arm bailed
+// earlier) - it is a coverage leg. The `as` form is the discriminator: it compiled and rc-133'd.
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    UBox badReturnCast(Wrap w) { return (UBox)w.b; }
+}
+
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    UBox badReturnAs(Wrap w) { return w.b as UBox; }
+}
+
+// A NESTED path under a wrapper: the recorded FieldPathRoot has to survive the peel too.
+expect_error("cannot consume field 'Mid.b' out of borrowed by-value parameter 'w'") {
+    int badNestedPathParen(Nest w) { UBox o = (w.a.b); return o.item->id; }
+}
+
 extern int main() { return 0; }

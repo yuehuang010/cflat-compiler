@@ -2016,3 +2016,66 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   spelling `return h.arr[0]` is correctly REJECTED on both. The `IsInterface` and
   `Pointer && IsUnique` arms of the new predicate are defensive: neither `span<IThing>` nor
   `span<unique T*>` compiles today (identical pre-existing errors on both binaries).
+- **`fix/wrapprov` - a WRAPPER is not an operator, and the provenance has to travel with the
+  value, not with the spelling.** (Closes and deletes BOTH
+  `p1/parenthesized-operand-loses-named-variable-provenance.md` and
+  `p1/cast-wrapped-consume-source-defeats-owning-sink-inference.md`, referenced by the
+  `fix/parenmv`, `fix/bvfield` and `fix/retfield` entries above.) A parenthesized primary returned a raw `llvm::Value*` and a
+  redundant same-type cast severed `Storage`, so every ownership arm keyed on the operand's
+  `NamedVariable` went blind under `(x)` / `(T)x` / `x as T`: consume arms copied instead of
+  moving (rc 134), `RejectConsumeOfBorrowedByValueParamField` stayed silent on programs whose
+  bare twins are hard errors, the moved-from marking was skipped (rc 139 instead of "use of moved
+  variable"), the owning-sink inference never fired, and `delete (r)` freed twice. ELEVEN measured
+  cells, one root cause. The landed shape is three parts, and the split is the lesson: the
+  SEMANTIC arms got `AdoptWrapperProvenance` (a curated field copy published through a new
+  `lastParenExprNamed` side channel, and restored at the tail of `ParseCastExpression` for a cast
+  proven redundant by `IsRedundantCastOfSource`); the SYNTACTIC collectors got a type-aware peel -
+  `BareSourceText` now optionally records each peeled cast/`as` TYPE SPELLING, and
+  `ApplyOwningSinkInferenceToBody` / `ClassifyValueStructReturns` admit the peeled name only when
+  every spelling names the parameter's (or return type's) own type. **A purely syntactic
+  cast peel is wrong and a purely semantic thread is insufficient - the scanner cannot resolve the
+  operand's type, and the caller-side half of the double free lives entirely in the scanner.**
+  **Copying HALF a fact set inverts a diagnostic.** The first cut of `AdoptWrapperProvenance`
+  carried `CallerName` and the borrow flags but not `IsOwning`, so `delete (n)` inside
+  `void f(move Node* n)` was rejected as "cannot delete borrowed parameter 'n'" - a message that
+  is factually false at a site whose parameter is spelled `move`. The guard reads
+  `!IsOwning && CallerName is a parameter`; supplying one operand of a conjunction and not the
+  other is how a fix manufactures a lie. Ownership state and borrow state are one set - copy them
+  together or copy neither. (The pre-fix behaviour there was rc 134, so nothing correct was lost -
+  but a wrong diagnostic over a real bug is still the wrong landing.)
+  Two smaller findings worth keeping. `return (p)` of a borrowed by-value owning parameter was NOT
+  a semantic-arm failure at all: `ClassifyValueStructReturns` compares `expr->getText()` with the
+  parameter names to infer an `alias` return, so the paren defeated the INFERENCE and the caller
+  allocated a second owner - the callee's IR was byte-identical in both spellings. **When only the
+  caller's IR differs, look for a function-level fact derived from the body's TEXT.** And
+  `UBox o = (x);` on a local already nulled the source lvalue before the fix (identical IR); only
+  the compile-time moved-from MARKING was missing, so its value leg is coverage and its
+  discriminator is the `expect_error` leg. Recorded in the leg's own comment rather than left to
+  read as a discriminator.
+  A THIRD finding, outside the two issues and found in review: the parenthesized-lvalue BaseType
+  restore also fixed a silent DATA-LOSS bug that nothing had reported. `(*p) = 9`, `(*p) += 1` and
+  `((*p)) = 20` all landed in a temp copy and were no-ops - the write was simply lost, with no
+  diagnostic - while `*p = 9` worked. A paren's Storage was already restored; its element type was
+  not, and the store arm needs both. Pinned by `plv_*` in `Test/test_basic.cb`, of which THREE
+  discriminate on the merge base (`got 1` for all three) and the rest are the accept set, labelled
+  as such in the file. **When a wrapper restores an lvalue's address, check that the arms reading
+  that address do not also need its TYPE** - a half-restored lvalue silently degrades to a temp
+  instead of failing.
+  The same restore did NOT reach `(*p)++` / `((*p))++`, which still write the incremented value to
+  a temp and drop it - measured identical on both binaries (`deref_post=5`, want 6) while `(y)++`,
+  `(a[0])++`, `(*sp).n++` and `(t.n)++` are all correct. The comment at the
+  `namedVar.Storage = lastParenExprStorage;` site CLAIMED that case worked and was corrected rather
+  than the guard loosened; the gap is filed as
+  `p2/paren-deref-increment-is-a-silent-no-op.md` with its measurements, and both the broken and
+  the four working `++` spellings are pinned as `plv_*_increment*` legs so a fix there arrives with
+  its accept set already built.
+  Out of scope with reasons. FILED as `p1/alias-spelled-redundant-cast-defeats-owning-sink-inference.md`:
+  an ALIAS-SPELLED redundant cast
+  (`using UB = UBox; UBox o = (UB)p;`) still double-frees, because the syntactic peel compares
+  spellings and the scanner cannot resolve `UB` - the conservative direction (a missed sink), and
+  the semantic half already consumes correctly, so only the caller-side rejection is absent.
+  `(string)s` and `(string)b.s` take the `operator string` overload branch and were ALREADY a hard
+  error on both binaries ("no overload of 'operator string' matches"), so the redundant-cast
+  restore at the tail of `ParseCastExpression` is unreachable from them; the `as` spelling is the
+  reachable one and is fixed. `(UBox[])v` on an owning view returns through the `IsArrayView`
+  early exit, and indexing it is a hard error on both binaries.

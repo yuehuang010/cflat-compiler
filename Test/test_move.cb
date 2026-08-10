@@ -6040,6 +6040,212 @@ int testParenConsumeSourceSink()
     return passed;
 }
 
+/*
+ * WRAPPER PROVENANCE. A parenthesis and a REDUNDANT same-type cast (`(T)x`, `x as T`) change the
+ * SPELLING of an operand, never its value - but the parenthesized-primary lowering returned a raw
+ * value and the cast lowering dropped the operand's Storage, so every ownership arm that keys on
+ * the operand's NamedVariable went blind under a wrapper: consume arms copied instead of moving
+ * (double free), the borrowed-by-value-parameter reject guard stayed silent on a program whose
+ * bare twin is a hard error, moved-from marking was skipped (a null deref instead of a
+ * "use of moved variable" rejection), and the owning-sink inference never fired.
+ * Every leg below is measured against its BARE twin - the oracle - and each was wrong on the
+ * pre-fix binary in the way its comment names.
+ */
+OaiBox wcpRetParen(OaiBox p)  { return (p); }        // (a) borrowed by-value param, was rc 134
+OaiBox wcpRetBare(OaiBox p)   { return p; }          // the oracle
+void   wcpCondMoveParen(OaiCopyBox p, int c) { OaiCopyBox o; if (c != 0) { o = move (p); } }
+void   wcpCondMoveBare(OaiCopyBox p, int c)  { OaiCopyBox o; if (c != 0) { o = move p; } }
+int    wcpCastDecl(OaiBox p)  { OaiBox o = (OaiBox)p;  return o.item->id; }   // (h) was rc 134
+int    wcpAsDecl(OaiBox p)    { OaiBox o = p as OaiBox; return o.item->id; }  // (h) was rc 134
+int    wcpCastBrace(OaiBox p) { OaiBox[2] d = { (OaiBox)p }; return d[0].item->id; }
+// (h6) an owning FIELD returned through a redundant `as`: the cast dropped Storage, so the
+// return-position consume arm could not see the field at all - rc 133 with a garbage id.
+OaiBox wcpRetFieldAs()        { OaiWrap w; w.b = oaiMake(31); return w.b as OaiBox; }
+// (f) a `string` FIELD of a dying frame under a wrapper: the deep-copy arm keys on FieldName,
+// which the wrapper dropped, so the caller read back the frame's freed buffer.
+string wcpRetStrParen()       { OaiSBox b; b.s = "wr" + "ap"; return (b.s); }
+string wcpRetStrAs()          { OaiSBox b; b.s = "wr" + "ap"; return b.s as string; }
+// (d) a `T[]` VIEW element under parens: IsViewElement was dropped, so the read aliased the live
+// slot instead of consuming it and the store orphaned the old element.
+int wcpViewElemRead(OaiBox[] v)  { OaiBox q = (v[0]); return q.item->id; }
+// ACCEPT SET: a TYPE-CHANGING cast is not a whole-value consume and must leave the parameter a
+// borrow. `(long)p.item` names neither the parameter nor its type.
+int wcpTypeChangingCast(OaiBox p) { long v = (long)p.item; return v != 0 ? 1 : 0; }
+// ACCEPT SET: wrappers stay inert over a POD and over a copyable owner.
+int wcpPodParen(OaiPod p)         { OaiPod o = ((p)); return o.x; }
+int wcpCopyParen(OaiCopyBox p)    { OaiCopyBox o = (p); return o.item->id; }
+
+int testWrapperConsumeProvenance()
+{
+    int passed = 0;
+
+    // 1. (a) `return (p)` of a BORROWED by-value owning parameter. The wrapper defeated the
+    // all-paths-return-a-borrowed-parameter classification, so the return stopped being inferred
+    // `alias`: the CALLER allocated a second owner and destructed it - rc 134, two frees of one
+    // Resource. The bare twin beside it is the oracle and was always correct.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox r = wcpRetParen(a);
+        passed += Test("wcp_retparen_value", r.item->id, 5);
+        passed += Test("wcp_retparen_no_second_owner", dtorCount, 0);
+    }
+    passed += Test("wcp_retparen_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        OaiBox r = wcpRetBare(a);
+        passed += Test("wcp_retbare_value", r.item->id, 5);
+    }
+    passed += Test("wcp_retbare_freed_once", dtorCount, 1);
+
+    // 2. (b) a CONDITIONAL `move (p)` of a COPYABLE owning parameter. Both spellings collect the
+    // name, and the concrete copyability gate keeps the parameter a borrow in both - the
+    // divergence was INSIDE the callee: `move (p)` moved out of the caller's storage (leaving the
+    // caller's source garbage, rc 134) where `move p` copies. Asserting the CALLER's source is
+    // what discriminates; the callee's own value is 5 either way.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 5;
+        wcpCondMoveParen(a, 1);
+        passed += Test("wcp_condmove_paren_source_live", a.item->id, 5);
+        passed += Test("wcp_condmove_paren_copy_freed", dtorCount, 1);
+    }
+    passed += Test("wcp_condmove_paren_freed_all", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 5;
+        wcpCondMoveBare(a, 1);
+        passed += Test("wcp_condmove_bare_source_live", a.item->id, 5);
+    }
+    passed += Test("wcp_condmove_bare_freed_all", dtorCount, 2);
+
+    // 3. (c) a parenthesized store source on a LOCAL was never marked moved-from, so reading the
+    // source afterwards was a null deref (rc 139) where the bare spelling is a compile-time
+    // "use of moved variable". The rejection itself is pinned in Test/errors; here the VALUE leg
+    // proves the local really is consumed - the source is nulled and freed exactly once.
+    dtorCount = 0;
+    {
+        OaiBox x = oaiMake(6);
+        OaiBox o = (x);
+        passed += Test("wcp_localparen_value", o.item->id, 6);
+        passed += Test("wcp_localparen_no_early_free", dtorCount, 0);
+    }
+    // COVERAGE, not a discriminator, and measured as such: the store already NULLED the source
+    // lvalue before the fix (the IR of this leg is byte-identical on both binaries), so only the
+    // compile-time moved-from MARKING was missing. Its discriminator is therefore the rejection
+    // leg `parenLocal` in Test/errors/err_wrapper_consume_source_use_after_move.cb, where the
+    // pre-fix binary compiles the read of `x` and null-derefs at rc 139.
+    passed += Test("wcp_localparen_freed_once", dtorCount, 1);
+
+    // 4. (h) the three CAST spellings of a whole-value consume. Each freed in the callee AND left
+    // the caller believing it still owned the value (rc 134). The owning-sink inference now sees
+    // the peeled name, so the caller surrenders the argument and the callee frees it once.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(7);
+        passed += Test("wcp_cast_decl_value", wcpCastDecl(a), 7);
+        passed += Test("wcp_cast_decl_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("wcp_cast_decl_freed_once_total", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(8);
+        passed += Test("wcp_as_decl_value", wcpAsDecl(a), 8);
+        passed += Test("wcp_as_decl_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("wcp_as_decl_freed_once_total", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(9);
+        passed += Test("wcp_cast_brace_value", wcpCastBrace(a), 9);
+        passed += Test("wcp_cast_brace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("wcp_cast_brace_freed_once_total", dtorCount, 1);
+
+    // 5. (h6) an owning FIELD returned through a redundant `as`. The cast severed Storage, so the
+    // return-position consume arm never ran: the field's bits were copied, the frame's struct
+    // freed the pointee, and the caller read a dangling id.
+    dtorCount = 0;
+    {
+        OaiBox r = wcpRetFieldAs();
+        passed += Test("wcp_retfield_as_value", r.item->id, 31);
+        passed += Test("wcp_retfield_as_no_early_free", dtorCount, 0);
+    }
+    passed += Test("wcp_retfield_as_freed_once", dtorCount, 1);
+
+    // 6. (f) a `string` FIELD of a frame-local struct returned under each wrapper. The buffer is
+    // freed by the frame on the way out, so a borrow hands the caller freed bytes - a SILENT
+    // wrong value at rc 0. Comparing the CONTENT is the whole leg: the length survives.
+    passed += Test("wcp_retstr_paren_value", wcpRetStrParen(), "wrap");
+    passed += Test("wcp_retstr_as_value", wcpRetStrAs(), "wrap");
+
+    // 7. (d) a `T[]` VIEW element read under parens. The fixed-array twin was correct in both
+    // spellings; only the view lost IsViewElement, so the read aliased a slot that stays live -
+    // two owners, rc 133. The source-nulled leg is the discriminator.
+    dtorCount = 0;
+    {
+        OaiBox[2] base;
+        base[0] = oaiMake(12);
+        OaiBox[] v = base;
+        passed += Test("wcp_viewelem_value", wcpViewElemRead(v), 12);
+        passed += Test("wcp_viewelem_source_nulled", base[0].item == nullptr, true);
+    }
+    passed += Test("wcp_viewelem_freed_once", dtorCount, 1);
+
+    // 8. (delete) `delete (r)` retired neither the local nor its owning bit, so the scope-exit
+    // cleanup freed the same pointer a second time (rc 134).
+    dtorCount = 0;
+    {
+        Resource* r = new Resource();
+        r->id = 13;
+        delete (r);
+        passed += Test("wcp_delete_paren_freed_once", dtorCount, 1);
+    }
+    passed += Test("wcp_delete_paren_no_second_free", dtorCount, 1);
+
+    // 9. ACCEPT SET: a TYPE-CHANGING cast is not a whole-value consume. `(long)p.item` must leave
+    // the parameter a plain borrow, so the CALLER still owns and frees the resource. Identical on
+    // both binaries - this leg is the false-rejection tripwire, not a discriminator.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(14);
+        passed += Test("wcp_typechanging_value", wcpTypeChangingCast(a), 1);
+        passed += Test("wcp_typechanging_no_callee_free", dtorCount, 0);
+        passed += Test("wcp_typechanging_source_live", a.item->id, 14);
+    }
+    passed += Test("wcp_typechanging_freed_by_caller", dtorCount, 1);
+
+    // 10. ACCEPT SET: wrappers stay inert over a POD and over a copyable owner (a copy duplicates
+    // no ownership, so the parameter stays a borrow and the caller's source lives on).
+    {
+        OaiPod a;
+        a.x = 15;
+        passed += Test("wcp_pod_paren_value", wcpPodParen(a), 15);
+        passed += Test("wcp_pod_paren_source_live", a.x, 15);
+    }
+
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 16;
+        passed += Test("wcp_copy_paren_value", wcpCopyParen(a), 16);
+        passed += Test("wcp_copy_paren_source_live", a.item->id, 16);
+    }
+    passed += Test("wcp_copy_paren_freed_all", dtorCount, 2);
+
+    return passed;
+}
+
 int testBorrowedPointerMoveNoAdopt()
 {
     int passed = 0;
@@ -8696,6 +8902,9 @@ extern int main()
 
     passed += testParenConsumeSourceSink();
     total += 35;
+
+    passed += testWrapperConsumeProvenance();
+    total += 41;
 
     passed += testReturnOfOwningField();
     total += 92;
