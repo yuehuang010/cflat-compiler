@@ -7962,6 +7962,224 @@ int testReturnOfOwningField()
     return passed;
 }
 
+// -- range-`for` over a FIXED ARRAY binds its element as a BORROW --------------------
+// The loop variable's alloca is hoisted once and its destructor is emitted ONCE, in
+// forRangeResume, so bit-copying an owning element's {ptr,len,owned} pair gave two owners
+// of one buffer: the resume dtor freed the LAST element's buffer and the array's own
+// teardown freed it again (rc 133), with the array left dangling in between. The element
+// load now clears the owned bits - the same borrow `alias T get` hands back on the
+// container leg - so the once-only dtor is a no-op and the array keeps every buffer.
+// Every leg below is value-discriminating: churn allocations after the loop reuse any
+// wrongly-freed buffer, so a premature free shows up as a corrupted array read rather
+// than only as a teardown crash.
+struct ForInBag { string[2] arr; };
+struct ForInPod { int a = 0; int b = 0; };
+struct ForInWide { int id = 0; string s = default; };
+interface IForInShape { int area(); };
+class ForInSquare : IForInShape { int side = 0; int area() { return side * side; } };
+string[2] forInGlobalArr;
+
+int forInLenOf(string s) { return s.length(); }
+
+void forInChurn()
+{
+    for (int i = 0; i < 40; i++)
+    {
+        string churn = "padding-padding-padding-" + i.toString();
+        if (churn.length() < 1) { printf("unreachable\n"); }
+    }
+}
+
+int testForInOverFixedArrayElement()
+{
+    int passed = 0;
+
+    // Core repro: read-only body over `string[2]`.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        dst[1] = "ef" + "gh";
+        int n = 0;
+        for (string s in dst)
+            n = n + (s == "abcd" || s == "efgh" ? 1 : 0);
+        forInChurn();
+        passed += Test("forin_fixed_string_matches", n, 2);
+        passed += Test("forin_fixed_string_first_intact", dst[0] == "abcd" ? 1 : 0, 1);
+        passed += Test("forin_fixed_string_last_intact", dst[1] == "efgh" ? 1 : 0, 1);
+        passed += Test("forin_fixed_string_last_len", dst[1].length(), 4);
+    }
+
+    // Struct element carrying an owning string FIELD: the field's owned bit is cleared too.
+    {
+        ForInWide[2] arr;
+        arr[0].id = 1; arr[0].s = "ab" + "cd";
+        arr[1].id = 2; arr[1].s = "ef" + "gh";
+        int n = 0;
+        for (ForInWide w in arr)
+            n = n + w.id * 10 + w.s.length();
+        forInChurn();
+        passed += Test("forin_fixed_wide_sum", n, 38);
+        passed += Test("forin_fixed_wide_last_intact", arr[1].s == "efgh" ? 1 : 0, 1);
+        passed += Test("forin_fixed_wide_first_intact", arr[0].s == "abcd" ? 1 : 0, 1);
+    }
+
+    // A fixed-array FIELD of a struct, and the null-conditional receiver spelling.
+    {
+        ForInBag b;
+        b.arr[0] = "ab" + "cd";
+        b.arr[1] = "ef" + "gh";
+        int n = 0;
+        for (string s in b.arr) n = n + s.length();
+        forInChurn();
+        passed += Test("forin_field_array_sum", n, 8);
+        passed += Test("forin_field_array_last_intact", b.arr[1] == "efgh" ? 1 : 0, 1);
+
+        ForInBag* p = &b;
+        int m = 0;
+        for (string s in p?.arr) m = m + s.length();
+        forInChurn();
+        passed += Test("forin_nullcond_array_sum", m, 8);
+        passed += Test("forin_nullcond_array_last_intact", b.arr[1] == "efgh" ? 1 : 0, 1);
+    }
+
+    // break / continue: the once-only dtor still sees a borrow on every exit edge.
+    {
+        string[3] dst;
+        dst[0] = "ab" + "cd";
+        dst[1] = "ef" + "gh";
+        dst[2] = "ij" + "kl";
+        int n = 0;
+        for (string s in dst)
+        {
+            if (s == "abcd") continue;
+            n = n + s.length();
+            if (s == "efgh") break;
+        }
+        forInChurn();
+        passed += Test("forin_break_continue_sum", n, 4);
+        passed += Test("forin_break_continue_intact", dst[1] == "efgh" ? 1 : 0, 1);
+        passed += Test("forin_break_continue_tail_intact", dst[2] == "ijkl" ? 1 : 0, 1);
+    }
+
+    // Nested iteration over the SAME array: two live borrows of one slot.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        dst[1] = "ef" + "gh";
+        int n = 0;
+        for (string s in dst)
+            for (string t in dst)
+                n = n + s.length() + t.length();
+        forInChurn();
+        passed += Test("forin_nested_sum", n, 32);
+        passed += Test("forin_nested_first_intact", dst[0] == "abcd" ? 1 : 0, 1);
+        passed += Test("forin_nested_last_intact", dst[1] == "efgh" ? 1 : 0, 1);
+    }
+
+    // The borrow passed to a function, and the array written THROUGH while borrowed.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        dst[1] = "efg" + "gh";
+        int n = 0;
+        for (string s in dst) n = n + forInLenOf(s);
+        forInChurn();
+        passed += Test("forin_pass_to_function_sum", n, 9);
+        passed += Test("forin_pass_to_function_intact", dst[1] == "efggh" ? 1 : 0, 1);
+
+        int i = 0;
+        int m = 0;
+        for (string s in dst)
+        {
+            dst[i] = "new" + i.toString();
+            m = m + s.length();
+            i = i + 1;
+        }
+        forInChurn();
+        passed += Test("forin_write_through_sum", m, 9);
+        passed += Test("forin_write_through_slot0", dst[0] == "new0" ? 1 : 0, 1);
+        passed += Test("forin_write_through_slot1", dst[1] == "new1" ? 1 : 0, 1);
+    }
+
+    // The borrow stored into a structure that OUTLIVES the array: the sink must take a
+    // copy, so the entries survive the array's teardown.
+    {
+        list<string> out;
+        {
+            string[2] dst;
+            dst[0] = "ab" + "cd";
+            dst[1] = "ef" + "gh";
+            for (string s in dst) out.add(s);
+        }
+        forInChurn();
+        passed += Test("forin_stored_count", out.count(), 2);
+        passed += Test("forin_stored_first", out.get(0) == "abcd" ? 1 : 0, 1);
+        passed += Test("forin_stored_last", out.get(1) == "efgh" ? 1 : 0, 1);
+    }
+
+    // A GLOBAL fixed array never crashed - globals are not destructed at teardown - but the
+    // loop variable's resume dtor still freed the last element's buffer, corrupting the global.
+    {
+        forInGlobalArr[0] = "ab" + "cd";
+        forInGlobalArr[1] = "ef" + "gh";
+        int n = 0;
+        for (string s in forInGlobalArr) n = n + s.length();
+        forInChurn();
+        passed += Test("forin_global_array_sum", n, 8);
+        passed += Test("forin_global_array_intact", forInGlobalArr[1] == "efgh" ? 1 : 0, 1);
+    }
+
+    // ---- accept set: legs that were already correct and must stay byte-identical ----
+    // (measured identical on the pre-fix and post-fix binaries)
+    {
+        int[3] a;
+        a[0] = 1; a[1] = 2; a[2] = 3;
+        int sum = 0;
+        for (int v in a) sum = sum + v;
+        passed += Test("forin_accept_int_array", sum, 6);
+    }
+    {
+        ForInPod[2] arr;
+        arr[0].a = 1; arr[0].b = 2;
+        arr[1].a = 3; arr[1].b = 4;
+        int sum = 0;
+        for (ForInPod p in arr) sum = sum + p.a * 10 + p.b;
+        passed += Test("forin_accept_pod_array", sum, 46);
+    }
+    {
+        ForInSquare q; q.side = 2;
+        ForInSquare r; r.side = 3;
+        IForInShape[2] shapes;
+        shapes[0] = q;
+        shapes[1] = r;
+        int sum = 0;
+        for (IForInShape x in shapes) sum = sum + x.area();
+        passed += Test("forin_accept_interface_array", sum, 13);
+    }
+    {
+        string[2] lits;
+        lits[0] = "abcd";
+        lits[1] = "efgh";
+        int n = 0;
+        for (string s in lits) n = n + s.length();
+        forInChurn();
+        passed += Test("forin_accept_literal_array", n, 8);
+        passed += Test("forin_accept_literal_intact", lits[1] == "efgh" ? 1 : 0, 1);
+    }
+    {
+        list<string> l;
+        l.add("ab" + "cd");
+        l.add("ef" + "gh");
+        int n = 0;
+        for (string s in l) n = n + (s == "abcd" || s == "efgh" ? 1 : 0);
+        forInChurn();
+        passed += Test("forin_accept_list_matches", n, 2);
+        passed += Test("forin_accept_list_last_intact", l.get(1) == "efgh" ? 1 : 0, 1);
+    }
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -8279,6 +8497,8 @@ extern int main()
 
     passed += testReturnOfOwningField();
     total += 92;
+    passed += testForInOverFixedArrayElement();
+    total += 34;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

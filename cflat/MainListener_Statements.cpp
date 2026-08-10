@@ -1855,6 +1855,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto* elemPtr = compiler->builder->CreateGEP(
                             arrTy, collNV.Storage, {zero, idxI64}, "arrayelemptr");
                         elemVal = compiler->builder->CreateLoad(arrTy->getElementType(), elemPtr, "arrayelem");
+                        // Bind the loop variable as a BORROW - its alloca is hoisted and destructed
+                        // once, so an owning bit-copy double-frees; matches the container `get`.
+                        elemVal = compiler->ClearStringOwnedBit(elemVal);
+                        elemVal = compiler->ClearStructOwnedBits(elemVal, elemType.TypeName);
                     }
                     else if (isFaceType)
                     {
