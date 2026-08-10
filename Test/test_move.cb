@@ -7550,6 +7550,418 @@ int testTernaryArmsShortCircuit()
     return passed;
 }
 
+/*
+ * RETURN of an owning FIELD PATH / fixed-array ELEMENT, and of an owning `string` FIELD.
+ * The six store arms consumed such a source; the RETURN path had no consume arm at all, so it
+ * copied the field's bits and left the field live - the returned value and the still-live struct
+ * both owned the same Resource and both freed it (rc 133, after printing a garbage id). The
+ * `string` sibling is the SILENT face of the same hole: the frame's destructor freed the buffer
+ * before the caller read the handed-back {ptr,len}, so the caller got an EMPTY string at rc 0.
+ * The by-value-parameter spelling is the one consume spelling of `w.b` that still compiled after
+ * fix/bvfield; it is now rejected, pinned in Test/errors/err_move_field_out_of_borrowed_struct_param.cb.
+ */
+OaiWrap rfldG;
+OaiSBox rfldSG;
+
+OaiBox rfldLocal()                    { OaiWrap w; w.b = oaiMake(41); return w.b; }
+OaiBox rfldMoveParam(move OaiWrap w)  { return w.b; }
+OaiBox rfldNested()                   { OaiOuter o; o.inner.b = oaiMake(43); return o.inner.b; }
+OaiBox rfldGlobal()                   { return rfldG.b; }
+OaiBox rfldPtr(OaiWrap* p)            { return p->b; }
+OaiBox rfldArrField()                 { OaiArrWrap w; w.arr[0] = oaiMake(46); return w.arr[0]; }
+OaiBox rfldElem()                     { OaiBox[2] arr; arr[0] = oaiMake(47); return arr[0]; }
+OaiBox rfldAliasSrc()                 { OaiWrap w; w.b = oaiMake(48); alias OaiWrap a = w; return a.b; }
+move OaiBox rfldMoveReturn()          { OaiWrap w; w.b = oaiMake(49); return w.b; }
+OaiCopyBox rfldCopyable(OaiCopyWrap* p) { return p->b; }
+// ACCEPT: not owning value types, so no consume decision is taken at all.
+int rfldIntField(OaiWrap w)           { return w.b.item->id; }
+Resource* rfldPtrField(OaiWrap w)     { return w.b.item; }
+
+string rfldStrLocal()                 { OaiSBox b; b.s = "ab" + "cd"; return b.s; }
+string rfldStrMoveParam(move OaiSBox b) { return b.s; }
+string rfldStrNested()                { OaiSWrap w; w.b.s = "ef" + "gh"; return w.b.s; }
+string rfldStrArrElem()               { OaiSBox[2] arr; arr[0].s = "ij" + "kl"; return arr[0].s; }
+OaiSBox rfldStrAsStruct()             { OaiSWrap w; w.b.s = "mn" + "op"; return w.b; }
+// ACCEPT: the struct OUTLIVES the return, so its field stays a borrow and the source stays live.
+string rfldStrGlobal()                { return rfldSG.s; }
+string rfldStrPtr(OaiSBox* p)         { return p->s; }
+string rfldStrByValueParam(OaiSBox b) { return b.s; }
+
+/*
+ * A field path DEEPER than the frame-local walk's step budget. The walk's fall-through answer is
+ * what decides the deep case, and answering "not a frame local" hands the caller the frame's
+ * free()d buffer again - the original silent-empty-string bug, at rc 0. 17 levels clears the
+ * original 16-step budget, so this leg is the budget's own regression test.
+ */
+struct RfldD0  { string s = ""; };
+struct RfldD1  { RfldD0  n; };  struct RfldD2  { RfldD1  n; };  struct RfldD3  { RfldD2  n; };
+struct RfldD4  { RfldD3  n; };  struct RfldD5  { RfldD4  n; };  struct RfldD6  { RfldD5  n; };
+struct RfldD7  { RfldD6  n; };  struct RfldD8  { RfldD7  n; };  struct RfldD9  { RfldD8  n; };
+struct RfldD10 { RfldD9  n; };  struct RfldD11 { RfldD10 n; };  struct RfldD12 { RfldD11 n; };
+struct RfldD13 { RfldD12 n; };  struct RfldD14 { RfldD13 n; };  struct RfldD15 { RfldD14 n; };
+struct RfldD16 { RfldD15 n; };  struct RfldD17 { RfldD16 n; };
+
+string rfldStrDeepPath()
+{
+    RfldD17 w;
+    w.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.s = "qr" + "st";
+    return w.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.n.s;
+}
+
+struct RfldHolder
+{
+    string s = "";
+    // The IMPLICIT self-field spelling. Its accept leg below pins that it stays a BORROW: the
+    // receiver outlives the call, so the frame-local walk answers no and nothing is copied.
+    string get() { return s; }
+};
+
+/*
+ * The IMPLICIT self-field spelling of the owning-struct return (`return b;` inside a method).
+ * GetMemberVariable deliberately omits FieldName / OwningStructName, so the arm's first cut -
+ * which asked for a FieldName - missed it while the identical `return this.b;` was consumed:
+ * rc 133 with the receiver's field still live. The arm now admits by GEP SHAPE, as the store
+ * arms admit by Storage alone (`UBox x = b;` in a method already consumed on both binaries).
+ * `this` is always a POINTER in CFlat (RegisterThisPointer), so no implicit self-field read can
+ * ever root at a borrowed by-value parameter and RejectConsumeOfBorrowedByValueParamField is
+ * structurally unreachable from here.
+ */
+struct RfldMHolder
+{
+    OaiBox b;
+    int n = 0;
+    OaiBox get()      { return b; }
+    OaiBox getThis()  { return this.b; }
+    // A LOCAL shadowing the field: name resolution reaches the local first, so this must take the
+    // movableLocalReturn path and leave the FIELD untouched.
+    OaiBox getShadow() { OaiBox b; b = oaiMake(56); return b; }
+    int getN()        { return n; }
+};
+
+struct RfldMInner { OaiBox b; };
+struct RfldMNest  { RfldMInner inner; OaiBox get() { return inner.b; } };
+struct RfldMCopy  { OaiCopyBox b; OaiCopyBox get() { return b; } };
+struct RfldSNest  { OaiSBox inner; string get() { return inner.s; } };
+
+RfldMHolder rfldMG;
+
+/*
+ * COPYABLE-IN-NAME CONTAINERS returned out of a member. `list<T>` has a `copy()`, so the return
+ * arm classifies Copy and calls it - which is the ratified STORE behaviour reaching the return
+ * position. When T itself is non-copyable the per-instantiation compile_error fires and the
+ * accessor is REJECTED; that is pinned in Test/errors/err_return_noncopyable_list_member*.cb,
+ * with `move` as the escape hatch pinned below. `list<string>` / `list<int>` copy cleanly and
+ * are the two shapes the arm silently repaired: on the merge base they printed these same
+ * numbers and then aborted at teardown (rc 133), both owners freeing one buffer.
+ */
+struct RfldCBag  { list<OaiBox> items; list<OaiBox> take() { return move items; } };
+struct RfldCSBag { list<string> a;     list<string> take() { return a; } };
+struct RfldCIBag { list<int>    a;     list<int>    take() { return a; } };
+
+int testReturnOfOwningField()
+{
+    int passed = 0;
+
+    // 1. The filed repro and its source-shape axes. Each was rc 133 with a garbage id before the
+    // fix; the id leg alone already discriminates (it read freed memory), and the dtor legs pin
+    // that the pointee is freed exactly ONCE rather than by two owners.
+    dtorCount = 0;
+    {
+        OaiBox r = rfldLocal();
+        passed += Test("rfld_local_value", r.item->id, 41);
+        passed += Test("rfld_local_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_local_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(42);
+        OaiBox r = rfldMoveParam(move w);
+        passed += Test("rfld_moveparam_value", r.item->id, 42);
+        passed += Test("rfld_moveparam_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_moveparam_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox r = rfldNested();
+        passed += Test("rfld_nested_value", r.item->id, 43);
+        passed += Test("rfld_nested_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_nested_freed_once", dtorCount, 1);
+
+    // 2. Sources whose owner OUTLIVES the frame. They double-freed too, so they are consumed
+    // exactly as the store arms consume a global / deref source: the source lvalue is nulled.
+    dtorCount = 0;
+    {
+        rfldG.b = oaiMake(44);
+        OaiBox r = rfldGlobal();
+        passed += Test("rfld_global_value", r.item->id, 44);
+        passed += Test("rfld_global_source_nulled", rfldG.b.item == nullptr, true);
+        passed += Test("rfld_global_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_global_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(45);
+        OaiBox r = rfldPtr(&w);
+        passed += Test("rfld_ptr_value", r.item->id, 45);
+        passed += Test("rfld_ptr_source_nulled", w.b.item == nullptr, true);
+        passed += Test("rfld_ptr_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_ptr_freed_once", dtorCount, 1);
+
+    // 3. Fixed-array shapes: a field-array element (`w.arr[0]`) and a BARE element of a local
+    // array of owning structs. The bare element carries no FieldName, so it reaches the arm
+    // through the two-index-array-GEP leg rather than the field leg.
+    dtorCount = 0;
+    {
+        OaiBox r = rfldArrField();
+        passed += Test("rfld_arrfield_value", r.item->id, 46);
+        passed += Test("rfld_arrfield_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_arrfield_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox r = rfldElem();
+        passed += Test("rfld_elem_value", r.item->id, 47);
+        passed += Test("rfld_elem_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_elem_freed_once", dtorCount, 1);
+
+    // 4. Through an `alias` binding of the local, and under a `move` RETURN TYPE. The two
+    // pre-existing move-return guards are keyed on the returned expression being a PARAMETER,
+    // so a local's field reached neither and double-freed exactly like the plain return type.
+    dtorCount = 0;
+    {
+        OaiBox r = rfldAliasSrc();
+        passed += Test("rfld_aliassrc_value", r.item->id, 48);
+        passed += Test("rfld_aliassrc_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_aliassrc_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        OaiBox r = rfldMoveReturn();
+        passed += Test("rfld_movereturn_value", r.item->id, 49);
+        passed += Test("rfld_movereturn_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_movereturn_freed_once", dtorCount, 1);
+
+    // 5. A COPYABLE owner takes the other leg of the same decision: copy() runs, the source
+    // stays live, and the two allocations are freed once each. This was rc 133 before the fix
+    // too - the return path took no decision at all, so `copy()` was never called.
+    dtorCount = 0;
+    {
+        OaiCopyWrap w;
+        w.b.item = new Resource();
+        w.b.item->id = 50;
+        {
+            OaiCopyBox r = rfldCopyable(&w);
+            passed += Test("rfld_copyable_value", r.item->id, 50);
+            passed += Test("rfld_copyable_source_live", w.b.item != nullptr, true);
+            passed += Test("rfld_copyable_independent", r.item != w.b.item, true);
+        }
+        passed += Test("rfld_copyable_copy_freed", dtorCount, 1);
+    }
+    passed += Test("rfld_copyable_both_freed", dtorCount, 2);
+
+    // 6. ACCEPT SET, measured green on the pre-fix binary and unchanged: a plain int field, a
+    // POINTER field, and a field of an owning TEMP (which has its own arm above). None of them
+    // is an owning VALUE read out of storage, so no consume decision is taken.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(51);
+        passed += Test("rfld_intfield_value", rfldIntField(w), 51);
+        passed += Test("rfld_ptrfield_value", rfldPtrField(w)->id, 51);
+        passed += Test("rfld_accept_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfld_accept_freed_once", dtorCount, 1);
+
+    // 7. The `string` FIELD sibling. Every leg below returned the EMPTY string before the fix
+    // (rc 0), because the frame's destructor freed the buffer the caller was handed. The value
+    // leg is therefore the discriminator; there is no abort to notice.
+    passed += Test("rfldstr_local_value", rfldStrLocal(), "abcd");
+    {
+        OaiSBox b;
+        b.s = "ab" + "cd";
+        passed += Test("rfldstr_moveparam_value", rfldStrMoveParam(move b), "abcd");
+    }
+    passed += Test("rfldstr_nested_value", rfldStrNested(), "efgh");
+    passed += Test("rfldstr_arrelem_value", rfldStrArrElem(), "ijkl");
+    // The same owning string handed back inside a STRUCT-typed return: that spelling goes
+    // through the owning-field consume arm (OaiSBox is an owning value type), not the string arm.
+    {
+        OaiSBox r = rfldStrAsStruct();
+        passed += Test("rfldstr_asstruct_value", r.s, "mnop");
+    }
+
+    // 8. ACCEPT SET for the string arm: the struct OUTLIVES the return in each of these, so the
+    // field must keep borrowing and the source must stay readable afterwards. All four were
+    // already correct before the fix and must not change.
+    {
+        rfldSG.s = "gl" + "ob";
+        string y = rfldStrGlobal();
+        passed += Test("rfldstr_global_value", y, "glob");
+        passed += Test("rfldstr_global_source_live", rfldSG.s, "glob");
+
+        OaiSBox b;
+        b.s = "pt" + "rr";
+        passed += Test("rfldstr_ptr_value", rfldStrPtr(&b), "ptrr");
+        passed += Test("rfldstr_ptr_source_live", b.s, "ptrr");
+
+        OaiSBox c;
+        c.s = "bv" + "al";
+        passed += Test("rfldstr_bvparam_value", rfldStrByValueParam(c), "bval");
+        passed += Test("rfldstr_bvparam_source_live", c.s, "bval");
+
+        // Same dying-local hazard as rfldstr_local, through a path longer than the walk's budget.
+        passed += Test("rfldstr_deep_path_value", rfldStrDeepPath(), "qrst");
+
+        RfldHolder h;
+        h.s = "me" + "th";
+        passed += Test("rfldstr_method_value", h.get(), "meth");
+        passed += Test("rfldstr_method_source_live", h.s, "meth");
+
+        RfldSNest sn;
+        sn.inner.s = "ne" + "st";
+        passed += Test("rfldstr_method_nested_value", sn.get(), "nest");
+        passed += Test("rfldstr_method_nested_source_live", sn.inner.s, "nest");
+    }
+
+    // 9. The IMPLICIT self-field spelling inside a method. `return b;` was rc 133 with the
+    // receiver's field still live while `return this.b;` beside it consumed correctly; both
+    // spellings now take the same decision. The source-nulled leg is the discriminator - the
+    // value alone read back correctly on the broken binary before the double free.
+    dtorCount = 0;
+    {
+        RfldMHolder h;
+        h.b = oaiMake(52);
+        OaiBox r = h.get();
+        passed += Test("rfldm_implicit_value", r.item->id, 52);
+        passed += Test("rfldm_implicit_source_nulled", h.b.item == nullptr, true);
+        passed += Test("rfldm_implicit_no_early_free", dtorCount, 0);
+    }
+    passed += Test("rfldm_implicit_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        RfldMHolder h;
+        h.b = oaiMake(53);
+        OaiBox r = h.getThis();
+        passed += Test("rfldm_explicit_value", r.item->id, 53);
+        passed += Test("rfldm_explicit_source_nulled", h.b.item == nullptr, true);
+    }
+    passed += Test("rfldm_explicit_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        RfldMNest w;
+        w.inner.b = oaiMake(54);
+        OaiBox r = w.get();
+        passed += Test("rfldm_nested_value", r.item->id, 54);
+        passed += Test("rfldm_nested_source_nulled", w.inner.b.item == nullptr, true);
+    }
+    passed += Test("rfldm_nested_freed_once", dtorCount, 1);
+
+    // A GLOBAL receiver takes the same consume as the explicit global spelling above.
+    dtorCount = 0;
+    {
+        rfldMG.b = oaiMake(55);
+        OaiBox r = rfldMG.get();
+        passed += Test("rfldm_global_value", r.item->id, 55);
+        passed += Test("rfldm_global_source_nulled", rfldMG.b.item == nullptr, true);
+    }
+    passed += Test("rfldm_global_freed_once", dtorCount, 1);
+
+    // ACCEPT: a LOCAL shadowing the field must leave the field alone (movableLocalReturn path),
+    // and an int field is not an owning value type, so no decision is taken for it at all.
+    dtorCount = 0;
+    {
+        RfldMHolder h;
+        h.b = oaiMake(57);
+        h.n = 58;
+        OaiBox r = h.getShadow();
+        passed += Test("rfldm_shadow_value", r.item->id, 56);
+        passed += Test("rfldm_shadow_field_live", h.b.item != nullptr, true);
+        passed += Test("rfldm_intfield_value", h.getN(), 58);
+    }
+    passed += Test("rfldm_shadow_both_freed", dtorCount, 2);
+
+    // A COPYABLE owning field read implicitly takes the copy leg: source live, buffers distinct.
+    dtorCount = 0;
+    {
+        RfldMCopy h;
+        h.b.item = new Resource();
+        h.b.item->id = 59;
+        {
+            OaiCopyBox r = h.get();
+            passed += Test("rfldm_copyable_value", r.item->id, 59);
+            passed += Test("rfldm_copyable_source_live", h.b.item != nullptr, true);
+            passed += Test("rfldm_copyable_independent", r.item != h.b.item, true);
+        }
+        passed += Test("rfldm_copyable_copy_freed", dtorCount, 1);
+    }
+    passed += Test("rfldm_copyable_both_freed", dtorCount, 2);
+
+    // 10. The container-member accessor. `return move items;` is the ratified escape hatch for a
+    // container whose element type is non-copyable, and it works identically on the merge base -
+    // these legs pin the remedy the rejection's message names, so the message cannot go stale.
+    dtorCount = 0;
+    {
+        RfldCBag g;
+        g.items.add(oaiMake(60));
+        {
+            list<OaiBox> t = g.take();
+            passed += Test("rfldc_move_count", t.count(), 1);
+            passed += Test("rfldc_move_id", t.get(0).item->id, 60);
+            passed += Test("rfldc_move_source_emptied", g.items.count(), 0);
+            passed += Test("rfldc_move_no_early_free", dtorCount, 0);
+        }
+        passed += Test("rfldc_move_freed_once", dtorCount, 1);
+    }
+    passed += Test("rfldc_move_no_double_free", dtorCount, 1);
+
+    // The two copyable instantiations. Every number below was already correct on the merge base;
+    // the DISCRIMINATOR is that the process reaches the end at all, since the merge base printed
+    // exactly these values and then aborted at teardown (rc 133) with two owners of one buffer.
+    {
+        RfldCSBag g;
+        g.a.add("x" + "y");
+        {
+            list<string> t = g.take();
+            passed += Test("rfldc_strlist_count", t.count(), 1);
+            passed += Test("rfldc_strlist_value", t.get(0), "xy");
+            passed += Test("rfldc_strlist_source_live", g.a.get(0), "xy");
+            t.add("z");
+            passed += Test("rfldc_strlist_copy_grew", t.count(), 2);
+            passed += Test("rfldc_strlist_source_unchanged", g.a.count(), 1);
+        }
+    }
+
+    {
+        RfldCIBag g;
+        g.a.add(7);
+        g.a.add(8);
+        {
+            list<int> t = g.take();
+            passed += Test("rfldc_intlist_count", t.count(), 2);
+            passed += Test("rfldc_intlist_value", t.get(0), 7);
+            passed += Test("rfldc_intlist_source_live", g.a.get(0), 7);
+            t.add(9);
+            passed += Test("rfldc_intlist_copy_grew", t.count(), 3);
+            passed += Test("rfldc_intlist_source_unchanged", g.a.count(), 2);
+        }
+    }
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -7864,6 +8276,9 @@ extern int main()
 
     passed += testParenConsumeSourceSink();
     total += 35;
+
+    passed += testReturnOfOwningField();
+    total += 92;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

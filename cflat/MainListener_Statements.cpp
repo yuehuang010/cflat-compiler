@@ -1000,6 +1000,65 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             clearReturnedStringBorrowBit = false;
         }
 
+        /*
+         * Returning an owning FIELD PATH or fixed-array ELEMENT (`return w.b;`). The six store
+         * arms consume such a source through ClassifyOwningAssignSource; the return path had no
+         * such arm at all, so it copied the field's bits and left the field live - the returned
+         * value and the still-live struct both owned the same pointee (rc 133). Take the SAME
+         * decision here: a copyable owner COPIES (source stays live), a non-copyable owner MOVES
+         * by zeroing the source lvalue. An `alias` function passes the borrow through.
+         */
+        if (right != nullptr && assignExpr != nullptr
+            && right->getType()->isStructTy()
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !returnNV.FromOwningTempField
+            && !returnNV.IsClosureValueCapture
+            && ReturnSourceIsIndirectOwningLvalue(returnNV, right))
+        {
+            AssignSourceKind kind;
+            llvm::Value* toReturn = ClassifyOwningAssignSource(
+                right, returnNV.TypeAndValue.TypeName, returnNV.TypeAndValue.IsMove, errCtx, kind);
+            // The same guard the six store arms run after their classify: consuming a field of a
+            // borrowed by-value parameter nulls only the callee's copy of it (double free).
+            if (kind != AssignSourceKind::Move
+                || !RejectConsumeOfBorrowedByValueParamField(compiler, returnNV, errCtx))
+            {
+                if (kind == AssignSourceKind::Move)
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(toReturn->getType()), returnNV.Storage);
+                right = toReturn;
+                // The value is this frame's to hand over now; the borrow classification computed
+                // above would otherwise clear its owning bits and orphan the pointee.
+                clearReturnedStructBorrowBits = false;
+                clearReturnedStringBorrowBit = false;
+            }
+        }
+
+        /*
+         * Returning an owning `string` FIELD of a struct that dies with this frame
+         * (`B b; b.s = "ab" + "cd"; return b.s;`). The borrow classification above hands the
+         * caller the field's {ptr,len} while the frame's destructor frees that buffer, so the
+         * caller read back an empty string - a SILENT wrong value, not an abort. Deep-copy so
+         * the caller owns an independent buffer. Gated on the borrow classification still being
+         * live, which is what keeps the temp-field, closure-capture and fixed-array-element arms
+         * above (each of which already took responsibility) from copying a second time.
+         */
+        if (right != nullptr
+            && clearReturnedStringBorrowBit
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !returnNV.TypeAndValue.IsMove
+            && !returnNV.FieldName.empty()
+            && returnNV.Storage != nullptr
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()
+                == llvm::StructType::getTypeByName(*compiler->context, "string")
+            && right->getType() == llvm::StructType::getTypeByName(*compiler->context, "string")
+            && FieldPathRootIsFrameLocal(returnNV.Storage))
+        {
+            right = compiler->EmitOwnedStringDeepCopy(right);
+            clearReturnedStringBorrowBit = false;
+        }
+
         // Clear flags consumed by the return check.
         compiler->lastOwningResult = false;
         compiler->lastAllocAlignment = 0;

@@ -1904,3 +1904,66 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   null proof - would have converted two crashing shapes (use-before-assign, guarded first assign)
   into diagnostics, but it manufactures a null witness for every such declaration and so can only
   ADD rejections; that is guard-polarity work with its own accept-set, not a ride-along.
+- **`fix/retfield` - the RETURN position joins the consume arms, and returning an owning field of
+  something that OUTLIVES the frame CONSUMES it, by design.** `return w.b` of an owning field had
+  no consume arm at all (rc 133 for a local, a `move` parameter, a nested path, an array element,
+  an alias binding, a copyable owner - `copy()` was never called on this path - and under a `move`
+  return type, whose two existing guards are keyed on the returned expression being a PARAMETER).
+  The arm now takes the same `ClassifyOwningAssignSource` decision the six store arms take, behind
+  the same `RejectConsumeOfBorrowedByValueParamField`, which makes `UBox mk(Wrap w){return w.b;}`
+  - the last consume spelling of `w.b` that still compiled after `fix/bvfield` - a hard error.
+  **RATIFIED, do not "fix" back: a GLOBAL / `static` / through-pointer source is CONSUMED (the
+  source lvalue is nulled), so `Wrap gW; UBox f(){return gW.b;}` returns the resource on the first
+  call and NULL on the second** (`scratch/rev_08_global_twice.cb`: `first=6 second=-1`;
+  `rev_07_static_twice` is the `static` twin). That is silent data loss and it is the correct
+  answer here: it mirrors the ratified store-arm transfer semantics of the 2026-08-09
+  indirect-owning-source session, where `x = gW.b` already consumed a global. Refusing to consume
+  restores the double free; rejecting would contradict `=` being total over T. Pinned by
+  `rfld_global_source_nulled` / `rfld_ptr_source_nulled` / `rfldm_global_source_nulled`.
+  The `string` sibling is the SILENT face of the same hole (`B b; return b.s;` handed back the
+  frame's free()d buffer at rc 0) and takes a DEEP COPY instead, gated on the field path rooting
+  at an alloca of this frame - which is what keeps a global, a pointee and an ordinary accessor
+  borrowing. **A step-budgeted use-def walk must answer its EXHAUSTION case on the safe side:**
+  that walk first returned false ("keep borrowing") on exhaustion with a 16-step budget, which
+  silently reinstated the empty-string bug at nesting depth 15 and deeper (review bisected it:
+  depth 14 answered `y=1`, depth 15 `y=0` - a path of depth N needs N+1 walk steps); review
+  flipped the answer to true ("copy") at a 256-step budget, since a spurious copy costs an
+  allocation and a spurious borrow returns freed bytes. Mutation-proven by
+  `rfldstr_deep_path_value`, which returns garbage with the old budget and answer.
+  **An IMPLICIT self-field read carries no FieldName**: `GetMemberVariable` deliberately omits
+  FieldName and OwningStructName, so an admission test asking for a FieldName saw `return this.b;`
+  and missed `return b;` in the same method - one consumed, one double-freed. The arm admits by
+  GEP SHAPE instead (a two-index struct or array access; a container / view slot is single-index
+  and still borrows), which is how the store arms already admitted it. `this` is always a POINTER
+  (`RegisterThisPointer`), so no implicit self-field read can root at a borrowed by-value
+  parameter and the reject guard is structurally unreachable from that spelling.
+  Side effect worth knowing: shape-based admission also fixed `return (w.b);`, which the
+  FieldName test could not see - but the paren equally drops `RootIsBorrowedByValueParam`, so the
+  borrowed-by-value-parameter spelling `return (w.b)` inside `f(Wrap w)` stays an UNDIAGNOSED
+  double free (rc 133 before and after, `scratch/rf_26_paren_bvparam.cb`). The `string` arm still
+  keys on FieldName, so `return (b.s);` is still the empty string. Both stay cells of
+  `p1/parenthesized-operand-loses-named-variable-provenance.md`.
+- **RATIFIED (`fix/retfield`, round 4): a copyable-IN-NAME container whose `copy()` rejects its
+  own instantiation is rejected at the RETURN position exactly as at the STORE position, and
+  `move` is the remedy at both. Do not "fix" the return-position error back to a borrow.**
+  `list<T>` / `dictionary<K,V>` have a `copy()`, so the return arm classifies Copy and calls it;
+  when T owns a `unique` pointer and has no `copy()`, the per-instantiation `compile_error` fires
+  and a member accessor `list<UBox> take() { return items; }` stops compiling. That reads like new
+  policy and is not: the STORE spelling `list<UBox> x = g.items;` ALREADY hard-errors on the merge
+  base with the byte-identical message ("cannot copy this list: its element type owns a 'unique'
+  pointer and has no 'copy()'..."), measured as `scratch/r4_03_store_parity.cb` - rc 1 on the merge
+  base AND on the branch, while the two return spellings were rc 0 on the merge base. That store
+  parity is the whole justification; check it before ruling on any future "the return position got
+  stricter" report. The remedy the message names works at BOTH positions and on BOTH binaries
+  (`return move items;` and `x = move g.items;` -> `n=1 src=0`, one free), so the accessor is
+  rewritten, not lost - and nothing exercised-correct is lost either, because CALLING the old
+  accessor was rc 133 on the merge base (the reviewer's `rev3_20_listmember.cb`); only an
+  UNCALLED definition used to compile. Pinned by `Test/errors/err_return_noncopyable_list_member*`
+  (implicit and `this.` spellings) plus the `dictionary` twin, and by the `rfldc_move_*` value
+  legs. The diagnostic is DEFERRED to the `copy()` instantiation and escapes a scoped
+  `expect_error` block, so each reject leg needs the BARE file-scope form in its own file.
+  The same widening silently repaired the copyable instantiations: a `list<string>` and a
+  `list<int>` member accessor were rc 133 on the merge base (both owners freeing one buffer) and
+  now return an independent copy with the source live - `rfldc_strlist_*` / `rfldc_intlist_*`.
+  Those legs' VALUES were already correct on the merge base; only the process surviving teardown
+  discriminates, so the comment says so rather than letting them read as stronger than they are.

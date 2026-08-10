@@ -61,6 +61,13 @@ expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter '
     int badGlobalDest(Wrap w) { gsink = w.b; return gsink.item->id; }
 }
 
+// The RETURN position - the seventh consume arm. It is the one consuming spelling of `w.b` that
+// still compiled after the six store arms were routed through this guard, and it double-freed
+// (rc 133) exactly as they did. Its accept twins are the rfld_* legs in Test/test_move.cb.
+expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
+    UBox badReturn(Wrap w) { return w.b; }
+}
+
 // A NESTED field path roots at the same borrowed parameter: 'w' owns nothing here either.
 expect_error("cannot consume field 'Mid.b' out of borrowed by-value parameter 'w'") {
     int badNestedPath(Nest w) { UBox o = w.a.b; return o.item->id; }

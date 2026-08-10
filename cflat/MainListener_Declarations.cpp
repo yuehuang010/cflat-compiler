@@ -5463,6 +5463,58 @@ bool MainListener::IsOwningArrayStringElementRead(
             == llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
     }
 
+/*
+ * A `return` source that reads an owning VALUE out of another object's storage: a FIELD path
+ * (`w.b`, `w.a.b`, `arr[0].b`) or a fixed-array ELEMENT (a two-index GEP over an array type).
+ * A container / view slot is a single-index GEP and deliberately stays a borrow, exactly as on
+ * the fixed-array element READ side. `string` has its own runtime owned bit and its own arm.
+ */
+bool MainListener::ReturnSourceIsIndirectOwningLvalue(
+        const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
+        auto* compiler = compilerLLVM;
+        if (value == nullptr || nv.Storage == nullptr) return false;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.ElemPointer
+            || nv.TypeAndValue.IsArrayView || nv.TypeAndValue.IsInterface
+            || nv.TypeAndValue.IsInterfacePointer || nv.TypeAndValue.IsFunctionPointer)
+            return false;
+        if (nv.TypeAndValue.TypeName.empty() || nv.TypeAndValue.TypeName == "string")
+            return false;
+        if (SourceIsDanglingAliasBorrow(compiler, nv)) return false;
+        if (!compiler->IsOwningValueType(nv.TypeAndValue.TypeName)) return false;
+        // Same type on both sides (alias-resolved). This arm rewrites the returned value, so a
+        // mismatch must fall through to the existing return-type diagnostics untouched.
+        if (compiler->ResolveTypeAlias(nv.TypeAndValue.TypeName)
+            != compiler->ResolveTypeAlias(compiler->currentFunctionReturnTypeName))
+            return false;
+        // A whole named local is `movableLocalReturn`'s job; only an indirect lvalue lands here.
+        auto* gep = llvm::dyn_cast<llvm::GEPOperator>(nv.Storage);
+        if (gep == nullptr) return false;
+        if (!nv.FieldName.empty()) return true;
+        // An IMPLICIT self-field read (`return b;` inside a method) carries no FieldName at all -
+        // GetMemberVariable deliberately omits it - so admit by GEP SHAPE as the store arms do by
+        // Storage alone: a two-index access into a struct (a field) or an array (an element). A
+        // container / view slot is a SINGLE-index GEP and still stays a borrow.
+        return gep->getNumIndices() == 2
+            && (gep->getSourceElementType()->isStructTy()
+                || gep->getSourceElementType()->isArrayTy());
+    }
+
+// Walks a field / element GEP chain down to the object it addresses, and answers true only when
+// that object is an alloca of this frame. A global, or anything reached through a loaded pointer,
+// outlives the return and must keep borrowing.
+bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
+        // The step budget is a belt-and-braces bound on an acyclic use-def walk, so exhausting it
+        // answers "copy": a spurious copy costs an allocation, a spurious borrow returns free()d bytes.
+        for (int depth = 0; storage != nullptr && depth < 256; ++depth)
+        {
+            if (llvm::isa<llvm::AllocaInst>(storage)) return true;
+            auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage);
+            if (gep == nullptr) return false;
+            storage = gep->getPointerOperand();
+        }
+        return true;
+    }
+
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         LLVMBackend::NamedVariable nv, bool savedOwned) {
         bool exprOwned = compilerLLVM->lastCallReturnsOwned;

@@ -1,0 +1,14 @@
+// The EXPLICIT `this.` spelling of err_return_noncopyable_list_member.cb. Both spellings reach
+// the return arm's copy leg and must produce the identical diagnostic; the implicit one carries
+// no FieldName and is admitted by GEP shape instead. Separate file because the diagnostic is
+// deferred to the copy() instantiation and the BARE expect_error form covers the whole scope.
+import "list.cb";
+struct Inner { int v = 0; };
+struct NC { unique Inner* p = nullptr; ~NC() {} };
+expect_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'");
+struct RetBagThis
+{
+    list<NC> items;
+    list<NC> take() { return this.items; }
+};
+extern int main() { return 0; }

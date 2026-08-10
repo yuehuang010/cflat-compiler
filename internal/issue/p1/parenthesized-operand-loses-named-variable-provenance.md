@@ -100,3 +100,27 @@ instance of this issue rather than a view/fixed asymmetry.)
   double-frees, because the guard reads `OwningStructName` / `FieldName` / `FieldPathRoot` and the
   parenthesized primary carries none of them. This is the concrete hole a fix here closes, and it
   is a cell of THIS issue, not of that one.
+
+### New cell measured by `fix/retfield` (2026-08-10)
+
+The `return` position joined this family. `fix/retfield` gave the return path the same consume
+decision the store arms take for an owning FIELD path, so `UBox mk() { Wrap w; w.b = umk(3);
+return w.b; }` went rc 133 -> rc 0.
+
+Two of the three wrapper cells measured against that arm survive, and the third only looks closed:
+
+- `return b.s as string` / `return w.b as UBox` (`scratch/rf_10_cast.cb`,
+  `scratch/rf_39_strparen.cb`): unchanged, rc 133 / the empty string on both binaries. The cast
+  drops the operand's `Storage` as well as its `FieldName`, so no shape test can reach it - this
+  cell belongs to the cast sibling issue.
+- `return (b.s);` (`scratch/rf_27_paren_string.cb`): still the empty string (`p=0`). The `string`
+  arm keys on `FieldName`, which the parenthesized primary drops.
+- `return (w.b);` (`scratch/rf_09_paren.cb`) is now rc 0 - **but not because this issue was
+  fixed.** The owning-struct arm admits by GEP SHAPE (a two-index struct/array access), which the
+  paren happens to preserve, so it consumes without ever seeing the field's provenance. The
+  provenance it does NOT see is `RootIsBorrowedByValueParam`, so the borrowed-by-value-parameter
+  spelling `UBox f(Wrap w) { return (w.b); }` is an UNDIAGNOSED double free (rc 133 before and
+  after, `scratch/rf_26_paren_bvparam.cb`), while the bare `return w.b;` beside it is a hard
+  error. Severity is unchanged by the widening - the bit-copying predecessor double-freed too -
+  but the shape now silently reaches a consume arm, which is a worse place to be missing the
+  guard. Closing this issue is what makes that spelling diagnosable.

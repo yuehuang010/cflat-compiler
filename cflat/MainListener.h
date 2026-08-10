@@ -3128,6 +3128,9 @@ public:
     // True when the NamedVariable's value is the `string` value type.
     bool NamedVarIsString(const LLVMBackend::NamedVariable& nv);
     bool IsOwningArrayStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
+    // Return-position consume/copy of an owning value read out of another object's storage.
+    bool ReturnSourceIsIndirectOwningLvalue(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
+    bool FieldPathRootIsFrameLocal(llvm::Value* storage);
 
     // Stamp owned-string ownership onto an expression result and restore the
     // "last call returns owned" flag for downstream consumers. `savedOwned` is the

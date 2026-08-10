@@ -1,0 +1,20 @@
+// Returning a `list<NC>` MEMBER whose element type owns a `unique` pointer and has no `copy()`.
+// The return arm takes the same ClassifyOwningAssignSource decision the store arms take, so the
+// copyable-in-name container reaches its own per-instantiation compile_error here exactly as the
+// STORE spelling `list<NC> x = g.items;` already does on the merge base - same message, same
+// remedy. This is RATIFIED, not new policy: before the return arm existed the accessor compiled
+// and its CALLER double-freed (rc 133). `move` is the escape hatch, pinned as a value leg
+// (rfldc_move_*) in Test/test_move.cb.
+// The diagnostic is DEFERRED to the copy() instantiation, past the close of a scoped block, so
+// the BARE file-scope form is required - which is also why the `this.` spelling and the
+// dictionary spelling each need their own file.
+import "list.cb";
+struct Inner { int v = 0; };
+struct NC { unique Inner* p = nullptr; ~NC() {} };
+expect_error("cannot copy this list: its element type owns a 'unique' pointer and has no 'copy()'");
+struct RetBag
+{
+    list<NC> items;
+    list<NC> take() { return items; }
+};
+extern int main() { return 0; }

@@ -69,3 +69,11 @@ close this spelling and the semantic cells at once.
   spellings) would subsume this one.
 - `internal/fix-issue-lessons.md` - the `fix/parenmv` record (the syntactic half, parentheses
   only).
+
+### New cell measured by `fix/retfield` (2026-08-10)
+
+`return w.b as UBox;` out of a dying local (`scratch/rf_10_cast.cb`) and `return b.s as string;`
+(`scratch/rf_39_strparen.cb`) are rc 133 / the empty string on both the merge base and
+`fix/retfield`, whose new return-position consume and string-field deep-copy arms fix every bare
+spelling of the same programs. Same mechanism as the parenthesized twin: the cast wrapper drops
+the operand's `FieldName` / field-path provenance before the arm sees it.
