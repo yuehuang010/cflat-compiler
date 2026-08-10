@@ -7666,6 +7666,16 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
                 }
             }
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, ctorArgs);
+            // The constructed value is about to land in a HEAP block that outlives the statement.
+            // No other escape site sees this store, so the ctor-launder leg is asked here.
+            if (structVal)
+            {
+                LLVMBackend::NamedVariable ctorNV;
+                ctorNV.Primary = structVal;
+                if (IsOwningTempUniqueFieldEscape(ctorNV))
+                    RejectOwningTempUniqueFieldEscape(
+                        ctorNV, std::format("the heap object 'new {}' allocates", typeName), ctx);
+            }
             if (structVal)
                 compiler->builder->CreateStore(structVal, typedPtr);
         }

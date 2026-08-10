@@ -1420,6 +1420,9 @@ public:
     // Separate cycle guard for ParameterProvablyRetainsArgument: the two analyses answer opposite
     // questions, so a key left by one must never terminate the other's walk.
     std::set<std::pair<const llvm::Function*, unsigned>> provableRetainsInProgress_;
+    // Third cycle guard, for ParameterMayReachReturn. Same reason: a key left by either escape
+    // walk must never terminate the return walk, which asks a different question again.
+    std::set<std::pair<const llvm::Function*, unsigned>> mayReachReturnInProgress_;
     // Functions whose emission is SUSPENDED while a nested one is emitted (lambda invoker,
     // generic instantiation, global-array initializer). Pushed/popped by Save/RestoreBuilderState.
     std::vector<const llvm::Function*> suspendedFunctions_;
@@ -1665,6 +1668,28 @@ private:
      * read really does dangle - the exclusion had to be deleted in the same change.
      */
     bool JoinCarriesOwningTempUniqueField(const llvm::Value* value, int depth = 0) const;
+
+    /*
+     * A call RESULT that was ledgered above because the call LAUNDERED a temp's `unique` field
+     * through a borrowing callee that may hand its parameter back. Carries the provenance the
+     * bare CallInst has none of, so the escape diagnostic can name the callee and the field
+     * instead of the cast/join wording, which is false at a laundered site.
+     */
+    struct LaunderedTempUniqueField
+    {
+        llvm::Value* Result = nullptr;
+        std::string CalleeName;
+        std::string Access;
+    };
+    std::vector<LaunderedTempUniqueField> launderedTempUniqueFields_;
+
+    void RegisterLaunderedTempUniqueField(llvm::Value* result, const std::string& calleeName,
+                                          const std::string& access);
+
+    // Look through '?:' / '??' arms the same way JoinCarriesOwningTempUniqueField does, so a
+    // laundered result reached through a join still names its callee in the diagnostic.
+    const LaunderedTempUniqueField* FindLaunderedTempUniqueField(const llvm::Value* value,
+                                                                 int depth = 0) const;
 
     /*
      * The MIRROR ledger of codeValues_: values PROVEN to be DATA - a pointer whose declared type
@@ -2863,6 +2888,25 @@ private:
     void RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
                                    const std::vector<NamedVariable>& args);
 
+    /*
+     * The DUAL of ParameterProvablyRetainsArgument: MAY this parameter come back out as the
+     * call's result? A borrowing callee that returns its argument launders the temp-field
+     * provenance off the value, so the existing declaration guard - which keys on ledger
+     * identity - never sees it. Answering yes re-ledgers the call result at the call site.
+     *
+     * MAY, not MUST: an arm of a '?:', one side of a branch, or a slot the parameter was ever
+     * parked in all count, because one path handing the pointer back is enough to dangle. The
+     * over-approximation is safe only because the RECEIVING guard's reject set is narrow (a
+     * binding that outlives the statement); a result consumed inside the statement stays legal.
+     * Unknown - no callee, a declaration, an unreadable body, recursion - answers FALSE, which
+     * is this guard family's ratified polarity.
+     */
+    bool ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth = 0);
+
+    // Worklist half of ParameterMayReachReturn. Not memoized, for the same reason
+    // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
+    bool ValueMayReachReturn(const llvm::Value* root, int depth);
+
     // Name a unique-field access for a diagnostic: "b.t", or the bare field / caller when a cast
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
@@ -3770,6 +3814,7 @@ public:
         std::vector<llvm::Value*> dataValues;
         std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
+        std::vector<LaunderedTempUniqueField> launderedTempUniqueFields;
         std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts;
         // The enclosing statement's ambient occurrence id (see currentCastOccurrence_) - a nested
         // emission (lambda invoker, global init, program shim) starts its own from 0, same as the

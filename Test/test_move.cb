@@ -7715,6 +7715,12 @@ int recursiveReadResourceId(Resource* r, int d) { if (d > 0) { return recursiveR
 void printResourcePointer(Resource* r) { snprintf(nullptr, 0, "%p", r); }
 Resource* passthruResource(Resource* r) { return r; }
 void keepResourceGlobal(Resource* r) { gKeptResource = r; }
+// The ACCEPT twins of the MAY-return walk. `passthruResource` above answers YES and re-ledgers
+// its result; these three answer NO, so their results stay bindable to a local. Each is a shape
+// the walk must NOT confuse with a passthru: another parameter, a global, a fresh allocation.
+Resource* retOtherResource(Resource* a, Resource* b) { return b; }
+Resource* retGlobalResource(Resource* r) { return gKeptResource; }
+move Resource* retFreshResource(Resource* r) { Resource* f = new Resource(); f->id = 77; return f; }
 // A join in RETURN position: the arm's temp must still be live when readResourceId reads it.
 int returnJoinResourceId(int c) { Resource* nul = nullptr; return readResourceId(c > 0 ? makeMoveBox().t : nul); }
 // A USER destructor that dereferences its owning field with no null check: a hoisted arm temp is
@@ -8125,6 +8131,79 @@ int testTempUniqueFieldBorrowAccepts()
     passed += Test("temp_uniq_accept_plain_param_passthru_read",
                    readResourceId(passthruResource(makeMoveBox().t)), 44);
     passed += Test("temp_uniq_accept_plain_param_passthru_freed_once", dtorCount, 1);
+    // Two launders deep, still consumed inside the statement: the outer call's argument is the
+    // inner call's re-ledgered result, so the MAY-return walk runs twice and must still accept.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_chained_passthru_read",
+                   readResourceId(passthruResource(passthruResource(makeMoveBox().t))), 44);
+    passed += Test("temp_uniq_accept_chained_passthru_freed_once", dtorCount, 1);
+    // The result DISCARDED: nothing outlives the statement, so nothing is rejected.
+    dtorCount = 0;
+    passthruResource(makeMoveBox().t);
+    passed += Test("temp_uniq_accept_passthru_discarded_freed_once", dtorCount, 1);
+
+    // The MAY-return walk's own accept set, frozen before the walk was written. Each callee below
+    // is a shape whose RESULT does not derive from the temp-field argument, so binding it to a
+    // local must stay legal - these are the false rejections the walk must not produce. The
+    // temp's pointee is still freed exactly once at the end of its own statement (dtors == 1).
+    {
+        Resource* liveOther = new Resource();
+        liveOther->id = 81;
+        dtorCount = 0;
+        Resource* retOther = retOtherResource(makeMoveBox().t, liveOther);
+        passed += Test("temp_uniq_accept_ret_other_param", retOther->id, 81);
+        passed += Test("temp_uniq_accept_ret_other_param_temp_freed", dtorCount, 1);
+        delete liveOther;
+    }
+    {
+        gKeptResource = new Resource();
+        gKeptResource->id = 82;
+        dtorCount = 0;
+        Resource* retGlob = retGlobalResource(makeMoveBox().t);
+        passed += Test("temp_uniq_accept_ret_global", retGlob->id, 82);
+        passed += Test("temp_uniq_accept_ret_global_temp_freed", dtorCount, 1);
+        delete gKeptResource;
+        gKeptResource = nullptr;
+    }
+    {
+        dtorCount = 0;
+        unique Resource* retFresh = retFreshResource(makeMoveBox().t);
+        passed += Test("temp_uniq_accept_ret_fresh_allocation", retFresh->id, 77);
+        passed += Test("temp_uniq_accept_ret_fresh_temp_freed", dtorCount, 1);
+    }
+    // A passthru of an ORDINARY heap pointer and of a `unique` LOCAL: the callee answers YES to
+    // the MAY-return walk in both, and both must still bind, because no temp was ever ledgered.
+    {
+        dtorCount = 0;
+        Resource* plainSrc = new Resource();
+        plainSrc->id = 83;
+        Resource* plainThru = passthruResource(plainSrc);
+        passed += Test("temp_uniq_accept_passthru_of_plain_ptr", plainThru->id, 83);
+        passed += Test("temp_uniq_accept_passthru_of_plain_ptr_not_freed", dtorCount, 0);
+        delete plainSrc;
+    }
+    {
+        dtorCount = 0;
+        {
+            unique Resource* uniqSrc = new Resource();
+            uniqSrc->id = 84;
+            Resource* uniqThru = passthruResource(uniqSrc);
+            passed += Test("temp_uniq_accept_passthru_of_unique_local", uniqThru->id, 84);
+            passed += Test("temp_uniq_accept_passthru_of_unique_local_live", dtorCount, 0);
+        }
+        passed += Test("temp_uniq_accept_passthru_of_unique_local_freed_once", dtorCount, 1);
+    }
+    // The REMEDY the new laundering diagnostic names, measured: bind the whole call result to a
+    // local, then pass the field read off that local. Both the passthru and the by-value
+    // constructor spelling the reject legs pin must compile and read LIVE memory here.
+    {
+        dtorCount = 0;
+        MoveBox<unique Resource*> boundTemp = makeMoveBox();
+        Resource* fromLocal = passthruResource(boundTemp.t);
+        passed += Test("temp_uniq_accept_launder_remedy_local", fromLocal->id, 44);
+        passed += Test("temp_uniq_accept_launder_remedy_local_live", dtorCount, 0);
+    }
+    passed += Test("temp_uniq_accept_launder_remedy_local_freed_once", dtorCount, 1);
     // The POLARITY twin: the same STORING callee that the reject legs pin, fed an ordinary heap
     // pointer instead of a temp's unique field. Nothing is ledgered, so nothing is judged - and
     // the caller still owns the pointee, which is why dtorCount is 0 until the delete below.
@@ -9452,7 +9531,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 92;
+    total += 109;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

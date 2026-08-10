@@ -4898,6 +4898,23 @@ bool MainListener::DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVar
 void MainListener::RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& rightNV,
                                            const std::string& destDesc,
                                            antlr4::ParserRuleContext* ctx) {
+        // A value LAUNDERED through a borrowing callee is a bare CallInst with no field
+        // provenance on it, so name the callee and the field the ledger recorded at the call.
+        if (compilerLLVM != nullptr)
+            if (const auto* laundered =
+                    compilerLLVM->FindLaunderedTempUniqueField(rightNV.Primary))
+            {
+                std::string field = laundered->Access.empty()
+                    ? std::string("a unique field")
+                    : std::format("unique field '{}'", laundered->Access);
+                LogErrorContext(ctx, std::format(
+                    "cannot store the result of '{}' into {} - '{}' may return its argument, which "
+                    "here is {} of a temporary, and the temporary's synthesized destructor frees "
+                    "the pointee at the end of this statement. Bind the whole call result to a "
+                    "local first and pass the field read from that local.",
+                    laundered->CalleeName, destDesc, laundered->CalleeName, field));
+                return;
+            }
         // A join arrives as a PHI and a cast severs Storage, so neither carries a name to quote;
         // say so rather than printing an empty one.
         std::string access = DescribeUniqueFieldAccess(rightNV);

@@ -294,6 +294,26 @@ JoinBox makeJoinBox()
     return b;
 }
 
+/*
+ * Return-walk launder helpers. A borrowing callee that hands its parameter back defeats the
+ * temp-unique-field escape guards on IDENTITY alone: the value the declaration sees is a fresh
+ * CallInst, not the ledgered field read. Each helper below is a shape the MAY-return walk must
+ * answer YES for; the accept twins (a callee returning another parameter, a global, or a fresh
+ * allocation) are value legs in Test/test_move.cb and must keep compiling.
+ */
+UniqueThing* gRwKept = nullptr;
+UniqueThing* rwPassthru(UniqueThing* n) { return n; }
+UniqueThing* rwViaLocal(UniqueThing* n) { UniqueThing* x = n; return x; }
+UniqueThing* rwViaBranch(UniqueThing* n, int c) { if (c > 0) { return n; } return gRwKept; }
+UniqueThing* rwChain(UniqueThing* n) { return rwPassthru(n); }
+struct RwSlot { UniqueThing* q = nullptr; RwSlot(UniqueThing* z) { this.q = z; } };
+void rwSink(unique UniqueThing* p) { }
+
+// RETURN position: the laundered result outlives the statement that destructs the temp.
+expect_error("cannot store the result of 'rwPassthru' into the return value") {
+    UniqueThing* rwLeakThroughReturn() { return rwPassthru(makeJoinBox().item); }
+}
+
 expect_error("mixes an owning and a borrowed 'JoinBox' arm into an owning variable") {
     void joinIntoOwningLocal(JoinBox borrowed, bool c)
     {
@@ -768,6 +788,58 @@ extern int main()
         unique SinkImpl* sinkOwner2 = new SinkImpl();
         ISink vsink2 = sinkOwner2;
         int kvcallv = vsink2.take(vview3);
+    }
+
+    // The RETURN-WALK legs. Each binds a temp's `unique` field, laundered through a borrowing
+    // callee, to something that outlives the statement. Pre-fix every one compiled and read
+    // freed memory (measured `v=99 same=1 dtors=1` against a freshly reallocated witness);
+    // the direct spelling `UniqueThing* d = makeJoinBox().item;` was already rejected.
+    expect_error("cannot store the result of 'rwPassthru' into a local") {
+        UniqueThing* rwA = rwPassthru(makeJoinBox().item);
+    }
+    // A local slot inside the callee, not a bare `ret <param>`.
+    expect_error("cannot store the result of 'rwViaLocal' into a local") {
+        UniqueThing* rwB = rwViaLocal(makeJoinBox().item);
+    }
+    // MAY-return: only ONE branch of the callee hands the parameter back.
+    expect_error("cannot store the result of 'rwViaBranch' into a local") {
+        UniqueThing* rwC = rwViaBranch(makeJoinBox().item, 1);
+    }
+    // The launder is two callees deep - the walk recurses through the inner call.
+    expect_error("cannot store the result of 'rwChain' into a local") {
+        UniqueThing* rwD = rwChain(makeJoinBox().item);
+    }
+    // Chained at the CALL site instead: the outer call's argument is the inner call's result,
+    // which this fix re-ledgered, so the outer launder is judged too.
+    expect_error("cannot store the result of 'rwPassthru' into a local") {
+        UniqueThing* rwE = rwPassthru(rwPassthru(makeJoinBox().item));
+    }
+    // Through a '?:' arm and a '??' fallback: the join machinery picks the marking off the arm.
+    expect_error("cannot store the result of 'rwPassthru' into a local") {
+        UniqueThing* rwNul = nullptr;
+        int rwc = 1;
+        UniqueThing* rwF = rwc > 0 ? rwPassthru(makeJoinBox().item) : rwNul;
+    }
+    expect_error("cannot store the result of 'rwPassthru' into a local") {
+        UniqueThing* rwNul2 = nullptr;
+        UniqueThing* rwG = rwNul2 ?? rwPassthru(makeJoinBox().item);
+    }
+    // A by-value CONSTRUCTOR lowers to insertvalue + ret with no store at all, which is why
+    // the store-based escape walk structurally could not see it.
+    expect_error("cannot store the result of 'RwSlot' into a local") {
+        RwSlot rwH = RwSlot(makeJoinBox().item);
+    }
+    // Same constructor, into the HEAP block `new` allocates - a store no other guard site sees.
+    expect_error("cannot store the result of 'RwSlot' into the heap object 'new RwSlot' allocates") {
+        RwSlot* rwI = new RwSlot(makeJoinBox().item);
+    }
+    // Assignment, not declaration: a second guard site on the same laundered value.
+    expect_error("cannot store the result of 'rwPassthru' into a longer-lived location") {
+        gRwKept = rwPassthru(makeJoinBox().item);
+    }
+    // Into a parameter that TAKES OWNERSHIP: the callee would own memory the temp frees.
+    expect_error("cannot pass a unique field of a temporary to parameter 'p'") {
+        rwSink(rwPassthru(makeJoinBox().item));
     }
 
     return 0;

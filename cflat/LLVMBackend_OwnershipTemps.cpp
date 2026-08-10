@@ -187,6 +187,34 @@ bool LLVMBackend::JoinCarriesOwningTempUniqueField(const llvm::Value* value, int
         return false;
     }
 
+void LLVMBackend::RegisterLaunderedTempUniqueField(llvm::Value* result, const std::string& calleeName,
+                                                   const std::string& access)
+{
+        if (result == nullptr) return;
+        for (auto& entry : launderedTempUniqueFields_)
+            if (entry.Result == result) return;   // first launder wins: it names the inner field
+        launderedTempUniqueFields_.push_back({ result, calleeName, access });
+    }
+
+const LLVMBackend::LaunderedTempUniqueField* LLVMBackend::FindLaunderedTempUniqueField(
+        const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return nullptr;
+        for (const auto& entry : launderedTempUniqueFields_)
+            if (entry.Result == value) return &entry;
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (const auto* hit = FindLaunderedTempUniqueField(phi->getIncomingValue(i), depth + 1))
+                    return hit;
+            return nullptr;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            for (const auto& arm : join->Arms)
+                if (const auto* hit = FindLaunderedTempUniqueField(arm.Value, depth + 1)) return hit;
+        return nullptr;
+    }
+
 void LLVMBackend::RegisterDataValue(llvm::Value* value)
 {
         if (value == nullptr) return;
@@ -1407,6 +1435,90 @@ bool LLVMBackend::OwningPtrProvablyEscapes(const llvm::Value* root, std::string&
         return false;
     }
 
+bool LLVMBackend::ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth)
+{
+        if (fn == nullptr || argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return false;
+        if (fn->getReturnType()->isVoidTy()) return false;
+        if (!FunctionBodyIsReadable(fn)) return false;
+        auto key = std::make_pair(fn, argIndex);
+        if (!mayReachReturnInProgress_.insert(key).second) return false;   // cycle: no proof
+        bool reaches = ValueMayReachReturn(fn->getArg(argIndex), depth);
+        mayReachReturnInProgress_.erase(key);
+        return reaches;
+    }
+
+bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
+{
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        visited.insert(root);
+        work.push_back(root);
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return false;   // gave up: no proof
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) continue;
+                if (const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(inst))
+                {
+                    if (ret->getReturnValue() == v) return true;
+                    continue;
+                }
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    // Park the tracked value in a stack slot - directly, or into a FIELD of one,
+                    // which is how a by-value constructor builds its result before returning it.
+                    // Writing THROUGH the tracked pointer stores something else.
+                    if (st->getValueOperand() != v) continue;
+                    const llvm::Value* obj = llvm::getUnderlyingObject(st->getPointerOperand());
+                    if (const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(obj))
+                        if (visited.insert(slot).second) work.push_back(slot);
+                    continue;
+                }
+                if (llvm::isa<llvm::LoadInst>(inst))
+                {
+                    // MAY: read back out of a slot this walk parked the value in, whatever else
+                    // was stored there. One path handing the pointer back is enough to dangle.
+                    if (!llvm::isa<llvm::AllocaInst>(v)) continue;
+                    if (visited.insert(inst).second) work.push_back(inst);
+                    continue;
+                }
+                if (const auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(inst))
+                {
+                    // A by-value constructor lowers to insertvalue + ret with no store at all.
+                    if (iv->getInsertedValueOperand() != v) continue;
+                    if (visited.insert(iv).second) work.push_back(iv);
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee == nullptr) continue;                 // indirect / virtual: no proof
+                    if (CallIsPointerOpaqueIntrinsic(callee)) continue;
+                    for (unsigned i = 0; i < call->arg_size(); ++i)
+                        if (call->getArgOperand(i) == v
+                            && ParameterMayReachReturn(callee, i, depth + 1))
+                        {
+                            if (visited.insert(call).second) work.push_back(call);
+                            break;
+                        }
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    if (visited.insert(inst).second) work.push_back(inst);
+                    continue;
+                }
+                continue;   // ptrtoint, a read, anything unmodelled: no proof, so accept
+            }
+        }
+        return false;
+    }
+
 std::string LLVMBackend::DescribeUniqueFieldAccess(const NamedVariable& nv)
 {
         std::string field = nv.FieldName.empty() ? nv.TypeAndValue.VariableName : nv.FieldName;
@@ -1432,6 +1544,15 @@ void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::
             TempUniqueFieldArg entry{ callee, i, functionName, access, sourceFileName,
                                       currentLine, currentColumn,
                                       !IsLedgeredOwningTempUniqueField(argVal) };
+            // The callee may hand the parameter straight back out. Re-ledger the RESULT so the
+            // existing escape guards see the laundered value as the temp field it still is.
+            if (FunctionBodyIsComplete(callee) && ParameterMayReachReturn(callee, i))
+            {
+                RegisterOwningTempUniqueField(call);
+                const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
+                RegisterLaunderedTempUniqueField(call, functionName,
+                    inner != nullptr ? inner->Access : access);
+            }
             std::string destKind;
             // Answer NOW when the body already proves it, so the diagnostic lands at the call
             // site inside any enclosing statement scope; otherwise defer (callee defined below).
@@ -2153,6 +2274,7 @@ void LLVMBackend::FlushOwnedTemps()
         currentCastOccurrence_ = 0;
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
+        launderedTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();

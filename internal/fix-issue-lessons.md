@@ -2281,3 +2281,42 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   had to be pinned to the commit the worktree is based on: `git show master:<path>` in a worktree
   whose `master` had moved on returned a NEWER test file and manufactured a "+1 leak regression"
   that cost a full bisect to disprove. **Pin a baseline by hash, not by branch name.**
+- **The dual walk: "does the callee RETURN this parameter" re-ledgers the call RESULT (RATIFIED,
+  2026-08-10, `fix/retwalk`)**: `Resource* b = passthruResource(makeMoveBox().t);` compiled and
+  read freed memory, because every temp-unique-field escape guard keys on LEDGER IDENTITY and a
+  borrowing callee hands back a fresh `CallInst` that was never ledgered. The fix is one predicate
+  - `ParameterMayReachReturn`, the dual of `ParameterProvablyRetainsArgument` - asked in
+  `RecordTempUniqueFieldArgs`, and one line of consequence: `RegisterOwningTempUniqueField(call)`.
+  **Re-ledgering, not a new guard, is what made this holistic.** All eight escape sites
+  (declaration, interface declaration, assignment, struct field, brace element, fixed-array
+  element, array-view element, return) already consult `JoinCarriesOwningTempUniqueField`, so they
+  fired with no edit at all, and the `?:` / `??` spellings came free because that walk already
+  recurses through join arms. Only ONE site had to be added: the by-value constructor result being
+  stored into the block `new T(...)` allocates, which no other guard observes.
+  **The walk is MAY, and the two rules that make it reach real code are both about slots.** A
+  store of the parameter into an alloca is followed by ANY load off that alloca - not the
+  `onlyTracked` rule the STORE walk uses, because one path handing the pointer back is enough to
+  dangle (`if (c) { return n; } return g;` must propagate). And the store destination is resolved
+  with `getUnderlyingObject`, so a store into a FIELD of a local aggregate tracks the aggregate:
+  without that the by-value constructor - the whole reason sub-case 1 was filed - is invisible,
+  since cflat lowers `Slot(Node* z) { this.q = z; }` to a GEP store into a `%Slot__` alloca that
+  is then whole-loaded and returned (the `insertvalue` shape the issue file quoted is what -O
+  makes of it, not what the walk sees). It does NOT follow a load off a GEP, which is what keeps
+  the frozen accept `storeIntoLocalThenRead` (`s.p = r; return s.p->id;`) accepting.
+  **Unknown = accept was mutation-proven, not asserted**: forcing `ParameterMayReachReturn` to
+  `return true` false-rejects `readResourceId` inside `Test/test_move.cb` itself at the first
+  laundered call, so the accept set has teeth. The three NO-answering callees are pinned as value
+  legs (`temp_uniq_accept_ret_other_param` / `_ret_global` / `_ret_fresh_allocation`), along with a
+  passthru of an ordinary heap pointer and of a `unique` local (nothing ledgered, so nothing
+  judged) and the remedy the new message names.
+  **A rejection reached by a NEW mechanism needs a NEW message.** The existing empty-access branch
+  says "reached through a cast or a '?:' / '??' join", which is false at a laundered site, so a
+  `launderedTempUniqueFields_` side ledger carries {result, callee, access} - joined through
+  phi/`??` arms exactly as the value ledger is - and the diagnostic names the callee.
+  Left open and re-measured identical pre/post, all fail-ACCEPT: indirect and interface dispatch
+  (no callee to ask), and a laundering callee defined BELOW its call site - the STORE half defers
+  that to end of module, but the RETURN half's missing fact is where the RESULT got bound, which
+  only the escape SITE knows. Retitled into
+  `p1/temp-unique-field-escapes-through-an-indirect-callee-or-a-joined-store.md`.
+  `Test/test_move.cb` under `leaks --atExit`: 18 / 352, unchanged - this change adds no leg that
+  allocates past its statement.
