@@ -3835,6 +3835,7 @@ extern int main()
     total++; passed += testFixedArrayDefaultInitDirtied() ? 1 : 0;
     total++; passed += testFixedArrayDestruction()        ? 1 : 0;
     total++; passed += testStaticLocals()                  ? 1 : 0;
+    total++; passed += testDirectVoidCallDiscarded()       ? 1 : 0;
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
@@ -5298,6 +5299,162 @@ bool testStaticLocals()
     Lambda<int()> lam = () => { static int L = 0; L = L + 1; return L; };
     result &= Test("static_lambda_1", lam(), 1);
     result &= Test("static_lambda_2", lam(), 2);
+
+    return result;
+}
+
+// =============================================================
+// ACCEPT SET of the direct-void-call gate.
+// Consuming a void call's result is now an error at the CALL (see
+// Test/errors/err_direct_void_call_consumed.cb). These legs are the other polarity: every
+// spelling below is a DISCARD (or a non-void result) that master compiled and ran, and must
+// keep doing so. They are pins, not repro legs - each one goes red by failing to COMPILE if
+// the gate over-fires, which is the failure mode that costs the most to find later.
+// =============================================================
+
+int dvaHits = 0;
+void dvaBump() { dvaHits = dvaHits + 1; }
+int  dvaTake(int v) { dvaHits = dvaHits + v; return v; }
+void dvaVoidReturn() { return dvaBump(); }
+void dvaCastReturn()  { return (void)dvaBump(); }
+void dvaGeneric<T>(T v) { dvaHits = dvaHits + 1; }
+
+using DvaVoid = void;
+DvaVoid dvaAliased() { dvaHits = dvaHits + 1; }
+
+void* dvaGivePtr() { return nullptr; }
+
+class DvaCounter
+{
+    int n = default;
+    void bump() { n = n + 1; }
+};
+
+interface IDvaBump { void bump(); };
+class DvaImpl : IDvaBump
+{
+    int n = default;
+    void bump() { n = n + 1; }
+};
+
+struct DvaOp
+{
+    int n = default;
+    void operator!()      { dvaHits = dvaHits + 1; }
+    void operator+(DvaOp o) { dvaHits = dvaHits + 2; }
+};
+
+// A bool method called for its VALUE inside an `alias V` method of a generic instantiated at a
+// `unique` interface. The call's recorded return type reads 'void' there even though the result
+// is a real i1, so a gate keyed on the type NAME alone rejects this - it is the exact shape that
+// broke core/hpc/btree.cb. The leg proves the gate demands value-lessness, not just the name.
+interface IDvaShape { int area(); };
+class DvaCircle : IDvaShape { int r = 0; int area() { return r * r; } };
+struct DvaIter<V>
+{
+    int slot = default;
+    V missing = default;
+    bool valid() { return slot >= 0; }
+    alias V value() { if (!valid()) return missing; return missing; }
+};
+
+bool testDirectVoidCallDiscarded()
+{
+    bool result = true;
+
+    dvaHits = 0;
+    dvaBump();
+    result &= Test("dva_bare_statement", dvaHits, 1);
+
+    dvaHits = 0;
+    (dvaBump());
+    result &= Test("dva_paren_statement", dvaHits, 1);
+
+    dvaHits = 0;
+    ((dvaBump()));
+    result &= Test("dva_double_paren_statement", dvaHits, 1);
+
+    dvaHits = 0;
+    for (int i = 0; i < 3; i++) { dvaBump(); }
+    result &= Test("dva_loop_body", dvaHits, 3);
+
+    dvaHits = 0;
+    for (dvaBump(); dvaHits < 3; dvaBump()) { }
+    result &= Test("dva_for_init_and_increment", dvaHits, 3);
+
+    dvaHits = 0;
+    while (dvaHits < 2) { dvaBump(); }
+    result &= Test("dva_while_body", dvaHits, 2);
+
+    dvaHits = 0;
+    do { dvaBump(); } while (dvaHits < 2);
+    result &= Test("dva_do_while_body", dvaHits, 2);
+
+    dvaHits = 0;
+    if (dvaHits == 0) dvaBump(); else dvaTake(9);
+    result &= Test("dva_if_branch_statement", dvaHits, 1);
+
+    // `return <void call>;` out of a VOID function stays legal - it is ResultUse::ReturnOperand,
+    // which the gate defers to EmitReturnExpression.
+    dvaHits = 0;
+    dvaVoidReturn();
+    result &= Test("dva_void_return_crossing", dvaHits, 1);
+
+    // A '(void)' CAST discards its operand, so a void call under it is not a consumption.
+    dvaHits = 0;
+    dvaCastReturn();
+    result &= Test("dva_void_cast_return_crossing", dvaHits, 1);
+
+    dvaHits = 0;
+    (void)dvaBump();
+    result &= Test("dva_void_cast_statement", dvaHits, 1);
+
+    dvaHits = 0;
+    dvaGeneric<int>(1);
+    dvaGeneric<bool>(true);
+    result &= Test("dva_generic_statement", dvaHits, 2);
+
+    dvaHits = 0;
+    dvaAliased();
+    result &= Test("dva_alias_void_statement", dvaHits, 1);
+
+    {
+        DvaCounter c;
+        c.bump();
+        c.bump();
+        result &= Test("dva_method_statement", c.n, 2);
+    }
+
+    {
+        DvaImpl d;
+        IDvaBump i = d;
+        i.bump();
+        result &= Test("dva_iface_statement", d.n, 1);
+    }
+
+    // A void OPERATOR overload in discard position (unary and binary spellings).
+    dvaHits = 0;
+    {
+        DvaOp a;
+        DvaOp b;
+        !a;
+        a + b;
+    }
+    result &= Test("dva_void_operator_statements", dvaHits, 3);
+
+    // Non-void results stay consumable, including the void* one the gate must not touch
+    // (it is a POINTER, not a value-less result).
+    dvaHits = 0;
+    int taken = dvaTake(7);
+    result &= Test("dva_nonvoid_value_consumable", taken, 7);
+    void* p = dvaGivePtr();
+    result &= Test("dva_voidptr_result_consumable", p == nullptr ? 1 : 0, 1);
+
+    {
+        DvaIter<unique IDvaShape> it;
+        it.slot = 0;
+        result &= Test("dva_bool_call_in_alias_generic", it.valid() ? 1 : 0, 1);
+    }
 
     return result;
 }

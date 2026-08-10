@@ -1,0 +1,136 @@
+// A DIRECT call to a void function hands back the void-typed CallInst itself. Consuming it
+// reached the LLVM verifier with no source location at all ("Invalid bitcast / %0 = bitcast
+// void <badref> to i32", "Instruction operands must be first-class values!"), and the 'auto'
+// spelling aborted the compiler outright (rc 133, no output). So every leg here fails on the
+// pre-fix binary for the same reason - no located error is produced - which is what makes them
+// non-vacuous. The closure spelling of the same rule lives in err_void_closure_call_consumed.cb
+// and shares the wording; the ACCEPT set (statement, paren, for-init/increment, '(void)' cast,
+// void 'return') is pinned by testDirectVoidCallDiscarded() in Test/test_basic.cb.
+//
+// The RETURN position is deliberately NOT here: `return dvcBump();` out of a VOID function is
+// legal and is settled by EmitReturnExpression, whose rejection leg (returning void from a
+// value function) lives in Test/errors/err_return_void_from_value.cb.
+
+int dvcHits = 0;
+void dvcBump() { dvcHits = dvcHits + 1; }
+int  dvcTake(int v) { return v; }
+
+struct DvcBox { int n = default; };
+
+// Declarator initializer - the headline repro.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcDecl() { int r = dvcBump(); return r; }
+}
+
+// Assignment to an existing local.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcAssign() { int r = 3; r = dvcBump(); return r; }
+}
+
+// Field store.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcField() { DvcBox b = default; b.n = dvcBump(); return b.n; }
+}
+
+// Array element store.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcElem() { int* a = new int[2]; a[0] = dvcBump(); return a[0]; }
+}
+
+// Positional argument - pre-fix this reported a misleading "no overload matches" instead.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    void dvcArg() { dvcTake(dvcBump()); }
+}
+
+// Variadic argument (printf) - no parameter type to mismatch against, so nothing else caught it.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    void dvcVariadic() { printf("%d\n", dvcBump()); }
+}
+
+// Binary operand.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcBinop() { int r = dvcBump() + 1; return r; }
+}
+
+// Condition position.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    void dvcCond() { if (dvcBump()) dvcBump(); }
+}
+
+// '?:' arm - a value context, so the statement-discard forwarding must NOT reach it.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcTernary() { return dvcHits == 0 ? dvcBump() : 5; }
+}
+
+// 'auto' declarator - pre-fix this aborted the compiler with rc 133 and printed nothing.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcAuto() { auto r = dvcBump(); return 0; }
+}
+
+// PARENTHESIZED consumption: the parens forward the position, so a consumed paren call is still
+// consumed (its discard twin '(dvcBump());' is an accept leg in test_basic.cb).
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
+    int dvcParen() { int r = (dvcBump()); return r; }
+}
+
+// CLASS METHOD spelling - a different call-lowering path from the free function.
+class DvcCounter
+{
+    int n = default;
+    void bump() { n = n + 1; }
+};
+expect_error("call to 'c.bump' returns 'void', so it produces no value to consume") {
+    int dvcMethod() { DvcCounter c; int r = c.bump(); return r; }
+}
+
+// INTERFACE method through the vtable - a third lowering path (pre-fix: bare "module
+// verification failed" with no location at all).
+interface IDvcBump { void bump(); };
+class DvcImpl : IDvcBump
+{
+    int n = default;
+    void bump() { n = n + 1; }
+};
+expect_error("call to 'i.bump' returns 'void', so it produces no value to consume") {
+    int dvcIface() { DvcImpl d; IDvcBump i = d; int r = i.bump(); return r; }
+}
+
+// GENERIC instantiation: the return type comes from the monomorphized signature.
+void dvcGeneric<T>(T v) { dvcHits = dvcHits + 1; }
+expect_error("call to 'dvcGeneric<int>' returns 'void', so it produces no value to consume") {
+    int dvcGenericCall() { int r = dvcGeneric<int>(1); return r; }
+}
+
+// NAMESPACE-qualified spelling.
+namespace DvcNs { void nsBump() { } }
+expect_error("call to 'DvcNs.nsBump' returns 'void', so it produces no value to consume") {
+    int dvcNamespace() { int r = DvcNs.nsBump(); return r; }
+}
+
+// `void` reached through a `using` ALIAS: the gate resolves the alias, so the alias spelling
+// cannot keep reaching the verifier after the literal one is closed.
+using DvcVoid = void;
+DvcVoid dvcAliased() { dvcHits = dvcHits + 1; }
+expect_error("call to 'dvcAliased' returns 'void', so it produces no value to consume") {
+    int dvcAlias() { int r = dvcAliased(); return r; }
+}
+
+// A UNARY OPERATOR OVERLOAD declared 'void' is the same value-less result under a different
+// spelling (its discard twin '!v;' is an accept leg in test_basic.cb).
+struct DvcOp
+{
+    int n = default;
+    void operator!() { dvcHits = dvcHits + 1; }
+};
+expect_error("call to 'operator!' returns 'void', so it produces no value to consume") {
+    int dvcUnaryOp() { DvcOp v; int r = !v; return r; }
+}
+
+// GLOBAL initializer - the listener walks file scope through the same expression parser.
+expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume");
+int dvcGlobalResult = dvcBump();
+
+extern int main()
+{
+    return 0;
+}

@@ -1814,3 +1814,39 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   rather than plumbed - the leg was re-pinned to the wording the compiler actually emits. **A
   cosmetic finding that turns out to need new plumbing stops being cheap, and the honest move is to
   pin the real behaviour, not to grow the diff.**
+- **The 2026-08-09 direct-void-call lesson (`fix/dvoid`)**: consuming a DIRECT void call's result
+  (`int r = f();`, `r = f();`, `s.n = f();`, `printf("%d", f());`, method, interface vtable slot,
+  generic instantiation, namespace-qualified, `using V = void` alias) reached the LLVM verifier as
+  `void <badref>` with NO source location, and `auto r = f();` aborted the compiler at rc 133 with
+  no output at all. The issue file said the result is built at "roughly a dozen `lastCallReturnType`
+  sites"; it is, but **all of them are inside ONE function** - `MainListener::ParsePostfixExpression`
+  - which has six function-level exits. The landed shape is therefore a rename to
+  `ParsePostfixExpressionInner` plus a five-line wrapper that funnels every exit through
+  `DiagnoseVoidResultConsumed(ctx, nv, use, subject)`. **Before enumerating N construction sites,
+  check whether they already share an enclosing function; a wrapper is one gate, and it cannot be
+  half-applied the way N edits can.** The unary operator overload (`void operator!`) is the one
+  sibling that exits elsewhere and gets the same helper called explicitly; the binary one has no
+  `ResultUse` reaching it at all and is filed as
+  `p3/void-binary-operator-overload-result-consumed-fails-verifier.md`.
+- **A type NAME is not proof of value-lessness; the LLVM value is.** The first cut of that gate
+  keyed on `ResolveTypeAlias(TypeName) == "void" && !Pointer && use == Value`, mirroring the closure
+  gate, and broke `core/hpc/btree.cb`: inside `alias V value()` of a generic instantiated at a
+  `unique` INTERFACE, the call `valid()` on a **`bool`** method carries a recorded return type of
+  `void` while its `Primary` is a genuine `i1`. Two tests went red on a pure false rejection
+  (`test_collection_leaks`, `err_moved_out_param_unique_iface`). The gate now also demands
+  `Storage == nullptr && (Primary == nullptr || Primary->getType()->isVoidTy())`. The stale
+  `lastCallReturnType` underneath is pre-existing and unfixed - the lesson is that a gate reading
+  cached type STATE must corroborate it against the value it is about to reject, because that state
+  has been observed wrong on a path nobody was looking at.
+- **A cast to `void` is a DISCARD position and has to be threaded like one.** `return (void)f();`
+  in `Test/test_function_ptr.cb` (an accept leg landed by `fix/retvoid`) went red because
+  `ParseCastExpression` parsed its operand at the default `ResultUse::Value`. Fixed by reading the
+  destination off the cast's spelling (alias-resolved) and handing the operand `Discard` when it is
+  `void`. **The existing accept legs of the PREVIOUS fix in the same area are the cheapest
+  false-rejection detector available - run that file first, not last.**
+- **When one gate moves upstream of another, the downstream diagnostic's test leg changes wording,
+  and that is not weakening it.** `c ? sideEffectOnly() : sideEffectOnly();` used to be caught by
+  the ternary join ("ternary branches must produce a value"); the arm is a value position, so the
+  call gate now sees it first. `Test/errors/err_ternary_incompatible_types.cb` was updated to the
+  new wording with a comment naming why, and the join's own diagnostic was PROVEN still live
+  (`c ? (void)f() : (void)f()` still hits it) rather than left to rot as dead code.

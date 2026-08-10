@@ -18,10 +18,13 @@ expect_error("ternary branches have incompatible types") {
 // Arms that produce no value at all: a `void` call in each branch has nothing to join.
 // This used to reach the LLVM join operation with a void operand and fail module
 // verification ("Instruction operands must be first-class values") instead of being
-// reported as a source-level error.
+// reported as a source-level error. The ruling now fires one step EARLIER, at the call
+// itself - a ternary arm is a value position, so the direct-void-call gate sees it first
+// and gives the same remedy by name. The join's own "must produce a value" diagnostic is
+// still live for arms that are void without being a call (e.g. `c ? (void)f() : (void)f()`).
 void sideEffectOnly() { }
 
-expect_error("ternary branches must produce a value") {
+expect_error("call to 'sideEffectOnly' returns 'void', so it produces no value to consume") {
     int bothVoid(bool c) {
         c ? sideEffectOnly() : sideEffectOnly();
         return 0;

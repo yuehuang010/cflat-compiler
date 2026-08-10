@@ -5096,7 +5096,11 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         }
         else if (castExp && typeName)
         {
-            auto namedVar = ParseCastExpression(castExp);
+            // A cast to 'void' DISCARDS its operand, so a value-less call is legal under it -
+            // read the destination off the spelling (alias-resolved) before parsing the operand.
+            bool destIsVoid = compiler->ResolveTypeAlias(typeName->getText()) == "void";
+            auto namedVar = ParseCastExpression(castExp, false,
+                destIsVoid ? ResultUse::Discard : ResultUse::Value);
             auto destTypeName = ParseTypeName(typeName);
             auto type = compiler->GetType(destTypeName);
 
@@ -5690,6 +5694,9 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 return namedVar;
             }
 
+            // A unary operator overload declared 'void' lands here with the same value-less
+            // result a direct call does - same ruling, same wording.
+            DiagnoseVoidResultConsumed(ctx, namedVar, use, std::format("'operator{}'", opText));
             return namedVar;
         }
         else if (auto* typeNameCtx = ctx->typeName())

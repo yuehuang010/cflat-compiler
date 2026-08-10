@@ -1,6 +1,54 @@
 #include "MainListener.h"
 
+/*
+ * Every direct call - free function, class method, interface vtable slot, generic
+ * instantiation, namespace-qualified, aliased return type - finishes here, so this wrapper
+ * is the one gate the void-result rule needs. The body has six exits; gating them
+ * individually is the site enumeration this repo has paid for before.
+ */
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
+                                                       size_t dropTrailingChildren, ResultUse use) {
+        auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        // Name the callee from the spelling: the chain up to its LAST top-level '(', so a call
+        // on another call's result names the callee consumed here, not the first one in the chain.
+        std::string text = ctx->getText();
+        size_t paren = std::string::npos;
+        int depth = 0;
+        for (size_t i = 0; i < text.size(); ++i)
+        {
+            if (text[i] == '(' || text[i] == '[')
+            {
+                if (depth == 0 && text[i] == '(') paren = i;
+                depth++;
+            }
+            else if ((text[i] == ')' || text[i] == ']') && depth > 0) depth--;
+        }
+        std::string name = paren == std::string::npos ? text : text.substr(0, paren);
+        std::string subject = (name.empty() || name.size() > 40)
+            ? std::string("the call") : std::format("'{}'", name);
+        DiagnoseVoidResultConsumed(ctx, namedVar, use, subject);
+        return namedVar;
+    }
+
+void MainListener::DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx,
+                                              const LLVMBackend::NamedVariable& nv,
+                                              ResultUse use, const std::string& subject) {
+        // Discard positions want exactly this result, and `return <call>;` is settled by
+        // EmitReturnExpression (a void crossing out of a void function is legal) - both defer.
+        if (use != ResultUse::Value || nv.TypeAndValue.Pointer) return;
+        // Resolve through `using V = void;` - the spelling is aliasable, so matching the
+        // literal "void" would leave the alias reaching the verifier.
+        if (Compiler(ctx)->ResolveTypeAlias(nv.TypeAndValue.TypeName) != "void") return;
+        // The NAME alone is not proof: a stale lastCallReturnType can spell 'void' over a
+        // result that really carries a value (an i1 from a bool method). Require value-lessness.
+        if (nv.Storage != nullptr || (nv.Primary != nullptr && !nv.Primary->getType()->isVoidTy()))
+            return;
+        LogErrorContext(ctx, std::format(
+            "call to {} returns 'void', so it produces no value to consume - "
+            "call it as a statement", subject));
+    }
+
+LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
                                                        size_t dropTrailingChildren, ResultUse use) {
         /*
         * postfixExpression

@@ -4349,6 +4349,17 @@ public:
                                                        size_t dropTrailingChildren = 0,
                                                        ResultUse use = ResultUse::Value);
 
+    // The body of ParsePostfixExpression. The public entry is a thin wrapper that funnels
+    // every exit through the void-result gate below.
+    LLVMBackend::NamedVariable ParsePostfixExpressionInner(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
+                                                       size_t dropTrailingChildren, ResultUse use);
+
+    // A call whose return type is 'void' produces no consumable value: the direct path hands
+    // back a void-typed CallInst that reaches the verifier as `void <badref>`. Reject at the
+    // call, where the position is still known, rather than at each consumer.
+    void DiagnoseVoidResultConsumed(antlr4::ParserRuleContext* ctx, const LLVMBackend::NamedVariable& nv,
+                                    ResultUse use, const std::string& subject);
+
     // Walk down single-child rule nodes to find a UnaryExpressionContext.
     // Returns nullptr if the path branches or never reaches a unaryExpression.
     CFlatParser::UnaryExpressionContext* tryGetUnaryExpression(antlr4::RuleContext* ctx);
