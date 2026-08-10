@@ -1645,3 +1645,45 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   binaries (`p1/parenthesized-consume-source-defeats-owning-sink-inference.md`). That is the
   over-approximation running the UNSOUND way - over-collecting a name is safe, MISSING one is a
   double free - so any future edit to these collectors must be checked in that direction too.
+- **The 2026-08-09 bare-`string` fixed-array element (fix/strelem)**: a `string` element of a
+  fixed array is neither a struct field, nor an alloca/global local, nor Part 6's single-index
+  container slot, so EVERY dedicated string arm skipped it and the plain aggregate store aliased
+  the `{ptr,len}` pair - source and element both carried the owned bit, both freed, rc 133 - while
+  an overwrite orphaned the old buffer (16 bytes under `leaks`). Both spellings were broken, and
+  both were fixed with the same shape: `ParseAssignmentExpression` grew a `string` twin of the
+  element-transfer arm (deep-copy an lvalue source, drop the old element, store, early return), and
+  `ConsumeOwningBraceElementSource` replaced its `elemTypeName == "string"` early return with a
+  deep-copy-only leg (the slot is CONSTRUCTED, so no drop-old) plus `UnregisterOwnedStringTemp`.
+- **Gate a `string` arm on the REPRESENTATION, not the spelling.** The first cut of that arm
+  compared `rightNV.TypeAndValue.TypeName == "string"` and silently missed the overwrite-leak
+  cell, because an `operator+` temp's `NamedVariable` carries NO `TypeName` at all. The landed gate
+  is `right->getType() == StructType::getTypeByName(context, "string")` on the source plus
+  `NamedVarIsString(namedVar)` on the DESTINATION - and both halves are load-bearing. The
+  destination half is what keeps a user struct that happens to share `%string`'s `{ptr,i32}` shape
+  out of the arm; the LLVM named-type identity is what keeps `using S = string;` IN it, since
+  `NamedVarIsString` already falls back to `BaseType`'s struct name. Reviewer-measured: a
+  same-shaped user struct in its own fixed array is untouched, and both alias spellings
+  (`S[2] dst; dst[0] = t;` and `S[2] dst = { t };`) went rc 133 -> rc 0 with distinct buffers.
+- **Copy BEFORE dtor for an element store; dtor-before-copy is only safe where a compile-time
+  self-assign guard exists.** The whole-local and struct-field oracles destruct the old value
+  first because `destination != rightNV.Storage` proves the two are distinct. A fixed-array
+  element has a RUNTIME index, so no such proof exists: `dst[i] = dst[i]` would deep-copy a buffer
+  the destructor just freed. The landed order is deep-copy, then dtor, then store. Note this is the
+  MIRROR of the non-string element arm two blocks above, which moves/zeroes the source first and
+  destructs after - same self-assign hazard, opposite resolution, because a move must not be
+  undone by the drop-old. Do not "harmonize" the two orders.
+- **The container mis-taint under an element access is SIDE-STEPPED, not fixed.** Both the head
+  `MarkVariableOwningString` (MainListener_Expressions.cpp:1361) and the tail
+  `SetVariableBorrowsOwnedString` refresh (~2656) key on `namedVar.CallerName` with an empty
+  `FieldName`, which for `dst[0] = ...` is the ARRAY `dst`, not the element. It is unreachable
+  today only because the new arm returns early; measured benign where it does fire (the array
+  teardown emits one dtor per element either way, and elem0's GEP folds to the array alloca).
+  Deliberately NOT filed as an issue - there is no spelling that observes it - but any future arm
+  that FALLS THROUGH to the tail re-arms it.
+- **Making an element genuinely own its buffer exposed the next domino: the element READ.**
+  `string q = dst[0];` shallow-copies the element's owned `{ptr,len}` into the new local, so both
+  free - rc 133 on master for a local-variable or concat-temp source, and rc 0 on master ONLY when
+  the element was an alias of something else. Closing the store aliasing turned that accidental
+  rc 0 into rc 133 for the field-source spelling. That is the fix being right, not a regression:
+  filed in review as [[fixed-array-string-element-read-aliases-the-element]]. When a fix converts
+  "the slot never really owned anything" into "the slot owns", re-probe every READ of that slot.

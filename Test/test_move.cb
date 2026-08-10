@@ -4212,6 +4212,22 @@ OaiBox[2] gAelsArr;
 
 int aelsIndex(int n) { return n; }
 
+// A by-value `string` parameter stored into an element: the CALLER still owns the buffer, so the
+// element must take an independent copy (returns 1 when the element reads back correctly).
+int aelsStrElemParam(string p)
+{
+    string[2] dst;
+    dst[0] = p;
+    return dst[0] == "abcd" ? 1 : 0;
+}
+
+// The brace-list twin of the helper above - the source's owner is another frame.
+int abriStrElemParam(string p)
+{
+    string[2] dst = { p };
+    return dst[0] == "abcd" ? 1 : 0;
+}
+
 int testOwningAssignIntoFixedArrayElement()
 {
     int passed = 0;
@@ -4422,8 +4438,7 @@ int testOwningAssignIntoFixedArrayElement()
     passed += Test("aels_copyable_freed_once_each", dtorCount, 3);
 
     // 14. An owning struct whose resource is a STRING (the axis a pointer dtor count cannot see).
-    // A bare `string` ELEMENT keeps its own owned-bit machinery and is deliberately not routed
-    // through this arm.
+    // A bare `string` ELEMENT carries a runtime owned bit, so it takes its own arm - legs 16-17.
     {
         string aelsSeed = "ab";
         OaiSBox a;
@@ -4444,6 +4459,45 @@ int testOwningAssignIntoFixedArrayElement()
         dst[0] = a;
         passed += Test("aels_pod_value", dst[0].x, 5);
         passed += Test("aels_pod_source_live", a.x, 5);
+    }
+
+    // 16. A BARE `string` element. It is neither a struct field nor a local, so both dedicated
+    // string arms skipped it: every store below aborted at teardown (rc 133) before the fix,
+    // and the overwrite legs additionally orphaned the old buffer (16 bytes under `leaks`).
+    {
+        string aelsT = "ab" + "cd";
+        string[2] dst;
+        dst[0] = aelsT;
+        passed += Test("aels_strelem_value", dst[0], "abcd");
+        passed += Test("aels_strelem_source_live", aelsT, "abcd");
+        passed += Test("aels_strelem_independent", dst[0].data() != aelsT.data(), true);
+        // Old-element states: a borrowed (literal) slot must not be freed, an owned one must be.
+        dst[1] = "lit";
+        dst[1] = aelsT;
+        passed += Test("aels_strelem_over_borrowed", dst[1], "abcd");
+        dst[0] = "ne" + "w";
+        passed += Test("aels_strelem_over_owned", dst[0], "new");
+        // Copy-FIRST order: destructing the old element before copying would free the source.
+        dst[0] = dst[0];
+        passed += Test("aels_strelem_self_assign", dst[0], "new");
+        dst[1] = dst[0];
+        passed += Test("aels_strelem_cross_index", dst[1], "new");
+        passed += Test("aels_strelem_cross_independent", dst[0].data() != dst[1].data(), true);
+    }
+
+    // 17. The same element store off sources whose owner is ANOTHER frame or another object:
+    // a by-value parameter (the caller still owns the buffer) and an owning string FIELD.
+    {
+        string aelsP = "ab" + "cd";
+        passed += Test("aels_strelem_param_value", aelsStrElemParam(aelsP), 1);
+        passed += Test("aels_strelem_param_caller_live", aelsP, "abcd");
+        OaiSBox src;
+        src.s = "ef" + "gh";
+        string[2] dst;
+        dst[0] = src.s;
+        passed += Test("aels_strelem_field_value", dst[0], "efgh");
+        passed += Test("aels_strelem_field_source_live", src.s, "efgh");
+        passed += Test("aels_strelem_field_independent", dst[0].data() != src.s.data(), true);
     }
 
     return passed;
@@ -4579,8 +4633,8 @@ int testOwningBraceInitFixedArray()
     }
     passed += Test("abri_copyable_freed_once_each", dtorCount, 4);
 
-    // 11. An owning struct whose resource is a STRING. A bare `string` ELEMENT keeps its own
-    // owned-bit machinery and is deliberately NOT routed through this arm.
+    // 11. An owning struct whose resource is a STRING. A bare `string` ELEMENT carries a runtime
+    // owned bit, so it takes its own deep-copy leg - legs 11b.
     {
         string abriSeed = "ab";
         OaiSBox a;
@@ -4597,6 +4651,36 @@ int testOwningBraceInitFixedArray()
         OaiPod[2] dst = { a };
         passed += Test("abri_pod_value", dst[0].x, 5);
         passed += Test("abri_pod_source_live", a.x, 5);
+    }
+
+    // 11b. A BARE `string` element of a positional brace list. Every lvalue source below aborted
+    // at teardown (rc 133) before the fix, and the owned-TEMP source additionally read back the
+    // wrong value - the temp was freed by the end-of-statement flush the slot never claimed it from.
+    {
+        string abriT = "ab" + "cd";
+        string abriU = "ef" + "gh";
+        string[2] dst = { abriT, abriU };
+        passed += Test("abri_strelem_value0", dst[0], "abcd");
+        passed += Test("abri_strelem_value1", dst[1], "efgh");
+        passed += Test("abri_strelem_source_live", abriT, "abcd");
+        passed += Test("abri_strelem_independent", dst[0].data() != abriT.data(), true);
+    }
+    {
+        string abriB = "cd";
+        string[2] dst = { "ab" + abriB };
+        passed += Test("abri_strelem_temp_value", dst[0], "abcd");
+        passed += Test("abri_strelem_temp_tail_empty", dst[1], "");
+    }
+    {
+        string abriP = "ab" + "cd";
+        passed += Test("abri_strelem_param_value", abriStrElemParam(abriP), 1);
+        passed += Test("abri_strelem_param_caller_live", abriP, "abcd");
+        OaiSBox src;
+        src.s = "ef" + "gh";
+        string[2] dst = { src.s };
+        passed += Test("abri_strelem_field_value", dst[0], "efgh");
+        passed += Test("abri_strelem_field_source_live", src.s, "efgh");
+        passed += Test("abri_strelem_field_independent", dst[0].data() != src.s.data(), true);
     }
 
     // 13. PARTIAL list: the trailing slot keeps its zero-fill (the value-init splat is untouched).
@@ -6656,10 +6740,10 @@ extern int main()
     total += 75;
 
     passed += testOwningAssignIntoFixedArrayElement();
-    total += 56;
+    total += 69;
 
     passed += testOwningBraceInitFixedArray();
-    total += 52;
+    total += 63;
 
     passed += testBraceInitConsumesParameter();
     total += 28;

@@ -2173,7 +2173,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
              * above skipped it and the plain store below aliased the source (double free) and
              * orphaned the old element (leak). The element IS live - a fixed array default- or
              * zero-constructs every slot - so drop-old applies here, unlike Part 6's container slot.
-             * `string` elements keep their own owned-bit machinery and are excluded.
+             * `string` elements carry a runtime owned bit, so they take the dedicated arm below.
              */
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && destIsFixedArrayElem
@@ -2214,6 +2214,36 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 compiler->builder->CreateStore(toStore, destination);
                 return finishStore(toStore);
+            }
+
+            /*
+             * The `string` twin of the element transfer above. A bare `string` element is neither
+             * a struct field nor a local/global, so both dedicated string arms skipped it and the
+             * plain store bit-copied the {ptr,len,owned} aggregate: the source kept its owned bit
+             * and the element got a copy of it, so both freed the buffer (double free), and the
+             * old element was orphaned (leak). Deep-copy an LVALUE source so the element owns an
+             * independent buffer exactly as the field arm does, then drop the old element (the
+             * string dtor is null/owned-bit guarded, so a never-assigned or borrowed slot is a
+             * safe no-op). ORDER is copy-FIRST: no compile-time proof rules out `dst[i] = dst[i]`
+             * for a runtime index, and destructing first would deep-copy a freed buffer.
+             */
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsFixedArrayElem
+                && NamedVarIsString(namedVar)
+                && !namedVar.TypeAndValue.Pointer
+                // By REPRESENTATION, not by spelling: an `operator+` temp's NamedVariable carries
+                // no TypeName, and it is exactly the source whose old element leaked.
+                && right->getType() == llvm::StructType::getTypeByName(*compiler->context, "string"))
+            {
+                // An lvalue source keeps its own buffer, so the element needs an independent one.
+                // A `move` or an owned temp / call result (no Storage) already hands us the buffer.
+                if (rightNV.Storage != nullptr && !rightNV.TypeAndValue.IsMove)
+                    right = compiler->EmitOwnedStringDeepCopy(right);
+                if (auto* dtor = compiler->GetOrCreateFullDestructor("string"))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(right, destination);
+                TransferMoveStringOwnershipOnStore(rightNV, ctx);
+                return finishStore(right);
             }
 
             // Owning-value MOVE through a pointer-deref destination (`*pc = *pa`): a shallow store
@@ -2271,7 +2301,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // Container element stores are excluded (would double-free if touched here). A FIXED
             // array element joins the same set: an lvalue source already returned from the element
             // transfer arm above, so only a temp / call-result RHS reaches here, and its old element
-            // would otherwise be orphaned. `string` elements keep their own owned-bit machinery.
+            // would otherwise be orphaned. A `string` element dropped its old value in its own
+            // arm above and returned, so it must not be dropped a second time here.
             bool destIsLocalOwningVar = namedVar.FieldName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination));
             bool destIsDropOldElem = destIsFixedArrayElem
@@ -6609,8 +6640,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
  * COPIES (source stays live), a non-copyable one MOVES and the source lvalue is zeroed, with
  * MarkVariableMoved for a named slot. NO drop-old - the slot was zero-filled by the caller and is
  * being constructed, not overwritten; that is the container-slot decision, not the assignment one.
- * `string` elements keep their own runtime owned-bit machinery and are excluded, exactly as in the
- * assignment arm.
+ * `string` elements carry a runtime owned bit instead of a copy()/move classification, so they get
+ * their own deep-copy leg, exactly as in the assignment arm.
  */
 void MainListener::ConsumeOwningBraceElementSource(
         const LLVMBackend::NamedVariable& nv,
@@ -6622,7 +6653,18 @@ void MainListener::ConsumeOwningBraceElementSource(
         auto* compiler = Compiler(ctx);
         if (val == nullptr || !val->getType()->isStructTy()) return;
         if (elemTV.Pointer || elemTV.ElemPointer || elemTV.IsArrayView) return;
-        if (elemTypeName == "string") return;
+        if (elemTypeName == "string")
+        {
+            // The slot is CONSTRUCTED (the caller zero-filled the array), so no drop-old: deep-copy
+            // an LVALUE source so the element owns an independent buffer, and adopt a `move` /
+            // owned temp as-is (dropping it from the temp-flush list, or the flush frees the
+            // element's buffer at end of statement). Mirrors the struct-field brace-init arm.
+            if (nv.Storage != nullptr && !nv.TypeAndValue.IsMove)
+                val = compiler->EmitOwnedStringDeepCopy(val);
+            compiler->UnregisterOwnedStringTemp(val);
+            TransferMoveStringOwnershipOnStore(nv, ctx);
+            return;
+        }
         if (compiler->IsInterfaceType(elemTypeName)) return;
 
         // A source with STORAGE is an lvalue: a named slot (alloca/global) or an INDIRECT one
