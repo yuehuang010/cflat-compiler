@@ -3349,6 +3349,18 @@ alias UniqueBox handBorrow(BoxWrap* w) { UniqueBox k = w->borrow(); return k; }
 // A real `move` sink: the callee owns the value and frees it on return.
 void sinkUniqueBox(move UniqueBox b) { }
 
+// A `move Resource*` sink for the re-bound-borrow legs: it adopts the pointee and frees it.
+void sinkBoxItem(move Resource* p) { }
+
+// A by-value owning-struct FIELD of a temp (`makeBoxHolder(2).b`) - the fourth spelling that
+// re-binds a borrow local, through the movable-temp-field arm rather than the generic drop-old.
+struct BoxHolder { UniqueBox b; };
+BoxHolder makeBoxHolder(int id) { BoxHolder h; h.b = makeUniqueBox(id); return h; }
+
+// Keeps a conditional rebind genuinely conditional at run time (the flag is set at run time).
+bool aliasRebindFlag = false;
+bool aliasRebindTaken() { return aliasRebindFlag; }
+
 /*
  * A '?:' joining an OWNING-VALUE STRUCT (a `unique` field, so a full field-deleting destructor is
  * synthesized) runs the same strict all-arms-owning rule the interface fat pointer does. A MIXED
@@ -3566,6 +3578,190 @@ int testOwningStructTernaryJoin()
         passed += Test("alias_guard_owning_move_freed_once", dtorCount, 1);
     }
     passed += Test("alias_guard_owning_move_total", dtorCount, 1);
+
+    /*
+     * RE-BINDING the borrow local itself (`Box k = w.get(); k = makeBox(2);`). The owning-local
+     * reassignment path drop-olds unconditionally, and the old destination here is a BORROW of the
+     * wrapper's value - so the wrapper's object was destroyed under it (read back as garbage, then
+     * a second free at teardown: abort). The drop-old is now skipped, and the borrow RETIRES so the
+     * local really owns what it was just given. Every leg asserts the value, the resource inside
+     * the scope, the resource after it, and that the WRAPPER's object survived intact.
+     */
+    // The filed spelling: a fresh owner from a call.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            k = makeUniqueBox(2);
+            passed += Test("alias_rebind_call_value", k.item->id, 2);
+            passed += Test("alias_rebind_call_no_drop_old", dtorCount, 0);
+            passed += Test("alias_rebind_call_owner_alive", w.b.item->id, 5);
+        }
+        // The re-bound local OWNS its new value now, so its scope-exit destructor must run.
+        passed += Test("alias_rebind_call_new_freed_at_exit", dtorCount, 1);
+        passed += Test("alias_rebind_call_owner_still_alive", w.b.item->id, 5);
+    }
+    passed += Test("alias_rebind_call_total", dtorCount, 2);
+
+    // Same rebind from an owning LOCAL (the consume arm) and from `move` of one.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            UniqueBox s = makeUniqueBox(3);
+            k = s;
+            passed += Test("alias_rebind_local_value", k.item->id, 3);
+            passed += Test("alias_rebind_local_no_drop_old", dtorCount, 0);
+            passed += Test("alias_rebind_local_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_rebind_local_new_freed_at_exit", dtorCount, 1);
+    }
+    passed += Test("alias_rebind_local_total", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            UniqueBox s = makeUniqueBox(4);
+            k = move s;
+            passed += Test("alias_rebind_move_value", k.item->id, 4);
+            passed += Test("alias_rebind_move_no_drop_old", dtorCount, 0);
+            passed += Test("alias_rebind_move_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_rebind_move_new_freed_at_exit", dtorCount, 1);
+    }
+    passed += Test("alias_rebind_move_total", dtorCount, 2);
+
+    // The movable-temp-FIELD arm (`k = makeBoxHolder(2).b`) is its own store path with its own
+    // drop-old, so it needs its own leg or one spelling re-opens the hole.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            k = makeBoxHolder(6).b;
+            passed += Test("alias_rebind_tempfield_value", k.item->id, 6);
+            passed += Test("alias_rebind_tempfield_no_drop_old", dtorCount, 0);
+            passed += Test("alias_rebind_tempfield_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_rebind_tempfield_new_freed_at_exit", dtorCount, 1);
+    }
+    passed += Test("alias_rebind_tempfield_total", dtorCount, 2);
+
+    // Re-binding TWICE: the FIRST rebind retires the borrow, so the SECOND is an ordinary owning
+    // reassignment and its drop-old must come back (otherwise the middle value leaks).
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            k = makeUniqueBox(2);
+            k = makeUniqueBox(3);
+            passed += Test("alias_rebind_twice_value", k.item->id, 3);
+            passed += Test("alias_rebind_twice_middle_dropped", dtorCount, 1);
+            passed += Test("alias_rebind_twice_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_rebind_twice_last_freed_at_exit", dtorCount, 2);
+    }
+    passed += Test("alias_rebind_twice_total", dtorCount, 3);
+
+    /*
+     * A CONDITIONAL rebind is deliberately NOT retired: the store does not run on every path to
+     * scope exit, so retiring it would destroy the wrapper's value on the path that did not rebind.
+     * The drop-old is still suppressed, so the not-taken path stays exactly correct and the taken
+     * path LEAKS the new value instead of double-freeing it - the safe direction of the trade.
+     */
+    dtorCount = 0;
+    aliasRebindFlag = false;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            if (aliasRebindTaken()) { k = makeUniqueBox(2); }
+            passed += Test("alias_rebind_cond_untaken_value", k.item->id, 5);
+            passed += Test("alias_rebind_cond_untaken_no_drop_old", dtorCount, 0);
+        }
+        passed += Test("alias_rebind_cond_untaken_no_adoption", dtorCount, 0);
+        passed += Test("alias_rebind_cond_untaken_owner_alive", w.b.item->id, 5);
+    }
+    passed += Test("alias_rebind_cond_untaken_owner_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    aliasRebindFlag = true;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            if (aliasRebindTaken()) { k = makeUniqueBox(2); }
+            passed += Test("alias_rebind_cond_taken_value", k.item->id, 2);
+            passed += Test("alias_rebind_cond_taken_no_drop_old", dtorCount, 0);
+        }
+        // The new value leaks (accepted trade); the WRAPPER's object is still freed exactly once.
+        passed += Test("alias_rebind_cond_taken_no_adoption", dtorCount, 0);
+        passed += Test("alias_rebind_cond_taken_owner_alive", w.b.item->id, 5);
+    }
+    passed += Test("alias_rebind_cond_taken_owner_freed_once", dtorCount, 1);
+    aliasRebindFlag = false;
+
+    // INTERACTION with the `move`-of-a-borrow's-field reject: after a rebind the local OWNS, so
+    // `move k.item` is legal again and transfers exactly once. This is the accept side of
+    // Test/errors/err_move.cb's `aliasBorrowFieldMove` leg.
+    dtorCount = 0;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = w.borrow();
+            k = makeUniqueBox(7);
+            sinkBoxItem(move k.item);
+            passed += Test("alias_rebind_then_move_field_sunk_once", dtorCount, 1);
+            passed += Test("alias_rebind_then_move_field_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_rebind_then_move_field_no_second_free", dtorCount, 1);
+    }
+    passed += Test("alias_rebind_then_move_field_total", dtorCount, 2);
+
+    // ACCEPT SET for the `move`-of-a-borrow's-field reject: the same `move` off a local that OWNS
+    // its value transfers, exactly as before.
+    dtorCount = 0;
+    {
+        UniqueBox owned = makeUniqueBox(9);
+        sinkBoxItem(move owned.item);
+        passed += Test("alias_field_move_owning_local_sunk_once", dtorCount, 1);
+    }
+    passed += Test("alias_field_move_owning_local_total", dtorCount, 1);
+
+    /*
+     * The MIXED '?:' join is the SECOND declaration site that marks a local a borrow, so the rebind
+     * fix has to reach it too. On the BORROW arm master ran the drop-old over the wrapper's value
+     * (garbage read, then abort at teardown); the drop-old is now skipped and the borrow retires in
+     * the declaration block, so the local frees exactly the value it was just handed.
+     */
+    dtorCount = 0;
+    aliasRebindFlag = false;
+    {
+        BoxWrap w;
+        w.b = makeUniqueBox(5);
+        {
+            UniqueBox k = aliasRebindTaken() ? makeUniqueBox(1) : w.borrow();
+            k = makeUniqueBox(9);
+            passed += Test("alias_join_rebind_value", k.item->id, 9);
+            passed += Test("alias_join_rebind_no_drop_old", dtorCount, 0);
+            passed += Test("alias_join_rebind_owner_alive", w.b.item->id, 5);
+        }
+        passed += Test("alias_join_rebind_new_freed_at_exit", dtorCount, 1);
+    }
+    passed += Test("alias_join_rebind_total", dtorCount, 2);
 
     return passed;
 }
@@ -8907,7 +9103,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 58;
+    total += 105;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

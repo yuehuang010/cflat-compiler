@@ -4348,6 +4348,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             nv.IsAliasBorrow = true;
                             nv.IsOwningString = false;
                             nv.IsOwning = false;
+                            RecordAliasBorrowDeclBlock(compiler, nv);
                         }
 
                         /*
@@ -4368,6 +4369,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             nv.IsAliasBorrow = true;
                             nv.IsOwningString = false;
                             nv.IsOwning = false;
+                            RecordAliasBorrowDeclBlock(compiler, nv);
                         }
 
                         // Apply field initializer overrides after the default value is stored.
@@ -5306,6 +5308,49 @@ bool MainListener::BorrowAdoptionIsUnsound(LLVMBackend* compiler,
         return nv.Storage == nullptr
             || llvm::isa<llvm::AllocaInst>(nv.Storage)
             || llvm::isa<llvm::GlobalVariable>(nv.Storage);
+    }
+
+void MainListener::RecordAliasBorrowDeclBlock(LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& nv) {
+        auto* here = compiler->builder != nullptr ? compiler->builder->GetInsertBlock() : nullptr;
+        nv.AliasBorrowDeclBlock = here;
+        nv.AliasBorrowDeclFunction = here != nullptr ? here->getParent() : nullptr;
+    }
+
+bool MainListener::IsAliasBorrowLocalBinding(const LLVMBackend::NamedVariable& nv) {
+        if (!nv.IsAliasBorrow) return false;
+        // OWN-SLOT only. A by-reference lambda capture is IsAliasBorrow too, but its Storage IS the
+        // outer owner's address, so writing/consuming through it reaches the one real owner.
+        return llvm::isa_and_nonnull<llvm::AllocaInst>(nv.Storage)
+            || llvm::isa_and_nonnull<llvm::GlobalVariable>(nv.Storage);
+    }
+
+bool MainListener::DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Value* destination) {
+        if (compiler == nullptr || destination == nullptr) return false;
+        if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
+            return false;
+        const auto* bind = compiler->FindVariableByStorage(destination);
+        return bind != nullptr && IsAliasBorrowLocalBinding(*bind);
+    }
+
+void MainListener::RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination) {
+        if (compiler == nullptr || destination == nullptr || compiler->builder == nullptr) return;
+        auto* here = compiler->builder->GetInsertBlock();
+        if (here == nullptr) return;
+        for (auto& frame : compiler->stackNamedVariable)
+            for (auto& [varName, nv] : frame.namedVariable)
+            {
+                if (nv.Storage != destination || !IsAliasBorrowLocalBinding(nv)) continue;
+                // Retire ONLY when this store sits in the block the binding was declared in: every
+                // path that reaches scope exit then ran it, so the local really owns what it holds.
+                if (nv.AliasBorrowDeclBlock != here
+                    || nv.AliasBorrowDeclFunction != here->getParent())
+                    return;
+                nv.IsAliasBorrow = false;
+                nv.AliasBorrowDeclBlock = nullptr;
+                nv.AliasBorrowDeclFunction = nullptr;
+                return;
+            }
     }
 
 bool MainListener::RejectAliasBorrowAdoption(

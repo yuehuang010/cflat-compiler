@@ -3153,6 +3153,28 @@ public:
                                         const LLVMBackend::NamedVariable& nv);
 
     /*
+     * The DESTINATION-side twin of the questions above: this binding is an `alias`/mixed-join borrow
+     * living in its OWN alloca/global slot. The own-slot clause is the same by-reference
+     * lambda-capture carve-out BorrowAdoptionIsUnsound uses - such a capture's Storage IS the outer
+     * owner's address, so a store through it correctly drops the outer's old value.
+     */
+    static bool IsAliasBorrowLocalBinding(const LLVMBackend::NamedVariable& nv);
+    static bool DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Value* destination);
+
+    // Records where a borrow binding was created, so a rebind can prove it runs on every path.
+    static void RecordAliasBorrowDeclBlock(LLVMBackend* compiler, LLVMBackend::NamedVariable& nv);
+
+    /*
+     * Re-binding a borrow local (`Box k = w.get(); k = makeBox(2);`) hands it a value it now really
+     * owns, so the borrow classification must retire or the new value's scope-exit destructor stays
+     * suppressed. Retired only when the store is emitted in the binding's DECLARATION block, where
+     * every path to scope exit provably ran it; anywhere else (a conditional rebind) the borrow
+     * stands and the new value LEAKS, which is the safe direction - the alternative destroys a
+     * value the real owner still frees on the path that did not rebind.
+     */
+    static void RetireAliasBorrowOnRebind(LLVMBackend* compiler, llvm::Value* destination);
+
+    /*
      * Same hazard as RejectAliasStoreIntoField with an owning LOCAL/GLOBAL destination (`other = k`)
      * instead of a field: the destination's always-run destructor would free storage the real owner
      * still holds. The caller gates that the destination destructs (an owning value type).

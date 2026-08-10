@@ -1073,6 +1073,10 @@ public:
         // CONSUMING param (sink/`move`/unique) or moving it out would launder ownership and double-free.
         bool IsBorrowedOwningValue = false;
         bool IsAliasBorrow = false;      // compile-time: local bound from an `alias` return - shallow-aliases storage it does not own, so its scope-exit destructor is suppressed
+        // The block/function the borrow BINDING was created in. A rebind emitted in that same block
+        // runs on every path that reaches scope exit, which is the only case the borrow may retire.
+        llvm::BasicBlock* AliasBorrowDeclBlock = nullptr;
+        llvm::Function* AliasBorrowDeclFunction = nullptr;
         // compile-time: this local is a lambda body's unpacked BY-VALUE capture of an owning value
         // type. The closure ENV owns the buffer; this local only borrows it, so handing it to a
         // caller (a `return`) must hand over an independent copy, not the env's storage.
@@ -1114,6 +1118,9 @@ public:
         // current function's borrowed (non-`move`) by-value struct parameter. Re-asking downstream by
         // NAME cannot distinguish the parameter from an inner local that shadows it.
         bool RootIsBorrowedByValueParam = false;
+        // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
+        // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
+        bool RootIsAliasBorrowLocal = false;
         // Field reached THROUGH an interface value (data ptr + the vtable's byte-offset slot). The
         // address is a byte GEP, not a 2-index struct GEP, so field-store rules must be told.
         bool IsInterfaceField = false;

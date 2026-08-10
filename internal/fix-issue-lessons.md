@@ -2110,3 +2110,54 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `Test/errors/err_coalesce_fallback_arm_escape.cb` and the value legs were rewritten around the
   shapes that stay legal. A new tripwire pinning `dtors == 0` was planted for the `?.` site.
   `Test/test_move.cb` under `leaks --atExit` went 19 leaks / 368 bytes -> 16 / 320.
+- **A re-bound alias-borrow LOCAL: suppress the drop-old, retire the classification only where the
+  store PROVABLY runs (RATIFIED, 2026-08-10, `fix/aliasres`)**: `Box k = w.get(); k = makeBox(2);`
+  destroyed the wrapper's object under `k` (the owning-local reassignment path drop-olds
+  unconditionally). Two halves, both load-bearing: `DestinationIsAliasBorrowLocal` skips the drop-old
+  at all THREE local-destination arms (the movable-temp-field arm, the owning-value MOVE arm, and the
+  generic drop-old - a one-arm fix leaves `k = makeHolder(2).b` and `k = s` still aborting), and
+  `RetireAliasBorrowOnRebind` clears `IsAliasBorrow` so the local's scope-exit destructor comes back
+  for the value it now owns. **Retiring UNCONDITIONALLY was measured wrong and must not be retried**:
+  under `if (c) { k = makeBox(2); }` the not-taken path is CORRECT on master, and an unconditional
+  retire destroys the wrapper's value on it - trading one double free for another. The retirement is
+  therefore gated on the store being emitted in the binding's DECLARATION block (recorded as
+  `AliasBorrowDeclBlock`, the same same-block latch `ExplicitlyMovedNull` uses), where every path to
+  scope exit provably ran it. Everywhere else the borrow stands and the new value LEAKS - the same
+  accepted trade as `rebound-lambda-capture-leaks-its-new-value`, and worth +1 leak / +16 bytes on
+  `Test/test_move.cb` under `leaks --atExit` (16/320 -> 17/336), all of it the one deliberate
+  `alias_rebind_cond_taken` leg. Re-binding twice is NOT a special case: the first rebind retires, so
+  the second is an ordinary owning reassignment whose drop-old must come back (`alias_rebind_twice_*`).
+  Re-binding a borrow to ANOTHER borrow never reaches the retirement at all - `RejectAliasBorrowAdoption`
+  already rejects `k = w2.get()` - so clearing the flag cannot wrongly make a local own a second borrow.
+  **Both DECLARATION sites that mark a local `IsAliasBorrow` are in scope, not just the `alias` return**:
+  the MIXED `?:` join (`Box k = c ? makeBox(1) : w.get();`) is the second, and it went from abort to
+  correct on the borrow arm (`alias_join_rebind_*` in `Test/test_move.cb`). On its OWNING arm the trade
+  flips which value leaks - master freed the old value at the store and leaked the new one, the fix
+  leaks the old and frees the new - so the file's leak count is unchanged either way. The same-block
+  latch is a conservative proxy and behaves as such under every control-flow shape measured. The
+  discriminator is whether the store shares the DECLARATION's block, not whether a loop is present:
+  a bare nested block, an `if const`, and a loop whose DECLARATION is also in the body
+  (`for (...) { Box k = w.get(); k = makeBox(i); }`) all retire; a loop/`while`/`switch` body whose
+  declaration sits OUTSIDE it, a ternary RHS, and anything after an `if` do not, and leak. Every one
+  of those keeps the owner intact and never double-frees - measured. Verified the
+  measurement methodology too - do NOT set `MallocStackLogging=0` when running `leaks --atExit`, it
+  perturbs the count by one allocation (reads 18/352 where the real figure is 17/336).
+- **`move` of a FIELD of a borrow local, and the ONE carve-out that makes it safe (RATIFIED,
+  2026-08-10)**: `psink(move k.item)` nulled only the borrow's shallow copy, leaving the owner's field
+  live. Rejected by mirroring the borrowed-by-value-parameter twin exactly - a `RootIsAliasBorrowLocal`
+  fact RECORDED at the field-access site against the RESOLVED root binding (so a nested `move k.b.item`
+  reaches it and a shadowing local cannot defeat it), never a downstream lookup by name. The carve-out
+  is the own-slot clause `BorrowAdoptionIsUnsound` already uses: a by-reference lambda capture is
+  `IsAliasBorrow` too, but its `Storage` IS the outer owner's address, so `move cap.field` really does
+  null the one owner's field. **Mutation-proven**: with the alloca/global clause removed,
+  `Test/test_function_ptr.cb`'s `refcap_field_move_*` legs become a hard FALSE REJECTION. The two fixes
+  compose in the right direction - after a rebind the local owns, so `move k.item` is legal again
+  (`alias_rebind_then_move_field_*`), which is what keeps the new diagnostic's wording true at its site.
+  The reject reaches the MIXED `?:` join local as well (`aliasJoinFieldMove` in `Test/errors/err_move.cb`),
+  where the borrow arm was a measured abort and the owning arm is the price of not knowing which arm ran -
+  the whole-value `move k` and `other = k` spellings already rejected a mixed-join local with the same
+  "'alias' value" wording on master, so the field spelling is completing a shipped rejection, not opening
+  a new one. **Only the `move` KEYWORD spelling is closed.** The implicit consume of the same field -
+  `other = kw.b`, or `sinkBox(kw.b)` into a `move` parameter - still double-frees on both binaries; it is
+  filed as `p2/implicit-consume-of-a-field-of-a-borrow-local-double-frees`, and the reason it escapes is
+  that the two implicit-consume sites ask `RootIsBorrowedByValueParam` only.

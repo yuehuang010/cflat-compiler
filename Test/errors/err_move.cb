@@ -359,6 +359,60 @@ expect_error("cannot 'move' the 'alias' value 'k'") {
     }
 }
 
+/*
+ * `move` of a FIELD of a borrow local. The whole-value `move k` above is rejected, but the field
+ * spelling walked straight past it: `k` shallow-copies the wrapper's struct, so nulling `k.item`
+ * leaves the wrapper's own `item` live and both the sink and the wrapper free the pointee (abort).
+ * Answered against the RESOLVED root binding at the field-access site, so a NESTED path reaches it
+ * too, and a by-reference lambda capture is carved out (its storage IS the owner's - see
+ * test_function_ptr.cb's `refcap_field_move_*` legs). The ACCEPT side - the same `move` off a local
+ * that OWNS its value, and off a borrow local that was RE-BOUND - is in Test/test_move.cb.
+ */
+void aliasItemSink(move UniqueThing* p) { }
+
+expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'k'") {
+    void aliasBorrowFieldMove(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        aliasItemSink(move k.item);
+    }
+}
+
+// The same field consumed by a DECLARATION rather than a call argument - a second store path.
+expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'k'") {
+    void aliasBorrowFieldMoveIntoLocal(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        unique UniqueThing* p = move k.item;
+    }
+}
+
+// A NESTED field path: the root recorded at each hop is still the borrow local, not the field.
+struct AliasOuter
+{
+    AliasWrap inner;
+    alias AliasWrap peek() { return this.inner; }
+};
+
+expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'ko'") {
+    void aliasBorrowNestedFieldMove(AliasOuter* o)
+    {
+        AliasWrap ko = o->peek();
+        aliasItemSink(move ko.b.item);
+    }
+}
+
+// The MIXED '?:' join is the SECOND declaration site that marks a local a borrow, and which arm ran
+// is not knowable, so the field spelling is rejected there too - the whole-value `move kj` already
+// was. The borrow arm double-freed on master; the owning arm is the price of not knowing.
+expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'kj'") {
+    void aliasJoinFieldMove(AliasWrap* w, bool c)
+    {
+        JoinBox kj = c ? makeJoinBox() : w->borrow();
+        aliasItemSink(move kj.item);
+    }
+}
+
 // The CHAINED borrow is the shape the accepted declaration produces, so it must be rejected at the
 // same two sites - otherwise one extra `=` launders the borrow right back out.
 expect_error("cannot store an 'alias' value 'k2' into an owning variable") {

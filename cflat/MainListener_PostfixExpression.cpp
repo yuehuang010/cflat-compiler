@@ -923,6 +923,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.RootIsBorrowedByValueParam = structVar.FieldPathRoot.empty()
                                         ? IsBorrowedByValueParamBinding(Compiler(ctx), structVar)
                                         : structVar.RootIsBorrowedByValueParam;
+                                    // Same shape for an `alias`-BORROW local root, settled here for
+                                    // the same reason (a downstream lookup cannot see a shadow).
+                                    namedVar.RootIsAliasBorrowLocal = structVar.FieldPathRoot.empty()
+                                        ? IsAliasBorrowLocalBinding(structVar)
+                                        : structVar.RootIsAliasBorrowLocal;
                                     // A cast off this read (`(Res*)b.p`, `free((void*)b.p)`) severs
                                     // Storage and rewrites the type; carry the unique provenance so
                                     // the borrow rules still fire (see IsUniqueFieldRead / Trap B).

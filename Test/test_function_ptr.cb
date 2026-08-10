@@ -770,6 +770,41 @@ bool testCaptureStructRefBorrows()
     }
     result &= Test("owning borrow freed once", refCapOwningDtors, 1);
 
+    /*
+     * The by-reference capture is the CARVE-OUT of the alias-borrow guards: it is marked
+     * IsAliasBorrow like an `alias`-return local, but its storage IS the outer owner's address, so
+     * consuming a field through it really does move out of the one owner and re-binding it really
+     * does drop the outer's old value. Both spellings must stay ACCEPTED (the `alias`-return twins
+     * are rejected / drop-old-suppressed - see Test/errors/err_move.cb's `aliasBorrowFieldMove`).
+     */
+    // `move` of a captured struct's field: the pointee is freed exactly once, by the sink.
+    refCapOwningDtors = 0;
+    {
+        RefCapOwning h = default;
+        h.slot = new RefCapNode();
+        h.slot->v = 4;
+        Lambda<int()> f = () => { RefCapNode* taken = move h.slot; int v = taken->v; delete taken; return v; };
+        result &= Test("refcap_field_move_value", f(), 4);
+        result &= Test("refcap_field_move_outer_nulled", h.slot == nullptr, true);
+    }
+    // ~RefCapOwning ran once and found a nulled slot: no second free of the moved-out node.
+    result &= Test("refcap_field_move_owner_dtor_once", refCapOwningDtors, 1);
+
+    // Re-binding the captured struct writes THROUGH to the outer, so its drop-old must still run.
+    refCapOwningDtors = 0;
+    {
+        RefCapOwning h = default;
+        h.slot = new RefCapNode();
+        h.slot->v = 5;
+        Lambda<int()> g = () => { RefCapOwning n = default; n.slot = new RefCapNode(); n.slot->v = 6; h = n; return h.slot->v; };
+        result &= Test("refcap_rebind_value", g(), 6);
+        // 2 = the outer's OLD value dropped through the capture + the body's moved-from local.
+        // Suppressing the drop-old here (as the `alias`-return twin does) would read 1 and leak.
+        result &= Test("refcap_rebind_old_dropped", refCapOwningDtors, 2);
+        result &= Test("refcap_rebind_outer_sees_new", h.slot->v, 6);
+    }
+    result &= Test("refcap_rebind_total_dtors", refCapOwningDtors, 3);
+
     return result;
 }
 

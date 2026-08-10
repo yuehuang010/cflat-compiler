@@ -1860,6 +1860,14 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && RejectAliasBorrowAdoption(rightNV, right, "an owning variable", ctx))
                 return finishStore(right);
 
+            // The DESTINATION is a borrow local (`Box k = w.get(); k = makeBox(2);`). Its old value
+            // is storage the real owner still frees, so every drop-old below must be SKIPPED here -
+            // running it double-frees the owner's object. The store itself is unchanged, and the
+            // borrow retires afterwards where that is provable (see RetireAliasBorrowOnRebind).
+            const bool destIsAliasBorrowLocal = operatorText == "="
+                && !destIsStructField && namedVar.FieldName.empty()
+                && DestinationIsAliasBorrowLocal(compiler, destination);
+
             // Copying a named owning value into a struct field by value. THE FLIP copies a copyable
             // owner in place (proceeds); a non-copyable owner is rejected. A self-assign is a no-op
             // (no copy - copying would leak the old buffer the self-store never frees). `rejectCopied`
@@ -2041,9 +2049,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !rightNV.TypeAndValue.Pointer
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
-                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                if (!destIsAliasBorrowLocal)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 compiler->builder->CreateStore(right, destination);
+                RetireAliasBorrowOnRebind(compiler, destination);
                 auto* srcGep = compiler->builder->CreateStructGEP(
                     rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca, rightNV.MoveTempFieldIndex, "movedfld");
                 compiler->builder->CreateStore(
@@ -2173,9 +2183,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);
-                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                if (!destIsAliasBorrowLocal)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 compiler->builder->CreateStore(toStore, destination);
+                RetireAliasBorrowOnRebind(compiler, destination);
                 if (kind == AssignSourceKind::Move)
                 {
                     compiler->builder->CreateStore(
@@ -2350,8 +2362,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 // NOTE: closes the reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
-                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
-                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                if (!destIsAliasBorrowLocal)
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                RetireAliasBorrowOnRebind(compiler, destination);
             }
 
             // `unique T* field` reassignment: free the old pointee before overwriting it, or it
@@ -8348,6 +8362,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.FieldName        = src.FieldName;
         dst.FieldPathRoot    = src.FieldPathRoot;
         dst.RootIsBorrowedByValueParam = src.RootIsBorrowedByValueParam;
+        dst.RootIsAliasBorrowLocal = src.RootIsAliasBorrowLocal;
         dst.IsInterfaceField = src.IsInterfaceField;
         // Element provenance: a view slot is LIVE storage, a container's internal slot is not.
         dst.IsElementAccess = src.IsElementAccess;
@@ -8453,6 +8468,28 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
                 "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
                 "field without moving it (a read borrows, a move consumes).",
+                argNV.OwningStructName, argNV.FieldName, parent, parent));
+            return {};
+        }
+
+        /*
+         * Same hazard with an `alias`-BORROW LOCAL root (`Box k = w.get(); move k.item;`): the
+         * borrow shallow-copies the owner's struct, so nulling this copy's field leaves the real
+         * owner's field live and both the receiver and the owner free the pointee. Uses the answer
+         * RECORDED at the field-access site, which also carries a NESTED path (`move k.b.item`).
+         * A by-reference lambda capture is carved out at the recording (its Storage IS the outer
+         * owner's address, so the move really does null the one owner's field), and a borrow that
+         * was RE-BOUND is no longer a borrow, so `move k.item` after `k = makeBox(2)` stays legal.
+         */
+        if (!argNV.OwningStructName.empty() && !argNV.FieldName.empty()
+            && argNV.RootIsAliasBorrowLocal)
+        {
+            const std::string parent = FieldPathRootName(argNV);
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' field '{}.{}' out of 'alias' borrow '{}' - '{}' shallow-copies storage "
+                "it does not own, so the move nulls only this copy and the real owner's field still "
+                "frees the pointee (double-free). Read the field without moving it (a read borrows, "
+                "a move consumes), or use '.copy()' for an independent owned copy.",
                 argNV.OwningStructName, argNV.FieldName, parent, parent));
             return {};
         }
