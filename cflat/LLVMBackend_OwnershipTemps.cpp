@@ -1324,7 +1324,50 @@ bool LLVMBackend::MemoryOutlivesCall(const llvm::Value* ptr, std::string& destKi
         if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(obj))
             return MemoryOutlivesCall(ld->getPointerOperand(), destKind, depth + 1)
                 || SlotHoldsOutlivingPointer(ld->getPointerOperand(), destKind, depth + 1);
+        // getUnderlyingObject stops at a join, so ask the arms: `c ? &g : &g2` is a destination
+        // this walk otherwise reads as neither global nor argument, and accepts.
+        if (llvm::isa<llvm::SelectInst>(obj) || llvm::isa<llvm::PHINode>(obj))
+            return JoinAddressOutlivesCall(llvm::cast<llvm::Instruction>(obj), destKind, depth);
         return false;   // alloca, fresh allocation, unrecognized: no proof, so accept
+    }
+
+/*
+ * A join of addresses proves the store outlives the call only when EVERY arm proves it. One arm
+ * naming a local is a path on which nothing escapes, so `c ? &loc : &g` stays accepted - that
+ * accept is what forbids the ANY-arm rule the sibling join walks use on values.
+ */
+bool LLVMBackend::JoinAddressOutlivesCall(const llvm::Instruction* join, std::string& destKind,
+                                          int depth) const
+{
+        if (join == nullptr || depth > kMaxRetainDepth) return false;
+        // Re-entering an in-progress join is a loop back-edge, not an arm naming local memory:
+        // answer it as "no counter-example" so the other arms still decide.
+        if (!joinAddressInProgress_.insert(join).second) return true;
+        llvm::SmallVector<const llvm::Value*, 4> arms;
+        if (const auto* sel = llvm::dyn_cast<llvm::SelectInst>(join))
+        {
+            arms.push_back(sel->getTrueValue());
+            arms.push_back(sel->getFalseValue());
+        }
+        else if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(join))
+            for (const llvm::Value* incoming : phi->incoming_values()) arms.push_back(incoming);
+        bool proven = !arms.empty();
+        bool sameKind = true;
+        std::string firstKind;
+        for (const llvm::Value* arm : arms)
+        {
+            std::string armKind;
+            if (!MemoryOutlivesCall(arm, armKind, depth + 1)) { proven = false; break; }
+            if (armKind.empty()) continue;                  // arm answered by the cycle guard
+            if (firstKind.empty()) firstKind = armKind;
+            else if (armKind != firstKind) sameKind = false;
+        }
+        joinAddressInProgress_.erase(join);
+        // No arm named a destination (every one was a back-edge): nothing true to report, so no
+        // proof rather than a diagnostic that cannot name where the pointer went.
+        if (!proven || firstKind.empty()) return false;
+        destKind = sameKind ? firstKind : "memory that outlives the call on every arm of a join";
+        return true;
     }
 
 bool LLVMBackend::SlotHoldsOutlivingPointer(const llvm::Value* ptr, std::string& destKind,
@@ -1350,6 +1393,10 @@ bool LLVMBackend::SlotHoldsOutlivingPointer(const llvm::Value* ptr, std::string&
             }
             if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(sv))
                 if (MemoryOutlivesCall(ld->getPointerOperand(), destKind, depth + 1)) return true;
+            // `Node** p = c > 0 ? &g : &g2;` parks the join in this slot; judge it by its arms.
+            if (llvm::isa<llvm::SelectInst>(sv) || llvm::isa<llvm::PHINode>(sv))
+                if (JoinAddressOutlivesCall(llvm::cast<llvm::Instruction>(sv), destKind, depth + 1))
+                    return true;
         }
         return false;
     }

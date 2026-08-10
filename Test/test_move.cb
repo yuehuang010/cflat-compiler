@@ -7715,6 +7715,34 @@ int recursiveReadResourceId(Resource* r, int d) { if (d > 0) { return recursiveR
 void printResourcePointer(Resource* r) { snprintf(nullptr, 0, "%p", r); }
 Resource* passthruResource(Resource* r) { return r; }
 void keepResourceGlobal(Resource* r) { gKeptResource = r; }
+// The ACCEPT twins of the joined-destination rule. A store through `c ? &a : &b` is proof only
+// when EVERY arm outlives the call, so one local arm - or two - must keep compiling.
+struct ResourceCell { Resource* v = nullptr; };
+Resource* gKeptResource2 = nullptr;
+int selLocalArmRead(Resource* r, int c)
+{
+    Resource* loc = nullptr;
+    Resource** p = c > 0 ? &loc : &gKeptResource2;
+    *p = r;
+    return r->id;
+}
+int selBothLocalArmsRead(Resource* r, int c)
+{
+    Resource* a = nullptr;
+    Resource* b = nullptr;
+    Resource** p = c > 0 ? &a : &b;
+    *p = r;
+    return r->id;
+}
+int selFreshArmRead(Resource* r, int c)
+{
+    ResourceCell* fresh = new ResourceCell();
+    Resource** p = c > 0 ? &fresh->v : &gKeptResource2;
+    *p = r;
+    int seen = r->id;
+    delete fresh;
+    return seen;
+}
 // The ACCEPT twins of the MAY-return walk. `passthruResource` above answers YES and re-ledgers
 // its result; these three answer NO, so their results stay bindable to a local. Each is a shape
 // the walk must NOT confuse with a passthru: another parameter, a global, a fresh allocation.
@@ -8141,6 +8169,21 @@ int testTempUniqueFieldBorrowAccepts()
     dtorCount = 0;
     passthruResource(makeMoveBox().t);
     passed += Test("temp_uniq_accept_passthru_discarded_freed_once", dtorCount, 1);
+
+    // The ACCEPT SET of the joined-destination rule, frozen before that rule was written. Each
+    // callee stores through a select whose arms are NOT all outliving memory, so no proof.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_join_dest_local_arm",
+                   selLocalArmRead(makeMoveBox().t, 1), 44);
+    passed += Test("temp_uniq_accept_join_dest_local_arm_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_join_dest_both_local_arms",
+                   selBothLocalArmsRead(makeMoveBox().t, 1), 44);
+    passed += Test("temp_uniq_accept_join_dest_both_local_arms_freed_once", dtorCount, 1);
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_join_dest_fresh_arm",
+                   selFreshArmRead(makeMoveBox().t, 1), 44);
+    passed += Test("temp_uniq_accept_join_dest_fresh_arm_freed_once", dtorCount, 1);
 
     // The MAY-return walk's own accept set, frozen before the walk was written. Each callee below
     // is a shape whose RESULT does not derive from the temp-field argument, so binding it to a
@@ -9531,7 +9574,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 109;
+    total += 115;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

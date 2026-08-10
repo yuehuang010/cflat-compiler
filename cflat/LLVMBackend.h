@@ -1423,6 +1423,9 @@ public:
     // Third cycle guard, for ParameterMayReachReturn. Same reason: a key left by either escape
     // walk must never terminate the return walk, which asks a different question again.
     std::set<std::pair<const llvm::Function*, unsigned>> mayReachReturnInProgress_;
+    // Cycle guard for the select/phi arm walk in MemoryOutlivesCall: a loop-carried phi reaches
+    // itself, and re-entering it must not be read as an arm that names local memory.
+    mutable std::set<const llvm::Instruction*> joinAddressInProgress_;
     // Functions whose emission is SUSPENDED while a nested one is emitted (lambda invoker,
     // generic instantiation, global-array initializer). Pushed/popped by Save/RestoreBuilderState.
     std::vector<const llvm::Function*> suspendedFunctions_;
@@ -2878,6 +2881,8 @@ private:
     // parameter-prologue shape: `store ptr %this, ptr %this.addr` parks a caller pointer in a
     // slot every later dereference reads back.
     bool SlotHoldsOutlivingPointer(const llvm::Value* ptr, std::string& destKind, int depth) const;
+    bool JoinAddressOutlivesCall(const llvm::Instruction* join, std::string& destKind,
+                                 int depth) const;
 
     /*
      * Record every argument of the just-emitted call that reads a temp's `unique` field and lands

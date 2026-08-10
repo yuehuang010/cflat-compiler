@@ -2317,6 +2317,35 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   (no callee to ask), and a laundering callee defined BELOW its call site - the STORE half defers
   that to end of module, but the RETURN half's missing fact is where the RESULT got bound, which
   only the escape SITE knows. Retitled into
-  `p1/temp-unique-field-escapes-through-an-indirect-callee-or-a-joined-store.md`.
+  `p1/temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return.md`
+  (that name is the later `fix/selglob` retitle; this round left it `...-or-a-joined-store.md`).
   `Test/test_move.cb` under `leaks --atExit`: 18 / 352, unchanged - this change adds no leg that
   allocates past its statement.
+- **A JOINED store destination is proof only on ALL arms (RATIFIED, 2026-08-10, `fix/selglob`)**:
+  `void keepsel(Node* n, int c) { Node** p = c > 0 ? &g : &g2; *p = n; }` compiled and dangled
+  (`v=7 same=1` against a reallocated witness) while the single-global `Node** p = &g;` one line
+  over was diagnosed, because `MemoryOutlivesCall` resolves the destination with
+  `llvm::getUnderlyingObject`, which stops at a `select` / `phi`. The fix is one helper,
+  `JoinAddressOutlivesCall`, asked from both places a join can surface: the `obj` of
+  `MemoryOutlivesCall` and the stored VALUE in `SlotHoldsOutlivingPointer` (which is where the
+  ternary actually lands - cflat parks the address in an alloca, so `getUnderlyingObject` never
+  sees the select at all; the direct spelling `*(c > 0 ? &g : &g2) = n;` does not even parse,
+  "Unable to dereference an object without a Storage").
+  **ALL-arms, not the ANY-arm rule the sibling value joins use** (strictly ALL-of-ANY: an arm that
+  is a slot load is proven by `SlotHoldsOutlivingPointer`'s ANY-store rule, so a select over a
+  mixed slot still rejects - safe direction, recorded in the issue file). The accept-set constraint decides
+  it: `c > 0 ? &loc : &g` has a path on which nothing escapes and must keep compiling, and ANY-arm
+  false-rejects it. Frozen as value legs (`temp_uniq_accept_join_dest_local_arm`, `_both_local_arms`,
+  `_fresh_arm`), each measured accepting on the pre-fix binary too.
+  **A join of arms with DIFFERENT outliving kinds needs its own message.** Naming "a global" at a
+  site whose other arm is caller memory is a false diagnostic, so the arm kinds are compared and a
+  mixed join reports "memory that outlives the call on every arm of a join".
+  Cycle guard: a loop-carried phi reaches itself, and re-entry answers "no counter-example" (true),
+  so the other arms still decide - the polarity that keeps a genuine escape rejected. A join whose
+  arms ALL come back through the guard names no destination and is therefore no proof, rather than
+  a diagnostic that cannot say where the pointer went.
+  Two spellings were ALREADY rejected pre-fix and are not this fix's doing - the `if/else`
+  assignment to `p` and the loop form - because `SlotHoldsOutlivingPointer` proves on ANY store
+  into the address slot. That same ANY rule REJECTS `Node** p = &loc; if (c) { p = &g; } *p = n;`
+  whose select twin is accepted; the disagreement is recorded in the issue file, unfiled.
+  `Test/test_move.cb` under `leaks --atExit`: 18 / 352, unchanged.

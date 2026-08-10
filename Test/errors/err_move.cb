@@ -309,6 +309,34 @@ UniqueThing* rwChain(UniqueThing* n) { return rwPassthru(n); }
 struct RwSlot { UniqueThing* q = nullptr; RwSlot(UniqueThing* z) { this.q = z; } };
 void rwSink(unique UniqueThing* p) { }
 
+/*
+ * JOINED store destinations. `getUnderlyingObject` stops at a select/phi, so a store through
+ * `c ? &g : &g2` used to find no proof and accept while the single-global spelling one line over
+ * was diagnosed. The rule is ALL arms: these callees have no arm naming local memory.
+ */
+UniqueThing* gSelA = nullptr;
+UniqueThing* gSelB = nullptr;
+UniqueThing* gSelC = nullptr;
+UniqueThing** gSelPtrA = nullptr;
+UniqueThing** gSelPtrB = nullptr;
+void selTwoGlobals(UniqueThing* n, int c) { UniqueThing** p = c > 0 ? &gSelA : &gSelB; *p = n; }
+void selGlobalAndParam(UniqueThing* n, UniqueThing** out, int c)
+{
+    UniqueThing** p = c > 0 ? out : &gSelA;
+    *p = n;
+}
+void selNestedGlobals(UniqueThing* n, int c, int d)
+{
+    UniqueThing** q = c > 0 ? &gSelA : &gSelB;
+    UniqueThing** p = d > 0 ? q : &gSelC;
+    *p = n;
+}
+void selOfGlobalLoads(UniqueThing* n, int c)
+{
+    UniqueThing** p = c > 0 ? gSelPtrA : gSelPtrB;
+    *p = n;
+}
+
 // RETURN position: the laundered result outlives the statement that destructs the temp.
 expect_error("cannot store the result of 'rwPassthru' into the return value") {
     UniqueThing* rwLeakThroughReturn() { return rwPassthru(makeJoinBox().item); }
@@ -840,6 +868,27 @@ extern int main()
     // Into a parameter that TAKES OWNERSHIP: the callee would own memory the temp frees.
     expect_error("cannot pass a unique field of a temporary to parameter 'p'") {
         rwSink(rwPassthru(makeJoinBox().item));
+    }
+
+    // The JOINED-DESTINATION legs. Pre-fix each compiled and read freed memory (measured
+    // `v=7 same=1` against a freshly reallocated witness); the single-global spelling of each
+    // was already diagnosed, so what these add is the select/phi arm walk.
+    expect_error("'selTwoGlobals' stores that pointer into a global") {
+        selTwoGlobals(makeJoinBox().item, 1);
+    }
+    // Arms of DIFFERENT outliving kinds - a global and caller memory - so the message names the
+    // join rather than claiming one of them.
+    expect_error("stores that pointer into memory that outlives the call on every arm of a join") {
+        UniqueThing* selOut = nullptr;
+        selGlobalAndParam(makeJoinBox().item, &selOut, 1);
+    }
+    // A select whose arm is itself a select: the arm walk recurses.
+    expect_error("'selNestedGlobals' stores that pointer into a global") {
+        selNestedGlobals(makeJoinBox().item, 1, 1);
+    }
+    // Arms that are LOADS of global pointer variables, not addresses of globals.
+    expect_error("'selOfGlobalLoads' stores that pointer into a global") {
+        selOfGlobalLoads(makeJoinBox().item, 1);
     }
 
     return 0;

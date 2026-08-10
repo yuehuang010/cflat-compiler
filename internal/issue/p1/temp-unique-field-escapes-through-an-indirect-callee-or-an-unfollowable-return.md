@@ -1,14 +1,16 @@
-# A temp's `unique` field still escapes through an INDIRECT callee, or through a JOINED store
+# A temp's `unique` field still escapes through an INDIRECT callee, or a return the walk cannot follow
 
 Filed 2026-08-08 by `fix/temp-uniq-plain-param`, which closed the plain-`T*` parameter for every
 callee whose body PROVABLY stores the pointer into memory that outlives the call. Trimmed
 2026-08-10 by `fix/retwalk`, which closed the RETURN-VALUE sub-case (a `return <param>` walk that
-re-ledgers the call result, so the existing escape guards fire on a laundered value). What is left
-here are the two shapes that guard's callee-side fact still cannot answer.
+re-ledgers the call result, so the existing escape guards fire on a laundered value). Trimmed again
+2026-08-10 by `fix/selglob`, which closed the JOINED-STORE sub-case (`MemoryOutlivesCall` now walks
+a select/phi destination's arms, ALL-arms). What is left here is the shape that guard's
+callee-side fact still cannot answer, plus the residues of the return walk.
 
-Severity: **silent use-after-free** in both sub-cases. Compiles clean, runs, exits 0.
+Severity: **silent use-after-free**. Compiles clean, runs, exits 0.
 
-## Sub-case 2: there is no callee to ask - function pointer and interface dispatch
+## There is no callee to ask - function pointer and interface dispatch
 
 `RecordTempUniqueFieldArgs` reads `CallInst::getCalledFunction()`, and both callee-side walks
 (`OwningPtrProvablyEscapes`, `ParameterMayReachReturn`) treat a null callee as "no proof". So an
@@ -35,27 +37,6 @@ module (`interfaceTable`), so an interface method could be judged as "every impl
 slot provably stores" (or "any implementor may return the parameter"), which is the same shape
 `ResolveMaterializedInterfaceUses` already runs at. A `function<T>` value has no such closed world
 short of a points-to analysis.
-
-## Sub-case 3: a SELECT / PHI of two global addresses launders the store
-
-`MemoryOutlivesCall` resolves the store destination with `llvm::getUnderlyingObject`, which does
-NOT look through a `select` or a `phi` - it returns the select itself, which is neither a global
-nor an argument, so the walk finds no proof and accepts:
-
-```cflat
-Node* g = nullptr;
-Node* g2 = nullptr;
-void keepsel(Node* n, int c) { Node** p = c > 0 ? &g : &g2; *p = n; }   // ACCEPTED, dangles
-void keepsel1(Node* n)       { Node** p = &g; *p = n; }                 // rejected correctly
-```
-
-Measured `-o` + run: `keepsel(makeBox().t, 1)` gives `v=99 same=1 dtors=1` on BOTH `0047297` and
-the merged `fix/temp-uniq-plain-param`, while the single-global indirection one line below it is
-diagnosed - so this is specifically the join, not indirection. `scratch/rvw_f8_selectglobal.cb`
-in that fix worktree (reviewer probe). The fix is small and local - answer a `SelectInst` /
-`PHINode` by recursing on its operands with an ANY-arm rule, which is the same polarity
-`JoinCarriesOwningTempUniqueField` already uses one file over - but it widens a REJECTION, so it
-needs its own accept set (a join of a global address with a LOCAL address must not be proof).
 
 ## Also left open by `fix/retwalk`: a laundering callee defined BELOW its call site
 
@@ -95,14 +76,25 @@ whose walk exceeds `kMaxRetainUses` values.
 
 They are separate mechanisms, filed together only because they are the remaining complement of one
 guard: what the callee-side walks answer is "a KNOWN callee that STORES or RETURNS", and these are
-"no known callee", "a store the destination walk cannot resolve", and the residues of the return
-walk itself (callee below the call site, field-indirect return, budget). Fixing any one alone is a
-self-contained change. Do not consolidate them further.
+"no known callee" and the residues of the return walk itself (callee below the call site,
+field-indirect return, budget). Fixing any one alone is a self-contained change. Do not
+consolidate them further.
 
 ## Also known, and deliberately accepted
 
 `OwningPtrProvablyEscapes` follows a load back out of a stack slot only while every store into
 that slot is a value the walk already tracks, so `Node* p = n; if (c) { p = other; } g = p;`
 proves nothing and accepts. That is the safe direction and is not a filed bug.
+
+The DESTINATION walk answers the mirror-image shape the other way, and did so before `fix/selglob`:
+`SlotHoldsOutlivingPointer` proves on ANY store into the address slot, so
+`Node** p = &loc; if (c) { p = &g; } *p = n;` is REJECTED while its select spelling
+`Node** p = c > 0 ? &loc : &g;` is accepted (both measured on `a4167aa` and after) - but only
+when no arm is itself a slot LOAD. `fix/selglob`'s join rule is ALL-of-ANY: every arm must prove
+outliving, yet an arm that is a load of a slot is proven by the slot's ANY-store rule, so a select
+over a mixed slot (`q = c > 0 ? p : &g2` where `p` held `&loc` then conditionally `&g`) rejects
+even though one path escapes nothing (safe direction, measured flip on `fix/selglob`). The two
+polarities are deliberate - the slot rule is the older, blunter one - but they disagree on the
+same program written two ways. Reconciling them is unfiled work, not a regression.
 
 Related: [[interface-issue-queue]]
