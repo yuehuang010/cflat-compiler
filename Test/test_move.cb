@@ -7097,6 +7097,86 @@ int testCopyFactPropagationAccepts()
     }
     passed += Test("join_condnull_arm_blocks_freed_twice", dtorCount, 2);
 
+    /*
+     * The ACCEPT half of the join proof on the `move` spelling (its reject half is
+     * jmJoin* in Test/errors/err_move.cb). `move` now asks the same BOTH-ARMS fact the raw
+     * `delete` asks, so every shape that leaves the join the sole owner must still adopt - each of
+     * these leaks if the guard fires, and each is measured identical before and after the change.
+     */
+    // Arm retired after the join: the fact retires with it, so the move is the real transfer.
+    dtorCount = 0;
+    {
+        Resource* mjArmOwner = new Resource();
+        mjArmOwner->id = 141;
+        Resource* mjArmJoin = identityBool(true) ? mjArmOwner : mjArmOwner;
+        mjArmOwner = nullptr;
+        Resource* mjArmAdopted = move mjArmJoin;
+        passed += Test("move_join_arm_nulled_value", mjArmAdopted->id, 141);
+        delete mjArmAdopted;
+        passed += Test("move_join_arm_nulled_freed_once", dtorCount, 1);
+    }
+    passed += Test("move_join_arm_nulled_no_second_free", dtorCount, 1);
+
+    // Two fresh `new` arms resolve to no binding at all, so the join owns what it holds.
+    dtorCount = 0;
+    {
+        Resource* mjNewJoin = identityBool(true) ? new Resource() : new Resource();
+        mjNewJoin->id = 142;
+        Resource* mjNewAdopted = move mjNewJoin;
+        passed += Test("move_join_two_new_value", mjNewAdopted->id, 142);
+        delete mjNewAdopted;
+        passed += Test("move_join_two_new_freed_once", dtorCount, 1);
+    }
+    passed += Test("move_join_two_new_no_second_free", dtorCount, 1);
+
+    // The MIXED join - one owning local, one fresh `new`. The BOTH-ARMS rule records nothing, so
+    // the move adopts the `new` arm and the owning local is still released by its own delete.
+    dtorCount = 0;
+    {
+        Resource* mjMixedOwner = new Resource();
+        mjMixedOwner->id = 143;
+        Resource* mjMixedJoin = identityBool(false) ? mjMixedOwner : new Resource();
+        mjMixedJoin->id = 144;
+        Resource* mjMixedAdopted = move mjMixedJoin;
+        passed += Test("move_join_mixed_value", mjMixedAdopted->id, 144);
+        delete mjMixedAdopted;
+        passed += Test("move_join_mixed_freed_once", dtorCount, 1);
+        delete mjMixedOwner;
+        passed += Test("move_join_mixed_freed_twice", dtorCount, 2);
+    }
+
+    // A provably-null local arm is neutral and the other arm is a fresh `new`, so the join still
+    // proves no other owner and the move must adopt.
+    dtorCount = 0;
+    {
+        Resource* mjParkedNull = nullptr;
+        Resource* mjNullArmJoin = mjParkedNull ?? new Resource();
+        mjNullArmJoin->id = 145;
+        Resource* mjNullArmAdopted = move mjNullArmJoin;
+        passed += Test("move_join_nullarm_new_value", mjNullArmAdopted->id, 145);
+        delete mjNullArmAdopted;
+        passed += Test("move_join_nullarm_new_freed_once", dtorCount, 1);
+    }
+    passed += Test("move_join_nullarm_new_no_second_free", dtorCount, 1);
+
+    // An arm null on only SOME paths is NOT provably null, so it blocks and the join proves
+    // nothing - the same polarity tripwire join_condnull_arm_blocks_* holds for `delete`.
+    dtorCount = 0;
+    {
+        Resource* mjCondArm = nullptr;
+        if (identityBool(true)) { mjCondArm = new Resource(); mjCondArm->id = 146; }
+        Resource* mjCondOther = new Resource();
+        mjCondOther->id = 147;
+        Resource* mjCondJoin = mjCondArm ?? mjCondOther;
+        mjCondArm = nullptr;
+        Resource* mjCondAdopted = move mjCondJoin;
+        passed += Test("move_join_condnull_value", mjCondAdopted->id, 146);
+        delete mjCondAdopted;
+        passed += Test("move_join_condnull_freed_once", dtorCount, 1);
+        delete mjCondOther;
+        passed += Test("move_join_condnull_freed_twice", dtorCount, 2);
+    }
+
     // A join arm consumed by a proven `move`. The move DETACHES its source at the join, so no
     // other binding frees the object and the join's own `delete` is the only release - rejecting
     // any of these three is a false rejection whose only remedy is to leak. The demotion is keyed
@@ -9788,7 +9868,7 @@ extern int main()
     total += 15;
 
     passed += testCopyFactPropagationAccepts();
-    total += 72;
+    total += 87;
 
     passed += testBorrowedPointerMoveNoAdopt();
     total += 23;

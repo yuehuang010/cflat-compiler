@@ -8704,6 +8704,21 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                     name, owner, owner));
                 return {};
             }
+            // Third proof: a local bound from a '?:' / '??' JOIN whose every non-null arm proves
+            // another owner. Same BOTH-ARMS fact (and same retirement) the raw `delete` guard asks,
+            // so the two spellings agree; a MIXED join records nothing and stays legal.
+            if (srcBind != nullptr && !srcBind->IsOwning
+                && JoinArmsStillKeepOwner(*srcBind)
+                && !srcBind->JoinKeepsOwnerSource.empty())
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - every arm of the join it was bound from holds an object {} "
+                    "already frees, so this move transfers nothing and the destination double-frees "
+                    "it. Bind '{}' to an object this frame owns, or drop the 'move' and let {} "
+                    "release it.",
+                    name, srcBind->JoinKeepsOwnerSource, name, srcBind->JoinKeepsOwnerSource));
+                return {};
+            }
         }
 
         // 'move' of a whole value this function only BORROWS (a plain by-value owning-value

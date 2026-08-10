@@ -548,6 +548,112 @@ expect_error("cannot convert '?:' arm to interface 'IUniqueThing': 'UniqueThing'
     }
 }
 
+/*
+ * `move` of a local bound from a '?:' / '??' JOIN whose every non-null arm proves another owner.
+ * The raw `delete` of the same local was already rejected; `move` consulted neither the join proof
+ * nor IsBorrowed (a join carries no source binding), so the destination adopted and the pointee was
+ * freed twice (rc 133 on every leg below, pre-fix). Same BOTH-ARMS fact and same retirement the
+ * delete guard uses, so the two spellings now agree. The ACCEPT half - MIXED joins, retired arms,
+ * `new` arms - is move_join_* in Test/test_move.cb.
+ */
+// The filed shape: both arms are borrowed parameters, so both callers still free the pointee.
+expect_error("cannot 'move' 'jmJ' - every arm of the join it was bound from") {
+    int jmJoinTwoBorrowedParams(MoveResource* p, MoveResource* q, bool c)
+    {
+        MoveResource* jmJ = c ? p : q;
+        MoveResource* jmD = move jmJ;
+        return jmD->id;
+    }
+}
+
+// The '??' spelling of the same join - its arms come from the coalesce ledger, not from a PHI.
+expect_error("cannot 'move' 'jmC' - every arm of the join it was bound from") {
+    int jmJoinCoalesce(MoveResource* p, MoveResource* q)
+    {
+        MoveResource* jmC = p ?? q;
+        MoveResource* jmD2 = move jmC;
+        return jmD2->id;
+    }
+}
+
+// A join OF a join: the arm walk recurses, so the outer local is proven too.
+expect_error("cannot 'move' 'jmN2' - every arm of the join it was bound from") {
+    int jmJoinNested(MoveResource* p, MoveResource* q, MoveResource* s, bool c)
+    {
+        MoveResource* jmN1 = c ? p : q;
+        MoveResource* jmN2 = c ? jmN1 : s;
+        MoveResource* jmD3 = move jmN2;
+        return jmD3->id;
+    }
+}
+
+// The move in ARGUMENT position, across a callee's explicit `move` contract. The guard is
+// destination-agnostic on purpose: the callee's delete frees a pointee both callers still own.
+expect_error("cannot 'move' 'jmS' - every arm of the join it was bound from") {
+    int jmJoinIntoSink(MoveResource* p, MoveResource* q, bool c)
+    {
+        MoveResource* jmS = c ? p : q;
+        consume(move jmS);
+        return 1;
+    }
+}
+
+// The move in RETURN position - a third site with no destination declaration to decline at.
+expect_error("cannot 'move' 'jmR' - every arm of the join it was bound from") {
+    move MoveResource* jmJoinReturn(MoveResource* p, MoveResource* q, bool c)
+    {
+        MoveResource* jmR = c ? p : q;
+        return move jmR;
+    }
+}
+
+// The join reached by ASSIGNMENT rather than declaration; the proof is recorded by the '='.
+expect_error("cannot 'move' 'jmA' - every arm of the join it was bound from") {
+    int jmJoinAssigned(MoveResource* p, MoveResource* q, bool c)
+    {
+        MoveResource* jmA = nullptr;
+        jmA = c ? p : q;
+        MoveResource* jmD4 = move jmA;
+        return jmD4->id;
+    }
+}
+
+// Both arms are OWNING LOCALS of this frame: each still frees at scope exit, so adopting here is
+// the same double-free the borrowed-parameter spelling produces.
+expect_error("cannot 'move' 'jmO' - every arm of the join it was bound from") {
+    int jmJoinOwnedLocals(bool c)
+    {
+        MoveResource* jmO1 = new MoveResource();
+        MoveResource* jmO2 = new MoveResource();
+        MoveResource* jmO = c ? jmO1 : jmO2;
+        MoveResource* jmD5 = move jmO;
+        return jmD5->id;
+    }
+}
+
+// A provably-null local arm is NEUTRAL, so the remaining owning arm decides and still proves.
+expect_error("cannot 'move' 'jmNA' - every arm of the join it was bound from") {
+    int jmJoinNullArm()
+    {
+        MoveResource* jmNAOwner = new MoveResource();
+        MoveResource* jmParked = nullptr;
+        MoveResource* jmNA = jmParked ?? jmNAOwner;
+        MoveResource* jmD6 = move jmNA;
+        return jmD6->id;
+    }
+}
+
+// A `unique` destination: rejected at the move, not at the destination, so the diagnostic is the
+// same one the plain destination gets.
+expect_error("cannot 'move' 'jmU' - every arm of the join it was bound from") {
+    int jmJoinUniqueDest(MoveResource* p, MoveResource* q, bool c)
+    {
+        MoveResource* jmU = c ? p : q;
+        unique MoveResource* jmD7 = move jmU;
+        return jmD7->id;
+    }
+}
+
 extern int main()
 {
     // use after move - pass to another call

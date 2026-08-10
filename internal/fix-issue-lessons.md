@@ -2512,3 +2512,28 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   in any function. Filed as `p2/global-pointer-destination-does-not-propagate-borrow-taint.md`.
   Field destinations (`h.f = p`) are out of scope too: `delete h.f` is already rejected by the
   delete-a-field-from-outside guard.
+
+- **`move` of a join-bound local: REJECT at the move, not decline at the destination
+  (RATIFIED)**: `ParseMoveExpression` now asks `JoinArmsStillKeepOwner` as a THIRD proof beside
+  `OwningLocalCopyStillAliases` and `BorrowsOwnedElement`, in the same pointer/alloca block, so
+  the raw `delete` and the `move` spelling of a join-bound local agree exactly. The sibling
+  shape - `fix/move-borrowed-plain-dest`'s decline-to-adopt at a plain destination - was
+  considered and REJECTED here for a measured reason: two of the nine broken spellings have NO
+  destination declaration to decline at (`consume(move j)` into a `move` parameter, and
+  `return move j` from a `move`-returning function), and both were rc 133 pre-fix. A
+  destination-side remedy structurally cannot reach them. The BOTH-ARMS rule and its arm-slot
+  retirement are reused UNCHANGED, which is what keeps this out of the false-rejection
+  direction: a MIXED join (any arm a fresh `new`, or an arm not provably null whose value cannot
+  be resolved) records nothing and still adopts. Measured pre-fix rc 133 on all nine: both arms
+  borrowed params, the `??` spelling, a join OF a join, the sink-argument and return positions,
+  the ASSIGNMENT path (`j = c ? p : q` records the fact exactly as the declaration does - there
+  is no assign-path gap), two OWNING LOCAL arms, a provably-null local arm beside an owning arm,
+  and a `unique` destination. Accept set frozen first and measured identical before/after:
+  retired arm, two `new` arms, MIXED owner-plus-`new`, null-arm-plus-`new`, and the
+  conditionally-null arm that BLOCKS. One spelling changed from silently-accepted to rejected -
+  `T* j = p; j = c ? p : q; T* d = move j;` - which previously survived only because the
+  declaration's `IsBorrowed` made the plain destination decline; its `delete` twin was already
+  rejected, so the rejection is the consistent answer. Per-site audit: the five
+  `JoinArmsStillKeepOwner` consumers are `BindingKeepsOwnershipOfBoxedObject`,
+  `DescribeBoxedSourceOwner`, the unique-field store, the raw `delete`, and now the `move`; no
+  other copy of the predicate exists.
