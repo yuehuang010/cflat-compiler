@@ -1687,3 +1687,31 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   rc 0 into rc 133 for the field-source spelling. That is the fix being right, not a regression:
   filed in review as [[fixed-array-string-element-read-aliases-the-element]]. When a fix converts
   "the slot never really owned anything" into "the slot owns", re-probe every READ of that slot.
+
+- **`fix/parenmv` - the parenthesized consume source, and where a text peel stops working.**
+  Closing the round above: `BareSourceText()` in `MainListener.h` walks down through single-child
+  nodes and through the `primaryExpression : '(' expression ')'` alternative, and all five
+  name-recording sites in `CollectConsumedStoreNames` / `CollectUnconditionalMovedNames` /
+  `CollectPositionalBraceElementNames` now record its result. Descending a single-child chain never
+  changes `getText()`, so the peel is text-preserving for everything except real parentheses - which
+  is why `(v.f)`, `(v + 1)`, `(f(1))` and the tuple `(a, b)` still fail the intersection, as they
+  must. All four consuming spellings, at paren depth 1-3, now match their bare control exactly,
+  caller-side `use of moved variable` rejection included.
+  The instructive part is what the peel could NOT fix. Three measured cells stay wrong and were
+  filed as `p1/parenthesized-operand-loses-named-variable-provenance.md`: `return (p)` of a borrowed
+  by-value owning parameter (rc 134 vs rc 0 bare - the caller allocates a second owner and destructs
+  it), a CONDITIONAL `move (p)` of a COPYABLE owning parameter (rc 134 vs rc 0), and `UBox o = (x);`
+  on an owning LOCAL (rc 139 vs a `use of moved variable` rejection). None runs through these
+  collectors; they all lose the operand's `NamedVariable` provenance (`CallerName` and its borrow
+  origin) through the parenthesized primary. **A text peel fixes the arms that compare SPELLINGS; it
+  can do nothing for the arms that need the resolved variable.** An `EmitReturnExpression` peel was
+  written, measured to change nothing observable (`return (localOwner)` was already rc 0 both ways,
+  and the borrowed-parameter case is gated off by `IsBorrowedStructParameter` before the name is
+  used), and REVERTED rather than shipped unverified.
+  Review then found the axis the round had not enumerated: parentheses are not the only TEXT
+  WRAPPER the semantic consume arms see through. A redundant same-type cast `(UBox)p` and the
+  `as` form `p as UBox` spell `"(UBox)p"` / `"pasUBox"`, match no parameter, and reproduce the
+  original rc 134 exactly - identical on both binaries, filed as
+  `p1/cast-wrapped-consume-source-defeats-owning-sink-inference.md`. **When a fix normalizes a
+  SPELLING before comparing it to a name, enumerate every wrapper that changes the spelling
+  without changing the value, not just the one in the issue title.**

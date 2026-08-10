@@ -1253,6 +1253,34 @@ inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node)
     return false;
 }
 
+// The source text of `node` with REDUNDANT PARENTHESES peeled off, so a parenthesized whole-value
+// source `(p)` / `((p))` records the bare name `p` and matches a parameter name. Only the
+// `'(' expression ')'` primaryExpression alternative is peeled - descending through single-child
+// nodes never changes the text, so a non-bare source (`v.f`, `v + 1`, `(a, b)`, `f(1)`) is
+// returned unchanged and keeps failing every name comparison, as it must.
+inline std::string BareSourceText(antlr4::tree::ParseTree* node)
+{
+    while (node != nullptr)
+    {
+        if (node->children.size() == 1)
+        {
+            node = node->children[0];
+            continue;
+        }
+        auto* prim = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node);
+        // 3 children with a leading '(' is exactly `'(' expression ')'` - nameof/typeof/sizeof
+        // spell 4, and a tuple `(a, b)` is its own context reached as a single child.
+        if (prim != nullptr && prim->children.size() == 3 && prim->expression() != nullptr
+            && prim->children[0]->getText() == "(")
+        {
+            node = prim->expression();
+            continue;
+        }
+        break;
+    }
+    return node == nullptr ? std::string() : node->getText();
+}
+
 // Tri-state evaluator for an `if const` condition under the CURRENT monomorphization:
 // returns 1 (branch taken / live), 0 (not taken / dead), or -1 (cannot decide at all).
 // Supplied by the main pass (where type substitutions are active); empty for the scanner.
@@ -1296,7 +1324,7 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
         if (cond->children.size() > 1) return;
     if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
         if (auto* u = mv->unaryExpression())
-            out.insert(u->getText());
+            out.insert(BareSourceText(u));
     for (auto* child : node->children)
     {
         CollectUnconditionalMovedNames(child, out, evalIfConst);
@@ -1317,7 +1345,7 @@ inline void CollectPositionalBraceElementNames(CFlatParser::InitializerListConte
     if (list == nullptr) return;
     for (auto* fi : list->fieldInit())
         if (fi != nullptr && fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
-            out.insert(fi->assignmentExpression(0)->getText());
+            out.insert(BareSourceText(fi->assignmentExpression(0)));
 }
 
 // Collect bare source names CONSUMED by a plain store ANYWHERE in the body (at-least-one-path):
@@ -1336,13 +1364,13 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
     if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
         if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
             && asn->assignmentExpression() != nullptr)
-            out.insert(asn->assignmentExpression()->getText());
+            out.insert(BareSourceText(asn->assignmentExpression()));
     if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
     {
         if (auto* iz = init->initializer(); iz != nullptr)
         {
             if (iz->assignmentExpression() != nullptr)
-                out.insert(iz->assignmentExpression()->getText());
+                out.insert(BareSourceText(iz->assignmentExpression()));
             CollectPositionalBraceElementNames(iz->initializerList(), out);
         }
         // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
@@ -1350,7 +1378,7 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
     }
     if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
         if (auto* u = mv->unaryExpression())
-            out.insert(u->getText());
+            out.insert(BareSourceText(u));
     for (auto* child : node->children)
         CollectConsumedStoreNames(child, out);
 }

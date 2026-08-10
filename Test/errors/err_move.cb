@@ -18,6 +18,14 @@ void bpsBraceParam(ArrElemBox p)     { ArrElemBox[2] d = { p }; }
 void bpsBraceBareParam(ArrElemBox p) { ArrElemBox[2] d { p }; }
 void bpsAssignParam(ArrElemBox p)    { ArrElemBox[2] d; d[0] = p; }
 
+// The same four consuming stores with a PARENTHESIZED source. The collectors that feed the
+// inference are text-based, so `(p)` used to spell "(p)", match no parameter, and leave the
+// caller holding a value the callee had already consumed (rc 134 instead of this rejection).
+void pcsBraceParam(ArrElemBox p)  { ArrElemBox[2] d = { (p) }; }
+void pcsAssignParam(ArrElemBox p) { ArrElemBox[2] d; d[0] = ((p)); }
+void pcsDeclParam(ArrElemBox p)   { ArrElemBox o = (((p))); }
+void pcsMoveParam(ArrElemBox p)   { ArrElemBox o = move (p); }
+
 // Dereference-of-explicitly-moved-pointer coverage. Explicit 'move' of a thin `unique`
 // pointer/interface local nulls it but, by design, leaves it plain-readable (a == nullptr,
 // passing it along, etc. stay legal - see test_move.cb's explicit_move_local_* cases); only a
@@ -555,6 +563,36 @@ extern int main()
         bpsC.item = new MoveResource();
         bpsAssignParam(bpsC);
         int bpsCId = bpsC.item->id;
+    }
+
+    // CALLER half again, with the source PARENTHESIZED in each of the four consuming spellings.
+    // Every one of these must reject exactly as its unparenthesized control above does.
+    expect_error("use of moved variable 'pcsA'") {
+        ArrElemBox pcsA;
+        pcsA.item = new MoveResource();
+        pcsBraceParam(pcsA);
+        int pcsAId = pcsA.item->id;
+    }
+
+    expect_error("use of moved variable 'pcsB'") {
+        ArrElemBox pcsB;
+        pcsB.item = new MoveResource();
+        pcsAssignParam(pcsB);
+        int pcsBId = pcsB.item->id;
+    }
+
+    expect_error("use of moved variable 'pcsC'") {
+        ArrElemBox pcsC;
+        pcsC.item = new MoveResource();
+        pcsDeclParam(pcsC);
+        int pcsCId = pcsC.item->id;
+    }
+
+    expect_error("use of moved variable 'pcsD'") {
+        ArrElemBox pcsD;
+        pcsD.item = new MoveResource();
+        pcsMoveParam(pcsD);
+        int pcsDId = pcsD.item->id;
     }
 
     // The brace element decision must not swallow a type mismatch either: an `ArrElemBox` value

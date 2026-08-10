@@ -4841,6 +4841,158 @@ int testBraceInitConsumesParameter()
     return passed;
 }
 
+/*
+ * Owning-sink inference through REDUNDANT PARENTHESES. The two collectors that feed
+ * ApplyOwningSinkInference record the source subtree's raw text, so `(p)` used to spell "(p)"
+ * and never match the parameter name `p` - the callee's semantic consume arms saw straight
+ * through the parens and consumed anyway, so the caller was never told and both sides freed
+ * (rc 134 in all four consuming spellings). Each leg below is measured against its
+ * unparenthesized control, which is carried in testBraceInitConsumesParameter above; the
+ * accept-set legs prove the peel stops at parentheses and does not normalize anything else.
+ */
+int pcsBrace(OaiBox p)          { OaiBox[2] dst = { (p) }; return dst[0].item->id; }
+int pcsBraceBareDepth(OaiBox p) { OaiBox[2] dst { ((p)) }; return dst[0].item->id; }
+int pcsAssign(OaiBox p)         { OaiBox[2] dst; dst[0] = (p); return dst[0].item->id; }
+int pcsDecl(OaiBox p)           { OaiBox o = (((p))); return o.item->id; }
+int pcsMove(OaiBox p)           { OaiBox o = move (p); return o.item->id; }
+int pcsGenericBrace<T>(T p)     { T[2] dst = { (p) }; return dst[0].item->id; }
+// ACCEPT SET: only a BARE name survives the peel. A parenthesized FIELD source, a parenthesized
+// CALL, a COPYABLE owner and a POD must all behave exactly as their unparenthesized spelling.
+int pcsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { (wp->b) }; return dst[0].item->id; }
+int pcsCallSrc(OaiBox p)        { OaiBox o = ( oaiMake(3) ); return o.item->id + p.item->id; }
+int pcsCopyDecl(OaiCopyBox p)   { OaiCopyBox o = (p); return o.item->id; }
+int pcsPodDecl(OaiPod p)        { OaiPod o = (p); return o.x; }
+// A nested block local SHADOWING the parameter name: the scan is name-based and
+// at-least-one-path, so the parenthesized spelling must over-collect exactly as the bare one does.
+int pcsShadow(OaiBox p)
+{
+    int id = 0;
+    { OaiBox p = oaiMake(9); OaiBox q = (p); id = q.item->id; }
+    return id;
+}
+
+int testParenConsumeSourceSink()
+{
+    int passed = 0;
+
+    // 1. Brace element `{ (p) }` - the filed repro. The callee consumes, so the caller's
+    // argument is surrendered and freed exactly once, by the callee.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_brace_value", pcsBrace(a), 5);
+        passed += Test("pcs_brace_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_brace_freed_once_total", dtorCount, 1);
+
+    // 2. Bare-brace declarator form at paren depth 2 - a second syntactic site, and the
+    // depth axis: the peel must be a loop, not a single unwrap.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_bracebare_depth2_value", pcsBraceBareDepth(a), 5);
+        passed += Test("pcs_bracebare_depth2_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_bracebare_depth2_freed_once_total", dtorCount, 1);
+
+    // 3. Slot store `dst[0] = (p)`.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_assign_value", pcsAssign(a), 5);
+        passed += Test("pcs_assign_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_assign_freed_once_total", dtorCount, 1);
+
+    // 4. Decl initializer at paren depth 3.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_decl_depth3_value", pcsDecl(a), 5);
+        passed += Test("pcs_decl_depth3_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_decl_depth3_freed_once_total", dtorCount, 1);
+
+    // 5. Explicit `move (p)` - the UNCONDITIONAL-move collector, a different trigger from
+    // legs 1-4 (it sets IsOwningSink without the structural consume flag).
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_move_value", pcsMove(a), 5);
+        passed += Test("pcs_move_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_move_freed_once_total", dtorCount, 1);
+
+    // 6. A generic function's monomorphized parameter runs the same inference.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(9);
+        passed += Test("pcs_generic_value", pcsGenericBrace<OaiBox>(a), 9);
+        passed += Test("pcs_generic_freed_by_callee", dtorCount, 1);
+    }
+    passed += Test("pcs_generic_freed_once_total", dtorCount, 1);
+
+    // 7. A TEMP argument has no named source to null, and must still be freed once.
+    dtorCount = 0;
+    passed += Test("pcs_temp_value", pcsBrace(oaiMake(7)), 7);
+    passed += Test("pcs_temp_freed_once", dtorCount, 1);
+
+    // 8. ACCEPT SET: `(wp->b)` peels to "wp->b", which matches no parameter name, so the
+    // pointer parameter stays a borrow and the field is consumed silently - as bare `wp->b`.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(3);
+        passed += Test("pcs_ptrfieldsrc_value", pcsPtrFieldBrace(&w), 3);
+        passed += Test("pcs_ptrfieldsrc_source_nulled", w.b.item == nullptr, true);
+    }
+    passed += Test("pcs_ptrfieldsrc_freed_once", dtorCount, 1);
+
+    // 9. ACCEPT SET: a parenthesized CALL source peels to "oaiMake(3)", never a name, so the
+    // parameter is NOT made a sink and the caller's source is still live after the call.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_callsrc_value", pcsCallSrc(a), 8);
+        passed += Test("pcs_callsrc_source_live", a.item->id, 5);
+        passed += Test("pcs_callsrc_callee_freed_its_temp", dtorCount, 1);
+    }
+    passed += Test("pcs_callsrc_freed_all", dtorCount, 2);
+
+    // 10. ACCEPT SET: a copyable owner's store is a COPY, so the concrete gate keeps the
+    // parameter a borrow even though the name is now collected.
+    dtorCount = 0;
+    {
+        OaiCopyBox a;
+        a.item = new Resource();
+        a.item->id = 11;
+        passed += Test("pcs_copyable_value", pcsCopyDecl(a), 11);
+        passed += Test("pcs_copyable_source_live", a.item->id, 11);
+    }
+    passed += Test("pcs_copyable_freed_all", dtorCount, 2);
+
+    // 11. ACCEPT SET: a POD parameter owns nothing, so it is never a sink.
+    {
+        OaiPod a;
+        a.x = 4;
+        passed += Test("pcs_pod_value", pcsPodDecl(a), 4);
+        passed += Test("pcs_pod_source_live", a.x, 4);
+    }
+
+    // 12. SHADOWING: the inner block's own `p` is consumed, and the name-based scan makes the
+    // PARAMETER a sink too - the deliberate over-approximation, and it must be identical for
+    // the parenthesized spelling. Both resources are therefore freed inside the callee.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(5);
+        passed += Test("pcs_shadow_value", pcsShadow(a), 9);
+        passed += Test("pcs_shadow_freed_by_callee", dtorCount, 2);
+    }
+    passed += Test("pcs_shadow_freed_once_total", dtorCount, 2);
+
+    return passed;
+}
+
 int testBorrowedPointerMoveNoAdopt()
 {
     int passed = 0;
@@ -6747,6 +6899,9 @@ extern int main()
 
     passed += testBraceInitConsumesParameter();
     total += 28;
+
+    passed += testParenConsumeSourceSink();
+    total += 35;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
