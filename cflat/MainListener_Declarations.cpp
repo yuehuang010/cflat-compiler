@@ -2918,6 +2918,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // (`string q = dst[0];`). Such a source has no FieldName, so the field-borrow
                 // taint above never sees it, yet the element owns its buffer just as a field does.
                 bool srcIsOwningArrayStringElem = false;
+                bool srcIsRawHeapStringElem = false;
+                bool srcPtrCopyIsRawNewArray = false;
                 // True when the initializer reads an element of a user `T[]` VIEW. The GEP has a
                 // container slot's single-index shape, so only this provenance separates them.
                 bool srcIsViewElem = false;
@@ -3379,6 +3381,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || rightNV.BorrowsOwnedString);
                                 srcIsOwningArrayStringElem =
                                     IsOwningArrayStringElementRead(rightNV, right);
+                                srcIsRawHeapStringElem =
+                                    IsRawHeapStringElementRead(rightNV, right);
+                                // Plain pointer copy from an already-tagged local (`string* q = p;`)
+                                // carries the `new T[n]` provenance across.
+                                srcPtrCopyIsRawNewArray = rightNV.AllocatedByRawNewArray;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
@@ -4246,6 +4253,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             right = compiler->EmitOwnedStringDeepCopy(right);
                             compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
                         }
+                        // Raw `new string[n]` twin of the arm above: the read BORROWS, so clear the
+                        // owned bit. Same whole-`%string`-local destination gate as that arm.
+                        else if (right->getType()->isStructTy()
+                            && srcIsRawHeapStringElem
+                            && !srcIsMove
+                            && !typeAndValue.Pointer
+                            && compiler->GetTypeFromStorage(alloc)
+                                == llvm::StructType::getTypeByName(*compiler->context, "string"))
+                        {
+                            right = compiler->ClearStringOwnedBit(right);
+                        }
 
                         /*
                          * `T[N] b = a;` (fixed array from an ARRAY-SHAPED source) is a COPY: the
@@ -4427,6 +4445,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->UnregisterOwnedStringTemp(right);
                             compiler->lastCallReturnsOwned = false;
                         }
+
+                        // Record `new T[n]` provenance on a raw `T*` local: a DIRECT new-array
+                        // initializer, or a plain copy of an already-tagged pointer local.
+                        auto* initNewArr = initializer && initializer->assignmentExpression()
+                            ? AsDirectNew(initializer->assignmentExpression()) : nullptr;
+                        if (typeAndValue.Pointer && !typeAndValue.IsArrayView
+                            && ((initNewArr != nullptr && initNewArr->assignmentExpression() != nullptr)
+                                || srcPtrCopyIsRawNewArray))
+                            compiler->stackNamedVariable.back().namedVariable[name]
+                                .AllocatedByRawNewArray = true;
 
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
@@ -5523,6 +5551,36 @@ bool MainListener::IsOwningArrayStringElementRead(
             return false;
         return value->getType()
             == llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
+    }
+
+// A `string` element read out of a raw `new string[n]` array: a single-index GEP whose base is a
+// LOAD from an alloca-backed LOCAL `string*`. The allocation does not own its elements (its
+// destructive `delete` is rejected), so the read must be a guaranteed BORROW - the caller clears
+// the runtime owned bit a slot may still carry. A CONTAINER's `_data[i]` loads its base from a
+// struct field, never from an alloca, so `list`/`dictionary` reads keep their exact bit-copy.
+bool MainListener::IsRawHeapStringElementRead(
+        const LLVMBackend::NamedVariable& nv, llvm::Value* value) {
+        if (value == nullptr || nv.Storage == nullptr || !nv.IsElementAccess) return false;
+        if (nv.IsViewElement || nv.TypeAndValue.IsArrayView || nv.TypeAndValue.Pointer)
+            return false;
+        auto* gep = llvm::dyn_cast<llvm::GEPOperator>(nv.Storage);
+        if (gep == nullptr || gep->getNumIndices() != 1) return false;
+        auto* baseLoad = llvm::dyn_cast<llvm::LoadInst>(gep->getPointerOperand());
+        if (baseLoad == nullptr || !llvm::isa<llvm::AllocaInst>(baseLoad->getPointerOperand()))
+            return false;
+        if (!RawHeapBaseIsNewArrayLocal(gep->getPointerOperand())) return false;
+        return value->getType()
+            == llvm::StructType::getTypeByName(*compilerLLVM->context, "string");
+    }
+
+// The POSITIVE admission for both raw-heap arms: the GEP's base is a LOAD of a local that holds a
+// `new T[n]` allocation. Anything else - a decayed fixed array, a join, a parameter - answers false
+// and keeps the plain store, so an unenumerated binding costs a copy and never a dangling borrow.
+bool MainListener::RawHeapBaseIsNewArrayLocal(llvm::Value* gepBase) {
+        auto* baseLoad = llvm::dyn_cast_or_null<llvm::LoadInst>(gepBase);
+        if (baseLoad == nullptr) return false;
+        const auto* bind = compilerLLVM->FindVariableByStorage(baseLoad->getPointerOperand());
+        return bind != nullptr && bind->AllocatedByRawNewArray;
     }
 
 /*

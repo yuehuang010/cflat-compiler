@@ -695,6 +695,21 @@ void LLVMBackend::SetVariableRefCountStorage(const std::string& varName, llvm::V
         }
     }
 
+// Set or CLEAR the `new T[n]` provenance of a raw pointer local. Clearing on any other source is
+// the point: a stale-positive flag costs a copy, a stale-negative one would be a use-after-free.
+void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value)
+{
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it != frame.namedVariable.end())
+            {
+                it->second.AllocatedByRawNewArray = value;
+                return;
+            }
+        }
+    }
+
 void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
 {
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))

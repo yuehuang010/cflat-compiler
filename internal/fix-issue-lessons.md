@@ -2349,3 +2349,68 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   into the address slot. That same ANY rule REJECTS `Node** p = &loc; if (c) { p = &g; } *p = n;`
   whose select twin is accepted; the disagreement is recorded in the issue file, unfiled.
   `Test/test_move.cb` under `leaks --atExit`: 18 / 352, unchanged.
+
+- **`fix/rawheap` - a raw `new string[n]` array is a BORROW container in BOTH directions, and the
+  discriminator is the base pointer's STORAGE, not the GEP shape.** The filed defect was one half
+  of a disagreement: Part 6's owning-slot arm deep-copied a named `string` source into ANY
+  single-index GEP slot (so a raw heap slot became an owner nothing ever frees), while the READ
+  stayed a shallow bit copy that carried the slot's runtime OWNED bit into the new local - two
+  owners, rc 133. RATIFIED: the slot BORROWS. A store from an lvalue source (alloca- or
+  global-backed: a local, a by-value param, a file-scope global; **not** gated on `CallerName`,
+  which `GetGlobalVariableNV` never sets) writes `ClearStringOwnedBit(value)`, and a read into a
+  whole `%string` local - decl-init and assignment alike - clears the bit too. This is the
+  completion of the shipped `delete` diagnostic ("a raw 'new string[n]' does not take ownership of
+  assigned strings ... its slots may hold borrowed text ... or an alias of another buffer"), whose
+  gate is exactly the same: an alloca-backed local `string*`. Both halves now agree with it.
+  **The gate is `dyn_cast<LoadInst>(gep->getPointerOperand())` rooting at an `AllocaInst`.** A
+  container's `_data[i]` / `_keys[slot]` loads its base from a STRUCT FIELD, so `list`,
+  `dictionary` and `span` never reach either arm - verified as byte-identical `--no-opt` IR for
+  `list<string>.add`, `list<string>.sort`, a 120-entry `dictionary<string,string>` rehash, the
+  `T[]` view legs and `Test/test_core.cb`. The plan's LOAD-BEARING INVARIANT is untouched.
+  **The read-side clear MUST carry the same whole-local DESTINATION gate the deep-copy arm has.**
+  The first cut applied it to every `=` whose SOURCE was a raw-heap element and broke
+  `dictionary._rehash`'s `_keys[slot] = oldKeys[i]` (`oldKeys` is an alloca-backed local `K*`),
+  masking the relocated key's owned bit and leaking every key - `test_collection_leaks` caught it,
+  the rest of the suite stayed green.
+  **Review round 3 found the shape gate was not enough, and the repair is PROVENANCE.** An
+  alloca-backed local `string*` also matches a DECAYED FIXED ARRAY (`string[4] arr; string* p = arr;`),
+  whose slots ARE live owners - the borrow store there was a new silent use-after-free
+  (`arr[0]` read back `v=1` on master, `v=0` on the first cut). That is the
+  "fixed-array slots are LIVE, the two gates can never be merged" lesson recurring through a
+  DIFFERENT SPELLING of the same destination, which is why a shape test could not see it.
+  `NamedVariable::DecayedFromFixedArray` is set when a raw `T*` local is bound by decay from a fixed
+  array (and propagates across `string* q = p;`), and BOTH arms skip such a base. NamedVariable
+  flags do not engage the `--init` serializer rule - verified, not assumed: the cache round-trip in
+  `LLVMBackend.cpp` serialises `globalNamedVariable` through `SerializeTav`, i.e. `TypeAndValue`
+  only, never a NamedVariable flag (same precedent as `RootIsBorrowedByValueParam`).
+  The residual is a `string*` PARAMETER, which cannot see its argument's provenance and so has two
+  incompatible correct meanings - filed as
+  `p2/string-pointer-param-slot-semantics-depend-on-argument-provenance.md` with both spellings
+  measured, plus its read-side twin (a decayed-pointer read of a fixed-array element misses the
+  deep copy on master too).
+  **Round 4 INVERTED that provenance, and the polarity argument is the transferable lesson.**
+  Round 3's flag was NEGATIVE (`DecayedFromFixedArray`: borrow unless the base is known to be a
+  decayed fixed array), which is only as good as the enumeration of ways a pointer can be bound -
+  and two were missed at once, a `?:` join base (`string* p = c ? arr : heap;`) and a post-decl
+  re-assignment (`p = arr;`), each a silent use-after-free where master was correct. The flag is
+  now POSITIVE (`AllocatedByRawNewArray`, set on a direct `new T[n]` initializer or assignment and
+  propagated across a plain pointer copy, CLEARED by anything else), and both arms REQUIRE it.
+  **Choose the polarity by what a STALE answer costs:** stale-positive here is a deep copy, i.e. a
+  leak at worst; stale-negative is a dangling borrow. A gate whose default lands on the
+  copy/leak side can be under-enumerated and still be safe; one whose default lands on the borrow
+  side cannot. `fix/viewelem`'s `IsViewElement` is the same shape and the same reason.
+  Consequence accepted by ruling: a `string*` PARAMETER is never tagged (the decay happens in the
+  caller's frame), so its STORE keeps master's deep copy - and the filed double free through a
+  param is still fixed anyway, because the CALLER's READ of its tagged local borrows
+  (`scratch/rh_22_param`: rc 133 -> rc 0). Both parameter misbehaviours are folded into
+  `p2/string-pointer-param-slot-semantics-depend-on-argument-provenance.md`.
+  **Two more cells were measured and deliberately left out, each with an issue file.** An owned TEMP
+  store (`h[k] = "a" + "b"`) cannot be rejected: its signature at that site is identical to
+  `newData[i] = move _data[i]` in `list<string>._grow` (single-index GEP off an alloca-backed local
+  `string*`; source with no Storage, not a Constant, `IsMove` false - dumped from a temporary
+  predicate print on both), so any rejection breaks list growth. Element 0 is still freed by the
+  local's scope-exit `string.dtor` (which destructs the FIRST element only - itself asymmetric with
+  the rejected explicit `delete[n]`); element k > 0 leaks 16 bytes, unchanged pre/post. And the
+  STRUCT twin (`Box* h = new Box[2]; h[0] = b; Box q = h[0];`) stays rc 133: a struct has no
+  runtime owned bit to mask, and the second destruction there is the READ's statement-end temp
+  (`printf("%d", h[0].p->v)` alone already runs one dtor), which is a different fix.

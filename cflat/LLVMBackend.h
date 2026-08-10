@@ -1118,6 +1118,10 @@ public:
         // current function's borrowed (non-`move`) by-value struct parameter. Re-asking downstream by
         // NAME cannot distinguish the parameter from an inner local that shadows it.
         bool RootIsBorrowedByValueParam = false;
+        // POSITIVE provenance: this raw `T*` LOCAL holds a `new T[n]` allocation, whose elements
+        // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
+        // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
+        bool AllocatedByRawNewArray = false;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -2608,6 +2612,7 @@ private:
     // Set a named local's ownership flag (e.g. a `unique` interface local adopting a new owned
     // value on reassignment, so its scope-exit teardown frees the current pointee).
     void SetVariableOwning(const std::string& varName, bool value);
+    void SetVariableRawNewArray(const std::string& varName, bool value);
 
     // True when the named variable currently owns its value (freed on scope exit). Used to decide
     // whether consuming it (into a move interface param) must disown the source.

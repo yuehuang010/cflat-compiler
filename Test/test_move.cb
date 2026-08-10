@@ -4462,6 +4462,11 @@ void aveStoreThroughParam(OaiBox[] v, OaiBox src) { v[0] = src; }
 int aveReadThroughParam(string[] v) { string q = v[0]; return q == "abcd" ? 1 : 0; }
 string aveReturnThroughParam(string[] v) { return v[0]; }
 
+// A raw `string*` PARAMETER is the same non-owning heap array seen from the callee frame: its
+// destructive `delete` is rejected there too, so its slot must borrow just like the caller's.
+void rhStoreThroughParam(string* h, string s) { h[0] = s; }
+string gRhStr = default;
+
 int testOwningAssignIntoArrayViewElement()
 {
     int passed = 0;
@@ -4728,6 +4733,95 @@ int testOwningAssignIntoArrayViewElement()
         string lq = ls.get(0);
         passed += Test("avelr_list_get_value", lq, "aabb");
         passed += Test("avelr_list_get_still_borrows", lq.data() == ls.get(0).data(), true);
+    }
+
+    /*
+     * 15. The raw `new string[n]` array is a BORROW container in BOTH directions - the completion
+     * of the accept legs above. The STORE of an lvalue source writes a borrowed {ptr,len} (it used
+     * to deep-copy, making the slot an owner nothing ever frees), and the READ clears the owned bit
+     * a slot may still carry from an owned-temp store. All three blocks are rc 133 on the merge base:
+     * the local and the raw array both freed one buffer.
+     */
+    {
+        string a = "ab" + "cd";
+        string* h = new string[2];
+        h[0] = a;                       // borrow: `a` stays the single owner
+        string q = h[0];
+        passed += Test("rhstr_named_value", q, "abcd");
+        // The discriminator for the STORE half: the merge base deep-copied here, so the slot held
+        // a SECOND owning buffer (`false`) that only the array's element-0 teardown ever freed.
+        passed += Test("rhstr_named_slot_borrows_source", h[0].data() == a.data(), true);
+        passed += Test("rhstr_named_source_live", a, "abcd");
+    }
+    {
+        // The filed repro: an OWNED TEMP still hands its buffer to the slot, and the READ borrows
+        // it, so the array's own teardown frees it exactly once. These three VALUES already read
+        // back correctly on the merge base while both owners pointed at one buffer - surviving
+        // teardown is the discriminator, and this block is rc 133 without the read-side clear.
+        string* h = new string[2];
+        h[0] = "ef" + "gh";
+        string q = h[0];
+        passed += Test("rhstr_temp_value", q, "efgh");
+        passed += Test("rhstr_temp_borrows", q.data() == h[0].data(), true);
+        string r = "seed";
+        r = h[0];                       // the ASSIGN read position, same clearing
+        passed += Test("rhstr_temp_assign_value", r, "efgh");
+    }
+    {
+        // A file-scope GLOBAL source carries no CallerName, so it reaches the store arm by its
+        // storage shape alone (the merge base left the global's OWNED bit in the slot and aborted
+        // at teardown - survival is this leg's discriminator).
+        gRhStr = "ij" + "kl";
+        string* h = new string[2];
+        h[0] = gRhStr;
+        string q = h[0];
+        passed += Test("rhstr_global_value", q, "ijkl");
+        passed += Test("rhstr_global_source_live", gRhStr, "ijkl");
+
+        string p = "mn" + "op";
+        rhStoreThroughParam(h, p);
+        string pq = h[0];
+        // A `string*` PARAM is NOT tagged (the decay happens in the caller's frame), so its store
+        // keeps the merge base's deep copy; the caller's READ of the tagged local is what stops the
+        // double free here, and surviving teardown is this pair's only discriminator.
+        passed += Test("rhstr_param_value", pq, "mnop");
+        passed += Test("rhstr_param_source_live", p, "mnop");
+        // No `delete[_]`: the param's deep copy landed in element 0, which the local's own
+        // scope-exit teardown destructs - see the filed `string*`-parameter ambiguity.
+    }
+    {
+        // ACCEPT SET for the borrow arms, which admit only a POSITIVE `new string[n]` provenance
+        // (`AllocatedByRawNewArray`). A decayed FIXED array, a `?:` join and a re-assignment away
+        // from the allocation are all UNTAGGED, so they keep the merge base's deep copy - those
+        // slots are LIVE owning storage and a borrow there reads freed bytes once `a` dies.
+        string[4] arr = default;
+        string* p = arr;
+        string* q = p;
+        {
+            string a = "ab" + "cd";
+            q[0] = a;
+        }
+        passed += Test("rhstr_decayed_fixed_array_still_copies", arr[0] == "abcd", true);
+
+        string[4] arr2 = default;
+        string* heap2 = new string[4];
+        string* j = arr2[0].length() == 0 ? arr2 : heap2;
+        {
+            string b = "ef" + "gh";
+            j[0] = b;
+        }
+        passed += Test("rhstr_join_base_still_copies", arr2[0] == "efgh", true);
+
+        string[4] arr3 = default;
+        string* heap3 = new string[4];
+        string* r = heap3;              // tagged by propagation ...
+        r = arr3;                       // ... and the re-assignment CLEARS it again
+        {
+            string c2 = "ij" + "kl";
+            r[0] = c2;
+        }
+        passed += Test("rhstr_reassigned_base_still_copies", arr3[0] == "ijkl", true);
+        delete[_] heap3;
     }
 
     return passed;
@@ -9601,7 +9695,7 @@ extern int main()
     total += 92;
 
     passed += testOwningAssignIntoArrayViewElement();
-    total += 64;
+    total += 77;
 
     passed += testOwningBraceInitFixedArray();
     total += 63;

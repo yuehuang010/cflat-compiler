@@ -2558,6 +2558,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     compiler->MarkVariableOwningString(namedVar.CallerName);
             }
 
+            // The raw `new string[n]` twin of the arm above: that allocation does not own its
+            // elements, so the read BORROWS - clear the owned bit instead of deep-copying. Same
+            // whole-local destination gate, so a container's element-to-element relocation
+            // (`_keys[slot] = oldKeys[i]` in `dictionary._rehash`) never reaches it.
+            if (operatorText == "=" && right
+                && NamedVarIsString(namedVar)
+                && namedVar.FieldName.empty()
+                && !namedVar.TypeAndValue.Pointer
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && IsRawHeapStringElementRead(rightNV, right))
+                right = compiler->ClearStringOwnedBit(right);
+
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
             // reassignment leak where a pre-declared string local reassigned in a loop
             // (`last = name.copy();`) dropped each prior owned buffer. The string dtor checks the
@@ -2601,6 +2614,60 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.BitfieldStorage && !namedVar.UnionFieldType
                 && !namedVar.TypeAndValue.IsArrayView;
             const std::string& slotElemType = namedVar.TypeAndValue.TypeName;
+
+            // Re-assignment re-derives the raw `new T[n]` provenance of a pointer local, and CLEARS
+            // it for a join / decayed array / unknown source (`p = arr;`, `p = c ? a : b;`).
+            if (operatorText == "=" && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(namedVar.Storage))
+            {
+                auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
+                compiler->SetVariableRawNewArray(
+                    namedVar.CallerName,
+                    (asgNewArr != nullptr && asgNewArr->assignmentExpression() != nullptr)
+                        || rightNV.AllocatedByRawNewArray);
+            }
+
+            /*
+             * A raw `new string[n]` element slot: a single-index GEP whose base is a LOAD from an
+             * alloca-backed LOCAL `string*`. This is the exact shape whose destructive `delete` is
+             * already rejected below ("a raw 'new string[n]' does not take ownership of assigned
+             * strings ... its slots may hold borrowed text"), so the slot must NOT become an owner
+             * here either - that mismatch is what let the local and the slot both free one buffer.
+             * A CONTAINER's `_data[i]` loads its base from a struct field (list/dictionary), never
+             * from an alloca, so the container store arms below are untouched. Admission is POSITIVE
+             * provenance (`AllocatedByRawNewArray`): a decayed fixed array, a join and a parameter
+             * all answer false and keep the plain store, so no unenumerated binding can dangle.
+             */
+            bool destIsRawHeapStringSlot = false;
+            if (operatorText == "=" && right && destSlotGep
+                && destSlotGep->getNumIndices() == 1
+                && !destIsStructField && !namedVar.IsViewElement
+                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.Pointer
+                && NamedVarIsString(namedVar))
+            {
+                if (auto* baseLoad =
+                        llvm::dyn_cast<llvm::LoadInst>(destSlotGep->getPointerOperand()))
+                    destIsRawHeapStringSlot =
+                        llvm::isa<llvm::AllocaInst>(baseLoad->getPointerOperand())
+                        && RawHeapBaseIsNewArrayLocal(destSlotGep->getPointerOperand());
+            }
+
+            // Borrow into the raw heap slot, leaving the LVALUE source the single owner. Keyed on
+            // alloca/global source storage, NOT CallerName, which a global source never carries.
+            bool srcIsLvalueSlot = rightNV.Storage != nullptr
+                && (llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                    || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
+            // Source type checked by REPRESENTATION: this arm returns early, so an ill-typed
+            // source must fall through to the existing store diagnostics untouched.
+            if (destIsRawHeapStringSlot && srcIsLvalueSlot
+                && right->getType()
+                    == llvm::StructType::getTypeByName(*compiler->context, "string"))
+            {
+                compiler->builder->CreateStore(compiler->ClearStringOwnedBit(right), destination);
+                return finishStore(right);
+            }
 
             if (destIsElemSlot && slotElemType == "__closure_fat_ptr"
                 && right->getType()->isStructTy())

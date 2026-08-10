@@ -3293,6 +3293,8 @@ public:
     // True when the NamedVariable's value is the `string` value type.
     bool NamedVarIsString(const LLVMBackend::NamedVariable& nv);
     bool IsOwningArrayStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
+    bool IsRawHeapStringElementRead(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
+    bool RawHeapBaseIsNewArrayLocal(llvm::Value* gepBase);
     // Return-position consume/copy of an owning value read out of another object's storage.
     bool ReturnSourceIsIndirectOwningLvalue(const LLVMBackend::NamedVariable& nv, llvm::Value* value);
     bool FieldPathRootIsFrameLocal(llvm::Value* storage);
