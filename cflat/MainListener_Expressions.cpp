@@ -1594,7 +1594,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 {
                     for (size_t i = 0; i < lhsP.size(); i++)
                     {
-                        if (lhsP[i].IsMove != rhsP[i].IsMove)
+                        if (!compiler->FuncPtrParamMoveAgrees(lhsP[i], rhsP[i]))
                         {
                             LogErrorContext(ctx, std::format(
                                 "incompatible function pointer assignment: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",
@@ -1603,6 +1603,23 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         }
                     }
                 }
+            }
+
+            // An INFERRED sink cannot be adopted onto an already-registered destination (or a
+            // struct field's type-wide entry), so the crossing loses it - name the spelling.
+            // Deliberately OUTSIDE the fat-struct gate above: a THIN `function<>` destination
+            // holds a bare code pointer, so its value is not a struct and would slip past.
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer && right)
+            {
+                int lost = compiler->FindLostClosureSinkParam(namedVar.TypeAndValue,
+                                                              rightNV.TypeAndValue);
+                if (lost >= 0)
+                    LogErrorContext(ctx, compiler->DescribeLostClosureSink(
+                        namedVar.TypeAndValue, (size_t)lost,
+                        namedVar.FieldName.empty()
+                            ? (namedVar.CallerName.empty() ? std::string("the destination type")
+                                                           : std::format("'{}'", namedVar.CallerName))
+                            : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName)));
             }
 
             // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
@@ -2379,17 +2396,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
                 && !namedVar.TypeAndValue.IsArrayView
-                && !rightNV.TypeAndValue.IsMove
+                // Same clause the alloca/global arm carries: a `move` PARAMETER is an owner
+                // (IsOwningStruct) that destructs at function exit, so it must TRANSFER here too.
+                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
                 && destination != rightNV.Storage
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
             {
                 // THE FLIP via the shared decision: a copyable owner COPIES into the deref lvalue
                 // (source stays live - no zero, no mark-moved); a non-copyable owner MOVES. Produce
-                // the value before destructing the old destination. The guard excludes an explicit
-                // `move` source, so pass srcIsMove=false.
+                // the value before destructing the old destination. `move` rides the same argument
+                // the alloca/global sibling passes, so a `move` source TRANSFERS for any owner.
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
-                    right, namedVar.TypeAndValue.TypeName, false, ctx, kind);
+                    right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
                     return finishStore(right);

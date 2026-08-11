@@ -6203,6 +6203,19 @@ struct DmfHolder { function<int(move OaiBox)> f = nullptr; };
 int dmfCallThrough(function<int(move OaiBox)> g, move OaiBox x) { return g(x); }
 function<int(move OaiBox)> dmfGet() { return dmfSink; }
 int dmfGeneric<T>(Lambda<int(move T)> g, move T x) { return g(x); }
+// The `Lambda<void(move T)>` spelling on a lambda LITERAL parameter: return and field homes.
+struct LmsHolder { Lambda<int(move OaiBox)> f = default; };
+// Non-consuming literals must keep crossing every declared closure door, in BOTH families.
+struct LmsBorrowL { Lambda<int(OaiBox)> f = default; };
+struct LmsBorrowF { function<int(OaiBox)> f = nullptr; };
+int lmsTakeL(Lambda<int(OaiBox)> g, OaiBox x) { return g(x); }
+int lmsTakeF(function<int(OaiBox)> g, OaiBox x) { return g(x); }
+Lambda<int(OaiBox)> lmsMakeL() { return (OaiBox p) => { return p.item->id; }; }
+function<int(OaiBox)> lmsMakeF() { return (OaiBox p) => { return p.item->id; }; }
+// A COPYABLE owner assigned through a DEREF destination: `move` must TRANSFER, not copy.
+struct LmsCopyVal { string s = ""; };
+void lmsDerefMove(move LmsCopyVal p, LmsCopyVal* out) { *out = p; }
+Lambda<int(move OaiBox)> lmsGet() { return (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; }; }
 
 int testDeclaredMoveFuncPtrParam()
 {
@@ -6378,6 +6391,152 @@ int testDeclaredMoveFuncPtrParam()
         function<int(move int*)> f = dmfAligned;
         passed += Test("dmf_align_accepted", f(b), 10);
     }
+
+
+    // ---- `Lambda<void(move T)>`: the sink SPELLED on a lambda LITERAL parameter. Every leg below
+    // was an ANTLR parse error ("no viable alternative at input '(move OaiBox p) =>'") before the
+    // lambda-parameter `move` spelling existed, so each fails pre-fix as a PARSE error.
+
+    // 18. The headline spelling: literal and declared type both state `move`; the body consumes.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(20);
+        Lambda<int(move OaiBox)> f = (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; };
+        passed += Test("lms_value", f(a), 20);
+        passed += Test("lms_freed_by_lambda", dtorCount, 1);
+    }
+    passed += Test("lms_freed_once_total", dtorCount, 1);
+
+    // 19. The THIN `function<>` family takes the same spelling (the lambda captures nothing).
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(21);
+        function<int(move OaiBox)> f = (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; };
+        passed += Test("lms_thin_value", f(a), 21);
+    }
+    passed += Test("lms_thin_freed_once_total", dtorCount, 1);
+
+    // 20. MIXED: only the `move` parameter transfers; the borrowed one stays live in the caller.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(1);
+        OaiBox b = oaiMake(2);
+        Lambda<int(OaiBox, move OaiBox)> f = (OaiBox x, move OaiBox y) => { return x.item->id + y.item->id; };
+        passed += Test("lms_mixed_value", f(a, b), 3);
+        passed += Test("lms_mixed_move_freed", dtorCount, 1);
+        passed += Test("lms_mixed_borrow_live", a.item->id, 1);
+    }
+    passed += Test("lms_mixed_freed_twice_total", dtorCount, 2);
+
+    // 21. A PRIMITIVE POINTER sink - `move int*` is spellable on a literal too, and the body
+    // may delete it because the parameter is no longer a borrow.
+    {
+        int* b = new int[1];
+        b[0] = 33;
+        Lambda<int(move int*)> f = (move int* p) => { int v = p[0]; delete[] p; return v; };
+        passed += Test("lms_intptr_value", f(b), 33);
+    }
+
+    // 22. STAGE 2: a literal with an INFERRED sink (no `move` token) satisfies a DECLARED `move`
+    // parameter - "parameter 1 differs in 'move' modifier" before, since a literal could not state it.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(22);
+        Lambda<int(move OaiBox)> f = (OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; };
+        passed += Test("lms_inferred_satisfies_declared", f(a), 22);
+    }
+    passed += Test("lms_inferred_freed_once_total", dtorCount, 1);
+
+    // 23. A `move` param stored into a BY-REFERENCE CAPTURED slot. The deref-destination assign
+    // arm excluded every `move` source, so the store aliased and both sides freed (rc 134).
+    dtorCount = 0;
+    {
+        OaiBox slot;
+        Lambda<void(move OaiBox)> f = (move OaiBox p) => { slot = p; };
+        OaiBox a = oaiMake(23);
+        f(a);
+        passed += Test("lms_capture_slot_not_freed_yet", dtorCount, 0);
+        passed += Test("lms_capture_slot_holds", slot.item->id, 23);
+    }
+    passed += Test("lms_capture_slot_freed_once_total", dtorCount, 1);
+
+    // 24. The spelled literal as a direct ARGUMENT to a declared `Lambda<...(move T)>` parameter -
+    // the crossing the un-spelled form is now rejected at.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(24);
+        passed += Test("lms_arg_value", dmfGeneric<OaiBox>(
+            (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; }, a), 24);
+    }
+    passed += Test("lms_arg_freed_once_total", dtorCount, 1);
+
+    // 25. RETURNED through a declared `Lambda<...(move T)>` return type.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(25);
+        Lambda<int(move OaiBox)> f = lmsGet();
+        passed += Test("lms_returned_value", f(a), 25);
+    }
+    passed += Test("lms_returned_freed_once_total", dtorCount, 1);
+
+    // 26. Stored into a STRUCT FIELD of the spelled closure type and invoked as `h.f(a)`.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(26);
+        LmsHolder h;
+        h.f = (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; };
+        passed += Test("lms_field_value", h.f(a), 26);
+    }
+    passed += Test("lms_field_freed_once_total", dtorCount, 1);
+
+    // 27. ACCEPT SET: a NON-consuming plain literal is untouched - the caller keeps ownership.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(27);
+        Lambda<int(OaiBox)> f = (OaiBox p) => { return p.item->id; };
+        passed += Test("lms_borrow_value", f(a), 27);
+        passed += Test("lms_borrow_no_callee_free", dtorCount, 0);
+        passed += Test("lms_borrow_source_live", a.item->id, 27);
+    }
+    passed += Test("lms_borrow_freed_by_caller", dtorCount, 1);
+
+    // 28. ACCEPT SET for the stage-3 guard: a NON-consuming literal must still cross the argument,
+    // return and struct-FIELD doors, in BOTH the fat `Lambda<>` and thin `function<>` families.
+    // The guard keys on the sink, so none of these six may be refused and the caller keeps its value.
+    dtorCount = 0;
+    {
+        OaiBox a = oaiMake(28);
+        passed += Test("lms_ok_arg_lambda", lmsTakeL((OaiBox p) => { return p.item->id; }, a), 28);
+        passed += Test("lms_ok_arg_function", lmsTakeF((OaiBox p) => { return p.item->id; }, a), 28);
+        LmsBorrowL hl;
+        hl.f = (OaiBox p) => { return p.item->id; };
+        passed += Test("lms_ok_field_lambda", hl.f(a), 28);
+        LmsBorrowF hf;
+        hf.f = (OaiBox p) => { return p.item->id; };
+        passed += Test("lms_ok_field_function", hf.f(a), 28);
+        Lambda<int(OaiBox)> rl = lmsMakeL();
+        passed += Test("lms_ok_return_lambda", rl(a), 28);
+        function<int(OaiBox)> rf = lmsMakeF();
+        passed += Test("lms_ok_return_function", rf(a), 28);
+        passed += Test("lms_ok_no_callee_free", dtorCount, 0);
+        passed += Test("lms_ok_source_live", a.item->id, 28);
+    }
+    passed += Test("lms_ok_freed_by_caller", dtorCount, 1);
+
+    // 29. A `move` source through a DEREF destination TRANSFERS for a COPYABLE owner too - the
+    // deref arm passed a hard-coded srcIsMove=false where its alloca/global sibling passes the
+    // source's own flag, so it copied and left the source live. The use-after-move half is pinned
+    // in Test/errors/err_funcptr_move_mismatch.cb; this leg pins that the payload arrives.
+    {
+        LmsCopyVal a;
+        a.s = "payload";
+        LmsCopyVal b;
+        lmsDerefMove(a, &b);
+        passed += Test("lms_deref_move_payload", b.s, "payload");
+    }
+
+    // Leg 22 above is the NON-COPYABLE twin of the copyable-sink rejection: OaiBox has a `unique`
+    // pointer field and no author copy(), so its inferred sink genuinely consumes and IS accepted.
 
     return passed;
 }
@@ -10450,7 +10609,7 @@ extern int main()
     passed += testLambdaParamOwningSink();
     total += 60;
     passed += testDeclaredMoveFuncPtrParam();
-    total += 44;
+    total += 79;
 
     passed += testConsumeOfBorrowedByValueParamField();
     total += 34;

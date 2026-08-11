@@ -1389,6 +1389,59 @@ bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
         return true;
     }
 
+bool LLVMBackend::FuncPtrParamMoveAgrees(const TypeAndValue::FuncPtrParam& dest,
+        const TypeAndValue::FuncPtrParam& src)
+{
+        if (dest.IsMove == src.IsMove) return true;
+        // A consuming literal has no `move` token but does consume, so it satisfies a declared
+        // sink. The reverse (source spells `move`, destination does not) still disagrees.
+        if (!dest.IsMove || !src.IsOwningSink) return false;
+        // ...but only when the sink CONSUMES for this concrete type. A consume-inferred sink of a
+        // COPYABLE owner stores a copy, so the caller's declared-move transfer would poison a
+        // source nobody took and leak it - that stays the pre-existing rejection.
+        return OwningSinkConsumesConcrete(FuncPtrParamAsTypeAndValue(src, 0));
+    }
+
+int LLVMBackend::FindLostClosureSinkParam(const TypeAndValue& dest, const TypeAndValue& src)
+{
+        // The SIGNATURE is the proof, not IsFunctionPointer: a closure ARGUMENT reaches the
+        // overload scorer with FuncPtrParams copied but IsFunctionPointer deliberately left alone.
+        if (!dest.IsFunctionPointer || src.FuncPtrParams.empty()) return -1;
+        if (dest.FuncPtrParams.size() != src.FuncPtrParams.size()) return -1;
+        for (size_t i = 0; i < src.FuncPtrParams.size(); i++)
+        {
+            const auto& d = dest.FuncPtrParams[i];
+            if (d.IsMove || d.IsOwningSink) continue;
+            TypeAndValue s = FuncPtrParamAsTypeAndValue(src.FuncPtrParams[i], i);
+            if (!OwningSinkConsumesConcrete(s)) continue;
+            if (!IsOwningValueOrClosureType(s.TypeName)) continue;
+            return (int)i;
+        }
+        return -1;
+    }
+
+std::string LLVMBackend::DescribeLostClosureSink(const TypeAndValue& dest, size_t index,
+        const std::string& destDescription)
+{
+        // Rebuild the destination's own spelling with `move` added at the offending parameter.
+        std::string family = dest.IsThinFnPtr() ? "function" : "Lambda";
+        std::string spelled = family + "<" + dest.FuncPtrReturnTypeName
+            + std::string(dest.FuncPtrReturnPointer ? "*" : "") + "(";
+        for (size_t i = 0; i < dest.FuncPtrParams.size(); i++)
+        {
+            if (i > 0) spelled += ", ";
+            if (i == index || dest.FuncPtrParams[i].IsMove) spelled += "move ";
+            spelled += dest.FuncPtrParams[i].TypeName;
+            if (dest.FuncPtrParams[i].Pointer) spelled += "*";
+        }
+        spelled += ")>";
+        return std::format(
+            "this closure CONSUMES parameter {} ('{}'), but {} does not spell it - ownership cannot "
+            "travel with a closure value, so the caller would free it again. Spell the sink in the "
+            "type: '{}'",
+            index + 1, dest.FuncPtrParams[index].TypeName, destDescription, spelled);
+    }
+
 bool LLVMBackend::HasRealCopyOverloadFor(const std::string& typeName) const
 {
         auto it = functionTable.find("copy");

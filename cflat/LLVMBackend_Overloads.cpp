@@ -1371,6 +1371,18 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
         }
 
+        // A consuming closure bound to a DECLARED closure PARAMETER: the parameter's registered
+        // type cannot adopt the inferred sink, so the callee consumes and the caller frees again.
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+        {
+            int lostSink = FindLostClosureSinkParam(candidate.Parameters[i],
+                                                    matched[i].TypeAndValue);
+            if (lostSink < 0) continue;
+            LogError(DescribeLostClosureSink(candidate.Parameters[i], (size_t)lostSink,
+                std::format("parameter '{}' of '{}'",
+                            candidate.Parameters[i].VariableName, functionName)));
+        }
+
         // Null out caller's storage for move parameters; mark the source moved (shared helper).
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched);
 

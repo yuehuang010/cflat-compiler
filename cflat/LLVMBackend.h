@@ -3593,6 +3593,19 @@ private:
     // ownership) consults, so the structural scanner flag and the full-info decision stay in sync.
     bool OwningSinkConsumesConcrete(const TypeAndValue& p);
 
+    // Per-parameter 'move' agreement between a funcptr DESTINATION and its source. A literal that
+    // INFERRED an owning sink satisfies a declared `move` - it already consumes - which is the one
+    // way a lambda literal could not previously state the sink.
+    bool FuncPtrParamMoveAgrees(const TypeAndValue::FuncPtrParam& dest,
+                                const TypeAndValue::FuncPtrParam& src);
+    // A closure whose parameter i is an owning sink crossing into a DECLARED closure type that
+    // spells neither `move` nor a sink at i: the fact cannot ride the fat struct, so the callee
+    // consumes and the caller frees again. Returns the 0-based index, or -1 when nothing is lost.
+    int FindLostClosureSinkParam(const TypeAndValue& dest, const TypeAndValue& src);
+    // The required spelling for the crossing FindLostClosureSinkParam rejected.
+    std::string DescribeLostClosureSink(const TypeAndValue& dest, size_t index,
+                                        const std::string& destDescription);
+
     // True when `typeName` has an AUTHOR-written (library/user) copy() - not the memberwise
     // synth generated on demand. The synth is registered under "<type>.copy.synth"; a real
     // copy is anything else. This is the deep-copy guarantee a container (list/dictionary)

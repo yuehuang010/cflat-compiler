@@ -375,7 +375,7 @@ lambdaParamList
     ;
 
 lambdaParam
-    : typeSpecifier pointer? Identifier
+    : Move? typeSpecifier pointer? Identifier   // leading Move = the parameter is an ownership sink, matching `Lambda<void(move T)>`
     ;
 
 lambdaBody

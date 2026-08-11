@@ -535,7 +535,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // Coerce the returned value to the function-pointer return type (thin vs
         // fat): a named function, a thin function<> value, or a fat closure value.
         if (right && returnFnPtrTV.IsFunctionPointer)
+        {
+            // The declared RETURN type is the crossing here: it cannot adopt an inferred sink,
+            // so a consuming closure leaving through it must spell the sink.
+            int lostSink = compiler->FindLostClosureSinkParam(returnFnPtrTV, returnNV.TypeAndValue);
+            if (lostSink >= 0)
+                LogErrorContext(errCtx, compiler->DescribeLostClosureSink(
+                    returnFnPtrTV, (size_t)lostSink, "the declared return type"));
             right = compiler->CoerceToFuncPtrReturn(right, returnFnPtrTV, returnNV);
+        }
         ProcessPlusPlus();
 
         /*

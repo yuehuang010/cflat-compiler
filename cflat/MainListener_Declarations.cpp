@@ -3590,7 +3590,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             {
                                 for (size_t i = 0; i < typeAndValue.FuncPtrParams.size(); i++)
                                 {
-                                    if (typeAndValue.FuncPtrParams[i].IsMove != rhsFuncPtrParams[i].IsMove)
+                                    if (!compiler->FuncPtrParamMoveAgrees(
+                                            typeAndValue.FuncPtrParams[i], rhsFuncPtrParams[i]))
                                     {
                                         LogErrorContext(assignmentExpression, std::format(
                                             "incompatible function pointer initializer: parameter {} differs in 'move' modifier - 'move' is part of the function-pointer type",

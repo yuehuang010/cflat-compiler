@@ -4839,6 +4839,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 LLVMBackend::DeclTypeAndValue p;
                 p.TypeName = compiler->ResolveTypeAlias(param->typeSpecifier()->getText());
                 p.Pointer = param->pointer() != nullptr;
+                // `(move T p) => ...` - the literal's half of the `Lambda<void(move T)>` spelling.
+                p.IsMove = param->Move() != nullptr;
                 p.IsInterface = compiler->IsInterfaceType(p.TypeName);
                 if (p.IsInterface)
                     p.IsInterfacePointer = param->pointer() != nullptr;
@@ -5240,6 +5242,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             // caller's source; a declared Lambda<...> spelling never sets these.
             fp.IsOwningSink = p.IsOwningSink;
             fp.IsConsumeInferredSink = p.IsConsumeInferredSink;
+            // A SPELLED `move` param rides the type, exactly as a named function's does.
+            fp.IsMove = p.IsMove;
             tv.FuncPtrParams.push_back(fp);
         }
 

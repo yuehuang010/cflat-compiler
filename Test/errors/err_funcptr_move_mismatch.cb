@@ -8,3 +8,93 @@ expect_error("'move' modifiers of function pointer signature") {
         function<void(move int*)> fp = borrow_int_ptr;
     }
 }
+
+// An INFERRED owning sink cannot ride a closure VALUE, so every crossing into a declared closure
+// type that does not spell `move` is rejected with the required spelling. All five double-freed
+// (rc 134) before the `Lambda<void(move T)>` spelling existed.
+struct FmmRes { int id = 0; ~FmmRes() { } };
+struct FmmBox { unique FmmRes* item = nullptr; };
+
+expect_error("but parameter 'g' of 'fmmCall' does not spell it") {
+    void fmmCall(Lambda<void(FmmBox)> g, move FmmBox x) { g(x); }
+    void fmmArg() {
+        FmmBox a;
+        fmmCall((FmmBox p) => { FmmBox[2] d = { p }; }, a);
+    }
+}
+
+expect_error("Lambda<void(move FmmBox)>") {
+    void fmmCall2(Lambda<void(FmmBox)> g, move FmmBox x) { g(x); }
+    void fmmNamedThenArg() {
+        FmmBox a;
+        Lambda<void(FmmBox)> f = (FmmBox p) => { FmmBox[2] d = { p }; };
+        fmmCall2(f, a);
+    }
+}
+
+expect_error("does not spell it") {
+    void fmmCallG<T>(Lambda<void(T)> g, move T x) { g(x); }
+    void fmmGeneric() {
+        FmmBox a;
+        fmmCallG<FmmBox>((FmmBox p) => { FmmBox[2] d = { p }; }, a);
+    }
+}
+
+expect_error("the declared return type does not spell it") {
+    Lambda<void(FmmBox)> fmmMake() { return (FmmBox p) => { FmmBox[2] d = { p }; }; }
+}
+
+expect_error("but 'h.f' does not spell it") {
+    struct FmmHolder { Lambda<void(FmmBox)> f = default; };
+    void fmmField() {
+        FmmHolder h;
+        h.f = (FmmBox p) => { FmmBox[2] d = { p }; };
+    }
+}
+
+// The thin `function<>` family rejects the same three crossings as the fat `Lambda<>` one, and
+// names its own spelling. The FIELD door needed the guard OUTSIDE the fat-struct gate: a thin
+// destination holds a bare code pointer, so its value is not a struct (rc 134 before).
+expect_error("function<void(move FmmBox)>") {
+    void fmmCallF(function<void(FmmBox)> g, move FmmBox x) { g(x); }
+    void fmmFnArg() {
+        FmmBox a;
+        fmmCallF((FmmBox p) => { FmmBox[2] d = { p }; }, a);
+    }
+}
+
+expect_error("the declared return type does not spell it") {
+    function<void(FmmBox)> fmmMakeF() { return (FmmBox p) => { FmmBox[2] d = { p }; }; }
+}
+
+expect_error("but 'hf.f' does not spell it") {
+    struct FmmHolderF { function<void(FmmBox)> f = nullptr; };
+    void fmmFnField() {
+        FmmHolderF hf;
+        hf.f = (FmmBox p) => { FmmBox[2] d = { p }; };
+    }
+}
+
+// An inferred sink of a COPYABLE owner does NOT consume (its store is a copy), so it must NOT
+// satisfy a declared `move`: the caller would transfer a value the literal never took and leak it.
+// Accepting this was measured as made=2 dtor=1 - the original never freed.
+struct FmmCopyable
+{
+    unique FmmRes* p = nullptr;
+    FmmCopyable copy() { FmmCopyable r; r.p = new FmmRes(); return r; }
+};
+
+expect_error("differs in 'move' modifier") {
+    void fmmCopyableSink() {
+        Lambda<void(move FmmCopyable)> f =
+            (FmmCopyable p) => { FmmCopyable[2] d = { p }; };
+    }
+}
+
+// A `move` source assigned through a DEREF destination TRANSFERS (cflat move = zero the source),
+// so reading it afterwards is a use-after-move. Pre-fix the deref arm copied instead and left the
+// source live, so this compiled and printed the payload from both.
+expect_error("use of moved variable 'p'") {
+    struct FmmVal { string s = ""; };
+    void fmmDerefMove(move FmmVal p, FmmVal* out) { *out = p; printf("%s", p.s.data()); }
+}
