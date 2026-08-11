@@ -28,9 +28,12 @@ DpCircle** dpForward(DpCircle** s) { return s; }
 // 32-bit "int"). Such an argument has no name to print, so the note reports only the depth.
 int dpPrimDeref(int* p) { return 100 + *p; }
 int dpCharTake(char* p) { return 100 + (int)(*p); }
+int dpPrimArrayDeref(int* p) { return 500 + p[0]; }
 int dpFirstR(DpCircle* c) { return 90 + c->r; }
 class DpVec { int k = 0; int operator+(DpCircle* o) { return 100 + o->r; } };
 int dpByPtrPtr3(DpCircle** c) { return 2000 + (*c)->r; }
+interface DpIface { int take(DpCircle* c); };
+class DpIfaceImpl : DpIface { int take(DpCircle* c) { return 5000 + c->r; } };
 
 // A generic type ARGUMENT carries its stars as a real depth, so DpGBox<DpCircle*> and
 // DpGBox<DpCircle**> are distinct instantiations and each substituted 'T x' is judgeable.
@@ -191,6 +194,23 @@ extern int main()
         DpCircle*[2] arr = default;
         arr[0] = new DpCircle();
         int r = dpFirstR(arr);
+    }
+
+    // The primitive twin has no CFlat TypeName on the decayed argument, but its fixed array
+    // element still proves the extra pointer level.
+    expect_error("parameter 0 'p' has type 'int*' and the argument has one more level of indirection") {
+        int*[2] arr = default;
+        int x = 3;
+        arr[0] = &x;
+        int r = dpPrimArrayDeref(arr);
+    }
+
+    // Interface dispatch has a separate lone-slot resolver and must apply the same depth gate.
+    expect_error("call to 'DpIface.take': parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpIface i = new DpIfaceImpl();
+        int r = i.take(pp);
     }
 
     // ---- OPERATOR OPERAND: only the RECEIVER reaches the scorer ----

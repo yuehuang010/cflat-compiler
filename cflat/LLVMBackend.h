@@ -852,7 +852,7 @@ public:
         {
             return ConstArraySize > 0 && Pointer && !ElemPointer && !IsArrayView && !IsSimd
                 && !IsInterface && !IsInterfacePointer && !IsFunctionPointer
-                && !TypeName.empty() && TypeName != "void";
+                && TypeName != "void";
         }
 
         /*

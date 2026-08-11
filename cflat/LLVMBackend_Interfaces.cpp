@@ -942,7 +942,9 @@ llvm::Function* LLVMBackend::LookupInterfaceMethodImpl(const std::string& struct
             bool paramsMatch = true;
             for (size_t pi = 0; pi < method.Parameters.size(); pi++)
             {
-                if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
+                if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName
+                    || sym.Parameters[1 + pi].ValuePointerDepth()
+                        != method.Parameters[pi].ValuePointerDepth())
                 { paramsMatch = false; break; }
             }
             if (!paramsMatch) continue;

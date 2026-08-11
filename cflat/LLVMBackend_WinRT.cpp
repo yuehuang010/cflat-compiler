@@ -153,6 +153,7 @@ std::string LLVMBackend::CreateWinrtVtableStruct(const std::string& className, c
                     TypeAndValue::FuncPtrParam p;
                     p.TypeName = mp.TypeName;
                     p.Pointer = mp.Pointer;
+                    p.PointerDepth = mp.PointerDepth;
                     params.push_back(p);
                 }
                 // WinRT ABI: the slot returns HRESULT (i32); a non-void logical return is passed
@@ -178,7 +179,9 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindWinrtMethod(const std::strin
             if (sym.Parameters[0].TypeName != className || !sym.Parameters[0].Pointer) continue;
             bool ok = true;
             for (size_t pi = 0; pi < m.Parameters.size(); pi++)
-                if (sym.Parameters[1 + pi].TypeName != m.Parameters[pi].TypeName) { ok = false; break; }
+                if (sym.Parameters[1 + pi].TypeName != m.Parameters[pi].TypeName
+                    || sym.Parameters[1 + pi].ValuePointerDepth()
+                        != m.Parameters[pi].ValuePointerDepth()) { ok = false; break; }
             if (ok) return &sym;
         }
         return nullptr;
@@ -2130,6 +2133,32 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
                     ifaceName, methodName, why.empty() ? "" : " - " + why));
                 return true;
             }
+            if (args[i].TypeAndValue.PointerDepthRefuses(params[i]))
+            {
+                bool tooDeep = args[i].TypeAndValue.IsProvenDoublePointer()
+                    || args[i].TypeAndValue.IsProvenDecayedDoublePointer();
+                std::string shown = DisplayNameOfMangledType(params[i].TypeName);
+                std::string argShown = DisplayNameOfMangledType(args[i].TypeAndValue.TypeName);
+                if (tooDeep)
+                {
+                    LogError(std::format(
+                        "call to '{}.{}': parameter {} '{}' has type '{}*' and the argument has {} - "
+                        "there is no implicit dereference. Dereference it with '*' at the call site.",
+                        ifaceName, methodName, i, params[i].VariableName, shown,
+                        argShown.empty() ? std::string("one more level of indirection")
+                                         : std::format("type '{}**'", argShown)));
+                }
+                else
+                {
+                    LogError(std::format(
+                        "call to '{}.{}': parameter {} '{}' has type '{}**' and the argument has {} - "
+                        "there is no implicit address-of. Take its address with '&' at the call site.",
+                        ifaceName, methodName, i, params[i].VariableName, shown,
+                        argShown.empty() ? std::string("one fewer level of indirection")
+                                         : std::format("type '{}*'", argShown)));
+                }
+                return true;
+            }
             if (PointerArgIntoByValueParam(args[i], params[i]))
             {
                 // Rendered when the rendering is provably writable source; a nested instantiation
@@ -2591,7 +2620,8 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
                     for (int i = 0; i < (int)method.Parameters.size(); i++)
                     {
                         if (sym.Parameters[i + 1].TypeName != method.Parameters[i].TypeName ||
-                            sym.Parameters[i + 1].Pointer != method.Parameters[i].Pointer)
+                            sym.Parameters[i + 1].ValuePointerDepth()
+                                != method.Parameters[i].ValuePointerDepth())
                         {
                             paramsMatch = false;
                             break;

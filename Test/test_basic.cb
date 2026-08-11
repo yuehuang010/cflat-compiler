@@ -2178,6 +2178,12 @@ class PdCircle { int r = 0; };
 int pdPick(PdCircle* c)  { return 1; }
 int pdPick(PdCircle** c) { return 2; }
 int pdByPtrPtr(PdCircle** c) { return 1000 + (*c)->r; }
+interface PdIface { int take(PdCircle* c); int take(PdCircle** c); };
+class PdIfaceImpl : PdIface
+{
+    int take(PdCircle* c) { return 100 + c->r; }
+    int take(PdCircle** c) { return 200 + (*c)->r; }
+};
 int pdByVoid(void* p) { return p == nullptr ? 0 : 1; }
 int pdNullOk(PdCircle** c) { return c == nullptr ? 9 : 8; }
 void pdFill(PdCircle** c, int v) { (*c)->r = v; }
@@ -2297,6 +2303,13 @@ bool testOverloadResolution()
     result &= Test("pd_ptrptr_arg_into_voidptr_param", pdByVoid(pdPP), 1);
     result &= Test("pd_ptr_arg_into_voidptr_param", pdByVoid(pdA), 1);
     result &= Test("pd_ptrptr_from_array_elem_addr", pdByPtrPtr(&pdArr[0]), 1004);
+
+    // Interface dispatch has its own slot resolver and implementation lookup. Both must keep
+    // pointer depth in the signature, so the same-arity T** overload receives the T** argument.
+    PdIfaceImpl pdIfaceImpl = default;
+    PdIface pdIface = pdIfaceImpl;
+    result &= Test("pd_iface_ptrptr_overload", pdIface.take(pdPP), 203);
+    result &= Test("pd_iface_ptr_overload", pdIface.take(pdA), 103);
 
     // ---- The MIRROR gate (a 'T*' argument must not bind a 'T**' parameter) ----
     // FIX LEG: pre-fix '&pdA' recorded no depth, so it scored a PERFECT match on the 'T*'
