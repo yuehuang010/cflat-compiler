@@ -1,9 +1,10 @@
 # `unique` assignment laundering: residue after the return-identity alias proof landed
 
 The 2026-08-10 RULING's item 1 (the return-identity alias proof) and the FIELD-OVERWRITE half of
-item 2 have LANDED. What is left of this file is the one shape from item 2 that a PROOF cannot
-reach, plus the two accepted caveats. Item 3 (the `llvm.mem*` DESTINATION analog) stays deferred
-and unreachable, exactly as ruled.
+item 2 have LANDED. The remaining shape from item 2 (varargs) received its own ruling later the
+same day - the va_arg C-boundary axiom pair below - and is now IMPLEMENTABLE work, not a deferral.
+The accepted caveats stand. Item 3 (the `llvm.mem*` DESTINATION analog) stays deferred and
+unreachable, exactly as ruled.
 
 ## What landed
 
@@ -23,7 +24,35 @@ and unreachable, exactly as ruled.
   through the tracked pointer still answers "retains" - the deallocation runs on the tracked
   pointer's own block, and that is the discriminator.
 
-## Residue - a projected pointer handed to an UNANALYZABLE callee (LEAKS, sound)
+## Residue - a projected pointer handed to an UNANALYZABLE callee - RULED 2026-08-10
+
+### RULING (maintainer) - a va_arg slot is a C BOUNDARY. Take the axiom pair.
+
+A variadic argument slot is C data: CFlat ownership never transfers INTO one. Two consequences,
+both to be implemented together:
+
+1. **A borrow handed to a va_arg slot is never retention.** The variadic callee reads C data; it
+   cannot become an owner, so `OwningPtrEscapes` may answer "does not retain past my call" for the
+   variadic portion of any call by AXIOM, not by walking the body. The owning receiver temp in the
+   `show()` repro below is then released at the statement boundary and the filed leak closes. The
+   `free`-family exclusion stays: a deallocating callee frees through its DECLARED (non-variadic)
+   parameter, which this axiom does not cover, so "the callee freed the object" keeps answering
+   "retains".
+2. **An OWNING value into a va_arg slot is a hard error.** Ownership cannot cross the boundary, the
+   callee cannot free it, and the caller just dropped its only handle. Measured 2026-08-10
+   (`scratch/va_q3.cb`): `printf("%p\n", mkOwned())` with `move R* mkOwned()` compiles with no
+   diagnostic and the object is never freed - a silent leak today. The error should direct the user
+   to bind the value to an owner first. Accept-set to freeze before the guard: every existing
+   `printf`-style call over BORROWED pointers (`%p` of a plain local, `.data()` of an owned-elsewhere
+   string, interior pointers) stays legal - only an owning temp / move-returned / explicitly moved
+   value entering a variadic slot errors.
+
+Supporting measurement (2026-08-10, `scratch/va_q1.cb` / `va_q2.cb`): `int* a = move data();` is
+already a compile error for BOTH borrow-returning and move-returning callees - "'move' expression
+requires an addressable source (field or local)" - so ownership at a call site is carried solely by
+the return TYPE and is statically visible exactly where guard 2 needs it.
+
+### The repro this ruling closes
 
 ```cflat
 void show() { printf("[%s]\n", tag.data()); }   // on an owning receiver temp
@@ -31,14 +60,11 @@ void show() { printf("[%s]\n", tag.data()); }   // on an owning receiver temp
 
 `data()` is now transparent (its parameter escapes only via its return, so the walk keeps following
 the buffer pointer in `show`'s frame). The pointer then reaches `printf`, a VARARG callee whose
-variadic slots are read back through a `va_list` the walk cannot follow. Answering "does not retain
-past my call" there is not a proof - it is a decision to TRUST an unanalyzable callee, and the
-harm it buys is a use-after-free (the temp is freed at the statement boundary while a stashed copy
-of the buffer pointer survives), not a leak. That inverts this family's polarity - free only what
-you can prove is unreferenced - so it was deliberately not taken. Closing it needs either a
-va_list-aware walk of the variadic callee's body, or an explicit ratified decision that an
-external/variadic declaration never retains, with `free`-family deallocations excluded so
-"the callee freed the object" keeps answering "retains".
+variadic slots are read back through a `va_list` the walk cannot follow. The previous position -
+that answering "does not retain" would be trusting an unanalyzable callee - is superseded by the
+boundary axiom above: the question is no longer what the callee does, but what a va_arg slot can
+BE. Note the axiom covers only the VARIADIC slots; a pointer passed through a DECLARED parameter of
+a variadic function is still judged by the ordinary walk.
 
 Sibling cell, decided: a callee that frees a field WITHOUT overwriting it keeps answering
 "retains". No proof of the overwrite, so no caller-side release.

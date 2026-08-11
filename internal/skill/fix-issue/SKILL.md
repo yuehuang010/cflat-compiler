@@ -92,6 +92,10 @@ compiler):**
   per cell. A leg that behaves identically before and after the fix tests
   nothing - this pre-fix recording is the one process step that has worked
   every time.
+- Write the matrix itself to `scratch/<prefix>_matrix.md` - one row per cell:
+  probe file, shape, pre-fix behaviour, intended post-fix behaviour, in/out of
+  scope. This file is the handoff artifact every review round reads from disk;
+  keep it updated if later rounds change a cell.
 - Report the matrix: each cell's shape, its pre-fix behaviour, and whether the
   fix will change it. Cells deliberately left out of scope must be listed with
   a reason each, not silently dropped.
@@ -238,10 +242,14 @@ check mid-loop, and say in the final report that the fallback was used.
 every later opus round continues it via SendMessage so it keeps context -
 never spawn a second or parallel opus reviewer for the same issue. `codex exec`
 has no such continuity: each invocation is a fresh process. So every codex
-round's prompt must paste in what SendMessage would otherwise carry - the fix
-agent's coverage matrix, the current `git diff master...HEAD`, and a short
-summary of prior rounds' findings and what changed in response - so it is not
-re-discovering ground a prior round already covered.
+round's prompt must carry what SendMessage would otherwise carry - point it at
+the fix agent's `scratch/<prefix>_matrix.md` for the coverage matrix, and paste
+a short summary of prior rounds' findings and what changed in response - so it
+is not re-discovering ground a prior round already covered. Do NOT paste the
+diff or the matrix inline: codex runs inside the worktree and reads
+`git diff master...HEAD` and the matrix file more reliably than a
+multi-hundred-line shell argument carries them - just name the command and the
+path.
 
 For an opus round: spawn (round 1 under fallback, or round 2) or continue via
 SendMessage (any later opus round) a code-review agent at **opus** in the
@@ -259,9 +267,17 @@ not re-derive it:
 - Does each regression leg fail on the pre-fix binary FOR THE STATED REASON
   (reaches the arm it names), not merely fail?
 - For changes to anything every program flows through (guard predicates,
-  overload resolution, mangling, type-flag semantics), require the differential
-  corpus sweep: build the parent commit in a scratch worktree, run both binaries
-  over every `.cb` in `Test/` and `example/`, and diff.
+  overload resolution, mangling, type-flag semantics), require the corpus
+  sweep: run the fix binary over every `.cb` in `Test/` and `example/` and
+  require it clean. Do NOT build the parent commit for comparison - master is
+  assumed green before any commit, so any corpus regression is the diff's.
+- **Guard against removed or weakened tests via the diff.** Landing an issue
+  should only ADD test legs. Scan `git diff master...HEAD -- Test/` for
+  removed lines: a deleted leg, a loosened assertion, a changed expected
+  value, or a rewritten `expect_error` substring in a PRE-EXISTING test is a
+  finding by default - the fix agent silencing a test its change broke. The
+  only exception is a behaviour change the issue file's ruling explicitly
+  ratifies, and then the report must name the ruling next to each such hunk.
 - **Hand the fix agent's probe corpus to the reviewer; do NOT have it rebuild
   one.** The fix agent leaves its corpus in `scratch/` (it is gitignored, so tell
   it not to delete it until the merge). The reviewer's job on that corpus is to
@@ -271,7 +287,7 @@ not re-derive it:
   avoidable duplication in this workflow, and the duplicated half is the half
   that finds nothing: real defects come from attacking an unprobed axis, never
   from re-running a cell the fix agent already ran.
-  Weight the evidence accordingly. The whole-corpus differential sweep is the
+  Weight the evidence accordingly. The whole-corpus sweep is the
   WEAK half for any change that adds a rejection - it structurally cannot see a
   crossing no corpus file performs, and it has certified changes that targeted
   probes then broke. Targeted crossings are the strong half. A clean sweep is
