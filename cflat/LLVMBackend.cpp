@@ -4266,7 +4266,6 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (t.ElemPointer)            o["ep"]  = true;
     // Read by the overload depth gate; dropped on a warm cache it would false-reject a
     // generic-substituted `T*` parameter, so it rides the round-trip with its siblings.
-    if (t.PointerDepthUnknown)    o["pdu"] = true;
     // Positive depth proof. Dropped on a warm cache the reverse-direction gate stops firing, so
     // it rides the round-trip with its siblings.
     if (t.PointerDepth)           o["pd"]  = static_cast<int64_t>(t.PointerDepth);
@@ -4343,7 +4342,6 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getString("n"))   t.VariableName = v->str();
     if (auto v = o.getBoolean("p"))  t.Pointer = *v;
     if (auto v = o.getBoolean("ep")) t.ElemPointer = *v;
-    if (auto v = o.getBoolean("pdu")) t.PointerDepthUnknown = *v;
     if (auto v = o.getInteger("pd")) t.PointerDepth = static_cast<int>(*v);
     if (auto v = o.getBoolean("if")) t.IsInterface = *v;
     if (auto v = o.getBoolean("ifp"))t.IsInterfacePointer = *v;

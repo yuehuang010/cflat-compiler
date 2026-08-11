@@ -22,6 +22,16 @@ class DpHolder { DpCircle** pp = nullptr; };
 
 DpCircle** dpForward(DpCircle** s) { return s; }
 
+// A generic type ARGUMENT carries its stars as a real depth, so DpGBox<DpCircle*> and
+// DpGBox<DpCircle**> are distinct instantiations and each substituted 'T x' is judgeable.
+class DpGBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; } };
+
+// The type-argument spelling COUNTS stars now, so it joins the 3-star cap like every other
+// spelling that does. It used to collapse to DpGBox<DpCircle*> and compile.
+expect_error("generic type argument 'DpCircle***' produces pointer depth 3, but the type model caps at 2 levels") {
+    DpGBox<DpCircle***> dpTripleArg = default;
+}
+
 // The 3-star cap applies to every spelling that counts WRITTEN stars, not only a local
 // declarator: a parameter, a struct field, a function-type signature component and a `using`
 // alias RHS. The declarator spellings share one guard at the head of ParseDeclarationSpecifiers;
@@ -106,6 +116,25 @@ extern int main()
         DpCircle* a = new DpCircle();
         DpCircle** pp = &a;
         DpWrap w = DpWrap(pp);
+    }
+
+    // A 'T**' into a substituted 'T' parameter of the DEPTH-1 instantiation. While a type
+    // argument's stars collapsed to one bool the parameter looked like a proven 'DpCircle*'
+    // either way, so the gate had to decline on it and this compiled.
+    expect_error("parameter 1 'x' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpGBox<DpCircle*> thin = default;
+        int r = thin.put(pp);
+    }
+
+    // A value flowing OUT of the depth-2 instantiation is a proven 'DpCircle**' at the call site.
+    expect_error("parameter 0 'c' has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpGBox<DpCircle**> deep = default;
+        deep.put(pp);
+        int r = dpByPtr(deep.get());
     }
 
     // An inline '&' over a RECORDED depth-1 value now proves depth 2, so it is refused here too.

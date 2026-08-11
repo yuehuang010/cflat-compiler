@@ -757,8 +757,10 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         }
         // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
         // bracket forms are rejected in the main pass, so the forward scan just names them.
+        // Stars are COUNTED here, exactly as the main pass counts them: a shell named Box__Cptr
+        // for a Box<C**> use would not match the instantiation the codegen pass builds.
         if (entry->pointer() != nullptr)
-            resolved += "*";
+            resolved += std::string(PointerDepthOf(entry->pointer()), '*');
         else if (IsArrayViewArg(entry))
             resolved += "[]";
         // Carry the `unique` / `alias` qualifier into the mangled/instantiation string; the main

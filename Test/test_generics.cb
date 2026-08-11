@@ -4115,11 +4115,18 @@ bool testGnUnresolvedGenericShellGate()
 // ---------------------------------------------------------------
 // Pointer-depth gate vs generic substitution
 // ---------------------------------------------------------------
-// PeelTypeArgSuffix collapses a type argument's stars into ONE bool, so the substituted `T x`
-// parameter of Pdg<C**> records Pointer=1/ElemPointer=0 - identical to a hand-written `C* x`.
-// The overload depth gate therefore must NOT read that as proof of depth 1 (PointerDepthUnknown).
+// PeelTypeArgSuffix carries a type argument's stars as a real DEPTH, so PdgBox<PdgC**> mangles
+// PdgBox__PdgCptrptr and its substituted `T x` parameter is a proven PdgC** - a distinct
+// instantiation from PdgBox<PdgC*>, and one the overload depth gate can judge.
 class PdgC { int r = 0; };
-class PdgBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; } };
+int pdgPick(PdgC* c) { return 1; }
+int pdgPick(PdgC** c) { return 2; }
+class PdgBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; }
+                  int which() { return pdgPick(v); } };
+// Overloaded on the two INSTANTIATIONS: while both mangled to PdgBox__PdgCptr this pair was a
+// redefinition, so the fact that it compiles at all is the distinctness proof.
+int pdgWhichBox(PdgBox<PdgC*> b) { return 1; }
+int pdgWhichBox(PdgBox<PdgC**> b) { return 2; }
 int pdgId<T>(T x) { return 7; }
 int pdgThin(PdgC* c) { return 100 + c->r; }
 
@@ -4131,8 +4138,7 @@ bool testGnPointerDepthSubstitution()
     a->r = 3;
     PdgC** pp = &a;
 
-    // A 'C**' argument into a substituted 'T' parameter. Rejected before PointerDepthUnknown
-    // existed, because the parameter looked like a proven 'C*'.
+    // A 'C**' argument into a substituted 'T' parameter - now a proven 'C**' on both sides.
     PdgBox<PdgC**> deep = default;
     result &= Test("pdg_ptrptr_typearg_put", deep.put(pp), 1);
     PdgC** back = deep.get();
@@ -4157,9 +4163,22 @@ bool testGnPointerDepthSubstitution()
     PdgC** dback = dict.get(1);
     result &= Test("pdg_ptrptr_dict_roundtrip", (*dback)->r, 3);
 
-    // A substituted value flowing OUT of a template into a plain 'C*' parameter also carries
-    // unknown depth, so it must keep binding exactly as it does on master.
+    // A depth-1 value flowing OUT of a template still binds a plain 'C*' parameter.
     result &= Test("pdg_typearg_value_into_thin_param", pdgThin(thin.get()), 103);
+
+    // The two instantiations are DISTINCT types: overloading on them is legal, and each picks
+    // its own overload. While the stars collapsed, this pair was a redefinition error.
+    result &= Test("pdg_distinct_instantiation_thin", pdgWhichBox(thin), 1);
+    result &= Test("pdg_distinct_instantiation_deep", pdgWhichBox(deep), 2);
+
+    // The substituted FIELD/parameter carries the real depth, so a call from inside the template
+    // body picks the 'C**' overload for T = C** and the 'C*' one for T = C*.
+    result &= Test("pdg_substituted_field_picks_ptrptr", deep.which(), 2);
+    result &= Test("pdg_substituted_field_picks_ptr", thin.which(), 1);
+
+    // The value flowing OUT of the deep instantiation is a proven 'C**' at the call site too.
+    result &= Test("pdg_typearg_value_picks_ptrptr", pdgPick(deep.get()), 2);
+    result &= Test("pdg_typearg_value_picks_ptr", pdgPick(thin.get()), 1);
 
     return result;
 }

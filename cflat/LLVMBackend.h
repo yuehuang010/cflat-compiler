@@ -544,11 +544,6 @@ public:
         std::string VariableName;
         bool Pointer = false;
         bool ElemPointer = false; // true when this is T** (pointer to pointer), e.g. T* field where T is a pointer type
-        // The Pointer/ElemPointer bits came (partly) from a GENERIC TYPE-ARGUMENT string, which
-        // PeelTypeArgSuffix collapses to one bool - `Box<C*>` and `Box<C**>` both record Pointer=1,
-        // ElemPointer=0. So the recorded depth is a LOWER BOUND here, not the depth. Read only by
-        // the IsProven* depth predicates, which decline to claim proof when it is set.
-        bool PointerDepthUnknown = false;
         // The '*' count POSITIVELY recorded for this value; 0 means NOT RECORDED, never "depth 0"
         // (same convention as FuncPtrParam::PointerDepth). The model caps at 2, and a declarator
         // OVER the cap records 0 - a clamped 2 stepped down by '*' would falsely prove depth 1.
@@ -840,14 +835,14 @@ public:
         bool IsProvenDoublePointer() const
         {
             return Pointer && (ElemPointer || PointerDepth >= 2)
-                && !PointerDepthUnknown && DepthIsAboutThisValue();
+                && DepthIsAboutThisValue();
         }
 
         // A POSITIVELY recorded depth-1 pointer. Unlike !ElemPointer (which is "not recorded"),
         // PointerDepth == 1 is a claim, so this is the proof the reverse-direction gate needs.
         bool IsProvenSinglePointerDepth() const
         {
-            return Pointer && PointerDepth == 1 && !ElemPointer && !PointerDepthUnknown
+            return Pointer && PointerDepth == 1 && !ElemPointer
                 && TypeName != "void" && DepthIsAboutThisValue();
         }
 
@@ -855,7 +850,7 @@ public:
         // that the overload dump claimed a `T**` cannot reach a `void*` param, which is false.
         bool IsProvenSinglePointer() const
         {
-            return Pointer && !ElemPointer && !PointerDepthUnknown
+            return Pointer && !ElemPointer
                 && TypeName != "void" && DepthIsAboutThisValue();
         }
 

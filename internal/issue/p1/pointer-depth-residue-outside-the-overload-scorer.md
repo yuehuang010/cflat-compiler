@@ -1,17 +1,19 @@
 # `T**` still binds a `T*` parameter everywhere the overload scorer is not the judge
 
-## RULING 2026-08-10 (maintainer) - section 5: CARRY REAL DEPTH through substitution.
+## RULING 2026-08-10 (maintainer) - section 5: CARRY REAL DEPTH through substitution. LANDED.
 
-Change `PeelTypeArgSuffix`'s single `bool& pointer` to an int DEPTH and let it reach
-`MangleTypeArg` intact. `Box<C**>` then mangles `Box__Cptrptr` and becomes its own instantiation,
-and the landed depth gate can claim proof through generics instead of declining with
-`PointerDepthUnknown`.
+Implemented; section 5 below is CLOSED. `PeelTypeArgSuffix` now accumulates an int depth, both
+type-argument spellings (written and substituted) count stars, and `TypeAndValue` no longer carries
+`PointerDepthUnknown` at all - the flag had exactly one producer and it is gone. Sections 2, 3,
+4's value-side residue and 7 remain open, which is why this file stays.
 
-**This is a wrong NAME being corrected, not a new naming scheme.** The section-5 text below frames
-it as "changes the monomorphization key ... a much larger change than this issue". That
-over-states it: the mangler already expresses this distinction everywhere else, and generic type
-arguments are the ONLY path that loses it. Measured on the current Release binary
-(`scratch/pd_mangle.cb`):
+The ruling: change `PeelTypeArgSuffix`'s single `bool& pointer` to an int DEPTH and let it reach
+`MangleTypeArg` intact, so `Box<C**>` mangles `Box__Cptrptr`, becomes its own instantiation, and
+the depth gate can claim proof through generics.
+
+**This was a wrong NAME being corrected, not a new naming scheme.** The mangler already expressed
+this distinction everywhere else; generic type arguments were the ONLY path that lost it. Measured
+on the pre-fix Release binary (`scratch/pd_mangle.cb`):
 
 | path | depth preserved? | evidence |
 |------|------------------|----------|
@@ -19,26 +21,24 @@ arguments are the ONLY path that loses it. Measured on the current Release binar
 | closure encoded name | **yes** | `BuildEncodedClosureName` (`MainListener.h:460`) threads an int depth per param and re-appends the stars before mangling |
 | `MangleTypeArg` itself | **yes** | `MainListener.h:357` appends `"ptr"` once PER STAR, so `C**` renders `Cptrptr` |
 | `PeelAliasPointerStars` | **yes** | `MainListener.h:513` - same job, returns an int |
-| generic type argument | **NO** | `PeelTypeArgSuffix` (`MainListener.h:481`) pops every star into ONE bool |
+| generic type argument | **was NO, now yes** | `PeelTypeArgSuffix` popped every star into ONE bool; it now accumulates an int depth |
 
-`Box<C*>` and `Box<C**>` in one program emit a single instantiation `@_Box__Cptr_Box__Cptr__` with
-one `@_put_void_Box__CptrPtrCPtr_`, i.e. the `T = C**` instantiation's method genuinely takes a
-`C*`. **The depth is destroyed before the mangler ever sees it** - by mangling time `C**` has
-already become `C*`. The naming half needs no design work; it already produces the right answer
-when handed the right string.
+Pre-fix, `Box<C*>` and `Box<C**>` in one program emitted a single instantiation
+`@_Box__Cptr_Box__Cptr__` with one `@_put_i32_Box__CptrPtrCPtr_`, i.e. the `T = C**`
+instantiation's method genuinely took a `C*`. The depth was destroyed before the mangler ever saw
+it; handed the right string the mangler already produced the right answer.
 
-**Work:** thread the int through substitution, then fix the downstream consumers of the collapsed
-flag (`Pointer` / `ElemPointer` on the substituted parameter, `MainListener_Declarations.cpp:669`)
-and the `typeParameterEntry` walkers. Splitting the instantiation is the POINT, not a side effect -
-but its blast radius is the part to scope before writing code.
+**Work (done):** the int is threaded through substitution and the downstream consumers of the
+collapsed flag (`Pointer` / `ElemPointer` / `PointerDepth` on the substituted parameter) are fixed.
+Splitting the instantiation was the POINT: a differential sweep of the whole `Test/` and `example/`
+corpus on the pre- and post-fix binaries shows ZERO divergence outside the section-5 cells.
 
-**Alternative considered and rejected:** refusing 2+ stars in a type ARGUMENT (matching section 6's
-ruling for written stars). It is a much smaller guard and costs only the four synthetic `pdg_*`
-legs - two-star type arguments have ZERO organic use, all four occurrences repo-wide being in
-`Test/test_generics.cb` where they were added to pin this capability. It was rejected because it
+**Alternative considered and rejected:** refusing 2+ stars in a type ARGUMENT. Rejected because it
 permanently forbids a spelling the mangler can already name correctly, to avoid fixing one boolean.
+`Box<C**>` therefore stays legal; only the 3-star spelling is refused, which is section 6's cap
+reaching a spelling that now counts stars.
 
-Sections 2, 3, 4 and 7 contain no design fork - they are engineering and can proceed independently.
+Sections 2, 3, 4's value-side residue and 7 contain no design fork - they are engineering and can proceed independently.
 Section 3's interface door keeps its own precondition: verify on WINDOWS before gating there,
 because WinRT synthesizes interface parameters without setting `ElemPointer`, and a true `T**`
 recorded `ElemPointer=false` would be a Windows-only false rejection.
@@ -119,28 +119,49 @@ Measured identically on the pre- and post-guard binaries, so this is untouched r
 regression. `Circle** q = &pp;` is accepted the same way. Closing it is value-side depth work
 (`ValuePointerDepth` over address-of), not another written-star guard.
 
-## 5. Generic substitution collapses depth, so the gate is blind through templates
+## 5. Generic substitution collapses depth - CLOSED
 
-`PeelTypeArgSuffix` (`cflat/MainListener.h:472`) records a type argument's stars as ONE bool, and
-`MainListener_Declarations.cpp:669` carries that one bit forward, so the substituted `T x`
-parameter of `Box<C**>::put` records `Pointer=1, ElemPointer=0` - byte-identical to a hand-written
-`C* x`. `Box<C*>` and `Box<C**>` are also ONE instantiation: both mangle to `Box__Cptr`.
+`PeelTypeArgSuffix` takes an `int& pointerDepth` and accumulates one level per star; both places
+that build a type-argument string count stars instead of flagging them (`ResolveTypeArgEntry`,
+`ForwardRefScanner::ResolveForwardTypeArg` - the two MUST stay identical or the shell name and the
+instantiation name diverge), as do the tuple-element sites. The substituted declarator combines
+that real depth with the declarator's own stars, so `Box<C**>::put`'s `T x` is a proven `C**`.
+`PointerDepthUnknown` is deleted: it had one producer and every `IsProven*` predicate now judges
+substituted pointers directly.
 
-The landed gate therefore marks any substitution-produced pointer `PointerDepthUnknown` and
-declines to claim proof on it, in BOTH directions. Without that it hard-errored four programs the
-merge base runs correctly - `Box<C**>.put(pp)`, `list<C**>.add(pp)`, `dictionary<int,C**>.add(1,pp)`
-and a generic function `idput<C**>(pp)` (found by review, not by the suite; now frozen as the
-`pdg_*` value legs in `Test/test_generics.cb`).
+Measured (`scratch/pdg5/`, pre = merge-base Release binary, post = this branch):
 
-The section-6 cap guard deliberately does NOT extend to the type-ARGUMENT spelling: `Box<C***>`
-still compiles and still collapses to `Box<C*>`, because `typeParameterEntry`'s stars are already
-collapsed to one bool for `C**` too, so rejecting only three stars there would fix nothing while
-adding a guard to every walker of that rule. Measured post-guard (probe `a7_generic`): accepts.
+| cell | pre | post |
+|------|-----|------|
+| `Box<C*>` + `Box<C**>` in one program | ONE instantiation `Box__Cptr`, `put` takes `C*` | `Box__Cptr` **and** `Box__Cptrptr`, `put` takes `C*` / `C**` |
+| `idput<C**>(pp)` | `@_idput__Cptrptr_i32_CPtr_` (name split, param collapsed) | `@_idput__Cptrptr_i32_CPtrPtr_` |
+| `list<C**>` / `dictionary<int,C**>` | `list__Cptr` / `dictionary__i32__Cptr` | `list__Cptrptr` / `dictionary__i32__Cptrptr` |
+| `Box<Box<C**>>`, `Pair<C*,C**>`, `Box<int**>` | inner arg collapsed | depth preserved at every level |
+| overload on `Box<C*>` vs `Box<C**>` | "redefinition" (one type) | two overloads, each picked correctly |
+| `Box<C*>.put(pp)` (a real mistake) | compiled | refused with the depth note |
+| `dpByPtr(deep.get())` | compiled, garbage | refused with the depth note |
+| `Box<C***>` | collapsed to `Box<C*>`, compiled | hard error - the type-argument spelling now COUNTS stars, so it joins section 6's cap |
+| `Box<C*>`, `list<C*>`, `Box<int>`, `list<string>` | accept | accept, byte-identical mangling |
 
-Consequence: a genuine `T**`-into-`T*` mistake is INVISIBLE anywhere a generic type argument is the
-parameter's type. Closing it means carrying a real depth int through substitution, which changes
-the monomorphization key (`Box<C*>` and `Box<C**>` would stop being the same instantiation) - a
-much larger change than this issue, and the reason the one-sided decline was taken instead.
+The four `pdg_*` accept-set programs still compile and now produce CORRECT results; seven value
+legs and three `expect_error` legs are frozen (`Test/test_generics.cb`,
+`Test/errors/err_double_pointer_arg_single_pointer_param.cb`). The 3-star cap is applied to the
+WRITTEN type-argument stars only: a substitution that composes past the cap (`list<C**>` feeding
+its own `T* _data`) must stay legal, so it clamps silently and claims no depth, exactly as it did.
+
+Still collapsed, NOT part of this section: `ResolveSigComponentCodegen` folds a substituted
+component's stars into a bool, so `function<void(T)>` with `T = C**` encodes depth 1. The scanner
+counterpart sees no substitutions at all, so making it count would need both passes changed
+together. Concrete effect (review probe): a `function<int(T)>` member of `Box<C**>` is typed
+`int(C*)`, so binding a correct `int(C**)` function to it is refused. Pre-existing, unchanged by
+this fix.
+
+Also still collapsed: a `using`-declared FUNCTION-TYPE alias used as a type argument re-encodes as
+`encodedAlias + "*"` (one star regardless of depth, `MainListener_Declarations.cpp:125`), so
+`Box<Fn*>` and `Box<Fn**>` remain one instantiation while `Box<C*>` / `Box<C**>` split. The forward
+scanner now emits the real star count for that same entry, so the two passes name it differently -
+they already did before this fix (the scanner names the alias, codegen the encoding), and a probe
+round-tripping an `Fn**` through such a box behaves identically on both binaries.
 
 ## 6. Depth 3 truncates SILENTLY in the plain spelling - CLOSED
 

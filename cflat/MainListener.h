@@ -120,6 +120,13 @@ static bool IsBadArrayArg(Ctx* c)
     if (DimSpecIsUnsizedMultiDim(dims)) return true;
     return dims != nullptr && !dims->assignmentExpression().empty();
 }
+// Number of '*' written on a pointer() context. The grammar is ('*' typeQualifierList?)+, so the
+// depth is Star().size(); the funcptr signature sites used to collapse it to a bool.
+static int PointerDepthOf(CFlatParser::PointerContext* p)
+{
+    return p == nullptr ? 0 : (int)p->Star().size();
+}
+
 // Type-arg string for one tuple element: the bare type plus its reference-kind suffix
 // ("*" pointer, "[]" noalias array-view). Bad bracket forms (`[N]`, `[]*`) contribute no
 // suffix here - the authoritative tuple-sugar path rejects them with a diagnostic.
@@ -131,7 +138,8 @@ static std::string TupleEntryArgName(const LLVMBackend* compiler, CFlatParser::T
     std::string argName = compiler != nullptr
         ? compiler->ResolveTypeArgBaseName(entry->typeSpecifier()->getText())
         : entry->typeSpecifier()->getText();
-    if (entry->pointer() != nullptr) argName += "*";
+    // Stars are counted, not flagged: a `(C**, int)` element must not mangle as `(C*, int)`.
+    if (entry->pointer() != nullptr) argName += std::string(PointerDepthOf(entry->pointer()), '*');
     else if (IsArrayViewArg(entry)) argName += "[]";
     return argName;
 }
@@ -426,13 +434,6 @@ static CFlatParser::GenericTypeParametersContext* GenericSpecOf(
 
 // Build the symbol-safe encoded name for a closure type used as a generic argument (gap a).
 // Length-prefixed components keep it collision-free; the result contains only [A-Za-z0-9_].
-// Number of '*' written on a pointer() context. The grammar is ('*' typeQualifierList?)+, so the
-// depth is Star().size(); the funcptr signature sites used to collapse it to a bool.
-static int PointerDepthOf(CFlatParser::PointerContext* p)
-{
-    return p == nullptr ? 0 : (int)p->Star().size();
-}
-
 // The type model holds two pointer levels (Pointer + ElemPointer), so a written depth of 3+ can
 // only be clamped. Every spelling that counts stars rejects it with this one message family.
 static const int PointerDepthCap = 2;
@@ -473,12 +474,13 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
 }
 
 
-// Peel the reference-kind suffixes off a (possibly substituted) type-arg string, recording them
-// as flags: a trailing "[]" is a noalias array-view (which is also a pointer repr), a trailing "*"
-// is a plain pointer. They never combine ("T[]*" is rejected at the grammar/listener). Suffixes
-// were appended in source order, so peel from the right until none remain. Returns the bare base
-// type name in `name`.
-static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView,
+// Peel the reference-kind suffixes off a (possibly substituted) type-arg string: a trailing "[]"
+// is a noalias array-view (which is also a pointer repr), a trailing "*" is a plain pointer. They
+// never combine ("T[]*" is rejected at the grammar/listener). Suffixes were appended in source
+// order, so peel from the right until none remain. Returns the bare base type name in `name`.
+// `pointerDepth` is ACCUMULATED (one per star), not a flag: `C**` must stay distinguishable from
+// `C*` all the way to MangleTypeArg, which is what makes Box<C**> its own instantiation.
+static void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayView,
     bool* unique = nullptr, bool* aliasOut = nullptr)
 {
     // A `unique` or `alias` qualifier is a leading prefix; peel it first so the suffix loop and
@@ -493,12 +495,12 @@ static void PeelTypeArgSuffix(std::string& name, bool& pointer, bool& arrayView,
         if (name.size() >= 2 && name.compare(name.size() - 2, 2, "[]") == 0)
         {
             arrayView = true;
-            pointer = true;
+            if (pointerDepth < 1) pointerDepth = 1;
             name.erase(name.size() - 2);
         }
         else if (!name.empty() && name.back() == '*')
         {
-            pointer = true;
+            pointerDepth++;
             name.pop_back();
         }
         else

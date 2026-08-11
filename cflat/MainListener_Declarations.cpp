@@ -39,7 +39,15 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         else if (entry->Identifier() != nullptr && !isUnique && !isAlias)
             LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' or 'alias' "
                 "is allowed on a generic type argument", entry->Identifier()->getText()));
-        bool hasPointer = entry->pointer() != nullptr;
+        // Written stars are COUNTED, not flagged: Box<C**> must reach MangleTypeArg as "C**" so it
+        // mangles Box__Cptrptr and becomes its own instantiation.
+        int pointerDepth = PointerDepthOf(entry->pointer());
+        bool hasPointer = pointerDepth > 0;
+        // Now that the stars are COUNTED here, this spelling joins the others that count them: a
+        // written depth of 3+ is refused rather than clamped (the type model holds two levels).
+        if (pointerDepth > PointerDepthCap)
+            LogErrorContext(entry, PointerDepthCapMessage(
+                std::format("generic type argument '{}'", entry->getText()), pointerDepth));
         // `T[]` as a generic/tuple type arg is a noalias array-view member; `[N]` and `[]*`
         // are not valid in a type-argument position (reject with one clear message).
         bool hasArrayView = IsArrayViewArg(entry);
@@ -96,7 +104,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 bool substUnique = false;
                 bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, hasPointer, hasArrayView, &substUnique, &substAlias);
+                PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substUnique, &substAlias);
+                hasPointer = pointerDepth > 0;
                 isUnique = isUnique || substUnique;
                 isAlias = isAlias || substAlias;
             }
@@ -132,7 +141,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             // A type parameter already BOUND to a closure reaches here as an encoded name, so the
             // two closure branches above cannot see it; reject the fat case at this funnel too.
             RejectFatEncodedClosurePointerArg(entry, uniqueBase);
-            resolved += "*";
+            resolved += std::string(pointerDepth, '*');
         }
         // D1: unique is only meaningful on a pointer or interface type; carry it as a leading
         // prefix (D10) so this instantiation mangles distinctly and is_unique(T) can see it.
@@ -354,6 +363,9 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Pointer depth from a pointer alias (using Handle = void*); peeled off the
                 // resolved alias string below and combined with the declarator's stars.
                 int aliasPtrDepth = 0;
+                // Star count contributed by an active type SUBSTITUTION (T bound to "C**" -> 2).
+                // Real depth, not a flag, so the declarator combination below can prove a total.
+                int substArgPtrDepth = 0;
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
                 // entry is only built by the next ProcessPendingInstantiations.
                 bool genericSpecIsInterface = false;
@@ -407,7 +419,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                     "tuple element; a sized 'T[N]', an unsized multi-dimensional "
                                     "'T[][]' and a pointer-to-array 'T[]*' are not");
                             std::string argName = entry->typeSpecifier()->getText();
-                            bool argPtr = entry->pointer() != nullptr;
+                            int argDepth = PointerDepthOf(entry->pointer());
                             bool argView = IsArrayViewArg(entry);
                             // Apply active type substitutions (e.g. T -> int inside generic body); a
                             // substituted arg may itself carry "*"/"[]" (e.g. T bound to "int[]").
@@ -415,14 +427,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             if (substIt != activeTypeSubstitutions.end())
                             {
                                 argName = substIt->second;
-                                PeelTypeArgSuffix(argName, argPtr, argView);
+                                PeelTypeArgSuffix(argName, argDepth, argView);
                             }
                             else
                                 // Same namespace walk as a generic type ARGUMENT (a substituted arg
                                 // is already resolved in the caller's scope - never re-resolve it).
                                 argName = Compiler(entry)->ResolveTypeArgBaseName(argName);
                             if (argView) argName += "[]";
-                            else if (argPtr) argName += "*";
+                            else if (argDepth > 0) argName += std::string(argDepth, '*');
                             typeArgs.push_back(argName);
                         }
                     }
@@ -632,7 +644,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     typeName = typeSpec->getText();
                     if (typeName == "long") typeName = LongSpellingTypeName(longSpecCount);
                     // Apply active type parameter substitutions (e.g. T -> int inside a template body)
-                    bool substPointer = false;
+                    int& substPointerDepth = substArgPtrDepth;
                     bool substArrayView = false;
                     auto substIt = activeTypeSubstitutions.find(typeName);
                     // A substituted name is ALREADY resolved in the caller's scope; re-resolving it
@@ -648,7 +660,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         typeName = substIt->second;
                         bool substUniqueArg = false;
                         bool substAliasArg = false;
-                        PeelTypeArgSuffix(typeName, substPointer, substArrayView, &substUniqueArg, &substAliasArg);
+                        PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView, &substUniqueArg, &substAliasArg);
                         // A `unique` type argument is an OWNING location: a plain by-value parameter
                         // of that type is a move sink, so the caller's source must be nulled.
                         // An `alias`-declared parameter is an explicit borrow and stays one.
@@ -689,15 +701,17 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     }
                     aliasPtrDepth = PeelAliasPointerStars(typeName);  // using Handle = void* -> depth 1
                     declType.TypeName = typeName;
-                    // A type-arg string carries its stars as ONE bool (PeelTypeArgSuffix), so from
-                    // here the recorded depth is a lower bound - `Box<C*>` and `Box<C**>` agree.
-                    if (substPointer) { declType.Pointer = true; declType.PointerDepthUnknown = true; }
+                    // A type-arg string carries its REAL star count, so the depth below is a proof:
+                    // `Box<C**>`'s substituted `T x` is a C**, not a C*.
+                    if (substPointerDepth > 0) declType.Pointer = true;
                     if (substArrayView)
                     {
                         // T bound to a `T[]` arg: the field/local is a noalias array-view (a thin
                         // pointer repr carrying the contract), exactly like a written `T[]`.
                         declType.IsArrayView = true;
                         declType.Pointer = true;
+                        // The view's own pointer repr is not a '*' the depth arithmetic may count.
+                        substPointerDepth = 0;
                     }
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
@@ -718,10 +732,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // any base-pointer-ness from a generic substitution. The Pointer + ElemPointer
                     // model caps at 2 levels - 3+ is a hard error (no silent truncation).
                     int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
-                    int totalPtr = aliasPtrDepth + declStars + (substPointer ? 1 : 0);
-                    if (totalPtr > PointerDepthCap)
+                    int totalPtr = aliasPtrDepth + declStars + substArgPtrDepth;
+                    // The cap counts a substitution as ONE level, exactly as it did before real
+                    // depth existed: a deeper type ARGUMENT must not turn an instantiation into an
+                    // error (list<C**> substitutes T=C** into its own `T* _data`).
+                    int writtenPtr = aliasPtrDepth + declStars + (substArgPtrDepth > 0 ? 1 : 0);
+                    if (writtenPtr > PointerDepthCap)
                         LogErrorContext(declSpec, PointerDepthCapMessage(
-                            std::format("pointer alias resolving to '{}'", declType.TypeName), totalPtr));
+                            std::format("pointer alias resolving to '{}'", declType.TypeName), writtenPtr));
                     declType.Pointer = totalPtr >= 1;
                     declType.ElemPointer = totalPtr >= 2;
                     declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
@@ -733,13 +751,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.ElemPointer = true;
                     declType.Pointer = hasExplicitPointer || declType.Pointer;
                     int declStars = hasExplicitPointer ? (int)declSpec->pointer()->Star().size() : 0;
-                    // Over the 2-level cap the exact depth is LOST, so claim nothing (0): a clamped
-                    // 2 stepped down by a '*' would falsely prove depth 1 for a `T***` dereference.
-                    declType.PointerDepth = declStars > 2 ? 0 : declStars;
+                    // A substituted type argument contributes its REAL star count, so `T x` with
+                    // T = C** is a proven C**. Over the 2-level cap the exact depth is LOST, so
+                    // claim nothing (0): a clamped 2 stepped down by a '*' would falsely prove 1.
+                    int totalPtr = declStars + substArgPtrDepth;
+                    if (substArgPtrDepth >= 2) declType.ElemPointer = true;
+                    declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
                 }
-                // A substituted type argument's stars are a LOWER BOUND (PeelTypeArgSuffix collapses
-                // them), so this declarator proves nothing about the total depth - claim nothing.
-                if (declType.PointerDepthUnknown) declType.PointerDepth = 0;
                 if (auto* dimSpec = ArrayDimsOf(declSpec))
                 {
                     auto dims = dimSpec->assignmentExpression();
