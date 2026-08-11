@@ -1418,6 +1418,28 @@ Resource* borrowFirstResource(Resource* a, Resource* b) { return a; }
 Resource* g_retainedResource = nullptr;
 Resource* retainSecondResource(Resource* a, Resource* b) { g_retainedResource = b; return a; }
 
+// The return-identity alias-proof corpus. Each of these is a discriminator the proof must get
+// right; the proof is "EVERY return is EXACTLY this argument, and it escapes nowhere else".
+Resource* identityResource(Resource* p) { return p; }
+Resource* mixedReturnResource(Resource* p, bool takeIt) { if (takeIt) { return p; } return nullptr; }
+struct Holder51 { Resource* kid = nullptr; };
+Resource* holderKid(Holder51* h) { return h->kid; }
+move Holder51* makeHolder51(int id) { Holder51* h = new Holder51(); h->kid = makeIdResource(id); return h; }
+Resource* g_stashedResource = nullptr;
+Resource* stashAndReturnResource(Resource* p) { g_stashedResource = p; return p; }
+
+// "Does not retain PAST my call": setTag replaces one FIELD through `this` (the field's
+// destructor, then a store back over it); disposeTagged frees the WHOLE object instead.
+struct Tagged
+{
+    string tag = default;
+    int id = 0;
+    ~Tagged() { dtorCount = dtorCount + 1; }
+    void setTag(string s) { tag = s.copy(); }
+};
+move Tagged* makeTagged(int id) { Tagged* t = new Tagged(); t->id = id; string st = "start"; t->tag = st.copy(); return t; }
+void disposeTagged(move Tagged* t) { delete t; }
+
 // A holder that OWNS its resource. `borrowKid` hands back a pointer read THROUGH the holder, so
 // the holder's destructor would free what the caller is left holding: releasing an owning holder
 // temp at the statement boundary is a use-after-free, not a leak fix.
@@ -1763,12 +1785,11 @@ int testUniqueLocalReassignMove()
     passed += Test("recv_temp_nonescaping_value", recvRead, 40);
     passed += Test("recv_temp_nonescaping_freed_once", dtorCount, 1);
 
-    // `self()` RETURNS the receiver, so the analysis answers "retains" and no release runs. The
-    // borrow reaches `b`, which never adopted it (the result is a different SSA value from the
-    // owning temp, and no alias proof exists), so scope exit frees nothing either: this shape
-    // LEAKS by design. dtorCount deliberately stays 0 - see
-    // internal/issue/unique-assign-syntactic-owned-rhs-leaks.md. A free at either point would be
-    // a use-after-free through `b`, which the last two legs prove is still live.
+    // `self()` RETURNS the receiver and does nothing else with it, so the return-identity alias
+    // proof holds: the call RESULT and the owning temp name ONE object, and the callee kept no
+    // second handle. `b` therefore ADOPTS the result. No release may run at the statement
+    // boundary - that would be a use-after-free through `b`, which the dispatch leg proves is
+    // still live - and scope exit frees it exactly once (it used to leak; the proof closed it).
     dtorCount = 0;
     {
         unique Resource* b = nullptr;
@@ -1777,7 +1798,82 @@ int testUniqueLocalReassignMove()
         passed += Test("recv_temp_escaping_not_freed_at_stmt", dtorCount, 0);
         passed += Test("recv_temp_escaping_still_dispatchable", b->idOf(), 41);
     }
-    passed += Test("recv_temp_escaping_leaks_by_design", dtorCount, 0);
+    passed += Test("recv_temp_escaping_adopted_freed_once", dtorCount, 1);
+
+    // Every discriminator the alias proof has to fail, each with the owning temp reaching an
+    // owning destination the same way. All still LEAK by design (0 destructors): a free would
+    // need a proof none of them supplies, and the value legs prove each result is still live.
+    dtorCount = 0;
+    {
+        unique Resource* m = nullptr;
+        m = mixedReturnResource(makeIdResource(51), true);   // one return is not the argument
+        passed += Test("alias_proof_mixed_return_value", m->id, 51);
+    }
+    passed += Test("alias_proof_mixed_return_not_adopted", dtorCount, 0);
+
+    dtorCount = 0;
+    {
+        unique Resource* f = nullptr;
+        f = holderKid(makeHolder51(52));   // returns a FIELD of the argument, not the argument
+        passed += Test("alias_proof_field_return_value", f->id, 52);
+    }
+    passed += Test("alias_proof_field_return_not_adopted", dtorCount, 0);
+
+    dtorCount = 0;
+    {
+        unique Resource* s = nullptr;
+        s = stashAndReturnResource(makeIdResource(53));       // retained in a global as well
+        passed += Test("alias_proof_second_handle_value", s->id, 53);
+    }
+    passed += Test("alias_proof_second_handle_not_adopted", dtorCount, 0);
+    delete g_stashedResource;
+    g_stashedResource = nullptr;
+    passed += Test("alias_proof_second_handle_global_freed", dtorCount, 1);
+
+    // Chained laundering: the proof carries the ownership along the chain, one free at the end.
+    dtorCount = 0;
+    {
+        unique Resource* c2 = nullptr;
+        c2 = makeIdResource(54)->self()->self();
+        passed += Test("alias_proof_chained_value", c2->id, 54);
+        passed += Test("alias_proof_chained_no_early_free", dtorCount, 0);
+    }
+    passed += Test("alias_proof_chained_freed_once", dtorCount, 1);
+
+    // A free FUNCTION whose only statement returns its parameter proves the same thing, and the
+    // owning temp may be a raw `new` in ARGUMENT position - the RESULT VALUE is what carries the
+    // ownership. The sibling below is the discriminator that must NOT adopt: borrowFirstResource
+    // returns its FIRST parameter, so the `new` in the second slot is never the result.
+    dtorCount = 0;
+    {
+        unique Resource* i0 = nullptr;
+        i0 = identityResource(new Resource());
+        passed += Test("alias_proof_identity_fn_no_early_free", dtorCount, 0);
+    }
+    passed += Test("alias_proof_identity_fn_freed_once", dtorCount, 1);
+
+    // A callee defined BELOW its call site has no readable body yet, so no proof - the accepted
+    // unknown-accepts caveat. It keeps leaking rather than being adopted and freed twice.
+    dtorCount = 0;
+    {
+        unique Resource* lateB = nullptr;
+        lateB = identityResourceDefinedBelow(makeIdResource(55));
+        passed += Test("alias_proof_callee_below_value", lateB->id, 55);
+    }
+    passed += Test("alias_proof_callee_below_no_proof_leaks", dtorCount, 0);
+
+    // "Does not retain PAST my call": `setTag`-style field replacement runs the FIELD's
+    // destructor through `this` and stores the replacement back over it. That is a use that
+    // ends, not a handle kept, so the receiver temp is released at the statement boundary.
+    dtorCount = 0;
+    makeTagged(61)->setTag("replaced");
+    passed += Test("retains_past_call_field_overwrite_freed", dtorCount, 1);
+
+    // The discriminator: a callee that frees the WHOLE object through the tracked pointer keeps
+    // answering "retains", or the caller-side release would free it a second time.
+    dtorCount = 0;
+    disposeTagged(makeTagged(62));
+    passed += Test("retains_past_call_whole_object_freed_once", dtorCount, 1);
 
     // The receiver hands back a pointer READ THROUGH itself, and it OWNS that pointee: releasing
     // the holder temp would run its destructor and leave `kid` dangling. It must leak instead.
@@ -10109,7 +10205,7 @@ extern int main()
     total += 11;
 
     passed += testUniqueLocalReassignMove();
-    total += 79;
+    total += 95;
 
     passed += testValueMoveArgDeferred();
     total += 5;
@@ -10211,3 +10307,8 @@ extern int main()
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
 }
+
+// Deliberately defined BELOW main, i.e. below its call site: cflat emits IR as it walks, so its
+// body is not readable when the call is emitted and the alias proof cannot be built. The
+// accepted unknown-accepts caveat - the temp keeps leaking instead of being freed twice.
+Resource* identityResourceDefinedBelow(Resource* p) { return p; }

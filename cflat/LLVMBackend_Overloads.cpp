@@ -1278,6 +1278,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Runs before ApplyMoveParamTransfer, whose UnregisterOwnedPtrTemp still has the
         // last word for a sink parameter.
         RegisterNonEscapingOwningPtrArgs(result);
+        // A callee that provably hands EXACTLY this owning argument back aliases it, so the
+        // result carries the ownership and an owning destination can adopt it.
+        AdoptLaunderedOwningTempResult(result);
 
         // Extern C function returning a function pointer: the LLVM-level return type is a
         // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.

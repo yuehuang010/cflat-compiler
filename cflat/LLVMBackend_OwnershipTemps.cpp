@@ -997,6 +997,8 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         if (fn == nullptr) return;
         std::erase_if(paramRetainsMemo_, [&](const auto& kv) { return kv.first.first == fn; });
         std::erase_if(paramRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase_if(paramRetainsPastCallMemo_, [&](const auto& kv) { return kv.first.first == fn; });
+        std::erase_if(paramRetainsPastCallInProgress_, [&](const auto& k) { return k.first == fn; });
         std::erase_if(provableRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
         // The record ledger holds this raw Function*, which LLVM may hand back to a later
         // Function::Create; an entry outliving its callee would be resolved against a stranger.
@@ -1008,6 +1010,8 @@ void LLVMBackend::DropModuleEscapeMemo()
 {
         paramRetainsMemo_.clear();
         paramRetainsInProgress_.clear();
+        paramRetainsPastCallMemo_.clear();
+        paramRetainsPastCallInProgress_.clear();
         provableRetainsInProgress_.clear();
         tempUniqueFieldArgs_.clear();
         suspendedFunctions_.clear();
@@ -1181,7 +1185,53 @@ bool LLVMBackend::FunctionBodyIsReadable(const llvm::Function* fn) const
         return true;
     }
 
-bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth)
+bool LLVMBackend::ParameterRetainsArgumentPastCall(const llvm::Function* fn, unsigned argIndex,
+                                                   int depth)
+{
+        if (fn == nullptr || fn->isVarArg()) return true;
+        if (argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return true;
+        auto key = std::make_pair(fn, argIndex);
+        if (auto it = paramRetainsPastCallMemo_.find(key); it != paramRetainsPastCallMemo_.end())
+            return it->second;
+        if (!FunctionBodyIsComplete(fn)) return true;
+        if (!paramRetainsPastCallInProgress_.insert(key).second) return true;   // cycle: retaining
+        bool retains = OwningPtrEscapes(fn->getArg(argIndex), depth, /*returnIsEscape*/ false);
+        paramRetainsPastCallInProgress_.erase(key);
+        paramRetainsPastCallMemo_[key] = retains;
+        return retains;
+    }
+
+/*
+ * The tracked pointer's memory is handed to a destructor and then written back over. Proof: the
+ * callee is the registered destructor of struct type S, the argument is the tracked address, and
+ * a later store in the same block puts an S back at that address. Freeing a field the callee does
+ * NOT overwrite is left answering "retains" - no proof, so no caller-side release.
+ */
+bool LLVMBackend::CallIsOverwrittenFieldDestructor(const llvm::CallBase* call,
+                                                   const llvm::Value* tracked) const
+{
+        if (call == nullptr || call->arg_size() != 1 || call->getArgOperand(0) != tracked)
+            return false;
+        const llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr) return false;
+        llvm::Type* fieldType = nullptr;
+        for (const auto& [name, ds] : dataStructures)
+            if (ds.Destructor == callee)
+            {
+                fieldType = ds.StructType;
+                break;
+            }
+        if (fieldType == nullptr && callee->getName() == "string.dtor")
+            fieldType = llvm::StructType::getTypeByName(*context, "string");
+        if (fieldType == nullptr) return false;
+        for (const llvm::Instruction* i = call->getNextNode(); i != nullptr; i = i->getNextNode())
+            if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(i))
+                if (st->getPointerOperand() == tracked
+                    && st->getValueOperand()->getType() == fieldType) return true;
+        return false;
+    }
+
+bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth, bool returnIsEscape)
 {
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
         llvm::SmallVector<const llvm::Value*, 16> work;
@@ -1196,7 +1246,7 @@ bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth)
                 const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
                 if (inst == nullptr) return true;
                 if (llvm::isa<llvm::ICmpInst>(inst)) continue;      // a bool result cannot retain
-                if (llvm::isa<llvm::ReturnInst>(inst)) return true;
+                if (llvm::isa<llvm::ReturnInst>(inst)) { if (returnIsEscape) return true; continue; }
                 if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
                 {
                     if (st->getValueOperand() != v)
@@ -1238,12 +1288,19 @@ bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth)
                             && call->getArgOperand(1) == v) return true;
                         continue;
                     }
+                    // The callee destroys a FIELD of the tracked memory and writes a replacement
+                    // back over it: a use that ends, not a handle the callee kept.
+                    if (CallIsOverwrittenFieldDestructor(call, v)) continue;
                     bool passedAsArg = false;
                     for (unsigned i = 0; i < call->arg_size(); ++i)
                     {
                         if (call->getArgOperand(i) != v) continue;
                         passedAsArg = true;
-                        if (ParameterRetainsArgument(callee, i, depth + 1)) return true;
+                        if (!ParameterRetainsArgument(callee, i, depth + 1)) continue;
+                        // Retained ONLY by being handed back: the pointer is in MY frame again,
+                        // so keep walking the result rather than answering "retains".
+                        if (ParameterRetainsArgumentPastCall(callee, i, depth + 1)) return true;
+                        if (visited.insert(call).second) work.push_back(call);
                     }
                     if (!passedAsArg) return true;                  // used as the callee operand
                     continue;
@@ -1527,6 +1584,94 @@ bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
             }
         }
         return false;
+    }
+
+bool LLVMBackend::ReturnedValueIsExactlyArgument(const llvm::Value* ret, const llvm::Argument* arg,
+                                                 int depth) const
+{
+        if (ret == nullptr || arg == nullptr || depth > kMaxRetainDepth) return false;
+        if (ret == arg) return true;
+        if (const auto* bc = llvm::dyn_cast<llvm::CastInst>(ret))
+            return (llvm::isa<llvm::BitCastInst>(bc) || llvm::isa<llvm::AddrSpaceCastInst>(bc))
+                && ReturnedValueIsExactlyArgument(bc->getOperand(0), arg, depth + 1);
+        // The parameter-prologue shape: the argument is parked in a slot nothing else is ever
+        // stored into, and read back out for the return.
+        if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(ret))
+        {
+            const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(ld->getPointerOperand());
+            if (slot == nullptr || !AllocaIsLoadStoreOnly(slot)) return false;
+            bool sawStore = false;
+            for (const llvm::User* u : slot->users())
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
+                    st != nullptr && st->getPointerOperand() == slot)
+                {
+                    if (!ReturnedValueIsExactlyArgument(st->getValueOperand(), arg, depth + 1))
+                        return false;
+                    sawStore = true;
+                }
+            return sawStore;
+        }
+        // A join is the argument only when EVERY arm is: one arm returning something else means
+        // the result and the argument are not one object on that path.
+        if (const auto* sel = llvm::dyn_cast<llvm::SelectInst>(ret))
+            return ReturnedValueIsExactlyArgument(sel->getTrueValue(), arg, depth + 1)
+                && ReturnedValueIsExactlyArgument(sel->getFalseValue(), arg, depth + 1);
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(ret))
+        {
+            if (phi->getNumIncomingValues() == 0) return false;
+            for (const llvm::Value* in : phi->incoming_values())
+                if (!ReturnedValueIsExactlyArgument(in, arg, depth + 1)) return false;
+            return true;
+        }
+        return false;
+    }
+
+bool LLVMBackend::ParameterIsExactlyReturned(const llvm::Function* fn, unsigned argIndex, int depth)
+{
+        if (fn == nullptr || fn->isVarArg() || argIndex >= fn->arg_size()) return false;
+        if (depth > kMaxRetainDepth) return false;
+        if (!fn->getReturnType()->isPointerTy()) return false;
+        // Unknown-accepts polarity: a callee defined BELOW its call site has no readable body
+        // yet, so no proof - the temp keeps leaking rather than being adopted and freed twice.
+        if (!FunctionBodyIsComplete(fn)) return false;
+        const llvm::Argument* arg = fn->getArg(argIndex);
+        if (!arg->getType()->isPointerTy()) return false;
+        bool sawReturn = false;
+        for (const llvm::BasicBlock& bb : *fn)
+            for (const llvm::Instruction& inst : bb)
+                if (const auto* ret = llvm::dyn_cast<llvm::ReturnInst>(&inst))
+                {
+                    sawReturn = true;
+                    if (!ReturnedValueIsExactlyArgument(ret->getReturnValue(), arg, 0)) return false;
+                }
+        if (!sawReturn) return false;
+        // ...and the callee kept no OTHER handle on it. Its own return is not an escape here:
+        // that is the aliasing the caller is about to adopt, not a second owner.
+        return !ParameterRetainsArgumentPastCall(fn, argIndex, depth);
+    }
+
+void LLVMBackend::AdoptLaunderedOwningTempResult(llvm::Value* callResult)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        if (call == nullptr || !call->getType()->isPointerTy()) return;
+        const llvm::Function* callee = call->getCalledFunction();
+        if (callee == nullptr) return;
+        if (IsOwningPtrTempValue(call)) return;             // already carries its own ownership
+        for (unsigned i = 0; i < call->arg_size(); ++i)
+        {
+            llvm::Value* argVal = call->getArgOperand(i);
+            if (!IsOwningPtrTempValue(argVal)) continue;
+            if (!ParameterIsExactlyReturned(callee, i)) continue;
+            // Move the ledger entry, never copy it: two live entries for one object are two
+            // eligible free sites.
+            if (const OwnedReturnTemp* e = FindOwnedReturnEntry(argVal); e != nullptr)
+                PropagateOwnedReturnTemp(argVal, call);
+            else if (const OwnedNewTemp* n = FindOwnedNewTemp(argVal); n != nullptr)
+                RegisterOwnedNewTemp(call, n->TypeName, n->AllocAlign);
+            else continue;
+            SuppressCallerRelease(argVal);
+            return;
+        }
     }
 
 std::string LLVMBackend::DescribeUniqueFieldAccess(const NamedVariable& nv)

@@ -2805,6 +2805,25 @@ private:
     bool ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth = 0);
 
     /*
+     * The "does not retain PAST my call" half of the question above: same walk, but the callee's
+     * OWN return is not an escape. Only ever asked about a NESTED callee, never about the
+     * function being walked - a pointer handed back to my frame is still mine to judge, whereas
+     * one handed back to MY caller has left. Used to keep following the call RESULT instead of
+     * answering "retains", so a projection consumed inside the statement stops leaking.
+     */
+    bool ParameterRetainsArgumentPastCall(const llvm::Function* fn, unsigned argIndex, int depth);
+    std::map<std::pair<const llvm::Function*, unsigned>, bool> paramRetainsPastCallMemo_;
+    std::set<std::pair<const llvm::Function*, unsigned>> paramRetainsPastCallInProgress_;
+
+    /*
+     * The setTag discriminator: `tag = s.copy();` emits the FIELD's destructor through `this` and
+     * then STORES the replacement into that same field. A callee that frees one field it goes on
+     * to overwrite has not retained the object - unlike one that frees the object itself, which
+     * keeps answering "retains" because the deallocation runs on the tracked pointer's own block.
+     */
+    bool CallIsOverwrittenFieldDestructor(const llvm::CallBase* call, const llvm::Value* tracked) const;
+
+    /*
      * True only when `fn`'s body can no longer grow. cflat emits IR as it walks the tree, and it
      * emits functions NESTED (a lambda invoker, a generic instantiation or a global initializer
      * suspends its enclosing function through SaveBuilderState), so neither "has a body" nor
@@ -2876,6 +2895,26 @@ private:
     // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
     bool ValueMayReachReturn(const llvm::Value* root, int depth);
 
+    /*
+     * The RETURN-IDENTITY ALIAS PROOF: strictly stronger than ParameterMayReachReturn ("one path
+     * MAY hand it back"). True only when EVERY return of `fn` hands back EXACTLY this argument
+     * and the argument escapes the body nowhere else, so the result and the argument name one
+     * object and the callee kept no second handle on it. That is what lets an owning destination
+     * ADOPT a borrow-returning call's result instead of leaking the argument temp. Unknown - a
+     * declaration, a body still growing (a callee defined BELOW its call site), a vararg,
+     * recursion - answers FALSE, so the temp keeps leaking rather than being freed twice.
+     */
+    bool ParameterIsExactlyReturned(const llvm::Function* fn, unsigned argIndex, int depth = 0);
+
+    // Half of the proof above: the returned value IS `arg`, seen through the no-op reshapes cflat
+    // emits (bitcast, a parameter-prologue slot, a join whose every arm is the argument).
+    bool ReturnedValueIsExactlyArgument(const llvm::Value* ret, const llvm::Argument* arg,
+                                        int depth) const;
+
+    // Re-ledger a laundered call RESULT as the owning temp its argument was, and retire the
+    // argument's own entry so exactly one value in the statement carries the ownership.
+    void AdoptLaunderedOwningTempResult(llvm::Value* callResult);
+
     // Name a unique-field access for a diagnostic: "b.t", or the bare field / caller when a cast
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
@@ -2923,7 +2962,7 @@ private:
 
     // Worklist half of ParameterRetainsArgument: true when `root`, any pointer derived from it, or
     // any pointer read out of its pointee can outlive the call. An unrecognized user escapes.
-    bool OwningPtrEscapes(const llvm::Value* root, int depth);
+    bool OwningPtrEscapes(const llvm::Value* root, int depth, bool returnIsEscape = true);
 
     /*
      * Backward origin walk for the store-through rule: can `val` name memory the CALLER still
