@@ -384,6 +384,20 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Install the shared example/vcpkg manifest before the parallel fan-out. The five examples
+REM under example/vcpkg all resolve the same vcpkg.json and vcpkg_installed tree; letting their
+REM first compiles race here makes vcpkg-running.lock turn four otherwise-valid examples into
+REM failures. zlib_demo is only a preflight trigger: --check performs the package resolution
+REM without producing or running an example executable.
+if exist "example\vcpkg\vcpkg.json" (
+    "%CFLAT%" "example\vcpkg\zlib_demo.cb" --check --nologo >"%RESDIR%\vcpkg-init.log" 2>&1
+    if errorlevel 1 (
+        echo FAILED: example/vcpkg vcpkg manifest preflight
+        type "%RESDIR%\vcpkg-init.log"
+        exit /b 1
+    )
+)
+
 REM Launch one worker per example. Excluded files are skipped up front (counted
 REM here, not in a worker) so the SKIP lines print in launch order.
 for /r example %%F in (*.cb) do (
