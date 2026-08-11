@@ -3445,31 +3445,8 @@ union UcThin { function<int(int)> f = fwAddOne; int i; };
 union UcFat  { Lambda<int(int)> f = fwAddOne;   int i; };
 union UcNoDefault { Lambda<int(int)> f = default; int i; };
 union UcInt  { int i = 41; float x; };
-// A union's FIRST member, when it is the only destructible arm, must still be destructed -
-// members alias at offset 0, so the arm is destructed through the union pointer itself.
-// Suppressing this wholesale (an intermediate version of the union fix did) is invisible to any
-// "it compiled" leg: assert the dtor COUNT. A destructible arm at any OTHER index is deliberately
-// NOT destructed: master does not compile such a union at all, so emitting there would newly
-// expose a wild free when a different arm is live (internal/issue/p3/union-destruction-residues.md).
-// Second axis: a `unique` pointer laundered one struct deep into a union - the direct spelling
-// `union { unique T* p; }` is rejected, this wrapper is not, so the release has to happen here.
-int ucmDtorCount = 0;
 int ucmNodeDtors = 0;
-struct UcOwner { int tag = default; ~UcOwner() { ucmDtorCount = ucmDtorCount + 1; } };
 struct UcNode  { int v = default;   ~UcNode()  { ucmNodeDtors = ucmNodeDtors + 1; } };
-struct UcUniqueBox { unique UcNode* p = default; };
-union UcOwnerFirst  { UcOwner o = default; int i; };
-union UcOwnerSecond { int i = default; UcOwner o; };
-union UcLaunderUnique { UcUniqueBox b = default; int i; };
-struct UcOwnerHolder { UcOwnerFirst u = default; int n = default; };
-
-void ucmScopedOwner()      { UcOwnerFirst u = default;  u.o.tag = 7; }
-void ucmScopedOwnerSecond(){ UcOwnerSecond u = default; u.o.tag = 7; }
-void ucmScopedInStruct()   { UcOwnerHolder h = default; h.u.o.tag = 3; }
-void ucmScopedArray()      { UcOwnerFirst[3] a = default; a[0].o.tag = 1; }
-UcOwnerFirst ucmMakeOwner(){ UcOwnerFirst u = default; u.o.tag = 4; return u; }
-void ucmScopedReturn()     { UcOwnerFirst v = ucmMakeOwner(); v.o.tag = 5; }
-void ucmScopedUnique()     { UcLaunderUnique u = default; u.b.p = new UcNode(); }
 
 // WRONG-ARM-LIVE at scope exit, destructible arm at index >= 1. The program writes the i64 arm
 // and leaves it live; if the union destructed its index-1 arm anyway it would `delete` 12345
@@ -3532,22 +3509,6 @@ bool testUnionClosureMember()
     UcStructArm us = default;
     result &= Test("ucm_union_struct_default_x", us.p.px, 7);
     result &= Test("ucm_union_struct_default_y", us.p.py, 9);
-
-    // A destructible union arm is destructed exactly once per instance, in every containment.
-    // Each of these read 0 while union member destruction was suppressed wholesale.
-    ucmDtorCount = 0; ucmScopedOwner();
-    result &= Test("ucm_dtor_arm_index0", ucmDtorCount, 1);
-    // Index >= 1: NOT destructed by design - the arm leaks rather than risk a wrong-arm free.
-    ucmDtorCount = 0; ucmScopedOwnerSecond();
-    result &= Test("ucm_dtor_arm_index1_suppressed", ucmDtorCount, 0);
-    ucmDtorCount = 0; ucmScopedInStruct();
-    result &= Test("ucm_dtor_union_in_struct", ucmDtorCount, 1);
-    ucmDtorCount = 0; ucmScopedArray();
-    result &= Test("ucm_dtor_union_array", ucmDtorCount, 3);
-    ucmDtorCount = 0; ucmScopedReturn();
-    result &= Test("ucm_dtor_union_return", ucmDtorCount, 1);
-    ucmNodeDtors = 0; ucmScopedUnique();
-    result &= Test("ucm_dtor_laundered_unique", ucmNodeDtors, 1);
 
     // The wrong-arm-live witnesses. These are VALUE legs only incidentally: what they really
     // assert is that the process is still alive to compare - an index >= 1 destructor would have
@@ -3953,11 +3914,16 @@ bool testReturnVoidExprFromVoid()
  */
 int vdcHits = 0;
 void vdcBump()             { vdcHits = vdcHits + 1; }
+auto vdcAutoVoid<T>(T value) { vdcBump(); return vdcBump(); }
 void vdcRun(Lambda<void()> f) { f(); }
 void vdcRunG<T>(T v, Lambda<void()> f) { f(); }
 struct VdcHold { Lambda<void()> f = default; };
 using VdcVoid = void;
 Lambda<VdcVoid()> vdcAliasCrossing = default;
+struct VboDiscard {
+    int n = default;
+    void operator+(VboDiscard other) { vdcHits = vdcHits + 1; }
+};
 // The one legal void crossing, spelled through the alias: EmitReturnExpression resolves it.
 void vdcAliasReturn() { return vdcAliasCrossing(); }
 
@@ -3969,6 +3935,10 @@ bool testVoidClosureCallDiscarded()
     Lambda<void()> g = () => { vdcBump(); };
     g();
     result &= Test("vdc_bare_statement", vdcHits, 1);
+
+    vdcHits = 0;
+    vdcAutoVoid<int>(1);
+    result &= Test("vdc_auto_return_void_expr", vdcHits, 2);
 
     // Thin `function<>` is the OTHER arm of CreateIndirectCall; it has to discard too.
     vdcHits = 0;
@@ -4070,7 +4040,22 @@ bool testVoidClosureCallDiscarded()
     void* pv = vp();
     result &= Test("vdc_voidptr_result_consumable", pv == vebGiveP() ? 1 : 0, 1);
 
+    // A ternary used as a statement discards BOTH arms. This reaches the conditional parser
+    // instead of the old single-child ResultUse path.
+    vdcHits = 0;
+    VboDiscard va = default;
+    VboDiscard vb = default;
+    true ? va + vb : va + vb;
+    result &= Test("vdc_ternary_void_binary_discarded", vdcHits, 1);
+
     return result;
+}
+
+int lambdaDefaultPlusTwo(function<int(int)> cb = (int x) => x + 2) { return cb(1); }
+
+bool testLambdaDefaultLiteral()
+{
+    return Test("lambda_default_literal", lambdaDefaultPlusTwo(), 3) == 1;
 }
 
 extern int main()
@@ -4226,6 +4211,7 @@ extern int main()
     // Accept set of the void-closure-call gate: every DISCARD position keeps working
     // now that consuming a void closure call's result is a diagnostic (fix/voidcall).
     total++; passed += testVoidClosureCallDiscarded()      ? 1 : 0;
+    total++; passed += testLambdaDefaultLiteral()           ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

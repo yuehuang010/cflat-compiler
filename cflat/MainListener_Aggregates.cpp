@@ -1,5 +1,24 @@
 #include "MainListener.h"
 
+namespace
+{
+bool ShouldWarnImplicitFieldNarrowing(llvm::Value* value, llvm::Type* destinationType,
+                                      const std::string& destinationTypeName)
+{
+    auto* constant = llvm::dyn_cast_or_null<llvm::ConstantInt>(value);
+    if (constant == nullptr || destinationType == nullptr || !destinationType->isIntegerTy())
+        return true;
+
+    unsigned bits = destinationType->getIntegerBitWidth();
+    std::string typeName = destinationTypeName;
+    bool isUnsigned = typeName == "u8" || typeName == "u16"
+        || typeName == "u32" || typeName == "u64";
+    const llvm::APInt& integer = constant->getValue();
+    return isUnsigned ? integer.isNegative() || integer.getActiveBits() > bits
+                      : !integer.isSignedIntN(bits);
+}
+}
+
 void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* ctx, const std::string& nameOverride, const std::string& namespaceName) {
         ResolvedMembersScope memberScope_(resolvedMembers_, (const void*)ctx);
         auto* compiler = Compiler(ctx);
@@ -360,10 +379,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             else
                             {
                                 // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                                compiler->LogWarning(std::format(
-                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    declList[structIndex].TypeName,
-                                    declList[structIndex].VariableName));
+                                if (ShouldWarnImplicitFieldNarrowing(
+                                        rvalue, destType, declList[structIndex].TypeName))
+                                    compiler->LogWarning(std::format(
+                                        "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                        declList[structIndex].TypeName,
+                                        declList[structIndex].VariableName));
                                 rvalue = compiler->CreateCast(rvalue, destType);
                             }
                         }
@@ -2324,10 +2345,11 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                         else
                         {
                             // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                            compiler->LogWarning(std::format(
-                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                declList[idx].TypeName,
-                                declList[idx].VariableName));
+                            if (ShouldWarnImplicitFieldNarrowing(rvalue, destType, declList[idx].TypeName))
+                                compiler->LogWarning(std::format(
+                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                    declList[idx].TypeName,
+                                    declList[idx].VariableName));
                             rvalue = compiler->CreateCast(rvalue, destType);
                         }
                     }
@@ -2865,10 +2887,12 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                         else
                         {
                             // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                            compiler->LogWarning(std::format(
-                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                declList[structIndex].TypeName,
-                                declList[structIndex].VariableName));
+                            if (ShouldWarnImplicitFieldNarrowing(
+                                    rvalue, destType, declList[structIndex].TypeName))
+                                compiler->LogWarning(std::format(
+                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                    declList[structIndex].TypeName,
+                                    declList[structIndex].VariableName));
                             rvalue = compiler->CreateCast(rvalue, destType);
                         }
                     }
@@ -3295,9 +3319,10 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                         else
                         {
                             // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                            compiler->LogWarning(std::format(
-                                "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                field.TypeName, field.VariableName));
+                            if (ShouldWarnImplicitFieldNarrowing(fieldVal, destType, field.TypeName))
+                                compiler->LogWarning(std::format(
+                                    "implicit narrowing to '{}' in field '{}' - use an explicit cast",
+                                    field.TypeName, field.VariableName));
                             fieldVal = compiler->CreateCast(fieldVal, destType);
                         }
                     }

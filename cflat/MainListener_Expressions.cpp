@@ -87,7 +87,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             auto* condCtx = ctx->conditionalExpression();
             if (condCtx && !ctx->assignmentOperator())
             {
-                auto tv = ParseConditionalExpression(condCtx);
+                auto tv = ParseConditionalExpression(condCtx, use);
                 result.Primary = tv.value;
                 if (result.Primary)
                 {
@@ -883,7 +883,11 @@ bool MainListener::IsAllNullPhi(llvm::Value* value) const {
 bool MainListener::RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
                                      const LLVMBackend::TypeAndValue& rhs) {
-        if (target.IsArrayView && rhs.Pointer && !rhs.IsArrayView)
+        // A fixed `T*[N]` decays to its first POINTER ELEMENT, so it carries Pointer even
+        // though it is a real bounded array source. Its matching `T*[]` view preserves that
+        // element star in ElemPointer and is safe to bind; a raw `T*` remains rejected.
+        if (target.IsArrayView && rhs.Pointer && !rhs.IsArrayView
+            && !(target.ElemPointer && rhs.ConstArraySize > 0))
         {
             LogErrorContext(ctx, "cannot bind a raw pointer 'T*' to an array-view 'T[]' - a view "
                 "must span a whole allocation (it comes only from 'new T[n]' or another 'T[]'); "
@@ -1141,7 +1145,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 }
 
                 if (namedVar.UnionFieldType)
-                    return compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType);
+                {
+                    auto* stored = compiler->CreateAssignment(val, destination, isUnsigned, namedVar.UnionFieldType);
+                    return stored;
+                }
                 return isDerefStorage()
                     ? compiler->CreateAssignment(val, destination, isUnsigned, namedVar.BaseType)
                     : compiler->CreateAssignment(val, destination, isUnsigned);
@@ -1873,9 +1880,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     destSlotInitialized = llvm::isa<llvm::AllocaInst>(base) || llvm::isa<llvm::GlobalVariable>(base);
                 }
                 // A UNION member is NOT a known-initialized closure slot: every arm names the same
-                // bytes, so the current contents may be an unrelated arm's value. Read as a closure
-                // an odd integer arm looks like an OWNED (tagged) env and the dtor makes a wild
-                // indirect call through it. Suppress the free here; the arm's old env leaks.
+                // bytes, so the current contents may be an unrelated arm's value.
                 if (namedVar.UnionFieldType != nullptr)
                     destSlotInitialized = false;
                 if (destSlotInitialized)
@@ -3118,7 +3123,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
-        CFlatParser::ConditionalExpressionContext* expressionFalseCtx) {
+        CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use) {
         auto* compiler = Compiler(ctx);
         if (condTv.value == nullptr) return {};
 
@@ -3136,6 +3141,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         llvm::Value* falseValue = nullptr;
         llvm::BranchInst* trueBr  = nullptr;
         llvm::BranchInst* falseBr = nullptr;
+        llvm::BasicBlock* trueEnd = nullptr;
+        llvm::BasicBlock* falseEnd = nullptr;
         bool trueOwnedString  = false;
         bool falseOwnedString = false;
         LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
@@ -3149,20 +3156,41 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 trueOcc   = armScope.Id;
-                trueValue = ParseExpression(expressionTrueCtx);
-                FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
+                if (use == ResultUse::Discard)
+                {
+                    trueValue = ParseAssignmentExpressionNamed(
+                        expressionTrueCtx->assignmentExpression(), use).Primary;
+                    ProcessPlusPlus();
+                }
+                else
+                    trueValue = ParseExpression(expressionTrueCtx);
+                if (use == ResultUse::Discard)
+                    compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
+                else
+                    FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
             }
-            trueBr    = compiler->CreateJump(resumeBlock);
+            trueEnd = compiler->builder->GetInsertBlock();
 
             compiler->SwitchToBlock(falseBlock);
             falseMark  = compiler->MarkOwnedTemps();
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 falseOcc   = armScope.Id;
-                falseValue = ParseConditionalExpression(expressionFalseCtx);
-                FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
+                falseValue = ParseConditionalExpression(expressionFalseCtx, use);
+                if (use == ResultUse::Discard)
+                    compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
+                else
+                    FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
             }
-            falseBr    = compiler->CreateJump(resumeBlock);
+            falseEnd = compiler->builder->GetInsertBlock();
+            if (use == ResultUse::Discard)
+            {
+                LLVMBackend::NamedVariable arm;
+                arm.Primary = trueValue;
+                DiagnoseDiscardedOwningReturn(ctx, arm);
+                arm.Primary = falseValue;
+                DiagnoseDiscardedOwningReturn(ctx, arm);
+            }
         }
         catch (...)
         {
@@ -3183,12 +3211,42 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             throw;
         }
 
+        // A ternary statement evaluates an arm for side effects only. In particular, both arms
+        // may be void calls, so it has no value to join and no PHI/select type to unify.
+        if (use == ResultUse::Discard)
+        {
+            if (trueEnd != nullptr && trueEnd->getTerminator() == nullptr)
+            {
+                compiler->builder->SetInsertPoint(trueEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            if (falseEnd != nullptr && falseEnd->getTerminator() == nullptr)
+            {
+                compiler->builder->SetInsertPoint(falseEnd);
+                compiler->CreateJump(resumeBlock);
+            }
+            compiler->SwitchToBlock(resumeBlock);
+            return {};
+        }
+
         // An arm whose own lowering terminated its block never reaches the join; the ternary can
         // then only yield the other arm, so no PHI is needed (and none is legal).
-        if (trueBr == nullptr || falseBr == nullptr)
+        bool trueLive = trueEnd != nullptr && trueEnd->getTerminator() == nullptr;
+        bool falseLive = falseEnd != nullptr && falseEnd->getTerminator() == nullptr;
+        if (!trueLive || !falseLive)
         {
+            if (trueLive)
+            {
+                compiler->builder->SetInsertPoint(trueEnd);
+                trueBr = compiler->CreateJump(resumeBlock);
+            }
+            if (falseLive)
+            {
+                compiler->builder->SetInsertPoint(falseEnd);
+                falseBr = compiler->CreateJump(resumeBlock);
+            }
             compiler->SwitchToBlock(resumeBlock);
-            if (trueBr == nullptr && falseBr == nullptr) return {};
+            if (!trueLive && !falseLive) return {};
             llvm::Value* only = trueBr != nullptr ? trueValue : falseValue;
             compiler->PromoteCastOccurrence(only, trueBr != nullptr ? trueOcc : falseOcc);
             return { only, false };
@@ -3200,16 +3258,23 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             return {};
         }
 
-        auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueBr); };
-        auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseBr); };
+        // Do arm-local conversions before adding their jumps. In particular, a runtime char*
+        // converted to string emits a call to operator string and cannot be inserted after a
+        // terminator.
+        auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueEnd); };
+        auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseEnd); };
         if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse, trueOcc, falseOcc))
         {
+            atTrue(); compiler->CreateJump(resumeBlock);
+            atFalse(); compiler->CreateJump(resumeBlock);
             compiler->SwitchToBlock(resumeBlock);
             return {};
         }
 
         if (trueValue->getType()->isVoidTy())
         {
+            atTrue(); compiler->CreateJump(resumeBlock);
+            atFalse(); compiler->CreateJump(resumeBlock);
             compiler->SwitchToBlock(resumeBlock);
             LogErrorContext(ctx, "ternary branches must produce a value; 'void' is not allowed");
             return {};
@@ -3226,8 +3291,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             ownedString = trueOwnedString && falseOwnedString;
         }
 
-        auto* trueEnd  = trueBr->getParent();
-        auto* falseEnd = falseBr->getParent();
+        atTrue();
+        trueBr = compiler->CreateJump(resumeBlock);
+        atFalse();
+        falseBr = compiler->CreateJump(resumeBlock);
         compiler->SwitchToBlock(resumeBlock);
         auto* phi = compiler->builder->CreatePHI(trueValue->getType(), 2, "ternary");
         phi->addIncoming(trueValue,  trueEnd);
@@ -3253,7 +3320,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         return { phi, false };
     }
 
-LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
+        CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
 
@@ -3266,7 +3334,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 lhsOcc = armScope.Id;
-                lhs = ParseLogicalOrExpression(logicCtx);
+                lhs = ParseLogicalOrExpression(logicCtx, ResultUse::Value);
             }
             if (!lhs) return {};
 
@@ -3285,17 +3353,38 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
             llvm::Value* rhs = nullptr;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
             LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
+            llvm::BranchInst* rhsBr = nullptr;
+            try
             {
-                LLVMBackend::CastOccurrenceScope armScope(compiler);
-                rhsOcc = armScope.Id;
-                rhs = ParseConditionalExpression(ctx->conditionalExpression());
+                {
+                    LLVMBackend::CastOccurrenceScope armScope(compiler);
+                    rhsOcc = armScope.Id;
+                    rhs = ParseConditionalExpression(ctx->conditionalExpression(), use);
+                }
+                // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
+                // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
+                // branch block does dominate the resume, so struct temps hoist there instead.
+                compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
+                compiler->CreateAssignment(rhs, resultAlloca);
+                rhsBr = compiler->CreateJump(resumeBlock);
             }
-            // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
-            // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
-            // branch block does dominate the resume, so struct temps hoist there instead.
-            compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
-            compiler->CreateAssignment(rhs, resultAlloca);
-            auto* rhsBr = compiler->CreateJump(resumeBlock);
+            catch (...)
+            {
+                // expect_error continues after LogError throws, so every arm opened above must
+                // be closed before the error propagates to its recovery path.
+                if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
+                for (auto* block : { nullBlock, notNullBlock })
+                {
+                    if (block->getTerminator() == nullptr)
+                    {
+                        compiler->SwitchToBlock(block);
+                        compiler->builder->CreateBr(resumeBlock);
+                    }
+                }
+                compiler->SwitchToBlock(resumeBlock);
+                compiler->DiscardOwnedTempsSince(rhsMark);
+                throw;
+            }
 
             compiler->SwitchToBlock(resumeBlock);
             auto* joined = compiler->CreateLoad(resultAlloca);
@@ -3320,7 +3409,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
 
         if (logicCtx != nullptr)
         {
-            auto condTv = ParseLogicalOrExpression(logicCtx);
+            auto condTv = ParseLogicalOrExpression(
+                logicCtx, expressionTrueCtx != nullptr ? ResultUse::Value : use);
 
             // Both expression should exist or not exist.
             if ((expressionFalseCtx != nullptr) != (expressionTrueCtx != nullptr))
@@ -3337,7 +3427,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
                     && compiler->currentFunction != nullptr
                     && insertBB->getParent() == compiler->currentFunction)
                 {
-                    return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx);
+                    return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx, use);
                 }
 
                 // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
@@ -3346,8 +3436,15 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
                 llvm::Value* falseValue = nullptr;
                 {
                     SuppressExplicitNullDerefGuardScope suppressGuard(compiler);
-                    trueValue  = ParseExpression(expressionTrueCtx);
-                    falseValue = ParseConditionalExpression(expressionFalseCtx);
+                    if (use == ResultUse::Discard)
+                    {
+                        trueValue = ParseAssignmentExpressionNamed(
+                            expressionTrueCtx->assignmentExpression(), use).Primary;
+                        ProcessPlusPlus();
+                    }
+                    else
+                        trueValue = ParseExpression(expressionTrueCtx);
+                    falseValue = ParseConditionalExpression(expressionFalseCtx, use);
                 }
 
                 // A branch that is a plain (non-`move`) string-returning CALL yields a fresh owned
@@ -3407,13 +3504,13 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(CFlatParser::Co
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
 
         if (logicCtxs.size() == 1)
         {
-            return ParseLogicalAndExpression(logicCtxs[0]);
+            return ParseLogicalAndExpression(logicCtxs[0], use);
         }
         else if (logicCtxs.size() > 1)
         {
@@ -3430,7 +3527,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
             {
                 if (left == nullptr)
                 {
-                    left = ParseLogicalAndExpression(logicCtx);
+                    left = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -3440,7 +3537,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
 
                     compiler->InitializeBlock(falseBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
-                    llvm::Value* right = ParseLogicalAndExpression(logicCtx);
+                    llvm::Value* right = ParseLogicalAndExpression(logicCtx, ResultUse::Value);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalOr, left, right);
                     // The short-circuit block does not dominate resumeOR, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -3459,13 +3556,13 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx, ResultUse use) {
         auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
 
         if (inclusiveCtxs.size() == 1)
         {
-            return ParseInclusiveOrExpression(inclusiveCtxs[0]);
+            return ParseInclusiveOrExpression(inclusiveCtxs[0], use);
         }
         else if (inclusiveCtxs.size() > 1)
         {
@@ -3483,7 +3580,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
             {
                 if (left == nullptr)
                 {
-                    left = ParseInclusiveOrExpression(inclusiveCtx);
+                    left = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
                     compiler->CreateAssignment(left, resultStorage);
                 }
                 else
@@ -3493,7 +3590,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
 
                     compiler->InitializeBlock(trueBlock, false);
                     LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
-                    llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx);
+                    llvm::Value* right = ParseInclusiveOrExpression(inclusiveCtx, ResultUse::Value);
                     left = compiler->CreateOperation(LLVMBackend::Operation::LogicalAnd, left, right);
                     // The short-circuit block does not dominate resumeAND, so the end-of-statement
                     // flush would skip its temps; the operands are already reduced to a bool here.
@@ -3512,18 +3609,18 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx, ResultUse use) {
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size() == 1)
-            return ParseExclusiveOrExpression(exclusiveCtxs[0]);
+            return ParseExclusiveOrExpression(exclusiveCtxs[0], use);
 
         if (exclusiveCtxs.size() > 1)
         {
-            auto lv = ParseExclusiveOrExpression(exclusiveCtxs[0]);
+            auto lv = ParseExclusiveOrExpression(exclusiveCtxs[0], ResultUse::Value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
-                auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i]);
+                auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i], ResultUse::Value);
                 acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
@@ -3533,18 +3630,18 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx, ResultUse use) {
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size() == 1)
-            return ParseAndExpression(andCtxs[0]);
+            return ParseAndExpression(andCtxs[0], use);
 
         if (andCtxs.size() > 1)
         {
-            auto lv = ParseAndExpression(andCtxs[0]);
+            auto lv = ParseAndExpression(andCtxs[0], ResultUse::Value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
-                auto rv = ParseAndExpression(andCtxs[i]);
+                auto rv = ParseAndExpression(andCtxs[i], ResultUse::Value);
                 acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
@@ -3554,18 +3651,18 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size() == 1)
-            return ParseEqualityExpression(nextCtxs[0]);
+            return ParseEqualityExpression(nextCtxs[0], use);
 
         if (nextCtxs.size() > 1)
         {
-            auto lv = ParseEqualityExpression(nextCtxs[0]);
+            auto lv = ParseEqualityExpression(nextCtxs[0], ResultUse::Value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                auto rv = ParseEqualityExpression(nextCtxs[i]);
+                auto rv = ParseEqualityExpression(nextCtxs[i], ResultUse::Value);
                 acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value);
             }
             return { acc, lv.isUnsigned };
@@ -3590,11 +3687,11 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
             rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
     }
 
-LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
         {
-            return ParseTypeCheckExpression(nextCtxs[0]);
+            return ParseTypeCheckExpression(nextCtxs[0], use);
         }
         else if (nextCtxs.size() == 2)
         {
@@ -3605,11 +3702,11 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             // An owning-POINTER operand (`makePtr() != nullptr`) is the same shape: the comparison
             // yields a bool, so the pointer cannot escape and the temp is freed at the same point.
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto lv = ParseTypeCheckExpression(nextCtxs[0]);
+            auto lv = ParseTypeCheckExpression(nextCtxs[0], ResultUse::Value);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto rv = ParseTypeCheckExpression(nextCtxs[1]);
+            auto rv = ParseTypeCheckExpression(nextCtxs[1], ResultUse::Value);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
@@ -3621,6 +3718,13 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
                                                        rv.pointerDepth, rv.elemPointer);
+            if (overload)
+            {
+                LLVMBackend::NamedVariable resultNV;
+                resultNV.Primary = overload;
+                resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
+            }
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // == != result is bool, not unsigned
@@ -3665,7 +3769,7 @@ CFlatParser::CastExpressionContext* MainListener::SoleCastOperandOf(CFlatParser:
         return casts.size() == 1 ? casts[0] : nullptr;
     }
 
-LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx, ResultUse use) {
         auto relCtx = ctx->relationalExpression();
         if (!relCtx)
         {
@@ -3688,7 +3792,7 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
         }
         else
         {
-            tv = ParseRelationalExpression(relCtx);
+            tv = ParseRelationalExpression(relCtx, typeSpecs.empty() ? use : ResultUse::Value);
         }
         llvm::Value* result = tv.value;
         llvm::Type* srcElemType = tv.elemType;
@@ -4256,11 +4360,11 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
         return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
 
-LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
         {
-            return ParseShiftExpression(nextCtxs[0]);
+            return ParseShiftExpression(nextCtxs[0], use);
         }
         else if (nextCtxs.size() == 2)
         {
@@ -4270,17 +4374,24 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             // operand for end-of-statement cleanup (see RegisterBorrowedStringOperandTemp).
             // Owning-POINTER operands are registered here too - see ParseEqualityExpression.
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto lv = ParseShiftExpression(nextCtxs[0]);
+            auto lv = ParseShiftExpression(nextCtxs[0], ResultUse::Value);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), lv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(lv.value);
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto rv = ParseShiftExpression(nextCtxs[1]);
+            auto rv = ParseShiftExpression(nextCtxs[1], ResultUse::Value);
             RegisterBorrowedStringOperandTemp(Compiler(ctx), rv.value);
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
                                                        rv.pointerDepth, rv.elemPointer);
+            if (overload)
+            {
+                LLVMBackend::NamedVariable resultNV;
+                resultNV.Primary = overload;
+                resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
+            }
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // comparison result is bool, not unsigned
@@ -4585,16 +4696,16 @@ bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, c
         return false;
     }
 
-LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.size() == 1)
         {
-            return ParseAdditiveExpression(nextCtxs[0]);
+            return ParseAdditiveExpression(nextCtxs[0], use);
         }
         else if (nextCtxs.size() == 2)
         {
-            auto lv = ParseAdditiveExpression(nextCtxs[0]);
-            auto rv = ParseAdditiveExpression(nextCtxs[1]);
+            auto lv = ParseAdditiveExpression(nextCtxs[0], ResultUse::Value);
+            auto rv = ParseAdditiveExpression(nextCtxs[1], ResultUse::Value);
             // '>>' is two tokens in the grammar (('>' '>')), so children[1] = '>' and children[2] = '>'.
             // '<<' is a single token, so children[1] = '<<'.
             std::string op = ctx->children[1]->getText();
@@ -4703,6 +4814,10 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
                     ra.BaseType     = rv.value ? rv.value->getType() : nullptr;
                     ra.CallerName   = rhsName;
                     auto* res = compiler->CreateOverloadedFunctionCall(opName, { la, ra });
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = res;
+                    resultNV.TypeAndValue = compiler->lastCallReturnType;
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     return { res, false };
                 }
             }
@@ -4715,19 +4830,19 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
         return {};
     }
 
-LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->multiplicativeExpression();
 
         if (nextCtxs.size() == 1)
         {
-            return ParseMultiplicativeExpression(nextCtxs[0]);
+            return ParseMultiplicativeExpression(nextCtxs[0], use);
         }
         else if (nextCtxs.size() > 1)
         {
             // Clear lastCallReturnsOwned before each operand: a preceding owned operator+ result would
             // otherwise leave the flag set and mis-register the next plain-variable operand (double-free).
             Compiler(ctx)->lastCallReturnsOwned = false;
-            auto lv = ParseMultiplicativeExpression(nextCtxs[0]);
+            auto lv = ParseMultiplicativeExpression(nextCtxs[0], ResultUse::Value);
             llvm::Value* lvalue = lv.value;
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
@@ -4740,7 +4855,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 Compiler(ctx)->lastCallReturnsOwned = false;
-                auto rv = ParseMultiplicativeExpression(nextCtxs[i]);
+                auto rv = ParseMultiplicativeExpression(nextCtxs[i], ResultUse::Value);
                 llvm::Value* rvalue = rv.value;
                 bool ru = rv.isUnsigned;
                 TrackOwnedStringOperatorResult(Compiler(ctx), rvalue);
@@ -4781,10 +4896,10 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 }
                 else
                 {
-                    auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
+                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
                                                               rv.pointerDepth, rv.elemPointer);
 
-                    // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
+                // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
                     auto isCStr = [&](llvm::Value* v, llvm::Type* et) -> bool {
                         if (et && et->isIntegerTy(8)) return true;
@@ -4813,6 +4928,13 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         TrackOwnedStringOperatorResult(Compiler(ctx), overload);
                     }
 
+                    if (overload)
+                    {
+                        LLVMBackend::NamedVariable resultNV;
+                        resultNV.Primary = overload;
+                        resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                        DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
+                    }
                     lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
                     lu = lu || ru;
                     elemType = nullptr;  // arithmetic result is no longer a pointer
@@ -5260,23 +5382,23 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         return nullptr;
     }
 
-LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx) {
+LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx, ResultUse use) {
         auto nextCtxs = ctx->castExpression();
 
         if (nextCtxs.size() == 1)
         {
-            auto namedVar = ParseCastExpression(nextCtxs[0]);
+            auto namedVar = ParseCastExpression(nextCtxs[0], false, use);
             return TypedValueOfNamedOperand(namedVar, nextCtxs[0]);
         }
         else if (nextCtxs.size() > 1)
         {
-            auto firstNV = ParseCastExpression(nextCtxs[0]);
+            auto firstNV = ParseCastExpression(nextCtxs[0], false, ResultUse::Value);
             bool lu = firstNV.TypeAndValue.IsUnsignedInteger() != -1;
             llvm::Value* lvalue = LoadNamedVariable(firstNV);
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
-                auto rightNV = ParseCastExpression(nextCtxs[i]);
+                auto rightNV = ParseCastExpression(nextCtxs[i], false, ResultUse::Value);
                 bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
                 std::string op = ctx->children[i * 2 - 1]->getText();
@@ -5285,6 +5407,13 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                                                           rightNV.TypeAndValue.DepthIsAboutThisValue()
                                                               ? rightNV.TypeAndValue.PointerDepth : 0,
                                                           rightNV.TypeAndValue.ElemPointer);
+                if (overload)
+                {
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = overload;
+                    resultNV.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
+                }
                 lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
                 lu = lu || ru;
             }
@@ -8327,7 +8456,24 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // and params; the alloca-storage test inside splits those out to a local-specific
             // message. Checked ahead of the from-outside rule so the precise reason wins for inside
             // and outside deletes alike.
-            if (namedVar.TypeAndValue.IsUnique)
+            std::string enclosing = SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler);
+            bool isRawUnionMember = false;
+            if (!namedVar.TypeAndValue.ParentVariableName.empty())
+            {
+                auto enclosingIt = compiler->dataStructures.find(enclosing);
+                if (enclosingIt != compiler->dataStructures.end() && enclosingIt->second.IsUnion)
+                {
+                    for (const auto& field : enclosingIt->second.StructFields)
+                    {
+                        if (field.VariableName == namedVar.TypeAndValue.ParentVariableName)
+                        {
+                            isRawUnionMember = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (namedVar.TypeAndValue.IsUnique && !isRawUnionMember)
             {
                 // A `unique` LOCAL (alloca storage, no field name) is freed automatically at scope
                 // exit, and reassignment frees the current pointee first. Distinguish it from the
@@ -8349,7 +8495,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 std::string fieldName = namedVar.FieldName.empty()
                     ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
                 std::string owner = namedVar.OwningStructName.empty()
-                    ? SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler)
+                    ? enclosing
                     : namedVar.OwningStructName;
                 std::string fieldDesc = owner.empty()
                     ? std::format("'{}'", fieldName)
@@ -8369,9 +8515,9 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // ownership transfer is visible at the call site and the owner sees nullptr.
             if (!namedVar.OwningStructName.empty()
                 && namedVar.Storage != nullptr
-                && !llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                && !llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                && !isRawUnionMember)
             {
-                std::string enclosing = SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler);
                 if (enclosing != namedVar.OwningStructName)
                 {
                     LogErrorContext(ctx, std::format(

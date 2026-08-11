@@ -549,6 +549,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.IsSimd = true;
                     declType.SimdLanes = lanes;
                     RecordSimdPointerAndDims(declType, declSpec);
+                    if (auto* dims = ArrayDimsOf(declSpec);
+                        dims != nullptr && dims->assignmentExpression().empty())
+                        LogErrorContext(declSpec,
+                            "array-view '[]' is not supported on simd types; use a fixed simd array");
                     break;
                 }
                 std::string baseName;
@@ -766,10 +770,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.ExtraArrayDims.push_back(dims[di]);
                     if (dims.empty())
                     {
-                        // `T[]` (empty brackets) = thin noalias array-view: an `int*` repr
-                        // (Pointer) carrying a noalias contract, distinct from a fixed array.
+                        // `T[]` is a thin noalias array-view. A preceding '*' belongs to the
+                        // ELEMENT, so `T*[]` carries Pointer + ElemPointer rather than collapsing
+                        // into the indistinguishable `T[]` shape.
+                        bool elementPointer = declType.Pointer;
                         declType.IsArrayView = true;
                         declType.Pointer = true;
+                        declType.ElemPointer = elementPointer || declType.ElemPointer;
                     }
                 }
                 if (ArrayPtrOf(declSpec))
@@ -3773,29 +3780,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                  * ("unknown type 'auto'"), and this is not the change that lifts that.
                  */
                 /*
-                 * A POINTER-ELEMENT fixed array (`T*[N]`, which carries Pointer on the ELEMENT)
-                 * has no view to deduce to: `T*[]` collapses to `T[]` in both
-                 * ParseDeclarationSpecifiers copies, so the explicit spelling does not work
-                 * either. Pointer-element views are an unimplemented feature, not a broken one.
-                 * Reject instead of deducing - the alternative was an unmaterialised shapeless
-                 * binding that indexed nothing and produced garbage.
-                 */
-                if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
-                    && !typeAndValue.Pointer && !typeAndValue.IsSimd
-                    && typeAndValue.ConstArraySize == 0
-                    && srcConstArraySize > 0 && srcInferredPointer
-                    && !srcIsArrayView && !srcIsSimd && !srcInferredTypeName.empty())
-                {
-                    LogErrorContext(direct, std::format(
-                        "cannot deduce 'auto' from pointer-element fixed array '{}*[{}]' - the "
-                        "array view '{}*[]' is not supported. Bind one element "
-                        "('{}* p = {}[i];') or index the array directly.",
-                        srcInferredTypeName, srcConstArraySize, srcInferredTypeName,
-                        srcInferredTypeName, DescribeInitializerPath(srcCallerName,
-                                                                     srcBorrowedField)));
-                }
-
-                /*
                  * A MULTI-DIMENSIONAL fixed array (`T[N][M]`) has no view to deduce to either:
                  * its decayed element is a ROW, so `T[]` is the wrong deduction, and the `T[][]`
                  * spelling is rejected outright (a thin view carries no row stride). Reject
@@ -3829,12 +3813,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     && !typeAndValue.Pointer && !typeAndValue.IsSimd
                     && typeAndValue.ConstArraySize == 0
                     && srcConstArraySize > 0 && srcConstInnerDimensions.empty()
-                    && !srcInferredPointer && !srcIsArrayView && !srcIsSimd
+                    && !srcIsArrayView && !srcIsSimd
                     && !srcInferredTypeName.empty() && srcInferredTypeName != "auto"
                     && right->getType()->isPointerTy())
                 {
                     typeAndValue.TypeName = srcInferredTypeName;
-                    typeAndValue.ElemPointer = srcInferredElemPointer;
+                    typeAndValue.ElemPointer = srcInferredPointer || srcInferredElemPointer;
                     typeAndValue.Pointer = true;
                     typeAndValue.IsArrayView = true;
                     typeAndValue.IsInterface = compiler->IsInterfaceType(typeAndValue.TypeName);
@@ -3987,13 +3971,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         bool fromStringLiteral = constant != nullptr
                             && compiler->IsStringLiteralConstant(constant);
                         if (fromStringLiteral)
-                            LogErrorContext(direct, std::format(
-                                "cannot initialize global fixed array '{} {}' from a string literal - "
-                                "CFlat has no C-style character-array initializer. Use 'char* {} = "
-                                "...' to point at the literal, 'string {} = ...' for a managed "
-                                "string, or '{} {} = {{'a','b',...}}' to spell the bytes out.",
-                                DescribeArrayShape(typeAndValue), name, name, name,
-                                DescribeArrayShape(typeAndValue), name));
+                        {
+                            auto* literalGlobal = llvm::dyn_cast<llvm::GlobalVariable>(
+                                constant->stripPointerCasts());
+                            auto* literalBytes = literalGlobal == nullptr ? nullptr
+                                : llvm::dyn_cast<llvm::ConstantDataSequential>(literalGlobal->getInitializer());
+                            auto* arrayTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
+                            if (literalBytes == nullptr || !arrayTy->getElementType()->isIntegerTy(8))
+                                LogErrorContext(direct, std::format(
+                                    "cannot initialize global fixed array '{} {}' from this string literal",
+                                    DescribeArrayShape(typeAndValue), name));
+                            std::string bytes = literalBytes->getAsString().str();
+                            size_t visible = bytes.empty() ? 0 : bytes.size() - 1;
+                            if (visible > typeAndValue.ConstArraySize)
+                                LogErrorContext(direct, std::format(
+                                    "too many initializers for '{}[{}]': string literal has {} characters",
+                                    typeAndValue.TypeName, typeAndValue.ConstArraySize, visible));
+                            std::vector<llvm::Constant*> elements;
+                            elements.reserve((size_t)typeAndValue.ConstArraySize);
+                            for (size_t i = 0; i < typeAndValue.ConstArraySize; ++i)
+                            {
+                                uint8_t ch = i < bytes.size() ? (uint8_t)bytes[i] : 0;
+                                elements.push_back(llvm::ConstantInt::get(arrayTy->getElementType(), ch));
+                            }
+                            constant = llvm::ConstantArray::get(arrayTy, elements);
+                        }
                         else
                             LogErrorContext(direct, std::format(
                                 "cannot initialize global fixed array '{} {}' from this expression - "
@@ -4349,16 +4351,38 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         else if (destIsFixedArray && rightConst != nullptr
                             && compiler->IsStringLiteralConstant(rightConst))
                         {
-                            // `char[8] b = "hello";` - the C idiom. A string literal is an
-                            // llvm::Constant, so the bad cast folds into a ConstantExpr that the
-                            // verifier does not check: the bytes then come from the POINTER value.
-                            LogErrorContext(direct, std::format(
-                                "cannot initialize fixed array '{}' from a string literal - CFlat "
-                                "has no C-style character-array initializer. Use 'char* {} = ...' "
-                                "to point at the literal, 'string {} = ...' for a managed string, "
-                                "or '{}[{}] {} = {{'a','b',...}}' to spell the bytes out.",
-                                DescribeArrayShape(typeAndValue), name, name,
-                                typeAndValue.TypeName, typeAndValue.ConstArraySize, name));
+                            // `char[N] b = "text";`: lower the literal's GLOBAL byte initializer
+                            // into the destination aggregate. A pointer-to-array cast reads pointer
+                            // bits and is invalid IR; this is the same zero-fill + byte-store result
+                            // as a positional brace initializer, folded into one constant store.
+                            auto* literalGlobal = llvm::dyn_cast<llvm::GlobalVariable>(
+                                rightConst->stripPointerCasts());
+                            auto* literalBytes = literalGlobal == nullptr ? nullptr
+                                : llvm::dyn_cast<llvm::ConstantDataSequential>(literalGlobal->getInitializer());
+                            if (literalBytes == nullptr || !destArrTy->getElementType()->isIntegerTy(8))
+                            {
+                                LogErrorContext(direct, std::format(
+                                    "cannot initialize fixed array '{}' from this string literal",
+                                    DescribeArrayShape(typeAndValue)));
+                            }
+                            std::string bytes = literalBytes->getAsString().str();
+                            // The pooled global includes its terminating NUL. C permits an exact
+                            // fit without it, but not fewer slots than the visible bytes.
+                            size_t visible = bytes.empty() ? 0 : bytes.size() - 1;
+                            if (visible > typeAndValue.ConstArraySize)
+                                LogErrorContext(direct, std::format(
+                                    "too many initializers for '{}[{}]': string literal has {} characters",
+                                    typeAndValue.TypeName, typeAndValue.ConstArraySize, visible));
+                            std::vector<llvm::Constant*> elements;
+                            elements.reserve((size_t)typeAndValue.ConstArraySize);
+                            for (size_t i = 0; i < typeAndValue.ConstArraySize; ++i)
+                            {
+                                uint8_t ch = i < bytes.size() ? (uint8_t)bytes[i] : 0;
+                                elements.push_back(llvm::ConstantInt::get(
+                                    destArrTy->getElementType(), ch));
+                            }
+                            compiler->builder->CreateStore(
+                                llvm::ConstantArray::get(destArrTy, elements), alloc);
                         }
                         else if (destIsFixedArray && srcIsArrayShaped)
                         {

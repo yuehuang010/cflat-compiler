@@ -4640,6 +4640,10 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     EnsureStrConcatRegistered();
     EnsureStringDtorRegistered();
     EnsureClosureLifetimeRegistered();   // closure dtor + env-cloning copy (Option A)
+    // Core bitcode must never cache a declaration-only rebox thunk: cache loading adopts such
+    // thunks, but cannot repair invalid IR that was already serialized.
+    if (!deferredIfaceRebox_.empty())
+        LogError("cannot save core bitcode with deferred interface rebox thunks");
     return true;
 }
 

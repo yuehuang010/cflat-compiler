@@ -271,10 +271,11 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         declType.ExtraArrayDims.push_back(dims[di]);
                     if (dims.empty())
                     {
-                        // `T[]` (empty brackets) = thin noalias array-view: an `int*` repr
-                        // (Pointer) carrying a noalias contract, distinct from a fixed array.
+                        // Preserve a declarator '*' as element pointer-ness for `T*[]`.
+                        bool elementPointer = declType.Pointer;
                         declType.IsArrayView = true;
                         declType.Pointer = true;
+                        declType.ElemPointer = elementPointer || declType.ElemPointer;
                     }
                 }
                 if (ArrayPtrOf(declSpec))

@@ -1785,9 +1785,9 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
                 // Normalize to i1 so AND behaves logically. isdigit() returns 4/8, which
                 // would AND to 0 against an i1-widened left side (1 & 4 == 0).
                 if (!left->getType()->isIntegerTy(1))
-                    left = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0), "tobool");
+                    left = builder->CreateICmpNE(left, llvm::Constant::getNullValue(left->getType()), "tobool");
                 if (!right->getType()->isIntegerTy(1))
-                    right = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0), "tobool");
+                    right = builder->CreateICmpNE(right, llvm::Constant::getNullValue(right->getType()), "tobool");
                 return builder->CreateAnd(left, right);
             }
             case Operation::BitwiseAnd:
@@ -1798,9 +1798,9 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             case Operation::LogicalOr:
             {
                 if (!left->getType()->isIntegerTy(1))
-                    left = builder->CreateICmpNE(left, llvm::ConstantInt::get(left->getType(), 0), "tobool");
+                    left = builder->CreateICmpNE(left, llvm::Constant::getNullValue(left->getType()), "tobool");
                 if (!right->getType()->isIntegerTy(1))
-                    right = builder->CreateICmpNE(right, llvm::ConstantInt::get(right->getType(), 0), "tobool");
+                    right = builder->CreateICmpNE(right, llvm::Constant::getNullValue(right->getType()), "tobool");
                 return builder->CreateOr(left, right);
             }
             case Operation::BitwiseOr:

@@ -2281,6 +2281,13 @@ private:
         ~ReturnFlagGuard() { *flag = saved; }
     };
 
+    struct LambdaExpectedTypeRestoreGuard {
+        LLVMBackend::TypeAndValue* value;
+        LLVMBackend::TypeAndValue saved;
+        explicit LambdaExpectedTypeRestoreGuard(LLVMBackend::TypeAndValue* v) : value(v), saved(*v) {}
+        ~LambdaExpectedTypeRestoreGuard() { *value = saved; }
+    };
+
     // Increments suppressExplicitNullDerefGuard_ for the ctor->dtor lifetime, unwinding even if
     // lowering a '?:' arm throws (LogError) or returns early - see the call site's comment.
     struct SuppressExplicitNullDerefGuardScope {
@@ -3717,26 +3724,34 @@ public:
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
-        CFlatParser::ConditionalExpressionContext* expressionFalseCtx);
+        CFlatParser::ConditionalExpressionContext* expressionFalseCtx,
+        ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
+                                                        ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx,
+                                                      ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx,
+                                                       ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx,
+                                                        ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx,
+                                                        ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx,
+                                                ResultUse use = ResultUse::Value);
 
     // `ifaceVal == nullptr` / `!= nullptr`: rewrite the fat-ptr operand to its data pointer so the
     // comparison is a plain pointer compare. Only fires when the other operand is a null constant.
     void LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
                                    LLVMBackend::TypedValue& lv, LLVMBackend::TypedValue& rv);
 
-    LLVMBackend::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx,
+                                                     ResultUse use = ResultUse::Value);
 
     // The single-child multiplicative body: reduce a parsed cast-expression binding to the
     // TypedValue the arithmetic chain hands upward. Shared so an 'as' operand can keep the
@@ -3753,7 +3768,8 @@ public:
      */
     CFlatParser::CastExpressionContext* SoleCastOperandOf(CFlatParser::RelationalExpressionContext* relCtx);
 
-    LLVMBackend::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx,
+                                                      ResultUse use = ResultUse::Value);
 
     // Returns the type descriptor pointer loaded from vtable[0].
     // Works whether interfaceValue is an aggregate {i8*,i8*} or a pointer to one.
@@ -3834,7 +3850,8 @@ public:
                                   const LLVMBackend::NamedVariable* srcBinding = nullptr,
                                   const std::string& srcTypeNameIn = {});
 
-    LLVMBackend::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx,
+                                                       ResultUse use = ResultUse::Value);
 
     // Walk a single-child expression chain to the leaf Identifier terminal.
     // Returns the identifier name, or "" if the expression is complex (e.g., arithmetic, member access).
@@ -3890,9 +3907,11 @@ public:
     // (member or free) instead of a primitive bit-shift.
     bool HasOperatorOverloadForFirstParam(const std::string& opName, const std::string& typeName);
 
-    LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx,
+                                                  ResultUse use = ResultUse::Value);
 
-    LLVMBackend::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx,
+                                                     ResultUse use = ResultUse::Value);
 
     // Diagnose move-flag mismatch when assigning a named function to a typed function pointer.
     // E.g. `function<void(move T*)> fp = borrowFn;` is rejected because borrowFn declares a borrow param.
@@ -3981,7 +4000,8 @@ public:
         antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
         int rhsPointerDepth = 0, bool rhsElemPointer = false);
 
-    LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx);
+    LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx,
+                                                           ResultUse use = ResultUse::Value);
 
     LLVMBackend::NamedVariable ParseCastExpression(CFlatParser::CastExpressionContext* ctx, bool lvalue = false,
                                                    ResultUse use = ResultUse::Value);

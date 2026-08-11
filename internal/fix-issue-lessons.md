@@ -2651,3 +2651,8 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   existing representation-based string diagnostic. The guard must ask the unbound-rvalue question
   and include by-value owning returns; the pointer-only ledger is insufficient. No new serialized
   field is needed: the existing value-identity ownership ledger is sufficient.
+- **The 2026-08-11 raw-union lifetime ruling**: unions follow C++ raw-union semantics. Their ABI
+  contains no hidden active-member tag, and the compiler never synthesizes destruction or old-value
+  release for a union arm. An explicitly written union destructor still runs. Managed alternatives
+  belong in a wrapper struct with a separate tag and explicit cleanup; do not retry an in-layout
+  discriminant or a compiler side table for raw unions.

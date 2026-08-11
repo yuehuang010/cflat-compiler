@@ -572,6 +572,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             right = nullptr;
         }
+        else if (autoReturn && returnExprIsVoid)
+        {
+            // Auto inference treats `return voidExpr;` exactly like bare `return;`: both
+            // contribute a void site. Do not retain a void CallInst as the captured value,
+            // because finalization replaces a null site with CreateRetVoid.
+            right = nullptr;
+        }
         else if (fnReturnsVoid && right != nullptr)
         {
             // A lambda that no function<>/Lambda<> context reached has "void" as an INFERRED
@@ -594,6 +601,24 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 "cannot return a 'void' expression from a function that returns '{}' - "
                 "the expression produces no value; call it as a statement and return a value",
                 autoReturn ? "auto" : CurrentReturnTypeSpelling(compiler)));
+        }
+
+        // Keep representation-changing return paths below (string wrapping, interface boxing,
+        // closure coercion) intact, but reject scalar/aggregate crossings that Upconvert cannot
+        // repair before they become a locationless LLVM return-type verifier failure.
+        if (!autoReturn && right != nullptr && compiler->currentFunction != nullptr)
+        {
+            auto* returnTy = compiler->currentFunction->getReturnType();
+            auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+            bool aggregateFromScalar = returnTy->isStructTy() && returnTy != stringTy
+                && !right->getType()->isStructTy() && !right->getType()->isPointerTy();
+            bool scalarFromPointer = returnTy->isIntegerTy() && right->getType()->isPointerTy();
+            if (aggregateFromScalar || scalarFromPointer)
+                LogErrorContext(errCtx, std::format(
+                    "cannot return a value of type '{}' from a function that returns '{}'",
+                    returnNV.TypeAndValue.TypeName.empty() ? std::string("this expression")
+                                                             : returnNV.TypeAndValue.TypeName,
+                    CurrentReturnTypeSpelling(compiler)));
         }
 
         /*
@@ -2298,8 +2323,21 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     {
                         if (!compiler->IsBlockTerminated())
                             compilerLLVM->builder->CreateUnreachable();
+                        // A throwing diagnostic can unwind through a guarded expression whose
+                        // sibling arm is not the current insert block (for example `?.`). The
+                        // expectation harness continues compilation, so close every abandoned
+                        // block in this function before creating its recovery continuation.
+                        auto* function = bb->getParent();
+                        for (auto& abandoned : *function)
+                        {
+                            if (abandoned.getTerminator() == nullptr)
+                            {
+                                compilerLLVM->builder->SetInsertPoint(&abandoned);
+                                compilerLLVM->builder->CreateUnreachable();
+                            }
+                        }
                         auto* resume = llvm::BasicBlock::Create(
-                            *compilerLLVM->context, "after_expect_error", bb->getParent());
+                            *compilerLLVM->context, "after_expect_error", function);
                         compilerLLVM->builder->SetInsertPoint(resume);
                     }
                     compilerLLVM->RestoreFileScopeExpectedError();
@@ -2587,6 +2625,14 @@ void MainListener::GenerateDefaultParamOverloads(
                 llvm::Value* defaultVal = nullptr;
                 if (auto* ae = initCtx->assignmentExpression())
                 {
+                    // Default arguments are lowered in a synthesized forwarding wrapper, but a
+                    // lambda literal still needs the declared parameter's function signature.
+                    // Restore on LogError unwind so the wrapper cannot leak its context.
+                    LambdaExpectedTypeRestoreGuard lambdaExpectedTypeRestore(&lambdaExpectedType);
+                    if (params[i].IsFunctionPointer)
+                        lambdaExpectedType = params[i];
+                    else if (const auto* encoded = compiler->GetEncodedClosureType(params[i].TypeName))
+                        lambdaExpectedType = *encoded;
                     // Parameter-DEFAULT leg of the code-value store gate: `f(Rec* p = ro)` put a
                     // code address in the omitted argument's slot and the body wrote through it.
                     auto defNV = ParseAssignmentExpressionNamed(ae);

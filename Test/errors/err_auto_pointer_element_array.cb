@@ -1,7 +1,0 @@
-// `auto v = <T*[N]>` has no view to deduce to: `T*[]` collapses to `T[]` in both
-// ParseDeclarationSpecifiers copies, so the explicit spelling does not work either.
-// Pointer-element array views are unimplemented. Before this reject the binding carried
-// no shape at all and `v[0]` read garbage (a silent miscompile).
-expect_error("the array view 'int*[]' is not supported") {
-    void f() { int*[2] a = default; auto v = a; a[0] = nullptr; }
-}

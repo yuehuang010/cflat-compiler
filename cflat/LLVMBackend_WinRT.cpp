@@ -1407,9 +1407,9 @@ llvm::Value* LLVMBackend::WrapStringLiteralAsString(llvm::Value* strLitPtr)
             }
         }
 
-        // Not a known literal: derive the length at runtime. Requires an active insert point
-        // (no builder block at file scope) - fall back to a zero-length wrap rather than crash.
-        if (builder->GetInsertBlock() == nullptr)
+        // Not a known literal: derive the length at runtime. A terminated block is no more
+        // usable than no block at all; emitting there would produce invalid IR.
+        if (!IsInsertBlockLive())
         {
             llvm::Value* strVal = llvm::UndefValue::get(strTy);
             strVal = builder->CreateInsertValue(strVal, strLitPtr, { 0u });

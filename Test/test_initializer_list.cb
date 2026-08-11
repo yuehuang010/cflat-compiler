@@ -219,6 +219,10 @@ extern int main()
     total++; passed += Test("char[4][0]", (int)fe[0], 72);
     total++; passed += Test("char[4][1]", (int)fe[1], 73);
 
+    char[8] cstr = "hello";
+    total++; passed += Test("char literal array first", cstr[0], 'h');
+    total++; passed += Test("char literal array terminator", (int)cstr[5], 0);
+
     bool[3] fg = {true, false, true};
     total++; passed += Test("bool[3][0]", fg[0], true);
     total++; passed += Test("bool[3][2]", fg[2], true);

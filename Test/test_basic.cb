@@ -41,6 +41,30 @@ bool testBuiltinIdentifiers()
     return result;
 }
 
+// Raw-union lifetime policy: no hidden active-member tag means member destruction is explicit.
+int unionDtorCount = 0;
+int unionNodeDtors = 0;
+int unionManualDtors = 0;
+struct UnionDtorOwner { int tag = default; ~UnionDtorOwner() { unionDtorCount++; } };
+class UnionDtorNode { int v = default; ~UnionDtorNode() { unionNodeDtors++; } };
+struct UnionUniqueBox { unique UnionDtorNode* p = default; };
+union UnionOwnerFirst { UnionDtorOwner o = default; int i; };
+union UnionOwnerSecond { int i = default; UnionDtorOwner o; };
+union UnionRawUnique { UnionUniqueBox b = default; int i; };
+union UnionManualDtor { int i = default; ~UnionManualDtor() { unionManualDtors++; } };
+union UnionManualUnique
+{
+    UnionUniqueBox b = default;
+    int i;
+    ~UnionManualUnique()
+    {
+        if (b.p != nullptr) delete b.p;
+    }
+};
+struct UnionOwnerHolder { UnionOwnerFirst u = default; int n = default; };
+
+UnionOwnerFirst makeUnionOwner() { UnionOwnerFirst u = default; u.o.tag = 4; return u; }
+
 struct UnionPoint { int x = default; int y = default; };
 struct UnionColor { int r = default; int g = default; int b = default; };
 
@@ -3236,6 +3260,7 @@ int[kGRows] gConstNameArr = default;
 // The pointer-initializer reject must not swallow a null constant.
 int[4] gNullArr = nullptr;
 char[8] gNullBuf = nullptr;
+char[8] gLiteralBuf = "hello";
 using GNullBuf = char[8];
 GNullBuf gNullAlias = nullptr;
 
@@ -3347,12 +3372,22 @@ bool testFixedArrays()
     result &= Test("fixed_global_partial_set", gPartialArr[1], 8);
     result &= Test("fixed_global_partial_zerofill", gPartialArr[3], 0);
     result &= Test("fixed_global_empty_zero", gEmptyArr[0], 0);
+    result &= Test("fixed_global_literal_first", gLiteralBuf[0], 'h');
+    result &= Test("fixed_global_literal_terminator", (int)gLiteralBuf[5], 0);
 
     // Global array sized by a named const / const-expr: full extent is usable.
     gConstExprArr[80] = 5;   // index 80 only valid if size folded to 9*9 = 81
     gConstNameArr[8]  = 6;   // index 8 only valid if size folded to 9
     result &= Test("fixed_global_constexpr_size", gConstExprArr[80], 5);
     result &= Test("fixed_global_constname_size", gConstNameArr[8], 6);
+
+    // A fixed array of pointer elements retains its element star when auto deduces an
+    // array view. The view must read pointer slots, rather than treating them as int slots.
+    int pointed = 42;
+    int*[2] pointerSlots = default;
+    pointerSlots[0] = &pointed;
+    auto pointerView = pointerSlots;
+    result &= Test("fixed_pointer_element_auto_view", *pointerView[0], 42);
 
     // Inline array field of a returned temporary: constant index, variable index, and a
     // non-int element type. Each call gets its own spill, so two reads do not alias.
@@ -3452,6 +3487,13 @@ bool testFixedArrays()
     result &= Test("fixed_copy_ptr_slot_independent", *pcDst[0], 4);
     pcA = 40;
     result &= Test("fixed_copy_ptr_pointee_shared", *pcDst[0], 40);
+
+    // A pointer-element fixed array decays to the matching pointer-element view, not to an
+    // `int[]` view that would index the pointer bytes as integers. `auto` has the same shape.
+    int*[] pcView = pcSrc;
+    auto pcAutoView = pcSrc;
+    result &= Test("ptr_element_view_explicit", *pcView[1], 5);
+    result &= Test("ptr_element_view_auto", *pcAutoView[0], 5);
 
     // Multi-dimensional copy: extents must match on every dimension.
     int[2][3] mdSrc = default;
@@ -4116,6 +4158,32 @@ bool testUnion()
     writeUnionStructViaPtr(&s2, 42, 99);
     result &= Test("union struct member write via ptr x", s2.pt.x, 42);
     result &= Test("union struct member write via ptr y", s2.pt.y, 99);
+
+    // No arm is implicitly destroyed, regardless of its index or the union's containment.
+    unionDtorCount = 0;
+    { UnionOwnerFirst u = default; u.o.tag = 7; }
+    result &= Test("union raw first arm not destroyed", unionDtorCount, 0);
+    unionDtorCount = 0;
+    { UnionOwnerSecond u = default; u.o.tag = 7; }
+    result &= Test("union raw second arm not destroyed", unionDtorCount, 0);
+    unionDtorCount = 0;
+    { UnionOwnerHolder h = default; h.u.o.tag = 3; }
+    result &= Test("union raw nested arm not destroyed", unionDtorCount, 0);
+    unionDtorCount = 0;
+    { UnionOwnerFirst[3] a = default; a[0].o.tag = 1; }
+    result &= Test("union raw array arms not destroyed", unionDtorCount, 0);
+    unionDtorCount = 0;
+    { UnionOwnerFirst u = makeUnionOwner(); u.o.tag = 5; }
+    result &= Test("union raw returned arm not destroyed", unionDtorCount, 0);
+    unionNodeDtors = 0;
+    { UnionRawUnique u = default; u.b.p = new UnionDtorNode(); }
+    result &= Test("union raw unique not destroyed", unionNodeDtors, 0);
+    unionManualDtors = 0;
+    { UnionManualDtor u = default; u.i = 1; }
+    result &= Test("union explicit destructor runs", unionManualDtors, 1);
+    unionNodeDtors = 0;
+    { UnionManualUnique u = default; u.b.p = new UnionDtorNode(); }
+    result &= Test("union explicit destructor releases unique", unionNodeDtors, 1);
 
     return result;
 }

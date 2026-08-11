@@ -313,6 +313,33 @@ s.num1 = 10;
 int t = s.Total();   // 12
 ```
 
+### Unions
+
+Unions use C++-style raw storage: they have no hidden active-member tag and their size is
+exactly the storage needed for the largest arm. The compiler never synthesizes destruction for
+union members, because it cannot know which arm is active. An explicitly written union destructor
+still runs, but it owns its cleanup policy.
+
+Use an enclosing struct when alternatives need lifetime management. Keep the tag outside the
+union and release the selected raw resource in the wrapper destructor:
+
+```c
+enum ValueKind { Number, Node };
+union ValueData { int number; Node* node; };
+
+struct Value
+{
+    ValueKind kind = Number;
+    ValueData data = default;
+
+    ~Value()
+    {
+        if (kind == Node && data.node != nullptr)
+            delete data.node;
+    }
+};
+```
+
 #### Member access: `.` and `->`
 
 Use `.` on a value and `->` on a pointer. Both reach **fields and methods** - `->`

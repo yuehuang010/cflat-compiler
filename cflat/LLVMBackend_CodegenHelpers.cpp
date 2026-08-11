@@ -1072,16 +1072,19 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         if (dsIt == dataStructures.end())
             return nullptr;
 
+        // C++-style raw union semantics: the union has no hidden active-member tag, so the
+        // compiler cannot safely synthesize member destruction. Only an explicitly written
+        // union destructor runs; users that need managed alternatives must keep the tag and
+        // lifetime policy in an enclosing wrapper.
+        if (dsIt->second.IsUnion)
+            return dsIt->second.Destructor;
+
         // Value-type member cycles are impossible (infinite size), but guard defensively
         // so a malformed registry cannot recurse forever - fall back to the user dtor.
         if (!fullDestructorInProgress_.insert(typeName).second)
             return dsIt->second.Destructor;
 
         llvm::Function* userDtor = dsIt->second.Destructor;
-
-        // A UNION's members all start at offset 0, so a destructible arm is destructed through
-        // `self` itself - never a per-field GEP, which walks off the single-slot union body.
-        const bool isUnion = dsIt->second.IsUnion;
 
         // Collect member fields that need destruction.
         struct MemberWork { unsigned Index; llvm::Function* Dtor; bool IsUniquePtr; std::string TypeName; uint64_t AllocAlign; bool IsUniqueArray = false; bool IsIface = false; bool IsUniqueIface = false; };
@@ -1149,20 +1152,6 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             return userDtor;
         }
 
-        /*
-         * A union destructs at most its FIRST field, and only when that is the sole destructible
-         * arm. Nothing here knows which arm is live, so running an arm's destructor over bytes the
-         * program last wrote through another arm is a wild free. That hazard is pre-existing at
-         * field 0 (the merge base emitted exactly this call, `CreateStructGEP(unionTy, self, 0)`
-         * being `self`), so keeping it is parity, not new exposure - and it is what makes an owning
-         * first member, a union inside a struct, an array of unions and a union returned by value
-         * release at all. For any OTHER field the merge base did not compile the program at all
-         * ("Invalid indices for GEP pointer type!"), so emitting there would be NEW reachability
-         * for a wild free; those arms leak instead. See internal/issue/p3/union-destruction-residues.md.
-         */
-        if (isUnion && (work.size() > 1 || work.front().Index != 0))
-            return userDtor;
-
         // Synthesize a wrapper: user dtor first (so hand-written free-and-null logic runs
         // before member teardown), then each member's full destructor.
         auto* structTy = dsIt->second.StructType;
@@ -1183,11 +1172,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
 
         for (const auto& w : work)
         {
-            // Union arm: the member IS `self` (offset 0) and its storage type is the member's own
-            // type - the union body is one slot, so a per-field GEP/element type is out of range.
-            auto* fieldPtr = isUnion ? self : b.CreateStructGEP(structTy, self, w.Index, "fld");
-            auto* fieldTy  = isUnion ? GetType(dsIt->second.StructFields[w.Index])
-                                     : structTy->getElementType(w.Index);
+            auto* fieldPtr = b.CreateStructGEP(structTy, self, w.Index, "fld");
+            auto* fieldTy  = structTy->getElementType(w.Index);
             if (w.IsUniqueIface)
                 EmitUniqueInterfaceFieldRelease(b, fieldPtr, w.TypeName);
             else if (w.IsUniqueArray)
@@ -1199,7 +1185,6 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
                 // Scalar field: one call; owning fixed-array field: one call per element.
                 EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor);
         }
-
         b.CreateRetVoid();
         return fn;
     }

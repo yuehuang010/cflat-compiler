@@ -69,19 +69,31 @@ expect_error("cannot 'return' without a value from a function that returns 'Lamb
     Lambda<int()> rvbClosureRet() { return; }
 }
 
+// Scalar/aggregate and pointer/integer crossings used to reach CreateRet and become raw LLVM
+// verifier errors. They now stop at the source return expression.
+expect_error("cannot return a value of type") {
+    struct RvbAggregate { int n = default; };
+    RvbAggregate rvbBadAggregate() { return 5; }
+}
+expect_error("cannot return a value of type") {
+    int rvbBadPointer() { return "x"; }
+}
+expect_error("cannot return a value of type") {
+    struct RvbCtor { int n = default; RvbCtor() { return 5; } };
+}
+
+// A void binary overload is legal as a statement, but assigning its non-existent result used
+// to make LLVM reject a bitcast from void. It must now be a source diagnostic.
+expect_error("'operator+' returns 'void', so it produces no value to consume") {
+    struct RvbVoidBinary { void operator+(RvbVoidBinary other) { } };
+    void rvbBinaryValue() { RvbVoidBinary a; RvbVoidBinary b; int result = a + b; }
+}
+
 // A `(void)` cast of a CONSTANT folds to LLVM's token 'none', not to a void-typed value, so it
 // reaches the gate carrying its void-ness in the TYPE of the operand rather than in a call
 // result. This leg is the only one that exercises that detection.
 expect_error("cannot return a 'void' expression from a function that returns 'int'") {
     int rvbCastConst() { return (void)0; }
-}
-
-// An 'auto' return type is emitted against an i64 PLACEHOLDER and unified after the body, so
-// the function's LLVM return type proves nothing - but a void OPERAND is still proven, and the
-// message must say 'auto' rather than quote the placeholder. Instantiated inside the block.
-auto rvbAuto<T>(T x) { return rvbBump(); }
-expect_error("cannot return a 'void' expression from a function that returns 'auto'") {
-    void rvbAutoUse() { rvbAuto<int>(1); }
 }
 
 extern int main()

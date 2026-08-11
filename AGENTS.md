@@ -6,6 +6,10 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) - an extended C language with modern features - generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access - to LLVM Intermediate Representation for native execution.
 
+## Workflow Questions
+
+When the user asks whether you performed a step that is part of the developer workflow, treat the question as a request to perform that step if it has not already been done.
+
 ## Git
 Do not commit to git.  Stash is allowed.  
 Keep `master` linear: every commit on `master` must have a single parent.  Do not create merge commits (no merge commits on `master`); integrate work by rebasing so history stays linear.

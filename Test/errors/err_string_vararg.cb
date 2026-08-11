@@ -30,6 +30,8 @@ expect_error("bind the value to an owner first") {
 
 move string makeVaText() { return "owned"; }
 
+int takesCharPtr(char* p) { return 1; }
+
 expect_error("cannot pass 'string' to the variadic '...'") {
     void rejectVaStringRValue() { printf("%s\n", makeVaText()); }
 }
@@ -44,6 +46,10 @@ extern int main()
     }
 
     string s = "hello";
+    expect_error("cannot pass 'string' to the 'char*' parameter 1 through a function value") {
+        function<int(char*)> fp = takesCharPtr;
+        fp(s);
+    }
     expect_error("cannot pass 'string' to the variadic '...'");
     printf("%s %d\n", s, 42);
 

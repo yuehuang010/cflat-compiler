@@ -3,3 +3,10 @@
 expect_error("simd lane count must be a power of 2 in [2,64] (got 7)") {
     simd<float, 7> v;
 }
+
+expect_error("array-view '[]' is not supported on simd types") {
+    void simdViewReject() {
+        simd<float, 4>[2] a = default;
+        simd<float, 4>[] v = a;
+    }
+}

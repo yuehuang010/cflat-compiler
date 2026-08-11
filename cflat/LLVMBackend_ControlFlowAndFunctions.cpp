@@ -390,6 +390,16 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
                                    const std::string& paramTypeName)
 {
         if (arg == nullptr || destTy == nullptr) return;
+        auto* stringTy = llvm::StructType::getTypeByName(*context, "string");
+        if (arg->getType() == stringTy && destTy->isPointerTy()
+            && (paramTypeName == "char" || paramTypeName == "i8"))
+        {
+            LogError(std::format(
+                "cannot pass 'string' to the 'char*' parameter {} through a function value: a "
+                "'string' is a {{ptr,len}} value, not a 'char*'. Pass the buffer explicitly with '.data()'.",
+                index + 1));
+            return;
+        }
         if (!arg->getType()->isPointerTy() || destTy->isPointerTy()) return;
 
         // An unnamed slot gets the shorter message: naming a type it does not have, or advising a
