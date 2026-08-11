@@ -223,15 +223,34 @@ If the agent fails or flails at `sonnet`, escalate ONCE to `opus` with the failu
 context appended - do not retry the same tier verbatim, and do not absorb the work
 into the main session.
 
-## Step 3 - Review loop (max 3 rounds)
+## Step 3 - Review loop (max 3 rounds, alternating reviewer)
 
-After the fix agent reports success, spawn ONE code-review agent at **opus** in
-the same worktree. **One reviewer per issue, total**: every later round continues
-this same reviewer via SendMessage so it keeps its context - never spawn a second
-or parallel reviewer for the same issue. Prompt it to review
-`git diff master...HEAD` in that worktree for
-correctness bugs, and for the CLAUDE.md constraints listed above. Give it the fix
-agent's coverage matrix and ask it to audit the matrix, not re-derive it:
+After the fix agent reports success, review the diff for up to 3 rounds.
+**Alternate the reviewer each round, starting with codex**: round 1 = codex
+CLI, round 2 = claude (opus agent), round 3 = codex CLI again.
+
+**Availability fallback.** Before round 1, check `codex --version` (or
+`which codex`). If codex is not on PATH or the check fails, use the opus agent
+for every round instead - do not block the workflow on codex, do not retry the
+check mid-loop, and say in the final report that the fallback was used.
+
+**Continuity differs by reviewer kind.** The opus agent is spawned once and
+every later opus round continues it via SendMessage so it keeps context -
+never spawn a second or parallel opus reviewer for the same issue. `codex exec`
+has no such continuity: each invocation is a fresh process. So every codex
+round's prompt must paste in what SendMessage would otherwise carry - the fix
+agent's coverage matrix, the current `git diff master...HEAD`, and a short
+summary of prior rounds' findings and what changed in response - so it is not
+re-discovering ground a prior round already covered.
+
+For an opus round: spawn (round 1 under fallback, or round 2) or continue via
+SendMessage (any later opus round) a code-review agent at **opus** in the
+worktree. For a codex round: run, in the worktree,
+`codex exec -c model="gpt-5.6-luna" -c model_reasoning_effort="high" "<prompt>"`.
+Either way, the reviewer for that round reviews `git diff master...HEAD` in
+that worktree for correctness bugs, and for the CLAUDE.md constraints listed
+above. Give it the fix agent's coverage matrix and ask it to audit the matrix,
+not re-derive it:
 
 - Is any axis missing a cell - a spelling, collision twin, neighbouring
   construct kind, or sub-case that reaches the same code path but was never
@@ -263,10 +282,13 @@ collide with the fix agent's files, to report findings as a ranked list with
 file:line, and to state plainly if the diff is clean - "safe with listed fixes"
 is not clean.
 
-**The reviewer MAY apply fixes directly.** It is in the worktree and already
-holds the context; bouncing a one-line correction back to the fix agent costs a
-full invocation plus a bar re-run for nothing. Grant it that authority in its
-prompt, with these rules:
+**The reviewer MAY apply fixes directly, whichever kind is active this round.**
+It is in the worktree and already holds the context; bouncing a one-line
+correction back to the fix agent costs a full invocation plus a bar re-run for
+nothing. A codex round applies fixes the same way in its own invocation (it
+has write access to the worktree via `codex exec`'s workspace-write sandbox);
+tell it in the prompt to amend the commit and re-run the bar itself, same as
+the opus agent would. Grant it that authority in its prompt, with these rules:
 
 - It applies the fix, folds it into the single commit with `git commit --amend`
   (never a follow-up commit), re-runs the full verification bar
@@ -304,9 +326,13 @@ Then, depending on what happened:
   worktree; continue the existing agent via SendMessage so it keeps its context)
   and ask for fixes plus a re-run of the full verification bar. Fixes must be
   folded into the single commit with `git commit --amend`, never stacked as
-  follow-up commits. Then re-review with the SAME reviewer (SendMessage),
-  scoping the next round to what the last round CHANGED and saying what not to
-  re-verify - narrowly-scoped rounds found the worst defects.
+  follow-up commits. Then re-review with the NEXT round's reviewer per the
+  alternation (opus continued via SendMessage if it is an opus round; a fresh
+  `codex exec` invocation, primed with the prior-round summary, if it is a
+  codex round), scoping the next round to what the last round CHANGED and
+  saying what not to re-verify - narrowly-scoped rounds found the worst
+  defects. Note in the final report whether the alternate reviewer caught
+  anything the other kind missed.
 
 Reviewer-applied fixes and their verification rounds count against the same
 3-round budget below.
