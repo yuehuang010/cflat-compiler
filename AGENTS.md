@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Overview
 
@@ -62,13 +62,13 @@ the same answer for fewer tokens - not a worse answer.
 ## Skills
 
 Project skills are **authored and tracked in `internal/skill/<name>/SKILL.md`** (tracked in
-git, like `internal/plan/` and `internal/issue/`). `.gitignore` ignores all of `.claude/`,
-so a skill living only under `.claude/skills/` is invisible to git and lost on a fresh
+git, like `internal/plan/` and `internal/issue/`). `.gitignore` ignores all of `.Codex/`,
+so a skill living only under `.Codex/skills/` is invisible to git and lost on a fresh
 clone - that is why the source of truth is `internal/skill/`.
 
-**Claude Code only auto-discovers project skills under `.claude/skills/`**, so a skill in
+**Codex only auto-discovers project skills under `.Codex/skills/`**, so a skill in
 `internal/skill/` is NOT invocable as `/<name>` - verified: with nothing under
-`.claude/skills/`, a fresh session reports no project skills. `internal/skill/` is the
+`.Codex/skills/`, a fresh session reports no project skills. `internal/skill/` is the
 tracked, reviewable home; it is deliberately not the live one, and no symlink bridges them.
 
 Two ways to use a skill from here:
@@ -78,12 +78,12 @@ Two ways to use a skill from here:
 - **Activate it for a session**, if you want the `/<name>` slash command:
 
   ```bash
-  mkdir -p .claude/skills/<name>
-  cp internal/skill/<name>/SKILL.md .claude/skills/<name>/SKILL.md   # restart the session to pick it up
+  mkdir -p .Codex/skills/<name>
+  cp internal/skill/<name>/SKILL.md .Codex/skills/<name>/SKILL.md   # restart the session to pick it up
   ```
 
   That copy is gitignored and can drift. `internal/skill/` stays the source of truth: edit
-  there, re-copy, and never edit the copy under `.claude/`.
+  there, re-copy, and never edit the copy under `.Codex/`.
 
 Current skills:
 

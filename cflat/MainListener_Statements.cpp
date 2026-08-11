@@ -551,16 +551,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         bool autoReturn = compiler->IsAutoReturnCaptureActive();
         bool fnReturnsVoid = !autoReturn && compiler->currentFunction != nullptr
             && compiler->currentFunction->getReturnType()->isVoidTy();
-        // Void-ness reaches here three ways. A void CALL is a void-typed value. A void CLOSURE
-        // call yields no LLVM value at all, so its void-ness rides the NamedVariable instead
-        // (`int f() { return g(); }` on a `Lambda<void()>` g). And a `(void)` cast of a
-        // CONSTANT folds to LLVM's token 'none' (`ret token none`) rather than to a void-typed
-        // value - the only token that can reach a user `return`. The Win64 SEH trampoline also
-        // builds tokens (a catchswitch/catchpad), but in a synthesized function with no body.
-        // The NamedVariable arm resolves through `using V = void;` - the mirror of the call-site
+        // Void-ness reaches here two ways. A void CALL is a void-typed value. A void CLOSURE call
+        // and a `(void)` cast both yield no LLVM value at all, so their void-ness rides the
+        // NamedVariable instead (`int f() { return g(); }` on a `Lambda<void()>` g). The
+        // NamedVariable arm resolves through `using V = void;` - the mirror of the call-site
         // gate, which would otherwise see the alias spelling and hand a null operand to the ret.
         bool returnExprIsVoid =
-            (right != nullptr && (right->getType()->isVoidTy() || right->getType()->isTokenTy()))
+            (right != nullptr && right->getType()->isVoidTy())
             || (right == nullptr && !returnNV.TypeAndValue.Pointer
                 && compiler->ResolveTypeAlias(returnNV.TypeAndValue.TypeName) == "void");
         if (fnReturnsVoid && returnExprIsVoid)

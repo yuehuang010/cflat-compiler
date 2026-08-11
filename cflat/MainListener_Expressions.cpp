@@ -5322,6 +5322,22 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
 
             ResolveValuelessCastOperand(ctx, castExp, namedVar, destTypeName);
 
+            // `(void)expr` DISCARDS the operand's value and keeps only its side effects - C's
+            // meaning for a void cast. The operand was already parsed at ResultUse::Discard above
+            // (destIsVoid), so its effects already ran; produce the same value-less shape a void
+            // CALL hands back (no Primary, no Storage) instead of ever reaching CreateCast, which
+            // has no valid IR for a void destination (a bitcast to void is invalid, and folds to
+            // garbage on a constant operand instead of erroring). Pointer/array-view destinations
+            // ('(void*)p', '(V[])p') are real reinterprets, not discards, so they fall through.
+            if (destIsVoid && !destTypeName.Pointer && !destTypeName.IsArrayView)
+            {
+                namedVar.Primary = nullptr;
+                namedVar.Storage = nullptr;
+                namedVar.TypeAndValue = LLVMBackend::TypeAndValue{};
+                namedVar.TypeAndValue.TypeName = "void";
+                return namedVar;
+            }
+
             // Answered on the OPERAND's own type, before any of the lowering below rewrites it.
             bool redundantCastOfSource = IsRedundantCastOfSource(namedVar.TypeAndValue, destTypeName);
             llvm::Value* redundantCastStorage = redundantCastOfSource ? namedVar.Storage : nullptr;
