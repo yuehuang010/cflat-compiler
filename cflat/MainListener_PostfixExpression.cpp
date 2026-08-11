@@ -3736,9 +3736,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 ncCallGuarded = true;
                             }
 
-                            if (argumentList.size() > 0)
+                            auto evaluateCallArguments = [&]()
                             {
-                                auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
+                                if (argumentList.size() > 0)
+                                {
+                                    auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
 
                                 // Look up the function signature to set lambdaExpectedType for lambda arguments.
                                 const LLVMBackend::FunctionSymbol* funcSym = nullptr;
@@ -4053,6 +4055,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     arguments.emplace_back(argVar);
                                 }
                             }
+                            };
+                            bool deferHresultChainArguments = hresultChainPending && winrtSlot != nullptr;
+                            if (!deferHresultChainArguments)
+                                evaluateCallArguments();
 
                             // [PFX-7] call lowering, three ways: a [winrt] COM vtable dispatch
                             // (recv->lpVtbl->slot), a null-conditional `?.` guarded call, or the
@@ -4064,14 +4070,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // recv->lpVtbl->Slot(recv, args). `arguments[0]` is the receiver; user
                                 // args follow. QI/AddRef/Release exist ONLY in the vtable, so this is the
                                 // only by-name path to them.
-                                std::vector<llvm::Value*> argVals;
-                                argVals.push_back(structVar.Storage);
-                                for (size_t ai = 1; ai < arguments.size(); ai++)
+                                auto buildWinrtArgVals = [&]()
                                 {
-                                    auto& a = arguments[ai];
-                                    llvm::Value* v = a.Primary ? a.Primary : LoadNamedVariable(a);
-                                    if (v) argVals.push_back(v);
-                                }
+                                    std::vector<llvm::Value*> argVals;
+                                    argVals.push_back(structVar.Storage);
+                                    for (size_t ai = 1; ai < arguments.size(); ai++)
+                                    {
+                                        auto& a = arguments[ai];
+                                        llvm::Value* v = a.Primary ? a.Primary : LoadNamedVariable(a);
+                                        if (v) argVals.push_back(v);
+                                    }
+                                    return argVals;
+                                };
                                 auto* compiler = Compiler(primaryCtx);
                                 if (hresultChainPending)
                                 {
@@ -4106,6 +4116,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         b->CreateCondBr(failed, failBB, okBB);
 
                                         compiler->SwitchToBlock(okBB);
+                                        evaluateCallArguments();
+                                        auto argVals = buildWinrtArgVals();
                                         std::string rt2; bool rp2 = false;
                                         auto* okRes = compiler->EmitWinrtSlotCall(
                                             structVar.TypeAndValue.TypeName, functionName, argVals, rt2, rp2);
@@ -4142,6 +4154,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 else
                                 {
+                                    auto argVals = buildWinrtArgVals();
                                     namedVar = {};
                                     std::string winrtResultType;
                                     bool winrtResultPtr = false;

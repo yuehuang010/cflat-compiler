@@ -212,6 +212,13 @@ HResult<Counter*> BorrowCounter()
     return r;
 }
 
+i32 gChainArgSideEffects = 0;
+i32 ChainArgSideEffect(i32 value)
+{
+    gChainArgSideEffects = gChainArgSideEffects + value;
+    return value;
+}
+
 bool testChaining()
 {
     bool result = true;
@@ -278,6 +285,17 @@ bool testChaining()
     result &= Test("com_chain_borrowed_owner_release", (int)gBorrowed->Release(), 0);
     result &= Test("com_chain_borrowed_released_by_owner", gCounterDtorCount, 5);
     gBorrowed = nullptr;
+
+    // A failed HResult chain skips its method call and its argument expressions. The successful
+    // sibling proves that the argument still runs when the chain enters the ok block.
+    gChainArgSideEffects = 0;
+    HResult<i32> badArgs = m->Make(true)?.Add(ChainArgSideEffect(5));
+    result &= Test("com_chain_fail_args_not_evaluated", gChainArgSideEffects, 0);
+    result &= Test("com_chain_fail_args_hr", badArgs.hr, E_FAIL);
+    gChainArgSideEffects = 0;
+    HResult<i32> okArgs = m->Make(false)?.Add(ChainArgSideEffect(5));
+    result &= Test("com_chain_ok_args_evaluated", gChainArgSideEffects, 5);
+    result &= Test("com_chain_ok_args_value", okArgs.value, 12);
 
     m->Release();
     return result;
