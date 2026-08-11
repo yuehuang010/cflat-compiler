@@ -575,12 +575,12 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
         auto stars = [](bool ptr, int depth) {
             return std::string(ptr ? (depth > 0 ? (size_t)depth : 1) : 0, '*');
         };
-        std::string s = tv.FuncPtrReturnTypeName
+        std::string s = DisplayNameOfMangledType(tv.FuncPtrReturnTypeName)
                       + stars(tv.FuncPtrReturnPointer, tv.FuncPtrReturnPointerDepth) + "(";
         for (size_t i = 0; i < tv.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
-            s += tv.FuncPtrParams[i].TypeName;
+            s += DisplayNameOfMangledType(tv.FuncPtrParams[i].TypeName);
             s += stars(tv.FuncPtrParams[i].Pointer, tv.FuncPtrParams[i].PointerDepth);
         }
         return s + ")";

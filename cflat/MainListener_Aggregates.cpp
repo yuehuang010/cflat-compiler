@@ -847,6 +847,39 @@ void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinition
         const std::vector<LLVMBackend::TypeAndValue>& params) {
         auto* compiler = compilerLLVM;
 
+        if (member == "run" && params.size() == 2 && params[1].TypeName == "list__string"
+            && params[1].IsMove)
+        {
+            auto it = compiler->functionTable.find(member);
+            if (it != compiler->functionTable.end())
+            {
+                for (const auto& sym : it->second)
+                {
+                    if (sym.Parameters.size() != params.size()
+                        || sym.ReturnType.ToUniqueString() != returnType.ToUniqueString())
+                        continue;
+                    bool sameExceptMove = true;
+                    for (size_t i = 0; i < params.size(); i++)
+                    {
+                        if (sym.Parameters[i].ToUniqueString() != params[i].ToUniqueString()
+                            || (i == params.size() - 1 && sym.Parameters[i].IsMove))
+                        {
+                            sameExceptMove = false;
+                            break;
+                        }
+                    }
+                    if (sameExceptMove)
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "program '{}': 'bool run(list<string>)' differs from the reserved "
+                            "'bool run(move list<string>)' only by 'move' and will not start the "
+                            "program thread; add 'move' to the parameter",
+                            progName));
+                    }
+                }
+            }
+        }
+
         std::string clashFile;
         size_t clashLine = 0;
         if (!compiler->OverloadSlotIsDefined(member, returnType, params, false, &clashFile, &clashLine))

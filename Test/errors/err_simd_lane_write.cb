@@ -15,7 +15,7 @@ extern int main()
     simd<float, 4>[2] a = default;
     simd<float, 4>[2] b = default;
     a[0] = 3.0;                     // legal: element store, not a lane write
-    expect_error("cannot assign to 'a' as a whole - it names fixed array 'simd<float,4>[2]'") {
+expect_error("assignment to a whole fixed array 'simd<float,4>[2]' is not supported") {
         a = b;
     }
 }

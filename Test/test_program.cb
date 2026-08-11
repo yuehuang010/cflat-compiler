@@ -1600,40 +1600,6 @@ bool testReservedNameDifferentReturn() {
     return result;
 }
 
-// bool run(list<string>) - the synthesized slot is bool run(move list<string>), so the
-// move-less spelling is a different overload and a borrowed argument binds the USER's run.
-// The synthesized one is still reachable with an explicit 'move' at the call.
-program ReservedNameMoveless {
-    int seed = 0;
-
-    bool run(list<string> args) { return true; }
-
-    int main(move list<string> args) {
-        return seed + 7;
-    }
-};
-
-bool testReservedNameMovelessRun() {
-    bool result = true;
-    ReservedNameMoveless p;
-    p.seed = 40;
-    list<string> borrowed;
-    // The user's own run - returns its value and does NOT start the program thread.
-    result &= Test("reserved name moveless run returns user value", p.run(borrowed), true);
-    // WaitForExit on a program whose thread was never started must return, not crash.
-    p.WaitForExit();
-    result &= Test("reserved name moveless run leaves exitCode unset", p.exitCode, -1);
-    list<string> owned;
-    // An explicit 'move' still reaches the synthesized run(move list<string>).
-    p.run(move owned);
-    p.WaitForExit();
-    result &= Test("reserved name moveless run leaves synth run working", p.exitCode, 47);
-    // A second WaitForExit has no packet left to consume and must also return.
-    p.WaitForExit();
-    result &= Test("reserved name moveless run second wait keeps exitCode", p.exitCode, 47);
-    return result;
-}
-
 // ---------------------------------------------------------------------------
 
 extern int main() {
@@ -1697,7 +1663,6 @@ extern int main() {
     total++; passed += testProgramInterfaceField()        ? 1 : 0;
     total++; passed += testReservedNameDifferentArity()   ? 1 : 0;
     total++; passed += testReservedNameDifferentReturn()  ? 1 : 0;
-    total++; passed += testReservedNameMovelessRun()      ? 1 : 0;
 
     printf("Program tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

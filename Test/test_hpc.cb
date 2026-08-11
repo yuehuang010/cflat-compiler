@@ -19,6 +19,11 @@ import "hpc/btree.cb";
 import "thread.cb";
 import "atomic.cb";
 
+// Global SIMD accept cells: bare, fixed-array default, and empty brace-list initialization.
+simd<float,4> gSimdBare = default;
+simd<float,4>[2] gSimdFixedDefault = default;
+simd<float,4>[2] gSimdFixedBrace = {};
+
 // ---------------------------------------------------------------------------
 // int[] array-view kernels
 // ---------------------------------------------------------------------------
@@ -1819,6 +1824,10 @@ extern int main(int argc, char** argv)
 {
     int passed = 0;
     int total  = 0;
+
+    passed += Test("global simd bare", gSimdBare[0], 0.0f); total += 1;
+    passed += Test("global simd fixed default", gSimdFixedDefault[1][0], 0.0f); total += 1;
+    passed += Test("global simd fixed brace", gSimdFixedBrace[1][0], 0.0f); total += 1;
 
     // ---- cache-line padding (alignas on a member) ----
     passed += testCacheLinePadding(); total += 12;

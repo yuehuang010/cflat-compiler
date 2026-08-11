@@ -74,6 +74,21 @@ expect_error("no overload of 'operator==' matches operands 'Point*' and 'Point'"
     }
 }
 
+// A failed declaration inside expect_error must not leave a dead shell that shadows the valid
+// outer type in the same namespace.
+namespace ExpectOuter { struct ExpectItem { int value = 9; }; }
+namespace ExpectScope
+{
+    expect_error("nullable '?' is not allowed on primitive type 'int'") {
+        struct ExpectItem { int? bad = 0; };
+    }
+    int useOuterItem()
+    {
+        ExpectOuter.ExpectItem item = default;
+        return item.value;
+    }
+}
+
 extern int main()
 {
     return 0;

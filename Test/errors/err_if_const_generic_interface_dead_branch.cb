@@ -9,7 +9,7 @@ if const (__WINDOWS__ && __LINUX__) {
 
 extern int main()
 {
-    // The message used to be the structural "has an incomplete layout (a field type C interop
+    // The message used to be the structural "is incomplete here (its layout is not available at
     // could not import)", which came from the opaque shell the forward-ref scan pre-declared for
     // every bare 'Name<Args>'. With that shell gated on the name actually naming a template, a
     // template that exists only in a dead arm names nothing and says so.

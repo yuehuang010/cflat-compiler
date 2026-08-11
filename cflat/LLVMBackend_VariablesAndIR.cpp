@@ -334,12 +334,13 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
             RecordInterfaceMaterialization(typeValue.TypeName, "the type of a local variable");
 
         auto type = GetType(typeValue, autoType);
-        // An abandoned C-imported record (field type the extractor couldn't map, e.g.
-        // INPUT_RECORD's anonymous union) is an unsized opaque shell - diagnose, don't emit invalid IR.
+        // An unsized opaque shell has no by-value layout. The shell may come from C interop,
+        // a forward declaration, or a declaration whose body was abandoned after an expected
+        // error, so this site must describe the mechanism rather than guess at its provenance.
         if (!typeValue.Pointer && type != nullptr && type->isStructTy() && !type->isSized())
         {
             LogError(std::format(
-                "type '{}' has an incomplete layout (a field type C interop could not import); "
+                "type '{}' is incomplete here (its layout is not available at this point); "
                 "it can only be used through a pointer", typeValue.TypeName));
             type = builder->getInt8Ty();  // sized placeholder; the error already aborts the compile
         }
@@ -1912,4 +1913,3 @@ llvm::Value* LLVMBackend::CreateNeg(llvm::Value* value)
             return builder->CreateFNeg(value);
         return builder->CreateNeg(value);
     }
-

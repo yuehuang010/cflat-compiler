@@ -78,6 +78,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             LLVMBackend::NamedVariable structVar;
             LLVMBackend::NamedVariable interfaceVar;
             std::string primaryIdentifier;
+            std::string callDisplayName;
             std::string namespaceContext;
 
             int functionArgCounter = 0;
@@ -1187,14 +1188,28 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 typeArgs.push_back(arg);
                                 mangledName += "__" + MangleTypeArg(Compiler(), arg);
                             }
+                            bool isFollowedByCall = false;
+                            for (size_t i = 0; i + 1 < ctx->children.size(); i++)
+                            {
+                                if (ctx->children[i] != parseTree) continue;
+                                auto* next = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[i + 1]);
+                                isFollowedByCall = next != nullptr && next->getSymbol()->getType() == CFlatParser::LeftParen;
+                                break;
+                            }
                             // If this is a generic function template (e.g. wrap<int>),
                             // instantiate it and record the mangled name as CallerName so
                             // ParseDeclaration can resolve the correct function pointer.
                             if (isGenericFunc)
                             {
+                                const auto& typeParams = Compiler(ctx)->gts.genericFunctionTypeParams[gfKey];
+                                if (isFollowedByCall && typeParams.size() != typeArgs.size())
+                                    LogErrorContext(prevPrimary, std::format(
+                                        "generic function '{}' expects {} type argument(s), but the call provides {}",
+                                        baseName, typeParams.size(), typeArgs.size()));
                                 mangledName = MangledGenericName(gfKey, typeArgs);
                                 InstantiateGenericFunction(gfKey, typeArgs);
                                 primaryIdentifier = mangledName;
+                                callDisplayName = prevPrimary->getText();
                                 namedVar = {};
                                 namedVar.CallerName = mangledName;
                                 break;
@@ -1214,6 +1229,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 interfaceVar = {};
                                 break;
                             }
+                            if (!genericClassTemplates.count(baseName) && !genericStructTemplates.count(baseName)
+                                && isFollowedByCall)
+                                LogErrorContext(prevPrimary, std::format("unknown generic function '{}'", baseName));
                             primaryIdentifier = mangledName;
                             namedVar = {};
                             break;
@@ -4219,7 +4237,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                 }
 
-                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
+                                namedVar.Primary = Compiler(ctx)->CreateOverloadedFunctionCall(
+                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName);
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;
@@ -4265,7 +4284,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if (!inst.empty()) resolvedFuncName = inst;
                                     }
                                 }
-                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(resolvedFuncName, arguments, globalScopeCall);
+                                namedVar.Primary = Compiler(primaryCtx)->CreateOverloadedFunctionCall(
+                                    resolvedFuncName, arguments, globalScopeCall, callDisplayName);
                                 globalScopeCall = false;
                                 {
                                     std::string rcvr = structVar.TypeAndValue.VariableName;

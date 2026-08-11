@@ -50,3 +50,15 @@ expect_error("'cvoPair<int>' did not instantiate the generic function template '
         return (void*)cvoPair<int>;
     }
 }
+
+expect_error("unknown generic function 'cvoMissing'") {
+    int callMissing() { return cvoMissing<int>(1); }
+}
+
+expect_error("generic function 'cvoGid' expects 1 type argument(s), but the call provides 2") {
+    int callWrongTypeCount() { return cvoGid<int, float>(1); }
+}
+
+expect_error("no overload of 'cvoGid<int>' matches the given arguments") {
+    int callWrongValueCount() { return cvoGid<int>(1, 2); }
+}

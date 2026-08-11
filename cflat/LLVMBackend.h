@@ -2214,6 +2214,9 @@ private:
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
+    // Source spellings for instantiated generic types used only by diagnostics. The mangled key
+    // remains the identity; this side map keeps user-facing text independent of MangleTypeArg.
+    std::unordered_map<std::string, std::string> mangledTypeDisplayNames;
     // Closure types used as generic arguments (e.g. list<Lambda<int(int)>>) are encoded into a
     // symbol-safe name (see BuildEncodedClosureName in MainListener.h) and registered here so the
     // call descriptor (signature + fat/thin) is recoverable at the invoke site. The encoded name
@@ -4568,6 +4571,11 @@ public:
      * no "__" comes back unchanged and is always writable.
      */
     std::string DisplayNameOfMangledType(const std::string& mangled, bool* writable = nullptr) const;
+    void RegisterMangledTypeDisplayName(const std::string& mangled, const std::string& spelled)
+    {
+        if (!mangled.empty() && !spelled.empty())
+            mangledTypeDisplayNames.emplace(mangled, spelled);
+    }
 
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
@@ -5980,7 +5988,8 @@ public:
     // Returns nullptr when name is not an atomic builtin (caller falls through to normal call).
     llvm::Value* TryEmitAtomicBuiltin(const std::string& name, const std::vector<llvm::Value*>& args);
 
-    llvm::Value* CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot = false);
+    llvm::Value* CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot = false,
+                                              const std::string& displayName = {});
 
     llvm::Function* GetFunction(const std::string& functionName);
 

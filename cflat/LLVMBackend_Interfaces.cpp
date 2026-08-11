@@ -92,6 +92,20 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
                         "interface '{}' is already defined at {} - an interface name must be unique "
                         "within its namespace", name, displaySite);
                 rejectedInterfaceDefMessages_[rejectedSiteKey] = message;
+                // Keep the normal basename prefix unless this collision has two files with the
+                // same basename; then disambiguate the reported occurrence as well as the def-site.
+                auto currentPath = std::filesystem::path(currentSourceFilePath_);
+                auto priorPath = DefSitePath(siteIt->second);
+                if (!currentPath.empty() && !priorPath.empty()
+                    && currentPath.filename() == priorPath.filename())
+                {
+                    std::string currentSite = currentSourceFilePath_
+                        + std::format("({},{})", currentLine, currentColumn);
+                    std::string displayCurrent = ShortenDefSiteForDisplay(currentSite, currentSourceIsCore_);
+                    displayCurrent.resize(displayCurrent.rfind('('));
+                    ReportingFileScope reportScope(this, displayCurrent, currentLine, currentColumn);
+                    LogError(std::move(message));
+                }
                 LogError(std::move(message));
                 return;
             }
@@ -1478,6 +1492,9 @@ bool LLVMBackend::MangledGenericNameIsAmbiguous(const std::string& mangled) cons
 std::string LLVMBackend::DisplayNameOfMangledType(const std::string& mangled, bool* writable) const
 {
         if (writable) *writable = true;
+
+        if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
+            return it->second;
 
         size_t d = mangled.find("__");
         if (d == std::string::npos)

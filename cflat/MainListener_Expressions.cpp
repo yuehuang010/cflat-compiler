@@ -1135,7 +1135,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
              * with its own axes (compound operators, field arrays, globals).
              */
             if (namedVar.TypeAndValue.ConstArraySize > 0
-                && !namedVar.TypeAndValue.IsArrayView && !namedVar.TypeAndValue.IsSimd
+                && !namedVar.TypeAndValue.IsArrayView
                 && namedVar.BaseType != nullptr && llvm::isa<llvm::ArrayType>(namedVar.BaseType))
             {
                 std::string rhsText = assignCtx != nullptr ? assignCtx->getText() : std::string();
@@ -3956,7 +3956,7 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
                                                                 : std::string{};
                 if (op == "is")
                 {
-                    result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType, srcTypeName);
+                    result = GenerateIsCheck(result, targetTypeName, ctx, srcElemType, srcTypeName, srcBinding);
                 }
                 else if (op == "as")
                 {
@@ -4010,7 +4010,18 @@ std::string MainListener::ConcreteStructNameFromValue(llvm::Value* value, LLVMBa
     }
 
 bool MainListener::ClassifyPointerShapedSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
-                                     LLVMBackend::TypeAndValue& shape) {
+                                     LLVMBackend::TypeAndValue& shape,
+                                     const LLVMBackend::NamedVariable* srcBinding) {
+        if (srcBinding != nullptr)
+        {
+            const auto& declared = srcBinding->TypeAndValue;
+            if (declared.ConstArraySize > 0 || (declared.Pointer && declared.ElemPointer))
+            {
+                shape = declared;
+                return true;
+            }
+        }
+
         llvm::Type* valueType = value->getType();
         llvm::ArrayType* arrayType = llvm::dyn_cast<llvm::ArrayType>(valueType);
         if (arrayType == nullptr && valueType->isPointerTy())
@@ -4065,7 +4076,8 @@ bool MainListener::ClassifyPointerShapedSource(llvm::Value* value, llvm::Type* e
 
 MainListener::CastSourceKind MainListener::ClassifyCastSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
                                       std::string& structName, LLVMBackend::TypeAndValue& shape,
-                                      const std::string& srcTypeName) {
+                                      const std::string& srcTypeName,
+                                      const LLVMBackend::NamedVariable* srcBinding) {
         structName.clear();
         shape = LLVMBackend::TypeAndValue{};
         if (value == nullptr) return CastSourceKind::Unknown;
@@ -4090,7 +4102,7 @@ MainListener::CastSourceKind MainListener::ClassifyCastSource(llvm::Value* value
 
         // An `arr[i]` element access is NOT pointer-shaped: it carries a class elemType and was
         // already classified as a concrete pointer above.
-        if (ClassifyPointerShapedSource(value, elemType, compiler, shape))
+        if (ClassifyPointerShapedSource(value, elemType, compiler, shape, srcBinding))
             return CastSourceKind::PointerShaped;
 
         // A pointer join carries no elemType; each leaf arm has its own concrete class. The
@@ -4111,7 +4123,8 @@ llvm::Value* MainListener::AddressOfClassValueOperand(llvm::Value* value, LLVMBa
 
 llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeNameIn,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType,
-                                  const std::string& srcTypeNameIn) {
+                                  const std::string& srcTypeNameIn,
+                                  const LLVMBackend::NamedVariable* srcBinding) {
         auto* compiler = Compiler(ctx);
         // targetTypeName is LOAD-BEARING: every direct interfaceTable.find/count below used to
         // miss an aliased spelling that IsInterfaceType (which resolves aliases) would accept -
@@ -4131,7 +4144,7 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
         CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
-                                                    srcStructName, srcShape, srcTypeName);
+                                                    srcStructName, srcShape, srcTypeName, srcBinding);
 
         // An unrouted generic-interface SOURCE has no method table, so its type-descriptor slot is
         // null and dereferencing it crashes. Only the SOURCE: as a TARGET the name is never
@@ -4248,7 +4261,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
         std::string srcStructName;
         LLVMBackend::TypeAndValue srcShape;
         CastSourceKind srcKind = ClassifyCastSource(interfaceValue, srcElemType, compiler,
-                                                    srcStructName, srcShape, srcTypeName);
+                                                    srcStructName, srcShape, srcTypeName, srcBinding);
 
         // An unrouted generic-interface SOURCE has no method table, so its type-descriptor slot is
         // null and dereferencing it crashes. Only the SOURCE: as a TARGET the name is never

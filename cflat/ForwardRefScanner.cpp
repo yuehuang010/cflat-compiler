@@ -1759,11 +1759,14 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
             compilerLLVM->expectedError = DequoteStringLiteral(rawText);
             try
             {
-                for (auto* extDecl : expectErrDecl->externalDeclaration())
-                    ScanExternalDeclaration(extDecl, namespaceName);
+                for (auto* nested : expectErrDecl->externalDeclaration())
+                    ScanExternalDeclaration(nested, namespaceName);
             }
-            catch (const ExpectedErrorReceived&) {}
+            catch (const ExpectedErrorReceived&)
+            {
+            }
             compilerLLVM->expectedError.clear();
+            return;
         }
         else if (auto* ifConst = ctx->ifConstDeclaration())
             MarkIfConstClassImplsUncertain(compilerLLVM, ifConst, namespaceName, {}, namespaceName);

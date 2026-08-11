@@ -637,9 +637,11 @@ bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const T
         return true;
     }
 
-llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot)
+llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
+        const std::string& displayName)
 {
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
+        const std::string& shownFunctionName = displayName.empty() ? functionName : displayName;
 
         // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
         // one generated on demand (the "every value type has an implicit copy() if undefined"
@@ -713,7 +715,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
-            LogError(std::format("unknown function '{}'", functionName));
+            LogError(displayName.empty()
+                ? std::format("unknown function '{}'", functionName)
+                : std::format("unknown generic function '{}'", displayName));
             return nullptr;
         }
 
@@ -756,23 +760,36 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
         if (candidate.Function == nullptr)
         {
-            // No candidate scored even non-diagnostically - re-run the exact same loop
-            // non-probed (the pre-fix behavior) so a genuine named-argument mismatch still
-            // reports MatchFunction's specific message via LogError (which throws/exits, so
-            // this never falls through if it fires). This only runs when NOTHING matched
-            // above, so a real winner found by the probed loop can never be shadowed by a
-            // losing candidate's diagnostic - that was the bug. If every candidate fails for
-            // a reason other than a name miss (arity/etc, silent under either probe value),
-            // this loop is a no-op and control falls through to the generic dump below.
+            std::string msg = std::format("no overload of '{}' matches the given arguments.\n", shownFunctionName);
+
+            // Recover a named-argument diagnostic only from candidates whose parameter names
+            // actually bind. A losing candidate with different names must not blame the call for
+            // a name miss when another candidate owns those names and failed for its types.
+            std::vector<std::string> argumentNames;
+            argumentNames.reserve(arguments.size());
+            for (const auto& arg : arguments)
+                argumentNames.push_back(arg.TypeAndValue.VariableName);
+            bool replayedNameMatch = false;
             for (const auto& c : candidates)
             {
+                auto binding = ComputeArgumentPositions(argumentNames, c.Parameters, c.Variadic);
+                if (!binding.Ok) continue;
+                replayedNameMatch = true;
                 if (c.Variadic)
                     MatchFunction(arguments, c.Parameters, true, false);
                 else if (!(arguments.size() == 0 && c.Parameters.size() == 0))
                     MatchFunction(arguments, c.Parameters, false, false);
             }
-
-            std::string msg = std::format("no overload of '{}' matches the given arguments.\n", functionName);
+            // If every candidate missed the names, preserve the specific unknown/duplicate-name
+            // diagnostic by replaying the first candidate once.
+            if (!replayedNameMatch && !candidates.empty())
+            {
+                const auto& c = candidates.front();
+                if (c.Variadic)
+                    MatchFunction(arguments, c.Parameters, true, false);
+                else if (!(arguments.size() == 0 && c.Parameters.size() == 0))
+                    MatchFunction(arguments, c.Parameters, false, false);
+            }
 
             // Call arguments
             msg += std::format("  Call arguments ({}):\n", arguments.size());
@@ -813,14 +830,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     const auto& p = c.Parameters[i];
                     paramList += std::format("{}{} {}", p.TypeName, PointerStars(p), p.VariableName);
                 }
-                msg += std::format("    {}({})\n", c.UniqueName, paramList);
+                msg += std::format("    {}({})\n", displayName.empty() ? c.UniqueName : shownFunctionName, paramList);
             }
 
             // If exactly one resolved candidate passed MatchFunction, show per-argument type comparison
             if (resolvedCandidate.size() == 1)
             {
                 const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
-                msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n", resolvedSym.UniqueName);
+                msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n",
+                    displayName.empty() ? resolvedSym.UniqueName : shownFunctionName);
                 size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
                 for (size_t i = 0; i < count; i++)
                 {
@@ -2109,4 +2127,3 @@ std::string LLVMBackend::MovedUseSubject(const NamedVariable& nv) const
             return nv.CallerName + "." + nv.FieldName;
         return "";
     }
-

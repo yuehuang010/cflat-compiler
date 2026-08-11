@@ -1679,7 +1679,7 @@ private:
 
     void ScanFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName = {}, const std::string& namespaceName = {}, const std::vector<std::string>& extraRequiredLocks = {});
 
-    void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
+void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                                  const std::string& namespaceName = {});
 
     // Pre-declare a struct or class type shell, member functions, and destructor.
@@ -3827,7 +3827,8 @@ public:
      * the GlobalVariable itself. Returns false when the source is not one of these shapes.
      */
     bool ClassifyPointerShapedSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
-                                     LLVMBackend::TypeAndValue& shape);
+                                     LLVMBackend::TypeAndValue& shape,
+                                     const LLVMBackend::NamedVariable* srcBinding = nullptr);
 
     /*
      * Classify an 'is'/'as' source. `structName` is set for the two concrete kinds; `shape` is
@@ -3841,7 +3842,8 @@ public:
      */
     CastSourceKind ClassifyCastSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
                                       std::string& structName, LLVMBackend::TypeAndValue& shape,
-                                      const std::string& srcTypeName = {});
+                                      const std::string& srcTypeName = {},
+                                      const LLVMBackend::NamedVariable* srcBinding = nullptr);
 
     // Boxing a class value into an interface needs the object's ADDRESS. A loaded value came
     // straight from its storage, so reuse that; anything else (a call result) is spilled.
@@ -3849,7 +3851,8 @@ public:
 
     llvm::Value* GenerateIsCheck(llvm::Value* interfaceValue, const std::string& targetTypeNameIn,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,
-                                  const std::string& srcTypeNameIn = {});
+                                  const std::string& srcTypeNameIn = {},
+                                  const LLVMBackend::NamedVariable* srcBinding = nullptr);
 
     llvm::Value* GenerateSafeCast(llvm::Value* interfaceValue, const std::string& targetTypeNameIn,
                                   antlr4::ParserRuleContext* ctx, llvm::Type* srcElemType = nullptr,

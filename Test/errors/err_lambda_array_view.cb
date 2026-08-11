@@ -47,12 +47,23 @@ expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; p
     LavBoxDirect<Lambda<int(int)>*> lavDirect = default;
 }
 
+expect_error("'unique' on a generic type argument: a function pointer or closure does not own an allocation") {
+    struct LavUniqueDirect<T> { T item = default; };
+    LavUniqueDirect<unique function<int(int)>*> lavUniqueDirect = default;
+}
+
 // The function-type-ALIAS arm of the same resolver: 'using' names the closure, so the rejection
 // has to reach it through functionTypeAliases rather than the functionPointerSpecifier branch.
 expect_error("pointer '*' is not supported on closure type 'LavAlias'; pass the closure by value or use a fixed size 'LavAlias[N]' instead") {
     using LavAlias = Lambda<int(int)>;
     struct LavBoxAlias<T> { T item = default; };
     LavBoxAlias<LavAlias*> lavAlias = default;
+}
+
+expect_error("'unique' on a generic type argument: a function pointer or closure does not own an allocation") {
+    using LavUniqueAlias = Lambda<int(int)>;
+    struct LavUniqueAliasBox<T> { T item = default; };
+    LavUniqueAliasBox<unique LavUniqueAlias*> lavUniqueAlias = default;
 }
 
 // The SUBSTITUTION arm: the '*' is written on a type PARAMETER, so by the time it is resolved the

@@ -137,6 +137,16 @@ program PResOkDtor {
     int main(move list<string> args) { return 0; }
 };
 
+// The move-less overload is distinct in the type system, but it cannot start the synthesized
+// program thread. Diagnose the likely typo while keeping other reserved-name overloads legal.
+expect_error("differs from the reserved 'bool run(move list<string>)' only by 'move'")
+{
+    program PResRunMove {
+        bool run(list<string> args) { return false; }
+        int main(move list<string> args) { return 0; }
+    };
+}
+
 extern int main()
 {
     PResOkArity a;

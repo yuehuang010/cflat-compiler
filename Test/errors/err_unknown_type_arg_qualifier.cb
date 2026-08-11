@@ -8,7 +8,7 @@ expect_error("unknown type qualifier 'borrow'; only 'unique' or 'alias' is allow
 
 // An undeclared GENERIC name used as a type. The forward-ref scan used to pre-declare an opaque
 // struct shell for every bare `Name<Args>`, which suppressed this diagnostic entirely: the local
-// declaration reported the structural "incomplete layout (a field type C interop could not
+// declaration reported the structural "is incomplete here (its layout is not available at
 // import)" instead, blaming C interop on a file with none.
 expect_error("unknown type 'ZzUnknown__i32'") {
     ZzUnknown<int> bad2 = default;

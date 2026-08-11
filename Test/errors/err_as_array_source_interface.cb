@@ -92,6 +92,17 @@ expect_error("'is' needs an interface value or a single class instance, not 'Cir
     void concreteTargetIs() { Circle[3] arr; bool b = arr is Circle; }
 }
 
+// Field and local-array-of-pointers sources retain their declared binding through the cast
+// classifier, so they must use the same concrete pointer-shape wording as their global twins.
+expect_error("cannot convert 'Circle**' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    struct Holder { Circle** pp = default; };
+    void fieldPointerArray() { Holder h = default; IShape s = h.pp as IShape; }
+}
+
+expect_error("cannot convert 'Circle[3]' to interface 'IShape' - only a single instance pointer 'Circle*' or a 'Circle' value can be boxed into an interface fat pointer; index or dereference it first") {
+    void localPointerArray() { Circle*[3] arr = default; IShape s = arr as IShape; }
+}
+
 extern int main()
 {
     return 0;

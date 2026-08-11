@@ -149,7 +149,7 @@ expect_error("cannot pass a function-pointer or closure VALUE into parameter 's'
 interface IIcvG<T> { int take(T v, IcvRec* p); };
 class IcvGTaker : IIcvG<int> { int take(int v, IcvRec* p) { p->a = 7; return p->a; } };
 
-expect_error("parameter 'p' of 'IIcvG<i32>.take' data type 'IcvRec*'") {
+expect_error("parameter 'p' of 'IIcvG<int>.take' data type 'IcvRec*'") {
     int icvGenericIface(int argc)
     {
         IcvRec* n = nullptr;

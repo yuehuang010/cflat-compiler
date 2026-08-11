@@ -2273,25 +2273,46 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
         // Same arity, no type winner: keep the historical first-slot pick rather than reject a
         // program the scorer cannot rank (an unresolved generic argument lands here).
+        int fallbackIdx = byArity[0];
         if (!args.empty())
         {
-            // Nothing scored, so re-run the probed loop above non-probed to recover the specific
-            // named-argument diagnostic every candidate swallowed (LogError does not return). An
-            // all-positional call cannot fail here: arity already matches, so pass 2 always binds.
+            // Nothing scored, so re-run only candidates whose parameter names bind. A different
+            // slot may fail on names while the slot the caller meant fails on types; replaying the
+            // first slot unconditionally would report the wrong cause. An all-positional call
+            // binds every slot by construction.
+            std::vector<std::string> argumentNames;
+            argumentNames.reserve(args.size());
+            for (const auto& arg : args)
+                argumentNames.push_back(arg.TypeAndValue.VariableName);
+            bool replayedNameMatch = false;
+            bool permutedMatchedArgs = false;
             for (int idx : byArity)
+            {
+                auto binding = ComputeArgumentPositions(argumentNames, methods[idx].Parameters, false);
+                if (!binding.Ok) continue;
+                replayedNameMatch = true;
+                if (!permutedMatchedArgs)
+                    fallbackIdx = idx;
                 MatchFunction(args, methods[idx].Parameters, false, false);
+                if (!permutedMatchedArgs)
+                {
+                    matchedArgs = MatchFunction(args, methods[idx].Parameters);
+                    permutedMatchedArgs = true;
+                }
+            }
+            if (!replayedNameMatch)
+                MatchFunction(args, methods[byArity[0]].Parameters, false, false);
 
             // The fallback slot still needs its permutation - matchedArgs is raw call order,
-            // so without this a reordered named call would bind its arguments backwards.
-            auto matched = MatchFunction(args, methods[byArity[0]].Parameters);
-            if (!matched.empty()) matchedArgs = matched;
+            // so without this a reordered named call would bind its arguments backwards. The
+            // first name-valid slot is the one the replay just established as intended.
         }
         // Same provable-mismatch gate as the lone-slot arm above: without it, adding a second
         // same-arity overload turns that arm's clean error back into a silent miscompile.
         if (DiagnoseProvableInterfaceArgMismatch(ifaceName, methodName, matchedArgs,
-                methods[byArity[0]].Parameters))
+                methods[fallbackIdx].Parameters))
             return -1;
-        return byArity[0];
+        return fallbackIdx;
     }
 
 llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::string& ifaceName,

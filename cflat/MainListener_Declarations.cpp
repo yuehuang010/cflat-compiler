@@ -83,7 +83,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             // pointer suffix for the THIN spelling only (see RejectFatClosurePointerArg).
             auto* fpSpec = typeSpec->functionPointerSpecifier();
             if (isUnique)
-                LogErrorContext(entry, "unique requires a pointer or interface type");
+                LogErrorContext(entry, "'unique' on a generic type argument: a function pointer or closure "
+                    "does not own an allocation");
             std::string encodedArg = EncodeClosureCodegen(fpSpec);
             if (!hasPointer)
                 return encodedArg;
@@ -116,7 +117,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                     fit != nullptr)
                 {
                     if (isUnique)
-                        LogErrorContext(entry, "unique requires a pointer or interface type");
+                        LogErrorContext(entry, "'unique' on a generic type argument: a function pointer or closure "
+                            "does not own an allocation");
                     std::string encodedAlias = EncodeClosureFromSig(Compiler(entry), *fit);
                     if (!hasPointer)
                         return encodedAlias;
@@ -571,6 +573,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    std::string displayName = baseName + "<";
+                    for (size_t i = 0; i < genParams->typeParameterList()->typeParameterEntry().size(); i++)
+                    {
+                        if (i > 0) displayName += ", ";
+                        displayName += genParams->typeParameterList()->typeParameterEntry()[i]->getText();
+                    }
+                    displayName += ">";
+                    Compiler(declSpecs)->RegisterMangledTypeDisplayName(mangledName, displayName);
                     declType.TypeName = mangledName;
                     // A generic INTERFACE instantiation is a fat pointer, not a struct. interfaceTable
                     // only gains it at the next drain, so mark it from the template name here. The
@@ -1528,6 +1538,9 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 std::string rawText = expectErrDecl->StringLiteral()->getText();
                 compilerLLVM->expectedError = ProcessRawText(rawText);
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                std::unordered_set<std::string> typesBefore;
+                for (const auto& [name, _] : compilerLLVM->dataStructures)
+                    typesBefore.insert(name);
 
                 bool errorReceived = false;
                 try
@@ -1538,6 +1551,16 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    // The declaration that failed inside the expectation is not a usable type.
+                    // Roll back shells created by this block so they cannot shadow outer names.
+                    for (auto it = compilerLLVM->dataStructures.begin(); it != compilerLLVM->dataStructures.end(); )
+                    {
+                        if (!typesBefore.count(it->first)
+                            && it->second.StructType != nullptr && it->second.StructType->isOpaque())
+                            it = compilerLLVM->dataStructures.erase(it);
+                        else
+                            ++it;
+                    }
                     // The rest of the block never ran, so its `if const` arms were never decided.
                     ForgetIfConstGuardedImpls(compilerLLVM, expectErrDecl);
                     compilerLLVM->AbortFunctionBlocks(0);
@@ -3993,7 +4016,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                      */
                     bool initIsNull = constant != nullptr && constant->isNullValue();
                     if (!externDeclOnly && typeAndValue.ConstArraySize > 0
-                        && !typeAndValue.IsArrayView && !typeAndValue.IsSimd && !initIsNull
+                        && !typeAndValue.IsArrayView && !initIsNull
                         && right != nullptr && right->getType()->isPointerTy()
                         && llvm::isa_and_nonnull<llvm::ArrayType>(compiler->GetType(typeAndValue)))
                     {
@@ -4867,6 +4890,8 @@ std::string MainListener::DescribeUniqueFieldOwner(const LLVMBackend::NamedVaria
         std::string owner = nv.OwningStructName;
         if (owner.empty() && compilerLLVM)
             owner = SplitEnclosingStruct(compilerLLVM->GetCurrentFunctionName(), compilerLLVM);
+        if (compilerLLVM && !owner.empty())
+            owner = compilerLLVM->DisplayNameOfMangledType(owner);
         if (field.empty()) return owner;
         return owner.empty() ? field : owner + "." + field;
     }

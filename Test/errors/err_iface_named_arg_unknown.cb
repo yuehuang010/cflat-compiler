@@ -20,6 +20,20 @@ class NOv : IFOv
     int f(double c, double d) { return (int)(c * 100.0 + d); }
 };
 
+// The slot with p/q is declared first, but the call names the later a/b slot. The replay must
+// not report p/q's name miss; the selected slot's pointer-to-by-value error is the true cause.
+interface IFSlot
+{
+    int g(int* p, int* q);
+    int g(int a, int b);
+};
+
+class IFSlotImpl : IFSlot
+{
+    int g(int* p, int* q) { return *p + *q; }
+    int g(int a, int b) { return a + b; }
+};
+
 extern int main()
 {
     N n;
@@ -34,6 +48,13 @@ extern int main()
 
     expect_error("named argument 'zz' does not match any parameter") {
         int bogusOv = ovio.f(zz: 1, a: 2);
+    }
+
+    IFSlotImpl slotImpl;
+    IFSlot slot = slotImpl;
+    int x = 1;
+    expect_error("call to 'IFSlot.g': cannot pass a pointer to by-value parameter") {
+        int bogusType = slot.g(b: &x, a: &x);
     }
 
     return 0;
