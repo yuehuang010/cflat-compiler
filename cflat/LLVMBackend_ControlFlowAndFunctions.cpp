@@ -149,6 +149,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.pendingStructTemps  = std::move(pendingOwnedStructTemps);
         s.pendingPtrTemps     = std::move(pendingOwnedPtrTemps);
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
+        s.ownedReturnReleaseTemps = std::move(ownedReturnReleaseTemps_);
         s.ownedNewTemps       = std::move(ownedNewTemps_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
@@ -176,6 +177,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         pendingOwnedStructTemps.clear();
         pendingOwnedPtrTemps.clear();
         ownedReturnTemps_.clear();
+        ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
@@ -214,6 +216,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         pendingOwnedStructTemps  = state.pendingStructTemps;
         pendingOwnedPtrTemps     = state.pendingPtrTemps;
         ownedReturnTemps_        = state.ownedReturnTemps;
+        ownedReturnReleaseTemps_ = state.ownedReturnReleaseTemps;
         ownedNewTemps_           = state.ownedNewTemps;
         valueElementTypeNames_   = state.valueElementTypeNames;
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
@@ -370,6 +373,8 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.IsFunctionPointer = true;
         tv.FuncPtrReturnTypeName = chosen->ReturnType.TypeName;
         tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
+        tv.FuncPtrReturnOwned = chosen->ReturnType.IsMove
+            || (chosen->ReturnType.IsUniqueTypeArg && chosen->ReturnType.Pointer);
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
         for (const auto& p : chosen->Parameters)
         {
@@ -441,6 +446,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             TypeAndValue retTV;
             retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
+            retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             auto* retTy   = GetType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
@@ -482,6 +488,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         TypeAndValue retTV;
         retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
+        retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         auto* retTy     = GetType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
@@ -1296,4 +1303,3 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 
         return fn;
     }
-

@@ -625,6 +625,9 @@ public:
         // is the first such reader); a reader of IsFunctionPointer may still assume these.
         std::string FuncPtrReturnTypeName;
         bool FuncPtrReturnPointer = false;
+        // Return ownership is semantic metadata carried by a stored function value. It is
+        // recovered from the bound function symbol and makes indirect calls follow direct calls.
+        bool FuncPtrReturnOwned = false;
         /*
          * Number of '*' on a signature component. 0 means NOT RECORDED, never "not a pointer" -
          * `Pointer` already answers that, and many producers (C-interop, WinRT, synthesized
@@ -1151,6 +1154,9 @@ public:
         // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
         // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
         bool AllocatedByRawNewArray = false;
+        // Runtime element count for a raw `new T[n]` pointer local. Used to destroy every
+        // constructed element before releasing the raw block; null means scalar/unknown.
+        llvm::Value* RawArrayLength = nullptr;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -1411,24 +1417,27 @@ public:
     // EmitDestructorsForScope; freed at end-of-full-expression by FlushOwnedStringTemps.
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> pendingOwnedStringTemps;
 
-    // Discard-detection ledger: SSA results of owning-RETURN calls (string / pointer /
-    // interface / owning-value struct), keyed by value for identity. Read by the no-discard
-    // check to reject an unconsumed owning return; never freed here (existing free paths own
-    // that); cleared each full expression in FlushOwnedTemps.
-    // TypeName/AllocAlign/IsOwningPtr also drive the owned-POINTER temp cleanup below: the
-    // consuming operand site only sees the SSA value, so the pointee type is carried here.
+    // Discard-detection ledger: SSA results of owning-RETURN calls, keyed by value for identity.
+    // This ledger answers only whether the no-discard diagnostic must fire. Release eligibility
+    // lives in ownedReturnReleaseTemps_ so erasing a release entry cannot hide a diagnostic and
+    // a diagnostic entry cannot accidentally authorize a free.
     struct OwnedReturnTemp
     {
         llvm::Value* Value;
         std::string FnName;
+    };
+    std::vector<OwnedReturnTemp> ownedReturnTemps_;
+
+    // Release ledger for owning-return values. A release entry is removed when ownership is
+    // adopted or suppressed; its presence never controls the no-discard diagnostic.
+    struct OwnedReturnReleaseTemp
+    {
+        llvm::Value* Value;
         std::string TypeName;
         uint64_t AllocAlign = 0;
         bool IsOwningPtr = false;
-        // Set on a '?:' join whose arms mix ownership: the entry stays VISIBLE to the no-discard
-        // check but must never drive a caller-side free. See PropagateTernaryOwnership.
-        bool CallerReleaseSuppressed = false;
     };
-    std::vector<OwnedReturnTemp> ownedReturnTemps_;
+    std::vector<OwnedReturnReleaseTemp> ownedReturnReleaseTemps_;
 
     // Owning-POINTER SSA values produced by `new`, keyed by value identity, plus any value they
     // propagate onto (a '?:' phi/select whose arm is one). Lets a `unique T*` assignment ask
@@ -2697,7 +2706,8 @@ private:
     // Set a named local's ownership flag (e.g. a `unique` interface local adopting a new owned
     // value on reassignment, so its scope-exit teardown frees the current pointee).
     void SetVariableOwning(const std::string& varName, bool value);
-    void SetVariableRawNewArray(const std::string& varName, bool value);
+    void SetVariableRawNewArray(const std::string& varName, bool value,
+                                llvm::Value* rawArrayLength = nullptr);
 
     // True when the named variable currently owns its value (freed on scope exit). Used to decide
     // whether consuming it (into a move interface param) must disown the source.
@@ -2772,7 +2782,7 @@ private:
                                  const TypeAndValue& retType);
 
     // Propagate an existing ledger entry onto a derived value (e.g. a '?:' select result).
-    // Copies CallerReleaseSuppressed with it, so suppression rides every derived join.
+    // Detection and release entries propagate independently.
     void PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to);
 
     /*
@@ -2783,7 +2793,7 @@ private:
      * opt-in through FindOwnedReturnEntryForDiagnostic, so forgetting the qualifier now costs
      * a leak instead of a double free.
      */
-    const OwnedReturnTemp* FindOwnedReturnEntry(llvm::Value* value) const;
+    const OwnedReturnReleaseTemp* FindOwnedReturnEntry(llvm::Value* value) const;
 
     // Raw lookup, suppression included. ONLY the no-discard diagnostic and suppression-preserving
     // propagation may use this - a suppressed entry must never answer an ownership question.
@@ -2824,7 +2834,7 @@ private:
     // Drop every escape-analysis answer: the whole module (and every Function* in it) is going away.
     void DropModuleEscapeMemo();
 
-    // Keep `value` visible to the no-discard check but bar every caller-side free path from it,
+    // Keep `value` visible to the no-discard check but remove every release entry for it,
     // including one an earlier operand site already registered.
     void SuppressCallerRelease(llvm::Value* value);
 
@@ -4019,6 +4029,7 @@ public:
         std::vector<PendingOwnedStructTemp> pendingStructTemps;
         std::vector<PendingOwnedPtrTemp> pendingPtrTemps;
         std::vector<OwnedReturnTemp> ownedReturnTemps;
+        std::vector<OwnedReturnReleaseTemp> ownedReturnReleaseTemps;
         std::vector<OwnedNewTemp> ownedNewTemps;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
@@ -6220,6 +6231,7 @@ public:
     // so an unrecognized shape can only suppress a rejection, never manufacture one - a false
     // rejection cannot come from missing a case.
     void RunInterfaceReturnDangleCheck(llvm::Function* F);
+    void RunDeferredEndOfBodyChecks(llvm::Function* F);
 
     /*
      * True when `slot`'s address provably never leaves the frame, so the only writes to it are

@@ -1079,6 +1079,7 @@ extern int main()
     {
         total++; passed += Test("temp receiver count", makeIntList(3).count(), 3);
         total++; passed += Test("temp receiver chained", makeIntList(2).copy().count(), 2);
+        total++; passed += Test("string temp receiver chained", returnOwnedConcat("x").copy().length(), 7);
 
         dictionary<int, list<string>> holder = default;
         list<string> hv = {"p", "q"};

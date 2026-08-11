@@ -285,7 +285,8 @@ bool MainListener::BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVa
         // A local that aliases a borrowed parameter. Retired above by any reassignment, which is
         // what makes it safe to consult here - `IS s = b;` must not launder what `delete b;` rejects.
         // Same pair of conditions the raw-delete guard uses, so the two spellings agree exactly.
-        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()) return true;
+        if (nv->IsBorrowed && !nv->BorrowedOrigin.empty()
+            && !compilerLLVM->BorrowProofRetiredByRebind(*nv)) return true;
         // A plain copy of an OWNING local, established at ITS declaration - so it belongs below the
         // retirement with the other declaration-time clauses. The raw `delete b;` guard uses the
         // same pair of conditions, so the boxed and raw spellings reject exactly the same set.
@@ -2739,7 +2740,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->SetVariableRawNewArray(
                     namedVar.CallerName,
                     (asgNewArr != nullptr && asgNewArr->assignmentExpression() != nullptr)
-                        || rightNV.AllocatedByRawNewArray);
+                        || rightNV.AllocatedByRawNewArray,
+                    rightNV.RawArrayLength);
             }
 
             /*
@@ -8077,6 +8079,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         result.TypeAndValue.IsArrayView = isArray;
         result.Primary = typedPtr;
         result.BaseType = ptrTy;
+        result.RawArrayLength = isArray ? count : nullptr;
         // A free site does not need the alignment VALUE - only which deallocator to use, since
         // __delete_aligned recovers the raw block without it. So the tag is needed only when the
         // element TYPE alone would NOT already route there: an over-aligned type (`struct
@@ -8349,7 +8352,8 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 && !namedVar.IsOwning
                 && namedVar.Storage != nullptr
                 && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
-                && compiler->IsFunctionParameter(namedVar.CallerName))
+                && compiler->IsFunctionParameter(namedVar.CallerName)
+                && !compiler->BorrowProofRetiredByRebind(namedVar))
             {
                 LogErrorContext(ctx, std::format(
                     "cannot delete borrowed parameter '{}' - caller may own this pointer and "
@@ -8380,7 +8384,8 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 && namedVar.IsBorrowed
                 && !namedVar.BorrowedOrigin.empty()
                 && namedVar.Storage != nullptr
-                && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                && !compiler->BorrowProofRetiredByRebind(namedVar))
             {
                 std::string name = namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName;
                 // Trap B: the borrow came from a `unique` field, not a parameter. The field's
@@ -9885,4 +9890,3 @@ std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* 
         }
         return "";
     }
-

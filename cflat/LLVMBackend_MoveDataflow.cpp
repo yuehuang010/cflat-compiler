@@ -216,6 +216,14 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
         }
     }
 
+void LLVMBackend::RunDeferredEndOfBodyChecks(llvm::Function* F)
+{
+        if (F == nullptr) return;
+        RunNullDerefDataflow(F);
+        RunInterfaceReturnDangleCheck(F);
+        RunNullIfaceDispatchCheck(F);
+}
+
 bool LLVMBackend::InterfaceSlotIsFrameLocal(const llvm::Value* slot) const
 {
         llvm::SmallPtrSet<const llvm::Value*, 16> seen;
@@ -1318,4 +1326,3 @@ std::vector<LLVMBackend::AutoReturnSite> LLVMBackend::EndAutoReturnCapture()
 
 bool LLVMBackend::IsAutoReturnCaptureActive() const
 { return autoReturnCapture.has_value(); }
-

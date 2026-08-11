@@ -73,3 +73,10 @@ expect_error("owning return value of 'makePtr9' must not be discarded") {
     move R9* makePtr9() { return new R9; }
     void useIt9() { Lambda<void()> g = () => makePtr9(); g(); }
 }
+
+// Indirect calls preserve the bound function's owning return metadata.
+expect_error("owning return value of 'f' must not be discarded") {
+    class R10 { int id = default; };
+    move R10* makePtr10() { return new R10; }
+    void useIt10() { function<R10*()> f = makePtr10; f(); }
+}

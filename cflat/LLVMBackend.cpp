@@ -2568,6 +2568,7 @@ void LLVMBackend::ResetForReanalysis()
     pendingOwnedStructTemps.clear();
     pendingOwnedPtrTemps.clear();
     ownedReturnTemps_.clear();
+    ownedReturnReleaseTemps_.clear();
     ownedNewTemps_.clear();
     valueElementTypeNames_.clear();
     fatInterfaceValueTypeNames_.clear();
@@ -4306,6 +4307,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
         o["fp"]  = true;
         o["fpr"] = t.FuncPtrReturnTypeName;
         if (t.FuncPtrReturnPointer) o["fprp"] = true;
+        if (t.FuncPtrReturnOwned) o["fpro"] = true;
         // Depth is only written when it is above the single level a bare `Pointer` already
         // implies, so a warm cache written before depth existed still reads back identically.
         if (t.FuncPtrReturnPointerDepth > 1)
@@ -4377,6 +4379,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     {
         if (auto v = o.getString("fpr"))   t.FuncPtrReturnTypeName = v->str();
         if (auto v = o.getBoolean("fprp")) t.FuncPtrReturnPointer = *v;
+        if (auto v = o.getBoolean("fpro")) t.FuncPtrReturnOwned = *v;
         // A pointer with no explicit depth is depth 1 - the level `Pointer` itself asserts.
         if (t.FuncPtrReturnPointer) t.FuncPtrReturnPointerDepth = 1;
         if (auto v = o.getInteger("fprd")) t.FuncPtrReturnPointerDepth = static_cast<int>(*v);

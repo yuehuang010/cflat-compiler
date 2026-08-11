@@ -517,6 +517,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.TypeName = "__c_fn_ptr";
         sig.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
         sig.FuncPtrReturnPointer = sym.ReturnType.Pointer;
+        sig.FuncPtrReturnOwned = sym.ReturnType.IsMove
+            || (sym.ReturnType.IsUniqueTypeArg && sym.ReturnType.Pointer);
         sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
         for (const auto& p : sym.Parameters)
         {
@@ -693,4 +695,3 @@ std::string LLVMBackend::DescribeCodeValueAsCompoundOperand(const std::string& s
             destIsPointer ? "a code address is not an offset"
                           : "a code address is not a value of that type");
     }
-

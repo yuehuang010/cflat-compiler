@@ -613,6 +613,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
                     declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrReturnOwned = fit->second.FuncPtrReturnOwned;
                     declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
@@ -2226,15 +2227,13 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
 
             // The body's CFG is complete - solve the MAY-null fixpoint here so the error still
             // lands inside an enclosing scoped expect_error rather than at end-of-module.
-            compiler->RunNullDerefDataflow(fn);
+            compiler->RunDeferredEndOfBodyChecks(fn);
 
             // Same reasoning, for the deferred interface-return-dangle existential check: the
             // slot's use-list is only complete once the body is fully lowered.
-            compiler->RunInterfaceReturnDangleCheck(fn);
 
             // Same reasoning again for the definitely-null interface dispatch: the proof reads
             // the dispatch's own block, which is only complete now.
-            compiler->RunNullIfaceDispatchCheck(fn);
         }
 
         if (isAutoReturn)
@@ -2970,6 +2969,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcIsOwningArrayStringElem = false;
                 bool srcIsRawHeapStringElem = false;
                 bool srcPtrCopyIsRawNewArray = false;
+                llvm::Value* srcRawArrayLength = nullptr;
                 // True when the initializer reads an element of a user `T[]` VIEW. The GEP has a
                 // container slot's single-index shape, so only this provenance separates them.
                 bool srcIsViewElem = false;
@@ -3275,6 +3275,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // Hoisted for the thin function<> provenance gate below, which needs the
                             // RHS's declared-pointer shape after rightNV itself goes out of scope.
                             bool rhsIsPointer = false;
+                            bool rhsFuncPtrReturnOwned = false;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
@@ -3452,7 +3453,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // Plain pointer copy from an already-tagged local (`string* q = p;`)
                                 // carries the `new T[n]` provenance across.
                                 srcPtrCopyIsRawNewArray = rightNV.AllocatedByRawNewArray;
+                                srcRawArrayLength = rightNV.RawArrayLength;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
+                                rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
@@ -3506,6 +3509,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     typeAndValue.FuncPtrReturnTypeName = inferred.FuncPtrReturnTypeName;
                                     typeAndValue.FuncPtrReturnPointer = inferred.FuncPtrReturnPointer;
+                                    typeAndValue.FuncPtrReturnOwned = inferred.FuncPtrReturnOwned;
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
@@ -3530,6 +3534,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     boundNamedFn = fn;
                                     boundNamedFnName = funcName;
+                                    auto boundSig = compiler->FuncPtrSigOfBoundFunction(funcName, fn);
+                                    if (boundSig.IsFunctionPointer)
+                                        typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = typeAndValue.IsThinFnPtr()
@@ -3547,6 +3554,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     boundNamedFn = genericFn;
                                     boundNamedFnName = genericFuncCallerName;
+                                    auto boundSig = compiler->FuncPtrSigOfBoundFunction(genericFuncCallerName, genericFn);
+                                    if (boundSig.IsFunctionPointer)
+                                        typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
                                     VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
                                     right = typeAndValue.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(genericFn, typeAndValue)
@@ -3612,7 +3622,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (right && typeAndValue.IsFunctionPointer)
                             {
                                 if (rhsIsFuncPtr)
+                                {
                                     AdoptInferredParamSinks(typeAndValue, rhsFuncPtrParams);
+                                    typeAndValue.FuncPtrReturnOwned = rhsFuncPtrReturnOwned;
+                                }
                                 else if (boundNamedFn != nullptr)
                                 {
                                     // A bare NAMED function initializer carries its facts in the
@@ -3620,7 +3633,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     auto named = compiler->FuncPtrSigOfBoundFunction(
                                         boundNamedFnName, boundNamedFn);
                                     if (named.IsFunctionPointer)
+                                    {
                                         AdoptInferredParamSinks(typeAndValue, named.FuncPtrParams);
+                                        typeAndValue.FuncPtrReturnOwned = named.FuncPtrReturnOwned;
+                                    }
                                 }
                             }
 
@@ -4534,11 +4550,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // initializer, or a plain copy of an already-tagged pointer local.
                         auto* initNewArr = initializer && initializer->assignmentExpression()
                             ? AsDirectNew(initializer->assignmentExpression()) : nullptr;
-                        if (typeAndValue.Pointer && !typeAndValue.IsArrayView
-                            && ((initNewArr != nullptr && initNewArr->assignmentExpression() != nullptr)
-                                || srcPtrCopyIsRawNewArray))
-                            compiler->stackNamedVariable.back().namedVariable[name]
-                                .AllocatedByRawNewArray = true;
+                        if (typeAndValue.Pointer && !typeAndValue.IsArrayView)
+                        {
+                            bool isRawArray = (initNewArr != nullptr
+                                && initNewArr->assignmentExpression() != nullptr)
+                                || srcPtrCopyIsRawNewArray;
+                            auto& local = compiler->stackNamedVariable.back().namedVariable[name];
+                            local.AllocatedByRawNewArray = isRawArray;
+                            local.RawArrayLength = isRawArray ? srcRawArrayLength : nullptr;
+                        }
 
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
@@ -5707,4 +5727,3 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         compilerLLVM->lastCallReturnsOwned = exprOwned ? true : savedOwned;
         return nv;
     }
-

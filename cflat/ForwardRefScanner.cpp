@@ -213,6 +213,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
                     declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
+                    declType.FuncPtrReturnOwned = fit->second.FuncPtrReturnOwned;
                     declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->second.FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
@@ -1768,4 +1769,3 @@ void ForwardRefScanner::ScanNamespace(CFlatParser::NamespaceDefinitionContext* c
         for (auto* extDecl : ctx->externalDeclaration())
             ScanExternalDeclaration(extDecl, namespaceName);
     }
-

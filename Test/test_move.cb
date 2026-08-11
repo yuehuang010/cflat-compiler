@@ -4242,6 +4242,26 @@ int bpmParamRebound(Resource* p)
     return v;
 }
 
+// The raw-delete guard must retire the declaration-time borrow after a same-block owner rebind.
+int rawDeleteCopyRebound(Resource* p)
+{
+    Resource* b = p;
+    b = new Resource();
+    b->id = 93;
+    int v = b->id;
+    delete b;
+    return v;
+}
+
+int rawDeleteParamRebound(Resource* p)
+{
+    p = new Resource();
+    p->id = 94;
+    int v = p->id;
+    delete p;
+    return v;
+}
+
 /*
  * Owning-struct assignment from an INDIRECT source - a deref (`*ap`), a field (`w.b`), or an
  * ELEMENT (`arr[i]`). `=` and decl-init defer to T exactly as they already do for a named local
@@ -4962,12 +4982,14 @@ int testOwningAssignIntoArrayViewElement()
         // teardown is the discriminator, and this block is rc 133 without the read-side clear.
         string* h = new string[2];
         h[0] = "ef" + "gh";
+        h[1] = "ij" + "kl";
         string q = h[0];
         passed += Test("rhstr_temp_value", q, "efgh");
         passed += Test("rhstr_temp_borrows", q.data() == h[0].data(), true);
         string r = "seed";
         r = h[0];                       // the ASSIGN read position, same clearing
         passed += Test("rhstr_temp_assign_value", r, "efgh");
+        passed += Test("rhstr_temp_nonzero_slot_value", h[1], "ijkl");
     }
     {
         // A file-scope GLOBAL source carries no CallerName, so it reaches the store arm by its
@@ -7167,6 +7189,24 @@ int testBorrowedPointerMoveNoAdopt()
     }
     passed += Test("bpm_param_rebound_total_frees", dtorCount, 2);
 
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        passed += Test("raw_delete_copy_rebound_value", rawDeleteCopyRebound(owner), 93);
+        passed += Test("raw_delete_copy_rebound_fresh_freed", dtorCount, 1);
+        delete owner;
+    }
+    passed += Test("raw_delete_copy_rebound_total_frees", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        Resource* owner = new Resource();
+        passed += Test("raw_delete_param_rebound_value", rawDeleteParamRebound(owner), 94);
+        passed += Test("raw_delete_param_rebound_fresh_freed", dtorCount, 1);
+        delete owner;
+    }
+    passed += Test("raw_delete_param_rebound_total_frees", dtorCount, 2);
+
     /*
      * A GLOBAL source and no `delete` anywhere - the one shape where the old adopting behaviour
      * ran to completion instead of aborting, because a global is not auto-freed and nothing freed
@@ -8952,21 +8992,17 @@ int testTempUniqueFieldBorrowAccepts()
         }
     }
 
-    // TRIPWIRE, same shape and still unfixed: the '?.' guarded chain is the third block that
-    // registers owning temps without a flush. `dtors == 0` pins that LEAK on purpose - see
-    // internal/issue/p2/owning-temp-in-null-conditional-arm-never-destructed.md.
+    // The guarded chain flushes owning temps before resuming after the `?.` block.
     dtorCount = 0;
     {
         Resource* live = new Resource();
         int got = live?.readId(makeMoveBox().t->id);
         passed += Test("null_conditional_arm_temp_value", got, 44);
-        passed += Test("null_conditional_arm_temp_not_freed", dtorCount, 0);
+        passed += Test("null_conditional_arm_temp_freed", dtorCount, 1);
         delete live;
     }
 
-    // A JOIN inside that same unflushed '?.' arm: the join hoists its temp to its own branch
-    // block, which still sits inside the arm, so the value is now RIGHT (it was garbage
-    // pre-fix) and the temp leaks instead - the p2 gap above, not a new one.
+    // A JOIN inside that same `?.` arm also flushes its nested owning temp before resume.
     dtorCount = 0;
     {
         int c = 1;
@@ -8974,7 +9010,7 @@ int testTempUniqueFieldBorrowAccepts()
         Resource* live = new Resource();
         int got = live?.readId(readResourceId(c > 0 ? makeMoveBox().t : nul));
         passed += Test("null_conditional_join_arm_value", got, 44);
-        passed += Test("null_conditional_join_arm_not_freed", dtorCount, 0);
+        passed += Test("null_conditional_join_arm_freed", dtorCount, 1);
         delete live;
     }
 
@@ -10640,7 +10676,7 @@ extern int main()
     total += 87;
 
     passed += testBorrowedPointerMoveNoAdopt();
-    total += 23;
+    total += 29;
 
     passed += testOwningAssignFromIndirectSource();
     total += 75;
@@ -10649,7 +10685,7 @@ extern int main()
     total += 92;
 
     passed += testOwningAssignIntoArrayViewElement();
-    total += 77;
+    total += 78;
 
     passed += testOwningBraceInitFixedArray();
     total += 63;

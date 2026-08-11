@@ -122,9 +122,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // Whole-chain '?.' short-circuit: links after the first '?.' run in a shared "access"
             // block, so a null anywhere upstream skips the REST of the chain (merged at the end).
             llvm::BasicBlock* ncChainNullBlock = nullptr;
+            std::optional<LLVMBackend::OwnedTempMark> ncTempMark;
             auto ncEnterGuard = [&](llvm::Value* testPtr)
             {
                 auto* compiler = Compiler(ctx);
+                if (!ncTempMark.has_value())
+                    ncTempMark = compiler->MarkOwnedTemps();
                 if (ncChainNullBlock == nullptr)
                     ncChainNullBlock = compiler->CreateBasicBlock("nc_null");
                 auto* accessBlock = compiler->CreateBasicBlock("nc_access");
@@ -886,7 +889,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             && Compiler(ctx)->IsOwningValueType(parentType);
                                         // Owns the temp's buffer unless it is an `alias` (borrow) return.
                                         bool parentOwnsTemp = parentIsOwningTemp
-                                            && !structVar.TypeAndValue.IsAlias;
+                                            && !structVar.TypeAndValue.IsAlias
+                                            // Preserve an owning origin across nested fields, but
+                                            // keep an alias-container origin non-owning at every hop.
+                                            && (!structVar.FromOwningTempField || structVar.OwningTempParent);
                                         // Records WHO owns the field for the temp-source diagnostics:
                                         // the temp itself, or whatever an `alias` return borrowed from.
                                         namedVar.OwningTempParent = parentOwnsTemp;
@@ -3086,6 +3092,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         std::format("function pointer '{}'", functionName));
                                 }
                                 auto result = Compiler(ctx)->CreateIndirectCall(funcPtrTV, funcPtr, callArgs);
+                                Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
+                                if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
+                                {
+                                    auto returnType = Compiler(ctx)->lastCallReturnType;
+                                    returnType.IsMove = true;
+                                    Compiler(ctx)->RegisterOwnedReturnTemp(result, functionName, returnType);
+                                }
                                 // A lambda literal's INFERRED owning sinks ride the funcptr type;
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
@@ -3419,6 +3432,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // pointer whose signature disagrees with the parameter's.
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Reading the side channel RETIRES it, like the two other
                                     // consumers, so a stale list cannot reach the next argument.
@@ -3958,6 +3972,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // TypeName and IsFunctionPointer are deliberately left alone here.
                                     argVar.TypeAndValue.FuncPtrReturnTypeName = argNV.TypeAndValue.FuncPtrReturnTypeName;
                                     argVar.TypeAndValue.FuncPtrReturnPointer  = argNV.TypeAndValue.FuncPtrReturnPointer;
+                                    argVar.TypeAndValue.FuncPtrReturnOwned = argNV.TypeAndValue.FuncPtrReturnOwned;
                                     argVar.TypeAndValue.FuncPtrParams         = argNV.TypeAndValue.FuncPtrParams;
                                     // Propagate bond info so bond-to-move checks work at the call site.
                                     argVar.IsBonded = argNV.IsBonded;
@@ -4306,6 +4321,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     llvm::Type* arrType = namedVar.BaseType;
                     llvm::Value* liveArrayPtr = namedVar.Storage;
                     auto* accessPred = compiler->builder->GetInsertBlock();
+                    if (ncTempMark.has_value())
+                        compiler->FlushOwnedTempsSince(*ncTempMark, liveArrayPtr);
                     compiler->CreateJump(resumeBlock);
 
                     compiler->SwitchToBlock(ncChainNullBlock);
@@ -4340,6 +4357,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         auto* resultAlloca = compiler->CreateAlloca(finalType);
                         compiler->CreateAssignment(namedVar.Primary, resultAlloca);
+                        if (ncTempMark.has_value())
+                            compiler->FlushOwnedTempsSince(*ncTempMark, namedVar.Primary);
                         compiler->CreateJump(resumeBlock);
 
                         compiler->SwitchToBlock(ncChainNullBlock);
@@ -4355,6 +4374,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     else
                     {
                         // Genuinely no result (void, or nothing at all) - merge control flow only.
+                        if (ncTempMark.has_value())
+                            compiler->FlushOwnedTempsSince(*ncTempMark, nullptr);
                         compiler->CreateJump(resumeBlock);
                         compiler->SwitchToBlock(ncChainNullBlock);
                         compiler->CreateJump(resumeBlock);
@@ -5024,6 +5045,19 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
+        struct LambdaDeferredCheckGuard
+        {
+            LLVMBackend* Compiler;
+            llvm::Function* Function;
+            bool Completed = false;
+            ~LambdaDeferredCheckGuard()
+            {
+                if (Completed) return;
+                Compiler->DiscardNullDerefEvents(Function);
+                Compiler->DiscardPendingReturnDangleChecks(Function);
+                Compiler->DiscardPendingNullIfaceDispatch(Function);
+            }
+        } deferredCheckGuard{ compiler, fn };
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -5232,6 +5266,11 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         if (!compiler->IsBlockTerminated() && lambdaBlockUnreachable)
             compiler->builder->CreateUnreachable();
 
+        // Lambda invokers do not pass through the named-function completion hook. Run the same
+        // deferred checks while this function's CFG and per-function ledgers are still current.
+        compiler->RunDeferredEndOfBodyChecks(fn);
+        deferredCheckGuard.Completed = true;
+
         compiler->RestoreBuilderState(savedState);
 
         // Build user-visible function-pointer TypeAndValue (no __env param).
@@ -5244,6 +5283,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         tv.TypeName = "__closure_fat_ptr";
         tv.FuncPtrReturnTypeName = returnType.TypeName;
         tv.FuncPtrReturnPointer  = returnType.Pointer;
+        tv.FuncPtrReturnOwned = returnType.IsMove;
         tv.FuncPtrReturnPointerDepth = returnType.ValuePointerDepth();
         for (const auto& p : params)
         {
@@ -6148,10 +6188,15 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
         if (receiver.Primary == nullptr || receiver.Storage != nullptr) return;
         if (receiver.BaseType == nullptr || !receiver.BaseType->isStructTy()) return;
         if (receiver.TypeAndValue.Pointer) return;
-        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
+        if (typeName.empty() || typeName == "__closure_fat_ptr") return;
         if (receiver.TypeAndValue.IsAlias || receiver.FromOwningTempField) return;
 
         auto* compiler = Compiler(ctx);
+        if (typeName == "string")
+        {
+            compiler->RegisterOwnedStringTemp(receiver.Primary);
+            return;
+        }
         if (!compiler->IsOwningValueType(typeName)) return;
         if (MethodConsumesReceiver(functionName, typeName)) return;
 
@@ -6240,4 +6285,3 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
             ScanAndQueueGenericTypeUses(ruleCtx);
         }
     }
-

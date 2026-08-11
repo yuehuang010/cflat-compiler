@@ -757,7 +757,8 @@ void LLVMBackend::SetVariableRefCountStorage(const std::string& varName, llvm::V
 
 // Set or CLEAR the `new T[n]` provenance of a raw pointer local. Clearing on any other source is
 // the point: a stale-positive flag costs a copy, a stale-negative one would be a use-after-free.
-void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value)
+void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
+                                         llvm::Value* rawArrayLength)
 {
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
@@ -765,6 +766,7 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value)
             if (it != frame.namedVariable.end())
             {
                 it->second.AllocatedByRawNewArray = value;
+                it->second.RawArrayLength = value ? rawArrayLength : nullptr;
                 return;
             }
         }
@@ -918,7 +920,36 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar)
         // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
         // through the delete-site resolver: a pointee still incomplete here (self-referential
         // element) binds the deferred stub instead of silently dropping the call.
-        if (auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName))
+        if (namedVar.RawArrayLength != nullptr)
+        {
+            auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName);
+            if (dtor != nullptr)
+            {
+                auto* elemType = GetType(TypeAndValue{ .TypeName = namedVar.TypeAndValue.TypeName });
+                auto* i64Ty = builder->getInt64Ty();
+                auto* indexAlloca = builder->CreateAlloca(i64Ty, nullptr, "raw_array_dtor_i");
+                builder->CreateStore(builder->getInt64(0), indexAlloca);
+                auto* condBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_cond",
+                                                        builder->GetInsertBlock()->getParent());
+                auto* bodyBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_body",
+                                                        builder->GetInsertBlock()->getParent());
+                auto* doneBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_done",
+                                                        builder->GetInsertBlock()->getParent());
+                builder->CreateBr(condBB);
+                builder->SetInsertPoint(condBB);
+                auto* index = builder->CreateLoad(i64Ty, indexAlloca);
+                auto* hasNext = builder->CreateICmpSLT(index, namedVar.RawArrayLength);
+                builder->CreateCondBr(hasNext, bodyBB, doneBB);
+                builder->SetInsertPoint(bodyBB);
+                auto* elemPtr = builder->CreateGEP(elemType, ptrVal, index, "raw_array_dtor_elem");
+                builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+                auto* next = builder->CreateAdd(index, builder->getInt64(1));
+                builder->CreateStore(next, indexAlloca);
+                builder->CreateBr(condBB);
+                builder->SetInsertPoint(doneBB);
+            }
+        }
+        else if (auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName))
             builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
 
         // Free the pointer. An over-aligned block came from the aligned allocator, so it must be
@@ -1024,27 +1055,51 @@ void LLVMBackend::RegisterOwnedReturnTemp(llvm::Value* value, const std::string&
         bool isOwningPtr = retType.Pointer && value->getType()->isPointerTy()
             && !retType.IsInterface && !retType.ElemPointer && retType.ConstArraySize == 0;
         for (auto& e : ownedReturnTemps_)
-            if (e.Value == value) { e.FnName = fnName; return; }
-        ownedReturnTemps_.push_back({ value, fnName, retType.TypeName,
-                                      retType.AllocAlignValue, isOwningPtr });
-    }
+            if (e.Value == value) { e.FnName = fnName; break; }
+        if (std::none_of(ownedReturnTemps_.begin(), ownedReturnTemps_.end(),
+                         [&](const OwnedReturnTemp& e) { return e.Value == value; }))
+            ownedReturnTemps_.push_back({ value, fnName });
+        for (auto& e : ownedReturnReleaseTemps_)
+            if (e.Value == value)
+            {
+                e.TypeName = retType.TypeName;
+                e.AllocAlign = retType.AllocAlignValue;
+                e.IsOwningPtr = isOwningPtr;
+                return;
+            }
+        ownedReturnReleaseTemps_.push_back({ value, retType.TypeName,
+                                             retType.AllocAlignValue, isOwningPtr });
+}
 
 void LLVMBackend::PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
 {
         const OwnedReturnTemp* src = FindOwnedReturnEntryForDiagnostic(from);
-        if (src == nullptr || to == nullptr) return;
-        OwnedReturnTemp copy = *src;
+        if (to == nullptr) return;
+        if (src != nullptr)
+        {
+            OwnedReturnTemp copy = *src;
+            copy.Value = to;
+            bool replaced = false;
+            for (auto& e : ownedReturnTemps_)
+                if (e.Value == to) { e = copy; replaced = true; break; }
+            if (!replaced) ownedReturnTemps_.push_back(copy);
+        }
+        const OwnedReturnReleaseTemp* release = FindOwnedReturnEntry(from);
+        if (release == nullptr) return;
+        OwnedReturnReleaseTemp copy = *release;
         copy.Value = to;
-        for (auto& e : ownedReturnTemps_)
+        for (auto& e : ownedReturnReleaseTemps_)
             if (e.Value == to) { e = copy; return; }
-        ownedReturnTemps_.push_back(copy);
-    }
+        ownedReturnReleaseTemps_.push_back(copy);
+}
 
-const LLVMBackend::OwnedReturnTemp* LLVMBackend::FindOwnedReturnEntry(llvm::Value* value) const
+const LLVMBackend::OwnedReturnReleaseTemp* LLVMBackend::FindOwnedReturnEntry(llvm::Value* value) const
 {
-        const OwnedReturnTemp* e = FindOwnedReturnEntryForDiagnostic(value);
-        return (e != nullptr && e->CallerReleaseSuppressed) ? nullptr : e;
-    }
+        if (value == nullptr) return nullptr;
+        for (const auto& e : ownedReturnReleaseTemps_)
+            if (e.Value == value) return &e;
+        return nullptr;
+}
 
 const LLVMBackend::OwnedReturnTemp* LLVMBackend::FindOwnedReturnEntryForDiagnostic(llvm::Value* value) const
 {
@@ -1064,7 +1119,7 @@ void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
 {
         std::string typeName;
         uint64_t allocAlign = 0;
-        if (const OwnedReturnTemp* e = FindOwnedReturnEntry(value); e != nullptr && e->IsOwningPtr)
+        if (const OwnedReturnReleaseTemp* e = FindOwnedReturnEntry(value); e != nullptr && e->IsOwningPtr)
         {
             typeName = e->TypeName;
             allocAlign = e->AllocAlign;
@@ -1083,7 +1138,7 @@ void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
 bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
 {
         if (value == nullptr || !value->getType()->isPointerTy()) return false;
-        const OwnedReturnTemp* e = FindOwnedReturnEntry(value);
+        const OwnedReturnReleaseTemp* e = FindOwnedReturnEntry(value);
         if (e != nullptr && e->IsOwningPtr) return true;
         const OwnedNewTemp* n = FindOwnedNewTemp(value);
         return n != nullptr && !n->TypeName.empty();
@@ -1157,11 +1212,11 @@ void LLVMBackend::DropModuleEscapeMemo()
 void LLVMBackend::SuppressCallerRelease(llvm::Value* value)
 {
         if (value == nullptr) return;
-        for (auto& e : ownedReturnTemps_)
-            if (e.Value == value) e.CallerReleaseSuppressed = true;
+        std::erase_if(ownedReturnReleaseTemps_,
+                      [&](const OwnedReturnReleaseTemp& e) { return e.Value == value; });
         std::erase_if(ownedNewTemps_, [&](const OwnedNewTemp& n) { return n.Value == value; });
         UnregisterOwnedPtrTemp(value);
-    }
+}
 
 bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
 {
@@ -1169,8 +1224,8 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
         if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)) return true;
         // An INTERFACE fat value and a by-value OWNING STRUCT both own through the owning-RETURN
-        // ledger, which the pointer-only IsOwningPtrTempValue cannot see; a suppressed entry
-        // already reads as absent there. A plain LOAD of a named local/parameter is never in that
+        // release ledger, which the pointer-only IsOwningPtrTempValue cannot see. A plain LOAD of
+        // a named local/parameter is never in that
         // ledger, so a borrowed struct arm correctly scores non-owning.
         if (IsInterfaceFatValue(arm) || IsOwningValueStructValue(arm))
             return FindOwnedReturnEntry(arm) != nullptr;
@@ -1805,7 +1860,7 @@ void LLVMBackend::AdoptLaunderedOwningTempResult(llvm::Value* callResult)
             if (!ParameterIsExactlyReturned(callee, i)) continue;
             // Move the ledger entry, never copy it: two live entries for one object are two
             // eligible free sites.
-            if (const OwnedReturnTemp* e = FindOwnedReturnEntry(argVal); e != nullptr)
+            if (const OwnedReturnReleaseTemp* e = FindOwnedReturnEntry(argVal); e != nullptr)
                 PropagateOwnedReturnTemp(argVal, call);
             else if (const OwnedNewTemp* n = FindOwnedNewTemp(argVal); n != nullptr)
                 RegisterOwnedNewTemp(call, n->TypeName, n->AllocAlign);
@@ -2740,7 +2795,18 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         TrimOwnedTempsSince(pendingOwnedClosureTemps, mark.Closures, nullptr, pairValue);
         TrimOwnedTempsSince(pendingOwnedStructTemps,  mark.Structs,  nullptr, structValue);
         TrimOwnedTempsSince(pendingOwnedPtrTemps,     mark.Ptrs,     nullptr, ptrValue);
-    }
+        // Pending vectors can retain obligations from before the aborted region, so they are
+        // trimmed by mark. Detection-only ledgers describe SSA values in the discarded region;
+        // clear them wholesale so a later expression can never consult an aborted fact.
+        ownedReturnTemps_.clear();
+        ownedReturnReleaseTemps_.clear();
+        ownedNewTemps_.clear();
+        valueElementTypeNames_.clear();
+        fatInterfaceValueTypeNames_.clear();
+        movedOutPtrValues_.clear();
+        movedBorrowedPtrValues_.clear();
+        movedBorrowedThroughFieldValues_.clear();
+}
 
 void LLVMBackend::FlushOwnedTemps()
 {
@@ -2752,6 +2818,7 @@ void LLVMBackend::FlushOwnedTemps()
         FlushOwnedPtrTemps();
         // Detection-only ledgers: end of a full expression retires its owning results.
         ownedReturnTemps_.clear();
+        ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
@@ -2949,4 +3016,3 @@ LLVMBackend::~LLVMBackend()
         // context is last to be released.
         context.release();
     }
-

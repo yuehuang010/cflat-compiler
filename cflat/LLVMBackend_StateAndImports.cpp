@@ -769,6 +769,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
             j["fp"]  = true;
             j["fpr"] = tv.FuncPtrReturnTypeName;
             if (tv.FuncPtrReturnPointer) j["fprp"] = true;
+            if (tv.FuncPtrReturnOwned) j["fpro"] = true;
             nlohmann::json fps = nlohmann::json::array();
             for (const auto& p : tv.FuncPtrParams)
             {
@@ -804,6 +805,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         {
             tv.FuncPtrReturnTypeName = j.value("fpr",  std::string{});
             tv.FuncPtrReturnPointer  = j.value("fprp", false);
+            tv.FuncPtrReturnOwned = j.value("fpro", false);
             if (j.contains("fps"))
                 for (const auto& pj : j["fps"])
                 {
@@ -1545,4 +1547,3 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
             file));
         return false;
     }
-
