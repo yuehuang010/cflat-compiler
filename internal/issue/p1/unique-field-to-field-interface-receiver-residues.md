@@ -1,5 +1,22 @@
 # unique-field-to-field-interface-receiver-residues
 
+## 2026-08-10 - SUPERSEDED by the ruling on [[unique-field-to-field-array-element-receiver]]
+
+The maintainer ruled that a plain `=` between two `unique` fields is a **uniform implicit move** -
+source nulled, old destination released, no proof required and no rejection. Every shape in this
+file is a MISSING DIAGNOSTIC caused by an unprovable receiver pair, so all five stop needing a proof
+and stop double-freeing. The five-shape inventory below is retained as the record of what the
+prove-then-reject design could not reach; it is no longer work to be done.
+
+`SoleStoreIntoSlot` and the interface half of `ProvablyDifferentObjects` become deletable with the
+rest of that machinery.
+
+**One item here does NOT close with the ruling** and should be re-filed separately if it matters:
+shape 5's underlying cause - the four deferred end-of-body checks (`RunUniqueIfaceFieldStoreCheck`,
+`RunNullDerefDataflow`, `RunInterfaceReturnDangleCheck`, `RunNullIfaceDispatchCheck`) never run for
+LAMBDA bodies, only for the named-function path. That is a pre-existing architectural gap affecting
+three checks that this ruling does not touch, and one shared hook fixes it for all of them.
+
 **Severity: P3 (deliberate deferral).** Filed 2026-08-05 out of the round-1 review of
 `fix/iface-selfassign` (the `interface-field-self-assign-false-positive` fix). Every shape here
 is a MISSING diagnostic, never a false rejection: the program compiles clean on both the pre-fix

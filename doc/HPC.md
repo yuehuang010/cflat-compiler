@@ -462,7 +462,9 @@ Rules:
 
 - **noalias by spelling.** Writing `int[]` emits LLVM `noalias` on that parameter, so the
   loop vectorizer drops the runtime overlap check it would otherwise insert for `int*`
-  (see the *runtime alias checks* note under `vectorize`). This is the headline win.
+  (see the *runtime alias checks* note under `vectorize`). This is the headline win. The
+  contract is yours to keep and is never checked - where two arguments may genuinely overlap,
+  pass them as `int*` and keep the may-alias behaviour.
 - **No pointer arithmetic.** `a + i`, `a++`, `a--` are compile errors on a view - index it
   with `a[i]` instead. This is what makes the noalias contract *provable* rather than
   trusted: with no arithmetic (and no `int* -> int[]` conversion), a view can only ever

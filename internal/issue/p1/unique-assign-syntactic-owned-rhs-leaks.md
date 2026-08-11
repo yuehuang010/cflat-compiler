@@ -1,5 +1,38 @@
 # `unique` assignment: owning value laundered through a BORROW-returning call still leaks
 
+## RULING 2026-08-10 (maintainer) - BUILD the alias proof, AND take the two precision gaps.
+
+**1. The return-identity alias proof.** Prove that EVERY return of the callee is EXACTLY the tracked
+argument, with no other escape - then the owning destination adopts the result and the temp stops
+leaking. This is the "only direction that closes this soundly" named below, and it is the strictly
+stronger form of `ParameterMayReachReturn`, which already lives beside `ParameterRetainsArgument` in
+`cflat/LLVMBackend_OwnershipTemps.cpp`. An extension of an existing walk, not a new analysis.
+
+Caveat: cflat emits IR as it walks, so a callee defined BELOW its call site yields no proof and
+keeps leaking. That is the unknown-accepts polarity and is acceptable; a record-then-resolve pass at
+end of module would shrink it, as `ResolveTempUniqueFieldArgEscapes` already does for a sibling
+guard.
+
+**2. Both "deferred gap - escape-analysis precision" shapes are IN SCOPE** - the projected pointer
+handed to an unanalyzable callee (`printf("%s", tag.data())`) and the field assignment that runs the
+field's destructor through `this` (`tag = s.copy()`). Both need a stronger question than the current
+one: **"does not retain PAST my call"** rather than "does not escape the callee". This is materially
+larger than item 1 and CHANGES WHEN DESTRUCTORS RUN, so it needs its own differential corpus sweep.
+Do not weaken the existing answers to buy the precision back - build the stronger question.
+
+**3. Still deferred:** the `llvm.mem*` DESTINATION analog. Unreachable today (a whole-struct field
+assignment lowers to `store %Inner`, verified on emitted IR); becomes live only if struct assignment
+ever lowers to a memcpy.
+
+**Unchanged prohibition:** do NOT loosen `AsDirectNew` / `TopLevelMoveExpression` to look through
+wrappers - that reintroduces the `b = addr(new R());` double free. Ask whether the RHS's resulting
+VALUE carries ownership, not what the RHS looks like.
+
+Follows the 2026-08-10 governing principle - "CFlat is a simplified reading: if ownership can be
+computed, it should be implicit" - stated in full in
+[[unique-field-to-field-array-element-receiver]]. `self()` visibly returns `this` unchanged, so the
+ownership IS computable and should not require the user to restructure the expression.
+
 Filed 2026-07-24. Last narrowed 2026-07-26.
 
 ## Residual - owning call laundered through a self-returning method (LEAKS)

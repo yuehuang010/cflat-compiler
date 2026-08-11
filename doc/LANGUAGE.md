@@ -480,12 +480,7 @@ void compute(double[] a, double[] b, double[] outResult, int* outSteps)
 Each `T[]` parameter carries a **noalias** contract - distinct `T[]` values address distinct
 whole allocations, so the compiler stamps the `noalias` attribute on every `T[]` argument
 (each also gets its own alias scope). A scalar `T*` out-param does **not** carry noalias, which
-is correct: it points at a single cell, not a whole buffer. The emitted IR shows the
-distinction:
-
-```
-define internal void @_compute_..._(ptr noalias %a, ptr noalias %b, ptr noalias %outResult, ptr %outSteps)
-```
+is correct: it points at a single cell, not a whole buffer.
 
 This noalias guarantee is a general property of `T[]` (it lets the optimizer reason about
 disjointness without runtime overlap checks - see [HPC.md](HPC.md) for how the loop vectorizer

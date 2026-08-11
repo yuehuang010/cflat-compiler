@@ -1,5 +1,31 @@
 # An inferred owning sink is lost when a closure crosses a declared boundary
 
+## RULING 2026-08-10 (maintainer) - DIRECTION 2, make the sink SPELLABLE
+
+`Lambda<void(move T)>`. Ownership transfer becomes part of what a closure TYPE can state.
+
+Staged:
+
+1. allow `move` on a lambda-literal PARAMETER in the grammar and in **both**
+   `ParseDeclarationSpecifiers` copies - `(move UBox p) => {...}` is an ANTLR parse error today
+   (`ls_e1`), which is what blocks this direction;
+2. let a consuming literal satisfy a declared `move` parameter - the current rule needs BOTH sides
+   to state it and a literal has no way to;
+3. reject an un-spelled crossing, with a message naming the required spelling.
+
+**Why not direction 1 (extend adoption).** Adoption cannot reach the parameter and return doors at
+all: the fact would have to travel with the runtime VALUE and the closure fat struct does not carry
+it. This issue's headline repro IS the parameter door, so adoption closes at most half the file.
+
+**Blast radius.** Code that consumes a closure parameter must be respelled - but that code
+double-frees today (rc 134), so no working program breaks.
+
+**Note against the governing principle.** The 2026-08-10 walkthrough otherwise ruled "CFlat is a
+simplified reading: if ownership can be computed, it should be implicit" (stated in full in
+[[unique-field-to-field-array-element-receiver]]). This issue is the deliberate EXCEPTION: the fact
+cannot be computed at the crossing, because it cannot travel with the value. Where computation is
+impossible, spelling is the remedy.
+
 Filed 2026-08-09 by the work on `fix/lamsink`, which fixed the lambda-literal half of
 `p1/lambda-parameters-get-no-owning-sink-inference.md`. These cells are the residue: measured
 IDENTICAL on the base `a6f7373` and after that fix (rc 133 both), so not a regression of it.

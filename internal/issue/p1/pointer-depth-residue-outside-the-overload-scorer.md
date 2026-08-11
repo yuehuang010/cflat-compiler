@@ -1,5 +1,48 @@
 # `T**` still binds a `T*` parameter everywhere the overload scorer is not the judge
 
+## RULING 2026-08-10 (maintainer) - section 5: CARRY REAL DEPTH through substitution.
+
+Change `PeelTypeArgSuffix`'s single `bool& pointer` to an int DEPTH and let it reach
+`MangleTypeArg` intact. `Box<C**>` then mangles `Box__Cptrptr` and becomes its own instantiation,
+and the landed depth gate can claim proof through generics instead of declining with
+`PointerDepthUnknown`.
+
+**This is a wrong NAME being corrected, not a new naming scheme.** The section-5 text below frames
+it as "changes the monomorphization key ... a much larger change than this issue". That
+over-states it: the mangler already expresses this distinction everywhere else, and generic type
+arguments are the ONLY path that loses it. Measured on the current Release binary
+(`scratch/pd_mangle.cb`):
+
+| path | depth preserved? | evidence |
+|------|------------------|----------|
+| function parameter mangling | **yes** | `@_byPtr_i32_CPtr_` vs `@_byPtrPtr_i32_CPtrPtr_` |
+| closure encoded name | **yes** | `BuildEncodedClosureName` (`MainListener.h:460`) threads an int depth per param and re-appends the stars before mangling |
+| `MangleTypeArg` itself | **yes** | `MainListener.h:357` appends `"ptr"` once PER STAR, so `C**` renders `Cptrptr` |
+| `PeelAliasPointerStars` | **yes** | `MainListener.h:513` - same job, returns an int |
+| generic type argument | **NO** | `PeelTypeArgSuffix` (`MainListener.h:481`) pops every star into ONE bool |
+
+`Box<C*>` and `Box<C**>` in one program emit a single instantiation `@_Box__Cptr_Box__Cptr__` with
+one `@_put_void_Box__CptrPtrCPtr_`, i.e. the `T = C**` instantiation's method genuinely takes a
+`C*`. **The depth is destroyed before the mangler ever sees it** - by mangling time `C**` has
+already become `C*`. The naming half needs no design work; it already produces the right answer
+when handed the right string.
+
+**Work:** thread the int through substitution, then fix the downstream consumers of the collapsed
+flag (`Pointer` / `ElemPointer` on the substituted parameter, `MainListener_Declarations.cpp:669`)
+and the `typeParameterEntry` walkers. Splitting the instantiation is the POINT, not a side effect -
+but its blast radius is the part to scope before writing code.
+
+**Alternative considered and rejected:** refusing 2+ stars in a type ARGUMENT (matching section 6's
+ruling for written stars). It is a much smaller guard and costs only the four synthetic `pdg_*`
+legs - two-star type arguments have ZERO organic use, all four occurrences repo-wide being in
+`Test/test_generics.cb` where they were added to pin this capability. It was rejected because it
+permanently forbids a spelling the mangler can already name correctly, to avoid fixing one boolean.
+
+Sections 2, 3, 4 and 7 contain no design fork - they are engineering and can proceed independently.
+Section 3's interface door keeps its own precondition: verify on WINDOWS before gating there,
+because WinRT synthesizes interface parameters without setting `ElemPointer`, and a true `T**`
+recorded `ElemPointer=false` would be a Windows-only false rejection.
+
 Residue split out of `double-pointer-arg-binds-single-pointer-param.md` when the depth gate landed
 in `TypeAndValue::IsTypeMatch`. That gate closed the direct-call / method / constructor cells and
 the overload-collision cell. Every row below was MEASURED on the post-fix Release binary

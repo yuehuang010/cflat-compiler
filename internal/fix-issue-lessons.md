@@ -2537,3 +2537,34 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `JoinArmsStillKeepOwner` consumers are `BindingKeepsOwnershipOfBoxedObject`,
   `DescribeBoxedSourceOwner`, the unique-field store, the raw `delete`, and now the `move`; no
   other copy of the predicate exists.
+- **The 2026-08-10 p1 walkthrough (invalidated issue)**: `nullcond-guard-skips-move-argument-cleanup`
+  was ruled INVALID and deleted rather than fixed. Two durable facts came out of it. (1) A
+  conditionally executed `move` is handled by a NULL SENTINEL, not a compile-time-only mark and
+  not a boolean flag: `move` writes null into the source variable, and scope exit emits a runtime
+  null-guarded `move.cleanup` block (`%a.0 = phi ptr [ null, %ifTrue ], [ %0, %entry ]` then
+  `icmp eq ptr %a.0, null` branching to `move.cleanup` / `move.after`). That is why `if`,
+  `if/else`, ternary, `&&` short-circuit AND `?.` all get a conditional move right with no special
+  casing - all six spellings measure `frees=1` whether or not the move actually executed, on both
+  the null and live receiver, on multi-link chains, and on an interface receiver. The filed
+  premise "move marking is a compile-time fact and 'did the move run' is a runtime fact, they
+  cannot be reconciled" is FALSE; the compiler already reconciles them. Do not build null-path
+  cleanup for this family. (2) The bug was a MEASUREMENT ARTIFACT of a kind worth naming: the
+  repro printed its allocation counter while the moved source was STILL IN SCOPE, so it measured
+  WHEN the free happened, not WHETHER. The pre-fix binary freed eagerly inside the argument list
+  (the bug being fixed) and the post-fix binary defers to scope exit, which is after the print -
+  so a correct fix looked like a leak. Any ownership counter must be read AFTER the enclosing
+  scope closes, and a differential `frees=1` vs `frees=0` between two binaries is not evidence of
+  a leak until that is true of both.
+- **The 2026-08-10 array-view noalias ruling**: `T[]` array-view parameters ARE contractually
+  non-aliasing, and **`T*` is the sanctioned opt-out** for code that needs overlap. Ratified by the
+  maintainer; `p1/array-view-params-unconditionally-noalias.md` was closed by DOCUMENTING it, with
+  NO check added and the `noalias` attribute left in place. Do not re-file this as "UB handed to
+  LLVM" - the language now states the contract. Do not build a caller-side aliasing check either:
+  it can only reach `f(arr, arr)`, `f(v, v)`, a view directly bound from a named array, and
+  constant-bound slices, while a view in a struct field, returned from a call, arriving as the
+  caller's own parameter, built through a pointer, or pulled out of a container is all invisible -
+  i.e. it would catch typos, not aliasing. The obligation and the `T*` escape hatch are documented
+  in `doc/HPC.md` under the *noalias by spelling* rule, deliberately NOT in `doc/LANGUAGE.md`,
+  which states only what the type means; the maintainer's standing preference is that public docs
+  carry no implementation-level detail, which is also why the emitted-IR sample was dropped from
+  the `LANGUAGE.md` array-view section in the same change.

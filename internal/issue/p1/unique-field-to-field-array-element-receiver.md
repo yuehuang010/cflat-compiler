@@ -1,5 +1,75 @@
 # `unique` field-to-field copy between ARRAY ELEMENTS - NARROWED to runtime indices
 
+## RULING 2026-08-10 (maintainer) - UNIFORM IMPLICIT MOVE. Stated as a GOAL.
+
+A plain `=` between two `unique` fields **always moves** - source nulled, old destination released -
+with no proof, no index analysis, and no rejection. `move` stays accepted and means the same thing.
+
+> Stated by the maintainer as a goal: **"reality gets a vote when implemented."** If the
+> implementation hits a shape where uniform implicit move cannot hold, that comes back as a finding
+> to be ruled on - it must NOT be quietly reinterpreted or narrowed.
+
+**Why this dissolves the issue rather than trading it.** Measured on the current Release binary,
+`arr[i].slot = move arr[j].slot` is correct for BOTH branches of the ambiguity:
+
+```
+move self  (i==j) : freed=0 survivors=2     <- correct no-op
+move diff  (i!=j) : freed=1 survivors=1     <- old dest released, source nulled
+```
+
+Both outcomes are right, so nothing needs to be proven. The provability analysis exists only to
+resolve an ambiguity that does not matter - and it is precisely its unprovable fall-through to
+ACCEPT that produces the silent double free this file reports. Removing the analysis removes the
+bug. This also absorbs the `const`-index residue below WITHOUT needing `const` to be enforced first.
+
+**Consistency.** Implicit move is already established cflat idiom: `string b = a` moves, auto-move
+applies to all owning value types, and `btree.cb:44` notes a plain `unique V*` parameter is "already
+a synthesized move sink". Requiring an explicit `move` here would have made `unique` FIELDS the odd
+one out.
+
+### The governing principle behind this ruling
+
+> CFlat is a simplified reading: **if ownership can be computed, it should be implicit.**
+
+Stated by the maintainer on 2026-08-10, replacing an earlier C++/Rust-shaped instinct toward
+mandatory explicit `move`. It is why this issue, `alias-borrow-remaining-launder-sites` and
+`unique-assign-syntactic-owned-rhs-leaks` all land on "compute it" rather than "make the user spell
+it". It does NOT extend to a fact the compiler cannot compute:
+`inferred-owning-sink-is-lost-when-a-closure-crosses-a-declared-boundary` is the deliberate
+exception, because the sink cannot travel with the value and must therefore become spellable.
+
+Corollary already in force across this family and preserved by every one of those rulings:
+**unknown accepts.** A false rejection is a blocker; a missed diagnostic is today's behaviour.
+
+**Reference-language check** (both verified locally, not asserted from memory):
+
+| | plain `=` between owning fields | index provability analysis | explicit marker |
+|---|---|---|---|
+| C++ `std::unique_ptr` | always rejected (C2280, deleted copy assign) | none | `std::move` |
+| Rust `Box<T>` | always rejected (E0508) - even for literal `arr[0]`/`arr[1]` | none | `mem::replace` |
+| cflat today | rejected ONLY when provably different | yes | `move` |
+| cflat RULED | never rejected - implicit move | none | `move` still accepted |
+
+Neither reference language performs provability analysis; cflat is the outlier, and that analysis is
+what leaks the double free. The ruling diverges from both by making the operation MEAN the move
+rather than rejecting it - deliberate, per the governing principle. C++ self-move-assignment of
+`unique_ptr` is a safe no-op (verified: pointer preserved, no premature dtor), matching cflat's
+measured self-move, so the semantics a C++ programmer expects are preserved.
+
+**Blast radius - this REVERSES landed work.** `Test/errors/err_unique_array_element_field_to_field.cb`
+and `err_unique_field_to_field.cb` flip from `expect_error` to value legs. `fix/uniq-array-elem`,
+`fix/uniq-global` and `fix/iface-selfassign` exist ONLY to make the rejection precise, so
+`ProvablyDifferentSlots`, `ProvablyDifferentObjects` and `SoleStoreIntoSlot` become deletable.
+[[unique-field-to-field-interface-receiver-residues]] closes with this ruling - all five of its
+shapes stop needing a proof. Everything below this ruling is retained as the record of the design
+this supersedes; do not read it as current policy.
+
+**Known implementation risk.** The emitting path (`sameFieldStore`) is gated on
+`AddressRootIsStackOrGlobal` because a receiver reached through a raw-`malloc`'d pointer had garbage
+contents destructed and SIGSEGV'd (exit 139). An implicit move must release the old destination,
+which reads that same slot, so a POINTER or array-VIEW receiver carries the same hazard. It is
+pre-existing rather than new, but it must be handled deliberately rather than inherited by accident.
+
 Filed 2026-08-01 by the round-1 review of `fix/uniq-family`. **NARROWED 2026-08-02** on
 `fix/uniq-array-elem`: every shape whose two element addresses are provably different FROM THE
 EMITTED ADDRESSES is now rejected. What remains is every shape where the index is not a
