@@ -2921,9 +2921,11 @@ private:
     /*
      * Escape analysis: "can parameter `argIndex` of `fn` RETAIN its argument past the call?".
      * Conservative by construction - true (retains, caller must not free) for anything not proven
-     * safe: an unseen body (extern / imported / varargs), an indirect or virtual-dispatch callee, a
+     * safe: an unseen body (extern / imported), an indirect or virtual-dispatch callee, a
      * store to a global or a field, a `return`, a ptrtoint, a hand-off into another retaining or
      * unanalyzable parameter slot, or a `delete` (which routes through the extern deallocator).
+     * A variadic argument past the declared parameter list is a C boundary and answers false by
+     * axiom; declared parameters of a variadic function are still walked normally.
      * A recursion cycle answers "retains", so mutual recursion terminates conservatively.
      * "Retain" also covers the pointee's CONTENTS: freeing the argument runs its destructor, so a
      * pointer the callee reads out of it (or parks into it) that outlives the call counts too.

@@ -2643,3 +2643,11 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   (6) Any per-`llvm::Function*` ledger must be dropped in `ForgetFunctionEscapeMemo`: the `auto`
   return retype erases the placeholder Function and LLVM recycles the address, so a surviving entry
   resolves a stranger's calls against this proof - and this proof REJECTS.
+- **The 2026-08-11 va_arg C-boundary ruling**: borrowed pointers of every spelling remain legal in
+  variadic slots, because a C vararg read is not retention. An owning temporary, move-returned
+  value, explicit move, raw `new`, or owning struct rvalue in a variadic slot is a hard error that
+  tells the user to bind it to an owner first. An owning struct bound to a local first remains the
+  existing legal by-value case; plain non-owning structs remain legal; string values keep the
+  existing representation-based string diagnostic. The guard must ask the unbound-rvalue question
+  and include by-value owning returns; the pointer-only ledger is insufficient. No new serialized
+  field is needed: the existing value-identity ownership ledger is sufficient.

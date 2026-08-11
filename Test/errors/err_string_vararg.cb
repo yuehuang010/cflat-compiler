@@ -5,6 +5,35 @@
 // so the variadic slot must reject it too; the user writes s.data().
 import "string.cb";
 
+struct VaR
+{
+    int value = 1;
+};
+
+move VaR* makeVaR() { return new VaR(); }
+
+expect_error("bind the value to an owner first") {
+    void rejectVaReturn() { printf("%p\n", makeVaR()); }
+}
+
+expect_error("bind the value to an owner first") {
+    void rejectVaExplicitMove()
+    {
+        VaR* local = new VaR();
+        printf("%p\n", move local);
+    }
+}
+
+expect_error("bind the value to an owner first") {
+    void rejectVaNew() { printf("%p\n", new VaR()); }
+}
+
+move string makeVaText() { return "owned"; }
+
+expect_error("cannot pass 'string' to the variadic '...'") {
+    void rejectVaStringRValue() { printf("%s\n", makeVaText()); }
+}
+
 extern int main()
 {
     // An interpolated literal IS a 'string'; printf's fixed 'char* fmt' is outside the variadic
@@ -17,5 +46,6 @@ extern int main()
     string s = "hello";
     expect_error("cannot pass 'string' to the variadic '...'");
     printf("%s %d\n", s, 42);
+
     return 0;
 }

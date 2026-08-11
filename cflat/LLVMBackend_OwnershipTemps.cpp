@@ -1292,7 +1292,9 @@ void LLVMBackend::PropagateFatInterfaceJoin(llvm::Value* trueValue, llvm::Value*
 
 bool LLVMBackend::ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth)
 {
-        if (fn == nullptr || fn->isVarArg()) return true;
+        // A va_arg slot is a C boundary: it cannot retain caller ownership and has no body to walk.
+        if (fn == nullptr) return true;
+        if (fn->isVarArg() && argIndex >= fn->arg_size()) return false;
         if (argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return true;
         auto key = std::make_pair(fn, argIndex);
         if (auto it = paramRetainsMemo_.find(key); it != paramRetainsMemo_.end()) return it->second;
@@ -1325,7 +1327,9 @@ bool LLVMBackend::FunctionBodyIsReadable(const llvm::Function* fn) const
 bool LLVMBackend::ParameterRetainsArgumentPastCall(const llvm::Function* fn, unsigned argIndex,
                                                    int depth)
 {
-        if (fn == nullptr || fn->isVarArg()) return true;
+        // Only the variadic portion gets the axiom; declared parameters use the ordinary walk.
+        if (fn == nullptr) return true;
+        if (fn->isVarArg() && argIndex >= fn->arg_size()) return false;
         if (argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return true;
         auto key = std::make_pair(fn, argIndex);
         if (auto it = paramRetainsPastCallMemo_.find(key); it != paramRetainsPastCallMemo_.end())

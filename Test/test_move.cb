@@ -10297,6 +10297,57 @@ int testAssignBorrowTaint()
     return passed;
 }
 
+void vaReadFirst(Resource* p, ...)
+{
+    int ignored = p->id;
+}
+
+void vaFreeFirst(move Resource* p, ...)
+{
+    delete p;
+}
+
+struct VaHolder
+{
+    string tag = default;
+    ~VaHolder() { dtorCount = dtorCount + 1; }
+    void show() { printf("[%s]\n", tag.data()); }
+};
+
+move VaHolder makeVaHolder()
+{
+    VaHolder h = default;
+    h.tag = "va-holder";
+    return h;
+}
+
+move string makeVaText()
+{
+    return "va-temp";
+}
+
+int testVariadicOwnershipBoundary()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        makeVaHolder()->show();
+    }
+    passed += Test("va_receiver_temp_releases", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        VaHolder bound = makeVaHolder();
+        printf("va-bound %p\n", bound);
+    }
+    passed += Test("va_bound_owner_by_value_stays_legal", dtorCount, 1);
+
+    dtorCount = 0;
+    vaReadFirst(createResource(31), 0);
+    passed += Test("va_declared_read_releases_temp", dtorCount, 1);
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -10627,6 +10678,9 @@ extern int main()
 
     passed += testAssignBorrowTaint();
     total += 9;
+
+    passed += testVariadicOwnershipBoundary();
+    total += 3;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

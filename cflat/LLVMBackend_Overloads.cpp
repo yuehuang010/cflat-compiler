@@ -969,6 +969,30 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // pushed as storage/GEP addresses instead of loaded values).
             bool inVariadicRange = candidate.Variadic && argIndex >= candidate.Parameters.size();
 
+            // An owning value rvalue has no named owner that can survive the C vararg boundary.
+            // The pointer ledger covers owning pointer returns/new; by-value owning returns use
+            // the same value identity ledger plus the owning-struct type test. Keep string values
+            // on the existing representation-based diagnostic below so its message is unchanged.
+            bool argIsUnbound = arg.Storage == nullptr
+                && FindVariableStorage(arg.CallerName).Storage == nullptr;
+            bool argIsStringValue = arg.Primary != nullptr
+                && arg.Primary->getType() == llvm::StructType::getTypeByName(*context, "string");
+            bool argIsOwningValueRValue = argIsUnbound && arg.FieldName.empty()
+                && !arg.TypeAndValue.Pointer
+                && (arg.IsOwningStruct || IsOwningValueStructValue(arg.Primary)
+                    || (arg.IsOwningString && !argIsStringValue
+                        && arg.TypeAndValue.TypeName != "string"));
+
+            if (inVariadicRange
+                && (arg.IsExplicitMove || IsOwningPtrTempValue(arg.Primary)
+                    || argIsOwningValueRValue))
+            {
+                LogError(std::format(
+                    "cannot pass an owning value to the variadic '...' slot of '{}'; bind the "
+                    "value to an owner first", functionName));
+                return nullptr;
+            }
+
             // Array-view parameter gate: a raw `T*` must not bind to a `T[]` parameter - that
             // would forge the noalias contract the view promises (a whole, distinct allocation).
             // Placed before the binding branches because an array-view param has Pointer=true and
