@@ -182,6 +182,48 @@ list(APPEND CFLAT_SOURCES ${WINMD_SOURCES})
 
 add_executable(cflat ${CFLAT_SOURCES} ${ANTLR_GEN_SOURCES})
 
+# The launcher is intentionally a separate, small C++ target. It does not link
+# LLVM or the compiler and can therefore remain runnable while compiler slots
+# are replaced. The prototype uses SHA-256 metadata as an explicit stand-in for
+# the future publisher signature verifier.
+if(WIN32)
+  set(CFLAT_LAUNCHER_PLATFORM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/PlatformWindows.cpp)
+else()
+  set(CFLAT_LAUNCHER_PLATFORM_SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/launcher/PlatformPosix.cpp)
+endif()
+
+add_executable(cflat-launcher
+  ${CMAKE_CURRENT_SOURCE_DIR}/launcher/Launcher.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/launcher/Sha256.cpp
+  ${CFLAT_LAUNCHER_PLATFORM_SOURCE})
+target_link_libraries(cflat-launcher PRIVATE nlohmann_json::nlohmann_json)
+set_target_properties(cflat-launcher PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/x64/$<CONFIG>)
+
+include(CTest)
+if(BUILD_TESTING)
+  add_executable(cflat-launcher-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/LauncherTest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/Sha256.cpp
+    ${CFLAT_LAUNCHER_PLATFORM_SOURCE})
+  target_link_libraries(cflat-launcher-test PRIVATE nlohmann_json::nlohmann_json)
+  set_target_properties(cflat-launcher-test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/x64/$<CONFIG>)
+
+  add_executable(cflat-launcher-test-compiler
+    ${CMAKE_CURRENT_SOURCE_DIR}/launcher/LauncherTestCompiler.cpp)
+  set_target_properties(cflat-launcher-test-compiler PROPERTIES
+    OUTPUT_NAME "launcher-test-compiler"
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/x64/$<CONFIG>)
+
+  add_test(NAME cflat-launcher-integration
+    COMMAND cflat-launcher-test
+      $<TARGET_FILE:cflat-launcher>
+      $<TARGET_FILE:cflat-launcher-test-compiler>)
+  set_tests_properties(cflat-launcher-integration
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
+
 # The generated parser includes <antlr4-runtime.h>. vcpkg's antlr4 target
 # propagates its include dir; Debian's does not - locate it explicitly so both
 # work. (Header lives in <prefix>/include/antlr4-runtime.)
