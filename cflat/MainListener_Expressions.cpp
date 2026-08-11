@@ -1667,7 +1667,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && ((llvm::isa<llvm::Constant>(right)
                         && llvm::cast<llvm::Constant>(right)->isNullValue())
                     || IsAllNullPhi(right));
-            if (operatorText == "=" && destUniqueIface
+            // The implicit-move ruling reaches a `unique` INTERFACE-valued FIELD too, so D5 must
+            // not pre-empt it. A LOCAL / GLOBAL destination keeps D5 and its own drop-old below.
+            bool uniqueIfaceFieldImplicitMove = operatorText == "=" && destUniqueIface
+                && !llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                && !llvm::isa_and_nonnull<llvm::GlobalVariable>(destination)
+                && IsUniqueFieldRead(rightNV);
+            if (operatorText == "=" && destUniqueIface && !uniqueIfaceFieldImplicitMove
                 && !srcIsOwnedForUniqueIface && !srcIsNullForUniqueIface)
             {
                 LogErrorContext(ctx, std::format(
@@ -1839,6 +1845,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // destruct must use the -Initialized form, which also requires both slots to root in
             // stack/global storage. A slot reached through a heap pointer may hold garbage, and
             // deep-copying or destructing that is a SIGSEGV, so those paths keep the old no-op.
+            // Scope after the 2026-08-10 implicit-move ruling: this proof serves the OWNING-VALUE
+            // field paths only. `unique` fields no longer ask it - they always move.
             bool provablyDifferentSlots = ProvablyDifferentSlots(destination, rightNV.Storage);
             bool provablyDifferentInitializedSlots = provablyDifferentSlots
                 && AddressRootIsStackOrGlobal(destination)
@@ -1853,8 +1861,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && namedVar.CallerName == rightNV.CallerName
                 && !provablyDifferentInitializedSlots;
 
-            // Self-assign of a `unique` field is one owner, not two, so neither reject below may
-            // fire on it. selfFieldAssign misses the bare `item = item` inside a method: that
+            // Self-assign of a `unique` field is one owner, not two, so the borrow/copy rejects
+            // below must not fire on it. selfFieldAssign misses the bare `item = item` in a method:
             // NamedVariable comes from GetMemberVariable, which deliberately leaves FieldName
             // empty. Both sides then name a field of the same `this`, so the declared field name
             // identifies the slot (each access re-loads `this`, so the GEPs never compare equal).
@@ -2001,45 +2009,43 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(right);
             }
 
-            // Direct `unique`-field-to-`unique`-field copy (`c.p = a.p`) - two owners of one
-            // pointee. Checked after Trap A so a source reached through a borrowed parameter keeps
-            // the more precise borrow message. `move a.p` clears Storage, so it is not a field read
-            // and stays legal (it nulls the source field); self-assign is excluded above.
             // A fat-interface slot fails both pointer-shaped tests, so it gets its own
             // destination leg (IsUniqueTempFieldRead / IsOwningUniqueInterfaceField).
             bool destOwnsUniquePointee = right && right->getType()->isPointerTy()
                 && IsOwningUniquePointerField(namedVar.TypeAndValue);
             bool destOwnsUniqueInterface = right && right->getType()->isStructTy()
                 && IsOwningUniqueInterfaceField(namedVar.TypeAndValue);
+
+            // A TEMPORARY's `unique` field is not an addressable source (no `move` spelling
+            // either), so the implicit move below has no slot to null. Kept as a reject.
             if (operatorText == "=" && destIsStructField
                 && (destOwnsUniquePointee || destOwnsUniqueInterface)
-                && (IsUniqueFieldRead(rightNV) || IsUniqueTempFieldRead(rightNV))
-                && !selfUniqueFieldAssign)
+                && IsUniqueTempFieldRead(rightNV))
             {
-                std::string destDesc = std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar));
-                // Temp source first: it is the more specific shape, and only its message names a
-                // remedy that exists (`move <temp>.<field>` is rejected as unaddressable).
-                std::string srcText = assignCtx != nullptr ? assignCtx->getText() : std::string();
-                if (IsUniqueTempFieldRead(rightNV))
-                    RejectUniqueTempFieldToField(rightNV, destDesc, ctx);
-                else if (destOwnsUniqueInterface)
-                    RejectUniqueInterfaceFieldToField(rightNV, destDesc, ctx);
-                else
-                    RejectUniqueFieldToUniqueField(rightNV, destDesc, ctx, srcText);
+                RejectUniqueTempFieldToField(
+                    rightNV, std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar)), ctx);
                 return finishStore(right);
             }
 
-            // Same store between two INTERFACE receivers: neither side carries a caller name, so
-            // the reject above reads them as a self-assign. Record it and settle at end of body.
+            /*
+             * RULED 2026-08-10: a plain `=` between two `unique` fields is a UNIFORM IMPLICIT MOVE
+             * (`c.p = a.p` nulls `a.p` and releases c.p's old pointee), with no proof, no index
+             * analysis and no rejection - `move a.p` spells the same thing. The source is nulled
+             * HERE, ahead of the drop-old further down, so a self-assign of any spelling
+             * (`x.p = x.p`, `arr[i].p = arr[j].p` with i==j) reads an already-null destination and
+             * frees nothing, exactly as the `move` spelling already did.
+             */
             if (operatorText == "=" && destIsStructField
-                && namedVar.IsInterfaceField && rightNV.IsInterfaceField
                 && (destOwnsUniquePointee || destOwnsUniqueInterface)
-                && (IsUniqueFieldRead(rightNV) || IsUniqueTempFieldRead(rightNV))
-                && !rightNV.TypeAndValue.IsMove
-                && selfUniqueFieldAssign)
-                RecordInterfaceFieldToFieldStore(
-                    namedVar, rightNV, destination, destOwnsUniqueInterface,
-                    assignCtx != nullptr ? assignCtx->getText() : std::string(), ctx);
+                && IsUniqueFieldRead(rightNV))
+            {
+                // Nulling a borrowed by-value parameter's field nulls only the callee's copy, so
+                // the caller frees the pointee twice. Same reject the `move` spelling raises.
+                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                EmitImplicitUniqueFieldMove(rightNV, right, destination,
+                    destOwnsUniqueInterface ? namedVar.TypeAndValue.TypeName : std::string());
+            }
 
             // A plain (non-move) by-value `string` PARAMETER stored into a struct field: deep-copy it.
             // The parameter is a by-value copy of the caller's argument, but the CALLER still owns and
@@ -2409,10 +2415,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // synthesized destructor already trusts it: every construction path (stack local,
             // `new T()`, `new T[n]`, user-ctor entry) runs a default constructor that
             // zero-initializes the fields.
+            // IsUniqueTypeArg rides along: a `Box<unique Node*>::t` field owns and is released at
+            // teardown exactly as a written `unique` is, so its reassignment must release too.
             bool consumedUniqueFieldSource = false;
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && destIsStructField
-                && namedVar.TypeAndValue.IsUnique)
+                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg))
             {
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, destination,
@@ -6172,16 +6180,11 @@ bool MainListener::EmitOneFieldInit(
         // `fieldType.Pointer` stands in for the `=` path's isPointerTy() test on the stored value:
         // IsOwningUniquePointerField answers TRUE for any written `unique`, fat interface included.
         bool braceDestOwnsPointee = IsOwningUniquePointerField(fieldType) && fieldType.Pointer;
-        if (braceSrcIsUniqueFieldRead && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType)))
-        {
-            std::string braceDesc = std::format("unique field '{}.{}'", typeName, fieldName);
-            if (braceDestOwnsPointee && IsUniqueTempFieldRead(rightNV))
-                RejectUniqueTempFieldToField(rightNV, braceDesc, errCtx);
-            else if (braceDestOwnsPointee)
-                RejectUniqueFieldToUniqueField(rightNV, braceDesc, errCtx);
-            else
-                RejectUniqueInterfaceFieldToField(rightNV, braceDesc, errCtx);
-        }
+        // A TEMPORARY's `unique` field has no addressable slot to null, so it stays a reject here
+        // too; a real field source takes the implicit move applied just after the load below.
+        if (braceDestOwnsPointee && IsUniqueTempFieldRead(rightNV))
+            RejectUniqueTempFieldToField(
+                rightNV, std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
         // Belt-and-braces: the source gates above all throw, so this leg runs only for the
         // cast/join spellings that reach an owning destination with every declared fact stripped.
         bool braceSrcGateFired = braceSrcIsUniqueFieldRead
@@ -6196,6 +6199,17 @@ bool MainListener::EmitOneFieldInit(
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        // The brace-init leg of the 2026-08-10 implicit-move ruling, kept in lockstep with the `=`
+        // path. The destination slot is freshly constructed here, so only the source is nulled.
+        if (braceSrcIsUniqueFieldRead && !IsUniqueTempFieldRead(rightNV)
+            && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType)))
+        {
+            // Same borrowed-by-value-parameter reject the `=` path applies: nulling the callee's
+            // copy leaves the caller's struct still freeing the pointee (double free).
+            RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, errCtx);
+            EmitImplicitUniqueFieldMove(rightNV, val, nullptr, std::string());
+        }
 
         // Same provable stack-address reject the `=` path applies, with the same scalar-pointer
         // shape gate; `&local` carries no borrow provenance for the legs above to see.

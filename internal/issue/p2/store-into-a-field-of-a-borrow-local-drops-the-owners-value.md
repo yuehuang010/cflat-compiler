@@ -54,3 +54,33 @@ frozen as `refcap_rebind_*` in `Test/test_function_ptr.cb`).
 
 Silent double free / use-after-free (compile 0, garbage read, abort at teardown, no diagnostic).
 Pre-existing on the merge base, so it is residue rather than a regression.
+
+## Second cell, same question: a BY-VALUE STRUCT PARAMETER as the destination root (2026-08-10)
+
+Measured on `fix/uniq-implicit-move` and IDENTICALLY on the merge base `c9405da`, so it predates
+that change. Probe: `scratch/rev_destbyval_new.cb`.
+
+```cflat
+struct H { unique Node* slot = nullptr; };
+void f(H h) { h.slot = new Node(); }   // drop-old frees the CALLER's pointee
+extern int main()
+{
+    H a = default; a.slot = new Node(); a.slot->v = 1;
+    f(a);                               // a.slot now dangles
+    ...
+}
+```
+```
+freed=1 anull=0     compile rc 0, run rc 133 - on BOTH binaries
+```
+
+The callee's `h` is a shallow copy of the caller's struct, so the `unique`-field drop-old at the
+store frees a pointee the caller still owns and still frees. Exactly this file's question - "is the
+destination field's PATH ROOT a borrow" - with a by-value parameter as the root instead of an
+`alias` local; `RootIsBorrowedByValueParam` is already recorded at the field-access site and is the
+fact to gate on.
+
+Note the asymmetry now pinned in the opposite direction: the SOURCE side of the same root IS
+guarded (`RejectConsumeOfBorrowedByValueParamField`, extended to the implicit-move store path on
+`fix/uniq-implicit-move`, legs in `Test/errors/err_unique_borrow_into_field.cb`). The DESTINATION
+side is this cell and remains open.

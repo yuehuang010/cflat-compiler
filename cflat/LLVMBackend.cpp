@@ -2596,8 +2596,6 @@ void LLVMBackend::ResetForReanalysis()
     // Same hazard: a pending dispatch record keys off a slot and an anchor instruction in the
     // module being discarded, so it must not survive into the next file's analysis.
     pendingNullIfaceDispatch_.clear();
-    // Same hazard for the interface field-to-field records, which key off a slot alloca.
-    pendingUniqueIfaceFieldStore_.clear();
     // Same hazard for the global-receiver ledger, which normally survives to module end.
     pendingNullIfaceGlobal_.clear();
     provenNoReturn_.clear();

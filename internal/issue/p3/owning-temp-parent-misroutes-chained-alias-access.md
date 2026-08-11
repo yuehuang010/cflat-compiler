@@ -70,5 +70,5 @@ alongside `FromOwningTempField`. Verify at depth 1, 2 and 3, and with both an ow
 Wants a regression leg pinning the CONTAINER wording on the depth-2 chained shape; the existing
 `tempElementFieldToField` leg only covers depth 1.
 
-Related: [[unique-field-to-field-array-element-receiver]],
+Related: the digest at the bottom of [[fix-issue-lessons]] (the 2026-08-10 uniform-implicit-move ruling),
 [[temp-unique-field-into-borrow-slot-use-after-free]], [[interface-issue-queue]]

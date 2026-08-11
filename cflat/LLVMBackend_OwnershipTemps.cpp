@@ -494,62 +494,10 @@ void LLVMBackend::RecordPendingNullIfaceDispatch(const NullIfaceDispatchSite& si
               site.Line, site.Col, gpath });
     }
 
-void LLVMBackend::RecordPendingUniqueIfaceFieldStore(const PendingUniqueIfaceFieldStore& rec)
-{
-        llvm::BasicBlock* bb = builder != nullptr ? builder->GetInsertBlock() : nullptr;
-        if (bb == nullptr || bb->getParent() == nullptr) return;
-        pendingUniqueIfaceFieldStore_[bb->getParent()].push_back(rec);
-    }
-
-llvm::StoreInst* LLVMBackend::SoleStoreIntoSlot(llvm::AllocaInst* slot)
-{
-        if (slot == nullptr) return nullptr;
-        llvm::StoreInst* only = nullptr;
-        for (llvm::User* u : slot->users())
-        {
-            if (llvm::isa<llvm::LoadInst>(u)) continue;
-            if (auto* call = llvm::dyn_cast<llvm::CallBase>(u))
-            {
-                const llvm::Function* f = call->getCalledFunction();
-                if (f != nullptr && (f->getName().starts_with("llvm.dbg.")
-                                     || f->getName().starts_with("llvm.lifetime."))) continue;
-                return nullptr;
-            }
-            auto* st = llvm::dyn_cast<llvm::StoreInst>(u);
-            if (st == nullptr || st->getPointerOperand() != slot) return nullptr;
-            if (auto* c = llvm::dyn_cast<llvm::Constant>(st->getValueOperand());
-                c != nullptr && c->isNullValue()) continue;
-            if (only != nullptr) return nullptr;
-            only = st;
-        }
-        return only;
-    }
-
-void LLVMBackend::RunUniqueIfaceFieldStoreCheck(llvm::Function* F)
-{
-        if (!F) return;
-        auto it = pendingUniqueIfaceFieldStore_.find(F);
-        if (it == pendingUniqueIfaceFieldStore_.end()) return;
-        std::vector<PendingUniqueIfaceFieldStore> pending = std::move(it->second);
-        pendingUniqueIfaceFieldStore_.erase(it);
-        for (const auto& rec : pending)
-        {
-            // Stale-record guard, same shape as RunNullIfaceDispatchCheck: a record whose slot
-            // now lives in another function (recycled address) must not be walked.
-            if (rec.DestSlot != nullptr && rec.DestSlot->getFunction() != F) continue;
-            if (rec.SrcSlot != nullptr && rec.SrcSlot->getFunction() != F) continue;
-            if (rec.DestSlot != nullptr && SoleStoreIntoSlot(rec.DestSlot) != rec.DestBoxStore) continue;
-            if (rec.SrcSlot != nullptr && SoleStoreIntoSlot(rec.SrcSlot) != rec.SrcBoxStore) continue;
-            SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
-            LogError(rec.Message);
-        }
-    }
-
 void LLVMBackend::DiscardPendingNullIfaceDispatch(llvm::Function* F)
 {
         if (!F) return;
         pendingNullIfaceDispatch_.erase(F);
-        pendingUniqueIfaceFieldStore_.erase(F);
         // The global ledger survives to module end, so an aborted body's records must be
         // removed here or the control-dependence test would run on a partial CFG.
         std::erase_if(pendingNullIfaceGlobal_, [F](const PendingNullIfaceGlobalAccess& r)

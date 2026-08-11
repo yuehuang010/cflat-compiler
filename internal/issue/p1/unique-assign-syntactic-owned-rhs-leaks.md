@@ -30,7 +30,7 @@ VALUE carries ownership, not what the RHS looks like.
 
 Follows the 2026-08-10 governing principle - "CFlat is a simplified reading: if ownership can be
 computed, it should be implicit" - stated in full in
-[[unique-field-to-field-array-element-receiver]]. `self()` visibly returns `this` unchanged, so the
+the digest at the bottom of [[fix-issue-lessons]] (the 2026-08-10 uniform-implicit-move ruling). `self()` visibly returns `this` unchanged, so the
 ownership IS computable and should not require the user to restructure the expression.
 
 Filed 2026-07-24. Last narrowed 2026-07-26.

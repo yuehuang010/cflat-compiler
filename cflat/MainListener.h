@@ -2885,40 +2885,6 @@ public:
      */
     bool ProvablyDifferentSlots(llvm::Value* a, llvm::Value* b);
 
-    /*
-     * The OBJECT an interface-FIELD lvalue reads through, resolved back to the value that was
-     * boxed. The address is a GEP chain off `extractvalue fat, 1`, so the fat value is
-     * recoverable; a fat value loaded out of an interface LOCAL is traced to the single box
-     * stored into that slot. Two DISTINCT boxes of one object share a data pointer, which is what
-     * makes this more than a Value equality test on the field address. Returns null - "cannot
-     * tell" - for a parameter, a call result, a rebound slot, or any other shape.
-     */
-    llvm::Value* ResolveBoxedObjectOfInterfaceField(llvm::Value* addr, llvm::AllocaInst*& slot,
-                                                    llvm::StoreInst*& boxStore);
-
-    /*
-     * The WRITTEN spelling of an INDEXED field-read RHS ("arr[1].slot", "p->arr[0].slot"), for a
-     * diagnostic that would otherwise name the slot from CallerName - which is the CONTAINER for
-     * an array element, so "<caller>.<field>" points at element 0 and its `move` remedy either
-     * transfers the wrong slot or does not compile at all. Keyed on the SOURCE TEXT rather than
-     * the GEP shape because a zero index folds its element GEP away, and that is exactly the
-     * element whose name-derived spelling is wrong. Returns empty for anything that is not a
-     * plain indexed lvalue path, leaving the name-derived spelling in place.
-     */
-    static std::string IndexedFieldPathText(const std::string& text);
-
-    /*
-     * The one spelling of a `unique` field SOURCE that is known to name the right slot, or empty
-     * when none is. The written text wins for an indexed path; otherwise the name-derived
-     * "<caller>.<field>" is trusted only when it IS what the user wrote. Empty means the caller
-     * must not put any expression in a `move` remedy - naming the wrong element silently
-     * transfers the wrong pointee, which is worse than the missing diagnostic this all replaced.
-     */
-    std::string ExactUniqueFieldAccess(const LLVMBackend::NamedVariable& nv,
-                                       const std::string& srcText);
-
-    // Spell the source expression a `unique` field was read through, as the user wrote it
-    // ("b.p", or bare "p" for a self-field access), so a diagnostic can suggest `move <that>`.
     std::string DescribeUniqueFieldAccess(const LLVMBackend::NamedVariable& nv);
 
     /*
@@ -3039,21 +3005,6 @@ public:
                                      bool isInit, antlr4::ParserRuleContext* ctx);
 
     /*
-     * A direct `unique`-field-to-`unique`-field copy (`c.p = a.p`): both synthesized destructors
-     * free the one pointee. The Trap A reject above cannot see this - a field read off a plain
-     * local is not a borrow - and the owning-value field-to-field rule cannot either, since a raw
-     * pointer is not an owning value type. Shared by the `=` and brace-init store paths.
-     */
-    std::string FormatUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
-                                               const std::string& fieldDesc,
-                                               const std::string& srcText);
-
-    void RejectUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
-                                        const std::string& fieldDesc,
-                                        antlr4::ParserRuleContext* ctx,
-                                        const std::string& srcText = {});
-
-    /*
      * The TEMPORARY-source form of the reject above. Neither spelling may suggest `move <access>`:
      * the access names a temporary and `move` off one is rejected outright ("requires an
      * addressable source"). The two halves of IsUniqueTempFieldRead have DIFFERENT owners and so
@@ -3075,31 +3026,13 @@ public:
                                       antlr4::ParserRuleContext* ctx);
 
     /*
-     * The fat-interface form of the reject above. Deliberately does NOT suggest `move`: the
-     * written `unique IShape` field spelling refuses a `move` source too (the D5 leg above only
-     * admits `new` / a move-returning call / nullptr), so naming `move` here would send the user
-     * at a spelling that does not work. `new` is the transfer that does. The wording holds for a
-     * `move` source as well, because a `move` out of an interface FIELD does not null it.
+     * RULED 2026-08-10 (uniform implicit move): a plain `=` between two `unique` fields MOVES.
+     * Null the source field so the destination is the sole owner. Emitted before the drop-old that
+     * releases the destination's previous pointee - that order is what makes a self-assign, which
+     * no compile-time proof can rule out for a runtime index, free nothing.
      */
-    std::string FormatUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                                  const std::string& fieldDesc);
-
-    void RejectUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                           const std::string& fieldDesc,
-                                           antlr4::ParserRuleContext* ctx);
-
-    /*
-     * RECORD an interface field-to-field `unique` store whose two receivers are PROVABLY different
-     * objects - two distinct boxed roots. Recording cannot reject, so a shape this cannot resolve
-     * degrades to today's missing diagnostic, never to a false rejection; the verdict is settled at
-     * end of body (RunUniqueIfaceFieldStoreCheck), where a receiver rebound later is visible.
-     */
-    void RecordInterfaceFieldToFieldStore(const LLVMBackend::NamedVariable& namedVar,
-                                          const LLVMBackend::NamedVariable& rightNV,
-                                          llvm::Value* destination,
-                                          bool destOwnsUniqueInterface,
-                                          const std::string& srcText,
-                                          antlr4::ParserRuleContext* ctx);
+    void EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& rightNV, llvm::Value* right,
+                                     llvm::Value* destination, const std::string& destIfaceName);
 
     /*
      * Reject an allocation-alignment disagreement storing into a struct field. The alignment of an

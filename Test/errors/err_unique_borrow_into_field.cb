@@ -23,37 +23,27 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
     void storeGeneric(Node* n) { Box<unique Node*> b = default; b.t = n; }
 }
 
-// The MIXED field-to-field shape: a written `unique` source field into a GENERIC unique
-// destination field. Both synthesized destructors free the one pointee (silent abort, exit
-// 134). The source gate already passed here - only the destination was blind.
-expect_error("cannot store unique field 'a.slot' into unique field 'Box") {
-    void mixedFieldToField() { Holder a = default; Box<unique Node*> c = default; c.t = a.slot; }
+// The three field-to-field legs that used to live here (mixed `unique`-into-generic, fully
+// generic, and the brace-init form of it) were REMOVED by the 2026-08-10 uniform-implicit-move
+// ruling: a plain `=` between two `unique` fields now MOVES instead of being rejected. They are
+// value-asserted in Test/test_move.cb::testUniqueFieldImplicitMove (uim_generic_*, uim_brace_*).
+
+/*
+ * The ONE field-to-field source shape the uniform implicit move must still refuse: a borrowed
+ * BY-VALUE struct parameter. Nulling `h.slot` nulls only the callee's copy, so the caller's
+ * struct frees the pointee a second time (silent abort, exit 133). The `move h.slot` spelling
+ * already rejects this, so accepting the plain `=` would break the ruling's own invariant that
+ * the two spellings mean the same thing. Both field-store paths - `=` and brace-init - are
+ * pinned, because each reaches the implicit move independently.
+ */
+Holder gByValDest = default;
+
+expect_error("cannot consume field 'Holder.slot' out of borrowed by-value parameter 'h'") {
+    void byValParamFieldAssign(Holder h) { gByValDest.slot = h.slot; }
 }
 
-// The FULLY generic field-to-field shape: both sides IsUniqueTypeArg, no written `unique`
-// anywhere. IsUniqueFieldRead was keyed on IsUnique alone, so even after the destination
-// widening above this leg still short-circuited on the SOURCE and reached the double-free
-// with no diagnostic at all (silent abort, exit 134). Fixed by widening IsUniqueFieldRead
-// to the same owning-slot predicate (IsOwningUniquePointerField) already used for the
-// destination.
-expect_error("cannot store unique field 'a.t' into unique field 'Box") {
-    void fullyGenericFieldToField()
-    {
-        Box<unique Node*> a = default;
-        Box<unique Node*> c = default;
-        c.t = a.t;
-    }
-}
-
-// Same fully-generic shape through the SECOND field-store path: brace-init (`EmitOneFieldInit`)
-// applies the same widened source gate independently of the `=` path above. Uncovered before
-// this leg: reverting the widening only in EmitOneFieldInit still double-frees here silently.
-expect_error("cannot store unique field 'a.t' into unique field 'Box") {
-    void fullyGenericBraceInit()
-    {
-        Box<unique Node*> a = default;
-        Box<unique Node*> c = { t = a.t };
-    }
+expect_error("cannot consume field 'Holder.slot' out of borrowed by-value parameter 'h'") {
+    void byValParamFieldBraceInit(Holder h) { Holder d = { slot = h.slot }; }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -189,38 +179,11 @@ expect_error("cannot store unique field 'makeBox.t' of a temporary into a local"
 interface IShape { int area(); };
 class Circle : IShape { int r = 3; int area() { return r * r; } };
 
-expect_error("cannot store unique interface field 'a.t' into unique field 'Box") {
-    void ifaceFieldToField()
-    {
-        Box<unique IShape> a = default; a.t = new Circle();
-        Box<unique IShape> c = default;
-        c.t = a.t;
-    }
-}
-
-expect_error("cannot store unique interface field 'a.t' into unique field 'Box") {
-    void ifaceFieldToFieldBraceInit()
-    {
-        Box<unique IShape> a = default; a.t = new Circle();
-        Box<unique IShape> c = { t = a.t };
-    }
-}
-
-// The WRITTEN `unique IShape` spelling through brace-init. IsOwningUniquePointerField answers
-// TRUE unconditionally for any written `unique`, fat interface included, so the pointer leg won
-// and told the user two fields "cannot own one pointer. Use 'move a.s'" - untrue (a fat
-// interface is not a pointer) and a closed loop (`move a.s` earns the identical message). The
-// destination gate now mirrors the `=` path's value-shape test, so the interface leg wins and
-// names 'new', which is verified to work (Test/test_move.cb::uniq_generic_iface_new_*).
+// The three `unique IShape` FIELD-to-field legs that used to live here (`=`, brace-init, and the
+// written-spelling brace form) were REMOVED by the 2026-08-10 uniform-implicit-move ruling: the
+// store now zeroes the source fat slot and releases the destination's old box. Value-asserted in
+// Test/test_move.cb::testUniqueFieldImplicitMove (uim_ifacefield_*).
 struct WrittenIfaceHolder { unique IShape s = default; };
-
-expect_error("cannot store unique interface field 'a.s' into unique field 'WrittenIfaceHolder.s'") {
-    void writtenIfaceFieldToFieldBraceInit()
-    {
-        WrittenIfaceHolder a = default; a.s = new Circle();
-        WrittenIfaceHolder c = { s = a.s };
-    }
-}
 
 // The FAT-INTERFACE form of the dtor-less escape: a `unique IShape` field read off a temp and
 // stored into a plain (borrowing) interface field. The pointer-shaped legs above cannot see a

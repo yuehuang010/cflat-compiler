@@ -108,6 +108,15 @@ bool RuntimeFalse() { return gGuardFlag != 0; }
 // guard to suppress. Never actually called - the guard below is behind RuntimeFalse().
 void dieNow() { printf("unreachable handoff\n"); exit(1); }
 
+// Two INTERFACE PARAMETER receivers of the implicit move. This shape ABORTED (rc 134) before the
+// 2026-08-10 ruling: neither parameter resolves to a box, so the store aliased one pointee.
+// Returns the moved-in id, or -1 when the source was not nulled.
+int uimStealAcrossIfaceParams(IUniqueBox ia, IUniqueBox ic)
+{
+    ic.item = ia.item;
+    return ia.item == nullptr ? ic.item->id : -1;
+}
+
 // Reassign through the interface's field slot: the old pointee is freed here, not orphaned.
 int storeViaIface(IUniqueBox h)
 {
@@ -3941,6 +3950,8 @@ move DiscardOwner* makeDiscardOwner()
 // A generic slot whose owning-ness comes purely from SUBSTITUTION (IsUniqueTypeArg, never a
 // written `unique`). Both the pointer and the fat-interface instantiations are exercised below.
 struct MoveBox<T> { T t = default; };
+// The WRITTEN `unique <interface>` field spelling, for the implicit-move legs.
+struct WrittenIfaceMoveHolder { unique IShapeMove s = default; };
 
 // area() returns a NON-default value, so a dispatch leg through a generic unique-interface slot
 // asserts a distinguishing number rather than the type default.
@@ -3983,6 +3994,9 @@ struct ElemBufHolder { ElemBuf f = default; };
 // reported caller "" and field "slot" and the whole guard stack was suppressed as a self-assign.
 struct GlobHolder { unique Resource* slot = nullptr; };
 GlobHolder gGH = default;
+// Two more file-scope receivers, for the implicit-move legs between two DIFFERENT globals.
+GlobHolder gGH2 = default;
+GlobHolder gGH3 = default;
 struct GlobOuter { GlobHolder inner = default; };
 GlobOuter gGO = default;
 namespace GlobNS { GlobHolder gN = default; }
@@ -7476,11 +7490,292 @@ int testUniqueArrayElementFieldStore()
         x.f = y.f;
         passed += Test("uae_local_reassign_destructs_old", elemBufDtor, 1);
     }
-    // LIMIT: a receiver reached through a POINTER or an array VIEW re-loads its base, so the
-    // storage cannot be proven initialized and the copy/destruct is NOT emitted for it (doing so
-    // SIGSEGVs on a raw-malloc'd block). Those shapes keep the pre-fix aliasing and cannot be
-    // asserted here - they abort at teardown. The `unique` REJECT is a diagnostic and still fires
-    // for them; err_unique_array_element_field_to_field.cb pins the p-> and view forms.
+    // LIMIT (owning VALUE fields only): a receiver reached through a POINTER or an array VIEW
+    // re-loads its base, so the storage cannot be proven initialized and the copy/destruct is NOT
+    // emitted for it (doing so SIGSEGVs on a raw-malloc'd block). Those shapes keep the pre-fix
+    // aliasing and cannot be asserted here - they abort at teardown. `unique` POINTER fields are
+    // unaffected: their drop-old was never gated on that proof, so the implicit move below reaches
+    // every receiver shape.
+
+    return passed;
+}
+
+/*
+ * RULED 2026-08-10: a plain `=` between two `unique` fields is a UNIFORM IMPLICIT MOVE - the
+ * source field is nulled, the destination's old pointee is released, and NOTHING is rejected. Every
+ * leg below was a COMPILE ERROR before the ruling landed except uim_rt_*, which compiled and
+ * aborted at teardown (rc 134) because the two elements aliased one pointee. Each leg asserts the
+ * RESOURCE, not just the value: the moved-in id, the nulled source, and the exact free count both
+ * at the store and at scope exit, so an implementation that stores without releasing (leak) or
+ * without nulling (double free) fails here.
+ */
+int testUniqueFieldImplicitMove()
+{
+    int passed = 0;
+
+    // Two named locals - the original filed spelling.
+    dtorCount = 0;
+    {
+        ElemHolder a = default;
+        ElemHolder c = default;
+        a.slot = new Resource(); a.slot->id = 91;
+        c.slot = new Resource(); c.slot->id = 92;
+        c.slot = a.slot;
+        passed += Test("uim_named_value", c.slot->id, 91);
+        passed += Test("uim_named_src_nulled", a.slot == nullptr ? 1 : 0, 1);
+        passed += Test("uim_named_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_named_freed_twice", dtorCount, 2);
+
+    // Two elements of ONE array, CONSTANT indices - the shape the reject used to prove apart.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        arr[0].slot = new Resource(); arr[0].slot->id = 93;
+        arr[1].slot = new Resource(); arr[1].slot->id = 94;
+        arr[0].slot = arr[1].slot;
+        passed += Test("uim_const_value", arr[0].slot->id, 94);
+        passed += Test("uim_const_src_nulled", arr[1].slot == nullptr ? 1 : 0, 1);
+        passed += Test("uim_const_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_const_freed_twice", dtorCount, 2);
+
+    // The same pair by RUNTIME index. This one COMPILED before the ruling and double-freed at
+    // teardown (rc 134) - it is the leg that fails for a reason other than a compile error.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        int i = 0;
+        int j = 1;
+        arr[i].slot = new Resource(); arr[i].slot->id = 95;
+        arr[j].slot = new Resource(); arr[j].slot->id = 96;
+        arr[i].slot = arr[j].slot;
+        passed += Test("uim_rt_value", arr[i].slot->id, 96);
+        passed += Test("uim_rt_src_nulled", arr[j].slot == nullptr ? 1 : 0, 1);
+        passed += Test("uim_rt_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_rt_freed_twice", dtorCount, 2);
+
+    // NESTED arrays: the element chain is two array GEPs deep.
+    dtorCount = 0;
+    {
+        ElemOuter[2] no = default;
+        no[0].arr[0].slot = new Resource(); no[0].arr[0].slot->id = 97;
+        no[0].arr[1].slot = new Resource(); no[0].arr[1].slot->id = 98;
+        no[0].arr[0].slot = no[0].arr[1].slot;
+        passed += Test("uim_nested_value", no[0].arr[0].slot->id, 98);
+        passed += Test("uim_nested_src_nulled", no[0].arr[1].slot == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uim_nested_freed_twice", dtorCount, 2);
+
+    // An array that is a FIELD of another struct.
+    dtorCount = 0;
+    {
+        ElemOuter o = default;
+        o.arr[0].slot = new Resource(); o.arr[0].slot->id = 99;
+        o.arr[1].slot = new Resource(); o.arr[1].slot->id = 100;
+        o.arr[0].slot = o.arr[1].slot;
+        passed += Test("uim_fieldarr_value", o.arr[0].slot->id, 100);
+        passed += Test("uim_fieldarr_src_nulled", o.arr[1].slot == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uim_fieldarr_freed_twice", dtorCount, 2);
+
+    // A POINTER receiver. The drop-old reads the destination slot, which is exactly the shape the
+    // owning-VALUE paths refuse to touch - a `unique` field is safe because every construction
+    // path zero-initializes it, the same premise the synthesized destructor already relies on.
+    dtorCount = 0;
+    {
+        ElemOuter o = default;
+        ElemOuter* p = &o;
+        p->arr[0].slot = new Resource(); p->arr[0].slot->id = 101;
+        p->arr[1].slot = new Resource(); p->arr[1].slot->id = 102;
+        p->arr[0].slot = p->arr[1].slot;
+        passed += Test("uim_ptr_value", p->arr[0].slot->id, 102);
+        passed += Test("uim_ptr_src_nulled", p->arr[1].slot == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uim_ptr_freed_twice", dtorCount, 2);
+
+    // An array VIEW receiver - same re-loaded-base shape through 'T[]'.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        ElemHolder[] v = arr;
+        v[0].slot = new Resource(); v[0].slot->id = 103;
+        v[1].slot = new Resource(); v[1].slot->id = 104;
+        v[0].slot = v[1].slot;
+        passed += Test("uim_view_value", v[0].slot->id, 104);
+        passed += Test("uim_view_src_nulled", v[1].slot == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uim_view_freed_twice", dtorCount, 2);
+
+    // Two DISTINCT local arrays - the pair the distinct-roots proof used to reject.
+    dtorCount = 0;
+    {
+        ElemHolder[2] a = default;
+        ElemHolder[2] b = default;
+        a[0].slot = new Resource(); a[0].slot->id = 105;
+        b[0].slot = new Resource(); b[0].slot->id = 106;
+        a[0].slot = b[0].slot;
+        passed += Test("uim_twoarr_value", a[0].slot->id, 106);
+        passed += Test("uim_twoarr_src_nulled", b[0].slot == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("uim_twoarr_freed_twice", dtorCount, 2);
+
+    // Two GLOBAL named receivers. A global's teardown is not observable here, so the free COUNT
+    // asserted is the one the store itself performs on the old destination.
+    dtorCount = 0;
+    gGH2.slot = new Resource(); gGH2.slot->id = 107;
+    gGH3.slot = new Resource(); gGH3.slot->id = 108;
+    gGH2.slot = gGH3.slot;
+    passed += Test("uim_global_value", gGH2.slot->id, 108);
+    passed += Test("uim_global_src_nulled", gGH3.slot == nullptr ? 1 : 0, 1);
+    passed += Test("uim_global_old_freed", dtorCount, 1);
+
+    // GENERIC substitution: ownership comes from the `unique Resource*` type argument, never a
+    // written `unique`. The old destination used to LEAK here even for the `move` spelling.
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> a = default;
+        MoveBox<unique Resource*> c = default;
+        a.t = new Resource(); a.t->id = 109;
+        c.t = new Resource(); c.t->id = 110;
+        c.t = a.t;
+        passed += Test("uim_generic_value", c.t->id, 109);
+        passed += Test("uim_generic_src_nulled", a.t == nullptr ? 1 : 0, 1);
+        passed += Test("uim_generic_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_generic_freed_twice", dtorCount, 2);
+
+    // Two boxed INTERFACE receivers of the same field. Neither side carries a caller name.
+    dtorCount = 0;
+    {
+        UniqueIfaceBox a = default;
+        UniqueIfaceBox c = default;
+        a.item = new Resource(); a.item->id = 111;
+        c.item = new Resource(); c.item->id = 112;
+        IUniqueBox ia = a;
+        IUniqueBox ic = c;
+        ic.item = ia.item;
+        passed += Test("uim_iface_value", ic.item->id, 111);
+        passed += Test("uim_iface_src_nulled", ia.item == nullptr ? 1 : 0, 1);
+        passed += Test("uim_iface_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_iface_freed_twice", dtorCount, 2);
+
+    // The BRACE-INIT store path is a separate lowering, so it gets its own leg. The destination
+    // slot is fresh (nothing to release), but the source must still be nulled.
+    dtorCount = 0;
+    {
+        MoveBox<unique Resource*> a = default;
+        a.t = new Resource(); a.t->id = 113;
+        MoveBox<unique Resource*> c = { t = a.t };
+        passed += Test("uim_brace_value", c.t->id, 113);
+        passed += Test("uim_brace_src_nulled", a.t == nullptr ? 1 : 0, 1);
+        passed += Test("uim_brace_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uim_brace_freed_once", dtorCount, 1);
+
+    // SELF-ASSIGN, every spelling: nulling the source before the drop-old is what makes these a
+    // no-op, since no compile-time proof can rule out i==j for a runtime index.
+    dtorCount = 0;
+    {
+        ElemHolder a = default;
+        a.slot = new Resource(); a.slot->id = 114;
+        a.slot = a.slot;
+        passed += Test("uim_self_named_value", a.slot == nullptr ? -1 : a.slot->id, 114);
+        passed += Test("uim_self_named_no_free", dtorCount, 0);
+    }
+    passed += Test("uim_self_named_freed_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        int i = 0;
+        int j = 0;
+        arr[i].slot = new Resource(); arr[i].slot->id = 115;
+        arr[i].slot = arr[j].slot;
+        passed += Test("uim_self_rt_value", arr[i].slot == nullptr ? -1 : arr[i].slot->id, 115);
+        passed += Test("uim_self_rt_no_free", dtorCount, 0);
+    }
+    passed += Test("uim_self_rt_freed_once", dtorCount, 1);
+
+    // A FAT-INTERFACE owning field (`Box<unique IShapeMove>::t`) - the value is a {vtable,data}
+    // struct, so the source is ZEROED rather than nulled and the old destination box is released
+    // through the vtable's dtor slot. This field destination has no other drop-old anywhere (only
+    // the interface LOCAL leg of D5 has one), so a store without it would leak.
+    dtorCount = 0;
+    {
+        MoveBox<unique IShapeMove> a = default; a.t = new Sq7Move();
+        MoveBox<unique IShapeMove> c = default; c.t = new CiMove();
+        c.t = a.t;
+        passed += Test("uim_ifacefield_dispatches", c.t.area(), 49);
+        passed += Test("uim_ifacefield_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_ifacefield_freed_twice", dtorCount, 2);
+
+    // The WRITTEN `unique IShapeMove` field spelling of the same store.
+    dtorCount = 0;
+    {
+        WrittenIfaceMoveHolder a = default; a.s = new Sq7Move();
+        WrittenIfaceMoveHolder c = default; c.s = new CiMove();
+        c.s = a.s;
+        passed += Test("uim_written_ifacefield_dispatches", c.s.area(), 49);
+        passed += Test("uim_written_ifacefield_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_written_ifacefield_freed_twice", dtorCount, 2);
+
+    // The BRACE form of the fat-interface field store: fresh destination, source still zeroed.
+    dtorCount = 0;
+    {
+        MoveBox<unique IShapeMove> a = default; a.t = new Sq7Move();
+        MoveBox<unique IShapeMove> c = { t = a.t };
+        passed += Test("uim_ifacefield_brace_dispatches", c.t.area(), 49);
+        passed += Test("uim_ifacefield_brace_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uim_ifacefield_brace_freed_once", dtorCount, 1);
+
+    // `move` keeps working and means exactly the same thing as the plain `=` above.
+    dtorCount = 0;
+    {
+        ElemHolder[2] arr = default;
+        arr[0].slot = new Resource(); arr[0].slot->id = 116;
+        arr[1].slot = new Resource(); arr[1].slot->id = 117;
+        arr[0].slot = move arr[1].slot;
+        passed += Test("uim_move_value", arr[0].slot->id, 117);
+        passed += Test("uim_move_src_nulled", arr[1].slot == nullptr ? 1 : 0, 1);
+        passed += Test("uim_move_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_move_freed_twice", dtorCount, 2);
+
+    // Two INTERFACE PARAMETER receivers, and the same store inside a LAMBDA body. Both aborted
+    // (rc 134) before the ruling and neither is reachable from the boxed-local leg above: the
+    // parameter shape resolves no box, and a lambda body is a separate emitted function.
+    dtorCount = 0;
+    {
+        UniqueIfaceBox a = default;
+        UniqueIfaceBox c = default;
+        a.item = new Resource(); a.item->id = 118;
+        c.item = new Resource(); c.item->id = 119;
+        passed += Test("uim_iface_param_value", uimStealAcrossIfaceParams(a, c), 118);
+        passed += Test("uim_iface_param_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_iface_param_freed_twice", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueIfaceBox a = default;
+        UniqueIfaceBox c = default;
+        a.item = new Resource(); a.item->id = 120;
+        c.item = new Resource(); c.item->id = 121;
+        IUniqueBox ia = a;
+        IUniqueBox ic = c;
+        Lambda<void()> f = () => { ic.item = ia.item; };
+        f();
+        passed += Test("uim_iface_lambda_value", ic.item->id, 120);
+        passed += Test("uim_iface_lambda_src_nulled", ia.item == nullptr ? 1 : 0, 1);
+        passed += Test("uim_iface_lambda_old_freed", dtorCount, 1);
+    }
+    passed += Test("uim_iface_lambda_freed_twice", dtorCount, 2);
 
     return passed;
 }
@@ -9857,6 +10152,9 @@ extern int main()
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
+
+    passed += testUniqueFieldImplicitMove();
+    total += 68;
 
     passed += testUninitializedUniqueLocalDecl();
     total += 20;

@@ -22,12 +22,9 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
     void makeGeneric(Node* n) { Box<unique Node*> b = { t = n }; }
 }
 
-// The brace form of the MIXED field-to-field shape: a written `unique` source field into a
-// generic unique destination field. Same double free, same destination-only blindness. The
-// fully generic source stays uncovered here too (IsUniqueFieldRead gates on the source).
-expect_error("cannot store unique field 'a.slot' into unique field 'Box") {
-    void mixedBrace() { Holder a = default; Box<unique Node*> c = { t = a.slot }; }
-}
+// The brace form of the field-to-field shape was REMOVED by the 2026-08-10 uniform-implicit-move
+// ruling: a plain `=` (and a plain brace init) between two `unique` fields now MOVES. It is
+// value-asserted in Test/test_move.cb::testUniqueFieldImplicitMove (uim_brace_*).
 
 extern int main()
 {

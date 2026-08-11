@@ -22,7 +22,7 @@ double-frees today (rc 134), so no working program breaks.
 
 **Note against the governing principle.** The 2026-08-10 walkthrough otherwise ruled "CFlat is a
 simplified reading: if ownership can be computed, it should be implicit" (stated in full in
-[[unique-field-to-field-array-element-receiver]]). This issue is the deliberate EXCEPTION: the fact
+the digest at the bottom of [[fix-issue-lessons]] (the 2026-08-10 uniform-implicit-move ruling)). This issue is the deliberate EXCEPTION: the fact
 cannot be computed at the crossing, because it cannot travel with the value. Where computation is
 impossible, spelling is the remedy.
 

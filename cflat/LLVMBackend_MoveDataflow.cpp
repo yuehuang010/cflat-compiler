@@ -666,8 +666,6 @@ void LLVMBackend::RunMoveDataflow()
         // end-of-body hook (a lambda, a synthesized body, or an erased global-init temp
         // function whose blocks are gone). Drop them unanalyzed - accept, never reject.
         pendingNullIfaceDispatch_.clear();
-        // Same, for the interface field-to-field records: an unreached body is unproven.
-        pendingUniqueIfaceFieldStore_.clear();
 
         // The GLOBAL-receiver half, by contrast, can only be answered here: the whole-module
         // "never assigned" fact needs every function emitted. LogError throws out of this.

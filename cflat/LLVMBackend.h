@@ -1909,45 +1909,6 @@ private:
     void RecordPendingNullIfaceDispatch(const NullIfaceDispatchSite& site, llvm::Value* slot,
                                         llvm::Value* anchor, const std::string& ifaceName);
 
-    /*
-     * A `unique` field-to-field store between two INTERFACE receivers, RECORDED rather than
-     * rejected on the spot. Neither receiver carries a caller name, so the store looks like a
-     * self-assign; the boxed object behind each side is resolvable, but only at end of body is it
-     * known that neither receiver is rebound later (a loop can rebind after the access).
-     */
-    struct PendingUniqueIfaceFieldStore
-    {
-        llvm::AllocaInst* DestSlot = nullptr;  // null when the box is an SSA value - nothing to recheck
-        llvm::AllocaInst* SrcSlot = nullptr;
-        llvm::StoreInst* DestBoxStore = nullptr;
-        llvm::StoreInst* SrcBoxStore = nullptr;
-        std::string Message;
-        int Line = 0;
-        int Col = 0;
-    };
-    std::unordered_map<llvm::Function*, std::vector<PendingUniqueIfaceFieldStore>> pendingUniqueIfaceFieldStore_;
-
-    void RecordPendingUniqueIfaceFieldStore(const PendingUniqueIfaceFieldStore& rec);
-
-    /*
-     * The ONE store of an implementation into an interface local's slot, or null when there are
-     * none, several, or the slot's address escapes. Debug and lifetime intrinsics are skipped -
-     * they write no memory. A store of a NULL fat value is skipped too: it leaves the slot with no
-     * implementation, so any access reaching through it faults before ownership can matter, and
-     * `I i = default; i = a;` is one binding written in two statements. Re-run at end of body,
-     * where a rebinding emitted AFTER the access is finally visible.
-     */
-    static llvm::StoreInst* SoleStoreIntoSlot(llvm::AllocaInst* slot);
-
-    /*
-     * Settle the recorded interface field-to-field stores for ONE function, at the same
-     * end-of-body hook as RunInterfaceReturnDangleCheck. Rejecting requires each receiver's slot
-     * to STILL hold exactly the one box store the site resolved it through; a rebinding later in
-     * the body, or an escaping address, leaves the store compiling - the polarity that makes an
-     * unprovable pair a missing diagnostic rather than a false rejection.
-     */
-    void RunUniqueIfaceFieldStoreCheck(llvm::Function* F);
-
     // Same rationale as DiscardPendingReturnDangleChecks: an aborted body's blocks are partial.
     void DiscardPendingNullIfaceDispatch(llvm::Function* F);
 

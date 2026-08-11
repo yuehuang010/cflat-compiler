@@ -58,7 +58,7 @@ happens. The compiler cannot see that owner, which is the whole difficulty.
    the only survivor of the reject-family.
 2. **Make the node graph `unique`**, so ownership becomes computable and the governing principle
    ("if ownership can be computed, it should be implicit" -
-   [[unique-field-to-field-array-element-receiver]]) applies with no new spelling. NOT the no-target
+   the digest at the bottom of [[fix-issue-lessons]] (the 2026-08-10 uniform-implicit-move ruling)) applies with no new spelling. NOT the no-target
    dead end previously recorded here: the target would be created - `unique children[17]`, bare
    `next`, bare `path[]`. Large, and **coupled to the field-to-field ruling**, since
    `_collapseEmptyRoot`'s `_root = node->children[0]` is exactly a `unique`-field-to-field move.

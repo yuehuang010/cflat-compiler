@@ -33,7 +33,7 @@ end of module would shrink the residue if it proves to matter.
 
 Follows the 2026-08-10 governing principle - "CFlat is a simplified reading: if ownership can be
 computed, it should be implicit" - stated in full in
-[[unique-field-to-field-array-element-receiver]].
+the digest at the bottom of [[fix-issue-lessons]] (the 2026-08-10 uniform-implicit-move ruling).
 
 Filed 2026-08-07 by `fix/aliaslaunder` as one of three neighbouring shapes left open by the
 five-site borrow predicate. **Cells 1 and 3 landed on `fix/aliasres` (2026-08-10)** - re-binding the
@@ -79,3 +79,30 @@ is untouched by design.
 A silent double free (compile 0, abort at run time, no diagnostic). Filed P2 rather than P1 under the
 residue-not-regression precedent: it is accepted by the PRE binary (`86f929b`) exactly as it is by
 the fix, so it is residue of the closed issue's family, not anything the fix introduced.
+
+## Also recorded here: the ternary-JOIN RHS of a `unique` field store (2026-08-10)
+
+Measured on `fix/uniq-implicit-move` while verifying the uniform-implicit-move ruling, and measured
+IDENTICALLY on the merge base `c9405da` - so it PREDATES that change and is residue, not regression.
+Probe: `scratch/rev_ternary_eq.cb`.
+
+```cflat
+struct H { unique Node* slot = nullptr; };
+H a = default; H b = default; H c = default;
+a.slot = new Node(); a.slot->v = 4;
+b.slot = new Node(); b.slot->v = 6;
+c.slot = 1 == 1 ? a.slot : b.slot;   // accepted; `a.slot` NOT nulled
+```
+```
+v=4 freed=0 anull=0     compile rc 0, run rc 133 (double free) - on BOTH binaries
+```
+
+Same laundering mechanism this file is about: the join strips the field provenance, so
+`IsUniqueFieldRead` answers false on the joined value and the store sees an ordinary pointer.
+The DIRECT spelling `c.slot = a.slot` is now an implicit move (source nulled, one owner), so the
+two spellings disagree - which makes this shape MORE reachable than before, since the direct form
+no longer rejects and a user reaching for the join gets no diagnostic either.
+
+Closing it needs the join to carry the field provenance (the same value-identity ledger this
+file's cells ask for), after which the joined value takes the implicit move like any other unique
+field read. Polarity unchanged: unknown accepts.

@@ -2568,3 +2568,27 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   which states only what the type means; the maintainer's standing preference is that public docs
   carry no implementation-level detail, which is also why the emitted-IR sample was dropped from
   the `LANGUAGE.md` array-view section in the same change.
+- **The 2026-08-10 uniform-implicit-move ruling** (landed on `fix/uniq-implicit-move`; closed and
+  deleted `p1/unique-field-to-field-array-element-receiver.md` and
+  `p1/unique-field-to-field-interface-receiver-residues.md`). A plain `=` between two `unique`
+  fields **always moves** - source nulled, old destination released - with no provability analysis,
+  no index analysis and no rejection; `move` stays accepted and means the same thing. The
+  governing principle behind it, stated by the maintainer and cited by several other issue files:
+  **"CFlat is a simplified reading: if ownership can be computed, it should be implicit."** It does
+  NOT extend to a fact the compiler cannot compute -
+  `inferred-owning-sink-is-lost-when-a-closure-crosses-a-declared-boundary` is the deliberate
+  exception, because the sink cannot travel with the value and must be spellable. Corollary
+  preserved across the family: **unknown accepts**; a false rejection is a blocker, a missed
+  diagnostic is today's behaviour. Do not re-propose an index/receiver provability proof for this
+  family: `ProvablyDifferentSlots` / `ProvablyDifferentObjects` / `SoleStoreIntoSlot` existed only
+  to resolve an ambiguity that does not matter once the operation MEANS the move, and it was
+  precisely their unprovable fall-through to ACCEPT that leaked the silent double free. Neither C++
+  `std::unique_ptr` nor Rust `Box<T>` performs such a proof (both reject unconditionally instead);
+  cflat diverges from both by making the operation mean the move. Two implementation facts worth
+  keeping: (1) SELF-ASSIGN SAFETY comes from ORDER, not from a proof or an address check - null the
+  SOURCE first, then run the drop-old, so an `i==j` runtime pair reads an already-null destination
+  and frees nothing; this is what the `move` spelling already did. (2) The `AddressRootIsStackOrGlobal`
+  gating that the issue file flagged as an inherited hazard does NOT apply to `unique` fields: their
+  drop-old (`EmitUniqueFieldDelete`) was never gated on it, so a pointer / array-view receiver is
+  reached safely. That gating is still load-bearing for owning-VALUE field-to-field stores, which
+  the ruling does not cover, so `ProvablyDifferentSlots` and friends were KEPT for those sites.

@@ -86,3 +86,12 @@ to cover the address-of spelling too, since it is the double-freeing member of t
 
 `internal/plan/ownership-transparent-assignment.md` (`=` is total over T); the landed
 `fix/owncopy` record at the bottom of `internal/fix-issue-lessons.md`.
+
+## Update 2026-08-10 - the BY-VALUE parameter half is now closed for `unique` fields
+
+`fix/uniq-implicit-move` extended `RejectConsumeOfBorrowedByValueParamField` to the implicit-move
+field-store path (both the `=` and the brace-init site), so `gDest.slot = h.slot` inside
+`void sink(Holder h)` now rejects with the same reason `move h.slot` always did - the two spellings
+agree. Legs in `Test/errors/err_unique_borrow_into_field.cb`; the named remedy (`move Holder h`) is
+measured working. This file's asymmetry is unchanged: it is about the POINTER-parameter spelling
+(`w->b`) and about owning-VALUE fields, neither of which that guard reaches.

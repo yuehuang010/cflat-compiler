@@ -2228,10 +2228,6 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             // Same reasoning again for the definitely-null interface dispatch: the proof reads
             // the dispatch's own block, which is only complete now.
             compiler->RunNullIfaceDispatchCheck(fn);
-
-            // And for the interface field-to-field `unique` store: the receivers' slots only stop
-            // gaining stores here, so a rebinding after the access is finally visible.
-            compiler->RunUniqueIfaceFieldStoreCheck(fn);
         }
 
         if (isAutoReturn)
@@ -4877,58 +4873,6 @@ bool MainListener::ProvablyDifferentSlots(llvm::Value* a, llvm::Value* b) {
         return offA != offB;
     }
 
-llvm::Value* MainListener::ResolveBoxedObjectOfInterfaceField(llvm::Value* addr, llvm::AllocaInst*& slot,
-                                                    llvm::StoreInst*& boxStore) {
-        slot = nullptr; boxStore = nullptr;
-        if (compilerLLVM == nullptr || addr == nullptr) return nullptr;
-        auto* dataExtract = llvm::dyn_cast_or_null<llvm::ExtractValueInst>(StripAllGeps(addr));
-        if (dataExtract == nullptr || dataExtract->getNumIndices() != 1
-            || dataExtract->getIndices()[0] != 1u) return nullptr;
-        llvm::Value* fat = dataExtract->getAggregateOperand();
-        if (const auto* direct = compilerLLVM->FindInterfaceBoxByFatValue(fat))
-            return direct->DataPointer;
-        auto* load = llvm::dyn_cast<llvm::LoadInst>(fat);
-        if (load == nullptr) return nullptr;
-        auto* candidate = llvm::dyn_cast<llvm::AllocaInst>(load->getPointerOperand()->stripPointerCasts());
-        llvm::StoreInst* sole = LLVMBackend::SoleStoreIntoSlot(candidate);
-        if (sole == nullptr) return nullptr;
-        const auto* box = compilerLLVM->FindInterfaceBoxByFatValue(sole->getValueOperand());
-        if (box == nullptr) return nullptr;
-        slot = candidate; boxStore = sole;
-        return box->DataPointer;
-    }
-
-std::string MainListener::IndexedFieldPathText(const std::string& text) {
-        if (text.find('[') == std::string::npos) return {};
-        std::string path = text;
-        for (size_t at = path.find("->"); at != std::string::npos; at = path.find("->", at))
-            path.replace(at, 2, ".");
-        // Outside brackets the text must be a bare lvalue path - a leading '(' would make the
-        // whole thing a parenthesized expression, not a path. Inside an index, arithmetic and a
-        // cast are allowed: the index still spells one element and `move <text>` still parses.
-        int depth = 0;
-        for (char c : path)
-        {
-            if (c == '[') { ++depth; continue; }
-            if (c == ']') { if (--depth < 0) return {}; continue; }
-            if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') continue;
-            if (depth == 0 && c == '.') continue;
-            if (depth > 0 && (c == '.' || c == '+' || c == '-' || c == '*' || c == '/'
-                              || c == '%' || c == ' ' || c == '(' || c == ')')) continue;
-            return {};
-        }
-        return depth == 0 ? text : std::string();
-    }
-
-std::string MainListener::ExactUniqueFieldAccess(const LLVMBackend::NamedVariable& nv,
-                                       const std::string& srcText) {
-        std::string indexed = IndexedFieldPathText(srcText);
-        if (!indexed.empty()) return indexed;
-        std::string derived = DescribeUniqueFieldAccess(nv);
-        if (srcText.empty() || derived.empty()) return derived;
-        return srcText == derived ? derived : std::string();
-    }
-
 std::string MainListener::DescribeUniqueFieldAccess(const LLVMBackend::NamedVariable& nv) {
         return LLVMBackend::DescribeUniqueFieldAccess(nv);
     }
@@ -5081,32 +5025,6 @@ void MainListener::RejectBorrowIntoUniqueLocal(const std::string& srcDesc, const
                 lead, originName, localName));
     }
 
-std::string MainListener::FormatUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
-                                               const std::string& fieldDesc,
-                                               const std::string& srcText) {
-        std::string access = ExactUniqueFieldAccess(rightNV, srcText);
-        if (access.empty())
-            // No spelling is known to be right, so name NO expression: "<caller>.<field>" would
-            // name element 0 here, and `move` on that transfers the wrong slot (silently).
-            return std::format(
-                "cannot store unique field '{}' into {} - the source field's synthesized destructor "
-                "already frees it, and two 'unique' fields cannot own one pointer. Prefix the source "
-                "expression with 'move' to transfer ownership out of the source field (which nulls it).",
-                rightNV.FieldName.empty() ? std::string("<field>") : rightNV.FieldName, fieldDesc);
-        return std::format(
-            "cannot store unique field '{}' into {} - the source field's synthesized destructor "
-            "already frees it, and two 'unique' fields cannot own one pointer. Use 'move {}' to "
-            "transfer ownership out of the source field (which nulls it).",
-            access, fieldDesc, access);
-    }
-
-void MainListener::RejectUniqueFieldToUniqueField(const LLVMBackend::NamedVariable& rightNV,
-                                        const std::string& fieldDesc,
-                                        antlr4::ParserRuleContext* ctx,
-                                        const std::string& srcText) {
-        LogErrorContext(ctx, FormatUniqueFieldToUniqueField(rightNV, fieldDesc, srcText));
-    }
-
 std::string MainListener::FormatUniqueTempFieldToField(const LLVMBackend::NamedVariable& rightNV,
                                              const std::string& fieldDesc) {
         std::string access = DescribeUniqueFieldAccess(rightNV);
@@ -5131,45 +5049,40 @@ void MainListener::RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable
         LogErrorContext(ctx, FormatUniqueTempFieldToField(rightNV, fieldDesc));
     }
 
-std::string MainListener::FormatUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                                  const std::string& fieldDesc) {
-        return std::format(
-            "cannot store unique interface field '{}' into {} - the source field keeps ownership "
-            "(a 'move' out of an interface field does not null it) and its synthesized destructor "
-            "still frees the boxed object, so two 'unique' fields would own one interface value. "
-            "Assign 'new' so the destination owns its own object.",
-            DescribeUniqueFieldAccess(rightNV), fieldDesc);
-    }
-
-void MainListener::RejectUniqueInterfaceFieldToField(const LLVMBackend::NamedVariable& rightNV,
-                                           const std::string& fieldDesc,
-                                           antlr4::ParserRuleContext* ctx) {
-        LogErrorContext(ctx, FormatUniqueInterfaceFieldToField(rightNV, fieldDesc));
-    }
-
-void MainListener::RecordInterfaceFieldToFieldStore(const LLVMBackend::NamedVariable& namedVar,
-                                          const LLVMBackend::NamedVariable& rightNV,
-                                          llvm::Value* destination,
-                                          bool destOwnsUniqueInterface,
-                                          const std::string& srcText,
-                                          antlr4::ParserRuleContext* ctx) {
-        LLVMBackend::PendingUniqueIfaceFieldStore rec;
-        llvm::Value* destData = ResolveBoxedObjectOfInterfaceField(
-            destination, rec.DestSlot, rec.DestBoxStore);
-        llvm::Value* srcData = ResolveBoxedObjectOfInterfaceField(
-            rightNV.Storage, rec.SrcSlot, rec.SrcBoxStore);
-        if (!ProvablyDifferentObjects(destData, srcData)) return;
-
-        std::string destDesc = std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar));
-        if (IsUniqueTempFieldRead(rightNV))
-            rec.Message = FormatUniqueTempFieldToField(rightNV, destDesc);
-        else if (destOwnsUniqueInterface)
-            rec.Message = FormatUniqueInterfaceFieldToField(rightNV, destDesc);
+/*
+ * The 2026-08-10 implicit-move lowering: null the SOURCE `unique` field so the destination
+ * becomes its sole owner. Emitted BEFORE the drop-old that releases the destination's previous
+ * pointee, which is what makes an unprovable self-assign (`arr[i].p = arr[j].p` with i==j) a
+ * safe no-op - the drop-old then reads a null slot and frees nothing.
+ */
+void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& rightNV,
+                                      llvm::Value* right, llvm::Value* destination,
+                                      const std::string& destIfaceName) {
+        if (compilerLLVM == nullptr || right == nullptr || rightNV.Storage == nullptr) return;
+        bool isFat = false;
+        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(right->getType()))
+            compilerLLVM->builder->CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy), rightNV.Storage);
+        else if (right->getType()->isStructTy())
+        {
+            compilerLLVM->builder->CreateStore(
+                llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
+            isFat = true;
+        }
         else
-            rec.Message = FormatUniqueFieldToUniqueField(rightNV, destDesc, srcText);
-        rec.Line = (int)ctx->getStart()->getLine();
-        rec.Col  = (int)ctx->getStart()->getCharPositionInLine();
-        compilerLLVM->RecordPendingUniqueIfaceFieldStore(rec);
+            return;
+        // A fat-interface FIELD destination has no drop-old anywhere else, so release the old box
+        // here or the move leaks it. Runs after the zeroing, so a self-assign frees nothing.
+        if (isFat && destination != nullptr && !destIfaceName.empty())
+        {
+            auto* oldFat = compilerLLVM->builder->CreateLoad(
+                compilerLLVM->GetFatPtrType(), destination, "uqif.old");
+            compilerLLVM->DeleteInterfaceValue(oldFat, destIfaceName, nullptr);
+        }
+        // Present the source as a moved value from here on: Storage is detached so no later leg
+        // re-reads the nulled slot, and IsMove is what the borrow/ownership legs already key on.
+        rightNV.TypeAndValue.IsMove = true;
+        rightNV.Storage = nullptr;
     }
 
 bool MainListener::RejectFieldAllocAlignMismatch(
