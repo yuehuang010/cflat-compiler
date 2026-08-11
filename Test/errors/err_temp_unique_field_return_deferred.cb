@@ -1,0 +1,50 @@
+/*
+ * The ORDER leg for the RETURN half of the temp-unique-field guard, and the reason that half is
+ * ALSO record-then-resolve. cflat emits IR as it walks, so `lateReturnPassthru` is still a bare
+ * declaration when the call below is emitted: ParameterMayReachReturn correctly reports "no
+ * proof" (unknown accepts, by design), the call result is not re-ledgered, and the declaration
+ * guard sees an ordinary `Node*`. Measured on the pre-fix binary (--run): `v=99 dtors=1` - the
+ * temporary's synthesized destructor freed the pointee and the read aliased a recycled block.
+ *
+ * The STORE half's deferral could not be reused directly: the fact it re-asks is "did the callee
+ * store", answerable from the callee alone, while the fact this needs is "where did the RESULT
+ * get bound" - known only at the destination the walk has already passed. So the ESCAPE SITE is
+ * what gets recorded (deferredTempUniqueFieldEscapes_), keyed on the destination, and the callee
+ * question is re-asked against it at end of module.
+ *
+ * This leg lives in its own file because the diagnostic is DEFERRED, the same structural
+ * constraint as err_temp_unique_field_plain_param_deferred.cb and
+ * err_temp_unique_field_iface_deferred.cb: a scoped `expect_error(...) { }` block closes before
+ * end-of-module resolution runs and would print "expected error ... did not occur", i.e. the
+ * opposite of the truth. Only the bare file-scope form stays armed to the end of the compile,
+ * and it covers the rest of the scope - one leg per file. The immediate-path twin of exactly
+ * this cell (the same callee written ABOVE its call site) is in err_unique_borrow_into_field.cb,
+ * and the two must produce the SAME message: the user is not meant to be able to tell which pass
+ * caught it.
+ *
+ * Mutation-tested: dropping the ResolveDeferredTempUniqueFieldEscapes call at the end of the
+ * walk makes this file exit 1 with "expected error ... did not occur".
+ */
+expect_error("cannot store the result of 'lateReturnPassthru' into a local - 'lateReturnPassthru' may return its argument, which here is unique field 'makeLateRetBox.t' of a temporary");
+
+struct LateRetNode { int v = 0; };
+struct LateRetBox<T> { T t = default; };
+LateRetBox<unique LateRetNode*> makeLateRetBox()
+{
+    LateRetBox<unique LateRetNode*> b = default;
+    b.t = new LateRetNode();
+    b.t->v = 99;
+    return b;
+}
+
+extern int main()
+{
+    LateRetNode* b = lateReturnPassthru(makeLateRetBox().t);
+    return b->v == 99 ? 0 : 1;
+}
+
+// Written BELOW its call site: the return-side fact is unanswerable there, so the reject can only
+// come from the deferred resolve. It is deliberately the LAST function in the file, which also
+// pins the `currentFunction` parking: FunctionBodyIsComplete refuses `currentFunction`, so the
+// resolve would exempt exactly the callee the walk happened to finish on.
+LateRetNode* lateReturnPassthru(LateRetNode* n) { return n; }

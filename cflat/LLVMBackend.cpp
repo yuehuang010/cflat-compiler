@@ -831,7 +831,16 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         // Every callee body is complete now, so a call whose callee was still a declaration
         // during the walk can finally be answered (record-then-resolve; see tempUniqueFieldArgs_).
-        ResolveTempUniqueFieldArgEscapes();
+        // The walk is over, so `currentFunction` is only the last function the file happened to
+        // define - and FunctionBodyIsComplete refuses it, which would exempt exactly that callee.
+        {
+            NoCurrentFunctionScope noCurrent(this);
+            ResolveTempUniqueFieldArgEscapes();
+
+            // The RETURN half of the same deferral: the escape SITE, not the callee question.
+            // After the store half, matching the eager order within a statement.
+            ResolveDeferredTempUniqueFieldEscapes();
+        }
 
         // Every generic instantiation has been drained by now, so interfaceTable is COMPLETE:
         // resolve the materialisation records captured during the walk. Inside the try so a
@@ -2572,6 +2581,7 @@ void LLVMBackend::ResetForReanalysis()
     nextCastOccurrence_ = 1;
     owningTempUniqueFields_.clear();
     launderedTempUniqueFields_.clear();
+    pendingLaunderTempUniqueFields_.clear();
     dataValueCodeCasts_.clear();
     movedOutPtrValues_.clear();
     movedBorrowedPtrValues_.clear();
@@ -2583,6 +2593,7 @@ void LLVMBackend::ResetForReanalysis()
     firstCallLocation_.clear();
     // Holds llvm::Function* into a module a rebuild invalidates.
     tempUniqueFieldArgs_.clear();
+    deferredTempUniqueFieldEscapes_.clear();
     lastAllocAlignment = 0;
     pendingInitAllocAlign = 0;
     lastCallReturnsAllocAlign = 0;

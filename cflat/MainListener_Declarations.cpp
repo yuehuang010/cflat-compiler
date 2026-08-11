@@ -3170,8 +3170,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             // Interface decl-init is its OWN branch, so the escape gate in the
                             // else below never sees `IShape s = makeIBox().t;` (it dangled).
-                            if (!global_scope && IsOwningTempUniqueFieldEscape(rightNV))
-                                RejectOwningTempUniqueFieldEscape(
+                            if (!global_scope)
+                                GuardOwningTempUniqueFieldEscape(
                                     rightNV, "an interface local", assignmentExpression);
                             right = LoadNamedVariable(rightNV);
                             srcPrimary = rightNV.Primary;
@@ -3298,8 +3298,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                                 // Same escape with a dtor-LESS pointee. Skipped at global scope,
                                 // where the compile-time-constant message is the truer one.
-                                if (!global_scope && IsOwningTempUniqueFieldEscape(rightNV))
-                                    RejectOwningTempUniqueFieldEscape(rightNV, "a local", assignmentExpression);
+                                if (!global_scope)
+                                    GuardOwningTempUniqueFieldEscape(rightNV, "a local", assignmentExpression);
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
                                 srcIsBorrowed = rightNV.IsBorrowed;
@@ -4942,15 +4942,8 @@ void MainListener::RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVar
             if (const auto* laundered =
                     compilerLLVM->FindLaunderedTempUniqueField(rightNV.Primary))
             {
-                std::string field = laundered->Access.empty()
-                    ? std::string("a unique field")
-                    : std::format("unique field '{}'", laundered->Access);
-                LogErrorContext(ctx, std::format(
-                    "cannot store the result of '{}' into {} - '{}' may return its argument, which "
-                    "here is {} of a temporary, and the temporary's synthesized destructor frees "
-                    "the pointee at the end of this statement. Bind the whole call result to a "
-                    "local first and pass the field read from that local.",
-                    laundered->CalleeName, destDesc, laundered->CalleeName, field));
+                LogErrorContext(ctx, LLVMBackend::DescribeLaunderedTempUniqueFieldEscape(
+                    laundered->CalleeName, laundered->Access, destDesc));
                 return;
             }
         // A join arrives as a PHI and a cast severs Storage, so neither carries a name to quote;
@@ -4972,6 +4965,20 @@ void MainListener::RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVar
             "'move' needs an addressable source, so bind the whole call result to a local first "
             "and read the field from that local.",
             access, destDesc));
+    }
+
+void MainListener::GuardOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv,
+                                           const std::string& destDesc,
+                                           antlr4::ParserRuleContext* ctx) {
+        if (IsOwningTempUniqueFieldEscape(nv))
+        {
+            RejectOwningTempUniqueFieldEscape(nv, destDesc, ctx);
+            return;   // LogErrorContext throws; this only says so
+        }
+        if (compilerLLVM == nullptr || nv.TypeAndValue.IsMove || ctx == nullptr) return;
+        compilerLLVM->RecordDeferredTempUniqueFieldEscape(nv.Primary, destDesc,
+            compilerLLVM->sourceFileName,
+            (size_t)ctx->getStart()->getLine(), (size_t)ctx->getStart()->getCharPositionInLine());
     }
 
 bool MainListener::IsOwningUniquePointerField(const LLVMBackend::TypeAndValue& tv) {

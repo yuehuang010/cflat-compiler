@@ -2949,6 +2949,15 @@ public:
                                            antlr4::ParserRuleContext* ctx);
 
     /*
+     * The single door every destination goes through. Rejects immediately when the ledger already
+     * proves the escape, and otherwise records the SITE when the value is a CANDIDATE launder (a
+     * callee defined below its call site), for the end-of-module resolve to answer.
+     */
+    void GuardOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv,
+                                          const std::string& destDesc,
+                                          antlr4::ParserRuleContext* ctx);
+
+    /*
      * True when a destination field PROVABLY owns a raw pointer whose synthesized destructor
      * frees it, by either spelling: the written `unique` qualifier, or generic substitution of a
      * `unique T*` type argument. Destructor synthesis already ORs the two (LLVMBackend.h ~4614),

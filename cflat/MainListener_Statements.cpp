@@ -882,8 +882,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
 
         // Same escape with a dtor-LESS pointee, which the type-name gate above
         // cannot see. After it, so a dtor-bearing pointee keeps its wording.
-        if (IsOwningTempUniqueFieldEscape(returnNV))
-            RejectOwningTempUniqueFieldEscape(returnNV, "the return value", errCtx);
+        GuardOwningTempUniqueFieldEscape(returnNV, "the return value", errCtx);
 
         // Returning a whole `alias` (borrow) value from a non-`alias` function hands
         // the caller a value whose always-run destructor frees a buffer the real owner

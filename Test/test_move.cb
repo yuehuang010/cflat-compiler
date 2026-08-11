@@ -8870,6 +8870,36 @@ int testTempUniqueFieldBorrowAccepts()
     passthruResource(makeMoveBox().t);
     passed += Test("temp_uniq_accept_passthru_discarded_freed_once", dtorCount, 1);
 
+    // The ACCEPT SET of the DEFERRED return half (a laundering callee defined BELOW its call
+    // site). The two callees are written at the bottom of this file, so at these call sites the
+    // proof is unanswerable and the escape SITE is recorded for the end-of-module resolve. These
+    // three cells must still resolve to ACCEPT there, exactly as their above-defined twins do
+    // (temp_uniq_accept_plain_param_passthru_discarded_freed_once and the retGlobalResource legs).
+    // A deferral that answered YES for any of them would false-reject a working program.
+    dtorCount = 0;
+    {
+        Resource* lateOther = lateRetGlobalResource(makeMoveBox().t);
+        passed += Test("temp_uniq_accept_late_callee_returns_other", lateOther == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("temp_uniq_accept_late_callee_returns_other_freed_once", dtorCount, 1);
+    // The below-defined PASSTHRU with the result discarded: the callee does hand the parameter
+    // back, but nothing binds it, so there is no destination and nothing to reject.
+    dtorCount = 0;
+    latePassthruResource(makeMoveBox().t);
+    passed += Test("temp_uniq_accept_late_passthru_discarded_freed_once", dtorCount, 1);
+    // The below-defined passthru over an ORDINARY heap pointer: no temp field is involved at all,
+    // so the deferred site must never be recorded and the pointee must survive the statement.
+    dtorCount = 0;
+    {
+        Resource* plainLateSrc = new Resource();
+        plainLateSrc->id = 84;
+        Resource* plainLate = latePassthruResource(plainLateSrc);
+        passed += Test("temp_uniq_accept_late_passthru_of_plain_ptr", plainLate->id, 84);
+        passed += Test("temp_uniq_accept_late_passthru_of_plain_ptr_not_freed", dtorCount, 0);
+        delete plainLateSrc;
+    }
+    passed += Test("temp_uniq_accept_late_passthru_of_plain_ptr_freed_once", dtorCount, 1);
+
     // The ACCEPT SET of the joined-destination rule, frozen before that rule was written. Each
     // callee stores through a select whose arms are NOT all outliving memory, so no proof.
     dtorCount = 0;
@@ -10379,7 +10409,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 121;
+    total += 127;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;
@@ -10447,3 +10477,11 @@ extern int main()
 // body is not readable when the call is emitted and the alias proof cannot be built. The
 // accepted unknown-accepts caveat - the temp keeps leaking instead of being freed twice.
 Resource* identityResourceDefinedBelow(Resource* p) { return p; }
+
+// The two callees the DEFERRED return-half accept legs call. Both are written here, BELOW every
+// call site, so ParameterMayReachReturn is unanswerable during the walk and the answer can only
+// come from the end-of-module resolve. `lateRetGlobalResource` answers NO there (it returns a
+// global, not its parameter) and `latePassthruResource` answers YES but is only ever called with
+// no destination, or with a pointer that is not a temporary's field.
+Resource* lateRetGlobalResource(Resource* r) { return gKeptResource2; }
+Resource* latePassthruResource(Resource* r) { return r; }

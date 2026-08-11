@@ -1732,6 +1732,76 @@ private:
                                                                  int depth = 0) const;
 
     /*
+     * The DEFERRED twin of launderedTempUniqueFields_. A callee defined BELOW its call site is
+     * still a bare declaration when the call is emitted, so ParameterMayReachReturn correctly
+     * reports "no proof" and the eager re-ledger above cannot run. The call result is instead
+     * recorded as a CANDIDATE launder: the destination sites record where it was bound, and the
+     * question is re-asked at end of module where every body is complete.
+     *
+     * Conds is a CONJUNCTION so a chain `f(g(x))` works with either callee below: an already
+     * proven hop adds nothing, an unanswerable hop adds itself, and the escape holds only when
+     * every hop really does hand its parameter back. Same statement scope as the eager ledger.
+     */
+    struct PendingLaunderTempUniqueField
+    {
+        llvm::Value* Result = nullptr;
+        std::vector<std::pair<const llvm::Function*, unsigned>> Conds;
+        std::string CalleeName;
+        std::string Access;
+    };
+    std::vector<PendingLaunderTempUniqueField> pendingLaunderTempUniqueFields_;
+
+    void RegisterPendingLaunderTempUniqueField(llvm::Value* result,
+            const std::vector<std::pair<const llvm::Function*, unsigned>>& conds,
+            const std::string& calleeName, const std::string& access);
+
+    // Join-aware exactly as FindLaunderedTempUniqueField is, for the same reason.
+    const PendingLaunderTempUniqueField* FindPendingLaunderTempUniqueField(const llvm::Value* value,
+                                                                          int depth = 0) const;
+
+    /*
+     * A DESTINATION that bound a candidate launder. The fact the return half needs is not "did
+     * the callee store" but "where did the RESULT get bound", which is known only here, at a
+     * point the walk has already passed by end of module - so the SITE is what gets deferred.
+     * Module lifetime, like tempUniqueFieldArgs_, and dropped at the same points.
+     */
+    struct DeferredTempUniqueFieldEscape
+    {
+        std::vector<std::pair<const llvm::Function*, unsigned>> Conds;
+        std::string CalleeName;
+        std::string Access;
+        std::string DestDesc;
+        // A sink PARAMETER destination has its own wording; empty means the ordinary store one.
+        std::string SinkFunction;
+        std::string SinkParam;
+        // The file the destination was written in - by end of module sourceFileName is the main
+        // file again, exactly as for TempUniqueFieldArg.
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+    };
+    std::vector<DeferredTempUniqueFieldEscape> deferredTempUniqueFieldEscapes_;
+
+    bool RecordDeferredTempUniqueFieldEscape(const llvm::Value* value, const std::string& destDesc,
+            const std::string& file, size_t line, size_t column);
+
+    void RecordDeferredTempUniqueFieldSinkEscape(const llvm::Value* value,
+            const std::string& functionName, const std::string& paramName);
+
+    // The ONE formatter for the laundered-escape wording, so the eager site and the deferred
+    // resolve cannot drift apart.
+    static std::string DescribeLaunderedTempUniqueFieldEscape(const std::string& calleeName,
+            const std::string& access, const std::string& destDesc);
+
+    static std::string DescribeTempUniqueFieldSinkEscape(const std::string& functionName,
+            const std::string& paramName);
+
+    void ResolveDeferredTempUniqueFieldEscapes();
+
+    // Every hop of a candidate launder really does hand its parameter back.
+    bool LaunderCondsAllProve(const std::vector<std::pair<const llvm::Function*, unsigned>>& conds);
+
+    /*
      * The MIRROR ledger of codeValues_: values PROVEN to be DATA - a pointer whose declared type
      * is not code - recorded at the same read where the facts are in hand. The closure-widen gate
      * asks the OPPOSITE question of the code-value gates, so it needs the opposite evidence: a
@@ -2039,6 +2109,9 @@ private:
         std::string MethodName;
         std::string ParamName;
         size_t Arity = 0;
+        // The argument was itself a CANDIDATE launder (`keep(g(makeBox().t))` with `g` below), so
+        // this entry only escapes when every hop of that chain also proves.
+        std::vector<std::pair<const llvm::Function*, unsigned>> LaunderConds;
     };
     std::vector<TempUniqueFieldArg> tempUniqueFieldArgs_;
 
@@ -3020,6 +3093,23 @@ private:
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
 
+    /*
+     * Parks `currentFunction` for the end-of-module resolves. FunctionBodyIsComplete refuses
+     * `currentFunction`, so leaving the walk's last function set would exempt exactly that
+     * callee. RAII because LogError THROWS out of the resolves.
+     */
+    struct NoCurrentFunctionScope
+    {
+        LLVMBackend* backend_;
+        llvm::Function* saved_;
+        explicit NoCurrentFunctionScope(LLVMBackend* backend)
+            : backend_(backend), saved_(backend->currentFunction)
+        { backend_->currentFunction = nullptr; }
+        ~NoCurrentFunctionScope() { backend_->currentFunction = saved_; }
+        NoCurrentFunctionScope(const NoCurrentFunctionScope&) = delete;
+        NoCurrentFunctionScope& operator=(const NoCurrentFunctionScope&) = delete;
+    };
+
     // Point diagnostics at a file/line recorded earlier, and put the compiler's own reporting
     // position back on the way out - LogError throws, so this cannot be a plain save/restore.
     struct ReportingFileScope
@@ -3924,6 +4014,7 @@ public:
         std::vector<std::pair<llvm::Value*, size_t>> codeValueDataCasts;
         std::vector<llvm::Value*> owningTempUniqueFields;
         std::vector<LaunderedTempUniqueField> launderedTempUniqueFields;
+        std::vector<PendingLaunderTempUniqueField> pendingLaunderTempUniqueFields;
         std::vector<std::pair<llvm::Value*, size_t>> dataValueCodeCasts;
         // The enclosing statement's ambient occurrence id (see currentCastOccurrence_) - a nested
         // emission (lambda invoker, global init, program shim) starts its own from 0, same as the

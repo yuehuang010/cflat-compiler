@@ -160,6 +160,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.codeValueDataCasts  = std::move(codeValueDataCasts_);
         s.owningTempUniqueFields = std::move(owningTempUniqueFields_);
         s.launderedTempUniqueFields = std::move(launderedTempUniqueFields_);
+        s.pendingLaunderTempUniqueFields = std::move(pendingLaunderTempUniqueFields_);
         s.dataValueCodeCasts  = std::move(dataValueCodeCasts_);
         s.savedCastOccurrence = currentCastOccurrence_;
         currentCastOccurrence_ = 0;
@@ -186,6 +187,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         codeValueDataCasts_.clear();
         owningTempUniqueFields_.clear();
         launderedTempUniqueFields_.clear();
+        pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
@@ -223,6 +225,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         codeValueDataCasts_     = state.codeValueDataCasts;
         owningTempUniqueFields_ = state.owningTempUniqueFields;
         launderedTempUniqueFields_ = state.launderedTempUniqueFields;
+        pendingLaunderTempUniqueFields_ = state.pendingLaunderTempUniqueFields;
         dataValueCodeCasts_     = state.dataValueCodeCasts;
         currentCastOccurrence_  = state.savedCastOccurrence;
         movedOutPtrValues_       = state.movedOutPtrValues;

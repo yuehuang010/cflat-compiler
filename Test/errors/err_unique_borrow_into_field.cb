@@ -424,6 +424,16 @@ expect_error("cannot store the result of 'IPassOne.ifacePassOne' into a local - 
     void tempDtorlessLaunderedThroughIfaceReturn() { PassOneC p = default; IPassOne ip = p; Node* b = ip.ifacePassOne(makeBox().t); }
 }
 
+// The DIRECT-call twin of the same return-side laundering, with the callee written ABOVE its
+// call site so the proof is answerable during the walk. This is the tripwire for the deferred
+// leg in err_temp_unique_field_return_deferred.cb: the two must produce the SAME message, or the
+// user can tell which pass caught it. Its ACCEPT twins are in Test/test_move.cb.
+Node* earlyPassNode(Node* n) { return n; }
+
+expect_error("cannot store the result of 'earlyPassNode' into a local - 'earlyPassNode' may return its argument, which here is unique field 'makeBox.t' of a temporary") {
+    void tempDtorlessLaunderedThroughEarlyReturn() { Node* b = earlyPassNode(makeBox().t); }
+}
+
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
 // rejected as of 2026-08-05 - two different boxed receivers still both carry an empty CallerName,
 // so they are told apart by the OBJECT each box wraps. Its legs live in

@@ -1527,13 +1527,13 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
         bool paramClaimsOwnership = param.Pointer && !param.IsAlias
             && (param.IsMove || param.IsUnique || param.IsUniqueTypeArg);
         if (!paramClaimsOwnership) return;
-        if (!JoinCarriesOwningTempUniqueField(arg.Primary)) return;
-        LogError(std::format(
-            "call to '{}': cannot pass a unique field of a temporary to parameter '{}', which "
-            "takes ownership - the temporary's synthesized destructor frees the pointee at the "
-            "end of this statement, so the callee would own freed memory. Bind the whole call "
-            "result to a local first and 'move' the field out of that local.",
-            functionName, param.VariableName));
+        if (!JoinCarriesOwningTempUniqueField(arg.Primary))
+        {
+            // Callee still below its call site: defer this destination like the others.
+            RecordDeferredTempUniqueFieldSinkEscape(arg.Primary, functionName, param.VariableName);
+            return;
+        }
+        LogError(DescribeTempUniqueFieldSinkEscape(functionName, param.VariableName));
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p,

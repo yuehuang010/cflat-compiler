@@ -2152,10 +2152,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
 
             // Same escape into a BORROWING destination (field, local, global, array element) with
             // a dtor-LESS pointee. After the gate above, so a dtor-bearing pointee keeps its wording.
-            if (operatorText == "=" && IsOwningTempUniqueFieldEscape(rightNV))
+            if (operatorText == "=")
             {
-                RejectOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
-                return finishStore(right);
+                // The guard THROWS when it rejects, so the skip below is what the original
+                // 'return finishStore' was: insurance if LogErrorContext ever stopped throwing.
+                GuardOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
+                if (IsOwningTempUniqueFieldEscape(rightNV)) return finishStore(right);
             }
 
             // Assigning a named string LOCAL into a string field. THE FLIP: a NAMED OWNED source
@@ -5503,10 +5505,22 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
             // A cast off a temp's `unique` field is the "I mean this" spelling, and it drops the
             // ownership facts with the type; carry them to the RESULT so persist sites still see it.
             bool castOfTempUniqueField = IsOwningTempUniqueFieldEscape(namedVar);
+            // A CANDIDATE launder (callee still below its call site) has to survive the cast too,
+            // or the deferred destination gate loses the value the eager one keeps.
+            const LLVMBackend::PendingLaunderTempUniqueField* castPending = castOfTempUniqueField
+                ? nullptr : compiler->FindPendingLaunderTempUniqueField(namedVar.Primary);
+            std::vector<std::pair<const llvm::Function*, unsigned>> castConds;
+            std::string castCallee, castAccess;
+            if (castPending != nullptr)
+            { castConds = castPending->Conds; castCallee = castPending->CalleeName;
+              castAccess = castPending->Access; }
             namedVar.Primary = compiler->CreateCast(namedVar.Primary, type, srcIsSigned);
             namedVar.TypeAndValue = destTypeName;
             if (castOfTempUniqueField)
                 compiler->RegisterOwningTempUniqueField(namedVar.Primary);
+            else if (!castConds.empty())
+                compiler->RegisterPendingLaunderTempUniqueField(namedVar.Primary, castConds,
+                                                                castCallee, castAccess);
             // A ptr->ptr cast is a no-op under opaque pointers, so the result IS the ledgered
             // code value; launder it or the explicit cast the rejection advises is itself refused.
             if (compiler->ParameterStoresData(destTypeName))
@@ -6274,10 +6288,10 @@ bool MainListener::EmitOneFieldInit(
         // cast/join spellings that reach an owning destination with every declared fact stripped.
         bool braceSrcGateFired = braceSrcIsUniqueFieldRead
             && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType));
-        if (!braceSrcGateFired && IsOwningTempUniqueFieldEscape(rightNV))
+        if (!braceSrcGateFired)
         {
             bool braceDestOwns = braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType);
-            RejectOwningTempUniqueFieldEscape(
+            GuardOwningTempUniqueFieldEscape(
                 rightNV, std::format("{}field '{}.{}'", braceDestOwns ? "unique " : "",
                                      typeName, fieldName), errCtx);
         }
@@ -6958,9 +6972,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
 
             // Array-aggregate leg of the temp-unique-field escape. This lowering is NOT
             // EmitOneFieldInit, so the struct brace-init leg could never see it.
-            if (IsOwningTempUniqueFieldEscape(nv))
-                RejectOwningTempUniqueFieldEscape(
-                    nv, std::format("element {} of array '{}'", i, name), fi);
+            GuardOwningTempUniqueFieldEscape(
+                nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -7553,9 +7566,8 @@ void MainListener::EmitArrayViewInferredInit(
 
             // Array-VIEW twin of the fixed-array leg above; a separate lowering reached by
             // neither the fixed path nor EmitOneFieldInit.
-            if (IsOwningTempUniqueFieldEscape(nv))
-                RejectOwningTempUniqueFieldEscape(
-                    nv, std::format("element {} of array '{}'", i, name), fi);
+            GuardOwningTempUniqueFieldEscape(
+                nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
                 && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
@@ -7885,9 +7897,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 LLVMBackend::NamedVariable ctorNV;
                 ctorNV.Primary = structVal;
-                if (IsOwningTempUniqueFieldEscape(ctorNV))
-                    RejectOwningTempUniqueFieldEscape(
-                        ctorNV, std::format("the heap object 'new {}' allocates", typeName), ctx);
+                GuardOwningTempUniqueFieldEscape(
+                    ctorNV, std::format("the heap object 'new {}' allocates", typeName), ctx);
             }
             if (structVal)
                 compiler->builder->CreateStore(structVal, typedPtr);

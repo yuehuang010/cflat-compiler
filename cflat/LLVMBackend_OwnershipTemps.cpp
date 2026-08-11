@@ -215,6 +215,118 @@ const LLVMBackend::LaunderedTempUniqueField* LLVMBackend::FindLaunderedTempUniqu
         return nullptr;
     }
 
+void LLVMBackend::RegisterPendingLaunderTempUniqueField(llvm::Value* result,
+        const std::vector<std::pair<const llvm::Function*, unsigned>>& conds,
+        const std::string& calleeName, const std::string& access)
+{
+        if (result == nullptr || conds.empty()) return;
+        for (auto& entry : pendingLaunderTempUniqueFields_)
+            if (entry.Result == result) return;   // first launder wins, as in the eager ledger
+        pendingLaunderTempUniqueFields_.push_back({ result, conds, calleeName, access });
+    }
+
+const LLVMBackend::PendingLaunderTempUniqueField*
+LLVMBackend::FindPendingLaunderTempUniqueField(const llvm::Value* value, int depth) const
+{
+        if (value == nullptr || depth > kMaxJoinArmDepth) return nullptr;
+        for (const auto& entry : pendingLaunderTempUniqueFields_)
+            if (entry.Result == value) return &entry;
+        if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+        {
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (const auto* hit = FindPendingLaunderTempUniqueField(phi->getIncomingValue(i),
+                                                                       depth + 1))
+                    return hit;
+            return nullptr;
+        }
+        if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+            for (const auto& arm : join->Arms)
+                if (const auto* hit = FindPendingLaunderTempUniqueField(arm.Value, depth + 1))
+                    return hit;
+        return nullptr;
+    }
+
+bool LLVMBackend::RecordDeferredTempUniqueFieldEscape(const llvm::Value* value,
+        const std::string& destDesc, const std::string& file, size_t line, size_t column)
+{
+        const PendingLaunderTempUniqueField* pending = FindPendingLaunderTempUniqueField(value);
+        if (pending == nullptr) return false;
+        deferredTempUniqueFieldEscapes_.push_back({ pending->Conds, pending->CalleeName,
+                                                    pending->Access, destDesc, "", "",
+                                                    file, line, column });
+        return true;
+    }
+
+void LLVMBackend::RecordDeferredTempUniqueFieldSinkEscape(const llvm::Value* value,
+        const std::string& functionName, const std::string& paramName)
+{
+        const PendingLaunderTempUniqueField* pending = FindPendingLaunderTempUniqueField(value);
+        if (pending == nullptr) return;
+        deferredTempUniqueFieldEscapes_.push_back({ pending->Conds, pending->CalleeName,
+                                                    pending->Access, "", functionName, paramName,
+                                                    sourceFileName, (size_t)currentLine,
+                                                    (size_t)currentColumn });
+    }
+
+std::string LLVMBackend::DescribeLaunderedTempUniqueFieldEscape(const std::string& calleeName,
+        const std::string& access, const std::string& destDesc)
+{
+        std::string field = access.empty() ? std::string("a unique field")
+                                           : std::format("unique field '{}'", access);
+        return std::format(
+            "cannot store the result of '{}' into {} - '{}' may return its argument, which "
+            "here is {} of a temporary, and the temporary's synthesized destructor frees "
+            "the pointee at the end of this statement. Bind the whole call result to a "
+            "local first and pass the field read from that local.",
+            calleeName, destDesc, calleeName, field);
+    }
+
+std::string LLVMBackend::DescribeTempUniqueFieldSinkEscape(const std::string& functionName,
+        const std::string& paramName)
+{
+        return std::format(
+            "call to '{}': cannot pass a unique field of a temporary to parameter '{}', which "
+            "takes ownership - the temporary's synthesized destructor frees the pointee at the "
+            "end of this statement, so the callee would own freed memory. Bind the whole call "
+            "result to a local first and 'move' the field out of that local.",
+            functionName, paramName);
+    }
+
+bool LLVMBackend::LaunderCondsAllProve(
+        const std::vector<std::pair<const llvm::Function*, unsigned>>& conds)
+{
+        for (const auto& cond : conds)
+        {
+            if (cond.first == nullptr || !FunctionBodyIsComplete(cond.first)) return false;
+            if (!ParameterMayReachReturn(cond.first, cond.second)) return false;
+        }
+        return !conds.empty();
+    }
+
+/*
+ * The RETURN half of the record-then-resolve pair. Runs after the STORE half, which is the order
+ * the eager path has within a statement: the argument gate fires at the call, the destination
+ * gate at the store that follows it.
+ */
+void LLVMBackend::ResolveDeferredTempUniqueFieldEscapes()
+{
+        std::vector<DeferredTempUniqueFieldEscape> pending;
+        pending.swap(deferredTempUniqueFieldEscapes_);
+        // ONE diagnostic per compile: LogError throws out of this loop, exactly as in the
+        // store half's resolve.
+        for (const auto& entry : pending)
+        {
+            if (!LaunderCondsAllProve(entry.Conds)) continue;
+            ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+            // LogError throws, so exactly one of these ever runs.
+            if (!entry.SinkFunction.empty())
+                LogError(DescribeTempUniqueFieldSinkEscape(entry.SinkFunction, entry.SinkParam));
+            else
+                LogError(DescribeLaunderedTempUniqueFieldEscape(entry.CalleeName, entry.Access,
+                                                                entry.DestDesc));
+        }
+    }
+
 void LLVMBackend::RegisterDataValue(llvm::Value* value)
 {
         if (value == nullptr) return;
@@ -1003,6 +1115,15 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         // The record ledger holds this raw Function*, which LLVM may hand back to a later
         // Function::Create; an entry outliving its callee would be resolved against a stranger.
         std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) { return e.Callee == fn; });
+        // Same hazard for the deferred RETURN half: a condition naming this Function* would be
+        // re-asked against whatever Function::Create hands the recycled address to next.
+        auto namesFn = [&](const std::pair<const llvm::Function*, unsigned>& c) { return c.first == fn; };
+        std::erase_if(deferredTempUniqueFieldEscapes_, [&](const DeferredTempUniqueFieldEscape& e) {
+            return std::any_of(e.Conds.begin(), e.Conds.end(), namesFn); });
+        std::erase_if(pendingLaunderTempUniqueFields_, [&](const PendingLaunderTempUniqueField& e) {
+            return std::any_of(e.Conds.begin(), e.Conds.end(), namesFn); });
+        std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) {
+            return std::any_of(e.LaunderConds.begin(), e.LaunderConds.end(), namesFn); });
         // Same hazard for the borrow-provenance ledger: a recycled Function* would resolve a
         // stranger's calls against this callee's proof, which REJECTS - so drop it here too.
         uniqueFieldBorrowReturns_.erase(fn);
@@ -1023,6 +1144,8 @@ void LLVMBackend::DropModuleEscapeMemo()
         paramRetainsPastCallInProgress_.clear();
         provableRetainsInProgress_.clear();
         tempUniqueFieldArgs_.clear();
+        deferredTempUniqueFieldEscapes_.clear();
+        pendingLaunderTempUniqueFields_.clear();
         // Both borrow-provenance ledgers are Function*/CallInst*-keyed, so a module rebuild
         // invalidates them exactly as it does the memos above. Two of the three callers of this
         // helper are module rebuilds OUTSIDE ResetForReanalysis, so clearing here is what covers them.
@@ -1752,26 +1875,45 @@ void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::
         for (unsigned i = 0; i < call->arg_size(); ++i)
         {
             llvm::Value* argVal = call->getArgOperand(i);
-            if (!JoinCarriesOwningTempUniqueField(argVal)) continue;
+            bool carries = JoinCarriesOwningTempUniqueField(argVal);
+            // A chain hop: the argument is itself a call whose callee is still below, so it is
+            // only the temp's field if that hop proves. Carry its conditions forward.
+            const PendingLaunderTempUniqueField* pendingArg =
+                carries ? nullptr : FindPendingLaunderTempUniqueField(argVal);
+            if (!carries && pendingArg == nullptr) continue;
             std::string access;
             for (const auto& nv : args)
                 if (nv.Primary == argVal) { access = DescribeUniqueFieldAccess(nv); break; }
             TempUniqueFieldArg entry{ callee, i, functionName, access, sourceFileName,
                                       currentLine, currentColumn,
-                                      !IsLedgeredOwningTempUniqueField(argVal) };
+                                      carries && !IsLedgeredOwningTempUniqueField(argVal) };
+            if (pendingArg != nullptr) entry.LaunderConds = pendingArg->Conds;
+            const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
+            std::string innerAccess = inner != nullptr ? inner->Access
+                : (pendingArg != nullptr ? pendingArg->Access : access);
+            bool bodyReadable = FunctionBodyIsComplete(callee);
             // The callee may hand the parameter straight back out. Re-ledger the RESULT so the
             // existing escape guards see the laundered value as the temp field it still is.
-            if (FunctionBodyIsComplete(callee) && ParameterMayReachReturn(callee, i))
+            if (carries && bodyReadable && ParameterMayReachReturn(callee, i))
             {
                 RegisterOwningTempUniqueField(call);
-                const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
-                RegisterLaunderedTempUniqueField(call, functionName,
-                    inner != nullptr ? inner->Access : access);
+                RegisterLaunderedTempUniqueField(call, functionName, innerAccess);
+            }
+            else
+            {
+                // No readable body here, or the hop feeding this one is itself unproven: record
+                // the result as a CANDIDATE so the destination sites can defer their own answer.
+                std::vector<std::pair<const llvm::Function*, unsigned>> conds =
+                    pendingArg != nullptr ? pendingArg->Conds
+                                          : std::vector<std::pair<const llvm::Function*, unsigned>>{};
+                if (!bodyReadable) conds.push_back({ callee, i });
+                else if (!ParameterMayReachReturn(callee, i)) conds.clear();
+                RegisterPendingLaunderTempUniqueField(call, conds, functionName, innerAccess);
             }
             std::string destKind;
-            // Answer NOW when the body already proves it, so the diagnostic lands at the call
-            // site inside any enclosing statement scope; otherwise defer (callee defined below).
-            if (FunctionBodyIsComplete(callee)
+            // Answer NOW when the body already proves it AND the argument is already known to be
+            // the field; otherwise defer (callee defined below, or an unproven chain hop).
+            if (carries && entry.LaunderConds.empty() && bodyReadable
                 && ParameterProvablyRetainsArgument(callee, i, destKind))
                 RejectTempUniqueFieldArgEscape(entry, destKind);
             tempUniqueFieldArgs_.push_back(entry);
@@ -1878,6 +2020,8 @@ void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
         for (const auto& entry : pending)
         {
             std::string destKind;
+            // A chained argument is the temp's field only if every hop below it proves.
+            if (!entry.LaunderConds.empty() && !LaunderCondsAllProve(entry.LaunderConds)) continue;
             if (!entry.IfaceName.empty())
             {
                 std::string implDetail;
@@ -2616,6 +2760,7 @@ void LLVMBackend::FlushOwnedTemps()
         // Same boundary destructs the owning temp, so its unique-field reads retire with it.
         owningTempUniqueFields_.clear();
         launderedTempUniqueFields_.clear();
+        pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();

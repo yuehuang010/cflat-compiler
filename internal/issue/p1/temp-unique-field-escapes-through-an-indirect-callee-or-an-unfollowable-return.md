@@ -6,8 +6,9 @@ callee whose body PROVABLY stores the pointer into memory that outlives the call
 re-ledgers the call result, so the existing escape guards fire on a laundered value). Trimmed again
 2026-08-10 by `fix/selglob`, which closed the JOINED-STORE sub-case (`MemoryOutlivesCall` now walks
 a select/phi destination's arms, ALL-arms). Trimmed again 2026-08-10 by `fix/iface-escape`, which
-closed the INTERFACE-DISPATCH sub-case (see below). What is left here is the shape that guard's
-callee-side fact still cannot answer, plus the residues of the return walk.
+closed the INTERFACE-DISPATCH sub-case (see below). Trimmed again 2026-08-10 by `fix/retlate`,
+which closed the BELOW-CALL-SITE return sub-case (see below). What is left here is the shape that
+guard's callee-side fact still cannot answer, plus the residues of the return walk.
 
 Severity: **silent use-after-free**. Compiles clean, runs, exits 0.
 
@@ -56,17 +57,47 @@ template as uncertain (`RecordUncertainInterfaceImpl`, MainListener.h) because t
 is not known before substitution, so the implementor set cannot be enumerated and the guard
 answers "no proof". Measured: `scratch/ife_s9_generic.cb`, `scratch/ife_s9b_generic_concrete_param.cb`.
 
-## Also left open by `fix/retwalk`: a laundering callee defined BELOW its call site
+## CLOSED 2026-08-10 by `fix/retlate`: a laundering callee defined BELOW its call site
 
-`Node* b = laterPassthru(makeBox().t);` with `laterPassthru` defined after `main` still compiles
-and dangles (`v=99 same=1 dtors=1`, `scratch/rw/b7_callee_after.cb`, measured identical before and
-after `fix/retwalk`). cflat emits IR as it walks, so the callee is a bare declaration when the
-call is emitted and `ParameterMayReachReturn` correctly reports "no proof". The STORE half of the
-same guard copes with this by recording the call and re-asking at end of module
-(`ResolveTempUniqueFieldArgEscapes`); the RETURN half cannot reuse that, because the fact it needs
-is not "did the callee store" but "where did the RESULT get bound", which is known only at the
-declaration/assignment/return site the walk has already passed. Closing it means deferring the
-escape SITE, not the callee question - a second record-then-resolve list keyed on the destination.
+`Node* b = laterPassthru(makeBox().t);` with `laterPassthru` defined after `main` used to compile
+and dangle (`v=99 dtors=1`). cflat emits IR as it walks, so the callee is a bare declaration when
+the call is emitted and `ParameterMayReachReturn` correctly reported "no proof". The STORE half
+copes by recording the CALL and re-asking at end of module (`ResolveTempUniqueFieldArgEscapes`);
+the RETURN half could not reuse that, because the fact it needs is not "did the callee store" but
+"where did the RESULT get bound", known only at the destination the walk has already passed.
+
+The fix defers the escape SITE, not the callee question. `RecordTempUniqueFieldArgs` registers the
+call result as a CANDIDATE launder (`pendingLaunderTempUniqueFields_`, statement-scoped like the
+eager ledger) carrying a CONJUNCTION of `(callee, argIndex)` conditions; every destination goes
+through one door (`MainListener::GuardOwningTempUniqueFieldEscape`) that rejects immediately when
+the eager ledger already proves it and otherwise records the SITE
+(`deferredTempUniqueFieldEscapes_`, module-lifetime like `tempUniqueFieldArgs_`).
+`ResolveDeferredTempUniqueFieldEscapes` re-asks at end of module, right after the store half.
+The conjunction makes a chain work with either callee below (`f(g(makeBox().t))`), and
+`TempUniqueFieldArg::LaunderConds` carries the same conditions when the laundered result is
+itself an ARGUMENT, so the store half's diagnostic defers too.
+
+Destinations covered, all measured in BOTH orderings (`scratch/rl_*.cb`): declaration init,
+interface declaration init, plain `=`, `unique` local `=`, field store, brace field init,
+`new T{...}` ctor store, fixed-array element, array-view element, `return`, argument to a second
+call, sink (`move` / `unique`) parameter, and through a cast. The wording is the eager path's,
+from one shared formatter (`DescribeLaunderedTempUniqueFieldEscape`) - the user cannot tell which
+pass caught it. The ACCEPT set is unchanged and frozen as value legs: a below-defined callee that
+returns something other than its parameter, a below-defined passthru whose result is DISCARDED,
+and a below-defined passthru of an ordinary heap pointer all still compile and free once.
+
+One incidental hole closed with it: `FunctionBodyIsComplete` refuses `currentFunction`, so BOTH
+end-of-module resolves used to exempt whichever callee the walk happened to finish on (a callee
+written last in the file). `NoCurrentFunctionScope` parks it across both.
+
+Evidence: reject leg `Test/errors/err_temp_unique_field_return_deferred.cb` (bare file-scope
+`expect_error`, mutation-tested against dropping the resolve call), immediate-path twin
+`tempDtorlessLaunderedThroughEarlyReturn` in `Test/errors/err_unique_borrow_into_field.cb`, accept
+legs `temp_uniq_accept_late_*` in `Test/test_move.cb`.
+
+Residue, deliberately left accepting: an interface-dispatch call whose ARGUMENT is a candidate
+launder (`it.take(g(makeBox().t))` with `g` below) - `RecordTempUniqueFieldInterfaceArgs` still
+keys on the eager ledger only.
 
 ## Also left open by `fix/retwalk`: the parameter returned back out of a local FIELD
 
@@ -94,9 +125,10 @@ whose walk exceeds `kMaxRetainUses` values.
 
 They are separate mechanisms, filed together only because they are the remaining complement of one
 guard: what the callee-side walks answer is "a KNOWN callee that STORES or RETURNS", and these are
-"no known callee" (now only `function<T>`) and the residues of the return walk itself (callee
-below the call site, field-indirect return, budget). Fixing any one alone is a self-contained
-change - the interface half was fixed exactly that way. Do not consolidate them further.
+"no known callee" (now only `function<T>`) and the residues of the return walk itself
+(field-indirect return, budget). Fixing any one alone is a self-contained change - the interface
+half and the below-call-site half were each fixed exactly that way. Do not consolidate them
+further.
 
 ## Also known, and deliberately accepted
 
