@@ -921,6 +921,39 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
         }
     }
 
+/*
+ * The vtable slot's implementing function for one concrete type. Shared by both vtable builders
+ * and by the interface-dispatch ownership walks, so the "which body does this slot call" answer
+ * can never drift between what is emitted and what is analysed.
+ */
+llvm::Function* LLVMBackend::LookupInterfaceMethodImpl(const std::string& structName,
+                                                      const InterfaceMethod& method) const
+{
+        auto funcIt = functionTable.find(method.Name);
+        if (funcIt == functionTable.end()) return nullptr;
+        // method.Parameters excludes 'this'; sym.Parameters[0] is 'this'.
+        // Match by struct this-pointer and remaining params to distinguish overloads.
+        size_t expectedParamCount = 1 + method.Parameters.size();
+        llvm::Function* fallback = nullptr;
+        for (const auto& sym : funcIt->second)
+        {
+            if (sym.Parameters.size() != expectedParamCount) continue;
+            if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer) continue;
+            bool paramsMatch = true;
+            for (size_t pi = 0; pi < method.Parameters.size(); pi++)
+            {
+                if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
+                { paramsMatch = false; break; }
+            }
+            if (!paramsMatch) continue;
+            // Bind the overload whose ownership contract matches the interface method, so dispatch
+            // honors the interface's move/alias/bond spelling regardless of declaration order.
+            if (!fallback) fallback = sym.Function;
+            if (InterfaceMethodContractConforms(method, sym)) return sym.Function;
+        }
+        return fallback;
+    }
+
 llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, const std::string& structName, const std::string& ifaceName)
 {
         auto it = pd.VTables.find(ifaceName);
@@ -947,32 +980,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
 
         for (const auto& method : ifaceIt->second)
         {
-            llvm::Function* fn = nullptr;
-            auto funcIt = functionTable.find(method.Name);
-            if (funcIt != functionTable.end())
-            {
-                size_t expectedParamCount = 1 + method.Parameters.size();
-                llvm::Function* fallback = nullptr;
-                for (const auto& sym : funcIt->second)
-                {
-                    if (sym.Parameters.size() != expectedParamCount) continue;
-                    if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer) continue;
-                    bool paramsMatch = true;
-                    for (size_t pi = 0; pi < method.Parameters.size(); pi++)
-                    {
-                        if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
-                        { paramsMatch = false; break; }
-                    }
-                    if (paramsMatch)
-                    {
-                        // Prefer the overload whose ownership contract matches the interface method;
-                        // fall back to the first type-match if none conform (see GetOrCreateVTable).
-                        if (!fallback) fallback = sym.Function;
-                        if (InterfaceMethodContractConforms(method, sym)) { fn = sym.Function; break; }
-                    }
-                }
-                if (fn == nullptr) fn = fallback;
-            }
+            llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
             {
                 LogError(std::format("GetOrCreateProgramVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
@@ -1038,42 +1046,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
 
         for (const auto& method : ifaceIt->second)
         {
-            llvm::Function* fn = nullptr;
-            auto funcIt = functionTable.find(method.Name);
-            if (funcIt != functionTable.end())
-            {
-                // method.Parameters excludes 'this'; sym.Parameters[0] is 'this'.
-                // Match by struct this-pointer and remaining params to distinguish overloads.
-                size_t expectedParamCount = 1 + method.Parameters.size();
-                llvm::Function* fallback = nullptr;
-                for (const auto& sym : funcIt->second)
-                {
-                    if (sym.Parameters.size() != expectedParamCount) continue;
-                    if (sym.Parameters[0].TypeName != structName || !sym.Parameters[0].Pointer) continue;
-                    bool paramsMatch = true;
-                    for (size_t pi = 0; pi < method.Parameters.size(); pi++)
-                    {
-                        if (sym.Parameters[1 + pi].TypeName != method.Parameters[pi].TypeName)
-                        {
-                            paramsMatch = false;
-                            break;
-                        }
-                    }
-                    if (paramsMatch)
-                    {
-                        // Bind the overload whose ownership contract matches the interface method,
-                        // so dispatch honors the interface's move/alias/bond spelling regardless of
-                        // class declaration order. Fall back to the first type-match if none conform.
-                        if (!fallback) fallback = sym.Function;
-                        if (InterfaceMethodContractConforms(method, sym))
-                        {
-                            fn = sym.Function;
-                            break;
-                        }
-                    }
-                }
-                if (fn == nullptr) fn = fallback;
-            }
+            llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
             {
                 LogError(std::format("GetOrCreateVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
@@ -1274,6 +1247,31 @@ bool LLVMBackend::AnyTypeMayProvideInterface(const std::string& ifaceName) const
         for (const auto& [name, ifaces] : scannedInterfaceImpls)
             if (TypeMayProvideInterface(name, ifaceName)) return true;
         return false;
+    }
+
+/*
+ * The CLOSED WORLD of an interface: every registered type that may provide it. False means the
+ * set cannot be trusted (still inside an import, or an uncertain template), which every caller
+ * must read as "no proof" - the unknown-accepts polarity the ownership guards are built on.
+ */
+bool LLVMBackend::EnumerateInterfaceImplementors(const std::string& ifaceNameIn,
+                                                 std::vector<std::string>& out) const
+{
+        std::string ifaceName = ResolveTypeAlias(ifaceNameIn);
+        if (ifaceName.empty() || !IsInterfaceType(ifaceName)) return false;
+        if (InterfaceImplementorSetIsUncertain(ifaceName)) return false;
+        std::unordered_set<std::string> seen;
+        auto consider = [&](const std::string& name)
+        {
+            if (!TypeMayProvideInterface(name, ifaceName)) return;
+            if (seen.insert(name).second) out.push_back(name);
+        };
+        for (const auto& [name, sd] : dataStructures)            consider(name);
+        for (const auto& [name, pd] : programTable)              consider(name);
+        for (const auto& [name, ifaces] : scannedInterfaceImpls) consider(name);
+        // Deterministic order: the diagnostic below names implementors, and a map walk is not.
+        std::sort(out.begin(), out.end());
+        return !out.empty();
     }
 
 bool LLVMBackend::InterfaceConversionIsProvablyImpossible(const std::string& srcIfaceIn,

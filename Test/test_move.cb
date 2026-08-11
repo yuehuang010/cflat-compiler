@@ -8328,6 +8328,21 @@ struct JoinUserBox
 JoinUserBox makeJoinUserBox() { JoinUserBox b = default; b.t = new Resource(); b.t->id = 44; return b; }
 void ownResourceGlobal(move Resource* r) { gKeptResource = r; }
 
+// INTERFACE DISPATCH accept set. The virtual slot has no single callee, so it is judged against
+// EVERY implementor: the store diagnostic needs ALL of them to store, and one implementor that
+// only reads makes it false on that dispatch. These three are the accepts that pins that down.
+interface IResourceRead { int ifaceLookRead(Resource* r); };
+class ResourceReaderC : IResourceRead { int ifaceLookRead(Resource* r) { return r->id; } };
+// Two implementors, one STORES and one only reads - the polarity cell. MixedStoreC is never
+// instantiated on purpose: being a registered implementor is what makes the slot ambiguous.
+interface IResourceMixed { int ifaceLookMixed(Resource* r); };
+class MixedStoreC : IResourceMixed { Resource* p = nullptr; int ifaceLookMixed(Resource* r) { this.p = r; return r->id; } };
+class MixedReadC : IResourceMixed { int ifaceLookMixed(Resource* r) { return r->id; } };
+// Return side: the sole implementor hands back something OTHER than its argument, so the result
+// is not the temp's field and the laundering re-ledger must not fire.
+interface IResourceRet { Resource* ifacePick(Resource* r); };
+class RetGlobalC : IResourceRet { Resource* ifacePick(Resource* r) { return gKeptResource; } };
+
 // The RECEIVER shape: `makeSelfBox().t->m()`. A method whose body only READS `this` must keep
 // working off a temp's unique field, and a method that DOES store `this` must keep working off
 // a BORROWED container element, where nothing is freed at end of statement. The storing
@@ -8462,6 +8477,34 @@ int testTempUniqueFieldBorrowAccepts()
     passed += Test("temp_uniq_accept_plain_param_cast_read",
                    readResourceId((Resource*)makeMoveBox().t), 44);
     passed += Test("temp_uniq_accept_plain_param_cast_freed_once", dtorCount, 1);
+
+    // INTERFACE DISPATCH, the closed-world twin of the plain-parameter accept above. The sole
+    // implementor only READS, so nothing outlives the call and the temp is still freed once.
+    dtorCount = 0;
+    ResourceReaderC ifaceRd = default;
+    IResourceRead ifaceRdI = ifaceRd;
+    passed += Test("temp_uniq_accept_iface_read", ifaceRdI.ifaceLookRead(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_iface_read_freed_once", dtorCount, 1);
+
+    // The POLARITY cell: two implementors, one stores and one only reads. With a non-storing
+    // implementor dispatchable, "the callee stores this pointer" is false, so the site is
+    // ACCEPTED - the storing-only twin of this shape is the reject leg in the errors file.
+    dtorCount = 0;
+    MixedReadC ifaceMx = default;
+    IResourceMixed ifaceMxI = ifaceMx;
+    passed += Test("temp_uniq_accept_iface_mixed_implementors",
+                   ifaceMxI.ifaceLookMixed(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_iface_mixed_freed_once", dtorCount, 1);
+
+    // Return side: the sole implementor returns a DIFFERENT pointer, so the result is not the
+    // temp's field - binding it to a local stays legal and the temp is freed once.
+    dtorCount = 0;
+    gKeptResource = nullptr;
+    RetGlobalC ifaceRet = default;
+    IResourceRet ifaceRetI = ifaceRet;
+    Resource* ifacePicked = ifaceRetI.ifacePick(makeMoveBox().t);
+    passed += Test("temp_uniq_accept_iface_return_other", ifacePicked == nullptr ? 1 : 0, 1);
+    passed += Test("temp_uniq_accept_iface_return_other_freed_once", dtorCount, 1);
 
     // FLIPPED by the '??' fallback-arm fix. The old pair here pinned `dtors == 0` on
     // `nul ?? makeMoveBox().t` - a deliberate tripwire on a LEAK: that arm got no per-arm
@@ -10244,7 +10287,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 115;
+    total += 121;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

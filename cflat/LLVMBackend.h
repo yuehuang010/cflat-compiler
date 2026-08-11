@@ -2029,6 +2029,12 @@ private:
         // The value was not ledgered directly, so it arrived through a '?:' / '??' join. Only
         // then may the diagnostic say so - a plain read and a cast are both ledgered directly.
         bool ThroughJoin = false;
+        // INTERFACE DISPATCH: there is no single Callee to ask, so the entry names the vtable
+        // SLOT and is judged against EVERY implementor. Empty IfaceName = ordinary direct call.
+        std::string IfaceName;
+        std::string MethodName;
+        std::string ParamName;
+        size_t Arity = 0;
     };
     std::vector<TempUniqueFieldArg> tempUniqueFieldArgs_;
 
@@ -2906,6 +2912,34 @@ private:
      */
     void RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
                                    const std::vector<NamedVariable>& args);
+
+    /*
+     * The INTERFACE-DISPATCH twin of RecordTempUniqueFieldArgs. There is no `getCalledFunction()`
+     * to ask, but the implementor set IS closed at end of module, so the slot is judged against
+     * every implementor: EVERY one must provably store (store side) or may return (return side).
+     */
+    void RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult, const std::string& ifaceName,
+                                            const InterfaceMethod& method,
+                                            const std::vector<NamedVariable>& args);
+
+    /*
+     * ALL-of-implementors polarity, both directions. A diagnostic must be TRUE of the site it
+     * fires at, and a single non-storing (resp. non-returning) implementor is a live dispatch on
+     * which the claim is false - so one counter-example accepts. An implementor with no readable
+     * body, or an untrustworthy implementor set, is a counter-example too: unknown accepts.
+     */
+    bool EveryImplementorRetainsInterfaceArg(const std::string& ifaceName,
+                                             const std::string& methodName, size_t arity,
+                                             unsigned paramIndex, std::string& destKind,
+                                             std::string& implDetail);
+
+    bool EveryImplementorMayReturnInterfaceArg(const std::string& ifaceName,
+                                               const std::string& methodName, size_t arity,
+                                               unsigned paramIndex);
+
+    void RejectTempUniqueFieldInterfaceArgEscape(const TempUniqueFieldArg& entry,
+                                                 const std::string& destKind,
+                                                 const std::string& implDetail);
 
     /*
      * The DUAL of ParameterProvablyRetainsArgument: MAY this parameter come back out as the
@@ -4210,6 +4244,16 @@ public:
 
     void VerifyInterfaceMethodContract(const std::string& implName, const std::string& ifaceName,
                                        const InterfaceMethod& method, const FunctionSymbol& sym);
+
+    // The function a vtable slot calls for one concrete implementor. Shared by both vtable
+    // builders and the interface-dispatch ownership walks so they can never disagree.
+    llvm::Function* LookupInterfaceMethodImpl(const std::string& structName,
+                                              const InterfaceMethod& method) const;
+
+    // Every registered type that may provide this interface. False = the set is untrustworthy
+    // (mid-import, uncertain template, or empty), which callers must read as "no proof".
+    bool EnumerateInterfaceImplementors(const std::string& ifaceName,
+                                        std::vector<std::string>& out) const;
 
     llvm::GlobalVariable* GetOrCreateProgramVTable(ProgramData& pd, const std::string& structName, const std::string& ifaceName);
 

@@ -2400,6 +2400,10 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 methodInfo->Parameters[i], callArgNVs[i]);
         ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs);
 
+        // A temp's `unique` field handed to a PLAIN `T*` parameter of a VIRTUAL slot. Same point
+        // in the sequence as the direct path's RecordTempUniqueFieldArgs, for the same reason.
+        RecordTempUniqueFieldInterfaceArgs(callResult, ifaceName, *methodInfo, callArgNVs);
+
         // Classify the virtual result's ownership exactly like the direct-call path
         // (CreateOverloadedFunctionCall): a 'move string' / 'move T*' / 'move <interface>'
         // return hands an owned value to the caller. Set the side-channel so a binding site

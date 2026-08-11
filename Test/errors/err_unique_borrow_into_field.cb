@@ -386,6 +386,44 @@ expect_error("call to 'keepGlobal': cannot pass unique field 'makeBox.t' of a te
     void tempDtorlessCastIntoStoringPlainParam() { keepGlobal((Node*)makeBox().t); }
 }
 
+// ---------------------------------------------------------------------------------------
+// INTERFACE DISPATCH. A virtual call has no `getCalledFunction()` to ask, but the implementor
+// set IS closed at end of module, so the slot is judged against EVERY implementor. The rule is
+// ALL-of-implementors: one implementor that does not store would make this message false on
+// that dispatch, so the MIXED shape stays legal and is frozen as an accept leg in
+// Test/test_move.cb. All three legs below were silent use-after-free before this guard
+// (measured -o + run: the store aliased a freshly reallocated block, `same=1`).
+Node* gIfaceKept = nullptr;
+interface IKeepOne { void ifaceKeep(Node* n); };
+class KeepOneC : IKeepOne { void ifaceKeep(Node* n) { gIfaceKept = n; } };
+
+expect_error("call to interface method 'IKeepOne.ifaceKeep': cannot pass unique field 'makeBox.t' of a temporary to plain pointer parameter 'n' - every implementor of this method stores that pointer into memory that outlives the call ('KeepOneC.ifaceKeep' stores it into a global)") {
+    void tempDtorlessIntoStoringIfaceSlot() { KeepOneC k = default; IKeepOne it = k; it.ifaceKeep(makeBox().t); }
+}
+
+// TWO implementors, both storing, into DIFFERENT destination kinds. This leg cannot pass for
+// the single-implementor leg's reason: the message COUNTS the implementors the proof covered,
+// which is what says the ALL rule actually visited more than the first one.
+Node* gIfaceKept2 = nullptr;
+interface IKeepBoth { void ifaceKeepBoth(Node* n); };
+class KeepBothA : IKeepBoth { void ifaceKeepBoth(Node* n) { gIfaceKept2 = n; } };
+class KeepBothB : IKeepBoth { Node* p = nullptr; void ifaceKeepBoth(Node* n) { this.p = n; } };
+
+expect_error("all 2 implementors store it, e.g. 'KeepBothA.ifaceKeepBoth' into a global") {
+    void tempDtorlessIntoTwoStoringIfaceSlots() { KeepBothA k = default; IKeepBoth it = k; it.ifaceKeepBoth(makeBox().t); }
+}
+
+// The RETURN side of the same closed world. Every implementor may hand the parameter straight
+// back, so the result IS the temp's unique field: the re-ledger relabels it and the existing
+// declaration guard fires. Its ACCEPT twin (an implementor returning something else) is in
+// Test/test_move.cb, and that is what makes the ALL polarity here observable.
+interface IPassOne { Node* ifacePassOne(Node* n); };
+class PassOneC : IPassOne { Node* ifacePassOne(Node* n) { return n; } };
+
+expect_error("cannot store the result of 'IPassOne.ifacePassOne' into a local - 'IPassOne.ifacePassOne' may return its argument, which here is unique field 'makeBox.t' of a temporary") {
+    void tempDtorlessLaunderedThroughIfaceReturn() { PassOneC p = default; IPassOne ip = p; Node* b = ip.ifacePassOne(makeBox().t); }
+}
+
 // NOTE: an interface-field-to-interface-field copy with the SAME field name on both sides is
 // rejected as of 2026-08-05 - two different boxed receivers still both carry an empty CallerName,
 // so they are told apart by the OBJECT each box wraps. Its legs live in

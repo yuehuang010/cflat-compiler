@@ -1,0 +1,41 @@
+/*
+ * The ORDER leg for the INTERFACE-DISPATCH half of the temp-unique-field guard. A virtual call
+ * has no callee to ask, so the slot is judged against every implementor of the interface - but
+ * cflat emits IR as it walks, so an implementor whose method body is emitted BELOW the call site
+ * is still a bare declaration when the call is emitted. The ALL-of-implementors proof therefore
+ * reports "no proof" there (unknown accepts, by design) and the call is RECORDED and re-asked at
+ * end of module, where every implementor body is complete.
+ *
+ * `doIt` is written above `class KLateKeeper`, so at the call site the only implementor of
+ * `ILateKeep` has no readable body; the reject can only come from the deferred resolve.
+ *
+ * This leg lives in its own file for the same structural reason as
+ * err_temp_unique_field_plain_param_deferred.cb: a scoped `expect_error(...) { }` block closes
+ * before end-of-module resolution runs and would report "expected error ... did not occur", the
+ * opposite of the truth. Only the bare file-scope form stays armed to the end of the compile, and
+ * it covers the rest of the scope - one leg per file. The immediate-path interface legs live in
+ * err_unique_borrow_into_field.cb.
+ *
+ * Measured on the pre-guard binary (--run): the call compiled clean and `gLateKept` was left
+ * pointing at a block the temporary's synthesized destructor had already freed.
+ */
+expect_error("call to interface method 'ILateKeep.lateKeep': cannot pass unique field 'makeLateBox.t' of a temporary to plain pointer parameter 'n' - every implementor of this method stores that pointer into memory that outlives the call ('KLateKeeper.lateKeep' stores it into a global)");
+
+struct LateNode { int v = 0; };
+struct LateBox<T> { T t = default; };
+LateBox<unique LateNode*> makeLateBox() { LateBox<unique LateNode*> b = default; b.t = new LateNode(); return b; }
+
+LateNode* gLateKept = nullptr;
+interface ILateKeep { void lateKeep(LateNode* n); };
+
+// Written ABOVE the only implementor: the callee-side fact is unanswerable here.
+void doIt(ILateKeep it) { it.lateKeep(makeLateBox().t); }
+
+class KLateKeeper : ILateKeep { void lateKeep(LateNode* n) { gLateKept = n; } };
+
+extern int main()
+{
+    KLateKeeper k = default;
+    doIt(k);
+    return 0;
+}

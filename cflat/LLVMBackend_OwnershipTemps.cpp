@@ -1718,6 +1718,97 @@ void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::
         }
     }
 
+bool LLVMBackend::EveryImplementorRetainsInterfaceArg(const std::string& ifaceName,
+        const std::string& methodName, size_t arity, unsigned paramIndex,
+        std::string& destKind, std::string& implDetail)
+{
+        std::vector<std::string> impls;
+        if (!EnumerateInterfaceImplementors(ifaceName, impls)) return false;
+        const InterfaceMethod* method = FindInterfaceMethod(ifaceName, methodName, arity);
+        if (method == nullptr || paramIndex >= method->Parameters.size()) return false;
+        std::string firstKind, firstImpl;
+        for (const std::string& impl : impls)
+        {
+            llvm::Function* fn = LookupInterfaceMethodImpl(impl, *method);
+            // No body to read, or the implementor is emitted later: no proof, so accept.
+            if (fn == nullptr || !FunctionBodyIsComplete(fn)) return false;
+            std::string kind;
+            // +1: the implementor's arg 0 is the receiver the interface parameter list omits.
+            if (!ParameterProvablyRetainsArgument(fn, paramIndex + 1, kind)) return false;
+            if (firstKind.empty()) { firstKind = kind; firstImpl = impl; }
+        }
+        if (firstKind.empty()) return false;
+        destKind = firstKind;
+        implDetail = impls.size() == 1
+            ? std::format("'{}.{}' stores it into {}", firstImpl, methodName, firstKind)
+            : std::format("all {} implementors store it, e.g. '{}.{}' into {}",
+                          impls.size(), firstImpl, methodName, firstKind);
+        return true;
+    }
+
+bool LLVMBackend::EveryImplementorMayReturnInterfaceArg(const std::string& ifaceName,
+        const std::string& methodName, size_t arity, unsigned paramIndex)
+{
+        std::vector<std::string> impls;
+        if (!EnumerateInterfaceImplementors(ifaceName, impls)) return false;
+        const InterfaceMethod* method = FindInterfaceMethod(ifaceName, methodName, arity);
+        if (method == nullptr || paramIndex >= method->Parameters.size()) return false;
+        for (const std::string& impl : impls)
+        {
+            llvm::Function* fn = LookupInterfaceMethodImpl(impl, *method);
+            if (fn == nullptr || !FunctionBodyIsComplete(fn)) return false;
+            if (!ParameterMayReachReturn(fn, paramIndex + 1)) return false;
+        }
+        return true;
+    }
+
+/*
+ * The interface-dispatch twin of RecordTempUniqueFieldArgs. Runs at the same point in the virtual
+ * call as the direct path's recorder: after the move transfer, on the emitted CallInst.
+ */
+void LLVMBackend::RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult,
+        const std::string& ifaceName, const InterfaceMethod& method,
+        const std::vector<NamedVariable>& args)
+{
+        auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(callResult);
+        if (call == nullptr) return;
+        for (size_t i = 0; i < method.Parameters.size(); i++)
+        {
+            const TypeAndValue& param = method.Parameters[i];
+            // A sink parameter states the ownership claim at the call site and is answered by the
+            // sink path, exactly as in the direct call; only a PLAIN pointer reaches here.
+            if (param.IsMove || param.IsUnique || !param.Pointer) continue;
+            if (i + 1 >= call->arg_size()) break;
+            llvm::Value* argVal = call->getArgOperand((unsigned)(i + 1));
+            if (!JoinCarriesOwningTempUniqueField(argVal)) continue;
+            std::string access;
+            for (const auto& nv : args)
+                if (nv.Primary == argVal) { access = DescribeUniqueFieldAccess(nv); break; }
+            TempUniqueFieldArg entry{ nullptr, (unsigned)i, ifaceName + "." + method.Name, access,
+                                      sourceFileName, currentLine, currentColumn,
+                                      !IsLedgeredOwningTempUniqueField(argVal),
+                                      ifaceName, method.Name, param.VariableName,
+                                      method.Parameters.size() };
+            // Return-side laundering, ALL polarity: re-ledgering feeds a REJECTION, so it may only
+            // fire when the result IS the temp's field on every implementor that can be dispatched.
+            if (EveryImplementorMayReturnInterfaceArg(ifaceName, method.Name,
+                                                      method.Parameters.size(), (unsigned)i))
+            {
+                RegisterOwningTempUniqueField(call);
+                const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
+                RegisterLaunderedTempUniqueField(call, entry.CalleeName,
+                    inner != nullptr ? inner->Access : access);
+            }
+            std::string destKind, implDetail;
+            // Answer now when every implementor is already emitted, so the diagnostic lands inside
+            // any enclosing statement scope; otherwise defer to the end-of-module resolve.
+            if (EveryImplementorRetainsInterfaceArg(ifaceName, method.Name,
+                    method.Parameters.size(), (unsigned)i, destKind, implDetail))
+                RejectTempUniqueFieldInterfaceArgEscape(entry, destKind, implDetail);
+            tempUniqueFieldArgs_.push_back(entry);
+        }
+    }
+
 void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
 {
         std::vector<TempUniqueFieldArg> pending;
@@ -1727,6 +1818,15 @@ void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
         for (const auto& entry : pending)
         {
             std::string destKind;
+            if (!entry.IfaceName.empty())
+            {
+                std::string implDetail;
+                if (!EveryImplementorRetainsInterfaceArg(entry.IfaceName, entry.MethodName,
+                        entry.Arity, entry.ArgIndex, destKind, implDetail)) continue;
+                ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+                RejectTempUniqueFieldInterfaceArgEscape(entry, destKind, implDetail);
+                continue;
+            }
             if (!ParameterProvablyRetainsArgument(entry.Callee, entry.ArgIndex, destKind)) continue;
             // The walk is over, so sourceFileName is the MAIN file again; a call written in an
             // imported module must be reported against the file it was written in. LogError
@@ -1781,6 +1881,32 @@ void LLVMBackend::RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry
             "declare the parameter 'move' and pass 'move <local>.<field>' to hand ownership over.",
             entry.CalleeName, what, DescribeCalleeParameter(entry.Callee, entry.ArgIndex),
             entry.CalleeName, destKind));
+    }
+
+/*
+ * The interface-dispatch wording. It must be TRUE of a VIRTUAL site, so it says "every
+ * implementor" (the ALL polarity the proof used) and names one, rather than claiming a single
+ * callee the call site does not have.
+ */
+void LLVMBackend::RejectTempUniqueFieldInterfaceArgEscape(const TempUniqueFieldArg& entry,
+        const std::string& destKind, const std::string& implDetail)
+{
+        std::string what = entry.Access.empty()
+            ? std::string("a unique field of a temporary")
+            : std::format("unique field '{}' of a temporary", entry.Access);
+        if (entry.Access.empty() && entry.ThroughJoin)
+            what += ", reached through a '?:' / '??' join";
+        std::string param = entry.ParamName.empty()
+            ? std::format("parameter #{}", entry.ArgIndex + 1)
+            : std::format("parameter '{}'", entry.ParamName);
+        LogError(std::format(
+            "call to interface method '{}': cannot pass {} to plain pointer {} - every "
+            "implementor of this method stores that pointer into memory that outlives the call "
+            "({}), and the temporary's synthesized destructor frees the pointee at the end of this "
+            "statement. Bind the whole call result to a local first and pass the field off that "
+            "local, so the pointee outlives the statement - or declare the interface parameter "
+            "'move' and pass 'move <local>.<field>' to hand ownership over.",
+            entry.CalleeName, what, param, implDetail));
     }
 
 bool LLVMBackend::StoredValueMayBeCallerOwned(const llvm::Value* val, int depth) const

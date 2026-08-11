@@ -5,12 +5,13 @@ callee whose body PROVABLY stores the pointer into memory that outlives the call
 2026-08-10 by `fix/retwalk`, which closed the RETURN-VALUE sub-case (a `return <param>` walk that
 re-ledgers the call result, so the existing escape guards fire on a laundered value). Trimmed again
 2026-08-10 by `fix/selglob`, which closed the JOINED-STORE sub-case (`MemoryOutlivesCall` now walks
-a select/phi destination's arms, ALL-arms). What is left here is the shape that guard's
+a select/phi destination's arms, ALL-arms). Trimmed again 2026-08-10 by `fix/iface-escape`, which
+closed the INTERFACE-DISPATCH sub-case (see below). What is left here is the shape that guard's
 callee-side fact still cannot answer, plus the residues of the return walk.
 
 Severity: **silent use-after-free**. Compiles clean, runs, exits 0.
 
-## There is no callee to ask - function pointer and interface dispatch
+## There is no callee to ask - function pointer dispatch
 
 `RecordTempUniqueFieldArgs` reads `CallInst::getCalledFunction()`, and both callee-side walks
 (`OwningPtrProvablyEscapes`, `ParameterMayReachReturn`) treat a null callee as "no proof". So an
@@ -20,23 +21,40 @@ indirect call accepts:
 function<void(Node*)> f = keep;   // void keep(Node* n) { g = n; }
 f(makeBox().t);                   // measured: dtors=1, dangles
 
-ITake it = keeperC;               // class KeeperC : ITake { void take(Node* n) { this.p = n; } }
-it.take(makeBox().t);             // measured: dtors=1, dangles
+function<Node*(Node*)> g2 = passthru;
+Node* b = g2(makeBox().t);        // measured: v=99 same=1 dtors=1
 ```
 
-`scratch/tup_a11_fnptr.cb` and `scratch/tup_a12_iface.cb` in the original fix worktree. The
-RETURN-value spelling of the same hole was re-measured by `fix/retwalk` and behaves identically -
-`function<Node*(Node*)> f = passthru; Node* b = f(makeBox().t);` and the interface twin
-`Node* b = ip.go(makeBox().t);` both give `v=99 same=1 dtors=1` before and after that fix
-(`scratch/rw/c2_funcptr.cb`, `scratch/rw/c3_iface.cb`). Both are recorded as ACCEPT cells
-deliberately: unknown-accepts is the guard family's chosen polarity and these are the honest
-unknowns.
+`scratch/tup_a11_fnptr.cb` and `scratch/rw/c2_funcptr.cb` in the original fix worktrees. Recorded
+as ACCEPT cells deliberately: unknown-accepts is the guard family's chosen polarity, and a
+`function<T>` value has no closed world short of a points-to analysis.
 
-The interface half is the more closable of the two - the set of implementors IS known at end of
-module (`interfaceTable`), so an interface method could be judged as "every implementor of this
-slot provably stores" (or "any implementor may return the parameter"), which is the same shape
-`ResolveMaterializedInterfaceUses` already runs at. A `function<T>` value has no such closed world
-short of a points-to analysis.
+## CLOSED 2026-08-10 by `fix/iface-escape`: the interface-dispatch twin
+
+The interface half WAS the closable one, and is now closed. `CallInterfaceMethod` records the
+virtual call (`RecordTempUniqueFieldInterfaceArgs`) and the slot is judged against the closed
+implementor set (`EnumerateInterfaceImplementors`, the registry
+`InterfaceConversionIsProvablyImpossible` already uses), at the call site when every implementor
+body is emitted and otherwise at the end-of-module resolve.
+
+Both directions are ALL-of-implementors, not ANY. The store side must be, or the message ("the
+callee stores this pointer") is false on a dispatch to a non-storing implementor. The RETURN side
+was given the same polarity for the same reason and against `ParameterMayReachReturn`'s own MAY
+shape: the re-ledger feeds a REJECTION, and with one implementor returning something else the
+resulting "the result IS the temp's unique field" is false on that dispatch. One counter-example
+- a non-storing implementor, an implementor with no readable body yet, an uncertain implementor
+set (a generic interface base clause, still inside an import) - accepts.
+
+Evidence: `it.take(makeBox().t)` and `Node* b = ip.go(makeBox().t)` are both rejected; the mixed
+two-implementor shape and the read-only implementor still compile and free once. Reject legs in
+`Test/errors/err_unique_borrow_into_field.cb` (+ `err_temp_unique_field_iface_deferred.cb` for the
+implementor emitted below the call site), accept legs in `Test/test_move.cb`. Corpus in
+`scratch/ife_*.cb`.
+
+Residue, deliberately left accepting: a GENERIC interface. A generic base clause records the
+template as uncertain (`RecordUncertainInterfaceImpl`, MainListener.h) because the instance name
+is not known before substitution, so the implementor set cannot be enumerated and the guard
+answers "no proof". Measured: `scratch/ife_s9_generic.cb`, `scratch/ife_s9b_generic_concrete_param.cb`.
 
 ## Also left open by `fix/retwalk`: a laundering callee defined BELOW its call site
 
@@ -76,9 +94,9 @@ whose walk exceeds `kMaxRetainUses` values.
 
 They are separate mechanisms, filed together only because they are the remaining complement of one
 guard: what the callee-side walks answer is "a KNOWN callee that STORES or RETURNS", and these are
-"no known callee" and the residues of the return walk itself (callee below the call site,
-field-indirect return, budget). Fixing any one alone is a self-contained change. Do not
-consolidate them further.
+"no known callee" (now only `function<T>`) and the residues of the return walk itself (callee
+below the call site, field-indirect return, budget). Fixing any one alone is a self-contained
+change - the interface half was fixed exactly that way. Do not consolidate them further.
 
 ## Also known, and deliberately accepted
 
