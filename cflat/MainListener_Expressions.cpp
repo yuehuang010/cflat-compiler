@@ -1962,6 +1962,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.UnionFieldType)
                 || destIsViewElem;
 
+            // A field of an alias-borrow local can arrive through the generic owning-local
+            // reassignment path rather than the specialized field-read arm. Ask the shared source
+            // guard before that path classifies copy versus move; either classification would make
+            // an owning local a second destroyer of the shallow field value.
+            if (operatorText == "=" && !destIsStructField
+                && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                return finishStore(right);
+
             if (operatorText == "=" && destIsStructField)
                 RejectFieldAllocAlignMismatch(
                     namedVar.TypeAndValue, namedVar.AllocAlignment, rightNV, right,
@@ -1969,6 +1981,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         ? std::string("a field")
                         : std::format("field '{}'", namedVar.FieldName),
                     ctx);
+
+            if (operatorText == "=" && destIsStructField
+                && !SourceIsDanglingAliasBorrow(compiler, rightNV)
+                && RejectStoreIntoBorrowedField(compiler, namedVar, ctx))
+                return finishStore(right);
 
             // Closure store (Option A): closures are clone-safe, so named-source assignment auto-clones.
             // Old dest env freed for alloca/global only - skipped for struct-field GEP (slot may be uninitialized).
@@ -2434,12 +2451,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // destination is destructed (self-assign is guarded by destination != rightNV.Storage
                 // above). On a Move, zero the moved-out source so its always-run scope-exit destructor
                 // is a no-op (cflat value-type move = zero the source) and mark it moved.
+                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
-                if (kind == AssignSourceKind::Move
-                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
-                    return finishStore(right);
                 if (!destIsAliasBorrowLocal)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
@@ -6649,7 +6665,8 @@ bool MainListener::EmitOneFieldInit(
         {
             // Same borrowed-by-value-parameter reject the `=` path applies: nulling the callee's
             // copy leaves the caller's struct still freeing the pointee (double free).
-            RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, errCtx);
+            if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, errCtx))
+                return false;
             EmitImplicitUniqueFieldMove(rightNV, val, nullptr, std::string());
         }
 
@@ -8963,8 +8980,17 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
         // consume of the parameter itself is the owning-sink inference's job, not this guard.
         if (srcNV.OwningStructName.empty() || srcNV.FieldName.empty()) return false;
         // The RECORDED answer from the field-access site, not a fresh lookup of the root's name.
-        if (!srcNV.RootIsBorrowedByValueParam) return false;
+        if (!srcNV.RootIsBorrowedByValueParam && !srcNV.RootIsAliasBorrowLocal) return false;
         const std::string root = FieldPathRootName(srcNV);
+        if (srcNV.RootIsAliasBorrowLocal && !srcNV.RootIsBorrowedByValueParam)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot consume field '{}.{}' out of 'alias' borrow '{}' - the store nulls only "
+                "this shallow copy, so the real owner's field still frees the pointee (double-free). "
+                "Read the field without storing it, or use '.copy()' for an independent owned copy.",
+                srcNV.OwningStructName, srcNV.FieldName, root));
+            return true;
+        }
         // On `w.arr[0]` this names the owning ARRAY field rather than the slot: coarse, but the
         // field, the parameter and the remedy are all correct. IsElementAccess is not set here.
         LogErrorContext(ctx, std::format(
@@ -8973,6 +8999,36 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
             "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
             "field without storing it (a read borrows, a store consumes).",
             srcNV.OwningStructName, srcNV.FieldName, root, root));
+        return true;
+    }
+
+bool MainListener::RejectStoreIntoBorrowedField(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& destNV,
+        antlr4::ParserRuleContext* ctx) {
+        if (destNV.OwningStructName.empty() || destNV.FieldName.empty()) return false;
+        if (!destNV.RootIsBorrowedByValueParam && !destNV.RootIsAliasBorrowLocal) return false;
+        const bool ownsValue = compiler->IsOwningValueType(destNV.TypeAndValue.TypeName)
+            || IsOwningUniquePointerField(destNV.TypeAndValue)
+            || IsOwningUniqueInterfaceField(destNV.TypeAndValue);
+        if (!ownsValue) return false;
+
+        const std::string root = FieldPathRootName(destNV);
+        if (destNV.RootIsBorrowedByValueParam)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot assign owning field '{}.{}' of borrowed by-value parameter '{}' - "
+                "dropping the old value would free the caller's pointee through the callee's copy. "
+                "Declare the parameter 'move {}' to take ownership, or assign through the owner.",
+                destNV.OwningStructName, destNV.FieldName, root, root));
+        }
+        else
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot assign owning field '{}.{}' through 'alias' borrow '{}' - dropping the old "
+                "value would free the real owner's pointee through a shallow copy. Rebind the whole "
+                "borrow local or assign through the owner.",
+                destNV.OwningStructName, destNV.FieldName, root));
+        }
         return true;
     }
 

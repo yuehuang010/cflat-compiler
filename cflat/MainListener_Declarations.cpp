@@ -3358,6 +3358,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
                                 srcFieldPathNV.RootIsBorrowedByValueParam =
                                     rightNV.RootIsBorrowedByValueParam;
+                                srcFieldPathNV.RootIsAliasBorrowLocal =
+                                    rightNV.RootIsAliasBorrowLocal;
                                 srcFieldPathNV.TypeAndValue.ParentVariableName =
                                     rightNV.TypeAndValue.ParentVariableName;
                                 // Trap B: a plain copy of a `unique` field does not null the field, so the
@@ -4136,6 +4138,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 : srcRhsExprText)
                             : std::string();
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
+                        auto& viewNV = compiler->stackNamedVariable.back().namedVariable[name];
+                        viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
+                        viewNV.FieldName = srcFieldPathNV.FieldName;
+                        viewNV.FieldPathRoot = srcFieldPathNV.FieldPathRoot;
+                        viewNV.RootIsBorrowedByValueParam =
+                            srcFieldPathNV.RootIsBorrowedByValueParam;
+                        viewNV.RootIsAliasBorrowLocal = srcFieldPathNV.RootIsAliasBorrowLocal;
                     }
 
                     // Declaration leg of the borrowed-box tag: `right` is the fat value this local
@@ -4500,6 +4509,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         {
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             nv.IsAliasBorrow = true;
+                            // The source may carry the owner's field path through an alias-return
+                            // call. This local is a shallow copy with its own borrow identity, so
+                            // downstream field access must resolve the root against this binding.
+                            nv.FieldPathRoot.clear();
+                            nv.RootIsBorrowedByValueParam = false;
+                            nv.RootIsAliasBorrowLocal = false;
                             nv.IsOwningString = false;
                             nv.IsOwning = false;
                             RecordAliasBorrowDeclBlock(compiler, nv);

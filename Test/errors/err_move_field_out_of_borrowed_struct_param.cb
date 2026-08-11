@@ -28,6 +28,13 @@ struct Wrap { UBox b; };
 struct Mid  { UBox b; };
 struct Nest { Mid a; };
 
+UBox makeBorrowedDestinationBox()
+{
+    UBox b = default;
+    b.item = new Res();
+    return b;
+}
+
 UBox gsink = default;
 
 expect_error("cannot consume field 'Wrap.b' out of borrowed by-value parameter 'w'") {
@@ -86,6 +93,16 @@ struct AWrap { UBox[2] arr; };
 
 expect_error("cannot consume field 'AWrap.arr' out of borrowed by-value parameter 'w'") {
     int badArrayFieldElement(AWrap w) { UBox o = w.arr[0]; return o.item->id; }
+}
+
+// Binding the array field to a view is another hop: the view local must retain the field root.
+expect_error("cannot consume field 'AWrap.arr' out of borrowed by-value parameter 'w'") {
+    UBox badViewBound(AWrap w) { UBox[] v = w.arr; return v[0]; }
+}
+
+// Reassignment drops the old field value, so a borrowed by-value destination cannot be overwritten.
+expect_error("cannot assign owning field 'Wrap.b' of borrowed by-value parameter 'w'") {
+    void badOwningFieldDestination(Wrap w) { w.b = makeBorrowedDestinationBox(); }
 }
 
 /*

@@ -435,12 +435,35 @@ expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'k'") {
     }
 }
 
+// An implicit owning-local assignment is still a consume of the field, even without `move`.
+expect_error("cannot consume field 'JoinBox.item' out of 'alias' borrow 'k'") {
+    void aliasBorrowImplicitFieldIntoLocal(AliasWrap* w)
+    {
+        JoinBox k = w->borrow();
+        JoinBox other = makeJoinBox();
+        other = k.item;
+    }
+}
+
+// The destination twin for a by-value struct parameter.
+expect_error("cannot assign owning field 'JoinHolder.box' of borrowed by-value parameter 'h'") {
+    void byValueOwningFieldDestination(JoinHolder h) { h.box = makeJoinBox(); }
+}
+
 // A NESTED field path: the root recorded at each hop is still the borrow local, not the field.
 struct AliasOuter
 {
     AliasWrap inner;
     alias AliasWrap peek() { return this.inner; }
 };
+
+expect_error("cannot assign owning field 'AliasWrap.b' through 'alias' borrow 'borrowed'") {
+    void aliasBorrowOwningFieldDestination(AliasOuter* o)
+    {
+        AliasWrap borrowed = o->peek();
+        borrowed.b = makeJoinBox();
+    }
+}
 
 expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'ko'") {
     void aliasBorrowNestedFieldMove(AliasOuter* o)

@@ -4427,13 +4427,20 @@ public:
 
     /*
      * Reject an IMPLICIT consuming store (`o = w.b`, `dst[0] = w.b`, `UBox o = w.b`, a brace
-     * element) whose source is a field path rooted at a BORROWED by-value struct parameter.
-     * The consume zeroes only the callee's bit copy of the field, so the caller's struct still
+     * element) whose source is a field path rooted at a borrowed by-value parameter or an
+     * alias-borrow local. The consume zeroes only a shallow copy, so the real owner's field still
      * frees the same pointee. This is the ruling ParseMoveExpression applies to `move w.b`.
      * Returns true (and has already reported) when the store must not be lowered.
      */
     bool RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        antlr4::ParserRuleContext* ctx);
+
+    // Reject an owning-field overwrite when the field path roots at a borrowed by-value
+    // parameter or an alias-borrow local. The drop-old destructor would free the real owner's
+    // pointee through a shallow copy. Returns true after reporting the diagnostic.
+    bool RejectStoreIntoBorrowedField(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& destNV,
         antlr4::ParserRuleContext* ctx);
 
     /*

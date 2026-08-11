@@ -938,6 +938,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // of `.b` is the field `a`, whose own root is still `w`.
                                     namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
                                         ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
+                                    // An alias-return binding can retain the source owner's path label
+                                    // while its own alloca is being introduced. Re-resolve the first
+                                    // field hop against the local binding so the shallow-copy borrow
+                                    // does not masquerade as the original owner.
+                                    const auto* rootBinding = Compiler(ctx)->FindVariableByStorage(
+                                        structVar.Storage);
+                                    bool rootIsAliasLocal = rootBinding != nullptr
+                                        && IsAliasBorrowLocalBinding(*rootBinding);
+                                    if (rootIsAliasLocal)
+                                    {
+                                        namedVar.FieldPathRoot = structVar.CallerName.empty()
+                                            ? structVar.TypeAndValue.VariableName : structVar.CallerName;
+                                    }
                                     // Settle the borrowed-parameter question HERE, against the
                                     // RESOLVED parent binding, and record it (see FieldPathRoot).
                                     namedVar.RootIsBorrowedByValueParam = structVar.FieldPathRoot.empty()
@@ -945,9 +958,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         : structVar.RootIsBorrowedByValueParam;
                                     // Same shape for an `alias`-BORROW local root, settled here for
                                     // the same reason (a downstream lookup cannot see a shadow).
-                                    namedVar.RootIsAliasBorrowLocal = structVar.FieldPathRoot.empty()
-                                        ? IsAliasBorrowLocalBinding(structVar)
-                                        : structVar.RootIsAliasBorrowLocal;
+                                    namedVar.RootIsAliasBorrowLocal = rootIsAliasLocal
+                                        || (structVar.FieldPathRoot.empty()
+                                            ? IsAliasBorrowLocalBinding(structVar)
+                                            : structVar.RootIsAliasBorrowLocal);
                                     // A cast off this read (`(Res*)b.p`, `free((void*)b.p)`) severs
                                     // Storage and rewrites the type; carry the unique provenance so
                                     // the borrow rules still fire (see IsUniqueFieldRead / Trap B).
