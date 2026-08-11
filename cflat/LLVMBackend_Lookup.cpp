@@ -58,8 +58,9 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
             "void", "char", "i8", "u8", "short", "i16", "u16", "int", "i32", "u32",
             "long", "ulong", "i64", "u64", "float", "double", "bool", "va_list", "auto" };
         if (scalars.count(name)) return true;
-        return enumBackingTypes.count(name) > 0 || typeAliases.count(name) > 0
-            || interfaceTable.count(name) > 0 || dataStructures.count(name) > 0;
+        std::string resolved = ResolveTypeAlias(name);
+        return enumBackingTypes.count(resolved) > 0 || resolved != name
+            || HasInterface(resolved) || dataStructures.count(resolved) > 0;
     }
 
 llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType, bool allowPointer) const
@@ -101,10 +102,10 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         std::vector<uint64_t> aliasArrayDims;  // outer dimension first, from an array alias
         if (!resolvedTypeName.empty())
         {
-            auto it = typeAliases.find(resolvedTypeName);
-            if (it != typeAliases.end())
+            std::string aliasedName = ResolveTypeAlias(resolvedTypeName);
+            if (aliasedName != resolvedTypeName)
             {
-                resolvedTypeName = it->second;
+                resolvedTypeName = aliasedName;
                 // Array brackets are outermost in the stored string ("int*[3]"); peel them first.
                 std::vector<uint64_t> rev;
                 while (!resolvedTypeName.empty() && resolvedTypeName.back() == ']')
@@ -129,11 +130,11 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         // that names a type, so a sibling function never hijacks a type name.
         if (!resolvedTypeName.empty()
             && dataStructures.find(resolvedTypeName) == dataStructures.end()
-            && interfaceTable.count(resolvedTypeName) == 0)
+            && !HasInterface(resolvedTypeName))
         {
             std::string nsResolved = ResolveQualifiedName(resolvedTypeName);
             if (nsResolved != resolvedTypeName
-                && (dataStructures.count(nsResolved) || interfaceTable.count(nsResolved)))
+                && (dataStructures.count(nsResolved) || HasInterface(nsResolved)))
                 resolvedTypeName = nsResolved;
         }
 
@@ -141,7 +142,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         auto dsIt = dataStructures.find(resolvedTypeName);
         // A generic interface instantiation lowers to a fat pointer even before its interfaceTable
         // entry exists (the forward-ref scan materializes signatures first).
-        bool isInterface = interfaceTable.count(resolvedTypeName) > 0
+        bool isInterface = HasInterface(resolvedTypeName)
                         || gts.genericInterfaceInstances.count(resolvedTypeName) > 0;
         bool skipPointerWrap = false;
 
@@ -343,7 +344,8 @@ std::string LLVMBackend::ResolveFuncPtrTypeSpelling(const std::string& typeName)
         std::string cur = typeName;
         for (int hop = 0; hop < 8 && !cur.empty(); hop++)
         {
-            if (auto a = typeAliases.find(cur); a != typeAliases.end()) { cur = a->second; continue; }
+            std::string aliased = ResolveTypeAlias(cur);
+            if (aliased != cur) { cur = aliased; continue; }
             if (auto e = enumBackingTypes.find(cur); e != enumBackingTypes.end()) { cur = e->second; continue; }
             break;
         }
@@ -397,7 +399,7 @@ std::string LLVMBackend::FuncPtrAbiCanonKey(const std::string& key) const
 std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string& spelling) const
 {
         std::vector<std::string> keys;
-        if (spelling.empty() || interfaceTable.count(spelling) > 0) return keys;
+        if (spelling.empty() || HasInterface(spelling)) return keys;
         for (const auto& entry : dataStructures)
         {
             const std::string& key = entry.first;
@@ -406,7 +408,7 @@ std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string&
                 && key.compare(key.size() - spelling.size(), spelling.size(), spelling) == 0
                 && key[key.size() - spelling.size() - 1] == '.';
             if (key != spelling && !tail) continue;
-            if (interfaceTable.count(key) > 0) continue;
+            if (HasInterface(key)) continue;
             // The SPELLING match is made on the raw key (that is what names the struct); the
             // recorded identity is the ABI-canonical form, so two instantiations that differ
             // only in a scalar spelling or in signedness compare equal.

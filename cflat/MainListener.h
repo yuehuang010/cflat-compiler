@@ -586,8 +586,9 @@ inline std::string BaseSpecifierName(CFlatParser::BaseSpecifierContext* spec)
  * Every name a base-clause spelling could be registered under, appended to `out`. The resolver
  * answers one name once the interface is registered; during the forward scan an interface
  * declared later in the same namespace is not yet visible, so the enclosing-namespace
- * candidates are added too. The static conversion check only ever PROVES impossibility, so a
- * surplus candidate can weaken a proof but can never cause a false rejection.
+ * candidates are retained as deferred possibilities. The static conversion check must treat
+ * those candidates as uncertainty: a surplus candidate can set sawSourceImplementor and must not
+ * become a false impossibility proof.
  */
 inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::string& namespaceName,
                                           const std::string& spelled, std::vector<std::string>& out)

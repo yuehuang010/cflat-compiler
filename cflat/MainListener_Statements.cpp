@@ -213,15 +213,20 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
             if (labeled->typeSpecifier() && labeled->pointer())
             {
                 std::string typeName = labeled->typeSpecifier()->getText();
+                std::string resolvedTypeName = compiler->ResolveQualifiedName(typeName);
+                if (compiler->HasInterface(typeName))
+                    resolvedTypeName = compiler->ResolveInterfaceName(typeName);
+                else
+                    resolvedTypeName = compiler->ResolveTypeAlias(resolvedTypeName);
                 std::string boundVar = labeled->Identifier() ? labeled->Identifier()->getText() : "";
-                bool isStruct = compiler->dataStructures.count(typeName) > 0;
-                bool isInterface = compiler->interfaceTable.count(typeName) > 0;
+                bool isStruct = compiler->dataStructures.count(resolvedTypeName) > 0;
+                bool isInterface = compiler->HasInterface(resolvedTypeName);
                 if (!isStruct && !isInterface)
                     LogErrorContext(labeled, std::format("'{}' is not a known struct or interface type", typeName));
                 if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
                     LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
                 ctx.isTypeSwitch = true;
-                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, typeName, boundVar, true };
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, resolvedTypeName, boundVar, true };
                 return;
             }
 
@@ -234,8 +239,13 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
             }
 
             std::string exprText = constExpr->getText();
-            bool isStruct = compiler->dataStructures.count(exprText) > 0;
-            bool isInterface = compiler->interfaceTable.count(exprText) > 0;
+            std::string resolvedExprText = compiler->ResolveQualifiedName(exprText);
+            if (compiler->HasInterface(exprText))
+                resolvedExprText = compiler->ResolveInterfaceName(exprText);
+            else
+                resolvedExprText = compiler->ResolveTypeAlias(resolvedExprText);
+            bool isStruct = compiler->dataStructures.count(resolvedExprText) > 0;
+            bool isInterface = compiler->HasInterface(resolvedExprText);
 
             // _ is a soft wildcard in arm-style switches - register as both default and caseMap entry
             // so ParseStatement can locate this labeled node and emit the arm body with auto-jump.
@@ -251,7 +261,7 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
                     LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
                 ctx.isTypeSwitch = true;
-                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, exprText, "", hasArrow };
+                ctx.caseMap[labeled] = { nullptr, nullptr, compiler->CreateBasicBlock("switchTypeCase"), true, resolvedExprText, "", hasArrow };
                 if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
             }
             else
@@ -2177,7 +2187,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
                             compiler->builder->CreateCondBr(cmp, entry.block, nextCheck);
                         }
-                        else if (compiler->interfaceTable.count(entry.typeCaseName))
+                        else if (compiler->HasInterface(entry.typeCaseName))
                         {
                             // Interface case: match if the concrete type implements this interface
                             // Emit: if (typedesc == any_implementing_struct_typedesc) goto case block
@@ -2433,7 +2443,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                 // A dynamically-dispatched lock cannot be named: the lock-set analysis
                 // canonicalizes targets by name, so an interface-typed value is rejected.
-                if (compiler->interfaceTable.count(mutexTypeName))
+                if (compiler->HasInterface(mutexTypeName))
                 {
                     LogErrorContext(lockStmt, std::format(
                         "lock: '{}' is an interface value of type '{}'; lock() requires a concrete lock type.",
@@ -2898,4 +2908,3 @@ int MainListener::DecideIfConstCondition(CFlatParser::ExpressionContext* expr) {
         if (!v) return -1;
         return (*v != 0) ? 1 : 0;
     }
-

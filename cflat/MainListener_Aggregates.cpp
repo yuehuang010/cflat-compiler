@@ -532,13 +532,13 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 if (ann.Name != "Capability") continue;
                 for (const auto& ifaceName : ann.Values)
                 {
-                    if (!compiler->interfaceTable.count(ifaceName))
+                    if (!compiler->HasInterface(ifaceName))
                     {
                         LogErrorContext(ctx, std::format(
                             "[Capability] on '{}': unknown interface '{}'", structName, ifaceName));
                         continue;
                     }
-                    capIfaces.push_back(ifaceName);
+                    capIfaces.push_back(compiler->ResolveInterfaceName(ifaceName));
                 }
             }
             if (!capIfaces.empty())
@@ -2605,8 +2605,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             // The value-returning member-call sugar `recv->Method()` produces an HResult<T>, a
             // type never spelled in user source - so prime its instantiation here (we have the
             // method return types) and record the mangled name for EmitWinrtSlotCall to build.
-            if (auto it = compiler->interfaceTable.find(winrtIface); it != compiler->interfaceTable.end())
-                for (const auto& m : it->second)
+            if (const auto* methods = compiler->FindInterface(winrtIface))
+                for (const auto& m : *methods)
                 {
                     if (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer) continue;
                     std::string arg = m.ReturnType.TypeName + (m.ReturnType.Pointer ? "*" : "");
@@ -3487,4 +3487,3 @@ void MainListener::LogErrorContext(antlr4::ParserRuleContext* ctx, std::string e
         compilerLLVM->currentColumn = static_cast<int>(ctx->getStart()->getCharPositionInLine());
         compilerLLVM->LogError(std::move(errorMessage));
     }
-

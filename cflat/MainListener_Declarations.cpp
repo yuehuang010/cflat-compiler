@@ -112,15 +112,15 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
             if (!hasArrayView)
-                if (auto fit = Compiler(entry)->functionTypeAliases.find(resolved);
-                    fit != Compiler(entry)->functionTypeAliases.end())
+                if (auto* fit = Compiler(entry)->FindFunctionTypeAlias(resolved);
+                    fit != nullptr)
                 {
                     if (isUnique)
                         LogErrorContext(entry, "unique requires a pointer or interface type");
-                    std::string encodedAlias = EncodeClosureFromSig(Compiler(entry), fit->second);
+                    std::string encodedAlias = EncodeClosureFromSig(Compiler(entry), *fit);
                     if (!hasPointer)
                         return encodedAlias;
-                    RejectFatClosurePointerArg(entry, fit->second.IsThinFnPtr(), resolved);
+                    RejectFatClosurePointerArg(entry, fit->IsThinFnPtr(), resolved);
                     return encodedAlias + "*";
                 }
             // Resolve the ARGUMENT the way the template BASE is resolved. A SUBSTITUTED argument
@@ -604,18 +604,18 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         }
                     }
                 }
-                else if (auto fit = Compiler(declSpecs)->functionTypeAliases.find(typeSpec->getText());
-                         fit != Compiler(declSpecs)->functionTypeAliases.end())
+                else if (auto* fit = Compiler(declSpecs)->FindFunctionTypeAlias(typeSpec->getText());
+                         fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
                     // into the stored signature, mirroring the functionPointerSpecifier branch above.
                     declType.IsFunctionPointer     = true;
-                    declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
-                    declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
-                    declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
-                    declType.FuncPtrReturnOwned = fit->second.FuncPtrReturnOwned;
-                    declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
-                    declType.FuncPtrParams         = fit->second.FuncPtrParams;
+                    declType.TypeName              = fit->IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
+                    declType.FuncPtrReturnTypeName = fit->FuncPtrReturnTypeName;
+                    declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
+                    declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
+                    declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
+                    declType.FuncPtrParams         = fit->FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
                     // Same fat-closure pointer rejection as the functionPointerSpecifier branch.
                     if (declType.Pointer && !declType.IsThinFnPtr())
@@ -1261,7 +1261,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // type/namespace dispatch below, which only recognizes named types.
         if (auto* fpSpec = typeSpec->functionPointerSpecifier())
         {
-            compiler->functionTypeAliases[alias] = BuildFuncPtrAliasType(fpSpec);
+            auto aliasKeys = compiler->ScopedNameCandidates(alias);
+            compiler->functionTypeAliases[aliasKeys.empty() ? alias : aliasKeys.front()] = BuildFuncPtrAliasType(fpSpec);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
@@ -1316,7 +1317,19 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // An alias of an alias (using PVStatics = IPropertyValueStatics;) names whatever the RHS
         // already names. One hop - enough for the qualified-WinMD-name -> short-alias -> shorter
         // -alias chains that consuming a .winmd produces.
+        target = compiler->ResolveQualifiedName(target);
         target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+
+        // Alias targets may already carry decoration from an earlier alias (e.g. Q = P where
+        // P = int*). Validate the undecorated base, then put every inherited decoration back into
+        // the canonical string stored for the new alias.
+        std::string targetBase = target;
+        std::vector<uint64_t> targetArrayDims;
+        PeelAliasArrayDims(targetBase, targetArrayDims);
+        int targetPointerDepth = PeelAliasPointerStars(targetBase);
+        std::string targetDecorated = targetBase + std::string(targetPointerDepth, '*');
+        for (uint64_t dim : targetArrayDims)
+            targetDecorated += "[" + std::to_string(dim) + "]";
 
         // A name that only becomes a type once its <...> arguments are supplied.
         auto IsGenericTemplateName = [&](const std::string& n) {
@@ -1366,9 +1379,9 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // Alias of a GENERIC BASE (using IReference = Windows.Foundation.IReference;) so a body can
         // keep writing the familiar `IReference<int>`. Only meaningful with no suffix - a base is
         // not a type, so `T*` / `T[N]` decoration on it is meaningless.
-        if (suffix.empty() && IsGenericTemplateName(target))
+        if (suffix.empty() && IsGenericTemplateName(targetBase))
         {
-            compiler->RegisterGenericBaseAlias(alias, target);
+            compiler->RegisterGenericBaseAlias(alias, targetBase);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
@@ -1380,26 +1393,26 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // If the target names a known type (interface, struct, primitive, or an imported winmd
         // type - delegates/enums/runtime classes have no CFlat struct but are nameable), register a
         // type alias. Otherwise treat it as a namespace alias.
-        if (compiler->IsInterfaceType(target) || compiler->GetDataStructure(target).StructType != nullptr
-            || LLVMBackend::IsPrimitiveTypeName(target) || compiler->IsWinrtFullName(target))
+        if (compiler->IsInterfaceType(targetBase) || compiler->GetDataStructure(targetBase).StructType != nullptr
+            || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
         {
             // A winmd projection must never silently displace a CFlat type of the same short name -
             // that is the collision the qualified registration exists to prevent. An alias is the
             // user explicitly claiming the name, so an outright clash is an error, not a shadow.
-            if (compiler->IsWinrtFullName(target) && alias != target
+            if (compiler->IsWinrtFullName(targetBase) && alias != targetBase
                 && (compiler->IsInterfaceType(alias) || compiler->GetDataStructure(alias).StructType != nullptr))
             {
                 compiler->LogError(std::format(
                     "using alias '{}' = '{}': '{}' already names a type in this program; "
                     "pick a different alias or spell the WinMD type fully qualified",
-                    alias, target, alias));
+                    alias, targetDecorated, alias));
                 return;
             }
-            compiler->RegisterTypeAlias(alias, target + suffix);
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            "using " + alias + " = " + target + suffix, {},
+                            "using " + alias + " = " + targetDecorated + suffix, {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
         }
         else if (!suffix.empty())
@@ -1407,12 +1420,12 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             // A pointer alias whose base is neither a type nor (a namespace can't take a '*')
             // is malformed - the RHS looks like a type but resolves to nothing.
             compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a known type",
-                                           alias, target + suffix, target));
+                                           alias, targetDecorated + suffix, targetBase));
         }
         else if (global_scope)
-            compiler->RegisterNamespaceAlias(alias, target);
+            compiler->RegisterNamespaceAlias(alias, targetBase);
         else
-            compiler->RegisterLocalNamespaceAlias(alias, target);
+            compiler->RegisterLocalNamespaceAlias(alias, targetBase);
     }
 
 void MainListener::ParseAnnotationDefinition(CFlatParser::AnnotationDefinitionContext* ctx) {

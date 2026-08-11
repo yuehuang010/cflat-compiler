@@ -204,18 +204,18 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     declType.TypeName = mangledName;
                 }
-                else if (auto fit = compiler->functionTypeAliases.find(typeSpec->getText());
-                         fit != compiler->functionTypeAliases.end())
+                else if (auto* fit = compiler->FindFunctionTypeAlias(typeSpec->getText());
+                         fit != nullptr)
                 {
                     // Function-type alias (using Cb = function<R(Args)> | Lambda<R(Args)>): expand
                     // into the stored signature, mirroring the functionPointerSpecifier branch above.
                     declType.IsFunctionPointer     = true;
-                    declType.TypeName              = fit->second.IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
-                    declType.FuncPtrReturnTypeName = fit->second.FuncPtrReturnTypeName;
-                    declType.FuncPtrReturnPointer  = fit->second.FuncPtrReturnPointer;
-                    declType.FuncPtrReturnOwned = fit->second.FuncPtrReturnOwned;
-                    declType.FuncPtrReturnPointerDepth = fit->second.FuncPtrReturnPointerDepth;
-                    declType.FuncPtrParams         = fit->second.FuncPtrParams;
+                    declType.TypeName              = fit->IsThinFnPtr() ? "__c_fn_ptr" : "__closure_fat_ptr";
+                    declType.FuncPtrReturnTypeName = fit->FuncPtrReturnTypeName;
+                    declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
+                    declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
+                    declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
+                    declType.FuncPtrParams         = fit->FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
                     // Like the functionPointerSpecifier branch, this one breaks out of the
                     // specifier loop, so a trailing '[N]' has to be captured right here.
@@ -702,7 +702,7 @@ void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext
         if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
         auto* typeSpec = ctx->typeSpecifier();
         if (typeSpec == nullptr) return;
-        std::string target = typeSpec->getText();
+        std::string target = compilerLLVM->ResolveQualifiedName(typeSpec->getText());
         std::string alias = ctx->Identifier()->getText();
         if (alias == target || !IsBareTypeName(target)) return;
         compilerLLVM->RegisterManglingAlias(alias, target);
@@ -723,9 +723,16 @@ void ForwardRefScanner::PreRegisterRenameAliases(antlr4::RuleContext* ctx) {
                 RegisterRenameAlias(static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
                 break;
             case CFlatParser::RuleExternalDeclaration:
-            case CFlatParser::RuleNamespaceDefinition:
                 PreRegisterRenameAliases(ruleCtx);
                 break;
+            case CFlatParser::RuleNamespaceDefinition:
+            {
+                auto* nsCtx = static_cast<CFlatParser::NamespaceDefinitionContext*>(ruleCtx);
+                LLVMBackend::NamespaceScope nsScope(
+                    compilerLLVM, NestedNamespaceName(compilerLLVM->GetCurrentNamespace(), nsCtx));
+                PreRegisterRenameAliases(ruleCtx);
+                break;
+            }
             default:
                 break;
             }
@@ -1397,7 +1404,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         // forward reference in a function signature resolves during the scan pass).
         if (auto* fpSpec = typeSpec->functionPointerSpecifier())
         {
-            compiler->functionTypeAliases[alias] = BuildFuncPtrAliasType(fpSpec);
+            auto aliasKeys = compiler->ScopedNameCandidates(alias);
+            compiler->functionTypeAliases[aliasKeys.empty() ? alias : aliasKeys.front()] = BuildFuncPtrAliasType(fpSpec);
             return;
         }
         std::string target = typeSpec->getText();
@@ -1440,22 +1448,30 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         }
 
         // An alias of an alias names whatever the RHS already names (one hop).
+        target = compiler->ResolveQualifiedName(target);
         target = compiler->ResolveGenericBaseAlias(compiler->ResolveTypeAlias(target));
+        std::string targetBase = target;
+        std::vector<uint64_t> targetArrayDims;
+        PeelAliasArrayDims(targetBase, targetArrayDims);
+        int targetPointerDepth = PeelAliasPointerStars(targetBase);
+        std::string targetDecorated = targetBase + std::string(targetPointerDepth, '*');
+        for (uint64_t dim : targetArrayDims)
+            targetDecorated += "[" + std::to_string(dim) + "]";
 
         // Alias of a generic BASE (using IVector = Windows.Foundation.Collections.IVector;) - the
         // use site supplies the <...> args. IsGenericTemplateKey also sees a same-TU template, whose
         // main-pass maps are still empty here. Authoritative handling is in ParseUsingDeclaration.
-        if (suffix.empty() && (compiler->IsWinrtGenericBase(target)
-                               || compiler->IsGenericTemplateKey(target)
-                               || compiler->gts.scannedGenericStructNamesUncertain.count(target) != 0))
+        if (suffix.empty() && (compiler->IsWinrtGenericBase(targetBase)
+                               || compiler->IsGenericTemplateKey(targetBase)
+                               || compiler->gts.scannedGenericStructNamesUncertain.count(targetBase) != 0))
         {
-            compiler->RegisterGenericBaseAlias(alias, target);
+            compiler->RegisterGenericBaseAlias(alias, targetBase);
             return;
         }
 
-        if (compiler->IsInterfaceType(target) || compiler->dataStructures.count(target) > 0
-            || LLVMBackend::IsPrimitiveTypeName(target) || compiler->IsWinrtFullName(target))
-            compiler->RegisterTypeAlias(alias, target + suffix);
+        if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
+            || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
     }
 
 void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {

@@ -56,6 +56,20 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
                                    std::vector<InterfaceMethod> methods, std::vector<TypeAndValue> fields,
                                    const std::string& definitionSite)
 {
+        std::string rejectedSiteKey = name + "\n" + definitionSite;
+        if (!definitionSite.empty() && rejectedInterfaceDefSites_.count(rejectedSiteKey) != 0)
+        {
+            auto messageIt = rejectedInterfaceDefMessages_.find(rejectedSiteKey);
+            if (messageIt != rejectedInterfaceDefMessages_.end()
+                && !expectedError.empty() && messageIt->second.find(expectedError) != std::string::npos)
+            {
+                if (!diagnosticSink_)
+                    std::cout << "PASS: expected error received\n";
+                throw ExpectedErrorReceived{};
+            }
+            return;
+        }
+
         // A second interface definition claiming a registered name used to overwrite it in
         // silence, so every use of the first one dispatched through the second one's contract.
         if (!definitionSite.empty())
@@ -64,17 +78,21 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
             if (siteIt != interfaceDefSites.end() && siteIt->second != definitionSite
                 && !IsSameCoreFileDefSite(siteIt->second, definitionSite))
             {
+                rejectedInterfaceDefSites_.insert(rejectedSiteKey);
                 bool siteIsCore = coreInterfaceDefs_.count(name) != 0;
                 std::string displaySite = ShortenDefSiteForDisplay(siteIt->second, siteIsCore);
+                std::string message;
                 if (siteIsCore)
-                    LogError(std::format(
+                    message = std::format(
                         "interface '{}' collides with the core library interface of the same name "
                         "defined at {} - declare it inside a namespace, or rename it (an interface "
-                        "name must be unique within its namespace)", name, displaySite));
+                        "name must be unique within its namespace)", name, displaySite);
                 else
-                    LogError(std::format(
+                    message = std::format(
                         "interface '{}' is already defined at {} - an interface name must be unique "
-                        "within its namespace", name, displaySite));
+                        "within its namespace", name, displaySite);
+                rejectedInterfaceDefMessages_[rejectedSiteKey] = message;
+                LogError(std::move(message));
                 return;
             }
         }
@@ -83,11 +101,12 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
         // lpVtbl. If a name meant both, the use site would GEP the fat pointer as a COM struct and
         // emit invalid IR. WinMD types are registered fully qualified so they can never take a bare
         // name - the only way back into that state is a `using` alias claiming this one. Reject it.
-        if (auto it = typeAliases.find(name); it != typeAliases.end() && IsWinrtProjectedType(it->second))
+        std::string aliasedName = ResolveTypeAlias(name);
+        if (aliasedName != name && IsWinrtProjectedType(aliasedName))
         {
             LogError(std::format(
                 "interface '{}' collides with the WinMD alias 'using {} = {};' - rename one of them "
-                "(a WinMD type and a CFlat interface cannot share a name)", name, name, it->second));
+                "(a WinMD type and a CFlat interface cannot share a name)", name, name, aliasedName));
             return;
         }
 
@@ -107,13 +126,13 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
         std::vector<TypeAndValue> inheritedFields;
         for (const auto& parentName : parentNames)
         {
-            auto it = interfaceTable.find(parentName);
-            if (it == interfaceTable.end())
+            const auto* parentMethods = FindInterface(parentName);
+            if (parentMethods == nullptr)
             {
                 LogError(std::format("unknown parent interface: '{}'", parentName));
                 continue;
             }
-            for (const auto& m : it->second)
+            for (const auto& m : *parentMethods)
                 inherited.push_back(m);
             if (auto fit = interfaceFields.find(parentName); fit != interfaceFields.end())
                 for (const auto& f : fit->second)
@@ -160,18 +179,34 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
 
 void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target)
 {
-        typeAliases[alias] = target;
+        const auto candidates = ScopedNameCandidates(alias);
+        typeAliases[candidates.empty() ? alias : candidates.front()] = target;
     }
 
 std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
 {
-        auto it = typeAliases.find(name);
-        return (it != typeAliases.end()) ? it->second : name;
+        for (const auto& candidate : ScopedNameCandidates(name))
+        {
+            auto it = typeAliases.find(candidate);
+            if (it != typeAliases.end()) return it->second;
+        }
+        return name;
+    }
+
+const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::string& name) const
+{
+        for (const auto& candidate : ScopedNameCandidates(name))
+        {
+            auto it = functionTypeAliases.find(candidate);
+            if (it != functionTypeAliases.end()) return &it->second;
+        }
+        return nullptr;
     }
 
 void LLVMBackend::RegisterManglingAlias(const std::string& alias, const std::string& target)
 {
-        manglingAliases_[alias] = target;
+        const auto candidates = ScopedNameCandidates(alias);
+        manglingAliases_[candidates.empty() ? alias : candidates.front()] = target;
     }
 
 std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
@@ -179,29 +214,43 @@ std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
         std::string cur = name;
         for (int guard = 0; guard < 8; ++guard)
         {
-            auto it = manglingAliases_.find(cur);
-            if (it == manglingAliases_.end() || it->second == cur) break;
-            cur = it->second;
+            bool found = false;
+            for (const auto& candidate : ScopedNameCandidates(cur))
+            {
+                auto it = manglingAliases_.find(candidate);
+                if (it == manglingAliases_.end()) continue;
+                if (it->second == cur) return cur;
+                cur = it->second;
+                found = true;
+                break;
+            }
+            if (!found) break;
         }
         return cur;
     }
 
 void LLVMBackend::RegisterGenericBaseAlias(const std::string& alias, const std::string& target)
 {
-        genericBaseAliases_[alias] = target;
+        const auto candidates = ScopedNameCandidates(alias);
+        genericBaseAliases_[candidates.empty() ? alias : candidates.front()] = target;
     }
 
 bool LLVMBackend::IsGenericBaseAlias(const std::string& name) const
 {
-        return genericBaseAliases_.count(name) != 0;
+        for (const auto& candidate : ScopedNameCandidates(name))
+            if (genericBaseAliases_.count(candidate) != 0) return true;
+        return false;
     }
 
 std::string LLVMBackend::ResolveGenericBaseAlias(const std::string& base) const
 {
         // An alias TARGET is explicit and already resolved at its declaration site: returning it
         // verbatim is what stops a global `using GBox = Box;` naming NS.Box inside `namespace NS`.
-        auto it = genericBaseAliases_.find(base);
-        if (it != genericBaseAliases_.end()) return it->second;
+        for (const auto& candidate : ScopedNameCandidates(base))
+        {
+            auto it = genericBaseAliases_.find(candidate);
+            if (it != genericBaseAliases_.end()) return it->second;
+        }
         return ResolveGenericTemplateBase(base);
     }
 
@@ -281,8 +330,10 @@ std::string LLVMBackend::ResolveGenericFunctionBase(const std::string& base) con
 
 bool LLVMBackend::IsTypeArgTypeKey(const std::string& key) const
 {
+        if (ResolveTypeAlias(key) != key)
+            return true;
         return dataStructures.count(key) != 0
-            || interfaceTable.count(key) != 0
+            || HasInterface(key)
             || gts.scannedTypeNames.count(key) != 0;
     }
 
@@ -351,14 +402,26 @@ void LLVMBackend::RevokeGenericInterfaceInstances(const std::string& base)
 
 bool LLVMBackend::IsInterfaceType(const std::string& name) const
 {
-        return interfaceTable.count(ResolveTypeAlias(name)) > 0;
+        return HasInterface(name);
+    }
+
+bool LLVMBackend::HasInterface(const std::string& name) const
+{
+        return FindInterface(name) != nullptr;
+    }
+
+const std::vector<LLVMBackend::InterfaceMethod>* LLVMBackend::FindInterface(const std::string& name) const
+{
+        std::string resolved = ResolveInterfaceName(name);
+        auto it = interfaceTable.find(resolved);
+        return it == interfaceTable.end() ? nullptr : &it->second;
     }
 
 bool LLVMBackend::HasInterfaceMethod(const std::string& ifaceName, const std::string& methodName) const
 {
-        auto it = interfaceTable.find(ifaceName);
-        if (it == interfaceTable.end()) return false;
-        for (const auto& m : it->second)
+        const auto* methods = FindInterface(ifaceName);
+        if (methods == nullptr) return false;
+        for (const auto& m : *methods)
             if (m.Name == methodName) return true;
         return false;
     }
@@ -367,10 +430,10 @@ const LLVMBackend::InterfaceMethod* LLVMBackend::FindInterfaceMethod(const std::
                                                const std::string& methodName,
                                                size_t argCount) const
 {
-        auto it = interfaceTable.find(ifaceName);
-        if (it == interfaceTable.end()) return nullptr;
+        const auto* methods = FindInterface(ifaceName);
+        if (methods == nullptr) return nullptr;
         const InterfaceMethod* firstByName = nullptr;
-        for (const auto& m : it->second)
+        for (const auto& m : *methods)
         {
             if (m.Name != methodName) continue;
             if (firstByName == nullptr) firstByName = &m;
@@ -390,9 +453,9 @@ const std::vector<LLVMBackend::TypeAndValue>* LLVMBackend::GetInterfaceMethodPar
 const LLVMBackend::TypeAndValue* LLVMBackend::GetInterfaceMethodReturnType(const std::string& ifaceName,
                                                     const std::string& methodName) const
 {
-        auto it = interfaceTable.find(ifaceName);
-        if (it == interfaceTable.end()) return nullptr;
-        for (const auto& m : it->second)
+        const auto* methods = FindInterface(ifaceName);
+        if (methods == nullptr) return nullptr;
+        for (const auto& m : *methods)
             if (m.Name == methodName) return &m.ReturnType;
         return nullptr;
     }
@@ -961,8 +1024,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
         auto it = pd.VTables.find(ifaceName);
         if (it != pd.VTables.end()) return it->second;
 
-        auto ifaceIt = interfaceTable.find(ifaceName);
-        if (ifaceIt == interfaceTable.end())
+        const auto* ifaceMethods = FindInterface(ifaceName);
+        if (ifaceMethods == nullptr)
         {
             LogError(std::format("GetOrCreateProgramVTable: unknown interface '{}'", ifaceName));
             return nullptr;
@@ -980,7 +1043,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
         }
         entries.push_back(pd.typeDescriptor);
 
-        for (const auto& method : ifaceIt->second)
+        for (const auto& method : *ifaceMethods)
         {
             llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
@@ -1025,8 +1088,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
         auto it = sd.VTables.find(ifaceName);
         if (it != sd.VTables.end()) return it->second;
 
-        auto ifaceIt = interfaceTable.find(ifaceName);
-        if (ifaceIt == interfaceTable.end())
+        const auto* ifaceMethods = FindInterface(ifaceName);
+        if (ifaceMethods == nullptr)
         {
             LogError(std::format("GetOrCreateVTable: unknown interface '{}'", ifaceName));
             return nullptr;
@@ -1046,7 +1109,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
         }
         entries.push_back(sd.typeDescriptor);
 
-        for (const auto& method : ifaceIt->second)
+        for (const auto& method : *ifaceMethods)
         {
             llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
@@ -1182,7 +1245,7 @@ std::string LLVMBackend::ResolveGuardedBaseCandidate(const std::vector<std::stri
         for (const auto& raw : candidates)
         {
             std::string resolved = ResolveTypeAlias(raw);
-            if (interfaceTable.count(resolved) > 0) return resolved;
+            if (HasInterface(resolved)) return ResolveInterfaceName(resolved);
         }
         return {};
     }
@@ -1336,7 +1399,7 @@ void LLVMBackend::ResolveMaterializedInterfaceUses()
         bool anyIfConst = false;
         for (const auto& u : uses)
         {
-            if (interfaceTable.count(u.MangledName) != 0) continue;
+            if (HasInterface(u.MangledName)) continue;
             std::string key = u.MangledName + "\x1f" + u.Role + "\x1f" + u.File
                             + "\x1f" + std::to_string(u.Line) + ":" + std::to_string(u.Column);
             if (!seen.insert(key).second) continue;
@@ -1663,4 +1726,3 @@ void LLVMBackend::ReportInterfaceReboxHasNoImplementor(const DeferredInterfaceRe
             "cannot convert to interface '{}' - no class implements it",
             site.DstInterface));
     }
-

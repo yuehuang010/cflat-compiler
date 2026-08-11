@@ -538,6 +538,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             }
                             else
                             {
+                                if (!isFileAlias && Compiler(ctx)->IsDataStructure(qualifiedName)
+                                    && Compiler(ctx)->GetLocalVariable(memberName).Storage == nullptr
+                                    && Compiler(ctx)->GetFunctionArgument(memberName).GetValue() == nullptr)
+                                {
+                                    // A namespace-qualified aggregate is a type qualifier for a
+                                    // following static member call (N.S.f()), not a namespace value.
+                                    namespaceContext = qualifiedName;
+                                    primaryIdentifier = qualifiedName;
+                                    namedVar = {};
+                                    structVar = {};
+                                    interfaceVar = {};
+                                    break;
+                                }
                                 // Qualified name (e.g. EnumName.Member, Cfg.W) - try to resolve
                                 // as a global variable (enum member / namespace global) or a
                                 // function. Fall back to leaving namedVar empty so later code
@@ -1217,13 +1230,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar = {};
                                 structVar = {};
                             }
-                            else if (Compiler(ctx)->IsDataStructure(idName)
+                            else if (Compiler(ctx)->IsDataStructure(
+                                         Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText()))
                                      && Compiler(ctx)->GetLocalVariable(idName).Storage == nullptr
                                      && Compiler(ctx)->GetFunctionArgument(idName).GetValue() == nullptr)
                             {
                                 // Type name used as qualifier for static method access: ClassName.Method()
                                 // Constructor calls (ClassName()) still work because functionName = "ClassName".
-                                namespaceContext = idName;
+                                namespaceContext = Compiler(ctx)->ResolveQualifiedName(prevPrimary->getText());
                                 namedVar = {};
                                 structVar = {};
                             }
@@ -2650,7 +2664,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         {
                                             std::string bare = resolved;
                                             StripOwnershipQualifiers(bare);
-                                            isPtr = Compiler(ctx)->interfaceTable.count(bare) > 0;
+                                            isPtr = Compiler(ctx)->HasInterface(bare);
                                         }
                                     }
                                 }
@@ -2709,7 +2723,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         std::string bare = substIt->second;
                                         StripOwnershipQualifiers(bare);
                                         if (!bare.empty() && bare.back() != '*')
-                                            isIface = Compiler(ctx)->interfaceTable.count(bare) > 0;
+                                            isIface = Compiler(ctx)->HasInterface(bare);
                                     }
                                 }
                             }
@@ -6240,6 +6254,20 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                     // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"
                     // Apply type substitutions for generic parameters.
                     auto* typeSpec = static_cast<CFlatParser::TypeSpecifierContext*>(ruleCtx);
+                    if (typeSpec->tupleTypeSpecifier() != nullptr)
+                    {
+                        auto* tupleSpec = typeSpec->tupleTypeSpecifier();
+                        if (tupleSpec->tupleTypePackEntry() == nullptr)
+                        {
+                            std::vector<std::string> typeArgs;
+                            for (auto* entry : tupleSpec->tupleTypeEntry())
+                                typeArgs.push_back(TupleEntryArgName(Compiler(entry), entry));
+                            std::string mangledName = MangledGenericName("tuple", typeArgs);
+                            tupleTypeArgs[mangledName] = typeArgs;
+                            QueueGenericInstantiation("tuple", typeArgs, mangledName);
+                        }
+                        break;
+                    }
                     std::string baseName;
                     // GenericSpecOf covers both spellings: bare 'Box<int>' and qualified 'NS.Box<int>'.
                     if (auto* genParams = GenericSpecOf(typeSpec, baseName))

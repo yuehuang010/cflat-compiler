@@ -4925,6 +4925,40 @@ bool testJoinArmClassification()
     return result;
 }
 
+interface ShadowInterface { int common(); };
+
+namespace InterfaceChecks
+{
+    interface ShadowInterface { int common(); int localOnly(); };
+    class ShadowImpl : ShadowInterface
+    {
+        int common() { return 2; }
+        int localOnly() { return 3; }
+    };
+    using LocalIfaceAlias = ShadowInterface;
+
+    int run()
+    {
+        ShadowImpl c = default;
+        LocalIfaceAlias value = c;
+        int result = value.common() + value.localOnly();
+        result = result + (value is LocalIfaceAlias ? 1 : 0);
+        ShadowImpl* back = value as ShadowImpl;
+        result = result + (back != nullptr ? 1 : 0);
+        switch (value)
+        {
+            case LocalIfaceAlias: result = result + 10; break;
+            default: break;
+        }
+        return result;
+    }
+}
+
+bool testNamespacedInterfaceAliasLookups()
+{
+    return Test("namespaced_interface_alias_lookups", InterfaceChecks.run(), 17) != 0;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4991,6 +5025,7 @@ extern int main()
     total++; passed += testNullIfaceDispatchAcceptSet()             ? 1 : 0;
     total++; passed += testIfaceCodeValueArgAcceptSet()             ? 1 : 0;
     total++; passed += testJoinArmClassification()                   ? 1 : 0;
+    total++; passed += testNamespacedInterfaceAliasLookups()           ? 1 : 0;
 
     total++; passed += testGiParamAfterMain()                            ? 1 : 0;
     total++; passed += testGiParamDefinedBeforeUse()                     ? 1 : 0;

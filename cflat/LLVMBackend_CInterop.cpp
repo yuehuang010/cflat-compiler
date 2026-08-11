@@ -990,7 +990,7 @@ void LLVMBackend::RegisterRecordAliases(const std::vector<std::pair<std::string,
         for (const auto& [alias, target] : aliases)
         {
             if (dataStructures.find(alias) != dataStructures.end()) continue;  // real type wins
-            if (typeAliases.find(alias) != typeAliases.end()) continue;        // first-writer-wins
+            if (ResolveTypeAlias(alias) != alias) continue;        // first-writer-wins
             RegisterTypeAlias(alias, target);
 
             // Surface the typedef name itself as a navigable LSP symbol. Type resolution already
@@ -2266,4 +2266,3 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         }
         return true;
     }
-

@@ -150,7 +150,7 @@ bool MainListener::RejectPointerShapedInterfaceUpcast(antlr4::ParserRuleContext*
 bool MainListener::RejectPrimitiveShapedInterfaceUpcast(antlr4::ParserRuleContext* errCtx,
                                               const LLVMBackend::TypeAndValue& src,
                                               const std::string& interfaceName) {
-        if (interfaceName.empty() || compilerLLVM->interfaceTable.count(interfaceName) == 0)
+        if (interfaceName.empty() || !compilerLLVM->HasInterface(interfaceName))
             return false;
         if (!LLVMBackend::IsPrimitiveTypeName(compilerLLVM->ResolveTypeAlias(src.TypeName)))
             return false;
@@ -4144,7 +4144,7 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
         if (srcKind == CastSourceKind::PointerShaped)
         {
             // Membership gates on the resolved name; the message spells what the user wrote.
-            if (compiler->interfaceTable.count(targetTypeName)
+            if (compiler->HasInterface(targetTypeName)
                 && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeNameIn))
                 return nullptr;
             LogErrorContext(ctx, std::format(
@@ -4156,7 +4156,7 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
         // A '?:' join has one concrete class per arm, so the answer is per arm too.
         if (srcKind == CastSourceKind::TernaryPointerJoin)
         {
-            bool targetIsInterface = compiler->interfaceTable.count(targetTypeName) != 0;
+            bool targetIsInterface = compiler->HasInterface(targetTypeName);
             if (!targetIsInterface && !compiler->dataStructures.count(targetTypeName))
             {
                 LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeNameIn));
@@ -4184,7 +4184,7 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
         // known at compile time.
         if (srcKind == CastSourceKind::ConcretePointer || srcKind == CastSourceKind::ConcreteValue)
         {
-            if (compiler->interfaceTable.count(targetTypeName))
+            if (compiler->HasInterface(targetTypeName))
                 return compiler->builder->getInt1(compiler->StructImplementsInterface(srcStructName, targetTypeName));
             if (compiler->dataStructures.count(targetTypeName))
                 return compiler->builder->getInt1(srcStructName == targetTypeName);
@@ -4195,7 +4195,7 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
 
         // Interface target: true when the runtime type is any implementor of that interface.
         // An OR-chain of typedesc compares - the same enumeration `switch` on an interface uses.
-        if (compiler->interfaceTable.count(targetTypeName))
+        if (compiler->HasInterface(targetTypeName))
         {
             auto loadedDesc = LoadTypeDescFromInterface(interfaceValue, ctx);
             llvm::Value* result = compiler->builder->getInt1(false);
@@ -4262,7 +4262,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
         if (srcKind == CastSourceKind::PointerShaped)
         {
             // Membership gates on the resolved name; the message spells what the user wrote.
-            if (compiler->interfaceTable.count(targetTypeName)
+            if (compiler->HasInterface(targetTypeName)
                 && RejectPointerShapedInterfaceUpcast(ctx, srcShape, targetTypeNameIn))
                 return nullptr;
             LogErrorContext(ctx, std::format(
@@ -4275,7 +4275,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
         // as the plain-assignment path does. This includes the slot-backed '??' spelling.
         if (srcKind == CastSourceKind::TernaryPointerJoin)
         {
-            if (compiler->interfaceTable.count(targetTypeName))
+            if (compiler->HasInterface(targetTypeName))
             {
                 std::string armFailure;
                 std::string joinSpelling;
@@ -4312,7 +4312,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
         {
             // Interface target: the shared boxing helper, so this spelling carries the same
             // implements/shape/ownership guards the plain-assignment spelling does.
-            if (compiler->interfaceTable.count(targetTypeName))
+            if (compiler->HasInterface(targetTypeName))
             {
                 return BoxConcreteIntoInterface(ctx, interfaceValue, !srcIsValue, srcStructName,
                                                 targetTypeName, srcBinding);
@@ -4337,7 +4337,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
 
         // Only InterfaceValue reaches here, so the source carries the vtable + typedesc header
         // the checks below load from. Interface target: runtime-checked interface-to-interface.
-        if (compiler->interfaceTable.count(targetTypeName))
+        if (compiler->HasInterface(targetTypeName))
         {
             auto fatTy = compiler->GetFatPtrType();
 

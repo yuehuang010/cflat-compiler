@@ -2514,6 +2514,8 @@ void LLVMBackend::ResetForReanalysis()
     interfaceFields.clear();
     interfaceParents.clear();
     interfaceDefSites.clear();
+    rejectedInterfaceDefSites_.clear();
+    rejectedInterfaceDefMessages_.clear();
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
@@ -5008,6 +5010,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     interfaceFields.clear();
     interfaceParents.clear();
     interfaceDefSites.clear();
+    rejectedInterfaceDefSites_.clear();
+    rejectedInterfaceDefMessages_.clear();
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();

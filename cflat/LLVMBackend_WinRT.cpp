@@ -142,10 +142,10 @@ std::string LLVMBackend::CreateWinrtVtableStruct(const std::string& className, c
         slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
         slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
 
-        auto it = interfaceTable.find(ifaceName);
-        if (it != interfaceTable.end())
+        const auto* methods = FindInterface(ifaceName);
+        if (methods != nullptr)
         {
-            for (const auto& m : it->second)
+            for (const auto& m : *methods)
             {
                 std::vector<TypeAndValue::FuncPtrParam> params = { vp() };  // this
                 for (const auto& mp : m.Parameters)
@@ -237,8 +237,8 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
         // A value-returning interface method: build the HResult<T> wrapper around the ABI call.
         const InterfaceMethod* im = nullptr;
         if (slotIdx >= 6)
-            if (auto it = interfaceTable.find(wi.InterfaceName); it != interfaceTable.end())
-                for (const auto& m : it->second) if (m.Name == slotName) { im = &m; break; }
+            if (const auto* methods = FindInterface(wi.InterfaceName))
+                for (const auto& m : *methods) if (m.Name == slotName) { im = &m; break; }
         bool nonVoidIface = im && !(im->ReturnType.TypeName == "void" && !im->ReturnType.Pointer);
 
         llvm::Value* retvalAlloca = nullptr;
@@ -416,10 +416,10 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
 
         // Per-method thunks: bitcast i8* self to the object pointer and forward to the member fn.
         std::vector<llvm::Function*> thunks;
-        auto ifIt = interfaceTable.find(ifaceName);
-        if (ifIt != interfaceTable.end())
+        const auto* methods = FindInterface(ifaceName);
+        if (methods != nullptr)
         {
-            for (const auto& m : ifIt->second)
+            for (const auto& m : *methods)
             {
                 const FunctionSymbol* implSym = FindWinrtMethod(className, m);
                 if (!implSym)
@@ -1309,8 +1309,8 @@ bool LLVMBackend::CheckWinmd(const std::string& path)
 int LLVMBackend::InterfaceDtorSlotIndex(const std::string& ifaceName) const
 {
         size_t methodCount = 0;
-        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
-            methodCount = it->second.size();
+        if (const auto* methods = FindInterface(ifaceName))
+            methodCount = methods->size();
         return (int)(1 + methodCount + InterfaceFieldCount(ifaceName));
     }
 
@@ -1321,8 +1321,8 @@ llvm::Value* LLVMBackend::EmitInterfaceFieldAddress(llvm::Value* fatVal, const s
         if (fieldIdx < 0) return nullptr;
 
         size_t methodCount = 0;
-        if (auto it = interfaceTable.find(ifaceName); it != interfaceTable.end())
-            methodCount = it->second.size();
+        if (const auto* methods = FindInterface(ifaceName))
+            methodCount = methods->size();
 
         auto ptrTy = builder->getInt8Ty()->getPointerTo();
         llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
@@ -2313,19 +2313,19 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         auto dataPtrField = builder->CreateStructGEP(fatTy, ifacePtr, 1);
         auto dataPtr = builder->CreateLoad(ptrTy, dataPtrField);
 
-        auto ifaceIt = interfaceTable.find(ifaceName);
-        if (ifaceIt == interfaceTable.end())
+        const auto* ifaceMethods = FindInterface(ifaceName);
+        if (ifaceMethods == nullptr)
         {
             LogError(std::format("unknown interface '{}'", ifaceName));
             return nullptr;
         }
 
         std::vector<NamedVariable> callArgNVs;
-        int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, ifaceIt->second,
+        int methodIdx = ResolveInterfaceMethodSlot(ifaceName, methodName, *ifaceMethods,
                                                    extraArgNVs, callArgNVs);
         if (methodIdx < 0)
             return nullptr;
-        const InterfaceMethod* methodInfo = &ifaceIt->second[methodIdx];
+        const InterfaceMethod* methodInfo = &(*ifaceMethods)[methodIdx];
 
         // Method indices start at 1 (slot 0 is type ID)
         auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx + 1));
@@ -2574,7 +2574,7 @@ bool LLVMBackend::TypeImplementsInterface(const std::string& typeName, const std
 {
         // An interface trivially satisfies a constraint to itself (e.g. arena_channel<IMessage>
         // uses IMessage as its payload type when constrained to IMessage).
-        if (typeName == ifaceName && interfaceTable.count(typeName)) return true;
+        if (typeName == ifaceName && HasInterface(typeName)) return true;
 
         auto it = dataStructures.find(typeName);
         if (it == dataStructures.end()) return false;
@@ -2589,14 +2589,14 @@ bool LLVMBackend::TypeImplementsInterface(const std::string& typeName, const std
 
 void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, const std::string& interfaceName)
 {
-        auto ifaceIt = interfaceTable.find(interfaceName);
-        if (ifaceIt == interfaceTable.end())
+        const auto* ifaceMethods = FindInterface(interfaceName);
+        if (ifaceMethods == nullptr)
         {
             LogError(std::format("unknown interface: '{}'", interfaceName));
             return;
         }
 
-        for (const auto& method : ifaceIt->second)
+        for (const auto& method : *ifaceMethods)
         {
             bool found = false;
             // A class may declare several overloads of the contract method that share the interface
@@ -2963,4 +2963,3 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
 
         return fn;
     }
-

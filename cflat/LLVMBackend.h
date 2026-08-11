@@ -2233,6 +2233,10 @@ private:
     // and the codegen walk both register the SAME definition, so the guard compares sites rather
     // than mere presence; a second definition at a different site is a redefinition.
     std::unordered_map<std::string, std::string> interfaceDefSites;
+    // A duplicate definition is visited by both passes. Remember rejected definition sites so
+    // the same source definition emits its diagnostic only once.
+    std::unordered_set<std::string> rejectedInterfaceDefSites_;
+    std::unordered_map<std::string, std::string> rejectedInterfaceDefMessages_;
     // Subset of interfaceDefSites keys whose recorded definition came from a core library file
     // (currentSourceIsCore_ was true when the site was recorded). Lets the redefinition guard in
     // CreateInterfaceDefinition tell a core/user name collision apart from a user/user one.
@@ -4115,6 +4119,9 @@ public:
 
     std::string ResolveTypeAlias(const std::string& name) const;
 
+    // Look up a closure alias using the same innermost-namespace-first rules as named types.
+    const TypeAndValue* FindFunctionTypeAlias(const std::string& name) const;
+
     // A pure-rename `using` alias is transparent the way a C typedef is, so it must not produce its
     // own monomorphization: list<MyInt> and list<int> are ONE instantiation. Registered ahead of
     // both passes (see PreRegisterRenameAliases) so the two mangle a type argument identically.
@@ -4134,6 +4141,11 @@ public:
     bool IsGenericBaseAlias(const std::string& name) const;
 
     std::string ResolveGenericBaseAlias(const std::string& base) const;
+
+    // Canonical interface lookup. Callers must not choose between a bare key and a qualified key
+    // themselves: a namespace-local interface shadows a global interface of the same tail name.
+    bool HasInterface(const std::string& name) const;
+    const std::vector<InterfaceMethod>* FindInterface(const std::string& name) const;
 
     // True when `key` is a key some generic template kind is registered (or was scanned) under.
     // The single definition of "the generic template key space" - both the routing predicates and
@@ -6643,6 +6655,10 @@ public:
     bool IsImportAliasMember(const std::string& alias, const std::string& member) const;
     bool IsDataStructure(const std::string& name) const;
     std::string ResolveNamespace(const std::string& name) const;
+
+    // Candidate keys for scope-sensitive registries. The declaring scope is captured in the key at
+    // registration time; lookup walks the active namespace outward and then the global scope.
+    std::vector<std::string> ScopedNameCandidates(const std::string& name, bool forceRoot = false) const;
 
     /*
      * Resolve a base-clause / parent-list interface spelling to the name the interface is

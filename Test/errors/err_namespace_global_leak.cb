@@ -4,11 +4,18 @@
 
 namespace Cfg {
     int P = 777;
+    using AliasP = int;
 }
 
 extern int main()
 {
-    expect_error("Undefined variable P.");
-    int x = P;
-    return x;
+    expect_error("Undefined variable P.") {
+        int x = P;
+        return x;
+    }
+    expect_error("unknown type 'AliasP'") {
+        AliasP x = 1;
+        return x;
+    }
+    return 0;
 }

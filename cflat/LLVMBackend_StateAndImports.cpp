@@ -446,22 +446,43 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
         return it != namespaceAliasTable.end() ? it->second : name;
     }
 
-std::string LLVMBackend::ResolveInterfaceName(const std::string& spelled) const
+std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& name, bool forceRoot) const
 {
-        std::string name = ResolveTypeAlias(spelled);
-        if (interfaceTable.count(name)) return name;
-        if (!currentNamespace_.empty() && name.find('.') == std::string::npos)
+        std::vector<std::string> candidates;
+        auto add = [&](const std::string& candidate) {
+            if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end())
+                candidates.push_back(candidate);
+        };
+
+        if (!forceRoot && !currentNamespace_.empty() && name.find('.') == std::string::npos)
         {
             std::string prefix = currentNamespace_;
             while (true)
             {
-                std::string candidate = prefix + "." + name;
-                if (interfaceTable.count(candidate)) return candidate;
+                add(prefix + "." + name);
                 auto dot = prefix.rfind('.');
                 if (dot == std::string::npos) break;
                 prefix = prefix.substr(0, dot);
             }
         }
+
+        if (name.find('.') != std::string::npos)
+        {
+            auto dot = name.find('.');
+            std::string first = name.substr(0, dot);
+            std::string rest = name.substr(dot + 1);
+            std::string resolvedFirst = ResolveNamespace(first);
+            add(resolvedFirst + "." + rest);
+        }
+        add(name);
+        return candidates;
+    }
+
+std::string LLVMBackend::ResolveInterfaceName(const std::string& spelled) const
+{
+        std::string name = ResolveTypeAlias(spelled);
+        for (const auto& candidate : ScopedNameCandidates(name))
+            if (interfaceTable.count(candidate)) return candidate;
         std::string qualified = ResolveTypeAlias(ResolveQualifiedName(name));
         return interfaceTable.count(qualified) ? qualified : name;
     }
