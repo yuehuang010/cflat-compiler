@@ -3952,9 +3952,13 @@ public:
 
     // lhsElemType is the POINTEE type when lvalue is a pointer (TypedValue::elemType);
     // it is what makes an `operator op(T*, U)` candidate findable under opaque pointers.
+    // rhsPointerDepth/rhsElemPointer carry the right OPERAND's recorded depth (0 = not
+    // recorded); only the receiver reaches the scorer with a type, so without them a
+    // 'T**' operand binds a 'T*' operator parameter under opaque pointers.
     llvm::Value* TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
-        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr);
+        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType = nullptr,
+        int rhsPointerDepth = 0, bool rhsElemPointer = false);
 
     LLVMBackend::TypedValue ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx);
 

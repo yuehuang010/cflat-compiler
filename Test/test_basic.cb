@@ -2181,6 +2181,24 @@ int pdByPtrPtr(PdCircle** c) { return 1000 + (*c)->r; }
 int pdByVoid(void* p) { return p == nullptr ? 0 : 1; }
 int pdNullOk(PdCircle** c) { return c == nullptr ? 9 : 8; }
 void pdFill(PdCircle** c, int v) { (*c)->r = v; }
+// Doors the SCORER is not the judge of, plus the PRIMITIVE cell it judges through a different
+// branch (an 'int**' argument carries no CFlat TypeName, so the numeric fallback ranked it).
+int pdPrimDeref(int* p) { return 100 + *p; }
+int pdPrimDerefPP(int** p) { return 200 + **p; }
+int pdSumArr(int* p) { return p[0] + p[1]; }
+int pdFirstR(PdCircle* c) { return 90 + c->r; }
+// An OVERLOAD SET holding both depths: a 'T*[N]' argument decays to 'T**' and must select the
+// 'T**' body, not merely be refused by the 'T*' one.
+int pdPickR(PdCircle* c) { return 90 + c->r; }
+int pdPickR(PdCircle** c) { return 190 + (*c)->r; }
+// The same array against a set holding the 'T*' mistake and the 'void*' SINK: refusing the
+// 'T*' one leaves the sink, which every pointer legitimately converts to.
+int pdPickV(PdCircle* c) { return 90 + c->r; }
+int pdPickV(void* p) { return 55; }
+class PdHold { PdCircle* p = nullptr; };
+class PdVec { int k = 0;
+              int operator+(PdCircle* o) { return 100 + o->r; }
+              int operator+(PdCircle** o) { return 200 + (*o)->r; } };
 
 bool testOverloadResolution()
 {
@@ -2300,6 +2318,62 @@ bool testOverloadResolution()
     // reachable - a 'T***' declarator is now REJECTED outright (this leg used to read '*pdPPP'
     // through one). The rejection is frozen in err_double_pointer_arg_single_pointer_param.cb.
     result &= Test("pd_ptrptr_local_at_cap_reads_through", (*pdPP)->r, 3);
+
+    // ---- PRIMITIVE pointers (accept side) ----
+    // A primitive pointer argument carries an EMPTY CFlat TypeName, so it never reached
+    // IsTypeMatch's depth gate and the numeric fallback scored 'int**' against 'int*' as one
+    // 32-bit "int". These legs are the accept set that fallback must keep granting.
+    int pdX = 3;
+    int* pdIP = &pdX;
+    int** pdIPP = &pdIP;
+    result &= Test("pd_prim_ptr_into_ptr_param", pdPrimDeref(pdIP), 103);
+    result &= Test("pd_prim_addrof_into_ptr_param", pdPrimDeref(&pdX), 103);
+    result &= Test("pd_prim_ptrptr_into_ptrptr_param", pdPrimDerefPP(pdIPP), 203);
+    result &= Test("pd_prim_addrof_ptr_into_ptrptr_param", pdPrimDerefPP(&pdIP), 203);
+    result &= Test("pd_prim_ptrptr_into_voidptr_param", pdByVoid(pdIPP), 1);
+
+    // ---- ARRAY DECAY is a sanctioned spelling ----
+    // 'T[N]' decays to 'T*', so 'T*[N]' decays to 'T**' - only binding that decayed 'T**' to a
+    // 'T*' parameter is the depth mistake (frozen in err_double_pointer_arg_single_pointer_param).
+    int[2] pdIArr = default;
+    pdIArr[0] = 3;
+    pdIArr[1] = 4;
+    result &= Test("pd_plain_array_decays_to_ptr_param", pdSumArr(pdIArr), 7);
+    PdCircle[2] pdSArr = default;
+    pdSArr[0].r = 7;
+    result &= Test("pd_struct_array_decays_to_ptr_param", pdFirstR(pdSArr), 97);
+    result &= Test("pd_ptr_array_element_into_ptr_param", pdFirstR(pdArr[0]), 94);
+    // Selection, not just refusal: with both depths declared the decayed 'T**' takes the 'T**'
+    // body. This read 94 (the wrong body) before the decay was judged.
+    result &= Test("pd_ptr_array_picks_ptrptr_overload", pdPickR(pdArr), 194);
+    // Second selection cell: with only the 'T*' mistake and a 'void*' sink declared, the array
+    // now takes the sink. Measured from the IR - '@_f_i32_CPtr_' pre, '@_f_i32_U8Ptr_' post.
+    result &= Test("pd_ptr_array_picks_voidptr_over_ptr", pdPickV(pdArr), 55);
+
+    // ---- INDIRECT 'function<>' call ----
+    // This door lowers its own argument list and enters neither the scorer nor the interface
+    // slot resolver, so it needed its own depth gate; both correct depths still call through.
+    function<int(PdCircle*)> pdF = pdFirstR;
+    result &= Test("pd_fnptr_ptr_param_correct_depth", pdF(pdA), 93);
+    function<int(PdCircle**)> pdFP = pdByPtrPtr;
+    result &= Test("pd_fnptr_ptrptr_param_correct_depth", pdFP(pdPP), 1003);
+    result &= Test("pd_fnptr_addrof_into_ptrptr_param", pdFP(&pdA), 1003);
+    function<int(PdCircle**)> pdFN = pdNullOk;
+    result &= Test("pd_fnptr_nullptr_arg_still_binds", pdFN(nullptr), 9);
+
+    // ---- OPERATOR OPERAND ----
+    // Only the RECEIVER reaches the scorer; the operand was reduced to a raw llvm::Value, so
+    // under opaque pointers 'pdV + pdPP' took the 'T*' body. With BOTH overloads declared the
+    // operand's depth is the only thing that can separate them - this pair goes red together if
+    // the depth stops being carried to the scorer.
+    PdVec pdV = default;
+    result &= Test("pd_op_operand_ptr_picks_ptr_overload", pdV + pdA, 103);
+    result &= Test("pd_op_operand_ptrptr_picks_ptrptr_overload", pdV + pdPP, 203);
+
+    // '&' over a 'T*' FIELD is depth 2, the deepest a value can be; it still binds a 'T**'.
+    PdHold pdH = default;
+    pdH.p = pdA;
+    result &= Test("pd_addrof_ptr_field_into_ptrptr_param", pdByPtrPtr(&pdH.p), 1003);
 
     delete pc;
     delete ps;

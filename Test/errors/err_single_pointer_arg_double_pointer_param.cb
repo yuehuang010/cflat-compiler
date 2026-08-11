@@ -27,6 +27,11 @@ class SpHolder { SpCircle* p = nullptr; };
 
 SpCircle* spForward(SpCircle* s) { return s; }
 
+// The mirror at the three doors the scorer does not judge alone. A PRIMITIVE pointer argument
+// carries no CFlat TypeName, so the note reports only the depth.
+int spPrimDerefPP(int** p) { return 200 + **p; }
+class SpVec { int k = 0; int operator+(SpCircle** o) { return 200 + (*o)->r; } };
+
 extern int main()
 {
     // The filed repro: a declared 'T*' local. The note names both types and the '&' remedy.
@@ -72,6 +77,29 @@ extern int main()
     expect_error("parameter 0 'p' has type 'SpCircle**' and the argument has type 'SpCircle*'") {
         SpCircle* a = new SpCircle();
         SpWrap w = SpWrap(a);
+    }
+
+    // PRIMITIVE pointer argument: the numeric fallback used to score 'int*' against 'int**' as
+    // one 32-bit "int", so the mirror never fired here either.
+    expect_error("parameter 0 'p' has type 'int**' and the argument has one fewer level of indirection") {
+        int x = 3;
+        int* p = &x;
+        int r = spPrimDerefPP(p);
+    }
+
+    // OPERATOR OPERAND: only the receiver reaches the scorer, so the operand's depth had to
+    // travel with it for the mirror to fire at all.
+    expect_error("parameter 1 'o' has type 'SpCircle**' and the argument has one fewer level of indirection") {
+        SpCircle* a = new SpCircle();
+        SpVec v = default;
+        int r = v + a;
+    }
+
+    // INDIRECT 'function<>' call: its own argument list, its own gate.
+    expect_error("call through function pointer 'spF': parameter 0 has type 'SpCircle**' and the argument has type 'SpCircle*'") {
+        SpCircle* a = new SpCircle();
+        function<int(SpCircle**)> spF = spByPtrPtr;
+        int r = spF(a);
     }
 
     return 0;

@@ -3550,7 +3550,8 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             // hit/miss test. Reduce the fat operand to its data pointer and compare pointers.
             LowerInterfaceNullCompare(ctx, lv, rv);
 
-            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
+                                                       rv.pointerDepth, rv.elemPointer);
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // == != result is bool, not unsigned
@@ -3573,6 +3574,13 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
         result.elemType = elemType;
         result.isArrayView = namedVar.TypeAndValue.IsArrayView;
+        // Carry the depth so an operator's right operand keeps a claim the raw llvm::Value loses.
+        // Only a depth that is about THIS value is carried; everything else stays unrecorded.
+        if (namedVar.TypeAndValue.DepthIsAboutThisValue())
+        {
+            result.pointerDepth = namedVar.TypeAndValue.PointerDepth;
+            result.elemPointer  = namedVar.TypeAndValue.ElemPointer;
+        }
         return result;
     }
 
@@ -4202,7 +4210,8 @@ LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::Rel
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
-            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType);
+            auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
+                                                       rv.pointerDepth, rv.elemPointer);
             llvm::Value* result = overload ? overload
                                            : Compiler(ctx)->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
             return { result, false };  // comparison result is bool, not unsigned
@@ -4703,7 +4712,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 }
                 else
                 {
-                    auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+                    auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
+                                                              rv.pointerDepth, rv.elemPointer);
 
                     // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
                     // and can't reach raw i8*; both must qualify as c-strings so int* + int* still errors.
@@ -5061,7 +5071,8 @@ llvm::Value* MainListener::TryPointerLhsOperatorOverload(
 
 llvm::Value* MainListener::TryBinaryOperatorOverload(
         llvm::Value* lvalue, const std::string& op, llvm::Value* rvalue,
-        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType) {
+        antlr4::ParserRuleContext* ctx, llvm::Type* lhsElemType,
+        int rhsPointerDepth, bool rhsElemPointer) {
         if (!lvalue) return nullptr;
         auto* compiler = Compiler(ctx);
 
@@ -5113,6 +5124,14 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                         rightNV.BaseType = rightNV.Primary->getType();
                         rightNV.TypeAndValue.TypeName = "string";
                     }
+                }
+                // A recorded operand depth is the only thing that survives the reduction to a raw
+                // llvm::Value; stamped ONLY when positive, so an unproven pointer claims nothing.
+                if (rightNV.TypeAndValue.TypeName.empty() && rhsPointerDepth >= 1)
+                {
+                    rightNV.TypeAndValue.Pointer      = true;
+                    rightNV.TypeAndValue.PointerDepth = rhsPointerDepth;
+                    rightNV.TypeAndValue.ElemPointer  = rhsElemPointer;
                 }
             }
             return rightNV;
@@ -5193,7 +5212,10 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
-                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx);
+                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
+                                                          rightNV.TypeAndValue.DepthIsAboutThisValue()
+                                                              ? rightNV.TypeAndValue.PointerDepth : 0,
+                                                          rightNV.TypeAndValue.ElemPointer);
                 lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
                 lu = lu || ru;
             }
@@ -5778,8 +5800,23 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // the noalias contract must keep one-way). Mark a scalar operand's address as a
                 // pointer so the array-view bind gate sees `&a[i]` as the raw `int*` it is.
                 namedVar.TypeAndValue.IsArrayView = false;
-                // Depth: `&` adds one level to an ALREADY-RECORDED depth, capped at 2. An operand
-                // whose depth was never recorded stays unrecorded - `&` cannot invent a claim.
+                /*
+                 * Depth: `&` adds one level to an ALREADY-RECORDED depth. An operand whose depth
+                 * was never recorded stays unrecorded - `&` cannot invent a claim. An operand
+                 * already PROVEN at the cap would produce a depth-3 VALUE, which the two-level
+                 * model cannot represent; refuse it where it is produced, exactly as a written
+                 * `T***` is refused at its declarator, rather than clamping it back to `T**`.
+                 */
+                if (namedVar.TypeAndValue.PointerDepth >= PointerDepthCap
+                    && namedVar.TypeAndValue.DepthIsAboutThisValue())
+                {
+                    std::string subject = namedVar.CallerName.empty()
+                        ? std::string("address-of expression")
+                        : std::format("address-of '{}{}'", namedVar.CallerName,
+                            namedVar.FieldName.empty() ? "" : "." + namedVar.FieldName);
+                    LogErrorContext(ctx, PointerDepthCapMessage(subject,
+                        namedVar.TypeAndValue.PointerDepth + 1));
+                }
                 if (namedVar.TypeAndValue.PointerDepth >= 1)
                     namedVar.TypeAndValue.PointerDepth =
                         namedVar.TypeAndValue.PointerDepth >= 2 ? 2 : namedVar.TypeAndValue.PointerDepth + 1;

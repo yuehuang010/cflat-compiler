@@ -727,12 +727,7 @@ public:
             if (Pointer && !other.Pointer)
                 return false;
 
-            if (IsProvenDoublePointer() && other.IsProvenSinglePointer())
-                return false;
-
-            // The mirror: a POSITIVELY depth-1 argument does not bind a proven `T**` parameter.
-            // Both sides must be proven, so an unrecorded depth (0) still accepts.
-            if (IsProvenSinglePointerDepth() && other.IsProvenDoublePointer())
+            if (PointerDepthRefuses(other))
                 return false;
 
             if (TypeName == other.TypeName)
@@ -844,6 +839,38 @@ public:
         {
             return Pointer && PointerDepth == 1 && !ElemPointer
                 && TypeName != "void" && DepthIsAboutThisValue();
+        }
+
+        /*
+         * A fixed `T[N]` ARGUMENT arrives as the element-0 address, so its decayed value is one
+         * level deeper than the ELEMENT that Pointer/ElemPointer describe: `T*[N]` decays to a
+         * proven `T**`. Plain `T[N]` decays to `T*` and is a sanctioned spelling, so only a
+         * POINTER element claims anything here. Views claim nothing (a view is a fat value that
+         * binds through its own gate), and `ElemPointer` on the element would mean depth 3.
+         */
+        bool IsProvenDecayedDoublePointer() const
+        {
+            return ConstArraySize > 0 && Pointer && !ElemPointer && !IsArrayView && !IsSimd
+                && !IsInterface && !IsInterfacePointer && !IsFunctionPointer
+                && !TypeName.empty() && TypeName != "void";
+        }
+
+        /*
+         * The pointer-DEPTH half of IsTypeMatch, split out for the two judges that do not call
+         * IsTypeMatch: the scorer's numeric fallback (which re-granted `int**` into `int*`,
+         * because both spell the 32-bit "int") and its empty-TypeName branch, where opaque
+         * pointers make every pointer pair identical. `this` is the ARGUMENT, `other` the
+         * PARAMETER - the same asymmetry IsTypeMatch documents.
+         */
+        bool PointerDepthRefuses(const TypeAndValue& other) const
+        {
+            if ((IsProvenDoublePointer() || IsProvenDecayedDoublePointer())
+                && other.IsProvenSinglePointer())
+                return true;
+
+            // The mirror: a POSITIVELY depth-1 argument does not bind a proven `T**` parameter.
+            // Both sides must be proven, so an unrecorded depth (0) still accepts.
+            return IsProvenSinglePointerDepth() && other.IsProvenDoublePointer();
         }
 
         // A plain `T*` value. `void*` is excluded because every pointer converts to it: without
@@ -1177,6 +1204,10 @@ public:
         bool         isUnsigned = false;
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
+        // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
+        // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
+        int          pointerDepth = 0;
+        bool         elemPointer  = false;
 
         TypedValue() = default;
         TypedValue(llvm::Value* v, bool u = false) : value(v), isUnsigned(u) {}
@@ -4835,6 +4866,15 @@ public:
      * virtual dispatch needs its own copy because the lone-slot arm picks by ARITY alone.
      */
     bool PointerArgIntoByValueParam(const NamedVariable& arg, const TypeAndValue& param) const;
+
+    /*
+     * The depth question at the INDIRECT-call door (`function<int(T*)> f; f(pp)`), which lowers
+     * its own argument list and enters neither the scorer nor ResolveInterfaceMethodSlot. A
+     * FuncPtrParam records no ElemPointer bit, only a PointerDepth whose 0 means "not recorded"
+     * (C interop, WinRT and synthesized signatures never fill it), so a POSITIVE depth on the
+     * parameter is required before anything is refused. Returns the diagnostic clause, or "".
+     */
+    std::string FuncPtrArgDepthMismatch(const NamedVariable& arg, const TypeAndValue::FuncPtrParam& p) const;
 
     /*
      * The same proof for a by-value PRIMITIVE parameter, which needs its own form: a primitive

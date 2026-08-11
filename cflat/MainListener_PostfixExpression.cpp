@@ -3057,6 +3057,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 }
                                 // Bond/move ownership-mismatch checks against the funcptr's per-param flags.
                                 size_t pcount = std::min(argNVs.size(), funcPtrTV.FuncPtrParams.size());
+                                // Pointer DEPTH: this door lowers its own argument list, so the
+                                // scorer never sees it and `f(pp)` bound an `int(T*)` slot silently.
+                                for (size_t i = 0; i < pcount; i++)
+                                {
+                                    auto why = Compiler(ctx)->FuncPtrArgDepthMismatch(
+                                        argNVs[i], funcPtrTV.FuncPtrParams[i]);
+                                    if (!why.empty())
+                                        Compiler(ctx)->LogError(std::format(
+                                            "call through function pointer '{}': parameter {} {}.",
+                                            functionName, i, why));
+                                }
                                 for (size_t i = 0; i < pcount; i++)
                                 {
                                     if (funcPtrTV.FuncPtrParams[i].IsMove && argNVs[i].IsBonded)

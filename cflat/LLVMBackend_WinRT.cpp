@@ -2087,6 +2087,36 @@ bool LLVMBackend::PointerArgIntoByValuePrimitiveParam(const NamedVariable& arg, 
             && param.IsPrimitive() && param.TypeName != "void";
     }
 
+std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
+        const TypeAndValue::FuncPtrParam& p) const
+{
+        if (!p.Pointer || p.PointerDepth < 1 || p.TypeName == "void" || p.TypeName.empty())
+            return "";
+
+        // Rebuild the parameter as a judgeable value: depth 2 is what ElemPointer would say.
+        TypeAndValue param;
+        param.TypeName = p.TypeName;
+        param.Pointer = true;
+        param.PointerDepth = p.PointerDepth;
+        param.ElemPointer = p.PointerDepth >= 2;
+        if (!arg.TypeAndValue.PointerDepthRefuses(param))
+            return "";
+
+        bool writable = true;
+        std::string shown = DisplayNameOfMangledType(p.TypeName, &writable);
+        std::string argShown = DisplayNameOfMangledType(arg.TypeAndValue.TypeName);
+        // A primitive pointer argument carries no CFlat TypeName; report only the depth then.
+        if (p.PointerDepth >= 2)
+            return std::format("has type '{}**' and the argument has {} - there is no "
+                "implicit address-of. Take its address with '&' at the call site", shown,
+                argShown.empty() ? std::string("one fewer level of indirection")
+                                 : std::format("type '{}*'", argShown));
+        return std::format("has type '{}*' and the argument has {} - there is no implicit "
+            "dereference. Dereference it with '*' at the call site", shown,
+            argShown.empty() ? std::string("one more level of indirection")
+                             : std::format("type '{}**'", argShown));
+    }
+
 bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& args,
         const std::vector<TypeAndValue>& params)

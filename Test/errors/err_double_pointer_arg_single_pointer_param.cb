@@ -22,6 +22,16 @@ class DpHolder { DpCircle** pp = nullptr; };
 
 DpCircle** dpForward(DpCircle** s) { return s; }
 
+// The doors the SCORER is not the judge of, plus the PRIMITIVE cell it judges through a
+// different branch: an 'int**' argument carries no CFlat TypeName, so IsTypeMatch's depth gate
+// refused the pair and the numeric fallback re-granted it ('int**' and 'int*' are both the
+// 32-bit "int"). Such an argument has no name to print, so the note reports only the depth.
+int dpPrimDeref(int* p) { return 100 + *p; }
+int dpCharTake(char* p) { return 100 + (int)(*p); }
+int dpFirstR(DpCircle* c) { return 90 + c->r; }
+class DpVec { int k = 0; int operator+(DpCircle* o) { return 100 + o->r; } };
+int dpByPtrPtr3(DpCircle** c) { return 2000 + (*c)->r; }
+
 // A generic type ARGUMENT carries its stars as a real depth, so DpGBox<DpCircle*> and
 // DpGBox<DpCircle**> are distinct instantiations and each substituted 'T x' is judgeable.
 class DpGBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; } };
@@ -150,6 +160,85 @@ extern int main()
         DpCircle*[2] arr = default;
         arr[0] = new DpCircle();
         int r = dpByPtr(&arr[0]);
+    }
+
+    // ---- PRIMITIVE pointer argument (no CFlat TypeName reaches the scorer) ----
+    expect_error("parameter 0 'p' has type 'int*' and the argument has one more level of indirection") {
+        int x = 3;
+        int* p = &x;
+        int** pp = &p;
+        int r = dpPrimDeref(pp);
+    }
+    expect_error("parameter 0 'p' has type 'char*' and the argument has one more level of indirection") {
+        char c = 'A';
+        char* p = &c;
+        char** pp = &p;
+        int r = dpCharTake(pp);
+    }
+    // A primitive pointer through a SUBSTITUTED parameter: the type argument now carries a real
+    // depth, and the substituted 'T x' is judged by the same override.
+    expect_error("parameter 1 'x' has type 'int*' and the argument has one more level of indirection") {
+        int x = 3;
+        int* p = &x;
+        int** pp = &p;
+        DpGBox<int*> thin = default;
+        int r = thin.put(pp);
+    }
+
+    // ---- ARRAY DECAY: 'T*[N]' decays to 'T**', so binding a 'T*' is the depth mistake ----
+    // Plain 'T[N]' -> 'T*' stays a sanctioned spelling (Test/test_basic.cb "pd_*_decays_*").
+    expect_error("(a 'DpCircle*[2]' array decays to 'DpCircle**')") {
+        DpCircle*[2] arr = default;
+        arr[0] = new DpCircle();
+        int r = dpFirstR(arr);
+    }
+
+    // ---- OPERATOR OPERAND: only the RECEIVER reaches the scorer ----
+    // The operand is reduced to a raw llvm::Value, so under opaque pointers it matched any
+    // pointer parameter; its recorded depth now travels with it.
+    expect_error("parameter 1 'o' has type 'DpCircle*' and the argument has one more level of indirection") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpVec v = default;
+        int r = v + pp;
+    }
+
+    // ---- INDIRECT 'function<>' call: its own argument list, its own gate ----
+    expect_error("call through function pointer 'dpF': parameter 0 has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        function<int(DpCircle*)> dpF = dpFirstR;
+        int r = dpF(pp);
+    }
+    // Same door reached through a LAMBDA value rather than a named function.
+    expect_error("call through function pointer 'dpL': parameter 0 has type 'DpCircle*' and the argument has type 'DpCircle**'") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        function<int(DpCircle*)> dpL = (DpCircle* c) => { return 90 + c->r; };
+        int r = dpL(pp);
+    }
+
+    // ---- A depth-3 VALUE needs no declarator ----
+    // '&' over an operand already PROVEN at the cap would produce a 'T***' value, which the
+    // two-level model cannot represent. Refused where it is produced, exactly as a written
+    // 'T***' is refused at its declarator - so no use site has to judge a clamped lie.
+    expect_error("address-of 'pp' produces pointer depth 3, but the type model caps at 2 levels") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        int r = dpByPtrPtr3(&pp);
+    }
+    // The INITIALIZER form of the same value: it never reaches a call at all.
+    expect_error("address-of 'pp' produces pointer depth 3, but the type model caps at 2 levels") {
+        DpCircle* a = new DpCircle();
+        DpCircle** pp = &a;
+        DpCircle** q = &pp;
+    }
+    // And over a 'T**' FIELD, whose depth rides the field type. Names the field, not the object.
+    expect_error("address-of 'h.pp' produces pointer depth 3, but the type model caps at 2 levels") {
+        DpCircle* a = new DpCircle();
+        DpHolder h = default;
+        h.pp = &a;
+        DpCircle** q = &h.pp;
     }
 
     return 0;

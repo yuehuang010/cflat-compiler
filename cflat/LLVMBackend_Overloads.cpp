@@ -282,6 +282,15 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                         result = 1;
                 }
 
+                /*
+                 * Depth OVERRIDES both branches above, because both re-granted a pair the depth
+                 * gates refuse: the named branch's numeric fallback scores `int**` against `int*`
+                 * as one 32-bit "int", and the empty-TypeName branch sees only opaque pointers.
+                 * Same predicate IsTypeMatch uses, so it refuses exactly what that refuses.
+                 */
+                if (result >= 0 && arg.TypeAndValue.PointerDepthRefuses(*candidateParamItr))
+                    result = -1;
+
                 if (result != 0)
                 {
                     perfectMatch = false;
@@ -896,7 +905,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto pi = c.Parameters.begin();
                 for (size_t i = 0; i < arguments.size() && pi != c.Parameters.end(); i++, ++pi)
                 {
-                    bool tooDeep = arguments[i].TypeAndValue.IsProvenDoublePointer()
+                    bool tooDeep = (arguments[i].TypeAndValue.IsProvenDoublePointer()
+                                 || arguments[i].TypeAndValue.IsProvenDecayedDoublePointer())
                                 && pi->IsProvenSinglePointer();
                     bool tooShallow = arguments[i].TypeAndValue.IsProvenSinglePointerDepth()
                                    && pi->IsProvenDoublePointer();
@@ -906,23 +916,38 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     bool writable = true;
                     std::string shown = DisplayNameOfMangledType(pi->TypeName, &writable);
                     std::string argShown = DisplayNameOfMangledType(arguments[i].TypeAndValue.TypeName);
+                    // A PRIMITIVE pointer argument carries no CFlat TypeName at all, so the depth
+                    // is all that is known about it - say only that, never "type '**'".
+                    auto argType = [&](const char* stars, const char* unnamed) {
+                        return argShown.empty() ? std::string(unnamed)
+                                                : std::format("type '{}{}'", argShown, stars);
+                    };
                     if (tooDeep)
                     {
                         std::string advice = writable
                             ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
+                        // A `T*[N]` argument decays to the element-0 ADDRESS, so the type the
+                        // callee receives is `T**`; say so rather than naming the array.
+                        std::string how = arguments[i].TypeAndValue.IsProvenDecayedDoublePointer()
+                            && !argShown.empty()
+                            ? std::format(" (a '{}*[{}]' array decays to '{}**')", argShown,
+                                arguments[i].TypeAndValue.ConstArraySize, argShown)
+                            : std::string();
                         msg += std::format("  [{}] parameter {} '{}' has type '{}*' and the argument has "
-                            "type '{}**' - there is no implicit dereference. Dereference it with '*' at "
+                            "{}{} - there is no implicit dereference. Dereference it with '*' at "
                             "the call site{}.\n",
-                            c.UniqueName, i, pi->VariableName, shown, argShown, advice);
+                            c.UniqueName, i, pi->VariableName, shown,
+                            argType("**", "one more level of indirection"), how, advice);
                     }
                     else
                     {
                         std::string advice = writable
                             ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
                         msg += std::format("  [{}] parameter {} '{}' has type '{}**' and the argument has "
-                            "type '{}*' - there is no implicit address-of. Take its address with '&' at "
+                            "{} - there is no implicit address-of. Take its address with '&' at "
                             "the call site{}.\n",
-                            c.UniqueName, i, pi->VariableName, shown, argShown, advice);
+                            c.UniqueName, i, pi->VariableName, shown,
+                            argType("*", "one fewer level of indirection"), advice);
                     }
                     break;
                 }
