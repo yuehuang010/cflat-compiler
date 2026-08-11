@@ -2616,6 +2616,16 @@ move IShapeMove ownJoinNC()
     return p ?? q;
 }
 
+// The source local is owning because it received `new` but is not marked `unique`. The return
+// check must use the per-arm join ownership proof instead of treating the coalesce load as a
+// borrowed value.
+move IShapeMove ownJoinLocalNC()
+{
+    CiMove* p = new CiMove(); p->r = 2;
+    CiMove* q = nullptr;
+    return q ?? p;
+}
+
 int testUniqueInterfaceTernary()
 {
     int passed = 0;
@@ -10635,6 +10645,15 @@ extern int main()
 
     passed += testUniqueInterfaceTernary();
     total += 181;
+
+    dtorCount = 0;
+    {
+        IShapeMove localJoin = ownJoinLocalNC();
+        passed += Test("iface_local_join_move_return_area", localJoin.area(), 9);
+        delete localJoin;
+    }
+    passed += Test("iface_local_join_move_return_freed_once", dtorCount, 1);
+    total += 2;
 
     passed += testTernaryInterfaceInheritanceRebox();
     total += 22;

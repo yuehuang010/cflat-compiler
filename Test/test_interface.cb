@@ -4879,6 +4879,52 @@ bool testIfaceCodeValueArgAcceptSet()
     return result;
 }
 
+// Join-arm classification matrix: a slot-backed '??', nested joins, mixed fat/thin boxing, and
+// direct call results all need the same concrete class resolution as a plain pointer arm.
+Circle* makeJoinCircle(int r)
+{
+    if (r == 0) return nullptr;
+    Circle* c = new Circle();
+    c->r = r;
+    return c;
+}
+
+int takeJoinShape(IShape s) { return s.area(); }
+
+bool testJoinArmClassification()
+{
+    bool result = true;
+    Circle* c = new Circle(); c->r = 3;
+    Circle* d = new Circle(); d->r = 4;
+    Square* s = new Square(); s->s = 5;
+    Circle* z = nullptr;
+
+    // '??' is a load from a coalesce slot, not a PHI, but its class and source binding are known.
+    result &= Test("join_nc_is_concrete", (z ?? c) is Circle, true);
+    result &= Test("join_nc_is_interface", (z ?? c) is IShape, true);
+    IShape nc = (z ?? c) as IShape;
+    result &= Test("join_nc_as_interface", nc.area(), 27);
+
+    // A nested join must preserve the predicate at the inner resume block. Both runtime paths
+    // are selected so a flat positional walk cannot pass this leg.
+    result &= Test("join_nested_is_inner_false", (ternaryPick(true)
+        ? (ternaryPick(false) ? c : s) : d) is Circle, false);
+    result &= Test("join_nested_is_outer_false", (ternaryPick(false)
+        ? (ternaryPick(false) ? c : s) : d) is Circle, true);
+
+    // The mixed fat/thin path boxes a nested '??' in that join's own block before the outer phi.
+    IShape mixed = (ternaryPick(false) ? (z ?? c) : s) as IShape;
+    result &= Test("join_nested_mixed_as", mixed.area(), 25);
+
+    // A call result has no load binding, so its registered pointer return type is the class source.
+    result &= Test("join_call_result_interface_arg", takeJoinShape(makeJoinCircle(0) ?? makeJoinCircle(4)), 48);
+
+    delete c;
+    delete d;
+    delete s;
+    return result;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -4944,6 +4990,7 @@ extern int main()
     total++; passed += testInterfaceFunctionPointerParam()         ? 1 : 0;
     total++; passed += testNullIfaceDispatchAcceptSet()             ? 1 : 0;
     total++; passed += testIfaceCodeValueArgAcceptSet()             ? 1 : 0;
+    total++; passed += testJoinArmClassification()                   ? 1 : 0;
 
     total++; passed += testGiParamAfterMain()                            ? 1 : 0;
     total++; passed += testGiParamDefinedBeforeUse()                     ? 1 : 0;

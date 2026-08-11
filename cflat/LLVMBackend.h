@@ -1536,8 +1536,8 @@ public:
     const InterfaceBoxRecord* FindInterfaceBoxByFatValue(const llvm::Value* value) const;
 
     // The only data-pointer lookup, deliberately provenance-filtered: a caller must say which
-    // kind of box it means, so a record of another kind can never answer for it. Records that
-    // share BOTH a data pointer and a Source are still resolved first-registered-wins.
+    // kind of box it means, so a record of another kind can never answer for it. Registration
+    // dedupes only an identical (fat value, data pointer, source) tuple.
     const InterfaceBoxRecord* FindInterfaceBoxByDataPointer(const llvm::Value* value,
                                                             InterfaceBoxSource source) const;
 
@@ -3246,8 +3246,8 @@ private:
 
     /*
      * Resolve the concrete class a pointer VALUE points at. The `new`-site ledger answers an
-     * owning temp; a BORROWED value is a plain load of a typed local, which is in no ledger, so
-     * fall back to the declared type of the binding the load came from.
+     * owning temp, a direct call uses its registered pointer return type, and a BORROWED value is
+     * a plain load of a typed local, which is in no ledger, so fall back to the binding's type.
      */
     std::string ResolvePointerElementTypeName(llvm::Value* value) const;
 

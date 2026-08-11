@@ -97,7 +97,13 @@ void LLVMBackend::RegisterInterfaceBox(const InterfaceBoxRecord& record)
 {
         if (record.FatValue == nullptr) return;
         for (auto& entry : interfaceBoxRecords_)
-            if (entry.FatValue == record.FatValue) { entry = record; return; }
+            if (entry.FatValue == record.FatValue
+                && entry.DataPointer == record.DataPointer
+                && entry.Source == record.Source)
+            {
+                entry = record;
+                return;
+        }
         interfaceBoxRecords_.push_back(record);
     }
 
@@ -2383,10 +2389,20 @@ std::string LLVMBackend::ResolvePointerElementTypeName(llvm::Value* value) const
 {
         std::string name = FindValueElementTypeName(value);
         if (!name.empty()) return name;
+        if (auto* call = llvm::dyn_cast_or_null<llvm::CallInst>(value))
+        {
+            const auto* symbol = FindSymbolForFunction(call->getCalledFunction());
+            if (symbol == nullptr) return {};
+            const auto& tv = symbol->ReturnType;
+            if (!tv.Pointer || tv.ElemPointer || tv.IsArrayView || tv.IsSimd
+                || tv.IsInterface || tv.IsInterfacePointer || tv.ConstArraySize != 0)
+                return {};
+            return tv.TypeName;
+        }
         auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
         if (load == nullptr) return {};
         return FindDeclaredElementTypeNameForStorage(load->getPointerOperand());
-    }
+}
 
 void LLVMBackend::RegisterMovedOutPtrValue(llvm::Value* value)
 {

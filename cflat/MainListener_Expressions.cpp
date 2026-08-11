@@ -574,17 +574,17 @@ bool MainListener::NestedJoinArmsBoxable(llvm::Value* value, const std::string& 
             if (arm.Value == nullptr || arm.Block == nullptr) return false;
             if (arm.Block->getTerminator() == nullptr) return false;
             if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
-            std::string name = compilerLLVM->ResolvePointerElementTypeName(arm.Value);
-            if (name.empty())
+            ResolvedJoinArmClass resolved;
+            if (!ResolveJoinArmClass(arm.Value, resolved))
             {
                 if (!NestedJoinArmsBoxable(arm.Value, interfaceName, armFailure, depth + 1))
                     return false;
                 continue;
             }
-            if (!compilerLLVM->StructImplementsInterface(name, interfaceName))
+            if (!compilerLLVM->StructImplementsInterface(resolved.Name, interfaceName))
             {
                 if (armFailure != nullptr)
-                    *armFailure = std::format("'{}' does not implement it", name);
+                    *armFailure = std::format("'{}' does not implement it", resolved.Name);
                 return false;
             }
         }
@@ -599,16 +599,124 @@ bool MainListener::CollectJoinArmClasses(llvm::Value* value, std::vector<std::st
         {
             if (arm.Value == nullptr) return false;
             if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
-            std::string name = compilerLLVM->ResolvePointerElementTypeName(arm.Value);
-            if (!name.empty())
+            ResolvedJoinArmClass resolved;
+            if (ResolveJoinArmClass(arm.Value, resolved))
             {
-                if (!compilerLLVM->IsDataStructure(name)) return false;
-                out.push_back(name);
+                if (!compilerLLVM->IsDataStructure(resolved.Name)) return false;
+                out.push_back(resolved.Name);
                 continue;
             }
             if (!CollectJoinArmClasses(arm.Value, out, depth + 1)) return false;
         }
         return true;
+    }
+
+bool MainListener::ResolveJoinArmClass(llvm::Value* value, ResolvedJoinArmClass& result) const {
+        result = {};
+        if (value == nullptr || !value->getType()->isPointerTy()) return false;
+        result.Name = compilerLLVM->ResolvePointerElementTypeName(value);
+        if (result.Name.empty()) return false;
+        if (auto* load = llvm::dyn_cast<llvm::LoadInst>(value))
+            result.Source = compilerLLVM->FindVariableByStorage(load->getPointerOperand());
+        return true;
+    }
+
+llvm::Value* MainListener::BuildJoinArmPredicate(llvm::Value* value,
+                                                  const std::string& targetTypeName,
+                                                  bool targetIsInterface,
+                                                  LLVMBackend* compiler,
+                                                  std::string& failure,
+                                                  int depth) {
+        if (depth > kMaxNestedJoinDepth)
+        {
+            failure = "nested join is too deep to classify";
+            return nullptr;
+        }
+        auto arms = CollectPointerJoinArms(value);
+        if (arms.empty())
+        {
+            failure = "the arm's concrete class cannot be determined; bind the arm to a "
+                      "local variable of the class type first";
+            return nullptr;
+        }
+
+        std::vector<llvm::Value*> answers;
+        answers.reserve(arms.size());
+        for (const auto& arm : arms)
+        {
+            if (arm.Value == nullptr || arm.Block == nullptr)
+            {
+                failure = "the arm's concrete class cannot be determined; bind the arm to a "
+                          "local variable of the class type first";
+                return nullptr;
+            }
+            if (llvm::isa<llvm::ConstantPointerNull>(arm.Value))
+            {
+                answers.push_back(compiler->builder->getInt1(false));
+                continue;
+            }
+
+            ResolvedJoinArmClass resolved;
+            if (ResolveJoinArmClass(arm.Value, resolved))
+            {
+                if (!compiler->IsDataStructure(resolved.Name))
+                {
+                    failure = std::format("'{}' is not a concrete class", resolved.Name);
+                    return nullptr;
+                }
+                bool matches = targetIsInterface
+                    ? compiler->StructImplementsInterface(resolved.Name, targetTypeName)
+                    : resolved.Name == targetTypeName;
+                answers.push_back(compiler->builder->getInt1(matches));
+                continue;
+            }
+
+            std::string nestedFailure;
+            llvm::Value* nested = BuildJoinArmPredicate(arm.Value, targetTypeName,
+                                                         targetIsInterface, compiler,
+                                                         nestedFailure, depth + 1);
+            if (nested == nullptr)
+            {
+                failure = nestedFailure.empty()
+                    ? "the arm's concrete class cannot be determined; bind the arm to a local "
+                      "variable of the class type first"
+                    : nestedFailure;
+                return nullptr;
+            }
+            answers.push_back(nested);
+        }
+
+        if (answers.empty()) return compiler->builder->getInt1(false);
+        bool allSame = true;
+        bool firstConstant = false;
+        if (auto* first = llvm::dyn_cast<llvm::ConstantInt>(answers.front()))
+            firstConstant = first->isOne();
+        else
+            allSame = false;
+        for (size_t i = 1; i < answers.size() && allSame; ++i)
+        {
+            auto* current = llvm::dyn_cast<llvm::ConstantInt>(answers[i]);
+            if (current == nullptr || current->isOne() != firstConstant) allSame = false;
+        }
+        if (allSame) return compiler->builder->getInt1(firstConstant);
+
+        llvm::Instruction* joinPoint = llvm::dyn_cast<llvm::Instruction>(value);
+        auto* phi = llvm::dyn_cast_or_null<llvm::PHINode>(value);
+        auto* load = llvm::dyn_cast_or_null<llvm::LoadInst>(value);
+        if (joinPoint == nullptr || (phi == nullptr && load == nullptr))
+        {
+            failure = "the join's runtime arm cannot be classified";
+            return nullptr;
+        }
+        auto* savedBlock = compiler->builder->GetInsertBlock();
+        auto savedPoint = compiler->builder->GetInsertPoint();
+        compiler->builder->SetInsertPoint(joinPoint);
+        auto* answerPhi = compiler->builder->CreatePHI(compiler->builder->getInt1Ty(),
+                                                        answers.size(), "join_is");
+        for (size_t i = 0; i < answers.size(); ++i)
+            answerPhi->addIncoming(answers[i], arms[i].Block);
+        compiler->builder->SetInsertPoint(savedBlock, savedPoint);
+        return answerPhi;
     }
 
 llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinArm>& arms,
@@ -620,13 +728,19 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
         if (count == 0 || joinPoint == nullptr || interfaceName.empty()) return nullptr;
         // Resolve every arm first: a partial rewrite would leave half-boxed IR behind.
         std::vector<std::string> armTypes(count);
+        std::vector<const LLVMBackend::NamedVariable*> armSources(count, nullptr);
         std::vector<bool> armIsNestedJoin(count, false);
         for (unsigned i = 0; i < count; i++)
         {
             llvm::Value* incoming = arms[i].Value;
             if (incoming == nullptr || arms[i].Block == nullptr) return nullptr;
             if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
-            armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
+            ResolvedJoinArmClass resolved;
+            if (ResolveJoinArmClass(incoming, resolved))
+            {
+                armTypes[i] = resolved.Name;
+                armSources[i] = resolved.Source;
+            }
             if (armTypes[i].empty())
             {
                 // The arm is itself a JOIN (a chained '??', or either spelling nested in the
@@ -662,7 +776,8 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
              * slot all answer "cannot tell" and are accepted, which is what keeps this from
              * reopening the false rejection that the whole-expression check used to produce.
              */
-            if (transferArmOwnership && !compiler->TernaryArmJoinsOwning(incoming)
+            if (transferArmOwnership && !JoinArmIsProvablyNull(incoming)
+                && !compiler->TernaryArmJoinsOwning(incoming)
                 && !compiler->IsMovedOutPtrValue(incoming)
                 && compiler->IsProvablyNonOwningPointerLoad(incoming))
             {
@@ -737,16 +852,17 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
             record.DataPointer = armData;
             record.SourceClassName = armTypes[i];
             record.InterfaceName = interfaceName;
-            record.Source = ClassifyInterfaceBoxSource(armData, nullptr, transferred);
+            record.Source = ClassifyInterfaceBoxSource(armData, armSources[i], transferred);
             record.OwnershipTransferred = transferred;
             // A PROVEN `move` arm detached its source here, so no other binding frees it. Same
             // demotion, and the same value keying, JoinArmsKeepOwner applies to the raw spelling.
             bool armMovedOut = compiler->IsMovedOutPtrValue(armData);
             record.SourceKeepsOwner = !armMovedOut
-                && ClassifyBoxedSourceKeepsOwner(armData, nullptr, transferred);
+                && ClassifyBoxedSourceKeepsOwner(armData, armSources[i], transferred);
             // The arm keeps its real vtable (the IR is unchanged); only the LEDGER calls it neutral.
             record.SourceProvablyNull = JoinArmIsProvablyNull(armData);
-            if (record.SourceKeepsOwner) record.SourceDisplayName = DescribeBoxedSourceOwner(armData, nullptr);
+            if (record.SourceKeepsOwner)
+                record.SourceDisplayName = DescribeBoxedSourceOwner(armData, armSources[i]);
             compiler->RegisterInterfaceBox(record);
         }
         compiler->builder->SetInsertPoint(joinPoint);
@@ -2950,7 +3066,19 @@ llvm::Value* MainListener::BoxTernaryThinArmToInterface(llvm::Value* thinValue, 
         if (auto* c = llvm::dyn_cast<llvm::Constant>(thinValue); c != nullptr && c->isNullValue())
             return llvm::Constant::getNullValue(fatTy);
 
-        std::string className = compiler->ResolvePointerElementTypeName(thinValue);
+        // The thin arm may itself be a slot-backed '??' (or a nested '?:'). Box that join at its
+        // own resume block; the outer mixed ternary block is not a predecessor of the inner phi.
+        if (!CollectPointerJoinArms(thinValue).empty())
+        {
+            if (auto* boxed = UpcastPointerJoinToInterface(thinValue, interfaceName,
+                                                            &armFailure))
+                return boxed;
+            return nullptr;
+        }
+
+        ResolvedJoinArmClass resolved;
+        std::string className = ResolveJoinArmClass(thinValue, resolved)
+            ? resolved.Name : std::string();
         if (className.empty())
         {
             armFailure = "the arm's concrete class cannot be determined; bind the arm to a "
@@ -3965,53 +4093,12 @@ MainListener::CastSourceKind MainListener::ClassifyCastSource(llvm::Value* value
         if (ClassifyPointerShapedSource(value, elemType, compiler, shape))
             return CastSourceKind::PointerShaped;
 
-        // A '?:' join of pointers carries no elemType; each arm has its own concrete class.
-        if (valueType->isPointerTy())
-            if (auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
-                if (phi->getNumIncomingValues() > 0) return CastSourceKind::TernaryPointerJoin;
+        // A pointer join carries no elemType; each leaf arm has its own concrete class. The
+        // collector recognizes both a PHI from '?:' and the slot-backed load from '??'.
+        if (valueType->isPointerTy() && !CollectPointerJoinArms(value).empty())
+            return CastSourceKind::TernaryPointerJoin;
 
         return CastSourceKind::Unknown;
-    }
-
-bool MainListener::ResolveTernaryArmClasses(llvm::Value* value, LLVMBackend* compiler,
-                                  std::vector<std::string>& armTypes, std::string& failure) {
-        auto* phi = llvm::cast<llvm::PHINode>(value);
-        armTypes.assign(phi->getNumIncomingValues(), std::string());
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-        {
-            llvm::Value* incoming = phi->getIncomingValue(i);
-            if (llvm::isa<llvm::ConstantPointerNull>(incoming)) continue;
-            armTypes[i] = compiler->ResolvePointerElementTypeName(incoming);
-            if (armTypes[i].empty())
-            {
-                failure = "the arm's concrete class cannot be determined; bind the arm to a "
-                          "local variable of the class type first";
-                return false;
-            }
-        }
-        return true;
-    }
-
-llvm::Value* MainListener::JoinTernaryArmPredicates(llvm::Value* value, const std::vector<bool>& answers,
-                                          LLVMBackend* compiler) {
-        // No arms means nothing can match; test this first, or the all-quantifiers below are
-        // both vacuously true and an empty join would answer TRUE.
-        if (answers.empty()) return compiler->builder->getInt1(false);
-        bool allTrue = true, allFalse = true;
-        for (bool a : answers) { if (a) allFalse = false; else allTrue = false; }
-        if (allTrue) return compiler->builder->getInt1(true);
-        if (allFalse) return compiler->builder->getInt1(false);
-
-        auto* phi = llvm::cast<llvm::PHINode>(value);
-        auto* savedBlock = compiler->builder->GetInsertBlock();
-        auto savedPoint = compiler->builder->GetInsertPoint();
-        compiler->builder->SetInsertPoint(phi);
-        auto* answerPhi = compiler->builder->CreatePHI(compiler->builder->getInt1Ty(),
-                                                       phi->getNumIncomingValues(), "ternary_is");
-        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
-            answerPhi->addIncoming(compiler->builder->getInt1(answers[i]), phi->getIncomingBlock(i));
-        compiler->builder->SetInsertPoint(savedBlock, savedPoint);
-        return answerPhi;
     }
 
 llvm::Value* MainListener::AddressOfClassValueOperand(llvm::Value* value, LLVMBackend* compiler) {
@@ -4069,29 +4156,19 @@ llvm::Value* MainListener::GenerateIsCheck(llvm::Value* interfaceValue, const st
         // A '?:' join has one concrete class per arm, so the answer is per arm too.
         if (srcKind == CastSourceKind::TernaryPointerJoin)
         {
-            std::vector<std::string> armTypes;
-            std::string failure;
-            if (!ResolveTernaryArmClasses(interfaceValue, compiler, armTypes, failure))
-            {
-                LogErrorContext(ctx, std::format("cannot test '?:' arm against '{}': {}",
-                                                 targetTypeNameIn, failure));
-                return nullptr;
-            }
             bool targetIsInterface = compiler->interfaceTable.count(targetTypeName) != 0;
             if (!targetIsInterface && !compiler->dataStructures.count(targetTypeName))
             {
                 LogErrorContext(ctx, std::format("'{}' is not a known struct or interface type for 'is' check", targetTypeNameIn));
                 return nullptr;
             }
-            std::vector<bool> answers(armTypes.size(), false);
-            for (size_t i = 0; i < armTypes.size(); i++)
-            {
-                if (armTypes[i].empty()) continue;
-                answers[i] = targetIsInterface
-                    ? compiler->StructImplementsInterface(armTypes[i], targetTypeName)
-                    : armTypes[i] == targetTypeName;
-            }
-            return JoinTernaryArmPredicates(interfaceValue, answers, compiler);
+            std::string failure;
+            if (auto* answer = BuildJoinArmPredicate(interfaceValue, targetTypeName,
+                                                      targetIsInterface, compiler, failure))
+                return answer;
+            LogErrorContext(ctx, std::format("cannot test join arm against '{}': {}",
+                                             targetTypeNameIn, failure));
+            return nullptr;
         }
 
         if (srcKind == CastSourceKind::Unknown)
@@ -4194,23 +4271,28 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
             return nullptr;
         }
 
-        // A '?:' join carries no single concrete class: box each arm in its own block, exactly
-        // as the plain-assignment path does.
+        // A pointer join carries no single concrete class: box each arm in its own block, exactly
+        // as the plain-assignment path does. This includes the slot-backed '??' spelling.
         if (srcKind == CastSourceKind::TernaryPointerJoin)
         {
             if (compiler->interfaceTable.count(targetTypeName))
             {
                 std::string armFailure;
-                if (auto* fat = UpcastTernaryPhiToInterface(interfaceValue, targetTypeName, &armFailure))
+                std::string joinSpelling;
+                if (auto* fat = UpcastPointerJoinToInterface(interfaceValue, targetTypeName,
+                                                              &armFailure, &joinSpelling))
                     return fat;
                 LogErrorContext(ctx, armFailure.empty()
-                    ? std::format("cannot convert '?:' result to interface '{}'", targetTypeNameIn)
-                    : std::format("cannot convert '?:' arm to interface '{}': {}", targetTypeNameIn, armFailure));
+                    ? std::format("cannot convert '{}' result to interface '{}'",
+                                  joinSpelling.empty() ? "join" : joinSpelling, targetTypeNameIn)
+                    : std::format("cannot convert '{}' arm to interface '{}': {}",
+                                  joinSpelling.empty() ? "join" : joinSpelling,
+                                  targetTypeNameIn, armFailure));
                 return nullptr;
             }
             LogErrorContext(ctx, std::format(
-                "cannot cast a '?:' result to '{}'; 'as' performs a runtime-checked downcast only "
-                "from an interface value - bind the '?:' to a local first", targetTypeNameIn));
+                "cannot cast a join result to '{}'; 'as' performs a runtime-checked downcast only "
+                "from an interface value - bind the join to a local first", targetTypeNameIn));
             return nullptr;
         }
 

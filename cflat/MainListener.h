@@ -3539,16 +3539,31 @@ public:
      */
     bool CollectJoinArmClasses(llvm::Value* value, std::vector<std::string>& out, int depth = 0);
 
+    // Resolve one leaf arm once, retaining both its concrete class and the binding that supplied it.
+    // A call result has no binding; nested joins are handled by the recursive callers below.
+    struct ResolvedJoinArmClass
+    {
+        std::string Name;
+        const LLVMBackend::NamedVariable* Source = nullptr;
+    };
+
+    bool ResolveJoinArmClass(llvm::Value* value, ResolvedJoinArmClass& result) const;
+
+    llvm::Value* BuildJoinArmPredicate(llvm::Value* value, const std::string& targetTypeName,
+                                       bool targetIsInterface, LLVMBackend* compiler,
+                                       std::string& failure, int depth = 0);
+
     /*
      * Box the arms of a pointer JOIN ('?:' or '??') into an interface fat pointer. A join carries
      * no NamedVariable TypeName, so the ordinary upcast is skipped and a raw `ptr` would be bitcast
      * into the fat struct type - invalid IR. Box each arm inside the arm's OWN block, which also
      * covers arms with DIFFERENT concrete classes (each gets its own vtable), and join the fat
      * pointers with a phi inserted at `joinPoint`. A null arm contributes a null fat pointer. An
-     * arm's concrete class comes from ResolvePointerElementTypeName, which answers a BORROWED arm
-     * (a plain load, absent from the `new`-site ledger) from the loaded binding's declared type -
-     * otherwise that arm would fail to resolve and the caller would bitcast a raw `ptr` into the
-     * fat struct. Returns nullptr when this does not apply, leaving the caller's normal path
+     * arm's concrete class comes from ResolveJoinArmClass, which answers a BORROWED arm (a plain
+     * load, absent from the `new`-site ledger) from the loaded binding's declared type and a direct
+     * call arm from its registered pointer return type - otherwise that arm would fail to resolve
+     * and the caller would bitcast a raw `ptr` into the fat struct. Returns nullptr when this does
+     * not apply, leaving the caller's normal path
      * untouched. `armFailure` (when given) is set ONLY for a pointer join that genuinely targets
      * this interface but has an arm that cannot be boxed - the caller must diagnose that instead of
      * bitcasting a raw `ptr` into the fat struct. It stays empty for every "does not apply" bail.
@@ -3818,24 +3833,14 @@ public:
      * set for PointerShaped and is the spelling used in the shared rejection message.
      *
      * Unknown is REACHABLE and is a hard error, not a dead bucket. Known spellings that land
-     * there: the `select` a chained `(x as C) as I` lowers to, the join a `??` produces, and any
-     * other bare `ptr` with no elemType. All of them miscompiled into a bogus fat pointer before
+     * there: the `select` a chained `(x as C) as I` lowers to and any other bare `ptr` with no
+     * elemType. All of them miscompiled into a bogus fat pointer before
      * this classification existed, so the error is the improvement - but do not assume the bucket
      * is empty.
      */
     CastSourceKind ClassifyCastSource(llvm::Value* value, llvm::Type* elemType, LLVMBackend* compiler,
                                       std::string& structName, LLVMBackend::TypeAndValue& shape,
                                       const std::string& srcTypeName = {});
-
-    // Concrete class of every arm of a pointer '?:' join. Returns false (with `failure` set) when
-    // an arm's class cannot be resolved. A null arm yields an empty name and is never an instance.
-    bool ResolveTernaryArmClasses(llvm::Value* value, LLVMBackend* compiler,
-                                  std::vector<std::string>& armTypes, std::string& failure);
-
-    // Join per-arm i1 answers back onto a pointer '?:'. Uniform answers fold to a constant;
-    // a mixed join becomes an i1 phi placed alongside the pointer phi it mirrors.
-    llvm::Value* JoinTernaryArmPredicates(llvm::Value* value, const std::vector<bool>& answers,
-                                          LLVMBackend* compiler);
 
     // Boxing a class value into an interface needs the object's ADDRESS. A loaded value came
     // straight from its storage, so reuse that; anything else (a call result) is spilled.
