@@ -1559,11 +1559,36 @@ public:
         std::vector<NullCoalesceJoinArm> Arms;
     };
 
+    // A value read from a unique field keeps the field slot that must be nulled when the value is
+    // implicitly moved. A join records one source per live arm, with the predecessor block where
+    // that arm's slot must be cleared before the joined value reaches its destination.
+    struct UniqueFieldReadSource
+    {
+        llvm::Value* Storage = nullptr;
+        llvm::BasicBlock* Block = nullptr;
+    };
+
+    struct UniqueFieldReadJoin
+    {
+        const llvm::Value* Joined = nullptr;
+        std::vector<UniqueFieldReadSource> Sources;
+    };
+
+    std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues_;
+    std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins_;
+
     std::vector<NullCoalesceJoin> nullCoalesceJoins_;
 
     void RegisterNullCoalesceJoin(llvm::Value* joined, std::vector<NullCoalesceJoinArm> arms);
 
     const NullCoalesceJoin* FindNullCoalesceJoin(const llvm::Value* value) const;
+
+    // Record a direct unique-field load and carry the source slot(s) through a `?:` or `??` join.
+    void RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage);
+    void PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* falseValue,
+                                  llvm::Value* joined);
+    bool IsUniqueFieldReadValue(const llvm::Value* value) const;
+    const UniqueFieldReadJoin* FindUniqueFieldReadJoin(const llvm::Value* value) const;
 
     /*
      * The cast occurrence (see codeValueDataCasts_) each ARM of a join was evaluated under, keyed
@@ -4058,6 +4083,8 @@ public:
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
         std::vector<llvm::Value*> movedBorrowedThroughFieldValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
+        std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues;
+        std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins;
     };
 
     BuilderState SaveBuilderState();

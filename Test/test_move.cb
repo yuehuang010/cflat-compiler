@@ -93,6 +93,18 @@ class UniqueIfaceBox : IUniqueBox
     int tag() { return 1; }
 };
 
+interface AssignmentShape { int area(); };
+class AssignmentSquare : AssignmentShape
+{
+    int area() { return 7; }
+    ~AssignmentSquare() { dtorCount = dtorCount + 1; }
+};
+
+struct AssignmentIfaceBox
+{
+    unique AssignmentShape item = default;
+};
+
 // Fixture for the cross-block `unique <interface>` deref regression below: a plain interface
 // (no owning field), so its dtor is a no-op and does not perturb dtorCount.
 interface IGuardBox { int tag(); };
@@ -994,6 +1006,92 @@ int testUniqueField()
         passed += Test("unique_iface_slot_nullptr_releases_early", dtorCount, 1);
     }
     passed += Test("unique_iface_slot_release_no_double_free", dtorCount, 1);
+
+    return passed;
+}
+
+int testUniqueAssignmentOwnership()
+{
+    int passed = 0;
+
+    // A direct unique-field read is an implicit move into a unique local. The old local owner
+    // must be released, and the field must be nulled before the destination stores the value.
+    dtorCount = 0;
+    {
+        UniqueBox source;
+        source.item = new Resource();
+        source.item->id = 5;
+        unique Resource* dest = new Resource();
+        dest->id = 9;
+        dest = source.item;
+        passed += Test("unique_field_assign_id", dest->id, 5);
+        passed += Test("unique_field_assign_source_nulled", source.item == nullptr ? 1 : 0, 1);
+        passed += Test("unique_field_assign_old_dest_freed", dtorCount, 1);
+    }
+    passed += Test("unique_field_assign_freed_once", dtorCount, 2);
+
+    // A ternary join keeps the selected field's source identity, so only that arm is nulled.
+    dtorCount = 0;
+    {
+        UniqueBox a;
+        UniqueBox b;
+        UniqueBox c;
+        a.item = new Resource();
+        a.item->id = 4;
+        b.item = new Resource();
+        b.item->id = 6;
+        c.item = identityBool(true) ? a.item : b.item;
+        passed += Test("unique_field_ternary_assign_id", c.item->id, 4);
+        passed += Test("unique_field_ternary_assign_selected_nulled", a.item == nullptr ? 1 : 0, 1);
+        passed += Test("unique_field_ternary_assign_other_alive", b.item->id, 6);
+        passed += Test("unique_field_ternary_assign_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_field_ternary_assign_freed_once_each", dtorCount, 2);
+
+    // Null-coalescing joins preserve the selected unique-field source just like ternaries.
+    dtorCount = 0;
+    {
+        UniqueBox a;
+        UniqueBox b;
+        UniqueBox c;
+        a.item = new Resource();
+        a.item->id = 4;
+        b.item = new Resource();
+        b.item->id = 6;
+        c.item = a.item ?? b.item;
+        passed += Test("unique_field_coalesce_assign_id", c.item->id, 4);
+        passed += Test("unique_field_coalesce_assign_selected_nulled", a.item == nullptr ? 1 : 0, 1);
+        passed += Test("unique_field_coalesce_assign_other_alive", b.item->id, 6);
+        passed += Test("unique_field_coalesce_assign_no_early_free", dtorCount, 0);
+    }
+    passed += Test("unique_field_coalesce_assign_freed_once_each", dtorCount, 2);
+
+    // A whole aggregate containing a unique fat-interface field must use the same move
+    // classification as its field-level spelling instead of bit-copying the owner.
+    dtorCount = 0;
+    {
+        AssignmentIfaceBox[2] values = default;
+        values[0].item = new AssignmentSquare();
+        values[1] = values[0];
+        passed += Test("whole_iface_assign_area", values[1].item.area(), 7);
+        passed += Test("whole_iface_assign_source_nulled", values[0].item == nullptr ? 1 : 0, 1);
+        passed += Test("whole_iface_assign_no_early_free", dtorCount, 0);
+    }
+    passed += Test("whole_iface_assign_freed_once", dtorCount, 1);
+
+    // Reassigning from a dereferenced pointer to the destination itself is a no-op, including
+    // when the runtime address comparison is needed rather than a static alloca identity match.
+    dtorCount = 0;
+    {
+        UniqueBox value;
+        value.item = new Resource();
+        value.item->id = 5;
+        UniqueBox* pointer = &value;
+        value = *pointer;
+        passed += Test("deref_self_assign_id", value.item->id, 5);
+        passed += Test("deref_self_assign_no_free", dtorCount, 0);
+    }
+    passed += Test("deref_self_assign_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -10609,6 +10707,9 @@ extern int main()
 
     passed += testUniqueField();
     total += 68;
+
+    passed += testUniqueAssignmentOwnership();
+    total += 21;
 
     passed += testParamStringToField();
     total += 1;

@@ -2084,6 +2084,36 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !destIsStructField && namedVar.FieldName.empty()
                 && DestinationIsAliasBorrowLocal(compiler, destination);
 
+            // A direct read from a unique field is an implicit move when adopted by a unique local.
+            // The field must be nulled before the old local value is released, matching the field-to-
+            // field ruling and preventing the source field and destination local from co-owning it.
+            if (operatorText == "=" && right && IsUniqueFieldRead(rightNV)
+                && !destIsStructField && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && namedVar.TypeAndValue.IsUnique
+                && ((namedVar.TypeAndValue.Pointer && right->getType()->isPointerTy())
+                    || (namedVar.TypeAndValue.IsFatInterfaceValue()
+                        && right->getType()->isStructTy())))
+            {
+                if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                const bool destIsUniqueIface = namedVar.TypeAndValue.IsFatInterfaceValue();
+                EmitImplicitUniqueFieldMove(
+                    rightNV, right, destination,
+                    destIsUniqueIface ? namedVar.TypeAndValue.TypeName : std::string());
+                if (!destIsUniqueIface)
+                    compiler->EmitUniqueFieldDelete(
+                        *compiler->builder, destination,
+                        compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
+                        namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
+                        right);
+                compiler->builder->CreateStore(right, destination);
+                if (!namedVar.CallerName.empty())
+                    compiler->SetVariableOwning(namedVar.CallerName, true);
+                return finishStore(right);
+            }
+
             // Copying a named owning value into a struct field by value. THE FLIP copies a copyable
             // owner in place (proceeds); a non-copyable owner is rejected. A self-assign is a no-op
             // (no copy - copying would leak the old buffer the self-store never frees). `rejectCopied`
@@ -2374,10 +2404,17 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             bool srcIsOwningAssignLvalue = rightNV.Storage != nullptr
                 && !SourceIsDanglingAliasBorrow(compiler, rightNV)
                 && (srcIsNamedSlot || rightNV.TypeAndValue.TypeName != "string");
+            // A dereferenced pointer has raw loaded-address Storage and must use the deref arm;
+            // treating that address as a named whole-value slot loses pointer-mediated self-assign.
+            bool srcIsDerefLvalue = rightNV.Storage != nullptr && rightNV.BaseType != nullptr
+                && !llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                && !llvm::isa<llvm::GlobalVariable>(rightNV.Storage)
+                && !llvm::isa<llvm::GetElementPtrInst>(rightNV.Storage);
             if (operatorText == "=" && right && right->getType()->isStructTy()
                 && !namedVar.TypeAndValue.IsInterface
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
                 && srcIsOwningAssignLvalue
+                && !srcIsDerefLvalue
                 // A `move` PARAMETER is an owner (IsOwningStruct) and destructs at function exit,
                 // so assigning it into an owning slot must TRANSFER just like an owned local.
                 && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
@@ -2386,6 +2423,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !rightNV.TypeAndValue.IsInterfacePointer
                 && !rightNV.TypeAndValue.IsFunctionPointer
                 && destination != rightNV.Storage
+                // This arm returns early; a different aggregate type must fall through to the
+                // normal assignment diagnostic instead of receiving a partial-width store.
+                && compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName)
+                    == compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName)
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
                 // THE FLIP via the shared decision: a copyable owner COPIES (source stays live), a
@@ -2416,6 +2457,61 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // The destination is now live again (it may have been moved-from earlier).
                 if (!namedVar.CallerName.empty() && namedVar.FieldName.empty())
                     compiler->MarkVariableUnmoved(namedVar.CallerName);
+                return finishStore(toStore);
+            }
+
+            // A dereferenced pointer on the RHS still targets a whole local/global destination
+            // (`o = *op`), so it cannot use the LHS-deref arm below. Handle it here, including the
+            // runtime same-address check needed when `op` points at `o`.
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && srcIsDerefLvalue
+                && !namedVar.TypeAndValue.IsInterface
+                && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsArrayView
+                && !namedVar.TypeAndValue.IsInterfacePointer
+                && !namedVar.TypeAndValue.IsFunctionPointer
+                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
+                && compiler->ResolveTypeAlias(rightNV.TypeAndValue.TypeName)
+                    == compiler->ResolveTypeAlias(namedVar.TypeAndValue.TypeName)
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+            {
+                AssignSourceKind kind;
+                llvm::Value* toStore = ClassifyOwningAssignSource(
+                    right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Move
+                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                if (kind == AssignSourceKind::Move && destination == rightNV.Storage)
+                    return finishStore(right);
+
+                if (kind == AssignSourceKind::Move)
+                {
+                    auto* selfBlock = compiler->CreateBasicBlock("ownassign_self");
+                    auto* moveBlock = compiler->CreateBasicBlock("ownassign_move");
+                    auto* doneBlock = compiler->CreateBasicBlock("ownassign_done");
+                    auto* same = compiler->builder->CreateICmpEQ(destination, rightNV.Storage,
+                        "ownassign_same");
+                    compiler->CreateConditionJump(same, selfBlock, moveBlock);
+                    compiler->SwitchToBlock(moveBlock);
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                    compiler->builder->CreateStore(toStore, destination);
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(toStore->getType()), rightNV.Storage);
+                    compiler->CreateJump(doneBlock);
+                    compiler->SwitchToBlock(selfBlock);
+                    compiler->CreateJump(doneBlock);
+                    compiler->SwitchToBlock(doneBlock);
+                    auto* result = compiler->builder->CreatePHI(toStore->getType(), 2, "ownassign_result");
+                    result->addIncoming(right, selfBlock);
+                    result->addIncoming(toStore, moveBlock);
+                    return finishStore(result);
+                }
+
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(toStore, destination);
                 return finishStore(toStore);
             }
 
@@ -3446,6 +3542,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
         if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
             compiler->ClearOwnedResultChannels();
+        compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         return { phi, false };
     }
@@ -3528,6 +3625,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
                 compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
+                compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
             }
             return { joined, false };
         }

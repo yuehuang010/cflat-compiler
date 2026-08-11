@@ -1319,7 +1319,14 @@ bool LLVMBackend::TypeOwnsUniquePointer(const std::string& typeName, std::string
         if (it == dataStructures.end()) return false;
         for (const auto& f : it->second.StructFields)
         {
-            if (f.IsUnique && f.Pointer && !f.ElemPointer)
+            // A unique interface field is a fat owning value rather than a thin pointer, but it
+            // has the same non-copyable ownership contract and must block memberwise bit copies.
+            bool ownsUniqueField = (f.IsUnique || f.IsUniqueTypeArg)
+                && !f.IsAlias && !f.IsBorrowOfUniqueElement
+                && !f.IsArrayView && !f.IsSimd && !f.IsBitfield
+                && ((f.Pointer && !f.ElemPointer && f.ConstArraySize == 0)
+                    || (f.IsInterface && !f.Pointer && f.ConstArraySize == 0));
+            if (ownsUniqueField)
             {
                 if (outPath) *outPath = f.VariableName;
                 return true;
@@ -1794,4 +1801,3 @@ llvm::Value* LLVMBackend::CreateIntegerConvert(const std::string& methodName, ll
                                      : builder->CreateZExt(intVal, destTy);
         return intVal; // same width - no-op
     }
-

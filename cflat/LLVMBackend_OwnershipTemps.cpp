@@ -138,6 +138,117 @@ const LLVMBackend::NullCoalesceJoin* LLVMBackend::FindNullCoalesceJoin(const llv
         return nullptr;
     }
 
+void LLVMBackend::RegisterUniqueFieldRead(llvm::Value* value, llvm::Value* storage)
+{
+        if (value == nullptr || storage == nullptr) return;
+        for (auto& entry : uniqueFieldReadValues_)
+            if (entry.first == value)
+            {
+                entry.second.Storage = storage;
+                entry.second.Block = builder != nullptr && builder->GetInsertBlock() != nullptr
+                    ? builder->GetInsertBlock() : nullptr;
+                return;
+            }
+        uniqueFieldReadValues_.push_back({
+            value,
+            { storage, builder != nullptr && builder->GetInsertBlock() != nullptr
+                ? builder->GetInsertBlock() : nullptr }
+        });
+    }
+
+void LLVMBackend::PropagateUniqueFieldRead(llvm::Value* trueValue, llvm::Value* falseValue,
+                                           llvm::Value* joined)
+{
+        if (joined == nullptr) return;
+
+        auto direct = [&](const llvm::Value* value, llvm::BasicBlock* block,
+                          std::vector<UniqueFieldReadSource>& out) -> bool {
+            for (const auto& entry : uniqueFieldReadValues_)
+                if (entry.first == value)
+                {
+                    out.push_back({ entry.second.Storage, block != nullptr ? block : entry.second.Block });
+                    return true;
+                }
+            return false;
+        };
+        auto joinedSources = [&](const llvm::Value* value,
+                                 std::vector<UniqueFieldReadSource>& out) -> bool {
+            for (const auto& entry : uniqueFieldReadJoins_)
+                if (entry.Joined == value)
+                {
+                    out.insert(out.end(), entry.Sources.begin(), entry.Sources.end());
+                    return true;
+                }
+            return false;
+        };
+        auto isNull = [](const llvm::Value* value) {
+            auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+            return constant != nullptr && constant->isNullValue();
+        };
+        auto collect = [&](const llvm::Value* value, llvm::BasicBlock* block,
+                           std::vector<UniqueFieldReadSource>& out) {
+            if (isNull(value)) return true;
+            if (direct(value, block, out)) return true;
+            return joinedSources(value, out);
+        };
+
+        std::vector<UniqueFieldReadSource> sources;
+        bool recognized = false;
+        if (auto* phi = llvm::dyn_cast<llvm::PHINode>(joined))
+        {
+            recognized = true;
+            for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+                if (!collect(phi->getIncomingValue(i), phi->getIncomingBlock(i), sources))
+                {
+                    recognized = false;
+                    break;
+                }
+        }
+        else if (const auto* nullJoin = FindNullCoalesceJoin(joined))
+        {
+            recognized = true;
+            for (const auto& arm : nullJoin->Arms)
+                if (!collect(arm.Value, arm.Block, sources))
+                {
+                    recognized = false;
+                    break;
+                }
+        }
+        else
+        {
+            recognized = collect(trueValue, nullptr, sources)
+                && collect(falseValue, nullptr, sources);
+        }
+        if (!recognized || sources.empty()) return;
+
+        for (auto& entry : uniqueFieldReadJoins_)
+            if (entry.Joined == joined)
+            {
+                entry.Sources = std::move(sources);
+                return;
+            }
+        uniqueFieldReadJoins_.push_back({ joined, std::move(sources) });
+    }
+
+bool LLVMBackend::IsUniqueFieldReadValue(const llvm::Value* value) const
+{
+        if (value == nullptr) return false;
+        for (const auto& entry : uniqueFieldReadValues_)
+            if (entry.first == value) return true;
+        for (const auto& entry : uniqueFieldReadJoins_)
+            if (entry.Joined == value) return true;
+        return false;
+    }
+
+const LLVMBackend::UniqueFieldReadJoin* LLVMBackend::FindUniqueFieldReadJoin(
+    const llvm::Value* value) const
+{
+        if (value == nullptr) return nullptr;
+        for (const auto& entry : uniqueFieldReadJoins_)
+            if (entry.Joined == value) return &entry;
+        return nullptr;
+    }
+
 void LLVMBackend::RegisterJoinArmCastOccurrence(const llvm::Value* joined, unsigned index, size_t occurrence)
 {
         if (joined == nullptr) return;
@@ -1486,8 +1597,16 @@ bool LLVMBackend::OwningPtrEscapes(const llvm::Value* root, int depth, bool retu
                     {
                         // llvm.mem* with the tracked pointer as SOURCE (operand 1) copies the
                         // pointee's bytes - including any pointer it owns - out of the call.
-                        if (callee->getName().starts_with("llvm.mem") && call->arg_size() > 1
-                            && call->getArgOperand(1) == v) return true;
+                        // The destination case is symmetric: caller-owned bytes copied into the
+                        // tracked pointee can park an owner there without a StoreInst to inspect.
+                        if (callee->getName().starts_with("llvm.mem") && call->arg_size() > 1)
+                        {
+                            if (call->getArgOperand(1) == v) return true;
+                            if (call->getArgOperand(0) == v
+                                && TypeHoldsPointer(call->getArgOperand(1)->getType())
+                                && StoredValueMayBeCallerOwned(call->getArgOperand(1), depth + 1))
+                                return true;
+                        }
                         continue;
                     }
                     // The callee destroys a FIELD of the tracked memory and writes a replacement
@@ -2853,6 +2972,8 @@ void LLVMBackend::FlushOwnedTemps()
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
+        uniqueFieldReadValues_.clear();
+        uniqueFieldReadJoins_.clear();
     }
 
 void LLVMBackend::DropValue(const NamedVariable& namedVar)

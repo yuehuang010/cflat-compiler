@@ -4986,6 +4986,10 @@ bool MainListener::IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv) {
         // fresh NamedVariable with the flag unset, so it stays legal.
         if (nv.IsUniqueFieldAlias && !nv.TypeAndValue.IsMove) return true;
         if (nv.TypeAndValue.IsMove) return false;
+        // A `?:`/`??` result has no field-shaped Storage. Its value ledger records the source
+        // field slots and is consumed by EmitImplicitUniqueFieldMove at the destination.
+        if (compilerLLVM != nullptr && compilerLLVM->IsUniqueFieldReadValue(nv.Primary))
+            return true;
         // Ownership gate only - the GEP-shape test below is deliberately NOT widened (it
         // over-matches borrows through casts; see the IsUniqueFieldAlias carve-out above).
         bool ownsPointee = IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
@@ -5188,7 +5192,35 @@ void MainListener::RejectUniqueTempFieldToField(const LLVMBackend::NamedVariable
 void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& rightNV,
                                       llvm::Value* right, llvm::Value* destination,
                                       const std::string& destIfaceName) {
-        if (compilerLLVM == nullptr || right == nullptr || rightNV.Storage == nullptr) return;
+        if (compilerLLVM == nullptr || right == nullptr) return;
+        // A joined field read has no single Storage. Clear each source in its own predecessor,
+        // before the destination drop at the join, so the selected arm transfers ownership and a
+        // runtime self-join sees a null old destination rather than freeing its live value.
+        if (rightNV.Storage == nullptr)
+        {
+            if (const auto* join = compilerLLVM->FindUniqueFieldReadJoin(rightNV.Primary))
+            {
+                auto savedIP = compilerLLVM->builder->saveIP();
+                for (const auto& source : join->Sources)
+                {
+                    if (source.Storage == nullptr || source.Block == nullptr
+                        || source.Block->getTerminator() == nullptr)
+                        continue;
+                    compilerLLVM->builder->SetInsertPoint(source.Block->getTerminator());
+                    if (right->getType()->isPointerTy())
+                        compilerLLVM->builder->CreateStore(
+                            llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),
+                            source.Storage);
+                    else if (right->getType()->isStructTy())
+                        compilerLLVM->builder->CreateStore(
+                            llvm::ConstantAggregateZero::get(right->getType()), source.Storage);
+                }
+                compilerLLVM->builder->restoreIP(savedIP);
+                rightNV.TypeAndValue.IsMove = true;
+                return;
+            }
+            return;
+        }
         bool isFat = false;
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(right->getType()))
             compilerLLVM->builder->CreateStore(

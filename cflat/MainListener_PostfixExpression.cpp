@@ -964,6 +964,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // the parent pointer is a borrowed parameter.
                                     namedVar.IsBorrowed       = structVar.IsBorrowed;
                                     namedVar.BorrowedOrigin   = structVar.BorrowedOrigin;
+                                    // A direct read is the source identity for an implicit move.
+                                    // Joins carry this ledger forward so only the selected arm is nulled.
+                                    if (IsUniqueFieldRead(namedVar))
+                                        Compiler(ctx)->RegisterUniqueFieldRead(
+                                            namedVar.Primary, namedVar.Storage);
                                 }
                             }
                             // The generic-template leg resolves the bare spelling to its namespace's

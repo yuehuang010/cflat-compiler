@@ -2590,6 +2590,8 @@ void LLVMBackend::ResetForReanalysis()
     movedBorrowedPtrValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
     nonOwningStructJoins_.clear();
+    uniqueFieldReadValues_.clear();
+    uniqueFieldReadJoins_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();

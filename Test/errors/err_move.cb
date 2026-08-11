@@ -961,6 +961,14 @@ extern int main()
         aelNest[0] = aelSrc;
     }
 
+    // The whole-local owning assignment arm must reject the same mismatch as the element arm.
+    expect_error("cannot cast an aggregate value") {
+        ArrElemBox alSrc;
+        alSrc.item = new MoveResource();
+        ArrElemNest alNest;
+        alNest = alSrc;
+    }
+
     // use after move - move happens inside an if, read happens after the if
     expect_error("use of moved variable 'r3'") {
         MoveResource* r3 = new MoveResource();

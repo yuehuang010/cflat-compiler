@@ -169,6 +169,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
         s.movedBorrowedThroughFieldValues = std::move(movedBorrowedThroughFieldValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
+        s.uniqueFieldReadValues = std::move(uniqueFieldReadValues_);
+        s.uniqueFieldReadJoins = std::move(uniqueFieldReadJoins_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -195,6 +197,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
+        uniqueFieldReadValues_.clear();
+        uniqueFieldReadJoins_.clear();
         return s;
     }
 
@@ -235,6 +239,8 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
         movedBorrowedThroughFieldValues_ = state.movedBorrowedThroughFieldValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
+        uniqueFieldReadValues_   = state.uniqueFieldReadValues;
+        uniqueFieldReadJoins_    = state.uniqueFieldReadJoins;
     }
 
 bool LLVMBackend::IsWinrtProjectedType(const std::string& name) const
