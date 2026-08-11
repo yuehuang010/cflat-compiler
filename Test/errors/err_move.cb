@@ -499,6 +499,146 @@ expect_error("cannot 'move' the 'alias' value 'JoinBox'") {
     }
 }
 
+/*
+ * A POINTER borrow whose OTHER OWNER is a `unique` FIELD the callee read. `alias` only suppresses
+ * this binding's own scope-exit free; whether anything ELSE owns the object is a separate,
+ * COMPUTED fact, taken from the callee's returns and re-asked at every adoption door. The direct
+ * spelling (`UniqueThing* k = w->item;`) was already rejected; through a CALL the provenance was
+ * laundered and each door below adopted a second owner (abort at run time, no diagnostic).
+ * Polarity is unknown-ACCEPTS: an opaque callee, a `function<>` value and a callee walked below
+ * its call site prove nothing and keep compiling - their accept legs are in Test/test_move.cb,
+ * together with the sanctioned hand-off (`alias T* e = makeT(); IS s = e; delete s;`), which
+ * borrows nothing live and must NOT be caught here.
+ */
+struct IfaceBorrowWrap
+{
+    unique UniqueIfaceThing* item = nullptr;
+    alias UniqueIfaceThing* borrowAlias() { return this.item; }
+};
+
+struct FieldBorrowWrap
+{
+    unique UniqueThing* item = nullptr;
+    alias UniqueThing* borrowAlias() { return this.item; }
+    UniqueThing* borrowPlain() { return this.item; }
+    // A `return nullptr;` owns nothing, so it is NEUTRAL: it neither proves nor blocks.
+    alias UniqueThing* borrowMaybe(bool c) { if (c) { return nullptr; } return this.item; }
+};
+
+// The filed repro: the field still owns it, so the unique local would be a second owner.
+expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+    void fieldBorrowIntoUniqueLocal(FieldBorrowWrap* w)
+    {
+        UniqueThing* k = w->borrowAlias();
+        unique UniqueThing* other = new UniqueThing();
+        other = k;
+    }
+}
+
+// No `alias` keyword anywhere: the provenance is computed from the callee's returns, not spelled.
+expect_error("it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+    void fieldBorrowIntoUniqueField(FieldBorrowWrap* w)
+    {
+        UniqueThing* k = w->borrowPlain();
+        JoinBox s;
+        s.item = k;
+    }
+}
+
+// The `move` ARGUMENT door: moving the alias does not null the field, so both would free it.
+expect_error("it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+    void fieldBorrowAsMoveArgument(FieldBorrowWrap* w)
+    {
+        UniqueThing* k = w->borrowPlain();
+        rwSink(move k);
+    }
+}
+
+// The INTERFACE-box door: the box is a second destroyer for the same object.
+expect_error("cannot delete interface 'si' - it boxes an object that 'IfaceBorrowWrap.item' already frees") {
+    void fieldBorrowDeleteThroughInterface(IfaceBorrowWrap* w)
+    {
+        UniqueIfaceThing* k = w->borrowAlias();
+        IUniqueThing si = k;
+        delete si;
+    }
+}
+
+// A neutral `return nullptr;` must not retire the proof the other return establishes.
+expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+    void fieldBorrowNullArmStillProves(FieldBorrowWrap* w, bool c)
+    {
+        UniqueThing* k = w->borrowMaybe(c);
+        unique UniqueThing* other = new UniqueThing();
+        other = k;
+    }
+}
+
+/*
+ * The same provenance with the call result used DIRECTLY as the RHS - never bound to a local. The
+ * classification runs while a binding is BUILT, so an unbound temporary reached every door with no
+ * borrow facts at all and the object was freed twice. Each door now asks the value-keyed ledger,
+ * so the direct spelling and the bound spelling above agree. The `move` ARGUMENT door needs no leg:
+ * a temporary is already refused ("'move' expression requires an addressable source").
+ */
+expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+    void directBorrowIntoUniqueLocal(FieldBorrowWrap* w)
+    {
+        unique UniqueThing* o = new UniqueThing();
+        o = w->borrowPlain();
+    }
+}
+
+expect_error("it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+    void directBorrowIntoUniqueField(FieldBorrowWrap* w)
+    {
+        JoinBox s;
+        s.item = w->borrowPlain();
+    }
+}
+
+expect_error("cannot delete this call result - it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+    void directBorrowDeleted(FieldBorrowWrap* w)
+    {
+        delete w->borrowPlain();
+    }
+}
+
+// The INTERFACE box of an unbound call result: no binding exists, so the boxing proof has to read
+// the same value-keyed ledger.
+expect_error("cannot delete interface 'sd' - it boxes an object that 'IfaceBorrowWrap.item' already frees") {
+    void directBorrowBoxedThenDeleted(IfaceBorrowWrap* w)
+    {
+        IUniqueThing sd = w->borrowAlias();
+        delete sd;
+    }
+}
+
+// A PARENTHESIZED call result is the same value, so it must reach the same door.
+expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+    void parenBorrowIntoUniqueLocal(FieldBorrowWrap* w)
+    {
+        unique UniqueThing* o = new UniqueThing();
+        o = (w->borrowPlain());
+    }
+}
+
+/*
+ * An `auto` return SPLICES the body into a fresh Function and erases the placeholder the proof was
+ * recorded against, so the entry has to travel with it - otherwise the accessor silently loses its
+ * provenance (and the stale placeholder entry could later be resolved against a recycled address).
+ */
+auto autoBorrowAccessor<T>(T* w) { return w->item; }
+
+expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+    void autoReturnBorrowIntoUniqueLocal(FieldBorrowWrap* w)
+    {
+        UniqueThing* k = autoBorrowAccessor<FieldBorrowWrap>(w);
+        unique UniqueThing* o = new UniqueThing();
+        o = k;
+    }
+}
+
 // A borrow that came from a mixed '?:' JOIN, laundered one statement later. The join's own reject
 // covers only a DIRECT store of the join; once it is bound to a local, this predicate is the only
 // thing standing between the borrow and a second destroyer.

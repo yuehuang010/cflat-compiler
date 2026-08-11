@@ -813,6 +813,21 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
         }
 
+        /*
+         * BORROW PROVENANCE for this function's callers: does EVERY pointer return read a live
+         * `unique` FIELD? A `return nullptr;` owns nothing and is NEUTRAL, exactly as a provably
+         * null join arm is. Recorded here, where the return's binding still carries the field
+         * flags; consumed at the call site, where the result becomes a borrow of that field.
+         */
+        if (compiler->builder != nullptr && compiler->builder->GetInsertBlock() != nullptr
+            && !(right != nullptr && llvm::isa<llvm::ConstantPointerNull>(right)))
+        {
+            bool provesFieldBorrow = returnNV.TypeAndValue.Pointer && IsUniqueFieldRead(returnNV);
+            compiler->RecordUniqueFieldBorrowReturn(
+                compiler->builder->GetInsertBlock()->getParent(), provesFieldBorrow,
+                provesFieldBorrow ? DescribeUniqueFieldOwner(returnNV) : std::string());
+        }
+
         // Bond return check: bonded value may only be returned if all its sources
         // are 'bond' parameters of the current function (not locals).
         auto checkBondSources = [&](const std::vector<std::string>& sources) {

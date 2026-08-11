@@ -2592,3 +2592,54 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   drop-old (`EmitUniqueFieldDelete`) was never gated on it, so a pointer / array-view receiver is
   reached safely. That gating is still load-bearing for owning-VALUE field-to-field stores, which
   the ruling does not cover, so `ProvablyDifferentSlots` and friends were KEPT for those sites.
+- **The 2026-08-10 alias-borrow provenance ruling** (landed on `fix/alias-provenance`; closed and
+  deleted `p1/alias-borrow-remaining-launder-sites.md`, whose ternary-JOIN residue was re-filed as
+  `p2/ternary-join-unique-field-store.md`). The maintainer's framing that unblocked it: **`alias`
+  has ONE meaning** (this binding's scope-exit free is suppressed); what differs between the two
+  "sanctioned meanings" people kept trying to separate is **whether anything ELSE owns the object**,
+  and that is COMPUTABLE. So: compute the provenance, record it on the binding, gate adoption on it,
+  and **unknown ACCEPTS**. The computed fact is per-CALLEE - *every* pointer `return` reads a live
+  `unique` FIELD - recorded while the body is walked (`RecordUniqueFieldBorrowReturn`) and consumed
+  at the call site, where the result becomes an ordinary Trap-B borrow. That last step is the whole
+  economy of the fix: the DIRECT spelling `T* k = w.p;` was already rejected at all four adoption
+  doors (owning local/global `=`, `unique` field store, `move` argument, interface box + `delete`),
+  so making the CALL result carry the same `IsBorrowed`/`BorrowedUniqueField` provenance lit up
+  every door at once. Do not re-derive a per-door guard for this family. Facts worth keeping:
+  (1) The proof set is deliberately NARROWER than `BindingKeepsOwnershipOfBoxedObject`'s three legs.
+  The **non-move pointer PARAMETER** leg must NOT be used here: a callee that hands its parameter
+  straight back is exactly `ParameterIsExactlyReturned`, which the neighbouring
+  `AdoptLaunderedOwningTempResult` uses to ADOPT - claiming "live owner" there would contradict a
+  landed decision. The `IsOwning` leg is unreachable as a rejection (ownership TRANSFER runs first;
+  measured). Only the `unique`-FIELD leg was reused, verified independently first: its rejection and
+  the parameter leg's are both TRUE (each accepts into a measured double free), the `IsOwning` one
+  never fires. (2) A `return nullptr;` is **NEUTRAL** - it owns nothing, so it neither proves nor
+  blocks, the same rule `JoinArmIsProvablyNull` applies to a null join arm. Any other non-proving
+  return retires the fact STICKILY, in either order. (3) `move this.p` **does not compile** inside a
+  method (`this` is a borrowed by-value parameter), so "have the accessor return a `move` of the
+  field" is a FALSE remedy - it was written, measured, and removed. The verified remedies are
+  "drop `unique` from the destination" and "pass it to a plain (non-`move`) parameter". A borrow
+  proven through a CALL also has no spellable source expression, so `BorrowedUniqueFieldViaCall`
+  exists purely to swap the `move <origin>` advice out of the four inherited diagnostics.
+  (4) Accepted residue, by the ruling: an indirect call (`function<>` / interface dispatch) and a
+  callee walked BELOW its call site prove nothing and keep laundering - a record-then-resolve pass
+  at end of module would shrink it if it ever matters. (5) **Classifying only where a BINDING is
+  built leaves the unbound spelling wide open** - review found `o = w->get();`, `s.q = w->get();`,
+  `delete w->get();` and `IS s = w->get(); delete s;` all still double-freeing after the first cut,
+  because the declaration and `=` paths stamp provenance onto a `NamedVariable` and a temporary
+  never becomes one. The repair is a value-keyed ask at the CONSUMER (`ApplyCallResultBorrowProvenance`
+  on the consumer's own copy, plus a ledger clause in `ClassifyBoxedSourceKeepsOwner`), not nine
+  stamps at the nine `lastCallReturnType` sites. Ask "which spellings never build a binding?" before
+  declaring a provenance fix complete. (6) A `Function*`-keyed ledger needs BOTH drop sites:
+  `ForgetFunctionEscapeMemo` (the `auto`-return retype erases a placeholder whose address LLVM
+  recycles - a survivor resolves a stranger's calls against a proof that REJECTS) and
+  `DropModuleEscapeMemo`, whose three callers include two module rebuilds OUTSIDE
+  `ResetForReanalysis`. The retype also SPLICES the body into a new Function, so the entry must be
+  MIGRATED, not just erased, or every `auto`-returning accessor silently loses its provenance.
+  (5) Found in review, filed as `p2/call-result-borrow-not-bound-to-a-local.md`: both consumers read
+  the tag off a `NamedVariable`, so the doors only see it when the call result is BOUND TO A LOCAL
+  first. `o = w->getPlain();` used directly as the RHS still launders, while `o = w->p;` and the
+  two-statement form both reject. When a value-identity fact is computed at a call site, wire it to
+  the DOORS, not only to the binding builders - otherwise the fix covers one spelling of two.
+  (6) Any per-`llvm::Function*` ledger must be dropped in `ForgetFunctionEscapeMemo`: the `auto`
+  return retype erases the placeholder Function and LLVM recycles the address, so a surviving entry
+  resolves a stranger's calls against this proof - and this proof REJECTS.

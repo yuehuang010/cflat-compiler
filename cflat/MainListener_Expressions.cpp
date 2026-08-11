@@ -261,6 +261,12 @@ bool MainListener::BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVa
         // A `unique` field's synthesized destructor frees it. Field-specific and proven by the
         // field itself, so it is asked before the direct-binding gate below excludes field reads.
         if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique) return true;
+        // A call RESULT proven to read a live `unique` field: the field frees it, so the box would
+        // be a second owner. Value-keyed, so it answers for a temporary with no binding at all.
+        if (nv->Primary != nullptr
+            && compilerLLVM->FindUniqueFieldBorrowResult(nv->Primary) != nullptr
+            && !nv->TypeAndValue.IsMove)
+            return true;
         // Direct bindings only below: a FIELD read's Storage is a GEP and its CallerName names the
         // BASE object, so without this gate a plain field read is blamed on the enclosing parameter.
         if (!llvm::isa<llvm::AllocaInst>(nv->Storage)) return false;
@@ -292,7 +298,14 @@ bool MainListener::BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVa
 std::string MainListener::DescribeBoxedSourceOwner(llvm::Value* dataPtr,
                                          const LLVMBackend::NamedVariable* srcNV) const {
         const LLVMBackend::NamedVariable* nv = ProvingBindingForBoxedSource(dataPtr, srcNV);
-        if (nv == nullptr) return {};
+        if (nv == nullptr)
+        {
+            // The value-keyed proof above names the FIELD, the only owner there is to name.
+            if (dataPtr != nullptr)
+                if (const auto* fb = compilerLLVM->FindUniqueFieldBorrowResult(dataPtr))
+                    return std::format("'{}'", fb->FieldOwner);
+            return {};
+        }
         // A container's element: the CONTAINER frees it, never the local holding the borrow, so
         // an unnameable container falls back to a phrase rather than blaming the local.
         // Gated exactly as in BindingKeepsOwnershipOfBoxedObject: after a '??=' the element fact is
@@ -440,7 +453,12 @@ const LLVMBackend::NamedVariable* MainListener::ProvingBindingForBoxedSource(
 bool MainListener::ClassifyBoxedSourceKeepsOwner(llvm::Value* dataPtr,
                                        const LLVMBackend::NamedVariable* srcNV,
                                        bool ownershipTransferred) const {
-        return !ownershipTransferred && ProvingBindingForBoxedSource(dataPtr, srcNV) != nullptr;
+        if (ownershipTransferred) return false;
+        // A boxed call RESULT proven to borrow a live `unique` field has no binding at all, so ask
+        // the value-keyed ledger directly - the field is the owner either way.
+        if (dataPtr != nullptr && compilerLLVM->FindUniqueFieldBorrowResult(dataPtr) != nullptr)
+            return true;
+        return ProvingBindingForBoxedSource(dataPtr, srcNV) != nullptr;
     }
 
 bool MainListener::InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
@@ -1210,6 +1228,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->pendingInitAllocAlign = targetAllocAlign;
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            // An UNBOUND call result carries no binding, so the declaration/'=' classification
+            // never saw it; stamp it here so the store doors read the same borrow facts.
+            ApplyCallResultBorrowProvenance(compiler, rightNV);
             compiler->pendingInitAllocAlign = 0;  // one-shot; consumed by the `new` above if direct
             lambdaExpectedType = {};
             /*
@@ -1315,11 +1336,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         storeBorrowUniqueField = DescribeUniqueFieldOwner(rightNV);
                         storeBorrowOrigin = DescribeUniqueFieldAccess(rightNV);
                     }
+                    // Trap B through a CALL, mirroring the declaration path: a callee that provably
+                    // returns a live `unique` field hands this store a borrow of that field.
+                    bool storeBorrowUniqueFieldViaCall = rightNV.BorrowedUniqueFieldViaCall;
+                    if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove
+                        && rightNV.TypeAndValue.Pointer)
+                    {
+                        const auto* fieldBorrow =
+                            compiler->FindUniqueFieldBorrowResult(rightNV.Primary);
+                        if (fieldBorrow != nullptr)
+                        {
+                            storeSrcIsBorrow = true;
+                            storeBorrowUniqueField = fieldBorrow->FieldOwner;
+                            storeBorrowOrigin = fieldBorrow->FieldOwner;
+                            storeBorrowUniqueFieldViaCall = true;
+                        }
+                    }
                     if (storeSrcIsBorrow && !reboundToOwnedStore)
                         compiler->RecordAssignBorrow(namedVar.CallerName, storeBorrowOrigin,
                                                      storeBorrowUniqueField,
                                                      !rightNV.FieldName.empty(),
-                                                     /*keepExistingOrigin*/ coalesceResume != nullptr);
+                                                     /*keepExistingOrigin*/ coalesceResume != nullptr,
+                                                     storeBorrowUniqueFieldViaCall);
                     else if (reboundToOwnedStore)
                         compiler->RetireAssignBorrow(namedVar.CallerName);
                     // A JOIN RHS carries no source binding, so no clause above can see it; ask its
@@ -2541,8 +2579,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     bool srcIsField = !rightNV.FieldName.empty();
                     std::string srcDesc = srcIsField
                         ? std::format("{}.{}", rightNV.CallerName, rightNV.FieldName) : origin;
+                    // A GLOBAL destination carries no CallerName and lives outside the stack
+                    // frames, so recover its SOURCE spelling by storage identity, never the
+                    // llvm value name (which carries uniquifying suffixes).
+                    std::string destName = namedVar.CallerName.empty()
+                        ? compiler->FindVariableNameByStorage(destination) : namedVar.CallerName;
+                    if (destName.empty())
+                        for (const auto& [gName, gVar] : compiler->globalNamedVariable)
+                            if (gVar == destination) { destName = gName; break; }
                     RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(origin), srcIsField,
-                                                namedVar.CallerName, false, ctx);
+                                                destName, false, ctx,
+                                                rightNV.BorrowedUniqueFieldViaCall
+                                                    ? rightNV.BorrowedUniqueField : std::string());
                     return finishStore(right);
                 }
 
@@ -7972,6 +8020,8 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         if (ue != nullptr)
         {
             auto namedVar = ParseUnaryExpression(ue);
+            // `delete w->get();` - an unbound call result, so nothing classified it as a borrow.
+            ApplyCallResultBorrowProvenance(compiler, namedVar);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
             operandAllocAlign = namedVar.AllocAlignment;
@@ -8149,6 +8199,19 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 return {};
             }
 
+            // Deleting a call result PROVEN to borrow a live `unique` field. It has no Storage at
+            // all, so the own-slot clause below cannot see it; the field is the one owner either way.
+            if (!namedVar.IsOwning && namedVar.BorrowedUniqueFieldViaCall
+                && !namedVar.BorrowedUniqueField.empty())
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot delete this call result - it was returned as a borrow of unique field "
+                    "'{}', whose synthesized destructor already frees it, so this is a double-free. "
+                    "Remove this delete and let the field's destructor free it.",
+                    namedVar.BorrowedUniqueField));
+                return {};
+            }
+
             // Error: deleting a local that aliases a borrowed parameter (e.g. via cast).
             // 'Payload* p = (Payload*)raw; delete p;' is the laundered form of the case above.
             // Exempt field accesses (storage is a GEP, not an alloca): 'delete param->field'
@@ -8163,7 +8226,13 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 std::string name = namedVar.CallerName.empty() ? namedVar.BorrowedOrigin : namedVar.CallerName;
                 // Trap B: the borrow came from a `unique` field, not a parameter. The field's
                 // synthesized destructor is the owner, so name it and point at `move` instead.
-                if (!namedVar.BorrowedUniqueField.empty())
+                if (!namedVar.BorrowedUniqueField.empty() && namedVar.BorrowedUniqueFieldViaCall)
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete '{}' - it was returned as a borrow of unique field '{}', whose "
+                        "synthesized destructor already frees it, so this is a double-free. Remove "
+                        "this delete and let the field's destructor free it.",
+                        name, namedVar.BorrowedUniqueField));
+                else if (!namedVar.BorrowedUniqueField.empty())
                     LogErrorContext(ctx, std::format(
                         "cannot delete '{}' - it aliases unique field '{}', whose synthesized destructor "
                         "already frees it, so this is a double-free. Use 'move {}' to take ownership out "
@@ -8556,6 +8625,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.BorrowedThroughField   = src.BorrowedThroughField;
         dst.BorrowedOrigin         = src.BorrowedOrigin;
         dst.BorrowedUniqueField    = src.BorrowedUniqueField;
+        dst.BorrowedUniqueFieldViaCall = src.BorrowedUniqueFieldViaCall;
         dst.IsUniqueFieldAlias     = src.IsUniqueFieldAlias;
         dst.IsBorrowedOwningValue  = src.IsBorrowedOwningValue;
         dst.IsAliasBorrow          = src.IsAliasBorrow;
@@ -8712,6 +8782,18 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         {
             std::string name = argNV.CallerName.empty() ? argNV.BorrowedOrigin : argNV.CallerName;
             std::string root = BorrowedOriginRoot(argNV.BorrowedOrigin);
+            // Proven through a CALL: the owner is only nameable as "Struct.field", so neither
+            // 'move <origin>' spelling below exists at this site.
+            if (argNV.BorrowedUniqueFieldViaCall)
+            {
+                LogErrorContext(ctx, std::format(
+                    "cannot 'move' '{}' - it was returned as a borrow of unique field '{}', and moving "
+                    "the alias does not null the field, so the field's synthesized destructor still "
+                    "frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or "
+                    "pass a value the receiver can own.",
+                    name, argNV.BorrowedUniqueField));
+                return {};
+            }
             // 'move <origin>' is the right remedy only when the struct holding the field is OWNED.
             // If it is a borrowed by-value parameter, that advice is itself a double-free.
             if (IsBorrowedStructParameter(compiler, root))

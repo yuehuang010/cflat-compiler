@@ -3002,7 +3002,8 @@ public:
      */
     void RejectBorrowIntoUniqueLocal(const std::string& srcDesc, const std::string& originName,
                                      bool srcIsField, const std::string& localName,
-                                     bool isInit, antlr4::ParserRuleContext* ctx);
+                                     bool isInit, antlr4::ParserRuleContext* ctx,
+                                     const std::string& uniqueFieldViaCall = {});
 
     /*
      * The TEMPORARY-source form of the reject above. Neither spelling may suggest `move <access>`:
@@ -3141,6 +3142,17 @@ public:
      */
     static bool SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
                                             const LLVMBackend::NamedVariable& nv);
+
+    /*
+     * Stamp the unique-field borrow provenance onto a call RESULT that was never bound to a local.
+     * The declaration and '=' paths classify while BUILDING a binding, so a temporary RHS
+     * (`o = w->get();`, `s.q = w->get();`, `delete w->get();`) carried no borrow facts and every
+     * door saw an ordinary pointer. Called on the consumer's OWN copy of the NamedVariable, so
+     * nothing outside that statement changes. Unknown accepts: no ledger entry, no stamp; an
+     * already-borrowed or `move` source is left exactly as it was.
+     */
+    static void ApplyCallResultBorrowProvenance(LLVMBackend* compiler,
+                                                LLVMBackend::NamedVariable& nv);
 
     /*
      * The ADOPTING sites (owning-local store, `move` argument) additionally require the borrow to

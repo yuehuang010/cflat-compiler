@@ -1110,6 +1110,10 @@ public:
         // Set to "Struct.field" when the borrow originates from a `unique` field rather than a
         // borrowed parameter, so the delete/store diagnostics can name the real owner (Trap B).
         std::string BorrowedUniqueField;
+        // True when BorrowedUniqueField was proven through a CALL rather than a direct field read.
+        // The owner is then only nameable as "Struct.field", so `move <origin>` is not spellable
+        // at this site and every diagnostic must offer a different remedy.
+        bool BorrowedUniqueFieldViaCall = false;
         // True when this NamedVariable reads a `unique` field. A cast severs Storage and rewrites
         // TypeAndValue, so this out-of-band flag preserves the field provenance the borrow rules
         // key on (delete/move/store-into-field), keeping `(T*)b.p` a tracked alias.
@@ -2298,6 +2302,18 @@ private:
     bool sanitizeOwnership_ = false;
     std::unordered_map<llvm::Value*, llvm::Value*> ownOriginSlots_;
 
+    struct UniqueFieldBorrowReturn
+    {
+        bool Failed = false;            // sticky: some return did NOT prove the field read
+        bool SawProof = false;          // at least one return did prove it
+        std::string FieldOwner;         // "Struct.field" - the owner named in a diagnostic
+    };
+    // The unique-field borrow provenance (see RecordUniqueFieldBorrowReturn). Both are keyed by
+    // module-bound pointers - a CallInst is one value per CALL SITE, never a shared constant, so
+    // value identity is safe here. Cleared by ResetForReanalysis with the module.
+    std::unordered_map<const llvm::Function*, UniqueFieldBorrowReturn> uniqueFieldBorrowReturns_;
+    std::unordered_map<const llvm::Value*, UniqueFieldBorrowReturn> uniqueFieldBorrowResults_;
+
     // --heap-audit: when set, force-import diagnostic/heap_audit.cb and instrument main
     // with HeapAudit.enable()/reportLeaks() (see InjectHeapAuditIntoMain). Report-only.
     bool heapAudit_ = false;
@@ -2979,6 +2995,26 @@ private:
     // Re-ledger a laundered call RESULT as the owning temp its argument was, and retire the
     // argument's own entry so exactly one value in the statement carries the ownership.
     void AdoptLaunderedOwningTempResult(llvm::Value* callResult);
+
+    /*
+     * The BORROW-OF-A-LIVE-OWNER provenance, the REJECT-side twin of the adoption proof above.
+     * Recorded per callee while its body is walked: EVERY pointer return of the function reads a
+     * live `unique` FIELD (a `return nullptr;` is NEUTRAL - it owns nothing, exactly as a null
+     * join arm proves and blocks nothing). The field's synthesized destructor still frees the
+     * object, so the result is a borrow and an owning destination adopting it is a second owner.
+     * Disjoint from ParameterIsExactlyReturned by construction: that proof needs the return value
+     * to BE the argument, and a load of a field GEP never is.
+     * Unknown ACCEPTS - a declaration, an opaque callee, or a callee walked below its call site
+     * has no entry here and keeps compiling exactly as before.
+     */
+    void RecordUniqueFieldBorrowReturn(const llvm::Function* fn, bool proves,
+                                       const std::string& fieldOwner);
+    const UniqueFieldBorrowReturn* FindUniqueFieldBorrowReturn(const llvm::Function* fn) const;
+    // An 'auto' return retype SPLICES the body into a new Function and erases the placeholder the
+    // proof was recorded against, so carry the entry across or the accessor loses its provenance.
+    void MigrateUniqueFieldBorrowReturn(const llvm::Function* oldFn, const llvm::Function* newFn);
+    void RegisterUniqueFieldBorrowResult(llvm::Value* callResult, const UniqueFieldBorrowReturn& info);
+    const UniqueFieldBorrowReturn* FindUniqueFieldBorrowResult(const llvm::Value* callResult) const;
 
     // Name a unique-field access for a diagnostic: "b.t", or the bare field / caller when a cast
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
@@ -5957,7 +5993,8 @@ public:
      */
     void RecordAssignBorrow(const std::string& name, const std::string& origin,
                             const std::string& uniqueField, bool throughField,
-                            bool keepExistingOrigin = false);
+                            bool keepExistingOrigin = false,
+                            bool uniqueFieldViaCall = false);
 
     /*
      * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='

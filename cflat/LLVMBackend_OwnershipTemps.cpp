@@ -1003,6 +1003,15 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         // The record ledger holds this raw Function*, which LLVM may hand back to a later
         // Function::Create; an entry outliving its callee would be resolved against a stranger.
         std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) { return e.Callee == fn; });
+        // Same hazard for the borrow-provenance ledger: a recycled Function* would resolve a
+        // stranger's calls against this callee's proof, which REJECTS - so drop it here too.
+        uniqueFieldBorrowReturns_.erase(fn);
+        // The CallInsts INSIDE this body die with it on the discard path, so their addresses
+        // recycle too. `fn` is still alive at both call sites, so the parent is still readable.
+        std::erase_if(uniqueFieldBorrowResults_, [&](const auto& kv) {
+            const auto* inst = llvm::dyn_cast<llvm::Instruction>(kv.first);
+            return inst != nullptr && inst->getFunction() == fn;
+        });
         std::erase(suspendedFunctions_, fn);
     }
 
@@ -1014,6 +1023,11 @@ void LLVMBackend::DropModuleEscapeMemo()
         paramRetainsPastCallInProgress_.clear();
         provableRetainsInProgress_.clear();
         tempUniqueFieldArgs_.clear();
+        // Both borrow-provenance ledgers are Function*/CallInst*-keyed, so a module rebuild
+        // invalidates them exactly as it does the memos above. Two of the three callers of this
+        // helper are module rebuilds OUTSIDE ResetForReanalysis, so clearing here is what covers them.
+        uniqueFieldBorrowReturns_.clear();
+        uniqueFieldBorrowResults_.clear();
         suspendedFunctions_.clear();
     }
 
@@ -1672,6 +1686,52 @@ void LLVMBackend::AdoptLaunderedOwningTempResult(llvm::Value* callResult)
             SuppressCallerRelease(argVal);
             return;
         }
+    }
+
+void LLVMBackend::RecordUniqueFieldBorrowReturn(const llvm::Function* fn, bool proves,
+                                                const std::string& fieldOwner)
+{
+        if (fn == nullptr) return;
+        auto& entry = uniqueFieldBorrowReturns_[fn];
+        // Sticky failure in EITHER order: one non-proving return retires the fact for good, so a
+        // proving return seen afterwards cannot re-arm it.
+        if (!proves) { entry.Failed = true; return; }
+        if (entry.SawProof) return;
+        entry.SawProof = true;
+        entry.FieldOwner = fieldOwner;
+    }
+
+void LLVMBackend::MigrateUniqueFieldBorrowReturn(const llvm::Function* oldFn,
+                                                 const llvm::Function* newFn)
+{
+        if (oldFn == nullptr || newFn == nullptr) return;
+        auto it = uniqueFieldBorrowReturns_.find(oldFn);
+        if (it == uniqueFieldBorrowReturns_.end()) return;
+        uniqueFieldBorrowReturns_[newFn] = it->second;
+    }
+
+const LLVMBackend::UniqueFieldBorrowReturn* LLVMBackend::FindUniqueFieldBorrowReturn(
+    const llvm::Function* fn) const
+{
+        if (fn == nullptr) return nullptr;
+        auto it = uniqueFieldBorrowReturns_.find(fn);
+        if (it == uniqueFieldBorrowReturns_.end()) return nullptr;
+        return (it->second.SawProof && !it->second.Failed) ? &it->second : nullptr;
+    }
+
+void LLVMBackend::RegisterUniqueFieldBorrowResult(llvm::Value* callResult,
+                                                  const UniqueFieldBorrowReturn& info)
+{
+        if (callResult == nullptr) return;
+        uniqueFieldBorrowResults_[callResult] = info;
+    }
+
+const LLVMBackend::UniqueFieldBorrowReturn* LLVMBackend::FindUniqueFieldBorrowResult(
+    const llvm::Value* callResult) const
+{
+        if (callResult == nullptr) return nullptr;
+        auto it = uniqueFieldBorrowResults_.find(callResult);
+        return it == uniqueFieldBorrowResults_.end() ? nullptr : &it->second;
     }
 
 std::string LLVMBackend::DescribeUniqueFieldAccess(const NamedVariable& nv)

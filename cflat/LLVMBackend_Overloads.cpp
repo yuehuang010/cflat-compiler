@@ -1306,6 +1306,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // A callee that provably hands EXACTLY this owning argument back aliases it, so the
         // result carries the ownership and an owning destination can adopt it.
         AdoptLaunderedOwningTempResult(result);
+        // The REJECT-side twin: a callee whose every return reads a live `unique` field hands back
+        // an object that field still owns, so this result is a borrow, not something to adopt.
+        if (result != nullptr && candidate.ReturnType.Pointer && !candidate.ReturnsOwned)
+            if (const auto* borrow = FindUniqueFieldBorrowReturn(candidate.Function))
+                RegisterUniqueFieldBorrowResult(result, *borrow);
 
         // Extern C function returning a function pointer: the LLVM-level return type is a
         // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.
@@ -1884,7 +1889,8 @@ void LLVMBackend::SetJoinKeepsOwner(const std::string& name, const std::string& 
     }
 
 void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string& origin,
-                           const std::string& uniqueField, bool throughField, bool keepExistingOrigin)
+                           const std::string& uniqueField, bool throughField, bool keepExistingOrigin,
+                           bool uniqueFieldViaCall)
 {
         if (name.empty() || origin.empty()) return;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1904,6 +1910,7 @@ void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string&
             nv->IsBorrowed = true;
             nv->BorrowedOrigin = origin;
             nv->BorrowedUniqueField = uniqueField;
+            nv->BorrowedUniqueFieldViaCall = uniqueFieldViaCall;
             nv->BorrowedThroughField = throughField;
             nv->AssignBorrowBlock = builder->GetInsertBlock();
             return;
@@ -1927,6 +1934,7 @@ void LLVMBackend::RetireAssignBorrow(const std::string& name)
             nv->IsBorrowed = false;
             nv->BorrowedOrigin.clear();
             nv->BorrowedUniqueField.clear();
+            nv->BorrowedUniqueFieldViaCall = false;
             nv->BorrowedThroughField = false;
             nv->AssignBorrowBlock = nullptr;
             return;

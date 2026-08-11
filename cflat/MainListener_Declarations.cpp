@@ -2906,6 +2906,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
                 std::string srcBorrowedUniqueField; // "Struct.field" when the borrow came from a `unique` field
+                bool srcBorrowedUniqueFieldViaCall = false; // proven through a call, so `move <origin>` is unspellable
                 std::string srcBorrowedField;       // RHS field name, when the borrow came through a field read
                 // Field-path provenance of the RHS, kept past rightNV's scope so the decl-init
                 // consume arm can ask whether the source roots at a borrowed by-value parameter.
@@ -3306,6 +3307,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     ? rightNV.CallerName
                                     : rightNV.BorrowedOrigin;
                                 srcBorrowedUniqueField = rightNV.BorrowedUniqueField;
+                                srcBorrowedUniqueFieldViaCall = rightNV.BorrowedUniqueFieldViaCall;
                                 srcBorrowedField = rightNV.FieldName;
                                 srcFieldPathNV.OwningStructName = rightNV.OwningStructName;
                                 srcFieldPathNV.FieldName = rightNV.FieldName;
@@ -3334,6 +3336,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     srcIsBorrowed = true;
                                     srcBorrowedUniqueField = DescribeUniqueFieldOwner(rightNV);
                                     srcBorrowedOrigin = DescribeUniqueFieldAccess(rightNV);
+                                }
+                                // Trap B through a CALL: the callee provably returns a live `unique`
+                                // field, so the result borrows it exactly as a direct `b.p` read does.
+                                if (!srcIsBorrowed && !rightNV.TypeAndValue.IsMove
+                                    && rightNV.TypeAndValue.Pointer)
+                                {
+                                    const auto* fieldBorrow =
+                                        compiler->FindUniqueFieldBorrowResult(rightNV.Primary);
+                                    if (fieldBorrow != nullptr)
+                                    {
+                                        srcIsBorrowed = true;
+                                        srcBorrowedUniqueField = fieldBorrow->FieldOwner;
+                                        srcBorrowedOrigin = fieldBorrow->FieldOwner;
+                                        srcBorrowedUniqueFieldViaCall = true;
+                                    }
                                 }
                                 // Trigger transfer only when the RHS is an owning pointer whose
                                 // source link was severed (Storage cleared) - typically by a cast.
@@ -4567,7 +4584,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     ? std::format("{}.{}", srcCallerName, srcBorrowedField)
                                     : srcBorrowedOrigin;
                                 RejectBorrowIntoUniqueLocal(srcDesc, BorrowedOriginRoot(srcBorrowedOrigin),
-                                                            srcIsField, name, true, initDecl);
+                                                            srcIsField, name, true, initDecl,
+                                                            srcBorrowedUniqueFieldViaCall
+                                                                ? srcBorrowedUniqueField : std::string());
                             }
                             if (!borrowMoveKeepsBorrow)
                             {
@@ -4670,6 +4689,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 nv.IsBorrowed = true;
                                 nv.BorrowedOrigin = srcBorrowedOrigin;
                                 nv.BorrowedUniqueField = srcBorrowedUniqueField;
+                                nv.BorrowedUniqueFieldViaCall = srcBorrowedUniqueFieldViaCall;
                                 nv.BorrowedThroughField = !srcBorrowedField.empty();
                             }
                         }
@@ -4974,7 +4994,13 @@ void MainListener::RejectBorrowIntoUniqueField(const LLVMBackend::NamedVariable&
         std::string origin = rightNV.BorrowedOrigin.empty() ? src : rightNV.BorrowedOrigin;
         // The borrow aliases another `unique` field, so the source field's synthesized
         // destructor owns the pointee - storing it here would make two owners of one pointer.
-        if (!rightNV.BorrowedUniqueField.empty())
+        if (!rightNV.BorrowedUniqueField.empty() && rightNV.BorrowedUniqueFieldViaCall)
+            LogErrorContext(ctx, std::format(
+                "cannot store '{}' into {} - it was returned as a borrow of unique field '{}', whose "
+                "synthesized destructor already frees it, and two 'unique' fields cannot own one "
+                "pointer. Drop 'unique' from the destination field if it only borrows.",
+                src, fieldDesc, rightNV.BorrowedUniqueField));
+        else if (!rightNV.BorrowedUniqueField.empty())
             LogErrorContext(ctx, std::format(
                 "cannot store '{}' into {} - it aliases '{}', a unique field whose synthesized "
                 "destructor already frees it, and two 'unique' fields cannot own one pointer. "
@@ -5005,7 +5031,21 @@ void MainListener::RejectNonHeapAddressIntoUnique(const std::string& destDesc,
 
 void MainListener::RejectBorrowIntoUniqueLocal(const std::string& srcDesc, const std::string& originName,
                                      bool srcIsField, const std::string& localName,
-                                     bool isInit, antlr4::ParserRuleContext* ctx) {
+                                     bool isInit, antlr4::ParserRuleContext* ctx,
+                                     const std::string& uniqueFieldViaCall) {
+        // A borrow returned by an ACCESSOR names no parameter and no spellable source expression -
+        // the one true owner is the `unique` field the callee read, so say exactly that.
+        // Assignment only: the DECL-INIT spelling is caught earlier by the borrowed-value reject
+        // (`cannot initialize unique 'o' from a borrowed value`), so `isInit` never reaches here.
+        if (!uniqueFieldViaCall.empty())
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot assign to unique local '{}' from a borrow of unique field '{}' - that "
+                "field's synthesized destructor already frees the pointee, so this would free it "
+                "twice. Drop 'unique' from '{}' if it only borrows.",
+                localName, uniqueFieldViaCall, localName));
+            return;
+        }
         const char* srcKind = srcIsField ? "" : "borrowed parameter ";
         std::string lead = isInit
             ? std::format("cannot initialize unique local '{}' from {}'{}'",
@@ -5304,6 +5344,18 @@ bool MainListener::SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
             && nv.TypeAndValue.TypeName != "__closure_fat_ptr"
             && (nv.TypeAndValue.Pointer
                 || compiler->IsOwningValueType(nv.TypeAndValue.TypeName));
+    }
+
+void MainListener::ApplyCallResultBorrowProvenance(LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& nv) {
+        if (compiler == nullptr || nv.IsBorrowed || nv.TypeAndValue.IsMove) return;
+        if (!nv.TypeAndValue.Pointer || nv.Primary == nullptr) return;
+        const auto* fieldBorrow = compiler->FindUniqueFieldBorrowResult(nv.Primary);
+        if (fieldBorrow == nullptr) return;
+        nv.IsBorrowed = true;
+        nv.BorrowedOrigin = fieldBorrow->FieldOwner;
+        nv.BorrowedUniqueField = fieldBorrow->FieldOwner;
+        nv.BorrowedUniqueFieldViaCall = true;
     }
 
 bool MainListener::BorrowAdoptionIsUnsound(LLVMBackend* compiler,

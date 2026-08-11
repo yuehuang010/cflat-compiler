@@ -226,6 +226,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         if (!oldFn->use_empty())
             LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported - declare the return type explicitly", functionName));
 
+        MigrateUniqueFieldBorrowReturn(oldFn, newFn);
         ForgetFunctionEscapeMemo(oldFn);
         oldFn->eraseFromParent();
         return newFn;

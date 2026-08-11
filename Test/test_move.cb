@@ -1315,6 +1315,33 @@ CopyableHolder pickCopyable(CopyableHolder h, int c)
     return t;
 }
 
+
+/*
+ * ACCEPT set for the unique-field borrow provenance (the reject legs are in
+ * Test/errors/err_move.cb). The proof is "EVERY pointer return reads a live `unique` FIELD" and
+ * nothing weaker, so each accessor below must keep laundering exactly as it did before: a PLAIN
+ * field owns nothing to double-free, a MIXED accessor proves nothing, and an indirect call has no
+ * callee to read. Unknown ACCEPTS is the polarity - a false rejection here is the blocker.
+ */
+struct PlainBorrowWrap
+{
+    Resource* p = nullptr;
+    alias Resource* borrowPlain() { return this.p; }
+};
+struct MixedBorrowWrap
+{
+    unique Resource* owned = nullptr;
+    Resource* plain = nullptr;
+    // One return proves the field read, the other does not: the fact retires for good.
+    alias Resource* borrowEither(bool c) { if (c) { return this.owned; } return this.plain; }
+};
+struct IndirectBorrowWrap { unique Resource* p = nullptr; };
+struct FieldBorrowAcceptWrap
+{
+    unique Resource* item = nullptr;
+    alias Resource* borrowItem() { return this.item; }
+};
+
 int testUniqueLocalAndParam()
 {
     int passed = 0;
@@ -1336,6 +1363,71 @@ int testUniqueLocalAndParam()
         passed += Test("copyable_mixed_return_borrow_branch", pickCopyable(src, 1).v, 7);
         passed += Test("copyable_mixed_return_owned_branch", pickCopyable(src, 0).v, 99);
     }
+
+    /*
+     * A PLAIN field is not an owner, so adopting the accessor's result into a `unique` local is
+     * the only thing that ever frees it - rejecting it would leak. The `unique`-field twin of
+     * this exact program is the filed double-free and is rejected in err_move.cb.
+     */
+    dtorCount = 0;
+    PlainBorrowWrap pw = default;
+    Resource* pwLeaked = nullptr;
+    {
+        pw.p = new Resource();
+        pwLeaked = pw.p;
+        pw.p->id = 61;
+        Resource* pk = pw.borrowPlain();
+        unique Resource* adopted = nullptr;
+        adopted = pk;
+        passed += Test("plain_field_borrow_adopt_value", adopted->id, 61);
+        passed += Test("plain_field_borrow_adopt_no_early_free", dtorCount, 0);
+    }
+    // The store does not TRANSFER (a plain field read is no owning source), so nothing frees it -
+    // a LEAK, and the pre-existing behaviour this change must leave alone. The `unique`-field twin
+    // of the same program freed it TWICE and is the rejection in err_move.cb.
+    passed += Test("plain_field_borrow_adopt_not_freed", dtorCount, 0);
+    delete pwLeaked;
+    passed += Test("plain_field_borrow_adopt_freed_by_hand", dtorCount, 1);
+
+    // A MIXED accessor proves nothing: one return is a plain field, so the fact never arms and
+    // the caller keeps today's behaviour (the `unique` field still frees its own pointee once).
+    dtorCount = 0;
+    {
+        MixedBorrowWrap mw = default;
+        mw.plain = new Resource();
+        mw.plain->id = 62;
+        Resource* mk = mw.borrowEither(false);
+        passed += Test("mixed_borrow_accessor_value", mk->id, 62);
+        delete mk;
+        passed += Test("mixed_borrow_accessor_freed_once", dtorCount, 1);
+    }
+    passed += Test("mixed_borrow_accessor_no_second_free", dtorCount, 1);
+
+    // No callee to read: an indirect call through a `function<>` value proves nothing, so the
+    // read stays legal and the field remains the single owner.
+    dtorCount = 0;
+    {
+        IndirectBorrowWrap iw = default;
+        iw.p = new Resource();
+        iw.p->id = 63;
+        function<Resource*(IndirectBorrowWrap*)> pick = (IndirectBorrowWrap* q) => { return q->p; };
+        Resource* ik = pick(&iw);
+        passed += Test("indirect_borrow_accessor_value", ik->id, 63);
+        passed += Test("indirect_borrow_accessor_no_early_free", dtorCount, 0);
+    }
+    passed += Test("indirect_borrow_accessor_freed_once_by_field", dtorCount, 1);
+
+    // READING through a proven borrow (never adopting it) is untouched: the field frees it once.
+    dtorCount = 0;
+    {
+        FieldBorrowAcceptWrap fw = default;
+        fw.item = new Resource();
+        fw.item->id = 64;
+        Resource* fk = fw.borrowItem();
+        passed += Test("proven_borrow_read_through", fk->id, 64);
+        passed += Test("proven_borrow_read_no_early_free", dtorCount, 0);
+    }
+    passed += Test("proven_borrow_read_freed_once_by_field", dtorCount, 1);
 
     // C escape hatch: bare pointer return, explicit `delete` frees the payload exactly once.
     dtorCount = 0;
@@ -10245,7 +10337,7 @@ extern int main()
     total += 12;
 
     passed += testUniqueLocalAndParam();
-    total += 11;
+    total += 24;
 
     passed += testUniqueLocalReassignMove();
     total += 95;
