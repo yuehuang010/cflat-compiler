@@ -1219,6 +1219,13 @@ extern int main()
         printf("%d\n", uqgLocal.item == nullptr ? 0 : 1);
     }
 
+    // Declaration-init is the same implicit consume as the assignment spelling. It must use
+    // the RHS binding's global storage, not only the destination's later store.
+    expect_error("cannot consume owning value 'uqgErrBox' out of storage that outlives this function") {
+        UqgBox uqgDeclLocal = uqgErrBox;
+        printf("%d\n", uqgDeclLocal.item == nullptr ? 0 : 1);
+    }
+
     // q11 ruling (2026-08-11): an IMPLICIT consume out of global owning storage is an error -
     // the global still owns the value, so the new local would be a second owner. The sanctioned
     // spelling is `move`, which nulls the global; its accept legs are in Test/test_move.cb

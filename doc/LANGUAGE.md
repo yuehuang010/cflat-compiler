@@ -1629,9 +1629,8 @@ Returning an owning **field** of a global is the same consume, and is rejected t
 (`return gWrap.b;`). Returning the whole global by value is a plain copy of a borrow and stays
 legal - it transfers nothing.
 
-> **Known gap.** The declaration-init spelling `Box o = gBox;` is not yet diagnosed - it still
-> consumes the global silently. The assignment, return-of-field, and field-default spellings
-> above are enforced.
+The declaration-init spelling (`Box o = gBox;`) is rejected by the same rule as assignment,
+return-of-field, and field-default consumes.
 
 **`move` out of such storage RE-INITIALIZES it**, so re-entry is defined rather than
 reading a moved-from husk: the second `move gBox` yields an empty `Box`, and a

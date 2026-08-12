@@ -3037,6 +3037,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 llvm::Value* right = nullptr;
                 LLVMBackend::NamedVariable interfaceSourceNV;
                 bool haveInterfaceSourceNV = false;
+                LLVMBackend::NamedVariable initializerSourceNV;
+                bool haveInitializerSourceNV = false;
                 bool srcIsUnsigned = false;
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
@@ -3415,6 +3417,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // rightNV scope so the fat->thin narrowing gate below can name them.
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                initializerSourceNV = rightNV;
+                                haveInitializerSourceNV = true;
                                 right = LoadNamedVariable(rightNV);
                                 // A `move`-temp's owning field can be MOVED into the local (the temp owns it):
                                 // capture the source so the store site adopts it and zeros the temp's field.
@@ -4418,6 +4422,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // and a is marked moved for the use-after-move diagnostic.
                                 AssignSourceKind kind;
                                 right = ClassifyOwningAssignSource(right, typeAndValue.TypeName, false, direct, kind);
+                                if (kind == AssignSourceKind::Move && haveInitializerSourceNV
+                                    && RejectImplicitConsumeOfOutlivingOwner(
+                                        compiler, initializerSourceNV, false, direct))
+                                    return allocList;
                                 // Bails like the five sibling sites rather than relying on
                                 // LogErrorContext's throw to skip the consume below.
                                 bool rejectedBorrowedField = kind == AssignSourceKind::Move
