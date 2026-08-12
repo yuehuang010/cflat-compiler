@@ -1,6 +1,6 @@
 # q12: Generics - templates, type arguments, mangling
 
-6 active items remain. Q12 fixed generic-function registration, generic-interface parent
+4 active items remain. Q12 fixed generic-function registration, generic-interface parent
 instantiation, closure type arguments to generic functions, unique array-view rejection, and
 variadic free generic functions. Generic structs and generic functions took different paths through registration,
 type-argument resolution, and name mangling, and the function path is missing pieces the struct
@@ -15,9 +15,8 @@ Three sub-themes, all "the generic path is a parallel implementation that drifte
   check, and the shell-acceptance fallback matches on the last dotted segment, ignoring namespace.
 - **Type arguments.** Generic-function type-argument resolution bypasses `ResolveTypeArgEntry`,
   which generic structs use, so closures and unique array views are handled wrongly or not at all.
-- **Mangling.** `sizeof` resolves its operand as raw text, and the variadic and zero-argument
-  paths apply mangling a different number of times on the declaration and the definition, emitting
-  unlinkable double-mangled symbols.
+- **Mangling.** The variadic and zero-argument paths apply mangling a different number of times on
+  the declaration and the definition, emitting unlinkable double-mangled symbols.
 
 ## Members
 
@@ -30,8 +29,6 @@ Registration / templates:
 Type arguments:
 
 Mangling / symbols:
-- `p2/sizeof-of-generic-instantiation`
-- `p2/sizeof-over-generic-instantiation-unresolved-while-alignof-resolves`
 - `p2/zero-parameter-generic-function-emits-double-mangled-symbol` (undiagnosed)
 
 Fixed in Q12:
@@ -52,7 +49,7 @@ Fixed in Q12:
 3. Q12 handles variadic free-function substitution and arity; the zero-parameter item remains
    active because its current repro now passes on the Q12 pre-fix binary and needs a fresh witness.
 4. The collision and last-segment shell items remain deferred by their recorded language/diagnostic
-   constraints. The two `sizeof` items are coordinated with Q14's grammar work.
+   constraints. Generic `sizeof` resolution is now shared with Q14's type-name grammar path.
 
-Fully disjoint from the ownership buckets; good parallel work. Sequence the two `sizeof` items with
-q14, which owns the `sizeof` grammar ambiguity they sit next to.
+Fully disjoint from the ownership buckets; good parallel work. The generic `sizeof` items landed
+with q14, which owns the surrounding grammar ambiguity.

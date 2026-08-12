@@ -7,34 +7,34 @@ import "tuple.cb";
 // Generic struct tests (compile-time only monomorphization)
 // =============================================================
 
-// Q12 generic-function registration and type-argument coverage.
-int q12_forward_function_caller() { return q12_forward_function<int>(4); }
-T q12_forward_function<T>(T value) { return value + 1; }
+// Generic-function registration and type-argument coverage.
+int forwardFunctionCaller() { return forwardFunction<int>(4); }
+T forwardFunction<T>(T value) { return value + 1; }
 
-T q12_closure_identity<T>(T value) { return value; }
-T q12_count_pack<T...>() { return (T)sizeof(T); }
-int q12_double(int x) { return x * 2; }
+T closureIdentity<T>(T value) { return value; }
+T countPack<T...>() { return (T)sizeof(T); }
+int doubleValue(int x) { return x * 2; }
 
-interface Q12GenericBase<T> { T Get(); };
-interface Q12GenericDerived<T> : Q12GenericBase<T> { void Set(T value); };
-class Q12GenericImpl<T> : Q12GenericDerived<T>
+interface FunctionBase<T> { T Get(); };
+interface FunctionDerived<T> : FunctionBase<T> { void Set(T value); };
+class FunctionImpl<T> : FunctionDerived<T>
 {
     T value = default;
     T Get() { return value; }
     void Set(T v) { value = v; }
 };
 
-bool testQ12GenericFunctions()
+bool testGenericFunctions()
 {
     bool result = true;
-    result &= Test("q12_generic_function_forward", q12_forward_function_caller(), 5);
-    function<int(int)> source = q12_double;
-    function<int(int)> closureResult = q12_closure_identity<function<int(int)>>(source);
-    result &= Test("q12_generic_function_closure_arg", closureResult(6), 12);
-    result &= Test("q12_generic_function_pack", q12_count_pack<int, int, int>(), 3);
-    Q12GenericImpl<int> impl = default;
+    result &= Test("generic_function_forward", forwardFunctionCaller(), 5);
+    function<int(int)> source = doubleValue;
+    function<int(int)> closureResult = closureIdentity<function<int(int)>>(source);
+    result &= Test("generic_function_closure_arg", closureResult(6), 12);
+    result &= Test("generic_function_pack", countPack<int, int, int>(), 3);
+    FunctionImpl<int> impl = default;
     impl.Set(9);
-    result &= Test("q12_generic_interface_parent", impl.Get(), 9);
+    result &= Test("generic_interface_parent", impl.Get(), 9);
     return result;
 }
 
@@ -60,6 +60,15 @@ struct Stack<T>
     T elements = default;
     int size = 0;
 };
+
+bool testGenericSizeof()
+{
+    bool result = true;
+    result &= Test("sizeof_generic_struct", (int)sizeof(Box<int>), 4);
+    result &= Test("sizeof_generic_interface", (int)sizeof(FunctionBase<int>), 16);
+    result &= Test("sizeof_generic_class", (int)sizeof(FunctionImpl<int>), 4);
+    return result;
+}
 
 bool testGenericBox()
 {
@@ -4380,7 +4389,8 @@ extern int main()
     total++; passed += testGnUnresolvedGenericShellGate()          ? 1 : 0;
     total++; passed += testGnPointerDepthSubstitution()            ? 1 : 0;
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
-    total++; passed += testQ12GenericFunctions()                      ? 1 : 0;
+    total++; passed += testGenericFunctions()                      ? 1 : 0;
+    total++; passed += testGenericSizeof()                          ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

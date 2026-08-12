@@ -32,12 +32,23 @@ struct IntRange
     int get(int i) { return lo + i; }
 };
 
+struct StructNamedMethod
+{
+    int StructNamedMethod() { return 7; }
+};
+
+int testStructNamedMethod()
+{
+    StructNamedMethod value;
+    return value.StructNamedMethod();
+}
+
 bool testBuiltinIdentifiers()
 {
     bool result = true;
     result &= Test("__FILE__", __FILE__, "test_basic.cb");
     result &= Test("__FUNCTION__", __FUNCTION__, "testBuiltinIdentifiers");
-    result &= Test("__LINE__", __LINE__, 40); // Remember to adjust if shifted.
+    result &= Test("__LINE__", __LINE__, 51); // Remember to adjust if shifted.
     return result;
 }
 
@@ -3356,6 +3367,7 @@ bool testFixedArrays()
     // measures its declared type (regression: any variable operand used to fail
     // with "unknown type").
     result &= Test("sizeof_fixed_array", (int)sizeof(buf), 8);
+    result &= Test("sizeof_fixed_array_type", (int)sizeof(int[2][3]), 24);
     result &= Test("sizeof_scalar_var", (int)sizeof(plain), 4);
     result &= Test("sizeof_struct_var", (int)sizeof(h), (int)sizeof(ArrayHolder));
 
@@ -3917,6 +3929,7 @@ extern int main()
     total++; passed += testGlobalDefaultSeeding()        ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;
+    total++; passed += Test("struct_named_method", testStructNamedMethod(), 7);
     total++; passed += testTypeof()                      ? 1 : 0;
     total++; passed += testNameof()                      ? 1 : 0;
     total++; passed += testNamespace()                   ? 1 : 0;

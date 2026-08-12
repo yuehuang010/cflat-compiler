@@ -526,7 +526,7 @@ void MainListener::PreDeclareInstantiationMembers(
             // Constructor overload - pre-declare without this* parameter.
             // A zero-arg ctor has a null parameterTypeList; ParseParameterTypeList
             // returns empty for null, so do not gate the ctor branch on it.
-            if (funcName == baseName)
+            if (!FunctionDeclaresReturnType(func) && funcName == baseName)
             {
                 auto* declParamList = func->parameterTypeList();
                 auto declParams = this->ParseParameterTypeList(declParamList);

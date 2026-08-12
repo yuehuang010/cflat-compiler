@@ -1797,7 +1797,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         {
             // Ctors are written with the bare type name - match baseTypeName, not the
             // namespace-qualified typeName, or a namespaced class's ctor falls through below.
-            if (getFunctionName(func) == baseTypeName)
+            if (!FunctionDeclaresReturnType(func) && getFunctionName(func) == baseTypeName)
             {
                 // Constructor overload - no implicit this* parameter, returns the type
                 std::vector<LLVMBackend::TypeAndValue> allCtorParams;
@@ -4067,7 +4067,7 @@ public:
                                      LLVMBackend::NamedVariable& namedVar,
                                      const LLVMBackend::TypeAndValue& destTypeName);
 
-    LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx);
+    LLVMBackend::TypeAndValue ParseTypeName(CFlatParser::TypeNameContext* ctx, bool allowSizedArray = false);
 
     LLVMBackend::NamedVariable ParseUnaryExpression(CFlatParser::UnaryExpressionContext* ctx,
                                                     ResultUse use = ResultUse::Value);

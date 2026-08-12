@@ -6030,7 +6030,7 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         return {};
     }
 
-LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameContext* ctx) {
+LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameContext* ctx, bool allowSizedArray) {
         auto specCtx = ctx->specifierQualifierList();
         auto abstractDecl = ctx->abstractDeclarator();
 
@@ -6123,11 +6123,14 @@ LLVMBackend::TypeAndValue MainListener::ParseTypeName(CFlatParser::TypeNameConte
             {
                 if (DimSpecIsUnsizedMultiDim(dimSpec))
                     LogErrorContext(ctx, UnsizedMultiDimMessage(typeValue.TypeName));
-                if (!dimSpec->assignmentExpression().empty())
+                if (!allowSizedArray && !dimSpec->assignmentExpression().empty())
                     LogErrorContext(ctx, "a sized array '(T[N])' is not a valid cast target; "
                         "use '(T[])' for the noalias array-view");
-                typeValue.IsArrayView = true;
-                typeValue.Pointer = true;
+                if (dimSpec->assignmentExpression().empty())
+                {
+                    typeValue.IsArrayView = true;
+                    typeValue.Pointer = true;
+                }
             }
         }
 
@@ -6165,6 +6168,29 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // Does this look like a type name? '(' ')' ',' count as type text only INSIDE
                 // balanced generic brackets (Pair<int,float>, Box<function<int(int)>>).
                 bool likelyType = !postfixText.empty() && (std::isalpha(postfixText[0]) || postfixText[0] == '_');
+                std::vector<uint64_t> rawArrayDims;
+                auto firstBracket = postfixText.find('[');
+                if (firstBracket != std::string::npos)
+                {
+                    std::string baseText = postfixText.substr(0, firstBracket);
+                    size_t pos = firstBracket;
+                    while (pos < postfixText.size())
+                    {
+                        if (postfixText[pos] != '[') { likelyType = false; break; }
+                        size_t close = postfixText.find(']', pos + 1);
+                        if (close == std::string::npos || close == pos + 1) { likelyType = false; break; }
+                        std::string dimText = postfixText.substr(pos + 1, close - pos - 1);
+                        size_t consumed = 0;
+                        unsigned long long dim = 0;
+                        try { dim = std::stoull(dimText, &consumed); }
+                        catch (...) { consumed = 0; }
+                        if (consumed != dimText.size() || dim == 0) { likelyType = false; break; }
+                        rawArrayDims.push_back(static_cast<uint64_t>(dim));
+                        pos = close + 1;
+                    }
+                    if (pos != postfixText.size() || rawArrayDims.empty()) likelyType = false;
+                    else postfixText = baseText;
+                }
                 int angleDepth = 0;
                 bool usedBracketPunct = false;
                 for (char c : postfixText)
@@ -6185,6 +6211,16 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // spelling like 'a<b' keeps its existing (bracket-free) classification.
                 if (usedBracketPunct && angleDepth != 0)
                     likelyType = false;
+                if (likelyType && postfixText.find('<') != std::string::npos)
+                {
+                    std::string genericBase = postfixText.substr(0, postfixText.find('<'));
+                    bool knownGeneric = compiler->IsKnownTypeName(genericBase)
+                        || genericStructTemplates.count(genericBase) != 0
+                        || genericClassTemplates.count(genericBase) != 0
+                        || genericInterfaceTemplates.count(genericBase) != 0
+                        || genericBase == "function" || genericBase == "Lambda";
+                    if (!knownGeneric) likelyType = false;
+                }
 
                 if (likelyType)
                 {
@@ -6248,7 +6284,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                             typeValue = varNV.TypeAndValue;
                     }
 
-                    auto* llvmType = compiler->GetType(typeValue, nullptr, true);
+                    llvm::Type* llvmType = compiler->GetType(typeValue, nullptr, true);
+                    for (auto it = rawArrayDims.rbegin();
+                         it != rawArrayDims.rend() && llvmType != nullptr; ++it)
+                        llvmType = llvm::ArrayType::get(llvmType, *it);
                     if (llvmType && !llvmType->isVoidTy())  // Void is a valid type but let's use basic validity check
                     {
                         llvm::Value* result;
@@ -6531,7 +6570,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             if (isSizeof || isAlignof)
             {
                 // Parse the type name to get its LLVM type
-                auto typeValue = ParseTypeName(typeNameCtx);
+                auto typeValue = ParseTypeName(typeNameCtx, true);
                 if (typeValue.TypeName.empty())
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not determine type");
@@ -6553,7 +6592,73 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     }
                 }
 
-                auto* llvmType = compiler->GetType(typeValue, nullptr, true);
+                std::vector<uint64_t> arrayDims;
+                auto peelArrayDims = [](std::string& name, std::vector<uint64_t>& dims) {
+                    auto first = name.find('[');
+                    if (first == std::string::npos) return;
+                    std::string base = name.substr(0, first);
+                    size_t pos = first;
+                    while (pos < name.size())
+                    {
+                        if (name[pos] != '[') return;
+                        size_t close = name.find(']', pos + 1);
+                        if (close == std::string::npos || close == pos + 1) return;
+                        std::string text = name.substr(pos + 1, close - pos - 1);
+                        size_t consumed = 0;
+                        unsigned long long dim = 0;
+                        try { dim = std::stoull(text, &consumed); }
+                        catch (...) { consumed = 0; }
+                        if (consumed != text.size() || dim == 0) return;
+                        dims.push_back(static_cast<uint64_t>(dim));
+                        pos = close + 1;
+                    }
+                    if (pos == name.size()) name = base;
+                    else dims.clear();
+                };
+                auto elementTV = typeValue;
+                peelArrayDims(elementTV.TypeName, arrayDims);
+                auto* dimSpec = typeNameCtx->abstractDeclarator() != nullptr
+                    ? ArrayDimsOf(typeNameCtx->abstractDeclarator()) : nullptr;
+                if (dimSpec != nullptr && !dimSpec->assignmentExpression().empty())
+                {
+                    auto dimExprs = dimSpec->assignmentExpression();
+                    for (auto* dimExpr : dimExprs)
+                    {
+                        auto* dimValue = ParseAssignmentExpression(dimExpr);
+                        auto* dimConst = dimValue != nullptr
+                            ? llvm::dyn_cast<llvm::ConstantInt>(dimValue) : nullptr;
+                        if (dimConst == nullptr || dimConst->isZero())
+                        {
+                            LogErrorContext(dimExpr, "sizeof: array dimensions must be positive constants");
+                            return {};
+                        }
+                        arrayDims.push_back(dimConst->getZExtValue());
+                    }
+                }
+                llvm::Type* llvmType = nullptr;
+                if (!arrayDims.empty())
+                {
+                    elementTV.Pointer = false;
+                    elementTV.IsArrayView = false;
+                    llvmType = compiler->GetType(elementTV, nullptr, true);
+                    for (auto it = arrayDims.rbegin(); it != arrayDims.rend() && llvmType != nullptr; ++it)
+                        llvmType = llvm::ArrayType::get(llvmType, *it);
+                }
+                else
+                {
+                    if (!typeValue.Pointer && !compiler->IsKnownTypeName(elementTV.TypeName))
+                    {
+                        auto varNV = compiler->GetLocalVariable(typeNameCtx->getText());
+                        if (varNV.Storage == nullptr && varNV.Primary == nullptr)
+                            varNV = compiler->GetGlobalVariableNV(typeNameCtx->getText());
+                        if (varNV.Storage != nullptr || varNV.Primary != nullptr)
+                        {
+                            typeValue = varNV.TypeAndValue;
+                            elementTV = typeValue;
+                        }
+                    }
+                    llvmType = compiler->GetType(elementTV, nullptr, true);
+                }
                 if (!llvmType)
                 {
                     LogErrorContext(ctx, "sizeof/alignof: could not resolve type to LLVM type");

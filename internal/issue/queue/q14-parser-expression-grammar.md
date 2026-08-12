@@ -1,6 +1,6 @@
 # q14: Parser and expression grammar edge cases
 
-11 items. A construct is legal in one syntactic position and silently unavailable, mis-parsed, or a
+9 active items remain. A construct is legal in one syntactic position and silently unavailable, mis-parsed, or a
 no-op in another.
 
 ## Shared root cause
@@ -29,7 +29,6 @@ Postfix / receiver:
   receiver empty, so the chain silently keeps the previous one.
 
 `sizeof` / cast:
-- `p3/sizeof-of-sized-array-type-parsed-as-cast`
 - `p3/sizeof-steals-discarded-tuple-comparison-spelling`
 
 Declaration-position-only:
@@ -38,20 +37,18 @@ Declaration-position-only:
   statement-position parsing, unreachable from the lambda expression-body path.
 - `p3/closure-arg-suffixes-unvalidated-in-signature-position` - array-view/pointer suffix checks
   skipped in the type-argument and signature-component funnels.
-- `p3/constructor-discriminator-inconsistent-name-only-sites` - six sites use the name-only test
-  instead of the corrected `declarationSpecifiers`-null check.
 - `p3/json-ish-brace-literal-still-typed-string` - `ClassifyBrace` returns Verbatim but
   `HasInterpolation` stays true.
 
 ## Fix direction
 
-1. `p3/constructor-discriminator-inconsistent-name-only-sites` is the cheapest and most mechanical:
-   six known sites, one already-correct predicate to call. Do it first.
-2. For the declaration-position cluster, move each check into the shared type-name/expression
+1. For the declaration-position cluster, move each check into the shared type-name/expression
    funnel rather than adding a fourth copy. Remember: any change to `ParseDeclarationSpecifiers`
    must land in BOTH the `ForwardRefScanner` and `MainListener` copies.
-3. The `sizeof`/cast items are grammar ordering in `CFlat.g4`; expect to need a predicate rather
-   than reordering alone, and re-run the whole suite - reordering cast rules has broad blast radius.
+2. The remaining `sizeof`/cast item is the tuple-expression ambiguity; keep its parser distinction
+   separate from the now-shared type-name path.
+3. The remaining `sizeof`/cast ambiguity is grammar ordering in `CFlat.g4`; use a predicate rather
+   than reordering alone, and re-run the whole suite - cast-rule changes have broad blast radius.
 4. The postfix cluster needs the parenthesized form to produce addressable storage; solve storage
    once and three of the four follow.
 

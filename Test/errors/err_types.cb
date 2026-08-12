@@ -80,25 +80,19 @@ expect_error("array views are not supported") {
     Q12UniqueArrayViewBox<unique Q12ArrayViewInterface[]> bad = default;
 }
 
-expect_error("unknown type 'SizeofBox<function<int(int)>>'") {
-    int test_sizeof_thin_closure_arg()
-    {
-        return (int)sizeof(SizeofBox<function<int(int)>>);
-    }
+int test_sizeof_thin_closure_arg()
+{
+    return (int)sizeof(SizeofBox<function<int(int)>>) == 8 ? 0 : 1;
 }
 
-expect_error("unknown type 'SizeofBox<Lambda<int(int)>>'") {
-    int test_sizeof_fat_closure_arg()
-    {
-        return (int)sizeof(SizeofBox<Lambda<int(int)>>);
-    }
+int test_sizeof_fat_closure_arg()
+{
+    return (int)sizeof(SizeofBox<Lambda<int(int)>>) == 16 ? 0 : 1;
 }
 
-expect_error("unknown type 'SizeofPair<int,float>'") {
-    int test_sizeof_two_type_args()
-    {
-        return (int)sizeof(SizeofPair<int, float>);
-    }
+int test_sizeof_two_type_args()
+{
+    return (int)sizeof(SizeofPair<int, float>) == 8 ? 0 : 1;
 }
 
 extern int main()

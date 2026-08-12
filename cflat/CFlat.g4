@@ -108,15 +108,23 @@ argumentNamedExpression
     ;
 
 unaryExpression
-    : ('sizeof')* (
+    : 'sizeof' '(' typeName ')'
+    | ('sizeof')+ (
         postfixExpression
         | unaryOperator castExpression
-        | ('sizeof' | 'alignof') '(' typeName ')'
+        | 'alignof' '(' typeName ')'
         | newExpression
         | deleteExpression
         | moveExpression
         | operatorStringExpression
     )
+    | postfixExpression
+    | unaryOperator castExpression
+    | 'alignof' '(' typeName ')'
+    | newExpression
+    | deleteExpression
+    | moveExpression
+    | operatorStringExpression
     ;
 
 operatorStringExpression

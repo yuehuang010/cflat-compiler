@@ -285,7 +285,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // ParseConstructorDefinition will handle it later in the member function loop.
         bool hasBareNoArgCtor = [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
-                if (getFunctionName(f) == baseName && !f->parameterTypeList())
+                if (!FunctionDeclaresReturnType(f) && getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
         }();
@@ -293,7 +293,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // symbol, so emitting the synthetic one too collides (see AllParametersDefaulted).
         bool hasAllDefaultedCtor = !hasBareNoArgCtor && [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
-                if (getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
+                if (!FunctionDeclaresReturnType(f) && getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
                     return true;
             return false;
         }();
@@ -492,7 +492,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
                 // Constructor - same name as struct (no-arg or with parameters)
-                if (funcName == baseName)
+                if (!FunctionDeclaresReturnType(func) && funcName == baseName)
                 {
                     // This ctor IS the type's no-arg ctor when every parameter is defaulted and
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.
@@ -2882,7 +2882,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // If the user wrote an explicit no-arg constructor, skip the auto-generated one.
         bool hasBareNoArgCtor = [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
-                if (getFunctionName(f) == baseName && !f->parameterTypeList())
+                if (!FunctionDeclaresReturnType(f) && getFunctionName(f) == baseName && !f->parameterTypeList())
                     return true;
             return false;
         }();
@@ -2890,7 +2890,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // symbol, so emitting the synthetic one too collides (see AllParametersDefaulted).
         bool hasAllDefaultedCtor = !hasBareNoArgCtor && [&]() {
             for (auto* f : MemberFunctionDefinitions(ctx))
-                if (getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
+                if (!FunctionDeclaresReturnType(f) && getFunctionName(f) == baseName && AllParametersDefaulted(f->parameterTypeList()))
                     return true;
             return false;
         }();
@@ -3115,7 +3115,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 if (compiler->IsVerbose())
                     std::cout << "[verbose]     parse member: " << structName << "." << funcName << "\n";
                 // Constructor - same name as class (no-arg or with parameters)
-                if (funcName == baseName)
+                if (!FunctionDeclaresReturnType(func) && funcName == baseName)
                 {
                     // This ctor IS the type's no-arg ctor when every parameter is defaulted and
                     // no bare 'T()' was written - it must seed fields itself, not self-delegate.

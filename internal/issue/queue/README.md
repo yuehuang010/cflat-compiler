@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 53 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 50 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -28,9 +28,9 @@ member list is empty.
 | q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 1 | One blocked p1 item remains; two always-wrong escapes are fixed |
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 3 | Three fixes landed; deferred/design items remain |
 | q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 3 | Static-local tooling fixed; ownership semantics blocked |
-| q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 6 | Five fixes landed; collisions and sizeof items remain |
+| q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 4 | Generic registration and mangling fixes landed; collision items remain |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
-| q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 11 | Disjoint; parallelizable |
+| q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 9 | Constructor and sizeof type parsing fixes landed; postfix gaps remain |
 | q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 5 | |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
@@ -48,7 +48,7 @@ fix work. Status:
 | q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third remains filed and blocked on q02. |
 | q10 | **PARTIALLY FIXED.** Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule, conditional-termination guard half, and closure return-type ownership grammar remain deferred or require a language decision. |
 | q11 | **PARTIALLY FIXED.** Static-local ownership-origin reporting and DWARF visibility are fixed. The three remaining global/program-lifetime ownership items remain blocked until the maintainer chooses the consume/reinitialization/destructor semantics. |
-| q12 | **PARTIALLY FIXED.** Generic function registration, closure/array-view type arguments, and variadic free functions are fixed. Name-collision and `sizeof` grammar items remain deferred or coordinated with Q14. |
+| q12 | **PARTIALLY FIXED.** Generic function registration, closure/array-view type arguments, variadic free functions, and generic `sizeof` operands are fixed. Name-collision items remain deferred. |
 | q13 | **PARTIALLY FIXED.** Fixed-array rejection, nested/char-row initialization, and field default construction are fixed. Side-effect folding and owning-value replacement/read semantics remain active. |
 | q17 | **SETTLED as "leave filed".** Both stay design deferrals, neither is a bug. Direction if ever pursued is a non-bitwise-copyable `Thread`, but that is BLOCKED: CFlat has no syntax for a deleted copy. Pool quiescence-as-typestate was not selected. |
 
