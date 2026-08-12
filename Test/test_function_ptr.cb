@@ -568,6 +568,23 @@ int storeStaticOwningValueCapture(int seed)
     return local();
 }
 
+struct StaticOriginNode { int value = 7; };
+
+int consumeStaticOriginNode(move StaticOriginNode* node)
+{
+    int result = node->value;
+    delete node;
+    return result;
+}
+
+int runStaticOriginProbe()
+{
+    static StaticOriginNode* node = new StaticOriginNode();
+    int result = node->value;
+    consumeStaticOriginNode(move node);
+    return result;
+}
+
 string capturedFieldThroughFrame(string p)
 {
     CapFieldBox b = default;
@@ -4092,8 +4109,17 @@ bool testLambdaDefaultLiteral()
     return Test("lambda_default_literal", lambdaDefaultPlusTwo(), 3) == 1;
 }
 
-extern int main()
+extern int main(int argc, char** argv)
 {
+    // The tooling regression harness passes one argument and calls this twice. The second call
+    // must report the first call's move location, rather than a generic null dereference.
+    if (argc > 1)
+    {
+        runStaticOriginProbe();
+        runStaticOriginProbe();
+        return 0;
+    }
+
     int passed = 0;
     int total  = 0;
 

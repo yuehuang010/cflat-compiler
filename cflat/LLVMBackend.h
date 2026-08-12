@@ -2749,6 +2749,8 @@ private:
         TypeAndValue typeValue;
         llvm::DIFile* file;
         unsigned line;
+        llvm::DIScope* scope = nullptr;
+        bool isLocalToUnit = false;
     };
     std::vector<PendingGlobalDI> pendingGlobalDI_;
 

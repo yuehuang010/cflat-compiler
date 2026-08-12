@@ -218,6 +218,38 @@ if !DONE! lss !LAUNCHED! (
     goto WaitLoop
 )
 
+REM Tooling regression: a static-local move must retain its sanitizer origin and DI record.
+set TOOLING_NAME=static_local_tooling
+set TOOLING_LOG=%OUT%\results\%TOOLING_NAME%.log
+set TOOLING_EXE=%OUT%\%TOOLING_NAME%.exe
+set TOOLING_LL=%OUT%\%TOOLING_NAME%.ll
+"%COMPILER%" "%SRC%\test_function_ptr.cb" -i "%LIB%" -o "%TOOLING_EXE%" --out-lli "%TOOLING_LL%" --sanitize=ownership %CFLAT_PLATFORM_FLAG% >"%TOOLING_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: sanitizer probe did not compile >"%OUT%\results\%TOOLING_NAME%.result"
+) else (
+    "%TOOLING_EXE%" static-origin-check >>"%TOOLING_LOG%" 2>&1
+    if not errorlevel 1 (
+        echo FAILED: sanitizer probe did not trap >"%OUT%\results\%TOOLING_NAME%.result"
+    ) else (
+        findstr /c:"ownership violation: value moved at" "%TOOLING_LOG%" >nul
+        if errorlevel 1 (
+            echo FAILED: sanitizer probe lost the move origin >"%OUT%\results\%TOOLING_NAME%.result"
+        ) else (
+            findstr /c:".static.node.own_origin" "%TOOLING_LL%" >nul
+            if errorlevel 1 (
+                echo FAILED: static origin metadata is missing >"%OUT%\results\%TOOLING_NAME%.result"
+            ) else (
+                findstr /r /c:"name: .*node.*isLocal: true" "%TOOLING_LL%" >nul
+                if errorlevel 1 (
+                    echo FAILED: static-local debug metadata is missing >"%OUT%\results\%TOOLING_NAME%.result"
+                ) else (
+                    echo PASS 0.00s >"%OUT%\results\%TOOLING_NAME%.result"
+                )
+            )
+        )
+    )
+)
+
 :Collect
 set /a ERRORS=0
 set FAILED_NAMES=

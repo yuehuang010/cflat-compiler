@@ -190,6 +190,30 @@ else
   tail -n 8 "$RES/_init.log" 2>/dev/null
 fi
 
+# Tooling regression: compile the existing function-pointer fixture with the ownership
+# sanitizer, then verify a static-local move keeps both its runtime origin and DI record.
+tooling_name="static_local_tooling"
+tooling_log="$RES/$tooling_name.log"
+tooling_bin="$RES/$tooling_name.bin"
+tooling_ll="$RES/$tooling_name.ll"
+run_tooling_probe() {
+  $TIMEOUT sh -c 'trap "exit 134" ABRT; "$1" static-origin-check' sh "$tooling_bin" >>"$tooling_log" 2>&1
+  return $?
+}
+if ! $TIMEOUT "$CFLAT" "$SRC/test_function_ptr.cb" -i "$LIB" \
+    --sanitize=ownership -o "$tooling_bin" --out-lli "$tooling_ll" >"$tooling_log" 2>&1; then
+  echo "FAIL compile" >"$RES/$tooling_name.result"
+elif run_tooling_probe; then
+  echo "FAIL: sanitizer probe did not trap" >"$RES/$tooling_name.result"
+elif ! grep -Fq "ownership violation: value moved at" "$tooling_log"; then
+  echo "FAIL: sanitizer probe lost the move origin" >"$RES/$tooling_name.result"
+elif ! grep -Fq ".static.node.own_origin" "$tooling_ll" \
+    || ! grep -Eq 'name: "node".*isLocal: true' "$tooling_ll"; then
+  echo "FAIL: static-local origin or debug metadata is missing" >"$RES/$tooling_name.result"
+else
+  echo "PASS" >"$RES/$tooling_name.result"
+fi
+
 # Collect.
 pass=0; fail=0; failed_names=""
 for r in "$RES"/*.result; do

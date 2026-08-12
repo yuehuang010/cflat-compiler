@@ -198,7 +198,8 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         {
             llvm::DIFile* gvFile = GetDIFileForCurrentSource();
             if (!gvFile) gvFile = diFile;
-            pendingGlobalDI_.push_back({gVar, typeValue, gvFile, (unsigned)currentLine});
+            pendingGlobalDI_.push_back({gVar, typeValue, gvFile, (unsigned)currentLine,
+                compileUnit, false});
         }
 
         return gVar;
@@ -234,6 +235,15 @@ void LLVMBackend::CreateOwnOriginSlot(llvm::Value* storage)
 {
         if (!sanitizeOwnership_ || storage == nullptr) return;
         if (ownOriginSlots_.count(storage)) return;
+        if (auto* global = llvm::dyn_cast<llvm::GlobalVariable>(storage))
+        {
+            auto* origin = new llvm::GlobalVariable(
+                *module, builder->getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+                builder->getInt64(0), global->getName() + ".own_origin");
+            origin->setAlignment(llvm::Align(8));
+            ownOriginSlots_[storage] = origin;
+            return;
+        }
         auto* slot = AllocaAtEntry(builder->getInt64Ty(), nullptr, "own_origin");
         builder->CreateStore(builder->getInt64(0), slot);
         ownOriginSlots_[storage] = slot;
@@ -381,6 +391,14 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
             if (symbolSink_ && !typeValue.VariableName.empty())
                 symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
                                               GetSourceFilePath(), (int)line, 0);
+            CreateOwnOriginSlot(gv);
+            if (diBuilder && diFile && !typeValue.VariableName.empty())
+            {
+                llvm::DIFile* gvFile = GetDIFileForCurrentSource();
+                if (!gvFile) gvFile = diFile;
+                pendingGlobalDI_.push_back({gv, typeValue, gvFile, (unsigned)line,
+                    currentSubprogram, true});
+            }
             return gv;
         }
         // Only annotate when above the natural ABI alignment - otherwise LLVM's

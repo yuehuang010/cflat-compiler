@@ -99,9 +99,10 @@ void LLVMBackend::FinalizeDebugInfo()
         {
             auto* diType = GetDIType(p.typeValue);
             auto* diGVE = diBuilder->createGlobalVariableExpression(
-                compileUnit, p.typeValue.VariableName, p.gVar->getName(),
+                p.scope != nullptr ? p.scope : compileUnit,
+                p.typeValue.VariableName, p.gVar->getName(),
                 p.file, p.line, diType,
-                /*isLocalToUnit*/ false, /*isDefined*/ true);
+                p.isLocalToUnit, /*isDefined*/ true);
             p.gVar->addDebugInfo(diGVE);
         }
         pendingGlobalDI_.clear();
