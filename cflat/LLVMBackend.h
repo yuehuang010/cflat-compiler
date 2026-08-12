@@ -628,6 +628,7 @@ public:
         // Return ownership is semantic metadata carried by a stored function value. It is
         // recovered from the bound function symbol and makes indirect calls follow direct calls.
         bool FuncPtrReturnOwned = false;
+        bool FuncPtrReturnAlias = false;
         /*
          * Number of '*' on a signature component. 0 means NOT RECORDED, never "not a pointer" -
          * `Pointer` already answers that, and many producers (C-interop, WinRT, synthesized

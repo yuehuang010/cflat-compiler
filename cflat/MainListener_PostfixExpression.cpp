@@ -4944,6 +4944,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             resolved.find('*') == std::string::npos)
             returnType.TypeName = resolved;
         returnType.Pointer = lambdaExpectedType.FuncPtrReturnPointer;
+        returnType.IsMove = lambdaExpectedType.FuncPtrReturnOwned;
+        returnType.IsAlias = lambdaExpectedType.FuncPtrReturnAlias;
         // An EMPTY expected return type means no context supplied one (e.g. an immediately-invoked
         // literal). "void" is a fallback, not a declaration, and the two must not be confused: a
         // declared void discards its expression body, an inferred one cannot.
@@ -5325,6 +5327,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         tv.FuncPtrReturnTypeName = returnType.TypeName;
         tv.FuncPtrReturnPointer  = returnType.Pointer;
         tv.FuncPtrReturnOwned = returnType.IsMove;
+        tv.FuncPtrReturnAlias = returnType.IsAlias;
         tv.FuncPtrReturnPointerDepth = returnType.ValuePointerDepth();
         for (const auto& p : params)
         {

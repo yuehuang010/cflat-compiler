@@ -319,6 +319,14 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
             int retStars = PointerDepthOf(fpSpec->pointer());
             tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
             tv.FuncPtrReturnPointer  = retPtr;
+            if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
+            {
+                std::string text = qualifier->getText();
+                if (text != "move" && text != "alias")
+                    LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
+                tv.FuncPtrReturnOwned = text == "move";
+                tv.FuncPtrReturnAlias = text == "alias";
+            }
             tv.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
             tv.FuncPtrReturnResolvedKey = SigComponentResolvedKey(tv.FuncPtrReturnTypeName);
             if (fpSpec->functionPointerParamList() != nullptr)

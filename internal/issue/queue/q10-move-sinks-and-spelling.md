@@ -1,6 +1,6 @@
 # q10: `move` sinks and move spelling
 
-3 active items remain. What counts as an owning sink, and what a `move` parameter accepts, is decided
+2 active items remain. What counts as an owning sink, and what a `move` parameter accepts, is decided
 inconsistently between the direct-call path, the indirect-call path, and the forward-ref scanner -
 and some legal intents cannot be spelled at all. Q10 fixed the indirect POD move false rejection,
 forward/local alias sink inference, function-pointer allocation-alignment propagation, and the
@@ -21,8 +21,8 @@ diagnostic assumed the named-function return syntax was available to a closure.
   borrow and frees caller-owned memory.
 - `p2/deref-of-moved-pointer-guard-inside-callee` - intraprocedural analysis cannot see a
   conditionally-terminating guard inside the callee body.
-- `p2/lambda-return-type-cannot-be-spelled-move-or-alias` - its diagnostic half is fixed; the
-  closure return-type ownership grammar remains a language decision.
+- Fixed: closure return types accept `move` and `alias` qualifiers and propagate ownership through
+  synthesized invokers.
 - `p1/move-of-borrow-into-move-sink-parameter` - a design/ownership rule intentionally remains
   deferred.
 
@@ -42,8 +42,8 @@ Fixed in Q10:
 3. Function-pointer parameter signatures carry allocation alignment through binding, agreement
    checks, and both cache serializers. Indirect calls therefore reject an over-aligned allocation
    when the named sink does not carry the matching clause.
-4. The lambda diagnostic now gives a compilable named-function remedy. The closure return-type
-   grammar remains deferred in `p2/lambda-return-type-cannot-be-spelled-move-or-alias`.
+4. The lambda diagnostic now gives a compilable named-function remedy. Closure return qualifiers
+   are now accepted and carried through indirect calls.
 
 `p1/move-of-borrow-into-move-sink-parameter` and the conditional-termination half of
 `p2/deref-of-moved-pointer-guard-inside-callee` remain filed by design.

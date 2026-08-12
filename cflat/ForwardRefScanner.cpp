@@ -216,6 +216,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.FuncPtrReturnTypeName = fit->FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
+                    declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;

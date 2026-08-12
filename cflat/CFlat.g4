@@ -360,10 +360,17 @@ tupleTypeEntry
 // closure (library type). Both share this rule; the listener distinguishes them
 // by which keyword token is present.
 functionPointerSpecifier
-    : Function '<' typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    : Function '<' functionReturnQualifier? typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
     | Function
-    | Lambda '<' typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
+    | Lambda '<' functionReturnQualifier? typeSpecifier pointer? '(' functionPointerParamList? ')' '>'
     | Lambda
+    ;
+
+// `alias` remains a soft keyword: the listener validates the Identifier text in this
+// qualifier rule instead of reserving it in the lexer.
+functionReturnQualifier
+    : Move
+    | Identifier
     ;
 
 functionPointerParamList

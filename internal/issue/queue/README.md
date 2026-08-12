@@ -27,7 +27,7 @@ member list is empty.
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 3 | Three fixes landed; deferred/design items remain |
+| q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 2 | Closure return qualifiers landed; deferred/design items remain |
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 1 | One last-segment shelling/design item remains; template registration, collisions, and mangling are fixed |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 4 | Constructor and postfix fixes landed; simd, closure suffix, JSON-brace, and sizeof ambiguities remain |

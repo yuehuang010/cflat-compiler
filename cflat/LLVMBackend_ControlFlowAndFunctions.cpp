@@ -455,6 +455,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
+            retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
             auto* retTy   = GetType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
@@ -497,6 +498,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
+        retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
         auto* retTy     = GetType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");

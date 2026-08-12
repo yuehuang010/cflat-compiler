@@ -289,6 +289,14 @@ std::string MainListener::EncodeClosureCodegen(CFlatParser::FunctionPointerSpeci
                 std::format("function type return '{}'", retName), retStars));
         sig.FuncPtrReturnTypeName = retName;
         sig.FuncPtrReturnPointer  = retPtr;
+        if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
+        {
+            std::string text = qualifier->getText();
+            if (text != "move" && text != "alias")
+                LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
+            sig.FuncPtrReturnOwned = text == "move";
+            sig.FuncPtrReturnAlias = text == "alias";
+        }
         sig.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
         sig.FuncPtrReturnResolvedKey = SigComponentResolvedKey(retName);
         std::vector<std::pair<std::string, int>> encParams;
@@ -478,6 +486,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         bool retPtr = fpSpec->pointer() != nullptr;
                         int retStars = PointerDepthOf(fpSpec->pointer());
                         declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
+                        if (auto* qualifier = fpSpec->functionReturnQualifier(); qualifier != nullptr)
+                        {
+                            std::string text = qualifier->getText();
+                            if (text != "move" && text != "alias")
+                                LogErrorContext(qualifier, "function return qualifier must be 'move' or 'alias'");
+                            declType.FuncPtrReturnOwned = text == "move";
+                            declType.FuncPtrReturnAlias = text == "alias";
+                        }
                         // Over the cap here too: no declarable function can supply this signature.
                         if (retStars > PointerDepthCap)
                             LogErrorContext(fpSpec, PointerDepthCapMessage(
@@ -628,6 +644,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.FuncPtrReturnTypeName = fit->FuncPtrReturnTypeName;
                     declType.FuncPtrReturnPointer  = fit->FuncPtrReturnPointer;
                     declType.FuncPtrReturnOwned = fit->FuncPtrReturnOwned;
+                    declType.FuncPtrReturnAlias = fit->FuncPtrReturnAlias;
                     declType.FuncPtrReturnPointerDepth = fit->FuncPtrReturnPointerDepth;
                     declType.FuncPtrParams         = fit->FuncPtrParams;
                     declType.Pointer               = declSpec->pointer() != nullptr;
@@ -3418,6 +3435,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // RHS's declared-pointer shape after rightNV itself goes out of scope.
                             bool rhsIsPointer = false;
                             bool rhsFuncPtrReturnOwned = false;
+                            bool rhsFuncPtrReturnAlias = false;
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
@@ -3601,6 +3619,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcRawArrayLength = rightNV.RawArrayLength;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
+                                rhsFuncPtrReturnAlias = rightNV.TypeAndValue.FuncPtrReturnAlias;
                                 rhsIsThinFnPtr = rightNV.TypeAndValue.IsThinFnPtr();
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
@@ -3658,6 +3677,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     typeAndValue.FuncPtrReturnTypeName = inferred.FuncPtrReturnTypeName;
                                     typeAndValue.FuncPtrReturnPointer = inferred.FuncPtrReturnPointer;
                                     typeAndValue.FuncPtrReturnOwned = inferred.FuncPtrReturnOwned;
+                                    typeAndValue.FuncPtrReturnAlias = inferred.FuncPtrReturnAlias;
                                     typeAndValue.FuncPtrParams = inferred.FuncPtrParams;
                                 }
                             }
@@ -3685,6 +3705,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     auto boundSig = compiler->FuncPtrSigOfBoundFunction(funcName, fn);
                                     if (boundSig.IsFunctionPointer)
                                         typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
+                                        typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
                                     VerifyFuncPtrAssignmentMoveFlags(funcName, typeAndValue, assignmentExpression);
                                     // thin `function<T>`: bare fn ptr; fat `Lambda<T>`: closure fat struct.
                                     right = typeAndValue.IsThinFnPtr()
@@ -3705,6 +3726,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     auto boundSig = compiler->FuncPtrSigOfBoundFunction(genericFuncCallerName, genericFn);
                                     if (boundSig.IsFunctionPointer)
                                         typeAndValue.FuncPtrReturnOwned = boundSig.FuncPtrReturnOwned;
+                                        typeAndValue.FuncPtrReturnAlias = boundSig.FuncPtrReturnAlias;
                                     VerifyFuncPtrAssignmentMoveFlags(genericFuncCallerName, typeAndValue, assignmentExpression);
                                     right = typeAndValue.IsThinFnPtr()
                                           ? compiler->MakeThinFnPtrValue(genericFn, typeAndValue)
@@ -3773,6 +3795,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     AdoptInferredParamSinks(typeAndValue, rhsFuncPtrParams);
                                     typeAndValue.FuncPtrReturnOwned = rhsFuncPtrReturnOwned;
+                                    typeAndValue.FuncPtrReturnAlias = rhsFuncPtrReturnAlias;
                                 }
                                 else if (boundNamedFn != nullptr)
                                 {

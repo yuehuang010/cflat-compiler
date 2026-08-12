@@ -791,6 +791,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
             j["fpr"] = tv.FuncPtrReturnTypeName;
             if (tv.FuncPtrReturnPointer) j["fprp"] = true;
             if (tv.FuncPtrReturnOwned) j["fpro"] = true;
+            if (tv.FuncPtrReturnAlias) j["fpra"] = true;
             nlohmann::json fps = nlohmann::json::array();
             for (const auto& p : tv.FuncPtrParams)
             {
@@ -828,6 +829,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
             tv.FuncPtrReturnTypeName = j.value("fpr",  std::string{});
             tv.FuncPtrReturnPointer  = j.value("fprp", false);
             tv.FuncPtrReturnOwned = j.value("fpro", false);
+            tv.FuncPtrReturnAlias = j.value("fpra", false);
             if (j.contains("fps"))
                 for (const auto& pj : j["fps"])
                 {
