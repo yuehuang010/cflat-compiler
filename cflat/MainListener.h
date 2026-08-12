@@ -3520,7 +3520,8 @@ public:
      * handed. A NULL box is neutral - it owns nothing, deleting it is a no-op - so it neither arms
      * nor poisons the tag. Everything else either proves a borrow or poisons the local for good.
      */
-    void TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue);
+    void TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue,
+                                   const LLVMBackend::NamedVariable* sourceNV = nullptr);
 
     // True when any boxing site reachable through `fatValue` (following '?:' joins) boxed a heap
     // object whose ownership it took over. Answers a join through the arms' data pointers.

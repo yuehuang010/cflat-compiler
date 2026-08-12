@@ -1269,10 +1269,17 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             if (auto* load = llvm::dyn_cast<llvm::LoadInst>(right))
                 if (auto* slot = llvm::dyn_cast<llvm::AllocaInst>(
                         load->getPointerOperand()->stripPointerCasts()))
+                {
+                    const auto* slotNV = compiler->FindVariableByStorage(slot);
                     compiler->RecordPendingReturnDangleCheck(
                         slot, static_cast<int>(errCtx->getStart()->getLine()),
                         static_cast<int>(errCtx->getStart()->getCharPositionInLine()),
-                        compiler->currentFunctionReturnTypeName);
+                        compiler->currentFunctionReturnTypeName,
+                        slotNV != nullptr && slotNV->InterfaceBoxFrameStorage,
+                        slotNV == nullptr || slotNV->InterfaceBoxReturnProvenanceUnknown,
+                        slotNV == nullptr ? std::string()
+                            : slotNV->InterfaceBoxFrameStorageClassName);
+                }
         }
         if (auto* fatTy = compiler->GetFatPtrType();
             right != nullptr && fatTy != nullptr && compiler->currentFunction != nullptr

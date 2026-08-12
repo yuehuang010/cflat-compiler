@@ -534,7 +534,8 @@ std::string MainListener::DescribeInterfaceBoxOwners(const std::vector<std::stri
         return text;
     }
 
-void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue) {
+void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::Value* fatValue,
+                                              const LLVMBackend::NamedVariable* sourceNV) {
         if (varName.empty() || fatValue == nullptr) return;
         if (auto* constant = llvm::dyn_cast<llvm::Constant>(fatValue);
             constant != nullptr && constant->isNullValue())
@@ -546,6 +547,30 @@ void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::V
                                                 DescribeInterfaceBoxOwners(sourceNames));
         compilerLLVM->SetInterfaceBoxBorrowSlots(
             varName, borrowed ? ownerSlots : std::vector<llvm::Value*>{});
+
+        bool frameStorage = false;
+        bool unknown = false;
+        std::string className;
+        if (auto* constant = llvm::dyn_cast<llvm::Constant>(fatValue);
+            constant != nullptr && constant->isNullValue())
+            unknown = true;
+        else if (const auto* record = compilerLLVM->FindInterfaceBoxByFatValue(fatValue);
+                 record != nullptr)
+        {
+            frameStorage = record->Source == LLVMBackend::InterfaceBoxSource::FrameStorage;
+            className = record->SourceClassName;
+            unknown = !frameStorage;
+        }
+        else if (sourceNV != nullptr)
+        {
+            frameStorage = sourceNV->InterfaceBoxFrameStorage;
+            unknown = sourceNV->InterfaceBoxReturnProvenanceUnknown;
+            className = sourceNV->InterfaceBoxFrameStorageClassName;
+        }
+        else
+            unknown = true;
+        compilerLLVM->SetInterfaceBoxReturnDangleProvenance(varName, frameStorage, unknown,
+                                                              className);
     }
 
 bool MainListener::FatValueOwnsHeapBox(llvm::Value* fatValue) {
@@ -1979,7 +2004,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && namedVar.TypeAndValue.IsFatInterfaceValue()
                 && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
                 && llvm::isa_and_nonnull<llvm::AllocaInst>(destination))
-                TagInterfaceBoxProvenance(namedVar.CallerName, right);
+                TagInterfaceBoxProvenance(namedVar.CallerName, right, &rightNV);
 
             // D5 (assignment leg): a `unique` interface local owns a heap-boxed object, and its
             // scope-exit teardown frees the fat-ptr data pointer. Reassigning it from a borrowed
@@ -9536,6 +9561,9 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.BorrowedInterfaceBox           = src.BorrowedInterfaceBox;
         dst.BorrowedInterfaceBoxSource     = src.BorrowedInterfaceBoxSource;
         dst.BorrowedInterfaceBoxSlots      = src.BorrowedInterfaceBoxSlots;
+        dst.InterfaceBoxFrameStorage        = src.InterfaceBoxFrameStorage;
+        dst.InterfaceBoxReturnProvenanceUnknown = src.InterfaceBoxReturnProvenanceUnknown;
+        dst.InterfaceBoxFrameStorageClassName = src.InterfaceBoxFrameStorageClassName;
         dst.OwnedStringBorrowBlock         = src.OwnedStringBorrowBlock;
         dst.OwnedStringBorrowFunction      = src.OwnedStringBorrowFunction;
         dst.OwnedElementBorrowBlock        = src.OwnedElementBorrowBlock;

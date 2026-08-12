@@ -21,12 +21,12 @@ member list is empty.
 | q07 | Facts not retired on rebind | `f3a135f` |
 | q08 | for-in loop variable | `3a663e1` |
 | q11 | Global, program-lifetime and static storage | this commit |
+| q09 | Return-dangle and escape analysis | this commit |
 
 ## Suggested order
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 1 | UNBLOCKED - its q02 prerequisite landed in `b911ccc`; the item was skipped on a stale blocker |
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 3 | Three fixes landed; deferred/design items remain |
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 4 | UNBLOCKED - collisions ruled a hard error; `Test/test_generics.cb` may be renamed |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |

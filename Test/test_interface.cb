@@ -3355,9 +3355,22 @@ move IShape dangleAdoptMovePointerParam(move Square* p)
     return p as IShape;
 }
 
+// A null writer remains accept evidence: this function returns null on the exercised path.
+IShape returnFrameBoxWithNullRebind(int n)
+{
+    Square loc; loc.s = n;
+    IShape r = loc as IShape;
+    if (n < 0) { r = nullptr; }
+    return r;
+}
+
 bool testInterfaceReturnDangleCorpus()
 {
     bool result = true;
+
+    IShape nullRebind = returnFrameBoxWithNullRebind(-1);
+    result &= Test("return frame box null rebind", nullRebind == nullptr ? 1 : 0, 1);
+    delete nullRebind;
 
     IShape v01 = dangleThenArmEarlyReturn(0);
     result &= Test("dangle_then_arm_early_return", v01.area(), 81);

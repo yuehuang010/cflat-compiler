@@ -59,3 +59,15 @@ expect_error("cannot return local value 'Square' as interface 'IShape'") {
 expect_error("cannot return local value 'Square' as interface 'IShape'") {
     IShape viaLocalPlain(int n) { Square loc; loc.s = n; IShape r = loc; return r; }
 }
+
+// A method dispatch is an extra user of the interface slot. It must not turn a
+// frame-origin binding into accept evidence for the deferred return check.
+expect_error("cannot return local value 'Square' as interface 'IShape'") {
+    IShape viaMethodUser(int n)
+    {
+        Square loc; loc.s = n;
+        IShape r = loc as IShape;
+        r.area();
+        return r;
+    }
+}

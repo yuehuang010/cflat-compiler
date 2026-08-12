@@ -3035,6 +3035,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
 
                 llvm::Value* right = nullptr;
+                LLVMBackend::NamedVariable interfaceSourceNV;
+                bool haveInterfaceSourceNV = false;
                 bool srcIsUnsigned = false;
                 bool srcIsBorrowed = false;
                 std::string srcBorrowedOrigin;
@@ -3305,6 +3307,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                            interfaceSourceNV = rightNV;
+                            haveInterfaceSourceNV = true;
                             // Interface decl-init is its OWN branch, so the escape gate in the
                             // else below never sees `IShape s = makeIBox().t;` (it dangled).
                             if (!global_scope)
@@ -4256,7 +4260,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // Declaration leg of the borrowed-box tag: `right` is the fat value this local
                     // is about to receive. See TagInterfaceBoxProvenance.
                     if (typeAndValue.IsFatInterfaceValue())
-                        TagInterfaceBoxProvenance(name, right);
+                        TagInterfaceBoxProvenance(
+                            name, right, haveInterfaceSourceNV ? &interfaceSourceNV : nullptr);
 
                     if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue);

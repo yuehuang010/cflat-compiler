@@ -575,14 +575,35 @@ bool LLVMBackend::JoinDeliversDataValue(const llvm::Value* value, size_t occurre
     }
 
 void LLVMBackend::RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int line, int col,
-                                        const std::string& ifaceName)
+                                        const std::string& ifaceName,
+                                        bool frameStorageProvenance,
+                                        bool provenanceUnknown,
+                                        const std::string& frameStorageClassName)
 {
         if (!slot || !builder) return;
         llvm::BasicBlock* bb = builder->GetInsertBlock();
         if (!bb || !bb->getParent()) return;
         pendingReturnDangleChecks_[bb->getParent()].push_back(
-            { bb->getParent(), slot, line, col, ifaceName });
-    }
+            { bb->getParent(), slot, line, col, ifaceName, frameStorageProvenance,
+              provenanceUnknown, frameStorageClassName });
+}
+
+void LLVMBackend::SetInterfaceBoxReturnDangleProvenance(const std::string& name,
+                                                         bool frameStorage, bool unknown,
+                                                         const std::string& className)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(name);
+            if (it == frame.namedVariable.end()) continue;
+            it->second.InterfaceBoxFrameStorage = frameStorage && !unknown;
+            it->second.InterfaceBoxReturnProvenanceUnknown = unknown;
+            it->second.InterfaceBoxFrameStorageClassName =
+                it->second.InterfaceBoxFrameStorage ? className : std::string();
+            return;
+        }
+}
 
 void LLVMBackend::DiscardPendingReturnDangleChecks(llvm::Function* F)
 {

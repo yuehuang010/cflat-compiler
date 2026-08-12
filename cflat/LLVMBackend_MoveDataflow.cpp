@@ -148,6 +148,39 @@ void LLVMBackend::RunInterfaceReturnDangleCheck(llvm::Function* F)
         for (const auto& rec : pending)
         {
             if (!rec.Slot) continue;
+            bool hasNonFrameWriter = false;
+            for (llvm::User* u : rec.Slot->users())
+            {
+                const auto* store = llvm::dyn_cast<llvm::StoreInst>(u);
+                if (store == nullptr || store->getPointerOperand() != rec.Slot) continue;
+                const llvm::Value* v = store->getValueOperand();
+                bool isNullish = llvm::isa<llvm::UndefValue>(v)
+                    || llvm::isa<llvm::ConstantAggregateZero>(v)
+                    || (llvm::isa<llvm::Constant>(v)
+                        && llvm::cast<llvm::Constant>(v)->isNullValue());
+                if (isNullish) { hasNonFrameWriter = true; break; }
+                const InterfaceBoxRecord* box = FindInterfaceBoxByFatValue(v);
+                if (box == nullptr || box->Source != InterfaceBoxSource::FrameStorage)
+                {
+                    hasNonFrameWriter = true;
+                    break;
+                }
+            }
+            if (rec.FrameStorageProvenance && !rec.ProvenanceUnknown && !hasNonFrameWriter)
+            {
+                SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
+                if (rec.FrameStorageClassName.empty())
+                    LogError(std::format(
+                        "cannot return a local value as interface '{}' - the interface fat pointer "
+                        "would dangle once this function returns; allocate the object on the heap "
+                        "and return the pointer", rec.InterfaceName));
+                else
+                    LogError(std::format(
+                        "cannot return local value '{}' as interface '{}' - the interface fat "
+                        "pointer would dangle once this function returns; allocate on the heap "
+                        "('new {}') and return the pointer", rec.FrameStorageClassName,
+                        rec.InterfaceName, rec.FrameStorageClassName));
+            }
             bool tainted = false;
             bool accepted = false;
             std::string taintClassName;

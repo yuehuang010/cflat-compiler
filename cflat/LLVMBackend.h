@@ -1044,6 +1044,11 @@ public:
         // Owner slots behind a boxed join. Re-ask PointerRebound at delete time so a later
         // null/rebind retires the stale boxed proof like a raw join.
         std::vector<llvm::Value*> BorrowedInterfaceBoxSlots;
+        // Return-dangle provenance recorded at every interface binding site. A frame box is
+        // actionable only while no later binding site supplied unknown/non-frame provenance.
+        bool InterfaceBoxFrameStorage = false;
+        bool InterfaceBoxReturnProvenanceUnknown = false;
+        std::string InterfaceBoxFrameStorageClassName;
         // Sticky: set once any binding hands this local a box that is NOT proven, and never cleared.
         // From then on the local can never be rejected - walk order over the AST is not control flow.
         bool InterfaceBoxProvenanceUnknown = false;
@@ -1963,11 +1968,20 @@ private:
         int Line = 0;
         int Col = 0;
         std::string InterfaceName;
+        bool FrameStorageProvenance = false;
+        bool ProvenanceUnknown = true;
+        std::string FrameStorageClassName;
     };
     std::unordered_map<llvm::Function*, std::vector<PendingReturnDangleCheck>> pendingReturnDangleChecks_;
 
     void RecordPendingReturnDangleCheck(llvm::AllocaInst* slot, int line, int col,
-                                        const std::string& ifaceName);
+                                        const std::string& ifaceName,
+                                        bool frameStorageProvenance,
+                                        bool provenanceUnknown,
+                                        const std::string& frameStorageClassName);
+
+    void SetInterfaceBoxReturnDangleProvenance(const std::string& name, bool frameStorage,
+                                               bool unknown, const std::string& className);
 
     // Drop a function's pending return-dangle checks without analyzing them (an aborted body
     // has a partial CFG - same rationale as DiscardNullDerefEvents).
