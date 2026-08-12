@@ -2478,13 +2478,45 @@ void MainListener::ValidateAllocAlignField(const LLVMBackend::DeclTypeAndValue& 
 
 // True when a pointer value roots at a stack allocation - the address of a local, of one of its
 // fields, or of an element of a local array. Globals, heap results and loads root elsewhere.
-static bool PointsIntoStackFrame(llvm::Value* value)
+bool MainListener::PointsIntoStackFrame(llvm::Value* value)
 {
         if (value == nullptr || !value->getType()->isPointerTy()) return false;
         value = value->stripPointerCasts();
         while (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value))
             value = gep->getPointerOperand()->stripPointerCasts();
         return llvm::isa<llvm::AllocaInst>(value);
+    }
+
+bool MainListener::IsProgramLifetimeStorage(
+        const LLVMBackend::NamedVariable& nv) const {
+        if (nv.IsStaticLocal) return true;
+        llvm::Value* storage = nv.Storage;
+        for (int depth = 0; storage != nullptr && depth < 64; ++depth)
+        {
+            storage = storage->stripPointerCasts();
+            if (llvm::isa<llvm::GlobalVariable>(storage)) return true;
+            auto* gep = llvm::dyn_cast<llvm::GEPOperator>(storage);
+            if (gep == nullptr) return false;
+            storage = gep->getPointerOperand();
+        }
+        return false;
+    }
+
+void MainListener::RejectLambdaReferenceCaptureEscape(
+        bool destinationHasProgramLifetime,
+        const LLVMBackend::NamedVariable& source,
+        antlr4::ParserRuleContext* ctx) {
+        if (!destinationHasProgramLifetime || source.LambdaReferenceCaptureNames.empty()) return;
+        std::string captures;
+        for (const auto& name : source.LambdaReferenceCaptureNames)
+        {
+            if (!captures.empty()) captures += ", ";
+            captures += "'" + name + "'";
+        }
+        LogErrorContext(ctx, std::format(
+            "cannot store a lambda with a by-reference capture of non-static local {} into "
+            "program-lifetime storage; the closure would access a dead stack frame",
+            captures));
     }
 
 void MainListener::OpenStaticLocalGuard(StaticLocalGuard& guard, const std::string& varName) {
@@ -2994,6 +3026,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcIsMove = false;
                 bool srcMovedFromSlot = false;
                 std::string srcCallerName;
+                std::vector<std::string> rhsLambdaCaptureNames;
+                std::vector<std::string> rhsLambdaReferenceCaptureNames;
                 // True when the initializer is (or transitively aliases) an owning string FIELD,
                 // e.g. `string t = b.name;`. Such a local borrows a heap buffer some struct still
                 // owns, so storing it into another field would double-free - tracked so the
@@ -3315,7 +3349,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             std::vector<LLVMBackend::TypeAndValue::FuncPtrParam> rhsFuncPtrParams;
                             // Captured-variable names of an RHS lambda literal, hoisted out of the
                             // rightNV scope so the fat->thin narrowing gate below can name them.
-                            std::vector<std::string> rhsLambdaCaptureNames;
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 right = LoadNamedVariable(rightNV);
@@ -3498,6 +3531,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 rhsIsPointer = rightNV.TypeAndValue.Pointer;
                                 rhsFuncPtrParams = rightNV.TypeAndValue.FuncPtrParams;
                                 rhsLambdaCaptureNames = rightNV.LambdaCaptureNames;
+                                rhsLambdaReferenceCaptureNames = rightNV.LambdaReferenceCaptureNames;
+                                RejectLambdaReferenceCaptureEscape(
+                                    isStaticLocal, rightNV, assignmentExpression);
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
                                 RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV.TypeAndValue);
                                 // Declarator-init leg of the code-value store gate: `Rec* r = w;`
@@ -4099,6 +4135,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
+                    if (typeAndValue.IsFunctionPointer)
+                    {
+                        auto& local = compiler->stackNamedVariable.back().namedVariable[name];
+                        local.LambdaCaptureNames = rhsLambdaCaptureNames;
+                        local.LambdaReferenceCaptureNames = rhsLambdaReferenceCaptureNames;
+                    }
 
                     /*
                      * A `static` local outlives the frame, so a pointer / array view it holds must

@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 69 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 67 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -25,7 +25,7 @@ member list is empty.
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 3 | |
+| q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 1 | One blocked p1 item remains; two always-wrong escapes are fixed |
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 6 | |
 | q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 4 | |
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 11 | Disjoint from ownership; parallelizable |
@@ -45,7 +45,7 @@ fix work. Status:
 |--------|--------|
 | q06 | **SETTLED - no decision was needed.** The repo had already ratified it: unknown ACCEPTS. The bucket file's proposal to make unknown reject was wrong and is corrected. The interface half of the p1 item is CLOSED, not open. |
 | q08 | **SETTLED and fixed.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. The landed implementation also rejects overwriting the borrowed collection storage and deep-copies returned values. |
-| q09 | **SETTLED - no decision was needed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. Two of the three members are always-wrong shapes that can be rejected without touching the polarity; the third is blocked on q02. |
+| q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third remains filed and blocked on q02. |
 | q11 | **BLOCKED.** Needs a design discussion: a global's lifetime cannot easily be proven, so a destructor cannot easily be run for it. Do not start this bucket. |
 | q13 | **SETTLED.** Multi-dim fixed arrays: nested braces only (`{{1,2,3},{4,5,6}}`), plus string rows for char arrays (`{"ab","cd"}`). A flat list for a multi-dim array is an ERROR naming the expected shape. |
 | q17 | **SETTLED as "leave filed".** Both stay design deferrals, neither is a bug. Direction if ever pursued is a non-bitwise-copyable `Thread`, but that is BLOCKED: CFlat has no syntax for a deleted copy. Pool quiescence-as-typestate was not selected. |

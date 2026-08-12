@@ -520,6 +520,19 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
+        // Check before the implicit whole-local move below clears Storage. An alias
+        // return must preserve the borrow, so a frame-local string cannot be moved
+        // out as an owned value and then escape the frame.
+        if (compiler->currentFunctionReturnTV.IsAlias
+            && NamedVarIsString(returnNV)
+            && PointsIntoStackFrame(returnNV.Storage)
+            && !compiler->IsBorrowStringParamStorage(returnNV.Storage))
+        {
+            LogErrorContext(errCtx,
+                "cannot return an 'alias' string value that borrows frame-local storage; "
+                "the buffer would dangle when the function returns");
+        }
+
         // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
         // return expression is a BARE IDENTIFIER naming a local (or by-value parameter)
         // whose owning value-struct type matches the function's return type; then it is

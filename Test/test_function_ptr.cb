@@ -551,6 +551,23 @@ string capturedThroughFrame(string p)
 
 // The same borrow reached through a FIELD of a captured owning struct.
 class CapFieldBox { string s = default; ~CapFieldBox() { } };
+Lambda<int()> globalOwningValueCapture = default;
+
+int storeGlobalOwningValueCapture(int seed)
+{
+    string s = seed.toString();
+    globalOwningValueCapture = () => { return s.length(); };
+    return globalOwningValueCapture();
+}
+
+int storeStaticOwningValueCapture(int seed)
+{
+    string s = seed.toString();
+    static Lambda<int()> local = default;
+    local = () => { return s.length(); };
+    return local();
+}
+
 string capturedFieldThroughFrame(string p)
 {
     CapFieldBox b = default;
@@ -571,6 +588,10 @@ bool testReturnCapturedOwningValue()
         result &= Test("captured string returned (expr body)", r, "xyz");
         result &= Test("captured string source intact",        s, "xyz");
     }
+
+    // By-value captures remain safe when stored in global or static program-lifetime slots.
+    result &= Test("global owning-value capture", storeGlobalOwningValueCapture(11), 2);
+    result &= Test("static owning-value capture", storeStaticOwningValueCapture(22), 2);
     {
         string s = "xyz";
         Lambda<string()> g = () => { return s; };

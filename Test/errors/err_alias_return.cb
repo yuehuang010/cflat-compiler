@@ -8,6 +8,30 @@ import "list.cb";
 
 struct Token { string text = default; };
 
+alias string frameArrayString()
+{
+    string[2] dst;
+    dst[0] = "ab" + "cd";
+    expect_error("cannot return an 'alias' string value");
+    return dst[0];
+}
+
+alias string frameWholeString()
+{
+    string s = "ab" + "cd";
+    expect_error("cannot return an 'alias' string value");
+    return s;
+}
+
+struct AliasStringBox { string s = default; };
+alias string frameFieldString()
+{
+    AliasStringBox b = default;
+    b.s = "ab" + "cd";
+    expect_error("cannot return an 'alias' string value");
+    return b.s;
+}
+
 Token firstToken(list<Token> toks)
 {
     expect_error("cannot return an 'alias' value");

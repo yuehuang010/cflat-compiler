@@ -2623,6 +2623,7 @@ void LLVMBackend::ResetForReanalysis()
     lastCallBondByAddress = false;
     lastCallBondedSources.clear();
     lastCallLambdaCaptureNames.clear();
+    lastLambdaReferenceCaptureNames.clear();
     lastCallRequiredLocks.clear();
     lastCallParameterNames.clear();
     pendingGlobalGuardedBy.clear();

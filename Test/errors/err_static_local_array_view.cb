@@ -2,6 +2,26 @@
 // alloca in the first call's frame, so the global view would dangle from the second
 // call on. Rejected instead of silently emitting the dangling view.
 struct StatP { int a = default; };
+struct LambdaEscapeBox { int n = default; };
+Lambda<int()> lambdaEscapeGlobal = default;
+
+expect_error("cannot store a lambda with a by-reference capture") {
+    int triggerGlobalLambdaEscape() {
+        LambdaEscapeBox b = LambdaEscapeBox();
+        b.n = 11;
+        lambdaEscapeGlobal = () => { return b.n; };
+        return 0;
+    }
+}
+
+expect_error("cannot store a lambda with a by-reference capture") {
+    int triggerStaticLambdaEscape() {
+        LambdaEscapeBox b = LambdaEscapeBox();
+        b.n = 22;
+        static Lambda<int()> localEscape = () => { return b.n; };
+        return 0;
+    }
+}
 
 extern int main()
 {

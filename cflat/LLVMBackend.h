@@ -1099,6 +1099,8 @@ public:
         // Capture names for lambda literals, in capture order. Empty for non-capturing lambdas.
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
+        // By-reference lambda captures that point at non-static storage.
+        std::vector<std::string> LambdaReferenceCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
         // Range-for variables borrow the current collection element. The slot is rebound for each
         // iteration, so it must never be treated as an owning value or a movable whole-local.
@@ -2183,6 +2185,7 @@ private:
     // Capture names of the last lambda literal, for the C function-pointer diagnostic. Uses the
     // compiler-level channel because lastLambdaType is cleared too early by postfix processing.
     std::vector<std::string> lastCallLambdaCaptureNames;
+    std::vector<std::string> lastLambdaReferenceCaptureNames;
     std::vector<std::string> lastCallRequiredLocks;  // RequiredLocks of the last resolved overload (for call-site lock checking)
     std::vector<std::string> lastCallParameterNames; // VariableName of each parameter of the last resolved overload
     // Set while parsing the declarations of a file-scope lock group; CreateGlobalVariable

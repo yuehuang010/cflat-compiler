@@ -1375,8 +1375,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         {
                             namedVar.TypeAndValue = lastLambdaType;
                             namedVar.LambdaCaptureNames = Compiler(ctx)->lastCallLambdaCaptureNames;
+                            namedVar.LambdaReferenceCaptureNames =
+                                Compiler(ctx)->lastLambdaReferenceCaptureNames;
                             lastLambdaType = {};
                             Compiler(ctx)->lastCallLambdaCaptureNames.clear();
+                            Compiler(ctx)->lastLambdaReferenceCaptureNames.clear();
                         }
 
                         if (namedVar.TypeAndValue.IsInterface)
@@ -4876,6 +4879,7 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                 ci.Name = name;
                                 ci.TV   = nv.TypeAndValue;
                                 ci.OuterStorage = nv.Storage;
+                                ci.SourceIsStaticLocal = nv.IsStaticLocal;
                                 // string is a value type ({i8*,i32}): its methods take string by value,
                                 // so it must be value-captured like primitives to avoid pointer mismatch.
                                 // Owning value types with a genuine deep copy (list/dictionary/owning
@@ -5382,8 +5386,13 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // parameter can report exactly which variables block the conversion. Mirror it onto
         // the compiler-level side-channel since only the value survives into the arg list.
         for (const auto& cap : captures)
+        {
             result.LambdaCaptureNames.push_back(cap.Name);
+            if (cap.ByReference && !cap.SourceIsStaticLocal)
+                result.LambdaReferenceCaptureNames.push_back(cap.Name);
+        }
         compiler->lastCallLambdaCaptureNames = result.LambdaCaptureNames;
+        compiler->lastLambdaReferenceCaptureNames = result.LambdaReferenceCaptureNames;
 
         // Phase 6: Bond tracking - reference-captured variables are held by pointer.
         // The lambda borrows stack addresses that cannot outlive their source scope.

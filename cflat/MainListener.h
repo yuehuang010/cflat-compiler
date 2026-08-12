@@ -3180,6 +3180,13 @@ public:
     static bool SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
                                             const LLVMBackend::NamedVariable& nv);
 
+    bool IsProgramLifetimeStorage(const LLVMBackend::NamedVariable& nv) const;
+    static bool PointsIntoStackFrame(llvm::Value* value);
+    void RejectLambdaReferenceCaptureEscape(
+        bool destinationHasProgramLifetime,
+        const LLVMBackend::NamedVariable& source,
+        antlr4::ParserRuleContext* ctx);
+
     /*
      * Stamp the unique-field borrow provenance onto a call RESULT that was never bound to a local.
      * The declaration and '=' paths classify while BUILDING a binding, so a temporary RHS
@@ -4625,6 +4632,7 @@ public:
         bool ByReference;       // true for non-pointer struct types (capture by reference)
         llvm::Value* OuterStorage;
         bool IsThis = false;    // the implicit method self pointer; capture by value, re-register as 'this'
+        bool SourceIsStaticLocal = false;
     };
 
     // Walk the lambda body AST and collect variables captured from the enclosing function scope.

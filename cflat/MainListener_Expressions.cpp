@@ -1457,6 +1457,22 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->pendingInitAllocAlign = targetAllocAlign;
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            RejectLambdaReferenceCaptureEscape(
+                IsProgramLifetimeStorage(namedVar), rightNV, ctx);
+            if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
+                && namedVar.FieldName.empty() && !namedVar.CallerName.empty())
+            {
+                for (auto frameIt = compiler->stackNamedVariable.rbegin();
+                     frameIt != compiler->stackNamedVariable.rend(); ++frameIt)
+                {
+                    auto dstIt = frameIt->namedVariable.find(namedVar.CallerName);
+                    if (dstIt == frameIt->namedVariable.end() || dstIt->second.Storage != destination)
+                        continue;
+                    dstIt->second.LambdaCaptureNames = rightNV.LambdaCaptureNames;
+                    dstIt->second.LambdaReferenceCaptureNames = rightNV.LambdaReferenceCaptureNames;
+                    break;
+                }
+            }
             // An UNBOUND call result carries no binding, so the declaration/'=' classification
             // never saw it; stamp it here so the store doors read the same borrow facts.
             ApplyCallResultBorrowProvenance(compiler, rightNV);
@@ -9217,6 +9233,8 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.OwnedElementBorrowFunction     = src.OwnedElementBorrowFunction;
         dst.BondDeclBlock                  = src.BondDeclBlock;
         dst.BondDeclFunction               = src.BondDeclFunction;
+        dst.LambdaCaptureNames             = src.LambdaCaptureNames;
+        dst.LambdaReferenceCaptureNames    = src.LambdaReferenceCaptureNames;
     }
 
 bool MainListener::IsRedundantCastOfSource(const LLVMBackend::TypeAndValue& src,
