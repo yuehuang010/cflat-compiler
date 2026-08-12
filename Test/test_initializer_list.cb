@@ -118,6 +118,10 @@ struct SviD      { int v = default; ~SviD() { sviDtors = sviDtors + 1; } };  // 
 int sviNews = 0;
 struct SviT      { int x = default; };
 SviT* sviMkT()   { sviNews = sviNews + 1; SviT* p = new SviT(); p.x = 9; return p; }
+
+int braceOverrideDtors = 0;
+struct BraceOverrideNode { ~BraceOverrideNode() { braceOverrideDtors = braceOverrideDtors + 1; } };
+struct BraceOverrideOwner { unique BraceOverrideNode* p = new BraceOverrideNode(); int v = default; };
 struct SviU      { unique SviT* p = sviMkT(); int v = default; };
 struct SviPod    { int a = 1; int b = 2; };                  // POD anchor: keeps seed + memcpy
 // The override EXPRESSION's own side effects: re-evaluated per slot on the owning arm, evaluated
@@ -661,6 +665,14 @@ extern int main()
     total++; passed += Test("POD value-init override expression runs once", sviOv, 1);
     total++; passed += Test("POD value-init override value splatted",
                             svipo[0].b + svipo[1].b + svipo[2].b, 3);
+
+    // A named override replaces an already default-constructed unique field. Both the seed and
+    // the replacement must be destroyed exactly once.
+    braceOverrideDtors = 0;
+    {
+        BraceOverrideOwner owner = { p = new BraceOverrideNode() };
+    }
+    total++; passed += Test("brace override releases constructed owner", braceOverrideDtors, 2);
 
     // ----- Accept cells, frozen: correct before the fix and must not move -----
     // Value freeze only: a regression here emits no store at all, and the undef read still came

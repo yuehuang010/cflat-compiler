@@ -7098,6 +7098,26 @@ bool MainListener::EmitOneFieldInit(
         else
         {
             auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
+            // The aggregate seed already constructed this field. Release that value before the
+            // named override replaces it, matching the ordinary assignment drop-old path.
+            if (fieldType.IsUnique && fieldType.Pointer)
+                compiler->EmitUniqueFieldDelete(
+                    *compiler->builder, gep,
+                    compiler->GetFullDestructorForDelete(fieldType.TypeName),
+                    fieldType.TypeName, fieldType.AllocAlignValue, val);
+            else if (fieldType.IsFatInterfaceValue() && fieldType.IsUnique)
+            {
+                auto* oldFat = compiler->builder->CreateLoad(compiler->GetFatPtrType(), gep);
+                compiler->DeleteInterfaceValue(oldFat, fieldType.TypeName, nullptr);
+            }
+            else if (!fieldType.Pointer
+                     && (fieldType.TypeName == "string"
+                         || compiler->IsOwningValueType(fieldType.TypeName))
+                     && val->getType()->isStructTy())
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(fieldType.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { gep });
+            }
             compiler->builder->CreateStore(val, gep);
             destination = gep;
         }

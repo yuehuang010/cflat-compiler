@@ -22,8 +22,8 @@ Construction / initialization:
 - `p3/array-default-splat-drops-ctor-side-effects`
 - `p3/named-override-expression-evaluated-per-slot-only-for-owning-elements` - POD arm evaluates
   once and memcpys; the owning arm needs single-eval plus an owning copy, not a re-emit.
-- `p2/brace-override-of-an-owning-field-leaks-the-constructed-value` - plain store into an already
-  default-constructed owning field, no destruct first.
+- `p2/brace-override-of-an-owning-field-leaks-the-constructed-value` - fixed: the existing field
+  value is destructed before the named override store.
 - `p2/raw-heap-struct-array-element-read-double-frees` - reading an owning struct element off a
   raw heap array materializes a destructible temp.
 
