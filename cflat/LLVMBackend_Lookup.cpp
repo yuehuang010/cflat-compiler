@@ -63,6 +63,51 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
             || HasInterface(resolved) || dataStructures.count(resolved) > 0;
     }
 
+/*
+ * Decode a raw `simd<T,N>` spelling into its element type and lane count. The declarator path
+ * records those two facts directly from the parse tree; a NAME-keyed position (cast target,
+ * lambda parameter, tuple element, closure signature component) only ever sees this text, so
+ * this is where the special form re-enters the type system. Returns false for any other name.
+ */
+static bool DecodeSimdSpelling(const std::string& text, std::string& elemOut, uint64_t& lanesOut)
+{
+    static const std::string kPrefix = "simd<";
+    if (!text.starts_with(kPrefix) || text.back() != '>') return false;
+    std::string inner = text.substr(kPrefix.size(), text.size() - kPrefix.size() - 1);
+    // Split on the LAST top-level comma: the element type can itself carry brackets.
+    int depth = 0;
+    size_t comma = std::string::npos;
+    for (size_t i = 0; i < inner.size(); i++)
+    {
+        if (inner[i] == '<' || inner[i] == '(') depth++;
+        else if (inner[i] == '>' || inner[i] == ')') depth--;
+        else if (inner[i] == ',' && depth == 0) comma = i;
+    }
+    if (comma == std::string::npos) return false;
+    std::string elem = inner.substr(0, comma);
+    std::string lanes = inner.substr(comma + 1);
+    auto trim = [](std::string& s) {
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+    };
+    trim(elem); trim(lanes);
+    if (elem.empty() || lanes.empty()) return false;
+    try
+    {
+        size_t pos = 0;
+        lanesOut = std::stoull(lanes, &pos, 0);
+        if (pos != lanes.size()) return false;
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (lanesOut < 2 || lanesOut > 64 || (lanesOut & (lanesOut - 1)) != 0)
+        return false;
+    elemOut = elem;
+    return true;
+}
+
 llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, llvm::Type* autoType, bool allowPointer) const
 {
         if (typeAndValue.IsFunctionPointer)
@@ -94,6 +139,17 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             auto it = enumBackingTypes.find(resolvedTypeName);
             if (it != enumBackingTypes.end())
                 resolvedTypeName = it->second;
+        }
+        // `simd<T,N>` is a builtin special form recognised by the DECLARATOR path, which records
+        // it as element type + lane count. Every other position resolves a type by NAME and hands
+        // us the raw spelling, which names no registered type - decode it here so a cast target, a
+        // lambda parameter and a tuple/signature component lower exactly as a declaration does.
+        bool simdFromSpelling = false;
+        uint64_t simdSpellingLanes = 0;
+        if (std::string simdElem; DecodeSimdSpelling(resolvedTypeName, simdElem, simdSpellingLanes))
+        {
+            resolvedTypeName = simdElem;
+            simdFromSpelling = true;
         }
         // Resolve user-defined type aliases. A pointer alias (using Handle = void*) keeps its
         // trailing stars in the stored string; peel them into a local pointer-depth count and
@@ -200,9 +256,10 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
 
         // simd<T,N> -> LLVM <N x T> vector primitive. Wrap before pointer wrapping so
         // simd<float,8>* lowers to <8 x float>*. Element must be a numeric scalar.
-        if (typeAndValue.IsSimd)
+        if (typeAndValue.IsSimd || simdFromSpelling)
         {
-            if (typeAndValue.SimdLanes == 0)
+            uint64_t lanes = typeAndValue.IsSimd ? typeAndValue.SimdLanes : simdSpellingLanes;
+            if (lanes == 0)
                 return type;  // malformed lane count already reported; avoid a 0-width vector
             bool numeric = type->isFloatTy() || type->isDoubleTy()
                 || (type->isIntegerTy() && !type->isIntegerTy(1));
@@ -216,7 +273,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                     "(i8..i64, u8..u64, float, double) or bool for a mask, got '{}'", resolvedTypeName));
                 return type;
             }
-            type = llvm::FixedVectorType::get(type, static_cast<unsigned>(typeAndValue.SimdLanes));
+            type = llvm::FixedVectorType::get(type, static_cast<unsigned>(lanes));
         }
 
         // Apply pointer wrapping to get the element type before array wrapping.

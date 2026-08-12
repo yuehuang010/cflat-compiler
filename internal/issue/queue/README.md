@@ -22,7 +22,8 @@ member list is empty.
 | q08 | for-in loop variable | `3a663e1` |
 | q11 | Global, program-lifetime and static storage | `f29e727` |
 | q09 | Return-dangle and escape analysis | `6c12e96` |
-| q12 | Generics: templates and mangling | this commit |
+| q12 | Generics: templates and mangling | `eddf712` |
+| q14 | Parser and expression grammar | this commit |
 
 ## Suggested order
 
@@ -30,7 +31,6 @@ member list is empty.
 |---|--------|-------|----------|
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 2 | Closure return qualifiers landed; deferred/design items remain |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
-| q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 4 | Constructor and postfix fixes landed; simd, closure suffix, JSON-brace, and sizeof ambiguities remain |
 | q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 2 | Nested expected-type propagation and null callable design remain |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
@@ -50,6 +50,7 @@ fix work. Status:
 | q11 | **RULED 2026-08-11, IMPLEMENTED, bucket closed.** Static-local ownership-origin reporting and DWARF visibility were already fixed. A spike (`scratch/uniqglobal/`) then showed the `unique T*` arm ALREADY implements the Rust model and struct globals implement the C++ one, so the maintainer ruled the Rust model for both: owning globals stay legal, implicit consume is an error, explicit `move` re-initializes, and NOTHING at global/static scope is destructed at exit. The core-globals worry was unfounded: `globalDtorOrder_` was already gated on `!currentSourceIsCore_`, so point 4 only ever affected USER globals. All three members are fixed and their files deleted. |
 | q12 | **RULED 2026-08-11 and UNBLOCKED.** Generic function registration, closure/array-view type arguments, variadic free functions, and generic `sizeof` operands are fixed. The two name-collision items were blocked only by `Test/test_generics.cb`'s deliberate `Container<T>` collision; the maintainer authorized renaming the interface leg, so a same-name generic struct/interface collision becomes a hard `LogError` at the second declaration. | **CLOSED 2026-08-12:** the last-segment shell fallback in `AnyGenericTypeTemplateNamed` is removed, so a bare spelling that names no visible key reports `unknown type` like any other undeclared name; the three `err_namespaced_generic_iface_*` messages were re-ratified with maintainer authorization.
 | q13 | **PARTIALLY FIXED.** Fixed-array rejection, nested/char-row initialization, and field default construction are fixed. Side-effect folding and owning-value replacement/read semantics remain active. |
+| q14 | **RULED 2026-08-12, IMPLEMENTED, bucket NOT deleted.** The simd spelling is fixed at ONE decode point in `GetType`, which covers the cast target, lambda parameter, tuple element and closure signature component together; the pointer/fixed-array messages are simd-specific, because the generic wording steers to `T*` and `simd<T,N>*` is unsupported too. The FIELD position was silently accepting a pointer-to-fixed-array (wrong predicate: `declSpec->pointer()` vs `arrayPtrSuffix`). Both closure-suffix cells are fixed, so the declarator guard, the type-argument funnel and `ResolveSigComponentCodegen` now agree. TWO members stay filed: the JSON-brace literal is DEFERRED BY THE MAINTAINER pending a ruling, and the `sizeof`/tuple ambiguity is still blocked on routing the operand through the real `typeName` rule. |
 | q17 | **SETTLED as "leave filed".** Both stay design deferrals, neither is a bug. Direction if ever pursued is a non-bitwise-copyable `Thread`, but that is BLOCKED: CFlat has no syntax for a deleted copy. Pool quiescence-as-typestate was not selected. |
 
 All six are now answered. Two of them (q06, q09) turned out to need no decision at all - the repo

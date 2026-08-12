@@ -76,6 +76,23 @@ expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; p
     LavOuter<Lambda<int(int)>> lavSubst = default;
 }
 
+// The array-view SUFFIX on a closure generic type ARGUMENT. Structural twin of the pointer case
+// above, one suffix over: ResolveTypeArgEntry returned the encoded name before the '[]' suffix
+// was applied, so this spelling compiled and ran on both binaries. Thin 'function<T>[]' stays
+// accepted - an array-view IS a thin 'ptr' repr.
+expect_error("array-view '[]' is not supported on closure type 'Lambda<int(int)>'; use a fixed size 'Lambda<int(int)>[N]' instead") {
+    struct LavViewBox<T> { T item = default; };
+    LavViewBox<Lambda<int(int)>[]> lavView = default;
+}
+
+// A fat closure POINTER as a SIGNATURE COMPONENT - a third site, distinct from the declarator
+// guard and the type-argument funnel. ResolveSigComponentCodegen never consulted the guard, so
+// this compiled and ran; the declarator spelling of the same signature was already rejected.
+expect_error("pointer '*' is not supported on closure type 'Lambda<int(int)>'; pass the closure by value or use a fixed size 'Lambda<int(int)>[N]' instead") {
+    struct LavSigBox<T> { T item = default; };
+    LavSigBox<Lambda<int(Lambda<int(int)>*)>> lavSig = default;
+}
+
 extern int main()
 {
     return 0;

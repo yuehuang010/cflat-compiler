@@ -48,9 +48,22 @@ straight back into the crash `fix/sizeof-closure` closed. That fallthrough is pr
 located diagnostic on a discarded no-op for a re-entry into the null-`Primary` path is a bad
 trade, and the stolen spelling has no realistic use.
 
+## Status 2026-08-12 (q14 bucket close) - STILL DEFERRED, blocker gone, wording now worse
+
+`sizeof-over-generic-instantiation-unresolved-while-alignof-resolves` was fixed in `bc53456`, so
+the stated precondition is satisfied. It did NOT route the operand through the real `typeName`
+rule, though: the prefix-`sizeof` arm in `MainListener_Expressions.cpp` still reconstructs the
+type from `postFixCtx->getText()`. So the parser still cannot decide, and the safe re-offer to the
+expression path this file asks for is still unavailable.
+
+Re-measured on this bucket's binary: `sizeof(a<b,c>d);` now reports `unknown type 'a__b__c'` -
+the MANGLED name, which is further from what the user wrote than the `'a<b,c>d'` recorded above.
+Severity is unchanged (a discarded no-op), so this stays deferred rather than being special-cased.
+Whoever routes the operand through `typeName` should fix the message in the same change.
+
 ## Fix direction
 
-Leave it until [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]] is taken.
+Leave it until the prefix-`sizeof` operand goes through the real `typeName` rule.
 That issue's fix routes the `sizeof` operand through the real `typeName` rule instead of the
 text-reconstruction handler, at which point the ambiguity has to be settled by the PARSER (which
 can tell a `typeName` from a tuple expression) rather than by a character test - and the operand

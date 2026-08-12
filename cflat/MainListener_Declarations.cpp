@@ -86,6 +86,13 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 LogErrorContext(entry, "'unique' on a generic type argument: a function pointer or closure "
                     "does not own an allocation");
             std::string encodedArg = EncodeClosureCodegen(fpSpec);
+            // An array-view is a thin `ptr` repr, so a FAT closure - a by-value struct - cannot be
+            // viewed this way. The declarator guard says so; this funnel skipped the suffix.
+            if (hasArrayView && fpSpec->Function() == nullptr)
+                LogErrorContext(entry, std::format(
+                    "array-view '[]' is not supported on closure type '{}'; "
+                    "use a fixed size '{}[N]' instead",
+                    typeSpec->getText(), typeSpec->getText()));
             if (!hasPointer)
                 return encodedArg;
             RejectFatClosurePointerArg(entry, fpSpec->Function() != nullptr, typeSpec->getText());
@@ -196,8 +203,14 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
 
 std::string MainListener::ResolveSigComponentCodegen(CFlatParser::TypeSpecifierContext* ts, bool& outPointer) {
         if (ts == nullptr) return "void";
-        if (ts->functionPointerSpecifier() != nullptr)
-            return EncodeClosureCodegen(ts->functionPointerSpecifier());
+        if (auto* inner = ts->functionPointerSpecifier(); inner != nullptr)
+        {
+            // Third site that reaches a closure shape: the declarator guard and the type-argument
+            // funnel both reject a FAT closure pointer, so this one must agree.
+            if (outPointer)
+                RejectFatClosurePointerArg(ts, inner->Function() != nullptr, ts->getText());
+            return EncodeClosureCodegen(inner);
+        }
         if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
         {
             std::string baseName = ts->genericIdentifier()->Identifier()->getText();
@@ -575,6 +588,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         dims != nullptr && dims->assignmentExpression().empty())
                         LogErrorContext(declSpec,
                             "array-view '[]' is not supported on simd types; use a fixed simd array");
+                    // The simd branch leaves the specifier loop before the mainstream
+                    // pointer-to-array guard, so state it here rather than fall out of
+                    // declaration parsing and be re-read as a multiplication expression.
+                    else if (ArrayPtrOf(declSpec) != nullptr && declType.ArraySize != nullptr)
+                        LogErrorContext(declSpec, SimdPointerTypeMessage(
+                            std::format("simd<{},{}>", elemType, lanes), true));
                     break;
                 }
                 std::string baseName;

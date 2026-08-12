@@ -10128,7 +10128,17 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
         // Method name is the identifier after the dot; the call args are the one argument list.
         auto identifiers = ctx->Identifier();
         auto argLists = ctx->argumentExpressionList();
-        if (identifiers.empty() || argLists.empty())
+        if (identifiers.empty())
+        {
+            // No '.method' at all: this is a TYPE spelled where a value belongs - usually a
+            // `simd<T,N>*` / `simd<T,N>[N]*` declaration the parser re-read as a multiplication.
+            std::string spelling = simdSpec->getText();
+            std::string whole = ctx->getText();
+            bool fixedArray = whole.size() > spelling.size() && whole[spelling.size()] == '[';
+            LogErrorContext(ctx, SimdPointerTypeMessage(spelling, fixedArray));
+            return result;
+        }
+        if (argLists.empty())
         {
             LogErrorContext(ctx, "simd<T,N> supports the static calls '.load(array, index)' and '.store(vector, array, index)'.");
             return result;

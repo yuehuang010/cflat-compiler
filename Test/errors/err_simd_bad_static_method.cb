@@ -6,4 +6,21 @@ extern int main()
     expect_error("is not a static method on simd<T,N>") {
         auto v = simd<double,4>.gather(a, 0);
     }
+
+    // A simd type reaching EXPRESSION position with no '.method' is a pointer declaration the
+    // parser re-read as a multiplication. Both spellings used to land on the static-call list,
+    // which says nothing about what was written; the fixed-array one was accepted outright in
+    // field position. The message must not steer to 'simd<T,N>*' - that is unsupported too.
+    expect_error("'simd<float,4>*' is not a valid type: a pointer to a simd vector is not supported") {
+        simd<float,4>* p;
+    }
+    expect_error("pointer to fixed array 'simd<float,4>[N]*' is not a valid type: a pointer to a simd vector is not supported") {
+        simd<float,4>[2]* p2;
+    }
+}
+
+// The FIELD position took the declaration path and silently accepted the pointer-to-fixed-array,
+// because the simd branch tested declSpec->pointer() while the trailing '*' is an arrayPtrSuffix.
+expect_error("pointer to fixed array 'simd<float,4>[N]*' is not a valid type") {
+    struct SimdPtrField { simd<float,4>[2]* p = default; };
 }

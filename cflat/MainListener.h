@@ -76,6 +76,19 @@ inline std::string FixedArrayPointerTypeMessage(const std::string& typeName)
         "pointer to fixed array '{}[N]*' is not a valid type; pass '{}*' (a fixed array decays to a pointer to its first element).",
         typeName, typeName);
 }
+
+// simd needs its own wording: the generic message steers to 'T*', but a pointer to a simd
+// vector is not a supported type either, so decaying is not the fix here.
+inline std::string SimdPointerTypeMessage(const std::string& spelling, bool fixedArray)
+{
+    return std::format(
+        "{} is not a valid type: a pointer to a simd vector is not supported. Pass the fixed "
+        "array '{}[N]' by value, or use '{}.load(array, index)' / '{}.store(vector, array, "
+        "index)' to move between memory and vectors.",
+        fixedArray ? std::format("pointer to fixed array '{}[N]*'", spelling)
+                   : std::format("'{}*'", spelling),
+        spelling, spelling, spelling);
+}
 // `long long` reaches the listener as two separate `long` typeSpecifiers (the grammar has no
 // combined rule), and the parse loops stop at the first one. Count them so the spelling can be
 // canonicalized to "i64": `long long` is 64-bit on every target, while bare `long` is the

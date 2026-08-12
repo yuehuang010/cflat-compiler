@@ -2722,3 +2722,25 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   file scope, and a `using` alias. They pass identically on both binaries by design - they are the
   must-still-work set, not regression legs; the regression legs are the two new `expect_error`
   blocks, which produced NO diagnostic at all pre-fix.
+- **q14 - simd outside declarations, and the three closure-suffix sites (2026-08-12).**
+  (1) **One decode point beats four copies.** `simd<T,N>` was recognised only in
+  `ParseDeclarationSpecifiers`, so the cast target, lambda parameter, tuple element and closure
+  signature component each reported `unknown type 'simd<float,4>'`. All four are NAME-keyed
+  lookups, so decoding the spelling inside `GetType` (`DecodeSimdSpelling`, splitting on the LAST
+  top-level comma since the element type can itself carry brackets) fixed all four at once. Do not
+  add a fifth copy of a special form's recognition; find the funnel every position shares.
+  (2) **A borrowed diagnostic can be actively wrong.** The generic pointer-to-fixed-array message
+  steers to `T*` - "a fixed array decays to a pointer to its first element" - but `simd<T,N>*` is
+  not a supported type either, so the advice was impossible to follow. simd got its own wording.
+  (3) **Check the PREDICATE against the grammar, not against the spelling.** The simd branch's new
+  pointer-to-fixed-array guard tested `declType.Pointer` (from `declSpec->pointer()`) and never
+  fired: a trailing `*` after `[N]` is an `arrayPtrSuffix`, not a `pointer`. The local spelling was
+  misdiagnosed and the FIELD spelling was accepted outright. Measured against a non-simd control
+  (`int[2]*`, correctly rejected in both positions) - which is what exposed it.
+  (4) Two stale claims in the issue files, both found by measurement: cell (d) `simd<T,N>[]` was
+  already rejected with a good message, and the `sizeof`/tuple item's stated blocker had already
+  been fixed. Re-measure a filed issue's cells before implementing its fix direction.
+  (5) The closure-suffix cells were "unreachable, so unfixed". Adding the guards at the funnels
+  that skipped them (`ResolveTypeArgEntry` for the `[]` suffix, `ResolveSigComponentCodegen` for
+  the fat pointer) costs nothing and makes all three sites agree; the thin `function<T>` spellings
+  stay accepted in both cells, which is the half that has a working lowering.

@@ -862,6 +862,19 @@ int testSimdPointerStorage()
     simd<float,4> bv = simdMakeByValue(10.0f);
     passed += Test("simd by-value return all-lane sum", bv[0]+bv[1]+bv[2]+bv[3], 46.0f);
 
+    // 12. The simd spelling used to be recognised only in a DECLARATION: the same text as a
+    //     CAST TARGET, a lambda PARAMETER and a TUPLE COMPONENT all reported "unknown type".
+    simd<float,4>* pcast = (simd<float,4>*)&v;
+    simd<float,4> tcast = *pcast;
+    passed += Test("simd cast-target spelling", tcast[0], 9.0f);
+    Lambda<float(simd<float,4>*)> lane0 = (simd<float,4>* q2) => { return (*q2)[0]; };
+    passed += Test("simd lambda-parameter spelling", lane0(&w), 4.0f);
+    (simd<float,4>*, int) tup = default;
+    tup.item_0 = &v;
+    tup.item_1 = 3;
+    simd<float,4> ttup = *tup.item_0;
+    passed += Test("simd tuple-component spelling", ttup[0] + (float)tup.item_1, 12.0f);
+
     return passed;
 }
 
@@ -1850,7 +1863,7 @@ extern int main(int argc, char** argv)
     passed += testSimdReduce();            total += 12;
     passed += testSimdMasked();            total += 8;
     passed += testSimdGatherScatter();     total += 9;
-    passed += testSimdPointerStorage();    total += 34;
+    passed += testSimdPointerStorage();    total += 37;
 
     // ---- span<T> / view<T> ----
     passed += testSpanView(); total += 29;
