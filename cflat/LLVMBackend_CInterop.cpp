@@ -66,7 +66,7 @@ void LLVMBackend::CheckPoisonedFunctionCalls()
                     auto locIt = firstCallLocation_.find(name);
                     if (locIt != firstCallLocation_.end())
                         SetSourceLocation(locIt->second.first, locIt->second.second);
-                    LogError(msg);
+                    LogRawError(msg);
                     break;
                 }
             }
@@ -164,14 +164,14 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         const std::string cc = FindCDriver();
         if (cc.empty())
         {
-            LogError(std::format("no C compiler driver (clang/cc/gcc) found - cannot compile C source '{}'.", cSourcePath));
+            LogErrorMessage("no C compiler driver (clang/cc/gcc) found - cannot compile C source '{}'.", { cSourcePath });
             return false;
         }
 
         llvm::SmallString<256> objFile;
         if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_c", "o", objFile))
         {
-            LogError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
+            LogRawError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
             return false;
         }
         std::string objPath = objFile.str().str();
@@ -214,7 +214,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
-            LogError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
+            LogRawError(std::format("C compiler failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, compileErr.empty() ? "" : ": ", compileErr));
             return false;
         }
@@ -240,7 +240,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         const std::string clangPath = FindClangCl();
         if (clangPath.empty())
         {
-            LogError(std::format("clang-cl.exe not found - cannot compile C source '{}'.", cSourcePath));
+            LogErrorMessage("clang-cl.exe not found - cannot compile C source '{}'.", { cSourcePath });
             return false;
         }
 
@@ -248,7 +248,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         llvm::SmallString<256> objFile;
         if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_c", "obj", objFile))
         {
-            LogError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
+            LogRawError(std::format("could not create temp object for C source '{}': {}", cSourcePath, ec.message()));
             return false;
         }
         std::string objPath = objFile.str().str();
@@ -307,7 +307,7 @@ bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
-            LogError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
+            LogRawError(std::format("clang-cl failed to compile C source '{}' (exit {}){}{}",
                 cSourcePath, rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
         }
@@ -320,7 +320,7 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
 {
         if (runtimeDir.empty())
         {
-            LogError("cannot locate crash handler source: runtime directory is unset.");
+            LogErrorMessage("cannot locate crash handler source: runtime directory is unset.");
             return false;
         }
 
@@ -328,21 +328,21 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
         llvm::sys::path::append(srcPath, "core", "diagnostic", "crashdump.c");
         if (!llvm::sys::fs::exists(srcPath))
         {
-            LogError(std::format("crash handler source not found: '{}'.", srcPath.str().str()));
+            LogErrorMessage("crash handler source not found: '{}'.", { srcPath.str().str() });
             return false;
         }
 
         const std::string clangPath = FindClangCl();
         if (clangPath.empty())
         {
-            LogError("clang-cl.exe not found - cannot compile crash handler.");
+            LogErrorMessage("clang-cl.exe not found - cannot compile crash handler.");
             return false;
         }
 
         llvm::SmallString<256> objFile;
         if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_crashdump", "obj", objFile))
         {
-            LogError(std::format("could not create temp object for crash handler: {}", ec.message()));
+            LogRawError(std::format("could not create temp object for crash handler: {}", ec.message()));
             return false;
         }
         std::string objPath = objFile.str().str();
@@ -377,7 +377,7 @@ bool LLVMBackend::CompileCrashHandlerObject(const std::string& arch)
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
-            LogError(std::format("clang-cl failed to compile crash handler (exit {}){}{}",
+            LogRawError(std::format("clang-cl failed to compile crash handler (exit {}){}{}",
                 rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
         }
@@ -390,7 +390,7 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
 {
         if (runtimeDir.empty())
         {
-            LogError("cannot locate cflat_builtins.c: runtime directory is unset.");
+            LogErrorMessage("cannot locate cflat_builtins.c: runtime directory is unset.");
             return false;
         }
 
@@ -398,21 +398,21 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
         llvm::sys::path::append(srcPath, "core", "cflat_builtins.c");
         if (!llvm::sys::fs::exists(srcPath))
         {
-            LogError(std::format("builtins source not found: '{}'.", srcPath.str().str()));
+            LogErrorMessage("builtins source not found: '{}'.", { srcPath.str().str() });
             return false;
         }
 
         const std::string clangPath = FindClangCl();
         if (clangPath.empty())
         {
-            LogError("clang-cl.exe not found - cannot compile cflat_builtins.c.");
+            LogErrorMessage("clang-cl.exe not found - cannot compile cflat_builtins.c.");
             return false;
         }
 
         llvm::SmallString<256> objFile;
         if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_builtins", "obj", objFile))
         {
-            LogError(std::format("could not create temp object for builtins: {}", ec.message()));
+            LogRawError(std::format("could not create temp object for builtins: {}", ec.message()));
             return false;
         }
         std::string objPath = objFile.str().str();
@@ -448,7 +448,7 @@ bool LLVMBackend::CompileBuiltinsObject(const std::string& arch)
         if (rc != 0)
         {
             llvm::sys::fs::remove(objPath);
-            LogError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}{}",
+            LogRawError(std::format("clang-cl failed to compile cflat_builtins.c (exit {}){}{}",
                 rc, clangCompileErr.empty() ? "" : ": ", clangCompileErr));
             return false;
         }
@@ -862,7 +862,7 @@ std::vector<std::string> LLVMBackend::BuildClangDriverArgs(const std::string& he
             {
                 // Do not fall through to a Linux triple - Apple headers would misparse.
                 // In LSP/analyze mode (symbolSink_ set) degrade silently like other binds.
-                LogError("C header import targeting macOS requires an SDK: set $SDKROOT or install "
+                LogErrorMessage("C header import targeting macOS requires an SDK: set $SDKROOT or install "
                          "Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves");
             }
         }
@@ -2055,13 +2055,13 @@ void LLVMBackend::ReportOrphanHeader(const std::vector<std::string>& headerPaths
             std::string grp;
             for (size_t i = 0; i < headerPaths.size(); ++i)
                 grp += (i ? ", \"" : "\"") + std::filesystem::path(headerPaths[i]).filename().string() + "\"";
-            LogError(std::format(
+            LogRawError(std::format(
                 "C header '{}' did not compile in this group ({}). Reorder the group so the "
                 "prerequisite header comes first, or add the missing one: import {{ {} }};",
                 name, detail, grp));
             return;
         }
-        LogError(std::format(
+        LogRawError(std::format(
             "C header '{}' does not compile on its own ({}). It likely needs a prerequisite "
             "header included first. Import them together as one group so they share a single "
             "translation unit, e.g. import {{ \"prerequisite.h\", \"{}\" }};",

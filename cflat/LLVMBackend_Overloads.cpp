@@ -446,9 +446,9 @@ std::vector<LLVMBackend::NamedVariable> LLVMBackend::MatchFunction(const std::ve
             // LogError does not return, so a reported failure never falls through to the
             // reconstruction below - and an unbound slot can therefore never reach a caller.
             if (!probe && binding.UnknownName)
-                LogError(std::format("named argument '{}' does not match any parameter", binding.FailedName));
+                LogErrorMessage("named argument '{}' does not match any parameter", { binding.FailedName });
             if (!probe && binding.DuplicateName)
-                LogError(std::format("duplicate named argument '{}'", binding.FailedName));
+                LogErrorMessage("duplicate named argument '{}'", { binding.FailedName });
             return {};
         }
 
@@ -592,18 +592,18 @@ bool LLVMBackend::RejectFuncPtrShapeMismatch(const NamedVariable& arg, const Typ
             const char* advice = paramShape == 2
                 ? "Pass a 'function<>[N]' array or another view to supply the shape it expects."
                 : "Take the address with '&' to supply the shape it expects.";
-            LogError(std::format("cannot pass {} to closure parameter '{}', which expects {}: {} {}",
-                FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
-                FuncPtrShapeWord(param, nullptr), shapesAre, advice));
+            LogErrorMessage("cannot pass {} to closure parameter '{}', which expects {}: {} {}",
+                { FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
+                  FuncPtrShapeWord(param, nullptr), shapesAre, advice });
             return true;
         }
 
         if (paramShape == 0 && argShape == 2)
         {
-            LogError(std::format("cannot pass {} to closure parameter '{}', which expects {}: {} "
+            LogErrorMessage("cannot pass {} to closure parameter '{}', which expects {}: {} "
                 "Index an element to supply the shape it expects.",
-                FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
-                FuncPtrShapeWord(param, nullptr), shapesAre));
+                { FuncPtrShapeWord(arg.TypeAndValue, &arg), param.VariableName,
+                  FuncPtrShapeWord(param, nullptr), shapesAre });
             return true;
         }
 
@@ -633,7 +633,7 @@ bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const T
         std::string what = param.VariableName.empty()
             ? std::format("parameter of '{}'", callee)
             : std::format("parameter '{}' of '{}'", param.VariableName, callee);
-        LogError(DescribeCodeValueIntoData(spelling, "pass", advice, what));
+        LogRawError(DescribeCodeValueIntoData(spelling, "pass", advice, what));
         return true;
     }
 
@@ -664,12 +664,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // The single choke point for "someone wants a copy of this type and it has no
                 // copy() of its own" - covers a user `.copy()`, a containing type's field copy,
                 // and a by-value closure capture alike.
-                LogError(std::format(
-                    "cannot copy '{}': its field '{}.{}' is 'unique', so it owns a raw pointer that has "
+                LogErrorMessage(
+                    "cannot copy '{}': its field '{}.{}' is '{}', so it owns a raw pointer that has "
                     "no generic deep-clone. A memberwise copy would share the pointer between two owners "
-                    "and double-free at teardown. Write a 'copy()' method for '{}' that clones the pointee "
-                    "itself, or 'move' the value to transfer ownership instead of copying it.",
-                    copyType, copyType, uniquePath, copyType));
+                    "and double-free at teardown. Write a '{}' method for '{}' that clones the pointee "
+                    "itself, or '{}' the value to transfer ownership instead of copying it.",
+                    { copyType, copyType, uniquePath, "unique", "copy()", copyType, "move" });
                 return nullptr;
             }
             else if (IsOwningValueType(copyType))
@@ -715,9 +715,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         auto funcSym = functionTable.find(functionName);
         if (funcSym == functionTable.end())
         {
-            LogError(displayName.empty()
-                ? std::format("unknown function '{}'", functionName)
-                : std::format("unknown generic function '{}'", displayName));
+            if (displayName.empty())
+                LogErrorMessage("unknown function '{}'", { functionName });
+            else
+                LogErrorMessage("unknown generic function '{}'", { displayName });
             return nullptr;
         }
 
@@ -971,7 +972,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
             }
 
-            LogError(msg);
+            LogRawError(msg);
             return nullptr;
         }
 
@@ -1005,9 +1006,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && (arg.IsExplicitMove || IsOwningPtrTempValue(arg.Primary)
                     || argIsOwningValueRValue))
             {
-                LogError(std::format(
-                    "cannot pass an owning value to the variadic '...' slot of '{}'; bind the "
-                    "value to an owner first", functionName));
+                LogErrorMessage(
+                    "cannot pass an owning value to the variadic '{}' slot of '{}'; bind the "
+                    "value to an owner first", { "...", functionName });
                 return nullptr;
             }
 
@@ -1018,10 +1019,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // is always safe; a view argument carries IsArrayView and passes.
             if (!inVariadicRange && candParamItr->IsArrayView
                 && arg.TypeAndValue.Pointer && !arg.TypeAndValue.IsArrayView)
-                LogError(std::format(
-                    "cannot pass a raw pointer 'T*' as array-view parameter '{}' ('T[]') - a view "
-                    "must span a whole allocation (it comes only from 'new T[n]' or another 'T[]'); "
-                    "the 'T[] -> T*' decay is one-way", candParamItr->VariableName));
+                LogErrorMessage(
+                    "cannot pass a raw pointer '{}' as array-view parameter '{}' ('{}') - a view "
+                    "must span a whole allocation (it comes only from '{}' or another '{}'); "
+                    "the '{} -> {}' decay is one-way",
+                    { "T*", candParamItr->VariableName, "T[]", "new T[n]", "T[]", "T[]", "T*" });
 
             // Closure SHAPE gate (value vs pointer vs view), shared with virtual dispatch.
             // Hoisted above the binding branches: it judges the pair, not one binding arm.
@@ -1039,11 +1041,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // value bound to it stays legal.
                 if (candParamItr->IsUnique && !arg.TypeAndValue.Pointer)
                 {
-                    LogError(std::format(
-                        "call to '{}': cannot pass a stack value to unique interface parameter '{}' - "
+                    LogErrorMessage(
+                        "call to '{}': cannot pass a stack value to {} interface parameter '{}' - "
                         "it takes ownership and frees the object at scope exit, so the source must be "
-                        "a heap 'new' (or a 'move' of an owned interface value), not a stack value",
-                        functionName, candParamItr->VariableName));
+                        "a heap '{}' (or a '{}' of an owned interface value), not a stack value",
+                        { functionName, "unique", candParamItr->VariableName, "new", "move" });
                     return nullptr;
                 }
                 // A pointer-shaped source (`T**`, `T[]`, `T[N]`, simd) is not an instance of its
@@ -1051,7 +1053,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 std::string argShape = DescribePointerShapedInterfaceSource(arg.TypeAndValue);
                 if (!argShape.empty())
                 {
-                    LogError(FormatPointerShapedInterfaceUpcastError(
+                    LogRawError(FormatPointerShapedInterfaceUpcastError(
                         argShape, arg.TypeAndValue.TypeName, candParamItr->TypeName));
                     return nullptr;
                 }
@@ -1084,9 +1086,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // Report the bad call instead of forging an invalid alloca.
                     if (structTy == nullptr || structTy->isVoidTy())
                     {
-                        LogError(std::format(
+                        LogErrorMessage(
                             "call to '{}': argument {} (interface parameter '{}') has no resolved type",
-                            functionName, argIndex, candParamItr->VariableName));
+                            { functionName, std::to_string(argIndex), candParamItr->VariableName });
                         return nullptr;
                     }
                     auto tempAlloca = AllocaAtEntry(structTy, nullptr);
@@ -1112,12 +1114,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             && arg.Primary->getType() == llvm::StructType::getTypeByName(*context, "string")));
                 if (argIsStringValue && (candParamItr->TypeName == "char" || candParamItr->TypeName == "i8"))
                 {
-                    LogError(std::format(
-                        "cannot pass 'string' to the 'char*' parameter '{}' of '{}': a 'string' is a "
-                        "{{ptr,len}} value, not a 'char*' - the callee would read the pair itself. Pass "
-                        "the buffer explicitly with '.data()'. An interpolated string literal is a "
-                        "'string': bind it first (string s = \"{{x}}\"; printf(\"%s\", s.data())).",
-                        candParamItr->VariableName, functionName));
+                    LogErrorMessage(
+                        "cannot pass '{}' to the '{}' parameter '{}' of '{}': a '{}' is a "
+                        "{} value, not a '{}' - the callee would read the pair itself. Pass "
+                        "the buffer explicitly with '{}'. An interpolated string literal is a "
+                        "'{}': bind it first ({}; {}).",
+                        { "string", "char*", candParamItr->VariableName, functionName, "string",
+                          "{ptr,len}", "char*", ".data()", "string", "string s = \"{{x}}\"",
+                          "printf(\"%s\", s.data())" });
                     return nullptr;
                 }
 
@@ -1158,14 +1162,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if ((candParamItr->IsMove || paramIsUniqueAutoSink)
                     && IsProvableNonHeapAddress(loweredArg))
                 {
-                    const char* qualifier = candParamItr->IsMove ? "'move'" : "unique";
-                    LogError(std::format(
+                    const std::string qualifier = candParamItr->IsMove ? "'move'" : "unique";
+                    LogErrorMessage(
                         "call to '{}': cannot pass the address of a stack or global value to {} "
                         "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
-                        "but neither is heap-allocated and freeing it is undefined. Use 'new' to "
+                        "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
                         "allocate on the heap, or drop '{}' if the callee only borrows.",
-                        functionName, qualifier, candParamItr->VariableName,
-                        candParamItr->IsMove ? "move" : "unique"));
+                        { functionName, qualifier, candParamItr->VariableName, "new", "new" });
                     return nullptr;
                 }
             }
@@ -1190,9 +1193,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             // Reject when no overload's IsMove flags match the destination signature.
                             if (!HasFunctionWithMoveFlags(arg.CallerName, candParamItr->FuncPtrParams))
                             {
-                                LogError(std::format(
-                                    "function '{}' has no overload matching the 'move' modifiers required by parameter '{}' - 'move' is part of the function-pointer type",
-                                    arg.CallerName, candParamItr->VariableName));
+                                LogErrorMessage(
+                                    "function '{}' has no overload matching the '{}' modifiers required by parameter '{}' - '{}' is part of the function-pointer type",
+                                    { arg.CallerName, "move", candParamItr->VariableName, "move" });
                             }
                         }
                         // Same provenance gate virtual dispatch applies (LowerByValueArg): under
@@ -1291,11 +1294,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // the LENGTH to the next slot and crashes on a second '%s'. cflat already
                     // rejects string -> char* at a typed parameter; be consistent and make the
                     // user state the lowering.
-                    LogError(std::format(
-                        "cannot pass 'string' to the variadic '...' of '{}': a variadic slot is "
-                        "untyped and a 'string' is a {{ptr,len}} value, not a 'char*' - the length "
+                    LogErrorMessage(
+                        "cannot pass '{}' to the variadic '{}' of '{}': a variadic slot is "
+                        "untyped and a '{}' is a {} value, not a '{}' - the length "
                         "field would be read as the next argument. Pass the buffer explicitly with "
-                        "'.data()' (e.g. printf(\"%s\", s.data())).", functionName));
+                        "'{}' (e.g. {}).", { "string", "...", functionName, "string", "{ptr,len}",
+                                              "char*", ".data()", "printf(\"%s\", s.data())" });
                 }
 
                 argList.push_back(value);
@@ -1323,7 +1327,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
-                LogError(std::format("parameter '{}': cannot pass bonded value to 'move' parameter - bonded values cannot be transferred out of their source's scope", candidate.Parameters[i].VariableName));
+                LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
+                    { candidate.Parameters[i].VariableName, "move" });
             DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
         }
 
@@ -1420,7 +1425,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             int lostSink = FindLostClosureSinkParam(candidate.Parameters[i],
                                                     matched[i].TypeAndValue);
             if (lostSink < 0) continue;
-            LogError(DescribeLostClosureSink(candidate.Parameters[i], (size_t)lostSink,
+            LogRawError(DescribeLostClosureSink(candidate.Parameters[i], (size_t)lostSink,
                 std::format("parameter '{}' of '{}'",
                             candidate.Parameters[i].VariableName, functionName)));
         }
@@ -1522,7 +1527,7 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
                     bindable.push_back(sym);
             if (bindable.empty())
             {
-                LogError(DescribeFuncPtrBindMismatch(functionName,
+                LogRawError(DescribeFuncPtrBindMismatch(functionName,
                     FuncPtrSigOfSymbol(*viable.front()), *destSig));
             }
             else

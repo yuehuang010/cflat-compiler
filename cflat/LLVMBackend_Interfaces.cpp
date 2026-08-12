@@ -104,9 +104,9 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
                     std::string displayCurrent = ShortenDefSiteForDisplay(currentSite, currentSourceIsCore_);
                     displayCurrent.resize(displayCurrent.rfind('('));
                     ReportingFileScope reportScope(this, displayCurrent, currentLine, currentColumn);
-                    LogError(std::move(message));
+                    LogRawError(std::move(message));
                 }
-                LogError(std::move(message));
+                LogRawError(std::move(message));
                 return;
             }
         }
@@ -118,9 +118,9 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
         std::string aliasedName = ResolveTypeAlias(name);
         if (aliasedName != name && IsWinrtProjectedType(aliasedName))
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "interface '{}' collides with the WinMD alias 'using {} = {};' - rename one of them "
-                "(a WinMD type and a CFlat interface cannot share a name)", name, name, aliasedName));
+                "(a WinMD type and a CFlat interface cannot share a name)", { name, name, aliasedName });
             return;
         }
 
@@ -143,7 +143,7 @@ void LLVMBackend::CreateInterfaceDefinition(const std::string& name, const std::
             const auto* parentMethods = FindInterface(parentName);
             if (parentMethods == nullptr)
             {
-                LogError(std::format("unknown parent interface: '{}'", parentName));
+                LogErrorMessage("unknown parent interface: '{}'", { parentName });
                 continue;
             }
             for (const auto& m : *parentMethods)
@@ -659,7 +659,7 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
                 // A capturing closure has no C-ABI representation, so reject it instead of dropping
                 // the env (which yields a thin ptr that reads freed/absent captures when called).
                 if (ClosureIsStaticallyNonCapturing(val)) return CoerceClosureFatToThin(val, retTV);
-                LogError(DescribeCapturingClosureToThin({}));
+                LogRawError(DescribeCapturingClosureToThin({}));
                 return llvm::UndefValue::get(BuildThinFnPtrType(retTV));
             }
             CheckClosureReturnProvenance(val, returnNV, /*thin=*/true);
@@ -827,18 +827,18 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
 
             if (impl == nullptr)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "class '{}' does not implement interface field '{}::{}' (expected type '{}')",
-                    implName, ifaceName, f.VariableName, InterfaceFieldTypeText(f)));
+                    { implName, ifaceName, f.VariableName, InterfaceFieldTypeText(f) });
                 continue;
             }
             if (impl->TypeName != f.TypeName || impl->Pointer != f.Pointer
                 || impl->IsInterface != f.IsInterface)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "class '{}' field '{}' has type '{}' but interface '{}' declares it as '{}'",
-                    implName, f.VariableName, InterfaceFieldTypeText(*impl), ifaceName,
-                    InterfaceFieldTypeText(f)));
+                    { implName, f.VariableName, InterfaceFieldTypeText(*impl), ifaceName,
+                      InterfaceFieldTypeText(f) });
             }
             // 'unique' is part of the field contract, not of the field's type: a store through the
             // interface's byte-offset slot reads ownership from the INTERFACE, because dynamic
@@ -847,22 +847,22 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
             if (impl->IsUnique != f.IsUnique)
             {
                 if (impl->IsUnique)
-                    LogError(std::format(
-                        "class '{}' field '{}' is declared 'unique' but interface '{}' does not declare "
-                        "it 'unique' - a store through the interface's field slot would neither free the "
+                    LogErrorMessage(
+                        "class '{}' field '{}' is declared '{}' but interface '{}' does not declare "
+                        "it '{}' - a store through the interface's field slot would neither free the "
                         "old pointee (it leaks) nor reject a borrow, which the class's synthesized "
-                        "destructor then frees. Declare the field 'unique {} {}' on interface '{}', or "
-                        "drop 'unique' from class '{}'.",
-                        implName, f.VariableName, ifaceName,
-                        InterfaceFieldTypeText(f), f.VariableName, ifaceName, implName));
+                        "destructor then frees. Declare the field '{} {} {}' on interface '{}', or "
+                        "drop '{}' from class '{}'.",
+                        { implName, f.VariableName, "unique", ifaceName, "unique", "unique",
+                          InterfaceFieldTypeText(f), f.VariableName, ifaceName, "unique", implName });
                 else
-                    LogError(std::format(
-                        "class '{}' field '{}' is not declared 'unique' but interface '{}' declares it "
-                        "'unique' - a store through the interface's field slot would free the old pointee, "
-                        "which class '{}' does not own. Declare the field 'unique {} {}' on class '{}', or "
-                        "drop 'unique' from interface '{}'.",
-                        implName, f.VariableName, ifaceName, implName,
-                        InterfaceFieldTypeText(f), f.VariableName, implName, ifaceName));
+                    LogErrorMessage(
+                        "class '{}' field '{}' is not declared '{}' but interface '{}' declares it "
+                        "'{}' - a store through the interface's field slot would free the old pointee, "
+                        "which class '{}' does not own. Declare the field '{} {} {}' on class '{}', or "
+                        "drop '{}' from interface '{}'.",
+                        { implName, f.VariableName, "unique", ifaceName, "unique", implName, "unique",
+                          InterfaceFieldTypeText(f), f.VariableName, implName, "unique", ifaceName });
             }
         }
     }
@@ -906,45 +906,45 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
             if (cpMove != ipMove)
             {
                 if (ipMove)
-                    LogError(std::format(
-                        "class '{}' method '{}': parameter '{}' is not declared 'move' but interface "
-                        "'{}' declares it 'move' - a call through the interface transfers ownership of "
+                    LogErrorMessage(
+                        "class '{}' method '{}': parameter '{}' is not declared '{}' but interface "
+                        "'{}' declares it '{}' - a call through the interface transfers ownership of "
                         "the argument, so the caller stops freeing it while class '{}' never takes it "
                         "over (the argument leaks). Declare the parameter '{}' on class '{}', or drop "
-                        "'move' from interface '{}'.",
-                        implName, method.Name, pname, ifaceName, implName,
-                        InterfaceMethodTypeText(ip, pname), implName, ifaceName));
+                        "'{}' from interface '{}'.",
+                        { implName, method.Name, pname, "move", ifaceName, "move", implName,
+                          InterfaceMethodTypeText(ip, pname), implName, "move", ifaceName });
                 else
-                    LogError(std::format(
-                        "class '{}' method '{}': parameter '{}' is declared 'move' but interface '{}' "
-                        "does not declare it 'move' - a call through the interface does not transfer "
+                    LogErrorMessage(
+                        "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
+                        "does not declare it '{}' - a call through the interface does not transfer "
                         "ownership, so the caller still frees the argument that class '{}' has already "
-                        "taken over (a double free). Drop 'move' from class '{}', or declare the "
+                        "taken over (a double free). Drop '{}' from class '{}', or declare the "
                         "parameter '{}' on interface '{}'.",
-                        implName, method.Name, pname, ifaceName, implName, implName,
-                        InterfaceMethodTypeText(cp, pname), ifaceName));
+                        { implName, method.Name, pname, "move", ifaceName, "move", implName, "move",
+                          implName, InterfaceMethodTypeText(cp, pname), ifaceName });
             }
             // 'bond' and 'move' are mutually exclusive, so report only the more severe disagreement.
             else if (cp.IsBond != ip.IsBond)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
-                    "declares it '{}' - 'bond' is part of the method's contract, and a call through "
+                    "declares it '{}' - '{}' is part of the method's contract, and a call through "
                     "the interface reads the contract from the interface, so the borrow the two "
                     "disagree about would go untracked. Make the two declarations agree.",
-                    implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
-                    InterfaceMethodTypeText(ip)));
+                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                      InterfaceMethodTypeText(ip), "bond" });
             }
             else if (cp.IsAlias != ip.IsAlias)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
-                    "declares it '{}' - 'alias' makes the parameter a borrow whose destructor is "
+                    "declares it '{}' - '{}' makes the parameter a borrow whose destructor is "
                     "suppressed, and a call through the interface reads the contract from the "
                     "interface, so the borrow the two disagree about would go untracked. Make the "
                     "two declarations agree.",
-                    implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
-                    InterfaceMethodTypeText(ip)));
+                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                      InterfaceMethodTypeText(ip), "alias" });
             }
         }
 
@@ -956,52 +956,52 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
         if (crMove != irMove)
         {
             if (irMove)
-                LogError(std::format(
-                    "class '{}' method '{}': the return type is not declared 'move' but interface "
+                LogErrorMessage(
+                    "class '{}' method '{}': the return type is not declared '{}' but interface "
                     "'{}' declares it '{}' - a call through the interface hands the caller an owned "
                     "value to free, while class '{}' returns one it still owns (a double free). "
-                    "Declare the return '{}' on class '{}', or drop 'move' from interface '{}'.",
-                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
-                    InterfaceMethodTypeText(ir), implName, ifaceName));
+                    "Declare the return '{}' on class '{}', or drop '{}' from interface '{}'.",
+                    { implName, method.Name, "move", ifaceName, InterfaceMethodTypeText(ir), implName,
+                      InterfaceMethodTypeText(ir), implName, "move", ifaceName });
             else
-                LogError(std::format(
-                    "class '{}' method '{}': the return type is declared 'move' but interface '{}' "
+                LogErrorMessage(
+                    "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
                     "declares it '{}' - a call through the interface treats the result as a borrow "
                     "and never frees it, while class '{}' hands over ownership (the result leaks). "
-                    "Drop 'move' from class '{}', or declare the return '{}' on interface '{}'.",
-                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
-                    implName, InterfaceMethodTypeText(cr), ifaceName));
+                    "Drop '{}' from class '{}', or declare the return '{}' on interface '{}'.",
+                    { implName, method.Name, "move", ifaceName, InterfaceMethodTypeText(ir), implName,
+                      "move", implName, InterfaceMethodTypeText(cr), ifaceName });
         }
         if (cr.IsAlias != ir.IsAlias)
         {
             if (ir.IsAlias)
-                LogError(std::format(
-                    "class '{}' method '{}': the return type is not declared 'alias' but interface "
+                LogErrorMessage(
+                    "class '{}' method '{}': the return type is not declared '{}' but interface "
                     "'{}' declares it '{}' - a call through the interface treats the result as a "
                     "borrow and suppresses its destructor, while class '{}' returns a value the "
                     "caller must destroy (the result leaks). Declare the return '{}' on class '{}', "
-                    "or drop 'alias' from interface '{}'.",
-                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
-                    InterfaceMethodTypeText(ir), implName, ifaceName));
+                    "or drop '{}' from interface '{}'.",
+                    { implName, method.Name, "alias", ifaceName, InterfaceMethodTypeText(ir), implName,
+                      InterfaceMethodTypeText(ir), implName, "alias", ifaceName });
             else
-                LogError(std::format(
-                    "class '{}' method '{}': the return type is declared 'alias' but interface '{}' "
+                LogErrorMessage(
+                    "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
                     "declares it '{}' - a call through the interface destroys the result at scope "
                     "exit, while class '{}' returns a borrow of storage it still owns (a double "
-                    "free). Drop 'alias' from class '{}', or declare the return '{}' on interface "
+                        "free). Drop '{}' from class '{}', or declare the return '{}' on interface "
                     "'{}'.",
-                    implName, method.Name, ifaceName, InterfaceMethodTypeText(ir), implName,
-                    implName, InterfaceMethodTypeText(cr), ifaceName));
+                    { implName, method.Name, "alias", ifaceName, InterfaceMethodTypeText(ir), implName,
+                      "alias", implName, InterfaceMethodTypeText(cr), ifaceName });
         }
         if (cr.IsBond != ir.IsBond)
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
-                "declares it '{}' - 'bond' is part of the return contract, and a call through the "
+                "declares it '{}' - '{}' is part of the return contract, and a call through the "
                 "interface reads the contract from the interface, so the borrow the two disagree "
                 "about would go untracked. Make the two declarations agree.",
-                implName, method.Name, InterfaceMethodTypeText(cr), ifaceName,
-                InterfaceMethodTypeText(ir)));
+                { implName, method.Name, InterfaceMethodTypeText(cr), ifaceName,
+                  InterfaceMethodTypeText(ir), "bond" });
         }
     }
 
@@ -1048,7 +1048,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogError(std::format("GetOrCreateProgramVTable: unknown interface '{}'", ifaceName));
+            LogErrorMessage("GetOrCreateProgramVTable: unknown interface '{}'", { ifaceName });
             return nullptr;
         }
 
@@ -1069,7 +1069,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
             llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
             {
-                LogError(std::format("GetOrCreateProgramVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
+                LogErrorMessage("GetOrCreateProgramVTable: '{}' does not implement '{}::{}'",
+                                { structName, ifaceName, method.Name });
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
             }
             else
@@ -1112,7 +1113,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogError(std::format("GetOrCreateVTable: unknown interface '{}'", ifaceName));
+            LogErrorMessage("GetOrCreateVTable: unknown interface '{}'", { ifaceName });
             return nullptr;
         }
 
@@ -1135,7 +1136,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
             llvm::Function* fn = LookupInterfaceMethodImpl(structName, method);
             if (fn == nullptr)
             {
-                LogError(std::format("GetOrCreateVTable: '{}' does not implement '{}::{}'", structName, ifaceName, method.Name));
+                LogErrorMessage("GetOrCreateVTable: '{}' does not implement '{}::{}'",
+                                { structName, ifaceName, method.Name });
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
             }
             else
@@ -1197,9 +1199,9 @@ llvm::Value* LLVMBackend::CoerceArgToInterface(const NamedVariable& arg, llvm::V
 
         if (structName.empty() || !StructImplementsInterface(structName, ifaceName))
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "cannot pass '{}' as interface parameter '{}' of {} - it does not implement '{}'",
-                structName.empty() ? "<unknown>" : structName, ifaceName, calleeDesc, ifaceName));
+                { structName.empty() ? "<unknown>" : structName, ifaceName, calleeDesc, ifaceName });
             return val;
         }
 
@@ -1214,9 +1216,9 @@ llvm::Value* LLVMBackend::CoerceArgToInterface(const NamedVariable& arg, llvm::V
             auto* structTy = arg.BaseType ? arg.BaseType : GetType(arg.TypeAndValue);
             if (structTy == nullptr || structTy->isVoidTy() || arg.Primary == nullptr)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "argument for interface parameter '{}' of {} has no resolved storage",
-                    ifaceName, calleeDesc));
+                    { ifaceName, calleeDesc });
                 return val;
             }
             auto* tempAlloca = AllocaAtEntry(structTy, nullptr);
@@ -1452,7 +1454,7 @@ void LLVMBackend::ResolveMaterializedInterfaceUses()
         sourceFileName = first.File;
         currentLine = first.Line;
         currentColumn = first.Column;
-        LogError(body);
+        LogRawError(body);
     }
 
 std::string LLVMBackend::TemplateBaseOfMangledName(const std::string& mangled)
@@ -1553,9 +1555,9 @@ llvm::Value* LLVMBackend::ReboxInterfaceIfNeeded(llvm::Value* fatVal, const std:
         // next method call dispatches through. Reject it here, where both names are still known.
         if (InterfaceConversionIsProvablyImpossible(srcIface, dstIface))
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "cannot convert interface '{}' to interface '{}' - no class implementing '{}' "
-                "implements '{}'", srcIface, dstIface, srcIface, dstIface));
+                "implements '{}'", { srcIface, dstIface, srcIface, dstIface });
             return fatVal;
         }
         return RebuildInterfaceFatValue(fatVal, dstIface);
@@ -1732,21 +1734,36 @@ void LLVMBackend::ReportInterfaceReboxHasNoImplementor(const DeferredInterfaceRe
             guard = TruncateDiagnosticText(guard, kIfConstConditionTextLimit);
             nest = TruncateDiagnosticText(nest, kIfConstConditionTextLimit);
             if (guardedCount == 1)
-                LogError(std::format(
-                    "cannot convert to interface '{}' - the only class implementing it, '{}', is "
-                    "declared inside {} that is not taken in this build{}",
-                    site.DstInterface, guardedClass, guard,
-                    nest.empty() ? "" : std::format(", further nested inside {}", nest)));
+            {
+                if (nest.empty())
+                    LogErrorMessage(
+                        "cannot convert to interface '{}' - the only class implementing it, '{}', is "
+                        "declared inside {} that is not taken in this build",
+                        { site.DstInterface, guardedClass, guard });
+                else
+                    LogErrorMessage(
+                        "cannot convert to interface '{}' - the only class implementing it, '{}', is "
+                        "declared inside {} that is not taken in this build, further nested inside {}",
+                        { site.DstInterface, guardedClass, guard, nest });
+            }
             else
-                LogError(std::format(
-                    "cannot convert to interface '{}' - all {} classes implementing it are declared "
-                    "inside 'if const' arms that are not taken in this build (for example '{}', "
-                    "declared inside {}{})",
-                    site.DstInterface, guardedCount, guardedClass, guard,
-                    nest.empty() ? "" : std::format(", further nested inside {}", nest)));
+            {
+                if (nest.empty())
+                    LogErrorMessage(
+                        "cannot convert to interface '{}' - all {} classes implementing it are declared "
+                        "inside 'if const' arms that are not taken in this build (for example '{}', "
+                        "declared inside {})",
+                        { site.DstInterface, std::to_string(guardedCount), guardedClass, guard });
+                else
+                    LogErrorMessage(
+                        "cannot convert to interface '{}' - all {} classes implementing it are declared "
+                        "inside 'if const' arms that are not taken in this build (for example '{}', "
+                        "declared inside {}, further nested inside {})",
+                        { site.DstInterface, std::to_string(guardedCount), guardedClass, guard, nest });
+            }
             return;
         }
-        LogError(std::format(
+        LogErrorMessage(
             "cannot convert to interface '{}' - no class implements it",
-            site.DstInterface));
+            { site.DstInterface });
     }

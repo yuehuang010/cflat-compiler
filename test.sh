@@ -53,6 +53,7 @@ ROOT="$(cd "$(dirname "$0")" && pwd)"
 CFLAT="$ROOT/x64/$CONFIG/cflat"
 SRC="$ROOT/Test"
 LIB="$ROOT/Test/library"
+LOCALE_DIR="$ROOT/locales"
 OUT="$ROOT/out-linux"
 RES="$OUT/results"
 TIMEOUT_SECS=120
@@ -121,7 +122,7 @@ is_err_skipped() {
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log"
-  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" -o "$RES/$n.bin" >"$log" 2>&1; then
+  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" -o "$RES/$n.bin" >"$log" 2>&1; then
     echo "FAIL compile" >"$RES/$n.result"; return
   fi
   if $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
@@ -134,7 +135,7 @@ run_cb() {
 # Worker: an err_*.cb passes when the compiler exits 0 (expect_error matched).
 run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
-  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --check >"$RES/$n.log" 2>&1; then
+  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check >"$RES/$n.log" 2>&1; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL" >"$RES/$n.result"
@@ -146,7 +147,7 @@ run_err() {
 # A ".warm" suffix keeps its result/log distinct from the cold run's.
 run_err_warm() {
   local f="$1" n; n="$(basename "$f" .cb).warm"
-  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --check >"$RES/$n.log" 2>&1; then
+  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check >"$RES/$n.log" 2>&1; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL" >"$RES/$n.result"
@@ -154,7 +155,7 @@ run_err_warm() {
 }
 
 export -f run_cb run_err run_err_warm is_skipped
-export CFLAT LIB RES TIMEOUT
+export CFLAT LIB LOCALE_DIR RES TIMEOUT
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
 cb_list=""
@@ -164,12 +165,26 @@ for f in "$SRC"/test_*.cb; do
   cb_list="$cb_list$f"$'\n'
 done
 err_list=""
+err_files=()
 if [ -d "$SRC/errors" ]; then
   for f in "$SRC"/errors/err_*.cb; do
     n="$(basename "$f" .cb)"
     is_err_skipped "$n" && continue
     err_list="$err_list$f"$'\n'
+    err_files+=("$f")
   done
+fi
+
+# Discovery pass: the error suite is the authoritative diagnostic inventory. Run it
+# serially with pseudo output so expect_error continues to match source English while
+# --update-locale records every template encountered by the batch.
+if [ "${#err_files[@]}" -gt 0 ]; then
+  if ! "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
+      --check -i "$LIB" "${err_files[@]}" >"$RES/_locale.log" 2>&1; then
+    echo "FAIL: pseudo-locale diagnostic discovery failed"
+    tail -n 20 "$RES/_locale.log"
+    exit 1
+  fi
 fi
 
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
@@ -200,7 +215,7 @@ run_tooling_probe() {
   $TIMEOUT sh -c 'trap "exit 134" ABRT; "$1" static-origin-check' sh "$tooling_bin" >>"$tooling_log" 2>&1
   return $?
 }
-if ! $TIMEOUT "$CFLAT" "$SRC/test_function_ptr.cb" -i "$LIB" \
+if ! $TIMEOUT "$CFLAT" "$SRC/test_function_ptr.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
     --sanitize=ownership -o "$tooling_bin" --out-lli "$tooling_ll" >"$tooling_log" 2>&1; then
   echo "FAIL compile" >"$RES/$tooling_name.result"
 elif run_tooling_probe; then

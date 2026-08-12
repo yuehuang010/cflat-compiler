@@ -1339,7 +1339,7 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
             // Warn: CFlat requires explicit narrowing - write "return expr != 0;" instead.
             if (retTy == builder->getInt1Ty() && value->getType()->isIntegerTy() && value->getType() != retTy)
             {
-                LogError("implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit");
+                LogErrorMessage("implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit");
                 value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
             }
             builder->CreateRet(value);

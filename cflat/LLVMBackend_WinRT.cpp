@@ -230,7 +230,7 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
             if (vtblSD.StructFields[i].VariableName == slotName) { slotIdx = i; slot = &vtblSD.StructFields[i]; break; }
         if (!slot || argVals.empty())
         {
-            LogError(std::format("EmitWinrtSlotCall: bad slot '{}' on '{}'", slotName, className));
+            LogErrorMessage("EmitWinrtSlotCall: bad slot '{}' on '{}'", { slotName, className });
             return nullptr;
         }
 
@@ -248,8 +248,8 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
             auto rt = winrtSlotHResultType_.find(className + "::" + slotName);
             if (rt == winrtSlotHResultType_.end() || !dataStructures.count(rt->second))
             {
-                LogError(std::format("[winrt] '{}::{}' sugar needs HResult<{}> instantiated "
-                    "(import \"com.cb\")", className, slotName, im->ReturnType.TypeName));
+                LogErrorMessage("[winrt] '{}::{}' sugar needs HResult<{}> instantiated "
+                    "(import \"com.cb\")", { className, slotName, im->ReturnType.TypeName });
                 return nullptr;
             }
             hresultTypeName = rt->second;
@@ -424,8 +424,8 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
                 const FunctionSymbol* implSym = FindWinrtMethod(className, m);
                 if (!implSym)
                 {
-                    LogError(std::format("[winrt] class '{}' does not implement '{}::{}'",
-                        className, ifaceName, m.Name));
+                    LogErrorMessage("[winrt] class '{}' does not implement '{}::{}'",
+                        { className, ifaceName, m.Name });
                     thunks.push_back(nullptr);
                     continue;
                 }
@@ -438,8 +438,8 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
                 // by the wrapping thunk; diagnose rather than miscompile.
                 if (impl->hasStructRetAttr())
                 {
-                    LogError(std::format("[winrt] '{}::{}' returns a struct via the sret ABI, "
-                        "which the WinRT thunk does not support yet", className, m.Name));
+                    LogErrorMessage("[winrt] '{}::{}' returns a struct via the sret ABI, "
+                        "which the WinRT thunk does not support yet", { className, m.Name });
                     thunks.push_back(nullptr);
                     continue;
                 }
@@ -656,7 +656,7 @@ llvm::Value* LLVMBackend::EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::
         auto vtblIt = dataStructures.find(vtblName);
         if (dsIt == dataStructures.end() || vtblIt == dataStructures.end())
         {
-            LogError(std::format("EmitWinrtThinSlotCall: '{}' is not a built WinRT interface", thinName));
+            LogErrorMessage("EmitWinrtThinSlotCall: '{}' is not a built WinRT interface", { thinName });
             return nullptr;
         }
         auto* objTy = dsIt->second.StructType;     // { <vtbl>* }
@@ -669,7 +669,7 @@ llvm::Value* LLVMBackend::EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::
             if (slots[i].VariableName == slotName) { slotIdx = i; slot = &slots[i]; break; }
         if (!slot)
         {
-            LogError(std::format("EmitWinrtThinSlotCall: no slot '{}' on '{}'", slotName, thinName));
+            LogErrorMessage("EmitWinrtThinSlotCall: no slot '{}' on '{}'", { slotName, thinName });
             return nullptr;
         }
 
@@ -754,8 +754,8 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
 
         if (cflatArgs.size() != tpl.genericParams.size())
         {
-            LogError(std::format("'{}<...>' expects {} type argument(s), got {}",
-                base, tpl.genericParams.size(), cflatArgs.size()));
+            LogErrorMessage("'{}<...>' expects {} type argument(s), got {}",
+                { base, std::to_string(tpl.genericParams.size()), std::to_string(cflatArgs.size()) });
             return true;   // handled (it IS a winmd generic), just mis-arity
         }
 
@@ -764,7 +764,7 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
         {
             cflat_winmd::TypeRef r;
             std::string err;
-            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogError(base + "<...>: " + err); return true; }
+            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogRawError(base + "<...>: " + err); return true; }
             argRefs.push_back(r);
         }
 
@@ -792,7 +792,7 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
         }
         else
         {
-            LogError("PIID derivation for '" + mangledName + "': " + err);
+            LogRawError("PIID derivation for '" + mangledName + "': " + err);
         }
         return true;
     }
@@ -972,20 +972,20 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         const cflat_winmd::Delegate* tpl = FindWinrtDelegate(base);
         if (!tpl)
         {
-            LogError("winrtDelegate: '" + base + "' is not an imported WinRT delegate type "
-                     "(import the .winmd that declares it)");
+            LogErrorMessage("winrtDelegate: '{}' is not an imported WinRT delegate type "
+                     "(import the .winmd that declares it)", { base });
             return nullptr;
         }
         if (cflatArgs.size() != tpl->genericParams.size())
         {
-            LogError(std::format("winrtDelegate: '{}' expects {} type argument(s), got {}",
-                base, tpl->genericParams.size(), cflatArgs.size()));
+            LogErrorMessage("winrtDelegate: '{}' expects {} type argument(s), got {}",
+                { base, std::to_string(tpl->genericParams.size()), std::to_string(cflatArgs.size()) });
             return nullptr;
         }
         if (!(tpl->invoke.returnType.fullName == "Void" && tpl->invoke.returnType.pointerDepth == 0))
         {
-            LogError("winrtDelegate: '" + base + "' has a non-void Invoke return, which the "
-                     "projection does not support yet (only void-returning handlers)");
+            LogErrorMessage("winrtDelegate: '{}' has a non-void Invoke return, which the "
+                     "projection does not support yet (only void-returning handlers)", { base });
             return nullptr;
         }
 
@@ -997,7 +997,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         for (const auto& a : cflatArgs)
         {
             cflat_winmd::TypeRef r; std::string err;
-            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogError("winrtDelegate " + base + "<...>: " + err); return nullptr; }
+            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogRawError("winrtDelegate " + base + "<...>: " + err); return nullptr; }
             argRefs.push_back(r);
         }
         cflat_winmd::Method invoke = tpl->invoke;
@@ -1009,7 +1009,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         {
             if (!ParseUuidToBytes(tpl->iid, iidBytes))
             {
-                LogError("winrtDelegate: delegate '" + base + "' has no IID in metadata");
+                LogErrorMessage("winrtDelegate: delegate '{}' has no IID in metadata", { base });
                 return nullptr;
             }
         }
@@ -1019,7 +1019,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
             std::string err;
             if (!cflat_winmd::DerivePiid(inst, winrtConsumedModel_, iidBytes, err))
             {
-                LogError("winrtDelegate PIID for '" + mangled + "': " + err);
+                LogRawError("winrtDelegate PIID for '" + mangled + "': " + err);
                 return nullptr;
             }
         }
@@ -1031,7 +1031,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
 
         if (!GetFunction("operator new"))
         {
-            LogError("winrtDelegate: 'operator new' unavailable (import a core library first)");
+            LogErrorMessage("winrtDelegate: 'operator new' unavailable (import a core library first)");
             return nullptr;
         }
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
@@ -1174,7 +1174,7 @@ bool LLVMBackend::CompileWinmdFile(const std::string& path)
         std::string err;
         if (!cflat_winmd::ReadWinmd(path, model, err))
         {
-            LogError("Failed to read WinRT metadata '" + path + "': " + err);
+            LogRawError("Failed to read WinRT metadata '" + path + "': " + err);
             return false;
         }
         RegisterWinrtModel(model, path);
@@ -1274,14 +1274,14 @@ bool LLVMBackend::EmitWinmd(const std::string& path, const std::string& assembly
 
         if (model.interfaces.empty() && model.runtimeClasses.empty())
         {
-            LogError("--emit-winmd: no [winrt] interfaces or classes found to emit");
+            LogErrorMessage("--emit-winmd: no [winrt] interfaces or classes found to emit");
             return false;
         }
 
         std::string err;
         if (!cflat_winmd::WriteWinmd(model, assemblyName, path, err))
         {
-            LogError("Failed to emit winmd '" + path + "': " + err);
+            LogRawError("Failed to emit winmd '" + path + "': " + err);
             return false;
         }
         if (verbose)
@@ -1296,7 +1296,7 @@ bool LLVMBackend::CheckWinmd(const std::string& path)
         std::string err;
         if (!cflat_winmd::ReadWinmd(path, model, err))
         {
-            LogError("Failed to read WinRT metadata '" + path + "': " + err);
+            LogRawError("Failed to read WinRT metadata '" + path + "': " + err);
             return false;
         }
         if (verbose)
@@ -1502,13 +1502,12 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         if (!(arg.IsOwningString || arg.IsOwningStruct || arg.IsOwning
               || TypeHasDestructor(arg.TypeAndValue.TypeName)
               || IsOwningValueType(arg.TypeAndValue.TypeName))) return;
-        LogError(std::format(
-            "call to '{}': parameter '{}' BORROWS its argument, so 'move {}' transfers nothing - "
-            "the callee never takes ownership and the value would be orphaned. Drop the 'move', "
-            "or declare the parameter 'move {}'.",
-            functionName, paramName,
-            arg.CallerName.empty() ? arg.TypeAndValue.TypeName : arg.CallerName,
-            paramType));
+        LogErrorMessage(
+            "call to '{}': parameter '{}' BORROWS its argument, so '{} {}' transfers nothing - "
+            "the callee never takes ownership and the value would be orphaned. Drop the '{}', "
+            "or declare the parameter '{} {}'.",
+            { functionName, paramName,
+              "move", arg.CallerName.empty() ? arg.TypeAndValue.TypeName : arg.CallerName, "move", "move", paramType });
     }
 
 void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
@@ -1536,7 +1535,7 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
             RecordDeferredTempUniqueFieldSinkEscape(arg.Primary, functionName, param.VariableName);
             return;
         }
-        LogError(DescribeTempUniqueFieldSinkEscape(functionName, param.VariableName));
+        LogRawError(DescribeTempUniqueFieldSinkEscape(functionName, param.VariableName));
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p,
@@ -1611,11 +1610,11 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             if (paramConsumesOwningValue
                 && IsVariableBorrowedOwningValue(args[i].CallerName))
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "call to '{}': parameter '{}' takes ownership of a value this function only "
                     "borrows ('{}' is a by-value parameter, so the caller keeps ownership). Accept "
-                    "the parameter as a sink (move it in the body), or pass a copy with '.copy()'.",
-                    functionName, params[i].VariableName, args[i].CallerName));
+                    "the parameter as a sink ({} it in the body), or pass a copy with '{}'.",
+                    { functionName, params[i].VariableName, args[i].CallerName, "move", "copy()" });
                 continue;
             }
             // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
@@ -1634,19 +1633,21 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         || params[i].AllocAlignValue > kDefaultNewAlign))
                 {
                     if (params[i].AllocAlignValue == 0)
-                        LogError(std::format(
-                            "cannot move the over-aligned buffer '{}' ('new T[n] alignas(0, {})') into the 'move' "
+                        LogErrorMessage(
+                            "cannot move the over-aligned buffer '{}' ('{}') into the '{}' "
                             "parameter of '{}': that alignment is a property of the allocation, not of the type, so "
-                            "the callee cannot recover it. Declare the parameter 'alignas(0, {})' so the block "
+                            "the callee cannot recover it. Declare the parameter '{}' so the block "
                             "alignment is recorded, or over-align the ELEMENT TYPE instead.",
-                            args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
-                            args[i].AllocAlignment, functionName, args[i].AllocAlignment));
+                            { args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
+                              std::format("new T[n] alignas(0, {})", args[i].AllocAlignment), "move", functionName,
+                              std::format("alignas(0, {})", args[i].AllocAlignment) });
                     else
-                        LogError(std::format(
+                        LogErrorMessage(
                             "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
                             "'alignas(0, {})' but the argument was allocated 'alignas(0, {})'. The two must agree "
                             "so the callee frees with the correct alignment.",
-                            functionName, params[i].AllocAlignValue, args[i].AllocAlignment));
+                            { functionName, std::to_string(params[i].AllocAlignValue),
+                              std::to_string(args[i].AllocAlignment) });
                 }
 
                 // A `move string` argument transfers ownership to the callee, which frees
@@ -1752,9 +1753,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         // We have caller storage to clear but no type telling us how. This can only
                         // arise from a malformed (hand-built) argument; emit a clear diagnostic
                         // rather than leaving a stale value that a later destructor would double-free.
-                        LogError(std::format(
+                        LogErrorMessage(
                             "call to '{}': 'move' argument {} has no resolved type, so its source "
-                            "storage cannot be cleared after the move", functionName, i));
+                            "storage cannot be cleared after the move", { functionName, std::to_string(i) });
                     }
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
@@ -1814,12 +1815,11 @@ llvm::Value* LLVMBackend::WidenToClosureFatChecked(llvm::Value* val, const Named
                     DescribeNonFunctionArgument(arg), paramName)
                 : std::format("store {} into closure field {}",
                     DescribeNonFunctionArgument(arg), fieldDesc);
-            LogError(std::format(
-                "cannot {}: only a named function, a "
-                "'function<>' value or a lambda converts to a closure - a data pointer "
+            LogErrorMessage(
+                "cannot {}: only a named function, a '{}' value or a lambda converts to a closure - a data pointer "
                 "would be called as code. If the value really holds a code address, assert "
-                "it with an explicit cast: '(function<...>)value'.",
-                action));
+                "it with an explicit cast: '{}'.",
+                { action, "function<>", "(function<...>)value" });
         }
         return WidenBareOrThinToClosureFat(val);
     }
@@ -1830,19 +1830,21 @@ void LLVMBackend::CheckClosureReturnProvenance(llvm::Value* val, const NamedVari
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, returnNV))
         {
             if (thin)
-                LogError(std::format(
-                    "cannot return {} as a 'function<>' value: only a named function, a "
-                    "'function<>' value or a non-capturing lambda converts to a function pointer - "
+                LogErrorMessage(
+                    "cannot return {} as a '{}' value: only a named function, a "
+                    "'{}' value or a non-capturing lambda converts to a function pointer - "
                     "a data pointer would be called as code. If the value really holds a code "
-                    "address, assert it with an explicit cast: '(function<...>)value'.",
-                    DescribeNonFunctionArgument(returnNV)));
+                    "address, assert it with an explicit cast: '{}'.",
+                    { DescribeNonFunctionArgument(returnNV), "function<>", "function<...>",
+                      "(function<...>)value" });
             else
-                LogError(std::format(
+                LogErrorMessage(
                     "cannot return {} as a closure: only a named function, a "
-                    "'function<>' value or a lambda converts to a closure - a data pointer "
+                    "'{}' value or a lambda converts to a closure - a data pointer "
                     "would be called as code. If the value really holds a code address, assert "
-                    "it with an explicit cast: '(function<...>)value'.",
-                    DescribeNonFunctionArgument(returnNV)));
+                    "it with an explicit cast: '{}'.",
+                    { DescribeNonFunctionArgument(returnNV), "function<>",
+                      "(function<...>)value" });
         }
     }
 
@@ -1851,12 +1853,13 @@ void LLVMBackend::CheckThinFnPtrArgProvenance(llvm::Value* val, const NamedVaria
 {
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
-            LogError(std::format(
-                "cannot pass {} to 'function<>' parameter '{}': only a named function, a "
-                "'function<>' value or a non-capturing lambda converts to a function pointer - "
+            LogErrorMessage(
+                "cannot pass {} to '{}' parameter '{}': only a named function, a "
+                "'{}' value or a non-capturing lambda converts to a function pointer - "
                 "a data pointer would be called as code. If the value really holds a code "
-                "address, assert it with an explicit cast: '(function<...>)value'.",
-                DescribeNonFunctionArgument(arg), paramName));
+                "address, assert it with an explicit cast: '{}'.",
+                { DescribeNonFunctionArgument(arg), "function<>", paramName, "function<>",
+                  "(function<...>)value" });
         }
     }
 
@@ -1865,12 +1868,13 @@ void LLVMBackend::CheckThinFnPtrAssignProvenance(llvm::Value* val, const NamedVa
 {
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
-            LogError(std::format(
-                "cannot assign {} to 'function<>' destination {}: only a named function, a "
-                "'function<>' value or a non-capturing lambda converts to a function pointer - "
+            LogErrorMessage(
+                "cannot assign {} to '{}' destination {}: only a named function, a "
+                "'{}' value or a non-capturing lambda converts to a function pointer - "
                 "a data pointer would be called as code. If the value really holds a code "
-                "address, assert it with an explicit cast: '(function<...>)value'.",
-                DescribeNonFunctionArgument(arg), destDesc));
+                "address, assert it with an explicit cast: '{}'.",
+                { DescribeNonFunctionArgument(arg), "function<>", destDesc, "function<>",
+                  "(function<...>)value" });
         }
     }
 
@@ -1879,12 +1883,13 @@ void LLVMBackend::CheckFatClosureAssignProvenance(llvm::Value* val, const NamedV
 {
         if (val && val->getType()->isPointerTy() && ArgumentIsProvablyDataPointer(val, arg))
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "cannot assign {} to closure destination {}: only a named function, a "
-                "'function<>' value or a lambda converts to a closure - a data pointer "
+                "'{}' value or a lambda converts to a closure - a data pointer "
                 "would be called as code. If the value really holds a code "
-                "address, assert it with an explicit cast: '(function<...>)value'.",
-                DescribeNonFunctionArgument(arg), destDesc));
+                "address, assert it with an explicit cast: '{}'.",
+                { DescribeNonFunctionArgument(arg), destDesc, "function<>",
+                  "(function<...>)value" });
         }
     }
 
@@ -1919,20 +1924,26 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
                 if (k != 0) list += ", ";
                 list += captureNames[k];
             }
-            std::string more = count > shown
-                ? std::format(", ... (and {} more)", count - shown) : "";
-            LogError(std::format(
-                "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} [{}{}]. "
-                "A C callback is a bare code pointer and cannot carry captured state - "
-                "pass a non-capturing lambda or a named function.",
-                paramName, count, (count == 1 ? "variable" : "variables"), list, more));
+            if (count > shown)
+                LogErrorMessage(
+                    "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} "
+                    "[{}, ... (and {} more)]. A C callback is a bare code pointer and cannot carry "
+                    "captured state - pass a non-capturing lambda or a named function.",
+                    { paramName, std::to_string(count), count == 1 ? "variable" : "variables", list,
+                      std::to_string(count - shown) });
+            else
+                LogErrorMessage(
+                    "cannot pass to C function-pointer parameter '{}': this lambda captured {} {} [{}]. "
+                    "A C callback is a bare code pointer and cannot carry captured state - "
+                    "pass a non-capturing lambda or a named function.",
+                    { paramName, std::to_string(count), count == 1 ? "variable" : "variables", list });
             return nullptr;   // unreachable: LogError above does not return
         }
         // A stored function<> value - its captures are not known at the call site.
-        LogError(std::format(
+        LogErrorMessage(
             "cannot pass to C function-pointer parameter '{}': this 'function<>' value may store captured state. "
             "A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
-            paramName));
+            { paramName });
         return nullptr;   // unreachable: LogError above does not return
     }
 
@@ -2148,8 +2159,8 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
             if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
             {
                 std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
-                LogError(std::format("no method of '{}.{}' matches the given arguments{}",
-                    ifaceName, methodName, why.empty() ? "" : " - " + why));
+                LogErrorMessage("no method of '{}.{}' matches the given arguments{}",
+                    { ifaceName, methodName, why.empty() ? "" : " - " + why });
                 return true;
             }
             if (args[i].TypeAndValue.PointerDepthRefuses(params[i]))
@@ -2160,21 +2171,21 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
                 std::string argShown = DisplayNameOfMangledType(args[i].TypeAndValue.TypeName);
                 if (tooDeep)
                 {
-                    LogError(std::format(
-                        "call to '{}.{}': parameter {} '{}' has type '{}*' and the argument has {} - "
-                        "there is no implicit dereference. Dereference it with '*' at the call site.",
-                        ifaceName, methodName, i, params[i].VariableName, shown,
-                        argShown.empty() ? std::string("one more level of indirection")
-                                         : std::format("type '{}**'", argShown)));
+                    LogErrorMessage(
+                        "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has {} - "
+                        "there is no implicit dereference. Dereference it with '{}' at the call site.",
+                        { ifaceName, methodName, std::to_string(i), params[i].VariableName,
+                          shown + "*", argShown.empty() ? std::string("one more level of indirection")
+                                           : std::format("type '{}**'", argShown), "*" });
                 }
                 else
                 {
-                    LogError(std::format(
-                        "call to '{}.{}': parameter {} '{}' has type '{}**' and the argument has {} - "
-                        "there is no implicit address-of. Take its address with '&' at the call site.",
-                        ifaceName, methodName, i, params[i].VariableName, shown,
-                        argShown.empty() ? std::string("one fewer level of indirection")
-                                         : std::format("type '{}*'", argShown)));
+                    LogErrorMessage(
+                        "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has {} - "
+                        "there is no implicit address-of. Take its address with '{}' at the call site.",
+                        { ifaceName, methodName, std::to_string(i), params[i].VariableName,
+                          shown + "**", argShown.empty() ? std::string("one fewer level of indirection")
+                                           : std::format("type '{}*'", argShown), "&" });
                 }
                 return true;
             }
@@ -2184,23 +2195,35 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
                 // stays raw and loses the advice clause rather than naming a type that cannot exist.
                 bool writable = true;
                 std::string shown = DisplayNameOfMangledType(params[i].TypeName, &writable);
-                std::string advice = writable
-                    ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
-                LogError(std::format(
-                    "call to '{}.{}': cannot pass a '{}*' to by-value parameter '{}' of type '{}' - "
-                    "there is no implicit dereference. Write '*' at the call site to pass the "
-                    "pointee{}.",
-                    ifaceName, methodName, shown, params[i].VariableName, shown, advice));
+                if (writable)
+                {
+                    LogErrorMessage(
+                        "call to '{}.{}': cannot pass a '{}' to by-value parameter '{}' of type '{}' - "
+                        "there is no implicit dereference. Write '{}' at the call site to pass the "
+                        "pointee, or declare the parameter as '{}'.",
+                        { ifaceName, methodName, std::format("{}*", shown), params[i].VariableName,
+                          shown, "*", std::format("{}*", shown) });
+                }
+                else
+                {
+                    LogErrorMessage(
+                        "call to '{}.{}': cannot pass a '{}' to by-value parameter '{}' of type '{}' - "
+                        "there is no implicit dereference. Write '{}' at the call site to pass the "
+                        "pointee.",
+                        { ifaceName, methodName, std::format("{}*", shown), params[i].VariableName,
+                          shown, "*" });
+                }
                 return true;
             }
             if (PointerArgIntoByValuePrimitiveParam(args[i], params[i]))
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "call to '{}.{}': cannot pass a pointer to by-value parameter '{}' of type '{}' - "
-                    "an address is not of type '{}'. Dereference it with '*' at the call site, or "
-                    "declare the parameter as '{}*'.",
-                    ifaceName, methodName, params[i].VariableName, params[i].TypeName,
-                    params[i].TypeName, params[i].TypeName));
+                    "an address is not of type '{}'. Dereference it with '{}' at the call site, or "
+                    "declare the parameter as '{}'.",
+                    { ifaceName, methodName, params[i].VariableName, params[i].TypeName,
+                      std::format("{}*", params[i].TypeName), "*",
+                      std::format("{}*", params[i].TypeName) });
                 return true;
             }
         }
@@ -2219,7 +2242,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
         if (byName.empty())
         {
-            LogError(std::format("interface '{}' has no method '{}'", ifaceName, methodName));
+            LogErrorMessage("interface '{}' has no method '{}'", { ifaceName, methodName });
             return -1;
         }
 
@@ -2244,9 +2267,9 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
                 if (i > 0) expected += (i + 1 == arities.size()) ? " or " : ", ";
                 expected += std::to_string(arities[i]);
             }
-            LogError(std::format(
+            LogErrorMessage(
                 "no overload of interface method '{}.{}' takes {} argument(s); expected {}",
-                ifaceName, methodName, args.size(), expected));
+                { ifaceName, methodName, std::to_string(args.size()), expected });
             return -1;
         }
 
@@ -2356,7 +2379,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogError(std::format("unknown interface '{}'", ifaceName));
+            LogErrorMessage("unknown interface '{}'", { ifaceName });
             return nullptr;
         }
 
@@ -2405,7 +2428,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 std::string argShape = DescribePointerShapedInterfaceSource(nv.TypeAndValue);
                 if (!argShape.empty())
                 {
-                    LogError(FormatPointerShapedInterfaceUpcastError(
+                    LogRawError(FormatPointerShapedInterfaceUpcastError(
                         argShape, nv.TypeAndValue.TypeName, param.TypeName));
                     return nullptr;
                 }
@@ -2522,7 +2545,7 @@ llvm::Value* LLVMBackend::GetTypeSizeBytes(llvm::Type* type)
 {
         if (!type)
         {
-            LogError("GetTypeSizeBytes: null type pointer");
+            LogErrorMessage("GetTypeSizeBytes: null type pointer");
             return nullptr;
         }
         const llvm::DataLayout& dl = module->getDataLayout();
@@ -2534,7 +2557,7 @@ llvm::Value* LLVMBackend::GetTypeAlignBytes(llvm::Type* type)
 {
         if (!type)
         {
-            LogError("GetTypeAlignBytes: null type pointer");
+            LogErrorMessage("GetTypeAlignBytes: null type pointer");
             return nullptr;
         }
         const llvm::DataLayout& dl = module->getDataLayout();
@@ -2632,7 +2655,7 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
         const auto* ifaceMethods = FindInterface(interfaceName);
         if (ifaceMethods == nullptr)
         {
-            LogError(std::format("unknown interface: '{}'", interfaceName));
+            LogErrorMessage("unknown interface{} '{}'", { ":", interfaceName });
             return;
         }
 
@@ -2685,7 +2708,8 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
 
             if (!found)
             {
-                LogError(std::format("class '{}' does not implement '{}::{}'", structName, interfaceName, method.Name));
+                LogErrorMessage("class '{}' does not implement '{}::{}'",
+                    { structName, interfaceName, method.Name });
             }
             else if (!anyConforms)
             {
@@ -2718,18 +2742,18 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         auto it = compiler->dataStructures.find(structName);
         if (it == compiler->dataStructures.end())
         {
-            LogError(std::format("reflect: unknown struct '{}'", structName));
+            LogErrorMessage("reflect: unknown struct '{}'", { structName });
             return nullptr;
         }
         auto& sd = it->second;
         if (!sd.StructType)
         {
-            LogError(std::format("reflect: struct '{}' has no LLVM type", structName));
+            LogErrorMessage("reflect: struct '{}' has no LLVM type", { structName });
             return nullptr;
         }
         if (sd.IsUnion)
         {
-            LogError(std::format("reflect is not supported on union type '{}'", structName));
+            LogErrorMessage("reflect is not supported on union type '{}'", { structName });
             return nullptr;
         }
 
@@ -2757,7 +2781,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         auto* fn = compiler->CreateFunctionDefinition(fnName, voidReturn, {objParam, visitorParam});
         if (!fn)
         {
-            LogError(std::format("reflect: failed to create function for '{}'", structName));
+            LogErrorMessage("reflect: failed to create function for '{}'", { structName });
             compiler->RestoreBuilderState(savedState);
             return nullptr;
         }
@@ -2778,7 +2802,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         }
         if (!visitorAlloca)
         {
-            LogError("reflect: failed to retrieve visitor alloca");
+            LogErrorMessage("reflect: failed to retrieve visitor alloca");
             compiler->RestoreBuilderState(savedState);
             return fn;
         }

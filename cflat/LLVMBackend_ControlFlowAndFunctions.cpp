@@ -407,10 +407,11 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
         if (arg->getType() == stringTy && destTy->isPointerTy()
             && (paramTypeName == "char" || paramTypeName == "i8"))
         {
-            LogError(std::format(
-                "cannot pass 'string' to the 'char*' parameter {} through a function value: a "
-                "'string' is a {{ptr,len}} value, not a 'char*'. Pass the buffer explicitly with '.data()'.",
-                index + 1));
+            LogErrorMessage(
+                "cannot pass '{}' to the '{}' parameter {} through a function value: a "
+                "'{}' is a {} value, not a '{}'. Pass the buffer explicitly with '{}'.",
+                { "string", "char*", std::to_string(index + 1), "string", "{ptr,len}",
+                  "char*", ".data()" });
             return;
         }
         if (!arg->getType()->isPointerTy() || destTy->isPointerTy()) return;
@@ -421,17 +422,17 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
         std::string shown = DisplayNameOfMangledType(paramTypeName, &writable);
         if (shown.empty())
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "call through a function value: cannot pass a pointer as argument {} - that "
                 "parameter is a by-value slot and there is no implicit dereference. Write '*' at "
-                "the call site to pass the pointee.", index + 1));
+                "the call site to pass the pointee.", { std::to_string(index + 1) });
             return;
         }
         // Same rule as the virtual site: a nested instantiation renders ambiguously, so it keeps
         // the raw name and loses the advice clause.
         std::string advice = writable
             ? std::format(", or declare the parameter as '{}*'", shown) : std::string();
-        LogError(std::format(
+        LogRawError(std::format(
             "call through a function value: cannot pass a pointer as argument {} - parameter {} is "
             "the by-value type '{}' and there is no implicit dereference. Write '*' at the call "
             "site to pass the pointee{}.",
@@ -529,7 +530,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
 llvm::SwitchInst* LLVMBackend::CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases)
 {
         if (!cond->getType()->isIntegerTy())
-            LogError("switch expression must be an integer type");
+            LogErrorMessage("switch expression must be an integer type");
         return builder->CreateSwitch(cond, defaultBlock, numCases);
     }
 
@@ -568,10 +569,10 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
 
         // An aggregate (a `string`, any struct) has no truth value. Diagnose it here rather than
         // handing it to CreateCondBr / CreateSelect, which fails module verification opaquely.
-        LogError(std::format(
+        LogErrorMessage(
             "condition must be a scalar (bool, integer, pointer or floating point), not '{}'"
             " - compare it explicitly",
-            DescribeConditionType(cond->getType())));
+            { DescribeConditionType(cond->getType()) });
         return builder->getFalse();
     }
 
@@ -990,12 +991,12 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
             // signature" assert at codegen. Reject with a clear diagnostic instead.
             if (external && existing->getFunctionType() != functionType)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "conflicting declaration of extern '{}': a function with this linkage "
                     "name already exists with a different signature (e.g. in a core library "
                     "such as os.windows). Rename your extern, or call the existing one "
                     "(for file I/O use os.windows.fopen/fread/fwrite/fclose).",
-                    functionName));
+                    { functionName });
                 return;
             }
         }
@@ -1115,10 +1116,10 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
         const std::string& firstFile = it->second.first;
         size_t firstLine = it->second.second;
         if (line == 0 || firstLine == 0 || firstLine == line) return;
-        LogError(std::format("redefinition of '{}' - the same overload is already defined at "
+        LogErrorMessage("redefinition of '{}' - the same overload is already defined at "
             "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
             "'i32' name the same type) are one overload, not two.",
-            functionName, firstFile, firstLine));
+            { functionName, firstFile, std::to_string(firstLine) });
     }
 
 bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,

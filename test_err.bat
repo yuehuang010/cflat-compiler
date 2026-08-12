@@ -2,12 +2,15 @@
 setlocal EnableDelayedExpansion
 
 if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
+if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0locales
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library
 set GROUP=0
 
 if "%~1"=="--group" set GROUP=%~2
+
+if "%~1"=="--discover" goto :Discover
 
 set ERRORS=0
 
@@ -62,7 +65,7 @@ for %%F in (%SRC%\errors\err_*.cb) do (
 )
 if defined GROUPFILES (
     echo === error group %~1 of %~2 ===
-    %COMPILER% --check -i %LIB% --nologo!GROUPFILES!
+    %COMPILER% --check -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --nologo!GROUPFILES!
     if !ERRORLEVEL! neq 0 set /a ERRORS+=1
 )
 exit /b
@@ -81,7 +84,7 @@ exit /b 0
 set CIRC_FILE=%~1
 set CIRC_TMP=%TEMP%\circ_%~n1_out.txt
 echo === circular\%CIRC_FILE% ===
-%COMPILER% %SRC%\errors\circular\%CIRC_FILE% --nologo > %CIRC_TMP% 2>&1
+%COMPILER% %SRC%\errors\circular\%CIRC_FILE% --locale-dir "%CFLAT_LOCALE_DIR%" --nologo > %CIRC_TMP% 2>&1
 findstr /i "Circular" %CIRC_TMP% > nul
 if %ERRORLEVEL% equ 0 (
     echo PASS: circular\%CIRC_FILE%
@@ -92,3 +95,9 @@ if %ERRORLEVEL% equ 0 (
 )
 del /q %CIRC_TMP% 2>nul
 exit /b
+
+:Discover
+set "DISCOVERY_FILES="
+for %%F in (%SRC%\errors\err_*.cb) do set "DISCOVERY_FILES=!DISCOVERY_FILES! "%SRC%\errors\%%~nxF""
+%COMPILER% --locale pseudo --update-locale en-pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --check -i %LIB% --nologo !DISCOVERY_FILES!
+exit /b %ERRORLEVEL%

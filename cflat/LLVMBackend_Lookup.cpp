@@ -248,7 +248,7 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                 }
                 else
                 {
-                    LogError(std::format("unknown type '{}'", resolvedTypeName));
+                    LogErrorMessage("unknown type '{}'", { resolvedTypeName });
                     type = builder->getVoidTy();
                 }
             }
@@ -269,8 +269,9 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             bool isMask = type->isIntegerTy(1);
             if (!numeric && !isMask)
             {
-                LogError(std::format("simd element type must be a numeric scalar "
-                    "(i8..i64, u8..u64, float, double) or bool for a mask, got '{}'", resolvedTypeName));
+                LogErrorMessage("simd element type must be a numeric scalar "
+                    "({}, {}, {}, {}) or {} for a mask, got '{}'",
+                    { "i8..i64", "u8..u64", "float", "double", "bool", resolvedTypeName });
                 return type;
             }
             type = llvm::FixedVectorType::get(type, static_cast<unsigned>(lanes));

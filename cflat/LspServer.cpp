@@ -455,6 +455,10 @@ public:
             auto b = std::make_unique<LLVMBackend>();
             b->SetRuntimeDir(runtimeDir_);
             b->SetVerbose(verbose_);
+            const char* locale = std::getenv("CFLAT_LOCALE");
+            b->SetLocale(locale && *locale ? locale : "en-simple");
+            b->SetLocaleDirectory((std::filesystem::path(runtimeDir_) / "locales").string());
+            b->LoadLocale(verbose_);
             backendPool_.push_back(std::move(b));
             freeBackends_.push_back(i);
         }
@@ -1430,6 +1434,10 @@ private:
             auto fresh = std::make_unique<LLVMBackend>();
             fresh->SetRuntimeDir(runtimeDir_);
             fresh->SetVerbose(verbose_);
+            const char* locale = std::getenv("CFLAT_LOCALE");
+            fresh->SetLocale(locale && *locale ? locale : "en-simple");
+            fresh->SetLocaleDirectory((std::filesystem::path(runtimeDir_) / "locales").string());
+            fresh->LoadLocale(verbose_);
             backendPool_[slot] = std::move(fresh);
             backendAnalyzed_[slot] = false;
 

@@ -8,6 +8,7 @@ REM Worker mode: compile and run a single .c test, write result file
 REM All compiler/exe output goes to a log file; nothing printed to console.
 REM ===========================================================================
 if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
+if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0locales
 
 if "%~1"=="--worker-c" (
     set NAME=%~2
@@ -17,7 +18,7 @@ if "%~1"=="--worker-c" (
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.c -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll --locale-dir "!CFLAT_LOCALE_DIR!" !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -51,7 +52,7 @@ if "%~1"=="--worker-cb" (
     set OUT=%CFLAT_OUT%
     if not defined CFLAT_PLATFORM_FLAG set CFLAT_PLATFORM_FLAG=
     set T0=!TIME!
-    !COMPILER! !SRC!\!NAME!.cb -i !LIB! -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
+    !COMPILER! !SRC!\!NAME!.cb -i !LIB! --locale-dir "!CFLAT_LOCALE_DIR!" -o !OUT!\!NAME!.exe --nologo --out-lli !OUT!\!NAME!.ll !CFLAT_PLATFORM_FLAG! !CFLAT_EXTRA! > "!OUT!\results\!NAME!.log" 2>&1
     if !ERRORLEVEL! neq 0 (
         echo FAILED: !NAME! - compiler error>"!OUT!\results\!NAME!.result"
         exit /b
@@ -161,6 +162,15 @@ REM and the suite never overwrites the developer's own per-user cache.
 if errorlevel 1 (
     echo FAILED: cflat.exe --init-local
     type "%OUT%\results\init.log"
+    exit /b 1
+)
+
+REM Discover diagnostic templates from the complete error-test suite before launching
+REM parallel workers. The discovery pass uses pseudo output so expect_error matches source text.
+call "%~dp0test_err.bat" --discover --locale-dir "%CFLAT_LOCALE_DIR%" >"%OUT%\results\locale.log" 2>&1
+if errorlevel 1 (
+    echo FAILED: pseudo-locale diagnostic discovery
+    type "%OUT%\results\locale.log"
     exit /b 1
 )
 

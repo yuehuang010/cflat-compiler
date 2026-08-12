@@ -211,6 +211,12 @@ static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool s
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
+    const char* symbolLocale = std::getenv("CFLAT_LOCALE");
+    compiler.SetLocale(args.getOption("locale").value_or(
+        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
+    compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
+        (std::filesystem::path(runtimeDir) / "locales").string()));
+    compiler.LoadLocale(args.hasFlag("verbose"));
 
     LspSymbolIndex index;
     compiler.SetSymbolSink(&index);
@@ -319,6 +325,9 @@ int main(int argc, char* argv[])
     args.addOption("platform", 'p', "Target platform: linux (native default), win64, win32, or macos (arm64 Mach-O cross-compile)", "linux");
 #endif
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
+    args.addOption("locale", 0, "Diagnostic locale (default: en-simple; CFLAT_LOCALE is used when omitted; pseudo prints source templates)");
+    args.addOption("locale-dir", 0, "Directory containing diagnostic locale JSON files (default: <compiler>/locales)");
+    args.addOption("update-locale", 0, "Collect localized templates during compilation and update <locale>.json under --locale-dir");
     args.addFlag("O0", '0', "No optimization (default)");
     args.addFlag("O1", '1', "Optimize for speed (level 1)");
     args.addFlag("O2", '2', "Optimize for speed (level 2)");
@@ -370,6 +379,17 @@ int main(int argc, char* argv[])
 
     // Locate runtime.cb next to this executable (needed for lld-link discovery too).
     std::string runtimeDir = GetExeDir();
+    std::string diagnosticLocale = args.getOption("locale").value_or("");
+    if (diagnosticLocale.empty())
+    {
+        if (const char* envLocale = std::getenv("CFLAT_LOCALE"); envLocale && *envLocale)
+            diagnosticLocale = envLocale;
+    }
+    if (diagnosticLocale.empty())
+        diagnosticLocale = "en-simple";
+    std::string diagnosticLocaleDir = args.getOption("locale-dir").value_or(
+        (std::filesystem::path(runtimeDir) / "locales").string());
+    auto updateLocale = args.getOption("update-locale");
 
     // --init / --init-local / --init-clear / --init-clear-local are mutually exclusive;
     // refuse rather than guessing which one was meant.
@@ -558,6 +578,9 @@ int main(int argc, char* argv[])
         LLVMBackend compiler;
         compiler.SetRuntimeDir(runtimeDir);
         compiler.SetVerbose(args.hasFlag("verbose"));
+        compiler.SetLocale(diagnosticLocale);
+        compiler.SetLocaleDirectory(diagnosticLocaleDir);
+        compiler.LoadLocale(args.hasFlag("verbose"));
         std::string report;
         bool ok = compiler.WinmdInstantiateSelfTest(*winmd, report);
         std::cout << report;
@@ -606,6 +629,9 @@ int main(int argc, char* argv[])
         LLVMBackend compiler;
         compiler.SetRuntimeDir(runtimeDir);
         compiler.SetVerbose(args.hasFlag("verbose"));
+        compiler.SetLocale(diagnosticLocale);
+        compiler.SetLocaleDirectory(diagnosticLocaleDir);
+        compiler.LoadLocale(args.hasFlag("verbose"));
 
         int failures = 0;
         for (size_t i = 0; i < args.positionalCount(); ++i)
@@ -630,6 +656,10 @@ int main(int argc, char* argv[])
         LLVMBackend compiler;
         compiler.SetRuntimeDir(runtimeDir);
         compiler.SetVerbose(args.hasFlag("verbose"));
+        compiler.SetLocale(diagnosticLocale);
+        compiler.SetLocaleDirectory(diagnosticLocaleDir);
+        compiler.LoadLocale(args.hasFlag("verbose"));
+        compiler.SetLocaleTemplateCollection(updateLocale.has_value());
         compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
         compiler.SetBatchMode(true);
         compiler.SetNoCache(args.hasFlag("no-cache"));
@@ -665,6 +695,9 @@ int main(int argc, char* argv[])
         if (showProgress)
             std::cout << std::format("Checked {} file(s), {} failed.\n", args.positionalCount(), failures);
 
+        if (updateLocale && !compiler.WriteCollectedLocale(*updateLocale, args.hasFlag("verbose")))
+            return 1;
+
         writeTimeTrace("check.time-trace.json");
         return failures == 0 ? 0 : 1;
     }
@@ -672,6 +705,10 @@ int main(int argc, char* argv[])
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
+    compiler.SetLocale(diagnosticLocale);
+    compiler.SetLocaleDirectory(diagnosticLocaleDir);
+    compiler.LoadLocale(args.hasFlag("verbose"));
+    compiler.SetLocaleTemplateCollection(updateLocale.has_value());
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
     compiler.SetNoCache(args.hasFlag("no-cache"));
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
@@ -705,6 +742,9 @@ int main(int argc, char* argv[])
     compiler.SetRunArgs(args.passthrough());
 
     bool ok = compiler.Compile(args);
+
+    if (updateLocale && !compiler.WriteCollectedLocale(*updateLocale, args.hasFlag("verbose")))
+        return 1;
 
     writeTimeTrace(std::filesystem::path(*filename).stem().string() + ".time-trace.json");
 

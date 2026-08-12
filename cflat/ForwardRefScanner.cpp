@@ -416,7 +416,8 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         // helpful "unknown type 'auto'" later in this scan.
         if (returnType.TypeName == "auto")
         {
-            Compiler(func)->LogError("'auto' return type is only supported on generic functions (e.g. auto f<T>(T x))");
+            Compiler(func)->LogErrorMessage("'{}' return type is only supported on generic functions (e.g. {})",
+                { "auto", "auto f<T>(T x)" });
             return;
         }
         auto* paramTypeList = func->parameterTypeList();

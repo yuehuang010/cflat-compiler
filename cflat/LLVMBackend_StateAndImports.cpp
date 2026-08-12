@@ -99,7 +99,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
 {
         if (sites.empty())
         {
-            LogError(std::format("'auto' return: function '{}' has no return statement; explicit return required for type inference", functionName));
+            LogErrorMessage("'{}' return: function '{}' has no return statement; explicit return required for type inference",
+                            { "auto", functionName });
             return oldFn;
         }
 
@@ -115,7 +116,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             // Both must be non-void (cannot mix 'return;' with 'return expr;').
             if (siteTy->isVoidTy() || unifiedTy->isVoidTy())
             {
-                LogError(std::format("'auto' return: cannot mix 'return;' and 'return <expr>;' in function '{}'", functionName));
+                LogErrorMessage("'{}' return: cannot mix '{}' and '{}' in function '{}'",
+                                { "auto", "return;", "return <expr>;", functionName });
                 return oldFn;
             }
             int srcToCur = CompareUpconvert(siteTy, unifiedTy);   // widens to current?
@@ -124,7 +126,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             else if (curToSrc > 0) { unifiedTy = siteTy; }
             else
             {
-                LogError(std::format("'auto' return: cannot unify return types in function '{}'", functionName));
+                LogErrorMessage("'{}' return: cannot unify return types in function '{}'",
+                                { "auto", functionName });
                 return oldFn;
             }
         }
@@ -143,7 +146,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         {
             // Discard the placeholder; the existing definition wins.
             if (!oldFn->use_empty())
-                LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported", functionName));
+                LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported",
+                                { "auto", functionName });
             ForgetFunctionEscapeMemo(oldFn);
             oldFn->eraseFromParent();
             return existing;
@@ -224,7 +228,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         // Recursion would leave uses behind (call to oldFn from inside its own body).
         // Diagnose explicitly rather than letting LLVM's verifier complain later.
         if (!oldFn->use_empty())
-            LogError(std::format("'auto' return: recursive call in function '{}' is not yet supported - declare the return type explicitly", functionName));
+            LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported - declare the return type explicitly",
+                            { "auto", functionName });
 
         MigrateUniqueFieldBorrowReturn(oldFn, newFn);
         ForgetFunctionEscapeMemo(oldFn);
@@ -584,6 +589,24 @@ void LLVMBackend::SetSourceFileDir(const std::string& dir)
 
 void LLVMBackend::SetSourceDisplayName(const std::string& name)
 { sourceDisplayName_ = name; }
+
+void LLVMBackend::SetLocale(const std::string& locale)
+{ diagnosticLocalization_.SetLocale(locale); }
+
+void LLVMBackend::SetLocaleDirectory(const std::string& directory)
+{ diagnosticLocalization_.SetLocaleDirectory(directory); }
+
+bool LLVMBackend::LoadLocale(bool verbose)
+{
+        llvm::TimeTraceScope localeScope("LocaleLoad");
+        return diagnosticLocalization_.Load(verbose);
+}
+
+void LLVMBackend::SetLocaleTemplateCollection(bool enabled)
+{ diagnosticLocalization_.SetCollectTemplates(enabled); }
+
+bool LLVMBackend::WriteCollectedLocale(const std::string& locale, bool verbose) const
+{ return diagnosticLocalization_.WriteCollectedCatalog(locale, verbose); }
 
 void LLVMBackend::SetVerbose(bool v)
 { verbose = v; }
@@ -1177,7 +1200,7 @@ bool LLVMBackend::CompileVcpkgImport(const std::string& importingFilePath,
         std::string err;
         if (!vcpkg_.Resolve(importingFilePath, portSpec, res, err))
         {
-            LogError(err);
+            LogRawError(err);
             return false;
         }
 
@@ -1236,17 +1259,17 @@ bool LLVMBackend::CompileVcpkgImport(const std::string& importingFilePath,
             // of the generic "install is incomplete" hint.
             if (vcpkg_.InstallSuppressed() && !includeDirPresent)
             {
-                LogError(std::format(
+                LogErrorMessage(
                     "import package-vcpkg: port for header '{}' is not installed (no '{}'), "
                     "and 'vcpkg install' is disabled (--vcpkg-no-install).\n"
                     "  Run 'vcpkg install' yourself, or drop --vcpkg-no-install to let cflat install it.",
-                    header, res.includeDir));
+                    { header, res.includeDir });
                 return false;
             }
-            LogError(std::format(
+            LogErrorMessage(
                 "import package-vcpkg: header '{}' not found under '{}'.\n"
                 "  The port may not own this header, or the install is incomplete.",
-                header, res.includeDir));
+                { header, res.includeDir });
             return false;
         }
         return BindCanonicalCHeader(headerCanon, res.includeDir, extraDefines);
@@ -1346,20 +1369,20 @@ bool LLVMBackend::ResolveNugetPri(const std::string& priName,
         {
             // LSP never deploys; a missing pri must not paint an error on a clean file.
             if (lspMode) return true;
-            LogError(std::format(
+            LogErrorMessage(
                 "import package-nuget: pri file '{}' was not found in package '{}' (probed '{}' "
                 "and a recursive search of '{}').",
-                priName, packageSpec, primary.string(), packageFolder));
+                { priName, packageSpec, primary.string(), packageFolder });
             return false;
         }
 
         std::string abs = fs::absolute(found, ec).string();
         if (!deployPriPath_.empty() && deployPriPath_ != abs)
         {
-            LogError(std::format(
+            LogErrorMessage(
                 "import package-nuget: conflicting pri deployment - both '{}' and '{}' were "
                 "requested as <exe>.pri. Only one pri may be deployed per output.",
-                deployPriPath_, abs));
+                { deployPriPath_, abs });
             return false;
         }
         deployPriPath_ = abs;
@@ -1395,16 +1418,18 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                 std::string ext = lowerExt(f);
                 if (ext == ".winmd")
                 {
-                    LogError(std::format(
+                    LogErrorMessage(
                         "import package-nuget: '{}' - a .winmd cannot appear in a multi-entry group; "
-                        "group a .winmd import on its own line.", f));
+                        "group a .winmd import on its own line.",
+                        { f });
                     return false;
                 }
                 if (ext != ".h" && ext != ".hpp" && ext != ".hh")
                 {
-                    LogError(std::format(
+                    LogErrorMessage(
                         "import package-nuget: '{}' - a multi-entry group may contain only "
-                        ".h/.hpp/.hh headers.", f));
+                        ".h/.hpp/.hh headers.",
+                        { f });
                     return false;
                 }
             }
@@ -1428,7 +1453,7 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                         packageSpec);
                 return true;
             }
-            LogError(err);
+            LogRawError(err);
             return false;
         }
 
@@ -1484,11 +1509,11 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                             f, packageSpec);
                     return true;
                 }
-                LogError(std::format(
+                LogErrorMessage(
                     "import package-nuget: header '{}' was not found in the include dirs of package '{}'.\n"
                     "  Only package-owned headers may appear in a package-nuget group; a system header "
                     "(e.g. windows.h) may not ride in a package-nuget group.",
-                    f, packageSpec));
+                    { f, packageSpec });
                 return false;
             }
             bool ok = CompileCHeaderGroup(headerCanonicals, extraDefines, /*diskCache=*/true);
@@ -1524,10 +1549,10 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                         file, packageSpec);
                 return true;
             }
-            LogError(std::format(
+            LogErrorMessage(
                 "import package-nuget: header '{}' not found in the include dirs of package '{}'.\n"
                 "  The package may not own this header, or the layout is unexpected.",
-                file, packageSpec));
+                { file, packageSpec });
             return false;
         }
 
@@ -1537,9 +1562,10 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
             // guarded-import hint, mirroring CompileImportedFile's .winmd guard.
             if (!targetWindows_)
             {
-                LogError(std::format("import package-nuget '{}': WinRT metadata (.winmd) is only supported when "
-                                     "targeting Windows; guard the import with "
-                                     "'if const (__WINDOWS__) {{ import ...; }}'.", file));
+                LogErrorMessage("import package-nuget '{}': WinRT metadata (.winmd) is only supported when "
+                                "targeting Windows; guard the import with "
+                                "'if const (__WINDOWS__) { import ...; }'.",
+                                { file });
                 return false;
             }
             // Search the resolved metadata dirs for the exact filename and route the absolute
@@ -1561,14 +1587,14 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
                         file, packageSpec);
                 return true;
             }
-            LogError(std::format(
+            LogErrorMessage(
                 "import package-nuget: metadata '{}' not found in the winmd dirs of package '{}'.",
-                file, packageSpec));
+                { file, packageSpec });
             return false;
         }
 
-        LogError(std::format(
+        LogErrorMessage(
             "import package-nuget: '{}': only .h/.hpp/.hh headers and .winmd metadata are supported.",
-            file));
+            { file });
         return false;
     }

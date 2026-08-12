@@ -2175,7 +2175,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         {
             if (nameOverride.empty())
             {
-                LogErrorContext(func, "'auto' return type is only supported on generic functions (e.g. auto f<T>(T x))");
+                Compiler(func)->LogErrorMessage("'{}' return type is only supported on generic functions (e.g. {})",
+                    { "auto", "auto f<T>(T x)" });
                 return;
             }
             // Substitute a placeholder return type so CreateFunctionDefinition can build

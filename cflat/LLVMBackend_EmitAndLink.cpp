@@ -76,6 +76,7 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
     }
 
+
 bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
                            const std::optional<std::string>& lliPath)
 {
@@ -207,7 +208,7 @@ bool LLVMBackend::AddFrameworkImport(const std::string& name)
 {
         if (!targetMacOS_ && symbolSink_ == nullptr)
         {
-            LogError(std::format("import framework '{}' is only supported when targeting macOS", name));
+            LogErrorMessage("import framework '{}' is only supported when targeting macOS", { name });
             return false;
         }
         for (const auto& f : cFrameworks_) if (f == name) return true;
@@ -353,9 +354,10 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                     const std::string asanDylib = rtDir + "/lib/darwin/libclang_rt.asan_osx_dynamic.dylib";
                     if (rtDir.empty() || !llvm::sys::fs::exists(asanDylib))
                     {
-                        LogError("--asan on macOS requires the AddressSanitizer runtime "
-                                 "from Xcode or the Command Line Tools (the SDK-free "
-                                 "harvested-stub link cannot supply it); install one and retry.");
+                        LogErrorMessage("{} on macOS requires the AddressSanitizer runtime "
+                                        "from Xcode or the Command Line Tools (the SDK-free "
+                                        "harvested-stub link cannot supply it); install one and retry.",
+                                        { "--asan" });
                         return false;
                     }
                     // Install name is @rpath/libclang_rt.asan_osx_dynamic.dylib.
@@ -656,10 +658,10 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             llvm::sys::fs::remove(objPath);
             for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
             if (!keepVcRuntime && arch == "x64")
-                LogError("Run cflat --init for the first time to finish setting up.");
+                LogErrorMessage("Run cflat --init for the first time to finish setting up.");
             else
-                LogError("Windows SDK / Visual Studio build tools are required for this build "
-                         "configuration but were not found.");
+                LogErrorMessage("Windows SDK / Visual Studio build tools are required for this build "
+                                "configuration but were not found.");
             return false;
         }
 
@@ -762,8 +764,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             fs::path dest = fs::path(exePath).parent_path() / fs::path(asanDllToCopy).filename();
             fs::copy_file(asanDllToCopy, dest, fs::copy_options::overwrite_existing, ec);
             if (ec)
-                LogError(std::format("--asan: failed to copy asan runtime DLL '{}' next to '{}': {}",
-                                     asanDllToCopy, exePath, ec.message()));
+                LogErrorMessage("{}: failed to copy asan runtime DLL '{}' next to '{}': {}",
+                                { "--asan", asanDllToCopy, exePath, ec.message() });
             else if (verbose)
                 std::cout << std::format("[verbose]   copied asan runtime DLL: {} -> {}\n", asanDllToCopy, dest.string());
         }
@@ -829,8 +831,8 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         llvm::Function* reportFn = module->getFunction("_HeapAudit.reportLeaks_u64__");
         if (!enableFn || !reportFn)
         {
-            LogError("--heap-audit: HeapAudit.enable/reportLeaks were not linked - "
-                     "diagnostic/heap_audit.cb failed to import; cannot instrument main.");
+            LogErrorMessage("--heap-audit: HeapAudit.enable/reportLeaks were not linked - "
+                            "diagnostic/heap_audit.cb failed to import; cannot instrument main.");
             return;
         }
 
@@ -890,7 +892,7 @@ bool LLVMBackend::JitRun(int& runExitCode)
 
         if (!module->getFunction("main"))
         {
-            LogError("--run: no 'main' function to execute.");
+            LogErrorMessage("{}: no '{}' function to execute.", { "--run", "main" });
             return false;
         }
 
@@ -910,14 +912,15 @@ bool LLVMBackend::JitRun(int& runExitCode)
         }
         else
         {
-            LogError("--run: 'main' must be 'int main()' or 'int main(int argc, char** argv)' "
-                     "to be executed in-process.");
+            LogErrorMessage("{}: '{}' must be '{}' or '{}' to be executed in-process.",
+                            { "--run", "main", "int main()", "int main(int argc, char** argv)" });
             return false;
         }
         if (!mainTakesArgv && !runArgs_.empty())
         {
-            LogError("--run: program arguments were supplied after '--', but 'main' takes no "
-                     "parameters. Declare 'int main(int argc, char** argv)' to receive them.");
+            LogErrorMessage("{}: program arguments were supplied after '{}', but '{}' takes no "
+                            "parameters. Declare '{}' to receive them.",
+                            { "--run", "--", "main", "int main(int argc, char** argv)" });
             return false;
         }
 
@@ -932,8 +935,8 @@ bool LLVMBackend::JitRun(int& runExitCode)
         auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
         if (!jtmb)
         {
-            LogError(std::format("--run: could not detect host machine: {}",
-                                 llvm::toString(jtmb.takeError())));
+            LogErrorMessage("{}: could not detect host machine: {}",
+                            { "--run", llvm::toString(jtmb.takeError()) });
             return false;
         }
 
@@ -981,8 +984,8 @@ bool LLVMBackend::JitRun(int& runExitCode)
         auto jitOrErr = jitBuilder.create();
         if (!jitOrErr)
         {
-            LogError(std::format("--run: failed to create JIT: {}",
-                                 llvm::toString(jitOrErr.takeError())));
+            LogErrorMessage("{}: failed to create JIT: {}",
+                            { "--run", llvm::toString(jitOrErr.takeError()) });
             return false;
         }
         std::unique_ptr<llvm::orc::LLJIT> jit = std::move(*jitOrErr);
@@ -1009,8 +1012,8 @@ bool LLVMBackend::JitRun(int& runExitCode)
             jit->getDataLayout().getGlobalPrefix());
         if (!gen)
         {
-            LogError(std::format("--run: failed to install process symbol resolver: {}",
-                                 llvm::toString(gen.takeError())));
+            LogErrorMessage("{}: failed to install process symbol resolver: {}",
+                            { "--run", llvm::toString(gen.takeError()) });
             return false;
         }
         jit->getMainJITDylib().addGenerator(std::move(*gen));
@@ -1025,8 +1028,8 @@ bool LLVMBackend::JitRun(int& runExitCode)
             if (auto err = jit->getMainJITDylib().define(
                     llvm::orc::absoluteSymbols(std::move(syms))))
             {
-                LogError(std::format("--run: failed to define __emutls_get_address: {}",
-                                     llvm::toString(std::move(err))));
+                LogErrorMessage("{}: failed to define {}: {}",
+                                { "--run", "__emutls_get_address", llvm::toString(std::move(err)) });
                 return false;
             }
         }
@@ -1037,24 +1040,24 @@ bool LLVMBackend::JitRun(int& runExitCode)
         if (auto err = jit->addIRModule(
                 llvm::orc::ThreadSafeModule(std::move(module), std::move(tsc))))
         {
-            LogError(std::format("--run: failed to add module to JIT: {}",
-                                 llvm::toString(std::move(err))));
+            LogErrorMessage("{}: failed to add module to JIT: {}",
+                            { "--run", llvm::toString(std::move(err)) });
             return false;
         }
 
         // Run static initializers (llvm.global_ctors / .CRT$XCU) before main.
         if (auto err = jit->initialize(jit->getMainJITDylib()))
         {
-            LogError(std::format("--run: static initializer execution failed: {}",
-                                 llvm::toString(std::move(err))));
+            LogErrorMessage("{}: static initializer execution failed: {}",
+                            { "--run", llvm::toString(std::move(err)) });
             return false;
         }
 
         auto mainSym = jit->lookup("main");
         if (!mainSym)
         {
-            LogError(std::format("--run: could not find 'main': {}",
-                                 llvm::toString(mainSym.takeError())));
+            LogErrorMessage("{}: could not find '{}': {}",
+                            { "--run", "main", llvm::toString(mainSym.takeError()) });
             return false;
         }
 
@@ -1101,9 +1104,9 @@ bool LLVMBackend::ResolveAsanRuntime(const std::string& arch, const std::string&
         namespace fs = std::filesystem;
         if (msvcLibDir.empty())
         {
-            LogError("--asan: MSVC lib directory not found, cannot locate the asan runtime "
-                     "(clang_rt.asan_dynamic). Ensure Visual Studio with the C++ "
-                     "AddressSanitizer component is installed.");
+            LogErrorMessage("{}: MSVC lib directory not found, cannot locate the asan runtime "
+                            "(clang_rt.asan_dynamic). Ensure Visual Studio with the C++ "
+                            "AddressSanitizer component is installed.", { "--asan" });
             return false;
         }
 
@@ -1117,9 +1120,9 @@ bool LLVMBackend::ResolveAsanRuntime(const std::string& arch, const std::string&
             std::error_code ec;
             if (!fs::exists(libDir / lib, ec))
             {
-                LogError(std::format("--asan: asan runtime import library '{}' not found in "
+                LogErrorMessage("{}: asan runtime import library '{}' not found in "
                                      "'{}'. Install the 'C++ AddressSanitizer' component for "
-                                     "this MSVC toolset.", lib, msvcLibDir));
+                                     "this MSVC toolset.", { "--asan", lib, msvcLibDir });
                 return false;
             }
         }
@@ -1145,10 +1148,10 @@ bool LLVMBackend::ResolveAsanRuntime(const std::string& arch, const std::string&
             }
         }
 
-        LogError(std::format("--asan: asan runtime DLL '{}' not found under '{}\\bin'. The "
+        LogErrorMessage("{}: asan runtime DLL '{}' not found under '{}\\bin'. The "
                              "import library was present but the matching runtime DLL is "
                              "missing; reinstall the 'C++ AddressSanitizer' component.",
-                             dllName, verRoot.string()));
+                             { "--asan", dllName, verRoot.string() });
         return false;
     }
 
@@ -1222,13 +1225,13 @@ void LLVMBackend::CopyCRuntimeDlls(const std::string& exePath)
             fs::path src(deployPriPath_);
             fs::path dest = exeDir / (fs::path(exePath).stem().string() + ".pri");
             if (!fs::exists(src, ec))
-                LogError(std::format("failed to deploy pri: source '{}' no longer exists", deployPriPath_));
+                LogErrorMessage("failed to deploy pri: source '{}' no longer exists", { deployPriPath_ });
             else
             {
                 fs::copy_file(src, dest, fs::copy_options::overwrite_existing, ec);
                 if (ec)
-                    LogError(std::format("failed to deploy pri '{}' to '{}': {}",
-                                         deployPriPath_, dest.string(), ec.message()));
+                    LogErrorMessage("failed to deploy pri '{}' to '{}': {}",
+                                    { deployPriPath_, dest.string(), ec.message() });
                 else if (verbose)
                     std::cout << std::format("[verbose]   copied pri: {} -> {}\n", src.string(), dest.string());
             }
@@ -1264,7 +1267,6 @@ LLVMBackend::Operation LLVMBackend::ParseOperation(const std::string& operationT
         else if (operationText == "^=") { return Operation::XorAssignment; }
         else if (operationText == "|=") { return Operation::OrAssignment; }
 
-        LogError(std::format("unknown operation '{}'", operationText));
+        LogErrorMessage("unknown operation '{}'", { operationText });
         return Operation::None;
     }
-

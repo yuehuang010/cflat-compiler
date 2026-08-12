@@ -761,9 +761,26 @@ void LLVMBackend::SetSourceLocation(size_t line, size_t column)
 {
         currentLine = line;
         currentColumn = column;
-    }
+}
+
+void LLVMBackend::LogErrorMessage(std::string englishTemplate,
+                                  std::vector<std::string> arguments) const
+{
+        EmitError(diagnosticLocalization_.Localize(englishTemplate, arguments),
+                  DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments));
+}
 
 void LLVMBackend::LogError(std::string message) const
+{
+        EmitError(std::move(message));
+}
+
+void LLVMBackend::LogRawError(std::string message) const
+{
+        EmitError(std::move(message));
+}
+
+void LLVMBackend::EmitError(std::string message, std::string sourceMessage) const
 {
         // Speculative compile-time evaluation: swallow the diagnostic and unwind. The construct
         // is re-evaluated for real later, where the diagnostic (if any) fires normally.
@@ -771,7 +788,9 @@ void LLVMBackend::LogError(std::string message) const
             throw SpeculativeEvalAbort{};
         // An expect_error match is not a real diagnostic - test it before the sink dispatch so it
         // never reaches the editor as a live error, nor aborts LSP analysis of the rest of the file.
-        bool isExpectedMatch = !expectedError.empty() && message.find(expectedError) != std::string::npos;
+        const std::string& matchMessage = sourceMessage.empty() ? message : sourceMessage;
+        bool isExpectedMatch = !expectedError.empty()
+            && matchMessage.find(expectedError) != std::string::npos;
         if (diagnosticSink_)
         {
             if (isExpectedMatch)

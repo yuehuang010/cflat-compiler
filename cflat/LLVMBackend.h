@@ -34,6 +34,7 @@
 #include <io.h>
 #endif
 #include "platform/PlatformCompat.h"
+#include "DiagnosticLocalization.h"
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
@@ -2218,6 +2219,10 @@ private:
     void SetSourceLocation(size_t line, size_t column);
 
     void LogError(std::string message) const;
+    void LogRawError(std::string message) const;
+    void EmitError(std::string message, std::string sourceMessage = {}) const;
+    void LogErrorMessage(std::string englishTemplate,
+                         std::vector<std::string> arguments = {}) const;
 
     // In batch/--check mode throws so the loop continues; otherwise exits with code 1.
     [[noreturn]] void FailCompilation(const std::string& message) const;
@@ -2743,6 +2748,7 @@ private:
     bool deferredIfaceReboxDrained_ = false;
     std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
+    DiagnosticLocalization diagnosticLocalization_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
 
@@ -6769,6 +6775,11 @@ public:
     // Overrides the file name shown in diagnostics (and baked into __FILE__) for the next
     // Analyze(). Used by the LSP so errors point at the real document, not the temp copy.
     void SetSourceDisplayName(const std::string& name);
+    void SetLocale(const std::string& locale);
+    void SetLocaleDirectory(const std::string& directory);
+    bool LoadLocale(bool verbose = false);
+    void SetLocaleTemplateCollection(bool enabled);
+    bool WriteCollectedLocale(const std::string& locale, bool verbose = false) const;
     void SetVerbose(bool v);
     bool IsVerbose() const;
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.

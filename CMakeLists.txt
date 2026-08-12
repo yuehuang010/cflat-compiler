@@ -138,6 +138,7 @@ add_custom_command(
 # ---------------------------------------------------------------------------
 set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
+  ${CFLAT_DIR}/DiagnosticLocalization.cpp
   ${CFLAT_DIR}/LLVMBackend.cpp
   ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
   ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
@@ -315,6 +316,18 @@ add_custom_command(
   DEPENDS ${CORE_FILES} cflat
   COMMENT "Deploying core/ library tree next to cflat")
 add_custom_target(deploy_core ALL DEPENDS ${_core_stamp})
+
+file(GLOB LOCALE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/locales/*.json")
+set(_locale_stamp "${CMAKE_CURRENT_BINARY_DIR}/deploy_locales.stamp")
+add_custom_command(
+  OUTPUT ${_locale_stamp}
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cflat>/locales"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+          "${CMAKE_CURRENT_SOURCE_DIR}/locales" "$<TARGET_FILE_DIR:cflat>/locales"
+  COMMAND ${CMAKE_COMMAND} -E touch ${_locale_stamp}
+  DEPENDS ${LOCALE_FILES} cflat
+  COMMENT "Deploying locales/ next to cflat")
+add_custom_target(deploy_locales ALL DEPENDS ${_locale_stamp})
 
 if(WIN32)
   # lld-link + clang-cl (the C-interop / native link drivers) and the LLVM
