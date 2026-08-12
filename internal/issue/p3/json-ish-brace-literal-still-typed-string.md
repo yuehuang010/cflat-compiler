@@ -50,3 +50,13 @@ by-product of another fix.
 
 `Test/test_reflect.cb` `toJson_nested` is the accept-set leg that pins today's behaviour - it fails
 the moment a `Verbatim` region starts folding braces.
+
+## Status 2026-08-12 (q14 bucket close) - DEFERRED BY THE MAINTAINER
+
+Asked for a ruling during the q14 round and answered "I need to think about this more". Do not
+implement either reading of the fix direction above without a fresh ruling: both (a) and (b) change
+documented behaviour or break a pinned accept-set leg, so this is a design decision, not a bug fix.
+
+The q14 bucket file was deleted on the same date; this file and
+[[sizeof-steals-discarded-tuple-comparison-spelling]] are what remained of it. What that bucket
+recorded about this item is exactly the paragraph above.

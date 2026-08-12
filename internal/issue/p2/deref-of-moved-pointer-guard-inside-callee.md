@@ -208,3 +208,11 @@ of `Test/test_move.cb`'s `cross_block_conditional_move_then_deref_interface`.
 `if (RuntimeFalse()) { move a; } a->v;` is reported even though the branch is never taken. By
 design, and the acceptance case the maintainer specified: the analysis models the presence of a
 guard on the dereference, not the reachability of the moving path.
+
+## From the q10 bucket file (deleted 2026-08-12)
+
+The q10 bucket is gone; this file and [[move-of-borrow-into-move-sink-parameter]] are what remained
+of it. What it recorded about this item: only the conditional-termination half is open. The
+cross-block diagnostic in `cflat/MoveDataflow.h` is intraprocedural, so a guard that prevents the
+dereference by calling a conditionally-terminating callee is invisible to it. Filed by design -
+closing it means interprocedural termination analysis.

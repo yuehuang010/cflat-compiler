@@ -71,3 +71,9 @@ that fails to be a type can be re-offered to the expression path safely, because
 null value, decides. Resolve both together; do not add a special case for this text alone.
 
 Related: [[sizeof-over-generic-instantiation-unresolved-while-alignof-resolves]], [[interface-issue-queue]]
+
+The q14 bucket file was deleted 2026-08-12; this file and
+[[json-ish-brace-literal-still-typed-string]] are what remained of it. What that bucket recorded
+about this item is the Status section above: the named blocker is gone, but `bc53456` did not route
+the prefix-`sizeof` operand through the real `typeName` rule, so the parser still cannot settle the
+ambiguity and the wording regressed to the mangled name.

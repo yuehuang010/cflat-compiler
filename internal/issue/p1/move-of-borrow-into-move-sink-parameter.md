@@ -125,3 +125,15 @@ destination-agnostic rejection at the `move` expression; that was measured and d
 
 [[interface-issue-queue]] - `fix/move-borrowed-plain-dest`'s landed record, which holds the
 destination table this is the last open row of.
+
+## From the q10 bucket file (deleted 2026-08-12)
+
+The q10 bucket is gone; this file and [[deref-of-moved-pointer-guard-inside-callee]] are what
+remained of it. Two things it carried that are not already above:
+
+- **Revisit order.** Deciding this cell now would either freeze a `move` contract around a btree
+  already queued for rewrite, or force that rewrite ahead of the `list`/`dictionary` containers it
+  is meant to imitate. Revisit AFTER those settle.
+- **Standing constraint for the whole family.** Explicit `move x` nulls the source and leaves it
+  READABLE AS NULL, by design. Do not "fix" anything here by importing Rust move semantics - that
+  has been tried and breaks the suite.
