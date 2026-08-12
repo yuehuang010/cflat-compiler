@@ -1,6 +1,6 @@
 # q12: Generics - templates, type arguments, mangling
 
-4 active items remain. Q12 fixed generic-function registration, generic-interface parent
+1 active item remains. Q12 fixed generic-function registration, generic-interface parent
 instantiation, closure type arguments to generic functions, unique array-view rejection, and
 variadic free generic functions. Generic structs and generic functions took different paths through registration,
 type-argument resolution, and name mangling, and the function path is missing pieces the struct

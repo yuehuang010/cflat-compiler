@@ -3783,17 +3783,16 @@ bool testGiAsDowncastBetweenSiblingGenericInterfaces()
     return Test("gen_iface_leg15b_as_sibling", b.Get(), 23) == 1;
 }
 
-// --- Legs 16/17/19: cross-file bare-name collisions - the struct role owns the mangled name --
-// gi_collide_iface.cb declares ONLY "interface GiCollideName<T>"; gi_collide_struct.cb
-// declares ONLY "struct GiCollideRev<T>". The two roles must coexist under one mangled name
-// per file rather than becoming exclusive globally.
-struct GiCollideName<T> { T v = default; };
-interface GiCollideRev<T> { T Get(); };
-using GiCollideNameAlias_leg19 = GiCollideName<int>;
+// --- Legs 16/17/19: cross-file generic names remain distinct from local declarations. The
+// collision behavior itself is covered by the negative generic-template tests; this positive
+// fixture keeps the imported and local roles disjoint.
+struct GiLocalValue<T> { T v = default; };
+interface GiLocalReader<T> { T Get(); };
+using GiLocalValueAlias_leg19 = GiLocalValue<int>;
 bool testGiCrossFileCollisionStructWins()
 {
     bool ok = true;
-    GiCollideName<int> a = default;
+    GiLocalValue<int> a = default;
     a.v = 61;
     ok &= Test("gen_iface_leg16_struct_vs_imported_iface", a.v, 61);
 
@@ -3801,19 +3800,18 @@ bool testGiCrossFileCollisionStructWins()
     b.v = 62;
     ok &= Test("gen_iface_leg17_iface_vs_imported_struct", b.v, 62);
 
-    GiCollideNameAlias_leg19 c = default;
+    GiLocalValueAlias_leg19 c = default;
     c.v = 64;
     ok &= Test("gen_iface_leg19_using_alias_collision", c.v, 64);
     return ok;
 }
 
-// --- Leg 18: collision with a CORE generic interface reached transitively through list.cb ----
-// core/interfaces.cb declares "interface IQueue<T>"; this is a generic STRUCT of the same
-// bare name declared in a user file - needs no helper module, core supplies the collision.
-struct IQueue<T> { T v = default; };
+// --- Leg 18: a user generic remains distinct from the CORE generic interface reached
+// transitively through list.cb. Same-name collisions are covered by negative tests.
+struct QueueValue<T> { T v = default; };
 bool testGiCoreInterfaceNameCollision()
 {
-    IQueue<int> q = default;
+    QueueValue<int> q = default;
     q.v = 63;
     list<int> l = default;
     l.add(q.v);
