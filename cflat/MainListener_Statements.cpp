@@ -515,8 +515,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunctionReturnTV.AllocAlignValue > LLVMBackend::kDefaultNewAlign
             && AsDirectNew(assignExpr) != nullptr)
             compiler->pendingInitAllocAlign = compiler->currentFunctionReturnTV.AllocAlignValue;
+        // The enclosing function's RETURN type is the context for an immediately-invoked literal
+        // in the returned expression, exactly as a declarator's type is for its initializer.
+        std::optional<DeclExpectedTypeScope> returnExpectedScope;
+        returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV);
         if (assignExpr != nullptr)
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
+        returnExpectedScope.reset();
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
@@ -2830,6 +2835,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     // lambda literal still needs the declared parameter's function signature.
                     // Restore on LogError unwind so the wrapper cannot leak its context.
                     LambdaExpectedTypeRestoreGuard lambdaExpectedTypeRestore(&lambdaExpectedType);
+                    DeclExpectedTypeScope defaultExpectedScope(&declExpectedType, params[i]);
                     if (params[i].IsFunctionPointer)
                         lambdaExpectedType = params[i];
                     else if (const auto* encoded = compiler->GetEncodedClosureType(params[i].TypeName))

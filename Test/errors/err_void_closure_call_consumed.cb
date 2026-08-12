@@ -99,9 +99,12 @@ expect_error("call through function value 'f' returns 'void', so it produces no 
     int vccHold() { VccHold h = default; h.f = () => { vccBump(); }; int r = h.f(); return r; }
 }
 
-// Immediately-invoked lambda literal: void-yielding body, result consumed. The literal has no
-// name, so the message quotes the spelling.
-expect_error("returns 'void', so it produces no value to consume") {
+// Immediately-invoked lambda literal: void-yielding body, result consumed.
+// RE-RATIFIED (Q15): an immediately-invoked literal now takes its return type from the
+// destination, so `int r = ...` makes this literal an int-returning lambda whose body yields
+// void - the blame moves from the consuming call to the body that has nothing to return. Still
+// rejected; the diagnostic names the contextual return type instead of the consumed void.
+expect_error("cannot return a 'void' expression from a function that returns 'int'") {
     int vccIife() { int r = (() => vccBump())(); return r; }
 }
 

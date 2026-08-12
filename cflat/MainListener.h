@@ -2123,6 +2123,10 @@ private:
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
     LLVMBackend::TypeAndValue lambdaExpectedType;
     LLVMBackend::TypeAndValue lastLambdaType;
+    // Destination type of the initializer/assignment being evaluated, for ANY type - not just a
+    // function pointer. An immediately-invoked lambda literal reads its return type from here
+    // instead of inheriting the enclosing literal's. Empty (and never "auto") when no context.
+    LLVMBackend::TypeAndValue declExpectedType;
     // Parser ambiguity for `decl = () => _ = expr`: the outer assignment can claim the discard
     // tail, leaving the lambda body as `_`. The named-expression path temporarily hands that RHS
     // to ParseLambdaExpression so the discard remains inside the lambda.
@@ -2334,6 +2338,37 @@ private:
         LLVMBackend::TypeAndValue saved;
         explicit LambdaExpectedTypeRestoreGuard(LLVMBackend::TypeAndValue* v) : value(v), saved(*v) {}
         ~LambdaExpectedTypeRestoreGuard() { *value = saved; }
+    };
+
+    // Scopes declExpectedType to one destination position - a declarator, an assignment target, a
+    // brace-init field, a return type, or a matched call parameter. Always ASSIGNS (clearing for a
+    // function-pointer or `auto` destination), so an inner position cannot inherit an outer one.
+    struct DeclExpectedTypeScope {
+        LLVMBackend::TypeAndValue* slot;
+        LLVMBackend::TypeAndValue saved;
+        DeclExpectedTypeScope(LLVMBackend::TypeAndValue* s, const LLVMBackend::TypeAndValue& dest)
+            : slot(s), saved(*s)
+        {
+            *slot = {};
+            if (!dest.IsFunctionPointer && !dest.TypeName.empty() && dest.TypeName != "auto")
+                *slot = dest;
+        }
+        ~DeclExpectedTypeScope() { *slot = saved; }
+    };
+
+    // A destination type describes the WHOLE expression, never one operand of it: `string s =
+    // "n=" + (() => 2)()` must not type the literal 'string' (measured: module verification
+    // failure). Every binary/ternary level withdraws the context unless it is a pure pass-through.
+    struct DeclExpectedTypeGate {
+        LLVMBackend::TypeAndValue* slot;
+        LLVMBackend::TypeAndValue saved;
+        bool armed;
+        DeclExpectedTypeGate(LLVMBackend::TypeAndValue* s, bool passthrough)
+            : slot(s), armed(!passthrough)
+        {
+            if (armed) { saved = *slot; *slot = {}; }
+        }
+        ~DeclExpectedTypeGate() { if (armed) *slot = saved; }
     };
 
     // Increments suppressExplicitNullDerefGuard_ for the ctor->dtor lifetime, unwinding even if

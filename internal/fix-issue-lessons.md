@@ -2744,3 +2744,48 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   that skipped them (`ResolveTypeArgEntry` for the `[]` suffix, `ResolveSigComponentCodegen` for
   the fat pointer) costs nothing and makes all three sites agree; the thin `function<T>` spellings
   stay accepted in both cells, which is the half that has a working lowering.
+- **q15 - nested lambda expected-type leak, and the null-callable ruling (2026-08-12).**
+  Two members, one fix and one ruling.
+  (1) `lambdaExpectedType` is ambient parse state, so a literal nested inside another literal's
+  body read the ENCLOSING literal's return type. Two faces, both measured: a void-bodied inner
+  literal invoked and DISCARDED inside an `int` outer was rejected with "Lambda '__lambda_1'
+  missing return statement", and a value-returning inner literal in a `void` outer was rejected
+  with "cannot return a value from a function whose return type is 'void'". The fix threads the
+  destination type (`declExpectedType`, any type - not just a function pointer) from the
+  declaration site, and the postfix path derives an immediately-invoked literal's return type
+  from how ITS call result is used: `ResultUse::Discard` declares void, a value context declares
+  the destination type, and anything else inherits as before.
+  (2) **Do not install a restore guard unconditionally on ambient parse state.** The first
+  attempt wrapped `lambdaExpectedType` in a `LambdaExpectedTypeRestoreGuard` for every postfix
+  primary, which undid a legitimate side-channel write the primary makes for the SUFFIX walk and
+  broke three ratified error tests. The guard has to be `std::optional` and constructed only on
+  the branch that actually overrides.
+  (3) **RULED: ownership rides the synthesized signature, and the two body spellings must
+  agree.** The first attempt applied the destination type to a BLOCK body only, so
+  `return ((int y) => { return y+1; })(x);` was legal while its `=> y+1` twin still reported
+  "cannot infer the return type of lambda". The carve-out was papering over a scope bug: inside a
+  lambda body `declExpectedType` still named the ENCLOSING declaration, so a nested
+  `Lambda<int()> n = () => (() => expr)();` handed the inner literal `Lambda<int()>`. Fixing the
+  scope properly - the body installs THIS lambda's return type, cleared when inferred - let the
+  carve-out and its two flags go, and both spellings now agree. The synthesized context carries
+  `FuncPtrReturnOwned`/`FuncPtrReturnAlias`/pointer depth, not just the type name; a `unique`
+  destination is an owning LOCATION whose filling return spelling is `move`, so both map to Owned.
+  Two ratified legs were re-ratified as a consequence: the bare `return <iife>` spellings in
+  `err_return_value_from_void.cb` and `err_lambda_expr_temp_escape.cb` are now legal and were
+  moved to an OPERAND position, and `err_void_closure_call_consumed.cb`'s `vccIife` now reports
+  the contextual return type instead of the consumed void. Still rejected, different blame.
+  (3a) **A destination type describes the WHOLE expression, never one operand of it.** Letting
+  `declExpectedType` descend into binary operands typed the literal in
+  `string s = "n=" + (() => 2)()` as `string` and produced a MODULE VERIFICATION FAILURE - a
+  crash-class regression a passing suite did not catch, found only by probing the mismatched
+  spelling by hand. Every binary/ternary level now withdraws the context unless it is a pure
+  pass-through (`DeclExpectedTypeGate`). When adding an ambient typing context, enumerate the
+  positions where the destination genuinely IS the sub-expression's type, and gate everywhere else.
+  (4) **RULED: `nullptr` into a VALUE-typed `function<T>` is accepted UB, WORKING AS INTENDED.**
+  Same class as C's `void (*fp)(void) = NULL; fp();`. No compiler change; do not re-file it or
+  add a construction-site reject. The pointer (`function<T>*`) and view (`function<T>[]`)
+  spellings stay accepted and inert, pinned by `test_function_ptr.cb`'s shape-gate accept legs.
+  (5) Out of scope and still open: `auto g = (int y) => { return y; };` at ANY scope reports
+  "cannot infer the return type of lambda" - an `auto`-bound literal gets no context. That is a
+  separate documented limitation, not this leak, and inside a lambda body it surfaces as the
+  downstream "unknown function 'g'".

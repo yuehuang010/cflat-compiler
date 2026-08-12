@@ -1496,6 +1496,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return derefLoad();
             };
 
+            // The assignment DESTINATION is the context an immediately-invoked literal in the RHS
+            // takes its return type from, exactly as a declarator's type is.
+            std::optional<DeclExpectedTypeScope> assignExpectedScope;
+            if (operatorText == "=")
+                assignExpectedScope.emplace(&declExpectedType, namedVar.TypeAndValue);
+
             // Thread expected function-pointer type into lambda RHS (for f = (x) => {...} reassignment)
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer)
                 lambdaExpectedType = namedVar.TypeAndValue;
@@ -3805,6 +3811,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
 LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
 
@@ -3989,6 +3996,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
     }
 
 LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::LogicalOrExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
         auto logicCtxs = ctx->logicalAndExpression();
 
@@ -4041,6 +4049,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalOrExpression(CFlatParser::Logi
     }
 
 LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::LogicalAndExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
         auto inclusiveCtxs = ctx->inclusiveOrExpression();
 
@@ -4094,6 +4103,7 @@ LLVMBackend::TypedValue MainListener::ParseLogicalAndExpression(CFlatParser::Log
     }
 
 LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::InclusiveOrExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto exclusiveCtxs = ctx->exclusiveOrExpression();
         if (exclusiveCtxs.size() == 1)
             return ParseExclusiveOrExpression(exclusiveCtxs[0], use);
@@ -4115,6 +4125,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
     }
 
 LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::ExclusiveOrExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto andCtxs = ctx->andExpression();
         if (andCtxs.size() == 1)
             return ParseAndExpression(andCtxs[0], use);
@@ -4136,6 +4147,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
     }
 
 LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->equalityExpression();
         if (nextCtxs.size() == 1)
             return ParseEqualityExpression(nextCtxs[0], use);
@@ -4172,6 +4184,7 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
     }
 
 LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::EqualityExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->typeCheckExpression();
         if (nextCtxs.size() == 1)
         {
@@ -4254,6 +4267,7 @@ CFlatParser::CastExpressionContext* MainListener::SoleCastOperandOf(CFlatParser:
     }
 
 LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::TypeCheckExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto relCtx = ctx->relationalExpression();
         if (!relCtx)
         {
@@ -4812,6 +4826,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
     }
 
 LLVMBackend::TypedValue MainListener::ParseRelationalExpression(CFlatParser::RelationalExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->shiftExpression();
         if (nextCtxs.size() == 1)
         {
@@ -5148,6 +5163,7 @@ bool MainListener::HasOperatorOverloadForFirstParam(const std::string& opName, c
     }
 
 LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->additiveExpression();
         if (nextCtxs.size() == 1)
         {
@@ -5282,6 +5298,7 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
     }
 
 LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::AdditiveExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->multiplicativeExpression();
 
         if (nextCtxs.size() == 1)
@@ -5834,6 +5851,7 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
     }
 
 LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser::MultiplicativeExpressionContext* ctx, ResultUse use) {
+        DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto nextCtxs = ctx->castExpression();
 
         if (nextCtxs.size() == 1)
@@ -5966,12 +5984,15 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
         }
         else if (castExp && typeName)
         {
+            auto destTypeName = ParseTypeName(typeName);
+            // The explicit cast target is the operand's conversion context. Do not let the
+            // outer initializer/return destination leak through the cast into its operand.
+            DeclExpectedTypeScope castExpectedScope(&declExpectedType, destTypeName);
             // A cast to 'void' DISCARDS its operand, so a value-less call is legal under it -
             // read the destination off the spelling (alias-resolved) before parsing the operand.
             bool destIsVoid = compiler->ResolveTypeAlias(typeName->getText()) == "void";
             auto namedVar = ParseCastExpression(castExp, false,
                 destIsVoid ? ResultUse::Discard : ResultUse::Value);
-            auto destTypeName = ParseTypeName(typeName);
             auto type = compiler->GetType(destTypeName);
 
             // Materialize a stored operand into Primary. A fixed-size array decays to
@@ -6465,6 +6486,12 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             /* unaryOperator : '&' | '*'| '+'| '-'| '~'| '!'; */
 
             std::string opText = unaryOperator->getText();
+            // Logical-not, dereference, and address-of change the operand's type, so the
+            // enclosing destination cannot describe that operand. Built-in +, -, and ~ are
+            // type-preserving and retain the destination context for their operand.
+            std::optional<DeclExpectedTypeScope> unaryExpectedScope;
+            if (opText == "!" || opText == "*" || opText == "&")
+                unaryExpectedScope.emplace(&declExpectedType, LLVMBackend::TypeAndValue{});
 
             // For '!', suspend any active short-circuit else-block before
             // evaluating the operand.  Without this, !(A && B) in a while
@@ -7593,12 +7620,16 @@ void MainListener::EmitFieldInitializer(
 
             // Thread the target field's closure signature into a lambda RHS so its return type is
             // inferred as `s.f = (int n) => ...` does. Spelled and ENCODED field types both.
+            std::optional<DeclExpectedTypeScope> fieldExpectedScope;
             for (const auto& field : sd.StructFields)
             {
                 if (field.VariableName != fieldName) continue;
                 if (field.IsFunctionPointer) lambdaExpectedType = field;
                 else if (const auto* enc = compiler->GetEncodedClosureType(field.TypeName))
                     lambdaExpectedType = *enc;
+                // The FIELD's type is the context for an immediately-invoked literal in its
+                // initializer, the same way a declarator's type is.
+                fieldExpectedScope.emplace(&declExpectedType, field);
                 break;
             }
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
@@ -8556,6 +8587,10 @@ bool MainListener::TryEmitContainerInitializer(
 
 LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        // The destination of `new T` is the allocated pointer, not its array count or
+        // constructor arguments. Those child expressions have their own types and must not
+        // inherit an enclosing initializer/return destination.
+        DeclExpectedTypeScope newExpectedScope(&declExpectedType, {});
         std::string typeName = ParseTypeSpecifierName(ctx->typeSpecifier());
         bool isArray = ctx->assignmentExpression() != nullptr;
 
@@ -8818,6 +8853,7 @@ std::string MainListener::SplitEnclosingStruct(const std::string& funcName, LLVM
 
 LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::DeleteExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        DeclExpectedTypeScope deleteExpectedScope(&declExpectedType, {});
         bool isArray      = ctx->LeftBracket() != nullptr;
         bool hasSizeExpr  = ctx->deleteArraySize() != nullptr;
         // delete[_] ptr - free backing buffer only, no destructor calls.
@@ -10076,6 +10112,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
 
 LLVMBackend::NamedVariable MainListener::ParseOperatorStringExpression(CFlatParser::OperatorStringExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        DeclExpectedTypeScope operatorStringExpectedScope(&declExpectedType, {});
 
         // Collect arguments passed to operator string(...)
         std::vector<LLVMBackend::NamedVariable> arguments;

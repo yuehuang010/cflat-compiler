@@ -4109,6 +4109,130 @@ bool testLambdaDefaultLiteral()
     return Test("lambda_default_literal", lambdaDefaultPlusTwo(), 3) == 1;
 }
 
+int nlcHits = 0;
+int nlcBump(int by) { nlcHits = nlcHits + by; return nlcHits; }
+int nlcApply(function<int(int)> g, int v) { return g(v); }
+int nlcAssign = 0;
+struct NlcBox { int value = default; };
+int nlcTakeText(string s) { return s == "ok" ? 1 : 0; }
+int nlcReturnsInvoked(int x) { return ((int y) => { return y + 1; })(x); }
+// The EXPRESSION-body spelling must agree with the block-body one above: both read the
+// enclosing function's return type, so neither is "uninferable".
+int nlcReturnsInvokedExpr(int x) { return ((int y) => y + 1)(x); }
+// Two levels deep: the inner literal reads the OUTER LITERAL's return type, not the
+// `Lambda<int()>` the variable was declared with.
+int nlcNestedInLambdaBody()
+{
+    Lambda<int()> n = () => (() => 41)() + 1;
+    return n();
+}
+// An OWNING destination must ride the synthesized signature, not just its spelling.
+class NlcDt { int v = default; ~NlcDt() { nlcHits = nlcHits + 1; } };
+int nlcOwningIife()
+{
+    unique NlcDt* p = (() => { unique NlcDt* q = new NlcDt(); q->v = 9; return q; })();
+    return p->v;
+}
+
+// A lambda literal nested inside another literal's body used to read the ENCLOSING
+// lambdaExpectedType. An immediately-invoked inner literal now takes its return type from how
+// ITS call result is used - void when discarded, the destination type in a value context.
+bool testNestedLambdaOwnContext()
+{
+    bool result = true;
+
+    // Inner literal has a VOID body and its invocation is DISCARDED, inside an outer literal
+    // declared to return int. Pre-fix the inner inherited the outer's 'int' and was rejected
+    // with "Lambda '__lambda_1' missing return statement."
+    nlcHits = 0;
+    function<int(int)> voidInner = (int x) => { ((int y) => { nlcBump(y); })(x); return x + 1; };
+    result &= Test("nlc_void_inner_discarded", voidInner(4), 5);
+    result &= Test("nlc_void_inner_ran", nlcHits, 4);
+
+    // Inner literal RETURNS A VALUE into an int destination, inside an outer literal declared
+    // to return void. Pre-fix the inner inherited 'void' and was rejected with "cannot return a
+    // value from a function whose return type is 'void'".
+    nlcHits = 0;
+    function<void(int)> valueInner = (int x) => { int v = ((int y) => { return y * 2; })(x); nlcBump(v); };
+    valueInner(5);
+    result &= Test("nlc_value_inner_in_void_outer", nlcHits, 10);
+
+    // Two levels of nesting: the innermost discarded invocation must not inherit either of the
+    // two enclosing literals. Pre-fix: "Lambda '__lambda_2' missing return statement."
+    nlcHits = 0;
+    function<int(int)> twoDeep = (int x) => {
+        ((int y) => { ((int z) => { nlcBump(z); })(y); })(x);
+        return x;
+    };
+    result &= Test("nlc_two_deep_discarded", twoDeep(9), 9);
+    result &= Test("nlc_two_deep_inner_ran", nlcHits, 9);
+
+    // ACCEPT SET - these already worked and must keep working, because the value context still
+    // reaches an inner literal by inheritance where no destination type supersedes it.
+    // Outer EXPRESSION body: the inner call IS the outer's return operand.
+    function<int(int)> exprBody = (int x) => ((int y) => { return y + 1; })(x);
+    result &= Test("nlc_expr_body_outer", exprBody(7), 8);
+
+    // Inner literal passed as an ARGUMENT (not immediately invoked): the parameter-matching
+    // path supplies its type, and this change must not disturb it.
+    function<int(int)> asArg = (int x) => { return nlcApply((int y) => { return y * 5; }, x); };
+    result &= Test("nlc_inner_as_argument", asArg(3), 15);
+
+    // Inner and outer both void.
+    nlcHits = 0;
+    function<void(int)> bothVoid = (int x) => { ((int y) => { nlcBump(y); })(x); };
+    bothVoid(2);
+    result &= Test("nlc_both_void", nlcHits, 2);
+
+    // Every DESTINATION position supplies the context, not just a declarator. Each of the four
+    // below reported an error pre-fix, and each names a different site.
+
+    // ASSIGNMENT target: pre-fix "cannot return a value from a function whose return type is
+    // 'void'" - the inner literal read the enclosing void literal instead of the int target.
+    nlcAssign = 0;
+    function<void(int)> toAssign = (int x) => { nlcAssign = ((int z) => { return z * 2; })(x); };
+    toAssign(5);
+    result &= Test("nlc_assignment_target", nlcAssign, 10);
+
+    // BRACE-INIT FIELD: same pre-fix message, at the field-initializer site.
+    nlcAssign = 0;
+    function<void(int)> toField = (int x) => {
+        NlcBox t = { value = ((int z) => { return z * 3; })(x) };
+        nlcAssign = t.value;
+    };
+    toField(4);
+    result &= Test("nlc_brace_init_field", nlcAssign, 12);
+
+    // An index has its own integer destination. It must not inherit the final string element's
+    // type, while the string array element remains a valid value destination for the declaration.
+    string[2] nlcIndexed = { "left", "right" };
+    result &= Test("nlc_index_context", nlcIndexed[((() => { return 1; })())], "right");
+
+    // RETURN of a plain named function: pre-fix "cannot infer the return type of lambda" - the
+    // return type only propagated when it was a function pointer.
+    result &= Test("nlc_named_function_return", nlcReturnsInvoked(6), 7);
+
+    // Inside a call ARGUMENT the matched PARAMETER wins over the enclosing declaration's type.
+    // Pre-fix "cannot infer"; with the declaration context alone it would be forced to 'int'
+    // and reject the string the parameter actually takes.
+    int viaArg = nlcTakeText(((int y) => { return "ok"; })(1));
+    result &= Test("nlc_argument_parameter_wins", viaArg, 1);
+
+    // The block-body and expression-body spellings of the same return must agree.
+    result &= Test("nlc_named_function_return_expr", nlcReturnsInvokedExpr(6), 7);
+
+    // An inner immediately-invoked literal reads its enclosing LITERAL's return type.
+    result &= Test("nlc_nested_in_lambda_body", nlcNestedInLambdaBody(), 42);
+
+    // Ownership rides the synthesized signature: the returned pointer stays owning, so the
+    // destructor runs exactly once at scope exit rather than the value being copied out raw.
+    nlcHits = 0;
+    result &= Test("nlc_owning_iife_value", nlcOwningIife(), 9);
+    result &= Test("nlc_owning_iife_dtor_once", nlcHits, 1);
+
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -4272,6 +4396,10 @@ extern int main(int argc, char** argv)
     // now that consuming a void closure call's result is a diagnostic (fix/voidcall).
     total++; passed += testVoidClosureCallDiscarded()      ? 1 : 0;
     total++; passed += testLambdaDefaultLiteral()           ? 1 : 0;
+
+    // An immediately-invoked lambda literal nested in another literal's body takes its return
+    // type from its OWN call context, not from the enclosing literal (fix/q15).
+    total++; passed += testNestedLambdaOwnContext()         ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

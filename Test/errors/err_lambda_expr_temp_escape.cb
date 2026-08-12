@@ -20,11 +20,28 @@ expect_error("taken from a temporary") {
     Lambda<LamEscDt*()> f = () => lamEscMake().t;
 }
 
-// An IMMEDIATELY-INVOKED literal gets no expected type, so the return type falls back to "void".
-// That fallback must not be read as a declared void: the value-yielding body would be discarded
-// and the caller would read garbage (measured `((int x) => x * 2)(4)` printing -16).
+// An immediately-invoked literal with NO destination type gets no expected type, so the return
+// type falls back to "void". That fallback must not be read as a declared void: the
+// value-yielding body would be discarded and the caller would read garbage (measured
+// `((int x) => x * 2)(4)` printing -16).
+// RE-RATIFIED (Q15): the bare `return ((int x) => x * 2)(4);` spelling is now LEGAL - a
+// destination type reaches the literal and supplies its return type. An OPERAND position does
+// not: `1 + <iife>` types the operand by its own rules, so the literal stays uninferable and
+// this leg keeps pinning the fallback.
 expect_error("cannot infer the return type of lambda") {
-    int lamInferUse() { return ((int x) => x * 2)(4); }
+    int lamInferUse() { return 1 + ((int x) => x * 2)(4); }
+}
+
+// A constructor argument is not the type of the pointer produced by `new`; it must not inherit
+// the declaration's pointer destination and turn the lambda into a pointer-returning literal.
+expect_error("cannot infer the return type of lambda") {
+    void lamNewInfer() { LamEscDt* p = new LamEscDt((() => { return 1; })()); }
+}
+
+// A logical-not result is bool, but its operand may be an int, pointer, or other truthy value.
+// The enclosing bool destination must not force an immediately-invoked operand lambda to bool.
+expect_error("cannot infer the return type of lambda") {
+    bool lamNotInfer() { return !((() => { return true; })()); }
 }
 
 extern int main() { return 0; }

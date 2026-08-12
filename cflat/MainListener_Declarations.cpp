@@ -3348,6 +3348,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     {
                         if (typeAndValue.IsFatInterfaceValue())
                         {
+                            // An interface declaration is a destination too: an immediately-
+                            // invoked literal in its RHS must see this interface, not an outer
+                            // lambda's return type.
+                            DeclExpectedTypeScope declExpectedScope(&declExpectedType, typeAndValue);
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
@@ -3447,6 +3451,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // Thread expected function-pointer type into lambda expression parsing.
                             if (typeAndValue.IsFunctionPointer)
                                 lambdaExpectedType = typeAndValue;
+                            // A non-funcptr destination still supplies the return type an
+                            // IMMEDIATELY-INVOKED literal in this initializer needs; the postfix
+                            // path consults it so the literal stops inheriting an enclosing one.
+                            DeclExpectedTypeScope declExpectedScope(&declExpectedType, typeAndValue);
                             std::string genericFuncCallerName;
                             bool rhsIsFuncPtr = false;
                             bool rhsIsThinFnPtr = false;

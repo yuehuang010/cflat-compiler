@@ -166,6 +166,29 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             childLimit -= std::min(dropTrailingChildren, childLimit);
             size_t childIndex = 0;
 
+            // A suffix consumes the primary as a receiver/callee, so the enclosing destination
+            // belongs to the final postfix result, not to that primary. The one exception is a
+            // direct call whose only suffix is its immediate call; that call result is the whole
+            // expression and may use the destination below.
+            bool directCallWhole = false;
+            if (childLimit > 1 && ctx->children[1]->getText() == "(")
+            {
+                size_t firstRightParen = childLimit;
+                for (size_t i = 1; i < childLimit; i++)
+                {
+                    auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(ctx->children[i]);
+                    if (terminal != nullptr && terminal->getSymbol()->getType() == CFlatParser::RightParen)
+                    {
+                        firstRightParen = i;
+                        break;
+                    }
+                }
+                directCallWhole = firstRightParen == childLimit - 1;
+            }
+            std::optional<DeclExpectedTypeScope> postfixBaseExpectedScope;
+            if (childLimit > 1 && !directCallWhole)
+                postfixBaseExpectedScope.emplace(&declExpectedType, LLVMBackend::TypeAndValue{});
+
             // The receiver of the member name currently being walked, spelled as in source
             // ("h.c", "a[0]"): every child before the '.'/'->' that introduced the name. Used
             // only to NAME a sub-object receiver in the definitely-null diagnostic, where the
@@ -1293,6 +1316,41 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
                         else
                         {
+                            // An IMMEDIATELY-INVOKED lambda literal takes its return type from how
+                            // THIS call's result is used, not from an enclosing literal: a discarded
+                            // invocation declares void, a value context declares the destination
+                            // type. Without this the inner literal inherits lambdaExpectedType and
+                            // is misdiagnosed as missing a return / returning from void.
+                            // Installed only when this postfix actually supplies a context, so a
+                            // primary that publishes lambdaExpectedType as a side-channel to the
+                            // suffix walk is left alone.
+                            std::optional<LambdaExpectedTypeRestoreGuard> immediateCallRestore;
+                            if (directCallWhole)
+                            {
+                                if (use == ResultUse::Discard)
+                                {
+                                    immediateCallRestore.emplace(&lambdaExpectedType);
+                                    lambdaExpectedType = {};
+                                    lambdaExpectedType.FuncPtrReturnTypeName = "void";
+                                }
+                                else if (!declExpectedType.TypeName.empty())
+                                {
+                                    immediateCallRestore.emplace(&lambdaExpectedType);
+                                    LLVMBackend::TypeAndValue ctxTv;
+                                    // Ownership rides the synthesized signature: an owning or
+                                    // aliasing destination must reach the literal's return type,
+                                    // not just its spelling.
+                                    ctxTv.FuncPtrReturnTypeName = declExpectedType.TypeName;
+                                    ctxTv.FuncPtrReturnPointer  = declExpectedType.Pointer;
+                                    ctxTv.FuncPtrReturnPointerDepth = declExpectedType.ValuePointerDepth();
+                                    // A `unique` destination is an owning LOCATION; the return
+                                    // spelling that fills it is `move`, so both map to Owned.
+                                    ctxTv.FuncPtrReturnOwned    = declExpectedType.IsMove
+                                                               || declExpectedType.IsUnique;
+                                    ctxTv.FuncPtrReturnAlias    = declExpectedType.IsAlias;
+                                    lambdaExpectedType = ctxTv;
+                                }
+                            }
                             // A parenthesized primary that IS the whole postfix expression keeps the
                             // caller's position; a suffix (`(g())(x)`, `(p).f`) consumes it as a value.
                             namedVar.Primary = ParsePrimaryExpression(
@@ -1428,6 +1486,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // pointer width below: LLVM treats GEP indices as SIGNED, so a narrow
                         // unsigned index (e.g. (u8)b with b >= 128) would sign-extend to a
                         // negative offset. Single evaluation - do not also call ParseExpression.
+                        LLVMBackend::TypeAndValue indexExpectedType;
+                        indexExpectedType.TypeName = "int";
+                        DeclExpectedTypeScope indexExpectedScope(&declExpectedType, indexExpectedType);
                         auto idxNamed = ParseAssignmentExpressionNamed(expressCtx->assignmentExpression());
                         bool idxIsUnsigned = idxNamed.TypeAndValue.IsUnsignedInteger() != -1;
                         auto rvalue = LoadNamedVariable(idxNamed);
@@ -3377,10 +3438,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     const auto& namedArgument = namedArgCtx[argIdx];
                                     auto argName = namedArgument->Identifier();
                                     lambdaExpectedType = {};
+                                    // The matched PARAMETER is the destination context inside this
+                                    // argument, so an enclosing declarator's type cannot leak in.
+                                    LLVMBackend::TypeAndValue ifaceArgExpectedDest;
                                     if (ifaceParams != nullptr && declaredIdx[argIdx] >= 0
                                         && declaredIdx[argIdx] < (int64_t)ifaceParams->size())
                                     {
                                         const auto& p = (*ifaceParams)[declaredIdx[argIdx]];
+                                        ifaceArgExpectedDest = p;
                                         if (p.IsFunctionPointer) lambdaExpectedType = p;
                                         else if (const auto* enc = Compiler(ctx)->GetEncodedClosureType(p.TypeName))
                                             lambdaExpectedType = *enc;
@@ -3389,7 +3454,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // cast here must not launder a sibling argument's join arm.
                                     size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
+                                    std::optional<DeclExpectedTypeScope> ifaceArgExpectedScope;
+                                    ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest);
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    ifaceArgExpectedScope.reset();
                                     lambdaExpectedType = {};
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
@@ -3908,10 +3976,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     lambdaExpectedType = {};
                                     lambdaLockThisReceiver = {};
                                     lambdaLockThisMode = LockMode::Exclusive;
+                                    // The matched PARAMETER is the destination context inside this
+                                    // argument, so an enclosing declarator's type cannot leak in.
+                                    LLVMBackend::TypeAndValue argExpectedDest;
                                     if (funcSym && declaredIdx[argIdx] >= 0
                                         && declaredIdx[argIdx] < (int64_t)funcSym->Parameters.size())
                                     {
                                         const auto& paramTv = funcSym->Parameters[declaredIdx[argIdx]];
+                                        argExpectedDest = paramTv;
                                         if (paramTv.IsFunctionPointer)
                                         {
                                             lambdaExpectedType = paramTv;
@@ -3941,7 +4013,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // cast here must not launder a sibling argument's join arm.
                                     size_t savedCastOcc = Compiler(ctx)->BeginCastOccurrence();
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
+                                    std::optional<DeclExpectedTypeScope> argExpectedScope;
+                                    argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                    argExpectedScope.reset();
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
@@ -5244,6 +5319,15 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                               lambdaName);
 
         // Parse body
+        // Inside the body, the destination context is THIS lambda's return type, not the
+        // enclosing declaration's: an immediately-invoked literal nested in the body must read
+        // `int`, not the `Lambda<int()>` the outer variable was declared with. An inferred
+        // return type supplies no context, so the scope clears it.
+        LLVMBackend::TypeAndValue bodyExpectedDest;
+        if (!returnTypeInferred)
+            bodyExpectedDest = returnType;
+        DeclExpectedTypeScope lambdaBodyExpectedScope(&declExpectedType, bodyExpectedDest);
+
         if (auto* body = ctx->lambdaBody())
         {
             if (auto* block = body->compoundStatement())
@@ -5428,6 +5512,9 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         std::vector<std::string> typeArgs;
         for (auto* entry : entries)
         {
+            // The tuple is the destination expression; its enclosing type is not the type of
+            // any one element. Element-specific inference is not available here, so clear it.
+            DeclExpectedTypeScope elementExpectedScope(&declExpectedType, {});
             auto nv = ParseAssignmentExpressionNamed(entry->assignmentExpression());
             auto* loaded = LoadNamedVariable(nv);
             elemValues.push_back(loaded);
@@ -5564,6 +5651,7 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
 
 llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        DeclExpectedTypeScope elementExpectedScope(&declExpectedType, {});
 
         auto tags = ctx->Identifier();
         std::string tagName = tags[0]->getText();
