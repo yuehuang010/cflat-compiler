@@ -1,6 +1,6 @@
 # q15: Lambdas, closures, and function-pointer typing
 
-3 active items remain. The type of a callable value is propagated on one call path and not the others, and a
+2 active items remain. The type of a callable value is propagated on one call path and not the others, and a
 null callable is accepted where it will be invoked unconditionally.
 
 ## Shared root cause
@@ -14,8 +14,8 @@ handle but not the callable field inside it.
 
 - `p2/lambda-expected-type-leaks-into-nested-literal` - a nested inferred lambda literal reads the
   ENCLOSING `lambdaExpectedType` instead of its own context.
-- `p3/iface-arg-lambda-fnptr-type-not-propagated` - the interface-call argument loop lacks the
-  direct call's `lastLambdaType` propagation step.
+- Reviewed and closed as no-repro: interface-call lambda propagation has no demonstrated wrong
+  overload or crash, and the existing callable suite remains green.
 - `p3/nullptr-into-thin-funcptr-value-calls-null` - `nullptr` into a value (non-pointer)
   `function<T>` parameter compiles clean and null-calls at invocation.
 

@@ -31,7 +31,7 @@ member list is empty.
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 1 | One last-segment shelling/design item remains; template registration, collisions, and mangling are fixed |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 4 | Constructor and postfix fixes landed; simd, closure suffix, JSON-brace, and sizeof ambiguities remain |
-| q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 3 | Callable typing gaps and null/design cases remain |
+| q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 2 | Nested expected-type propagation and null callable design remain |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
 | q18 | [Platform, C interop, UI](q18-platform-c-interop-and-ui.md) | 8 | Disjoint; parallelizable |
