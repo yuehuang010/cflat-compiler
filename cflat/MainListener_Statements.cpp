@@ -876,7 +876,20 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunction != nullptr
             && compiler->currentFunction->getReturnType()->isPointerTy())
         {
-            LogErrorContext(errCtx, std::format(
+            bool lambdaInvoker = compiler->currentFunction != nullptr
+                && compiler->currentFunction->getName().contains("__lambda_");
+            if (lambdaInvoker)
+            {
+                LogErrorContext(errCtx, std::format(
+                    "returning a fresh allocation from a lambda with the bare pointer return type '{}*' "
+                    "gives the caller no ownership signal - declare a named function with return type "
+                    "'move {}*' and call it from the lambda, or use a named function with return type "
+                    "'alias {}*' for manual ownership",
+                    compiler->currentFunctionReturnTypeName,
+                    compiler->currentFunctionReturnTypeName,
+                    compiler->currentFunctionReturnTypeName));
+            }
+            else LogErrorContext(errCtx, std::format(
                 "returning a fresh allocation from a function whose return type is the bare "
                 "pointer '{}*' gives the caller no signal that it owns the result - a forgotten "
                 "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "

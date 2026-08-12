@@ -66,15 +66,17 @@ behaviour change in that commit, and this file is where the remedy gap it expose
 
 Two independent halves; the first is cheap and the second is the real one.
 
-1. **The message.** At a lambda / `function<>` destination the two named remedies are invalid
+1. **The message - FIXED in Q10.** At a lambda / `function<>` destination the two named remedies are invalid
    syntax. Per the standing rule ("compile the remedy before shipping the message, per
    destination spelling"), the reject site should detect that the enclosing function is a lambda
    invoker and print the remedy that does compile - allocate in a named `move T*` function and
-   call it - rather than advice the grammar refuses.
+   call it - rather than advice the grammar refuses. Expression-body and block-body `Lambda<>`
+   and `function<>` cases now use that diagnostic, with regression coverage in
+   `Test/errors/err_return_new_from_bare_pointer_return.cb`.
 2. **The grammar.** `functionPointerSpecifier` accepts no ownership qualifier on the return
    type, so a closure can never transfer ownership of a fresh allocation to its caller. Whether
    that is worth implementing is a language decision; the enumeration to do first is which of
    `move` / `alias` / `unique` the closure ABI can actually honour, since the invoker is
-   synthesized.
+   synthesized. This half remains active and is intentionally not changed by Q10.
 
 Related: [[nodiscard-residual-gaps]], [[return-value-void-mismatch-fails-module-verification]].

@@ -6530,6 +6530,7 @@ int testDeclaredMoveFuncPtrParam()
         int x = 20;
         function<int(move int)> f = dmfInt;
         passed += Test("dmf_int_value", f(x), 21);
+        passed += Test("dmf_int_source_live", x, 20);
     }
 
     // 15. A `move string` funcptr param: the owning-string arm of the same transfer.
@@ -10876,7 +10877,7 @@ extern int main()
     passed += testLambdaParamOwningSink();
     total += 60;
     passed += testDeclaredMoveFuncPtrParam();
-    total += 79;
+    total += 80;
 
     passed += testConsumeOfBorrowedByValueParamField();
     total += 34;

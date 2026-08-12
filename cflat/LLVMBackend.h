@@ -654,6 +654,7 @@ public:
         {
             std::string TypeName;
             bool Pointer = false;
+            uint64_t AllocAlignValue = 0;
             bool IsMove = false;
             // Inferred owning sink (never spelled): lets the indirect call site transfer like
             // ApplyMoveParamTransfer. OwningSinkConsumesConcrete filters the structural half.
@@ -5009,8 +5010,8 @@ public:
     void RejectOwningTempUniqueFieldIntoSinkParam(const std::string& functionName,
         const TypeAndValue& param, const NamedVariable& arg);
 
-    // paramsCarryAllocAlign=false when the params were synthesized from a funcptr TYPE, which has
-    // no `alignas` clause to record - see ApplyFuncPtrSinkTransfer.
+    // paramsCarryAllocAlign=false only for ABI signatures that do not carry source allocation
+    // alignment (for example C interop). Named function-pointer signatures carry the fact.
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
         bool paramsCarryAllocAlign = true);

@@ -6,6 +6,7 @@
 // that path is covered positively in Test/test_basic.cb testAlignas.)
 
 import "list.cb";
+import "function.cb";
 
 struct AlignEscapeHolder { double[] buf = default; };
 
@@ -37,6 +38,18 @@ expect_error("into the 'move' parameter") {
         list<unique double*> bufs;
         double* b = new double[64] alignas(64);
         bufs.add(b);
+    }
+}
+
+// A named function's alignment fact must survive binding to a function pointer. Without it,
+// the indirect call accepts a release through a callee that lacks the matching clause.
+expect_error("cannot move the over-aligned buffer") {
+    void unalignedFuncptrSink(move int* p) { delete[] p; }
+    void callUnalignedFuncptrSink()
+    {
+        alignas(0, 64) int* b = new int[4] alignas(0, 64);
+        function<void(move int*)> f = unalignedFuncptrSink;
+        f(b);
     }
 }
 

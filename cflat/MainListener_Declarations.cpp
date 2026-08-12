@@ -2270,6 +2270,23 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
 
             // Same reasoning again for the definitely-null interface dispatch: the proof reads
             // the dispatch's own block, which is only complete now.
+
+            // Local using aliases are registered while the body is walked. Re-run sink inference
+            // now so a cast through an alias declared in this function updates the emitted symbol.
+            ApplyOwningSinkInference(Compiler(), func, allParams, SinkIfConstEvaluator());
+            auto symIt = compiler->functionTable.find(name);
+            if (symIt != compiler->functionTable.end())
+            {
+                for (auto& sym : symIt->second)
+                {
+                    if (sym.Function != fn) continue;
+                    sym.Parameters = allParams;
+                    sym.ReturnType = returnType;
+                    sym.ReturnsOwned = returnsOwned;
+                    sym.ReturnsAlias = returnType.IsAlias;
+                    break;
+                }
+            }
         }
 
         if (isAutoReturn)

@@ -527,6 +527,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
+            fp.AllocAlignValue = p.AllocAlignValue;
             fp.IsMove = p.IsMove;
             // The function's INFERRED owning sinks are part of what a funcptr bound to it must
             // honour at the indirect call; a declared spelling cannot restate them.

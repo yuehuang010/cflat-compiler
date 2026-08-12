@@ -1199,7 +1199,8 @@ inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const s
         }
         return mangled;
     }
-    return compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(spelled));
+    return compiler->ResolveManglingAlias(
+        compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(spelled)));
 }
 
 // Every peeled wrapper names exactly `typeName`, so the whole wrapper chain is redundant and the
@@ -1596,6 +1597,8 @@ inline void AdoptInferredParamSinks(LLVMBackend::TypeAndValue& dest,
     if (dest.FuncPtrParams.size() != src.size()) return;
     for (size_t i = 0; i < src.size(); i++)
     {
+        if (dest.FuncPtrParams[i].AllocAlignValue == 0)
+            dest.FuncPtrParams[i].AllocAlignValue = src[i].AllocAlignValue;
         dest.FuncPtrParams[i].IsOwningSink =
             dest.FuncPtrParams[i].IsOwningSink || src[i].IsOwningSink;
         dest.FuncPtrParams[i].IsConsumeInferredSink =

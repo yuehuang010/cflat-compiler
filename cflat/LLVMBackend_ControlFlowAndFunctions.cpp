@@ -387,6 +387,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
             TypeAndValue::FuncPtrParam fp;
             fp.TypeName = p.TypeName;
             fp.Pointer = p.Pointer;
+            fp.AllocAlignValue = p.AllocAlignValue;
             fp.IsMove = p.IsMove;
             // Same as the Lookup twin: an inferred sink belongs to the function's signature.
             fp.IsOwningSink = p.IsOwningSink;
@@ -1306,6 +1307,5 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
                 }
             }
         }
-
         return fn;
     }

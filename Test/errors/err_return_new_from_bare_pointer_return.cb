@@ -11,6 +11,16 @@ expect_error("returning a fresh allocation from a function whose return type is 
 move Leaky* makeOwned() { return new Leaky(); }
 alias Leaky* makeManual() { return new Leaky(); }
 
+// A closure return type cannot spell the ownership qualifier; the diagnostic must give a remedy
+// that compiles for this destination spelling.
+expect_error("declare a named function with return type 'move Leaky*'") {
+    Lambda<Leaky*()> badLambda = () => new Leaky();
+}
+
+expect_error("declare a named function with return type 'move Leaky*'") {
+    function<Leaky*()> badFunction = () => new Leaky();
+}
+
 extern int main()
 {
     unique Leaky* a = makeOwned();

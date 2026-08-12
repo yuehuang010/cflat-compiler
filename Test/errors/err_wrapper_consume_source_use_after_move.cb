@@ -78,6 +78,16 @@ void sinkAliasCast2(UBox p)   { UBox o = (UBAlias2)p; }
 void sinkAliasAs(UBox p)      { UBox o = p as UBAlias; }
 void sinkAliasParam(UBAlias p){ UBox o = (UBAlias)p; }
 
+// Forward file-scope and function-local aliases must reach the same owning-sink inference.
+void sinkForwardAlias(UBox p) { UBox o = (ForwardAlias)p; }
+using ForwardAlias = UBox;
+
+void sinkLocalAlias(UBox p)
+{
+    using LocalAlias = UBox;
+    UBox o = (LocalAlias)p;
+}
+
 expect_error("use of moved variable 'a'") {
     int callAliasCast() { UBox a = umk(13); sinkAliasCast(a); return a.item->id; }
 }
@@ -92,6 +102,14 @@ expect_error("use of moved variable 'a'") {
 
 expect_error("use of moved variable 'a'") {
     int callAliasParam() { UBox a = umk(16); sinkAliasParam(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callForwardAlias() { UBox a = umk(19); sinkForwardAlias(a); return a.item->id; }
+}
+
+expect_error("use of moved variable 'a'") {
+    int callLocalAlias() { UBox a = umk(20); sinkLocalAlias(a); return a.item->id; }
 }
 
 // A GENERIC instantiation carries no alias at all: the parameter's TypeName is the MANGLED name,

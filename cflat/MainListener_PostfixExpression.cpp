@@ -3157,7 +3157,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
                                     functionName, funcPtrTV.FuncPtrParams, argNVs);
-                                // Null caller storage and mark as moved for params declared 'move' on the funcptr type.
+                                // Diagnose explicit move-to-borrow here; ownership transfer is
+                                // centralized in ApplyFuncPtrSinkTransfer below.
                                 for (size_t i = 0; i < pcount; i++)
                                 {
                                     if (i < argNVs.size())
@@ -3167,21 +3168,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             funcPtrTV.FuncPtrParams[i].IsMove
                                                 || funcPtrTV.FuncPtrParams[i].IsOwningSink,
                                             argNVs[i]);
-                                    if (!funcPtrTV.FuncPtrParams[i].IsMove) continue;
-                                    auto& argNV = argNVs[i];
-                                    if (argNV.Storage != nullptr && argNV.TypeAndValue.Pointer)
-                                    {
-                                        if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(argNV.BaseType))
-                                            Compiler(ctx)->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
-                                    }
-                                    if (!argNV.CallerName.empty())
-                                    {
-                                        // Moving a field marks only that field, not the base.
-                                        if (!argNV.FieldName.empty())
-                                            Compiler(ctx)->MarkVariableFieldMoved(argNV.CallerName, argNV.FieldName);
-                                        else
-                                            Compiler(ctx)->MarkVariableMoved(argNV.CallerName);
-                                    }
                                 }
                                 // The call RESULT is a fresh value, not a read of the callee, so it must
                                 // inherit no callee provenance - rebuild it rather than clear flags.

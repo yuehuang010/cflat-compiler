@@ -1546,6 +1546,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
         tv.TypeName = p.TypeName;
         tv.Pointer  = p.Pointer;
         tv.PointerDepth = p.PointerDepth;
+        tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
         // A param whose funcptr TYPE spells `move` takes the DECLARED move path, exactly as a
@@ -1567,9 +1568,7 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         std::vector<TypeAndValue> synth;
         for (size_t i = 0; i < params.size(); i++)
             synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
-        // A funcptr TYPE cannot spell `alignas` (parse error), so FuncPtrParam records no
-        // allocation alignment and a synthesized param's 0 is "unknown", not "unaligned".
-        ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ false);
+        ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ true);
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,

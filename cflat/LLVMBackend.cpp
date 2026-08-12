@@ -4325,6 +4325,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
             llvm::json::Object po;
             po["t"] = p.TypeName;
             if (p.Pointer) po["p"] = true;
+            if (p.AllocAlignValue > 0) po["aav"] = static_cast<int64_t>(p.AllocAlignValue);
             if (p.IsMove)  po["mv"] = true;
             if (p.IsOwningSink) po["osk"] = true;
             if (p.IsConsumeInferredSink) po["cis"] = true;
@@ -4396,6 +4397,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     TAV::FuncPtrParam p;
                     if (auto v = po->getString("t"))  p.TypeName = v->str();
                     if (auto v = po->getBoolean("p")) p.Pointer = *v;
+                    if (auto v = po->getInteger("aav")) p.AllocAlignValue = static_cast<uint64_t>(*v);
                     if (auto v = po->getBoolean("mv"))p.IsMove = *v;
                     if (auto v = po->getBoolean("osk")) p.IsOwningSink = *v;
                     if (auto v = po->getBoolean("cis")) p.IsConsumeInferredSink = *v;

@@ -797,6 +797,7 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 nlohmann::json pj;
                 pj["t"] = p.TypeName;
                 if (p.Pointer) pj["p"]  = true;
+                if (p.AllocAlignValue > 0) pj["aav"] = static_cast<int64_t>(p.AllocAlignValue);
                 if (p.IsMove)  pj["mv"] = true;
                 if (p.IsOwningSink) pj["osk"] = true;
                 if (p.IsConsumeInferredSink) pj["cis"] = true;
@@ -833,6 +834,7 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
                     TypeAndValue::FuncPtrParam p;
                     p.TypeName = pj.value("t",  std::string{});
                     p.Pointer  = pj.value("p",  false);
+                    p.AllocAlignValue = pj.value("aav", uint64_t{0});
                     p.IsMove   = pj.value("mv", false);
                     p.IsOwningSink = pj.value("osk", false);
                     p.IsConsumeInferredSink = pj.value("cis", false);

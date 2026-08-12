@@ -1,44 +1,52 @@
 # q10: `move` sinks and move spelling
 
-6 items. What counts as an owning sink, and what a `move` parameter accepts, is decided
+3 active items remain. What counts as an owning sink, and what a `move` parameter accepts, is decided
 inconsistently between the direct-call path, the indirect-call path, and the forward-ref scanner -
-and some legal intents cannot be spelled at all.
+and some legal intents cannot be spelled at all. Q10 fixed the indirect POD move false rejection,
+forward/local alias sink inference, function-pointer allocation-alignment propagation, and the
+lambda fresh-allocation diagnostic. The remaining items are deferred behavior or a language-design
+question.
 
 ## Shared root cause
 
-Two halves:
-
-- **Inconsistent sink inference.** The direct call, the indirect call, and `ForwardRefScanner`
-  each compute "is this an owning sink" from different inputs (canonical name intersection, an
-  owning-type gate, a text match). Any input the other side cannot see - a local `using` alias, a
-  callee-internal guard, a POD type - produces a disagreement.
-- **Unspellable types.** The grammar cannot express `move T*` / `alias T*` as a lambda return
-  type, and the funcptr type has no field for a move parameter's alloc alignment, so a diagnostic
-  suggests a remedy that does not compile.
+The affected paths had no single source of truth for ownership facts. The indirect call repeated
+move-source bookkeeping instead of using the direct-call transfer routine, wrapper sink inference
+compared raw spellings before all aliases were available, and a function-pointer signature dropped
+allocation alignment while binding a named function. Separately, the lambda fresh-allocation
+diagnostic assumed the named-function return syntax was available to a closure.
 
 ## Members
 
 - `p1/move-of-borrow-into-move-sink-parameter` - a callee's `move` parameter accepts a moved
   borrow and frees caller-owned memory.
-- `p3/indirect-call-marks-a-pod-move-argument-moved-but-the-direct-call-does-not` - indirect path
-  lacks the direct path's owning-type gate.
 - `p2/deref-of-moved-pointer-guard-inside-callee` - intraprocedural analysis cannot see a
   conditionally-terminating guard inside the callee body.
-- `p2/forward-or-local-alias-in-cast-defeats-owning-sink-inference` - `ForwardRefScanner` does not
-  see a forward or local `using` alias, so canonical-name intersection misses.
-- `p2/lambda-return-type-cannot-be-spelled-move-or-alias`
+- `p2/lambda-return-type-cannot-be-spelled-move-or-alias` - its diagnostic half is fixed; the
+  closure return-type ownership grammar remains a language decision.
+- `p1/move-of-borrow-into-move-sink-parameter` - a design/ownership rule intentionally remains
+  deferred.
+
+Fixed in Q10:
+
+- `p3/indirect-call-marks-a-pod-move-argument-moved-but-the-direct-call-does-not`
+- `p2/forward-or-local-alias-in-cast-defeats-owning-sink-inference`
 - `p3/funcptr-type-cannot-record-a-move-param-alloc-alignment`
 
 ## Fix direction
 
-1. Extract ONE `IsOwningSink(param)` used by the direct call, the indirect call, and the scanner.
-   The POD gate and the alias resolution then apply everywhere by construction. Note the
-   both-passes rule: any change to `ParseDeclarationSpecifiers` must land in BOTH copies in
-   `MainListener.h`.
-2. `p1/move-of-borrow-into-move-sink-parameter` is the acceptance check on the callee side and can
-   be fixed independently - do it first, it is the p1.
-3. The two spelling gaps are grammar work (`CFlat.g4` plus a funcptr type field) and are
-   independent of the inference work; they can go to a separate agent.
+1. The indirect-call path now delegates ownership transfer to the same move-param transfer used by
+   direct calls, so POD arguments stay readable and owning arguments retain the established path.
+2. Wrapper sink inference canonicalizes pure rename aliases and refreshes the emitted function
+   symbol after the main body walk, which covers file-forward and function-local aliases without
+   changing the type-changing-cast accept set.
+3. Function-pointer parameter signatures carry allocation alignment through binding, agreement
+   checks, and both cache serializers. Indirect calls therefore reject an over-aligned allocation
+   when the named sink does not carry the matching clause.
+4. The lambda diagnostic now gives a compilable named-function remedy. The closure return-type
+   grammar remains deferred in `p2/lambda-return-type-cannot-be-spelled-move-or-alias`.
+
+`p1/move-of-borrow-into-move-sink-parameter` and the conditional-termination half of
+`p2/deref-of-moved-pointer-guard-inside-callee` remain filed by design.
 
 Note the design record: explicit `move x` nulls the source and leaves it readable as null BY
 DESIGN. Do not "fix" any of these by importing Rust move semantics - that has been tried and

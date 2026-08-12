@@ -1384,6 +1384,9 @@ bool LLVMBackend::OwningSinkConsumesConcrete(const TypeAndValue& p)
 bool LLVMBackend::FuncPtrParamMoveAgrees(const TypeAndValue::FuncPtrParam& dest,
         const TypeAndValue::FuncPtrParam& src)
 {
+        if (dest.AllocAlignValue != 0 && src.AllocAlignValue != 0
+            && dest.AllocAlignValue != src.AllocAlignValue)
+            return false;
         if (dest.IsMove == src.IsMove) return true;
         // A consuming literal has no `move` token but does consume, so it satisfies a declared
         // sink. The reverse (source spells `move`, destination does not) still disagrees.
