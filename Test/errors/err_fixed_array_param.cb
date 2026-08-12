@@ -64,6 +64,11 @@ expect_error("fixed-size array parameter 'v' of type 'int*[2]' is not supported;
     int firstPtr(int*[2] v) { return 0; }
 }
 
+// A pointer to a fixed array is a distinct invalid shape, including for function pointers.
+expect_error("pointer to fixed array 'function<int(int)>[N]*' is not a valid type") {
+    function<int(int)>[2]* p = nullptr;
+}
+
 extern int main()
 {
     printf("PASS: fixed-size array parameter legs\n");

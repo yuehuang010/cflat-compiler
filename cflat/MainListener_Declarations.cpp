@@ -518,6 +518,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (auto* fpDimSpec = ArrayDimsOf(declSpec))
                     {
                         auto fpDims = fpDimSpec->assignmentExpression();
+                        if (ArrayPtrOf(declSpec) != nullptr && !fpDims.empty())
+                            LogErrorContext(declSpec, FixedArrayPointerTypeMessage(typeSpec->getText()));
                         declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
                         for (size_t di = 1; di < fpDims.size(); di++)
                             declType.ExtraArrayDims.push_back(fpDims[di]);
@@ -1108,6 +1110,33 @@ llvm::Value* MainListener::GenerateDefaultValue(const LLVMBackend::DeclTypeAndVa
         auto* llvmType = compiler->GetType(resolved);
         if (!llvmType) return nullptr;
 
+        // A fixed-array field default must construct each aggregate element, not just zero-fill
+        // the enclosing array. The local declarator already uses EmitFixedArrayDefaultInit; use
+        // the same element walk when a synthetic aggregate constructor asks for the field value.
+        if (!resolved.Pointer && llvmType->isArrayTy() && !global_scope)
+        {
+            auto* array = llvm::cast<llvm::ArrayType>(llvmType);
+            if (resolved.ConstArraySize == 0)
+            {
+                resolved.ConstArraySize = array->getNumElements();
+                for (auto* inner = array->getElementType(); inner->isArrayTy();
+                     inner = inner->getArrayElementType())
+                    resolved.ConstInnerDimensions.push_back(
+                        llvm::cast<llvm::ArrayType>(inner)->getNumElements());
+            }
+            auto* element = array->getElementType();
+            while (element->isArrayTy()) element = element->getArrayElementType();
+            if (element->isStructTy()
+                && compiler->GetDataStructure(resolved.TypeName).StructType != nullptr
+                && compiler->GetFunction(resolved.TypeName) != nullptr)
+            {
+                auto* slot = compiler->AllocaAtEntry(llvmType, nullptr, "arrayfielddefault");
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(llvmType), slot);
+                EmitFixedArrayDefaultInit(slot, resolved);
+                return compiler->builder->CreateLoad(llvmType, slot, "arrayfielddefault_value");
+            }
+        }
+
         if (!resolved.Pointer && llvmType->isStructTy())
         {
             auto structData = compiler->GetDataStructure(resolved.TypeName);
@@ -1205,6 +1234,14 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
             if (RejectVariadicInterfaceMethod(name, method)) continue;
             LLVMBackend::InterfaceMethod m;
             m.ReturnType = ParseDeclarationSpecifiers(method->declarationSpecifiers());
+            bool fixedReturn = false;
+            for (auto* spec : method->declarationSpecifiers()->declarationSpecifier())
+                if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
+                    fixedReturn = true;
+            if (fixedReturn)
+                LogErrorContext(method, std::format(
+                    "interface method '{}.{}' cannot return a fixed-size array by value; return a struct with the array as a field or take an out-parameter",
+                    name, getInterfaceMethodName(method)));
             m.Name = getInterfaceMethodName(method);
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
@@ -3118,7 +3155,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     bool positionalArray = false;
                     if (arrInitList)
                         for (auto* fi : arrInitList->fieldInit())
-                            if (fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
+                            if (fi->Identifier() == nullptr
+                                && (fi->assignmentExpression().size() == 1 || fi->initializerList() != nullptr))
                             { positionalArray = true; break; }
 
                     bool emptyArrInit = (arrInitList == nullptr || arrInitList->fieldInit().empty());

@@ -111,8 +111,32 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
         std::vector<LLVMBackend::DeclTypeAndValue> declList;
+        auto rejectFixedArrayMemberPrototype = [&](CFlatParser::DeclarationContext* decl) {
+            auto* specs = decl->declarationSpecifiers();
+            if (specs == nullptr || decl->initDeclaratorList() == nullptr) return;
+            std::string element;
+            for (auto* spec : specs->declarationSpecifier())
+            {
+                if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
+                {
+                    if (spec->typeSpecifier() != nullptr) element = spec->typeSpecifier()->getText();
+                    break;
+                }
+            }
+            if (element.empty()) return;
+            for (auto* init : decl->initDeclaratorList()->initDeclarator())
+            {
+                auto* declarator = init->declarator();
+                if (declarator == nullptr
+                    || (declarator->parameterTypeList() == nullptr && declarator->children.size() <= 1)) continue;
+                LogErrorContext(decl, std::format(
+                    "member '{}' cannot return the fixed array '{}[N]' by value; return a struct with the array as a field or take an out-parameter",
+                    declarator->directDeclarator()->getText(), element));
+            }
+        };
         for (auto* decl : declarationList)
         {
+            rejectFixedArrayMemberPrototype(decl);
             std::string packParamName;
             if (decl->declarationSpecifiers())
             {
@@ -323,6 +347,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             rvalue = GenerateDefaultValue(typeValue);
                         }
                     }
+                    if (rvalue == nullptr && compiler->GetType(typeValue)->isArrayTy())
+                    {
+                        GlobalScopeGuard defaultCtorScope(global_scope);
+                        rvalue = GenerateDefaultValue(typeValue);
+                    }
                     initializers.push_back(rvalue);
                 }
 
@@ -342,12 +371,14 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 {
                     auto* destType = structType->getTypeAtIndex(structIndex);
                     // No explicit initializer on a struct-typed field - call its default ctor.
-                    if (rvalue == nullptr && destType->isStructTy())
+                    if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
                     {
                         std::string fieldTypeName = declList[structIndex].TypeName;
                         // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                         // here would call a same-named sibling type's ctor (layer 3).
-                        if (compiler->GetFunction(fieldTypeName))
+                        if (destType->isArrayTy())
+                            rvalue = GenerateDefaultValue(declList[structIndex]);
+                        else if (compiler->GetFunction(fieldTypeName))
                             rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                         else
                             rvalue = llvm::Constant::getNullValue(destType);
@@ -1999,6 +2030,11 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                 }
+                if (rvalue == nullptr && compiler->GetType(typeValue)->isArrayTy())
+                {
+                    GlobalScopeGuard defaultCtorScope(global_scope);
+                    rvalue = GenerateDefaultValue(typeValue);
+                }
                 initializers.push_back(rvalue);
             }
 
@@ -2698,8 +2734,32 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
 
         // Build field list, expanding pack fields (T... fieldName -> fieldName_0, fieldName_1, ...)
         std::vector<LLVMBackend::DeclTypeAndValue> declList;
+        auto rejectFixedArrayMemberPrototype = [&](CFlatParser::DeclarationContext* decl) {
+            auto* specs = decl->declarationSpecifiers();
+            if (specs == nullptr || decl->initDeclaratorList() == nullptr) return;
+            std::string element;
+            for (auto* spec : specs->declarationSpecifier())
+            {
+                if (auto* dims = ArrayDimsOf(spec); dims != nullptr && !dims->assignmentExpression().empty())
+                {
+                    if (spec->typeSpecifier() != nullptr) element = spec->typeSpecifier()->getText();
+                    break;
+                }
+            }
+            if (element.empty()) return;
+            for (auto* init : decl->initDeclaratorList()->initDeclarator())
+            {
+                auto* declarator = init->declarator();
+                if (declarator == nullptr
+                    || (declarator->parameterTypeList() == nullptr && declarator->children.size() <= 1)) continue;
+                LogErrorContext(decl, std::format(
+                    "member '{}' cannot return the fixed array '{}[N]' by value; return a struct with the array as a field or take an out-parameter",
+                    declarator->directDeclarator()->getText(), element));
+            }
+        };
         for (auto* decl : declarationList)
         {
+            rejectFixedArrayMemberPrototype(decl);
             std::string packParamName;
             if (decl->declarationSpecifiers())
             {
@@ -2892,12 +2952,14 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             {
                 auto* destType = structType->getTypeAtIndex(structIndex);
                 // No explicit initializer on a struct-typed field - call its default ctor.
-                if (rvalue == nullptr && destType->isStructTy())
+                if (rvalue == nullptr && (destType->isStructTy() || destType->isArrayTy()))
                 {
                     std::string fieldTypeName = declList[structIndex].TypeName;
                     // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                     // here would call a same-named sibling type's ctor (layer 3).
-                    if (compiler->GetFunction(fieldTypeName))
+                    if (destType->isArrayTy())
+                        rvalue = GenerateDefaultValue(declList[structIndex]);
+                    else if (compiler->GetFunction(fieldTypeName))
                         rvalue = compiler->CreateOverloadedFunctionCall(fieldTypeName, {}, true);
                     else
                         rvalue = llvm::Constant::getNullValue(destType);
@@ -3323,11 +3385,13 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 }
                 // No initializer at all on a struct-typed field - call its default ctor, matching
                 // the synthetic default-ctor path.
-                if (fieldVal == nullptr && destType->isStructTy())
+                if (fieldVal == nullptr && (destType->isStructTy() || destType->isArrayTy()))
                 {
                     // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk
                     // here would call a same-named sibling type's ctor (layer 3).
-                    if (compiler->GetFunction(field.TypeName))
+                    if (destType->isArrayTy())
+                        fieldVal = GenerateDefaultValue(field);
+                    else if (compiler->GetFunction(field.TypeName))
                         fieldVal = compiler->CreateOverloadedFunctionCall(field.TypeName, {}, true);
                 }
                 if (fieldVal != nullptr)

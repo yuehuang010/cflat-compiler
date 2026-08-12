@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 58 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 53 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -29,7 +29,7 @@ member list is empty.
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 3 | Three fixes landed; deferred/design items remain |
 | q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 3 | Static-local tooling fixed; ownership semantics blocked |
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 6 | Five fixes landed; collisions and sizeof items remain |
-| q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 9 | Disjoint; parallelizable |
+| q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 11 | Disjoint; parallelizable |
 | q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 5 | |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
@@ -49,7 +49,7 @@ fix work. Status:
 | q10 | **PARTIALLY FIXED.** Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule, conditional-termination guard half, and closure return-type ownership grammar remain deferred or require a language decision. |
 | q11 | **PARTIALLY FIXED.** Static-local ownership-origin reporting and DWARF visibility are fixed. The three remaining global/program-lifetime ownership items remain blocked until the maintainer chooses the consume/reinitialization/destructor semantics. |
 | q12 | **PARTIALLY FIXED.** Generic function registration, closure/array-view type arguments, and variadic free functions are fixed. Name-collision and `sizeof` grammar items remain deferred or coordinated with Q14. |
-| q13 | **SETTLED.** Multi-dim fixed arrays: nested braces only (`{{1,2,3},{4,5,6}}`), plus string rows for char arrays (`{"ab","cd"}`). A flat list for a multi-dim array is an ERROR naming the expected shape. |
+| q13 | **PARTIALLY FIXED.** Fixed-array rejection, nested/char-row initialization, and field default construction are fixed. Side-effect folding and owning-value replacement/read semantics remain active. |
 | q17 | **SETTLED as "leave filed".** Both stay design deferrals, neither is a bug. Direction if ever pursued is a non-bitwise-copyable `Thread`, but that is BLOCKED: CFlat has no syntax for a deleted copy. Pool quiescence-as-typestate was not selected. |
 
 All six are now answered. Two of them (q06, q09) turned out to need no decision at all - the repo

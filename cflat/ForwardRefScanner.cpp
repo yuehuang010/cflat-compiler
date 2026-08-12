@@ -124,6 +124,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         if (auto* fpDimSpec = ArrayDimsOf(declSpec))
                         {
                             auto fpDims = fpDimSpec->assignmentExpression();
+                            if (ArrayPtrOf(declSpec) != nullptr && !fpDims.empty())
+                                compiler->LogError(FixedArrayPointerTypeMessage(typeSpec->getText()));
                             declType.ArraySize = fpDims.empty() ? nullptr : fpDims[0];
                             for (size_t di = 1; di < fpDims.size(); di++)
                                 declType.ExtraArrayDims.push_back(fpDims[di]);

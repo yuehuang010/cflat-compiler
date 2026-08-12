@@ -67,6 +67,13 @@ expect_error("is not a known struct or interface type for 'as' cast") {
 struct SizeofBox<T> { T item = default; };
 struct SizeofPair<A, B> { A a = default; B b = default; };
 
+expect_error("interface method 'Q13TypeInterface.get' cannot return a fixed-size array") {
+    interface Q13TypeInterface { char[8] get(); };
+}
+expect_error("member 'get' cannot return the fixed array 'char[N]' by value") {
+    struct Q13TypeStruct { char[8] get(); };
+}
+
 interface Q12ArrayViewInterface { int f(); };
 struct Q12UniqueArrayViewBox<T> { T value = default; };
 expect_error("array views are not supported") {

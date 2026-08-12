@@ -69,6 +69,13 @@ static CFlatParser::ArrayPtrSuffixContext* ArrayPtrOf(Ctx* c)
 {
     return c->arrayTypeSuffix() ? c->arrayTypeSuffix()->arrayPtrSuffix() : nullptr;
 }
+
+inline std::string FixedArrayPointerTypeMessage(const std::string& typeName)
+{
+    return std::format(
+        "pointer to fixed array '{}[N]*' is not a valid type; pass '{}*' (a fixed array decays to a pointer to its first element).",
+        typeName, typeName);
+}
 // `long long` reaches the listener as two separate `long` typeSpecifiers (the grammar has no
 // combined rule), and the parse loops stop at the first one. Count them so the spelling can be
 // canonicalized to "i64": `long long` is 64-bit on every target, while bare `long` is the

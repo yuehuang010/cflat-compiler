@@ -7137,7 +7137,8 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         // field name is what distinguishes them, exactly as the declarator decides it.
         bool positional = false;
         for (auto* fi : list->fieldInit())
-            if (fi->Identifier() == nullptr && fi->assignmentExpression().size() == 1)
+            if (fi->Identifier() == nullptr
+                && (fi->assignmentExpression().size() == 1 || fi->initializerList() != nullptr))
             { positional = true; break; }
         bool emptyList = list->fieldInit().empty();
 
@@ -7426,7 +7427,93 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         llvm::Value* arrAlloc) {
         auto* compiler = Compiler(initList);
         auto elements = initList->fieldInit();
+        bool multidim = !tv.ConstInnerDimensions.empty();
         uint64_t n = tv.ConstArraySize;
+        for (uint64_t d : tv.ConstInnerDimensions) n *= d;
+
+        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
+        auto* elemTy = arrTy->getElementType();
+
+        if (multidim)
+        {
+            uint64_t rowWidth = tv.ConstInnerDimensions.front();
+            bool hasNested = false;
+            for (auto* fi : elements)
+                if (fi->initializerList() != nullptr) { hasNested = true; break; }
+
+            // The only non-nested multi-dimensional spelling is a string per char row.
+            if (!hasNested && elemTy->isArrayTy()
+                && elemTy->getArrayElementType()->isIntegerTy(8))
+            {
+                if (elements.size() > tv.ConstArraySize)
+                    LogErrorContext(initList, std::format(
+                        "too many string rows for '{}[{}][{}]': got {} rows",
+                        tv.TypeName, tv.ConstArraySize, rowWidth, elements.size()));
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
+                llvm::Value* zero = compiler->builder->getInt32(0);
+                for (size_t row = 0; row < elements.size(); row++)
+                {
+                    auto* fi = elements[row];
+                    if (fi->assignmentExpression().size() != 1)
+                        LogErrorContext(fi, "multi-dimensional fixed-array initializers require nested braces or one string per char row");
+                    auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
+                    auto* literal = llvm::dyn_cast_or_null<llvm::Constant>(LoadNamedVariable(nv));
+                    auto* global = literal == nullptr ? nullptr
+                        : llvm::dyn_cast<llvm::GlobalVariable>(literal->stripPointerCasts());
+                    auto* bytes = global == nullptr ? nullptr
+                        : llvm::dyn_cast<llvm::ConstantDataSequential>(global->getInitializer());
+                    if (bytes == nullptr || !compiler->IsStringLiteralConstant(literal))
+                        LogErrorContext(fi, "multi-dimensional char arrays require string literal rows");
+                    std::string text = bytes->getAsString().str();
+                    if (!text.empty() && text.size() - 1 > rowWidth)
+                        LogErrorContext(fi, std::format("string row has {} characters but '{}' has width {}",
+                            text.size() - 1, tv.TypeName, rowWidth));
+                    for (uint64_t col = 0; col < rowWidth; col++)
+                    {
+                        auto* colVal = compiler->builder->getInt32((uint32_t)col);
+                        auto* rowVal = compiler->builder->getInt32((uint32_t)row);
+                        auto* cell = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc,
+                            {zero, rowVal, colVal}, "charrow");
+                        uint8_t ch = col < text.size() ? (uint8_t)text[col] : 0;
+                        compiler->builder->CreateStore(compiler->builder->getInt8(ch), cell);
+                    }
+                }
+                return;
+            }
+
+            if (!hasNested)
+                LogErrorContext(initList, std::format(
+                    "flat initializer lists are not supported for '{}[{}]'; use nested braces matching each dimension",
+                    tv.TypeName, tv.ConstArraySize));
+
+            std::vector< CFlatParser::FieldInitContext* > flattened;
+            std::function<void(CFlatParser::InitializerListContext*, size_t)> flatten =
+                [&](CFlatParser::InitializerListContext* list, size_t depth) {
+                    uint64_t expected = depth == 0 ? tv.ConstArraySize
+                        : tv.ConstInnerDimensions[depth - 1];
+                    if (list->fieldInit().size() > expected)
+                        LogErrorContext(list, std::format(
+                            "too many initializers at dimension {}: expected at most {}, got {}",
+                            depth + 1, expected, list->fieldInit().size()));
+                    for (auto* fi : list->fieldInit())
+                    {
+                        if (depth + 1 < 1 + tv.ConstInnerDimensions.size())
+                        {
+                            if (fi->initializerList() == nullptr)
+                                LogErrorContext(fi, "multi-dimensional fixed-array initializers require nested braces matching each dimension");
+                            flatten(fi->initializerList(), depth + 1);
+                        }
+                        else
+                        {
+                            if (fi->initializerList() != nullptr)
+                                LogErrorContext(fi, "too many nested braces for fixed-array element");
+                            flattened.push_back(fi);
+                        }
+                    }
+                };
+            flatten(initList, 0);
+            elements = std::move(flattened);
+        }
 
         if (elements.size() > n)
         {
@@ -7435,8 +7522,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             return;
         }
 
-        auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
-        auto* elemTy = arrTy->getElementType();
+        if (multidim)
+        {
+            while (elemTy->isArrayTy()) elemTy = elemTy->getArrayElementType();
+        }
         // Zero-fill the whole array so unspecified trailing slots are well-defined.
         compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
 
@@ -7449,6 +7538,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         fixedElemTV.IsArrayView = false;
 
         llvm::Value* zero = compiler->builder->getInt32(0);
+        std::vector<llvm::Value*> elementPtrs;
+        if (multidim)
+            compiler->EmitFixedArrayElementWalk(*compiler->builder, arrAlloc, elemTy, n,
+                [&](llvm::Value* ptr) { elementPtrs.push_back(ptr); });
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
@@ -7487,7 +7580,9 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 val = CoerceInitValueToInterface(nv, val, tv.TypeName, fi);
 
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
-            auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
+            auto* elemPtr = multidim
+                ? elementPtrs[i]
+                : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
             compiler->CreateAssignment(val, elemPtr, false, elemTy);
         }

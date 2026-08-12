@@ -1,6 +1,7 @@
 # q13: Fixed arrays and aggregate initialization
 
-9 items. Two related failures: the array EXTENT is dropped in declarator handling (so rejection
+4 active items remain. Q13 fixed the array rejection and field default-construction legs;
+two related failures remain: the array EXTENT is dropped in declarator handling (so rejection
 guards and mangling misbehave), and element-wise CONSTRUCTION is replaced by a splat or memcpy
 that skips constructors and side effects.
 
@@ -15,17 +16,9 @@ that skips constructors and side effects.
 
 ## Members
 
-Extent / rejection:
-- `p2/fixed-array-parameter-not-callable`
-- `p3/function-pointer-to-fixed-array-not-rejected` - the funcptr branch exits the loop before the
-  rejection check.
-- `p3/interface-and-struct-member-fixed-array-return-not-rejected` - guard present on the
-  free-function and definition paths only.
-- `p2/multidim-fixed-array-has-no-brace-initializer` - nested-brace grammar rejects multi-dim
-  literals; flat lists and string elements also mis-map per dimension.
+Extent / rejection: fixed in Q13; see the fixed list below.
 
 Construction / initialization:
-- `p2/fixed-array-field-skips-element-default-construction`
 - `p3/array-default-splat-drops-ctor-side-effects`
 - `p3/named-override-expression-evaluated-per-slot-only-for-owning-elements` - POD arm evaluates
   once and memcpys; the owning arm needs single-eval plus an owning copy, not a re-emit.
@@ -33,6 +26,14 @@ Construction / initialization:
   default-constructed owning field, no destruct first.
 - `p2/raw-heap-struct-array-element-read-double-frees` - reading an owning struct element off a
   raw heap array materializes a destructible temp.
+
+Fixed in Q13:
+
+- `p2/fixed-array-parameter-not-callable` (already landed; reconciled with this bucket)
+- `p3/function-pointer-to-fixed-array-not-rejected`
+- `p3/interface-and-struct-member-fixed-array-return-not-rejected`
+- `p2/multidim-fixed-array-has-no-brace-initializer`
+- `p2/fixed-array-field-skips-element-default-construction`
 
 ## RULING 2026-08-11: nested braces only, plus string rows for char arrays
 
@@ -54,17 +55,22 @@ flat case: `char[2][8] b = {'a','b',...}` flat is still an error.
 
 ## Fix direction
 
-0. Land the ruling above as the shape rule the initializer validates against, BEFORE the
+0. Q13 landed the ruling above as the shape rule the initializer validates against, BEFORE the
    element-construction work in step 2 - the reject and the string-row case both need the per-
    dimension mapping to be correct first, and `p2/multidim-fixed-array-has-no-brace-initializer` is
    where that mapping lives.
-1. Carry the extent through the declarator into the parameter/return type, and move the fixed-array
+1. Q13 added the remaining member/funcptr rejection funnels and retained the existing parameter
+   rejection. It also accepts nested shapes and char string rows; flat multi-dimensional lists
+   remain errors.
+2. Carry the extent through the declarator into the parameter/return type, and move the fixed-array
    rejection to a single funnel every declarator path reaches (the funcptr and member paths
    currently bypass it by returning early).
-2. Replace the splat with one element-init routine parameterized by POD-ness: evaluate the override
+3. Q13 routes fixed-array field defaults through the existing per-element construction walk. The
+   remaining side-effect and owning-value semantics are still active.
+4. Replace the splat with one element-init routine parameterized by POD-ness: evaluate the override
    ONCE, then per slot either memcpy (POD) or copy-construct (owning). That single routine covers
    the default-construction, side-effect, and per-slot-override items together.
-3. The two owning items (`brace-override...`, `raw-heap-struct-array-element...`) interact with the
+5. The two owning items (`brace-override...`, `raw-heap-struct-array-element...`) interact with the
    owned-temp ledgers - sequence them after q01.
 
 Mostly disjoint from ownership; items 1 and 2 are good parallel work at the sonnet tier.

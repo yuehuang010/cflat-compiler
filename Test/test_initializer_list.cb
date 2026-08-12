@@ -142,7 +142,7 @@ struct FadDtor   { int k = 7; ~FadDtor() { fadDtors = fadDtors + 1; } };
 int fadAddOne(int x) { return x + 1; }
 struct FadClo    { Lambda<int(int)> f = fadAddOne; };            // PRE: the zeroed slot was CALLED
 FadS[2] fadGlobal = default;                       // frozen: a global still skips the ctor
-struct FadHost   { FadS[2] a; int z = 3; };        // frozen: no initializer at all - separate residue
+struct FadHost   { FadS[2] a; int z = 3; };        // field array defaults are constructed per element
 
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
@@ -595,6 +595,15 @@ extern int main()
                             fbasi.a[0] * 100 + fbasi.a[1] * 10 + fbasi.a[2], 423);
     total++; passed += Test("fixed-array field brace non-constant element runs once", fbaBumped, 1);
 
+    // Multi-dimensional fixed arrays use nested braces. The char-row spelling is the one
+    // exception: each outer row may be initialized by one string literal.
+    int[2][3] q13Nested = {{1, 2, 3}, {4, 5, 6}};
+    total++; passed += Test("multi-dimensional nested brace shape",
+                            q13Nested[0][0] + q13Nested[1][2], 7);
+    char[2][8] q13Rows = {"ab", "cd"};
+    total++; passed += Test("multi-dimensional char string rows",
+                            (int)q13Rows[0][0] + (int)q13Rows[1][1], 'a' + 'd');
+
     // Accept set - identical on both binaries: an empty list on a primitive element is zero.
     FbaEmpty fbae;
     total++; passed += Test("fixed-array field brace empty list stays zero",
@@ -670,8 +679,8 @@ extern int main()
     // fixed above (fixed-array-field-skips-element-default-construction); this leg pins that
     // neither the local-declarator fix nor the field-brace fix moved that cell.
     FadHost fadH = default;
-    total++; passed += Test("frozen: fixed-array FIELD still skips element defaults",
-                            fadH.a[0].k + fadH.a[1].k, 0);
+    total++; passed += Test("fixed-array FIELD constructs element defaults",
+                            fadH.a[0].k + fadH.a[1].k, 14);
     total++; passed += Test("frozen: fixed-array FIELD sibling scalar default", fadH.z, 3);
 
     if (passed == total)

@@ -532,6 +532,7 @@ fieldInit
     : Identifier '=' assignmentExpression               // named struct field:    {x = 1}
     | assignmentExpression ':' assignmentExpression      // dictionary key:value:   {k: v}
     | assignmentExpression                               // positional list/array:  {v0, v1}
+    | '{' initializerList? ','? '}'                       // nested fixed-array row
     ;
 
 statement
