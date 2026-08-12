@@ -5819,9 +5819,11 @@ int bpsGenericBrace<T>(T p)     { T[2] dst = { p }; return dst[0].item->id; }
 // copyability gate, so the caller's source must still be live after the call.
 int bpsCopyBrace(OaiCopyBox p)  { OaiCopyBox[2] dst = { p }; return dst[0].item->id; }
 int bpsPodBrace(OaiPod p)       { OaiPod[2] dst = { p }; return dst[0].x; }
-// A field reached through a BORROWED POINTER parameter: an indirect source, consumed silently,
-// and the pointer parameter itself is not sink-eligible.
-int bpsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { wp->b }; return dst[0].item->id; }
+// A field reached through a BORROWED POINTER parameter. RE-RATIFIED (Q06, 2026-08-12): the
+// IMPLICIT spelling used to be consumed silently and is now an error naming `move` as the remedy;
+// the explicit spelling below is that remedy, and is legal for an owning VALUE field. The pointer
+// parameter itself is still not sink-eligible.
+int bpsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { move wp->b }; return dst[0].item->id; }
 
 int testBraceInitConsumesParameter()
 {
@@ -5944,9 +5946,13 @@ int cbvReadNested(OaiOuter w)    { return w.inner.b.item->id; }
 int cbvMoveParamField(move OaiWrap w) { OaiBox o = w.b; return o.item->id; }
 // Field of a LOCAL struct - the root is not a parameter, so the consume stays legal.
 int cbvLocalField()              { OaiWrap w; w.b = oaiMake(6); OaiBox o = w.b; return o.item->id; }
-// Field through a BORROWED POINTER parameter: filed separately (p2, memory-safe today) and
-// deliberately NOT covered by this guard, which keys on a by-VALUE struct parameter.
-int cbvPtrParamField(OaiWrap* w) { OaiBox o = w.b; return o.item->id; }
+// Field through a BORROWED POINTER parameter. RE-RATIFIED (Q06, 2026-08-12): the implicit
+// spelling this leg used to pin is now an error, and `move` is the sanctioned transfer - the
+// same shape as the `move` by-value parameter leg above, reached through a pointer.
+int cbvPtrParamField(OaiWrap* w) { OaiBox o = move w.b; return o.item->id; }
+// `&param` on a borrowed by-value parameter: the READ through the laundered pointer still
+// borrows, so it stays legal. Its consume twin is rejected in err_move_field_borrowed_param.cb.
+int cbvAmpParamRead(OaiWrap w)   { OaiWrap* p = &w; return p.b.item->id; }
 // Whole by-value param consumed (no field path): the owning-sink inference's job, not this guard.
 int cbvWholeParam(OaiBox p)      { OaiBox o = p; return o.item->id; }
 /*
@@ -6052,6 +6058,17 @@ int testConsumeOfBorrowedByValueParamField()
         passed += Test("cbvf_ptrparam_source_nulled", w.b.item == nullptr, true);
     }
     passed += Test("cbvf_ptrparam_freed_once", dtorCount, 1);
+
+    // 8b. `&param` laundering, READ form: still a borrow, so the caller keeps the field and
+    // frees it exactly once. Its consume twin is rejected in err_move_field_borrowed_param.cb.
+    dtorCount = 0;
+    {
+        OaiWrap w;
+        w.b = oaiMake(9);
+        passed += Test("cbvf_amp_param_read", cbvAmpParamRead(w), 9);
+        passed += Test("cbvf_amp_param_source_live", w.b.item != nullptr, true);
+    }
+    passed += Test("cbvf_amp_param_freed_once", dtorCount, 1);
 
     // 9. A WHOLE by-value parameter consume has no field path, so the guard cannot see it and
     // the owning-sink inference keeps handing the callee ownership.
@@ -6742,7 +6759,10 @@ int pcsMove(OaiBox p)           { OaiBox o = move (p); return o.item->id; }
 int pcsGenericBrace<T>(T p)     { T[2] dst = { (p) }; return dst[0].item->id; }
 // ACCEPT SET: only a BARE name survives the peel. A parenthesized FIELD source, a parenthesized
 // CALL, a COPYABLE owner and a POD must all behave exactly as their unparenthesized spelling.
-int pcsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { (wp->b) }; return dst[0].item->id; }
+// RE-RATIFIED (Q06, 2026-08-12): the implicit consume through a borrowed pointer parameter is now
+// an error whether or not it is parenthesized, so this leg carries the `move` remedy. The point it
+// pins is unchanged - the parenthesized spelling must behave as its unparenthesized twin.
+int pcsPtrFieldBrace(OaiWrap* wp) { OaiBox[2] dst = { move (wp->b) }; return dst[0].item->id; }
 int pcsCallSrc(OaiBox p)        { OaiBox o = ( oaiMake(3) ); return o.item->id + p.item->id; }
 int pcsCopyDecl(OaiCopyBox p)   { OaiCopyBox o = (p); return o.item->id; }
 int pcsPodDecl(OaiPod p)        { OaiPod o = (p); return o.x; }
@@ -9779,7 +9799,9 @@ OaiBox rfldNested()                   { OaiOuter o; o.inner.b = oaiMake(43); ret
 // q11: an IMPLICIT consume out of the global is rejected (err_move.cb); `move` is the sanctioned
 // spelling and re-initializes the field, so a second call reads a defined empty value.
 OaiBox rfldGlobal()                   { return move rfldG.b; }
-OaiBox rfldPtr(OaiWrap* p)            { return p->b; }
+// q06 RULED 2026-08-12: same shape as the global leg above - the IMPLICIT consume through a
+// borrowed pointer parameter is rejected and `move` is the sanctioned spelling.
+OaiBox rfldPtr(OaiWrap* p)            { return move p->b; }
 OaiBox rfldArrField()                 { OaiArrWrap w; w.arr[0] = oaiMake(46); return w.arr[0]; }
 OaiBox rfldElem()                     { OaiBox[2] arr; arr[0] = oaiMake(47); return arr[0]; }
 OaiBox rfldAliasSrc()                 { OaiWrap w; w.b = oaiMake(48); alias OaiWrap a = w; return a.b; }
@@ -10995,7 +11017,7 @@ extern int main()
     total += 80;
 
     passed += testConsumeOfBorrowedByValueParamField();
-    total += 34;
+    total += 37;
 
     passed += testParenConsumeSourceSink();
     total += 35;

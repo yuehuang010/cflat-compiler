@@ -1170,6 +1170,7 @@ public:
         std::string CallerName;          // the variable's name at the call site, for move tracking
         std::string OwningStructName;    // when this NamedVariable is a struct-field access, the field's owning struct
         std::string FieldName;           // when this NamedVariable is a struct-field access, the field name
+        std::string FieldPathText;       // source spelling of a field path, e.g. "w.inner.b"
         // Root VARIABLE of a field path ("w" for `w.a.b`). TypeAndValue.ParentVariableName names
         // only the IMMEDIATE parent, which on a nested path is an intermediate field, not a variable.
         std::string FieldPathRoot;
@@ -1177,6 +1178,10 @@ public:
         // current function's borrowed (non-`move`) by-value struct parameter. Re-asking downstream by
         // NAME cannot distinguish the parameter from an inner local that shadows it.
         bool RootIsBorrowedByValueParam = false;
+        // This pointer LOCAL holds the address of a borrowed by-value struct parameter (`Wrap* p =
+        // &w;`). Taking the address launders the field path past the root walk - it now roots at
+        // `p`, a local - so the fact has to ride the local's binding to reach the field site.
+        bool PointsToBorrowedByValueParam = false;
         // POSITIVE provenance: this raw `T*` LOCAL holds a `new T[n]` allocation, whose elements
         // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
         // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
@@ -6197,6 +6202,8 @@ public:
                             const std::string& uniqueField, bool throughField,
                             bool keepExistingOrigin = false,
                             bool uniqueFieldViaCall = false);
+
+    void SetPointsToBorrowedByValueParam(const std::string& name, bool value);
 
     /*
      * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='

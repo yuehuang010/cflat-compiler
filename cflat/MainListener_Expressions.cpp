@@ -1664,6 +1664,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                                                      reboundToOwnedStore ? std::string() : assignedOwner,
                                                      /*coalesceJoin*/ false, reboundToOwnedStore);
                     }
+                    compiler->SetPointsToBorrowedByValueParam(
+                        namedVar.CallerName, rightNV.PointsToBorrowedByValueParam);
                     /*
                      * Record the borrow the RHS carries, which MarkPointerRebound above does not:
                      * it retires the declaration-time facts and re-arms only the OWNER-side proofs,
@@ -6520,6 +6522,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     LogErrorContext(ctx, "Unable to get an Address-of an object without a Storage.");
                 }
 
+                // `&w` on a borrowed by-value struct parameter launders every later field path
+                // past the root walk, so record the fact on the produced pointer (measured rc 134).
+                {
+                    LLVMBackend::NamedVariable probe = namedVar;
+                    if (probe.TypeAndValue.VariableName.empty())
+                        probe.TypeAndValue.VariableName = namedVar.CallerName;
+                    if (IsBorrowedByValueParamBinding(compiler, probe))
+                        namedVar.PointsToBorrowedByValueParam = true;
+                }
                 namedVar.Primary = namedVar.Storage;
                 namedVar.Storage = nullptr;
                 // The address of an element (e.g. &a[i]) is a raw pointer to one slot, never a
@@ -9519,6 +9530,26 @@ std::string MainListener::FieldPathRootName(const LLVMBackend::NamedVariable& nv
             ? BorrowedOriginRoot(nv.TypeAndValue.ParentVariableName) : nv.FieldPathRoot;
     }
 
+// Is this field an owning VALUE (a struct with a destructor or an owning field), as opposed to a
+// pointer? Only the value family is covered by the q06 move-required/move-allowed ruling.
+bool MainListener::FieldIsOwningValue(LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv)
+{
+    if (nv.TypeAndValue.Pointer || nv.TypeAndValue.ElemPointer) return false;
+    if (nv.TypeAndValue.TypeName.empty()) return false;
+    return compiler->IsOwningValueType(nv.TypeAndValue.TypeName);
+}
+
+// A method's implicit `this` receiver is a borrowed pointer parameter too, but `this.field`
+// consume is a RATIFIED accept (issue q06) - the ruling covers written parameters only.
+bool MainListener::BorrowOriginIsMethodReceiver(LLVMBackend* compiler, const std::string& origin)
+{
+    if (origin.empty() || compiler->builder->GetInsertBlock() == nullptr) return false;
+    const auto* sym = compiler->FindSymbolForFunction(
+        compiler->builder->GetInsertBlock()->getParent());
+    return sym != nullptr && sym->IsMethod && !sym->Parameters.empty()
+        && sym->Parameters[0].VariableName == origin;
+}
+
 bool MainListener::RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         antlr4::ParserRuleContext* ctx) {
@@ -9526,7 +9557,29 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
         // consume of the parameter itself is the owning-sink inference's job, not this guard.
         if (srcNV.OwningStructName.empty() || srcNV.FieldName.empty()) return false;
         // The RECORDED answer from the field-access site, not a fresh lookup of the root's name.
-        if (!srcNV.RootIsBorrowedByValueParam && !srcNV.RootIsAliasBorrowLocal) return false;
+        // The borrowed POINTER-parameter root is the third spelling (RULED 2026-08-12: move
+        // required, move allowed). Element slots stay exempt - IsBorrowed only tags pointer bases.
+        bool rootIsBorrowedPtrParam = srcNV.IsBorrowed && !srcNV.BorrowedOrigin.empty()
+                                   && !srcNV.IsElementAccess
+                                   && FieldIsOwningValue(compiler, srcNV)
+                                   && !BorrowOriginIsMethodReceiver(compiler, srcNV.BorrowedOrigin);
+        if (!srcNV.RootIsBorrowedByValueParam && !srcNV.RootIsAliasBorrowLocal
+            && !rootIsBorrowedPtrParam)
+            return false;
+        if (rootIsBorrowedPtrParam && !srcNV.RootIsBorrowedByValueParam
+            && !srcNV.RootIsAliasBorrowLocal)
+        {
+            const std::string fieldPath = srcNV.FieldPathText.empty()
+                ? srcNV.BorrowedOrigin + "." + srcNV.FieldName : srcNV.FieldPathText;
+            LogErrorContext(ctx, std::format(
+                "cannot consume field '{}.{}' through borrowed parameter '{}' - the store takes the "
+                "caller's value and leaves its field null, without the caller ever agreeing to "
+                "surrender it. Write 'move {}' to say so explicitly, or declare the parameter "
+                "'move {}' to take ownership of the whole struct.",
+                srcNV.OwningStructName, srcNV.FieldName, srcNV.BorrowedOrigin,
+                fieldPath, srcNV.BorrowedOrigin));
+            return true;
+        }
         const std::string root = FieldPathRootName(srcNV);
         if (srcNV.RootIsAliasBorrowLocal && !srcNV.RootIsBorrowedByValueParam)
         {
@@ -9534,6 +9587,18 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
                 "cannot consume field '{}.{}' out of 'alias' borrow '{}' - the store nulls only "
                 "this shallow copy, so the real owner's field still frees the pointee (double-free). "
                 "Read the field without storing it, or use '.copy()' for an independent owned copy.",
+                srcNV.OwningStructName, srcNV.FieldName, root));
+            return true;
+        }
+        // Reached through `T* p = &param`: `p` is a LOCAL, so it must not be called a parameter
+        // and 'move p' is not the remedy - the parameter that owns the storage is not nameable here.
+        if (srcNV.PointsToBorrowedByValueParam)
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot consume field '{}.{}' through pointer '{}' - it points at a borrowed "
+                "by-value parameter, so the store nulls only the callee's copy and the caller's "
+                "struct still frees the pointee (double-free). Declare that parameter 'move' to "
+                "take ownership, or read the field without storing it.",
                 srcNV.OwningStructName, srcNV.FieldName, root));
             return true;
         }
@@ -9628,9 +9693,11 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         // borrowed-by-value-parameter reject guard read.
         dst.OwningStructName = src.OwningStructName;
         dst.FieldName        = src.FieldName;
+        dst.FieldPathText    = src.FieldPathText;
         dst.FieldPathRoot    = src.FieldPathRoot;
         dst.RootIsBorrowedByValueParam = src.RootIsBorrowedByValueParam;
         dst.RootIsAliasBorrowLocal = src.RootIsAliasBorrowLocal;
+        dst.PointsToBorrowedByValueParam = src.PointsToBorrowedByValueParam;
         dst.IsInterfaceField = src.IsInterfaceField;
         // Element provenance: a view slot is LIVE storage, a container's internal slot is not.
         dst.IsElementAccess = src.IsElementAccess;
@@ -9744,6 +9811,18 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // synthesized destructors free it. Declaring the parameter 'move' makes the callee the owner.
         // Uses the answer RECORDED at the field-access site, which is also what makes a NESTED path
         // (`move w.a.b`) reach this leg: ParentVariableName names the intermediate field, not `w`.
+        if (!argNV.OwningStructName.empty() && argNV.PointsToBorrowedByValueParam)
+        {
+            const std::string pointer = FieldPathRootName(argNV);
+            const std::string fieldPath = argNV.FieldPathText.empty()
+                ? pointer + "." + argNV.FieldName : argNV.FieldPathText;
+            LogErrorContext(ctx, std::format(
+                "cannot 'move' field '{}' through pointer '{}' - it points at a borrowed "
+                "by-value parameter, so the caller's struct still frees the pointee (double-free). "
+                "Declare that parameter 'move' to take ownership, or read the field without moving it.",
+                fieldPath, pointer));
+            return {};
+        }
         if (!argNV.OwningStructName.empty() && argNV.RootIsBorrowedByValueParam)
         {
             const std::string parent = FieldPathRootName(argNV);
@@ -9778,15 +9857,21 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             return {};
         }
 
-        // Reject 'move param->field' (or any field whose parent traces to a borrowed
-        // parameter): the caller still owns the parent struct and will see a nulled field
-        // it never agreed to surrender. Require the parent parameter to be declared 'move'.
-        // Element slots (n->values[i]) are exempt: IsBorrowed only tags pointer bases, so the
-        // slot GEP nulls the one real object - recovery derives ownership from the element type.
+        /*
+         * RULED 2026-08-12 (move required, move allowed): `move w.b` through a borrowed POINTER
+         * parameter is LEGAL for an owning VALUE field. The move nulls the one real object the
+         * caller can see - exactly what the implicit store already did silently, and that spelling
+         * is the one now rejected with this as its named remedy. A POINTER field keeps the
+         * rejection: handing out the raw pointer is the delete-borrow hazard q10 ruled DEFER, and
+         * its own downstream guards would reject the remedy anyway. The by-value and alias-borrow
+         * roots above also stay rejected - there the move nulls only a shallow copy.
+         */
         if (!argNV.OwningStructName.empty()
             && argNV.IsBorrowed
             && !argNV.BorrowedOrigin.empty()
-            && !argNV.IsElementAccess)
+            && !argNV.IsElementAccess
+            && !FieldIsOwningValue(compiler, argNV)
+            && !BorrowOriginIsMethodReceiver(compiler, argNV.BorrowedOrigin))
         {
             LogErrorContext(ctx, std::format(
                 "cannot 'move' field '{}.{}' through borrowed parameter '{}'. Declare the "

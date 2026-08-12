@@ -74,4 +74,38 @@ int stealLocalField() {
     return 0;
 }
 
+// Q06 (RULED 2026-08-12: move required, move allowed). An owning-VALUE field reached through a
+// borrowed POINTER parameter is the third spelling of the same hazard: the implicit store nulls
+// only the callee's view while the caller's struct still frees the pointee.
+class QRes { int id = default; };
+struct QBox  { unique QRes* item = default; };
+struct QWrap { QBox b = default; };
+
+expect_error("cannot consume field 'QWrap.b' through borrowed parameter 'w'") {
+    int qImplicit(QWrap* w) { QBox o = w.b; return o.item->id; }
+}
+
+// Taking the address launders the field path past the root walk: `p` is a LOCAL, so the
+// diagnostic must not call it a parameter, and 'move p' is not the remedy.
+expect_error("through pointer 'p' - it points at a borrowed by-value parameter") {
+    int qLaunder(QWrap w) { QWrap* p = &w; QBox o = p.b; return o.item->id; }
+}
+
+expect_error("through pointer 'q' - it points at a borrowed by-value parameter") {
+    int qLaunderAssign(QWrap w) {
+        QWrap* p = &w;
+        QWrap* q = nullptr;
+        q = p;
+        QBox o = q.b;
+        return o.item->id;
+    }
+}
+
+expect_error("cannot 'move' field 'p.b' through pointer 'p'") {
+    int qLaunderMove(QWrap w) { QWrap* p = &w; QBox o = move p.b; return o.item->id; }
+}
+
+// Sanity: explicit 'move' is the sanctioned transfer through the same borrowed pointer.
+int qMoveOk(QWrap* w) { QBox o = move w.b; return o.item->id; }
+
 extern int main() { return 0; }

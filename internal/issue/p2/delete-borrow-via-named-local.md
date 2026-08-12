@@ -110,3 +110,15 @@ recommended path for callers who want the check today.
 
 ## Related
 - `internal/plan/unique-ownership.md` - the `alias` design.
+
+## From the q06 bucket file (deleted 2026-08-12)
+
+The q06 bucket is gone. This item,
+[[string-pointer-param-slot-semantics-depend-on-argument-provenance]] and
+[[temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return]] are what remained
+of it; each is now PLAN-LEVEL work in its own right (maintainer, 2026-08-12), not a guard tweak.
+
+The bucket's shared root cause and the "root provenance" fix direction are written out in full in
+[[string-pointer-param-slot-semantics-depend-on-argument-provenance]] - read it before planning
+here, since the delete site is one of the guards that would ask the single provenance question
+instead of testing `IsBorrowed`. Polarity is ratified: unknown ACCEPTS.

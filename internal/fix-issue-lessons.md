@@ -2815,3 +2815,24 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   longer flushed a destructor, and the named-override issue's title said the POD arm was the
   correct one when the OWNING arm was already doing what the ruling chose. Re-measure before
   implementing a filed fix direction.
+
+- **q06 - implicit consume through a borrowed POINTER parameter, and the `&param` launder (2026-08-12).**
+  RULED: move required, move allowed. Three lessons.
+  (1) **The remedy has to be measured, not assumed.** The first cut applied the ruling to POINTER
+  fields too, and the sanctioned spelling dead-ended: `Resource* taken = move c->item; delete
+  taken;` is still rejected downstream, which is q10's ruled-DEFER territory. A guard whose named
+  remedy does not compile is worse than no guard. The ruling was narrowed to owning-VALUE fields
+  (`FieldIsOwningValue`), where `move w.b` demonstrably works.
+  (2) **A method's implicit receiver is a borrowed pointer parameter too.** The guard fired on
+  `this.field` inside a method, which the issue file explicitly ratifies as ACCEPTED - the ruling
+  covers WRITTEN parameters only. `BorrowOriginIsMethodReceiver` compares the borrow origin
+  against the enclosing symbol's first parameter rather than trusting the flag alone.
+  (3) **`&param` launders the field path past the ROOT WALK, so the fact must ride the binding.**
+  `Wrap* p = &w; Box o = p.b;` roots at the LOCAL `p`, so `RootIsBorrowedByValueParam` was false
+  and the double-free stood (measured rc 134, pre-existing). The fix records
+  `PointsToBorrowedByValueParam` on the pointer local at the `&` site and reads it at the field
+  access. Two measurement traps on the way: the storage lookup MISSES for a loaded pointer
+  (`FindVariableByStorage` returned null while the base's own NamedVariable carried the flag - test
+  BOTH), and the shared diagnostic then named `p` "a borrowed by-value parameter", which it is not.
+  A laundered path needs its own wording: the parameter that owns the storage is not nameable at
+  that site, so the message must not invent a `move p` remedy.

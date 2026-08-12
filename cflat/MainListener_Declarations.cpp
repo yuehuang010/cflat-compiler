@@ -3171,6 +3171,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 bool srcIsOwningArrayStringElem = false;
                 bool srcIsRawHeapStringElem = false;
                 bool srcPtrCopyIsRawNewArray = false;
+                bool srcPointsToBorrowedByValueParam = false;
                 llvm::Value* srcRawArrayLength = nullptr;
                 // True when the initializer reads an element of a user `T[]` VIEW. The GEP has a
                 // container slot's single-index shape, so only this provenance separates them.
@@ -3503,11 +3504,24 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcBorrowedField = rightNV.FieldName;
                                 srcFieldPathNV.OwningStructName = rightNV.OwningStructName;
                                 srcFieldPathNV.FieldName = rightNV.FieldName;
+                                srcFieldPathNV.FieldPathText = rightNV.FieldPathText;
                                 srcFieldPathNV.FieldPathRoot = rightNV.FieldPathRoot;
                                 srcFieldPathNV.RootIsBorrowedByValueParam =
                                     rightNV.RootIsBorrowedByValueParam;
                                 srcFieldPathNV.RootIsAliasBorrowLocal =
                                     rightNV.RootIsAliasBorrowLocal;
+                                // The borrowed POINTER-parameter root travels on these three, and
+                                // the guard needs all of them (IsElementAccess is the slot carve-out).
+                                srcFieldPathNV.IsBorrowed = rightNV.IsBorrowed;
+                                srcFieldPathNV.BorrowedOrigin = rightNV.BorrowedOrigin;
+                                srcFieldPathNV.IsElementAccess = rightNV.IsElementAccess;
+                                srcFieldPathNV.PointsToBorrowedByValueParam =
+                                    rightNV.PointsToBorrowedByValueParam;
+                                // The field's own type decides owning-VALUE vs pointer, so it has
+                                // to travel too - the guard reads it, not the root's type.
+                                srcFieldPathNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName;
+                                srcFieldPathNV.TypeAndValue.Pointer = rightNV.TypeAndValue.Pointer;
+                                srcFieldPathNV.TypeAndValue.ElemPointer = rightNV.TypeAndValue.ElemPointer;
                                 srcFieldPathNV.TypeAndValue.ParentVariableName =
                                     rightNV.TypeAndValue.ParentVariableName;
                                 // Trap B: a plain copy of a `unique` field does not null the field, so the
@@ -3639,6 +3653,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // Plain pointer copy from an already-tagged local (`string* q = p;`)
                                 // carries the `new T[n]` provenance across.
                                 srcPtrCopyIsRawNewArray = rightNV.AllocatedByRawNewArray;
+                                // Both the `&w` producer and a plain copy of an already-tainted
+                                // pointer local carry the fact forward.
+                                srcPointsToBorrowedByValueParam =
+                                    rightNV.PointsToBorrowedByValueParam;
                                 srcRawArrayLength = rightNV.RawArrayLength;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
@@ -4307,6 +4325,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             viewNV.RawArrayLength = srcRawArrayLength;
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
+                        viewNV.FieldPathText = srcFieldPathNV.FieldPathText;
                         viewNV.FieldPathRoot = srcFieldPathNV.FieldPathRoot;
                         viewNV.RootIsBorrowedByValueParam =
                             srcFieldPathNV.RootIsBorrowedByValueParam;
@@ -4785,6 +4804,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto& local = compiler->stackNamedVariable.back().namedVariable[name];
                             local.AllocatedByRawNewArray = isRawArray;
                             local.RawArrayLength = isRawArray ? srcRawArrayLength : nullptr;
+                            // `Wrap* p = &w;` carries the by-value parameter's borrow contract onto
+                            // `p`, so a later `p.b` still roots at the parameter.
+                            local.PointsToBorrowedByValueParam = srcPointsToBorrowedByValueParam;
                         }
 
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,

@@ -1999,6 +1999,22 @@ void LLVMBackend::RecordAssignBorrow(const std::string& name, const std::string&
         }
     }
 
+void LLVMBackend::SetPointsToBorrowedByValueParam(const std::string& name, bool value)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            nv->PointsToBorrowedByValueParam = value;
+            return;
+        }
+    }
+
 void LLVMBackend::RetireAssignBorrow(const std::string& name)
 {
         if (name.empty()) return;

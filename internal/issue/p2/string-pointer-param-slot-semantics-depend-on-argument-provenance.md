@@ -72,3 +72,29 @@ is the existing answer for the fixed-array caller, so the narrower fix may be to
 making the base-local gate NEGATIVE (admit unless known to be a fixed array): that was tried in
 round 3 and leaks a use-after-free at every binding nobody enumerated - a join, a re-assignment -
 which is why the gate is positive.
+
+## From the q06 bucket file (deleted 2026-08-12)
+
+The q06 bucket is gone. This item, [[delete-borrow-via-named-local]] and
+[[temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return]] are what remained
+of it; each is now PLAN-LEVEL work in its own right (maintainer, 2026-08-12), not a guard tweak.
+
+**Shared root cause the bucket named.** Provenance facts live on `NamedVariable` / `TypeAndValue` as
+single flags with no propagation rule. Every hop is a separate site that must remember to copy the
+flag, and most do not. Guards then test one specific flag (`IsBorrowed`,
+`RootIsBorrowedByValueParam`) rather than "is this reachable from something I do not own". Four of
+the original seven members were closed by copying one more flag across one more hop; this item is
+the one that cannot be, because a parameter slot has nowhere to carry caller intent.
+
+**Fix direction the bucket carried** (this is the plan-level shape):
+
+1. Replace the flag set with a single "root provenance" answer: given a value, walk back through
+   field GEPs, view bindings, and parameter slots to the ROOT and report owned / borrowed / unknown.
+   Every consume, delete, and drop-old guard then asks that one question.
+2. Make that root walk cross a parameter boundary by encoding provenance in the parameter slot -
+   that is precisely what this item needs.
+3. Polarity is ratified: unknown ACCEPTS. A false rejection is a blocker; a missed dangle is
+   today's behaviour. Two relaxations in this area were already built, measured, and reverted for
+   false-rejecting code in `Test/test_move.cb`.
+
+It overlaps q05's guards and will touch the same functions, so serialize the two.

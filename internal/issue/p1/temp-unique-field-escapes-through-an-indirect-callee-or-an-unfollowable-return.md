@@ -148,3 +148,36 @@ polarities are deliberate - the slot rule is the older, blunter one - but they d
 same program written two ways. Reconciling them is unfiled work, not a regression.
 
 Related: [[interface-issue-queue]]
+
+## From the q06 bucket file (deleted 2026-08-12)
+
+The q06 bucket is gone. This item, [[string-pointer-param-slot-semantics-depend-on-argument-provenance]]
+and [[delete-borrow-via-named-local]] are what remained of it; each is now PLAN-LEVEL work in its
+own right (maintainer, 2026-08-12), not a guard tweak. What the bucket recorded about this one:
+
+**Do NOT consolidate this into a "root provenance" rework.** It is filed with the other two for
+adjacency only - it does not share their flag-propagation root cause. Its remaining sub-cases are
+separate mechanisms sharing one guard, and the two that were fixed were each fixed alone.
+
+**Ratified polarity: unknown ACCEPTS** (same governing rule as q09). A `function<T>` value has no
+closed world short of a points-to analysis, so the remaining funcptr shape is a deliberate ACCEPT
+cell, not an unfixed bug:
+
+```cflat
+function<void(Node*)> f = keep;   // void keep(Node* n) { g = n; }
+f(makeBox().t);                   // measured: dtors=1, dangles - accepted by design
+```
+
+**Already tried and rejected - do not retry either.** Making `ParameterMayReachReturn` follow a load
+through a GEP (to catch `Node* viaField(Node* n) { Slot s; s.q = n; return s.q; }`) was BUILT and
+MEASURED: it false-rejects `int readResourceId(Resource* r) { return r->id; }` in `Test/test_move.cb`
+itself. The type-based refinement (follow only a load of POINTER type) false-rejects
+`Node* getNext(Node* n) { return n->next; }`. Closing this needs field/offset awareness the walk
+does not have.
+
+**Correction to an earlier draft** (2026-08-11): the bucket once summarized this as "indirect
+callees have no callee analysis" and proposed making `unknown` reject. Both are wrong. The
+interface-dispatch half was CLOSED 2026-08-10 by `fix/iface-escape` and the below-call-site return
+half by `fix/retlate`. Residues still open and deliberately accepting: a GENERIC interface base
+clause (implementor set not enumerable before substitution), an interface-dispatch call whose
+ARGUMENT is a candidate launder, and two budget escapes (`kMaxRetainDepth`, `kMaxRetainUses`).

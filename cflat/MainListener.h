@@ -4526,6 +4526,10 @@ public:
      * frees the same pointee. This is the ruling ParseMoveExpression applies to `move w.b`.
      * Returns true (and has already reported) when the store must not be lowered.
      */
+    // Is this field an owning VALUE (not a pointer)? Only that family is covered by the q06
+    // move-required/move-allowed ruling; a pointer field stays on the delete-borrow rules.
+    static bool FieldIsOwningValue(LLVMBackend* compiler, const LLVMBackend::NamedVariable& nv);
+    static bool BorrowOriginIsMethodReceiver(LLVMBackend* compiler, const std::string& origin);
     bool RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         antlr4::ParserRuleContext* ctx);

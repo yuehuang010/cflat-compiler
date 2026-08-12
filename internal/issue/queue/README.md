@@ -6,9 +6,10 @@ exactly one bucket; cross-bucket relatives are named under "Adjacent" inside eac
 
 These files are an INDEX, not issues. They own no repro of their own - the member files stay the
 source of truth and are deleted individually as they are fixed. Delete a bucket file when its
-member list is empty - and also when it is down to ONE OR TWO members: a two-item index earns
-nothing, so fold whatever the bucket recorded about those items into the item files themselves
-(they cross-link each other) and delete the bucket.
+member list is empty - and also once it is down to a HANDFUL (two, or three when each survivor is
+plan-level work in its own right): a short index earns nothing, so fold whatever the bucket
+recorded about those items into the item files themselves (they cross-link each other) and delete
+the bucket.
 
 ## Completed
 
@@ -45,6 +46,7 @@ fix work. Status:
 
 | Bucket | Ruling |
 |--------|--------|
+| q06 | **RULED 2026-08-12 (implicit-consume member), bucket DELETED.** Move required, move allowed: an owning-VALUE field consumed through a borrowed POINTER parameter is now an error in the implicit spelling, and explicit `move w.b` - previously rejected - is the sanctioned transfer. The `&param` laundering spelling (the only double-freeing member of the family) is covered by the same ruling via a `PointsToBorrowedByValueParam` fact carried on the pointer local's binding, since the field path roots at the LOCAL and the storage walk cannot see the parameter. `this.field` inside a method stays ACCEPTED; POINTER fields keep the older `move`-through-borrow rejection, because their remedy dead-ends in q10's ruled-DEFER territory. **Bucket file DELETED 2026-08-12**: the three surviving members are each PLAN-LEVEL work in their own right (maintainer ruling), not guard tweaks, so what the bucket recorded now lives in `p1/temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return`, `p2/string-pointer-param-slot-semantics-depend-on-argument-provenance` and `p2/delete-borrow-via-named-local`. The shared root cause and the "root provenance" fix direction are written out in the string-pointer file. |
 | q06 | **SETTLED - no decision was needed.** The repo had already ratified it: unknown ACCEPTS. The bucket file's proposal to make unknown reject was wrong and is corrected. The interface half of the p1 item is CLOSED, not open. |
 | q08 | **SETTLED and fixed.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. The landed implementation also rejects overwriting the borrowed collection storage and deep-copies returned values. |
 | q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third is now UNBLOCKED - its q02 prerequisite landed in `b911ccc` and it was skipped on a stale blocker. |

@@ -970,6 +970,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
                                     namedVar.FieldName        = primaryIdentifier;
+                                    namedVar.FieldPathText = structVar.FieldPathText.empty()
+                                        ? structVar.TypeAndValue.VariableName + "." + primaryIdentifier
+                                        : structVar.FieldPathText + "." + primaryIdentifier;
                                     // Carry the path's ROOT variable forward: on `w.a.b` the parent
                                     // of `.b` is the field `a`, whose own root is still `w`.
                                     namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
@@ -992,6 +995,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.RootIsBorrowedByValueParam = structVar.FieldPathRoot.empty()
                                         ? IsBorrowedByValueParamBinding(Compiler(ctx), structVar)
                                         : structVar.RootIsBorrowedByValueParam;
+                                    // A pointer LOCAL holding `&param` roots at the parameter too;
+                                    // the binding carries the fact the storage walk cannot see.
+                                    // The base's own NamedVariable carries it when the storage
+                                    // lookup misses (a loaded pointer has no alloca to key on).
+                                    if (structVar.PointsToBorrowedByValueParam
+                                        || (rootBinding != nullptr
+                                            && rootBinding->PointsToBorrowedByValueParam))
+                                        namedVar.RootIsBorrowedByValueParam = true;
+                                    namedVar.PointsToBorrowedByValueParam =
+                                        structVar.PointsToBorrowedByValueParam;
                                     // Same shape for an `alias`-BORROW local root, settled here for
                                     // the same reason (a downstream lookup cannot see a shadow).
                                     namedVar.RootIsAliasBorrowLocal = rootIsAliasLocal
