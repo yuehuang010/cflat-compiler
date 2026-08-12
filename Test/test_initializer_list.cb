@@ -119,13 +119,21 @@ int sviNews = 0;
 struct SviT      { int x = default; };
 SviT* sviMkT()   { sviNews = sviNews + 1; SviT* p = new SviT(); p.x = 9; return p; }
 
+// Per-element construction COUNT fixture: a field initializer with a side effect.
+struct SviCount  { int k = sviBump(); };
+
+// Raw `new T[n]` heap array of an OWNING struct - the double-free repro's types.
+int rawHeapDtors = 0;
+class RawHeapNode { int v = default; ~RawHeapNode() { rawHeapDtors = rawHeapDtors + 1; } };
+struct RawHeapBox { unique RawHeapNode* p = default; };
+RawHeapBox rawHeapMk(int v) { RawHeapBox b = default; b.p = new RawHeapNode(); b.p.v = v; return b; }
+
 int braceOverrideDtors = 0;
 struct BraceOverrideNode { ~BraceOverrideNode() { braceOverrideDtors = braceOverrideDtors + 1; } };
 struct BraceOverrideOwner { unique BraceOverrideNode* p = new BraceOverrideNode(); int v = default; };
 struct SviU      { unique SviT* p = sviMkT(); int v = default; };
-struct SviPod    { int a = 1; int b = 2; };                  // POD anchor: keeps seed + memcpy
-// The override EXPRESSION's own side effects: re-evaluated per slot on the owning arm, evaluated
-// once on the POD arm. Pinned, not endorsed - see internal/issue/p3/.
+struct SviPod    { int a = 1; int b = 2; };                  // POD anchor: constant override
+// The override EXPRESSION's own side effects: re-evaluated per slot on BOTH arms (Q13 ruling).
 int sviOv = 0;
 int sviBump()    { sviOv = sviOv + 1; return sviOv; }
 
@@ -647,14 +655,17 @@ extern int main()
     }
     total++; passed += Test("owning value-init destructs exactly once per element", sviDtors, 3);
 
-    // POD anchor: no destructor anywhere in the element type, so the seed-and-memcpy fast path
-    // still runs. Its IR is byte-identical pre/post; this leg pins the observable half.
+    // POD anchor: a constant override needs no per-slot evaluation to differ, so this leg holds
+    // across the Q13 change and pins that per-element construction did not disturb the values.
     SviPod[3] svip = { b = 5 };
     total++; passed += Test("POD value-init splat unchanged",
                             svip[0].a + svip[0].b + svip[2].a + svip[2].b, 12);
 
-    // The override EXPRESSION is evaluated once per SLOT on the owning arm and once per ARRAY on
-    // the POD arm, so one spelling has two evaluation counts. These legs pin the measured split.
+    // RE-RATIFIED (Q13, 2026-08-12): element initialization runs ONCE PER ELEMENT for every
+    // element type, POD or owning - the C++ rule for `S a[N]`. These legs previously pinned a
+    // POD/owning SPLIT (POD once per array, owning once per slot); that split is retired and the
+    // two arms now agree. C++ has no splat spelling to copy: its nearest form writes the
+    // initializer per element, which evaluates per element.
     sviOv = 0;
     SviE[3] svio = { v = sviBump() };
     total++; passed += Test("owning value-init override expression runs per slot", sviOv, 3);
@@ -662,9 +673,38 @@ extern int main()
                             svio[0].v + svio[1].v + svio[2].v, 6);
     sviOv = 0;
     SviPod[3] svipo = { b = sviBump() };
-    total++; passed += Test("POD value-init override expression runs once", sviOv, 1);
-    total++; passed += Test("POD value-init override value splatted",
-                            svipo[0].b + svipo[1].b + svipo[2].b, 3);
+    total++; passed += Test("POD value-init override expression runs per slot", sviOv, 3);
+    total++; passed += Test("POD value-init override values differ per slot",
+                            svipo[0].b + svipo[1].b + svipo[2].b, 6);
+
+    // Q13 RULING 2026-08-12: element initialization runs ONCE PER ELEMENT for every spelling,
+    // matching C++ `S a[N]`. Pre-fix this family disagreed with itself: the bare and `= {}`
+    // spellings ran a non-trivial default ONCE and splatted it, and `= default` ran it ZERO times
+    // (one construction was folded to a constant and replicated, dropping the side effect
+    // entirely). The COUNT is the discriminator - every value leg passed pre-fix too.
+    sviOv = 0; SviCount[3] scBare;           total++; passed += Test("per-element bare", sviOv, 3);
+    sviOv = 0; SviCount[3] scEmpty = {};     total++; passed += Test("per-element = {}", sviOv, 3);
+    sviOv = 0; SviCount[3] scDef = default;  total++; passed += Test("per-element = default", sviOv, 3);
+    sviOv = 0; SviCount[2][3] scMulti = {};  total++; passed += Test("per-element multidim", sviOv, 6);
+    // The scalar and heap spellings already ran per element and must not move.
+    sviOv = 0; SviCount scOne = default;     total++; passed += Test("per-element scalar", sviOv, 1);
+    sviOv = 0; SviCount* scHeap = new SviCount[3];
+    total++; passed += Test("per-element new T[n]", sviOv, 3);
+    total++; passed += Test("per-element values built", scBare[2].k + scHeap[2].k > 0, 1);
+
+    // Reading an owning STRUCT element out of a raw `new T[n]` heap array used to materialize an
+    // independently-destructible copy, so the pointee was freed twice (measured rc 134). A
+    // one-index GEP on that provenance now takes the owning-assign decision like any other
+    // indirect owning lvalue: a non-copyable owner MOVES, so exactly one destruction runs.
+    rawHeapDtors = 0;
+    {
+        RawHeapBox rhb = rawHeapMk(7);
+        RawHeapBox* rhh = new RawHeapBox[2];
+        rhh[0] = rhb;
+        RawHeapBox rhq = rhh[0];
+        total++; passed += Test("raw-heap owning element read value", rhq.p == nullptr ? -1 : rhq.p.v, 7);
+    }
+    total++; passed += Test("raw-heap owning element read destructs once", rawHeapDtors, 1);
 
     // A named override replaces an already default-constructed unique field. Both the seed and
     // the replacement must be destroyed exactly once.

@@ -1014,6 +1014,30 @@ LLVMBackend::DeclTypeAndValue MainListener::getFunctionReturnType(CFlatParser::F
  * Anything the walk does not recognise (a load, an allocation, a runtime call) yields nullptr
  * and the caller keeps the zero default.
  */
+/*
+ * Does running `callee` do anything besides produce its return value? The fold below replays the
+ * VALUE, so any store, allocation, or unknown call inside the body would be dropped - and a
+ * `= default` array must run its field initializers once per element (C++ semantics), not once.
+ * Conservative: an unresolvable callee, a declaration, or recursion past the same depth cap used
+ * by the value fold all count as having effects, so the fold declines and the caller emits real
+ * per-element construction.
+ */
+static bool CalleeHasSideEffects(llvm::Function* callee, int depth)
+{
+    if (callee == nullptr || callee->isDeclaration() || depth > 16) return true;
+    for (llvm::BasicBlock& bb : *callee)
+        for (llvm::Instruction& inst : bb)
+        {
+            if (inst.mayWriteToMemory() && !llvm::isa<llvm::CallInst>(inst)) return true;
+            if (auto* inner = llvm::dyn_cast<llvm::CallInst>(&inst))
+            {
+                if (inner->getCalledFunction() == nullptr) return true;
+                if (CalleeHasSideEffects(inner->getCalledFunction(), depth + 1)) return true;
+            }
+        }
+    return false;
+}
+
 static llvm::Constant* FoldConstructedValueToConstant(
     llvm::Value* value,
     const llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameArgs,
@@ -1049,6 +1073,9 @@ static llvm::Constant* FoldConstructedValueToConstant(
         if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return nullptr;
         if (callee->size() != 1) return nullptr;
         if (call->arg_size() != callee->arg_size()) return nullptr;
+        // Replaying the VALUE is only equivalent to running the call when the call has no other
+        // effect: a field initializer `int k = bump();` must run once per element, not once.
+        if (CalleeHasSideEffects(callee, 0)) return nullptr;
         auto* ret = llvm::dyn_cast<llvm::ReturnInst>(callee->back().getTerminator());
         if (ret == nullptr || ret->getReturnValue() == nullptr) return nullptr;
         // Every argument must itself fold, and it folds in the CALLER's frame.
@@ -3246,46 +3273,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto* initList = barebraceInit ? barebraceList
                                            : initializer->initializerList();
 
-                            if (compiler->IsOwningValueType(typeAndValue.TypeName))
                             {
-                                // An OWNING element must be built independently in each slot: one
-                                // seed replicated bitwise aliases the same resource into every slot
-                                // and double-frees at teardown. Same rule and same walk as the
-                                // `= default` / no-initializer arm (EmitFixedArrayDefaultInit).
+                                // Every element is built INDEPENDENTLY, whatever its ownership:
+                                // an owning element replicated bitwise aliases one resource into
+                                // every slot and double-frees, and a non-owning one with a field
+                                // initializer or a named override must run it once per element
+                                // (the C++ rule for `S a[N]`), not once for the whole array.
                                 auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
                                 allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
-                                EmitOwningArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false);
-                            }
-                            else
-                            {
-                                // Build a single-element seed alloca and default-construct it.
-                                auto* seedAlloc = compiler->AllocaAtEntry(elemTy, nullptr, "arrayseed");
-                                if (compiler->GetFunction(typeAndValue.TypeName))
-                                {
-                                    llvm::Value* seedVal = compiler->CreateOverloadedFunctionCall(typeAndValue.TypeName, {});
-                                    if (seedVal) compiler->CreateAssignment(seedVal, seedAlloc);
-                                }
-
-                                // Apply field overrides onto the seed (= {} or bare {} form).
-                                if (initList)
-                                    EmitFieldInitializer(seedAlloc, typeAndValue.TypeName, initList);
-
-                                // Create the array alloca and register it.
-                                auto* arrAlloc = compiler->CreateLocalVariable(typeAndValue, nullptr, arraySize, line);
-                                allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(arrAlloc)));
-
-                                // Memcpy seed into every element.
-                                auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(typeAndValue));
-                                const auto& dl = compiler->module->getDataLayout();
-                                uint64_t elemBytes = dl.getTypeAllocSize(elemTy);
-                                llvm::Value* zero = compiler->builder->getInt32(0);
-                                uint64_t n = typeAndValue.ConstArraySize;
-                                for (uint64_t i = 0; i < n; i++)
-                                {
-                                    llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
-                                    auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, {zero, idx}, "arrelem");
-                                    compiler->builder->CreateMemCpy(elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
-                                }
+                                EmitArrayValueInitSlots(arrAlloc, elemTy, typeAndValue, initList, false);
                             }
                         }
                     }
@@ -4443,7 +4439,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 || (srcInitGep->getNumIndices() == 2
                                     && (srcInitGep->getSourceElementType()->isStructTy()
                                         || srcInitGep->getSourceElementType()->isArrayTy()))
-                                || (srcInitGep->getNumIndices() == 1 && srcIsViewElem));
+                                || (srcInitGep->getNumIndices() == 1 && srcIsViewElem)
+                                // A raw `new T[n]` heap element is also a ONE-index GEP, so it is
+                                // admitted on the same alloca-backed-local provenance the string
+                                // arms use - never on the GEP shape, which container internals share.
+                                || (srcInitGep->getNumIndices() == 1
+                                    && RawHeapBaseIsNewArrayLocal(srcInitGep->getPointerOperand())));
                         if (right->getType()->isStructTy()
                             && (srcIsNamedSlot || srcIsIndirectOwningLvalue)
                             && !srcIsMove

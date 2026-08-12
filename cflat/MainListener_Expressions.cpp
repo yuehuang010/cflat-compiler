@@ -7449,7 +7449,7 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
  * local declarator arm and the field-default arm; the walk is the one the `= default` arm and
  * the destruction path already use, so the traversals cannot drift.
  */
-void MainListener::EmitOwningArrayValueInitSlots(
+void MainListener::EmitArrayValueInitSlots(
         llvm::Value* arrAlloc,
         llvm::StructType* elemTy,
         const LLVMBackend::TypeAndValue& tv,
@@ -7490,7 +7490,7 @@ void MainListener::EmitFieldDefaultArraySplat(
 
         if (compiler->IsOwningValueType(field.TypeName))
         {
-            EmitOwningArrayValueInitSlots(slot, elemTy, field, list, true);
+            EmitArrayValueInitSlots(slot, elemTy, field, list, true);
             return;
         }
 
@@ -8042,31 +8042,38 @@ void MainListener::EmitFixedArrayDefaultInit(llvm::Value* arrAlloc, const LLVMBa
             return;
         }
 
-        llvm::Value* seedVal = compiler->GetFunction(tv.TypeName)
-            ? compiler->CreateOverloadedFunctionCall(tv.TypeName, {})
-            : nullptr;
-
-        // No default constructor, or one that folds to all-zero: a single store of the whole
-        // array, which lowers to one memset regardless of N.
-        auto* seedConst = llvm::dyn_cast_or_null<llvm::Constant>(seedVal);
-        if (seedVal == nullptr || (seedConst != nullptr && seedConst->isNullValue()))
+        // No default constructor: one store of the whole array, which lowers to a single memset.
+        if (compiler->GetFunction(tv.TypeName) == nullptr)
         {
             compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
             return;
         }
 
-        // A non-owning non-trivial default (plain field initializers, no owned resource) is safe
-        // to replicate bitwise: seed one element and copy it into every slot.
-        auto* seedAlloc = compiler->AllocaAtEntry(structData.StructType, nullptr, "arrdefseed");
-        compiler->CreateAssignment(seedVal, seedAlloc);
-        uint64_t elemBytes = compiler->module->getDataLayout().getTypeAllocSize(structData.StructType);
+        // A construction that folds to a COMPILE-TIME CONSTANT has no side effect to run (the
+        // fold declines on any callee that writes memory), so replicating it is observationally
+        // identical to constructing N times - and keeps the single store for the common case.
+        LLVMBackend::DeclTypeAndValue elemDecl;
+        static_cast<LLVMBackend::TypeAndValue&>(elemDecl) = tv;
+        elemDecl.ConstArraySize = 0;
+        elemDecl.ConstInnerDimensions.clear();
+        if (auto* folded = TryFoldGlobalDefaultConstruction(elemDecl))
+        {
+            if (folded->isNullValue())
+                compiler->builder->CreateStore(llvm::Constant::getNullValue(arrTy), arrAlloc);
+            else
+                compiler->builder->CreateStore(
+                    SplatConstantOverFixedArray(folded, arrTy), arrAlloc);
+            return;
+        }
 
+        // Otherwise the element default is non-trivial: run it ONCE PER ELEMENT, the same rule
+        // C++ applies to `S a[N]`. A single seed replicated bitwise runs its effects once.
         compiler->EmitFixedArrayElementWalk(
             *compiler->builder, arrAlloc, structData.StructType, n,
             [&](llvm::Value* elemPtr)
             {
-                compiler->builder->CreateMemCpy(
-                    elemPtr, llvm::MaybeAlign(), seedAlloc, llvm::MaybeAlign(), elemBytes);
+                llvm::Value* elem = compiler->CreateOverloadedFunctionCall(tv.TypeName, {});
+                compiler->CreateAssignment(elem, elemPtr);
             });
     }
 

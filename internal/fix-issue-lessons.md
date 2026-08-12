@@ -2789,3 +2789,29 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   "cannot infer the return type of lambda" - an `auto`-bound literal gets no context. That is a
   separate documented limitation, not this leak, and inside a lambda body it surfaces as the
   downstream "unknown function 'g'".
+
+- **q13 - per-element initialization, and the fold that ate a side effect (2026-08-12).**
+  (1) **RULED: element initialization runs ONCE PER ELEMENT, for every spelling and every element
+  type.** The seven-spelling family disagreed with itself and no spelling was obviously canonical:
+  scalar `= default` ran a field initializer once, `S[2] a;` and `= {}` ran it ONCE and splatted,
+  `S[2] a = default;` ran it ZERO times, and `new S[2]` and the dtor-bearing spellings ran it N.
+  C++ settles it - `S a[N]` constructs N times - and the maintainer took that rule. The named
+  OVERRIDE split (POD once per array, owning once per slot) went the same way: C++ has no spelling
+  that replicates one initializer across an array, and its nearest form writes the initializer per
+  element, so N is the C++-shaped answer there too.
+  (2) **A value-replaying fold must screen the callee for effects.** `FoldConstructedValueToConstant`
+  admitted any single-BB non-declaration call whose return value folded, so
+  `struct S { int k = bump(); }` folded to the constant 7 and `bump()`'s store ran ZERO times.
+  Screening `mayWriteToMemory` (recursively, treating an unresolvable callee as effectful) makes
+  the fold decline and the caller emit real per-element construction. The screen is also what lets
+  the constant path stay: a fold that survives it provably has nothing to run N times, so
+  replicating it is observationally identical and the single store is kept.
+  (3) **Admit on PROVENANCE, not on GEP shape.** A raw `new T[n]` element read is a ONE-index GEP -
+  the same shape as a `T[]` view element and as `list`'s own `_data[i]` internals, which must stay
+  copies. Reusing `RawHeapBaseIsNewArrayLocal` (the GEP's base is a LOAD of a local holding a
+  `new T[n]`) admitted exactly the raw-heap case and fixed the double free (rc 134 -> rc 0,
+  one destruction) with no container fallout.
+  (4) Two claims in the filed issues were STALE and one was inverted: the read-temp-only repro no
+  longer flushed a destructor, and the named-override issue's title said the POD arm was the
+  correct one when the OWNING arm was already doing what the ruling chose. Re-measure before
+  implementing a filed fix direction.
