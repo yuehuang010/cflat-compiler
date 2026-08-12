@@ -3,11 +3,18 @@
 // no template post-fix, so this rejects the same way regardless of contract identity. Pre-fix
 // this already rejected too, but for the opposite reason: the bare key collapsed onto ONE
 // namespace's template and the other contract's method was simply missing.
+//
+// RE-RATIFIED 2026-08-12 (q12, maintainer): the message moved from "Unknown identifier 'Tag'." to
+// "unknown type 'IV2__i32'". The old wording came from the last-segment shell fallback in
+// AnyGenericTypeTemplateNamed, which accepted any bare name matching the last dotted segment of a
+// namespaced key and so blamed a phantom METHOD on a type the user never declared. The fallback
+// is removed; a bare spelling that names no visible key now reports "unknown type", the same as a
+// name colliding with nothing.
 namespace DA { interface IV2<T> { int Tag(); }; }
 namespace DB { interface IV2<T> { int Other(); }; }
 class DC1<T> : IV2<T> { int Tag() { return 32; } };
 
-expect_error("Unknown identifier 'Tag'.");
+expect_error("unknown type 'IV2__i32'");
 int useD1(IV2<int> v) { return v.Tag(); }
 
 extern int main()

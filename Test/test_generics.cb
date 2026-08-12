@@ -4110,6 +4110,17 @@ if const (sizeof(int) == 4) {
     int gsUncertainRead(GsUncertainBox<int>* b) { return b->v; }
 }
 
+// The same uncertain-name evidence inside a namespace must preserve a bare spelling. The
+// qualified name is stored while the scan is uncertain, so the gate must walk enclosing namespaces
+// just as ResolveGenericTemplateBase does for ordinary template keys.
+namespace GsUncertainNs
+{
+    if const (sizeof(int) == 4) {
+        class GsUncertainNsBox<T> { T v = default; };
+        int gsUncertainNsRead(GsUncertainNsBox<int>* b) { return b->v; }
+    }
+}
+
 // ACCEPT-SET legs for the gate, alias face. `using X = Template;` names a generic BASE, and the
 // forward scan only learns that through IsGenericTemplateKey - the main-pass template maps it used
 // to consult are still empty for a template declared in THIS file. Without that the alias is not
@@ -4137,6 +4148,10 @@ bool testGnUnresolvedGenericShellGate()
     GsUncertainBox<int> ub = default;
     ub.v = 21;
     result &= Test("gs_ifconst_uncertain_template_use", gsUncertainRead(&ub), 21);
+
+    GsUncertainNs.GsUncertainNsBox<int> un = default;
+    un.v = 22;
+    result &= Test("gs_ifconst_uncertain_namespace_use", GsUncertainNs.gsUncertainNsRead(&un), 22);
 
     GsAliasBase<int> ab = default;
     ab.v = 4;
@@ -4245,6 +4260,51 @@ namespace TupleChecks
 bool testNamespaceTupleAndGenericAlias()
 {
     return Test("namespace_tuple_and_alias", TupleChecks.run(), 10) != 0;
+}
+
+// The ACCEPT SET of the namespaced-generic spelling rule (q12). Removing the last-segment shell
+// fallback must not touch any of these: they are the spellings that genuinely resolve, and each
+// one reaches a different clause of AnyGenericTypeTemplateNamed than the removed one did.
+namespace NsgBare
+{
+    class NsgBox<T> { T v = default; };
+
+    // Bare spelling from INSIDE the declaring namespace - resolved by the enclosing-namespace
+    // walk (ResolveGenericTemplateBase), not by the last-segment fallback.
+    int nsgSameNs() { NsgBox<int> b = default; b.v = 41; return b.v + 1; }
+
+    // Bare spelling through a PARAMETER, so the shell has to survive a by-value signature too.
+    int nsgTake(NsgBox<int> b) { return b.v + 1; }
+    int nsgSameNsParam() { NsgBox<int> b = default; b.v = 41; return nsgTake(b); }
+
+    // Bare spelling from a NESTED namespace - one more level of the same walk.
+    namespace NsgInner
+    {
+        int nsgNested() { NsgBox<int> b = default; b.v = 41; return b.v + 1; }
+    }
+}
+
+using NsgAlias = NsgBare.NsgBox<int>;
+
+bool testNsgNamespacedGenericSpellings()
+{
+    bool result = true;
+    result &= Test("nsg_bare_same_namespace", NsgBare.nsgSameNs(), 42) != 0;
+    result &= Test("nsg_bare_same_namespace_param", NsgBare.nsgSameNsParam(), 42) != 0;
+    result &= Test("nsg_bare_nested_namespace", NsgBare.NsgInner.nsgNested(), 42) != 0;
+
+    // QUALIFIED spelling from file scope - the documented answer for a use site the walk cannot
+    // reach, and the spelling the new "unknown type" diagnostic steers callers to.
+    NsgBare.NsgBox<int> q = default;
+    q.v = 41;
+    result &= Test("nsg_qualified_from_file_scope", q.v + 1, 42) != 0;
+
+    // `using` ALIAS from file scope - the other working answer.
+    NsgAlias a = default;
+    a.v = 41;
+    result &= Test("nsg_using_alias_from_file_scope", a.v + 1, 42) != 0;
+
+    return result;
 }
 
 extern int main()
@@ -4393,6 +4453,7 @@ extern int main()
     total++; passed += testNamespaceTupleAndGenericAlias()           ? 1 : 0;
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;
+    total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

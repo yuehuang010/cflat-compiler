@@ -4232,13 +4232,12 @@ public:
     /*
      * True when SOME generic TYPE template (struct / class / interface) by this spelling was seen
      * anywhere in this compile. The ACCEPT side of the opaque-shell gate in ScanGenericTypeUses,
-     * and deliberately wider than IsGenericTemplateKey: it also accepts a bare spelling of a
-     * namespace-qualified template (the `IV<int>` naming `NS.IV` that the namespaced-generic-
-     * interface diagnostics are built on), a `using GB = Box;` base alias, an imported winmd
-     * generic, and a template declared where the scan is not `certain` (an unfoldable `if const`
-     * arm, an expect_error block) and so has no key at all. Accept-on-doubt: only a name with NO
-     * evidence anywhere is refused, since the sole consequence of refusing is that the use falls
-     * through to `unknown type`.
+     * and deliberately wider than IsGenericTemplateKey: it also accepts a `using GB = Box;` base
+     * alias, an imported winmd generic, and a template declared where the scan is not `certain`
+     * (an unfoldable `if const` arm, an expect_error block) and so has no key at all. A bare name
+     * from another namespace is not accepted merely because it matches a dotted key's tail.
+     * Accept-on-doubt: only a name with NO visible evidence is refused, since the sole consequence
+     * of refusing is that the use falls through to `unknown type`.
      * Generic FUNCTION templates are deliberately NOT consulted - a zero-argument `mk<int>()` call
      * parses as a type construction, and shelling it is exactly the bug this gate closes.
      */

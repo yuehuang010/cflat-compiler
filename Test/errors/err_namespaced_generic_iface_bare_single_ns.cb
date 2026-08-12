@@ -5,11 +5,36 @@
 // different key. Pre-fix this compiled and printed a2=7 (the bare key was the ONLY key the
 // template used). The working spelling is qualified: NS.IV<int>.
 // See internal/issue/generic-template-namespace-key-space.md, "T1".
+//
+// RE-RATIFIED 2026-08-12 (q12, maintainer): the message moved from "Unknown identifier 'Width'."
+// to "unknown type 'IV__i32'". The old wording was a side effect of the last-segment shell
+// fallback in AnyGenericTypeTemplateNamed, which accepted any bare name matching the last dotted
+// segment of some namespaced key; it made the diagnostic blame a phantom METHOD on a type the
+// user never declared. With the fallback removed, this bare spelling reports the same
+// "unknown type" a name colliding with nothing has always reported.
 namespace NS { interface IV<T> { int Width(); }; }
 class C<T> : IV<T> { int Width() { return 7; } };
 
-expect_error("Unknown identifier 'Width'.");
+expect_error("unknown type 'IV__i32'");
 int use(IV<int> v) { return v.Width(); }
+
+// The generic STRUCT/CLASS twin of the same hole, and the actual q12 bug: pre-fix these two
+// compiled, linked and ran CLEAN with no diagnostic at all, because the bare name collided with
+// the last segment of the namespaced key. A name colliding with nothing (`Nope<int>`) always
+// reported "unknown type"; the collision was the whole difference.
+namespace NB { class Box<T> { T v = default; }; }
+expect_error("unknown type 'Box__i32'") {
+    int useBox(Box<int> b) { return 1; }
+}
+
+// The CROSS-namespace variant: the use site sits in a DIFFERENT namespace than the template, so
+// the enclosing-namespace walk cannot reach it either.
+namespace TA { class Tag<T> { T v = default; }; }
+namespace TB {
+    expect_error("unknown type 'Tag__i32'") {
+        int useTag(Tag<int> t) { return 1; }
+    }
+}
 
 extern int main()
 {

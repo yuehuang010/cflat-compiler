@@ -302,19 +302,26 @@ bool LLVMBackend::AnyGenericTypeTemplateNamed(const std::string& spelledBase) co
         if (IsGenericTemplateKey(ResolveGenericTemplateBase(spelledBase))) return true;
         if (IsGenericBaseAlias(spelledBase)) return true;
         if (gts.scannedGenericStructNamesUncertain.count(spelledBase) != 0) return true;
+        if (!currentNamespace_.empty())
+        {
+            std::string prefix = currentNamespace_;
+            while (true)
+            {
+                if (gts.scannedGenericStructNamesUncertain.count(prefix + "." + spelledBase) != 0)
+                    return true;
+                auto dot = prefix.rfind('.');
+                if (dot == std::string::npos) break;
+                prefix = prefix.substr(0, dot);
+            }
+        }
         // An imported winmd generic is a real template built elsewhere; keep whatever the shell
         // sites did with it rather than turning a Windows-only spelling into `unknown type`.
         if (IsWinrtGenericBase(spelledBase) || IsWinrtFullName(spelledBase)) return true;
-        // A bare spelling of a namespaced template: it names no key, but the template exists, and
-        // the shell is what carries today's downstream diagnostic for it.
-        std::string tail = "." + spelledBase;
-        auto endsWithTail = [&](const std::string& n) { return n.ends_with(tail); };
-        for (const auto& kv : gts.genericStructTemplates)    if (endsWithTail(kv.first)) return true;
-        for (const auto& kv : gts.genericClassTemplates)     if (endsWithTail(kv.first)) return true;
-        for (const auto& kv : gts.genericInterfaceTemplates) if (endsWithTail(kv.first)) return true;
-        for (const auto& n : gts.scannedGenericStructNames)          if (endsWithTail(n)) return true;
-        for (const auto& n : gts.scannedGenericInterfaceNames)       if (endsWithTail(n)) return true;
-        for (const auto& n : gts.scannedGenericStructNamesUncertain) if (endsWithTail(n)) return true;
+        // A bare spelling whose only evidence is that it matches the LAST DOTTED SEGMENT of some
+        // namespaced key is NOT accepted: the name is declared nowhere the use site can see it.
+        // The enclosing-namespace walk above (ResolveGenericTemplateBase) is what makes a bare
+        // spelling legal from inside the declaring namespace or a nested one; from a sibling
+        // namespace or file scope the working spellings are `NS.Box<int>` and a `using` alias.
         return false;
     }
 

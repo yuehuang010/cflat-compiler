@@ -2692,3 +2692,33 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   binding is program-wide and this walk is not control-flow aware, so keeping the fact across
   functions turns a local false rejection into a program-wide one. Cross-function `delete` stays
   accepted - unknown accepts.
+
+- **q12 - the last-segment shell fallback, removed (2026-08-12).**
+  `AnyGenericTypeTemplateNamed` accepted any bare spelling matching the LAST DOTTED SEGMENT of a
+  namespaced template key, so a `Box<int>` declared nowhere at the use site compiled clean while
+  its non-colliding twin `Nope<int>` reported `unknown type`. The clause is gone.
+  (1) **The accept set was the whole question, and measuring it settled the fix in one pass.**
+  The issue file predicted the obvious narrowing could not be separated from the ratified tests by
+  scoping alone. Measuring first showed why that was over-cautious: bare-from-inside-the-declaring
+  namespace and bare-from-a-nested-namespace both resolve through the ENCLOSING-namespace walk
+  (`ResolveGenericTemplateBase`), a different clause entirely, and both still run correctly with
+  the fallback deleted. The fallback served only file-scope and SIBLING-namespace spellings, which
+  are exactly the bug. Do not infer a clause's accept set from the tests that happen to exercise
+  it - measure which clause each accepted spelling actually reaches.
+  (2) **Silent accept was only ever visible in an UNUSED parameter position.** A bare namespaced
+  generic in a local declaration, a return type or a type argument already rejected - with
+  "type 'Box__i32' is incomplete here (its layout is not available at this point)", a message
+  about layout for a type that does not exist. Removing the fallback replaced all of these with
+  `unknown type 'Box__i32'` too, so one deletion fixed the silent accept AND a misleading
+  diagnostic on three other positions.
+  (3) **RE-RATIFIED, with maintainer authorization:** the three
+  `err_namespaced_generic_iface_*` tests moved from `Unknown identifier 'Width'.` /
+  `'Tag'.` to `unknown type 'IV__i32'` / `'IV2__i32'`. The old wording was itself a symptom - the
+  shell made the compiler blame a phantom METHOD on a type nobody declared. Each file carries the
+  re-ratification note next to its changed expectation.
+  (4) The working spellings, all pinned as value legs in `test_generics.cb`
+  (`testNsgNamespacedGenericSpellings`): bare inside the declaring namespace, bare inside a nested
+  namespace, bare through a by-value parameter within the namespace, qualified `NS.Box<int>` from
+  file scope, and a `using` alias. They pass identically on both binaries by design - they are the
+  must-still-work set, not regression legs; the regression legs are the two new `expect_error`
+  blocks, which produced NO diagnostic at all pre-fix.

@@ -3,11 +3,18 @@
 // spelling at file scope names no template at all - not even a collapsed one. Pre-fix, both
 // templates collapsed onto the bare key 'IV' and this compiled silently (printing width=32),
 // with no diagnostic distinguishing the two. See internal/issue/generic-template-namespace-key-space.md.
+//
+// RE-RATIFIED 2026-08-12 (q12, maintainer): the message moved from "Unknown identifier 'Width'." to
+// "unknown type 'IV__i32'". The old wording came from the last-segment shell fallback in
+// AnyGenericTypeTemplateNamed, which accepted any bare name matching the last dotted segment of a
+// namespaced key and so blamed a phantom METHOD on a type the user never declared. The fallback
+// is removed; a bare spelling that names no visible key now reports "unknown type", the same as a
+// name colliding with nothing.
 namespace HA { interface IV<T> { int Width(); }; }
 namespace HB { interface IV<T> { int Width(); }; }
 class HC1<T> : IV<T> { int Width() { return 32; } };
 
-expect_error("Unknown identifier 'Width'.");
+expect_error("unknown type 'IV__i32'");
 int useH1(IV<int> v) { return v.Width(); }
 
 extern int main()
