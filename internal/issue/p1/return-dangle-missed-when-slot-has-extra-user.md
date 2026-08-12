@@ -58,6 +58,12 @@ produces a false rejection. Any attempt here must solve that first: it needs eve
 assignment site to interface locals to be observable, which
 [[interface-boxing-keyed-on-source-binding]] is the prerequisite for.
 
-Until then this is a known, bounded gap and should stay filed rather than patched.
+**UNBLOCKED 2026-08-11.** The prerequisite has LANDED: `p3/interface-boxing-keyed-on-source-binding`
+was fixed and its file deleted by `b911ccc` (q02, join-arm classification). This item was skipped
+during the q09 round on a blocker that no longer existed. It is now actionable: record at the
+BINDING site that an interface local was initialized from frame storage, carry it on the
+`NamedVariable`, and stop recovering it from finished IR. The polarity rule above still governs -
+unknown ACCEPTS, and the front-end provenance must observe EVERY assignment site or it reintroduces
+the false rejection that killed the source-level "tainted binding" proposal.
 
 Related: [[interface-issue-queue]], [[interface-boxing-keyed-on-source-binding]].

@@ -25,10 +25,10 @@ member list is empty.
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 1 | One blocked p1 item remains; two always-wrong escapes are fixed |
+| q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 1 | UNBLOCKED - its q02 prerequisite landed in `b911ccc`; the item was skipped on a stale blocker |
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 3 | Three fixes landed; deferred/design items remain |
-| q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 3 | Static-local tooling fixed; ownership semantics blocked |
-| q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 4 | Generic registration and mangling fixes landed; collision items remain |
+| q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 3 | UNBLOCKED 2026-08-11 - ruled the Rust model after a spike; see the bucket file |
+| q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 4 | UNBLOCKED - collisions ruled a hard error; `Test/test_generics.cb` may be renamed |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 9 | Constructor and sizeof type parsing fixes landed; postfix gaps remain |
 | q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 3 | Callable typing gaps and null/design cases remain |
@@ -45,10 +45,10 @@ fix work. Status:
 |--------|--------|
 | q06 | **SETTLED - no decision was needed.** The repo had already ratified it: unknown ACCEPTS. The bucket file's proposal to make unknown reject was wrong and is corrected. The interface half of the p1 item is CLOSED, not open. |
 | q08 | **SETTLED and fixed.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. The landed implementation also rejects overwriting the borrowed collection storage and deep-copies returned values. |
-| q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third remains filed and blocked on q02. |
-| q10 | **PARTIALLY FIXED.** Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule, conditional-termination guard half, and closure return-type ownership grammar remain deferred or require a language decision. |
-| q11 | **PARTIALLY FIXED.** Static-local ownership-origin reporting and DWARF visibility are fixed. The three remaining global/program-lifetime ownership items remain blocked until the maintainer chooses the consume/reinitialization/destructor semantics. |
-| q12 | **PARTIALLY FIXED.** Generic function registration, closure/array-view type arguments, variadic free functions, and generic `sizeof` operands are fixed. Name-collision items remain deferred. |
+| q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third is now UNBLOCKED - its q02 prerequisite landed in `b911ccc` and it was skipped on a stale blocker. |
+| q10 | **PARTIALLY FIXED; the grammar half is now RULED.** Closure return types will accept `move` and `alias` (not `unique`) - see `p2/lambda-return-type-cannot-be-spelled-move-or-alias`. Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule (deferred until `list`/`dictionary`/btree settle) and the conditional-termination guard half remain deferred. |
+| q11 | **RULED 2026-08-11 and UNBLOCKED.** Static-local ownership-origin reporting and DWARF visibility were already fixed. A spike (`scratch/uniqglobal/`) then showed the `unique T*` arm ALREADY implements the Rust model and struct globals implement the C++ one, so the maintainer ruled the Rust model for both: owning globals stay legal, implicit consume is an error, explicit `move` re-initializes, and NOTHING at global/static scope is destructed at exit. That last point removes exit-time `~mutex()`/`~page_pool()` in `core/` deliberately. |
+| q12 | **RULED 2026-08-11 and UNBLOCKED.** Generic function registration, closure/array-view type arguments, variadic free functions, and generic `sizeof` operands are fixed. The two name-collision items were blocked only by `Test/test_generics.cb`'s deliberate `Container<T>` collision; the maintainer authorized renaming the interface leg, so a same-name generic struct/interface collision becomes a hard `LogError` at the second declaration. |
 | q13 | **PARTIALLY FIXED.** Fixed-array rejection, nested/char-row initialization, and field default construction are fixed. Side-effect folding and owning-value replacement/read semantics remain active. |
 | q17 | **SETTLED as "leave filed".** Both stay design deferrals, neither is a bug. Direction if ever pursued is a non-bitwise-copyable `Thread`, but that is BLOCKED: CFlat has no syntax for a deleted copy. Pool quiescence-as-typestate was not selected. |
 
@@ -61,8 +61,10 @@ Still-open language gaps surfaced by this triage, neither filed as its own issue
 
 - **No syntax for a deleted copy** (blocks q17's `Thread` direction, and any future
   non-copyable type).
-- **`p3/interface-boxing-keyed-on-source-binding` is a prerequisite**, not just an adjacent item -
-  q09's p1 member cannot be fixed until it lands. Tracked in q02.
+- ~~**`p3/interface-boxing-keyed-on-source-binding` is a prerequisite**~~ - RESOLVED. It landed in
+  `b911ccc` (q02) and its file is deleted, so q09's p1 member is actionable. The q09 round skipped
+  it on this blocker AFTER the blocker had already cleared: re-check a named prerequisite against
+  `git log` before deferring on it.
 
 ### The governing rule for the guard family (q06, q09, and every future proposal in the area)
 

@@ -18,6 +18,22 @@ Three sub-themes, all "the generic path is a parallel implementation that drifte
 - **Mangling.** The variadic and zero-argument paths apply mangling a different number of times on
   the declaration and the definition, emitting unlinkable double-mangled symbols.
 
+## RULING 2026-08-11 (maintainer): reject the collision; the test may be renamed
+
+The stated blocker is lifted. `Test/test_generics.cb` may be edited: rename the INTERFACE leg
+(`interface Container<T>` at line 244, and its uses through `Storage<T>` and `ExtGet<T>`) to a
+distinct name such as `IContainer<T>`, leaving the `struct Container<T>` at line 52 alone.
+
+With that done, option 1 is authorized for BOTH collision items: a generic interface and a generic
+struct/class template that share a name and a scope are a hard `LogError` at the SECOND
+declaration, mirroring the non-generic guard in `CreateInterfaceDefinition`. That also retires the
+core-template veto - `list`, `Pair`, `span`, `queue`, `stack`, `view` and the rest stop silently
+vetoing a user's generic interface, because the collision is now diagnosed instead of resolved by
+an undocumented struct-always-wins precedence.
+
+Do NOT implement option 2 (a role qualifier at the use site): collisions are not meant to be legal,
+so there is nothing to disambiguate.
+
 ## Members
 
 Registration / templates:

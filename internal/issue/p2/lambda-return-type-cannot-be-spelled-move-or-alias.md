@@ -62,6 +62,16 @@ correctly on master (`14`, rc 0, no leak because the caller `delete`s) and are h
 That is the intended convergence - the three spellings answer alike - but it is the largest
 behaviour change in that commit, and this file is where the remedy gap it exposes is recorded.
 
+## RULING 2026-08-11 (maintainer): closure return types accept `move` and `alias`
+
+Half 2 of the fix direction below is AUTHORIZED. `functionPointerSpecifier` gains an ownership
+qualifier on the return type, accepting `move T*` and `alias T*`. `unique` is NOT included.
+
+That makes `Lambda<move C*()>` and `function<alias C*()>` spellable, so the fresh-allocation
+diagnostic's original remedy becomes valid at a closure destination too. Enumerate what the
+synthesized invoker must honour for each of the two before implementing: `move` transfers to the
+caller (who adopts with `unique C* x = f();`), `alias` opts out of tracking entirely.
+
 ## Fix direction
 
 Two independent halves; the first is cheap and the second is the real one.
