@@ -21,6 +21,22 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
         // override (see ParseDeclaration); clear any value left by a prior statement.
         compilerLLVM->lastMovedFromContainerSlot = false;
 
+        CFlatParser::LambdaExpressionContext* directLambda = nullptr;
+        if (auto* unary = ctx->unaryExpression())
+            if (auto* postfix = unary->postfixExpression())
+                if (auto* primary = postfix->primaryExpression())
+                    directLambda = primary->lambdaExpression();
+        if (directLambda != nullptr && ctx->assignmentOperator() != nullptr
+            && ctx->assignmentOperator()->getText() == "=" && ctx->assignmentExpression() != nullptr
+            && directLambda->lambdaBody() != nullptr && directLambda->lambdaBody()->getText() == "_")
+        {
+            auto* savedDiscardRhs = lambdaDiscardRhs_;
+            lambdaDiscardRhs_ = ctx->assignmentExpression();
+            auto result = ParseLambdaExpression(directLambda);
+            lambdaDiscardRhs_ = savedDiscardRhs;
+            return result;
+        }
+
         auto* condCtx = ctx->conditionalExpression();
         if (condCtx && !ctx->assignmentOperator()
             && !condCtx->Question() && !condCtx->QuestionQuestion())
@@ -80,6 +96,17 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 }
             }
         }
+        // The statement parser has a dedicated `_ = expr` discard arm, but a lambda expression
+        // body reaches this named path directly. Route the same top-level spelling through the
+        // existing implementation so the remedy named by the owning-return diagnostic remains
+        // writable in expression-body position (and in a parenthesized wrapper around it).
+        if (ctx->assignmentOperator() != nullptr && ctx->assignmentOperator()->getText() == "="
+            && (ctx->unaryExpression() != nullptr && ctx->unaryExpression()->getText() == "_"
+                || ctx->getText().starts_with("_=")))
+        {
+            ParseAssignmentExpression(ctx);
+            return {};
+        }
         // Fall back: call ParseConditionalExpression directly (when no assignment) so we can
         // recover the isUnsigned flag from TypedValue and synthesize the TypeName for Upconvert.
         {
@@ -121,6 +148,25 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             {
                 result.Primary = ParseAssignmentExpression(ctx);
                 if (result.Primary) result.BaseType = result.Primary->getType();
+            }
+            // A parenthesized `is`/`as` expression reaches this fallback as a raw value, so the
+            // result otherwise loses the target type before a postfix member access sees it.
+            // Restore the target identity for `(p as IMore).more()` and the corresponding `as`
+            // value shapes without changing ordinary expression inference.
+            if (result.Primary != nullptr && condCtx != nullptr && !ctx->assignmentOperator())
+            {
+                if (auto* typeCheck = SoleTypeCheckExpressionOf(condCtx);
+                    typeCheck != nullptr && typeCheck->typeSpecifier().size() == 1
+                    && typeCheck->children.size() >= 2
+                    && typeCheck->children[1]->getText() == "as")
+                {
+                    std::string target = ParseTypeSpecifierName(typeCheck->typeSpecifier()[0]);
+                    result.TypeAndValue.TypeName = compilerLLVM->ResolveTypeAlias(target);
+                    result.TypeAndValue.IsInterface = compilerLLVM->HasInterface(result.TypeAndValue.TypeName);
+                    result.TypeAndValue.Pointer = !result.TypeAndValue.IsInterface
+                        && result.Primary->getType()->isPointerTy();
+                    result.TypeAndValue.IsInterfacePointer = false;
+                }
             }
             // A bare `x as T` whose T is x's own type reached here as a raw value. Restore the
             // operand's storage and provenance, matched on the exact node so `x as T + 1` cannot.
@@ -1106,7 +1152,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // result, and - like a bare-statement temp - destruct an owning-struct rvalue at the
             // end of the full expression. `_` is never an lvalue, so only the plain `=` form is
             // meaningful; a compound op (`_ += x`) would have to read `_` and is rejected.
-            if (unaryCtx != nullptr && unaryCtx->getText() == "_")
+            if ((unaryCtx != nullptr && unaryCtx->getText() == "_")
+                || ctx->getText().starts_with("_="))
             {
                 if (operatorText != "=")
                     LogErrorContext(unaryCtx,
@@ -6490,7 +6537,8 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             {
                 if (!namedVar.Storage)
                 {
-                    LogErrorContext(ctx, "Unable to dereference an object without a Storage.");
+                    LogErrorContext(ctx, "cannot dereference a value without addressable storage; "
+                        "bind the pointer to a local before dereferencing it");
                 }
 
                 if (!namedVar.Storage->getType()->isPointerTy())

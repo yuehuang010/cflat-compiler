@@ -74,6 +74,17 @@ expect_error("owning return value of 'makePtr9' must not be discarded") {
     void useIt9() { Lambda<void()> g = () => makePtr9(); g(); }
 }
 
+// The explicit discard remedy is also valid in a lambda expression body, with or without an
+// extra pair of parentheses around the assignment.
+class R11 { int id = default; };
+move R11* makePtr11() { return new R11; }
+void useIt11() {
+    Lambda<void()> a = () => _ = makePtr11();
+    Lambda<void()> b = () => (_ = makePtr11());
+    a();
+    b();
+}
+
 // Indirect calls preserve the bound function's owning return metadata.
 expect_error("owning return value of 'f' must not be discarded") {
     class R10 { int id = default; };

@@ -101,6 +101,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // root function: the following call must resolve at root (skip the enclosing-namespace
             // walk). Consumed and cleared by the call dispatch so chained calls do not inherit it.
             bool globalScopeCall = false;
+            // Storage restored from a parenthesized primary must remain available to ++/--
+            // while the suffix walk consumes the restored value.
+            llvm::Value* parenthesizedPostfixStorage = nullptr;
             // Armed by [PFX-1] when a bare-pointer BORROW receiver is followed by `.copy` - the next
             // call is a pointer-identity copy (see [PFX-copy-ptr]). The pointer value/type are stashed
             // because the auto-deref mutates namedVar. Consumed and cleared by the call.
@@ -208,6 +211,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     case CFlatParser::Arrow:
                     case CFlatParser::QuestionDot:
                     {
+                        if (namedVar.Primary != nullptr && namedVar.Primary->getType()->isVoidTy())
+                            LogErrorContext(ctx, "a void call result cannot be used as a chain receiver");
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
                         // [PFX-1b] Unadopted owning-POINTER receiver (`makePtr()->v = 1;`): free it
@@ -454,7 +459,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
                         CheckGuardedWrite(ctx, namedVar);
-                        if (namedVar.Storage)
+                        llvm::Value* incrementStorage = namedVar.Storage
+                            ? namedVar.Storage : parenthesizedPostfixStorage;
+                        if (incrementStorage)
                         {
                             llvm::Type* et = nullptr;
                             if (namedVar.TypeAndValue.Pointer)
@@ -463,9 +470,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[namedVar.Storage].Amount++;
-                            PlusPlus[namedVar.Storage].ElemType = et;
-                            PlusPlus[namedVar.Storage].LoadType = namedVar.UnionFieldType;
+                            PlusPlus[incrementStorage].Amount++;
+                            PlusPlus[incrementStorage].ElemType = et;
+                            PlusPlus[incrementStorage].LoadType = namedVar.UnionFieldType
+                                ? namedVar.UnionFieldType
+                                : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
                         }
                         else
                         {
@@ -483,7 +492,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
                         CheckGuardedWrite(ctx, namedVar);
-                        if (namedVar.Storage)
+                        llvm::Value* decrementStorage = namedVar.Storage
+                            ? namedVar.Storage : parenthesizedPostfixStorage;
+                        if (decrementStorage)
                         {
                             llvm::Type* et = nullptr;
                             if (namedVar.TypeAndValue.Pointer)
@@ -492,9 +503,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                                 et = Compiler(ctx)->GetType(elemTV);
                             }
-                            PlusPlus[namedVar.Storage].Amount--;
-                            PlusPlus[namedVar.Storage].ElemType = et;
-                            PlusPlus[namedVar.Storage].LoadType = namedVar.UnionFieldType;
+                            PlusPlus[decrementStorage].Amount--;
+                            PlusPlus[decrementStorage].ElemType = et;
+                            PlusPlus[decrementStorage].LoadType = namedVar.UnionFieldType
+                                ? namedVar.UnionFieldType
+                                : (parenthesizedPostfixStorage ? namedVar.BaseType : nullptr);
                         }
                         else
                         {
@@ -1296,7 +1309,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // the object ('(*p) = 9'). Postfix '(*p)++' is still a no-op - see
                             // internal/issue/p2/paren-deref-increment-is-a-silent-no-op.md.
                             if (prevPrimary->expression() != nullptr)
+                            {
                                 namedVar.Storage = lastParenExprStorage;
+                                parenthesizedPostfixStorage = namedVar.Storage;
+                            }
                             // Parentheses change the spelling, never the value: hand the ownership
                             // arms the SAME provenance the bare operand would have carried.
                             if (prevPrimary->expression() != nullptr)
@@ -5229,7 +5245,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         if (auto* body = ctx->lambdaBody())
         {
             if (auto* block = body->compoundStatement())
-            {
+                {
                 if (auto* items = block->blockItemList())
                     ParseBlockItemList(items);
             }
@@ -5237,6 +5253,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             {
                 if (!compiler->IsBlockTerminated())
                 {
+                    auto* discardExpr = lambdaDiscardRhs_ != nullptr ? lambdaDiscardRhs_ : expr;
+                    bool forcedDiscard = lambdaDiscardRhs_ != nullptr;
                     if (returnType.TypeName == "void" && !returnType.Pointer)
                     {
                         // On a VOID lambda `=> expr` is a DISCARDED full expression, not a return:
@@ -5244,8 +5262,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         // below then emits the CreateRetVoid. FlushOwnedTemps stands in for the
                         // block-item boundary flush an expression body never reaches. `void*`
                         // returns a real value and stays on the return lowering.
-                        bool bareExpr = expr->assignmentOperator() == nullptr;
-                        auto resultNV = ParseAssignmentExpressionNamed(expr, ResultUse::Discard);
+                        bool bareExpr = !forcedDiscard && expr->assignmentOperator() == nullptr;
+                        auto resultNV = ParseAssignmentExpressionNamed(discardExpr, ResultUse::Discard);
                         // No context declared the return type, so "void" here is a fallback. A body
                         // that yields a VALUE would be silently dropped and the caller would read
                         // garbage - say so instead (a void-yielding body is a genuine discard).

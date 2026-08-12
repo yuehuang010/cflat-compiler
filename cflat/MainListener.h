@@ -2110,6 +2110,10 @@ private:
     // and the last lambda's TypeAndValue (side-channel from ParsePrimaryExpression to ParsePostfixExpression).
     LLVMBackend::TypeAndValue lambdaExpectedType;
     LLVMBackend::TypeAndValue lastLambdaType;
+    // Parser ambiguity for `decl = () => _ = expr`: the outer assignment can claim the discard
+    // tail, leaving the lambda body as `_`. The named-expression path temporarily hands that RHS
+    // to ParseLambdaExpression so the discard remains inside the lambda.
+    CFlatParser::AssignmentExpressionContext* lambdaDiscardRhs_ = nullptr;
     // Non-empty when the matched function parameter is declared lock(this): holds the canonical
     // receiver name (e.g. "d->ready") to seed currentLockSet during lambda body analysis.
     std::string lambdaLockThisReceiver;

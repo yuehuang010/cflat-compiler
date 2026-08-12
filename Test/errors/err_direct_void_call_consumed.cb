@@ -16,10 +16,16 @@ void dvcBump() { dvcHits = dvcHits + 1; }
 int  dvcTake(int v) { return v; }
 
 struct DvcBox { int n = default; };
+struct DvcChain { void stop() { } int read() { return 1; } };
 
 // Declarator initializer - the headline repro.
 expect_error("call to 'dvcBump' returns 'void', so it produces no value to consume") {
     int dvcDecl() { int r = dvcBump(); return r; }
+}
+
+// A void intermediate in a member chain must not silently reuse the original receiver.
+expect_error("a void call result cannot be used as a chain receiver") {
+    int dvcChain() { DvcChain b = default; return b.stop().read(); }
 }
 
 // Assignment to an existing local.

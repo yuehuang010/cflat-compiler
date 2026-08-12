@@ -3718,6 +3718,8 @@ bool testMultiDimArrays()
 // =============================================================
 
 struct CastMemberPoint { int x = 0; int y = 0; };
+interface CastMemberIface { int value(); };
+class CastMemberImpl : CastMemberIface { int value() { return 7; } };
 
 bool testCastMemberAccess()
 {
@@ -3736,6 +3738,9 @@ bool testCastMemberAccess()
     // Outer cast applied to a cast->arrow expression
     int y = (int)((CastMemberPoint*)vp)->y;
     result &= Test("(int)(cast->field y)", y, 13);
+
+    CastMemberImpl impl = CastMemberImpl();
+    result &= Test("parenthesized as method call", (impl as CastMemberIface).value(), 7);
 
     return result;
 }
@@ -5727,15 +5732,17 @@ bool testParenLvalueStore()
     (arr[0]) = 4;
     result &= Test("plv_paren_element_store", arr[0], 4);
 
-    // NOT fixed, and pinned so the gap stays visible next to its repaired sibling: `(*p)++` still
-    // writes the incremented value to a temp and drops it - identical on both binaries, while the
-    // compound `(*p) += 1` above was repaired. Filed as
-    // internal/issue/p2/paren-deref-increment-is-a-silent-no-op.md. The three `++` spellings that
-    // DO work are pinned beside it so a fix there has its accept set.
+    // Parenthesized dereference increments must write through the restored lvalue storage, just
+    // like the compound assignment above. Keep the double-parenthesized form in the accept set too.
     int inc = 5;
     int* ip = &inc;
     (*ip)++;
-    result &= Test("plv_paren_deref_increment_known_noop", inc, 5);
+    result &= Test("plv_paren_deref_increment", inc, 6);
+
+    int doubleInc = 5;
+    int* doubleIp = &doubleInc;
+    ((*doubleIp))++;
+    result &= Test("plv_double_paren_deref_increment", doubleInc, 6);
 
     int nm = 5;
     (nm)++;

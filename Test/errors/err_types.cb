@@ -14,6 +14,12 @@ struct Foo
     int x = 0;
 };
 
+int* typeDerefResult() { return nullptr; }
+
+expect_error("cannot dereference a value without addressable storage") {
+    int type_deref_call_result() { return *typeDerefResult(); }
+}
+
 expect_error("unknown type") {
     int test_unknown_type()
     {
