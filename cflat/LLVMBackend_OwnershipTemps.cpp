@@ -3019,6 +3019,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
         // A `static` local's storage outlives the scope (and every later call), so scope exit must
         // not destruct it. Policy: a static local is destructed NEVER - no atexit machinery.
         if (namedVar.IsStaticLocal) return;
+        if (namedVar.IsRangeForBorrow) return;
         // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
         // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
         if (IsOwningUniqueArray(namedVar))
@@ -3075,6 +3076,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
 bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
 {
         if (namedVar.IsStaticLocal) return false;   // never dropped; see DropValue
+        if (namedVar.IsRangeForBorrow) return false;
         if (IsOwningUniqueArray(namedVar)) return true;
         if (IsOwningInterfaceValue(namedVar)) return true;
         if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning) return true;

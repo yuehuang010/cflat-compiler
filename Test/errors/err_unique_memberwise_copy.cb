@@ -51,6 +51,17 @@ expect_error("field 'NestHolder.inner.slot' is 'unique'") {
     }
 }
 
+// A direct store into the collection while the loop borrow is live could free its referent.
+// Mutate through the loop variable instead, which writes through the element safely.
+expect_error("cannot overwrite collection storage while range-for variable 's' borrows its element") {
+    int overwriteWhileBorrowed()
+    {
+        string[2] dst;
+        for (string s in dst) dst[0] = "changed";
+        return 0;
+    }
+}
+
 extern int main()
 {
     return 0;

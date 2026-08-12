@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 119 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 69 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -8,18 +8,23 @@ These files are an INDEX, not issues. They own no repro of their own - the membe
 source of truth and are deleted individually as they are fixed. Delete a bucket file when its
 member list is empty.
 
+## Completed
+
+| # | Bucket | Landed |
+|---|--------|--------|
+| q01 | Owned-temp ledger accounting | `c7996f2` |
+| q02 | Join-arm classification | `b911ccc` |
+| q03 | Namespace and alias resolution | `dfa443a` |
+| q04 | Diagnostics wording and attribution | `9062709` |
+| q05 | Unique/owning assignment arm | `3f1bee6` |
+| q06 | Borrow provenance lost across a hop | `427e076` |
+| q07 | Facts not retired on rebind | `f3a135f` |
+| q08 | for-in loop variable | this commit |
+
 ## Suggested order
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q01 | [Owned-temp ledger accounting](q01-owned-temp-ledger-accounting.md) | 9 | Ledger split is a stated prerequisite; other ownership buckets read the conflated ledger |
-| q02 | [Join-arm classification](q02-join-arm-classification.md) | 5 | One shared classifier; unblocks join cases in q05 and q07 |
-| q03 | [Namespace and alias resolution](q03-namespace-and-alias-resolution.md) | 9 | One key convention, no ownership risk |
-| q04 | [Diagnostics wording and attribution](q04-diagnostics-wording-and-attribution.md) | 10 | Cheap, zero semantic risk, batchable at the sonnet tier |
-| q05 | [Unique/owning assignment arm](q05-unique-owning-assignment-arm.md) | 6 | Has a plan already; do after q01 |
-| q06 | [Borrow provenance lost across a hop](q06-borrow-provenance-across-hops.md) | 7 | Same guard family as q05 |
-| q07 | [Facts not retired on rebind](q07-fact-retirement-on-rebind.md) | 5 | Flow-sensitivity; needs q02's classifier for the join arms |
-| q08 | [for-in loop variable](q08-for-in-loop-variable.md) | 4 | Self-contained, disjoint from q01-q07 |
 | q09 | [Return-dangle and escape analysis](q09-return-dangle-escape-analysis.md) | 3 | |
 | q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 6 | |
 | q11 | [Global and program-lifetime storage](q11-global-and-program-lifetime-storage.md) | 4 | |
@@ -39,7 +44,7 @@ fix work. Status:
 | Bucket | Ruling |
 |--------|--------|
 | q06 | **SETTLED - no decision was needed.** The repo had already ratified it: unknown ACCEPTS. The bucket file's proposal to make unknown reject was wrong and is corrected. The interface half of the p1 item is CLOSED, not open. |
-| q08 | **SETTLED.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. Recorded in the bucket file. |
+| q08 | **SETTLED and fixed.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. The landed implementation also rejects overwriting the borrowed collection storage and deep-copies returned values. |
 | q09 | **SETTLED - no decision was needed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. Two of the three members are always-wrong shapes that can be rejected without touching the polarity; the third is blocked on q02. |
 | q11 | **BLOCKED.** Needs a design discussion: a global's lifetime cannot easily be proven, so a destructor cannot easily be run for it. Do not start this bucket. |
 | q13 | **SETTLED.** Multi-dim fixed arrays: nested braces only (`{{1,2,3},{4,5,6}}`), plus string rows for char arrays (`{"ab","cd"}`). A flat list for a multi-dim array is an ERROR naming the expected shape. |
@@ -68,8 +73,8 @@ code in `Test/test_move.cb`; they are named in the q06 file so nobody retries th
 
 ## Scheduling
 
-- **Serialize** q01 -> q02 -> q05 -> q06 -> q07. They all touch the same ownership code in
-  `LLVMBackend.h` / `MainListener.h` and will conflict if run concurrently.
+- **Completed chain** q01 -> q02 -> q05 -> q06 -> q07. They all touched the same ownership code in
+  `LLVMBackend.h` / `MainListener.h` and were landed sequentially.
 - **Parallel-safe** against that chain and against each other: q03, q04, q12, q13, q14, q18.
-- q08, q09, q10, q11 touch ownership but in narrow, well-fenced paths; run them singly between
-  chain steps rather than alongside.
+- q08 is complete. q09, q10, and q11 touch ownership but in narrow, well-fenced paths; run them
+  singly rather than alongside unrelated ownership work.

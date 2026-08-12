@@ -2274,6 +2274,26 @@ private:
     // Per-loop stack of moved-state snapshots taken at each break/continue inside the body.
     std::vector<std::vector<LLVMBackend::MovedStateSnapshot>> loopBreakMovedStates_;
 
+    struct RangeForContext
+    {
+        std::string variableName;
+        LLVMBackend::NamedVariable collection;
+        llvm::Value* indexStorage = nullptr;
+        llvm::Value* collectionStorage = nullptr;
+        llvm::Value* collectionValue = nullptr;
+        llvm::Value* elementStorage = nullptr;
+        llvm::Type* elementBaseType = nullptr;
+        LLVMBackend::TypeAndValue elementType;
+        llvm::Value* interfaceStorage = nullptr;
+        bool isFixedArray = false;
+        bool isArrayView = false;
+        bool isInterface = false;
+    };
+    std::vector<RangeForContext> rangeForStack_;
+
+    RangeForContext* FindActiveRangeForVariable(const LLVMBackend::NamedVariable& nv);
+    bool IsActiveRangeCollectionElement(const LLVMBackend::NamedVariable& nv) const;
+
     // Save/restore straightLineReturned_ across a construct that falls through (loop, switch):
     // a return in its body must not mark the enclosing straight-line as returned.
     struct ReturnFlagGuard {

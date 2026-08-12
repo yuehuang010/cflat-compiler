@@ -10154,15 +10154,10 @@ int testReturnOfOwningField()
 }
 
 // -- range-`for` over a FIXED ARRAY binds its element as a BORROW --------------------
-// The loop variable's alloca is hoisted once and its destructor is emitted ONCE, in
-// forRangeResume, so bit-copying an owning element's {ptr,len,owned} pair gave two owners
-// of one buffer: the resume dtor freed the LAST element's buffer and the array's own
-// teardown freed it again (rc 133), with the array left dangling in between. The element
-// load now clears the owned bits - the same borrow `alias T get` hands back on the
-// container leg - so the once-only dtor is a no-op and the array keeps every buffer.
-// Every leg below is value-discriminating: churn allocations after the loop reuse any
-// wrongly-freed buffer, so a premature free shows up as a corrupted array read rather
-// than only as a teardown crash.
+// The loop variable borrows the current element. Fixed arrays, views, and containers keep the
+// loop variable on the live element slot, while accessor-only legs clear owned bits on the value
+// copy. Assignment through the variable writes through; a direct collection overwrite is rejected
+// while the borrow is live because it could destroy the referent.
 struct ForInBag { string[2] arr; };
 struct ForInPod { int a = 0; int b = 0; };
 struct ForInWide { int id = 0; string s = default; };
@@ -10175,6 +10170,15 @@ class ForInSquare : IForInShape { int side = 0; int area() { return side * side;
 string[2] forInGlobalArr;
 
 int forInLenOf(string s) { return s.length(); }
+
+string forInReturnFirst()
+{
+    list<string> l;
+    l.add("ab" + "cd");
+    for (string s in l)
+        if (s.length() == 4) return s;
+    return "none";
+}
 
 void forInChurn()
 {
@@ -10271,7 +10275,7 @@ int testForInOverFixedArrayElement()
         passed += Test("forin_nested_last_intact", dst[1] == "efgh" ? 1 : 0, 1);
     }
 
-    // The borrow passed to a function, and the array written THROUGH while borrowed.
+    // The borrow passed to a function, and assignment through the loop variable itself.
     {
         string[2] dst;
         dst[0] = "ab" + "cd";
@@ -10286,14 +10290,35 @@ int testForInOverFixedArrayElement()
         int m = 0;
         for (string s in dst)
         {
-            dst[i] = "new" + i.toString();
+            s = "new" + i.toString();
             m = m + s.length();
             i = i + 1;
         }
         forInChurn();
-        passed += Test("forin_write_through_sum", m, 9);
+        passed += Test("forin_write_through_sum", m, 8);
         passed += Test("forin_write_through_slot0", dst[0] == "new0" ? 1 : 0, 1);
         passed += Test("forin_write_through_slot1", dst[1] == "new1" ? 1 : 0, 1);
+    }
+
+    // A T[] view uses the same counted element lowering as a fixed array and keeps each element
+    // a borrow of the view's live allocation.
+    {
+        string[2] dst;
+        dst[0] = "ab" + "cd";
+        dst[1] = "ef" + "gh";
+        string[] view = dst;
+        int n = 0;
+        for (string s in view) n = n + s.length();
+        forInChurn();
+        passed += Test("forin_view_sum", n, 8);
+        passed += Test("forin_view_intact", dst[1] == "efgh" ? 1 : 0, 1);
+    }
+
+    // Returning a loop variable copies the borrowed element before its collection is destroyed.
+    {
+        string r = forInReturnFirst();
+        passed += Test("forin_return_copy_value", r == "abcd" ? 1 : 0, 1);
+        passed += Test("forin_return_copy_length", r.length(), 4);
     }
 
     // The borrow stored into a structure that OUTLIVES the array: the sink must take a
@@ -10865,7 +10890,7 @@ extern int main()
     passed += testReturnOfOwningField();
     total += 92;
     passed += testForInOverFixedArrayElement();
-    total += 41;
+    total += 45;
 
     passed += testAssignBorrowTaint();
     total += 9;

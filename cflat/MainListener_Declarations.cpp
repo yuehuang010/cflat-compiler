@@ -4139,6 +4139,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             : std::string();
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
                         auto& viewNV = compiler->stackNamedVariable.back().namedVariable[name];
+                        if (boundFromFixedArray)
+                            viewNV.RawArrayLength = compiler->builder->getInt64(srcConstArraySize);
+                        else if (srcIsArrayView)
+                            viewNV.RawArrayLength = srcRawArrayLength;
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
                         viewNV.FieldPathRoot = srcFieldPathNV.FieldPathRoot;

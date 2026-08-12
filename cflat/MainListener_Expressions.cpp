@@ -1157,6 +1157,63 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             auto namedVar = ParseUnaryExpression(unaryCtx);
             auto destination = namedVar.Storage;
 
+            // A range-for variable is a borrow of the current element, not an owning local. For
+            // addressable arrays/views, route the ordinary assignment machinery to that element
+            // slot. Container legs use their write-through `set` operation instead.
+            if (operatorText == "=")
+            {
+                if (auto* range = FindActiveRangeForVariable(namedVar))
+                {
+                    if (range->elementStorage != nullptr)
+                    {
+                        namedVar.Storage = range->elementStorage;
+                        namedVar.Primary = nullptr;
+                        namedVar.BaseType = range->elementBaseType;
+                        namedVar.TypeAndValue = range->elementType;
+                        namedVar.CallerName.clear();
+                        namedVar.FieldName.clear();
+                        namedVar.IsRangeForBorrow = false;
+                        destination = namedVar.Storage;
+                    }
+                    else
+                    {
+                        auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+                        LLVMBackend::NamedVariable indexNV;
+                        indexNV.Primary = compiler->CreateLoad(range->indexStorage);
+                        indexNV.BaseType = indexNV.Primary->getType();
+                        indexNV.TypeAndValue.TypeName = "int";
+                        LLVMBackend::NamedVariable selfArg = range->collection;
+                        selfArg.TypeAndValue.VariableName.clear();
+                        selfArg.Primary = nullptr;
+                        llvm::Value* setResult = nullptr;
+                        if (range->isInterface)
+                        {
+                            setResult = compiler->CallInterfaceMethod(
+                                range->interfaceStorage, range->collection.TypeAndValue.TypeName,
+                                "set", { indexNV, rightNV });
+                        }
+                        else
+                        {
+                            setResult = compiler->CreateOverloadedFunctionCall(
+                                "set", { selfArg, indexNV, rightNV });
+                        }
+                        return setResult != nullptr ? setResult : LoadNamedVariable(rightNV);
+                    }
+                }
+                else if (IsActiveRangeCollectionElement(namedVar))
+                {
+                    for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
+                    {
+                        if (it->collectionStorage == nullptr && it->collectionValue == nullptr)
+                            continue;
+                        LogErrorContext(unaryCtx, std::format(
+                            "cannot overwrite collection storage while range-for variable '{}' "
+                            "borrows its element; mutate through '{}' instead",
+                            it->variableName, it->variableName));
+                    }
+                }
+            }
+
             // Guarded-field WRITE check: the lock must be held exclusively. Runs on the resolved
             // LHS only, so a guarded field READ inside the LHS (e.g. an index 'a[n->count]') is
             // not mistaken for a write.

@@ -1100,6 +1100,9 @@ public:
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
         bool IsBorrowed = false;         // compile-time: true for non-move pointer parameters and locals that alias one - 'delete' is forbidden
+        // Range-for variables borrow the current collection element. The slot is rebound for each
+        // iteration, so it must never be treated as an owning value or a movable whole-local.
+        bool IsRangeForBorrow = false;
         // Set alongside IsBorrowed when the borrow was read out of a FIELD of the origin rather
         // than being the origin itself, so no diagnostic prescribes `move <origin>` (another object).
         bool BorrowedThroughField = false;

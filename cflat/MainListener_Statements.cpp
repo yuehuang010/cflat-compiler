@@ -1,5 +1,38 @@
 #include "MainListener.h"
 
+MainListener::RangeForContext* MainListener::FindActiveRangeForVariable(
+        const LLVMBackend::NamedVariable& nv) {
+        std::string name = nv.CallerName.empty() ? nv.TypeAndValue.VariableName : nv.CallerName;
+        for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
+            if (it->variableName == name)
+                return &*it;
+        return nullptr;
+    }
+
+bool MainListener::IsActiveRangeCollectionElement(
+        const LLVMBackend::NamedVariable& nv) const {
+        if (!nv.IsElementAccess || nv.Storage == nullptr) return false;
+        auto contains = [](llvm::Value* value, llvm::Value* base) {
+            for (int depth = 0; value != nullptr && depth < 64; ++depth)
+            {
+                if (value == base) return true;
+                auto* gep = llvm::dyn_cast<llvm::GEPOperator>(value);
+                if (gep == nullptr) return false;
+                value = gep->getPointerOperand();
+            }
+            return false;
+        };
+        for (auto it = rangeForStack_.rbegin(); it != rangeForStack_.rend(); ++it)
+        {
+            if (it->elementStorage != nullptr && nv.Storage == it->elementStorage)
+                continue;
+            if (contains(nv.Storage, it->collectionStorage)
+                || contains(nv.Storage, it->collectionValue))
+                return true;
+        }
+        return false;
+    }
+
 void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
         auto blockItems = ctx->blockItem();
 
@@ -685,7 +718,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         bool returnIsWholeLocal = returnNV.FieldName.empty()
             && returnNV.Storage != nullptr
             && llvm::isa<llvm::AllocaInst>(returnNV.Storage)
-            && !returnNV.BorrowsOwnedString;
+            && !returnNV.BorrowsOwnedString
+            && !returnNV.IsRangeForBorrow;
         // A direct call result carries an authoritative runtime OWNED bit: the callee
         // already cleared it for a borrow return (list.get's `return _data[i]`) or left
         // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
@@ -1052,6 +1086,28 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             right = compiler->EmitOwnedStringDeepCopy(right);
             clearReturnedStringBorrowBit = false;
+        }
+
+        // A range-for variable is a borrow held in a reusable local slot. Returning that slot
+        // must copy the current element before the collection's frame-local storage is destroyed.
+        if (right != nullptr && returnNV.IsRangeForBorrow
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()
+                == llvm::StructType::getTypeByName(*compiler->context, "string")
+            && returnNV.TypeAndValue.TypeName == "string")
+        {
+            right = compiler->EmitOwnedStringDeepCopy(right);
+            clearReturnedStringBorrowBit = false;
+        }
+
+        if (right != nullptr && returnNV.IsRangeForBorrow
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !NamedVarIsString(returnNV)
+            && compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName))
+        {
+            right = EmitCopyableOwnerCopy(returnNV, right, errCtx);
+            clearReturnedStructBorrowBits = false;
         }
 
         /*
@@ -1863,6 +1919,24 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                     bool isFaceType   = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
                     bool isFixedArray = collNV.BaseType && llvm::isa<llvm::ArrayType>(collNV.BaseType);
+                    bool isArrayView  = collNV.TypeAndValue.IsArrayView;
+                    bool isDirectContainer = collNV.TypeAndValue.TypeName.starts_with("list__")
+                        || collNV.TypeAndValue.TypeName.starts_with("array__");
+                    int dataFieldIndex = -1;
+                    if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType
+                        && collNV.BaseType->isStructTy())
+                    {
+                        auto data = compiler->GetDataStructure(collNV.TypeAndValue.TypeName);
+                        for (size_t i = 0; i < data.StructFields.size(); ++i)
+                            if ((collNV.TypeAndValue.TypeName.starts_with("list__")
+                                    ? data.StructFields[i].VariableName == "_data"
+                                    : data.StructFields[i].VariableName == "_ptr")
+                                && data.StructFields[i].Pointer)
+                            {
+                                dataFieldIndex = (int)i;
+                                break;
+                            }
+                    }
 
                     // Call count() once and cache it
                     llvm::Value* countVal = nullptr;
@@ -1871,6 +1945,16 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     {
                         auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
                         countVal = compiler->builder->getInt32((uint32_t)arrTy->getNumElements());
+                    }
+                    else if (isArrayView)
+                    {
+                        countVal = collNV.RawArrayLength;
+                        if (countVal == nullptr)
+                            LogErrorContext(iterationStatement,
+                                "cannot range-for over an array view whose length is unknown");
+                        if (countVal != nullptr && countVal->getType() != compiler->builder->getInt32Ty())
+                            countVal = compiler->builder->CreateIntCast(
+                                countVal, compiler->builder->getInt32Ty(), false, "viewcount");
                     }
                     else if (isFaceType)
                     {
@@ -1900,6 +1984,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                     // Pre-allocate the element variable in the init block (one alloca for all iterations)
                     auto elemAlloca = compiler->CreateLocalVariable(elemType);
+                    compiler->stackNamedVariable.back().namedVariable[varName].IsRangeForBorrow = true;
 
                     compiler->CreateBlockBreak(blockCond, false);
 
@@ -1919,6 +2004,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     indexNV.TypeAndValue.TypeName = "int";
 
                     llvm::Value* elemVal = nullptr;
+                    llvm::Value* elemStorage = nullptr;
+                    llvm::Value* rangeCollectionValue = nullptr;
                     if (isFixedArray)
                     {
                         auto* arrTy = llvm::cast<llvm::ArrayType>(collNV.BaseType);
@@ -1927,9 +2014,48 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             compiler->CreateLoad(indexAlloca), compiler->builder->getInt64Ty(), "idxi64");
                         auto* elemPtr = compiler->builder->CreateGEP(
                             arrTy, collNV.Storage, {zero, idxI64}, "arrayelemptr");
+                        elemStorage = elemPtr;
                         elemVal = compiler->builder->CreateLoad(arrTy->getElementType(), elemPtr, "arrayelem");
                         // Bind the loop variable as a BORROW - its alloca is hoisted and destructed
                         // once, so an owning bit-copy double-frees; matches the container `get`.
+                        elemVal = compiler->ClearStringOwnedBit(elemVal);
+                        elemVal = compiler->ClearStructOwnedBits(elemVal, elemType.TypeName);
+                    }
+                    else if (isArrayView)
+                    {
+                        auto viewElemType = elemType;
+                        viewElemType.Pointer = false;
+                        viewElemType.ElemPointer = false;
+                        viewElemType.IsArrayView = false;
+                        viewElemType.ConstArraySize = 0;
+                        auto* viewElemLLVMType = compiler->GetType(viewElemType);
+                        auto* viewValue = compiler->builder->CreateLoad(
+                            compiler->GetType(collNV.TypeAndValue), collNV.Storage, "viewbase");
+                        rangeCollectionValue = viewValue;
+                        auto* idxI64 = compiler->builder->CreateZExt(
+                            compiler->CreateLoad(indexAlloca), compiler->builder->getInt64Ty(), "idxi64");
+                        elemStorage = compiler->builder->CreateGEP(
+                            viewElemLLVMType, viewValue, idxI64, "viewelemptr");
+                        elemVal = compiler->builder->CreateLoad(
+                            viewElemLLVMType, elemStorage, "viewelem");
+                        elemVal = compiler->ClearStringOwnedBit(elemVal);
+                        elemVal = compiler->ClearStructOwnedBits(elemVal, elemType.TypeName);
+                    }
+                    else if (dataFieldIndex >= 0)
+                    {
+                        auto data = compiler->GetDataStructure(collNV.TypeAndValue.TypeName);
+                        const auto& dataField = data.StructFields[(size_t)dataFieldIndex];
+                        auto* dataSlot = compiler->CreateStructGEP(
+                            collNV.BaseType, collNV.Storage, (uint32_t)dataFieldIndex);
+                        auto* dataPtr = compiler->builder->CreateLoad(
+                            compiler->GetType(dataField), dataSlot, "rangeptr");
+                        auto* elemLLVMType = compiler->GetType(elemType);
+                        auto* idxI64 = compiler->builder->CreateZExt(
+                            compiler->CreateLoad(indexAlloca), compiler->builder->getInt64Ty(), "idxi64");
+                        elemStorage = compiler->builder->CreateGEP(
+                            elemLLVMType, dataPtr, idxI64, "rangeelemptr");
+                        elemVal = compiler->builder->CreateLoad(
+                            elemLLVMType, elemStorage, "rangeelem");
                         elemVal = compiler->ClearStringOwnedBit(elemVal);
                         elemVal = compiler->ClearStructOwnedBits(elemVal, elemType.TypeName);
                     }
@@ -1944,11 +2070,37 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         elemVal = compiler->CreateOverloadedFunctionCall("get", { selfArg, indexNV });
                     }
 
-                    if (elemVal)
+                    auto& rangeVariable = compiler->stackNamedVariable.back().namedVariable[varName];
+                    if (elemStorage != nullptr)
+                    {
+                        // Keep reads and writes of the loop variable on the live element slot. The
+                        // fallback alloca is only needed for accessor legs that return a value.
+                        rangeVariable.Storage = elemStorage;
+                        rangeVariable.Primary = nullptr;
+                        rangeVariable.BaseType = compiler->GetType(elemType);
+                    }
+                    else if (elemVal)
+                    {
                         compiler->CreateAssignment(elemVal, elemAlloca);
+                    }
 
+                    RangeForContext rangeCtx;
+                    rangeCtx.variableName = varName;
+                    rangeCtx.collection = collNV;
+                    rangeCtx.indexStorage = indexAlloca;
+                    rangeCtx.collectionStorage = collNV.Storage;
+                    rangeCtx.collectionValue = rangeCollectionValue;
+                    rangeCtx.elementStorage = elemStorage;
+                    rangeCtx.elementBaseType = compiler->GetType(elemType);
+                    rangeCtx.elementType = elemType;
+                    rangeCtx.interfaceStorage = ifacePtr;
+                    rangeCtx.isFixedArray = isFixedArray;
+                    rangeCtx.isArrayView = isArrayView;
+                    rangeCtx.isInterface = isFaceType;
+                    rangeForStack_.push_back(std::move(rangeCtx));
                     compiler->RecordMoveGenBind(varName); // element is a fresh binding each iteration
                     ParseControlledBody(bodyStmt);
+                    rangeForStack_.pop_back();
                     compiler->CreateContinueCall();
 
                     // Increment block: i++
