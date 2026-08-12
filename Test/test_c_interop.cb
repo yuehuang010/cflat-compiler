@@ -47,6 +47,7 @@ extern int  strcmp(const char* a, const char* b);
 // typedef ML_BinaryOp (declared in mathlib.h as `typedef int (*ML_BinaryOp)(int,int)`).
 int my_add_cb(int a, int b) { return a + b; }
 int my_sub_cb(int a, int b) { return a - b; }
+int my_inc_cb(int x) { return x + 1; }
 
 // Section L: float/double #define macro extraction.
 static bool near(double actual, double expected, double tol)
@@ -118,6 +119,7 @@ extern int main()
     if (ml_add(40, 2) != 42)            return 20;       // plain function
     if (ml_mul(6, 7) != 42)             return 21;
     if (ml_sum(4, 10, 20, 30, 40) != 100) return 22;     // variadic call-site ABI
+    if (ml_apply_const(my_inc_cb, 9) != 10) return 26;
     if (WHITE != 100)                   return 23;       // explicit enum value
     if (GREEN != 2)                     return 24;       // auto-incremented enum value
     if (EXTRA_FLAG != 7)                return 25;       // gated by inline `define "ML_EXTRA"`

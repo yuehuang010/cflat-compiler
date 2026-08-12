@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 50 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 47 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -31,7 +31,7 @@ member list is empty.
 | q12 | [Generics: templates and mangling](q12-generics-templates-and-mangling.md) | 4 | Generic registration and mangling fixes landed; collision items remain |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q14 | [Parser and expression grammar](q14-parser-expression-grammar.md) | 9 | Constructor and sizeof type parsing fixes landed; postfix gaps remain |
-| q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 5 | |
+| q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 3 | Callable typing gaps and null/design cases remain |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
 | q18 | [Platform, C interop, UI](q18-platform-c-interop-and-ui.md) | 8 | Disjoint; parallelizable |

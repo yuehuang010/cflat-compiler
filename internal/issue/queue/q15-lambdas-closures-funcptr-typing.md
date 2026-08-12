@@ -1,6 +1,6 @@
 # q15: Lambdas, closures, and function-pointer typing
 
-5 items. The type of a callable value is propagated on one call path and not the others, and a
+3 active items remain. The type of a callable value is propagated on one call path and not the others, and a
 null callable is accepted where it will be invoked unconditionally.
 
 ## Shared root cause
@@ -16,12 +16,8 @@ handle but not the callable field inside it.
   ENCLOSING `lambdaExpectedType` instead of its own context.
 - `p3/iface-arg-lambda-fnptr-type-not-propagated` - the interface-call argument loop lacks the
   direct call's `lastLambdaType` propagation step.
-- `p2/c-binder-misses-decorated-function-pointer-parameter` - the `"(*)"` substring match misses
-  clang's `"(* const)"` spelling, so the parameter binds as `void*`.
 - `p3/nullptr-into-thin-funcptr-value-calls-null` - `nullptr` into a value (non-pointer)
   `function<T>` parameter compiles clean and null-calls at invocation.
-- `ui/ui-boxed-closure-unguarded-null` - box-invoke helpers guard the box pointer but not the
-  closure field inside it.
 
 ## Fix direction
 
@@ -30,9 +26,10 @@ handle but not the callable field inside it.
    whole class of future drift.
 2. Extract the direct call's callable-type propagation into a helper and call it from the
    interface-call argument loop too.
-3. Reject `nullptr` into a value-typed `function<T>` at the call site, and null-check the closure
-   field in the box-invoke helpers - both are missing guards, not typing.
-4. Replace the `"(*)"` substring test in the C binder with a parse of clang's declarator rather
-   than a wider substring set; the current approach will keep missing spellings.
+3. Reject `nullptr` into a value-typed `function<T>` at the call site, and continue investigating
+   the interface/lambda propagation shape only when a concrete wrong overload or crash is shown.
+
+The C binder now parses the declarator rather than requiring the `"(*)"` substring, and boxed
+closure helpers guard both the box and its closure field. Their issue files are deleted when fixed.
 
 Small and self-contained apart from item 1, which sits in shared lambda code.

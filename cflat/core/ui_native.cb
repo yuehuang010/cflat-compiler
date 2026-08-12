@@ -3059,7 +3059,7 @@ class ListView : IListView
             while (cc < ncol)
             {
                 if (cc > 0) line = line + " | ";
-                line = line + this.rowText(r, cc);
+                if (this.rowText != nullptr) line = line + this.rowText(r, cc);
                 cc++;
             }
             if (r == this.selectedIndex) line = ">" + line;
@@ -3162,6 +3162,7 @@ move string __uiListRowText(u64 boxPtr, int row, int col)
 {
     if (boxPtr == 0u) return "";
     ListRowBox* b = (ListRowBox*)boxPtr;
+    if (b.cb == nullptr) return "";
     return b.cb(row, col);
 }
 
@@ -3426,14 +3427,14 @@ class TreeView : ITreeView
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
         cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
         int ink = pickColor(0, ctx.theme.textColor);
-        int n = this.childCount(TREE_ROOT);
+        int n = this.childCount != nullptr ? this.childCount(TREE_ROOT) : 0;
         int visible = this.bounds.h - 1;
         int r = 0;
         while (r < n && r < visible)
         {
-            int nid = this.childId(TREE_ROOT, r);
-            string mark = this.childCount(nid) > 0 ? "+ " : "  ";
-            string line = mark + this.label(nid);
+            int nid = this.childId != nullptr ? this.childId(TREE_ROOT, r) : 0;
+            string mark = this.childCount != nullptr && this.childCount(nid) > 0 ? "+ " : "  ";
+            string line = mark + (this.label != nullptr ? this.label(nid) : "");
             if (nid == this.selectedNode) line = ">" + line;
             cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
             r++;
@@ -3667,6 +3668,7 @@ int __uiTreeChildCount(u64 boxPtr, int nodeId)
 {
     if (boxPtr == 0u) return 0;
     TreeBox* b = (TreeBox*)boxPtr;
+    if (b.childCount == nullptr) return 0;
     return b.childCount(nodeId);
 }
 
@@ -3674,6 +3676,7 @@ int __uiTreeChildId(u64 boxPtr, int nodeId, int i)
 {
     if (boxPtr == 0u) return 0;
     TreeBox* b = (TreeBox*)boxPtr;
+    if (b.childId == nullptr) return 0;
     return b.childId(nodeId, i);
 }
 
@@ -3681,6 +3684,7 @@ move string __uiTreeLabel(u64 boxPtr, int nodeId)
 {
     if (boxPtr == 0u) return "";
     TreeBox* b = (TreeBox*)boxPtr;
+    if (b.label == nullptr) return "";
     return b.label(nodeId);
 }
 
@@ -3988,7 +3992,7 @@ class CanvasView : ICanvasView
     }
 
     // ICanvas fallback: the host IS a ICanvas, so delegate straight to the app's painter.
-    void paint(ICanvas cv, IUiContext ctx) { this.onPaint(cv); }
+    void paint(ICanvas cv, IUiContext ctx) { if (this.onPaint != nullptr) this.onPaint(cv); }
 
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
@@ -4030,7 +4034,7 @@ void __uiCanvasPaint(u64 boxPtr, ICanvas c)
 {
     if (boxPtr == 0u) return;
     CanvasBox* b = (CanvasBox*)boxPtr;
-    b.paint(c);
+    if (b.paint != nullptr) b.paint(c);
 }
 
 void __uiFreeCanvasBox(u64 boxPtr)

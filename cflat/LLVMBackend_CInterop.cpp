@@ -489,6 +489,24 @@ bool LLVMBackend::ParseCFunctionPointerSpelling(const std::string& s, TypeAndVal
             if (j >= s.size() || s[j] != '*') continue;
             ++j;
             while (j < s.size() && std::isspace((unsigned char)s[j])) ++j;
+            for (;;)
+            {
+                bool removed = false;
+                for (const char* qualifier : { "const", "volatile", "restrict", "__restrict",
+                                               "__restrict__", "_Nonnull", "_Nullable",
+                                               "_Null_unspecified" })
+                {
+                    size_t len = std::strlen(qualifier);
+                    if (s.compare(j, len, qualifier) == 0)
+                    {
+                        j += len;
+                        while (j < s.size() && std::isspace((unsigned char)s[j])) ++j;
+                        removed = true;
+                        break;
+                    }
+                }
+                if (!removed) break;
+            }
             if (j < s.size() && s[j] == ')') { markerPos = i; break; }
         }
         if (markerPos == std::string::npos) return false;
@@ -619,16 +637,11 @@ std::string LLVMBackend::AggregatePointeeTag(const std::string& spelling, int& o
 bool LLVMBackend::MapCTypeToTypeAndValueImpl(std::string ctype, TypeAndValue& out,
                                     std::unordered_set<std::string>& visited)
 {
-        // Detect function-pointer spelling before the '*'-strip path mangles it.
-        // clang spells these as "R (*)(args)"; the "(*)" token disambiguates from a declaration.
-        if (ctype.find("(*)") != std::string::npos)
-        {
-            if (ParseCFunctionPointerSpelling(ctype, out, visited))
-                return true;
-            // Fall through only if the parse failed - lets unknown shapes hit the normal
-            // "return false" path below instead of being silently accepted.
-            return false;
-        }
+        // Detect function-pointer spelling before the '*'-strip path mangles it. The declarator
+        // may carry cv/nullability words between '*' and ')', so do not rely on the literal
+        // "(*)" substring as a precondition for the parser.
+        if (ParseCFunctionPointerSpelling(ctype, out, visited))
+            return true;
 
         // Arrays decay to a pointer; drop the '[...]' and bump the pointer level.
         int ptr = 0;

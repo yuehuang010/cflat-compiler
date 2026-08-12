@@ -97,6 +97,7 @@ void ml_flags_set_count(struct ML_Flags* f, unsigned c) { f->count = c; }
 unsigned ml_flags_get_count(struct ML_Flags* f) { return f->count; }
 
 int ml_apply(ML_BinaryOp op, int a, int b) { return op(a, b); }
+int ml_apply_const(int (* const op)(int), int value) { return op(value); }
 
 static int ml_op_add(int a, int b) { return a + b; }
 static int ml_op_mul(int a, int b) { return a * b; }

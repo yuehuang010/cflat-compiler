@@ -203,6 +203,10 @@ typedef int (*ML_BinaryOp)(int a, int b);
 int         ml_apply(ML_BinaryOp op, int a, int b);
 ML_BinaryOp ml_pick_op(int which);
 
+/* Qualifier on the function-pointer parameter itself. Clang prints this as
+ * `int (*const)(int)`; it remains a thin callable parameter. */
+int ml_apply_const(int (* const op)(int), int value);
+
 /* Opaque forward-declared handle - declared but never defined anywhere in the
  * translation unit. This is the SDL_Window / sqlite3_stmt / CURL* idiom. The
  * C-interop extractor must register it as an opaque (pointer-only) type so CFlat
