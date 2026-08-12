@@ -1188,24 +1188,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<std::string> typeArgs;
                             for (auto* entry : prevPrimary->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                             {
-                                // `unique` in an explicit function type argument is not supported: this
-                                // path takes the raw getText() spelling and cannot carry the qualifier.
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
-                                if (TypeArgHasAlias(entry))
-                                    LogErrorContext(entry, "alias is not supported as an explicit generic function type argument");
-                                std::string arg = entry->getText();
-                                // Apply active type substitutions to each type argument
-                                auto it = activeTypeSubstitutions.find(arg);
-                                bool substituted = it != activeTypeSubstitutions.end();
-                                if (substituted)
-                                    arg = it->second;
-                                // A generic FUNCTION's argument resolves like a template base; a
-                                // SUBSTITUTED one is already resolved in the caller's scope.
-                                if (isGenericFunc && !substituted)
-                                    arg = Compiler(ctx)->ResolveTypeArgBaseName(arg);
-                                typeArgs.push_back(arg);
-                                mangledName += "__" + MangleTypeArg(Compiler(), arg);
+                                typeArgs.push_back(ResolveTypeArgEntry(entry));
+                                mangledName += "__" + MangleTypeArg(Compiler(), typeArgs.back());
                             }
                             bool isFollowedByCall = false;
                             for (size_t i = 0; i + 1 < ctx->children.size(); i++)
@@ -1221,7 +1207,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (isGenericFunc)
                             {
                                 const auto& typeParams = Compiler(ctx)->gts.genericFunctionTypeParams[gfKey];
-                                if (isFollowedByCall && typeParams.size() != typeArgs.size())
+                                auto packIt = Compiler(ctx)->gts.genericFunctionPackIndex.find(gfKey);
+                                size_t packIdx = packIt != Compiler(ctx)->gts.genericFunctionPackIndex.end()
+                                    ? packIt->second : std::string::npos;
+                                bool wrongArity = packIdx == std::string::npos
+                                    ? typeParams.size() != typeArgs.size()
+                                    : typeArgs.size() < packIdx;
+                                if (isFollowedByCall && wrongArity)
                                     LogErrorContext(prevPrimary, std::format(
                                         "generic function '{}' expects {} type argument(s), but the call provides {}",
                                         baseName, typeParams.size(), typeArgs.size()));
@@ -1753,22 +1745,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<std::string> typeArgs;
                             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                             {
-                                // `unique` on an explicit method/function type argument is unsupported
-                                // (raw getText() spelling cannot carry the qualifier).
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
-                                if (TypeArgHasAlias(entry))
-                                    LogErrorContext(entry, "alias is not supported as an explicit generic function type argument");
-                                std::string arg = entry->getText();
-                                auto it = activeTypeSubstitutions.find(arg);
-                                bool substituted = it != activeTypeSubstitutions.end();
-                                if (substituted)
-                                    arg = it->second;
-                                // Same rule as the primary path: resolve an unsubstituted argument
-                                // spelling, leave an already-resolved substituted one alone.
-                                if (!substituted)
-                                    arg = Compiler(ctx)->ResolveTypeArgBaseName(arg);
-                                typeArgs.push_back(arg);
+                                typeArgs.push_back(ResolveTypeArgEntry(entry));
                             }
                             std::string mangled = InstantiateGenericFunction(templateName, typeArgs);
                             if (!mangled.empty())

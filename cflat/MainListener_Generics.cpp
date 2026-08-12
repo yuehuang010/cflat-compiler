@@ -14,11 +14,6 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
 
         TemplateNamespaceScope nsScope(compilerLLVM, baseName);
 
-        // Collect parent interface names
-        std::vector<std::string> parentNames;
-        for (auto* spec : ctx->baseSpecifier())
-            parentNames.push_back(Compiler()->ResolveInterfaceName(BaseSpecifierName(spec)));
-
         // Apply substitutions to instantiate the interface methods
         auto savedSubst = activeTypeSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
@@ -26,6 +21,50 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
             activeTypeSubstitutions[k] = v;
         for (const auto& [k, v] : packSubstitutions)
             activePackSubstitutions[k] = v;
+
+        // Resolve and materialize generic parents after the child substitutions are active.
+        // BaseSpecifierName intentionally drops the parent's type arguments, so passing that
+        // bare name to CreateInterfaceDefinition loses the concrete parent instance.
+        std::vector<std::string> parentNames;
+        for (auto* spec : ctx->baseSpecifier())
+        {
+            std::string parentBase = Compiler()->ResolveGenericBaseAlias(BaseSpecifierName(spec));
+            if (spec->genericTypeParameters() == nullptr)
+            {
+                parentNames.push_back(Compiler()->ResolveInterfaceName(parentBase));
+                continue;
+            }
+
+            std::vector<std::string> parentArgs;
+            for (auto* entry : spec->genericTypeParameters()->typeParameterList()->typeParameterEntry())
+                parentArgs.push_back(ResolveTypeArgEntry(entry));
+            std::string parentMangled = MangledGenericName(parentBase, parentArgs);
+            parentNames.push_back(parentMangled);
+
+            auto parentIt = genericInterfaceTemplates.find(parentBase);
+            if (parentIt != genericInterfaceTemplates.end())
+            {
+                std::unordered_map<std::string, std::string> parentSubst;
+                std::unordered_map<std::string, std::vector<std::string>> parentPackSubst;
+                const auto& parentParams = genericInterfaceTypeParams[parentBase];
+                auto packIt = genericInterfacePackIndex.find(parentBase);
+                size_t packIndex = packIt != genericInterfacePackIndex.end()
+                    ? packIt->second : std::string::npos;
+                if (packIndex == std::string::npos)
+                {
+                    for (size_t i = 0; i < parentParams.size() && i < parentArgs.size(); i++)
+                        parentSubst[parentParams[i]] = parentArgs[i];
+                }
+                else
+                {
+                    for (size_t i = 0; i < packIndex && i < parentArgs.size(); i++)
+                        parentSubst[parentParams[i]] = parentArgs[i];
+                    parentPackSubst[parentParams[packIndex]] =
+                        std::vector<std::string>(parentArgs.begin() + packIndex, parentArgs.end());
+                }
+                InstantiateGenericInterface(parentBase, parentMangled, parentSubst, parentPackSubst);
+            }
+        }
 
         // Entered after the substitutions are installed: this instantiation must re-evaluate the
         // if-const conditions under its own T, not reuse another instantiation's branch selection.
@@ -100,14 +139,33 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         TemplateNamespaceScope nsScope(compilerLLVM, baseName);
 
         const auto& typeParams = genericFunctionTypeParams[baseName];
-        if (typeParams.size() != typeArgs.size()) return {};
+        auto packIt = genericFunctionPackIndex.find(baseName);
+        size_t packIdx = packIt != genericFunctionPackIndex.end()
+            ? packIt->second : std::string::npos;
+        if ((packIdx == std::string::npos && typeParams.size() != typeArgs.size())
+            || (packIdx != std::string::npos && typeArgs.size() < packIdx))
+            return {};
 
         if (!CheckConstraints(baseName, typeParams, typeArgs, genericFunctionConstraints, tmplCtx))
             return {};
 
         auto savedSubst = activeTypeSubstitutions;
-        for (size_t i = 0; i < typeParams.size(); i++)
-            activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+        auto savedPackSubst = activePackSubstitutions;
+        if (packIdx == std::string::npos)
+        {
+            for (size_t i = 0; i < typeParams.size(); i++)
+                activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+        }
+        else
+        {
+            for (size_t i = 0; i < packIdx; i++)
+                activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+            activePackSubstitutions[typeParams[packIdx]] =
+                std::vector<std::string>(typeArgs.begin() + packIdx, typeArgs.end());
+            if (!activePackSubstitutions[typeParams[packIdx]].empty())
+                activeTypeSubstitutions[typeParams[packIdx]] =
+                    activePackSubstitutions[typeParams[packIdx]].front();
+        }
 
         // A generic member method is keyed "Owner.method". An instance method must be
         // emitted as a member (implicit `this` param) so its body can reach the owner's
@@ -131,6 +189,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         instCompiler->RestoreBuilderState(savedState);
 
         activeTypeSubstitutions = savedSubst;
+        activePackSubstitutions = savedPackSubst;
         return mangledName;
     }
 
@@ -529,4 +588,3 @@ bool MainListener::EnsureArenaChannelInstantiated(LLVMBackend* compiler) {
         ProcessPendingInstantiations();
         return isSized();
     }
-

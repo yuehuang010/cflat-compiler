@@ -149,6 +149,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
         // prefix (D10) so this instantiation mangles distinctly and is_unique(T) can see it.
         if (isUnique)
         {
+            if (hasArrayView)
+                LogErrorContext(entry, std::format("'unique' on '{}': array views are not supported - a view does not own its buffer", entry->getText()));
             if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
                 LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
@@ -1987,6 +1989,9 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
             genericFunctionTypeParams[name] = typeParams;
             genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
+            auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
+            bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
+            genericFunctionPackIndex[name] = hasPack ? typeParams.size() - 1 : std::string::npos;
             return;
         }
 

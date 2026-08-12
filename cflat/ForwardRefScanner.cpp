@@ -1225,6 +1225,43 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                 }
                 break;
             }
+            case CFlatParser::RuleFunctionDefinition:
+            {
+                auto* fd = static_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx);
+                auto* gp = fd->genericTypeParameters();
+                if (gp != nullptr)
+                {
+                    std::string fn = getFunctionName(fd);
+                    if (!fn.empty())
+                    {
+                        std::string key = QualifyName(QualifyName(ns, typePath), fn);
+                        compiler->gts.genericFunctionTemplates[key] = fd;
+                        compiler->gts.genericTemplateNamespace[key] = ns;
+                        std::vector<std::string> params;
+                        for (auto* entry : gp->typeParameterList()->typeParameterEntry())
+                            params.push_back(entry->typeSpecifier() != nullptr
+                                ? entry->typeSpecifier()->getText() : entry->getText());
+                        compiler->gts.genericFunctionTypeParams[key] = params;
+                        std::unordered_map<std::string, std::vector<std::string>> constraints;
+                        if (auto* where = fd->whereClause(); where != nullptr)
+                        {
+                            for (auto* constraint : where->typeParameterConstraint())
+                            {
+                                auto ids = constraint->Identifier();
+                                if (ids.size() >= 2)
+                                    constraints[ids[0]->getText()].push_back(ids[1]->getText());
+                            }
+                        }
+                        compiler->gts.genericFunctionConstraints[key] = std::move(constraints);
+                        bool hasPack = !params.empty()
+                            && !gp->typeParameterList()->typeParameterEntry().empty()
+                            && gp->typeParameterList()->typeParameterEntry().back()->Ellipsis() != nullptr;
+                        compiler->gts.genericFunctionPackIndex[key] =
+                            hasPack ? params.size() - 1 : std::string::npos;
+                    }
+                }
+                break;
+            }
             }
             CollectGenericTemplateDecls(ruleCtx, certain, ifConstUnfoldable, ns, typePath, unkeyable);
         }

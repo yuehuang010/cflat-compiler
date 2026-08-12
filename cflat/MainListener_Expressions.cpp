@@ -6191,6 +6191,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     // Try to parse as a type
                     LLVMBackend::TypeAndValue typeValue;
                     typeValue.TypeName = postfixText;
+                    std::string rawTypeName = typeValue.TypeName;
 
                     // Check for trailing * (pointer)
                     if (!typeValue.TypeName.empty() && typeValue.TypeName.back() == '*')
@@ -6216,7 +6217,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     // sizeof(T) where T is a pack param returns the element count
                     if (prefixSizeof)
                     {
-                        auto packIt = activePackSubstitutions.find(typeValue.TypeName);
+                        auto packIt = activePackSubstitutions.find(rawTypeName);
                         if (packIt != activePackSubstitutions.end())
                         {
                             LLVMBackend::NamedVariable namedVar;
@@ -6540,7 +6541,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // sizeof(T) where T is a pack param returns the element count, not byte size
                 if (isSizeof)
                 {
-                    auto packIt = activePackSubstitutions.find(typeValue.TypeName);
+                    auto packIt = activePackSubstitutions.find(typeNameCtx->getText());
                     if (packIt != activePackSubstitutions.end())
                     {
                         LLVMBackend::NamedVariable namedVar;
