@@ -251,7 +251,10 @@ llvm::Value* MainListener::BoxConcreteIntoInterface(antlr4::ParserRuleContext* e
         record.Source = ClassifyInterfaceBoxSource(dataPtr, srcNV, transferred);
         record.OwnershipTransferred = transferred;
         record.SourceKeepsOwner = ClassifyBoxedSourceKeepsOwner(dataPtr, srcNV, transferred);
-        if (record.SourceKeepsOwner) record.SourceDisplayName = DescribeBoxedSourceOwner(dataPtr, srcNV);
+        if (record.SourceKeepsOwner)
+        {
+            record.SourceDisplayName = DescribeBoxedSourceOwner(dataPtr, srcNV);
+        }
         compiler->RegisterInterfaceBox(record);
         return fat;
     }
@@ -442,6 +445,22 @@ bool MainListener::JoinArmsStillKeepOwner(const LLVMBackend::NamedVariable& nv, 
         return true;
     }
 
+bool MainListener::InterfaceBoxBorrowStillKeepsOwner(
+    const LLVMBackend::NamedVariable& nv) const {
+        if (!nv.BorrowedInterfaceBox) return false;
+        // Direct boxes intentionally have no slot; slot-backed join records get the precise
+        // rebind retirement.
+        if (nv.BorrowedInterfaceBoxSlots.empty()) return true;
+        for (auto* slot : nv.BorrowedInterfaceBoxSlots)
+        {
+            const auto* arm = compilerLLVM->FindVariableByStorage(slot);
+            // Non-local slots (for example a unique field GEP) were never rebindable through
+            // the boxed local's spelling. Keep their established positive proof intact.
+            if (arm != nullptr && arm->PointerRebound) return false;
+        }
+        return true;
+    }
+
 const LLVMBackend::NamedVariable* MainListener::ProvingBindingForBoxedSource(
         llvm::Value* dataPtr, const LLVMBackend::NamedVariable* srcNV) const {
         if (BindingKeepsOwnershipOfBoxedObject(srcNV)) return srcNV;
@@ -463,7 +482,8 @@ bool MainListener::ClassifyBoxedSourceKeepsOwner(llvm::Value* dataPtr,
     }
 
 bool MainListener::InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
-                                             std::vector<std::string>& sourceNames) {
+                                             std::vector<std::string>& sourceNames,
+                                             std::vector<llvm::Value*>& ownerSlots) {
         if (fatValue == nullptr) return false;
         auto* compiler = compilerLLVM;
         if (auto* record = compiler->FindInterfaceBoxByFatValue(fatValue))
@@ -471,6 +491,8 @@ bool MainListener::InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
             if (!record->SourceKeepsOwner) return false;
             if (!record->SourceDisplayName.empty())
                 sourceNames.push_back(record->SourceDisplayName);
+            if (record->SourceOwnerSlot != nullptr)
+                ownerSlots.push_back(record->SourceOwnerSlot);
             return true;
         }
 
@@ -494,6 +516,10 @@ bool MainListener::InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
             if (!name.empty()
                 && std::find(sourceNames.begin(), sourceNames.end(), name) == sourceNames.end())
                 sourceNames.push_back(name);
+            if (record->SourceOwnerSlot != nullptr
+                && std::find(ownerSlots.begin(), ownerSlots.end(), record->SourceOwnerSlot)
+                    == ownerSlots.end())
+                ownerSlots.push_back(record->SourceOwnerSlot);
         }
         return sawBox;
     }
@@ -514,9 +540,12 @@ void MainListener::TagInterfaceBoxProvenance(const std::string& varName, llvm::V
             constant != nullptr && constant->isNullValue())
             return;
         std::vector<std::string> sourceNames;
-        bool borrowed = InterfaceBoxValueIsProvablyBorrowed(fatValue, sourceNames);
+        std::vector<llvm::Value*> ownerSlots;
+        bool borrowed = InterfaceBoxValueIsProvablyBorrowed(fatValue, sourceNames, ownerSlots);
         compilerLLVM->SetInterfaceBoxIsBorrowed(varName, borrowed,
                                                 DescribeInterfaceBoxOwners(sourceNames));
+        compilerLLVM->SetInterfaceBoxBorrowSlots(
+            varName, borrowed ? ownerSlots : std::vector<llvm::Value*>{});
     }
 
 bool MainListener::FatValueOwnsHeapBox(llvm::Value* fatValue) {
@@ -862,7 +891,26 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
             // The arm keeps its real vtable (the IR is unchanged); only the LEDGER calls it neutral.
             record.SourceProvablyNull = JoinArmIsProvablyNull(armData);
             if (record.SourceKeepsOwner)
+            {
                 record.SourceDisplayName = DescribeBoxedSourceOwner(armData, armSources[i]);
+                if (const auto* proving = ProvingBindingForBoxedSource(armData, armSources[i]))
+                {
+                    llvm::Value* ownerSlot = proving->Storage;
+                    // A plain assignment such as `p = q` leaves p's binding as the display and
+                    // proof carrier, but q is the owner slot to re-ask after a boxed join.
+                    if (armSources[i] != nullptr && armSources[i]->InheritedKeepsOwner
+                        && !armSources[i]->BorrowedOrigin.empty())
+                    {
+                        auto originNV = compiler->GetScopedLocalOrArgument(
+                            BorrowedOriginRoot(armSources[i]->BorrowedOrigin));
+                        if (originNV.Storage != nullptr)
+                            if (compiler->FindVariableByStorage(originNV.Storage) != nullptr)
+                                ownerSlot = originNV.Storage;
+                    }
+                    if (ownerSlot != nullptr && llvm::isa<llvm::AllocaInst>(ownerSlot))
+                        record.SourceOwnerSlot = ownerSlot;
+                }
+            }
             compiler->RegisterInterfaceBox(record);
         }
         compiler->builder->SetInsertPoint(joinPoint);
@@ -1399,13 +1447,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                      * false-rejects `c = new Ci(); c ??= q;`; taking neither laundered `p ??= q`
                      * between two borrowed parameters, which the raw `delete p;` rejects.
                      */
-                    std::string assignedOwner = DescribeAssignedSourceOwner(rightNV);
+                    // TransferPointerOwnershipOnStore consumes an owning pointer source later in
+                    // this assignment. Do not snapshot that source's pre-transfer owner proof:
+                    // the destination is the sole owner by the end of this statement.
+                    bool reboundToOwnedStore = coalesceResume == nullptr
+                        && (srcIsOwnedPtrRhs || rightNV.IsOwning)
+                        && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
+                    std::string assignedOwner = reboundToOwnedStore
+                        ? std::string() : DescribeAssignedSourceOwner(rightNV);
                     // A cast erases the RHS binding's Storage; the boxed VALUE still names the slot,
                     // which is what the pre-tail '??=' handler asked. Coalesce path only.
                     if (coalesceResume != nullptr && assignedOwner.empty()
                         && ProvingBindingForBoxedSource(rightNV.Primary, nullptr) != nullptr)
                         assignedOwner = DescribeBoxedSourceOwner(rightNV.Primary, nullptr);
-                    bool reboundToOwnedStore = false;
                     if (coalesceResume != nullptr)
                     {
                         std::string joined;
@@ -1432,11 +1486,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                          * rather than in srcIsOwnedPtrRhs, whose other consumer sits behind its own
                          * IsBorrowed gate and must keep the syntactic leg for a genuine transfer.
                          */
-                        bool reboundToOwnedValue = srcIsOwnedPtrRhs
-                            && !compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
-                        compiler->MarkPointerRebound(namedVar.CallerName, assignedOwner,
-                                                     /*coalesceJoin*/ false, reboundToOwnedValue);
-                        reboundToOwnedStore = reboundToOwnedValue;
+                        compiler->MarkPointerRebound(namedVar.CallerName,
+                                                     reboundToOwnedStore ? std::string() : assignedOwner,
+                                                     /*coalesceJoin*/ false, reboundToOwnedStore);
                     }
                     /*
                      * Record the borrow the RHS carries, which MarkPointerRebound above does not:
@@ -6896,6 +6948,21 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         llvm::Value* val = LoadNamedVariable(nv);
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
+        // Aggregate field defaults use a shared path instead of the ordinary declaration upcast.
+        // Box a concrete pointer here before the aggregate is assembled, otherwise an interface
+        // field initialized with `new Impl()` is returned as a null fat value and its later
+        // dispatch check reports a false null-interface proof.
+        if (val != nullptr && field.IsFatInterfaceValue() && val->getType()->isPointerTy()
+            && nv.TypeAndValue.Pointer
+            && compiler->StructImplementsInterface(nv.TypeAndValue.TypeName, field.TypeName))
+        {
+            val = BoxConcreteIntoInterface(ae, val, true, nv.TypeAndValue.TypeName,
+                                           field.TypeName, &nv, field.IsUnique);
+            // The aggregate now carries the pointer (as a box), so an owning `new` temporary
+            // must not also be released by end-of-expression cleanup. A non-unique interface
+            // field intentionally remains a non-owning reference; its object is not field-owned.
+            compiler->ConsumeOwnedNewTemp(nv.Primary);
+        }
         // Thin sibling of the widen elsewhere: a default initializer into a thin
         // function<> field fed a raw pointer (spelled or generic-encoded).
         const LLVMBackend::TypeAndValue* clo = field.IsFunctionPointer
@@ -8506,6 +8573,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // Error: deleting an interface box whose object a DIFFERENT owner already frees - see
             // BorrowedInterfaceBox. Proven at the binding site; never inferred at this one.
             if (isInterfaceOperand && namedVar.BorrowedInterfaceBox
+                && InterfaceBoxBorrowStillKeepsOwner(namedVar)
                 && namedVar.Storage != nullptr && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
             {
                 std::string name = namedVar.CallerName.empty()
@@ -9085,6 +9153,13 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.ViewOfFixedArraySourceName     = src.ViewOfFixedArraySourceName;
         dst.BorrowedInterfaceBox           = src.BorrowedInterfaceBox;
         dst.BorrowedInterfaceBoxSource     = src.BorrowedInterfaceBoxSource;
+        dst.BorrowedInterfaceBoxSlots      = src.BorrowedInterfaceBoxSlots;
+        dst.OwnedStringBorrowBlock         = src.OwnedStringBorrowBlock;
+        dst.OwnedStringBorrowFunction      = src.OwnedStringBorrowFunction;
+        dst.OwnedElementBorrowBlock        = src.OwnedElementBorrowBlock;
+        dst.OwnedElementBorrowFunction     = src.OwnedElementBorrowFunction;
+        dst.BondDeclBlock                  = src.BondDeclBlock;
+        dst.BondDeclFunction               = src.BondDeclFunction;
     }
 
 bool MainListener::IsRedundantCastOfSource(const LLVMBackend::TypeAndValue& src,

@@ -983,12 +983,30 @@ bool LLVMBackend::IsVariableBorrowingOwnedString(const std::string& name) const
 void LLVMBackend::SetVariableBorrowsOwnedString(const std::string& name, bool value)
 {
         if (name.empty()) return;
+        auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        auto* function = here != nullptr ? here->getParent() : nullptr;
+        auto apply = [&](NamedVariable& nv) {
+            if (value)
+            {
+                nv.BorrowsOwnedString = true;
+                nv.OwnedStringBorrowBlock = here;
+                nv.OwnedStringBorrowFunction = function;
+            }
+            else if (nv.BorrowsOwnedString
+                     && nv.OwnedStringBorrowBlock == here
+                     && nv.OwnedStringBorrowFunction == function)
+            {
+                nv.BorrowsOwnedString = false;
+                nv.OwnedStringBorrowBlock = nullptr;
+                nv.OwnedStringBorrowFunction = nullptr;
+            }
+        };
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.BorrowsOwnedString = value; return; }
+                { apply(it->second); return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.BorrowsOwnedString = value; return; }
+                { apply(it->second); return; }
         }
     }
 
@@ -996,14 +1014,34 @@ void LLVMBackend::SetVariableBorrowsOwnedElement(const std::string& name, bool v
         const std::string& container, bool externallyOwned)
 {
         if (name.empty()) return;
+        auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        auto* function = here != nullptr ? here->getParent() : nullptr;
+        auto apply = [&](NamedVariable& nv) {
+            if (value)
+            {
+                nv.BorrowsOwnedElement = true;
+                nv.OwnedElementContainer = container;
+                nv.BorrowedElementExternallyOwned = externallyOwned;
+                nv.OwnedElementBorrowBlock = here;
+                nv.OwnedElementBorrowFunction = function;
+            }
+            else if (nv.BorrowsOwnedElement
+                     && nv.OwnedElementBorrowBlock == here
+                     && nv.OwnedElementBorrowFunction == function)
+            {
+                nv.BorrowsOwnedElement = false;
+                nv.OwnedElementContainer.clear();
+                nv.BorrowedElementExternallyOwned = false;
+                nv.OwnedElementBorrowBlock = nullptr;
+                nv.OwnedElementBorrowFunction = nullptr;
+            }
+        };
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
-                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : "";
-                  it->second.BorrowedElementExternallyOwned = value && externallyOwned; return; }
+                { apply(it->second); return; }
             if (auto it = frame.functionArgument.find(name); it != frame.functionArgument.end())
-                { it->second.BorrowsOwnedElement = value; it->second.OwnedElementContainer = value ? container : "";
-                  it->second.BorrowedElementExternallyOwned = value && externallyOwned; return; }
+                { apply(it->second); return; }
         }
     }
 

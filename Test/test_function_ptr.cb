@@ -603,6 +603,19 @@ bool testReturnCapturedOwningValue()
         result &= Test("mutated capture is per-call", g(),      4);
     }
 
+    // Rebinding the unpacked capture to a fresh concatenation must restore its local cleanup.
+    // The capture still owns the original environment value, while each new result is owned by
+    // the lambda body and must not be left on the heap after the call returns.
+    {
+        string s = "xyz";
+        Lambda<string()> g = () => { s = s + "!"; return s; };
+        string r1 = g();
+        string r2 = g();
+        result &= Test("rebound capture value 1", r1, "xyz!");
+        result &= Test("rebound capture value 2", r2, "xyz!");
+        result &= Test("rebound capture source intact", s, "xyz");
+    }
+
     // The env dies BEFORE the result is read. Pre-fix these returned freed storage and
     // printed the empty string - a silent wrong value, not only the double free.
     {

@@ -19,3 +19,14 @@ expect_error("cannot reassign 'src2' while 'v2' holds a bonded reference") {
         src2 ??= other2;
     }
 }
+
+// A conditional rebind of the bonded view may not retire the bond for the merge base.
+expect_error("cannot reassign 'src3' while 'v3' holds a bonded reference") {
+    int* Borrow3(bond int* src3) { return src3; }
+
+    void Test3(int* src3, int* other3) {
+        int* v3 = Borrow3(src3);
+        if (other3 != nullptr) { v3 = other3; }
+        src3 = other3;
+    }
+}

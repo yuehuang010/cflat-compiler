@@ -55,6 +55,10 @@ class CWithDtor{ int a; int b; int c; int d; ~CWithDtor() { } };   // dtor, stil
 class CWithCtor{ int a; int b; CWithCtor() { a = 11; b = 12; } };  // must be UNTOUCHED
 interface IArea { int Area(); };
 class CSide : IArea { int side; int Area() { return side * side; } };
+interface HeapDefaultIface { int value(); };
+int heapDefaultDtors = 0;
+class HeapDefaultImpl : HeapDefaultIface { int value() { return 1; } ~HeapDefaultImpl() { heapDefaultDtors = heapDefaultDtors + 1; } };
+struct HeapDefaultHolder { unique HeapDefaultIface c = new HeapDefaultImpl(); };
 class COwn     { string s; int n; };                       // owning field: null, then teardown
 struct CBox<T> { T v; int tag; };                          // class inside a generic container
 
@@ -147,6 +151,15 @@ extern int main()
 {
     int passed = 0;
     int total = 0;
+
+    // An interface field initialized by a concrete heap implementation must be boxed by the
+    // synthesized default constructor, so dispatch sees a real vtable rather than null.
+    {
+        heapDefaultDtors = 0;
+        HeapDefaultHolder heapDefault = default;
+        total++; passed += Test("interface field heap default dispatch", heapDefault.c.value(), 1);
+    }
+    total++; passed += Test("interface field heap default frees once", heapDefaultDtors, 1);
 
     // ===== list<T> across element types =====
     list<int> li = {10, 20, 30};

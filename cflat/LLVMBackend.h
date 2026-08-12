@@ -1009,6 +1009,10 @@ public:
         uint64_t AllocAlignment = 0;     // per-allocation alignment from `new T[n] alignas(N)` (>16 = over-aligned); frees via __delete_aligned
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
         bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
+        // The block that established the current string-field borrow fact. A plain rebind may
+        // retire it only in this block; a conditional rebind must leave the fact conservative.
+        llvm::BasicBlock* OwnedStringBorrowBlock = nullptr;
+        llvm::Function* OwnedStringBorrowFunction = nullptr;
         bool IsOwningStruct = false;     // true for move parameters of struct types with destructors - destructor called on scope exit
         bool IsMoved = false;            // compile-time: true after this variable's ownership was transferred via a move call
         // compile-time: this argument was written 'move x' at a call site and is a VALUE type
@@ -1036,6 +1040,9 @@ public:
         // different owner already frees. Cleared by any later binding. See SetInterfaceBoxIsBorrowed.
         bool BorrowedInterfaceBox = false;
         std::string BorrowedInterfaceBoxSource; // pre-rendered owner list, for the diagnostic
+        // Owner slots behind a boxed join. Re-ask PointerRebound at delete time so a later
+        // null/rebind retires the stale boxed proof like a raw join.
+        std::vector<llvm::Value*> BorrowedInterfaceBoxSlots;
         // Sticky: set once any binding hands this local a box that is NOT proven, and never cleared.
         // From then on the local can never be rejected - walk order over the AST is not control flow.
         bool InterfaceBoxProvenanceUnknown = false;
@@ -1085,6 +1092,10 @@ public:
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
+        // The block that established the bond. A rebind in a nested block is conditional at the
+        // later source use and must not retire the bond for the whole function.
+        llvm::BasicBlock* BondDeclBlock = nullptr;
+        llvm::Function* BondDeclFunction = nullptr;
         // Capture names for lambda literals, in capture order. Empty for non-capturing lambdas.
         // Used to diagnose capturing lambdas passed to C function-pointer params (C ABI can't carry state).
         std::vector<std::string> LambdaCaptureNames;
@@ -1130,6 +1141,10 @@ public:
         // elsewhere) rather than a container-owned unique element. Selects the delete message only.
         bool BorrowedElementExternallyOwned = false;
         std::string OwnedElementContainer; // container variable name, for the delete diagnostic
+        // The block that established the current element-borrow fact. A conditional owned rebind
+        // cannot retire the fact globally, because the old element remains live on another path.
+        llvm::BasicBlock* OwnedElementBorrowBlock = nullptr;
+        llvm::Function* OwnedElementBorrowFunction = nullptr;
         // compile-time: this pointer local's DECLARATION plainly copied a live OWNING local
         // (`T* b = c;` / `alias T* b = c;`), which still frees the pointee at its own scope exit.
         // Retired by PointerRebound like the other declaration-time facts. Kept off the general
@@ -1514,6 +1529,9 @@ public:
         // PROVEN at the boxing site: a nameable OTHER owner frees this object anyway, so deleting
         // the box double-frees. See BindingKeepsOwnershipOfBoxedObject for what does and does not count.
         bool SourceKeepsOwner = false;
+        // The binding slot that proved SourceKeepsOwner, when the proof came from a named
+        // pointer. Consumers re-ask its PointerRebound state at the later delete site.
+        llvm::Value* SourceOwnerSlot = nullptr;
         // A join ARM boxed off a binding PROVABLY parked at null. It owns nothing, so the join-wide
         // ledger skips it as NEUTRAL instead of reading SourceKeepsOwner=false as a blocking arm.
         bool SourceProvablyNull = false;
@@ -2768,6 +2786,9 @@ private:
     // over `g = l.get(0)` clears it so a later `delete g` is allowed (see BorrowsOwnedElement).
     void SetVariableBorrowsOwnedElement(const std::string& name, bool value,
         const std::string& container, bool externallyOwned = false);
+
+    void SetInterfaceBoxBorrowSlots(const std::string& name,
+        const std::vector<llvm::Value*>& slots);
 
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount);
 

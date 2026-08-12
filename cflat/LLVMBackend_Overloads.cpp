@@ -1810,12 +1810,22 @@ std::string LLVMBackend::FindActiveBondBorrower(const std::string& sourceName) c
 
 void LLVMBackend::ClearVariableBond(const std::string& name)
 {
+        auto* here = builder != nullptr ? builder->GetInsertBlock() : nullptr;
+        auto* function = here != nullptr ? here->getParent() : nullptr;
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
         {
             if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
             {
+                // A rebind in a nested control-flow block is not known to run before every later
+                // use of the bonded value. Retire only a same-block store.
+                if (it->second.BondDeclBlock == nullptr
+                    || it->second.BondDeclBlock != here
+                    || it->second.BondDeclFunction != function)
+                    return;
                 it->second.IsBonded = false;
                 it->second.BondedSources.clear();
+                it->second.BondDeclBlock = nullptr;
+                it->second.BondDeclFunction = nullptr;
                 return;
             }
         }
@@ -1884,11 +1894,29 @@ void LLVMBackend::SetInterfaceBoxIsBorrowed(const std::string& name, bool borrow
                 nv->InterfaceBoxProvenanceUnknown = true;
                 nv->BorrowedInterfaceBox = false;
                 nv->BorrowedInterfaceBoxSource.clear();
+                nv->BorrowedInterfaceBoxSlots.clear();
                 return;
             }
             if (nv->InterfaceBoxProvenanceUnknown) return;
             nv->BorrowedInterfaceBox = true;
             nv->BorrowedInterfaceBoxSource = sourceName;
+            return;
+        }
+    }
+
+void LLVMBackend::SetInterfaceBoxBorrowSlots(const std::string& name,
+                                              const std::vector<llvm::Value*>& slots)
+{
+        if (name.empty()) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            NamedVariable* nv = nullptr;
+            if (auto it = frame.namedVariable.find(name); it != frame.namedVariable.end())
+                nv = &it->second;
+            else if (auto it2 = frame.functionArgument.find(name); it2 != frame.functionArgument.end())
+                nv = &it2->second;
+            if (nv == nullptr) continue;
+            nv->BorrowedInterfaceBoxSlots = slots;
             return;
         }
     }

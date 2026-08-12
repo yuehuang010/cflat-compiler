@@ -3393,6 +3393,10 @@ public:
      */
     bool BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVariable* nv) const;
 
+    // Re-ask the owner slots behind a boxed provenance proof. A later plain assignment may have
+    // nulled or rebound an arm, making the interface box the sole owner.
+    bool InterfaceBoxBorrowStillKeepsOwner(const LLVMBackend::NamedVariable& nv) const;
+
     /*
      * The AST name to blame, taken from the binding that ACTUALLY proved the claim - which is often
      * not `srcNV`: a self-field read and a container-element read both arrive here as a transient
@@ -3469,7 +3473,8 @@ public:
      * choice: naming only the first would state as fact something the run can contradict.
      */
     bool InterfaceBoxValueIsProvablyBorrowed(llvm::Value* fatValue,
-                                             std::vector<std::string>& sourceNames);
+                                             std::vector<std::string>& sourceNames,
+                                             std::vector<llvm::Value*>& ownerSlots);
 
     // "'a'", "'a' or 'b'", "'a', 'b' or 'c'" - every owner the value can carry, never just one.
     std::string DescribeInterfaceBoxOwners(const std::vector<std::string>& names) const;

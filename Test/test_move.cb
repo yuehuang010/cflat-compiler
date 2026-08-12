@@ -3382,6 +3382,41 @@ int testUniqueInterfaceTernary()
     }
     passed += Test("iface_nullcoalesce_move_return_freed_once", dtorCount, 2);
 
+    // A boxed join must re-ask its arm slot at the delete site. Once the selected arm is nulled,
+    // the box is the sole owner and rejecting it would force a leak.
+    dtorCount = 0;
+    {
+        CiMove* c = new CiMove();
+        IShapeMove s = nullptr ?? c;
+        c = nullptr;
+        delete s;
+        passed += Test("iface_boxed_join_nulled_arm_freed_once", dtorCount, 1);
+    }
+
+    // The same retirement through a rebound arm leaves two independent owners.
+    dtorCount = 0;
+    {
+        CiMove* c = new CiMove();
+        IShapeMove s = identityBool(true) ? c : c;
+        c = new CiMove();
+        delete s;
+        delete c;
+        passed += Test("iface_boxed_join_rebound_arm_freed_twice", dtorCount, 2);
+    }
+
+    // An owning local copied into a null pointer is transferred by the store. The boxed spelling
+    // must observe the post-transfer state, while a borrowed-parameter copy remains rejected in
+    // Test/errors/err_delete_borrowed_interface_box.cb.
+    dtorCount = 0;
+    {
+        CiMove* c = new CiMove();
+        CiMove* p = nullptr;
+        p = c;
+        IShapeMove s = p;
+        delete s;
+        passed += Test("iface_boxed_implied_move_freed_once", dtorCount, 1);
+    }
+
     return passed;
 }
 
@@ -10745,7 +10780,7 @@ extern int main()
     total += 8;
 
     passed += testUniqueInterfaceTernary();
-    total += 181;
+    total += 184;
 
     dtorCount = 0;
     {

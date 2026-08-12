@@ -5215,6 +5215,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     {
                         captureNV.IsAliasBorrow = true;
                         captureNV.IsClosureValueCapture = true;
+                        RecordAliasBorrowDeclBlock(compiler, captureNV);
                     }
                 }
             }

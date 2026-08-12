@@ -4582,7 +4582,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // move (above) makes the local a true owner, not a borrow, so skip the taint.
                         if (typeAndValue.TypeName == "string" && srcBorrowsOwnedString
                             && !srcMovableTempField && !didDeepCopyBorrowString)
-                            compiler->stackNamedVariable.back().namedVariable[name].BorrowsOwnedString = true;
+                            compiler->SetVariableBorrowsOwnedString(name, true);
 
                         // Propagate ownership: if the RHS was a heap-allocating string call,
                         // mark this local as owning so the destructor frees the buffer on scope exit.
@@ -4768,6 +4768,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             nv.IsBonded = true;
                             nv.BondByAddress = compiler->lastCallBondByAddress;
                             nv.BondedSources = compiler->lastCallBondedSources;
+                            nv.BondDeclBlock = compiler->builder->GetInsertBlock();
+                            nv.BondDeclFunction = nv.BondDeclBlock != nullptr
+                                ? nv.BondDeclBlock->getParent() : nullptr;
                             compiler->lastCallIsBonded = false;
                             compiler->lastCallBondByAddress = false;
                             compiler->lastCallBondedSources.clear();
@@ -4812,11 +4815,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         {
                             auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
                             if (!nv.IsOwning && !nv.IsNewAllocated)
-                            {
-                                nv.BorrowsOwnedElement = true;
-                                nv.OwnedElementContainer = srcOwnedElementContainer;
-                                nv.BorrowedElementExternallyOwned = srcElementExternallyOwned;
-                            }
+                                compiler->SetVariableBorrowsOwnedElement(
+                                    name, true, srcOwnedElementContainer, srcElementExternallyOwned);
                         }
 
                         // Tag a local declared from a '?:' / '??' JOIN whose every non-null arm

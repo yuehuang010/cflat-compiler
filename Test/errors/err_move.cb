@@ -1,5 +1,7 @@
 // Tests that using a variable after it has been moved is a compile-time error.
 
+import "list.cb";
+
 struct MoveResource { int id = 0; };
 void MoveResource(MoveResource* self) { self->id = 0; }
 void consume(move MoveResource* r) { delete r; }
@@ -10,6 +12,17 @@ void Holder(Holder* self) {}
 // An owning value struct, for the fixed-array-element store below.
 struct ArrElemBox { unique MoveResource* item = nullptr; };
 struct ArrElemNest { ArrElemBox inner = default; };
+
+// A conditional rebind is not a function-wide retirement of the container-element borrow.
+expect_error("cannot delete 'conditionalElem'") {
+    void conditionalElementRebind() {
+        list<unique MoveResource*> conditionalElemList;
+        conditionalElemList.add(new MoveResource());
+        MoveResource* conditionalElem = conditionalElemList.get(0);
+        if (conditionalElem == nullptr) { conditionalElem = new MoveResource(); }
+        delete conditionalElem;
+    }
+}
 
 // A by-value owning PARAMETER used as a positional brace element is consumed by the callee, so
 // the owning-sink inference must make it a sink and the CALLER must surrender its argument. Both
