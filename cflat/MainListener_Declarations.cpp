@@ -1212,6 +1212,12 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
         // Generic interface template - store for on-demand instantiation
         if (nameGid->genericTypeParameters() != nullptr)
         {
+            if (Compiler()->gts.scannedGenericStructNames.count(name) != 0
+                || genericStructTemplates.count(name) != 0
+                || genericClassTemplates.count(name) != 0)
+                LogErrorContext(ctx, std::format(
+                    "generic interface '{}' conflicts with a generic struct/class template of the same name",
+                    name));
             // Keyed on the namespace-QUALIFIED name, like a generic struct or class. The use site
             // resolves its spelled base to this key via LLVMBackend::ResolveGenericTemplateBase.
             auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());

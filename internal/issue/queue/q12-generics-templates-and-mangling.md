@@ -37,15 +37,17 @@ so there is nothing to disambiguate.
 ## Members
 
 Registration / templates:
-- `p2/generic-interface-name-vetoed-by-core-template` - struct/interface tie-break globally favors
-  any struct template, even an unrelated core-imported one.
 - `p2/last-segment-collision-still-shells-unknown-generic`
-- `p3/duplicate-generic-template-name-silently-accepted`
 
 Type arguments:
 
 Mangling / symbols:
-- `p2/zero-parameter-generic-function-emits-double-mangled-symbol` (undiagnosed)
+- `p2/zero-parameter-generic-function-emits-double-mangled-symbol` - fixed in the earlier Q12
+  mangling commit; its value regression is now in `Test/test_generics.cb`.
+
+The same-scope generic struct/interface collision is now a hard diagnostic. The core-template
+name-veto and duplicate-template members are closed by that rule; `Test/test_generics.cb` uses
+distinct struct/interface names so it no longer relies on the collision.
 
 Fixed in Q12:
 
@@ -62,10 +64,9 @@ Fixed in Q12:
    collision check somewhere to live.
 2. Q12 routes generic-function type arguments through `ResolveTypeArgEntry`; the closure and array-view
    items then reduce to adding the two exclusions in one place.
-3. Q12 handles variadic free-function substitution and arity; the zero-parameter item remains
-   active because its current repro now passes on the Q12 pre-fix binary and needs a fresh witness.
-4. The collision and last-segment shell items remain deferred by their recorded language/diagnostic
-   constraints. Generic `sizeof` resolution is now shared with Q14's type-name grammar path.
+3. Q12 handles variadic free-function substitution and arity, including zero-value-parameter
+   explicit instantiation. Generic `sizeof` resolution is now shared with Q14's type-name grammar path.
+4. The last-segment shell item remains deferred by its recorded language/diagnostic constraints.
 
 Fully disjoint from the ownership buckets; good parallel work. The generic `sizeof` items landed
 with q14, which owns the surrounding grammar ambiguity.

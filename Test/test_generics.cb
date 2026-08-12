@@ -13,6 +13,7 @@ T forwardFunction<T>(T value) { return value + 1; }
 
 T closureIdentity<T>(T value) { return value; }
 T countPack<T...>() { return (T)sizeof(T); }
+int zeroValueGeneric<T>() { T value = default; return 7; }
 int doubleValue(int x) { return x * 2; }
 
 interface FunctionBase<T> { T Get(); };
@@ -88,6 +89,7 @@ bool testGenericBox()
     Box<i32> i32Box = default;
     i32Box.value = 100;
     result &= Test("generic_box_i32", i32Box.value, 100);
+    result &= Test("generic_zero_value_parameters", zeroValueGeneric<Box<int>>(), 7);
 
     return result;
 }
@@ -241,7 +243,7 @@ bool testInterface()
 
 
 // Generic interface for storing and retrieving a value
-interface Container<T>
+interface IContainer<T>
 {
     T Get();
     void Set(T value);
@@ -253,7 +255,7 @@ struct MyInt
 };
 
 // Generic struct template with type parameter T implementing Container<T>
-class Storage<T> : Container<T>
+class Storage<T> : IContainer<T>
 {
     T data = default;
 
@@ -268,7 +270,7 @@ class Storage<T> : Container<T>
     }
 };
 
-T ExtGet<T>(Container<T> container)
+T ExtGet<T>(IContainer<T> container)
 {
     T value = container.Get();
     return value;

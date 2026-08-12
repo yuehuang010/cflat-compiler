@@ -4,6 +4,8 @@
 // "does not implement" on a method the class never declared). Two interfaces named
 // the same in DIFFERENT namespaces are fine - each registers as "ns.IFace" - but a
 // redefinition within one scope is now rejected.
+import "list.cb";
+
 expect_error("interface 'IDupIface' is already defined at")
 {
     interface IDupIface { int a(); };
@@ -39,6 +41,22 @@ import "iface_defsite_helper/err_duplicate_interface_name.cb";
 expect_error("err_duplicate_interface_name.cb(41,4) - an interface name must be unique within its namespace")
 {
     interface IFooDefsite { i64 b(); };
+}
+
+// Generic struct/interface collisions are rejected before either role can silently win the
+// shared bare-name lookup. The forward scan sees both templates; this source order reaches the
+// struct declaration's collision diagnostic first.
+expect_error("generic struct 'GenericCollision' conflicts with a generic interface of the same name")
+{
+    struct GenericCollision<T> { T value = default; };
+    interface GenericCollision<T> { T get(); };
+}
+
+// A core generic class occupies the same global template key space. A user interface may not
+// silently lose that name and later fail as an unrelated unknown method.
+expect_error("generic interface 'list' conflicts with a generic struct/class template of the same name")
+{
+    interface list<T> { T Get(); };
 }
 
 extern int main()

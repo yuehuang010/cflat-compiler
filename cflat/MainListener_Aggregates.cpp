@@ -43,6 +43,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
         // If this is a generic template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
+            if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
+                || genericInterfaceTemplates.count(structName) != 0)
+                LogErrorContext(ctx, std::format(
+                    "generic struct '{}' conflicts with a generic interface of the same name",
+                    structName));
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericStructTemplates[structName] = ctx;
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
@@ -2633,6 +2638,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // If this is a generic template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && ctx->genericTypeParameters() != nullptr)
         {
+            if (Compiler()->gts.scannedGenericInterfaceNames.count(structName) != 0
+                || genericInterfaceTemplates.count(structName) != 0)
+                LogErrorContext(ctx, std::format(
+                    "generic class '{}' conflicts with a generic interface of the same name",
+                    structName));
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericClassTemplates[structName] = ctx;
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
