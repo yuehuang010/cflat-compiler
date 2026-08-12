@@ -22,14 +22,14 @@ member list is empty.
 | q08 | for-in loop variable | `3a663e1` |
 | q11 | Global, program-lifetime and static storage | `f29e727` |
 | q09 | Return-dangle and escape analysis | `6c12e96` |
+| q10 | move sinks and move spelling | this commit |
 | q12 | Generics: templates and mangling | `eddf712` |
-| q14 | Parser and expression grammar | this commit |
+| q14 | Parser and expression grammar | `e542618` |
 
 ## Suggested order
 
 | # | Bucket | Items | Why here |
 |---|--------|-------|----------|
-| q10 | [move sinks and move spelling](q10-move-sinks-and-spelling.md) | 2 | Closure return qualifiers landed; deferred/design items remain |
 | q13 | [Fixed arrays and aggregate init](q13-fixed-arrays-and-aggregate-init.md) | 4 | Five fixes landed; construction semantics remain |
 | q15 | [Lambdas, closures, funcptr typing](q15-lambdas-closures-funcptr-typing.md) | 2 | Nested expected-type propagation and null callable design remain |
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
@@ -46,7 +46,7 @@ fix work. Status:
 | q06 | **SETTLED - no decision was needed.** The repo had already ratified it: unknown ACCEPTS. The bucket file's proposal to make unknown reject was wrong and is corrected. The interface half of the p1 item is CLOSED, not open. |
 | q08 | **SETTLED and fixed.** The `for-in` loop variable is a BORROW of the element; assignment writes through to the container element. The landed implementation also rejects overwriting the borrowed collection storage and deep-copies returned values. |
 | q09 | **SETTLED and partially fixed.** Same ratified rule as q06. The bucket file's proposal to invert to fail-closed contradicted a ruling reached after three abandoned attempts, and is corrected. The two always-wrong escape members are fixed; the third is now UNBLOCKED - its q02 prerequisite landed in `b911ccc` and it was skipped on a stale blocker. |
-| q10 | **PARTIALLY FIXED; the grammar half is now RULED.** Closure return types will accept `move` and `alias` (not `unique`) - see `p2/lambda-return-type-cannot-be-spelled-move-or-alias`. Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule (deferred until `list`/`dictionary`/btree settle) and the conditional-termination guard half remain deferred. |
+| q10 | **BUCKET CLOSED 2026-08-12; the grammar half was RULED.** Closure return types will accept `move` and `alias` (not `unique`) - see `p2/lambda-return-type-cannot-be-spelled-move-or-alias`. Indirect POD move handling, forward/local alias sink inference, function-pointer allocation-alignment propagation, and lambda diagnostic wording are fixed. The move-of-borrow rule (RULED DEFER 2026-08-10, until `list`/`dictionary`/btree settle) and the conditional-termination guard half remain deferred - both are ratified deferrals with recorded rulings, so the bucket file survives only to carry them. No actionable work remains. |
 | q11 | **RULED 2026-08-11, IMPLEMENTED, bucket closed.** Static-local ownership-origin reporting and DWARF visibility were already fixed. A spike (`scratch/uniqglobal/`) then showed the `unique T*` arm ALREADY implements the Rust model and struct globals implement the C++ one, so the maintainer ruled the Rust model for both: owning globals stay legal, implicit consume is an error, explicit `move` re-initializes, and NOTHING at global/static scope is destructed at exit. The core-globals worry was unfounded: `globalDtorOrder_` was already gated on `!currentSourceIsCore_`, so point 4 only ever affected USER globals. All three members are fixed and their files deleted. |
 | q12 | **RULED 2026-08-11 and UNBLOCKED.** Generic function registration, closure/array-view type arguments, variadic free functions, and generic `sizeof` operands are fixed. The two name-collision items were blocked only by `Test/test_generics.cb`'s deliberate `Container<T>` collision; the maintainer authorized renaming the interface leg, so a same-name generic struct/interface collision becomes a hard `LogError` at the second declaration. | **CLOSED 2026-08-12:** the last-segment shell fallback in `AnyGenericTypeTemplateNamed` is removed, so a bare spelling that names no visible key reports `unknown type` like any other undeclared name; the three `err_namespaced_generic_iface_*` messages were re-ratified with maintainer authorization.
 | q13 | **PARTIALLY FIXED.** Fixed-array rejection, nested/char-row initialization, and field default construction are fixed. Side-effect folding and owning-value replacement/read semantics remain active. |
