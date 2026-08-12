@@ -879,49 +879,6 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         }
     }
 
-void LLVMBackend::EmitGlobalDestructorsInMain()
-{
-        llvm::Function* mainFn = module->getFunction("main");
-        if (!mainFn || mainFn->isDeclaration())
-            return;
-
-        std::vector<std::pair<llvm::GlobalVariable*, llvm::Function*>> work;
-        for (auto it = globalDtorOrder_.rbegin(); it != globalDtorOrder_.rend(); ++it)
-        {
-            auto gIt = globalNamedVariable.find(*it);
-            auto tIt = globalVariableTypes.find(*it);
-            if (gIt == globalNamedVariable.end() || tIt == globalVariableTypes.end()) continue;
-
-            const TypeAndValue& tv = tIt->second;
-            // A global that is DIRECTLY an owning fixed array (`SBox g[3];`) is still skipped: not
-            // part of the struct-field triad (dtor/copy/clear), and skipping only leaks at exit
-            // (OS reclaims) - never a double free. A scalar global whose struct type merely
-            // CONTAINS an owning array field is handled correctly by its now-array-aware full dtor.
-            if (tv.Pointer || tv.IsArrayView || tv.IsInterface || tv.ConstArraySize > 0) continue;
-            if (!IsOwningValueType(tv.TypeName)) continue;
-            if (auto* dtor = GetOrCreateFullDestructor(tv.TypeName))
-                work.emplace_back(gIt->second, dtor);
-        }
-        if (work.empty())
-            return;
-
-        // Under -g every call needs a !dbg location or the verifier rejects it; reuse the
-        // return's own location, falling back to the subprogram scope.
-        llvm::DISubprogram* sp = mainFn->getSubprogram();
-        for (llvm::BasicBlock& bb : *mainFn)
-        {
-            auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb.getTerminator());
-            if (!ret) continue;
-            llvm::IRBuilder<> b(ret);
-            if (ret->getDebugLoc())
-                b.SetCurrentDebugLocation(ret->getDebugLoc());
-            else if (sp)
-                b.SetCurrentDebugLocation(llvm::DILocation::get(*context, sp->getLine(), 0, sp));
-            for (const auto& [gVar, dtor] : work)
-                b.CreateCall(dtor->getFunctionType(), dtor, { gVar });
-        }
-    }
-
 bool LLVMBackend::JitRun(int& runExitCode)
 {
         runExitCode = 0;

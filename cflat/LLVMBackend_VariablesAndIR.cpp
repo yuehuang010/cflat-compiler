@@ -183,13 +183,11 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         globalNamedVariable[typeValue.VariableName] = gVar;
         globalVariableTypes[typeValue.VariableName] = typeValue;
 
-        // Record definition order for end-of-main destruction (see EmitGlobalDestructorsInMain).
-        // Externs (not ours to free), thread-locals (main destroys only its own copy) and
-        // core-library globals (process-lifetime infrastructure) are excluded.
-        if (!externalDecl && !threadLocal && !currentSourceIsCore_ && !typeValue.VariableName.empty()
-            && std::find(globalDtorOrder_.begin(), globalDtorOrder_.end(), typeValue.VariableName)
-               == globalDtorOrder_.end())
-            globalDtorOrder_.push_back(typeValue.VariableName);
+        // q11 ruling point 4: a global / `static` owner is NEVER destructed - its lifetime cannot
+        // be proven, so no exit-time teardown is synthesized. Core globals, externs and
+        // thread-locals were already excluded here before the ruling; it extends that to user
+        // globals, making the two storage arms agree. Deterministic cleanup is spelled
+        // `move g` into a local, which re-initializes the storage and destructs at scope exit.
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);

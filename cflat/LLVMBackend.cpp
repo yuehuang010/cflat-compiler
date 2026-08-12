@@ -812,8 +812,6 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
             // element type was incomplete when the container dtor was emitted).
             EmitDeferredFullDestructorBodies();
-            // Every return in main is now lowered: destruct global owning values on each of them.
-            EmitGlobalDestructorsInMain();
         }
         stream.close();
         if (verbose) std::cout << "[verbose]   walk complete\n";
@@ -2526,7 +2524,6 @@ void LLVMBackend::ResetForReanalysis()
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
-    globalDtorOrder_.clear();
     namespaceTable.clear();
     stringPool.clear();
     stackNamedVariable.clear();
@@ -5033,7 +5030,6 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
-    globalDtorOrder_.clear();
     namespaceTable.clear();
     typeAliases.clear();
     manglingAliases_.clear();

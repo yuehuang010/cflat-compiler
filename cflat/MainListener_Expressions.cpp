@@ -1504,6 +1504,29 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
                     compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
+                /*
+                 * q11: a GLOBAL pointer destination (`g = p;`). The block below is gated on
+                 * alloca storage and its ledger only walks stackNamedVariable, so a global has
+                 * no slot to carry the fact and `delete g` was accepted where the identical
+                 * local spelling is rejected. Record it in the per-function global ledger
+                 * instead - same-function only, so a program-wide false rejection cannot arise
+                 * (see globalAssignBorrowOrigin_). A store that does NOT carry a borrow retires
+                 * any earlier fact, so a rebind to fresh memory is not poisoned by it.
+                 */
+                if (namedVar.TypeAndValue.Pointer && namedVar.FieldName.empty()
+                    && namedVar.Storage != nullptr
+                    && llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+                {
+                    // Keyed on the STORAGE, not the name: GetGlobalVariableNV records no
+                    // CallerName, so a global arrives unnamed at both this store and the delete.
+                    const std::string globalBorrowOrigin = rightNV.BorrowedOrigin.empty()
+                        ? rightNV.CallerName : rightNV.BorrowedOrigin;
+                    if (rightNV.IsBorrowed && !rightNV.TypeAndValue.IsMove
+                        && !globalBorrowOrigin.empty())
+                        compiler->globalAssignBorrowOrigin_[namedVar.Storage] = globalBorrowOrigin;
+                    else
+                        compiler->globalAssignBorrowOrigin_.erase(namedVar.Storage);
+                }
                 // Retire the declaration-time "someone else frees this" facts about a POINTER
                 // binding that has just been pointed elsewhere - UNLESS the RHS binding proves an
                 // owner of its own, in which case the proof is carried across. `p = q;` between two
@@ -2581,6 +2604,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 AssignSourceKind kind;
                 llvm::Value* toStore = ClassifyOwningAssignSource(
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                if (kind == AssignSourceKind::Move
+                    && RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
+                    return finishStore(right);
                 if (!destIsAliasBorrowLocal)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
@@ -2622,6 +2649,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                if (kind == AssignSourceKind::Move
+                    && RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
                     return finishStore(right);
                 if (kind == AssignSourceKind::Move && destination == rightNV.Storage)
                     return finishStore(right);
@@ -2692,6 +2723,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right, rightNV.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                if (kind == AssignSourceKind::Move
+                    && RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
                     return finishStore(right);
                 if (kind == AssignSourceKind::Move)
                 {
@@ -2770,6 +2805,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
                 if (kind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                if (kind == AssignSourceKind::Move
+                    && RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
                     return finishStore(right);
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
@@ -3203,6 +3242,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     right, slotElemType, rightNV.TypeAndValue.IsMove, ctx, slotKind);
                 if (slotKind == AssignSourceKind::Move
                     && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                    return finishStore(right);
+                if (slotKind == AssignSourceKind::Move
+                    && RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
                     return finishStore(right);
                 compiler->builder->CreateStore(toStore, destination);
                 if (slotKind == AssignSourceKind::Move && rightNV.Storage != nullptr)
@@ -7754,6 +7797,7 @@ void MainListener::ConsumeOwningBraceElementSource(
                                          nv.TypeAndValue.IsMove, ctx, kind);
         if (kind != AssignSourceKind::Move) return;
         if (RejectConsumeOfBorrowedByValueParamField(compiler, nv, ctx)) return;
+        if (RejectImplicitConsumeOfOutlivingOwner(compiler, nv, nv.TypeAndValue.IsMove, ctx)) return;
         compiler->builder->CreateStore(
             llvm::ConstantAggregateZero::get(val->getType()), nv.Storage);
         // Only a named slot has a spelling to report a later use of; an indirect lvalue
@@ -8963,6 +9007,30 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 return {};
             }
 
+            /*
+             * q11: the GLOBAL spelling of the check just above (`g = p; delete g;`). The fact
+             * lives in the per-function global ledger rather than on a NamedVariable, because
+             * GetGlobalVariableNV builds a fresh NV per lookup and carries no borrow bits.
+             * Same-function only by construction.
+             */
+            if (!namedVar.IsOwning
+                && namedVar.Storage != nullptr
+                && llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+            {
+                auto gb = compiler->globalAssignBorrowOrigin_.find(namedVar.Storage);
+                if (gb != compiler->globalAssignBorrowOrigin_.end())
+                {
+                    std::string name = namedVar.CallerName.empty()
+                        ? namedVar.Storage->getName().str() : namedVar.CallerName;
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete '{}' - it aliases borrowed parameter '{}'. The caller may own "
+                        "this pointer and will free it on scope exit. Declare the source parameter "
+                        "'move {}' to take ownership.",
+                        name, gb->second, gb->second));
+                    return {};
+                }
+            }
+
             // Error: deleting a plain copy of an OWNING local (`T* b = c;`, `alias T* b = c;`). The
             // source still frees the pointee at its own scope exit, so this delete double-frees.
             // Retired by any reassignment: a rebound copy is the sole owner of what it now holds.
@@ -9341,6 +9409,46 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
             "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
             "field without storing it (a read borrows, a store consumes).",
             srcNV.OwningStructName, srcNV.FieldName, root, root));
+        return true;
+    }
+
+bool MainListener::RejectImplicitConsumeOfOutlivingOwner(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        bool srcIsMove, antlr4::ParserRuleContext* ctx) {
+        // Explicit `move` is the sanctioned spelling: it transfers AND re-initializes the storage
+        // (q11 point 3), so the next entry reads a defined value. Only the implicit store is wrong.
+        if (srcIsMove || srcNV.TypeAndValue.IsMove) return false;
+        if (srcNV.Storage == nullptr) return false;
+        // A field path's Storage is a GEP into the base object; strip GEPs and casts so the
+        // question is asked of the real storage, not of the access path.
+        const llvm::Value* obj = srcNV.Storage;
+        for (int hop = 0; hop < 8; hop++)
+        {
+            if (auto* gep = llvm::dyn_cast<llvm::GEPOperator>(obj)) { obj = gep->getPointerOperand(); continue; }
+            if (auto* bc = llvm::dyn_cast<llvm::BitCastOperator>(obj)) { obj = bc->getOperand(0); continue; }
+            break;
+        }
+        // A `static` local carries module-lifetime GlobalVariable storage too, so both storage
+        // classes the ruling names are covered by this one test.
+        if (!llvm::isa_and_nonnull<llvm::GlobalVariable>(obj)) return false;
+        // GetGlobalVariableNV records no CallerName, so a whole-global source arrives unnamed.
+        // Recover the spelling from the GlobalVariable itself, and use the lookup as the
+        // user-global test - it keeps compiler-internal globals (literals, vtables) out.
+        const std::string globalName = obj->getName().str();
+        if (compiler->globalVariableTypes.find(globalName) == compiler->globalVariableTypes.end())
+            return false;
+
+        std::string spelling = srcNV.CallerName.empty() ? globalName : srcNV.CallerName;
+        if (!srcNV.FieldName.empty()) spelling += "." + srcNV.FieldName;
+        const std::string message = std::format(
+            "cannot consume owning value '{}' out of storage that outlives this function - a global "
+            "or 'static' local is never re-initialized between entries, so this store empties it and "
+            "the next execution reads an empty value. Write 'move {}' to take the value and "
+            "re-initialize the storage, or give '{}' a 'copy()' method and copy it.",
+            spelling, spelling, srcNV.TypeAndValue.TypeName);
+        // The declaration-init caller (EmitImplicitUniqueFieldMove) carries no parse context.
+        if (ctx != nullptr) LogErrorContext(ctx, message);
+        else                compiler->LogError(message);
         return true;
     }
 

@@ -1218,6 +1218,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         // Sibling of the currentFunctionReturn* fields set inside createFunctionBlock: retain the
         // full return TypeAndValue so a returned lambda literal can adopt a function<> return type.
         currentFunctionReturnTV = returnType;
+        // Per-function by construction: see globalAssignBorrowOrigin_'s comment.
+        globalAssignBorrowOrigin_.clear();
 
         if (diBuilder && diFile && line > 0)
         {

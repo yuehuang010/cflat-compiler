@@ -327,6 +327,34 @@ void rwSink(unique UniqueThing* p) { }
  * `c ? &g : &g2` used to find no proof and accept while the single-global spelling one line over
  * was diagnosed. The rule is ALL arms: these callees have no arm naming local memory.
  */
+// q11: global owning storage for the implicit-consume rejection legs at the end of main. The
+// pointer arm was already rejected before the ruling; the owning-VALUE arm (UqgBox) is the one
+// the ruling changed, and the FIELD-DEFAULT arm below is the spelling with no cue that it is
+// one-shot - it is written once but runs on every construction of the type.
+unique UniqueThing* uqgErrGlobal = nullptr;
+struct UqgBox { unique UniqueThing* item = nullptr; };
+UniqueThing* gTaintDest = nullptr;
+// q11: the GLOBAL destination of a borrow taint. `gTaintDest = p; delete gTaintDest;` was
+// accepted (rc 134, no diagnostic) while the identical LOCAL spelling was rejected, because the
+// taint ledger only walks stack frames. Same-function only by construction, so a delete in a
+// LATER function stays accepted - unknown accepts.
+expect_error("cannot delete 'gTaintDest' - it aliases borrowed parameter 'taintP'") {
+    void gTaintDelete(UniqueThing* taintP) { gTaintDest = taintP; delete gTaintDest; }
+}
+UqgBox uqgErrBox;
+UqgBox uqgErrSeed;
+struct UqgOuter { UqgBox b; };
+UqgOuter uqgErrRet;
+// The RETURN spelling of the same rule: handing an owning FIELD of a global to the caller
+// consumes storage that is never re-initialized, so the second call would read it empty.
+// `return move uqgErrRet.b;` is the sanctioned form (see test_move.cb's rfldGlobal), as is a
+// copyable owner.
+expect_error("cannot consume owning value 'uqgErrRet.b' out of storage that outlives this function") {
+    UqgBox uqgRetGlobalField() { return uqgErrRet.b; }
+}
+expect_error("cannot consume owning value 'uqgErrSeed' out of storage that outlives this function") {
+    struct UqgFdWrap { UqgBox[2] arr = { uqgErrSeed }; };
+}
 UniqueThing* gSelA = nullptr;
 UniqueThing* gSelB = nullptr;
 UniqueThing* gSelC = nullptr;
@@ -1179,6 +1207,25 @@ extern int main()
     // Arms that are LOADS of global pointer variables, not addresses of globals.
     expect_error("'selOfGlobalLoads' stores that pointer into a global") {
         selOfGlobalLoads(makeJoinBox().item, 1);
+    }
+
+    // q11 ruling (2026-08-11): the ASSIGNMENT spelling of the same rule, on a non-copyable owning
+    // VALUE. Ratified the other way until this ruling (test_move.cb leg 7 asserted the global was
+    // silently nulled); the second execution of the statement read an empty value with no
+    // diagnostic. `move uqgErrBox` and a `copy()` method are both accepted - see test_move.cb.
+    expect_error("cannot consume owning value 'uqgErrBox' out of storage that outlives this function") {
+        UqgBox uqgLocal;
+        uqgLocal = uqgErrBox;
+        printf("%d\n", uqgLocal.item == nullptr ? 0 : 1);
+    }
+
+    // q11 ruling (2026-08-11): an IMPLICIT consume out of global owning storage is an error -
+    // the global still owns the value, so the new local would be a second owner. The sanctioned
+    // spelling is `move`, which nulls the global; its accept legs are in Test/test_move.cb
+    // (testUniqueGlobalStorage). This is the storage-duration case of the same rule.
+    expect_error("cannot initialize unique 'uqgBorrowed' from a borrowed value") {
+        unique UniqueThing* uqgBorrowed = uqgErrGlobal;
+        printf("%d\n", uqgBorrowed->get());
     }
 
     return 0;

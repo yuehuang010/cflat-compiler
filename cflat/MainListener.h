@@ -2844,13 +2844,12 @@ public:
     // Explicitly release a live owning GLOBAL NOW (the `_ = move g;` form). Globals have no
     // stackNamedVariable frame, so this mirrors ReleaseOwningLocalNow but resolves the
     // NamedVariable via GetGlobalVariableNV (globalNamedVariable/globalVariableTypes) instead.
-    // Nulling the global's storage after DropValue is load-bearing: EmitGlobalDestructorsInMain
-    // runs the same type's full destructor over every global at exit, and that destructor reads
-    // the runtime owned-bit from storage - zeroing it here makes that later call a no-op instead
-    // of a double free.
+    // Nulling the global's storage after DropValue is the q11 point-3 re-initialization: the
+    // storage outlives the frame, so leaving a released husk behind would hand the next read (or
+    // a second discard of the same global) a freed value. There is no exit-time destructor to
+    // coordinate with - q11 point 4 removed it - so this is the ONLY release a global ever gets.
     // Only covers the shapes OwnsDroppableResource recognizes (string, owning value struct); a
-    // `unique T*` / unique-interface / closure global is NOT released here, matching
-    // EmitGlobalDestructorsInMain's own Pointer/IsInterface skip at exit.
+    // `unique T*` / unique-interface / closure global is NOT released here.
     void ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const std::string& name);
 
     // Recover ownership of a local/temp that was `move`d out of a container element slot. The slot
@@ -4477,6 +4476,19 @@ public:
     bool RejectConsumeOfBorrowedByValueParamField(
         LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
         antlr4::ParserRuleContext* ctx);
+
+    /*
+     * q11 ruling point 2: reject an IMPLICIT consuming store whose source is storage that
+     * OUTLIVES the frame - a file-scope global or a `static` local. Such storage is not
+     * re-initialized between entries, so the transfer silently empties it and the second
+     * execution of the same statement reads nothing. Explicit `move` stays legal (it is the
+     * sanctioned spelling and re-initializes the storage), and a copyable owner never reaches
+     * here because it takes the copy arm. Returns true (and has already reported) when the
+     * store must not be lowered.
+     */
+    bool RejectImplicitConsumeOfOutlivingOwner(
+        LLVMBackend* compiler, const LLVMBackend::NamedVariable& srcNV,
+        bool srcIsMove, antlr4::ParserRuleContext* ctx);
 
     // Reject an owning-field overwrite when the field path roots at a borrowed by-value
     // parameter or an alias-borrow local. The drop-old destructor would free the real owner's

@@ -1726,9 +1726,20 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
                         if (strTy)
                         {
-                            auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
-                            auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
-                            builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                            // q11 ruling point 3: a move out of PROGRAM-LIFETIME storage re-initializes
+                            // it, so the next entry reads a defined value. Nulling _ptr alone leaves
+                            // _len stale, and `string` is { i8* _ptr, i32 _len } - the next run then
+                            // reads a stale length off a null pointer and segfaults. A frame local
+                            // cannot observe this (its declaration re-runs, and reads after the move
+                            // are rejected), so only the outliving storage class is widened here.
+                            if (llvm::isa<llvm::GlobalVariable>(srcStorage))
+                                builder->CreateStore(llvm::ConstantAggregateZero::get(strTy), srcStorage);
+                            else
+                            {
+                                auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
+                                auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
+                                builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                            }
                         }
                     }
                     else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
@@ -2005,11 +2016,20 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 auto* rawLen = builder->CreateExtractValue(value, { 1u }, "litlenraw");
                 // Owned bit is _len's high bit - already-owned strings transfer without a copy.
                 auto* alreadyOwned = builder->CreateICmpSLT(rawLen, builder->getInt32(0), "movearg.owned");
+                // An EMPTY/default string ({ null, 0 }) has the owned bit clear but no buffer to
+                // copy from: the copy path would memcpy 1 byte off a null _ptr and segfault. It
+                // owns nothing, so transfer it as-is and let the callee's destructor no-op on the
+                // null buffer. Reachable without any global (`string s = default; sink(move s);`)
+                // and also as the re-initialized state q11 leaves in program-lifetime storage.
+                auto* srcIsNull = builder->CreateICmpEQ(
+                    srcPtr, llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo()),
+                    "movearg.empty");
+                auto* skipCopy = builder->CreateOr(alreadyOwned, srcIsNull, "movearg.nocopy");
                 auto* transferBB = builder->GetInsertBlock();
                 auto* fn = transferBB->getParent();
                 auto* copyBB  = llvm::BasicBlock::Create(*context, "movearg.copy",  fn);
                 auto* mergeBB = llvm::BasicBlock::Create(*context, "movearg.merge", fn);
-                builder->CreateCondBr(alreadyOwned, mergeBB, copyBB);
+                builder->CreateCondBr(skipCopy, mergeBB, copyBB);
 
                 // Non-owning source: heap-copy the bytes (plus the null terminator) and set
                 // the OWNED bit. Mask off _len's high bit before using it as a byte count -

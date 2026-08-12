@@ -2656,3 +2656,39 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   release for a union arm. An explicitly written union destructor still runs. Managed alternatives
   belong in a wrapper struct with a separate tag and explicit cleanup; do not retry an in-layout
   discriminant or a compiler side table for raw unions.
+- **The 2026-08-11 q11 global/static storage ruling** (landed; three issue files retired): owning
+  types are LEGAL at global and `static` scope; an IMPLICIT consume out of such storage is an
+  ERROR; explicit `move g` is the sanctioned spelling and RE-INITIALIZES the storage so re-entry is
+  defined; nothing at global/static scope is destructed at exit; program-lifetime storage is the
+  `thread_local` analog and re-initializes per entry. Chosen as Rust's model (statics are never
+  dropped, moving out of a static is rejected, `Option::take` is the way out) over C++'s
+  (`__cxa_atexit` teardown plus a silent `std::move` out of a global). Facts worth keeping:
+  (1) **Measure before ruling.** The premise the question was first framed on - "globals are never
+  destructed" - was FALSE: `unique T*` globals already implemented the Rust model in full while
+  struct globals implemented the C++ one, and the ruling was really "which arm moves". A spike
+  (`scratch/uniqglobal/`) settled in minutes what the issue files had left ambiguous for two rounds.
+  (2) **The C++ static destruction order fiasco does NOT apply to CFlat** and must not be cited as
+  a reason to change anything here: a global cannot forward-reference a later global (`Undefined
+  variable`), and reverse-declaration destruction holds ACROSS IMPORTS, so dependencies always
+  outlive dependents. Verified, not assumed. (3) `core/` was never at risk from the never-destruct
+  point: `globalDtorOrder_` registration was already gated on `!currentSourceIsCore_` (plus externs
+  and thread-locals), and static locals were already never destructed. Read the registration filter
+  before estimating the blast radius of removing a teardown - the first estimate written into the
+  bucket file was wrong and would have scared off the right decision.
+  (4) **A ruling that contradicts ratified test legs is a maintainer call, not a fix-time one.**
+  `test_move.cb`'s `rfld_global_*` and `oai_global_*` legs asserted the silent consume this ruling
+  makes an error; they were converted to the `move` spelling with the maintainer's explicit
+  re-ratification, and the old behaviour became `expect_error` legs. Surface the conflict and stop;
+  do not weaken the legs to make a ruling land.
+  (5) The re-entry crash was NOT global-specific. `move` of a `string` zeroed only `_ptr`, leaving
+  `_len` stale, and the move-argument copy path then memcpy'd off a null buffer - reachable with no
+  global at all (`string s = default; sink(move s);`). Two fixes: full-zero the source for
+  program-lifetime storage, and treat a null `_ptr` as nothing-to-copy at the sink. When a bug is
+  filed against one storage class, check whether the mechanism is storage-agnostic first.
+  (6) A global carries NO `CallerName` (`GetGlobalVariableNV` sets none) and has no
+  `stackNamedVariable` slot, so any per-binding ledger silently no-ops on globals. Both q11 guards
+  had to key on the STORAGE pointer and recover the spelling from `GlobalVariable::getName()`.
+  The borrow-taint ledger is deliberately per-FUNCTION (cleared at every function entry): a global
+  binding is program-wide and this walk is not control-flow aware, so keeping the fact across
+  functions turns a local false rejection into a program-wide one. Cross-function `delete` stays
+  accepted - unknown accepts.

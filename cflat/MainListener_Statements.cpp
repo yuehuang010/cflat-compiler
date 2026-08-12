@@ -1156,8 +1156,14 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 right, returnNV.TypeAndValue.TypeName, returnNV.TypeAndValue.IsMove, errCtx, kind);
             // The same guard the six store arms run after their classify: consuming a field of a
             // borrowed by-value parameter nulls only the callee's copy of it (double free).
+            // q11 point 2: the same rule the store arms apply - returning an owning value out of
+            // a global / `static` local consumes storage that is never re-initialized, so the
+            // next call reads it empty. Explicit `move` remains the sanctioned spelling.
             if (kind != AssignSourceKind::Move
                 || !RejectConsumeOfBorrowedByValueParamField(compiler, returnNV, errCtx))
+            if (kind != AssignSourceKind::Move
+                || !RejectImplicitConsumeOfOutlivingOwner(
+                        compiler, returnNV, returnNV.TypeAndValue.IsMove, errCtx))
             {
                 if (kind == AssignSourceKind::Move)
                     compiler->builder->CreateStore(

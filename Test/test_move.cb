@@ -4467,9 +4467,13 @@ struct OaiSWrap  { OaiSBox b; };
 OaiBox oaiGlobal;
 
 // The FIELD-DEFAULT brace path (EmitFieldDefaultFixedArrayBrace -> the same slot emitter as the
-// local declarator). Its source has to outlive the struct declaration, so it is a global.
-OaiBox oaiFdSeed;
-struct OaiFdWrap { OaiBox[2] arr = { oaiFdSeed }; };
+// local declarator). Its source has to outlive the struct declaration, so it is necessarily a
+// GLOBAL - and the q11 ruling makes an implicit consume out of global storage an error, since a
+// field default is written once but runs per construction. The legal spelling is therefore a
+// COPYABLE owner, which takes the copy arm and leaves the seed live for the next construction.
+// The rejection of the non-copyable spelling lives in Test/errors/err_move.cb.
+OaiCopyBox oaiFdSeed;
+struct OaiFdWrap { OaiCopyBox[2] arr = { oaiFdSeed }; };
 
 int oaiId(OaiBox b)
 {
@@ -4580,17 +4584,25 @@ int testOwningAssignFromIndirectSource()
     }
     passed += Test("oai_fieldofelem_freed_once_each", dtorCount, 2);
 
-    // 7. GLOBAL source. GetGlobalVariableNV carries no CallerName, so the named-slot leg never
-    // saw a file-scope global - it took the indirect leg and now transfers like every other slot.
+    // 7. GLOBAL source. An IMPLICIT consume out of a global is rejected by the q11 ruling (the
+    // storage is never re-initialized between entries, so the second run would read it empty -
+    // see Test/errors/err_move.cb). The sanctioned spelling is an explicit `move`, which
+    // transfers AND re-initializes, so a second read finds a defined empty value rather than a
+    // husk. The copyable-owner spelling is leg 15's.
     dtorCount = 0;
     {
         oaiGlobal = oaiMake(5);
         OaiBox o = oaiMake(1);
-        o = oaiGlobal;
+        o = move oaiGlobal;
         passed += Test("oai_global_value", oaiId(o), 5);
         passed += Test("oai_global_source_nulled", oaiGlobal.item == nullptr, true);
     }
     passed += Test("oai_global_freed_once_each", dtorCount, 2);
+    // The re-initialized global is READABLE, not a husk: a second consume yields the empty value.
+    {
+        OaiBox again = move oaiGlobal;
+        passed += Test("oai_global_reentry_defined", oaiId(again), -1);
+    }
 
     // 8. DECL-INIT is a separate hand-mirrored path - same three source shapes.
     dtorCount = 0;
@@ -5766,17 +5778,23 @@ int testOwningBraceInitFixedArray()
     }
     passed += Test("abri_barebrace_freed_once_each", dtorCount, 1);
 
-    // 15. The FIELD-DEFAULT brace path, the emitter's second caller. The global source is
-    // consumed by the default construction exactly as a local source is.
+    // 15. The FIELD-DEFAULT brace path, the emitter's second caller. TWO constructions, which the
+    // old consuming leg could not do: the copy arm leaves the seed live, so a field default reads
+    // as the per-instance initializer it is written as.
     dtorCount = 0;
     {
-        oaiFdSeed = oaiMake(5);
-        OaiFdWrap w = default;
-        passed += Test("abri_fielddefault_value", w.arr[0].item->id, 5);
-        passed += Test("abri_fielddefault_source_nulled", oaiFdSeed.item == nullptr, true);
-        passed += Test("abri_fielddefault_no_early_free", dtorCount, 0);
+        oaiFdSeed.item = new Resource();
+        oaiFdSeed.item->id = 5;
+        OaiFdWrap w1 = default;
+        OaiFdWrap w2 = default;
+        passed += Test("abri_fielddefault_value", w1.arr[0].item->id, 5);
+        passed += Test("abri_fielddefault_second_construction", w2.arr[0].item->id, 5);
+        passed += Test("abri_fielddefault_source_stays_live", oaiFdSeed.item != nullptr, true);
+        passed += Test("abri_fielddefault_independent", w1.arr[0].item != w2.arr[0].item, true);
     }
-    passed += Test("abri_fielddefault_freed_once_each", dtorCount, 1);
+    // Assigning nullptr frees the current pointee (an explicit delete of a unique field is a
+    // double-free); this keeps the seed from outliving the leg.
+    oaiFdSeed.item = nullptr;
 
     return passed;
 }
@@ -9758,7 +9776,9 @@ OaiSBox rfldSG;
 OaiBox rfldLocal()                    { OaiWrap w; w.b = oaiMake(41); return w.b; }
 OaiBox rfldMoveParam(move OaiWrap w)  { return w.b; }
 OaiBox rfldNested()                   { OaiOuter o; o.inner.b = oaiMake(43); return o.inner.b; }
-OaiBox rfldGlobal()                   { return rfldG.b; }
+// q11: an IMPLICIT consume out of the global is rejected (err_move.cb); `move` is the sanctioned
+// spelling and re-initializes the field, so a second call reads a defined empty value.
+OaiBox rfldGlobal()                   { return move rfldG.b; }
 OaiBox rfldPtr(OaiWrap* p)            { return p->b; }
 OaiBox rfldArrField()                 { OaiArrWrap w; w.arr[0] = oaiMake(46); return w.arr[0]; }
 OaiBox rfldElem()                     { OaiBox[2] arr; arr[0] = oaiMake(47); return arr[0]; }
@@ -9885,6 +9905,9 @@ int testReturnOfOwningField()
 
     // 2. Sources whose owner OUTLIVES the frame. They double-freed too, so they are consumed
     // exactly as the store arms consume a global / deref source: the source lvalue is nulled.
+    // Since the q11 ruling the global spelling must say `move` (the implicit one is rejected -
+    // see err_move.cb); the consume itself is unchanged, and a second call now reads the
+    // re-initialized empty value instead of a husk.
     dtorCount = 0;
     {
         rfldG.b = oaiMake(44);
@@ -9892,6 +9915,8 @@ int testReturnOfOwningField()
         passed += Test("rfld_global_value", r.item->id, 44);
         passed += Test("rfld_global_source_nulled", rfldG.b.item == nullptr, true);
         passed += Test("rfld_global_no_early_free", dtorCount, 0);
+        OaiBox again = rfldGlobal();
+        passed += Test("rfld_global_reentry_defined", oaiId(again), -1);
     }
     passed += Test("rfld_global_freed_once", dtorCount, 1);
 
@@ -10531,6 +10556,96 @@ move string makeVaText()
     return "va-temp";
 }
 
+// q11 ruling (2026-08-11): global and static owning storage follows the Rust model. A `unique T*`
+// global is legal, is NEVER destructed at exit, rejects an implicit consume (the rejection leg
+// lives in Test/errors/err_move.cb), and `move`s out to a local that destructs at scope exit.
+// Re-entry is defined: a second move out of the emptied storage yields null, not a double free.
+unique Resource* uqGlobalOwner = nullptr;
+
+// q11: the accept side of the GLOBAL borrow-taint check (its rejection is in err_move.cb). A
+// store that carries no borrow RETIRES the taint, so a rebind to fresh memory must stay legal -
+// this is the leg that would catch the guard turning into a false rejection.
+Resource* uqgTaintGlobal = nullptr;
+void uqgTaintRebindToFresh(Resource* borrowed)
+{
+    uqgTaintGlobal = borrowed;
+    uqgTaintGlobal = new Resource();
+    uqgTaintGlobal->id = 71;
+    delete uqgTaintGlobal;
+    uqgTaintGlobal = nullptr;
+}
+
+// An owning-VALUE global, for the explicit-discard leg. Since q11 point 4 removed exit-time
+// destruction of globals, `_ = move g` is the ONLY release such a global ever gets.
+OaiBox uqgDiscardOwner;
+
+// A static local owner: same storage-duration question asked of a function-local slot.
+int uqStaticLocalId()
+{
+    static unique Resource* s = nullptr;
+    if (s == nullptr) { s = new Resource(); s->id = 61; }
+    return s->id;
+}
+
+int testUniqueGlobalStorage()
+{
+    int passed = 0;
+
+    // A unique global holds its value and nothing is auto-released on the way in.
+    dtorCount = 0;
+    uqGlobalOwner = new Resource();
+    uqGlobalOwner->id = 60;
+    passed += Test("uqg_global_holds_value", uqGlobalOwner->id, 60);
+    passed += Test("uqg_global_not_released_on_assign", dtorCount, 0);
+
+    // `move` out is the sanctioned consume: it transfers, NULLS the global, and the receiving
+    // local destructs at scope exit. This is the Option::take analog the ruling names.
+    {
+        unique Resource* taken = move uqGlobalOwner;
+        passed += Test("uqg_move_transfers_value", taken->id, 60);
+        passed += Test("uqg_move_nulls_global", uqGlobalOwner == nullptr, true);
+        passed += Test("uqg_move_no_early_free", dtorCount, 0);
+    }
+    passed += Test("uqg_move_freed_once_at_scope_exit", dtorCount, 1);
+
+    // Re-entry is DEFINED rather than a double free of a zeroed value.
+    dtorCount = 0;
+    {
+        unique Resource* again = move uqGlobalOwner;
+        passed += Test("uqg_second_move_is_null", again == nullptr, true);
+    }
+    passed += Test("uqg_second_move_frees_nothing", dtorCount, 0);
+
+    // The explicit discard is now the only release a global owner gets: it must free exactly
+    // once and re-initialize the storage, with no exit-time destructor to double-free it.
+    dtorCount = 0;
+    uqgDiscardOwner.item = new Resource();
+    _ = move uqgDiscardOwner;
+    passed += Test("uqg_discard_releases_once", dtorCount, 1);
+    passed += Test("uqg_discard_reinitializes", uqgDiscardOwner.item == nullptr, true);
+
+    // A borrow stored into a global, then REBOUND to fresh memory: the delete is of the fresh
+    // object, so it must compile and free exactly once while the borrowed source stays live.
+    dtorCount = 0;
+    {
+        Resource* uqgKeep = new Resource();
+        uqgKeep->id = 70;
+        uqgTaintRebindToFresh(uqgKeep);
+        passed += Test("uqg_taint_rebind_frees_only_fresh", dtorCount, 1);
+        passed += Test("uqg_taint_borrowed_source_live", uqgKeep->id, 70);
+        delete uqgKeep;
+    }
+    passed += Test("uqg_taint_source_freed_once", dtorCount, 2);
+
+    // A static local owner persists across calls and is never destructed.
+    dtorCount = 0;
+    passed += Test("uqg_static_local_first_call", uqStaticLocalId(), 61);
+    passed += Test("uqg_static_local_second_call", uqStaticLocalId(), 61);
+    passed += Test("uqg_static_local_not_destructed", dtorCount, 0);
+
+    return passed;
+}
+
 int testVariadicOwnershipBoundary()
 {
     int passed = 0;
@@ -10860,7 +10975,7 @@ extern int main()
     total += 29;
 
     passed += testOwningAssignFromIndirectSource();
-    total += 75;
+    total += 76;
 
     passed += testOwningAssignIntoFixedArrayElement();
     total += 92;
@@ -10889,7 +11004,7 @@ extern int main()
     total += 83;
 
     passed += testReturnOfOwningField();
-    total += 92;
+    total += 93;
     passed += testForInOverFixedArrayElement();
     total += 45;
 
@@ -10898,6 +11013,9 @@ extern int main()
 
     passed += testVariadicOwnershipBoundary();
     total += 3;
+
+    passed += testUniqueGlobalStorage();
+    total += 16;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -41,6 +41,7 @@
   - [`move` Return Type](#move-return-type)
   - [`alias` Return Type (borrow)](#alias-return-type-borrow)
   - [`bond` Lifetime Keyword](#bond-lifetime-keyword)
+  - [Ownership at Global and `static` Scope](#ownership-at-global-and-static-scope)
 - [Namespaces & Modules](#namespaces--modules)
   - [Namespaces](#namespaces)
   - [`using` Aliases](#using-aliases)
@@ -1579,6 +1580,89 @@ marks the enclosing method as poisoned for that instantiation; the error only fi
 the method is actually called (not merely instantiated), which is what lets
 `list<unique T*>.copy()` exist in source without breaking every unique-list
 instantiation that never calls `.copy()`.
+
+### Ownership at Global and `static` Scope
+
+Storage whose lifetime outlives the frame - a file-scope global, or a `static` local -
+follows three rules. They exist because such storage is entered more than once and its
+lifetime cannot be proven, so the frame-local rules do not carry over unchanged.
+
+**1. Owning types are legal there.** A `unique T*` global, or a global of a struct with
+owning fields or a destructor, is allowed. Reading one without `move` yields a borrow,
+exactly as it does for a local:
+
+```c
+struct Resource { int id = 0; ~Resource() {} };
+
+unique Resource* gOwner = nullptr;
+
+void setup()
+{
+    gOwner = new Resource();
+    Resource* view = gOwner;    // borrow: the global still owns it
+    printf("%d\n", view->id);
+}
+```
+
+**2. An implicit consume out of that storage is an error.** A plain `=`, a by-value
+return, or a field default that would TRANSFER the value silently empties storage the
+next entry still reads, so it is rejected. Write `move` to say so, or give the type a
+`copy()` method:
+
+```c
+struct Box { unique Resource* item = nullptr; };
+Box gBox;
+
+Box takeIt()
+{
+    Box o;
+    o = gBox;            // error: cannot consume owning value 'gBox' out of storage that
+                         // outlives this function ... Write 'move gBox' to take the value
+                         // and re-initialize the storage, or give 'Box' a 'copy()' method
+    return o;
+}
+
+Box moveIt() { Box o = move gBox; return o; }   // OK: transfers AND re-initializes gBox
+```
+
+Returning an owning **field** of a global is the same consume, and is rejected the same way
+(`return gWrap.b;`). Returning the whole global by value is a plain copy of a borrow and stays
+legal - it transfers nothing.
+
+> **Known gap.** The declaration-init spelling `Box o = gBox;` is not yet diagnosed - it still
+> consumes the global silently. The assignment, return-of-field, and field-default spellings
+> above are enforced.
+
+**`move` out of such storage RE-INITIALIZES it**, so re-entry is defined rather than
+reading a moved-from husk: the second `move gBox` yields an empty `Box`, and a
+`move` of a global `string` yields `""`. This is the equivalent of Rust's
+`Option::take()`.
+
+A field default naming a global is the sharpest case, since it is written once but runs
+on every construction of the type - so a consuming one would be silently one-shot:
+
+```c
+Box seed;
+struct Wrap { Box[2] arr = { seed }; };   // error unless Box is copyable
+```
+
+**3. Nothing at global or `static` scope is destructed at program exit.** No teardown is
+synthesized for such storage; an owning global still holding a value when the program ends
+simply leaks, and the OS reclaims it. This matches Rust, where `static` items are never
+dropped. For deterministic cleanup, move the value into a local and let normal scope exit
+destruct it, or discard it explicitly:
+
+```c
+{
+    unique Resource* owned = move gOwner;   // gOwner is re-initialized to nullptr
+}                                           // freed here, at scope exit
+
+_ = move gBox;                              // explicit release, in place
+```
+
+Destructors on non-global values are unaffected: a `mutex` field inside a struct that dies
+during the run still runs `~mutex()` as always. Only the global/`static` storage class
+opts out.
 
 ### Memory Deallocation (`delete`)
 

@@ -2237,9 +2237,16 @@ private:
     // differs from the real file, so line (not path) is the stable identity. Cleared by
     // ResetForReanalysis like the maps above.
     std::unordered_map<std::string, int> globalDeclSite;
-    // Definition order of the globals that end-of-main destruction covers (see
-    // EmitGlobalDestructorsInMain). Excludes externs, thread-locals and core-library globals.
-    std::vector<std::string> globalDtorOrder_;
+    /*
+     * q11: borrow taint recorded on a GLOBAL pointer destination (`g = p;`), so a later
+     * `delete g` in the SAME function is rejected the way the local spelling already is.
+     * Deliberately per-function and cleared at every function entry: a global binding is
+     * program-wide and this walk is not control-flow aware, so keeping the fact across
+     * functions would turn a local false rejection into a program-wide one. A cross-function
+     * delete therefore stays accepted - unknown accepts, per the governing rule. Transient
+     * per-call state, so it is NOT part of the --init cache round-trip.
+     */
+    std::unordered_map<const llvm::Value*, std::string> globalAssignBorrowOrigin_;
     std::unordered_map<std::string, StructData> dataStructures;
 
     // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).
@@ -4016,21 +4023,6 @@ private:
     void InjectHeapAuditIntoMain();
 
     // Destruct global owning values (list, dictionary, string, closure, ...) on the normal return
-    // path out of main, in REVERSE definition order - the global-scope analog of a scope's
-    // destructors. Emitted as a post-pass once every return in main is lowered, so it covers every
-    // `return` and the implicit fall-off return alike.
-    //
-    // Safety notes:
-    // - A moved-from global was zeroed at the move site (ApplyMoveParamTransfer stores a zeroed
-    //   aggregate into the source), so its destructor is a no-op - no double free.
-    // - Extern globals (not ours), thread-locals (main owns only its own copy) and core-library
-    //   globals are excluded at registration time (see globalDtorOrder_). Core globals are
-    //   process-lifetime infrastructure (page pools, allocator registries, their mutexes) that
-    //   threads and the allocator may still touch as the process winds down.
-    // - Pointer globals are skipped: a raw `T*` global has no owning-value destructor contract.
-    // - An early exit()/abort() bypasses main's return and therefore skips these. Accepted: there
-    //   is no atexit hook, and a hard exit leaks nothing the OS does not reclaim.
-    void EmitGlobalDestructorsInMain();
 
     bool JitRun(int& runExitCode);
 
