@@ -1034,6 +1034,34 @@ bool LLVMBackend::JitRun(int& runExitCode)
             }
         }
 
+        // Imported C sources are compiled to native objects during the import walk. The AOT
+        // linker consumes cObjectFiles_, while --run must add the same objects to the ORC
+        // JITDylib explicitly. Prebuilt libraries are rejected before reaching this path.
+        for (const auto& cObj : cObjectFiles_)
+        {
+            auto objOrErr = llvm::MemoryBuffer::getFile(cObj);
+            if (!objOrErr)
+            {
+                LogErrorMessage("{}: could not read imported C object '{}': {}",
+                                { "--run", cObj, objOrErr.getError().message() });
+                for (const auto& path : cObjectFiles_)
+                    llvm::sys::fs::remove(path);
+                return false;
+            }
+            if (auto err = jit->addObjectFile(std::move(*objOrErr)))
+            {
+                LogErrorMessage("{}: could not load imported C object '{}': {}",
+                                { "--run", cObj, llvm::toString(std::move(err)) });
+                for (const auto& path : cObjectFiles_)
+                    llvm::sys::fs::remove(path);
+                return false;
+            }
+        }
+        // addObjectFile owns the object bytes after this point, so the compiler's temporary
+        // files are no longer needed. The JIT keeps its in-memory copies alive for execution.
+        for (const auto& cObj : cObjectFiles_)
+            llvm::sys::fs::remove(cObj);
+
         // Hand the module (and its context) to the JIT. After this the backend's module is
         // consumed - fine, since --run executes and the process exits.
         llvm::orc::ThreadSafeContext tsc(std::move(context));

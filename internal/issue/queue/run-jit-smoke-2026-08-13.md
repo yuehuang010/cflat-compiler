@@ -46,9 +46,8 @@ a targeted diagnostic when used with `--run`.
 
 The in-process JIT is viable for the ordinary portable suite: 30/30 compatible fixtures passed,
 including ownership, generics, SIMD/HPC, synchronization, process, and threadpool coverage. The
-remaining work is grouped in [q19](q19-run-jit-interop-and-diagnostics.md): add or explicitly
-scope JIT support for imported native symbols, imported program adapters, and C-backed diagnostic
-fixtures.
+remaining work was grouped in q19: add or explicitly scope JIT support for imported native
+symbols, imported program adapters, and C-backed diagnostic fixtures.
 
 ## Triage recommendation
 
@@ -59,5 +58,17 @@ fixtures.
 4. Leave HeapAudit parity for last. The existing `--heap-audit` restriction makes AOT-only leak
    validation an acceptable near-term disposition.
 
-This ordering is recorded in the [q19 triage table](q19-run-jit-interop-and-diagnostics.md) and
-keeps the 30/30 portable smoke set independent of optional native-diagnostic parity.
+This ordering was recorded in the q19 triage table and keeps the 30/30 portable smoke set
+independent of optional native-diagnostic parity.
+
+## Follow-up - 2026-08-13
+
+Implemented the first two work items:
+
+- Imported C source objects are now loaded into ORC/LLJIT for `--run`.
+- `import program` works for both imported CFlat and real-C program adapters.
+- Prebuilt C libraries are rejected before JIT materialization with a targeted diagnostic.
+- `test.sh --run` is an opt-in smoke mode; it passed 35/35 selected checks.
+
+The normal suite remains unchanged and passed 647/647 runnable checks. The only remaining q19
+item is the deliberately lower-priority HeapAudit/AOT-only gap.

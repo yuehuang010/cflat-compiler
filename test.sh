@@ -10,6 +10,7 @@
 #   ./test.sh            # Release (default)
 #   ./test.sh Debug      # Debug
 #   ./test.sh -j 8       # cap parallelism (default: nproc)
+#   ./test.sh --run      # opt-in in-process JIT smoke set
 #
 # Like test.bat, after the cold pass this runs `cflat --init-local` and re-runs the
 # negative tests against the warm bitcode cache. --init reconstructs compiler
@@ -39,10 +40,12 @@ set -u
 
 CONFIG=Release
 JOBS=$(nproc 2>/dev/null || echo 4)
+RUN_MODE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     Debug|debug)     CONFIG=Debug ;;
     Release|release) CONFIG=Release ;;
+    --run)           RUN_MODE=1 ;;
     -j) shift; JOBS="$1" ;;
     *) echo "unknown arg: $1"; exit 2 ;;
   esac
@@ -122,6 +125,13 @@ is_err_skipped() {
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log"
+  if [ "$RUN_MODE" -eq 1 ]; then
+    if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --run --nologo >"$log" 2>&1; then
+      echo "FAIL run" >"$RES/$n.result"; return
+    fi
+    echo "PASS" >"$RES/$n.result"
+    return
+  fi
   if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" -o "$RES/$n.bin" >"$log" 2>&1; then
     echo "FAIL compile" >"$RES/$n.result"; return
   fi
@@ -155,15 +165,33 @@ run_err_warm() {
 }
 
 export -f run_cb run_err run_err_warm is_skipped
-export CFLAT LIB LOCALE_DIR RES TIMEOUT
+export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE
+
+# The JIT path is deliberately opt-in. This list excludes fixtures that require a prebuilt C
+# library or the C-backed HeapAudit oracle; those remain AOT-only by design. test_program is
+# included because it exercises both CFlat and real-C imported program adapters.
+RUN_TESTS="test_allocators test_basic test_bitmap test_c test_com test_core test_crt \
+  test_filesystem test_fpenv test_function_ptr test_generics test_hpc test_hpc_kernels \
+  test_import_group test_initializer_list test_interface test_linear_mat test_math test_module \
+  test_move test_operators test_parallel test_process test_program test_random test_regex \
+  test_socket test_stdio test_stream test_sync test_terminal test_threadpool test_time test_vectorize"
 
 # Build the work list, then fan out across $JOBS workers via xargs -P.
 cb_list=""
-for f in "$SRC"/test_*.cb; do
-  n="$(basename "$f" .cb)"
-  is_skipped "$n" && continue
-  cb_list="$cb_list$f"$'\n'
-done
+if [ "$RUN_MODE" -eq 1 ]; then
+  for n in $RUN_TESTS; do
+    f="$SRC/$n.cb"
+    [ -f "$f" ] || { echo "missing opt-in --run fixture: $f"; exit 1; }
+    is_skipped "$n" && continue
+    cb_list="$cb_list$f"$'\n'
+  done
+else
+  for f in "$SRC"/test_*.cb; do
+    n="$(basename "$f" .cb)"
+    is_skipped "$n" && continue
+    cb_list="$cb_list$f"$'\n'
+  done
+fi
 err_list=""
 err_files=()
 if [ -d "$SRC/errors" ]; then
@@ -178,7 +206,7 @@ fi
 # Discovery pass: the error suite is the authoritative diagnostic inventory. Run it
 # serially with pseudo output so expect_error continues to match source English while
 # --update-locale records every template encountered by the batch.
-if [ "${#err_files[@]}" -gt 0 ]; then
+if [ "$RUN_MODE" -eq 0 ] && [ "${#err_files[@]}" -gt 0 ]; then
   if ! "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
       --check -i "$LIB" "${err_files[@]}" >"$RES/_locale.log" 2>&1; then
     echo "FAIL: pseudo-locale diagnostic discovery failed"
@@ -188,7 +216,25 @@ if [ "${#err_files[@]}" -gt 0 ]; then
 fi
 
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}
-printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
+if [ "$RUN_MODE" -eq 0 ]; then
+  printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err "$@"' _ {}
+fi
+
+# The opt-in JIT smoke set also checks the deliberate prebuilt-library rejection. The fixture
+# mixes an imported C source with a prebuilt package library; the latter must be diagnosed before
+# JIT materialization rather than producing an unresolved-symbol list.
+if [ "$RUN_MODE" -eq 1 ]; then
+  rejected_name="run_prebuilt_c_rejected"
+  rejected_log="$RES/$rejected_name.log"
+  if $TIMEOUT "$CFLAT" "$SRC/test_c_interop.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+      --run --nologo >"$rejected_log" 2>&1; then
+    echo "FAIL: prebuilt C library was accepted by --run" >"$RES/$rejected_name.result"
+  elif grep -Fq "does not support prebuilt C libraries" "$rejected_log"; then
+    echo "PASS" >"$RES/$rejected_name.result"
+  else
+    echo "FAIL: --run prebuilt-library diagnostic missing" >"$RES/$rejected_name.result"
+  fi
+fi
 
 # Warm-cache pass: populate the --init-local bitcode cache, then re-run the negative
 # tests against it. This exercises the serializer round-trip that test.bat covers
@@ -197,16 +243,19 @@ printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err 
 # --init-local (not --init) so the cache lands in <exe dir>/.cflat: two worktrees or a
 # Debug/Release pair testing concurrently then cannot collide on one ~/.cflat, and the
 # suite never overwrites the developer's own per-user cache.
-if "$CFLAT" --init-local >"$RES/_init.log" 2>&1; then
-  printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err_warm "$@"' _ {}
-else
-  echo "FAIL: cflat --init-local crashed (warm-cache pass could not run)"
-  echo "FAIL" >"$RES/_init.result"
-  tail -n 8 "$RES/_init.log" 2>/dev/null
+if [ "$RUN_MODE" -eq 0 ]; then
+  if "$CFLAT" --init-local >"$RES/_init.log" 2>&1; then
+    printf '%s' "$err_list" | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_err_warm "$@"' _ {}
+  else
+    echo "FAIL: cflat --init-local crashed (warm-cache pass could not run)"
+    echo "FAIL" >"$RES/_init.result"
+    tail -n 8 "$RES/_init.log" 2>/dev/null
+  fi
 fi
 
 # Tooling regression: compile the existing function-pointer fixture with the ownership
 # sanitizer, then verify a static-local move keeps both its runtime origin and DI record.
+if [ "$RUN_MODE" -eq 0 ]; then
 tooling_name="static_local_tooling"
 tooling_log="$RES/$tooling_name.log"
 tooling_bin="$RES/$tooling_name.bin"
@@ -227,6 +276,7 @@ elif ! grep -Fq ".static.node.own_origin" "$tooling_ll" \
   echo "FAIL: static-local origin or debug metadata is missing" >"$RES/$tooling_name.result"
 else
   echo "PASS" >"$RES/$tooling_name.result"
+fi
 fi
 
 # Collect.

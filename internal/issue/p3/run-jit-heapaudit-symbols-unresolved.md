@@ -30,6 +30,9 @@ diagnostic object. These fixtures bypass that option but still require the same 
 Last in q19 and not a prerequisite for ordinary `--run` correctness. Keep these tests AOT-only in
 the near term unless the order-1 ORC object-loading work makes a JIT-safe audit backend natural.
 
+The source-C object-loading and imported-program work from q19 landed on 2026-08-13. This remains
+the only unresolved item from that bucket.
+
 ## Root cause
 
 `core/diagnostic/heap_audit.cb` declares the C functions from `heap_audit.c`; `JitRun` does not
@@ -45,7 +48,7 @@ in an AOT-only leak-validation group rather than counting them as ordinary `--ru
 
 ## Related
 
-- `q19-run-jit-interop-and-diagnostics`
+- `internal/issue/queue/run-jit-smoke-2026-08-13.md`
 - `cflat/core/diagnostic/heap_audit.cb`
 - `cflat/core/diagnostic/heap_audit.c`
 - `cflat/main.cpp` (`--heap-audit` validation)

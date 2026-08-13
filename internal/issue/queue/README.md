@@ -1,6 +1,6 @@
 # Issue queue: buckets
 
-Filed 2026-08-11. The 50 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
+Filed 2026-08-11. The 48 active items under `internal/issue/{p1,p2,p3,ui}/` grouped by SHARED
 ROOT CAUSE, so a round of work fixes a family rather than one symptom. Each issue appears in
 exactly one bucket; cross-bucket relatives are named under "Adjacent" inside each file.
 
@@ -38,7 +38,6 @@ the bucket.
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
 | q18 | [Platform, C interop, UI](q18-platform-c-interop-and-ui.md) | 8 | Disjoint; parallelizable |
-| q19 | [JIT execution: interop and diagnostics](q19-run-jit-interop-and-diagnostics.md) | 3 | Triage: contract/object loading first, imported programs second, HeapAudit last |
 
 ## Design rulings
 

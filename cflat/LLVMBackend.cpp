@@ -993,6 +993,16 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
+    // --run can load objects compiled from imported C source, but it deliberately does not
+    // support prebuilt C libraries. Check after imports so inline `lib` clauses and package
+    // imports are covered as well as direct --c-lib arguments.
+    if (runMode_ && !cLinkLibs_.empty())
+    {
+        LogError("--run does not support prebuilt C libraries (from --c-lib, package imports, or "
+                 "an inline lib clause). Remove the library binding or compile with -o instead.");
+        return false;
+    }
+
     // --run: JIT and execute in-process, emitting nothing to disk. Mutually exclusive with
     // -o (checked in main). Consumes the module, so it must come after IR/bitcode writes.
     //

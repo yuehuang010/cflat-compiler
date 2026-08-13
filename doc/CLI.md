@@ -70,6 +70,10 @@ program argument, so program args are never mistaken for compiler flags or sourc
 - *Single-threaded only.* A program that spawns a thread (via the `program` construct or
   `thread<T>`) is rejected - in-process JIT'd workers would need Windows SEH unwind tables the
   JIT cannot register. Compile to an exe instead. Importing `thread.cb` without spawning is fine.
+- *C interop.* Importing a real C source file (`import "file.c";`) is supported and its object is
+  loaded into the in-process JIT. Prebuilt C libraries (`--c-lib`, an inline `lib` clause, or a
+  package import that resolves to a library) are not supported by `--run`; use an AOT build with
+  `-o` instead.
 - *Entry signature.* `main` must be exactly `int main()` or `int main(int argc, char** argv)`.
 - *Arguments require the matching entry.* Passing arguments after `--` to an `int main()`
   program is an error rather than a silent drop. Arguments after `--` without `--run` are also

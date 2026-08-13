@@ -54,7 +54,11 @@ native binary, skipping Windows-only tests.
 
 ```bash
 ./test.sh Release     # or Debug, or -j N
+./test.sh --run       # opt-in in-process JIT smoke set
 ```
+
+The `--run` mode is intentionally opt-in. It runs the curated positive JIT fixtures and the
+prebuilt-C-library rejection check; the default suite remains the AOT plus diagnostic suite.
 
 > After any portability change, re-verify BOTH: `test.sh` on macOS/WSL and `test.bat` (Release) on Windows.
 
