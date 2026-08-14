@@ -23,22 +23,15 @@ Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` re
 
 ## Agent Delegation: Cost vs Intelligence
 
-The main session runs on the most expensive model tier. Implementation work should be delegated to a subagent (Agent tool) at the cheapest tier that can do the job reliably; the main session plans, coordinates, and reviews the results.
+The default worker agent is Luna with high effort. Implementation work should be delegated to Luna; the main session plans, coordinates, and reviews the results.
 
-This section addresses the MAIN SESSION only. A spawned implementation agent does the work itself in its own session; it must never re-delegate to another agent, regardless of how it judges the task's tier - if it believes it is the wrong tier for the job, it should say so in its report instead of spawning a sub-agent.
-
-| Tier | Relative cost | Right for |
-|------|---------------|-----------|
-| `sonnet` (`general-purpose-sonnet`) | Low | Mechanical and routine implementation: renames, running builds/tests and reporting output, well-specified single-area changes, straightforward features from a clear plan, doc updates, writing regression tests |
-| `opus` (`opus-general-purpose`) | High | Hard implementation: multi-file compiler changes (grammar + ForwardRefScanner + codegen), debugging with unclear root cause, ownership/lifetime work |
+Subagents must not create or invoke subagents. If the task is unsuitable for Luna, it should report that to the main session instead of delegating further.
 
 Guidelines:
 
-- Never use the `haiku` tier; `sonnet` is the floor.
-- Default flow: main session writes the plan and acceptance criteria, spawns an implementation agent at the right tier, then verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on macOS/Linux).
+- Default flow: the main session writes the plan and acceptance criteria, delegates implementation to Luna with high effort, then verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on macOS/Linux).
 - Give implementation agents a self-contained prompt: exact files, the plan, constraints from this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and how to verify.
-- Use the read-only `Explore` agent for broad codebase searches instead of burning main-session context.
-- If an agent at one tier fails or flails, escalate one tier with the failure context - do not retry the same tier with the same prompt, and do not silently absorb the work into the main session for convenience.
+- Use read-only exploration for broad codebase searches instead of burning main-session context.
 - Independent sub-tasks should be spawned in parallel when they touch disjoint files.
 
 ## Token Efficiency

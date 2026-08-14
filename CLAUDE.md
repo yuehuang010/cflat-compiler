@@ -19,23 +19,47 @@ Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` re
 
 ## Agent Delegation: Cost vs Intelligence
 
-The main session runs on the most expensive model tier. Implementation work should be delegated to a subagent (Agent tool) at the cheapest tier that can do the job reliably; the main session plans, coordinates, and reviews the results.
+**Codex Luna is the default implementation agent for ALL delegated work.** It replaces the
+former `sonnet` / `opus` tier split - there is no tier choice to make any more, for mechanical
+work or for hard compiler work. The main session plans, coordinates, and reviews the results.
 
-This section addresses the MAIN SESSION only. A spawned implementation agent does the work itself in its own session; it must never re-delegate to another agent, regardless of how it judges the task's tier - if it believes it is the wrong tier for the job, it should say so in its report instead of spawning a sub-agent.
+This section addresses the MAIN SESSION only. A spawned implementation agent does the work
+itself in its own session; it must never re-delegate to another agent - if it believes the task
+is wrong for it, it should say so in its report instead of spawning a sub-agent.
 
 | Tier | Relative cost | Right for |
 |------|---------------|-----------|
-| `sonnet` (`general-purpose-sonnet`) | Low | Mechanical and routine implementation: renames, running builds/tests and reporting output, well-specified single-area changes, straightforward features from a clear plan, doc updates, writing regression tests |
-| `opus` (`opus-general-purpose`) | High | Hard implementation: multi-file compiler changes (grammar + ForwardRefScanner + codegen), debugging with unclear root cause, ownership/lifetime work |
+| Codex Luna (`gpt-5.6-luna`, High effort) | Low | **Default for everything.** High intelligence at low cost, so there is no reason to trade down: mechanical work (renames, builds/tests, doc updates, regression tests) and hard compiler work alike (multi-file changes across grammar + ForwardRefScanner + codegen, debugging with unclear root cause, ownership/lifetime work) |
+| `opus` (`opus-general-purpose`) | High | Fallback only: Codex unavailable, or the task genuinely needs the Claude toolchain (skills, worktree tooling) |
+| `sonnet` (`general-purpose-sonnet`) | Low | Not used - Codex Luna covers this range at comparable cost and higher intelligence |
+
+Codex Luna is not an Agent-tool subagent - it is the `codex` CLI (`~/.local/bin/codex`), run
+non-interactively from Bash. `~/.codex/config.toml` already pins `model = "gpt-5.6-luna"` and
+`model_reasoning_effort = "high"`, so no flags are needed for the model or effort:
+
+```bash
+codex exec --sandbox workspace-write -C /Users/felixhuang/source/cflat-compiler "<self-contained prompt>"
+```
+
+Add `-m` / `-c model_reasoning_effort=...` only to override those defaults. The prompt must be
+self-contained - Codex does not see this session's context.
 
 Guidelines:
 
-- Never use the `haiku` tier; `sonnet` is the floor.
-- Default flow: main session writes the plan and acceptance criteria, spawns an implementation agent at the right tier, then verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on macOS/Linux).
-- Give implementation agents a self-contained prompt: exact files, the plan, constraints from this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and how to verify.
+- Delegate implementation to Codex Luna by default. Fall back to a Claude `opus` Agent-tool
+  subagent only when Codex is unavailable or the task genuinely needs the Claude toolchain
+  (skills, worktree tooling); never to `sonnet` or `haiku`.
+- Default flow: main session writes the plan and acceptance criteria, runs Codex Luna, then
+  verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on
+  macOS/Linux).
+- Give the implementation agent a self-contained prompt: exact files, the plan, constraints from
+  this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and
+  how to verify.
 - Use the read-only `Explore` agent for broad codebase searches instead of burning main-session context.
-- If an agent at one tier fails or flails, escalate one tier with the failure context - do not retry the same tier with the same prompt, and do not silently absorb the work into the main session for convenience.
-- Independent sub-tasks should be spawned in parallel when they touch disjoint files.
+- If Codex Luna fails or flails, re-run with the failure context added, or escalate to an `opus`
+  subagent - do not re-run the same prompt unchanged, and do not silently absorb the work into
+  the main session for convenience.
+- Independent sub-tasks should be run in parallel when they touch disjoint files.
 
 ## Token Efficiency
 
