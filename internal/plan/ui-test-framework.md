@@ -111,8 +111,8 @@ Kit signatures (all in ui_test.cb):
 3. FIXED - now `list<string>`. reconcileStress's expectedKeys formerly returned a comma-separated
    STRING as a workaround: a generic type argument to a closure type (`Lambda<list<string>()>` /
    `function<list<string>()>`) did not monomorphize ("unknown type 'list<string>'"). That gap
-   (closure-generics monomorphization gaps a+b) is now closed - see
-   internal/plan/closure-generics-monomorphization.md - so expectedKeys returns a real
+   (closure-generics monomorphization gaps a+b) is now closed (compiler bug fix, landed,
+   no doc successor) - so expectedKeys returns a real
    `list<string>` and the kit no longer splits a CSV. The related T1 deviation 2
    (`list<function<...>>`) is likewise now expressible.
 4. ui_test.cb no longer `import "time.cb"` - it forward-declares `void sleep(i64 ms)`. Reason:

@@ -5,7 +5,7 @@ Date: 2026-07-13
 Gates for the spike build: `test.bat` (Release) ALL PASSED, `test_lsp.bat` 204/204,
 `example.bat` 89 passed / 0 failed / 24 skipped. No existing test was modified.
 
-Feeds: `internal/plan/ui-interface-refactor.md` (Phase 1).
+Feeds: the ui-interface-refactor work (Phase 1; landed, see doc/UI.md).
 
 ## VERDICT
 

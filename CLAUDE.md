@@ -125,7 +125,7 @@ The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default pa
 
 ### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
 
-**CMake + vcpkg is the build system.** It is the only path, and the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/plan/cross-platform-macos.md` for the staged port status. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 178/0 in both Debug and Release; run it with Homebrew tools on PATH).
+**CMake + vcpkg is the build system.** It is the only path, and the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/macos-build.md` for the macOS internals. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 178/0 in both Debug and Release; run it with Homebrew tools on PATH).
 
 > The CMake build writes the Windows `cflat.exe` to the `x64/<Config>/` layout, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
 

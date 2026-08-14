@@ -38,7 +38,7 @@ Status (original): PROPOSED
 Created: 2026-07-11
 Parent: internal/plan/hpc-gaps.md (G7, first bullet - the last unclaimed
 item in that section besides the documented list<int[]> restriction)
-Related: internal/plan/numa-domains.md (the vm_* layering this rides on)
+Related: doc/HPC.md (NumaDomainInfo, topo.maskNuma - the vm_* layering this rides on)
 
 Goal: let a program back a multi-GB kernel buffer with 2 MB pages instead
 of 4 KB pages, cutting dTLB misses and page-walk cost on the streaming and

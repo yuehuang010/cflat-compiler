@@ -720,8 +720,8 @@ rule that keeps the two plans independent:
 - `internal/plan/ownership-move-alias-discipline.md` - parameter discipline
 - `internal/plan/interface-fields-feasibility.md` - F1; see "Interaction with interface
   fields"
-- `internal/plan/ownership-sanitizer.md`, `internal/plan/move-dataflow.md` - runtime and
-  dataflow companions to the static rules here
+- `internal/plan/ownership-sanitizer.md`, doc/LANGUAGE.md ("Local ownership";
+  cflat/MoveDataflow.h) - runtime and dataflow companions to the static rules here
 - `internal/issue/brace-init-field-store-not-at-parity.md` - the durable store-path-parity
   rule (shared helpers from the start), learned partly from this feature
 - `Test/test_interface.cb:95-106` - both boxing forms

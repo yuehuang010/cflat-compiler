@@ -305,9 +305,9 @@ LLVMBackend), so they can run in parallel.
 
 - internal/plan/lock-hand-over-hand.md (typestate-on-pointer design, the loop-merge gap
   this plan's C builds on)
-- internal/plan/lock-capability-interface.md (capability model; why raw acquire/release
-  stays legal)
-- internal/plan/lock-guard-mandatory.md (release-on-early-return, mode fix)
-- internal/plan/optimistic-lock-coupling.md (IOptimisticLockable, lambda read path)
+- doc/THREADING.md, "Custom Lock Types ([Capability(ILockable)])" (capability model; why raw
+  acquire/release stays legal - enforcement was evaluated and intentionally not implemented)
+- doc/THREADING.md, the lock(...) positions section (release-on-early-return, mode fix)
+- doc/THREADING.md, "Optimistic Lock Coupling (olock)" (IOptimisticLockable, lambda read path)
 - core/diagnostic/thread_fuzz.cb, core/diagnostic/heap_audit.cb (runtime hook-shim
   precedent for tool A)

@@ -567,16 +567,17 @@ double[] a = new double[n] alignas(64);   // base address is a multiple of 64
 This is an allocation property, not a type property: `sizeof(double)` is still
 8 and the buffer strides by 8.
 
-#### The buffer must stay owned by the local that allocated it
+#### The buffer must stay owned by the local that allocated it - unless tagged with `alignas(slot, alloc)`
 
 The block comes from the aligned allocator, so it has to be freed through the
-matching aligned path - and because the alignment is deliberately **not in the
-type**, the only thing that knows about it is the local the `new` was bound to.
-Freeing through that local is fine: an explicit `delete[_] a;` / `delete[n] a;`,
-the automatic scope-exit free, or a `move` to another local all work.
+matching aligned path - and because a bare `new T[n] alignas(N)` keeps the
+alignment out of the type, the only thing that knows about it by default is the
+local the `new` was bound to. Freeing through that local is fine: an explicit
+`delete[_] a;` / `delete[n] a;`, the automatic scope-exit free, or a `move` to
+another local all work.
 
-Every ownership transfer that would drop the alignment is a **compile error**,
-not a silent mis-free:
+Every ownership transfer of a *bare* `alignas(N)` allocation is a **compile
+error**, not a silent mis-free:
 
 ```c
 struct Tile { double[] buf = default; };
@@ -590,17 +591,66 @@ move double[] make(i64 n) { return new double[n] alignas(64); }  // error: retur
 
 A field, a parameter, a return type, and a generic container's element type all
 carry only the *type*, and `double` says nothing about 64-byte alignment - so no
-free site reached that way could pick the right deallocator.
+free site reached that way could pick the right deallocator, unless the
+declaration itself carries the allocation-alignment fact (below).
 
 Borrowing is unrestricted: passing the buffer as a `T[]` / `span<T>` argument is
 a borrow, not a transfer, so kernels take it normally. Only *ownership* moves are
 restricted.
 
+#### Escaping a raw buffer: the `alignas(slot, alloc)` positional form
+
+`alignas` takes an optional second argument: `alignas(slot, alloc)`. The first
+argument is the usual slot/type alignment (`0` means "natural, unaligned
+slot"); the second is the **allocation alignment** of the buffer the field,
+`move` parameter, or return type is declared to own. Tagging the declaration
+this way is what lets a *raw*, un-padded `double[]`/`T*` buffer escape into a
+field, a `move` parameter, or a return type - without wrapping the element type
+in an over-aligned struct:
+
+```c
+struct FlatTile
+{
+    alignas(0, 64) double[] data = default;   // owns a flat, 64-byte-aligned double[]
+};
+
+FlatTile t;
+t.data = new double[n] alignas(0, 64);        // direct init: clause must agree with the field
+
+void consumeFlat(move alignas(0, 64) double[] buf) { }   // move-param escape
+consumeFlat(new double[8] alignas(0, 64));                // indirect call-arg: clause required at both ends
+
+alignas(0, 64) double[] makeAlignedFlat(int n)            // return-type escape
+{
+    return new double[n] alignas(0, 64);
+}
+```
+
+The `alignas(0, N)` clause on the declaration and the `alignas(0, N)` clause on
+the `new` must agree; the compiler validates this at the store/return/move
+site. `sizeof(double)` and the array stride are unaffected - `0` in the first
+slot means the element type itself stays natural width, only the allocation's
+base address is over-aligned.
+
+The channel from a declaration's `alignas(slot, alloc)` clause to its `new`
+initializer only reaches a **direct** initializer, direct assignment, or direct
+`return` - `new T[n] alignas(0, N)` buried in a ternary, cast, or call
+argument cannot be inferred, and the compiler raises "cannot infer allocation
+alignment here" rather than silently under-aligning. In that case, write the
+`alignas(0, N)` clause explicitly on the `new` at the call site, as in
+`consumeFlat` above.
+
+This closes all three escapes (field, `move` parameter, return) that a bare
+`alignas(N)` allocation cannot take. The `unique` pointer form works the same
+way for a scalar allocation, e.g. `alignas(0, 64) unique AlignedRes* p`.
+
 #### To store an over-aligned buffer in a struct, over-align the type
 
-Put the alignment on the **element type**. Then it *is* part of the type, so
-every free site recovers it from the same static type the `new` used - exactly as
-in C++ - and the buffer escapes freely into fields, containers and returns:
+The other option is to put the alignment on the **element type** instead of the
+allocation. Then it *is* part of the type, so every free site recovers it from
+the same static type the `new` used - exactly as in C++ - and the buffer
+escapes freely into fields, containers and returns without any `alignas(slot,
+alloc)` clause:
 
 ```c
 struct alignas(64) Chunk { double a = 0.0; double b = 0.0; };   // sizeof == 64
@@ -618,8 +668,9 @@ t.buf = new Chunk[n];                 // aligned allocation - no `alignas` claus
 The tradeoff is that `alignas` on a type also pads its `sizeof` and array stride
 (here `sizeof(Chunk) == 64`), which is what you want for cache-line-separated
 records but not for a flat `double[]` you want to stream through a `vectorize`
-loop. There is currently no way to own a *raw* over-aligned `double[]` in a
-struct field - keep it in a local, or wrap it in an over-aligned element type.
+loop. Use the type-level form when padding is fine or desired; use
+`alignas(slot, alloc)` on the field/parameter/return declaration (previous
+section) when you need a flat, un-padded buffer to escape a local.
 
 ### Assume-aligned for the vectorizer
 
@@ -1235,8 +1286,7 @@ stragglers. On a 1-domain box the identical code degrades to "pinned threads + o
   first-touch after pinning; nothing in this library *moves* an already-placed page afterward. A
   `moveToDomain(p, size, domain)` helper is a recorded post-v1 TODO (Linux can do this
   unprivileged via `mbind(MPOL_MF_MOVE)`; Windows has no migration API, so the portable shape
-  would alloc-on-target + copy + free, changing the pointer) - see
-  `internal/plan/numa-domains.md` for the exact mechanism.
+  would alloc-on-target + copy + free, changing the pointer).
 - **Multi-node performance itself is unverified on this repo's hardware.** Every API call
   (query, acquire, confinement, pinning, `allocLocal`, kill/release) was validated for
   correctness on Windows and on Linux/WSL, but the only development machine available is a
@@ -1474,6 +1524,39 @@ vmem_free_numa(nodeBuf);
   choosing a strategy) calls `vmem_huge_pages_available()` first rather than getting
   an out-param or a global "was that huge" flag. Freed by the existing `vmem_free` /
   `vmem_free_numa` - there is no separate huge-page free entry point.
+
+### Lower-level: the `os.*` layer
+
+`vmem_alloc_huge` / `vmem_huge_pages_available` are thin wrappers over `import "os.cb";`
+primitives, which are usable directly when you need the reservation without `vmem`'s
+header/bookkeeping, or want to force `huge=true` through the general-purpose reserve+commit
+entry point:
+
+```c
+import "os.cb";
+
+i64  bytes = os.huge_page_bytes();       // 2097152 where usable, else 0
+bool ok    = os.huge_pages_enable();     // attempt to enable; memoized, safe to call repeatedly
+void* p    = os.vm_reserve_commit_ex(size, -1, true);   // node=-1 (no NUMA bind), huge=true
+```
+
+- **`os.huge_page_bytes()`** - `2097152` where huge pages are usable in this process, else
+  `0`. Calls `huge_pages_enable()` internally on first use.
+- **`os.huge_pages_enable()`** - attempts to enable huge pages for this process and memoizes
+  the result (0=not yet probed, 1=available, 2=unavailable internally; the function itself
+  returns a `bool`). Idempotent - only the first call does real work.
+- **`os.vm_reserve_commit_ex(i64 size, int node, bool huge)`** - the one implementation
+  behind `vm_reserve_commit` / `vm_reserve_commit_numa` / `vmem_alloc_huge` /
+  `vmem_alloc_numa_huge`. `node >= 0` binds to a NUMA node (Windows
+  `VirtualAllocExNuma`, Linux `mmap`+`mbind`; macOS ignores `node` - no per-node lever, same
+  posture as the rest of the NUMA story); `node = -1` skips binding. `huge = true` is best
+  effort per the platform matrix below and never fails the call - it silently falls back to
+  normal pages.
+
+`vmem_alloc_huge(size)` is exactly `os.vm_reserve_commit_ex(size, -1, true)`;
+`vmem_alloc_numa_huge(size, node)` is exactly `os.vm_reserve_commit_ex(size, node, true)`.
+Reach for `vmem.cb` unless you specifically need the bare `os.cb` call (e.g. composing your
+own allocator on top).
 
 ### Per-platform admin steps
 

@@ -2,8 +2,8 @@
 
 Status: M0 DONE (committed). M1 DONE. M2 DONE (via option B - the generalized null-deref
 guard; the object-lifecycle shadow map was abandoned, see below). M0 (loop back-edge
-move-state soundness) shipped as the move-dataflow pass (internal/plan/move-dataflow.md,
-cflat/MoveDataflow.h): loop-carried use-after-move is a COMPILE ERROR. The runtime
+move-state soundness) shipped as the move-dataflow pass (see doc/LANGUAGE.md, "Local
+ownership", and cflat/MoveDataflow.h): loop-carried use-after-move is a COMPILE ERROR. The runtime
 sanitizer (`--sanitize=ownership`) now catches use-after-move / use-after-free through
 ANY provenance (locals, fields, containers) at DEREFERENCE time, with zero false positives
 and byte-identical flag-off (test.sh 403/0/8). DEFERRED: double-free and use-after-drop via
@@ -153,7 +153,7 @@ static fix catches loops/conditionals, and the runtime-null crutch already traps
 rest. The differentiated value is entirely in the shadow MAP.
 
 - M0 DONE (committed): loop back-edge move-state soundness, shipped as the move-dataflow
-  fixpoint (internal/plan/move-dataflow.md, cflat/MoveDataflow.h). Loop-carried
+  fixpoint (doc/LANGUAGE.md, "Local ownership"; cflat/MoveDataflow.h). Loop-carried
   use-after-move is now a compile error. ~~internal/issue/move-state-loop-merge.md~~
   **FIXED 2026-07-18, issue file deleted.**
 - M1 DONE (uncommitted working tree): `--sanitize=ownership` (+ `-fsanitize=ownership`),
@@ -332,7 +332,8 @@ Ordering: Stage 1 first (foundation, clearly correct, thread-safe). Stage 2 afte
 
 - ~~internal/issue/move-state-loop-merge.md~~ **FIXED 2026-07-18, issue file deleted.** - was
   the M0 static soundness fix (loop back-edge move-state merge) that this plan's split depends
-  on; now shipped as the move-dataflow fixpoint (internal/plan/move-dataflow.md).
+  on; now shipped as the move-dataflow fixpoint (doc/LANGUAGE.md, "Local ownership";
+  cflat/MoveDataflow.h).
 - internal/plan/lock-hand-over-hand.md - also pointer-variable typestate; the loop-merge
   "possibly-X at a join point" machinery should be built ONCE and shared (move-state =
   MAY/union; held-locks = MUST/intersection - same plumbing, opposite meet).

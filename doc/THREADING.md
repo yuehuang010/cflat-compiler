@@ -628,6 +628,64 @@ lock(rd.rw.write) {
 
 The `.read` / `.write` suffix is stripped when checking lock-set membership, so `lock(rw.read)` and `lock(rw.write)` both count as holding `rw` for the purposes of guarded-field checks.
 
+### Custom Lock Types (`[Capability(ILockable)]`)
+
+The `lock(...)` statement does not hardcode which types are locks. A type declares its lock
+capability with the `[Capability(...)]` annotation, naming one or more interfaces from
+`core/interfaces.cb`:
+
+```c
+import "interfaces.cb";
+
+interface ILockable       { void acquire();      void release();      };
+interface ISharedLockable : ILockable { void acquire_read(); void release_read(); };
+interface ICvWaitable     { void sleep_cv(void* cvSlot); };
+```
+
+`mutex` carries `[Capability(ILockable, ICvWaitable)]`, `rwlock` carries
+`[Capability(ISharedLockable)]`, and `semaphore` carries `[Capability(ILockable)]` - these are
+declared in `core/mutex.cb`, `core/rwlock.cb`, and `core/semaphore.cb` respectively, with no
+special-casing in the compiler. To make your own type work with `lock(...)`, implement the
+matching methods and add the annotation:
+
+```c
+[Capability(ILockable)]
+struct MySpinLock {
+    i32 flag = 0;
+    void acquire() { while (__atomic_i32_cas(&flag, 0, 1) != 0) { } }
+    void release() { __atomic_i32_store(&flag, 0); }
+};
+
+MySpinLock sl;
+lock(sl) {
+    // sl.acquire() / sl.release() are called for you at block entry/exit
+}
+```
+
+`ISharedLockable : ILockable` composes transitively, so a type that supports both exclusive and
+shared locking (like `rwlock`) names only the derived interface - `[Capability(ISharedLockable)]`
+is enough to unlock both `lock(x)` (exclusive) and `lock(x.read)` / `lock(x.write)`.
+
+**Static conformance, not dynamic dispatch.** `[Capability(I)]` is a compile-time-only
+declaration: the compiler checks the method shapes at compile time but the type can **never**
+be converted to an `I` fat-pointer interface value. This is deliberate - it is what stops a
+`mutex` from being silently boxed at an overload boundary. If a type needs both the lock
+capability and genuine dynamic dispatch through the interface, use the ordinary nominal base
+list instead (`class MyLock : ILockable { ... }`), which registers the capability *and* remains
+convertible to `ILockable`.
+
+**Raw `acquire()`/`release()` calls outside `lock(...)` remain legal - by design, not
+oversight.** Scoped `lock()` acquires LIFO (stack-discipline) and is the right default, but
+hand-over-hand lock coupling (e.g. walking a linked structure while holding the current node's
+lock only until the next node's lock is acquired) needs FIFO release order that a lexical
+`lock()` block cannot express, and returning a held lock across a function boundary needs the
+same escape. `semaphore` is the sharpest example of why this can never be closed off: it
+legitimately carries `[Capability(ILockable)]` (so `lock(s) { }` works, and is tested), but it
+is *also* used as a non-lexical counting handoff - acquired on one thread, released on another -
+which can never be expressed as a `lock()` block. "Is a lock" and "must be taken via `lock()`"
+are orthogonal properties, so raw acquire/release enforcement was evaluated and intentionally
+not implemented.
+
 ### Atomic Memory-Ordering Guards
 
 Mutexes provide mutual exclusion; atomics provide visibility ordering. CFlat extends the same lock-set analysis to lock-free code so the compiler can statically verify that every access to data protected by an atomic happens inside a correctly-ordered release or acquire scope.
@@ -728,3 +786,95 @@ void withData(SharedData* d, lock(this) Lambda<void()> body) lock(d->ready) {
 | `atomic_flag` | `release(bool, fn)` / `acquire(fn<void(bool)>)` | One-shot boolean flag (no `load()`) |
 
 Use `atomic__i32` when you need to poll the guard value in a spin loop before calling `acquire`; `atomic_flag` has no `load()` method and cannot be polled.
+
+## Optimistic Lock Coupling (`olock`)
+
+`import "hpc/olock.cb";` gives `olock`, a version lock (seqlock) for optimistic lock coupling
+(OLC): readers take no lock at all, snapshotting a version, reading speculatively, and
+validating that nothing changed - the read path never dirties the lock's cache line, which is
+the point when many threads are descending the same structure (e.g. a concurrent B-tree; see
+`core/hpc/btree.cb`). Writers still take an exclusive lock, same as any other `ILockable` type.
+
+```c
+import "hpc/olock.cb";
+
+struct Node { olock ver = default; int count = 0; };
+
+Node n;
+
+// speculative read: retry loop around read_begin/validate
+bool ok = false;
+while (!ok) {
+    i64 v = n.ver.read_begin();      // snapshot; spins while a writer holds it
+    int c = n.count;                 // speculative read - may be torn
+    ok = n.ver.read_validate(v);     // false -> the read above is garbage, restart
+}
+
+lock(n.ver) {                        // ILockable path: exclusive write, same as mutex/rwlock
+    n.count = n.count + 1;
+}
+```
+
+### The scoped form - `olock.read(...)`
+
+`olock.read()` wraps the snapshot/body/validate pattern in one call, taking a
+`lock(this.optimistic) Lambda<void()>` body:
+
+```c
+i64 total = 0;
+bool valid = n.ver.read(() => {
+    total = n.count;      // optimistic read of a field guarded by n.ver
+});
+if (!valid) { /* restart: total may be garbage */ }
+```
+
+`lock(this.optimistic)` is what makes the speculation sound: it grants the body permission to
+**read** fields guarded by `this` (`n.ver` here) but the compiler rejects a **write** to one
+inside the body - a write from inside a speculative read would corrupt a node that may be
+mid-split or already retired, not just race an ordinary access.
+
+### Lock modes: exclusive, shared, optimistic
+
+`.optimistic` is a third lock-set mode, alongside the existing `.read` / `.write` suffixes (no
+grammar change - it parses as ordinary member access, exactly like `.read`/`.write`). Holding a
+lock in a given mode gates guarded-field access:
+
+| Held mode | Read guarded field | Write guarded field |
+|---|---|---|
+| Exclusive (`lock(x)` / `lock(x.write)`) | ok | ok |
+| Shared (`lock(x.read)`) | ok | error |
+| Optimistic (`lock(x.optimistic)`, i.e. inside `olock.read()`'s body) | ok | error |
+
+`IOptimisticLockable` (`read_begin`, `read_validate`, `upgrade`) is a **checking** capability
+only - it has no lowering row in the compiler's lock table, because an optimistic read is an
+ordinary method call taking a lambda, not something `lock(...)` acquires/releases for you. It
+composes with `ILockable`: `olock` carries `[Capability(ILockable, IOptimisticLockable)]`, so
+`lock(n.ver) { }` (exclusive) and `n.ver.read_begin()` / `read_validate()` / `read()` (optimistic)
+both work on the same field.
+
+### `upgrade` - optimistic to exclusive without re-descending
+
+`upgrade(v)` promotes a snapshot version directly to the exclusive lock, atomically, without
+releasing and re-acquiring: `false` means a writer won the race and the caller must restart
+(re-descend) rather than proceed with a stale snapshot. This is the pattern a concurrent
+insert uses: descend optimistically, then `upgrade` the target leaf's lock right before
+mutating it.
+
+### What is NOT supported: concurrent structural remove
+
+**Concurrent structural remove (freeing a node on `remove()`, e.g. via merge/borrow) is not
+supported** - this was evaluated (plan Phase 6) and deliberately deferred, not an oversight.
+The reason is a hard precondition of OLC itself:
+
+**A node must never be freed while an optimistic reader may be inside it.** An optimistic
+reader holds no lock, so nothing stops it from following a pointer into memory that has just
+been freed and reused. OLC is sound only under deferred reclamation (epoch-based reclamation,
+hazard pointers, or RCU) once any operation can free a node while readers are active. `core/hpc/btree.cb`'s
+lookup and insert never free a node - a split only allocates a new sibling - so they are safe
+today. Only merge (on `remove()`) frees a node, which is why structural delete is gated behind
+reclamation. A safe interim substitute is tombstone-only delete: mark the entry dead in its
+leaf, never merge, never free - no node is ever retired, so no reader can dereference freed
+memory, at the cost of a leaf population that only a single-threaded rebuild can compact.
+Deferred reclamation for real concurrent delete is expected to need an epoch-scoped ownership
+model the current lifetime system does not yet express - it is out of scope until pursued as
+its own effort.

@@ -2,7 +2,6 @@
 
 Moved from CLAUDE.md. Validated on Apple Silicon. The quick invocation lives in
 CLAUDE.md; this file is the "why it works" reference. See also
-`internal/plan/cross-platform-macos.md` for the staged port status and
 `internal/worktree-vcpkg-sharing.md` for the shared `vcpkg_installed` tree.
 
 ## Build + link path

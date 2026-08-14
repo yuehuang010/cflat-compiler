@@ -562,7 +562,7 @@ Write its own plan before starting; do not fold into a gap-fix pass.
 ## G8. Memory-mapped files (mmap-with-fd / MapViewOfFile)
 
 Status: DONE (2026-07-11, all 3 phases). Its detail plan
-(internal/plan/hpc-g8-mapped-files.md) has been consolidated into this
+(hpc-g8-mapped-files.md) has been consolidated into this
 section and deleted, the same way G2-G5's were. It WAS a pure
 core-library change - no compiler, grammar, or codegen work (unlike G7,
 which broke that same claim on advapi32.lib): every API used is kernel32

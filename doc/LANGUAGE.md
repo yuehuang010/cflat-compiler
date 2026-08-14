@@ -38,6 +38,7 @@
   - [`is` and `as` Operators](#is-and-as-operators)
   - [Switch on Interface Type](#switch-on-interface-type)
 - [Ownership / Lifetime (`move`)](#ownership--lifetime-move-keyword)
+  - [Assignment (`dest = src`)](#assignment-dest--src)
   - [`move` Return Type](#move-return-type)
   - [`alias` Return Type (borrow)](#alias-return-type-borrow)
   - [`bond` Lifetime Keyword](#bond-lifetime-keyword)
@@ -1007,8 +1008,23 @@ offset of the field, so two implementors with completely different layouts both 
 are inherited by a derived interface exactly like methods, including across several levels.
 
 Reading or writing a field on a **null** interface value (the result of a failed
-`as <Interface>`) faults, exactly as calling a method on one does. Guard with a null compare
-(see below) before reaching through a value that may have missed.
+`as <Interface>`, or a value never assigned an implementation) is caught wherever the
+compiler can prove the receiver is null - a plain local, a struct field, an array element,
+or a global, checked across straight-line code, branches, and loops. That is a **compile-time
+error**, not a crash:
+
+```c
+PTagged fv;
+fv.tag;   // error: member access on uninitialized interface value 'fv' - 'fv' is never
+          // assigned an implementation before this access, so 'fv.tag' would resolve its
+          // address through an uninitialized vtable
+```
+
+Where the compiler cannot prove it - a parameter, a receiver whose value depends on
+information the analysis does not track, or a nested field/array-element path - the access
+is accepted, and it faults at run time if the value really is null, exactly as calling a
+method on one does. Guard with a null compare (see below) or `?.` before reaching through a
+value whose liveness the compiler cannot see statically.
 
 ### Generic Interfaces
 
@@ -1177,6 +1193,36 @@ consume(res);   // res is automatically nulled in the caller after this call
 - **Call site is silent** - no annotation required; the caller's pointer is automatically nulled after a `move` call.
 - `move` is a soft keyword detected by text matching, not an ANTLR token - identifiers named `move` still work.
 - For value types `move` is a no-op; ownership semantics only activate on pointer types.
+
+### Assignment (`dest = src`)
+
+Plain `=` is **total over the type on the right** - what a given `dest = src` does is
+decided entirely by `T`, not by anything written at the call site:
+
+| `T` is... | `dest = src` does... |
+|---|---|
+| a copyable owner (`string`, a container, a struct with a synthesized or user `copy()`) | **copies** - `src` is unaffected, `dest` gets its own independent value |
+| a non-copyable owner (`unique T*`, `unique <interface>`, a struct holding one) | **moves** - ownership transfers from `src` to `dest`; `src` is consumed (nulled, and further reads follow the use-after-move rules in [Local ownership](#local-ownership)) |
+| a borrow (bare `T*`, `alias T*`, a plain interface value) | **aliases** - `dest` and `src` refer to the same object; neither owns it |
+| a trivial/value type (a primitive, a POD struct) | **copies** - the ordinary bitwise copy |
+
+In every case **`dest`'s old value is dropped first**, so there is exactly one owner at all
+times - reassigning a `unique` field, local, or container slot never leaks the value it held:
+
+```c
+unique Resource* a = new Resource();
+unique Resource* b = new Resource();
+a = b;          // frees a's old Resource, then MOVES b's Resource into a; b is nulled
+
+list<int> l1 = { 1, 2, 3 };
+list<int> l2 = default;
+l2 = l1;        // COPIES - l1 is untouched, l2 gets its own elements
+```
+
+This is the same drop-old-then-store rule already shown for
+[Field ownership](#field-ownership-original-form) (`t._root = new Node();` frees the old
+node) - it applies uniformly to local reassignment, struct-field stores, and container
+element stores; there is no separate "container" or "field" special case to learn.
 
 ### `move` Return Type
 
@@ -1376,7 +1422,7 @@ struct Tree
 };
 ```
 
-`unique` is **opt-in and additive**: an unmarked `T*` field behaves exactly as it always has. Mark only the fields your struct genuinely owns. It composes with `alignas(0, N)` - an over-aligned pointee is freed through the matching aligned path.
+`unique` is **opt-in and additive**: an unmarked `T*` field behaves exactly as it always has. Mark only the fields your struct genuinely owns. It composes with `alignas(slot, alloc)` - the two-argument, positional form of `alignas` that adds an ALLOCATION alignment (`alloc`) alongside the ordinary SLOT alignment (`slot`; `0` means "natural"): `alignas(0, 64) double[] data = default;` over-aligns the heap block to 64 bytes and frees it through the matching aligned path. The same `alignas(0, N)` on a declaration is inherited by a direct `new` on its right-hand side, so the `new` itself does not need to repeat it, and it is honored across the three escapes the compiler tracks: a `unique`/owning FIELD (as above), a `move` PARAMETER, and a function's RETURN type - so ownership of an over-aligned allocation can cross a call in either direction without losing the alignment it must be freed with.
 
 **Assigning to a `unique` field frees whatever it held.** There is no need to delete first, and no way to leak the old value:
 
@@ -1445,6 +1491,37 @@ printf("%d\n", view->id);
 `delete` on a `unique` local is rejected, the same as on a `unique` field - assign
 `nullptr` to free it early, or let scope exit free it.
 
+**After an explicit `move` of a `unique T*` local, the source is safe to read again** - it
+observes a zeroed pointer that compares equal to `nullptr` - but *dereferencing* it (a
+method call, `->`, or field access) is caught at compile time as
+`dereference of moved variable '<name>'`, not left to fault at run time:
+
+```c
+unique Resource* e = new Resource();
+Resource* taken = move e;   // e is now null, but still a legal read
+if (e == nullptr) { ... }   // OK: reading e is fine
+e->id;                       // error: dereference of moved variable 'e'
+```
+
+This use-after-move check is a whole-function dataflow analysis, not a single linear pass
+over the text, so it also catches a value read on the *next* iteration of a loop after being
+moved inside the loop body - not just a use later in the same straight-line block:
+
+```c
+while (cond)
+{
+    consume(move r);   // r is nulled here
+    // ... r read again before being reassigned -> compile error, even though the read and
+    //     the move are on different iterations of the loop
+}
+```
+
+Non-pointer, non-interface value types (structs without the thin-pointer contract, `string`,
+etc.) are stricter: any read of a moved-from local, not just a dereference, is rejected as
+`use of moved variable '<name>'`. Global and `static` storage is the one place a plain read
+after `move` is well-defined instead - see
+[Ownership at Global and `static` Scope](#ownership-at-global-and-static-scope).
+
 #### Parameter ownership
 
 A `unique`-typed parameter is exactly a synthesized `move` parameter - the two
@@ -1487,6 +1564,12 @@ unique IShape bad = t;            // error: cannot initialize unique 'bad' from 
 
 Deleting a `unique IShape` dispatches the concrete implementor's destructor through the
 vtable, then frees the object - exactly like `delete` on a scalar interface value today.
+
+Moving a `unique IShape` local follows the same read/dereference split documented for
+`unique T*` in [Local ownership](#local-ownership): after `move`, the source is a legal read
+that observes a null interface value (both the vtable and data slots are zeroed, so it
+compares equal to `nullptr`), but calling a method or accessing a field through it is caught
+at compile time as `dereference of moved variable`, not deferred to a runtime crash.
 
 #### `unique` containers
 
@@ -2874,10 +2957,36 @@ need a real wall-clock or millisecond duration.
 | `stream.cb` | Double-buffered text pipe between two `program` constructs |
 | `process.cb` | Launch and communicate with a child process |
 | `time.cb` | `TimePoint`, `Stopwatch`, `Timer`, `sleep`, `rdtscp`/`lfence` timing |
-| `os.cb` | Platform dispatcher (imports `os.windows.cb` on Windows) |
+| `os.cb` | Platform dispatcher (imports `os.windows.cb` on Windows) - stateless free functions behind `namespace os`, see below |
 | `os.windows.cb` | Windows platform externs: Win32 API and MSVC CRT |
 | `network/socket.cb` | Platform-agnostic TCP/UDP socket API |
 | `network/socket.windows.cb` | Winsock2 raw bindings (pulled in by `socket.cb` on Windows) |
+
+**`os.*` capability surface**
+
+`os.cb` is the one place a capability performs its actual system call; everything else in
+`core/` reaches the OS only through it. The functions are stateless (a caller-owned `void**`
+slot carries any state) so `os.*` never allocates a wrapper of its own - stateful wrapper
+structs (`mutex`, `rwlock`, `semaphore`, `event`, `Latch`, `thread`, ...) live in their own
+`.cb` files and call into `os.*` underneath:
+
+| Group | Functions |
+|---|---|
+| Time | `sleep_ms`, `monotonic_nanos`, `monotonic_freq`, `wallclock_filetime` |
+| System info | `page_size`, `num_processors`, `cache_line_size`, `process_working_set_bytes`, `process_peak_working_set_bytes`, `process_private_bytes` |
+| Virtual memory | `vm_reserve`, `vm_commit`, `vm_reserve_commit`, `vm_release` |
+| Mutex | `mutex_lock(void** slot)`, `mutex_unlock`, `mutex_destroy` |
+| Condition variable | `cond_init(void** slot)`, `cond_wait(void** cv, void** mtx)`, `cond_signal`, `cond_broadcast`, `cond_destroy` |
+| Reader-writer lock | `rwlock_read_lock(void** slot)`, `rwlock_read_unlock`, `rwlock_write_lock`, `rwlock_write_unlock`, `rwlock_destroy` |
+| Semaphore | `sem_new(i32 initial, i32 max) -> void*`, `sem_wait`, `sem_post(n)`, `sem_destroy` |
+| Event | `event_new() -> void*`, `event_set`, `event_wait`, `event_destroy` |
+| Thread | `thread_create(function<void(void*)> start, void* arg) -> void*`, `thread_join`, `thread_timed_join`, `thread_detach`, `thread_kill`, `thread_set_affinity`, `thread_yield`, `thread_current_id`, `thread_hardware_concurrency` |
+| Terminal | `term_make_raw`, `term_restore`, `term_poll_in`, `term_read_byte`, `term_get_size`, `std_write`, `std_stream` |
+| Filesystem | `mkdir`, `rmdir`, `is_dir`, `access`, `unlink`, `rename`, `getcwd`, `chdir`, `opendir`/`readdir_name`/`closedir`, `realpath`, temp-path and directory-enumeration helpers |
+
+Prefer the stateful wrapper struct for your own code (`mutex`, `thread`, `Latch`, and so on) -
+`os.*` is the substrate they are built on, useful directly mainly when writing a new
+concurrency primitive or porting one that needs a raw platform handle.
 
 **Serialization & text**
 

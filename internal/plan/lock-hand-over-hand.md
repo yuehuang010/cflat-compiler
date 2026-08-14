@@ -13,7 +13,8 @@ so the existing scoped `lock(m) { ... }` form cannot express it.
 Original ask: an explicit non-scoped form, e.g. `lock(mtx1); ... unlock(mtx1);`.
 
 Constraint from maintainer: raw `mtx.acquire()`/`mtx.release()` must stay legal
-(see internal/plan/lock-capability-interface.md phase 5; the concurrent-btree work
+(see doc/THREADING.md, "Custom Lock Types ([Capability(ILockable)])" - raw acquire/release
+enforcement was evaluated and intentionally not implemented; the concurrent-btree work
 depends on it). This feature is additive on top of raw acquire/release.
 
 Key maintainer constraint (decisive): the guard/capability is COMPILE-TIME ONLY.
@@ -203,7 +204,8 @@ flow-sensitive state, not just locks - see staging note 4 on scope.
 
 ## Related
 
-- internal/plan/lock-capability-interface.md (capability model, why raw stays legal)
-- internal/plan/lock-guard-mandatory.md (release-on-early-return, mode fix)
-- internal/plan/optimistic-lock-coupling.md (IOptimisticLockable)
+- doc/THREADING.md, "Custom Lock Types ([Capability(ILockable)])" (capability model, why raw
+  stays legal)
+- doc/THREADING.md, the lock(...) positions section (release-on-early-return, mode fix)
+- doc/THREADING.md, "Optimistic Lock Coupling (olock)" (IOptimisticLockable)
 - memory: concurrent-btree-direction (raw acquire/release must stay legal)

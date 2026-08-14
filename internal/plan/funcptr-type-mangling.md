@@ -399,4 +399,5 @@ only asserts "it compiles" cannot see that. Green `./test.sh Release` is the bar
 
 Related: `internal/issue/p1/funcptr-overload-binding-ignores-signature.md`,
 `internal/issue/p1/funcptr-pointer-depth-not-compared.md` (branch only),
-`internal/plan/closure-generics-monomorphization.md`, `internal/fix-issue-lessons.md`.
+the closure-generics-monomorphization fix (landed; compiler bug fix, no doc successor),
+`internal/fix-issue-lessons.md`.
