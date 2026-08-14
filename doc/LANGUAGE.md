@@ -59,6 +59,7 @@
 - [Reflection](#reflection)
   - [`IReflector` Interface](#ireflector-interface)
   - [`reflect(value, visitor)`](#reflectvalue-visitor)
+  - [Compile-Time Serialization (`json_const` and `xml_const`)](#compile-time-serialization-json_const-and-xml_const)
 - [Range-Based For](#range-based-for)
 - [Control Flow](#control-flow)
   - [Ternary Operator (`? :`)](#ternary-operator--)
@@ -411,6 +412,7 @@ Point q = {y = 5};          // x stays at its default (0)
 ```
 
 A *positional* list on a struct (`Point p = {1, 2}`) is a compile error - use named fields.
+Nested named braces work in ordinary struct declarations and initializers too: `Outer o = { inner = { x = 1 } };`.
 
 **Fixed-size arrays `T[N]` - positional** (the size belongs to the type). Fewer elements than `N`
 leaves the trailing slots zero-filled; more than `N` is an error:
@@ -2373,6 +2375,77 @@ reflect(p, visitor);    // prints: x=3 y=7
 
 `reflect` also works on null pointers - calls `visitNull` with the field name.
 
+### Compile-Time Serialization (`json_const` and `xml_const`)
+
+`json_const(TypeName, { ... })` folds a brace literal at compile time and returns a string
+constant containing JSON. The result can be used anywhere a string literal can be used. The
+initializer accepts only integer, float, boolean, and string literals, `EnumType.Member`
+references, nested named braces, and positional list braces. Struct fields must be named; fields
+not included in the literal are omitted. `[JsonName("...")]` changes a key, and `[Private]`
+skips a field. Enum members are serialized as their names, as JSON strings.
+
+```c
+enum Mode : int { Fast, Safe };
+struct Meta { int count = default; };
+struct JsonConfig {
+    [JsonName("mode_name")] Mode mode = default;
+    Meta meta = default;
+    list<int> values = default;
+};
+
+string json = json_const(JsonConfig, {
+    mode = Mode.Fast,
+    meta = { count = 3 },
+    values = { 1, 2, 3 }
+});
+// {"mode_name":"Fast","meta":{"count":3},"values":[1,2,3]}
+```
+
+`xml_const(TypeName, { ... })` uses the same compile-time literal fold and returns an XML string
+constant. The root type is a transparent wrapper: its fields become the top-level elements. Each
+output name is the field name or its `[JsonName]` value. A struct field becomes an element, and a
+scalar field becomes an attribute. A scalar field marked `[JsonText]` becomes an element whose
+text is the scalar value. A `list<struct>` field emits repeated elements with its output name. XML
+text and attribute values are escaped automatically.
+As with JSON, fields marked `[Private]` are skipped.
+
+For XML, unnamed scalar fields with a declared literal default are still emitted. This is useful
+for boilerplate attributes such as `string xmlns = "...";`. An unnamed field initialized with
+`default` is omitted. Root fields must be structs or `list<struct>` fields.
+
+```c
+enum Dpi : int { Unaware, PerMonitor };
+annotation JsonText { };
+struct Settings {
+    [JsonText] Dpi dpi = default;
+    string xmlns = "urn:example:settings";
+};
+struct Dependency { string name = default; };
+struct Assembly {
+    string xmlns = "urn:example:assembly";
+    list<Dependency> dependency = default;
+    Settings settings = default;
+};
+struct XmlDoc { Assembly assembly = default; };
+
+string xml = xml_const(XmlDoc, { assembly = {
+    dependency = { { name = "one" }, { name = "two" } },
+    settings = { dpi = Dpi.PerMonitor }
+} });
+// <assembly xmlns="urn:example:assembly"><dependency name="one"/><dependency name="two"/><settings xmlns="urn:example:settings"><dpi>PerMonitor</dpi></settings></assembly>
+```
+
+The common errors are:
+
+- A non-literal value is rejected because the initializer must be a compile-time literal.
+- An unknown named field is rejected; the field must exist on `TypeName`.
+- An enum value must name a member of that enum, such as `Mode.Fast`.
+- Positional initialization of a struct is rejected; use named fields, including in nested braces.
+
+XML also rejects scalar root fields and `list<T>` fields whose elements are not structs. Nested
+named brace initializers (`field = { ... }`) are ordinary brace initialization as well; see
+[Brace Initializers](#brace-initializers).
+
 ---
 
 ## Range-Based For
@@ -2644,8 +2717,8 @@ name at all.
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `expect_error`, `is_pointer`, `nameof`, `reflect`, `reflect_set`,
-`sizeof`, `typeof`
+`annotationof`, `expect_error`, `is_pointer`, `json_const`, `nameof`, `reflect`,
+`reflect_set`, `sizeof`, `typeof`, `xml_const`
 
 **Compiler-recognized methods** (not reserved - you define them on a type, the
 compiler auto-invokes them by name):

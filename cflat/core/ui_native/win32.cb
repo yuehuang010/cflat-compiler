@@ -23,7 +23,19 @@
 import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib",
                          "uxtheme.lib" } cache;
 import "ui_native.cb";
+import "manifest.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
+
+manifest ManifestDoc uiNativeManifest = { assembly = {
+    dependency = { { dependentAssembly = { assemblyIdentity = {
+        type = "win32", name = Manifest.commonControlsName,
+        version = Manifest.commonControlsVersion, processorArchitecture = "*",
+        publicKeyToken = Manifest.commonControlsToken, language = "*"
+    } } } },
+    application = { settings2016 = {
+        dpiAwareness = DpiAwareness.PerMonitorV2, longPathAware = true
+    } }
+} };
 
 // -- APIs not surfaced by the windows.h binding (declared by hand) ------------
 // InitCommonControls() (commctrl.h) registers the classic control classes;

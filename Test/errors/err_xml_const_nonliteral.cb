@@ -1,0 +1,11 @@
+struct XmlBadNonliteralChild { int value = default; };
+struct XmlBadNonliteral { XmlBadNonliteralChild child = default; };
+
+extern int main()
+{
+    int source = 7;
+    expect_error("xml_const initializer must be a compile-time literal") {
+        string result = xml_const(XmlBadNonliteral, { child = { value = source } });
+    }
+    return 0;
+}

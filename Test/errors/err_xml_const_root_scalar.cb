@@ -1,0 +1,9 @@
+struct XmlBadRootScalar { int value = default; };
+
+extern int main()
+{
+    expect_error("xml_const root fields must be elements") {
+        string result = xml_const(XmlBadRootScalar, { value = 1 });
+    }
+    return 0;
+}

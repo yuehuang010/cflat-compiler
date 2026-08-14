@@ -38,6 +38,16 @@
 #include "LLVMBackend.h"
 #include "LspSymbolIndex.h"
 
+static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
+                                        const std::string& name)
+{
+    if (specs == nullptr) return false;
+    for (auto* spec : specs->declarationSpecifier())
+        if (spec->typeSpecifier() != nullptr && spec->typeSpecifier()->getText() == name)
+            return true;
+    return false;
+}
+
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
 static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)
@@ -2876,6 +2886,11 @@ public:
 
     std::vector<std::pair<std::string, llvm::AllocaInst*>> ParseDeclaration(CFlatParser::DeclarationContext* ctx, const std::string& namespaceName = {});
 
+    std::optional<std::string> FoldConstLiteral(
+        antlr4::ParserRuleContext* ctx, const std::string& intrinsicName,
+        const std::string& typeName, CFlatParser::InitializerListContext* init,
+        std::vector<LLVMBackend::ManifestFragment::Leaf>* manifestLeaves = nullptr);
+
     void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx);
 
     // Descend a single-child expression chain from `ctx` to a top-level `move` expression, if one
@@ -4330,7 +4345,9 @@ public:
         const std::string& typeName,
         CFlatParser::InitializerListContext* ctx);
 
-    bool RejectNestedNamedBraceInitializer(CFlatParser::InitializerListContext* list);
+    bool RejectNestedNamedBraceInitializer(
+        CFlatParser::InitializerListContext* list,
+        const std::string& message);
 
     // Coerce a parsed element value to the container's `string` element type.
     // Mirrors EmitFieldInitializer's string handling: a char* string-literal constant is

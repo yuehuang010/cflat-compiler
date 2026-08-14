@@ -1,0 +1,5 @@
+import "manifest.cb";
+
+expect_error("manifest initializer must be a compile-time literal") {
+    manifest ManifestDoc appManifest = default;
+}

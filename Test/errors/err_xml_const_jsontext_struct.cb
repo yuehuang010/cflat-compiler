@@ -1,0 +1,12 @@
+annotation JsonText { };
+
+struct XmlBadTextChild { int value = default; };
+struct XmlBadTextRoot { [JsonText] XmlBadTextChild child = default; };
+
+extern int main()
+{
+    expect_error("xml_const [JsonText] requires a scalar field") {
+        string result = xml_const(XmlBadTextRoot, { child = { value = 1 } });
+    }
+    return 0;
+}

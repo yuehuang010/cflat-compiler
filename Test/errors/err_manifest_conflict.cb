@@ -1,0 +1,16 @@
+import "manifest.cb";
+
+expect_error("manifest [JsonText] conflict") {
+    manifest ManifestDoc firstManifest = { assembly = {
+        application = { settings2016 = {
+            dpiAwareness = DpiAwareness.PerMonitorV2
+        } }
+    } };
+    manifest ManifestDoc secondManifest = { assembly = {
+        application = { settings2016 = {
+            dpiAwareness = DpiAwareness.System
+        } }
+    } };
+}
+
+extern int main() { return 0; }

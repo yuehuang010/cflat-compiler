@@ -1,0 +1,5 @@
+struct NestedGlobalBraceInner { int count = default; };
+struct NestedGlobalBraceCfg { NestedGlobalBraceInner inner = default; };
+
+expect_error("nested named brace initializer is not supported in global fixed-array elements");
+NestedGlobalBraceCfg[1] globalValues = { { inner = { count = 3 } } };

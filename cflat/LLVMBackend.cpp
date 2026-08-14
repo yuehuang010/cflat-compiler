@@ -2409,6 +2409,8 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
 void LLVMBackend::ResetForReanalysis()
 {
+    manifestFragments_.clear();
+    compileTimeStringConstants_.clear();
     // Reset the LLVM context so named struct types from a previous analysis do
     // not survive into the next one.  Without this, two fixtures that define a
     // struct with the same name but different field types (e.g. Point{int,int}
@@ -4687,7 +4689,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
     // Each version added tables an older cache lacks (v2: interface fields; v3: annotation
     // declarations), so an older cache must be rejected rather than silently reused.
-    root["version"]   = 3;
+    root["version"]   = 4;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -4862,6 +4864,33 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         root["globals"] = std::move(arr);
     }
 
+    // manifest fragments and their [JsonText] leaf records. These are compile-time state from
+    // core declarations; dropping them on a warm cache would silently remove the manifest.
+    {
+        llvm::json::Array arr;
+        for (const auto& fragment : manifestFragments_)
+        {
+            llvm::json::Object fo;
+            fo["source_file"] = fragment.SourceFile;
+            fo["line"] = static_cast<int64_t>(fragment.Line);
+            fo["xml"] = fragment.Xml;
+            llvm::json::Array leaves;
+            for (const auto& leaf : fragment.Leaves)
+            {
+                llvm::json::Object lo;
+                lo["namespace"] = leaf.Namespace;
+                lo["local_name"] = leaf.LocalName;
+                lo["text"] = leaf.Text;
+                lo["source_file"] = leaf.SourceFile;
+                lo["line"] = static_cast<int64_t>(leaf.Line);
+                leaves.push_back(std::move(lo));
+            }
+            fo["leaves"] = std::move(leaves);
+            arr.push_back(std::move(fo));
+        }
+        root["manifest_fragments"] = std::move(arr);
+    }
+
     // Serialize one family of generic templates into root[jsonKey].
     // All template context types expose getStart()/getStop() via ParserRuleContext, so the
     // templates map is accepted as `const auto&` and the type is deduced per call site.
@@ -4989,7 +5018,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 3) return false;
+    if (!ver || *ver != 4) return false;
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
 
@@ -5043,6 +5072,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     globalNamedVariable.clear();
     globalVariableTypes.clear();
     globalDeclSite.clear();
+    manifestFragments_.clear();
     namespaceTable.clear();
     typeAliases.clear();
     manglingAliases_.clear();
@@ -5244,6 +5274,42 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
         }
 
     } // end CoreDes:Globals
+
+    // Manifest fragments and their [JsonText] leaf records.
+    { llvm::TimeTraceScope s("CoreDes:Manifest", jsonPath);
+    if (auto* arr = root->getArray("manifest_fragments"))
+        for (auto& elem : *arr)
+        {
+            auto* fo = elem.getAsObject();
+            if (!fo) continue;
+            auto source = fo->getString("source_file");
+            auto xml = fo->getString("xml");
+            if (!source || !xml) continue;
+            ManifestFragment fragment;
+            fragment.SourceFile = source->str();
+            if (auto line = fo->getInteger("line")) fragment.Line = static_cast<size_t>(*line);
+            fragment.Xml = xml->str();
+            if (auto* leaves = fo->getArray("leaves"))
+                for (auto& elem : *leaves)
+                {
+                    auto* lo = elem.getAsObject();
+                    if (!lo) continue;
+                    auto ns = lo->getString("namespace");
+                    auto local = lo->getString("local_name");
+                    auto text = lo->getString("text");
+                    auto leafSource = lo->getString("source_file");
+                    if (!ns || !local || !text || !leafSource) continue;
+                    ManifestFragment::Leaf leaf;
+                    leaf.Namespace = ns->str();
+                    leaf.LocalName = local->str();
+                    leaf.Text = text->str();
+                    leaf.SourceFile = leafSource->str();
+                    if (auto line = lo->getInteger("line")) leaf.Line = static_cast<size_t>(*line);
+                    fragment.Leaves.push_back(std::move(leaf));
+                }
+            manifestFragments_.push_back(std::move(fragment));
+        }
+    } // end CoreDes:Manifest
 
     // Register generic templates lazily: store each template's source text plus a null context
     // placeholder. The ANTLR parse is deferred to MaterializeGeneric* on first instantiation,

@@ -1,0 +1,9 @@
+import "manifest.cb";
+
+extern int main()
+{
+    expect_error("manifest declarations are only allowed at file scope") {
+        manifest ManifestDoc appManifest = { assembly = {} };
+    }
+    return 0;
+}

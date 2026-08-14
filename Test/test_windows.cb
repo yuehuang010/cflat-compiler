@@ -26,6 +26,9 @@
 //      sizeof(PROCESSENTRY32) == 304, not a decayed-pointer 40. The compiler has no built-in
 //      knowledge of windows.h - the dependency is expressed entirely in this source.
 import "test_helper.cb";
+import "manifest.cb";
+import "filesystem.cb";
+import "wstring.cb";
 // A standalone `import "windows.h";` BEFORE the group must not strip windows.h from the
 // group's inclusion context. Dedup applies to registration only - the group stub still
 // #includes windows.h (so tlhelp32.h's HANDLE/DWORD prerequisites resolve) while windows.h's
@@ -35,10 +38,39 @@ import "test_helper.cb";
 import "windows.h";
 import {"windows.h", "tlhelp32.h"} lib { "user32.lib", "gdi32.lib" };
 
-extern int main()
+extern stdcall win_int QueryActCtxSettingsW(void* hActCtx, u32 flags,
+    const u16* settingsNamespace, const u16* settingName, u16* buffer,
+    u64 bufferLength, u64* writtenOrRequired);
+
+manifest ManifestDoc appManifest = { assembly = {
+    dependency = { { dependentAssembly = { assemblyIdentity = {
+        type = "win32", name = "Microsoft.Windows.Common-Controls", version = "6.0.0.0",
+        processorArchitecture = "*", publicKeyToken = "6595b64144ccf1df", language = "*"
+    } } } },
+    application = { settings2016 = {
+        dpiAwareness = DpiAwareness.PerMonitorV2, longPathAware = true
+    } }
+} };
+
+extern int main(int argc, char** argv)
 {
     int passed = 0;
     int total = 0;
+
+    string image = File.readAllText("" + argv[0]);
+    total++; passed += Test("embedded manifest dependency", image.contains("Microsoft.Windows.Common-Controls"), true);
+
+    string settingsNamespaceText = "http://schemas.microsoft.com/SMI/2016/WindowsSettings";
+    string settingNameText = "dpiAwareness";
+    wstring settingsNamespace = settingsNamespaceText.toWString();
+    wstring settingName = settingNameText.toWString();
+    u16[64] settingValue = default;
+    u64 writtenOrRequired = 0;
+    int queryOk = QueryActCtxSettingsW(0, nullptr, settingsNamespace.data(), settingName.data(),
+        &settingValue[0], 64, &writtenOrRequired);
+    int valueLength = writtenOrRequired > 0 ? (int)writtenOrRequired - 1 : 0;
+    wstring dpiValue = wstring.fromUtf16(&settingValue[0], valueLength);
+    total++; passed += Test("OS-loaded dpiAwareness", queryOk != 0 && dpiValue.toString() == "PerMonitorV2", true);
 
     u32 pid = GetCurrentProcessId();
     total++; passed += Test("GetCurrentProcessId nonzero", pid != 0, true);

@@ -6,6 +6,7 @@ import "diagnostic/heap_audit.cb";
 
 annotation Private   { };
 annotation JsonName  { string value; };
+annotation JsonText  { };
 annotation MaxLength { int value; };
 
 // -- Structs ------------------------------------------------------------------
@@ -139,6 +140,42 @@ struct JsonConstFloats {
     double hi = default;
     float f = default;
 };
+
+enum XmlDpi : int { XmlUnaware, XmlPerMonitorV2 };
+
+struct XmlSettings {
+    [JsonText] XmlDpi dpiAwareness = default;
+    [JsonText] bool longPathAware = default;
+    string xmlns = "http://ns.example/ws";
+};
+
+struct XmlIdentity {
+    string type = default;
+    string name = default;
+    string version = default;
+};
+
+struct XmlFragment {
+    string xmlns = "urn:schemas-example:asm.v1";
+    string manifestVersion = "1.0";
+    list<XmlIdentity> dependency = default;
+    XmlSettings settings = default;
+};
+
+struct XmlDoc { XmlFragment assembly = default; };
+
+struct XmlRename {
+    [JsonName("renamed_attr")] int original = default;
+};
+
+struct XmlRenameDoc { XmlRename value = default; };
+
+struct XmlPrivate {
+    int visible = default;
+    [Private] int hidden = default;
+};
+
+struct XmlPrivateDoc { XmlPrivate value = default; };
 
 enum ReflectColor : u8 { ReflectRed, ReflectGreen, ReflectBlue };
 
@@ -336,6 +373,23 @@ extern int main()
     string jsonConstFloats = json_const(JsonConstFloats, { lo = .5, hi = -3., f = 1.25f });
     total++; passed += Test("json_const float normalization", jsonConstFloats,
         "{\"lo\":0.5,\"hi\":-3.0,\"f\":1.25}");
+
+    // xml_const() emits a transparent root, declaration defaults, attributes, text elements,
+    // repeated struct elements, escaping, and omitted default lists without whitespace.
+    string xmlConstText = xml_const(XmlDoc, { assembly = {
+        dependency = { { type = "win32", name = "A&B <\"Controls\">", version = "6.0.0.0" }, { type = "win32", name = "second", version = "1.0.0.0" } },
+        settings = { dpiAwareness = XmlDpi.XmlPerMonitorV2, longPathAware = true }
+    } });
+    total++; passed += Test("xml_const worked example", xmlConstText,
+        "<assembly xmlns=\"urn:schemas-example:asm.v1\" manifestVersion=\"1.0\"><dependency type=\"win32\" name=\"A&amp;B &lt;&quot;Controls&quot;&gt;\" version=\"6.0.0.0\"/><dependency type=\"win32\" name=\"second\" version=\"1.0.0.0\"/><settings xmlns=\"http://ns.example/ws\"><dpiAwareness>XmlPerMonitorV2</dpiAwareness><longPathAware>true</longPathAware></settings></assembly>");
+
+    string xmlConstRename = xml_const(XmlRenameDoc, { value = { original = 5 } });
+    total++; passed += Test("xml_const JsonName", xmlConstRename, "<value renamed_attr=\"5\"/>");
+    string xmlConstPrivate = xml_const(XmlPrivateDoc, { value = { visible = 7, hidden = 9 } });
+    total++; passed += Test("xml_const Private", xmlConstPrivate, "<value visible=\"7\"/>");
+    string xmlConstEmptyList = xml_const(XmlDoc, { assembly = { dependency = {} } });
+    total++; passed += Test("xml_const empty list omission", xmlConstEmptyList,
+        "<assembly xmlns=\"urn:schemas-example:asm.v1\" manifestVersion=\"1.0\"/>");
 
     // =========================================================================
     // Enum JSON round-trip tests

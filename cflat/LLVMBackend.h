@@ -999,6 +999,22 @@ public:
         std::vector<AnnotationValue> Annotations;
     };
 
+    struct ManifestFragment
+    {
+        std::string SourceFile;
+        size_t Line = 0;
+        std::string Xml;
+        struct Leaf
+        {
+            std::string Namespace;
+            std::string LocalName;
+            std::string Text;
+            std::string SourceFile;
+            size_t Line = 0;
+        };
+        std::vector<Leaf> Leaves;
+    };
+
     struct NamedVariable
     {
     public:
@@ -2770,6 +2786,8 @@ private:
     llvm::Function* currentFunction;
     std::string sourceFileName;
     std::string currentSourceFilePath_;
+    std::vector<ManifestFragment> manifestFragments_;
+    std::unordered_map<std::string, std::string> compileTimeStringConstants_;
     // True while the file being scanned/walked lives under runtimeDir/core (set by CompileImportedFile).
     bool currentSourceIsCore_ = false;
     // Where a function BODY was first attached, keyed on the MANGLED name: source file leaf and
@@ -6740,6 +6758,15 @@ public:
 
     std::string GetSourceFileName() const;
     std::string GetSourceFilePath() const;
+
+    void RecordManifestFragment(const std::string& sourceFile, size_t line,
+                                const std::string& xml,
+                                std::vector<ManifestFragment::Leaf> leaves = {});
+    const std::vector<ManifestFragment>& GetManifestFragments() const;
+    std::optional<std::string> MergeManifestFragments() const;
+    bool ValidateManifestActivationContext(const std::string& xml) const;
+    void RecordCompileTimeStringConstant(const std::string& name, const std::string& value);
+    std::optional<std::string> GetCompileTimeStringConstant(const std::string& name) const;
 
     // The path that identifies the file currently being walked, for def-site identity. The LSP
     // analyzes a temp copy of the open document, so the root file's own path is a throwaway name

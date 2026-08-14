@@ -84,6 +84,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
 
         for (auto paramDecl : paramDeclList)
         {
+            if (HasSoftDeclarationSpecifier(paramDecl->declarationSpecifiers(), "manifest"))
+                LogErrorContext(paramDecl, "manifest declarations are only allowed at file scope");
             LLVMBackend::DeclTypeAndValue paramType = this->ParseDeclarationSpecifiers(paramDecl->declarationSpecifiers());
             if (auto declarer = paramDecl->declarator())
             {

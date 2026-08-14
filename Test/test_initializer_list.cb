@@ -84,6 +84,12 @@ int fbBump() { fbBumped = fbBumped + 1; return 41; }
 struct FbSide  { FbIn i = { x = fbBump(), y = 2 }; };      // the call must run exactly once
 FbEq fbGlobal = default;                                   // globals skip the ctor - still zero
 
+// Nested named braces reuse the ordinary per-field emission path.
+struct NbiLeaf   { int x = 11; string label = default; };
+struct NbiMiddle { NbiLeaf leaf = default; int keep = 22; };
+struct NbiOuter  { NbiMiddle middle = default; list<int> nums = default; int[3] fixed = default; int id = 33; };
+struct NbiDefaultOuter { NbiMiddle middle = { leaf = { x = 5, label = "field" } }; };
+
 // ===== a FIXED-ARRAY field whose OWN default is a brace list =====
 // The brace-list field arm above bailed on ConstArraySize > 0, so an array field fell back to
 // the zero seed. Every value leg below reads 0 (or "") on the pre-fix binary. The list is
@@ -483,6 +489,30 @@ extern int main()
     FbSide fbs;
     total++; passed += Test("field brace default call value", fbs.i.x * 1000 + fbs.i.y, 41002);
     total++; passed += Test("field brace default call runs once", fbBumped, 1);
+
+    // Nested named braces recurse through three struct levels, replace an owning string,
+    // preserve omitted defaults, and route a named list field through its normal initializer.
+    NbiOuter nbi = { id = 7, middle = { leaf = { x = 3, label = "hi" } }, nums = { 1, 2, 3 }, fixed = { 4, 5, 6 } };
+    total++; passed += Test("nested named struct value", nbi.middle.leaf.x, 3);
+    total++; passed += Test("nested named owning string", nbi.middle.leaf.label, "hi");
+    total++; passed += Test("nested named omitted field default", nbi.middle.keep, 22);
+    total++; passed += Test("nested named list count", nbi.nums.count(), 3);
+    total++; passed += Test("nested named list values", nbi.nums.get(0) + nbi.nums.get(1) + nbi.nums.get(2), 6);
+    total++; passed += Test("nested named fixed array values", nbi.fixed[0] + nbi.fixed[1] + nbi.fixed[2], 15);
+
+    NbiDefaultOuter nbiFieldDefault;
+    total++; passed += Test("nested named field default", nbiFieldDefault.middle.leaf.x, 5);
+    total++; passed += Test("nested named field default string", nbiFieldDefault.middle.leaf.label, "field");
+
+    NbiOuter* nbiNew = new NbiOuter { middle = { leaf = { x = 4, label = "new" } } };
+    total++; passed += Test("nested named new expression", nbiNew->middle.leaf.x, 4);
+    total++; passed += Test("nested named new owning string", nbiNew->middle.leaf.label, "new");
+    delete nbiNew;
+
+    NbiOuter nbiPartial = { middle = { leaf = { x = 9 } } };
+    total++; passed += Test("nested named partial keeps leaf default", nbiPartial.middle.leaf.label, "");
+    total++; passed += Test("nested named partial keeps middle default", nbiPartial.middle.keep, 22);
+    total++; passed += Test("nested named partial keeps outer default", nbiPartial.id, 33);
 
     // Instantiation axis - all four spellings run the same synthesized ctor.
     FbEq fbeB = {};

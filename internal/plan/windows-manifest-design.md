@@ -1,6 +1,8 @@
 # Typed Windows manifests: compile-time field verification (DESIGN)
 
-Status: PROPOSED DESIGN - not ratified, do NOT implement yet.
+Status: IMPLEMENTED 2026-08-14 (Phases A, B, C1, C2 all landed and verified; see
+"Implementation order" for what each phase contains and the remaining deferred items:
+winui.cb adoption, helper-function folding, LSP brace-init completion).
 This doc absorbed `internal/issue/ui/win32-classic-common-controls-v5.md` (issue removed
 2026-08-14); the comctl32 v6 dependency is the first fragment this design must carry, and
 `internal/plan/ui-win32-native-polish.md` Phase 5 is the first consumer.
@@ -200,9 +202,12 @@ selftest: `GetProcessDpiAwarenessContext` (dpiAwareness), `GetACP` == 65001
 (activeCodePage utf-8), `RtlAreLongPathsEnabled` (longPathAware), comctl32
 `DllGetVersion` >= 6 (the v6 dependency).
 
-Implementation probe needed (scratch, before coding): does `CreateActCtxW` accept a
-fragment with no `assemblyIdentity` of its own? If not, validate only the merged document
-and rely on layers 1-2 per fragment. (The probes above ran with an identity present.)
+Implementation probe ANSWERED 2026-08-14 (scratch/manifest_probe/probe3.ps1):
+`CreateActCtxW` ACCEPTS fragments with no `assemblyIdentity` of their own - a
+dependency-only fragment, a windowsSettings-only fragment, and even a bare `<assembly>`
+all create fine - so layer 3 can validate PER FRAGMENT as well as the merged document.
+Bonus finding: a dependency on a nonexistent version (Common-Controls 9.9.9.9) FAILS
+creation with gle 14001, confirming bad SxS references are caught at compile time.
 
 ## Declaration, trigger, and composition
 
@@ -236,9 +241,12 @@ and rely on layers 1-2 per fragment. (The probes above ran with an identity pres
   declare fragments in v1 - this is required, not optional, because `activatableClass`
   entries for unpackaged WinUI are app-specific and cannot live in core.
 
-- Emission: each fragment -> one temp XML -> its own `/manifestinput:` in `EmitExecutable`'s
-  `linkArgStrs`, plus `/manifest:embed`. lld merges (verified 2026-07-13). COFF path only;
-  ELF/MachO untouched. Unconditional - no opt-out flag unless a real need appears.
+- Emission (REVISED 2026-08-14): compiler-side merge of all deduped fragments into one
+  document, written as a self-generated RT_MANIFEST `.res` link input. NOT
+  `/manifestinput:` - that path shells out to mt.exe when lld lacks libxml2 (ours does),
+  breaking self-contained linking; the original "lld merges without mt.exe" probe ran in
+  a vcvars shell and was environment-polluted. COFF path only; ELF/MachO untouched.
+  Unconditional - no opt-out flag unless a real need appears.
 
 - Conflict rule (vocabulary-free): byte-identical fragments dedupe silently. For the
   compiler-side merged document used in layer 3: two text-elements at the same element path
@@ -299,12 +307,40 @@ feature of supporting it there).
   the JSON. Unknown field name / wrong enum member / non-literal value = compile errors,
   testable via `expect_error`. Also in this phase: the RUNTIME reflect enum fix (enum arm
   -> `visitInt` via `GetEnumBackingType`, in both `reflect` and `reflect_set`).
-- **Phase B - XML visitor.** Same fold, second builtin emitter implementing the five
-  layer-2 rules (`[JsonText]`, xmlns, attribute-vs-element, list repetition, default
-  omission). The JSON emitter from Phase A is the scaffolding proof; XML is a sibling.
-- **Phase C - manifest wiring.** `manifest` soft keyword, fragment collection across
-  imports, `/manifestinput:` emission, CreateActCtxW + QueryActCtxSettingsW backstop,
-  cache round-trip, core/manifest.cb vocabulary from `utilities/windows-manifest/manifest-schema.json`.
+- **Phase B - XML visitor. DONE 2026-08-14** (test_reflect 147/147, test.bat Release
+  all-pass, four `err_xml_const_*.cb`). `xml_const(TypeName, { ... })` shares the Phase A
+  fold (`foldScalar`/`foldValue`/`foldStruct` factored out); root struct is a TRANSPARENT
+  WRAPPER whose fields become the top-level elements (so core will declare
+  `ManifestDoc { ManifestFragment assembly; }` and the field name yields `<assembly>`);
+  scalar->attribute, `[JsonText]`->element text, `list<struct>`->repeated elements,
+  `[JsonName]` renames, and - one addition over the original five rules - an UNNAMED
+  scalar field whose struct declaration carries a literal default (xmlns, manifestVersion)
+  is emitted anyway, which is how boilerplate attributes appear without user typing.
+  Nested named brace initializers now also work in ordinary declarations (the Phase A
+  grammar follow-up was implemented, not just contained).
+- **Phase C - manifest wiring.** Split in two:
+  - **C1 DONE 2026-08-14 with one REVISED FINDING**: `manifest` soft keyword (both
+    ParseDeclarationSpecifiers copies), fragment collection + byte-identical dedupe,
+    core/manifest.cb vocabulary (windowsSettings grouped per-namespace with
+    `xmlns:wsYYYY` PREFIX attributes and prefixed leaf names via `[JsonName]` - all in
+    core data, compiler stays vocabulary-free), test_windows byte-check +
+    runtime QueryActCtxSettingsW(NULL hActCtx) proof the OS loaded the field.
+    REVISED: the 5.1a claim "lld merges /manifestinput: without mt.exe" is WRONG in a
+    plain shell - our lld-link is built without libxml2, so ANY `/manifestinput:`
+    shells out to mt.exe (the 2026-07-13 probe and C1's own verification both ran
+    inside vcvars shells where mt.exe exists). `/manifestinput:` is therefore
+    unusable for a self-contained toolchain.
+  - **C2 DONE 2026-08-14** (verified in a CLEAN shell with no mt.exe on PATH:
+    test_windows 57/57 direct, test.bat all-pass, LSP all-pass, example.bat 90/0/27
+    including gallery cold+warm-cache byte checks): replace lld manifest machinery with compiler-side merge +
+    self-written RT_MANIFEST `.res` link input (lld's built-in cvtres consumes it, no
+    external tool - this also means lld no longer injects its default trustInfo, so
+    the embedded manifest is exactly the merged document); structural conflict rule on
+    recorded `[JsonText]` leaf (namespace, local-name, text) records; CreateActCtxW +
+    per-leaf QueryActCtxSettingsW backstop on the merged document (Windows host only);
+    --init cache round-trip of fragment+leaf records; win32 UI host core file declares
+    Common-Controls v6 + PerMonitorV2 + longPathAware (the original motivating issue).
+    winui.cb adoption deliberately deferred (needs live gallery verification).
 
 ## Open decisions for ratification
 

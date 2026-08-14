@@ -1,0 +1,11 @@
+import "list.cb";
+
+struct XmlBadScalarList { list<int> values = default; };
+
+extern int main()
+{
+    expect_error("xml_const list field 'values' must contain struct elements") {
+        string result = xml_const(XmlBadScalarList, { values = { 1, 2 } });
+    }
+    return 0;
+}

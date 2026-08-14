@@ -394,7 +394,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
                 // entry is only built by the next ProcessPendingInstantiations.
                 bool genericSpecIsInterface = false;
-                // 'move', 'alias', 'bond' and 'unique' are soft keywords parsed as Identifiers
+                // 'move', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
                 // in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
@@ -419,6 +419,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     declType.IsUnique = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
+                if (typeSpec->getText() == "manifest")
+                    continue;  // collected by ParseDeclaration at file scope
                 // tuple type sugar: (T1, T2) -> tuple<T1, T2>
                 if (typeSpec->tupleTypeSpecifier() != nullptr)
                 {
@@ -2075,6 +2077,11 @@ void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationCont
 
 void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, const std::string& namespaceName, const std::string& nameOverride, const std::string& bodyNamespace) {
         auto* compiler = Compiler(func);
+        if (HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "manifest"))
+        {
+            LogErrorContext(func, "manifest is only valid on file-scope variable declarations");
+            return;
+        }
         // Create Function Definition
         auto name = nameOverride.empty() ? ::getFunctionName(func) : nameOverride;
         if (!namespaceName.empty())
@@ -2473,6 +2480,11 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
             for (auto decl : ctx)
             {
                 auto direct = decl->declarationSpecifiers();
+                if (HasSoftDeclarationSpecifier(direct, "manifest"))
+                {
+                    LogErrorContext(direct, "manifest declarations are only allowed at file scope");
+                    continue;
+                }
                 LLVMBackend::DeclTypeAndValue typeAndValue;
                 {
                     StructFieldDeclGuard fieldCtx(inStructFieldDecl_);
@@ -2898,7 +2910,37 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
         size_t line = declSpec->getStart()->getLine();
+        const bool isManifest = HasSoftDeclarationSpecifier(declSpec, "manifest");
         auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
+
+        if (isManifest)
+        {
+            if (!global_scope)
+            {
+                LogErrorContext(declSpec, "manifest declarations are only allowed at file scope");
+                return allocList;
+            }
+            for (auto* manifestDecl : initDecl->initDeclarator())
+            {
+                auto* initializer = manifestDecl->initializer();
+                auto* initList = manifestDecl->initializerList();
+                if (initList == nullptr && initializer != nullptr)
+                    initList = initializer->initializerList();
+                if (manifestDecl->declarator()->parameterTypeList() != nullptr || initList == nullptr)
+                {
+                    LogErrorContext(manifestDecl,
+                        "manifest initializer must be a compile-time literal");
+                    continue;
+                }
+                std::vector<LLVMBackend::ManifestFragment::Leaf> manifestLeaves;
+                auto folded = FoldConstLiteral(manifestDecl, "xml_const",
+                    typeAndValue.TypeName, initList, &manifestLeaves);
+                if (folded)
+                    compiler->RecordManifestFragment(compiler->GetSourceFilePath(),
+                        manifestDecl->getStart()->getLine(), *folded, std::move(manifestLeaves));
+            }
+            return allocList;
+        }
 
         // Queue any pending generic instantiation for this declaration's type.
         // Actual instantiation happens later in ProcessPendingInstantiations() at top-level scope.
@@ -4236,6 +4278,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
 
                     compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
+                    if (!externDeclOnly && DeclSpecHasConst(declSpec)
+                        && typeAndValue.TypeName == "string" && initializer != nullptr
+                        && initializer->assignmentExpression() != nullptr)
+                    {
+                        std::string raw = initializer->assignmentExpression()->getText();
+                        if (raw.size() >= 2 && raw.front() == '"' && raw.back() == '"'
+                            && !HasInterpolation(raw))
+                            compiler->RecordCompileTimeStringConstant(name, ProcessRawText(raw));
+                    }
                     // A const-qualified global scalar with a constant-int initializer is foldable
                     // in an `if const` condition; a mutable global is not (see constFoldableGlobals_).
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)

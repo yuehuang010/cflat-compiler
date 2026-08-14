@@ -7456,18 +7456,19 @@ CFlatParser::InitializerListContext* MainListener::FieldDefaultBraceList(
         return field.BraceInitializer;
     }
 
-bool MainListener::RejectNestedNamedBraceInitializer(CFlatParser::InitializerListContext* list) {
+bool MainListener::RejectNestedNamedBraceInitializer(
+        CFlatParser::InitializerListContext* list, const std::string& message) {
         if (list == nullptr) return false;
         bool rejected = false;
         for (auto* fi : list->fieldInit())
         {
             if (fi->Identifier() != nullptr && fi->initializerList() != nullptr)
             {
-                LogErrorContext(fi, "nested named brace initializer is only supported in json_const");
+                LogErrorContext(fi, message);
                 rejected = true;
             }
             if (fi->initializerList() != nullptr
-                && RejectNestedNamedBraceInitializer(fi->initializerList()))
+                && RejectNestedNamedBraceInitializer(fi->initializerList(), message))
                 rejected = true;
         }
         return rejected;
@@ -7483,8 +7484,6 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list) {
         auto* compiler = Compiler(list);
-        if (RejectNestedNamedBraceInitializer(list))
-            return llvm::Constant::getNullValue(compiler->GetType(field));
         // A 'T[]' VIEW field: the local spelling infers backing storage a field cannot outlive,
         // so a list with values is rejected ('{}' parses to no initializerList and never gets here).
         if (field.IsArrayView) {
@@ -7541,8 +7540,6 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         auto* compiler = Compiler(list);
         auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(field));
         if (arrTy == nullptr) return nullptr;
-        if (RejectNestedNamedBraceInitializer(list))
-            return llvm::Constant::getNullValue(arrTy);
 
         // Positional ({v0, v1}) vs value-init ({} / {field=v}) - an element carrying no
         // field name is what distinguishes them, exactly as the declarator decides it.
@@ -7599,7 +7596,6 @@ void MainListener::EmitArrayValueInitSlots(
         CFlatParser::InitializerListContext* list,
         bool forceRoot) {
         auto* compiler = Compiler();
-        if (RejectNestedNamedBraceInitializer(list)) return;
         if (arrAlloc == nullptr || elemTy == nullptr) return;
 
         // Total slots: the outer extent times every inner dimension (T[N][M] is N*M elements).
@@ -7630,7 +7626,6 @@ void MainListener::EmitFieldDefaultArraySplat(
         llvm::ArrayType* arrTy,
         llvm::StructType* elemTy) {
         auto* compiler = Compiler(list);
-        if (RejectNestedNamedBraceInitializer(list)) return;
         if (elemTy == nullptr) return;
 
         if (compiler->IsOwningValueType(field.TypeName))
@@ -7699,7 +7694,6 @@ void MainListener::EmitFieldInitializer(
         const std::string& typeName,
         CFlatParser::InitializerListContext* ctx) {
         auto* compiler = Compiler(ctx);
-        if (RejectNestedNamedBraceInitializer(ctx)) return;
         auto it = compiler->dataStructures.find(typeName);
         if (it == compiler->dataStructures.end())
         {
@@ -7724,6 +7718,76 @@ void MainListener::EmitFieldInitializer(
             if (!seen.insert(fieldName).second)
             {
                 LogErrorContext(fi, std::format("Duplicate field initializer for '{}'", fieldName));
+                continue;
+            }
+
+            if (auto* nested = fi->initializerList())
+            {
+                int nestedFieldIndex = -1;
+                for (int i = 0; i < (int)sd.StructFields.size(); ++i)
+                    if (sd.StructFields[i].VariableName == fieldName)
+                    {
+                        nestedFieldIndex = i;
+                        break;
+                    }
+                if (nestedFieldIndex < 0)
+                {
+                    LogErrorContext(fi, std::format("'{}' has no field named '{}'", typeName, fieldName));
+                    continue;
+                }
+
+                const auto& nestedField = sd.StructFields[nestedFieldIndex];
+                std::string nestedFieldPath = std::format("'{}.{}'", typeName, fieldName);
+                if (nestedField.IsBitfield)
+                {
+                    LogErrorContext(fi, std::format(
+                        "nested named brace initializer is not supported for bitfield {}", nestedFieldPath));
+                    continue;
+                }
+                if (nestedField.Pointer)
+                {
+                    LogErrorContext(fi, std::format(
+                        "nested named brace initializer is not supported for pointer field {}", nestedFieldPath));
+                    continue;
+                }
+                if (nestedField.IsArrayView)
+                {
+                    LogErrorContext(fi, std::format(
+                        "nested named brace initializer is not supported for array-view field {}", nestedFieldPath));
+                    continue;
+                }
+
+                llvm::Value* nestedDestination = sd.IsUnion
+                    ? structPtr
+                    : compiler->builder->CreateStructGEP(sd.StructType, structPtr,
+                        (unsigned)nestedFieldIndex, fieldName + "_nested_init");
+                if (nestedField.ConstArraySize > 0)
+                {
+                    auto nestedValue = EmitFieldDefaultFixedArrayBrace(typeName, nestedField, nested);
+                    if (nestedValue != nullptr)
+                        compiler->CreateAssignment(nestedValue, nestedDestination, false,
+                            compiler->GetType(nestedField));
+                    continue;
+                }
+
+                bool isContainer = nestedField.TypeName.rfind("list__", 0) == 0
+                    || nestedField.TypeName.rfind("array__", 0) == 0
+                    || nestedField.TypeName.rfind("dictionary__", 0) == 0;
+                if (isContainer)
+                {
+                    TryEmitContainerInitializer(nestedDestination, nestedField, nested);
+                    continue;
+                }
+
+                auto nestedData = compiler->GetDataStructure(nestedField.TypeName);
+                if (nestedData.StructType != nullptr)
+                {
+                    EmitFieldInitializer(nestedDestination, nestedField.TypeName, nested);
+                    continue;
+                }
+
+                LogErrorContext(fi, std::format(
+                    "nested named brace initializer requires a struct or container field {}", nestedFieldPath));
                 continue;
             }
 
@@ -7844,7 +7908,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         CFlatParser::InitializerListContext* initList,
         llvm::Value* arrAlloc) {
         auto* compiler = Compiler(initList);
-        if (RejectNestedNamedBraceInitializer(initList)) return;
+        if (RejectNestedNamedBraceInitializer(initList,
+                "nested named brace initializer is not supported in positional fixed-array elements")) return;
         auto elements = initList->fieldInit();
         bool multidim = !tv.ConstInnerDimensions.empty();
         uint64_t n = tv.ConstArraySize;
@@ -8259,7 +8324,8 @@ void MainListener::EmitGlobalFixedArrayInit(
         CFlatParser::DirectDeclaratorContext* direct,
         antlr4::ParserRuleContext* errCtx) {
         auto* compiler = Compiler(errCtx);
-        if (RejectNestedNamedBraceInitializer(initList)) return;
+        if (RejectNestedNamedBraceInitializer(initList,
+                "nested named brace initializer is not supported in global fixed-array elements")) return;
         auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
         auto* elemTy = arrTy->getElementType();
         uint64_t n = tv.ConstArraySize;
@@ -8528,7 +8594,8 @@ void MainListener::EmitArrayViewInferredInit(
         size_t line,
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList) {
         auto* compiler = Compiler(initList);
-        if (RejectNestedNamedBraceInitializer(initList)) return;
+        if (RejectNestedNamedBraceInitializer(initList,
+                "nested named brace initializer is not supported for inferred array-view elements")) return;
         std::vector<CFlatParser::FieldInitContext*> elements;
         if (initList != nullptr)
             elements = initList->fieldInit();
@@ -8621,7 +8688,6 @@ bool MainListener::TryEmitContainerInitializer(
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList) {
         auto* compiler = Compiler(initList);
-        if (RejectNestedNamedBraceInitializer(initList)) return true;
         const std::string& typeName = tv.TypeName;
 
         const bool isList  = typeName.rfind("list__", 0) == 0;
@@ -8629,6 +8695,8 @@ bool MainListener::TryEmitContainerInitializer(
         const bool isDict  = typeName.rfind("dictionary__", 0) == 0;
         if (!isList && !isArray && !isDict)
             return false;
+        if (RejectNestedNamedBraceInitializer(initList,
+                "nested named brace initializer is not supported in container elements")) return true;
 
         auto elements = initList->fieldInit();
 

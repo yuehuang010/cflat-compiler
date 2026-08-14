@@ -40,7 +40,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
-                    // 'move', 'alias', 'bond' and 'unique' are soft keywords parsed as Identifiers
+                    // 'move', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
                     // in typeSpecifier context
                     if (typeSpec->getText() == "move")
                     {
@@ -64,6 +64,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         declType.IsUnique = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
+                    if (typeSpec->getText() == "manifest")
+                        continue;  // collected by the main pass; not a runtime type
                     // tuple type sugar: (T1, T2) -> tuple<T1, T2>
                     if (typeSpec->tupleTypeSpecifier() != nullptr)
                     {

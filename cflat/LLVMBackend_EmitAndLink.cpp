@@ -39,6 +39,9 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <fstream>
+#include <cstdint>
+#include <vector>
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -48,6 +51,73 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <sys/sysctl.h>
+#endif
+
+static void AppendManifestResU16(std::vector<uint8_t>& bytes, uint16_t value)
+{
+    bytes.push_back(static_cast<uint8_t>(value));
+    bytes.push_back(static_cast<uint8_t>(value >> 8));
+}
+
+static void AppendManifestResU32(std::vector<uint8_t>& bytes, uint32_t value)
+{
+    for (int i = 0; i < 4; ++i)
+        bytes.push_back(static_cast<uint8_t>(value >> (i * 8)));
+}
+
+static bool WriteManifestResource(const std::string& path, const std::string& xml)
+{
+    std::vector<uint8_t> bytes;
+    auto appendHeader = [&](uint32_t dataSize, uint16_t type, uint16_t id) {
+        AppendManifestResU32(bytes, dataSize);
+        AppendManifestResU32(bytes, 32);
+        AppendManifestResU16(bytes, 0xffff);
+        AppendManifestResU16(bytes, type);
+        AppendManifestResU16(bytes, 0xffff);
+        AppendManifestResU16(bytes, id);
+        AppendManifestResU32(bytes, 0);
+        AppendManifestResU16(bytes, 0x0030);
+        AppendManifestResU16(bytes, 1033);
+        AppendManifestResU32(bytes, 0);
+        AppendManifestResU32(bytes, 0);
+    };
+
+    appendHeader(0, 0, 0);
+    appendHeader(static_cast<uint32_t>(xml.size()), 24, 1);
+    bytes.insert(bytes.end(), xml.begin(), xml.end());
+    while ((bytes.size() & 3u) != 0) bytes.push_back(0);
+
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    return static_cast<bool>(out);
+}
+
+#if defined(_WIN32)
+struct CflatActCtxW
+{
+    unsigned long cbSize;
+    unsigned long dwFlags;
+    const wchar_t* lpSource;
+    unsigned short wProcessorArchitecture;
+    unsigned short wLangId;
+    const wchar_t* lpAssemblyDirectory;
+    const wchar_t* lpResourceName;
+    const wchar_t* lpApplicationName;
+    void* hModule;
+};
+
+extern "C" void* __stdcall CreateActCtxW(const CflatActCtxW* actCtx);
+extern "C" int __stdcall QueryActCtxSettingsW(unsigned long flags, void* actCtx,
+    const wchar_t* settingsNamespace, const wchar_t* settingName, wchar_t* buffer,
+    size_t bufferLength, size_t* writtenOrRequired);
+extern "C" void __stdcall ReleaseActCtx(void* actCtx);
+extern "C" unsigned long __stdcall GetLastError();
+
+static std::wstring ManifestAsciiToWide(const std::string& text)
+{
+    return std::wstring(text.begin(), text.end());
+}
 #endif
 
 // ---- Definitions moved out of LLVMBackend.h (EmitAndLink) ----
@@ -437,8 +507,89 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
             std::cout << std::format("Error: linking failed (exit {}): {}\n", rc, linkErr);
             return false;
         }
-        return true;
+    return true;
     }
+
+bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) const
+{
+#if !defined(_WIN32)
+    (void)xml;
+    return true;
+#else
+    llvm::SmallString<256> manifestPath;
+    if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_manifest_check", "manifest", manifestPath))
+    {
+        LogError(std::format("could not create manifest backstop input: {}", ec.message()));
+        return false;
+    }
+    std::string path = manifestPath.str().str();
+    std::string document = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + xml;
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(document.data(), static_cast<std::streamsize>(document.size()));
+        if (!out)
+        {
+            out.close();
+            llvm::sys::fs::remove(path);
+            LogError(std::format("could not write manifest backstop input '{}'", path));
+            return false;
+        }
+    }
+
+    std::wstring widePath = std::filesystem::path(path).wstring();
+    CflatActCtxW actCtx = {};
+    actCtx.cbSize = sizeof(actCtx);
+    actCtx.lpSource = widePath.c_str();
+    void* handle = CreateActCtxW(&actCtx);
+    if (handle == reinterpret_cast<void*>(static_cast<intptr_t>(-1)))
+    {
+        unsigned long error = GetLastError();
+        std::string locations;
+        for (const auto& fragment : manifestFragments_)
+        {
+            if (!locations.empty()) locations += ", ";
+            locations += std::format("{}:{}", fragment.SourceFile, fragment.Line);
+        }
+        llvm::sys::fs::remove(path);
+        LogError(std::format(
+            "manifest activation context failed with Win32 error {} for declaration(s) at {}",
+            error, locations));
+        return false;
+    }
+
+    for (const auto& fragment : manifestFragments_)
+        for (const auto& leaf : fragment.Leaves)
+        {
+            if (leaf.Namespace.empty()) continue;
+            std::wstring wideNamespace = ManifestAsciiToWide(leaf.Namespace);
+            std::wstring wideName = ManifestAsciiToWide(leaf.LocalName);
+            std::vector<wchar_t> buffer(1024);
+            size_t written = 0;
+            int ok = QueryActCtxSettingsW(0, handle, wideNamespace.c_str(), wideName.c_str(),
+                buffer.data(), buffer.size(), &written);
+            size_t length = written > 0 ? written - 1 : 0;
+            std::wstring returned(buffer.data(), std::min(length, buffer.size()));
+            std::string returnedText;
+            for (wchar_t c : returned) returnedText.push_back(static_cast<char>(c));
+            if (!ok || returnedText != leaf.Text)
+            {
+                unsigned long error = ok ? 0 : GetLastError();
+                ReleaseActCtx(handle);
+                llvm::sys::fs::remove(path);
+                LogError(std::format(
+                    "manifest [JsonText] backstop failed for '{}:{}' declared at {}:{}: "
+                    "Win32 error {}; OS returned '{}', expected '{}'",
+                    leaf.Namespace, leaf.LocalName, leaf.SourceFile, leaf.Line,
+                    error, returnedText, leaf.Text));
+                return false;
+            }
+        }
+
+    ReleaseActCtx(handle);
+    llvm::sys::fs::remove(path);
+    return true;
+#endif
+}
 
 bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo,
                         const std::optional<std::string>& lliPath)
@@ -729,6 +880,45 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             linkArgStrs.push_back(std::filesystem::path(lib).filename().string());
         }
 
+        std::vector<std::string> manifestTempFiles;
+        auto cleanupManifestFiles = [&]() {
+            for (const auto& path : manifestTempFiles)
+                llvm::sys::fs::remove(path);
+            manifestTempFiles.clear();
+        };
+        if (!manifestFragments_.empty())
+        {
+            auto merged = MergeManifestFragments();
+            if (!merged || !ValidateManifestActivationContext(*merged))
+            {
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                return false;
+            }
+
+            llvm::SmallString<256> resourcePath;
+            if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_manifest", "res", resourcePath))
+            {
+                LogError(std::format("could not create temporary manifest resource: {}", ec.message()));
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                return false;
+            }
+            std::string path = resourcePath.str().str();
+            std::string document = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
+                + *merged;
+            if (!WriteManifestResource(path, document))
+            {
+                llvm::sys::fs::remove(path);
+                LogError(std::format("could not write temporary manifest resource '{}'", path));
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                return false;
+            }
+            manifestTempFiles.push_back(path);
+            linkArgStrs.push_back(path);
+        }
+
         std::vector<llvm::StringRef> linkArgs;
         for (auto& s : linkArgStrs) linkArgs.push_back(s);
 
@@ -740,6 +930,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
             llvm::sys::fs::remove(objPath);
             for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+            cleanupManifestFiles();
 
             if (rc != 0)
             {

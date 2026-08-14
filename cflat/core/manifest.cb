@@ -1,0 +1,138 @@
+annotation JsonText { };
+annotation JsonName { string value = default; };
+
+enum ExecutionLevel : int { asInvoker, highestAvailable, requireAdministrator };
+enum DpiAwareness : int { Unaware, System, PerMonitor, PerMonitorV2 };
+
+struct ManifestAssemblyIdentity {
+    string type = default;
+    string name = default;
+    string language = "*";
+    string processorArchitecture = "*";
+    string version = default;
+    string publicKeyToken = default;
+};
+
+struct ManifestDependentAssembly {
+    ManifestAssemblyIdentity assemblyIdentity = default;
+};
+
+struct ManifestDependency {
+    ManifestDependentAssembly dependentAssembly = default;
+};
+
+struct ManifestSupportedOs {
+    string Id = default;
+};
+
+struct ManifestCompatibilityApplication {
+    list<ManifestSupportedOs> supportedOS = default;
+    ManifestMaxVersionTested maxversiontested = default;
+};
+
+struct ManifestMaxVersionTested {
+    string Id = default;
+};
+
+struct ManifestCompatibility {
+    string xmlns = "urn:schemas-microsoft-com:compatibility.v1";
+    ManifestCompatibilityApplication application = default;
+};
+
+struct ManifestRequestedExecutionLevel {
+    ExecutionLevel level = default;
+    bool uiAccess = default;
+};
+
+struct ManifestRequestedPrivileges {
+    ManifestRequestedExecutionLevel requestedExecutionLevel = default;
+};
+
+struct ManifestSecurity {
+    ManifestRequestedPrivileges requestedPrivileges = default;
+};
+
+struct ManifestTrustInfo {
+    string xmlns = "urn:schemas-microsoft-com:asm.v3";
+    ManifestSecurity security = default;
+};
+
+struct ManifestWindowsSettings2005 {
+    [JsonName("xmlns:ws2005")] string xmlns = "http://schemas.microsoft.com/SMI/2005/WindowsSettings";
+    [JsonName("ws2005:dpiAware")] [JsonText] string dpiAware = default;
+    [JsonName("ws2005:gdiScaling")] [JsonText] bool gdiScaling = default;
+    [JsonName("ws2005:disableTheming")] [JsonText] bool disableTheming = default;
+    [JsonName("ws2005:disableWindowFiltering")] [JsonText] bool disableWindowFiltering = default;
+    [JsonName("ws2005:highResolutionScrollingAware")] [JsonText] bool highResolutionScrollingAware = default;
+    [JsonName("ws2005:printerDriverIsolation")] [JsonText] bool printerDriverIsolation = default;
+    [JsonName("ws2005:ultraHighResolutionScrollingAware")] [JsonText] bool ultraHighResolutionScrollingAware = default;
+    [JsonName("ws2005:supportedArchitectures")] [JsonText] string supportedArchitectures = default;
+    [JsonName("ws2005:consoleAllocationPolicy")] [JsonText] string consoleAllocationPolicy = default;
+};
+
+struct ManifestWindowsSettings2016 {
+    [JsonName("xmlns:ws2016")] string xmlns = "http://schemas.microsoft.com/SMI/2016/WindowsSettings";
+    [JsonName("ws2016:dpiAwareness")] [JsonText] DpiAwareness dpiAwareness = default;
+    [JsonName("ws2016:longPathAware")] [JsonText] bool longPathAware = default;
+    [JsonName("ws2016:autoElevate")] [JsonText] bool autoElevate = default;
+};
+
+struct ManifestWindowsSettings2019 {
+    [JsonName("xmlns:ws2019")] string xmlns = "http://schemas.microsoft.com/SMI/2019/WindowsSettings";
+    [JsonName("ws2019:activeCodePage")] [JsonText] string activeCodePage = default;
+};
+
+struct ManifestWindowsSettings2020 {
+    [JsonName("xmlns:ws2020")] string xmlns = "http://schemas.microsoft.com/SMI/2020/WindowsSettings";
+    [JsonName("ws2020:heapType")] [JsonText] string heapType = default;
+};
+
+struct ManifestActivatableClass {
+    string name = default;
+    string threadingModel = default;
+};
+
+struct ManifestFile {
+    string name = default;
+    string hashalg = default;
+    string hash = default;
+    list<ManifestActivatableClass> activatableClass = default;
+};
+
+struct ManifestApplication {
+    string xmlns = "urn:schemas-microsoft-com:asm.v3";
+    list<ManifestFile> file = default;
+    [JsonName("windowsSettings")] ManifestWindowsSettings2005 settings2005 = default;
+    [JsonName("windowsSettings")] ManifestWindowsSettings2016 settings2016 = default;
+    [JsonName("windowsSettings")] ManifestWindowsSettings2019 settings2019 = default;
+    [JsonName("windowsSettings")] ManifestWindowsSettings2020 settings2020 = default;
+};
+
+struct ManifestFragment {
+    string xmlns = "urn:schemas-microsoft-com:asm.v1";
+    string manifestVersion = "1.0";
+    ManifestAssemblyIdentity assemblyIdentity = default;
+    list<ManifestDependency> dependency = default;
+    ManifestCompatibility compatibility = default;
+    ManifestTrustInfo trustInfo = default;
+    ManifestApplication application = default;
+};
+
+struct ManifestDoc {
+    ManifestFragment assembly = default;
+};
+
+namespace Manifest {
+    const string osWindowsVista = "{{e2011457-1546-43c5-a5fe-008deee3d3f0}}";
+    const string osWindows7 = "{{35138b9a-5d96-4fbd-8e2d-a2440225f93a}}";
+    const string osWindows10 = "{{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}}";
+    const string osWindows10Version1703 = "{{1f676c76-80e1-4239-95bb-83d0f6d0da78}}";
+    const string osWindows11 = "{{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}}";
+
+    const string commonControlsName = "Microsoft.Windows.Common-Controls";
+    const string commonControlsVersion = "6.0.0.0";
+    const string commonControlsToken = "6595b64144ccf1df";
+}
+
+// The schema's msix and packaged COM internals are omitted: they are not useful for the
+// v1 desktop manifest composition surface and would require vocabulary beyond these structs.

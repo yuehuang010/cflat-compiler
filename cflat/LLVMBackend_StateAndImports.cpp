@@ -361,6 +361,131 @@ std::string LLVMBackend::GetSourceFileName() const
 std::string LLVMBackend::GetSourceFilePath() const
 { return currentSourceFilePath_; }
 
+void LLVMBackend::RecordManifestFragment(const std::string& sourceFile, size_t line,
+                                         const std::string& xml,
+                                         std::vector<ManifestFragment::Leaf> leaves)
+{
+    for (const auto& fragment : manifestFragments_)
+        if (fragment.Xml == xml)
+            return;
+
+    auto location = [](const ManifestFragment::Leaf& leaf) {
+        return std::format("{}:{}", leaf.SourceFile, leaf.Line);
+    };
+    std::unordered_map<std::string, const ManifestFragment::Leaf*> seen;
+    for (const auto& fragment : manifestFragments_)
+        for (const auto& leaf : fragment.Leaves)
+            seen.emplace(leaf.Namespace + "\n" + leaf.LocalName, &leaf);
+    std::vector<ManifestFragment::Leaf> uniqueLeaves;
+    for (const auto& leaf : leaves)
+    {
+        std::string key = leaf.Namespace + "\n" + leaf.LocalName;
+        auto [it, inserted] = seen.emplace(key, &leaf);
+        if (!inserted && it->second->Text != leaf.Text)
+        {
+            LogError(std::format(
+                "manifest [JsonText] conflict for '{}:{}': '{}' at {} versus '{}' at {}",
+                leaf.Namespace, leaf.LocalName, it->second->Text, location(*it->second),
+                leaf.Text, location(leaf)));
+            return;
+        }
+        if (inserted || it->second == &leaf)
+            uniqueLeaves.push_back(leaf);
+    }
+    manifestFragments_.push_back({ sourceFile, line, xml, std::move(uniqueLeaves) });
+}
+
+const std::vector<LLVMBackend::ManifestFragment>& LLVMBackend::GetManifestFragments() const
+{ return manifestFragments_; }
+
+std::optional<std::string> LLVMBackend::MergeManifestFragments() const
+{
+    if (manifestFragments_.empty()) return std::nullopt;
+
+    auto location = [](const std::string& file, size_t line) {
+        return std::format("{}:{}", file.empty() ? "<unknown>" : file, line);
+    };
+    auto parse = [](const std::string& xml, std::string& rootAttributes,
+                    std::string& childContent) {
+        constexpr std::string_view prefix = "<assembly";
+        constexpr std::string_view suffix = "</assembly>";
+        if (!xml.starts_with(prefix)) return false;
+        size_t openEnd = xml.find('>');
+        if (openEnd == std::string::npos) return false;
+        rootAttributes = xml.substr(prefix.size(), openEnd - prefix.size());
+        if (!rootAttributes.empty() && rootAttributes.back() == '/')
+            rootAttributes.pop_back();
+        if (openEnd > 0 && xml[openEnd - 1] == '/')
+        {
+            childContent.clear();
+            return true;
+        }
+        if (xml.size() < suffix.size() || !xml.ends_with(suffix)) return false;
+        size_t closeStart = xml.size() - suffix.size();
+        childContent = xml.substr(openEnd + 1, closeStart - openEnd - 1);
+        return true;
+    };
+
+    std::string rootAttributes;
+    std::string children;
+    bool haveRoot = false;
+    for (const auto& fragment : manifestFragments_)
+    {
+        std::string fragmentAttributes;
+        std::string fragmentChildren;
+        if (!parse(fragment.Xml, fragmentAttributes, fragmentChildren))
+        {
+            LogError(std::format("manifest fragment from {} is not a valid assembly document",
+                                 location(fragment.SourceFile, fragment.Line)));
+            return std::nullopt;
+        }
+        if (!haveRoot)
+        {
+            rootAttributes = fragmentAttributes;
+            haveRoot = true;
+        }
+        else if (rootAttributes != fragmentAttributes)
+        {
+            const auto& first = manifestFragments_.front();
+            LogError(std::format(
+                "manifest root attributes conflict between {} and {}",
+                location(first.SourceFile, first.Line),
+                location(fragment.SourceFile, fragment.Line)));
+            return std::nullopt;
+        }
+        children += fragmentChildren;
+    }
+
+    std::unordered_map<std::string, const ManifestFragment::Leaf*> seen;
+    for (const auto& fragment : manifestFragments_)
+        for (const auto& leaf : fragment.Leaves)
+        {
+            std::string key = leaf.Namespace + "\n" + leaf.LocalName;
+            auto [it, inserted] = seen.emplace(key, &leaf);
+            if (!inserted && it->second->Text != leaf.Text)
+            {
+                LogError(std::format(
+                    "manifest [JsonText] conflict for '{}:{}': '{}' at {} versus '{}' at {}",
+                    leaf.Namespace, leaf.LocalName, it->second->Text,
+                    location(it->second->SourceFile, it->second->Line), leaf.Text,
+                    location(leaf.SourceFile, leaf.Line)));
+                return std::nullopt;
+            }
+        }
+
+    return "<assembly" + rootAttributes + ">" + children + "</assembly>";
+}
+
+void LLVMBackend::RecordCompileTimeStringConstant(const std::string& name, const std::string& value)
+{ compileTimeStringConstants_[name] = value; }
+
+std::optional<std::string> LLVMBackend::GetCompileTimeStringConstant(const std::string& name) const
+{
+    auto it = compileTimeStringConstants_.find(name);
+    return it == compileTimeStringConstants_.end()
+        ? std::nullopt : std::optional<std::string>(it->second);
+}
+
 std::string LLVMBackend::DefinitionSitePath() const
 {
         if (sourceFileDir_.empty() || sourceDisplayName_.empty()

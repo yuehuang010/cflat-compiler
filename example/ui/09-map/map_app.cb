@@ -827,6 +827,12 @@ int mapSelfTest()
         t.expectTrue("TileCache: hitCount tracks tryGet hits", tc.hitCount >= 1);
         t.expectTrue("TileCache: missCount tracks tryGet misses", tc.missCount >= 1);
         t.expectTrue("TileCache: evictCount tracks evictions", tc.evictCount == 2);
+
+        // Globals are never destructed at exit (compiler policy); drain the
+        // recorder into a local so heap-audit sees its backing buffer freed.
+        {
+            list<u64> drained = move _mapTestReleased;
+        }
     });
 
     // 6. Scheduler dedupe.
