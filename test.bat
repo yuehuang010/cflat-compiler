@@ -238,7 +238,10 @@ if errorlevel 1 (
     echo FAILED: sanitizer probe did not compile >"%OUT%\results\%TOOLING_NAME%.result"
 ) else (
     "%TOOLING_EXE%" static-origin-check >>"%TOOLING_LOG%" 2>&1
-    if not errorlevel 1 (
+    REM abort() traps via __fastfail, so the exit code is 0xC0000409 - negative to cmd's
+    REM signed `if errorlevel`. Compare the value itself: any non-zero exit is a trap.
+    set TOOLING_RC=!ERRORLEVEL!
+    if !TOOLING_RC! equ 0 (
         echo FAILED: sanitizer probe did not trap >"%OUT%\results\%TOOLING_NAME%.result"
     ) else (
         findstr /c:"ownership violation: value moved at" "%TOOLING_LOG%" >nul

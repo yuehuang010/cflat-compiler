@@ -2815,6 +2815,9 @@ private:
     void SetVariableOwning(const std::string& varName, bool value);
     void SetVariableRawNewArray(const std::string& varName, bool value,
                                 llvm::Value* rawArrayLength = nullptr);
+    // Record the per-site allocation alignment a reassignment delivered, so the free site picks
+    // __delete_aligned. Monotonic: an unaligned source never retires a recorded over-alignment.
+    void SetVariableAllocAlignment(const std::string& varName, uint64_t allocAlign);
 
     llvm::Value* LoadRawArrayLength(const NamedVariable& namedVar);
     void StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value* rawArrayLength);

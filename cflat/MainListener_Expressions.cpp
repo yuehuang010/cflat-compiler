@@ -3227,6 +3227,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     namedVar.CallerName,
                     !namedVar.TypeAndValue.IsArrayView && rhsIsRawArray,
                     rhsCount);
+                // Re-derive the block's allocation alignment the same way. The declaration path
+                // consumes lastAllocAlignment; a local assigned only after its declaration has no
+                // such door, so its free site would use the wrong deallocator.
+                compiler->SetVariableAllocAlignment(
+                    namedVar.CallerName, rightNV.AllocAlignment);
                 if (namedVar.TypeAndValue.IsArrayView
                     && rightNV.TypeAndValue.ConstArraySize > 0
                     && !rightNV.TypeAndValue.IsArrayView)

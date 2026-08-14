@@ -929,6 +929,23 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
         }
     }
 
+// The reassignment twin of ParseDeclaration consuming lastAllocAlignment. Without it a local
+// first assigned AFTER its declaration froze at alignment 0 and freed an over-aligned block
+// through plain `operator delete`, which corrupts the heap.
+void LLVMBackend::SetVariableAllocAlignment(const std::string& varName, uint64_t allocAlign)
+{
+        if (varName.empty() || allocAlign == 0) return;
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it != frame.namedVariable.end())
+            {
+                it->second.AllocAlignment = std::max(it->second.AllocAlignment, allocAlign);
+                return;
+            }
+        }
+    }
+
 llvm::Value* LLVMBackend::LoadRawArrayLength(const NamedVariable& namedVar)
 {
         auto* i64Ty = builder->getInt64Ty();
