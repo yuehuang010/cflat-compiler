@@ -1261,7 +1261,7 @@ llvm::StructType* LLVMBackend::CreateUnionType(std::string name, std::vector<Dec
         {
             unionTy = it->second.StructType;
             if (unionTy->isOpaque())
-                unionTy->setBody({bodyTy});
+                unionTy->setBody(bodyTy);
         }
         else
         {

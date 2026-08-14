@@ -2407,7 +2407,7 @@ void LLVMBackend::RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry
             ? std::string("a unique field of a temporary")
             : std::format("unique field '{}' of a temporary", entry.Access);
         if (entry.Access.empty() && entry.ThroughJoin)
-            what += ", reached through a '?:' / '??' join";
+            what += ", reached through a '?:' / '" "?" "?" "' join";
         // A method RECEIVER is not a parameter the caller can re-declare, so `move` is not a
         // remedy for it and the message must not offer one.
         if (ArgumentIsMethodReceiver(entry.Callee, entry.ArgIndex))
@@ -2442,7 +2442,7 @@ void LLVMBackend::RejectTempUniqueFieldInterfaceArgEscape(const TempUniqueFieldA
             ? std::string("a unique field of a temporary")
             : std::format("unique field '{}' of a temporary", entry.Access);
         if (entry.Access.empty() && entry.ThroughJoin)
-            what += ", reached through a '?:' / '??' join";
+            what += ", reached through a '?:' / '" "?" "?" "' join";
         std::string param = entry.ParamName.empty()
             ? std::format("parameter #{}", entry.ArgIndex + 1)
             : std::format("parameter '{}'", entry.ParamName);

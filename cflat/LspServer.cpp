@@ -1187,6 +1187,7 @@ private:
                     case SymbolKind::Namespace: item["kind"] = lsp::CompletionItemKindModule;    break;
                     case SymbolKind::TypeAlias: item["kind"] = lsp::CompletionItemKindTypeParam; break;
                     case SymbolKind::Field:     item["kind"] = lsp::CompletionItemKindField;     break;
+                    case SymbolKind::Variable:  item["kind"] = lsp::CompletionItemKindVariable;  break;
                 }
                 items.push_back(std::move(item));
             }

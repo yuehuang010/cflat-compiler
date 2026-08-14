@@ -1465,7 +1465,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
              */
             llvm::BasicBlock* coalesceResume = nullptr;
             std::string coalesceLhsOwner;
-            if (operatorText == "??=")
+            if (operatorText == "?" "?=")
             {
                 auto* lhs = derefLoad();
                 // The null test IS a guard read of the destination, and derefLoad bypasses

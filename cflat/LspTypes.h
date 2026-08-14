@@ -45,6 +45,7 @@ enum CompletionItemKind
 {
     CompletionItemKindFunction  = 3,
     CompletionItemKindField     = 5,
+    CompletionItemKindVariable  = 6,
     CompletionItemKindInterface = 8,
     CompletionItemKindModule    = 9,
     CompletionItemKindStruct    = 22,

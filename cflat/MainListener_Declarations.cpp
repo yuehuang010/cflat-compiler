@@ -4668,7 +4668,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 "borrow the source instead of copying it, or copy the elements into "
                                 "'{}' individually.",
                                 DescribeArrayShape(typeAndValue),
-                                isJoin ? " A '?:' or '??' join yields a pointer for this reason too."
+                                isJoin ? " A '?:' or '" "?" "?" "' join yields a pointer for this reason too."
                                        : "",
                                 name, name));
                         }
@@ -5260,7 +5260,7 @@ void MainListener::RejectOwningTempUniqueFieldEscape(const LLVMBackend::NamedVar
         {
             LogErrorContext(ctx, std::format(
                 "cannot store a unique field of a temporary, reached through a cast or a "
-                "'?:' / '??' join, into {} - the temporary's synthesized destructor frees the "
+                "'?:' / '" "?" "?" "' join, into {} - the temporary's synthesized destructor frees the "
                 "pointee at the end of this statement, leaving it dangling. Bind the whole call "
                 "result to a local first and read the field from that local.",
                 destDesc));
