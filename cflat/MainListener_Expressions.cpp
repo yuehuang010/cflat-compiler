@@ -7456,6 +7456,23 @@ CFlatParser::InitializerListContext* MainListener::FieldDefaultBraceList(
         return field.BraceInitializer;
     }
 
+bool MainListener::RejectNestedNamedBraceInitializer(CFlatParser::InitializerListContext* list) {
+        if (list == nullptr) return false;
+        bool rejected = false;
+        for (auto* fi : list->fieldInit())
+        {
+            if (fi->Identifier() != nullptr && fi->initializerList() != nullptr)
+            {
+                LogErrorContext(fi, "nested named brace initializer is only supported in json_const");
+                rejected = true;
+            }
+            if (fi->initializerList() != nullptr
+                && RejectNestedNamedBraceInitializer(fi->initializerList()))
+                rejected = true;
+        }
+        return rejected;
+    }
+
 /*
  * Build the value of a field whose default is a brace list. Mirrors the local declarator:
  * seed the slot with the field type's OWN default (so its scalar field defaults survive a
@@ -7466,6 +7483,8 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         const LLVMBackend::DeclTypeAndValue& field,
         CFlatParser::InitializerListContext* list) {
         auto* compiler = Compiler(list);
+        if (RejectNestedNamedBraceInitializer(list))
+            return llvm::Constant::getNullValue(compiler->GetType(field));
         // A 'T[]' VIEW field: the local spelling infers backing storage a field cannot outlive,
         // so a list with values is rejected ('{}' parses to no initializerList and never gets here).
         if (field.IsArrayView) {
@@ -7522,6 +7541,8 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         auto* compiler = Compiler(list);
         auto* arrTy = llvm::dyn_cast<llvm::ArrayType>(compiler->GetType(field));
         if (arrTy == nullptr) return nullptr;
+        if (RejectNestedNamedBraceInitializer(list))
+            return llvm::Constant::getNullValue(arrTy);
 
         // Positional ({v0, v1}) vs value-init ({} / {field=v}) - an element carrying no
         // field name is what distinguishes them, exactly as the declarator decides it.
@@ -7578,6 +7599,7 @@ void MainListener::EmitArrayValueInitSlots(
         CFlatParser::InitializerListContext* list,
         bool forceRoot) {
         auto* compiler = Compiler();
+        if (RejectNestedNamedBraceInitializer(list)) return;
         if (arrAlloc == nullptr || elemTy == nullptr) return;
 
         // Total slots: the outer extent times every inner dimension (T[N][M] is N*M elements).
@@ -7608,6 +7630,7 @@ void MainListener::EmitFieldDefaultArraySplat(
         llvm::ArrayType* arrTy,
         llvm::StructType* elemTy) {
         auto* compiler = Compiler(list);
+        if (RejectNestedNamedBraceInitializer(list)) return;
         if (elemTy == nullptr) return;
 
         if (compiler->IsOwningValueType(field.TypeName))
@@ -7676,6 +7699,7 @@ void MainListener::EmitFieldInitializer(
         const std::string& typeName,
         CFlatParser::InitializerListContext* ctx) {
         auto* compiler = Compiler(ctx);
+        if (RejectNestedNamedBraceInitializer(ctx)) return;
         auto it = compiler->dataStructures.find(typeName);
         if (it == compiler->dataStructures.end())
         {
@@ -7820,6 +7844,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         CFlatParser::InitializerListContext* initList,
         llvm::Value* arrAlloc) {
         auto* compiler = Compiler(initList);
+        if (RejectNestedNamedBraceInitializer(initList)) return;
         auto elements = initList->fieldInit();
         bool multidim = !tv.ConstInnerDimensions.empty();
         uint64_t n = tv.ConstArraySize;
@@ -8234,6 +8259,7 @@ void MainListener::EmitGlobalFixedArrayInit(
         CFlatParser::DirectDeclaratorContext* direct,
         antlr4::ParserRuleContext* errCtx) {
         auto* compiler = Compiler(errCtx);
+        if (RejectNestedNamedBraceInitializer(initList)) return;
         auto* arrTy = llvm::cast<llvm::ArrayType>(compiler->GetType(tv));
         auto* elemTy = arrTy->getElementType();
         uint64_t n = tv.ConstArraySize;
@@ -8502,6 +8528,7 @@ void MainListener::EmitArrayViewInferredInit(
         size_t line,
         std::vector<std::pair<std::string, llvm::AllocaInst*>>& allocList) {
         auto* compiler = Compiler(initList);
+        if (RejectNestedNamedBraceInitializer(initList)) return;
         std::vector<CFlatParser::FieldInitContext*> elements;
         if (initList != nullptr)
             elements = initList->fieldInit();
@@ -8594,6 +8621,7 @@ bool MainListener::TryEmitContainerInitializer(
         const LLVMBackend::TypeAndValue& tv,
         CFlatParser::InitializerListContext* initList) {
         auto* compiler = Compiler(initList);
+        if (RejectNestedNamedBraceInitializer(initList)) return true;
         const std::string& typeName = tv.TypeName;
 
         const bool isList  = typeName.rfind("list__", 0) == 0;

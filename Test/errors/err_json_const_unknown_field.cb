@@ -1,0 +1,5 @@
+struct JsonConstUnknownFieldCfg { int known = default; };
+
+expect_error("no field named missing in JsonConstUnknownFieldCfg") {
+    string value = json_const(JsonConstUnknownFieldCfg, { missing = 1 });
+}

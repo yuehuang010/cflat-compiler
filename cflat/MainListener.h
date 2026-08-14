@@ -4330,6 +4330,8 @@ public:
         const std::string& typeName,
         CFlatParser::InitializerListContext* ctx);
 
+    bool RejectNestedNamedBraceInitializer(CFlatParser::InitializerListContext* list);
+
     // Coerce a parsed element value to the container's `string` element type.
     // Mirrors EmitFieldInitializer's string handling: a char* string-literal constant is
     // wrapped directly; any other char* runtime value goes through operator string(char*).

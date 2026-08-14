@@ -1,0 +1,10 @@
+struct NestedNamedBraceInner { int count = default; };
+struct NestedNamedBraceCfg { NestedNamedBraceInner inner = default; };
+
+extern int main()
+{
+    expect_error("nested named brace initializer is only supported in json_const") {
+        NestedNamedBraceCfg value = { inner = { count = 3 } };
+    }
+    return 0;
+}

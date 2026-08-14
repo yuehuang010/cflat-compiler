@@ -1,0 +1,6 @@
+struct JsonConstNonliteralCfg { int value = default; };
+
+expect_error("json_const initializer must be a compile-time literal") {
+    int source = 3;
+    string value = json_const(JsonConstNonliteralCfg, { value = source });
+}

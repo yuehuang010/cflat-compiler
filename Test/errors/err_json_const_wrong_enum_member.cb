@@ -1,0 +1,8 @@
+enum JsonConstErrorColor : int { JsonConstErrorRed, JsonConstErrorBlue };
+struct JsonConstWrongEnumCfg { JsonConstErrorColor color = default; };
+
+expect_error("unknown enum member 'JsonConstErrorColor.JsonConstErrorGreen'") {
+    string value = json_const(JsonConstWrongEnumCfg, {
+        color = JsonConstErrorColor.JsonConstErrorGreen
+    });
+}

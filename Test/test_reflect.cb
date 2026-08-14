@@ -115,6 +115,38 @@ struct AnnotatedPerson {
     string lastName = default;
 };
 
+enum JsonConstDpi : int { JsonConstUnaware, JsonConstSystem, JsonConstPerMonitor, JsonConstPerMonitorV2 };
+
+struct JsonConstInner {
+    int count = default;
+    string label = default;
+};
+
+struct JsonConstConfig {
+    JsonConstDpi dpi = default;
+    bool longPath = default;
+    [JsonName("renamed_key")]
+    string renamed = default;
+    [Private]
+    string hidden = default;
+    JsonConstInner inner = default;
+    list<int> nums = default;
+    int omitted = default;
+};
+
+struct JsonConstFloats {
+    double lo = default;
+    double hi = default;
+    float f = default;
+};
+
+enum ReflectColor : u8 { ReflectRed, ReflectGreen, ReflectBlue };
+
+struct ReflectPaint {
+    ReflectColor color = default;
+    int amount = default;
+};
+
 // -- Class --------------------------------------------------------------------
 
 class Config {
@@ -284,6 +316,39 @@ extern int main()
 
     string none = annotationof(AnnotatedPerson, "lastName", "JsonName");
     total++; passed += Test("no annotation on lastName", none.length(), 0);
+
+    // =========================================================================
+    // json_const() compile-time fold tests
+    // =========================================================================
+
+    string jsonConstText = json_const(JsonConstConfig, {
+        dpi = JsonConstDpi.JsonConstPerMonitorV2,
+        longPath = true,
+        renamed = "a\\b\"c",
+        hidden = "not emitted",
+        inner = { count = 3, label = "hi" },
+        nums = { 1, 2, 3 }
+    });
+    total++; passed += Test("json_const struct/list/enum", jsonConstText,
+        "{\"dpi\":\"JsonConstPerMonitorV2\",\"longPath\":true,\"renamed_key\":\"a\\\\b\\\"c\",\"inner\":{\"count\":3,\"label\":\"hi\"},\"nums\":[1,2,3]}");
+
+    // Bare-dot float literals must normalize to valid JSON (digits on both sides).
+    string jsonConstFloats = json_const(JsonConstFloats, { lo = .5, hi = -3., f = 1.25f });
+    total++; passed += Test("json_const float normalization", jsonConstFloats,
+        "{\"lo\":0.5,\"hi\":-3.0,\"f\":1.25}");
+
+    // =========================================================================
+    // Enum JSON round-trip tests
+    // =========================================================================
+
+    ReflectPaint paint = default;
+    paint.color = ReflectColor.ReflectGreen;
+    paint.amount = 7;
+    string paintJson = JsonBuilder.toJson(paint);
+    total++; passed += Test("toJson enum backing integer", paintJson, "{\"color\":1,\"amount\":7}");
+    ReflectPaint paintRoundTrip = JsonBuilder.fromJson<ReflectPaint>(paintJson);
+    total++; passed += Test("fromJson enum backing integer", (int)paintRoundTrip.color, 1);
+    total++; passed += Test("fromJson enum other field", paintRoundTrip.amount, 7);
 
     // =========================================================================
     // Bitfield reflect tests

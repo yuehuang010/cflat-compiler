@@ -1,5 +1,94 @@
 #include "MainListener.h"
 
+static bool JsonConstIdentifier(const std::string& text)
+{
+    if (text.empty() || (!std::isalpha((unsigned char)text[0]) && text[0] != '_')) return false;
+    for (char c : text)
+        if (!std::isalnum((unsigned char)c) && c != '_') return false;
+    return true;
+}
+
+static bool JsonConstStringToken(const std::string& text)
+{
+    size_t quote = 0;
+    if (text.starts_with("u8")) quote = 2;
+    else if (!text.empty() && (text[0] == 'u' || text[0] == 'U' || text[0] == 'L')) quote = 1;
+    if (quote >= text.size() || text[quote] != '"') return false;
+
+    bool escaped = false;
+    for (size_t i = quote + 1; i < text.size(); ++i)
+    {
+        char c = text[i];
+        if (!escaped && c == '"') return i + 1 == text.size();
+        if (!escaped && c == '\\') escaped = true;
+        else escaped = false;
+    }
+    return false;
+}
+
+static bool JsonConstIntegerToken(const std::string& text)
+{
+    if (text.empty()) return false;
+    size_t i = text[0] == '-' ? 1 : 0;
+    if (i == text.size()) return false;
+    for (; i < text.size(); ++i)
+    {
+        if (!std::isdigit((unsigned char)text[i])) return false;
+    }
+    return true;
+}
+
+static bool JsonConstFloatToken(const std::string& text)
+{
+    if (text.empty() || text[0] == '+') return false;
+    size_t digitCount = 0;
+    bool dot = false;
+    bool exponent = false;
+    for (size_t i = text[0] == '-' ? 1 : 0; i < text.size(); ++i)
+    {
+        char c = text[i];
+        if (std::isdigit((unsigned char)c)) { ++digitCount; continue; }
+        if (c == '.' && !dot && !exponent) { dot = true; continue; }
+        if ((c == 'e' || c == 'E') && !exponent && digitCount > 0)
+        {
+            exponent = true;
+            if (i + 1 < text.size() && (text[i + 1] == '+' || text[i + 1] == '-')) ++i;
+            continue;
+        }
+        if ((c == 'f' || c == 'F') && i + 1 == text.size()) continue;
+        return false;
+    }
+    return digitCount > 0 && (dot || exponent);
+}
+
+static std::string JsonConstEscape(const std::string& text)
+{
+    std::string result;
+    for (unsigned char c : text)
+    {
+        switch (c)
+        {
+        case '\\': result += "\\\\"; break;
+        case '"': result += "\\\""; break;
+        case '\b': result += "\\b"; break;
+        case '\f': result += "\\f"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (c < 0x20)
+            {
+                static constexpr char hex[] = "0123456789abcdef";
+                result += "\\u00";
+                result += hex[c >> 4];
+                result += hex[c & 0xf];
+            }
+            else result += (char)c;
+        }
+    }
+    return result;
+}
+
 /*
  * Every direct call - free function, class method, interface vtable slot, generic
  * instantiation, namespace-qualified, aliased return type - finishes here, so this wrapper
@@ -2060,6 +2149,211 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        // Compile-time intrinsic: json_const(TypeName, { field = literal, ... }).
+                        if (functionName == "json_const")
+                        {
+                            auto* compiler = Compiler(ctx);
+                            auto args = argumentList.empty()
+                                ? std::vector<CFlatParser::ArgumentNamedExpressionContext*>{}
+                                : argumentList[0]->argumentNamedExpression();
+                            if (args.size() != 2 || args[0]->assignmentExpression() == nullptr
+                                || args[1]->initializerList() == nullptr)
+                            {
+                                LogErrorContext(ctx, "json_const() requires a type name and a brace initializer");
+                                break;
+                            }
+
+                            std::string typeName = args[0]->assignmentExpression()->getText();
+                            auto rootData = compiler->GetDataStructure(typeName);
+                            if (!rootData.StructType)
+                            {
+                                LogErrorContext(args[0], std::format("json_const(): unknown struct type '{}'", typeName));
+                                break;
+                            }
+                            if (rootData.IsUnion)
+                            {
+                                LogErrorContext(args[0], std::format("json_const() is not supported on union type '{}'", typeName));
+                                break;
+                            }
+
+                            bool valid = true;
+                            auto literalError = [&](antlr4::ParserRuleContext* valueCtx) {
+                                LogErrorContext(valueCtx, "json_const initializer must be a compile-time literal");
+                                valid = false;
+                            };
+                            auto isIntegerType = [](const std::string& name) {
+                                return name == "char" || name == "short" || name == "int" || name == "long"
+                                    || name == "i8" || name == "i16" || name == "i32" || name == "i64"
+                                    || name == "u8" || name == "u16" || name == "u32" || name == "u64"
+                                    || name == "ulong";
+                            };
+
+                            std::function<std::string(const std::string&, CFlatParser::FieldInitContext*)> foldValue;
+                            std::function<std::string(const std::string&, CFlatParser::InitializerListContext*)> foldStruct;
+
+                            foldValue = [&](const std::string& fieldType, CFlatParser::FieldInitContext* fieldInit) -> std::string {
+                                if (fieldInit == nullptr) { literalError(ctx); return {}; }
+                                auto values = fieldInit->assignmentExpression();
+                                auto* nested = fieldInit->initializerList();
+                                if (nested != nullptr)
+                                {
+                                    if (fieldType.rfind("list__", 0) == 0)
+                                    {
+                                        std::string elementType = fieldType.substr(6);
+                                        std::string result = "[";
+                                        bool first = true;
+                                        for (auto* element : nested->fieldInit())
+                                        {
+                                            if (element->Identifier() != nullptr || element->Colon() != nullptr
+                                                || (element->assignmentExpression().size() > 1))
+                                            {
+                                                literalError(element);
+                                                continue;
+                                            }
+                                            if (!first) result += ",";
+                                            first = false;
+                                            result += foldValue(elementType, element);
+                                        }
+                                        result += "]";
+                                        return result;
+                                    }
+                                    if (compiler->GetDataStructure(fieldType).StructType != nullptr)
+                                        return foldStruct(fieldType, nested);
+                                    literalError(fieldInit);
+                                    return {};
+                                }
+                                if (fieldInit->Colon() != nullptr || values.size() != 1)
+                                {
+                                    literalError(fieldInit);
+                                    return {};
+                                }
+
+                                std::string raw = values[0]->getText();
+                                if (isIntegerType(fieldType))
+                                {
+                                    if (!JsonConstIntegerToken(raw)) { literalError(values[0]); return {}; }
+                                    return raw;
+                                }
+                                if (fieldType == "float" || fieldType == "double")
+                                {
+                                    if (!JsonConstFloatToken(raw)) { literalError(values[0]); return {}; }
+                                    if (!raw.empty() && (raw.back() == 'f' || raw.back() == 'F')) raw.pop_back();
+                                    // JSON requires digits on both sides of the decimal point.
+                                    size_t lead = raw[0] == '-' ? 1 : 0;
+                                    if (raw.size() > lead && raw[lead] == '.') raw.insert(lead, "0");
+                                    if (raw.back() == '.') raw += "0";
+                                    return raw;
+                                }
+                                if (fieldType == "bool")
+                                {
+                                    if (raw != "true" && raw != "false") { literalError(values[0]); return {}; }
+                                    return raw;
+                                }
+                                if (fieldType == "string")
+                                {
+                                    if (!JsonConstStringToken(raw) || HasInterpolation(raw))
+                                    {
+                                        literalError(values[0]);
+                                        return {};
+                                    }
+                                    return "\"" + JsonConstEscape(ProcessRawText(raw)) + "\"";
+                                }
+
+                                auto backingType = compiler->GetEnumBackingType(fieldType);
+                                if (!backingType.empty())
+                                {
+                                    size_t dot = raw.find('.');
+                                    if (dot == std::string::npos || raw.find('.', dot + 1) != std::string::npos
+                                        || raw.substr(0, dot) != fieldType
+                                        || !JsonConstIdentifier(raw.substr(dot + 1)))
+                                    {
+                                        LogErrorContext(values[0], std::format(
+                                            "json_const enum initializer must name a member of '{}', got '{}'",
+                                            fieldType, raw));
+                                        valid = false;
+                                        return {};
+                                    }
+                                    std::string member = raw.substr(dot + 1);
+                                    auto memberNV = compiler->GetGlobalVariableNV(fieldType + "." + member);
+                                    if (!memberNV.Storage)
+                                    {
+                                        LogErrorContext(values[0], std::format(
+                                            "json_const: unknown enum member '{}.{}'", fieldType, member));
+                                        valid = false;
+                                        return {};
+                                    }
+                                    return "\"" + JsonConstEscape(member) + "\"";
+                                }
+
+                                literalError(values[0]);
+                                return {};
+                            };
+
+                            foldStruct = [&](const std::string& structName, CFlatParser::InitializerListContext* init) -> std::string {
+                                auto data = compiler->GetDataStructure(structName);
+                                std::unordered_map<std::string, CFlatParser::FieldInitContext*> named;
+                                for (auto* fieldInit : init->fieldInit())
+                                {
+                                    if (fieldInit->Identifier() == nullptr || fieldInit->assignmentExpression().size() > 1
+                                        || (fieldInit->initializerList() == nullptr && fieldInit->assignmentExpression().empty()))
+                                    {
+                                        LogErrorContext(fieldInit, std::format(
+                                            "json_const struct initializer for '{}' requires named fields", structName));
+                                        valid = false;
+                                        continue;
+                                    }
+                                    std::string fieldName = fieldInit->Identifier()->getText();
+                                    auto [it, inserted] = named.emplace(fieldName, fieldInit);
+                                    if (!inserted)
+                                    {
+                                        LogErrorContext(fieldInit, std::format(
+                                            "json_const: duplicate field initializer '{}'", fieldName));
+                                        valid = false;
+                                    }
+                                }
+
+                                std::string result = "{";
+                                bool first = true;
+                                for (const auto& field : data.StructFields)
+                                {
+                                    if (field.IsBitfieldStorage || field.IsPadding) continue;
+                                    bool isPrivate = false;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "Private") { isPrivate = true; break; }
+                                    if (isPrivate) continue;
+                                    auto it = named.find(field.VariableName);
+                                    if (it == named.end()) continue;
+
+                                    std::string displayName = field.VariableName;
+                                    for (const auto& ann : field.Annotations)
+                                        if (ann.Name == "JsonName" && !ann.Value.empty()) { displayName = ann.Value; break; }
+                                    std::string value = foldValue(field.TypeName, it->second);
+                                    if (!first) result += ",";
+                                    first = false;
+                                    result += "\"" + JsonConstEscape(displayName) + "\":" + value;
+                                }
+                                for (const auto& [fieldName, fieldInit] : named)
+                                {
+                                    bool found = false;
+                                    for (const auto& field : data.StructFields)
+                                        if (field.VariableName == fieldName) { found = true; break; }
+                                    if (!found)
+                                    {
+                                        LogErrorContext(fieldInit, std::format(
+                                            "json_const: no field named {} in {}", fieldName, structName));
+                                        valid = false;
+                                    }
+                                }
+                                result += "}";
+                                return result;
+                            };
+
+                            std::string jsonText = foldStruct(typeName, args[1]->initializerList());
+                            if (valid)
+                                namedVar = compiler->MakeStringLiteralNV(jsonText);
+                            break;
+                        }
+
                         // Intrinsic: reflect(obj, visitor)
                         // Compile-time resolves obj's struct type T, synthesizes __reflect_T if needed,
                         // then emits: visitor.beginObject(""); __reflect_T(obj, visitor); visitor.endObject();
@@ -2292,6 +2586,17 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         // after loop
                                         compiler->builder->SetInsertPoint(afterBB);
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "endArray", {});
+                                    }
+                                    // Enum values serialize through their declared backing integer.
+                                    else if (!field.Pointer && !compiler->GetEnumBackingType(typeName).empty())
+                                    {
+                                        auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
+                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt32Ty(), false);
+                                        intNV = {};
+                                        intNV.Primary = widened;
+                                        intNV.TypeAndValue.TypeName = "int";
+                                        auto nameNV = compiler->MakeStringLiteralNV(displayName);
+                                        compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, intNV});
                                     }
                                     // ── nested struct (value type) ────────────────────────────
                                     else if (!field.Pointer && compiler->dataStructures.count(typeName))
@@ -2566,6 +2871,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         srcStrNV.TypeAndValue.TypeName = "string";
                                         auto* owned = compiler->CreateOverloadedFunctionCall("copy", {srcStrNV});
                                         compiler->builder->CreateStore(owned, gep);
+                                    }
+                                    // Enum values use the same JSON integer representation as their backing type.
+                                    else if (!field.Pointer && !compiler->GetEnumBackingType(typeName).empty())
+                                    {
+                                        auto* intVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getInt", {nameNV});
+                                        auto backingType = compiler->GetEnumBackingType(typeName);
+                                        LLVMBackend::TypeAndValue backingTV;
+                                        backingTV.TypeName = backingType;
+                                        auto* narrowed = compiler->Upconvert(intVal, compiler->GetType(backingTV), false);
+                                        compiler->builder->CreateStore(narrowed, gep);
                                     }
                                     // ── list<T> (value type) ──────────────────────────────────
                                     else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
@@ -6124,7 +6439,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
             "compile_error",
-            "reflect", "reflect_set", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
+            "reflect", "reflect_set", "json_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
             "__atomic_acquire_fence",
         };

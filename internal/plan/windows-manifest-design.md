@@ -61,8 +61,8 @@ struct AssemblyIdentity
 
 struct WindowsSettings
 {
-    xtext<DpiAwareness> dpiAwareness;       // element with text content
-    xtext<bool> longPathAware;
+    [JsonText] DpiAwareness dpiAwareness = default;   // element with text content
+    [JsonText] bool longPathAware = default;
     string xmlns = "http://schemas.microsoft.com/SMI/2016/WindowsSettings";
 }
 
@@ -121,7 +121,21 @@ Optional follow-on, valuable language-wide and not manifest-specific: completion
 brace-init of a known struct type (`LspServer.cpp` already tracks the enclosing type per
 open brace; it only lacks the trigger - see 5.1a GAP note).
 
-## Layer 2: vocabulary-free transliteration
+## Layer 2: vocabulary-free transliteration (DECIDED 2026-08-14: Path A, [Text] annotation)
+
+Implementation shape: this is the existing `reflect` intrinsic's compile-time machinery
+with a COMPILER-OWNED visitor. `reflect(obj, visitor)` already walks `StructData` fields
+entirely at compile time (MainListener_PostfixExpression.cpp:2063) - field names, types,
+annotations, skip rules for `__bf`/`__pad` slots and `[Private]` - and only the value
+loads and visitor dispatch are runtime. The manifest fold reuses that same StructData
+walk, substituting (a) values read from the literal initializer instead of emitted loads
+and (b) a builtin XML-writing visitor instead of an `IReflector`. Do NOT write a bespoke
+parse-tree walker; being a sibling of `reflect` keeps the two consistent (same skip
+rules, same annotation handling) for free.
+(For the record: Path B - true comptime execution of a user visitor via the --run ORC
+JIT - was considered and deferred; it generalizes to arbitrary comptime generation but
+conflates host and target layouts under cross-compilation. Path C - a growing
+const-evaluator - re-implements language semantics a second time. Neither is needed here.)
 
 The compiler knows XML SHAPE only. Mapping rules, applied to the folded initializer:
 
@@ -129,17 +143,24 @@ The compiler knows XML SHAPE only. Mapping rules, applied to the folded initiali
   dependency` emits repeated `<dependency>` elements; the type name never appears in XML).
 - scalar field -> attribute (`name="..."`); values XML-escaped (`&<>"'`).
 - `list<T>` -> repeated child elements.
-- `xtext<T>` (new generic marker type in core, like `attr<T>` from the brainstorm but only
-  ONE marker is needed): element whose TEXT CONTENT is the value -
+- a `[JsonText]` field annotation: element whose TEXT CONTENT is the value -
   `<dpiAwareness>PerMonitorV2</dpiAwareness>`. Enum values serialize as their name; bools
-  as `true`/`false`.
+  as `true`/`false`. Annotations already exist on `StructData` fields (`[Private]` and
+  `[JsonName]` are the precedents), so this is zero grammar change. NAMING DECIDED
+  2026-08-14 (user, reversing an earlier neutral-name direction): the `[Json*]` prefix is
+  RE-USED for the whole serialization-annotation family even when the emitter is XML -
+  one family shared across formats (`[JsonName]` rename, `[JsonText]` text content,
+  `[Private]` skip), no parallel `[Xml*]` vocabulary, no neutral renames of the existing
+  annotation.
 - a field literally named `xmlns` -> the `xmlns` attribute (reserved name, not vocabulary).
 - fields left at `default` (empty string / empty list / absent) are omitted entirely.
 
-That is the whole compiler-side XML knowledge: five structural rules and one marker type.
+That is the whole compiler-side XML knowledge: five structural rules and one annotation.
 All names in the SxS schema are valid cflat identifiers (checked: assemblyIdentity,
-windowsSettings, supportedOS attributes, activatableClass) so no rename escape is needed
-in v1; if a future schema needs one, add it then (YAGNI).
+windowsSettings, supportedOS attributes, activatableClass) so no rename is needed in v1.
+If a future schema needs one, the mechanism already exists: `[JsonName]` is a valued
+rename annotation honored by reflect/reflect_set today, and per the `[Json*]`-prefix
+decision it is exactly the annotation the XML path would honor too - nothing new to mint.
 
 ## Layer 3: OS backstop at compile time
 
@@ -200,6 +221,13 @@ and rely on layers 1-2 per fragment. (The probes above ran with an identity pres
   `LogError` ("manifest initializer must be a compile-time literal"). This deliberately
   does NOT depend on general const-eval or const globals (known unimplemented gap).
 
+  To be explicit: cflat has NO compile-time serializer today - `toJson`/`fromJson` are
+  RUNTIME reflection (`reflect_*` builtins walked by core/json.cb while the compiled
+  program runs), which cannot serve a manifest that must exist at LINK time. This fold is
+  new machinery, but it is not a serializer or an evaluator: it is a parse-tree-to-text
+  walk over a literal, using only the five layer-2 rules. That restriction is what makes
+  it feasible without any compile-time execution engine.
+
 - Ownership shape: fragments compose, so a library owns its own OS requirement -
   `core/ui_native/win32.cb` declares the comctl32 v6 fragment, `core/ui_native/winui.cb`
   declares PerMonitorV2 (replacing its current runtime opt-in at winui.cb:272) and its
@@ -237,15 +265,51 @@ XML string): the XML is the fold's output, so nothing structural needs re-foldin
   both themes per Phase 5 of the polish plan.
 - LSP: `test_lsp.bat` after any `LspServer.cpp` change (brace-init completion follow-on).
 
+## Decisions landed 2026-08-14
+
+- Path A: the fold is `reflect`'s compile-time StructData walk with a builtin visitor
+  and literal-sourced values. No comptime execution engine (Paths B/C deferred).
+- `[JsonText]` field ANNOTATION marks element-text content - not a marker type. The
+  `[Json*]` prefix is re-used for the whole serialization-annotation family across
+  formats (user decision, reversing an earlier `[Text]`/format-neutral direction).
+- Element name = field name (makes `list<T> dependency` natural; type names never appear
+  in the XML contract).
+- The reflect enum-field silent-skip fix (`internal/issue/p3/reflect-enum-field-silently-skipped.md`)
+  ships as part of this implementation.
+- STAGED IMPLEMENTATION (user decision): comp-time JSON first, XML second, manifest
+  wiring third. See "Implementation order" below.
+
+## Implementation order
+
+Feasibility note: brace-init literals already parse in function-argument position
+(CFlat.g4:106, `argumentNamedExpression`), but the named NESTED form (`inner = { ... }`)
+did not - Phase A added a fieldInit alternative for it. That alternative now also parses
+in ordinary declaration initializers, where it is rejected with a clean error (see
+`internal/issue/p3/nested-named-brace-init-declarations.md` for the deliberate follow-up
+feature of supporting it there).
+
+- **Phase A - comp-time JSON. DONE 2026-08-14** (test_reflect 143/143, test.bat Release
+  all-pass, three `Test/errors/err_json_const_*.cb` + `err_nested_named_brace_decl.cb`).
+  New intrinsic `json_const(TypeName, { ... })` (name
+  bikesheddable) recognized in `MainListener_PostfixExpression.cpp` like `reflect`:
+  resolves the type to `StructData`, walks fields with reflect's exact skip/annotation
+  rules (`[Private]`, `[JsonName]`), reads VALUES from the brace literal's parse tree
+  (literals, enum member refs, nested braces, list literals only - `LogErrorContext`
+  otherwise), and yields a compile-time string constant (`MakeStringLiteralNV`) holding
+  the JSON. Unknown field name / wrong enum member / non-literal value = compile errors,
+  testable via `expect_error`. Also in this phase: the RUNTIME reflect enum fix (enum arm
+  -> `visitInt` via `GetEnumBackingType`, in both `reflect` and `reflect_set`).
+- **Phase B - XML visitor.** Same fold, second builtin emitter implementing the five
+  layer-2 rules (`[JsonText]`, xmlns, attribute-vs-element, list repetition, default
+  omission). The JSON emitter from Phase A is the scaffolding proof; XML is a sibling.
+- **Phase C - manifest wiring.** `manifest` soft keyword, fragment collection across
+  imports, `/manifestinput:` emission, CreateActCtxW + QueryActCtxSettingsW backstop,
+  cache round-trip, core/manifest.cb vocabulary from `utilities/windows-manifest/manifest-schema.json`.
+
 ## Open decisions for ratification
 
-1. Marker type spelling: `xtext<T>` as the single XML primitive (this doc), vs the
-   brainstorm's `attr<T>`/`elem<T>` pair. Default mapping makes the pair redundant; one
-   marker is the smaller compiler surface.
-2. Element name = field name (this doc) vs struct type name. Field name wins because it
-   makes `list<T> dependency` natural and keeps type names out of the XML contract.
-3. Helper-function folding (inline a brace-returning core function) - accept the small
+1. Helper-function folding (inline a brace-returning core function) - accept the small
    fold complexity, or v1 ships brace-init-only and `Manifest.commonControlsV6()` becomes
    a named const fragment instead.
-4. Conflict rule strictness: LogError on same-path/different-value (this doc), vs defer
+2. Conflict rule strictness: LogError on same-path/different-value (this doc), vs defer
    entirely to lld merge + CreateActCtxW of the merged doc.
