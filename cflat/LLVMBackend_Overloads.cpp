@@ -1177,7 +1177,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 // function<T> parameter - dispatch depends on whether the callee is extern C.
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
                 // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
-                auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType((unsigned)argList.size());
+                unsigned llvmParamIndex = (unsigned)argList.size();
+                if (!candidate.External)
+                {
+                    llvmParamIndex = 0;
+                    for (size_t i = 0; i < argIndex && i < candidate.Parameters.size(); i++)
+                        llvmParamIndex += ParameterCarriesRawArrayCount(candidate.Parameters[i]) ? 2u : 1u;
+                }
+                auto* llvmParamTy = candidate.Function->getFunctionType()->getParamType(llvmParamIndex);
                 if (llvmParamTy->isStructTy())
                 {
                     // Internal function<T>: provide a closure fat struct {i8*, i8*}.
@@ -1343,9 +1350,32 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             firstCallLocation_.emplace(candidate.Function->getName().str(),
                 std::make_pair(currentLine, currentColumn));
 
+        llvm::Value* rawReturnCountSlot = nullptr;
+        if (!candidate.Recipe.hasLowering && !candidate.External)
+        {
+            std::vector<llvm::Value*> abiArgs;
+            abiArgs.reserve(argList.size() + candidate.Parameters.size() + 1);
+            size_t normalIndex = 0;
+            for (size_t i = 0; i < candidate.Parameters.size() && normalIndex < argList.size(); i++)
+            {
+                abiArgs.push_back(argList[normalIndex++]);
+                if (ParameterCarriesRawArrayCount(candidate.Parameters[i]))
+                    abiArgs.push_back(RawArrayCountArgument(matched[i]));
+            }
+            while (normalIndex < argList.size()) abiArgs.push_back(argList[normalIndex++]);
+            if (ReturnCarriesRawArrayCount(candidate.ReturnType))
+            {
+                rawReturnCountSlot = CreateRawArrayReturnCountSlot();
+                abiArgs.push_back(rawReturnCountSlot);
+            }
+            argList = std::move(abiArgs);
+        }
+
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
+        RegisterRawArrayCallResult(result, rawReturnCountSlot,
+                                   candidate.ReturnType.AllocAlignValue);
 
         // Runs before ApplyMoveParamTransfer, whose UnregisterOwnedPtrTemp still has the
         // last word for a sink parameter.

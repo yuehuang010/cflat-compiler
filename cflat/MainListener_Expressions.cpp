@@ -149,6 +149,13 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 result.Primary = ParseAssignmentExpression(ctx);
                 if (result.Primary) result.BaseType = result.Primary->getType();
             }
+            if (const auto* raw = compilerLLVM->FindRawArrayResult(result.Primary))
+            {
+                result.AllocatedByRawNewArray = true;
+                result.RawArrayLength = raw->Count;
+                result.AllocAlignment = raw->AllocAlign;
+                result.IsOwning = raw->Owns;
+            }
             // A parenthesized `is`/`as` expression reaches this fallback as a raw value, so the
             // result otherwise loses the target type before a postfix member access sees it.
             // Restore the target identity for `(p as IMore).more()` and the corresponding `as`
@@ -1566,6 +1573,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 || TopLevelMoveExpression(assignCtx) != nullptr
                 || compiler->IsOwningPtrTempValue(rightNV.Primary)
                 || compiler->IsOwnedNewTemp(rightNV.Primary)
+                || compiler->RawArrayResultOwns(rightNV.Primary)
                 || compiler->IsMovedOutPtrValue(rightNV.Primary);
             // Reassignment / field store into an array-view: `a = rawIntPtr;` or `s.view = p;`
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
@@ -3790,6 +3798,26 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             ownedString = trueOwnedString && falseOwnedString;
         }
 
+        bool trueRawArray = compiler->IsRawArrayResult(trueValue);
+        bool falseRawArray = compiler->IsRawArrayResult(falseValue);
+        bool rawArrayJoin = (trueRawArray || falseRawArray)
+            && compiler->TernaryArmJoinsOwning(trueValue)
+            && compiler->TernaryArmJoinsOwning(falseValue);
+        llvm::Value* trueRawCount = nullptr;
+        llvm::Value* falseRawCount = nullptr;
+        if (rawArrayJoin)
+        {
+            auto* i64Ty = compiler->builder->getInt64Ty();
+            atTrue();
+            trueRawCount = trueRawArray
+                ? compiler->Upconvert(compiler->RawArrayCountOf(trueValue), i64Ty)
+                : compiler->builder->getInt64(-1);
+            atFalse();
+            falseRawCount = falseRawArray
+                ? compiler->Upconvert(compiler->RawArrayCountOf(falseValue), i64Ty)
+                : compiler->builder->getInt64(-1);
+        }
+
         atTrue();
         trueBr = compiler->CreateJump(resumeBlock);
         atFalse();
@@ -3800,6 +3828,32 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         phi->addIncoming(falseValue, falseEnd);
         compiler->RegisterJoinArmCastOccurrence(phi, 0, trueOcc);
         compiler->RegisterJoinArmCastOccurrence(phi, 1, falseOcc);
+
+        if (rawArrayJoin)
+        {
+            auto* countPhi = compiler->builder->CreatePHI(
+                compiler->builder->getInt64Ty(), 2, "raw_array_count_join");
+            countPhi->addIncoming(trueRawCount, trueEnd);
+            countPhi->addIncoming(falseRawCount, falseEnd);
+            auto allocAlignOf = [&](llvm::Value* value) {
+                if (const auto* raw = compiler->FindRawArrayResult(value))
+                    return raw->AllocAlign;
+                if (const auto* scalar = compiler->FindOwnedNewTemp(value))
+                    return scalar->AllocAlign;
+                return uint64_t{0};
+            };
+            auto isNull = [](llvm::Value* value) {
+                auto* constant = llvm::dyn_cast_or_null<llvm::Constant>(value);
+                return constant != nullptr && constant->isNullValue();
+            };
+            uint64_t trueAlign = allocAlignOf(trueValue);
+            uint64_t falseAlign = allocAlignOf(falseValue);
+            if (!isNull(trueValue) && !isNull(falseValue) && trueAlign != falseAlign)
+                LogErrorContext(ctx, "cannot join owning pointer allocations with different "
+                    "alignment; use the same 'alignas' on every allocating arm");
+            uint64_t commonAlign = isNull(trueValue) ? falseAlign : trueAlign;
+            compiler->RegisterRawArrayResult(phi, countPhi, commonAlign);
+        }
 
         if (ownedString)
         {
@@ -3840,6 +3894,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             if (!lhs) return {};
 
             auto* resultAlloca = compiler->CreateAlloca(lhs->getType());
+            auto* rawCountAlloca = compiler->CreateAlloca(compiler->builder->getInt64Ty());
 
             auto* nullBlock = compiler->CreateBasicBlock("nullcoal_null");
             auto* notNullBlock = compiler->CreateBasicBlock("nullcoal_notnull");
@@ -3848,6 +3903,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             compiler->CreateConditionJump(lhs, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
             compiler->CreateAssignment(lhs, resultAlloca);
+            compiler->builder->CreateStore(
+                compiler->IsRawArrayResult(lhs)
+                    ? compiler->Upconvert(compiler->RawArrayCountOf(lhs), compiler->builder->getInt64Ty())
+                    : compiler->builder->getInt64(-1),
+                rawCountAlloca);
             auto* lhsBr = compiler->CreateJump(resumeBlock);
 
             compiler->SwitchToBlock(nullBlock);
@@ -3867,6 +3927,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // branch block does dominate the resume, so struct temps hoist there instead.
                 compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
                 compiler->CreateAssignment(rhs, resultAlloca);
+                compiler->builder->CreateStore(
+                    compiler->IsRawArrayResult(rhs)
+                        ? compiler->Upconvert(compiler->RawArrayCountOf(rhs), compiler->builder->getInt64Ty())
+                        : compiler->builder->getInt64(-1),
+                    rawCountAlloca);
                 rhsBr = compiler->CreateJump(resumeBlock);
             }
             catch (...)
@@ -3900,6 +3965,33 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
                 compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
                 compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
+                bool rawJoin = (compiler->IsRawArrayResult(lhs)
+                        || compiler->IsRawArrayResult(rhs))
+                    && compiler->TernaryArmJoinsOwning(lhs)
+                    && compiler->TernaryArmJoinsOwning(rhs);
+                if (rawJoin)
+                {
+                    auto allocAlignOf = [&](llvm::Value* value) {
+                        if (const auto* raw = compiler->FindRawArrayResult(value))
+                            return raw->AllocAlign;
+                        if (const auto* scalar = compiler->FindOwnedNewTemp(value))
+                            return scalar->AllocAlign;
+                        return uint64_t{0};
+                    };
+                    uint64_t lhsAlign = allocAlignOf(lhs);
+                    uint64_t rhsAlign = allocAlignOf(rhs);
+                    auto* lhsConstant = llvm::dyn_cast_or_null<llvm::Constant>(lhs);
+                    bool lhsIsNull = lhsConstant != nullptr && lhsConstant->isNullValue();
+                    if (!lhsIsNull && lhsAlign != rhsAlign)
+                        LogErrorContext(ctx, "cannot join owning pointer allocations with different "
+                            "alignment; use the same 'alignas' on every allocating arm");
+                    compiler->RegisterRawArrayResult(
+                        joined, compiler->builder->CreateLoad(
+                            compiler->builder->getInt64Ty(), rawCountAlloca,
+                            "raw_array_count_join"),
+                        lhsIsNull ? rhsAlign : lhsAlign);
+                    compiler->PropagateTernaryOwnership(lhs, rhs, joined);
+                }
             }
             return { joined, false };
         }
@@ -5528,6 +5620,11 @@ llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVa
         // values PROVEN to be data must not widen into a fat closure's code slot (see dataValues_).
         if (result != nullptr && compiler->ArgumentIsDataValue(namedVar))
             compiler->RegisterDataValue(result);
+        if (result != nullptr && namedVar.AllocatedByRawNewArray)
+        {
+            if (auto* count = compiler->LoadRawArrayLength(namedVar))
+                compiler->RegisterRawArrayResult(result, count, namedVar.AllocAlignment, false);
+        }
         return result;
     }
 
@@ -8839,6 +8936,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         bool typeAlreadyAligned = effAlign > LLVMBackend::kDefaultNewAlign;
         uint64_t siteExcess = (useAligned && !typeAlreadyAligned) ? allocAlign : 0;
         result.AllocAlignment = siteExcess;
+        if (isArray)
+            compiler->RegisterRawArrayResult(typedPtr, count, siteExcess);
         // A COM object's lifetime is refcounted via Release, not owning-pointer auto-free, so the
         // caller must NOT auto-delete it at scope exit.
         compiler->lastOwningResult = !isWinrtNew;

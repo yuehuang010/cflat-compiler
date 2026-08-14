@@ -1387,6 +1387,7 @@ public:
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
         bool Variadic = false;
+        bool External = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool ReturnsAlias = false; // true when the function returns an 'alias' by-value borrow - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
@@ -1489,6 +1490,17 @@ public:
         uint64_t AllocAlign = 0;
     };
     std::vector<OwnedNewTemp> ownedNewTemps_;
+
+    // Runtime provenance of a raw `new T[n]` pointer result, keyed by the pointer SSA value.
+    // Count and allocation alignment always travel with the same value through joins and calls.
+    struct RawArrayResult
+    {
+        llvm::Value* Value;
+        llvm::Value* Count;
+        uint64_t AllocAlign = 0;
+        bool Owns = false;
+    };
+    std::vector<RawArrayResult> rawArrayResults_;
 
     // Per-(callee, parameter) result of ParameterRetainsArgument. Cached only for callees whose
     // body is complete. Keyed on a raw llvm::Function*, so an entry MUST be dropped before that
@@ -3309,6 +3321,13 @@ private:
     const OwnedNewTemp* FindOwnedNewTemp(llvm::Value* value) const;
 
     bool IsOwnedNewTemp(llvm::Value* value) const;
+
+    void RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
+                                uint64_t allocAlign = 0, bool owns = true);
+    const RawArrayResult* FindRawArrayResult(llvm::Value* value) const;
+    bool IsRawArrayResult(llvm::Value* value) const;
+    bool RawArrayResultOwns(llvm::Value* value) const;
+    llvm::Value* RawArrayCountOf(llvm::Value* value) const;
 
     // Carry the owning bit from an arm value onto a derived value ('?:' phi / select result).
     void PropagateOwnedNewTemp(llvm::Value* from, llvm::Value* to);
@@ -5540,7 +5559,9 @@ public:
                                    const std::string& paramTypeName);
 
     // Emits an indirect call through a closure fat struct {i8* fnptr, i8* envptr}.
-    llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr, std::vector<llvm::Value*> args);
+    llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
+                                    std::vector<llvm::Value*> args,
+                                    const std::vector<NamedVariable>* argNVs = nullptr);
 
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases);
 
@@ -6577,6 +6598,14 @@ public:
     void StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint64_t byteOff);
 
     llvm::Value* CreateFunctionCall(llvm::Function* func, const std::vector<llvm::Value*>& arg);
+
+    bool ParameterCarriesRawArrayCount(const TypeAndValue& param) const;
+    bool ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const;
+    llvm::Value* RawArrayCountArgument(const NamedVariable& arg);
+    llvm::Value* CreateRawArrayReturnCountSlot();
+    void RegisterRawArrayCallResult(llvm::Value* result, llvm::Value* countSlot,
+                                    uint64_t allocAlign = 0);
+    llvm::Argument* CurrentRawArrayReturnCountArgument() const;
 
     // Returns true if value is a load from an owning alloca in any live scope.
     bool IsOwningValue(llvm::Value* value) const;

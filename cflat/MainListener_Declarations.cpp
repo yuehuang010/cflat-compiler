@@ -4324,7 +4324,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (boundFromFixedArray)
                             compiler->StoreRawArrayLength(
                                 viewNV, compiler->builder->getInt64(srcConstArraySize));
-                        else if (srcIsArrayView)
+                        else if (srcIsArrayView || compiler->IsRawArrayResult(srcPrimary))
                             compiler->StoreRawArrayLength(viewNV, srcRawArrayLength);
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
@@ -4854,8 +4854,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 || (initAssignExprOwn != nullptr
                                     && (AsDirectNew(initAssignExprOwn) != nullptr
                                         || TopLevelMoveExpression(initAssignExprOwn) != nullptr))
-                                || compiler->IsOwnedNewTemp(srcPrimary)
-                                || compiler->IsOwningPtrTempValue(srcPrimary)
+                                        || compiler->IsOwnedNewTemp(srcPrimary)
+                                        || compiler->RawArrayResultOwns(srcPrimary)
+                                        || compiler->IsOwningPtrTempValue(srcPrimary)
                                 || compiler->IsMovedOutPtrValue(srcPrimary));
                         /*
                          * `move` of a BORROWED pointer transfers nothing - the real owner still frees
@@ -4892,7 +4893,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 nv.IsOwning = true;
                                 nv.IsNewAllocated = true;
                                 // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
-                                nv.AllocAlignment = compiler->lastAllocAlignment;
+                                nv.AllocAlignment = haveInitializerSourceNV
+                                    && initializerSourceNV.AllocAlignment != 0
+                                    ? initializerSourceNV.AllocAlignment : compiler->lastAllocAlignment;
                             }
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
@@ -5992,6 +5995,13 @@ bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         LLVMBackend::NamedVariable nv, bool savedOwned) {
+        if (const auto* raw = compilerLLVM->FindRawArrayResult(nv.Primary))
+        {
+            nv.AllocatedByRawNewArray = true;
+            nv.RawArrayLength = raw->Count;
+            nv.AllocAlignment = raw->AllocAlign;
+            nv.IsOwning = raw->Owns;
+        }
         bool exprOwned = compilerLLVM->lastCallReturnsOwned;
         if (exprOwned && NamedVarIsString(nv))
             nv.IsOwningString = true;

@@ -2402,7 +2402,13 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         llvm::Type* retTy = GetType(methodInfo->ReturnType);
         std::vector<llvm::Type*> paramTypes = { ptrTy };
         for (const auto& p : methodInfo->Parameters)
+        {
             paramTypes.push_back(GetType(p));
+            if (ParameterCarriesRawArrayCount(p))
+                paramTypes.push_back(builder->getInt64Ty());
+        }
+        if (ReturnCarriesRawArrayCount(methodInfo->ReturnType))
+            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
         auto fnTy = llvm::FunctionType::get(retTy, paramTypes, false);
 
         // callArgNVs is arity-matched to Parameters by the resolver, so no clamp here: a
@@ -2481,9 +2487,20 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 val = LowerByValueArg(val, param, nv);
                 callArgs.push_back(val);
             }
+            if (ParameterCarriesRawArrayCount(param))
+                callArgs.push_back(RawArrayCountArgument(nv));
+        }
+
+        llvm::Value* rawReturnCountSlot = nullptr;
+        if (ReturnCarriesRawArrayCount(methodInfo->ReturnType))
+        {
+            rawReturnCountSlot = CreateRawArrayReturnCountSlot();
+            callArgs.push_back(rawReturnCountSlot);
         }
 
         auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
+        RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
+                                   methodInfo->ReturnType.AllocAlignValue);
 
         // A `move` parameter on an INTERFACE method transfers ownership just as it does on a
         // direct call, so the caller's source must be nulled/marked-moved here too. Without this

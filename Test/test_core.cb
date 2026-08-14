@@ -2203,6 +2203,245 @@ int runRawCountStaticView(int choose)
     return count * 100 + sum;
 }
 
+int runRawCountJoinDecl(int choose)
+{
+    resetRawCountState();
+    {
+        int a = 2;
+        int b = 4;
+        unique RawCountElem* values = choose != 0
+            ? new RawCountElem[a] : new RawCountElem[b];
+        int i = 0;
+        int n = choose != 0 ? a : b;
+        while (i < n) { values[i].id = i + 1; i++; }
+    }
+    return g_raw_count_dtors * 100 + g_raw_count_sum;
+}
+
+int runRawCountJoinAssign(int choose)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = nullptr;
+        values = choose != 0
+            ? new RawCountElem[2] : new RawCountElem[4];
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinNested(int mode)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = mode == 0
+            ? new RawCountElem[2]
+            : (mode == 1 ? new RawCountElem[3] : new RawCountElem[4]);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinNullScalar(int mode)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = mode == 0
+            ? new RawCountElem[2]
+            : (mode == 1 ? nullptr : new RawCountElem());
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinCoalesce(int choose)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values =
+            ((choose != 0 ? new RawCountElem[2] : nullptr) ?? new RawCountElem[4]);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinZero(int choose)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = choose != 0
+            ? new RawCountElem[0] : new RawCountElem[2];
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinResources(int choose)
+{
+    resetRawCountState();
+    g_raw_count_resource_dtors = 0;
+    {
+        unique RawCountOwnerElem* values = choose != 0
+            ? new RawCountOwnerElem[2] : new RawCountOwnerElem[4];
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
+}
+
+int runRawCountJoinAligned(int choose)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = nullptr;
+        values = choose != 0
+            ? new RawCountElem[2] alignas(0, 64)
+            : new RawCountElem[4] alignas(0, 64);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountJoinView(int choose)
+{
+    int count = 0;
+    int[] values = choose != 0 ? new int[2] : new int[4];
+    for (int value in values) count++;
+    delete[_] values;
+    return count;
+}
+
+void rawCountSink(move RawCountElem* values) {}
+void rawCountForward(move RawCountElem* values) { rawCountSink(move values); }
+void rawCountGenericSink<T>(move T* values) {}
+void rawCountAlignedSink(move alignas(0, 64) RawCountElem* values) {}
+void rawCountOwnerSink(move RawCountOwnerElem* values) {}
+move RawCountElem* rawCountReturn(move RawCountElem* values) { return move values; }
+
+interface RawCountSinkInterface
+{
+    void sink(move RawCountElem* values);
+    move RawCountElem* pass(move RawCountElem* values);
+};
+
+class RawCountSinkImpl : RawCountSinkInterface
+{
+    void sink(move RawCountElem* values) {}
+    move RawCountElem* pass(move RawCountElem* values) { return move values; }
+};
+
+int runRawCountMoveDirect(int n)
+{
+    resetRawCountState();
+    { unique RawCountElem* values = new RawCountElem[n]; rawCountSink(move values); }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveScalarNull(int scalar)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = scalar != 0 ? new RawCountElem() : nullptr;
+        rawCountSink(move values);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveIndirect(int n)
+{
+    resetRawCountState();
+    {
+        function<void(move RawCountElem*)> sink = rawCountSink;
+        unique RawCountElem* values = new RawCountElem[n];
+        sink(move values);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveGeneric(int n)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[n];
+        rawCountGenericSink<RawCountElem>(move values);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveInterface(int n)
+{
+    resetRawCountState();
+    {
+        RawCountSinkInterface sink = new RawCountSinkImpl();
+        unique RawCountElem* values = new RawCountElem[n];
+        sink.sink(move values);
+        delete sink;
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveForwardReturn(int n, int returnIt)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[n];
+        if (returnIt != 0)
+        {
+            unique RawCountElem* result = rawCountReturn(move values);
+        }
+        else
+        {
+            rawCountForward(move values);
+        }
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveReturnDispatch(int n, int interfaceCall)
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[n];
+        if (interfaceCall != 0)
+        {
+            RawCountSinkInterface sink = new RawCountSinkImpl();
+            unique RawCountElem* result = sink.pass(move values);
+            delete sink;
+        }
+        else
+        {
+            function<move RawCountElem*(move RawCountElem*)> pass = rawCountReturn;
+            unique RawCountElem* result = pass(move values);
+        }
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveResources(int n)
+{
+    resetRawCountState();
+    g_raw_count_resource_dtors = 0;
+    {
+        unique RawCountOwnerElem* values = new RawCountOwnerElem[n];
+        rawCountOwnerSink(move values);
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
+}
+
+int runRawCountMoveAligned(int n)
+{
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* values =
+            new RawCountElem[n] alignas(0, 64);
+        rawCountAlignedSink(move values);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveReassign()
+{
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[2];
+        values = new RawCountElem[4];
+        rawCountSink(move values);
+    }
+    return g_raw_count_dtors;
+}
+
 int testRawArrayRuntimeCount()
 {
     int passed = 0;
@@ -2360,6 +2599,53 @@ int testRawArrayRuntimeCount()
     passed += Test("raw count zero move source null", zeroMoveSourceNull, 1);
     passed += Test("raw count zero move cleanup", g_raw_count_dtors, 0);
 
+    passed += Test("raw count ternary declaration both arms",
+        runRawCountJoinDecl(1) * 1000 + runRawCountJoinDecl(0), 203410);
+    passed += Test("raw count ternary assignment both arms",
+        runRawCountJoinAssign(1) * 10 + runRawCountJoinAssign(0), 24);
+    passed += Test("raw count nested ternary all arms",
+        runRawCountJoinNested(0) * 100 + runRawCountJoinNested(1) * 10
+            + runRawCountJoinNested(2), 234);
+    passed += Test("raw count ternary null and scalar sentinels",
+        runRawCountJoinNullScalar(0) * 100 + runRawCountJoinNullScalar(1) * 10
+            + runRawCountJoinNullScalar(2), 201);
+    passed += Test("raw count coalesce both arms",
+        runRawCountJoinCoalesce(1) * 10 + runRawCountJoinCoalesce(0), 24);
+    passed += Test("raw count zero-length ternary",
+        runRawCountJoinZero(1) * 10 + runRawCountJoinZero(0), 2);
+    passed += Test("raw count ternary owning resources",
+        runRawCountJoinResources(1) * 100 + runRawCountJoinResources(0), 2244);
+    passed += Test("raw count ternary aligned allocations",
+        runRawCountJoinAligned(1) * 10 + runRawCountJoinAligned(0), 24);
+    passed += Test("raw count ternary array view ranges",
+        runRawCountJoinView(1) * 10 + runRawCountJoinView(0), 24);
+    passed += Test("raw count move parameter direct zero and counts",
+        runRawCountMoveDirect(0) * 100 + runRawCountMoveDirect(2) * 10
+            + runRawCountMoveDirect(4), 24);
+    passed += Test("raw count move parameter scalar and null",
+        runRawCountMoveScalarNull(1) * 10 + runRawCountMoveScalarNull(0), 10);
+    passed += Test("raw count move parameter indirect and generic",
+        runRawCountMoveIndirect(2) * 1000 + runRawCountMoveIndirect(4) * 100
+            + runRawCountMoveGeneric(2) * 10 + runRawCountMoveGeneric(4), 2424);
+    passed += Test("raw count move parameter interface",
+        runRawCountMoveInterface(2) * 10 + runRawCountMoveInterface(4), 24);
+    passed += Test("raw count move parameter forward and return",
+        runRawCountMoveForwardReturn(2, 0) * 1000
+            + runRawCountMoveForwardReturn(4, 0) * 100
+            + runRawCountMoveForwardReturn(2, 1) * 10
+            + runRawCountMoveForwardReturn(4, 1), 2424);
+    passed += Test("raw count move return indirect and interface",
+        runRawCountMoveReturnDispatch(2, 0) * 1000
+            + runRawCountMoveReturnDispatch(4, 0) * 100
+            + runRawCountMoveReturnDispatch(2, 1) * 10
+            + runRawCountMoveReturnDispatch(4, 1), 2424);
+    passed += Test("raw count move parameter owning resources",
+        runRawCountMoveResources(2) * 100 + runRawCountMoveResources(4), 2244);
+    passed += Test("raw count move parameter alignment",
+        runRawCountMoveAligned(2) * 10 + runRawCountMoveAligned(4), 24);
+    passed += Test("raw count move parameter after reassignment",
+        runRawCountMoveReassign(), 6);
+
     return passed;
 }
 
@@ -2405,7 +2691,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 21;
+    r = testRawArrayRuntimeCount(); passed += r; total += 39;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -1369,6 +1369,17 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 right, srcIface, compiler->currentFunctionReturnTypeName);
         }
 
+        if (auto* rawCountOut = compiler->CurrentRawArrayReturnCountArgument())
+        {
+            llvm::Value* count = compiler->LoadRawArrayLength(returnNV);
+            if (count == nullptr) count = compiler->RawArrayCountOf(right);
+            compiler->builder->CreateStore(
+                count != nullptr
+                    ? compiler->Upconvert(count, compiler->builder->getInt64Ty())
+                    : compiler->builder->getInt64(-1),
+                rawCountOut);
+        }
+
         compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
     }
 

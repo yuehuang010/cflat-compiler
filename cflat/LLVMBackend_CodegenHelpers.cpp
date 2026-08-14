@@ -86,12 +86,20 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         launderedTempUniqueFields_.clear();
         pendingLaunderTempUniqueFields_.clear();
         dataValueCodeCasts_.clear();
+        rawArrayResults_.clear();
 
         // populate function arguments
         auto itr_nameArg = arguments.begin();
-        for (auto& arg : fn->args())
+        auto llvmArgIt = fn->arg_begin();
+        for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end(); ++itr_nameArg)
         {
+            auto& arg = *llvmArgIt++;
+            llvm::Argument* rawArrayCountArg = nullptr;
+            if (ParameterCarriesRawArrayCount(*itr_nameArg) && llvmArgIt != fn->arg_end())
+                rawArrayCountArg = &*llvmArgIt++;
             arg.setName(itr_nameArg->VariableName);
+            if (rawArrayCountArg != nullptr)
+                rawArrayCountArg->setName(itr_nameArg->VariableName + ".raw_array_count");
 
             // 8a (thin unique): a plain (non-move) `unique`-type-arg pointer / interface param is a
             // synthesized sink - ApplyMoveParamTransfer nulls the caller on IsUniqueTypeArg - but
@@ -141,6 +149,14 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     // frees via __delete_aligned. The call site already checked the arg agrees.
                     .AllocAlignment = itr_nameArg->AllocAlignValue,
                 };
+                namedVar.RawArrayLengthStorage =
+                    AllocaAtEntry(builder->getInt64Ty(), nullptr,
+                                  itr_nameArg->VariableName + ".raw_array_count");
+                builder->CreateStore(rawArrayCountArg != nullptr
+                    ? static_cast<llvm::Value*>(rawArrayCountArg)
+                    : static_cast<llvm::Value*>(builder->getInt64(-1)),
+                    namedVar.RawArrayLengthStorage);
+                namedVar.AllocatedByRawNewArray = true;
                 stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
             }
             else if (itr_nameArg->IsMove && itr_nameArg->TypeName == "string")
@@ -242,7 +258,6 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
 
             RecordMoveGenBind(itr_nameArg->VariableName); // fresh parameter binding
 
-            itr_nameArg++;
         }
 
         currentFunction = fn;

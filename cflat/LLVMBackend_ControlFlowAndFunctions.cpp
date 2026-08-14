@@ -439,7 +439,9 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
             index + 1, index + 1, shown, advice));
     }
 
-llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr, std::vector<llvm::Value*> args)
+llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
+                                             std::vector<llvm::Value*> args,
+                                             const std::vector<NamedVariable>* argNVs)
 {
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
 
@@ -449,30 +451,55 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             std::vector<llvm::Type*> paramTypes;
             for (const auto& p : funcPtrType.FuncPtrParams)
             {
-                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+                TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
                 paramTypes.push_back(GetType(pTV));
+                if (ParameterCarriesRawArrayCount(pTV))
+                    paramTypes.push_back(builder->getInt64Ty());
             }
             TypeAndValue retTV;
             retTV.TypeName = funcPtrType.FuncPtrReturnTypeName;
             retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+            if (ReturnCarriesRawArrayCount(retTV))
+                paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
             auto* retTy   = GetType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
-            for (size_t i = 0; i < args.size() && i < paramTypes.size(); i++)
+            std::vector<llvm::Value*> abiArgs;
+            size_t typeIndex = 0;
+            for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); i++)
             {
-                auto* destTy = paramTypes[i];
+                auto* destTy = paramTypes[typeIndex++];
                 auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
                 if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                     args[i] = WrapStringLiteralAsString(args[i]);
                 else
                     args[i] = Upconvert(args[i], destTy);
                 CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
+                abiArgs.push_back(args[i]);
+                TypeAndValue pTV;
+                pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
+                pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
+                pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+                if (ParameterCarriesRawArrayCount(pTV))
+                {
+                    abiArgs.push_back(argNVs != nullptr && i < argNVs->size()
+                        ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1));
+                    typeIndex++;
+                }
+            }
+            llvm::Value* rawReturnCountSlot = nullptr;
+            if (ReturnCarriesRawArrayCount(retTV))
+            {
+                rawReturnCountSlot = CreateRawArrayReturnCountSlot();
+                abiArgs.push_back(rawReturnCountSlot);
             }
             lastCallReturnType = retTV;
-            auto* result = builder->CreateCall(cFnTy, fnPtr, args);
-            return retTy->isVoidTy() ? nullptr : result;
+            auto* result = builder->CreateCall(cFnTy, fnPtr, abiArgs);
+            llvm::Value* value = retTy->isVoidTy() ? nullptr : result;
+            RegisterRawArrayCallResult(value, rawReturnCountSlot);
+            return value;
         }
 
         // Extract fn ptr (field 0) and env ptr (field 1) from the closure fat struct.
@@ -491,8 +518,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         std::vector<llvm::Type*> paramTypes;
         for (const auto& p : funcPtrType.FuncPtrParams)
         {
-            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer; pTV.IsMove = p.IsMove;
             paramTypes.push_back(GetType(pTV));
+            if (ParameterCarriesRawArrayCount(pTV))
+                paramTypes.push_back(builder->getInt64Ty());
         }
         paramTypes.push_back(i8PtrTy); // env (trailing)
         TypeAndValue retTV;
@@ -500,6 +529,8 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.Pointer  = funcPtrType.FuncPtrReturnPointer;
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
+        if (ReturnCarriesRawArrayCount(retTV))
+            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
         auto* retTy     = GetType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
@@ -507,24 +538,46 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         // Upconvert user args to match declared param types (the trailing slot is env, skip it).
         // String literals arrive as i8* - wrap them into %string{ptr,len} when the
         // param expects a string value type.
-        for (size_t i = 0; i < args.size() && i + 1 < paramTypes.size(); i++)
+        std::vector<llvm::Value*> userArgs;
+        size_t typeIndex = 0;
+        for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); i++)
         {
-            auto* destTy = paramTypes[i];
+            auto* destTy = paramTypes[typeIndex++];
             auto* strTy  = llvm::StructType::getTypeByName(*context, "string");
             if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                 args[i] = WrapStringLiteralAsString(args[i]);
             else
                 args[i] = Upconvert(args[i], destTy);
             CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
+            userArgs.push_back(args[i]);
+            TypeAndValue pTV;
+            pTV.TypeName = funcPtrType.FuncPtrParams[i].TypeName;
+            pTV.Pointer = funcPtrType.FuncPtrParams[i].Pointer;
+            pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
+            if (ParameterCarriesRawArrayCount(pTV))
+            {
+                userArgs.push_back(argNVs != nullptr && i < argNVs->size()
+                    ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1));
+                typeIndex++;
+            }
         }
 
         // Append env to call args (env-last)
-        std::vector<llvm::Value*> fullArgs(args.begin(), args.end());
+        std::vector<llvm::Value*> fullArgs(userArgs.begin(), userArgs.end());
         fullArgs.push_back(envPtr);
+
+        llvm::Value* rawReturnCountSlot = nullptr;
+        if (ReturnCarriesRawArrayCount(retTV))
+        {
+            rawReturnCountSlot = CreateRawArrayReturnCountSlot();
+            fullArgs.push_back(rawReturnCountSlot);
+        }
 
         lastCallReturnType = retTV;
         auto* result = builder->CreateCall(invokerTy, fnPtr, fullArgs);
-        return retTy->isVoidTy() ? nullptr : result;
+        llvm::Value* value = retTy->isVoidTy() ? nullptr : result;
+        RegisterRawArrayCallResult(value, rawReturnCountSlot);
+        return value;
     }
 
 llvm::SwitchInst* LLVMBackend::CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases)
@@ -1020,6 +1073,7 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
+                .External = external,
                 .ReturnsOwned = returnsOwned,
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
@@ -1057,12 +1111,57 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         for (const auto& p : tv.FuncPtrParams)
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
+            pTV.IsMove = p.IsMove;
             paramTypes.push_back(GetType(pTV));
+            if (ParameterCarriesRawArrayCount(pTV))
+                paramTypes.push_back(builder->getInt64Ty());
         }
         TypeAndValue retTV;
         retTV.TypeName = tv.FuncPtrReturnTypeName;
         retTV.Pointer  = tv.FuncPtrReturnPointer;
+        retTV.IsMove   = tv.FuncPtrReturnOwned;
+        if (ReturnCarriesRawArrayCount(retTV))
+            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
         return llvm::FunctionType::get(GetType(retTV), paramTypes, false)->getPointerTo();
+    }
+
+bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
+{
+        return param.Pointer && (param.IsMove || param.IsUniqueTypeArg);
+    }
+
+bool LLVMBackend::ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const
+{
+        return returnType.Pointer && (returnType.IsMove || returnType.IsUniqueTypeArg);
+    }
+
+llvm::Value* LLVMBackend::RawArrayCountArgument(const NamedVariable& arg)
+{
+        llvm::Value* count = LoadRawArrayLength(arg);
+        return count != nullptr ? Upconvert(count, builder->getInt64Ty()) : builder->getInt64(-1);
+    }
+
+llvm::Value* LLVMBackend::CreateRawArrayReturnCountSlot()
+{
+        auto* slot = AllocaAtEntry(builder->getInt64Ty(), nullptr, "raw_array_return_count");
+        builder->CreateStore(builder->getInt64(-1), slot);
+        return slot;
+    }
+
+void LLVMBackend::RegisterRawArrayCallResult(llvm::Value* result, llvm::Value* countSlot,
+                                             uint64_t allocAlign)
+{
+        if (result == nullptr || countSlot == nullptr) return;
+        RegisterRawArrayResult(result,
+            builder->CreateLoad(builder->getInt64Ty(), countSlot, "raw_array_return_count"),
+            allocAlign);
+    }
+
+llvm::Argument* LLVMBackend::CurrentRawArrayReturnCountArgument() const
+{
+        if (currentFunction == nullptr || !ReturnCarriesRawArrayCount(currentFunctionReturnTV)
+            || currentFunction->arg_empty()) return nullptr;
+        return &*std::prev(currentFunction->arg_end());
     }
 
 llvm::Type* LLVMBackend::GetCCompatibleType(const TypeAndValue& tv) const
@@ -1080,7 +1179,12 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
             types.emplace_back(externC ? GetCCompatibleType(arg) : GetType(arg));
+            if (!externC && ParameterCarriesRawArrayCount(arg))
+                types.emplace_back(builder->getInt64Ty());
         }
+
+        if (!externC && ReturnCarriesRawArrayCount(returnType))
+            types.emplace_back(builder->getInt64Ty()->getPointerTo());
 
         auto* retTy = externC ? GetCCompatibleType(returnType) : GetType(returnType);
         return llvm::FunctionType::get(retTy, types, varargs);
@@ -1213,7 +1317,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             {
                 if (a.IsArrayView && ai < fn->arg_size())
                     fn->addParamAttr(ai, llvm::Attribute::NoAlias);
-                ++ai;
+                ai += ParameterCarriesRawArrayCount(a) ? 2u : 1u;
             }
         }
 
@@ -1289,6 +1393,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
+                .External = external,
                 .ReturnsOwned = returnsOwned,
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,

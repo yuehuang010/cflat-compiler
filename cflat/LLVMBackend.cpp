@@ -4546,6 +4546,7 @@ static llvm::json::Object SerializeFuncSym(const std::string& key, const FS& s)
     for (auto& p : s.Parameters) ps.push_back(SerializeTav(p));
     o["ps"] = std::move(ps);
     if (s.Variadic)     o["va"] = true;
+    if (s.External)     o["ext"] = true;
     if (s.ReturnsOwned) o["ro"] = true;
     if (s.ReturnsAlias) o["ra"] = true;
     if (s.IsMethod)     o["m"]  = true;
@@ -5122,11 +5123,13 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             sym.UniqueName = uniq->str();
             sym.Function   = module->getFunction(sym.UniqueName);
             if (!sym.Function) continue;
+            sym.External = sym.Function->hasExternalLinkage();
             if (auto* r = fo->getObject("r")) sym.ReturnType = DeserializeTav(*r);
             if (auto* ps = fo->getArray("ps"))
                 for (auto& pe : *ps)
                     if (auto* po = pe.getAsObject()) sym.Parameters.push_back(DeserializeTav(*po));
             if (auto v = fo->getBoolean("va")) sym.Variadic = *v;
+            if (auto v = fo->getBoolean("ext")) sym.External = *v;
             if (auto v = fo->getBoolean("ro")) sym.ReturnsOwned = *v;
             if (auto v = fo->getBoolean("ra")) sym.ReturnsAlias = *v;
             if (auto v = fo->getBoolean("m"))  sym.IsMethod = *v;

@@ -934,8 +934,9 @@ llvm::Value* LLVMBackend::LoadRawArrayLength(const NamedVariable& namedVar)
         auto* i64Ty = builder->getInt64Ty();
         if (namedVar.RawArrayLengthStorage != nullptr)
             return builder->CreateLoad(i64Ty, namedVar.RawArrayLengthStorage, "raw_array_count");
-        if (namedVar.RawArrayLength == nullptr) return nullptr;
-        return Upconvert(namedVar.RawArrayLength, i64Ty);
+        llvm::Value* count = namedVar.RawArrayLength;
+        if (count == nullptr) count = RawArrayCountOf(namedVar.Primary);
+        return count != nullptr ? Upconvert(count, i64Ty) : nullptr;
     }
 
 void LLVMBackend::StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value* rawArrayLength)
@@ -1466,7 +1467,8 @@ bool LLVMBackend::TernaryArmJoinsOwning(llvm::Value* arm)
 {
         if (arm == nullptr) return false;
         if (auto* c = llvm::dyn_cast<llvm::Constant>(arm); c != nullptr && c->isNullValue()) return true;
-        if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)) return true;
+        if (IsOwningPtrTempValue(arm) || IsMovedOutPtrValue(arm)
+            || RawArrayResultOwns(arm)) return true;
         // An INTERFACE fat value and a by-value OWNING STRUCT both own through the owning-RETURN
         // release ledger, which the pointer-only IsOwningPtrTempValue cannot see. A plain LOAD of
         // a named local/parameter is never in that
@@ -2355,16 +2357,29 @@ bool LLVMBackend::ArgumentIsMethodReceiver(const llvm::Function* fn, unsigned ar
 {
         if (fn == nullptr || argIndex != 0) return false;
         const FunctionSymbol* sym = FindSymbolForFunction(fn);
-        return sym != nullptr && sym->IsMethod && fn->arg_size() == sym->Parameters.size();
+        if (sym == nullptr || !sym->IsMethod || sym->Parameters.empty()) return false;
+        size_t expanded = 0;
+        for (const auto& param : sym->Parameters)
+            expanded += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+        return fn->arg_size() == expanded || fn->arg_size() == expanded + 1;
     }
 
 std::string LLVMBackend::DescribeCalleeParameter(const llvm::Function* fn, unsigned argIndex) const
 {
         if (ArgumentIsMethodReceiver(fn, argIndex)) return "the receiver object";
-        if (const FunctionSymbol* sym = FindSymbolForFunction(fn);
-            sym != nullptr && argIndex < sym->Parameters.size()
-            && !sym->Parameters[argIndex].VariableName.empty())
-            return std::format("parameter '{}'", sym->Parameters[argIndex].VariableName);
+        if (const FunctionSymbol* sym = FindSymbolForFunction(fn); sym != nullptr)
+        {
+            size_t expanded = 0;
+            for (const auto& param : sym->Parameters)
+                expanded += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+            unsigned llvmIndex = sym->IsMethod && fn->arg_size() == expanded + 1 ? 1u : 0u;
+            for (const auto& param : sym->Parameters)
+            {
+                if (llvmIndex == argIndex && !param.VariableName.empty())
+                    return std::format("parameter '{}'", param.VariableName);
+                llvmIndex += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+            }
+        }
         return std::format("parameter #{}", argIndex + 1);
     }
 
@@ -2472,16 +2487,19 @@ bool LLVMBackend::ParameterIsMove(const llvm::Function* fn, unsigned argIndex) c
 {
         const FunctionSymbol* sym = FindSymbolForFunction(fn);
         if (sym == nullptr || sym->Recipe.hasLowering) return false;
-        // A method's Parameters may or may not carry the implicit `this`, so map by arity: 1:1
-        // when the counts match, shifted by one when the llvm signature has exactly one more.
-        size_t i = argIndex;
-        if (fn->arg_size() == sym->Parameters.size() + 1 && sym->IsMethod)
+        if (ArgumentIsMethodReceiver(fn, argIndex)) return false;
+        size_t expanded = 0;
+        for (const auto& param : sym->Parameters)
+            expanded += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+        unsigned llvmIndex = sym->IsMethod && fn->arg_size() == expanded + 1 ? 1u : 0u;
+        for (const auto& param : sym->Parameters)
         {
-            if (argIndex == 0) return false;                // `this` is never a `move` parameter
-            i = argIndex - 1;
+            if (llvmIndex == argIndex) return param.IsMove;
+            if (ParameterCarriesRawArrayCount(param) && llvmIndex + 1 == argIndex)
+                return false;
+            llvmIndex += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
         }
-        else if (fn->arg_size() != sym->Parameters.size()) return false;
-        return i < sym->Parameters.size() && sym->Parameters[i].IsMove;
+        return false;
     }
 
 bool LLVMBackend::TypeHoldsPointer(const llvm::Type* t) const
@@ -2543,6 +2561,46 @@ const LLVMBackend::OwnedNewTemp* LLVMBackend::FindOwnedNewTemp(llvm::Value* valu
 bool LLVMBackend::IsOwnedNewTemp(llvm::Value* value) const
 {
         return FindOwnedNewTemp(value) != nullptr;
+    }
+
+void LLVMBackend::RegisterRawArrayResult(llvm::Value* value, llvm::Value* count,
+                                         uint64_t allocAlign, bool owns)
+{
+        if (value == nullptr || count == nullptr || !value->getType()->isPointerTy()) return;
+        for (auto& entry : rawArrayResults_)
+            if (entry.Value == value)
+            {
+                entry.Count = count;
+                entry.AllocAlign = allocAlign;
+                entry.Owns = entry.Owns || owns;
+                return;
+            }
+        rawArrayResults_.push_back({ value, count, allocAlign, owns });
+    }
+
+const LLVMBackend::RawArrayResult* LLVMBackend::FindRawArrayResult(llvm::Value* value) const
+{
+        if (value == nullptr) return nullptr;
+        for (const auto& entry : rawArrayResults_)
+            if (entry.Value == value) return &entry;
+        return nullptr;
+    }
+
+bool LLVMBackend::IsRawArrayResult(llvm::Value* value) const
+{
+        return FindRawArrayResult(value) != nullptr;
+    }
+
+bool LLVMBackend::RawArrayResultOwns(llvm::Value* value) const
+{
+        const auto* entry = FindRawArrayResult(value);
+        return entry != nullptr && entry->Owns;
+    }
+
+llvm::Value* LLVMBackend::RawArrayCountOf(llvm::Value* value) const
+{
+        const auto* entry = FindRawArrayResult(value);
+        return entry != nullptr ? entry->Count : nullptr;
     }
 
 void LLVMBackend::PropagateOwnedNewTemp(llvm::Value* from, llvm::Value* to)
@@ -3063,6 +3121,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
         movedOutPtrValues_.clear();
@@ -3082,6 +3141,7 @@ void LLVMBackend::FlushOwnedTemps()
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
         // A named function is one shared llvm::Function constant, so a cast's launder must not

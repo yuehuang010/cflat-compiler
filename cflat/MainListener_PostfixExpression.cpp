@@ -3214,7 +3214,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argNVs[i], callArgs[i], fp.TypeName,
                                         std::format("function pointer '{}'", functionName));
                                 }
-                                auto result = Compiler(ctx)->CreateIndirectCall(funcPtrTV, funcPtr, callArgs);
+                                auto result = Compiler(ctx)->CreateIndirectCall(
+                                    funcPtrTV, funcPtr, callArgs, &argNVs);
                                 Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
                                 {
@@ -3508,6 +3509,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
+                                    argVar.AllocatedByRawNewArray = argNV.AllocatedByRawNewArray;
+                                    argVar.RawArrayLength = argNV.RawArrayLength;
+                                    argVar.RawArrayLengthStorage = argNV.RawArrayLengthStorage;
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
