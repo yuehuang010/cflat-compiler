@@ -1580,7 +1580,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // stores are never tracked in the first place).
                 if (namedVar.TypeAndValue.IsArrayView && namedVar.FieldName.empty()
                     && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
-                    && llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                    && (llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                        || llvm::isa<llvm::GlobalVariable>(namedVar.Storage)))
                     compiler->SetViewOfFixedArrayStorage(namedVar.CallerName, false);
                 /*
                  * q11: a GLOBAL pointer destination (`g = p;`). The block below is gated on
@@ -3054,8 +3055,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // adopt ownership below. Reuse EmitUniqueFieldDelete for the drop-old so the store-site
             // free matches teardown (a null old pointee is a safe no-op). The outer
             // destination != rightNV.Storage guard - and passing `right` to skip on an equal
-            // pointee - make self-assign `a = a` free nothing and keep its live pointer, mirroring
-            // the transfer-side self-assign guard in TransferPointerOwnershipOnStore.
+            // pointee - make self-assign `a = a` free nothing and keep its live pointer. The owning
+            // cleanup also uses the binding's active raw-array count for array reassignment.
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && !destIsStructField && destIsLocalOwningVar
                 && namedVar.TypeAndValue.IsUnique
@@ -3103,11 +3104,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     return finishStore(right);
                 }
 
-                compiler->EmitUniqueFieldDelete(
-                    *compiler->builder, destination,
-                    compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
-                    namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
-                    right);
+                compiler->EmitOwningPtrCleanup(namedVar, right);
                 // When the RHS transfers ownership (owning local, move param, or `new` temp -
                 // exactly what TransferPointerOwnershipOnStore nulls), the destination adopts it.
                 // A NON-owning destination (`unique R* b = nullptr; b = a;`) would otherwise be
@@ -3201,19 +3198,31 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.IsArrayView;
             const std::string& slotElemType = namedVar.TypeAndValue.TypeName;
 
-            // Re-assignment re-derives the raw `new T[n]` provenance of a pointer local, and CLEARS
-            // it for a join / decayed array / unknown source (`p = arr;`, `p = c ? a : b;`).
+            // Re-assignment re-derives raw-array state for an automatic or static pointer local.
+            // A fixed-array RHS supplies its compile-time span to a view; unknown sources clear it.
             if (operatorText == "=" && namedVar.TypeAndValue.Pointer
-                && !namedVar.TypeAndValue.IsArrayView
                 && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
-                && llvm::isa_and_nonnull<llvm::AllocaInst>(namedVar.Storage))
+                && (llvm::isa_and_nonnull<llvm::AllocaInst>(namedVar.Storage)
+                    || llvm::isa_and_nonnull<llvm::GlobalVariable>(namedVar.Storage)))
             {
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
+                bool rhsIsRawArray = (asgNewArr != nullptr
+                    && asgNewArr->assignmentExpression() != nullptr)
+                    || rightNV.AllocatedByRawNewArray;
+                llvm::Value* rhsCount = compiler->LoadRawArrayLength(rightNV);
+                if (namedVar.TypeAndValue.IsArrayView
+                    && rightNV.TypeAndValue.ConstArraySize > 0
+                    && !rightNV.TypeAndValue.IsArrayView)
+                    rhsCount = compiler->builder->getInt64(
+                        rightNV.TypeAndValue.ConstArraySize);
                 compiler->SetVariableRawNewArray(
                     namedVar.CallerName,
-                    (asgNewArr != nullptr && asgNewArr->assignmentExpression() != nullptr)
-                        || rightNV.AllocatedByRawNewArray,
-                    rightNV.RawArrayLength);
+                    !namedVar.TypeAndValue.IsArrayView && rhsIsRawArray,
+                    rhsCount);
+                if (namedVar.TypeAndValue.IsArrayView
+                    && rightNV.TypeAndValue.ConstArraySize > 0
+                    && !rightNV.TypeAndValue.IsArrayView)
+                    compiler->SetVariableOwning(namedVar.CallerName, false);
             }
 
             /*
@@ -8891,6 +8900,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         llvm::Value* ptrVal = nullptr;
         llvm::Value* srcAlloca = nullptr;
         llvm::Type* srcAllocaElemType = nullptr;
+        LLVMBackend::NamedVariable operandNamedVar;
         std::string targetName;         // name of the deleted local (empty for field/expr targets)
         uint64_t operandAllocAlign = 0; // per-site over-alignment carried on the operand (`new T[n] alignas(N)`)
 
@@ -8924,6 +8934,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         if (ue != nullptr)
         {
             auto namedVar = ParseUnaryExpression(ue);
+            operandNamedVar = namedVar;
             // `delete w->get();` - an unbound call result, so nothing classified it as a borrow.
             ApplyCallResultBorrowProvenance(compiler, namedVar);
             typeName  = namedVar.TypeAndValue.TypeName;
@@ -9390,38 +9401,8 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             llvm::Function* elemDtor = compiler->GetFullDestructorForDelete(typeName);
             if (elemDtor)
             {
-                auto* i64Ty = compiler->builder->getInt64Ty();
                 llvm::Value* arrCount = ParseExpression(ctx->deleteArraySize()->expression());
-                arrCount = compiler->Upconvert(arrCount, i64Ty);
-
-                LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName };
-                llvm::Type* elemType = compiler->GetType(typeInfo);
-
-                auto* indexAlloca = compiler->builder->CreateAlloca(i64Ty, nullptr, "del_i");
-                compiler->builder->CreateStore(
-                    compiler->builder->CreateSub(arrCount, compiler->builder->getInt64(1), "del_start"),
-                    indexAlloca);
-
-                auto* condBB  = compiler->CreateBasicBlock("del_dtor_cond");
-                auto* bodyBB  = compiler->CreateBasicBlock("del_dtor_body");
-                auto* afterBB = compiler->CreateBasicBlock("del_dtor_after");
-                compiler->builder->CreateBr(condBB);
-
-                compiler->builder->SetInsertPoint(condBB);
-                auto* idx = compiler->builder->CreateLoad(i64Ty, indexAlloca);
-                compiler->builder->CreateCondBr(
-                    compiler->builder->CreateICmpSGE(idx, compiler->builder->getInt64(0)),
-                    bodyBB, afterBB);
-
-                compiler->builder->SetInsertPoint(bodyBB);
-                auto* idx2    = compiler->builder->CreateLoad(i64Ty, indexAlloca);
-                auto* elemPtr = compiler->builder->CreateGEP(elemType, ptrVal, idx2, "del_elem");
-                compiler->builder->CreateCall(elemDtor, { elemPtr });
-                compiler->builder->CreateStore(
-                    compiler->builder->CreateSub(idx2, compiler->builder->getInt64(1)), indexAlloca);
-                compiler->builder->CreateBr(condBB);
-
-                compiler->builder->SetInsertPoint(afterBB);
+                compiler->EmitCountedArrayDestruction(ptrVal, typeName, arrCount);
             }
         }
 
@@ -9469,8 +9450,11 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         if (srcAlloca && srcAllocaElemType)
         {
             if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(srcAllocaElemType))
+            {
                 compiler->builder->CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy), srcAlloca);
+                compiler->StoreRawArrayLength(operandNamedVar, nullptr);
+            }
         }
 
         return {};
@@ -9723,6 +9707,9 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsOwningString   = src.IsOwningString;
         dst.IsOwningStruct   = src.IsOwningStruct;
         dst.AllocAlignment   = src.AllocAlignment;
+        dst.AllocatedByRawNewArray = src.AllocatedByRawNewArray;
+        dst.RawArrayLength = src.RawArrayLength;
+        dst.RawArrayLengthStorage = src.RawArrayLengthStorage;
         dst.IsStaticLocal    = src.IsStaticLocal;
         dst.MovedIntoInterface = src.MovedIntoInterface;
         dst.ExplicitlyMovedNull = src.ExplicitlyMovedNull;
@@ -10135,9 +10122,13 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             return argNV;
         }
 
+        llvm::Value* movedRawArrayLength = compiler->LoadRawArrayLength(argNV);
+        bool movedRawNewArray = argNV.AllocatedByRawNewArray;
+
         // Null the source (field GEP or local alloca) to transfer ownership.
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
+        compiler->StoreRawArrayLength(argNV, nullptr);
 
         // Explicit 'move a' of a whole thin pointer local: nulled but plain-readable (only a later
         // SAME-BLOCK deref errors - see MarkVariableExplicitlyMovedNull). Excludes a field-path move.
@@ -10193,6 +10184,8 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;
         result.TypeAndValue   = argNV.TypeAndValue;
         result.AllocAlignment = argNV.AllocAlignment;
+        result.AllocatedByRawNewArray = movedRawNewArray;
+        result.RawArrayLength = movedRawArrayLength;
         // A 'move' of a BORROWED pointer parameter transfers nothing - the caller still owns the
         // pointee. Carry the provenance so a store into a `unique` field (a deferred delete, exactly
         // like the already-blocked `delete b`) is rejected, and so a PLAIN `T*` destination declines

@@ -923,10 +923,28 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
             if (it != frame.namedVariable.end())
             {
                 it->second.AllocatedByRawNewArray = value;
-                it->second.RawArrayLength = value ? rawArrayLength : nullptr;
+                StoreRawArrayLength(it->second, rawArrayLength);
                 return;
             }
         }
+    }
+
+llvm::Value* LLVMBackend::LoadRawArrayLength(const NamedVariable& namedVar)
+{
+        auto* i64Ty = builder->getInt64Ty();
+        if (namedVar.RawArrayLengthStorage != nullptr)
+            return builder->CreateLoad(i64Ty, namedVar.RawArrayLengthStorage, "raw_array_count");
+        if (namedVar.RawArrayLength == nullptr) return nullptr;
+        return Upconvert(namedVar.RawArrayLength, i64Ty);
+    }
+
+void LLVMBackend::StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value* rawArrayLength)
+{
+        if (namedVar.RawArrayLengthStorage == nullptr) return;
+        auto* count = rawArrayLength != nullptr
+            ? Upconvert(rawArrayLength, builder->getInt64Ty())
+            : builder->getInt64(-1);
+        builder->CreateStore(count, namedVar.RawArrayLengthStorage);
     }
 
 void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
@@ -1097,50 +1115,47 @@ void LLVMBackend::EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar,
         builder->SetInsertPoint(skipBB);
     }
 
-void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar)
+void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement)
 {
         // Load the current pointer value from the alloca
         auto* ptrVal = builder->CreateLoad(namedVar.BaseType, namedVar.Storage);
 
         // Skip if null (pointer may have been moved out)
-        auto* isNull = builder->CreateICmpEQ(
+        llvm::Value* skipCleanup = builder->CreateICmpEQ(
             ptrVal,
             llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(namedVar.BaseType)));
+        if (replacement != nullptr && replacement->getType() == ptrVal->getType())
+            skipCleanup = builder->CreateOr(
+                skipCleanup, builder->CreateICmpEQ(ptrVal, replacement, "move.same"));
         auto* cleanupBB = llvm::BasicBlock::Create(*context, "move.cleanup", builder->GetInsertBlock()->getParent());
         auto* afterBB   = llvm::BasicBlock::Create(*context, "move.after",   builder->GetInsertBlock()->getParent());
-        builder->CreateCondBr(isNull, afterBB, cleanupBB);
+        builder->CreateCondBr(skipCleanup, afterBB, cleanupBB);
 
         builder->SetInsertPoint(cleanupBB);
 
         // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
         // through the delete-site resolver: a pointee still incomplete here (self-referential
         // element) binds the deferred stub instead of silently dropping the call.
-        if (namedVar.RawArrayLength != nullptr)
+        if (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr)
         {
             auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName);
             if (dtor != nullptr)
             {
-                auto* elemType = GetType(TypeAndValue{ .TypeName = namedVar.TypeAndValue.TypeName });
-                auto* i64Ty = builder->getInt64Ty();
-                auto* indexAlloca = builder->CreateAlloca(i64Ty, nullptr, "raw_array_dtor_i");
-                builder->CreateStore(builder->getInt64(0), indexAlloca);
-                auto* condBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_cond",
-                                                        builder->GetInsertBlock()->getParent());
-                auto* bodyBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_body",
-                                                        builder->GetInsertBlock()->getParent());
-                auto* doneBB = llvm::BasicBlock::Create(*context, "raw_array_dtor_done",
-                                                        builder->GetInsertBlock()->getParent());
-                builder->CreateBr(condBB);
-                builder->SetInsertPoint(condBB);
-                auto* index = builder->CreateLoad(i64Ty, indexAlloca);
-                auto* hasNext = builder->CreateICmpSLT(index, namedVar.RawArrayLength);
-                builder->CreateCondBr(hasNext, bodyBB, doneBB);
-                builder->SetInsertPoint(bodyBB);
-                auto* elemPtr = builder->CreateGEP(elemType, ptrVal, index, "raw_array_dtor_elem");
-                builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
-                auto* next = builder->CreateAdd(index, builder->getInt64(1));
-                builder->CreateStore(next, indexAlloca);
-                builder->CreateBr(condBB);
+                auto* count = LoadRawArrayLength(namedVar);
+                auto* arrayBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_array", builder->GetInsertBlock()->getParent());
+                auto* scalarBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_scalar", builder->GetInsertBlock()->getParent());
+                auto* doneBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_done", builder->GetInsertBlock()->getParent());
+                builder->CreateCondBr(
+                    builder->CreateICmpSGE(count, builder->getInt64(0)), arrayBB, scalarBB);
+                builder->SetInsertPoint(arrayBB);
+                EmitCountedArrayDestruction(ptrVal, namedVar.TypeAndValue.TypeName, count);
+                builder->CreateBr(doneBB);
+                builder->SetInsertPoint(scalarBB);
+                builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+                builder->CreateBr(doneBB);
                 builder->SetInsertPoint(doneBB);
             }
         }
@@ -1170,6 +1185,40 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar)
 
         builder->CreateBr(afterBB);
         builder->SetInsertPoint(afterBB);
+    }
+
+void LLVMBackend::EmitCountedArrayDestruction(llvm::Value* ptrVal,
+                                               const std::string& typeName,
+                                               llvm::Value* count)
+{
+        auto* dtor = GetFullDestructorForDelete(typeName);
+        auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(ptrVal ? ptrVal->getType() : nullptr);
+        if (dtor == nullptr || ptrTy == nullptr || count == nullptr) return;
+
+        auto* i64Ty = builder->getInt64Ty();
+        count = Upconvert(count, i64Ty);
+        auto* fn = builder->GetInsertBlock()->getParent();
+        auto* condBB = llvm::BasicBlock::Create(*context, "array_dtor_cond", fn);
+        auto* bodyBB = llvm::BasicBlock::Create(*context, "array_dtor_body", fn);
+        auto* doneBB = llvm::BasicBlock::Create(*context, "array_dtor_done", fn);
+        auto* indexAlloca = CreateAlloca(i64Ty);
+        builder->CreateStore(count, indexAlloca);
+        auto* isNull = builder->CreateICmpEQ(ptrVal, llvm::ConstantPointerNull::get(ptrTy));
+        auto* isEmpty = builder->CreateICmpSLE(count, builder->getInt64(0));
+        builder->CreateCondBr(builder->CreateOr(isNull, isEmpty), doneBB, condBB);
+
+        builder->SetInsertPoint(condBB);
+        auto* index = builder->CreateLoad(i64Ty, indexAlloca);
+        builder->CreateCondBr(
+            builder->CreateICmpSGT(index, builder->getInt64(0)), bodyBB, doneBB);
+        builder->SetInsertPoint(bodyBB);
+        auto* next = builder->CreateSub(index, builder->getInt64(1));
+        auto* elemType = GetType(TypeAndValue{ .TypeName = typeName });
+        auto* elemPtr = builder->CreateGEP(elemType, ptrVal, next, "array_dtor_elem");
+        builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+        builder->CreateStore(next, indexAlloca);
+        builder->CreateBr(condBB);
+        builder->SetInsertPoint(doneBB);
     }
 
 bool LLVMBackend::IsOwningInterfaceValue(const NamedVariable& namedVar) const

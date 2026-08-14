@@ -385,6 +385,14 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
             staticVariable.TypeAndValue = typeValue;
             staticVariable.BaseType = type;
             staticVariable.IsStaticLocal = true;
+            if (typeValue.Pointer && typeValue.ConstArraySize == 0
+                && !typeValue.IsFunctionPointer && !typeValue.IsInterface
+                && !typeValue.IsInterfacePointer)
+            {
+                staticVariable.RawArrayLengthStorage = new llvm::GlobalVariable(
+                    *module, builder->getInt64Ty(), false, llvm::GlobalValue::InternalLinkage,
+                    builder->getInt64(-1), gv->getName() + ".raw_array_count");
+            }
             RecordMoveGenBind(typeValue.VariableName);
             if (symbolSink_ && !typeValue.VariableName.empty())
                 symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
@@ -409,6 +417,15 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
+        if (typeValue.Pointer && typeValue.ConstArraySize == 0
+            && !typeValue.IsFunctionPointer && !typeValue.IsInterface
+            && !typeValue.IsInterfacePointer)
+        {
+            namedVariable.RawArrayLengthStorage =
+                AllocaAtEntry(builder->getInt64Ty(), nullptr,
+                              typeValue.VariableName + ".raw_array_count");
+            builder->CreateStore(builder->getInt64(-1), namedVariable.RawArrayLengthStorage);
+        }
         RecordMoveGenBind(typeValue.VariableName); // fresh local binding
         // --sanitize=ownership (M1): give every pointer local a zero-initialized move-origin slot.
         if (typeValue.Pointer)

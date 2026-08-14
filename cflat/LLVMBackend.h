@@ -1187,9 +1187,12 @@ public:
         // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
         // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
         bool AllocatedByRawNewArray = false;
-        // Runtime element count for a raw `new T[n]` pointer local. Used to destroy every
-        // constructed element before releasing the raw block; null means scalar/unknown.
+        // Expression-local count produced by `new T[n]`. A bound local stores this immediately
+        // in RawArrayLengthStorage so branch-local SSA never survives as binding metadata.
         llvm::Value* RawArrayLength = nullptr;
+        // Runtime array state for a local pointer/view binding. -1 means scalar/unknown; values
+        // >= 0 are raw-array element counts, including the distinct zero-length case.
+        llvm::Value* RawArrayLengthStorage = nullptr;
         // Same question for an `alias`-BORROW local root (`Box k = w.get(); move k.item;`): answered
         // where the root binding is RESOLVED, since a downstream name lookup cannot see a shadow.
         bool RootIsAliasBorrowLocal = false;
@@ -2801,6 +2804,9 @@ private:
     void SetVariableRawNewArray(const std::string& varName, bool value,
                                 llvm::Value* rawArrayLength = nullptr);
 
+    llvm::Value* LoadRawArrayLength(const NamedVariable& namedVar);
+    void StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value* rawArrayLength);
+
     // True when the named variable currently owns its value (freed on scope exit). Used to decide
     // whether consuming it (into a move interface param) must disown the source.
     bool IsVariableOwning(const std::string& name) const;
@@ -2834,7 +2840,11 @@ private:
 
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount);
 
-    void EmitOwningPtrCleanup(const NamedVariable& namedVar);
+    void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr);
+
+    // Null-safe reverse-order element destruction shared by scope cleanup and `delete[n]`.
+    void EmitCountedArrayDestruction(llvm::Value* ptrVal, const std::string& typeName,
+                                     llvm::Value* count);
 
     // True when this variable owns a heap-boxed interface value freed at scope exit: a `unique`
     // interface local (IsOwning set from its `new` / move source) or a `unique` interface param.

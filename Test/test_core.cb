@@ -2126,6 +2126,243 @@ int testCLongWidth()
     return passed;
 }
 
+int g_raw_count_dtors = 0;
+int g_raw_count_order = 0;
+int g_raw_count_sum = 0;
+int g_raw_count_resource_dtors = 0;
+
+class RawCountElem
+{
+    int id = 0;
+    ~RawCountElem()
+    {
+        g_raw_count_dtors++;
+        g_raw_count_order = g_raw_count_order * 10 + id;
+        g_raw_count_sum += id;
+    }
+};
+
+class RawCountResource
+{
+    int id = 0;
+    ~RawCountResource() { g_raw_count_resource_dtors++; }
+};
+
+class RawCountOwnerElem
+{
+    unique RawCountResource* resource = new RawCountResource();
+    ~RawCountOwnerElem() { g_raw_count_dtors++; }
+};
+
+void resetRawCountState()
+{
+    g_raw_count_dtors = 0;
+    g_raw_count_order = 0;
+    g_raw_count_sum = 0;
+}
+
+void runRawCountIfElse(int choose)
+{
+    unique RawCountElem* values = nullptr;
+    int a = 2;
+    int b = 4;
+    if (choose != 0)
+    {
+        values = new RawCountElem[a];
+        values[0].id = 10; values[1].id = 20;
+    }
+    else
+    {
+        values = new RawCountElem[b];
+        values[0].id = 1; values[1].id = 2;
+        values[2].id = 3; values[3].id = 4;
+    }
+}
+
+void runRawCountConditionalMove(int choose)
+{
+    unique RawCountElem* source = nullptr;
+    int n = 3;
+    if (choose != 0)
+    {
+        source = new RawCountElem[n];
+        source[0].id = 4; source[1].id = 5; source[2].id = 6;
+    }
+    unique RawCountElem* destination = move source;
+}
+
+int runRawCountStaticView(int choose)
+{
+    static int[3] fixed = {4, 5, 6};
+    static int[1] initial = {99};
+    static int[] view = initial;
+    if (choose != 0) view = fixed;
+    int count = 0;
+    int sum = 0;
+    for (int value in view) { count++; sum += value; }
+    return count * 100 + sum;
+}
+
+int testRawArrayRuntimeCount()
+{
+    int passed = 0;
+
+    resetRawCountState();
+    {
+        int n = 3;
+        unique RawCountElem* values = new RawCountElem[n];
+        values[0].id = 1; values[1].id = 2; values[2].id = 3;
+    }
+    passed += Test("raw count declaration init order", g_raw_count_order, 321);
+
+    resetRawCountState();
+    {
+        unique RawCountElem* values = nullptr;
+        int n = 3;
+        values = new RawCountElem[n];
+        values[0].id = 1; values[1].id = 2; values[2].id = 3;
+    }
+    passed += Test("raw count later assignment order", g_raw_count_order, 321);
+
+    resetRawCountState();
+    {
+        unique RawCountElem* values = nullptr;
+        int n = 3;
+        if (n > 0)
+        {
+            values = new RawCountElem[n];
+            values[0].id = 1; values[1].id = 2; values[2].id = 3;
+        }
+    }
+    passed += Test("raw count if-only cleanup", g_raw_count_order, 321);
+
+    resetRawCountState();
+    runRawCountIfElse(1);
+    passed += Test("raw count if-else true arm", g_raw_count_dtors * 100 + g_raw_count_sum, 230);
+    resetRawCountState();
+    runRawCountIfElse(0);
+    passed += Test("raw count if-else false arm", g_raw_count_dtors * 100 + g_raw_count_sum, 410);
+
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[1];
+        values[0].id = 1;
+        int i = 0;
+        while (i < 2)
+        {
+            int n = i + 2;
+            values = new RawCountElem[n];
+            int j = 0;
+            while (j < n) { values[j].id = 10 * n + j; j++; }
+            i++;
+        }
+    }
+    passed += Test("raw count loop reassignment", g_raw_count_dtors * 1000 + g_raw_count_sum, 6135);
+
+    resetRawCountState();
+    runRawCountConditionalMove(1);
+    passed += Test("raw count conditional move live", g_raw_count_dtors * 100 + g_raw_count_sum, 315);
+    resetRawCountState();
+    runRawCountConditionalMove(0);
+    passed += Test("raw count conditional move null", g_raw_count_dtors, 0);
+
+    resetRawCountState();
+    int nullMarker = 0;
+    {
+        unique RawCountElem* values = new RawCountElem[2];
+        values[0].id = 1; values[1].id = 2;
+        values = nullptr;
+        nullMarker = values == nullptr ? g_raw_count_order : -1;
+    }
+    passed += Test("raw count null assignment releases old", nullMarker, 21);
+    passed += Test("raw count null assignment clears state", g_raw_count_order, 21);
+
+    resetRawCountState();
+    RawCountElem* nullValues = nullptr;
+    int nullCount = 3;
+    delete[nullCount] nullValues;
+    passed += Test("delete[n] null counted destruction", g_raw_count_dtors, 0);
+
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* values;
+        int n = 2;
+        if (n > 0)
+            values = new RawCountElem[n] alignas(0, 64);
+    }
+    passed += Test("raw count aligned conditional cleanup", g_raw_count_dtors, 2);
+
+    resetRawCountState();
+    int moveSourceNull = 0;
+    {
+        unique RawCountElem* source = new RawCountElem[3];
+        source[0].id = 1; source[1].id = 2; source[2].id = 3;
+        unique RawCountElem* destination = move source;
+        moveSourceNull = source == nullptr ? 1 : 0;
+    }
+    passed += Test("raw count direct move source null", moveSourceNull, 1);
+    passed += Test("raw count direct move destination order", g_raw_count_order, 321);
+
+    resetRawCountState();
+    {
+        unique RawCountElem* values = new RawCountElem[2];
+        values[0].id = 1; values[1].id = 2;
+        values = new RawCountElem[3];
+        values[0].id = 3; values[1].id = 4; values[2].id = 5;
+    }
+    passed += Test("raw count array reassignment order", g_raw_count_order, 21543);
+
+    resetRawCountState();
+    g_raw_count_resource_dtors = 0;
+    {
+        unique RawCountOwnerElem* source = new RawCountOwnerElem[3];
+        unique RawCountOwnerElem* destination = move source;
+    }
+    passed += Test("raw count move element resources", g_raw_count_dtors * 10 + g_raw_count_resource_dtors, 33);
+
+    int[] view = new int[1];
+    view[0] = 99;
+    int chooseView = 1;
+    if (chooseView != 0)
+    {
+        int n = 4;
+        view = new int[n];
+        view[0] = 1; view[1] = 2; view[2] = 3; view[3] = 4;
+    }
+    int viewSum = 0;
+    int viewCount = 0;
+    for (int value in view) { viewSum += value; viewCount++; }
+    delete[_] view;
+    passed += Test("raw count conditional view range", viewCount * 100 + viewSum, 410);
+
+    int[3] fixedViewSource = {1, 2, 3};
+    int[1] initialViewSource = {99};
+    int[] fixedView = initialViewSource;
+    fixedView = fixedViewSource;
+    int fixedViewSum = 0;
+    int fixedViewCount = 0;
+    for (int value in fixedView) { fixedViewSum += value; fixedViewCount++; }
+    passed += Test("raw count fixed-array view rebind", fixedViewCount * 100 + fixedViewSum, 306);
+
+    int staticViewFirst = runRawCountStaticView(1);
+    int staticViewSecond = runRawCountStaticView(0);
+    passed += Test("raw count static view rebind persists",
+                   staticViewFirst * 1000 + staticViewSecond, 315315);
+
+    resetRawCountState();
+    int zeroMoveSourceNull = 0;
+    {
+        int n = 0;
+        unique RawCountElem* source = new RawCountElem[n];
+        unique RawCountElem* destination = move source;
+        zeroMoveSourceNull = source == nullptr ? 1 : 0;
+    }
+    passed += Test("raw count zero move source null", zeroMoveSourceNull, 1);
+    passed += Test("raw count zero move cleanup", g_raw_count_dtors, 0);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -2168,6 +2405,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
+    r = testRawArrayRuntimeCount(); passed += r; total += 21;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

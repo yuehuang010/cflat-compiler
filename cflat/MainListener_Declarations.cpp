@@ -2853,6 +2853,7 @@ void MainListener::ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBac
         compiler->DropValue(*nv);
         if (nv->Storage != nullptr && nv->BaseType != nullptr)
             compiler->builder->CreateStore(llvm::Constant::getNullValue(nv->BaseType), nv->Storage);
+        compiler->StoreRawArrayLength(*nv, nullptr);
         nv->IsOwning = false;
         nv->RefCountStorage = nullptr;
         compiler->MarkVariableMoved(name);
@@ -3658,7 +3659,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // pointer local carry the fact forward.
                                 srcPointsToBorrowedByValueParam =
                                     rightNV.PointsToBorrowedByValueParam;
-                                srcRawArrayLength = rightNV.RawArrayLength;
+                                srcRawArrayLength = compiler->LoadRawArrayLength(rightNV);
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
                                 rhsFuncPtrReturnAlias = rightNV.TypeAndValue.FuncPtrReturnAlias;
@@ -4321,9 +4322,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
                         auto& viewNV = compiler->stackNamedVariable.back().namedVariable[name];
                         if (boundFromFixedArray)
-                            viewNV.RawArrayLength = compiler->builder->getInt64(srcConstArraySize);
+                            compiler->StoreRawArrayLength(
+                                viewNV, compiler->builder->getInt64(srcConstArraySize));
                         else if (srcIsArrayView)
-                            viewNV.RawArrayLength = srcRawArrayLength;
+                            compiler->StoreRawArrayLength(viewNV, srcRawArrayLength);
                         viewNV.OwningStructName = srcFieldPathNV.OwningStructName;
                         viewNV.FieldName = srcFieldPathNV.FieldName;
                         viewNV.FieldPathText = srcFieldPathNV.FieldPathText;
@@ -4804,7 +4806,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 || srcPtrCopyIsRawNewArray;
                             auto& local = compiler->stackNamedVariable.back().namedVariable[name];
                             local.AllocatedByRawNewArray = isRawArray;
-                            local.RawArrayLength = isRawArray ? srcRawArrayLength : nullptr;
+                            compiler->StoreRawArrayLength(
+                                local, isRawArray ? srcRawArrayLength : nullptr);
                             // `Wrap* p = &w;` carries the by-value parameter's borrow contract onto
                             // `p`, so a later `p.b` still roots at the parameter.
                             local.PointsToBorrowedByValueParam = srcPointsToBorrowedByValueParam;
@@ -5596,6 +5599,7 @@ void MainListener::TransferPointerOwnershipOnStore(
                 {
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                    compiler->StoreRawArrayLength(rightNV, nullptr);
                     // Moving a field (`x = node->left`) marks only that field, not the base.
                     if (!rightNV.FieldName.empty())
                         compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);

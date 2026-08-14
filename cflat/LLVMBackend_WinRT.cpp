@@ -1716,6 +1716,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     {
                         // Pointer move param: null the caller's storage.
                         builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                        StoreRawArrayLength(args[i], nullptr);
                         // --sanitize=ownership (M1): record this move site for a tracked pointer local.
                         if (!isFieldAccess)
                             SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);

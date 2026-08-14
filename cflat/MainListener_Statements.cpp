@@ -1992,7 +1992,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     }
                     else if (isArrayView)
                     {
-                        countVal = collNV.RawArrayLength;
+                        countVal = compiler->LoadRawArrayLength(collNV);
                         if (countVal == nullptr)
                             LogErrorContext(iterationStatement,
                                 "cannot range-for over an array view whose length is unknown");
