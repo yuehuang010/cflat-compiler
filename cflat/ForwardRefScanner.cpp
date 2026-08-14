@@ -1831,3 +1831,70 @@ void ForwardRefScanner::ScanNamespace(CFlatParser::NamespaceDefinitionContext* c
         for (auto* extDecl : ctx->externalDeclaration())
             ScanExternalDeclaration(extDecl, namespaceName);
     }
+
+void ForwardRefScanner::PrepareWinrtClasses(antlr4::RuleContext* ctx, const std::string& namespaceName)
+{
+        if (auto* tu = dynamic_cast<CFlatParser::TranslationUnitContext*>(ctx))
+        {
+            for (auto* decl : tu->externalDeclaration())
+                PrepareWinrtClasses(decl, namespaceName);
+            return;
+        }
+        if (auto* ext = dynamic_cast<CFlatParser::ExternalDeclarationContext*>(ctx))
+        {
+            if (auto* ns = ext->namespaceDefinition())
+            {
+                std::string nested;
+                for (auto* id : ns->Identifier())
+                    nested += (nested.empty() ? "" : ".") + id->getText();
+                if (!namespaceName.empty()) nested = namespaceName + "." + nested;
+                for (auto* decl : ns->externalDeclaration())
+                    PrepareWinrtClasses(decl, nested);
+            }
+            else if (auto* cls = ext->classDefinition())
+                PrepareWinrtClasses(cls, namespaceName);
+            else if (auto* str = ext->structDefinition())
+                PrepareWinrtClasses(str, namespaceName);
+            return;
+        }
+        if (auto* cls = dynamic_cast<CFlatParser::ClassDefinitionContext*>(ctx))
+        {
+            std::string typeName = cls->directDeclarator()->getText();
+            if (!namespaceName.empty()) typeName = namespaceName + "." + typeName;
+            if (Compiler(cls)->FindTypeAnnotation(typeName, "winrt") != nullptr)
+            {
+                auto bases = cls->baseSpecifier();
+                if (bases.size() == 1)
+                {
+                    auto* compiler = Compiler(cls);
+                    compiler->PrepareWinrtClass(typeName, BaseSpecifierName(bases[0]));
+                    auto vtblName = typeName + "__" + BaseSpecifierName(bases[0]) + "_comvtbl";
+                    if (MemberDeclarations(cls).empty())
+                    {
+                        LLVMBackend::DeclTypeAndValue lpVtbl;
+                        lpVtbl.VariableName = "lpVtbl";
+                        lpVtbl.TypeName = vtblName;
+                        lpVtbl.Pointer = true;
+                        LLVMBackend::DeclTypeAndValue refcount;
+                        refcount.VariableName = "__refcount";
+                        refcount.TypeName = "u32";
+                        compiler->CreateStructType(typeName, { lpVtbl, refcount });
+                    }
+                }
+            }
+            for (auto* nested : MemberStructDefinitions(cls))
+                PrepareWinrtClasses(nested, typeName);
+            for (auto* nested : MemberClassDefinitions(cls))
+                PrepareWinrtClasses(nested, typeName);
+            return;
+        }
+        if (auto* str = dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx))
+        {
+            std::string typeName = str->directDeclarator()->getText();
+            if (!namespaceName.empty()) typeName = namespaceName + "." + typeName;
+            for (auto* nested : MemberStructDefinitions(str))
+                PrepareWinrtClasses(nested, typeName);
+            for (auto* nested : MemberClassDefinitions(str))
+                PrepareWinrtClasses(nested, typeName);
+        }
+    }

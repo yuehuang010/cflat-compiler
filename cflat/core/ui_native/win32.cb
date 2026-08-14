@@ -41,7 +41,13 @@ manifest ManifestDoc uiNativeManifest = { assembly = {
 // InitCommonControls() (commctrl.h) registers the classic control classes;
 // DwmSetWindowAttribute (dwmapi.h) drives the immersive dark-mode titlebar.
 extern stdcall void InitCommonControls();
+extern stdcall i32 InitCommonControlsEx(void* p);
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
+struct _InitCommonControlsExArgs
+{
+    u32 cbSize = 0u;
+    u32 dwICC = 0u;
+};
 // PrintWindow + GetDIBits back the offscreen screenshot path; not surfaced by the binding.
 extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
 extern stdcall i32 GetDIBits(void* hdc, void* hbm, u32 start, u32 lines, void* bits, void* bmi, u32 usage);
@@ -1940,6 +1946,16 @@ class Window : INativeHost
         else if (strcmp(cn, "SysTreeView32") == 0)  this._themeTreeView(h);
         else if (strcmp(cn, "SysTabControl32") == 0) this._themeTabs(h);
         else if (strcmp(cn, "msctls_progress32") == 0) this._themeProgress(h);
+        else if (strcmp(cn, "BUTTON") == 0 || strcmp(cn, "Button") == 0)
+        {
+            i64 style = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE);
+            if ((style & (i64)BS_GROUPBOX) != 0) this._themeGroupBox(h);
+            else this._themeBasicControl(h, "DarkMode_CFD");
+        }
+        else if (strcmp(cn, "COMBOBOX") == 0 || strcmp(cn, "ComboBox") == 0)
+            this._themeBasicControl(h, "DarkMode_CFD");
+        else if (strcmp(cn, "msctls_trackbar32") == 0)
+            this._themeBasicControl(h, "DarkMode_Explorer");
     }
 
     // ListView: the body takes DarkMode_Explorer (dark scrollbars + hot track) plus explicit
@@ -2010,6 +2026,24 @@ class Window : INativeHost
         SendMessageA(ctrl, (u32)PBM_SETBARCOLOR, 0u, (i64)(u64)(dk ? this.themeAccent : CLR_DEFAULT));
         InvalidateRect(ctrl, nullptr, 1);
     }
+
+    void _themeGroupBox(u64 h)
+    {
+        void* ctrl = u2h(h);
+        _allowDark(ctrl, this.ctlDark);
+        if (this.ctlDark) _ctlThemeNone(ctrl); else _ctlThemeReset(ctrl);
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // Basic controls need an explicit v6 theme; their parent still supplies text colors.
+    void _themeBasicControl(u64 h, string darkTheme)
+    {
+        void* ctrl = u2h(h);
+        _allowDark(ctrl, this.ctlDark);
+        if (this.ctlDark) _ctlTheme(ctrl, darkTheme); else _ctlThemeReset(ctrl);
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
 
     // Re-theme every live control. Driven ONLY by a real theme change (see applyTheme):
     // re-theming per pump would flicker. The scroll gutter's bar is NON-CLIENT, so it rides
@@ -4125,6 +4159,9 @@ u32 shadeRef(u32 c, int delta)
 // draws a focus ring when focused, paints the centered label in the accent text color,
 // and returns CDRF_SKIPDEFAULT (fully owning the draw). Returns true (with the LRESULT in
 // *result) only when it custom-drew; false lets the caller fall through to the default.
+int _liveCustomDrawCount = 0;
+bool _liveCustomDrawProbe = false;
+
 bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
 {
     char* p = (char*)u2h((u64)lParam);
@@ -4161,6 +4198,7 @@ bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
     SetTextColor(hdc, fg);
     DrawTextA(hdc, label, -1, &rc,
               (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
+    if (_liveCustomDrawProbe) _liveCustomDrawCount++;
     result[0] = (i64)CDRF_SKIPDEFAULT;
     return true;
 }
@@ -4193,7 +4231,33 @@ u32 nativeTestCustomDrawFill(string keyPath)
     DeleteObject(bmp);
     DeleteDC(memDC);
     ReleaseDC(nullptr, screenDC);
-    return px;
+
+    // Exercise the notification from a real v6 BUTTON in the test window. The parent is
+    // shown briefly because UpdateWindow skips hidden child paints.
+    u32 liveBg = nativeAccentBg(keyPath);
+    int liveColor = ((int)(liveBg & 0xFFu) << 16)
+                  | ((int)((liveBg >> 8) & 0xFFu) << 8)
+                  | (int)((liveBg >> 16) & 0xFFu);
+    void* parent = curWin().content != nullptr ? curWin().content : curWin().hwnd;
+    void* live = CreateWindowExA(0u, "BUTTON", "custom draw probe",
+        (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | BS_PUSHBUTTON | BS_NOTIFY),
+        0, 0, 160, 28, parent, nullptr, _hInst, nullptr);
+    int before = _liveCustomDrawCount;
+    if (live != nullptr)
+    {
+        curWin().setAccent((u64)live, 0xFFFFFF, liveColor);
+        ShowWindow(curWin().hwnd, (int)SW_SHOW);
+        ShowWindow(live, (int)SW_SHOW);
+        _liveCustomDrawProbe = true;
+        InvalidateRect(live, nullptr, 1);
+        UpdateWindow(live);
+        pumpNative();
+        _liveCustomDrawProbe = false;
+        curWin()._forgetAccent((u64)live);
+        DestroyWindow(live);
+        ShowWindow(curWin().hwnd, (int)SW_HIDE);
+    }
+    return _liveCustomDrawCount > before ? px : 0u;
 }
 
 // -- Host-neutral test drivers (form + data controls) ---------------------------
@@ -4755,7 +4819,10 @@ void ensureWindowClass()
 {
     if (_classReg) return;
     SetProcessDpiAwarenessContext((void*)(i64)(-4));
-    InitCommonControls();
+    _InitCommonControlsExArgs icc = default;
+    icc.cbSize = (u32)sizeof(_InitCommonControlsExArgs);
+    icc.dwICC = 0x000000FFu | 0x00004000u;
+    if (InitCommonControlsEx(&icc) == 0) InitCommonControls();
     _hInst = GetModuleHandleA(nullptr);
 
     WNDCLASSEXA wc = default;

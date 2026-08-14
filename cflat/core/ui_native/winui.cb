@@ -687,6 +687,9 @@ void* winuiSolidBrush(int color)
 // panel's cache leaves only the rows that actually fit, which is what bounds the control.
 // The panel exists only once the control template has applied, so this is retried per pump
 // until it takes (a ListView is created, then measured on the next frame).
+// Chosen over IScrollViewerStatics attached properties. If those are ever revisited: the
+// projection slots are correct, but the element argument MUST be QI'd to IDependencyObject
+// (passing an IUIElement* crashes - measured 2026-08-14, scratch/q18_probe).
 void winuiZeroItemsCache(u64 h)
 {
     void* ic = wqi((void*)h, iidof(XamlItemsControl));

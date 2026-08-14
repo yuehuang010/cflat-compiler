@@ -4831,6 +4831,9 @@ public:
     // <interface methods in slot order>]. Returns the registered struct name.
     std::string CreateWinrtVtableStruct(const std::string& className, const std::string& ifaceName);
 
+    // Prepare the vtable type and static global before any class method bodies are emitted.
+    void PrepareWinrtClass(const std::string& className, const std::string& ifaceName);
+
     // Find the user member function implementing interface method m on className. Mirrors the
     // overload match in GetOrCreateVTable (this-pointer + remaining params). Returns the full
     // symbol so the HRESULT-ABI thunk can see the impl's return type (plain T vs HResult<T>).

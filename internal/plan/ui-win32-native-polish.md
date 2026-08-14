@@ -1,9 +1,13 @@
 # Win32 native host: scrolling, paint correctness, dark theming
 
 Created: 2026-07-13 (gallery ran on Win32 for the first time; this is the fallout)
-Status: Phases 1-4 DONE and committed (2800f22). Phase 5 (embed the comctl32 v6 manifest)
-NOT STARTED. The linker mechanics are VERIFIED (5.1); how the manifest content is DECLARED
-is still in brainstorm (5.1a) - the user does not want it hardcoded in the compiler.
+Status: Phases 1-5 DONE (Phase 5 completed 2026-08-14). 5.1/5.1a shipped as the typed
+manifest system (internal/plan/windows-manifest-design.md) - win32.cb declares the v6
+manifest itself, nothing hardcoded in the compiler. 5.2 (InitCommonControlsEx), 5.3
+(per-control verdicts below), 5.4 (real NM_CUSTOMDRAW path) landed same day; visual pass
+done in both themes at 14 scroll depths (scratch/theme_deep). Residual filed:
+internal/issue/ui/win32-trackbar-dark-channel-light.md (channel/tics stay light in dark;
+thumb is fixed).
 
 ## Context
 
@@ -261,6 +265,11 @@ used (`ICC_WIN95_CLASSES` covers listview/treeview/tab/trackbar/progress/statusb
 add `ICC_STANDARD_CLASSES`). Without this, v6 control classes may fail to register
 and `CreateWindowExA` on them returns null.
 
+Status: DONE. `ensureWindowClass()` now calls `InitCommonControlsEx` with a local
+`INITCOMMONCONTROLSEX`-shaped value containing `ICC_WIN95_CLASSES | ICC_STANDARD_CLASSES`
+(`0x000000FF | 0x00004000`) and falls back to `InitCommonControls()` when the extended call
+fails.
+
 ### 5.3 Re-tune / delete the Phase-4 owner-draw
 
 With v6 + `SetWindowTheme(ctl, "DarkMode_Explorer")` actually working, revisit each
@@ -280,6 +289,32 @@ Phase-4 workaround and prefer deleting it over keeping it:
 - GroupBox/Box `ContainerCtlProc` interior erase: still needed (a themed group box is
   background-transparent and the pane is `WS_CLIPCHILDREN`), but re-verify.
 
+Status: DONE. The permanent four-depth gallery scans are in `scratch/theme_before/` and
+`scratch/theme_after/`; a temporary deeper probe was used for controls below the required
+four depths.
+
+- ProgressBar: KEPT deliberately unthemed. `scratch/theme_probe/gallery_dark_d4.bmp` shows
+  a dark track with a visible accent bar; the color-message route is still the correct path.
+- StatusBar: KEPT unthemed with `SB_SETBKCOLOR` and owner-drawn text. This preserves the dark
+  strip and readable pane text; the size grip remains the native status-bar grip.
+- TabControl: KEPT `TCS_OWNERDRAWFIXED`, `_drawTabItem`, and the container body erase.
+  `scratch/theme_probe/gallery_dark_d8.bmp` shows readable tabs and a dark body; v6 still does
+  not provide a usable dark SysTabControl32 theme.
+- ListView header: KEPT the custom draw. Although `ItemsView` is applied, disabling the custom
+  draw produced a black header and black labels in `gallery_dark_d7.bmp`; the active path is
+  readable in the corresponding probe image with the custom draw enabled.
+- GroupBox and Box: KEPT `ContainerCtlProc` interior erase. GroupBox is deliberately kept
+  unthemed so its title follows the dark parent colors; `scratch/theme_probe/gallery_dark_d5.bmp`
+  shows the frame, title, and interior correctly.
+- Buttons, checkboxes, radios, and combo boxes now receive `DarkMode_CFD` in the per-control
+  pass (group boxes are excluded); `scratch/theme_probe/gallery_dark_d6.bmp` shows readable
+  radio labels and a dark combo. `gallery_dark_d3.bmp` shows the checkbox fix in the required
+  permanent scan.
+- Trackbars receive `DarkMode_Explorer`; `scratch/theme_probe/gallery_dark_d4.bmp` shows the
+  themed blue thumb and usable dark-mode control. The native channel remains light on current
+  Windows, so it is retained as an explicit v6 theme rather than adding a new owner-draw path.
+- The status-bar size grip remains part of the deliberately unthemed status-bar workaround.
+
 ### 5.4 The dead custom-draw button test
 
 Under v6 a `BUTTON` DOES send `NM_CUSTOMDRAW`, so `tryCustomDrawButton` starts firing
@@ -288,8 +323,19 @@ for real. Today it never runs in a live window and its self-test passes only bec
 manifest lands, make the test drive the real message path so it stops certifying
 something that does not happen.
 
+Status: DONE. `nativeTestCustomDrawFill` still performs the focused memory-DC pixel check, then
+creates a real temporary v6 `BUTTON` in the test window, registers its accent, shows it briefly,
+invalidates it, calls `UpdateWindow`, and pumps native messages. `tryCustomDrawButton` increments
+a probe counter only while that live repaint is active; the test returns failure unless the real
+`NM_CUSTOMDRAW` path handled the button.
+
 ### 5.5 Gates
 
+VERIFIED 2026-08-14: gallery --shots now scans BOTH themes at 14 scroll depths
+(gallery_<theme>_d0..d13.bmp); reviewer-eyeballed dark sweep confirmed buttons, text
+input, checkbox, progress (dark track + accent bar), groupbox, radio, combo, listview
+incl. header, tabs (owner-drawn), tree, context/flex, status bar all correct; trackbar
+thumb accent-correct with the channel residual filed as an issue. Original gate text:
 `gallery.exe --selftest`, `test.bat Release`, `test_lsp.bat`, `example.bat` - plus, and
 this is the point of the whole phase, a VISUAL pass in BOTH themes over every example
 with a GUI (gallery, fedit, settings, map, 01-elements). The manifest changes the look

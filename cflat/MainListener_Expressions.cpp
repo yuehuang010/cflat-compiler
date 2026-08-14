@@ -9015,7 +9015,8 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         }
 
         // [winrt] object: wire lpVtbl -> static vtable and set refcount = 1 after the ctor ran.
-        bool isWinrtNew = !isArray && !typeIsPtr && compiler->IsWinrtClass(typeName);
+        bool isWinrtNew = !isArray && !typeIsPtr
+            && compiler->FindTypeAnnotation(typeName, "winrt") != nullptr;
         if (isWinrtNew)
             compiler->WireWinrtObject(typedPtr, typeName);
 

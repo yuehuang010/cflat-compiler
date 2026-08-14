@@ -13,14 +13,13 @@ macOS:
   `_applyNode`/`_syncProps` path; the Win32/WinUI side has no equivalent.
 
 Windows / WinRT:
-- `ui/winrt-self-new-missing-vtable` - the `winrtClasses` entry is populated only after the
-  class's own method bodies are codegen'd, so a self-`new` sees a not-yet-registered class.
-- `ui/winmd-scrollviewer-statics-vtable-mismatch` - statics-interface slot index likely diverges
-  from runtime vtable ordering (UNDIAGNOSED).
-- `ui/winui-icontrol-get-template-misreads` - probe reading unconfirmed; may be the wrong slot
-  offset or simply an unmeasured control (UNDIAGNOSED).
 - `ui/ui-native-canvas-input-images-win32-winui` - GDI canvas host image/input parity, mostly
   closed, residual gaps.
+
+(Closed 2026-08-14: winrt-self-new-missing-vtable FIXED; winui-icontrol-get-template-misreads
+measured benign; winmd-scrollviewer-statics-vtable-mismatch measured NOT a projection bug -
+slots match the SDK ABI, the crash was an IUIElement-for-IDependencyObject argument mismatch,
+caller contract now noted at the winuiZeroItemsCache site in winui.cb.)
 
 Portable:
 - `p2/file-offsets-capped-at-2gb` - `filesystem.cb` narrows offsets through `int` / C `long`,
@@ -33,10 +32,7 @@ Portable:
 - `p2/macos-header-import-and-framework-link` is verifiable on this host and unblocks the most
   downstream work. Two parts: correct the Darwin triple, and emit `-framework`/`-F`. See
   `internal/macos-build.md` for the existing link path.
-- `ui/winrt-self-new-missing-vtable` is a registration-ordering fix (register the class before
-  codegen'ing its bodies) and is the only WinRT item with a clear root cause - do it before the two
-  undiagnosed vtable items, since a fix there may change what they measure.
-- The two UNDIAGNOSED WinRT items need a measurement, not a fix: dump the actual runtime vtable
-  ordering and compare against the projected slot index before proposing anything.
+- The WinMD slot measurements are complete. Keep attached-property arguments at their declared
+  ABI interface type; do not infer IDependencyObject calls from an IUIElement pointer.
 - Everything under Windows/WinRT needs a Windows host to verify. Do not land those from a macOS
   session on reasoning alone.

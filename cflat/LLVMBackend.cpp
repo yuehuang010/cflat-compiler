@@ -791,6 +791,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 // Second pass: register non-generic struct shells and function signatures.
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                scanner.PrepareWinrtClasses(tu);
             }
         }
 
@@ -1625,6 +1626,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                 scanner.ScanGenericTypeUses(decl);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanExternalDeclaration(decl);
+            scanner.PrepareWinrtClasses(tu);
         }
     }
 
@@ -2382,6 +2384,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     scanner.ScanGenericTypeUses(decl);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanExternalDeclaration(decl);
+                scanner.PrepareWinrtClasses(tu);
             }
         }
 

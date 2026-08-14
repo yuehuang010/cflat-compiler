@@ -2081,6 +2081,9 @@ public:
 
     void ScanExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx, const std::string& namespaceName = {});
 
+    // Prepare all forward-scanned [winrt] classes before the main code-generation walk.
+    void PrepareWinrtClasses(antlr4::RuleContext* ctx, const std::string& namespaceName = {});
+
     void ScanNamespace(CFlatParser::NamespaceDefinitionContext* ctx, const std::string& parentNamespace = {});
 };
 

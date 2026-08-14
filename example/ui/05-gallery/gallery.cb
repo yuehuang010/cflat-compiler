@@ -44,6 +44,34 @@ int galleryShots(const char* dir)
     bool okL = uiShot(lightPath);
     printf("%s: %s\n", okL ? "wrote" : "FAIL", lightPath.data());
 
+    // Capture enough scroll positions that every common control below the fold is seen
+    // at least once (the page is ~10 capture-bands tall; extra bottom captures clamp).
+    int scanDepths = 14;
+    int depth = 0;
+    while (depth < scanDepths)
+    {
+        string path = "" + dir + "/gallery_light_d" + depth.toString() + ".bmp";
+        bool ok = uiShot(path);
+        printf("%s: %s\n", ok ? "wrote" : "FAIL", path.data());
+        if (depth < scanDepths - 1)
+        {
+            RECT rc = default;
+            GetClientRect(hwnd, &rc);
+            POINT pt = default;
+            pt.x = (rc.left + rc.right) / 2;
+            pt.y = (rc.top + rc.bottom) / 2;
+            ClientToScreen(hwnd, &pt);
+            u32 wheel = ((u32)(-120 * 4)) << 16;
+            i64 xy = (i64)(((u32)pt.y << 16) | ((u32)pt.x & 0xFFFFu));
+            SendMessageA(hwnd, (u32)WM_MOUSEWHEEL, (u64)wheel, xy);
+            pumpNative();
+        }
+        depth++;
+    }
+
+    curWin().scrollTo(0);
+    pumpNative();
+
     // Flip to dark and recapture (a call-result downcast is a borrow).
     GalleryApp* g = activeApp() as GalleryApp;
     if (g != nullptr) { g.dark = true; activeCtx().invalidate(); pumpNative(); }
@@ -51,6 +79,28 @@ int galleryShots(const char* dir)
     string darkPath = "" + dir + "/gallery_dark.bmp";
     bool okD = uiShot(darkPath);
     printf("%s: %s\n", okD ? "wrote" : "FAIL", darkPath.data());
+
+    depth = 0;
+    while (depth < scanDepths)
+    {
+        string path = "" + dir + "/gallery_dark_d" + depth.toString() + ".bmp";
+        bool ok = uiShot(path);
+        printf("%s: %s\n", ok ? "wrote" : "FAIL", path.data());
+        if (depth < scanDepths - 1)
+        {
+            RECT rc = default;
+            GetClientRect(hwnd, &rc);
+            POINT pt = default;
+            pt.x = (rc.left + rc.right) / 2;
+            pt.y = (rc.top + rc.bottom) / 2;
+            ClientToScreen(hwnd, &pt);
+            u32 wheel = ((u32)(-120 * 4)) << 16;
+            i64 xy = (i64)(((u32)pt.y << 16) | ((u32)pt.x & 0xFFFFu));
+            SendMessageA(hwnd, (u32)WM_MOUSEWHEEL, (u64)wheel, xy);
+            pumpNative();
+        }
+        depth++;
+    }
 
     nativeTeardownForTest();
     return (okL && okD) ? 0 : 1;

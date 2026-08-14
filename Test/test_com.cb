@@ -134,6 +134,7 @@ interface ICounter
 {
     i32 Add(i32 by);   // returns the new total
     i32 Value();
+    Counter* Clone();
     Cat* Adopt();      // factory: hands back a fresh +1 reference, the caller must release it
 };
 
@@ -143,6 +144,12 @@ interface ICounter
     Counter(i32 start) { this.total = start; }
     i32 Add(i32 by) { this.total = this.total + by; return this.total; }
     i32 Value() { return this.total; }
+    HResult<Counter*> Clone()
+    {
+        HResult<Counter*> r = default;
+        r.succeed(new Counter(this.total));
+        return r;
+    }
     // A second factory slot, so a `?.` chain can run through two produced objects in a row.
     HResult<Cat*> Adopt()
     {
@@ -179,6 +186,58 @@ bool testMultiMethodAndParamForwarding()
 
     k->Release();   // balance the QI AddRef
     k->Release();   // original -> frees
+    return result;
+}
+
+bool testSelfFactory()
+{
+    bool result = true;
+    gCounterDtorCount = 0;
+    Counter* source = new Counter(31);
+    HResult<Counter*> clone = source->Clone();
+    HResult<i32> value = clone.value->Value();
+    result &= Test("com_self_factory_value", value.value, 31);
+    result &= Test("com_self_factory_release", (int)clone.value->Release(), 0);
+    result &= Test("com_self_factory_clone_dtor", gCounterDtorCount, 1);
+    result &= Test("com_self_factory_source_release", (int)source->Release(), 0);
+    result &= Test("com_self_factory_dtor_once", gCounterDtorCount, 2);
+    return result;
+}
+
+// The producer is defined before the class it creates. The forward scan must prepare both.
+int gForwardPing = 0;
+
+[uuid("c1b2c3d4-e5f6-4789-8abc-def012345678")]
+interface IForwardMaker { ForwardB* Make(); };
+
+[uuid("d1b2c3d4-e5f6-4789-8abc-def012345678")]
+interface IForwardB { void Ping(); };
+
+[winrt] class ForwardA : IForwardMaker
+{
+    HResult<ForwardB*> Make()
+    {
+        HResult<ForwardB*> r = default;
+        r.succeed(new ForwardB());
+        return r;
+    }
+};
+
+[winrt] class ForwardB : IForwardB
+{
+    void Ping() { gForwardPing = 9; }
+};
+
+bool testForwardFactory()
+{
+    bool result = true;
+    gForwardPing = 0;
+    ForwardA* maker = new ForwardA();
+    HResult<ForwardB*> made = maker->Make();
+    made.value->Ping();
+    result &= Test("com_forward_factory_dispatch", gForwardPing, 9);
+    result &= Test("com_forward_factory_release", (int)made.value->Release(), 0);
+    result &= Test("com_forward_factory_maker_release", (int)maker->Release(), 0);
     return result;
 }
 
@@ -320,6 +379,8 @@ extern int main()
     total++; passed += testDispatchAndLifecycle()         ? 1 : 0;
     total++; passed += testQueryInterface()               ? 1 : 0;
     total++; passed += testMultiMethodAndParamForwarding() ? 1 : 0;
+    total++; passed += testSelfFactory()                  ? 1 : 0;
+    total++; passed += testForwardFactory()               ? 1 : 0;
     total++; passed += testChaining()                     ? 1 : 0;
     total++; passed += testTypeLevelAnnotation()          ? 1 : 0;
     total++; passed += testAnnotationBeforeDef()          ? 1 : 0;

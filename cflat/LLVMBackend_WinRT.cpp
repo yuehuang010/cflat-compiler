@@ -131,41 +131,55 @@ LLVMBackend::DeclTypeAndValue LLVMBackend::MakeWinrtSlot(const std::string& name
 std::string LLVMBackend::CreateWinrtVtableStruct(const std::string& className, const std::string& ifaceName)
 {
         std::string vtblName = className + "__" + ifaceName + "_comvtbl";
-        if (dataStructures.count(vtblName)) return vtblName;
-
-        auto vp = []() { TypeAndValue::FuncPtrParam p; p.TypeName = "void"; p.Pointer = true; return p; };
-        std::vector<DeclTypeAndValue> slots;
-        slots.push_back(MakeWinrtSlot("QueryInterface", "i32", false, { vp(), vp(), vp() }));
-        slots.push_back(MakeWinrtSlot("AddRef", "u32", false, { vp() }));
-        slots.push_back(MakeWinrtSlot("Release", "u32", false, { vp() }));
-        slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
-        slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
-        slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
-
-        const auto* methods = FindInterface(ifaceName);
-        if (methods != nullptr)
+        if (!dataStructures.count(vtblName))
         {
-            for (const auto& m : *methods)
+            auto vp = []() { TypeAndValue::FuncPtrParam p; p.TypeName = "void"; p.Pointer = true; return p; };
+            std::vector<DeclTypeAndValue> slots;
+            slots.push_back(MakeWinrtSlot("QueryInterface", "i32", false, { vp(), vp(), vp() }));
+            slots.push_back(MakeWinrtSlot("AddRef", "u32", false, { vp() }));
+            slots.push_back(MakeWinrtSlot("Release", "u32", false, { vp() }));
+            slots.push_back(MakeWinrtSlot("GetIids", "i32", false, { vp(), vp(), vp() }));
+            slots.push_back(MakeWinrtSlot("GetRuntimeClassName", "i32", false, { vp(), vp() }));
+            slots.push_back(MakeWinrtSlot("GetTrustLevel", "i32", false, { vp(), vp() }));
+
+            const auto* methods = FindInterface(ifaceName);
+            if (methods != nullptr)
             {
-                std::vector<TypeAndValue::FuncPtrParam> params = { vp() };  // this
-                for (const auto& mp : m.Parameters)
+                for (const auto& m : *methods)
                 {
-                    TypeAndValue::FuncPtrParam p;
-                    p.TypeName = mp.TypeName;
-                    p.Pointer = mp.Pointer;
-                    p.PointerDepth = mp.PointerDepth;
-                    params.push_back(p);
+                    std::vector<TypeAndValue::FuncPtrParam> params = { vp() };  // this
+                    for (const auto& mp : m.Parameters)
+                    {
+                        TypeAndValue::FuncPtrParam p;
+                        p.TypeName = mp.TypeName;
+                        p.Pointer = mp.Pointer;
+                        p.PointerDepth = mp.PointerDepth;
+                        params.push_back(p);
+                    }
+                    // WinRT ABI: the slot returns HRESULT (i32); a non-void logical return is passed
+                    // back through a trailing [out,retval] pointer (opaque void* in the slot type).
+                    bool voidRet = (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer);
+                    if (!voidRet) params.push_back(vp());
+                    slots.push_back(MakeWinrtSlot(m.Name, "i32", false, params));
                 }
-                // WinRT ABI: the slot returns HRESULT (i32); a non-void logical return is passed
-                // back through a trailing [out,retval] pointer (opaque void* in the slot type).
-                bool voidRet = (m.ReturnType.TypeName == "void" && !m.ReturnType.Pointer);
-                if (!voidRet) params.push_back(vp());
-                slots.push_back(MakeWinrtSlot(m.Name, "i32", false, params));
             }
+
+            CreateStructType(vtblName, slots);
         }
 
-        CreateStructType(vtblName, slots);
+        auto* vtblTy = dataStructures.at(vtblName).StructType;
+        std::string globalName = "__winrt_" + className + "_vtbl";
+        auto* vtblGlobal = module->getNamedGlobal(globalName);
+        if (!vtblGlobal)
+            vtblGlobal = new llvm::GlobalVariable(*module, vtblTy, true,
+                llvm::GlobalValue::InternalLinkage, nullptr, globalName);
+        winrtClasses[className] = WinrtClassInfo{ ifaceName, vtblTy, vtblGlobal };
         return vtblName;
+    }
+
+void LLVMBackend::PrepareWinrtClass(const std::string& className, const std::string& ifaceName)
+{
+        CreateWinrtVtableStruct(className, ifaceName);
     }
 
 const LLVMBackend::FunctionSymbol* LLVMBackend::FindWinrtMethod(const std::string& className, const InterfaceMethod& m)
@@ -497,8 +511,11 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
             entries.push_back(fnC);
         }
         auto* init = llvm::ConstantStruct::get(vtblTy, entries);
-        auto* vtblGlobal = new llvm::GlobalVariable(*module, vtblTy, true,
-            llvm::GlobalValue::InternalLinkage, init, prefix + "vtbl");
+        auto* vtblGlobal = module->getNamedGlobal(prefix + "vtbl");
+        if (!vtblGlobal)
+            vtblGlobal = new llvm::GlobalVariable(*module, vtblTy, true,
+                llvm::GlobalValue::InternalLinkage, nullptr, prefix + "vtbl");
+        vtblGlobal->setInitializer(init);
 
         winrtClasses[className] = WinrtClassInfo{ ifaceName, vtblTy, vtblGlobal };
     }
