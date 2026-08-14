@@ -108,9 +108,15 @@ Both now grow to hold their inset children instead of overflowing.
 ## Phase 5 - NOT STARTED: embed the comctl32 v6 manifest
 
 Push BUTTONS, the COMBO box, the TRACKBAR thumb, and the size-grip GLYPH are still
-light in dark theme. Same root cause as Phase 4: the exe has no manifest, so the app
-binds the CLASSIC (v5) common controls (see
-`internal/issue/ui/win32-classic-common-controls-v5.md`).
+light in dark theme. Same root cause as Phase 4: the exe has no manifest - not just no
+comctl32 v6 dependency, no `assemblyIdentity` of any kind - so the app binds the
+CLASSIC (v5) common controls. HOW the manifest is declared and verified is designed in
+`internal/plan/windows-manifest-design.md`; this phase is its first consumer.
+
+REJECTED alternative, for the record: stay on v5 and owner-draw the rest
+(`BS_OWNERDRAW` buttons, `CBS_OWNERDRAWFIXED` combo, custom-painted trackbar + grip).
+Contained to `win32.cb` with no blast radius, but it is more hand-painted code to own
+and cflat apps would keep the classic control look.
 
 DECISION (2026-07-13): embed a comctl32 v6 manifest, rather than owner-drawing the
 remaining controls on v5. It modernizes every control at once, makes `SetWindowTheme`
@@ -156,8 +162,13 @@ Notes / things to check when doing it:
   also gets the manifest - harmless, just note it. Do NOT add a flag "just in case"
   unless a real need appears.
 - Confirm the manifest actually landed: the string
-  `Microsoft.Windows.Common-Controls` must appear in the emitted exe (the check in the
-  issue file), and the controls must visibly change appearance.
+  `Microsoft.Windows.Common-Controls` must appear in the emitted exe, and the controls
+  must visibly change appearance. Byte check on any built exe:
+
+  ```powershell
+  $b = [System.IO.File]::ReadAllBytes("out\gallery.exe")
+  [System.Text.Encoding]::ASCII.GetString($b).Contains("Microsoft.Windows.Common-Controls")
+  ```
 
 ### 5.1a Where does the manifest CONTENT come from? (BRAINSTORM - NOT DECIDED)
 

@@ -13,8 +13,6 @@ macOS:
   `_applyNode`/`_syncProps` path; the Win32/WinUI side has no equivalent.
 
 Windows / WinRT:
-- `ui/win32-classic-common-controls-v5` - the emitted exe has no manifest at all, so it binds
-  classic v5 comctl32 instead of themed v6.
 - `ui/winrt-self-new-missing-vtable` - the `winrtClasses` entry is populated only after the
   class's own method bodies are codegen'd, so a self-`new` sees a not-yet-registered class.
 - `ui/winmd-scrollviewer-statics-vtable-mismatch` - statics-interface slot index likely diverges

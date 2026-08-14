@@ -1,0 +1,322 @@
+{
+  "source": "https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests",
+  "sourceUrl": "https://learn.microsoft.com/en-us/windows/win32/sbscs/application-manifests",
+  "elements": [
+    {
+      "name": "assembly",
+      "parent": null,
+      "description": "A container element.",
+      "attributes": [
+        {
+          "name": "manifestVersion",
+          "description": "The manifestVersion attribute must be set to 1.0 ."
+        }
+      ],
+      "values": []
+    },
+    {
+      "name": "noInherit",
+      "parent": "assembly",
+      "description": "Include this element in an application manifest to set the activation contexts generated from the manifest with the \"no inherit\" flag.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "assemblyIdentity",
+      "parent": [
+        "assembly",
+        "dependentAssembly"
+      ],
+      "description": "As the first subelement of an assembly element, assemblyIdentity describes and uniquely identifies the application owning this application manifest.",
+      "attributes": [
+        {
+          "name": "type",
+          "description": "Specifies the application or assembly type."
+        },
+        {
+          "name": "name",
+          "description": "Uniquely names the application or assembly."
+        },
+        {
+          "name": "language",
+          "description": "Identifies the language of the application or assembly."
+        },
+        {
+          "name": "processorArchitecture",
+          "description": "Specifies the processor."
+        },
+        {
+          "name": "version",
+          "description": "Specifies the application or assembly version."
+        },
+        {
+          "name": "publicKeyToken",
+          "description": "A 16-character hexadecimal string representing the last 8 bytes of the SHA-1 hash of the public key under which the application or assembly is signed."
+        }
+      ],
+      "values": []
+    },
+    {
+      "name": "compatibility",
+      "parent": null,
+      "description": "Contains at least one application .",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "application",
+      "parent": null,
+      "description": "Contains at least one supportedOS element.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "supportedOS",
+      "parent": null,
+      "description": "The supportedOS element has the following attribute.",
+      "attributes": [
+        {
+          "name": "Id",
+          "description": "Set the Id attribute to {e2011457-1546-43c5-a5fe-008deee3d3f0} to run the application using Vista functionality."
+        }
+      ],
+      "values": [
+        "{e2011457-1546-43c5-a5fe-008deee3d3f0}",
+        "{35138b9a-5d96-4fbd-8e2d-a2440225f93a}",
+        "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}",
+        "{1f676c76-80e1-4239-95bb-83d0f6d0da78}",
+        "{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"
+      ]
+    },
+    {
+      "name": "maxversiontested",
+      "parent": null,
+      "description": "The maxversiontested element specifies the versions of Windows that the application was tested against starting with the minimum OS version the application supports up to the maximum version.",
+      "attributes": [
+        {
+          "name": "Id",
+          "description": "Set the Id attribute to a 4-part version string that specifies the maximum version of Windows that the application was tested against."
+        }
+      ],
+      "values": [
+        "{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"
+      ]
+    },
+    {
+      "name": "dependency",
+      "parent": null,
+      "description": "Contains at least one dependentAssembly .",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "dependentAssembly",
+      "parent": "dependency",
+      "description": "The first subelement of dependentAssembly must be an assemblyIdentity element that describes a side-by-side assembly required by the application.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "file",
+      "parent": null,
+      "description": "Specifies files that are private to the application.",
+      "attributes": [
+        {
+          "name": "name",
+          "description": "Name of the file."
+        },
+        {
+          "name": "hashalg",
+          "description": "Algorithm used to create a hash of the file."
+        },
+        {
+          "name": "hash",
+          "description": "A hash of the file referred to by name."
+        }
+      ],
+      "values": []
+    },
+    {
+      "name": "activatableClass",
+      "parent": null,
+      "description": "Allows non-packaged desktop apps to make use of user-defined Windows Runtime (WinRT) Components.",
+      "attributes": [
+        {
+          "name": "name",
+          "description": "Specifies the class identifier for the activatable class."
+        },
+        {
+          "name": "threadingModel",
+          "description": "Represents the apartment threading model to use for activating an in-process server."
+        }
+      ],
+      "values": []
+    },
+    {
+      "name": "activeCodePage",
+      "parent": null,
+      "description": "On Windows 10, this element forces a process to use UTF-8 as the process code page.",
+      "attributes": [],
+      "values": [
+        "UTF-8",
+        "Legacy",
+        "en-US",
+        "ja-JP"
+      ]
+    },
+    {
+      "name": "autoElevate",
+      "parent": null,
+      "description": "Specifies whether auto elevate is enabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "disableTheming",
+      "parent": null,
+      "description": "Specifies whether giving UI elements a theme is disabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "disableWindowFiltering",
+      "parent": null,
+      "description": "Specifies whether to disable window filtering.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "dpiAware",
+      "parent": null,
+      "description": "Specifies whether the current process is dots per inch (dpi) aware.",
+      "attributes": [],
+      "values": [
+        "Absent",
+        "Contains \"true\"",
+        "Contains \"false\"",
+        "Contains \"true/pm\"",
+        "Contains \"per monitor\"",
+        "Contains any other string"
+      ]
+    },
+    {
+      "name": "dpiAwareness",
+      "parent": null,
+      "description": "Specifies whether the current process is dots per inch (dpi) aware.",
+      "attributes": [],
+      "values": [
+        "Element is absent",
+        "Contains no recognized items",
+        "First recognized item is \"system\"",
+        "First recognized item is \"permonitor\"",
+        "First recognized item is \"permonitorv2\"",
+        "First recognized item is \"unaware\""
+      ]
+    },
+    {
+      "name": "gdiScaling",
+      "parent": null,
+      "description": "Specifies whether GDI scaling is enabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "highResolutionScrollingAware",
+      "parent": null,
+      "description": "Specifies whether high-resolution-scrolling aware is enabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "longPathAware",
+      "parent": null,
+      "description": "Enables long paths that exceed MAX_PATH in length.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "printerDriverIsolation",
+      "parent": null,
+      "description": "Specifies whether printer driver isolation is enabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "ultraHighResolutionScrollingAware",
+      "parent": null,
+      "description": "Specifies whether ultra-high-resolution-scrolling aware is enabled.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "msix",
+      "parent": null,
+      "description": "Specifies the identity info of a package with external location for the current application (see Grant package identity by packaging with external location ).",
+      "attributes": [
+        {
+          "name": "publisher",
+          "description": "Describes the publisher information."
+        },
+        {
+          "name": "packageName",
+          "description": "Describes the contents of the package."
+        },
+        {
+          "name": "applicationId",
+          "description": "The unique identifier of the application."
+        }
+      ],
+      "values": []
+    },
+    {
+      "name": "heapType",
+      "parent": null,
+      "description": "Overrides the default heap implementation for the Win32 heap APIs to use.",
+      "attributes": [],
+      "values": [
+        "SegmentHeap"
+      ]
+    },
+    {
+      "name": "supportedArchitectures",
+      "parent": null,
+      "description": "For IL-only .NET Framework executables, specifies a list of native processor architectures the application is compatible with.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "consoleAllocationPolicy",
+      "parent": null,
+      "description": "Console applications automatically spawn a terminal window (a console host) when launched from Explorer or similar.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "trustInfo",
+      "parent": null,
+      "description": "All UAC-compliant apps should have a requested execution level added to the application manifest.",
+      "attributes": [],
+      "values": []
+    },
+    {
+      "name": "requestedExecutionLevel",
+      "parent": "trustInfo",
+      "description": "Requested execution levels specify the privileges required for an app.",
+      "attributes": [
+        {
+          "name": "level",
+          "description": "The requested execution level is specified with the level attribute of the requestedExecutionLevel descendent of the trustInfo element."
+        },
+        {
+          "name": "uiAccess",
+          "description": "The requestedExecutionLevel element also has an optional attribute uiAccess ."
+        }
+      ],
+      "values": [
+        "asInvoker",
+        "requireAdministrator",
+        "highestAvailable"
+      ]
+    }
+  ]
+}
