@@ -22,13 +22,11 @@ slots match the SDK ABI, the crash was an IUIElement-for-IDependencyObject argum
 caller contract now noted at the winuiZeroItemsCache site in winui.cb.)
 
 Portable:
-- `p2/file-offsets-capped-at-2gb` - `filesystem.cb` narrows offsets through `int` / C `long`,
-  capping file I/O at 2GB on every platform.
+(Closed 2026-08-14: `p2/file-offsets-capped-at-2gb` widened the filesystem offset path to
+64-bit entry points and public APIs on Windows and POSIX.)
 
 ## Fix direction and sequencing
 
-- `p2/file-offsets-capped-at-2gb` is portable, verifiable on any host, and independent of
-  everything else here. Do it first and separately.
 - The WinMD slot measurements are complete. Keep attached-property arguments at their declared
   ABI interface type; do not infer IDependencyObject calls from an IUIElement pointer.
 - Everything under Windows/WinRT needs a Windows host to verify. Do not land those from a macOS

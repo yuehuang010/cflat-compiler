@@ -62,7 +62,7 @@ int testFileClass()
     // "hello\n" + "world\n" = 12 bytes
     File* s = new File;
     s->openRead(path);
-    int sz = s->size();
+    i64 sz = s->size();
     passed += Test("file size 12", sz == 12, true);
     delete s;
 
@@ -187,7 +187,7 @@ int testFileInstanceMethods()
     f->openWrite(bpath);
     i8* wbuf = new i8[4];
     wbuf[0] = 10; wbuf[1] = 20; wbuf[2] = 30; wbuf[3] = 40;
-    int written = f->writeBytes(wbuf, 4);
+    i64 written = f->writeBytes(wbuf, 4);
     f->flush();
     delete f;
     delete[] wbuf;
@@ -198,8 +198,13 @@ int testFileInstanceMethods()
     f->openRead(bpath);
     passed += Test("size after writeBytes", f->size(), 4);
 
+    i64 farOffset = (i64)0x100000000 + 123;
+    passed += Test("seek beyond 4GB", f->seek(farOffset, 0), true);
+    passed += Test("tell beyond 4GB", f->tell(), farOffset);
+    passed += Test("seek back to start", f->seek(0, 0), true);
+
     i8* rbuf = new i8[4];
-    int nread = f->readBytes(rbuf, 4);
+    i64 nread = f->readBytes(rbuf, 4);
     passed += Test("readBytes count", nread, 4);
     passed += Test("readBytes[0]", rbuf[0], 10);
     passed += Test("readBytes[3]", rbuf[3], 40);
@@ -453,7 +458,7 @@ extern int main()
     r = testDirectoryFunctions();   passed += r; total += 6;
     r = testDirectoryClass();       passed += r; total += 4;
     r = testFileStaticHelpers();    passed += r; total += 7;
-    r = testFileInstanceMethods();  passed += r; total += 13;
+    r = testFileInstanceMethods();  passed += r; total += 16;
     r = testPathClass();            passed += r; total += 17;
     r = testDirectoryExtended();    passed += r; total += 8;
     r = testMappedFile();           passed += r; total += 14;

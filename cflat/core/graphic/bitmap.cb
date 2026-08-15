@@ -103,7 +103,7 @@ class Bitmap
         i8* fhdr = new i8[14];
         if (f->readBytes(fhdr, 14) != 14) { delete[] fhdr; return false; }
         bool isBmp = fhdr[0] == 'B' && fhdr[1] == 'M';
-        int pixelOffset = Bitmap._readI32(fhdr, 10);
+        i64 pixelOffset = (i64)Bitmap._readI32(fhdr, 10);
         delete[] fhdr;
         if (!isBmp) return false;
 

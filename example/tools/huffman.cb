@@ -177,7 +177,7 @@ int compress(char* inPath, char* outPath)
         delete inf;
         return 1;
     }
-    int n = inf->size();
+    i64 n = inf->size();
     i8* data = new i8[n > 0 ? n : 1];
     inf->readBytes(data, n);
     inf->close();
@@ -273,7 +273,7 @@ int compress(char* inPath, char* outPath)
     delete of;
 
     double ratio = n > 0 ? (double)total / (double)n : 0.0;
-    printf("compressed %d -> %d bytes (%.1f%% of original)\n", n, total, ratio * 100.0);
+    printf("compressed %lld -> %d bytes (%.1f%% of original)\n", n, total, ratio * 100.0);
 
     delete[_] pool;
     delete[] data;
@@ -292,7 +292,7 @@ int decompress(char* inPath, char* outPath)
         delete inf;
         return 1;
     }
-    int n = inf->size();
+    i64 n = inf->size();
     i8* data = new i8[n > 0 ? n : 1];
     inf->readBytes(data, n);
     inf->close();
@@ -362,11 +362,11 @@ int decompress(char* inPath, char* outPath)
         delete of;
         return 1;
     }
-    of->writeBytes(out, (int)produced);
+    of->writeBytes(out, produced);
     of->close();
     delete of;
 
-    printf("decompressed %d -> %d bytes\n", n, (int)produced);
+    printf("decompressed %lld -> %lld bytes\n", n, produced);
 
     delete[_] pool;
     delete[] data;

@@ -1113,7 +1113,7 @@ struct FileShard {
 };
 
 // Reads this shard's [offset, offset+len) range of g_loadPath straight into
-// its domain-local buffer, in 64 MB chunks (File.seek/readBytes are int-sized,
+// its domain-local buffer, in 64 MB chunks (the destination buffer is bounded per call,
 // so a multi-GB shard is read incrementally rather than in one call).
 void loadShard(void* arg) {
     FileShard* s = (FileShard*)arg;
@@ -1124,7 +1124,7 @@ void loadShard(void* arg) {
     while (done < s->len) {
         i64 remaining = s->len - done;
         int n = (remaining < chunkSize) ? (int)remaining : (int)chunkSize;
-        f.seek((int)(s->offset + done), 0);
+        f.seek(s->offset + done, 0);
         f.readBytes((i8*)(s->base + done), n);
         done = done + (i64)n;
     }
@@ -1167,7 +1167,7 @@ int main() {
 
     File probe;
     probe.openRead(g_loadPath);
-    i64 fileSize = (i64)probe.size();
+    i64 fileSize = probe.size();
     probe.close();
 
     // 1) Query each domain (feature 2) and acquire it (feature 3). Sizing is
