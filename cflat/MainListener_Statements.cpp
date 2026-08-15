@@ -130,9 +130,8 @@ void MainListener::EnsureTupleInstantiated(const std::string& mangledName) {
             pendingInstantiations.push_back({"tuple", it->second, mangledName});
             instantiatedGenerics.insert(mangledName);
         }
-        auto savedState = Compiler()->SaveBuilderState();
+        LLVMBackend::BuilderStateGuard savedState(Compiler());
         ProcessPendingInstantiations();
-        Compiler()->RestoreBuilderState(savedState);
     }
 
 void MainListener::ParseDestructuringDeclaration(CFlatParser::DestructuringDeclarationContext* ctx) {
@@ -2309,6 +2308,17 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     }
                 }
 
+                // caseMap is keyed by parser-context pointers; sort by source position so
+                // unordered-map bucket order cannot affect the generated IR.
+                std::vector<CFlatParser::LabeledStatementContext*> orderedCaseLabels;
+                orderedCaseLabels.reserve(switchCtx.caseMap.size());
+                for (const auto& caseEntry : switchCtx.caseMap)
+                    orderedCaseLabels.push_back(caseEntry.first);
+                std::sort(orderedCaseLabels.begin(), orderedCaseLabels.end(),
+                    [](auto* lhs, auto* rhs) {
+                        return lhs->getStart()->getStartIndex() < rhs->getStart()->getStartIndex();
+                    });
+
                 auto switchDefault = switchCtx.defaultBlock ? switchCtx.defaultBlock : switchCtx.resumeBlock;
 
                 // Owned-string temporaries produced while evaluating the scrutinee (the scrutinee
@@ -2364,8 +2374,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     llvm::Value* loadedDesc = LoadTypeDescFromInterface(condVal, expression);
 
                     // Emit linear dispatch chain: for each type case, check if it matches
-                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    for (auto* labeledCtx : orderedCaseLabels)
                     {
+                        auto& entry = switchCtx.caseMap.at(labeledCtx);
                         if (!entry.isTypeCase) continue;  // skip non-type cases (shouldn't happen)
 
                         auto* nextCheck = compiler->CreateBasicBlock("typeswitch_next");
@@ -2457,8 +2468,9 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     auto* strcmpFn = compiler->GetOrDeclareStrcmp();
                     auto* i32Zero = compiler->builder->getInt32(0);
 
-                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    for (auto* labeledCtx : orderedCaseLabels)
                     {
+                        auto& entry = switchCtx.caseMap.at(labeledCtx);
                         if (!entry.strLiteral) continue;
                         auto* nextBlock = compiler->CreateBasicBlock("switchCmp");
                         auto* cmpResult = compiler->builder->CreateCall(strcmpFn, { strPtr, entry.strLiteral });
@@ -2471,9 +2483,12 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 else
                 {
                     auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
-                    for (auto& [labeledCtx, entry] : switchCtx.caseMap)
+                    for (auto* labeledCtx : orderedCaseLabels)
+                    {
+                        auto& entry = switchCtx.caseMap.at(labeledCtx);
                         if (entry.value)  // null value = wildcard (_) arm, handled via defaultBlock
                             switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                    }
                 }
 
                 // Push scope: break -> resumeBlock, no continue (propagates to outer loop)

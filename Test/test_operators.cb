@@ -31,6 +31,18 @@ struct Bits
     int operator~() { return ~value; }
 };
 
+// ── UBits: overloads whose RETURN type is unsigned (u64) ─────────────────────
+// The expression result must carry the overload's return signedness, not the
+// operands' flags: 0x8000000000000000 divides/compares unsigned, never sdiv/sgt.
+
+struct UBits
+{
+    u64 v = 0;
+    u64 operator+(u64 rhs)  { return v + rhs; }
+    u64 operator*(u64 rhs)  { return v * rhs; }
+    u64 operator>>(int rhs) { return v >> rhs; }
+};
+
 // ── Cells: subscript overload, reached through a pointer deref ──────────────
 
 struct Cells
@@ -416,5 +428,14 @@ extern int main()
     ptrOpPassed += Test("ptr == nullptr builtin, nulled",    pnode == nullptr, true);
     ptrOpPassed += Test("ptr != nullptr builtin, nulled",    pnode != nullptr, false);
 
-    return (terPassed == 19 && ptrOpPassed == 8) ? 0 : 1;
+    // Overload results above 2^63 stay unsigned through /, >, and chained arithmetic.
+    int uPassed = 0;
+    UBits ub = default;
+    ub.v = (u64)0x8000000000000000;
+    uPassed += Test("u64 operator>> result divides unsigned", (ub >> 0) / 2 == (u64)4611686018427387904, true);
+    // RHS literals stay SIGNED so the operands' flags cannot mask a dropped return signedness.
+    uPassed += Test("u64 operator+ result divides unsigned",  (ub + 0) / 2 == (u64)4611686018427387904, true);
+    uPassed += Test("u64 operator* result compares unsigned", (ub * 1) > 1000, true);
+
+    return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3) ? 0 : 1;
 }

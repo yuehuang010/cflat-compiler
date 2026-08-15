@@ -5393,12 +5393,13 @@ LLVMBackend::TypedValue MainListener::ParseShiftExpression(CFlatParser::ShiftExp
                     resultNV.Primary = res;
                     resultNV.TypeAndValue = compiler->lastCallReturnType;
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
-                    return { res, false };
+                    // The result's signedness is the overload's RETURN type, not a fixed signed.
+                    return { res, resultNV.TypeAndValue.IsUnsignedInteger() != -1 };
                 }
             }
 
             auto result = compiler->CreateOperation(op, lv, rv, lv.isUnsigned, rv.isUnsigned);
-            return { result, false };
+            return { result, lv.isUnsigned };
         }
 
         LogErrorContext(ctx, "Shift expression has no operands.");
@@ -5512,7 +5513,8 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
                     lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
-                    lu = lu || ru;
+                    // An overload's signedness is its RETURN type, not the operands' flags.
+                    lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1 : (lu || ru);
                     elemType = nullptr;  // arithmetic result is no longer a pointer
                 }
             }
@@ -5997,7 +5999,8 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                 }
                 lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
-                lu = lu || ru;
+                // An overload's signedness is its RETURN type, not the operands' flags.
+                lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1 : (lu || ru);
             }
 
             return { lvalue, lu };
@@ -8350,7 +8353,7 @@ void MainListener::EmitGlobalFixedArrayInit(
 
             // Evaluate element expressions inside a throwaway function so stray IR does
             // not corrupt the current insert block; each must fold to a constant.
-            auto savedState = compiler->SaveBuilderState();
+            LLVMBackend::BuilderStateGuard savedState(compiler);
             auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
             auto* tmpFn = llvm::Function::Create(
                 voidTy, llvm::Function::PrivateLinkage, "__global_arr_init_tmp", compiler->module.get());
@@ -8400,7 +8403,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                 elems.push_back(llvm::Constant::getNullValue(elemTy));
 
             tmpFn->eraseFromParent();
-            compiler->RestoreBuilderState(savedState);
+            savedState.restore();
 
             if (codeValueElem != nullptr)
                 LogErrorContext(codeValueElem, compiler->DescribeCodeValueIntoData(
@@ -8564,7 +8567,7 @@ bool MainListener::TryFoldConstInt(llvm::Value* v, uint64_t& out,
 
 llvm::ConstantInt* MainListener::EvalGlobalArrayDim(CFlatParser::AssignmentExpressionContext* expr) {
         auto* compiler = Compiler(expr);
-        auto savedState = compiler->SaveBuilderState();
+        LLVMBackend::BuilderStateGuard savedState(compiler);
         auto* voidTy = llvm::FunctionType::get(compiler->builder->getVoidTy(), false);
         auto* tmpFn = llvm::Function::Create(
             voidTy, llvm::Function::PrivateLinkage, "__global_arr_dim_tmp", compiler->module.get());
@@ -8576,7 +8579,7 @@ llvm::ConstantInt* MainListener::EvalGlobalArrayDim(CFlatParser::AssignmentExpre
         bool ok = sizeVal && TryFoldConstInt(sizeVal, folded);
 
         tmpFn->eraseFromParent();
-        compiler->RestoreBuilderState(savedState);
+        savedState.restore();
 
         auto* i64Ty = llvm::Type::getInt64Ty(*compiler->context);
         if (!ok)

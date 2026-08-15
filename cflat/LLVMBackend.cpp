@@ -806,8 +806,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
             auto walker = antlr4::tree::ParseTreeWalker();
             walker.walk(myListener.get(), computeUnit);
+            {
+                NoCurrentFunctionScope noCurrent(this);
+                myListener->ResolvePendingGlobalDefaultConstructions();
+            }
             // Now that every implementor is registered, emit the interface rebox if-chains.
-            // Before the destructor pass: building a vtable here can bind a new deferred dtor.
+            // Resolve-created calls can register deferred interface work, so resolve first.
             EmitDeferredInterfaceReboxBodies();
             // Now that every type and generic monomorphization is registered, fill in the
             // bodies of deferred delete-site destructor wrappers (recursive containers whose
@@ -1436,6 +1440,20 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     }
     // Register eagerly so any re-entrant or duplicate import is caught above.
     importedFiles.insert(canonicalStr);
+    // HeapAudit's C backing object needs a linked diagnostic library and cannot be loaded by
+    // the --run JIT. Check only after import dedup so repeated imports do not repeat this work.
+    if (runMode_ && !runtimeDir.empty())
+    {
+        if (heapAuditCanonicalPath_.empty())
+        {
+            std::error_code auditEc;
+            auto auditPath = std::filesystem::canonical(
+                std::filesystem::path(runtimeDir) / "core" / "diagnostic" / "heap_audit.cb", auditEc);
+            if (!auditEc) heapAuditCanonicalPath_ = auditPath.string();
+        }
+        if (!heapAuditCanonicalPath_.empty() && canonicalStr == heapAuditCanonicalPath_)
+            LogError("HeapAudit requires a linked C diagnostic object and cannot be used with --run.");
+    }
     // Real C source: hand off to clang-cl rather than the CFlat parser. The compiled
     // object is linked by EmitExecutable; the importing .cb supplies the declarations.
     {
@@ -1643,6 +1661,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         llvm::TimeTraceScope codegenScope("CodeGeneration", importFilename);
         auto myListener = std::make_unique<MainListener>(parserPtr, this, sourceFileName);
         antlr4::tree::ParseTreeWalker().walk(myListener.get(), computeUnit);
+        {
+            NoCurrentFunctionScope noCurrent(this);
+            myListener->ResolvePendingGlobalDefaultConstructions();
+        }
     }
     if (verbose) std::cout << std::format("[verbose]   import done: {}\n", importFilename);
 
@@ -2399,15 +2421,17 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
         auto walker = antlr4::tree::ParseTreeWalker();
         walker.walk(myListener.get(), computeUnit);
+        {
+            NoCurrentFunctionScope noCurrent(this);
+            myListener->ResolvePendingGlobalDefaultConstructions();
+        }
         // Now that every implementor is registered, emit the interface rebox if-chains.
-        // Before the destructor pass: building a vtable here can bind a new deferred dtor.
+        // Resolve-created calls can register deferred interface work, so resolve first.
         EmitDeferredInterfaceReboxBodies();
         // Now that every type and generic monomorphization is registered, fill in the
         // bodies of deferred delete-site destructor wrappers (recursive containers whose
         // element type was incomplete when the container dtor was emitted).
         EmitDeferredFullDestructorBodies();
-        // Same resolve as the Compile path: without it --check reports a program clean that -o
-        // rejects, and the IDE shows nothing for a use that cannot work.
         ResolveMaterializedInterfaceUses();
         stream.close();
     }
@@ -2657,6 +2681,7 @@ void LLVMBackend::ResetForReanalysis()
     importedFiles.clear();
     importStack.clear();
     importedParseStates.clear();
+    heapAuditCanonicalPath_.clear();
 
     // Generic-template state must also be cleared so prior-analysis ANTLR contexts
     // (which point into a discarded parse tree) don't survive into the next run.

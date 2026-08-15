@@ -177,6 +177,7 @@ class File
         if (_handle == nullptr) return "";
         _fs_fseek(_handle, 0, 2);
         i64 isz = _fs_ftell(_handle);
+        if (isz < 0 || isz > (i64)2147483647) { _fs_fseek(_handle, 0, 0); return ""; }
         _fs_fseek(_handle, 0, 0);
         i8* buf = new i8[isz + 1];
         _fs_fread(buf, 1, isz, _handle);

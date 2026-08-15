@@ -11,6 +11,18 @@ using ModuleIntList = list<int>;
 using ModuleIntPtr = int*;
 using ModuleVec = i32[4];
 
+ImportedDefaultFold importedDefaultFold;
+
+struct ImportedDefaultFold
+{
+    int value = 17;
+};
+
+int getImportedDefaultFold()
+{
+    return importedDefaultFold.value;
+}
+
 int moduleAdd(int a, int b) { return a + b; }
 int moduleMultiply(int a, int b) { return a * b; }
 

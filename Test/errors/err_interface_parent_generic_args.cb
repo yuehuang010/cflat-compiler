@@ -1,0 +1,11 @@
+// Generic arguments on a non-generic interface parent are not supported.
+
+expect_error("generic arguments are not supported on a non-generic interface parent") {
+    interface C6Base { int base(); };
+    interface C6Derived : C6Base<int, float, whatever> { int derived(); };
+}
+
+extern int main()
+{
+    return 0;
+}

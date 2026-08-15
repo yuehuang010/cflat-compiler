@@ -2090,6 +2090,8 @@ public:
 
 
 
+struct FoldConstructedValueState;
+
 class MainListener : public CFlatBaseListener
 {
 private:
@@ -2120,6 +2122,14 @@ private:
     struct IncrementWork { int Amount = 0; llvm::Type* ElemType = nullptr; llvm::Type* LoadType = nullptr; };
     std::unordered_map<llvm::Value*, IncrementWork> PlusPlus;
     bool global_scope = true; // true when parsing an entity in the global scope.
+
+    struct PendingGlobalDefaultConstruction
+    {
+        llvm::GlobalVariable* Global = nullptr;
+        LLVMBackend::DeclTypeAndValue TypeValue;
+        antlr4::ParserRuleContext* Context = nullptr;
+    };
+    std::vector<PendingGlobalDefaultConstruction> pendingGlobalDefaultConstructions_;
 
     // RAII guard: sets global_scope to false on entry and restores the saved value on exit.
     struct GlobalScopeGuard
@@ -2513,10 +2523,15 @@ private:
 
     // Constant value of a type's default construction, or nullptr when it is not constant.
     llvm::Constant* TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue);
+    llvm::Constant* TryFoldGlobalDefaultConstruction(
+        const LLVMBackend::DeclTypeAndValue& typeValue, FoldConstructedValueState& foldState);
     llvm::Constant* SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType);
 
 public:
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
+
+    // Retry global default folds after all declarations and deferred instantiations are emitted.
+    void ResolvePendingGlobalDefaultConstructions();
 
     void SetImportNamespace(const std::string& ns);
 

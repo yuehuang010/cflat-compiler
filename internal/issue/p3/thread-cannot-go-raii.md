@@ -79,7 +79,22 @@ The double-`start()` half of the original report landed:
 diagnostic and `abort()`, instead of leaking the prior handle and `_args` and abandoning a
 running thread that could never be joined. See `cflat/core/thread.cb`.
 
+## RULING 2026-08-11 (maintainer, from the q17 bucket - folded in 2026-08-15 when the bucket closed)
+
+Stays filed as a design deferral; NOT a bug (nothing is unsafe today because no destructor
+exists to run at the wrong time - do not add one). Direction if ever pursued: make `Thread`
+non-bitwise-copyable so `ThreadPool.resize` moves instead of copies. BLOCKER: CFlat has no
+syntax for a deleted copy, so that is a language-design task in its own right (grammar, both
+`ParseDeclarationSpecifiers` copies, diagnostics at every copy site, interaction with
+move/borrow inference) and must not be smuggled in as part of a `Thread` fix. Pool
+quiescence-as-typestate was NOT selected (see `pools-no-destructor-shutdown-ordering.md`,
+same ruling). Any RAII decision must settle `Thread` and the pools TOGETHER - a destructor on
+one and not the other leaves the same footgun. The planned concurrent B-tree needs
+hand-over-hand locking, so raw mutex acquire/release must remain legal; do not propose an
+RAII-only lock story here.
+
 ## Related
 
 - `internal/plan/unique-ownership.md` NEXT item 4 - the ruling and the copy-suppression
   problem it is working around.
+- `pools-no-destructor-shutdown-ordering.md` - the other half of the same 2026-08-11 ruling.

@@ -572,7 +572,12 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
 
         std::vector<std::string> parentNames;
         for (auto* spec : ctx->baseSpecifier())
+        {
+            if (spec->genericTypeParameters() != nullptr)
+                Compiler(spec)->LogError(
+                    "generic arguments are not supported on a non-generic interface parent");
             parentNames.push_back(Compiler(ctx)->ResolveInterfaceName(BaseSpecifierName(spec)));
+        }
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
         for (auto method : InterfaceMethods(ctx))

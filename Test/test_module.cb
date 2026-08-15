@@ -26,6 +26,13 @@ bool testImportedStruct()
     return result;
 }
 
+bool testImportedGlobalDefaultFold()
+{
+    bool result = true;
+    result &= Test("imported global default fold", getImportedDefaultFold(), 17);
+    return result;
+}
+
 bool testImportedNamespace()
 {
     bool result = true;
@@ -98,6 +105,7 @@ extern int main()
     total++; passed += testCrossFileAlias()    ? 1 : 0;
     total++; passed += testImportedFunctions() ? 1 : 0;
     total++; passed += testImportedStruct()    ? 1 : 0;
+    total++; passed += testImportedGlobalDefaultFold() ? 1 : 0;
     total++; passed += testImportedNamespace() ? 1 : 0;
     total++; passed += testImportAs()          ? 1 : 0;
     total++; passed += testProgramImport()     ? 1 : 0;

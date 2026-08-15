@@ -1020,77 +1020,180 @@ LLVMBackend::DeclTypeAndValue MainListener::getFunctionReturnType(CFlatParser::F
  * Does running `callee` do anything besides produce its return value? The fold below replays the
  * VALUE, so any store, allocation, or unknown call inside the body would be dropped - and a
  * `= default` array must run its field initializers once per element (C++ semantics), not once.
- * Conservative: an unresolvable callee, a declaration, or recursion past the same depth cap used
- * by the value fold all count as having effects, so the fold declines and the caller emits real
- * per-element construction.
+ * Conservative: an unresolvable callee, a declaration, or a recursive call all count as having
+ * effects, so the fold declines and the caller emits real per-element construction.
  */
-static bool CalleeHasSideEffects(llvm::Function* callee, int depth)
+static bool CalleeHasSideEffectsSafe(
+    llvm::Function* callee,
+    llvm::DenseSet<llvm::Function*>& visiting,
+    llvm::DenseMap<llvm::Function*, bool>& memo)
 {
-    if (callee == nullptr || callee->isDeclaration() || depth > 16) return true;
+    if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return true;
+    auto memoIt = memo.find(callee);
+    if (memoIt != memo.end()) return memoIt->second;
+    if (!visiting.insert(callee).second) return true;
+    bool hasEffects = false;
     for (llvm::BasicBlock& bb : *callee)
         for (llvm::Instruction& inst : bb)
         {
-            if (inst.mayWriteToMemory() && !llvm::isa<llvm::CallInst>(inst)) return true;
-            if (auto* inner = llvm::dyn_cast<llvm::CallInst>(&inst))
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(&inst))
             {
-                if (inner->getCalledFunction() == nullptr) return true;
-                if (CalleeHasSideEffects(inner->getCalledFunction(), depth + 1)) return true;
+                if (CalleeHasSideEffectsSafe(call->getCalledFunction(), visiting, memo))
+                {
+                    hasEffects = true;
+                    break;
+                }
+            }
+            else if (inst.mayWriteToMemory())
+            {
+                hasEffects = true;
+                break;
             }
         }
-    return false;
+    visiting.erase(callee);
+    memo[callee] = hasEffects;
+    return hasEffects;
 }
 
+struct FoldConstructedValueState
+{
+    static constexpr unsigned MaxConstructorFrames = 128;
+    static constexpr unsigned MaxValueDepth = 512;
+    llvm::DenseMap<const llvm::Function*, llvm::Constant*> FoldedFunctions;
+    llvm::DenseSet<const llvm::Function*> ActiveFunctions;
+    llvm::DenseSet<llvm::Function*> EffectVisiting;
+    llvm::DenseMap<llvm::Function*, bool> EffectMemo;
+    unsigned ConstructorFrames = 0;
+    unsigned ValueDepth = 0;
+};
+
+static llvm::Constant* FoldConstructedValueToConstantImpl(
+    llvm::Value* value,
+    const llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameArgs,
+    llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameMemo,
+    FoldConstructedValueState& state);
+
+/*
+ * Memoizing front door for the fold walk. The memo is PER FRAME: the same instruction folds to
+ * different constants under different constructor arguments, so a cross-frame memo would be
+ * wrong. Within one frame it collapses shared sub-DAGs from exponential to linear, and the
+ * depth cap bounds the native recursion the old flat depth-16 budget used to bound.
+ */
 static llvm::Constant* FoldConstructedValueToConstant(
     llvm::Value* value,
     const llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameArgs,
-    int depth)
+    llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameMemo,
+    FoldConstructedValueState& state)
 {
-    if (value == nullptr || depth > 16) return nullptr;
+    if (value == nullptr) return nullptr;
     if (auto* c = llvm::dyn_cast<llvm::Constant>(value)) return c;
+    if (state.ValueDepth >= FoldConstructedValueState::MaxValueDepth) return nullptr;
+    auto memoIt = frameMemo.find(value);
+    if (memoIt != frameMemo.end()) return memoIt->second;
+    state.ValueDepth++;
+    auto* folded = FoldConstructedValueToConstantImpl(value, frameArgs, frameMemo, state);
+    state.ValueDepth--;
+    frameMemo[value] = folded;
+    return folded;
+}
 
+static llvm::Constant* FoldConstructedValueToConstantImpl(
+    llvm::Value* value,
+    const llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameArgs,
+    llvm::DenseMap<const llvm::Value*, llvm::Constant*>& frameMemo,
+    FoldConstructedValueState& state)
+{
     if (auto* arg = llvm::dyn_cast<llvm::Argument>(value))
     {
         auto it = frameArgs.find(arg);
         return it == frameArgs.end() ? nullptr : it->second;
     }
 
-    if (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(value))
+    if (llvm::isa<llvm::InsertValueInst>(value))
     {
-        auto* agg = FoldConstructedValueToConstant(iv->getAggregateOperand(), frameArgs, depth + 1);
-        auto* elem = FoldConstructedValueToConstant(iv->getInsertedValueOperand(), frameArgs, depth + 1);
-        if (agg == nullptr || elem == nullptr) return nullptr;
-        return llvm::ConstantFoldInsertValueInstruction(agg, elem, iv->getIndices());
+        struct InsertStep { llvm::InsertValueInst* Inst; };
+        std::vector<InsertStep> steps;
+        llvm::Value* aggregate = value;
+        while (auto* iv = llvm::dyn_cast<llvm::InsertValueInst>(aggregate))
+        {
+            steps.push_back({iv});
+            aggregate = iv->getAggregateOperand();
+        }
+        auto* folded = FoldConstructedValueToConstant(aggregate, frameArgs, frameMemo, state);
+        if (folded == nullptr) return nullptr;
+        for (auto it = steps.rbegin(); it != steps.rend(); ++it)
+        {
+            auto* element = FoldConstructedValueToConstant(
+                it->Inst->getInsertedValueOperand(), frameArgs, frameMemo, state);
+            if (element == nullptr) return nullptr;
+            folded = llvm::ConstantFoldInsertValueInstruction(folded, element, it->Inst->getIndices());
+            if (folded == nullptr) return nullptr;
+        }
+        return folded;
     }
 
     if (auto* ev = llvm::dyn_cast<llvm::ExtractValueInst>(value))
     {
-        auto* agg = FoldConstructedValueToConstant(ev->getAggregateOperand(), frameArgs, depth + 1);
+        auto* agg = FoldConstructedValueToConstant(ev->getAggregateOperand(), frameArgs, frameMemo, state);
         if (agg == nullptr) return nullptr;
         return llvm::ConstantFoldExtractValueInstruction(agg, ev->getIndices());
     }
 
-    if (auto* call = llvm::dyn_cast<llvm::CallInst>(value))
+    if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
     {
         llvm::Function* callee = call->getCalledFunction();
         if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return nullptr;
         if (callee->size() != 1) return nullptr;
         if (call->arg_size() != callee->arg_size()) return nullptr;
+        if (call->arg_size() == 0)
+        {
+            auto memoIt = state.FoldedFunctions.find(callee);
+            if (memoIt != state.FoldedFunctions.end()) return memoIt->second;
+        }
+        if (!state.ActiveFunctions.insert(callee).second) return nullptr;
+        if (state.ConstructorFrames >= FoldConstructedValueState::MaxConstructorFrames)
+        {
+            state.ActiveFunctions.erase(callee);
+            return nullptr;
+        }
         // Replaying the VALUE is only equivalent to running the call when the call has no other
         // effect: a field initializer `int k = bump();` must run once per element, not once.
-        if (CalleeHasSideEffects(callee, 0)) return nullptr;
+        if (CalleeHasSideEffectsSafe(callee, state.EffectVisiting, state.EffectMemo))
+        {
+            state.ActiveFunctions.erase(callee);
+            return nullptr;
+        }
+        state.ConstructorFrames++;
         auto* ret = llvm::dyn_cast<llvm::ReturnInst>(callee->back().getTerminator());
-        if (ret == nullptr || ret->getReturnValue() == nullptr) return nullptr;
+        if (ret == nullptr || ret->getReturnValue() == nullptr)
+        {
+            state.ConstructorFrames--;
+            state.ActiveFunctions.erase(callee);
+            return nullptr;
+        }
         // Every argument must itself fold, and it folds in the CALLER's frame.
         llvm::DenseMap<const llvm::Value*, llvm::Constant*> calleeArgs;
         unsigned i = 0;
         for (llvm::Argument& formal : callee->args())
         {
-            auto* actual = FoldConstructedValueToConstant(call->getArgOperand(i), frameArgs, depth + 1);
-            if (actual == nullptr) return nullptr;
+            auto* actual = FoldConstructedValueToConstant(call->getArgOperand(i), frameArgs, frameMemo, state);
+            if (actual == nullptr)
+            {
+                state.ConstructorFrames--;
+                state.ActiveFunctions.erase(callee);
+                return nullptr;
+            }
             calleeArgs[&formal] = actual;
             i++;
         }
-        return FoldConstructedValueToConstant(ret->getReturnValue(), calleeArgs, depth + 1);
+        // The callee's body folds in its own frame: fresh args, fresh memo.
+        llvm::DenseMap<const llvm::Value*, llvm::Constant*> calleeMemo;
+        auto* folded = FoldConstructedValueToConstant(ret->getReturnValue(), calleeArgs, calleeMemo, state);
+        state.ConstructorFrames--;
+        state.ActiveFunctions.erase(callee);
+        if (folded != nullptr && call->arg_size() == 0)
+            state.FoldedFunctions[callee] = folded;
+        return folded;
     }
 
     return nullptr;
@@ -1101,7 +1204,16 @@ static llvm::Constant* FoldConstructedValueToConstant(
  * cannot stand as a global initializer, so emit it into a throwaway function (the same guard
  * the `= <expr>` global path uses), fold the result, and discard the IR either way.
  */
-llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(const LLVMBackend::DeclTypeAndValue& typeValue) {
+llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
+    const LLVMBackend::DeclTypeAndValue& typeValue)
+{
+        FoldConstructedValueState foldState;
+        return TryFoldGlobalDefaultConstruction(typeValue, foldState);
+    }
+
+llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(
+    const LLVMBackend::DeclTypeAndValue& typeValue, FoldConstructedValueState& foldState)
+{
         auto* compiler = Compiler();
         if (compiler->GetDataStructure(typeValue.TypeName).StructType == nullptr) return nullptr;
         if (compiler->GetFunction(typeValue.TypeName) == nullptr) return nullptr;
@@ -1121,7 +1233,8 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(const LLVMBackend
             // forceRoot: an exact-key lookup, so a namespace walk cannot pick a sibling's ctor.
             llvm::Value* constructed = compiler->CreateOverloadedFunctionCall(typeValue.TypeName, {}, true);
             llvm::DenseMap<const llvm::Value*, llvm::Constant*> noArgs;
-            folded = FoldConstructedValueToConstant(constructed, noArgs, 0);
+            llvm::DenseMap<const llvm::Value*, llvm::Constant*> rootMemo;
+            folded = FoldConstructedValueToConstant(constructed, noArgs, rootMemo, foldState);
         }
         catch (...)
         {
@@ -1137,6 +1250,26 @@ llvm::Constant* MainListener::TryFoldGlobalDefaultConstruction(const LLVMBackend
         // A fold that produced the wrong shape is not usable as this global's initializer.
         if (folded != nullptr && folded->getType() != compiler->GetType(typeValue)) return nullptr;
         return folded;
+    }
+
+void MainListener::ResolvePendingGlobalDefaultConstructions()
+{
+        auto pending = std::move(pendingGlobalDefaultConstructions_);
+        pendingGlobalDefaultConstructions_.clear();
+        FoldConstructedValueState foldState;
+        for (const auto& item : pending)
+        {
+            if (item.Global == nullptr || item.Global->isDeclaration()) continue;
+            auto* folded = TryFoldGlobalDefaultConstruction(item.TypeValue, foldState);
+            if (folded != nullptr)
+            {
+                item.Global->setInitializer(folded);
+                continue;
+            }
+            LogWarningContext(item.Context, std::format(
+                "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
+                item.TypeValue.TypeName));
+        }
     }
 
 // Replicates one element constant across a fixed-array type, recursing through every inner
@@ -1268,6 +1401,14 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
         // forward scan's raw record with the validated set, so an unknown annotation that errored
         // does not linger as queryable.
         Compiler(ctx)->SetTypeAnnotations(name, ParseAnnotationList(ctx->annotationList()));
+
+        if (nameGid->genericTypeParameters() == nullptr)
+        {
+            for (auto* spec : ctx->baseSpecifier())
+                if (spec->genericTypeParameters() != nullptr)
+                    LogErrorContext(spec,
+                        "generic arguments are not supported on a non-generic interface parent");
+        }
 
         // Collect parent interface names, resolved to the names they are registered under.
         std::vector<std::string> parentNames;
@@ -3148,6 +3289,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 }
 
                 llvm::Value* right = nullptr;
+                bool pendingGlobalDefaultConstruction = false;
                 LLVMBackend::NamedVariable interfaceSourceNV;
                 bool haveInterfaceSourceNV = false;
                 LLVMBackend::NamedVariable initializerSourceNV;
@@ -4031,9 +4173,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         {
                             right = TryFoldGlobalDefaultConstruction(typeAndValue);
                             if (right == nullptr)
-                                LogWarningContext(direct, std::format(
-                                    "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
-                                    typeAndValue.TypeName));
+                            {
+                                // A defined outer constructor can still call a field constructor
+                                // emitted later, so defer every candidate until the module walk ends.
+                                pendingGlobalDefaultConstruction = true;
+                            }
                         }
                         else
                             LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
@@ -4277,7 +4421,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 DescribeArrayShape(typeAndValue), name, name));
                     }
 
-                    compiler->CreateGlobalVariable(typeAndValue, constant, typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
+                    auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
+                        typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
+                    if (pendingGlobalDefaultConstruction && !externDeclOnly)
+                        pendingGlobalDefaultConstructions_.push_back({global, typeAndValue, direct});
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)
                         && typeAndValue.TypeName == "string" && initializer != nullptr
                         && initializer->assignmentExpression() != nullptr)

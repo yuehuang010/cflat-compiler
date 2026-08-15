@@ -31,13 +31,13 @@ the bucket.
 | q15 | Lambdas, closures, funcptr typing | `b3662f8` |
 | q13 | Fixed arrays and aggregate init | this commit |
 | q18 | Platform, C interop, UI | this commit |
+| q16 | Codegen folding and determinism | 2026-08-15 round (all 4 members fixed) |
+| q17 | Concurrency and RAII resources | 2026-08-15: WaitForExit hang fixed; the two design deferrals live on as p3 item files (ruling folded into `p3/thread-cannot-go-raii.md`) |
 
 ## Suggested order
 
-| # | Bucket | Items | Why here |
-|---|--------|-------|----------|
-| q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
-| q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
+No open buckets. Remaining active items under `p1/`-`p3/` are individual plan-level or
+design-deferred files; see each file for its ruling and blockers.
 
 ## Design rulings
 

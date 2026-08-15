@@ -143,6 +143,12 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         BuilderState s{ builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
                         currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName,
                         currentFunctionReturnTV };
+        s.aliasDomain = aliasDomain_;
+        s.aliasScopes = std::move(aliasScopes_);
+        s.viewScopeByOrigin = std::move(viewScopeByOrigin_);
+        aliasDomain_ = nullptr;
+        aliasScopes_.clear();
+        viewScopeByOrigin_.clear();
         // Park the outer function's pending owned temps in the saved state and start the
         // nested emission with empty lists (see the BuilderState field comment).
         s.pendingStringTemps  = std::move(pendingOwnedStringTemps);
@@ -216,6 +222,9 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         currentFunctionReturnIsArrayView = state.returnIsArrayView;
         currentFunctionReturnTypeName = state.returnTypeName;
         currentFunctionReturnTV  = state.returnTV;
+        aliasDomain_             = state.aliasDomain;
+        aliasScopes_             = state.aliasScopes;
+        viewScopeByOrigin_       = state.viewScopeByOrigin;
         pendingOwnedStringTemps  = state.pendingStringTemps;
         pendingOwnedClosureTemps = state.pendingClosureTemps;
         pendingOwnedStructTemps  = state.pendingStructTemps;

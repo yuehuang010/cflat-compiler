@@ -175,7 +175,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         // Save the current IRBuilder insertion point so that emitting a new
         // function definition mid-block does not corrupt the caller's block.
         auto* instCompiler = Compiler(tmplCtx);
-        auto savedState = instCompiler->SaveBuilderState();
+        LLVMBackend::BuilderStateGuard savedState(instCompiler);
         // Isolate the outer function's local-variable stack: if we are
         // instantiating mid-emission of another function, its frames are still
         // on stackNamedVariable, and the generic body's identifier lookup would
@@ -186,7 +186,7 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         instCompiler->stackNamedVariable.clear();
         ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
         instCompiler->stackNamedVariable = std::move(savedStack);
-        instCompiler->RestoreBuilderState(savedState);
+        savedState.restore();
 
         activeTypeSubstitutions = savedSubst;
         activePackSubstitutions = savedPackSubst;

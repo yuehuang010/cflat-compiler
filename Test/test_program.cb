@@ -1172,6 +1172,28 @@ bool testWaitForExitWithToken() {
     return result;
 }
 
+bool testWaitForExitUnstarted() {
+    bool result = true;
+
+    // All WaitForExit spellings agree when the program has not been started.
+    Minimal noArg;
+    noArg.WaitForExit();
+    result &= Test("WaitForExit() unstarted returns", noArg.exitCode, -1);
+
+    stop_source src;
+    src.init();
+    Minimal tokenProg;
+    bool tokenDone = tokenProg.WaitForExit(src.get_token());
+    result &= Test("WaitForExit(token) unstarted", tokenDone, true);
+    src.dispose();
+
+    Minimal timeoutProg;
+    bool timeoutDone = timeoutProg.WaitForExit(50);
+    result &= Test("WaitForExit(ms) unstarted", timeoutDone, true);
+
+    return result;
+}
+
 bool testWaitForExitCancelled() {
     bool result = true;
 
@@ -1628,6 +1650,7 @@ extern int main() {
     total++; passed += testListStringConcatNoLeaks()     ? 1 : 0;
     total++; passed += testListOwnershipNoLeaks()        ? 1 : 0;
     total++; passed += testWaitForExitWithToken()        ? 1 : 0;
+    total++; passed += testWaitForExitUnstarted()        ? 1 : 0;
     total++; passed += testWaitForExitCancelled()        ? 1 : 0;
     total++; passed += testAllocatorNonNullAfterRun()    ? 1 : 0;
     total++; passed += testAllocatorNullBeforeRun()      ? 1 : 0;

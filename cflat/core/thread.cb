@@ -279,6 +279,11 @@ struct Thread {
     // Returns true if the thread exited within timeout_ms; does full cleanup and
     // sets _exitCode. Returns false on timeout; all handles remain intact.
     bool try_join(i32 timeout_ms) {
+        // Match join(): a missing packet means there is nothing to wait for.
+        if (_args == nullptr) {
+            _handle = nullptr;
+            return true;
+        }
         // On finish os.thread_timed_join frees the os handle; on timeout it
         // leaves it intact for a later join. Only null _handle / read the packet
         // on finish so a timeout keeps the thread joinable.

@@ -525,6 +525,47 @@ GSeedClass gSeedClass;
 GSeedNS.GSeedNsType gSeedNs;
 GSeedUserCtor gSeedUserCtor;
 
+// Global default-fold budget and source-order legs. Each global is paired with a local oracle.
+struct GSeedFoldD0 { int v = 100; };
+struct GSeedFoldD1 { GSeedFoldD0 inner; int w = 1; };
+struct GSeedFoldD2 { GSeedFoldD1 inner; int w = 2; };
+struct GSeedFoldD3 { GSeedFoldD2 inner; int w = 3; };
+struct GSeedFoldD4 { GSeedFoldD3 inner; int w = 4; };
+struct GSeedFoldD5 { GSeedFoldD4 inner; int w = 5; };
+struct GSeedFoldD6 { GSeedFoldD5 inner; int w = 6; };
+struct GSeedFoldLeaf { int v = 9; };
+struct GSeedFoldWide
+{
+    GSeedFoldLeaf f0; GSeedFoldLeaf f1; GSeedFoldLeaf f2; GSeedFoldLeaf f3;
+    GSeedFoldLeaf f4; GSeedFoldLeaf f5; GSeedFoldLeaf f6; GSeedFoldLeaf f7;
+    GSeedFoldLeaf f8; GSeedFoldLeaf f9; GSeedFoldLeaf f10; GSeedFoldLeaf f11;
+    GSeedFoldLeaf f12; GSeedFoldLeaf f13; int t = 5;
+};
+struct GSeedFoldOrder<T> { T item = default; int tag = 55; };
+
+GSeedFoldD6 gSeedFoldDeep;
+GSeedFoldWide gSeedFoldWide;
+GSeedFoldForward gSeedFoldForward;
+GSeedFoldOrder<int> gSeedFoldOrder;
+struct GSeedFoldForward { int a = 17; };
+int gSeedFoldWarm() { GSeedFoldOrder<int> warm; return warm.tag; }
+
+bool testGlobalFoldOrderBudget()
+{
+    bool result = true;
+    GSeedFoldD6 localDeep;
+    result &= Test("gseed_fold_deep_global", gSeedFoldDeep.w, localDeep.w);
+    result &= Test("gseed_fold_deep_leaf", gSeedFoldDeep.inner.inner.inner.inner.inner.inner.v, 100);
+    GSeedFoldWide localWide;
+    result &= Test("gseed_fold_wide_global", gSeedFoldWide.f13.v, localWide.f13.v);
+    result &= Test("gseed_fold_wide_tail", gSeedFoldWide.t, localWide.t);
+    GSeedFoldForward localForward;
+    result &= Test("gseed_fold_forward_global", gSeedFoldForward.a, localForward.a);
+    GSeedFoldOrder<int> localOrder;
+    result &= Test("gseed_fold_order_global", gSeedFoldOrder.tag, localOrder.tag);
+    return result;
+}
+
 bool testGlobalDefaultSeeding()
 {
     bool result = true;
@@ -3932,6 +3973,7 @@ extern int main()
     total++; passed += testNoArgCtorFieldSeeding()       ? 1 : 0;
     total++; passed += testNoArgCtorFieldSeedingCasts()  ? 1 : 0;
     total++; passed += testGlobalDefaultSeeding()        ? 1 : 0;
+    total++; passed += testGlobalFoldOrderBudget()       ? 1 : 0;
     total++; passed += testDestructor()                  ? 1 : 0;
     total++; passed += testBuiltinIdentifiers()          ? 1 : 0;
     total++; passed += Test("struct_named_method", testStructNamedMethod(), 7);
@@ -5106,6 +5148,17 @@ bool testAlignas()
     return result;
 }
 
+int nestedShiftU8Named(u8 v) { u8 s = v << 1; return (int)(s >> 4); }
+int nestedShiftU8Inline(u8 v) { return (int)((v << 1) >> 4); }
+int nestedShiftU16Named(u16 v) { u16 s = v << 1; return (int)(s >> 8); }
+int nestedShiftU16Inline(u16 v) { return (int)((v << 1) >> 8); }
+int nestedShiftU32Named(u32 v) { u32 s = v << 1; return (int)(s >> 24); }
+int nestedShiftU32Inline(u32 v) { return (int)((v << 1) >> 24); }
+int nestedShiftU64Named(u64 v) { u64 s = v << 32; return (int)(s >> 48); }
+int nestedShiftU64Inline(u64 v) { return (int)((v << 32) >> 48); }
+int nestedShiftI64Named(i64 v) { i64 s = v << 32; return (int)(s >> 48); }
+int nestedShiftI64Inline(i64 v) { return (int)((v << 32) >> 48); }
+
 // =============================================================
 // Compile-time constant folding (C integer promotion)
 // =============================================================
@@ -5139,6 +5192,28 @@ bool testConstFold()
     int a = 4;
     int k = 1024;
     result &= Test("fold==runtime mul", 4 * 1024 * 1024, a * k * k);
+
+    // A nested shift keeps the signedness of its left operand. The folded legs exercise the
+    // constant folder; the parameter legs force runtime codegen and compare named/inline forms.
+    result &= Test("u8 folded nested right shift", (int)(((u8)0x80 << 24) >> 31), 1);
+    result &= Test("u16 folded nested right shift", (int)(((u16)0x8000 << 16) >> 31), 1);
+    result &= Test("u32 folded nested right shift", (int)(((u32)0x40000000 << 1) >> 31), 1);
+    result &= Test("u64 folded nested right shift", (int)(((u64)0xFF880000 << 32) >> 48), 65416);
+    u64 foldedU64 = (u64)0xFF880000;
+    result &= Test("u64 folded named right shift", (int)((foldedU64 << 32) >> 48), 65416);
+    result &= Test("u64 folded inline right shift", (int)(((u64)0xFF880000 << 32) >> 48), 65416);
+    result &= Test("i64 folded nested right shift", (int)(((i64)0xFF880000 << 32) >> 48), -120);
+
+    result &= Test("u8 runtime named nested right shift", nestedShiftU8Named((u8)0xF8), 15);
+    result &= Test("u8 runtime inline nested right shift", nestedShiftU8Inline((u8)0xF8), 15);
+    result &= Test("u16 runtime named nested right shift", nestedShiftU16Named((u16)0xFF80), 255);
+    result &= Test("u16 runtime inline nested right shift", nestedShiftU16Inline((u16)0xFF80), 255);
+    result &= Test("u32 runtime named nested right shift", nestedShiftU32Named((u32)0xFF800000), 255);
+    result &= Test("u32 runtime inline nested right shift", nestedShiftU32Inline((u32)0xFF800000), 255);
+    result &= Test("u64 runtime named nested right shift", nestedShiftU64Named((u64)0xFF880000), 65416);
+    result &= Test("u64 runtime inline nested right shift", nestedShiftU64Inline((u64)0xFF880000), 65416);
+    result &= Test("i64 runtime named nested right shift", nestedShiftI64Named((i64)0xFF880000), -120);
+    result &= Test("i64 runtime inline nested right shift", nestedShiftI64Inline((i64)0xFF880000), -120);
 
     return result;
 }

@@ -5700,7 +5700,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         }
 
         // Save builder position - invoker emits into a separate LLVM function.
-        auto savedState = compiler->SaveBuilderState();
+        LLVMBackend::BuilderStateGuard savedState(compiler);
 
         // Invoker signature: (user_params..., i8* __env) -> RetType. Env is the trailing
         // param (the closure ABI is env-last) so a non-capturing lambda's invoker is directly
@@ -5951,7 +5951,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         compiler->RunDeferredEndOfBodyChecks(fn);
         deferredCheckGuard.Completed = true;
 
-        compiler->RestoreBuilderState(savedState);
+        savedState.restore();
 
         // Build user-visible function-pointer TypeAndValue (no __env param).
         LLVMBackend::TypeAndValue tv;
@@ -6115,9 +6115,8 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         // CreateFunctionDefinition and moves the builder into the new constructor.
         // Save and restore so we continue emitting into the caller's function body.
         {
-            auto savedState = compiler->SaveBuilderState();
+            LLVMBackend::BuilderStateGuard savedState(compiler);
             ProcessPendingInstantiations();
-            compiler->RestoreBuilderState(savedState);
         }
 
         // Allocate the tuple struct and store each element into item_i field

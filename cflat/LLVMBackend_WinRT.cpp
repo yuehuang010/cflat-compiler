@@ -2792,8 +2792,9 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
             return nullptr;
         }
 
-        // Save builder state (includes currentFunction, currentSubprogram)
-        auto savedState = compiler->SaveBuilderState();
+        // Save builder state (includes currentFunction, currentSubprogram); the guard restores
+        // on every exit, including a thrown LogError.
+        BuilderStateGuard savedState(compiler);
 
         // Build parameter types
         TypeAndValue objParam;
@@ -2817,7 +2818,6 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         if (!fn)
         {
             LogErrorMessage("reflect: failed to create function for '{}'", { structName });
-            compiler->RestoreBuilderState(savedState);
             return nullptr;
         }
         fn->setLinkage(llvm::Function::InternalLinkage);
@@ -2838,7 +2838,6 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         if (!visitorAlloca)
         {
             LogErrorMessage("reflect: failed to retrieve visitor alloca");
-            compiler->RestoreBuilderState(savedState);
             return fn;
         }
 
@@ -3056,9 +3055,6 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         // Pop stack frame
         if (!compiler->stackNamedVariable.empty())
             compiler->stackNamedVariable.pop_back();
-
-        // Restore builder state
-        compiler->RestoreBuilderState(savedState);
 
         return fn;
     }

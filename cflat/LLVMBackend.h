@@ -2519,6 +2519,7 @@ private:
     // --heap-audit: when set, force-import diagnostic/heap_audit.cb and instrument main
     // with HeapAudit.enable()/reportLeaks() (see InjectHeapAuditIntoMain). Report-only.
     bool heapAudit_ = false;
+    std::string heapAuditCanonicalPath_;
 
     // --run: jitExitCode_ carries the program's exit status (Compile returns compile success only).
     // runArgs_ are forwarded as argv[1..] to main(int argc, char** argv); empty for main().
@@ -4151,6 +4152,10 @@ public:
         // Leaving it unsaved let a nested emission's function<>/Lambda<> return type steer the
         // ENCLOSING function's `return` through CoerceToFuncPtrReturn.
         TypeAndValue returnTV;
+        // The enclosing function's array-view alias registry. Nested emission starts empty.
+        llvm::MDNode* aliasDomain = nullptr;
+        std::vector<llvm::MDNode*> aliasScopes;
+        std::map<std::string, int> viewScopeByOrigin;
         // The enclosing function's not-yet-flushed owned temps. A nested function emitted
         // mid-body (lambda invoker, global init, program shim) runs its OWN end-of-expression
         // flushes; those must not see - and drop - the outer function's temps, which are
@@ -4735,6 +4740,24 @@ public:
         ~FullBuilderStateScope() { backend_->RestoreBuilderState(state_); }
         FullBuilderStateScope(const FullBuilderStateScope&) = delete;
         FullBuilderStateScope& operator=(const FullBuilderStateScope&) = delete;
+    };
+
+    // FullBuilderStateScope variant for sites that restore MID-SCOPE and keep emitting into the
+    // outer function afterwards: restore() re-arms the outer state at the exact point the old
+    // raw pair did, and the destructor covers the throw path (SaveBuilderState moves the alias
+    // registry and owned-temp ledgers OUT, so a skipped restore empties them for the resumed
+    // outer function - see the expect_error/LSP resume hazard on RestoreBuilderState).
+    struct BuilderStateGuard
+    {
+        LLVMBackend* backend_;
+        BuilderState state_;
+        bool restored_ = false;
+        explicit BuilderStateGuard(LLVMBackend* backend)
+            : backend_(backend), state_(backend->SaveBuilderState()) {}
+        void restore() { backend_->RestoreBuilderState(state_); restored_ = true; }
+        ~BuilderStateGuard() { if (!restored_) backend_->RestoreBuilderState(state_); }
+        BuilderStateGuard(const BuilderStateGuard&) = delete;
+        BuilderStateGuard& operator=(const BuilderStateGuard&) = delete;
     };
 
     // RAII park of the member builder state around the finalization pass. GetOrCreateVTable can
