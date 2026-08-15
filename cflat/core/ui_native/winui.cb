@@ -1086,6 +1086,12 @@ class WinUI3Host : INativeHost
     list<u32>    accBg = default;
     list<u32>    accFg = default;
 
+    // TextBlock foreground brushes are cached per control so a reconcile does not allocate
+    // another XAML brush on every pump when a Text keeps the same caption color.
+    list<u64>    textH = default;
+    list<int>    textColor = default;
+    list<u64>    textBrush = default;
+
     // Image bookkeeping: parallel control handle -> hasBitmap + last pixel buffer uploaded.
     list<u64>    imgH    = default;
     list<bool>   imgHas  = default;
@@ -1115,6 +1121,53 @@ class WinUI3Host : INativeHost
         int i = 0;
         while (i < xs.count()) { if (xs.get(i) == h) return i; i++; }
         return -1;
+    }
+
+    void _syncTextFont(u64 h, IText t)
+    {
+        void* tb = wqi((void*)h, iidof(XamlTextBlock));
+        if (tb == nullptr) return;
+        double size = 14.0;
+        u32 weight = 400u;
+        int ink = this.appTheme().textColor;
+        if (t.font == 2) { size = 18.2; weight = 700u; }
+        else if (t.font == 3)
+        {
+            size = 12.0;
+            ink = ink != 0 ? shade(ink, 96) : rgb(120, 120, 120);
+        }
+        if (t.color != 0) ink = t.color;
+        ((XamlTextBlock*)tb)->lpVtbl->put_FontSize(tb, size);
+        ((XamlTextBlock*)tb)->lpVtbl->put_FontWeight(tb, weight);
+
+        int i = this._slot(&this.textH, h);
+        if (ink == 0)
+        {
+            ((XamlTextBlock*)tb)->lpVtbl->put_Foreground(tb, nullptr);
+            if (i >= 0) { this.textColor.set(i, 0); this.textBrush.set(i, 0u); }
+            return;
+        }
+        if (i < 0)
+        {
+            void* br = winuiSolidBrush(ink);
+            this.textH.add(h); this.textColor.add(ink); this.textBrush.add((u64)br);
+            if (br != nullptr) ((XamlTextBlock*)tb)->lpVtbl->put_Foreground(tb, br);
+            return;
+        }
+        if (this.textColor.get(i) != ink || this.textBrush.get(i) == 0u)
+        {
+            void* br = winuiSolidBrush(ink);
+            this.textColor.set(i, ink); this.textBrush.set(i, (u64)br);
+        }
+        u64 brush = this.textBrush.get(i);
+        ((XamlTextBlock*)tb)->lpVtbl->put_Foreground(tb, (void*)brush);
+    }
+
+    void _forgetTextFont(u64 h)
+    {
+        int i = this._slot(&this.textH, h);
+        if (i < 0) return;
+        this.textH.removeAt(i); this.textColor.removeAt(i); this.textBrush.removeAt(i);
     }
 
     // -- ListView: the bound item source --------------------------------------
@@ -1757,6 +1810,7 @@ class WinUI3Host : INativeHost
             this._canvasFreeSurface(ci);
         }
         this._forgetAccent(h);
+        this._forgetTextFont(h);
         int fi = this._slot(&this.cfH, h);
         if (fi >= 0) { this.cfH.removeAt(fi); this.cfMenu.removeAt(fi); }
         // Remove from whichever Canvas holds it, so it leaves the visual tree (refcounted).
@@ -2253,7 +2307,12 @@ class WinUI3Host : INativeHost
             int afg = pickColor(b.color, this.appTheme().buttonText);
             this.setAccent(h, afg, abg);
         }
-        else if (k == ELEM_TEXT)      { IText t = node as IText; this.setText(h, t.text.data()); }
+        else if (k == ELEM_TEXT)
+        {
+            IText t = node as IText;
+            this.setText(h, t.text.data());
+            this._syncTextFont(h, t);
+        }
         else if (k == ELEM_TEXTINPUT)
         {
             ITextInput ti = node as ITextInput;
@@ -2697,8 +2756,7 @@ void _winuiCanvasWheel(string key, void* args)
     if (ctrl && horizontal == 0)
     {
         if (!cv.hasPinch) return;
-        double scale = 1.0 + lines * 0.25;   // per-event zoom factor around 1.0
-        if (scale <= 0.0) return;
+        double scale = pow(1.25, lines);   // per-event zoom factor around 1.0
         cv.onPinch(x, y, scale);
         pumpWinui();
         return;

@@ -2836,3 +2836,16 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   BOTH), and the shared diagnostic then named `p` "a borrowed by-value parameter", which it is not.
   A laundered path needs its own wording: the parameter that owns the storage is not nameable at
   that site, so the message must not invent a `move p` remedy.
+
+- **q18 - Windows UI font variants, GDI canvas input, and dark trackbars (2026-08-15).**
+  (1) The OS input-routing layer stays manually verified; do not add a test file. Re-verify XAML
+  with `SendInput`/`mouse_event` against a foreground window, and Win32 with real messages plus
+  HUD readback. The GDI canvas host now also routes real OS input; this is a new settled ruling.
+  (2) Touch-screen pinch remains deferred: there is no touch hardware, so ctrl-wheel is the only
+  verified pinch path. (3) Canvas re-rasterizes every reconcile by design; a dirty/revision flag
+  was deliberately rejected as a public API change. (4) WinUI DPI/rendered-pixel oracle remains
+  blocked on WinRT delegate projection because `RenderTargetBitmap` is asynchronous; PrintWindow
+  cannot capture WinUI DirectComposition content. (5) Win32 font variants need per-window GDI
+  ownership and per-control caption ink; a single themeText predicate is insufficient after a
+  re-sync or theme flip. Trackbar channel/ticks use dark NM_CUSTOMDRAW parts while the thumb
+  stays default-themed.

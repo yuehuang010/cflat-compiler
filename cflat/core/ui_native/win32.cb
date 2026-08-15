@@ -313,6 +313,9 @@ const int CDRF_SKIPDEFAULT   = 0x00000004;
 const int CDIS_SELECTED      = 0x00000001;
 const int CDIS_FOCUS         = 0x00000010;
 const int CDIS_HOT           = 0x00000040;
+const int TBCD_TICS          = 0x00000001;
+const int TBCD_THUMB         = 0x00000002;
+const int TBCD_CHANNEL       = 0x00000003;
 
 // GDI + shell APIs used by the image DIB upload, the canvas child, and screenshots that
 // the windows.h binding may not surface; declared by hand to match the Win32 signatures.
@@ -528,6 +531,8 @@ class Window : INativeHost
     // spans the whole client height, status band included, and hangs a classic size box off it.
     void* vscroll = nullptr;
     void* font    = nullptr;
+    void* fontTitle = nullptr;
+    void* fontCaption = nullptr;
     void* tooltip = nullptr;         // lazily-created tooltips_class32 for this window
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
     u32   dpi     = 96u;             // window dpi (96 = 100%); drives DIP->px
@@ -547,6 +552,12 @@ class Window : INativeHost
     void* bgBrush   = nullptr;       // cached solid brush of themeBg
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
+    // Text-only font/ink overrides. The font handles are cached per window; these parallel
+    // arrays let WM_CTLCOLORSTATIC apply FONT_CAPTION or an explicit Text.color per control.
+    list<u64>    textHandles = default;
+    list<int>    textFonts = default;
+    list<int>    textColors = default;
+    list<u32>    textInks = default;
     // ListView rowText callback boxes: parallel HWND -> ListRowBox* (as u64). The
     // host owns these; freed on destroyControl and dispose. A Lambda cannot cross the
     // seam, so the callback rides as an opaque u64 (see setListOp / __uiListRowText).
@@ -766,6 +777,7 @@ class Window : INativeHost
         this._freeTreeBox(h);   // no-op unless h is a TreeView with a boxed node source
         this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
         this._freeCanvasBox(h); // no-op unless h is a CanvasView with a boxed painter
+        this._forgetText(h);
         this._forgetAccent(h);
         this._freeBackdrop(h);  // no-op unless h is a container backdrop
         this._freeStatusBar(h); // no-op unless h is a status bar with cached pane text
@@ -789,6 +801,104 @@ class Window : INativeHost
         GetWindowTextA(u2h(h), cur, 512);
         if (strcmp(cur, (char*)s) == 0) return;
         SetWindowTextA(u2h(h), (char*)s);
+    }
+
+    void* fontFor(int fontId)
+    {
+        if (fontId == 2)
+        {
+            if (this.fontTitle == nullptr)
+            {
+                int px = -(19 * (int)this.dpi / 96);
+                this.fontTitle = CreateFontA(px, 0, 0, 0, FW_BOLD, 0u, 0u, 0u,
+                    (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                    (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                    (u32)(VARIABLE_PITCH | FF_SWISS), "Segoe UI Variable Text");
+            }
+            return this.fontTitle;
+        }
+        if (fontId == 3)
+        {
+            if (this.fontCaption == nullptr)
+            {
+                int px = -(13 * (int)this.dpi / 96);
+                this.fontCaption = CreateFontA(px, 0, 0, 0, FW_NORMAL, 0u, 0u, 0u,
+                    (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                    (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                    (u32)(VARIABLE_PITCH | FF_SWISS), "Segoe UI Variable Text");
+            }
+            return this.fontCaption;
+        }
+        return this.font;
+    }
+
+    u32 captionInk() { return shadeRef(this.themeText, this.dark ? (0 - 70) : 96); }
+
+    void _setTextAppearance(u64 h, IText t)
+    {
+        void* f = this.fontFor(t.font);
+        u32 ink = t.color != 0 ? this.colorRef(t.color)
+            : (t.font == 3 ? this.captionInk() : this.themeText);
+        int i = 0;
+        while (i < this.textHandles.count())
+        {
+            if (this.textHandles.get(i) == h)
+            {
+                if (this.textFonts.get(i) == t.font && this.textColors.get(i) == t.color
+                    && this.textInks.get(i) == ink) return;
+                if (f != nullptr) SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)f, (i64)1);
+                this.textFonts.set(i, t.font);
+                this.textColors.set(i, t.color);
+                this.textInks.set(i, ink);
+                InvalidateRect(u2h(h), nullptr, 1);
+                return;
+            }
+            i++;
+        }
+        if (f != nullptr) SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)f, (i64)1);
+        this.textHandles.add(h);
+        this.textFonts.add(t.font);
+        this.textColors.add(t.color);
+        this.textInks.add(ink);
+    }
+
+    u32 textInk(u64 h)
+    {
+        int i = 0;
+        while (i < this.textHandles.count())
+        {
+            if (this.textHandles.get(i) == h) return this.textInks.get(i);
+            i++;
+        }
+        return this.themeText;
+    }
+
+    void _forgetText(u64 h)
+    {
+        int i = 0;
+        while (i < this.textHandles.count())
+        {
+            if (this.textHandles.get(i) == h)
+            {
+                this.textHandles.removeAt(i); this.textFonts.removeAt(i);
+                this.textColors.removeAt(i); this.textInks.removeAt(i);
+                return;
+            }
+            i++;
+        }
+    }
+
+    void _refreshTextInks()
+    {
+        int i = 0;
+        while (i < this.textHandles.count())
+        {
+            int c = this.textColors.get(i);
+            int f = this.textFonts.get(i);
+            this.textInks.set(i, c != 0 ? this.colorRef(c) : (f == 3 ? this.captionInk() : this.themeText));
+            InvalidateRect(u2h(this.textHandles.get(i)), nullptr, 1);
+            i++;
+        }
     }
 
     void setBoolProp(u64 h, int prop, bool v)
@@ -1488,7 +1598,8 @@ class Window : INativeHost
         Size sz = default;
         void* dc = GetDC(this.hwnd);
         void* oldF = nullptr;
-        if (this.font != nullptr) oldF = SelectObject(dc, this.font);
+        void* f = this.fontFor(fontId);
+        if (f != nullptr) oldF = SelectObject(dc, f);
         SIZE px = default;
         GetTextExtentPoint32A(dc, (char*)s, strlen((char*)s), &px);
         if (oldF != nullptr) SelectObject(dc, oldF);
@@ -2200,6 +2311,7 @@ class Window : INativeHost
         {
             IText t = node as IText;
             this.setText(h, t.text.data());
+            this._setTextAppearance(h, t);
         }
         else if (k == ELEM_TEXTINPUT)
         {
@@ -2420,6 +2532,7 @@ class Window : INativeHost
         }
         if (changed)
         {
+            this._refreshTextInks();
             this._applyStatusTheme();
             RedrawWindow(this.hwnd, nullptr, nullptr,
                          (u32)(RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN));
@@ -2441,6 +2554,8 @@ class Window : INativeHost
         if (this.vscroll != nullptr) { DestroyWindow(this.vscroll); this.vscroll = nullptr; }
         if (this.bgBrush != nullptr) { DeleteObject(this.bgBrush); this.bgBrush = nullptr; }
         if (this.font != nullptr) { DeleteObject(this.font); this.font = nullptr; }
+        if (this.fontTitle != nullptr) { DeleteObject(this.fontTitle); this.fontTitle = nullptr; }
+        if (this.fontCaption != nullptr) { DeleteObject(this.fontCaption); this.fontCaption = nullptr; }
         // Free any ListView rowText boxes still live (DestroyWindow destroys the child
         // controls without routing through destroyControl, so free them here).
         int bi = 0;
@@ -2494,6 +2609,10 @@ class Window : INativeHost
         }
         this.canvasHandles.clear();
         this.canvasBoxes.clear();
+        this.textHandles.clear();
+        this.textFonts.clear();
+        this.textColors.clear();
+        this.textInks.clear();
         this.accentHandles.clear();
         this.accentBg.clear();
         this.accentFg.clear();
@@ -2881,8 +3000,7 @@ bool _dispatchCanvasWheel(void* hwnd, int px, int py, double lines, bool horizon
     {
         if (!cv.hasPinch) return false;
         // Per-event zoom factor around 1.0, the shape magnifyWithEvent: reports.
-        double scale = 1.0 + lines * 0.25;
-        if (scale <= 0.0) return false;
+        double scale = pow(1.25, lines);
         cv.onPinch(x, y, scale);
         pumpNative();
         return true;
@@ -4203,6 +4321,38 @@ bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
     return true;
 }
 
+// Dark trackbar custom draw: the themed thumb remains native, while the theme has no dark
+// channel/tick parts. dwItemSpec is the TBCD_* part id at offset 56 in NMCUSTOMDRAW.
+bool tryCustomDrawTrackbar(Window* wnd, i64 lParam, i64* result)
+{
+    if (!wnd.ctlDark) return false;
+    char* p = (char*)u2h((u64)lParam);
+    u32* stagePtr = (u32*)(p + 24);
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    char[32] cn;
+    GetClassNameA(nh.hwndFrom, cn, 32);
+    if (strcmp(cn, "msctls_trackbar32") != 0) return false;
+    if (stagePtr[0] == (u32)CDDS_PREPAINT)
+    {
+        result[0] = (i64)CDRF_NOTIFYITEMDRAW;
+        return true;
+    }
+    if (stagePtr[0] != (u32)CDDS_ITEMPREPAINT) return false;
+    i64* itemPtr = (i64*)(p + 56);
+    if (itemPtr[0] != (i64)TBCD_CHANNEL && itemPtr[0] != (i64)TBCD_TICS)
+    {
+        result[0] = (i64)CDRF_DODEFAULT;
+        return true;
+    }
+    void** hdcPtr = (void**)(p + 32);
+    i32* rcPtr = (i32*)(p + 40);
+    RECT rc = default;
+    rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+    FillRect(hdcPtr[0], &rc, wnd._brushFor(wnd.themeTrack));
+    result[0] = (i64)CDRF_SKIPDEFAULT;
+    return true;
+}
+
 // Headless verification of the accent-button DRAW. NM_CUSTOMDRAW cannot be captured
 // by PrintWindow (it re-renders controls default), so this drives the custom-draw path into
 // a memory DC with a synthetic NMCUSTOMDRAW and returns the filled pixel as a COLORREF. The
@@ -4599,6 +4749,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         {
             i64 cdr = (i64)CDRF_DODEFAULT;
             if (tryCustomDrawButton(wnd, lParam, &cdr)) return cdr;
+            if (tryCustomDrawTrackbar(wnd, lParam, &cdr)) return cdr;
         }
         if (wnd.ready && routeNotify(lParam)) return (i64)0;
         return DefWindowProcA(hwnd, msg, wParam, lParam);
@@ -4666,12 +4817,27 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         if (nd < 96u) nd = 96u;
         wnd.dpi = nd;
         if (wnd.font != nullptr) DeleteObject(wnd.font);
+        if (wnd.fontTitle != nullptr) DeleteObject(wnd.fontTitle);
+        if (wnd.fontCaption != nullptr) DeleteObject(wnd.fontCaption);
         wnd.font = createUiFontDpi(nd);
+        wnd.fontTitle = nullptr;
+        wnd.fontCaption = nullptr;
         int i = 0;
         while (i < wnd.liveHandles.count())
         {
-            SendMessageA(u2h(wnd.liveHandles.get(i)), (u32)WM_SETFONT,
-                         (u64)wnd.font, (i64)1);
+            u64 h = wnd.liveHandles.get(i);
+            SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)wnd.font, (i64)1);
+            int ti = 0;
+            while (ti < wnd.textHandles.count())
+            {
+                if (wnd.textHandles.get(ti) == h)
+                {
+                    void* tf = wnd.fontFor(wnd.textFonts.get(ti));
+                    if (tf != nullptr) SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)tf, (i64)1);
+                    break;
+                }
+                ti++;
+            }
             i++;
         }
         RECT* pr = (RECT*)u2h((u64)lParam);
@@ -4693,7 +4859,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             if (bdBrush != nullptr)
             {
                 void* bdc = u2h(wParam);
-                SetTextColor(bdc, wnd.themeText);
+                SetTextColor(bdc, wnd.textInk((u64)lParam));
                 SetBkColor(bdc, bdBg);
                 return (i64)(u64)bdBrush;
             }
@@ -4702,7 +4868,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         if (brush != nullptr)
         {
             void* hdc = u2h(wParam);
-            SetTextColor(hdc, wnd.themeText);
+            SetTextColor(hdc, wnd.textInk((u64)lParam));
             SetBkColor(hdc, wnd.themeBg);
             return (i64)(u64)brush;
         }

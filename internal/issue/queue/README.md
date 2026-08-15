@@ -30,6 +30,7 @@ the bucket.
 | q14 | Parser and expression grammar | `e542618` |
 | q15 | Lambdas, closures, funcptr typing | `b3662f8` |
 | q13 | Fixed arrays and aggregate init | this commit |
+| q18 | Platform, C interop, UI | this commit |
 
 ## Suggested order
 
@@ -37,7 +38,6 @@ the bucket.
 |---|--------|-------|----------|
 | q16 | [Codegen folding and determinism](q16-codegen-folding-and-determinism.md) | 4 | |
 | q17 | [Concurrency and RAII resources](q17-concurrency-and-raii-resources.md) | 3 | Two are design decisions, not bugs |
-| q18 | [Platform, C interop, UI](q18-platform-c-interop-and-ui.md) | 8 | Disjoint; parallelizable |
 
 ## Design rulings
 

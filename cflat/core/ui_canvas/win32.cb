@@ -62,6 +62,12 @@ IComponent _gApp   = default;
 IElement   _gTree  = default;
 UiContext _gCtx   = default;
 bool      _gReady = false;
+string    _gCanvasCaptureKey = default;
+double    _gCanvasLastX = 0.0;
+double    _gCanvasLastY = 0.0;
+// The live window, so the canvas dispatch helpers (and the test seams, which have no hwnd in
+// scope) repaint THIS window. InvalidateRect(NULL) would redraw every window on the desktop.
+void*     _gCanvasHwnd = nullptr;
 
 // Drain the dirty/repaint flags after an input event: re-render + reconcile when
 // state changed, and repaint when the diff produced patches OR a node requested a
@@ -81,7 +87,9 @@ void pumpAfterInput(void* hwnd)
     if (needPaint)
     {
         layoutRoot(_gTree, 0, 0, _gTermW);
-        InvalidateRect(hwnd, nullptr, 1);
+        // A headless seam drive has no window; InvalidateRect(NULL) would invalidate the
+        // whole desktop, so skip the repaint instead.
+        if (hwnd != nullptr) InvalidateRect(hwnd, nullptr, 1);
     }
 }
 
@@ -232,10 +240,154 @@ void rebuildTree()
     _gReady = true;
 }
 
+IElement _gFindByKey(IElement node, string path, string want)
+{
+    if (node == nullptr) return nullptr;
+    if (path == want) return node;
+    list<IElement>* kids = node.childList();
+    if (kids == nullptr) return nullptr;
+    int i = 0;
+    while (i < kids.count())
+    {
+        IElement c = kids.get(i);
+        IElement found = _gFindByKey(c, joinKeyPath(path, keySegment(c, i)), want);
+        if (found != nullptr) return found;
+        i++;
+    }
+    return nullptr;
+}
+
+// Find the top-most CanvasView at a cell coordinate. ScrollView is the only container whose
+// children may lie outside its visible bounds; prune it so an off-screen canvas cannot win.
+string _gCanvasScan(IElement node, string path, int cx, int cy)
+{
+    if (node.kind() == ELEM_SCROLL && !node.nodeBounds().contains(cx, cy)) return "";
+    if (node.kind() == ELEM_CANVAS && node.nodeBounds().contains(cx, cy)) return "" + path;
+    list<IElement>* kids = node.childList();
+    if (kids == nullptr) return "";
+    int i = kids.count() - 1;
+    while (i >= 0)
+    {
+        IElement c = kids.get(i);
+        string found = _gCanvasScan(c, joinKeyPath(path, keySegment(c, i)), cx, cy);
+        if (found.length() > 0) return found;
+        i--;
+    }
+    return "";
+}
+
+ICanvasView _gCanvasForKey(string key)
+{
+    if (!_gReady || key.length() == 0) return nullptr;
+    IElement e = _gFindByKey(_gTree, keySegment(_gTree, 0), key);
+    if (e == nullptr) return nullptr;
+    return e as ICanvasView;
+}
+
+int _gCanvasButtons(u64 wParam)
+{
+    int b = 0;
+    if ((wParam & (u64)MK_LBUTTON) != 0u) b = b | 1;
+    if ((wParam & (u64)MK_RBUTTON) != 0u) b = b | 2;
+    return b;
+}
+
+// The GDI canvas host has no dpi/points scale: drawImage receives device pixels 1:1, and
+// drawText/drawRect expand layout cells by CELL_W/CELL_H. Handler coordinates use those same
+// device pixels relative to the CanvasView's top-left, y down.
+bool _gDispatchCanvasPointer(string key, int phase, int px, int py, int buttons)
+{
+    ICanvasView cv = _gCanvasForKey(key);
+    if (cv == nullptr) return false;
+    Rect b = cv.nodeBounds();
+    double x = (double)(px - b.x * CELL_W);
+    double y = (double)(py - b.y * CELL_H);
+    // Remember the CLIENT point, not the canvas-relative one: _gCanvasCaptureLost feeds it
+    // back through this same helper, which subtracts the canvas origin again.
+    _gCanvasLastX = (double)px; _gCanvasLastY = (double)py;
+    if (phase == 0)
+    {
+        if (!cv.hasPointerDown) return false;
+        cv.onPointerDown(x, y, buttons);
+    }
+    else if (phase == 1)
+    {
+        if (!cv.hasPointerMove) return false;
+        cv.onPointerMove(x, y, buttons);
+    }
+    else
+    {
+        if (!cv.hasPointerUp) return false;
+        cv.onPointerUp(x, y, buttons);
+    }
+    pumpAfterInput(_gCanvasHwnd);
+    return true;
+}
+
+bool _gDispatchCanvasWheel(string key, int px, int py, double lines, bool horizontal, bool ctrl)
+{
+    ICanvasView cv = _gCanvasForKey(key);
+    if (cv == nullptr) return false;
+    Rect b = cv.nodeBounds();
+    double x = (double)(px - b.x * CELL_W);
+    double y = (double)(py - b.y * CELL_H);
+    if (ctrl && !horizontal)
+    {
+        if (!cv.hasPinch) return false;
+        double scale = pow(1.25, lines);
+        cv.onPinch(x, y, scale);
+    }
+    else
+    {
+        if (!cv.hasWheel) return false;
+        double dx = horizontal ? lines : 0.0;
+        double dy = horizontal ? 0.0 : lines;
+        cv.onWheel(x, y, dx, dy, false);
+    }
+    pumpAfterInput(_gCanvasHwnd);
+    return true;
+}
+
+void nativeCanvasPointer(string keyPath, int phase, double x, double y)
+{
+    ICanvasView cv = _gCanvasForKey(keyPath);
+    if (cv == nullptr) return;
+    int buttons = phase == 2 ? 0 : 1;
+    if (phase == 0) { if (cv.hasPointerDown) cv.onPointerDown(x, y, buttons); }
+    else if (phase == 1) { if (cv.hasPointerMove) cv.onPointerMove(x, y, buttons); }
+    else { if (cv.hasPointerUp) cv.onPointerUp(x, y, buttons); }
+    pumpAfterInput(_gCanvasHwnd);
+}
+
+void nativeCanvasWheel(string keyPath, double x, double y, double dx, double dy)
+{
+    ICanvasView cv = _gCanvasForKey(keyPath);
+    if (cv == nullptr || !cv.hasWheel) return;
+    cv.onWheel(x, y, dx, dy, true);
+    pumpAfterInput(_gCanvasHwnd);
+}
+
+void nativeCanvasPinch(string keyPath, double x, double y, double scale)
+{
+    ICanvasView cv = _gCanvasForKey(keyPath);
+    if (cv == nullptr || !cv.hasPinch) return;
+    cv.onPinch(x, y, scale);
+    pumpAfterInput(_gCanvasHwnd);
+}
+
+void _gCanvasCaptureLost()
+{
+    string key = "" + _gCanvasCaptureKey;
+    _gCanvasCaptureKey = "";
+    if (key.length() > 0)
+        _gDispatchCanvasPointer(key, 2, (int)_gCanvasLastX, (int)_gCanvasLastY, 0);
+}
+
 // LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM). stdcall keeps the ABI
 // correct on 32-bit (no-op on x64).
 stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
+    _gCanvasHwnd = hwnd;
     if (msg == WM_SIZE)
     {
         // LOWORD/HIWORD of lParam are the new client width/height in pixels.
@@ -293,46 +445,91 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         return (i64)0;
     }
 
-    if (msg == WM_LBUTTONDOWN)
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN)
     {
-        int px = (int)(lParam & (i64)0xFFFF);
-        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        int px = (int)((lParam << 48) >> 48);
+        int py = (int)((lParam << 32) >> 48);
         if (_gReady)
         {
-            // Dispatch the click; the handler mutates state and calls invalidate().
-            // pumpAfterInput then drains the dirty flag and repaints on a change.
-            _gTree.dispatch(mouseDown(px / CELL_W, py / CELL_H), &_gCtx);
-            pumpAfterInput(hwnd);
+            string key = _gCanvasScan(_gTree, keySegment(_gTree, 0), px / CELL_W, py / CELL_H);
+            bool consumed = _gDispatchCanvasPointer(key, 0, px, py, _gCanvasButtons(wParam));
+            if (consumed) { _gCanvasCaptureKey = "" + key; SetCapture(hwnd); }
+            else if (msg == WM_LBUTTONDOWN)
+            {
+                _gTree.dispatch(mouseDown(px / CELL_W, py / CELL_H), &_gCtx);
+                pumpAfterInput(hwnd);
+            }
         }
         return (i64)0;
     }
 
     if (msg == WM_MOUSEMOVE)
     {
-        int px = (int)(lParam & (i64)0xFFFF);
-        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        int px = (int)((lParam << 48) >> 48);
+        int py = (int)((lParam << 32) >> 48);
         if (_gReady)
         {
-            // Hover is pure paint state: a move that hits no interactive node
-            // clears hover. setHover repaints only when the identity changes.
-            if (!_gTree.dispatch(mouseMove(px / CELL_W, py / CELL_H), &_gCtx))
-                _gCtx.setHover("");
-            pumpAfterInput(hwnd);
+            bool consumed = false;
+            if (_gCanvasCaptureKey.length() > 0)
+                consumed = _gDispatchCanvasPointer(_gCanvasCaptureKey, 1, px, py, _gCanvasButtons(wParam));
+            else
+            {
+                string key = _gCanvasScan(_gTree, keySegment(_gTree, 0), px / CELL_W, py / CELL_H);
+                consumed = _gDispatchCanvasPointer(key, 1, px, py, _gCanvasButtons(wParam));
+            }
+            if (!consumed)
+            {
+                if (!_gTree.dispatch(mouseMove(px / CELL_W, py / CELL_H), &_gCtx))
+                    _gCtx.setHover("");
+                pumpAfterInput(hwnd);
+            }
         }
         return (i64)0;
     }
 
-    if (msg == WM_LBUTTONUP)
+    if (msg == WM_LBUTTONUP || msg == WM_RBUTTONUP)
     {
-        int px = (int)(lParam & (i64)0xFFFF);
-        int py = (int)((lParam >> 16) & (i64)0xFFFF);
+        int px = (int)((lParam << 48) >> 48);
+        int py = (int)((lParam << 32) >> 48);
         if (_gReady)
         {
-            _gTree.dispatch(mouseUp(px / CELL_W, py / CELL_H), &_gCtx);
-            _gCtx.clearPress();   // release clears any held press, even off-target
-            pumpAfterInput(hwnd);
+            string key = "" + _gCanvasCaptureKey;
+            _gCanvasCaptureKey = "";
+            if (GetCapture() == hwnd) ReleaseCapture();
+            bool consumed = _gDispatchCanvasPointer(key, 2, px, py, 0);
+            if (!consumed && msg == WM_LBUTTONUP)
+            {
+                _gTree.dispatch(mouseUp(px / CELL_W, py / CELL_H), &_gCtx);
+                _gCtx.clearPress();
+                pumpAfterInput(hwnd);
+            }
         }
         return (i64)0;
+    }
+
+    if (msg == WM_CAPTURECHANGED)
+    {
+        if (_gCanvasCaptureKey.length() > 0) _gCanvasCaptureLost();
+        return (i64)0;
+    }
+
+    if (msg == WM_MOUSEWHEEL || msg == WM_MOUSEHWHEEL)
+    {
+        if (_gReady)
+        {
+            POINT pt = default;
+            pt.x = (int)((lParam << 48) >> 48);
+            pt.y = (int)((lParam << 32) >> 48);
+            ScreenToClient(hwnd, &pt);
+            string key = _gCanvasScan(_gTree, keySegment(_gTree, 0),
+                                     pt.x / CELL_W, pt.y / CELL_H);
+            // The wheel halves are signed 16-bit values; sign-extend the high half explicitly.
+            double lines = (double)((int)((((i64)wParam) << 32) >> 48)) / 120.0;
+            bool ctrl = (wParam & (u64)MK_CONTROL) != 0u;
+            if (_gDispatchCanvasWheel(key, pt.x, pt.y, lines,
+                                      msg == WM_MOUSEHWHEEL, ctrl)) return (i64)0;
+        }
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 
     if (msg == WM_KEYDOWN)
@@ -361,6 +558,7 @@ stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     if (msg == WM_DESTROY)
     {
         if (_gReady) { deleteTree(_gTree); _gReady = false; }
+        _gCanvasHwnd = nullptr;
         PostQuitMessage(0);
         return (i64)0;
     }

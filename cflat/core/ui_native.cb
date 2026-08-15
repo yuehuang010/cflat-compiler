@@ -19,6 +19,7 @@
 import "list.cb";
 import "string.cb";
 import "dictionary.cb";
+import "math.cb";
 
 // Flex main-axis direction for a View's children (the layout pass strategy).
 int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
@@ -1618,7 +1619,10 @@ class Text : IText
     bool propsEqual(IElement other)
     {
         IText o = other as IText;
-        return o != nullptr && this.text == o.text && this.font == o.font;
+        // color is compared too: the native hosts now paint a Text's ink from it, so a
+        // color-only change must produce a patch or the new ink never reaches the host.
+        return o != nullptr && this.text == o.text && this.font == o.font
+            && this.color == o.color;
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3948,9 +3952,8 @@ move IGroupBox groupBox(string title, Style style)
 // direct field write would not arm the flag). Calling an unset Lambda faults, so the hosts
 // only invoke a handler when its flag is set - a canvas with none behaves exactly as before.
 // Handlers are NOT serialized (toJson) and NOT compared (propsEqual) - identical to onPaint -
-// so installing one never churns reconcile identity. Only the native hosts route real OS
-// input; the TUI/ICanvas host exposes the same handlers through its test drivers (wheel/pinch
-// are native-host-only there).
+// so installing one never churns reconcile identity. Native and GDI canvas hosts route real
+// OS input; the TUI/ICanvas host exposes the same handlers through its test drivers.
 class CanvasView : ICanvasView
 {
     Lambda<void(ICanvas)> onPaint = default;
