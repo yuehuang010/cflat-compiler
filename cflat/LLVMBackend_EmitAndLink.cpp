@@ -414,6 +414,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
                 }
                 for (const auto& fw : cFrameworks_)
                     argStrs.push_back("-framework"), argStrs.push_back(fw);
+                if (cLinkObjC_) argStrs.push_back("-lobjc");
                 // The AArch64 backend can emit compiler-rt libcalls (e.g. __multi3);
                 // clang always links libclang_rt.osx.a, so mirror it when locatable.
                 // Also the source of the asan runtime dylib below (--asan) - hoisted
@@ -491,6 +492,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         // macOS frameworks (`import framework`); the clang driver accepts -framework.
         for (const auto& fw : cFrameworks_)
             argStrs.push_back("-framework"), argStrs.push_back(fw);
+        if (cLinkObjC_) argStrs.push_back("-lobjc");
         if (debugInfo) argStrs.push_back("-g");
         if (asan_) argStrs.push_back("-fsanitize=address");
 

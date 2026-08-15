@@ -6,6 +6,8 @@
 // through the bundled ld64.lld against the harvested ~/.cflat/macsdk (no SDK).
 import framework "CoreFoundation";
 import framework { "AppKit", "Foundation" };
+// Bare objc runtime import proves libobjc is auto-linked.
+import package "objc/runtime.h";
 
 // S3: `framework` clause on a C-header import binds the header with auto-extern AND
 // links the framework. CGColorSpaceCreateDeviceRGB / CGColorSpaceGetNumberOfComponents /
@@ -25,6 +27,14 @@ extern int main()
         return 1;
     }
     printf("PASS: CFAbsoluteTimeGetCurrent = %f\n", now);
+
+    void* cls = (void*)objc_getClass("NSObject");
+    if (cls == nullptr)
+    {
+        printf("FAIL: objc_getClass returned null\n");
+        return 1;
+    }
+    printf("PASS: objc_getClass(NSObject) returned non-null\n");
 
     // Auto-externed CoreGraphics C functions - no hand-written prototype above.
     // CGColorSpaceRef is the header's own handle typedef (`typedef struct CGColorSpace

@@ -12,14 +12,14 @@ emits a Mach-O arm64 object (versioned triple `arm64-apple-macosx11.0.0` so it
 carries `LC_BUILD_VERSION`), and links via the **bundled `ld64.lld`** deployed next
 to the exe (CMake copies it from the vcpkg LLVM). `EmitExecutableMachO` invokes it
 directly with `-arch arm64 -platform_version macos 11.0.0 <ver> -syslibroot <root>
--lSystem`, mirroring the Windows `lld-link` path.
+-lSystem` (and `-lobjc` for objc runtime header imports), mirroring the Windows `lld-link` path.
 
 ## Self-contained (no Xcode / Command Line Tools)
 
 Self-contained after a one-time `cflat --init`: on Darwin, `--init` harvests
-libSystem's reexport-closure symbols from the live dyld shared cache (export-trie
-walk over the `/usr/lib/system/*` images) into a flattened tbd stub at
-`~/.cflat/macsdk/usr/lib/libSystem.tbd`, and the link uses that as `-syslibroot`.
+libSystem's reexport-closure symbols and the objc runtime stub from the live dyld shared cache
+(export-trie walk over the `/usr/lib/system/*` images) into tbd stubs under
+`~/.cflat/macsdk/usr/lib/`, and the link uses that as `-syslibroot`.
 
 Fallbacks preserve robustness:
 - No harvested stub -> `$SDKROOT`/`xcrun` SDK.

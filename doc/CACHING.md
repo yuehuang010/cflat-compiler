@@ -171,8 +171,8 @@ populated lazily by compiles that use the `cache` import clause, so an expensive
 the list comes back with one `--init` / `--init-local`.
 
 **Re-run `--init` / `--init-local` afterward.** Normal compiles fall back to a full source
-parse when the cache is missing, so nothing breaks - but on macOS the harvested libSystem
-stub at `macsdk/usr/lib/libSystem.tbd` is what makes linking self-contained without Xcode /
+parse when the cache is missing, so nothing breaks - but on macOS the harvested libSystem and
+libobjc stubs under `macsdk/usr/lib/` are what make linking self-contained without Xcode /
 Command Line Tools. Until it is re-harvested, the `-o` link falls back to a `$SDKROOT`/`xcrun`
 SDK, which may not be installed.
 
@@ -251,9 +251,10 @@ populates it with:
 
 - `compiler_path.txt` - same role as on Windows: the VS Code extension reads this to
   auto-detect the compiler when `cflat.executablePath` is not set.
-- `macsdk/usr/lib/libSystem.tbd` - a flattened link stub harvested from the live dyld
-  shared cache (export-trie walk over `/usr/lib/system/*`), used as the link `-syslibroot`
-  so linking is self-contained without Xcode / Command Line Tools.
+- `macsdk/usr/lib/libSystem.tbd` and `libobjc.tbd` - flattened link stubs harvested from the
+  live dyld shared cache (an export-trie walk over `/usr/lib/system/*` for libSystem, and over
+  the dlopen'd `/usr/lib/libobjc.A.dylib` for libobjc), used by the link `-syslibroot` so
+  linking is self-contained without Xcode / Command Line Tools.
 - `runtime/<hash>/core_macos.bc` - the core bitcode cache, same purpose and invalidation
   rule as `core_win64.bc` on Windows (hash derived from core `.cb` file mtimes).
 

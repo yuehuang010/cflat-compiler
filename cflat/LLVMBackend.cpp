@@ -1329,6 +1329,9 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
     {
         std::string ext = LowerExtension(entry);
         const bool isHeader = (ext == ".h" || ext == ".hpp" || ext == ".hh");
+        // Same objc runtime auto-link as the single-import path in CompileImportedFile.
+        if (isHeader && targetMacOS_ && entry.starts_with("objc/"))
+            cLinkObjC_ = true;
         if (!isHeader)
         {
             // .cb / .c entries are independent - route each like a plain `import "x";`.
@@ -1467,6 +1470,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         // AST dump; the prebuilt library is linked via --c-lib in EmitExecutable.
         if (ext == ".h" || ext == ".hpp" || ext == ".hh")
         {
+            // The objc runtime lives in libobjc, carried as a tbd by both the harvested stub
+            // root and the real SDK.
+            if (targetMacOS_ && importFilename.starts_with("objc/"))
+                cLinkObjC_ = true;
             // Inline `lib "..."` (or `lib { "a", "b" }`) clause: resolve each and add it to
             // the link line, alongside any --c-lib libraries. A library that ships beside the
             // .cb is used by path; a bare system lib name (user32.lib, ...) is passed through

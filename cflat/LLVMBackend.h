@@ -2547,6 +2547,7 @@ private:
     // macOS frameworks requested via `import framework "X"` / --framework. Each becomes
     // a `-framework X` pair on the Mach-O link. Deduped, first-seen order preserved.
     std::vector<std::string> cFrameworks_;
+    bool cLinkObjC_ = false;
     // Authoritative DLL list from vcpkg_installed/<triplet>/bin, copied next to the exe.
     // Kept separate from cLinkLibs_-based DLL probing.
     std::vector<std::string> vcpkgRuntimeDlls_;

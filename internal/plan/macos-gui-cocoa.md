@@ -25,71 +25,41 @@ Fixed along the way: int-to-pointer casts now sign-extend signed sources
 (`(void*)-2` == RTLD_DEFAULT; regression test testIntToPtrCast in
 Test/test_c.cb).
 
-Known gaps (see `internal/issue/p2/macos-header-import-and-framework-link.md`):
+The formerly tracked header/link gaps closed on 2026-08-14: Darwin header
+binding uses the arm64 Apple triple plus isysroot, framework imports emit
+`-framework`/`-F`, and objc runtime header imports auto-link harvested or SDK
+`libobjc`.
 
-1. `BuildClangDriverArgs` (LLVMBackend.h ~3650) hard-codes
-   `x86_64-pc-linux-gnu` on non-Windows, so `__APPLE__` is never defined and
-   Apple header imports collapse (objc/runtime.h registers 1 of ~80 sigs).
-2. `EmitExecutableMachO` (LLVMBackend.h ~5296) has no `-framework`/`-F`, and
-   the harvested `~/.cflat/macsdk` syslibroot contains only libSystem.tbd -
-   no framework stubs, no libobjc.
-
-## Stage 1: framework linking (small, highest leverage)
+## Stage 1: framework linking (complete)
 
 Outcome: `import framework "AppKit";` (and `--c-framework AppKit`) lets a .cb
 declare plain externs for objc_msgSend/objc_getClass/etc. and link them at
 build time. Kills all the dlopen/dlsym/function-pointer-caching boilerplate
 in cocoa.cb; symbol errors surface at link instead of null pointers at run.
 
-Work items:
+Implementation notes:
 
-- Grammar/CLI: add a `framework "Name"` clause to the import-package rule
-  (or a standalone `import framework "Name";` form) and a `--c-framework`
-  flag in ArgParser.h. Route into a `cFrameworks_` list next to `cLinkLibs_`.
-- `EmitExecutableMachO`: append `-framework <Name>` per entry to the ld64.lld
-  invocation. Add `-F <syslibroot>/System/Library/Frameworks` when present.
-- Stub availability, in order of preference:
-  a. Extend `--init`'s dyld-shared-cache harvest (the export-trie walk that
-     builds libSystem.tbd) to also emit
-     `~/.cflat/macsdk/System/Library/Frameworks/<Name>.framework/<Name>.tbd`
-     for a curated set (AppKit, Foundation, CoreFoundation, CoreGraphics)
-     plus `usr/lib/libobjc.tbd`. Note: objc_msgSend lives in libobjc, which
-     libSystem does NOT reexport - the dlopen bridge only dodged this because
-     AppKit pulls libobjc transitively. Direct externs need `-lobjc` or the
-     AppKit framework on the link line.
-  b. Fallback: real SDK via $SDKROOT/xcrun (framework tbds already there),
-     mirroring the existing libSystem fallback chain.
-- On-demand harvest option: if `import framework "X"` names a framework not
-  in the harvested set, harvest it lazily at compile time from the shared
-  cache rather than failing (frameworks are cheap to walk).
+- `framework` import forms and `--framework` route into `cFrameworks_`.
+- `EmitExecutableMachO` emits `-framework <Name>` and `-F` search paths; the
+  harvest includes the curated framework and `usr/lib/libobjc.tbd` stubs.
 
-Validation: rewrite cocoa.cb to plain externs + `import framework "AppKit";`
-(keep the dlopen variant as a fallback path or delete it), all three macos
-examples still run, `bash test.sh Release` green, and since linker/driver code
-is shared, `test.bat` (Release) on the Windows box.
+Validation: the framework example and `bash test.sh Release`.
 
-## Stage 2: Darwin triple for header binding (C frameworks)
+## Stage 2: Darwin triple for header binding (complete)
 
 Outcome: `import package "objc/runtime.h";`, sysctl.h, CoreFoundation and
 CoreGraphics headers bind via the existing auto-extern machinery.
 
-Work items:
+Implementation notes:
 
-- `BuildClangDriverArgs`: when targeting macOS, use the versioned triple
-  already used for codegen (`arm64-apple-macosx11.0.0`) instead of the Linux
-  triple, and pass `-isysroot` resolved the same way as
-  `PosixSystemIncludeDirs` ($SDKROOT -> xcrun). Requires an SDK/CLT for the
-  headers themselves - header import is inherently not SDK-free; document
-  that (`--init`'s harvested stub covers linking only, not header text).
-- Verify the extractor handles Apple-isms that now become visible:
-  availability attributes, __attribute__((objc_...)) spillover in nominally-C
-  headers, blocks (`^` types - should degrade to "skipped", not error).
-- Re-test the existing Linux/WSL header-bind path afterward (same function,
-  keep the Linux triple branch intact).
+- `BuildClangDriverArgs` uses the versioned Apple triple and `-isysroot`.
+  Header import remains dependent on an SDK/CLT for header text; harvested
+  stubs cover linking only.
+- The extractor handles the Apple-isms exposed by the Darwin header path, and
+  the Linux/WSL header-bind path retains its Linux triple branch.
 
-Validation: the repro in the issue file (`objc_getClass` after
-`import package "objc/runtime.h"`) compiles and runs; `-v` shows ~80 sigs,
-not 1. test.sh + test.bat both green.
+Validation: the `objc_getClass` repro after `import package "objc/runtime.h"`
+compiles and runs, and the header binds the runtime declarations.
 
 ## Stage 3: core cocoa library with ownership
 

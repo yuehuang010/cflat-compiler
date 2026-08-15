@@ -6,11 +6,11 @@ items share a toolchain and a verification story, not a code path.
 ## Members
 
 macOS:
-- `p2/macos-header-import-and-framework-link` - the clang driver hardcodes a Linux triple on
-  Darwin, and no `-framework`/`-F` linking is emitted. This is the blocker for header-imported
-  system frameworks and therefore for the Cocoa GUI direction.
 - `ui/ui-native-visual-polish-win32-winui` - font-variant styling exists only in Cocoa's
   `_applyNode`/`_syncProps` path; the Win32/WinUI side has no equivalent.
+
+(Closed 2026-08-14: macOS header binding's Darwin triple + isysroot and framework linking landed
+earlier; objc auto-linking closed the residual.)
 
 Windows / WinRT:
 - `ui/ui-native-canvas-input-images-win32-winui` - GDI canvas host image/input parity, mostly
@@ -29,9 +29,6 @@ Portable:
 
 - `p2/file-offsets-capped-at-2gb` is portable, verifiable on any host, and independent of
   everything else here. Do it first and separately.
-- `p2/macos-header-import-and-framework-link` is verifiable on this host and unblocks the most
-  downstream work. Two parts: correct the Darwin triple, and emit `-framework`/`-F`. See
-  `internal/macos-build.md` for the existing link path.
 - The WinMD slot measurements are complete. Keep attached-property arguments at their declared
   ABI interface type; do not infer IDependencyObject calls from an IUIElement pointer.
 - Everything under Windows/WinRT needs a Windows host to verify. Do not land those from a macOS
