@@ -8,7 +8,7 @@ REM Worker mode: compile and run a single .c test, write result file
 REM All compiler/exe output goes to a log file; nothing printed to console.
 REM ===========================================================================
 if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
-if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0locales
+if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0cflat\locales
 
 if "%~1"=="--worker-c" (
     set NAME=%~2

@@ -270,6 +270,46 @@ std::string DiagnosticLocalization::NormalizeKey(std::string_view englishTemplat
     return CompactKey(NormalizeKeyFull(englishTemplate));
 }
 
+std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientTag,
+                                                        const std::filesystem::path& localeDirectory)
+{
+    std::string tag;
+    for (char c : clientTag)
+        tag += static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
+    if (tag.empty() || tag == "pseudo")
+        return "en-simple";
+
+    auto catalogExists = [&localeDirectory](const std::string& name)
+    {
+        std::error_code ec;
+        return std::filesystem::exists(localeDirectory / (name + ".json"), ec);
+    };
+
+    const std::string primary = tag.substr(0, tag.find('-'));
+    if (primary == "en")
+        return "en-simple";
+
+    // Chinese needs script, not region: the catalogs are zh-Hans / zh-Hant.
+    if (primary == "zh")
+    {
+        const bool traditional = tag.find("hant") != std::string::npos
+            || tag.find("-tw") != std::string::npos
+            || tag.find("-hk") != std::string::npos
+            || tag.find("-mo") != std::string::npos;
+        const std::string candidate = traditional ? "zh-Hant" : "zh-Hans";
+        if (catalogExists(candidate))
+            return candidate;
+        return "en-simple";
+    }
+
+    // Exact tag first (fr-ca.json if someone ships one), then the primary subtag.
+    if (catalogExists(tag))
+        return tag;
+    if (catalogExists(primary))
+        return primary;
+    return "en-simple";
+}
+
 std::string DiagnosticLocalization::FormatSourceTemplate(
     std::string_view englishTemplate,
     const std::vector<std::string>& arguments)

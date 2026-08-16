@@ -317,13 +317,13 @@ add_custom_command(
   COMMENT "Deploying core/ library tree next to cflat")
 add_custom_target(deploy_core ALL DEPENDS ${_core_stamp})
 
-file(GLOB LOCALE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/locales/*.json")
+file(GLOB LOCALE_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/cflat/locales/*.json")
 set(_locale_stamp "${CMAKE_CURRENT_BINARY_DIR}/deploy_locales.stamp")
 add_custom_command(
   OUTPUT ${_locale_stamp}
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:cflat>/locales"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
-          "${CMAKE_CURRENT_SOURCE_DIR}/locales" "$<TARGET_FILE_DIR:cflat>/locales"
+          "${CMAKE_CURRENT_SOURCE_DIR}/cflat/locales" "$<TARGET_FILE_DIR:cflat>/locales"
   COMMAND ${CMAKE_COMMAND} -E touch ${_locale_stamp}
   DEPENDS ${LOCALE_FILES} cflat
   COMMENT "Deploying locales/ next to cflat")

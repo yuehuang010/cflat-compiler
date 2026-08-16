@@ -65,11 +65,16 @@ async function startClient(): Promise<void> {
         debug: { command: exePath, args: ['lsp', '--verbose', '--log-file', logFilePath],  transport: TransportKind.stdio }
     };
 
+    // The client library already sends initialize.params.locale; pass it again in
+    // initializationOptions so the server sees it on clients that omit the field.
+    outputChannel.appendLine(`UI language    : ${vscode.env.language}`);
+
     const clientOptions: LanguageClientOptions = {
         documentSelector: [{ scheme: 'file', language: 'cflat' }],
         synchronize: {
             fileEvents: vscode.workspace.createFileSystemWatcher('**/*.{cb,c}')
         },
+        initializationOptions: { locale: vscode.env.language },
         outputChannel
     };
 

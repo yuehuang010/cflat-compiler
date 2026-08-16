@@ -176,6 +176,78 @@ are tracked - pointers allocated earlier, or freed via a raw allocator path that
 bypasses `operator delete`, are ignored, not flagged. It catches leaks, not
 double-frees or use-after-free reads (use `--asan` for those).
 
+## Diagnostic localization - authoring and translation
+
+Compiler diagnostics are localized. The canonical English template stays in the
+C++ source; translations live in JSON catalogs under `cflat/locales/`, deployed
+next to the compiler at build time.
+
+### Authoring a diagnostic
+
+Call `LogErrorMessage` with the unformatted English template and ordered
+arguments. Do not pre-format the message, and do not invent an error code or a
+named symbol - the catalog key is derived from the template text:
+
+```cpp
+LogErrorMessage("use of moved variable '{}'", { moved });
+```
+
+Rules that keep a call site translatable:
+
+- The template must be a **string literal** (adjacent literals across lines are
+  fine). A template built with `std::format` or concatenated at runtime cannot be
+  keyed, and the extractor reports it.
+- Every `{}` needs exactly one argument, in order. A translation may reorder them
+  because catalog values use numbered placeholders (`{0}`, `{1}`).
+- Put dynamic text - identifiers, type names, paths - in arguments, never in the
+  template. Two templates that differ only by a spliced-in name are two keys that
+  translators must handle twice.
+- Genuinely preformatted or third-party text (linker, LLVM, clang output) goes
+  through `LogRawError`, which is deliberately not localized.
+
+### Catalog keys
+
+The key is derived, not written: lowercase the template, replace each `{}` with
+`arg0`, `arg1`, ..., drop every non-alphanumeric character, and compact anything
+over 40 characters to `<first 20>...<last 20><16-hex FNV-1a of the full key>`.
+`NormalizeKey` in `cflat/DiagnosticLocalization.cpp` is the single source of
+truth. Changing the English wording changes the key, which orphans the old
+translations - expected, and reported by the extractor as a stale entry.
+
+### Catalogs
+
+`cflat/locales/<name>.json` holds `locale` plus a `messages` map of key to
+translated template. `en-simple.json` is the default display catalog and must
+cover every key; the source template is only the fallback. `en-pseudo.json` is
+the migration catalog: it carries the English source templates plus
+`argumentExamples` (real values observed at runtime), and the extractor also
+writes `argumentNames` and `sites` there as translator context.
+
+To add a language, copy `en-simple.json`, set `locale` to the file's basename,
+and translate the values. Name the file by BCP-47 tag: a plain primary subtag
+where that suffices (`de`, `fr`, `it`, `ja`, `ko`, `ru`), and by script for
+Chinese (`zh-Hans`, `zh-Hant`) because the client sends regions (`zh-CN`,
+`zh-TW`) that the compiler maps onto scripts.
+
+### Keeping catalogs complete
+
+Two producers write `en-pseudo.json`, and the order matters:
+
+```bash
+x64/Release/cflat --locale pseudo --update-locale en-pseudo --locale-dir cflat/locales \
+    --check Test/errors/err_*.cb -i Test/library
+python3 utilities/extract_diagnostics.py --report
+```
+
+The compiler pass is the only source of real argument values, but it sees only
+diagnostics a test actually provokes. The extractor statically scans every
+`LogErrorMessage` call site, so it supplies the complete key set - and carries
+the observed examples forward. Run the compiler first, the extractor last.
+
+`--report` also prints the remaining unmigrated `LogError(` call sites and every
+key with no example, which is the missing-negative-test backlog. `--strict` exits
+non-zero when a call site cannot be extracted cleanly.
+
 ## Case study: the test_threadpool UAF
 
 These tools were built to crack an intermittent `test_threadpool` crash that

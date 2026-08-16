@@ -30,6 +30,12 @@ public:
 
     static std::string NormalizeKey(std::string_view englishTemplate);
 
+    // Map an LSP/BCP-47 client tag ("ja", "zh-cn", "fr-CA") to a catalog name in
+    // localeDirectory. Returns "en-simple" when no catalog matches; never selects
+    // the migration-only "pseudo" locale.
+    static std::string ResolveClientLocale(std::string_view clientTag,
+                                           const std::filesystem::path& localeDirectory);
+
 private:
     bool LoadCatalog(const std::filesystem::path& path,
                      std::unordered_map<std::string, std::string>& messages,

@@ -73,6 +73,14 @@ if [ ! -d "$RELEASE_DIR/core" ]; then
 fi
 cp -R "$RELEASE_DIR/core" "$PUBLISH_DIR/core"
 
+# Diagnostic catalogs: without them every message falls back to the source
+# template and the default en-simple catalog never loads.
+if [ ! -d "$RELEASE_DIR/locales" ]; then
+    echo "ERROR: locales/ not found at $RELEASE_DIR - run a Release build first." >&2
+    exit 1
+fi
+cp -R "$RELEASE_DIR/locales" "$PUBLISH_DIR/locales"
+
 cp -R "$SCRIPT_DIR/doc" "$PUBLISH_DIR/doc"
 cp "$SCRIPT_DIR/README.md" "$PUBLISH_DIR/"
 cp "$SCRIPT_DIR/LICENSE" "$PUBLISH_DIR/"

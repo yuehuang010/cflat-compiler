@@ -181,9 +181,9 @@ parse-verified only (no registration). Authoring COM objects with `[winrt] class
 | `--sanitize=ownership` | | | Debug-only ownership sanitizer: trap on a dereference of a moved-from owning pointer. Implies `-g`. Aliases: `-fsanitize=ownership`, `--fsanitize=ownership`. See [below](#ownership-sanitizer). |
 | `--heap-audit` | | | Instrument the program with the HeapAudit leak oracle (no source edits). Requires `-o`. See [below](#heap-audit). |
 | `--verbose` | `-v` | | Print detailed diagnostic messages during compilation. |
-| `--locale` | | locale | Select the compiler diagnostic locale. Defaults to `en-simple`; `CFLAT_LOCALE` is used when omitted. Use `pseudo` to print source templates and coverage warnings. |
+| `--locale` | | locale | Select the compiler diagnostic locale, named after a catalog in `--locale-dir` (`de`, `en-simple`, `es`, `fr`, `it`, `ja`, `ko`, `ru`, `zh-Hans`, `zh-Hant`). Defaults to `en-simple`; `CFLAT_LOCALE` is used when omitted. Use `pseudo` to print source templates and coverage warnings. |
 | `--locale-dir` | | directory | Directory containing diagnostic JSON catalogs. Defaults to `<compiler directory>/locales`. |
-| `--update-locale` | | locale | During compilation, collect encountered diagnostic templates and update `<locale>.json` under `--locale-dir`, preserving non-empty translations and adding source-template stubs with numbered placeholders. Generated `en-pseudo.json` also records an `argumentExamples` array for each key. |
+| `--update-locale` | | locale | During compilation, collect encountered diagnostic templates and update `<locale>.json` under `--locale-dir`, preserving non-empty translations and adding source-template stubs with numbered placeholders. Generated `en-pseudo.json` also records an `argumentExamples` array for each key. Only diagnostics the run actually triggers are collected - see the catalog workflow below. |
 | `--check` | | | Check one or more source files for errors without emitting output (batch; every positional is an independent source). |
 | `--grammar` | | | Validate the grammar (parse only) of one or more sources; add `-v` for the full parse-tree rule stack. |
 | `--xthread-scan` | | `1`..`3` | Cross-thread sharing scan level (default off). Reports non-atomic/unguarded struct fields shared across a thread spawn. 1=borrowed ctx, 2=+ptr handoff, 3=+any struct-ptr call arg. |
@@ -201,6 +201,27 @@ back to the source template. `--locale pseudo`
 prints source templates and reports whether each `en-simple` key is present. The test
 discovery pass writes the source-template catalog to `en-pseudo.json`; this is separate
 from the default `en-simple.json` catalog.
+
+Catalogs are authored under `cflat/locales/` and deployed next to the compiler by the
+build and by the release packaging scripts. Keeping `en-pseudo.json` complete takes two
+passes, in this order - the compiler observes real argument values but only for
+diagnostics a test provokes, and the extractor statically covers every call site:
+
+```bash
+x64/Release/cflat --locale pseudo --update-locale en-pseudo --locale-dir cflat/locales \
+    --check Test/errors/err_*.cb -i Test/library
+python3 utilities/extract_diagnostics.py --report
+```
+
+Authoring rules for diagnostic call sites, catalog key derivation, and how to add a
+language are in [`doc/DIAGNOSTIC.md`](DIAGNOSTIC.md#diagnostic-localization---authoring-and-translation).
+
+**Language server.** `cflat lsp` picks its catalog from the editor's UI language, sent as
+`initialize.params.locale` (the VS Code extension also passes it in
+`initializationOptions`). A BCP-47 tag is resolved to a catalog by exact name, then by
+script for Chinese (`zh-CN` and `zh-SG` to `zh-Hans`; `zh-TW`, `zh-HK` and `zh-MO` to
+`zh-Hant`), then by primary subtag, falling back to `en-simple`. `CFLAT_LOCALE` overrides
+the editor language when it is set in the environment the editor was launched from.
 
 ### Ownership sanitizer
 

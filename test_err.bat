@@ -2,7 +2,7 @@
 setlocal EnableDelayedExpansion
 
 if "%CFLAT_CONFIG%"=="" set CFLAT_CONFIG=Release
-if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0locales
+if not defined CFLAT_LOCALE_DIR set CFLAT_LOCALE_DIR=%~dp0cflat\locales
 set COMPILER=x64\%CFLAT_CONFIG%\cflat.exe
 set SRC=Test
 set LIB=Test\library

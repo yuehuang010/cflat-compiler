@@ -1,9 +1,36 @@
 # Diagnostic localization plan
 
-Status: PHASE 2 IN PROGRESS. Phase 1 is complete. The error-test discovery pass is present, and
-the StateAndImports, Lookup, WinRT, Interfaces, ControlFlow,
-EmitAndLink, CInterop, and Overloads diagnostic categories have been migrated. Remaining
-compiler and direct-print call sites are pending.
+Status: PHASE 2 IN PROGRESS. Phase 1 is complete. The StateAndImports, Lookup, WinRT,
+Interfaces, ControlFlow, EmitAndLink, CInterop, and Overloads diagnostic categories have been
+migrated - 147 templates across 148 `LogErrorMessage` call sites. 115 legacy `LogError(` call
+sites and the direct-print inventory remain, so the `= delete` migration guard is not yet armed.
+
+Landed since the original draft:
+
+- **The error-test run is no longer the inventory.** It reached only 55 of 147 templates, because
+  a diagnostic is only collected if some test provokes it. `utilities/extract_diagnostics.py`
+  statically scans every `LogErrorMessage` call site and is now the completeness source; the
+  runtime pass is enrichment that supplies real `argumentExamples`. The extractor writes
+  `en-pseudo.json` directly and carries observed examples forward, so the compiler pass must run
+  first and the extractor last. It also reports unmigrated `LogError(` sites, non-literal
+  templates, stale catalog entries, and keys with no example.
+- **The extractor ports `NormalizeKey`/`CompactKey` to Python.** The C++ version stays
+  authoritative: every run re-derives the key of each existing catalog entry and reports any
+  disagreement, so drift between the two implementations is caught immediately.
+- **Catalogs moved from `locales/` to `cflat/locales/`** and are deployed next to the compiler by
+  CMake and by both release packaging scripts. `test.sh`, `test.bat`, and `test_err.bat` point at
+  the new path.
+- **All ten catalogs cover the full 147-key inventory**: `de`, `en-simple`, `es`, `fr`, `it`,
+  `ja`, `ko`, `ru`, `zh-Hans`, `zh-Hant`, plus the generated `en-pseudo`.
+- **The LSP honors the editor UI language.** `initialize.params.locale` (or
+  `initializationOptions.locale`) is resolved by `DiagnosticLocalization::ResolveClientLocale` and
+  applied to the whole backend pool; `CFLAT_LOCALE` still wins. The VS Code extension passes
+  `vscode.env.language`.
+
+Not done, and deliberately out of the current slice: regression tests for locale selection, a
+`cflat.locale` editor setting that overrides the UI language, and the `zh-HK` resolver ordering
+fix (the `zh` branch returns before the exact-tag probe, and the probe lowercases the tag, so a
+`zh-HK.json` catalog would not be selected until both are addressed).
 
 ## Objective
 
@@ -85,8 +112,11 @@ Enumerate every user-visible output site, including:
   output, `--check` output, cache/init output, linker-driver output, and crash diagnostics.
 - Messages sent through `DiagnosticSink`, hint sinks, and LSP `Diagnostic` objects.
 
-The error-test suite is the discovery inventory. Run its files in batch with `--locale pseudo` so
-every exercised `LogErrorMessage` source template is recorded and reported. After migration, the
+`utilities/extract_diagnostics.py` is the discovery inventory: it scans the C++ sources and
+enumerates every `LogErrorMessage` template whether or not a test reaches it. The error-test
+batch run with `--locale pseudo` is the enrichment pass - it contributes real argument values for
+the templates it exercises, and its coverage gap (55 of 147 at the time of writing) is exactly
+what the extractor's no-example report lists. After migration, the
 deleted `LogError` API and the absence of an approved localized-output wrapper around direct prints
 must make omissions visible during build/review. Every direct print must either be converted or
 appear in an explicit raw-output exemption list.
@@ -138,10 +168,10 @@ become a practical problem, the validator should reject them rather than silentl
 Locale files live under:
 
 ```text
-locales/en-simple.json
-locales/en-pseudo.json
-locales/ja-JP.json
-locales/zh-CN.json
+cflat/locales/en-simple.json
+cflat/locales/en-pseudo.json
+cflat/locales/ja-JP.json
+cflat/locales/zh-CN.json
 ```
 
 Example:
@@ -193,7 +223,7 @@ The default catalog remains `en-simple`. The pseudo-locale discovery output is w
 to `en-pseudo`, for example:
 
 ```text
-cflat --locale pseudo --update-locale en-pseudo --locale-dir locales --check Test/errors/err_*.cb
+cflat --locale pseudo --update-locale en-pseudo --locale-dir cflat/locales --check Test/errors/err_*.cb
 ```
 
 This command is the translator handoff step. Newly encountered entries are deliberately written
@@ -203,8 +233,11 @@ with the source template as the initial value, for example:
 "useofmovedvariablearg0": "use of moved variable '{0}'"
 ```
 
-The update operation is driven by the error-test compilation itself; it does not require a
-manifest, source scanner, or the C++ source tree at runtime.
+The compiler-side update is driven by the error-test compilation itself and needs no manifest or
+source tree at runtime. It is complemented, not replaced, by `utilities/extract_diagnostics.py`,
+which reads the C++ sources to supply the templates no test reaches. Run the compiler pass first
+and the extractor last: the extractor preserves every `argumentExamples` entry already present,
+while the compiler rewrite drops the extractor's `argumentNames` and `sites` fields.
 
 ### `pseudo` migration locale
 
@@ -228,7 +261,8 @@ Add:
 
 - `cflat/DiagnosticLocalization.h`
 - `cflat/DiagnosticLocalization.cpp`
-- `locales/en-simple.json`
+- `cflat/locales/en-simple.json`
+- `utilities/extract_diagnostics.py` - static call-site inventory; writes `en-pseudo.json`.
 
 Update:
 
@@ -238,8 +272,12 @@ Update:
 - `cflat/MainListener.h` and relevant listener implementation files - migrate context-aware
   diagnostics where structured arguments are available.
 - `cflat/main.cpp` - register and apply `--locale`, `--locale-dir`, and `--update-locale`.
-- `CMakeLists.txt` - compile the localizer and deploy the `locales/` directory beside `cflat`.
-- `doc/CLI.md` - document locale options and fallback behavior.
+- `CMakeLists.txt` - compile the localizer and deploy the `cflat/locales/` directory beside the `cflat` executable.
+- `cflat/LspServer.cpp` - resolve the editor UI language from `initialize` and apply it to the
+  backend pool.
+- `vscode-extension/src/extension.ts` - pass `vscode.env.language` in `initializationOptions`.
+- `package_release.sh` / `package_release.ps1` - ship `locales/` alongside `core/`.
+- `doc/CLI.md` - document locale options, the catalog workflow, and LSP locale selection.
 - `doc/DIAGNOSTIC.md` - document authoring and translation rules.
 - the test harness - run diagnostic coverage with `--locale pseudo` and fail or report according
   to the agreed missing-`en-simple` policy.
@@ -269,7 +307,7 @@ the first localization pass.
 - Inventory direct `LogError(std::format(...))` and `LogErrorContext` call sites.
 - Inventory every direct user-facing print and every diagnostic sink, not just error calls.
 - The first migrated categories are `LLVMBackend_StateAndImports.cpp` and
-  `LLVMBackend_Lookup.cpp`; their templates are exercised by the error-test discovery pass.
+  `LLVMBackend_Lookup.cpp`; their templates are exercised by the error-test pass.
 - The current migrated tranche also covers `LLVMBackend_WinRT.cpp`, `LLVMBackend_Interfaces.cpp`,
   `LLVMBackend_ControlFlowAndFunctions.cpp`, `LLVMBackend_EmitAndLink.cpp`,
   `LLVMBackend_CInterop.cpp`, and `LLVMBackend_Overloads.cpp`.
@@ -282,10 +320,12 @@ the first localization pass.
 
 ### Phase 3: catalogs and deployment
 
-- Keep `en-simple` updated from the error-test discovery pass, with English source templates as
-  initial translation values; refine wording where needed.
-- Add at least one non-English catalog for end-to-end verification.
-- Deploy catalogs in Debug, Release, packaging, and worktree test layouts.
+- DONE: keep `en-simple` updated from the extractor plus the error-test pass, with English source
+  templates as initial translation values; refine wording where needed.
+- DONE: nine non-English catalogs (`de`, `es`, `fr`, `it`, `ja`, `ko`, `ru`, `zh-Hans`,
+  `zh-Hant`), verified end-to-end through the LSP.
+- DONE: deploy catalogs in Debug, Release, packaging (`package_release.sh` / `.ps1`), and
+  worktree test layouts.
 - Add catalog validation to the developer workflow.
 
 ## Verification
@@ -297,7 +337,8 @@ Extend existing test files rather than creating new compiler integration test fi
 - A selected locale translates a migrated diagnostic.
 - `--locale pseudo` prints canonical source text and reports whether each `en-simple` key exists
   and is non-empty.
-- The error-test discovery run exercises diagnostic paths and records encountered templates.
+- The extractor enumerates every `LogErrorMessage` call site, and the error-test run records real
+  argument values for the subset it exercises.
 - `--update-locale <locale>` preserves existing non-empty values and adds encountered keys with
   the source English template and numbered placeholders as translation stubs.
 - Catalog update output is deterministic and follows `--locale-dir`.
@@ -326,8 +367,9 @@ is reused across `--check` and LSP analyses.
 - **Messages are missed by the migration:** run the complete error-test suite with `--locale
   pseudo`, require every exercised diagnostic to be collected, and require direct-print
   exemptions to be explicit.
-- **Default English coverage drifts:** run the error-test discovery pass with `--locale pseudo`,
-  warn for every missing `en-simple` entry, and regenerate catalogs with `--update-locale`.
+- **Default English coverage drifts:** run the error-test pass with `--locale pseudo`, warn for
+  every missing `en-simple` entry, regenerate with `--update-locale`, then run the extractor to
+  re-add the templates no test reaches.
 - **Locale file is unavailable in an installed build:** locate catalogs beside the executable
   and fall back silently to English with optional verbose reporting.
 - **Unmigrated call sites bypass localization:** delete `LogError(std::string)` and require every

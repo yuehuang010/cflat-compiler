@@ -432,6 +432,14 @@ public:
         , verbose_(verbose)
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
+        // CFLAT_LOCALE outranks the client's UI language; without it the pool starts
+        // on en-simple and switches in ApplyClientLocale when initialize arrives.
+        if (const char* envLocale = std::getenv("CFLAT_LOCALE"); envLocale && *envLocale)
+        {
+            diagnosticLocale_ = envLocale;
+            localeFromEnvironment_ = true;
+        }
+
         // Backend pool sized to hardware_concurrency. Each backend owns its own
         // LLVMContext/Module so multiple analyses can run in parallel.
         unsigned int hw = std::thread::hardware_concurrency();
@@ -455,10 +463,7 @@ public:
             auto b = std::make_unique<LLVMBackend>();
             b->SetRuntimeDir(runtimeDir_);
             b->SetVerbose(verbose_);
-            const char* locale = std::getenv("CFLAT_LOCALE");
-            b->SetLocale(locale && *locale ? locale : "en-simple");
-            b->SetLocaleDirectory((std::filesystem::path(runtimeDir_) / "locales").string());
-            b->LoadLocale(verbose_);
+            ApplyLocale(*b);
             backendPool_.push_back(std::move(b));
             freeBackends_.push_back(i);
         }
@@ -512,7 +517,7 @@ private:
             id = msg["id"];
 
         if (method == "initialize")
-            HandleInitialize(id);
+            HandleInitialize(msg, id);
         else if (method == "initialized")
             {}  // no-op notification
         else if (method == "textDocument/didOpen")
@@ -554,8 +559,58 @@ private:
         }
     }
 
-    void HandleInitialize(const std::optional<nlohmann::json>& id)
+    // The client's UI language arrives as initialize.params.locale (LSP 3.16+).
+    // CFLAT_LOCALE stays authoritative when set, so an explicit override wins.
+    void ApplyClientLocale(const nlohmann::json& msg)
     {
+        if (localeFromEnvironment_)
+            return;
+        if (!msg.contains("params") || !msg["params"].is_object())
+            return;
+        const auto& params = msg["params"];
+        std::string clientTag;
+        if (params.contains("locale") && params["locale"].is_string())
+            clientTag = params["locale"].get<std::string>();
+        else if (params.contains("initializationOptions")
+                 && params["initializationOptions"].is_object()
+                 && params["initializationOptions"].contains("locale")
+                 && params["initializationOptions"]["locale"].is_string())
+            clientTag = params["initializationOptions"]["locale"].get<std::string>();
+        if (clientTag.empty())
+            return;
+
+        const std::string resolved =
+            DiagnosticLocalization::ResolveClientLocale(clientTag, LocaleDirectory());
+        if (verbose_)
+            std::cerr << std::format("[lsp] client locale '{}' -> catalog '{}'\n",
+                                     clientTag, resolved);
+        if (resolved == diagnosticLocale_)
+            return;
+
+        diagnosticLocale_ = resolved;
+
+        // Reserve every slot before touching the backends: backendMutex_ guards the
+        // free list, not a backend a worker is analyzing with.
+        std::vector<size_t> reserved;
+        {
+            std::unique_lock<std::mutex> lock(backendMutex_);
+            backendCV_.wait(lock, [&] { return freeBackends_.size() == backendPool_.size(); });
+            reserved.swap(freeBackends_);
+        }
+        for (size_t slot : reserved)
+            if (backendPool_[slot])
+                ApplyLocale(*backendPool_[slot]);
+        {
+            std::lock_guard<std::mutex> lock(backendMutex_);
+            freeBackends_ = std::move(reserved);
+        }
+        backendCV_.notify_all();
+    }
+
+    void HandleInitialize(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
+    {
+        ApplyClientLocale(msg);
+
         nlohmann::json result = {
             {"capabilities", {
                 {"textDocumentSync", 1},  // 1 = Full sync
@@ -1435,10 +1490,7 @@ private:
             auto fresh = std::make_unique<LLVMBackend>();
             fresh->SetRuntimeDir(runtimeDir_);
             fresh->SetVerbose(verbose_);
-            const char* locale = std::getenv("CFLAT_LOCALE");
-            fresh->SetLocale(locale && *locale ? locale : "en-simple");
-            fresh->SetLocaleDirectory((std::filesystem::path(runtimeDir_) / "locales").string());
-            fresh->LoadLocale(verbose_);
+            ApplyLocale(*fresh);
             backendPool_[slot] = std::move(fresh);
             backendAnalyzed_[slot] = false;
 
@@ -1686,7 +1738,21 @@ private:
     // -----------------------------------------------------------------------
 
     JsonRpcLoop loop_;
+    std::filesystem::path LocaleDirectory() const
+    {
+        return std::filesystem::path(runtimeDir_) / "locales";
+    }
+
+    void ApplyLocale(LLVMBackend& backend) const
+    {
+        backend.SetLocale(diagnosticLocale_);
+        backend.SetLocaleDirectory(LocaleDirectory().string());
+        backend.LoadLocale(verbose_);
+    }
+
     std::string runtimeDir_;
+    std::string diagnosticLocale_ = "en-simple";
+    bool localeFromEnvironment_ = false;
     std::vector<std::string> importSearchDirs_;
 
     std::mutex docsMutex_;
