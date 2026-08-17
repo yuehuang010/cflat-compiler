@@ -50,6 +50,9 @@ public:
                   int line, int col, const std::string& sig,
                   const std::vector<std::string>& members = {},
                   const std::string& docComment = {});
+    void RegisterDefinition(const SymbolDef& def);
+    void MergeFrom(const LspSymbolIndex& other);
+    void MergeVariablesFrom(const LspSymbolIndex& other);
     const SymbolDef* Lookup(const std::string& name) const;
     std::vector<const SymbolDef*> LookupPrefix(const std::string& prefix) const;
     void Clear();
@@ -62,7 +65,6 @@ public:
                           const std::string& file, int line, int column);
     const std::string* LookupVariableType(const std::string& varName) const;
     const VariableInfo* LookupVariable(const std::string& varName) const;
-    void ReplaceVariablesFrom(const LspSymbolIndex& other);
 
     // Unused-code candidates (declarations that may turn out to be unreferenced).
     void RegisterCandidate(const UnusedCandidate& cand);
@@ -71,6 +73,7 @@ public:
     // All registered symbols, keyed by name. Used by the unused-import check to map
     // a resolved import file to the set of symbol names it defines.
     const std::unordered_map<std::string, SymbolDef>& Symbols() const { return symbols_; }
+    const std::unordered_map<std::string, VariableInfo>& Variables() const { return variables_; }
 
     size_t SymbolCount() const { return symbols_.size(); }
 

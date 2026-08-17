@@ -127,6 +127,10 @@ Current skills:
 
 - Use `LogError` or `LogErrorContext` for all error reporting in the compiler. Do not introduce `LogWarning` or leave `std::cout`.
 
+## Localization
+
+- Do NOT hand-edit the locale JSON files under `cflat/locales/` (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, or en-simple/en-pseudo). Translations are maintained externally from `en-pseudo.json`. When adding or changing a diagnostic message, just write the new `LogError*` format string in code; the locale files are regenerated outside this repo workflow.
+
 ## Debugging Workflow
 
 - Before editing, state the hypothesized root cause and verify against the codebase. Avoid speculative edits based on a single guess (e.g., do not assume lexer token conflicts before checking parser/grammar paths).

@@ -11,10 +11,13 @@ cflat lsp                       # run the Language Server (see the VS Code exten
 cflat lsp --lsp-pool-size N      # cap concurrent analyses to N backends/workers
 ```
 
-The `lsp` subcommand accepts `--verbose`/`-v`, `--import-dir`/`-i <dir>` (repeatable), and
-`--lsp-pool-size <N>`. The pool size bounds how many analyses run in parallel (one
-backend and worker thread per slot); it defaults to the logical CPU count. The switch
-takes precedence over the `CFLAT_LSP_POOL_SIZE` environment variable.
+The `lsp` subcommand accepts `--verbose`/`-v`, `--import-dir`/`-i <dir>` (repeatable),
+`--lsp-pool-size <N>`, and `-ftime-trace`. With the trace switch, each analysis writes a
+Chrome trace under the system temporary directory's `cflat-lsp-traces` folder; only the
+latest 64 traces from the server process are retained. The pool size bounds how many
+analyses run in parallel (one backend and worker thread per slot); it defaults to the
+logical CPU count. The switch takes precedence over the `CFLAT_LSP_POOL_SIZE` environment
+variable.
 
 `<input>` is the source file to compile. A `.cb` file is CFlat; a `.c` file is real C
 (compiled by clang-cl and linked in); a `.h`/`.hpp`/`.hh` file is a C header binding. Extra

@@ -39,6 +39,23 @@ void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const st
     symbols_[name] = std::move(def);
 }
 
+void LspSymbolIndex::RegisterDefinition(const SymbolDef& def)
+{
+    if (def.name.empty()) return;
+    symbols_[def.name] = def;
+}
+
+void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
+{
+    for (const auto& [name, def] : other.symbols_)
+        if (!symbols_.contains(name))
+            symbols_.emplace(name, def);
+    for (const auto& [name, info] : other.variables_)
+        if (!variables_.contains(name))
+            variables_.emplace(name, info);
+    candidates_.insert(candidates_.end(), other.candidates_.begin(), other.candidates_.end());
+}
+
 const SymbolDef* LspSymbolIndex::Lookup(const std::string& name) const
 {
     auto it = symbols_.find(name);
@@ -101,9 +118,12 @@ const VariableInfo* LspSymbolIndex::LookupVariable(const std::string& varName) c
     return (it != variables_.end()) ? &it->second : nullptr;
 }
 
-void LspSymbolIndex::ReplaceVariablesFrom(const LspSymbolIndex& other)
+void LspSymbolIndex::MergeVariablesFrom(const LspSymbolIndex& other)
 {
-    variables_ = other.variables_;
+    // Union, new-wins: a partial parse truncates registration early, so wholesale
+    // replacement would drop variables the cached index legitimately still has.
+    for (const auto& [name, info] : other.variables_)
+        variables_[name] = info;
 }
 
 void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& toFile)

@@ -21,6 +21,7 @@
 #include <atomic>
 #include <csignal>
 #include <deque>
+#include <functional>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -421,17 +422,59 @@ std::string DescribeCrash(int retCode)
 #endif
 }
 
+std::string SanitizeTraceDocumentName(std::string name)
+{
+    for (char& c : name)
+        if (!std::isalnum((unsigned char)c) && c != '_' && c != '-') c = '_';
+    if (name.empty()) name = "document";
+    if (name.size() > 80) name.resize(80);
+    return name;
+}
+
+class LspTraceGuard
+{
+public:
+    explicit LspTraceGuard(std::function<void(bool)> finish) : finish_(std::move(finish)) {}
+    ~LspTraceGuard() { Finish(true); }
+
+    void Finish(bool writeFile)
+    {
+        if (!finish_) return;
+        auto finish = std::move(finish_);
+        finish(writeFile);
+    }
+
+private:
+    std::function<void(bool)> finish_;
+};
+
 class LspServer
 {
 public:
     LspServer(int protocolFd, const std::string& runtimeDir, const std::vector<std::string>& importDirs, bool verbose,
-              unsigned int poolSizeOverride = 0)
+              unsigned int poolSizeOverride = 0, bool ftimeTrace = false)
         : loop_(protocolFd, verbose)
         , runtimeDir_(runtimeDir)
         , importSearchDirs_(importDirs)
         , verbose_(verbose)
+        , timeTraceEnabled_(ftimeTrace)
         , currentIndex_(std::make_shared<LspSymbolIndex>())
     {
+        if (timeTraceEnabled_)
+        {
+            std::error_code traceEc;
+            traceDirectory_ = std::filesystem::temp_directory_path(traceEc) / "cflat-lsp-traces";
+            if (traceEc || traceDirectory_.empty())
+                traceDirectory_ = std::filesystem::path(runtimeDir_) / "cflat-lsp-traces";
+            std::filesystem::create_directories(traceDirectory_, traceEc);
+            if (traceEc)
+            {
+                std::cerr << std::format("[lsp] cannot create time trace directory '{}': {}\n",
+                                         traceDirectory_.string(), traceEc.message());
+                timeTraceEnabled_ = false;
+            }
+        }
+
         // CFLAT_LOCALE outranks the client's UI language; without it the pool starts
         // on en-simple and switches in ApplyClientLocale when initialize arrives.
         if (const char* envLocale = std::getenv("CFLAT_LOCALE"); envLocale && *envLocale)
@@ -1413,6 +1456,9 @@ private:
         const std::string& filePath = job.filePath;
         const std::string& text     = job.text;
 
+        auto tracePath = BeginTimeTrace(job);
+        LspTraceGuard traceGuard([this, tracePath](bool writeFile) { FinishTimeTrace(tracePath, writeFile); });
+
         std::string tempPath;
         {
             int counter;
@@ -1477,6 +1523,12 @@ private:
         {
             ok = backend->Analyze(tempPath, importSearchDirs_, runtimeDir_);
         });
+
+        // CrashRecoveryContext can bypass C++ destructors. Finish explicitly here so a
+        // crashed analysis cannot leave this worker's profiler active for the next job.
+        // On a crash the skipped TimeTraceScope destructors leave the profiler stack
+        // non-empty and timeTraceProfilerWrite would assert - discard instead of writing.
+        traceGuard.Finish(recovered);
 
         if (!recovered)
         {
@@ -1548,7 +1600,7 @@ private:
                 // completion. Copy-and-swap: readers hold shared_ptr snapshots of
                 // currentIndex_ without a lock, so never mutate the shared object.
                 auto merged = std::make_shared<LspSymbolIndex>(*currentIndex_);
-                merged->ReplaceVariablesFrom(*newIndex);
+                merged->MergeVariablesFrom(*newIndex);
                 currentIndex_ = std::move(merged);
                 if (verbose_)
                     std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
@@ -1570,6 +1622,62 @@ private:
         }
 
         PublishDiagnostics(uri, diagnostics);
+    }
+
+    std::filesystem::path BeginTimeTrace(const AnalysisJob& job)
+    {
+        if (!timeTraceEnabled_) return {};
+
+        uint64_t counter;
+        {
+            std::lock_guard<std::mutex> lock(traceMutex_);
+            counter = traceCounter_++;
+        }
+
+        std::filesystem::path source = job.filePath.empty()
+            ? std::filesystem::path(uriToFilePath(job.uri))
+            : std::filesystem::path(job.filePath);
+        std::string document = SanitizeTraceDocumentName(source.stem().string());
+        auto path = traceDirectory_ /
+            std::format("cflat-lsp-{}-{}-{}.time-trace.json", _getpid(), counter, document);
+        llvm::timeTraceProfilerInitialize(500, "cflat-lsp");
+        return path;
+    }
+
+    void FinishTimeTrace(const std::filesystem::path& path, bool writeFile)
+    {
+        if (path.empty() || !llvm::timeTraceProfilerEnabled()) return;
+
+        if (!writeFile)
+        {
+            llvm::timeTraceProfilerCleanup();
+            return;
+        }
+
+        bool written = false;
+        if (auto error = llvm::timeTraceProfilerWrite(path.string(), ""))
+            llvm::consumeError(std::move(error));
+        else
+            written = true;
+        // Deliberately Cleanup, not FinishThread: nothing in cflat calls
+        // timeTraceProfilerFinishThread, so the global instance list stays empty.
+        llvm::timeTraceProfilerCleanup();
+
+        if (!written)
+        {
+            std::cerr << std::format("[lsp] failed to write time trace '{}'\n", path.string());
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(traceMutex_);
+        tracePaths_.push_back(path);
+        while (tracePaths_.size() > kMaxTimeTraces)
+        {
+            std::error_code removeEc;
+            std::filesystem::remove(tracePaths_.front(), removeEc);
+            tracePaths_.pop_front();
+        }
+        std::cerr << std::format("[lsp] time trace written to {}\n", path.string());
     }
 
     // Build faded "never used" hints by cross-referencing the declarations recorded
@@ -1780,6 +1888,13 @@ private:
     std::mutex tempCounterMutex_;
     int tempFileCounter_ = 0;
 
+    static constexpr size_t kMaxTimeTraces = 64;
+    bool timeTraceEnabled_ = false;
+    std::filesystem::path traceDirectory_;
+    uint64_t traceCounter_ = 0;
+    std::deque<std::filesystem::path> tracePaths_;
+    std::mutex traceMutex_;
+
     // Job queue - every analysis (immediate or debounced) lands here.
     std::deque<AnalysisJob> jobQueue_;
     std::mutex jobMutex_;
@@ -1844,6 +1959,7 @@ int RunLspServer(int argc, char* argv[])
     bool verbose = false;
     std::vector<std::string> importDirs;
     unsigned int poolSizeOverride = 0;
+    bool ftimeTrace = false;
     for (int i = 0; i < argc; ++i)
     {
         std::string_view arg(argv[i]);
@@ -1856,10 +1972,12 @@ int RunLspServer(int argc, char* argv[])
             int v = std::atoi(argv[++i]);
             if (v > 0) poolSizeOverride = (unsigned int)v;
         }
+        else if (arg == "-ftime-trace" || arg == "--ftime-trace")
+            ftimeTrace = true;
     }
 
     if (verbose) std::cerr << "[lsp] server starting\n";
-    LspServer server(protocolFd, runtimeDir, importDirs, verbose, poolSizeOverride);
+    LspServer server(protocolFd, runtimeDir, importDirs, verbose, poolSizeOverride, ftimeTrace);
     if (verbose) std::cerr << "[lsp] entering Run()\n";
     server.Run();
     if (verbose) std::cerr << "[lsp] Run() returned\n";

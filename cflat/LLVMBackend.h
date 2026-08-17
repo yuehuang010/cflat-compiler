@@ -2784,6 +2784,8 @@ private:
     DiagnosticLocalization diagnosticLocalization_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
     LspSymbolIndex* symbolSink_ = nullptr;
+    // Core symbols are restored from the bitcode-cache metadata for LSP analyses.
+    LspSymbolIndex coreSymbolIndex_;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
