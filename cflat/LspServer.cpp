@@ -1542,8 +1542,17 @@ private:
 
             if (!keepCached)
                 currentIndex_ = newIndex;
-            else if (verbose_)
-                std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
+            else
+            {
+                // Keep complete symbol definitions, but refresh variables for receiver
+                // completion. Copy-and-swap: readers hold shared_ptr snapshots of
+                // currentIndex_ without a lock, so never mutate the shared object.
+                auto merged = std::make_shared<LspSymbolIndex>(*currentIndex_);
+                merged->ReplaceVariablesFrom(*newIndex);
+                currentIndex_ = std::move(merged);
+                if (verbose_)
+                    std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
+            }
         }
 
         // Occurrence-based unused-code hints (functions / locals / params / imports).

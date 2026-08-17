@@ -6,6 +6,12 @@
       "int main()",
       "int main(int argc, char** argv)"
     ],
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": [
+      "MyClass",
+      "1 type parameter",
+      "T",
+      "MyClass<int>"
+    ],
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
       "--asan"
     ],
@@ -438,6 +444,7 @@
     "arg0failedtocreatejitarg1": "{0}: failed to create JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: failed to define {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: failed to install process symbol resolver: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), for example {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
     "arg0noarg1functiontoexecute": "{0}: no '{1}' function to execute.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} on macOS requires the AddressSanitizer runtime from Xcode or the Command Line Tools (the SDK-free harvested-stub link cannot supply it); install one and retry.",

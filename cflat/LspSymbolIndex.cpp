@@ -101,6 +101,11 @@ const VariableInfo* LspSymbolIndex::LookupVariable(const std::string& varName) c
     return (it != variables_.end()) ? &it->second : nullptr;
 }
 
+void LspSymbolIndex::ReplaceVariablesFrom(const LspSymbolIndex& other)
+{
+    variables_ = other.variables_;
+}
+
 void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& toFile)
 {
     for (auto& [name, def] : symbols_)

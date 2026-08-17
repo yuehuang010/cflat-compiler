@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: JIT の作成に失敗しました: {1}",
     "arg0failedtodefinearg1arg2": "{0}: {1} の定義に失敗しました: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: プロセスシンボル解決プログラムのインストールに失敗しました: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' はジェネリック型です。型引数が必要です（{1}: {2} を想定）。例: {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC ライブラリ ディレクトリが見つかりません。AddressSanitizer ランタイム (clang_rt.asan_dynamic) を特定できません。C++ AddressSanitizer コンポーネント付きの Visual Studio がインストールされていることを確認してください。",
     "arg0noarg1functiontoexecute": "{0}: 実行する '{1}' 関数が見つかりません。",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "macOS での {0} には、Xcode またはコマンドラインツールから AddressSanitizer ランタイムが必要です（SDK 不要のハーベスティングスタブリンクでは提供できません）。いずれかをインストールして再試行してください。",

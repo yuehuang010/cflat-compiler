@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: не удалось создать JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: не удалось определить {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: не удалось установить разрешитель символов процесса: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' — обобщенный тип; требуются аргументы типа (требуется {1}: {2}), например {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: каталог библиотек MSVC не найден, невозможно найти среду выполнения asan (clang_rt.asan_dynamic). Убедитесь, что Visual Studio с компонентом C++ AddressSanitizer установлена.",
     "arg0noarg1functiontoexecute": "{0}: нет функции '{1}' для выполнения.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} в macOS требует среды выполнения AddressSanitizer из Xcode или Command Line Tools (ссылка-заглушка без SDK не может её предоставить); установите одно из них и повторите попытку.",

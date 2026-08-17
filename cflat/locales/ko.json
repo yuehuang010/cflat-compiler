@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: JIT 생성 실패: {1}",
     "arg0failedtodefinearg1arg2": "{0}: {1} 정의 실패: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: 프로세스 심볼 해결기 설치 실패: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}'은(는) 제네릭 타입입니다. 타입 인수가 필요합니다 ({1}: {2} 필요). 예: {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC 라이브러리 디렉토리를 찾을 수 없습니다. asan 런타임(clang_rt.asan_dynamic)을 찾을 수 없습니다. C++ AddressSanitizer 구성 요소가 포함된 Visual Studio가 설치되어 있는지 확인하십시오.",
     "arg0noarg1functiontoexecute": "{0}: 실행할 '{1}' 함수가 없습니다.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "macOS에서 {0}을(를) 사용하려면 Xcode 또는 커맨드 라인 도구의 AddressSanitizer 런타임이 필요합니다(SDK 없는 harvested-stub 링크로는 이를 제공할 수 없음). 하나를 설치한 후 다시 시도하십시오.",

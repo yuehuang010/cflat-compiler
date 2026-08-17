@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: impossibile creare JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: definizione di {1} non riuscita: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: installazione del risolutore dei simboli del processo non riuscita: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' è un tipo generico; sono necessari argomenti di tipo (prevede {1}: {2}), ad es. {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: directory lib di MSVC non trovata, impossibile individuare il runtime asan (clang_rt.asan_dynamic). Assicurati che Visual Studio con il componente AddressSanitizer C++ sia installato.",
     "arg0noarg1functiontoexecute": "{0}: nessuna funzione '{1}' da eseguire.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} su macOS richiede il runtime AddressSanitizer da Xcode o gli Strumenti da riga di comando (il collegamento stub senza SDK non può fornirlo); installane uno e riprova.",

@@ -62,6 +62,7 @@ public:
                           const std::string& file, int line, int column);
     const std::string* LookupVariableType(const std::string& varName) const;
     const VariableInfo* LookupVariable(const std::string& varName) const;
+    void ReplaceVariablesFrom(const LspSymbolIndex& other);
 
     // Unused-code candidates (declarations that may turn out to be unreferenced).
     void RegisterCandidate(const UnusedCandidate& cand);

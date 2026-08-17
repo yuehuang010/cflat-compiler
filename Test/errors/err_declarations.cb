@@ -36,6 +36,15 @@ expect_error("Generic type parameter must be an identifier, not a built-in type"
     struct Box<int> { int value = 0; };
 }
 
+struct BareGeneric<T> { T value = default; };
+expect_error("is a generic type; type arguments are required") {
+    int test_bare_generic_name()
+    {
+        BareGeneric value = default;
+        return 0;
+    }
+}
+
 expect_error("does not implement") {
     class Foo : IGreet
     {

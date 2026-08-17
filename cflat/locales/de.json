@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: Erstellen der JIT fehlgeschlagen: {1}",
     "arg0failedtodefinearg1arg2": "{0}: Definieren von {1} fehlgeschlagen: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: Installieren des Prozess-Symbolauflösers fehlgeschlagen: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' ist ein generischer Typ; Typargumente sind erforderlich (erwartet {1}: {2}), z. B. {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC-Bibliotheksverzeichnis nicht gefunden, asan-Laufzeit (clang_rt.asan_dynamic) kann nicht gefunden werden. Stellen Sie sicher, dass Visual Studio mit dem C++ AddressSanitizer-Komponenten installiert ist.",
     "arg0noarg1functiontoexecute": "{0}: Keine '{1}'-Funktion zum Ausführen.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} unter macOS erfordert die AddressSanitizer-Laufzeit von Xcode oder den Command Line Tools (der SDK-freie harvested-stub-Link kann sie nicht bereitstellen); installieren Sie eine davon und wiederholen Sie den Vorgang.",

@@ -248,7 +248,47 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                 }
                 else
                 {
-                    LogErrorMessage("unknown type '{}'", { resolvedTypeName });
+                    std::string genericKey = resolvedTypeName;
+                    if (!IsGenericTemplateKey(genericKey))
+                        genericKey = ResolveGenericTemplateBase(genericKey);
+
+                    const std::vector<std::string>* typeParams = nullptr;
+                    if (IsGenericTemplateKey(genericKey))
+                    {
+                        auto structParams = gts.genericStructTypeParams.find(genericKey);
+                        if (structParams != gts.genericStructTypeParams.end())
+                            typeParams = &structParams->second;
+                        else
+                        {
+                            auto interfaceParams = gts.genericInterfaceTypeParams.find(genericKey);
+                            if (interfaceParams != gts.genericInterfaceTypeParams.end())
+                                typeParams = &interfaceParams->second;
+                        }
+                    }
+
+                    if (typeParams != nullptr && !typeParams->empty())
+                    {
+                        std::string parameterNames;
+                        std::string exampleArgs;
+                        for (size_t i = 0; i < typeParams->size(); i++)
+                        {
+                            if (i != 0)
+                            {
+                                parameterNames += ", ";
+                                exampleArgs += ", ";
+                            }
+                            parameterNames += (*typeParams)[i];
+                            exampleArgs += "int";
+                        }
+                        std::string count = std::format("{} type parameter{}", typeParams->size(),
+                            typeParams->size() == 1 ? "" : "s");
+                        LogErrorMessage("'{}' is a generic type; type arguments are required "
+                            "(expects {}: {}), e.g. {}",
+                            { resolvedTypeName, count, parameterNames,
+                              resolvedTypeName + "<" + exampleArgs + ">" });
+                    }
+                    else
+                        LogErrorMessage("unknown type '{}'", { resolvedTypeName });
                     type = builder->getVoidTy();
                 }
             }

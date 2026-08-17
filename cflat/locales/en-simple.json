@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}: cannot create the JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: could not define {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: could not set up the symbol resolver: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), e.g. {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: cannot find the MSVC library folder. The compiler needs the AddressSanitizer runtime (clang_rt.asan_dynamic). Install Visual Studio with the C++ AddressSanitizer component.",
     "arg0noarg1functiontoexecute": "{0}: no '{1}' function to run.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} on macOS needs the AddressSanitizer runtime from Xcode or the Command Line Tools. The stub link cannot provide it. Install one and try again.",

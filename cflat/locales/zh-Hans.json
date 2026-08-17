@@ -15,6 +15,7 @@
     "arg0failedtocreatejitarg1": "{0}：创建 JIT 失败：{1}",
     "arg0failedtodefinearg1arg2": "{0}: 定义 {1} 失败: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: 安装进程符号解析器失败: {1}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' 是泛型类型；需要类型参数（需要 {1}：{2}），例如 {3}",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: 未找到 MSVC lib 目录，无法定位 asan 运行时 (clang_rt.asan_dynamic)。请确保已安装带有 C++ AddressSanitizer 组件的 Visual Studio。",
     "arg0noarg1functiontoexecute": "{0}: 没有可执行的 '{1}' 函数。",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "在 macOS 上使用 {0} 需要来自 Xcode 或命令行工具的 AddressSanitizer 运行时（无 SDK 的 harvested-stub 链接无法提供）；请安装其中一个并重试。",
