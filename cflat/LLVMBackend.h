@@ -2786,6 +2786,8 @@ private:
     LspSymbolIndex* symbolSink_ = nullptr;
     // Core symbols are restored from the bitcode-cache metadata for LSP analyses.
     LspSymbolIndex coreSymbolIndex_;
+    // Basenames under runtimeDir/core, built lazily for the root-is-core cache guard.
+    mutable std::unordered_set<std::string> coreFileNames_;
 
     llvm::Function* currentFunction;
     std::string sourceFileName;
@@ -6923,6 +6925,7 @@ public:
     void ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
                            const std::vector<std::string>& sourceLines);
 
+    bool RootFileNameIsCore(const std::string& fileName) const;
     bool Compile(const ArgParser& args, const std::string& inputOverride = {});
 
     bool CheckGrammar(const std::string& filename);

@@ -504,7 +504,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Batch (--check) loads the cache too: ResetForReanalysis leaves each file in the same
     // state a fresh backend is in at this point, and the load replaces context/module wholesale.
     bool bitcodeLoaded = false;
-    if (!noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport)
+    if (!noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport
+        && !RootFileNameIsCore(std::filesystem::path(filename).filename().string()))
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (verbose)
@@ -2232,6 +2233,28 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     }
 }
 
+// True when the root file being compiled/analyzed shares its name with a core library
+// file, whose definitions the core cache already holds. Matching by BASENAME mirrors the
+// cross-path import dedup: a repo-tree core/*.cb and its deployed runtimeDir/core copy
+// are treated as the same file there, so the cache guard must agree.
+bool LLVMBackend::RootFileNameIsCore(const std::string& fileName) const
+{
+    if (runtimeDir.empty() || fileName.empty()) return false;
+    if (coreFileNames_.empty())
+    {
+        std::error_code ec;
+        std::filesystem::recursive_directory_iterator it(
+            std::filesystem::path(runtimeDir) / "core", ec), end;
+        for (; !ec && it != end; it.increment(ec))
+        {
+            std::error_code fec;
+            if (it->is_regular_file(fec) && !fec)
+                coreFileNames_.insert(it->path().filename().string());
+        }
+    }
+    return coreFileNames_.count(fileName) != 0;
+}
+
 bool LLVMBackend::Analyze(const std::string& filePath,
                               const std::vector<std::string>& importDirs,
                               const std::string& runtimeDirPath)
@@ -2278,8 +2301,13 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 #endif
     SetTargetLongWidth(targetWindows_, platformValue);
 
+    // A core file analyzed as the ROOT document (LSP open / --check on core/*.cb) must
+    // not load the cache: the cache already contains this file's own definitions, and
+    // re-walking the root over them reports spurious redeclarations.
+    bool rootIsCoreFile = RootFileNameIsCore(sourceFileName);
+
     bool bitcodeLoaded = false;
-    if (!noCache_ && !runtimeDir.empty() && !skipRuntimeImport)
+    if (!noCache_ && !runtimeDir.empty() && !skipRuntimeImport && !rootIsCoreFile)
     {
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (!bcCacheDir.empty())

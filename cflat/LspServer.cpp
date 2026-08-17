@@ -967,6 +967,34 @@ private:
         return t;
     }
 
+    // Resolve the spelling recorded for a receiver to the index's member key.
+    static std::string ResolveMemberTypeName(LspSymbolIndex* index, const std::string& type)
+    {
+        std::string base = StripPointer(type);
+        for (int hops = 0; hops < 16; ++hops)
+        {
+            if (base == "string")
+            {
+                // The builtin string keeps its friendly spelling, while its generic
+                // member instantiation is indexed as list__string.
+                if (index->Lookup("list__string")
+                    || !index->LookupPrefix("list__string.").empty())
+                    base = "list__string";
+                break;
+            }
+
+            const SymbolDef* alias = index->Lookup(base);
+            if (alias == nullptr || alias->kind != SymbolKind::TypeAlias)
+                break;
+            size_t equal = alias->signatureMarkdown.find('=');
+            if (equal == std::string::npos) break;
+            std::string target = BaseTypeName(alias->signatureMarkdown.substr(equal + 1));
+            if (target.empty() || target == base) break;
+            base = StripPointer(target);
+        }
+        return base;
+    }
+
     // Element type of an indexed container/array/pointer type:
     //   "array__Sphere" -> "Sphere", "Sphere[10]"/"Sphere[]" -> "Sphere",
     //   "Sphere*" -> "Sphere". A fixed array stores its element type directly, so a
@@ -1014,7 +1042,7 @@ private:
     // Look up "Type.member", tolerating a pointer/qualified/generic-mangled type.
     static const SymbolDef* LookupMember(LspSymbolIndex* index, const std::string& type, const std::string& member)
     {
-        std::string base = StripPointer(type);
+        std::string base = ResolveMemberTypeName(index, type);
         if (const SymbolDef* d = index->Lookup(base + "." + member)) return d;
         size_t dot = base.rfind('.');
         if (dot != std::string::npos)
@@ -1241,6 +1269,7 @@ private:
             std::string typeName = receiver;
             if (auto* vt = index->LookupVariableType(receiver))
                 typeName = *vt;
+            typeName = ResolveMemberTypeName(index.get(), typeName);
 
             // LookupPrefix("TypeName.partial") returns matching fields and methods.
             auto members = index->LookupPrefix(typeName + "." + partial);
