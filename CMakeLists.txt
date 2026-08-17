@@ -163,7 +163,8 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/CClangExtract.cpp
   ${CFLAT_DIR}/JsonRpcLoop.cpp
   ${CFLAT_DIR}/LspServer.cpp
-  ${CFLAT_DIR}/LspSymbolIndex.cpp)
+  ${CFLAT_DIR}/LspSymbolIndex.cpp
+  ${CFLAT_DIR}/SymbolQuery.cpp)
 
 # WinMD import is a Windows-only feature (reads .winmd via windows.h). It will
 # be compiled out / stubbed on other platforms in Stage 2.

@@ -4,13 +4,9 @@
 #include <iostream>
 #include <filesystem>
 #include <stdlib.h>
-#include <algorithm>
 #include <vector>
 #include <string>
-#include <cctype>
 #include <cstring>
-#include <chrono>
-#include <fstream>
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
@@ -20,252 +16,13 @@
 #include "LLVMBackend.h"
 #include "CompilerManager.h"
 #include "ArgParser.h"
+#include "SymbolQuery.h"
 #include "Version.h"
 #include "LspServer.h"
 #include "WinmdExtract.h"
 #include "WinmdEmit.h"
 #include "WinmdSignature.h"
 
-// ---- --symbol query mode -------------------------------------------------
-// A lightweight "IDE quick search" over the symbol index that a real analysis
-// pass produces (the same index that drives LSP hover / go-to-definition). For
-// each search term an exact (or case-insensitive) name match prints detailed
-// symbol info; a miss falls back to substring / edit-distance matching and
-// suggests the closest symbols. The point is to give an agent the API-discovery
-// surface a human gets from an editor's symbol search.
-
-static std::string ToLower(std::string s)
-{
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return (char)std::tolower(c); });
-    return s;
-}
-
-static const char* SymbolKindName(SymbolKind k)
-{
-    switch (k)
-    {
-        case SymbolKind::Function:  return "function";
-        case SymbolKind::Struct:    return "struct";
-        case SymbolKind::Interface: return "interface";
-        case SymbolKind::Namespace: return "namespace";
-        case SymbolKind::TypeAlias: return "type alias";
-        case SymbolKind::Field:     return "field";
-        case SymbolKind::Variable:  return "variable";
-    }
-    return "symbol";
-}
-
-// Case-insensitive Levenshtein edit distance.
-static int EditDistance(const std::string& a, const std::string& b)
-{
-    const size_t n = a.size(), m = b.size();
-    std::vector<int> prev(m + 1), cur(m + 1);
-    for (size_t j = 0; j <= m; ++j) prev[j] = (int)j;
-    for (size_t i = 1; i <= n; ++i)
-    {
-        cur[0] = (int)i;
-        for (size_t j = 1; j <= m; ++j)
-        {
-            int cost = (std::tolower((unsigned char)a[i - 1]) ==
-                        std::tolower((unsigned char)b[j - 1])) ? 0 : 1;
-            cur[j] = std::min({ prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost });
-        }
-        std::swap(prev, cur);
-    }
-    return prev[m];
-}
-
-// Print full detail for an exact symbol hit, including any members - methods and
-// fields are registered under "<Type>.<member>", so we scan the index for that prefix.
-static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
-{
-    std::cout << std::format("{}  ({})\n", def.name, SymbolKindName(def.kind));
-    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
-        std::cout << std::format("  {}\n", def.signatureMarkdown);
-    for (const auto& sig : def.overloadSignatures)
-        std::cout << std::format("  {}\n", sig);
-    if (def.line > 0 && !def.file.empty())
-        std::cout << std::format("  defined: {}:{}\n", def.file, def.line);
-    if (!def.docComment.empty())
-        std::cout << std::format("  doc: {}\n", def.docComment);
-
-    const std::string prefix = def.name + ".";
-    std::vector<const SymbolDef*> members;
-    for (const auto& [name, m] : index.Symbols())
-        if (name.starts_with(prefix) && name.size() > prefix.size())
-            members.push_back(&m);
-    std::sort(members.begin(), members.end(),
-              [](const SymbolDef* a, const SymbolDef* b) { return a->name < b->name; });
-    if (!members.empty())
-    {
-        std::cout << "  members:\n";
-        for (const auto* m : members)
-        {
-            std::string shortName = m->name.substr(prefix.size());
-            std::cout << "    " << m->name;
-            if (!m->signatureMarkdown.empty() && m->signatureMarkdown != shortName)
-                std::cout << "  :  " << m->signatureMarkdown;
-            std::cout << "\n";
-            for (const auto& sig : m->overloadSignatures)
-                std::cout << std::format("    {}  :  {}\n", m->name, sig);
-        }
-    }
-}
-
-// Print "did you mean" suggestions for a term with no exact match. Substring hits
-// rank ahead of edit-distance hits; prefix and shorter names rank best within each band.
-static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::string& term)
-{
-    struct Suggestion { int score; const SymbolDef* def; };
-    const std::string lcq = ToLower(term);
-    const int threshold = std::max(2, (int)term.size() / 2);
-
-    std::vector<Suggestion> hits;
-    for (const auto& [name, def] : index.Symbols())
-    {
-        const std::string lcs = ToLower(name);
-        int score;
-        size_t pos = lcs.find(lcq);
-        if (pos != std::string::npos)
-            score = (int)pos * 2 + (int)(name.size() - term.size());  // substring band: 0..
-        else
-        {
-            int ed = EditDistance(lcq, lcs);
-            if (ed > threshold) continue;
-            score = 1000 + ed;  // edit-distance band: ranks after every substring hit
-        }
-        hits.push_back({ score, &def });
-    }
-
-    if (hits.empty())
-    {
-        std::cout << "  (no similar symbols found)\n";
-        return;
-    }
-
-    std::sort(hits.begin(), hits.end(), [](const Suggestion& a, const Suggestion& b) {
-        if (a.score != b.score) return a.score < b.score;
-        return a.def->name < b.def->name;
-    });
-
-    std::cout << "  did you mean:\n";
-    const size_t maxShow = 10;
-    for (size_t i = 0; i < hits.size() && i < maxShow; ++i)
-    {
-        const SymbolDef* d = hits[i].def;
-        std::cout << std::format("    {}  ({})", d->name, SymbolKindName(d->kind));
-        if (d->line > 0 && !d->file.empty())
-            std::cout << std::format("  {}:{}", d->file, d->line);
-        std::cout << "\n";
-    }
-}
-
-static int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProgress)
-{
-    const std::vector<std::string> terms = args.getMultiOption("symbol");
-    const std::vector<std::string> importDirs = args.getMultiOption("import-dir");
-
-    // What to index: an explicit positional source file (true IDE semantics - the
-    // index reflects exactly what that file imports), or, when none is given, a
-    // synthetic file that imports every core library so the whole standard library
-    // is searchable with zero setup.
-    std::string sourcePath;
-    std::string tempPath;
-    if (args.positionalCount() >= 1)
-    {
-        sourcePath = *args.getPositional(0);
-    }
-    else
-    {
-        std::string body;
-        std::error_code ec;
-        auto coreDir = std::filesystem::path(runtimeDir) / "core";
-        if (std::filesystem::is_directory(coreDir, ec))
-        {
-            std::vector<std::string> names;
-            // Recursive: subdirectory libraries (e.g. hpc/vecmath.cb) must be
-            // searchable too, or --symbol silently hides whole library families.
-            for (const auto& e : std::filesystem::recursive_directory_iterator(coreDir, ec))
-            {
-                if (e.path().extension() != ".cb" || e.path().filename() == "runtime.cb")
-                    continue;
-                std::string rel = std::filesystem::relative(e.path(), coreDir, ec).generic_string();
-                names.push_back(rel);
-            }
-            std::sort(names.begin(), names.end());
-            for (const auto& n : names)
-                body += "import \"" + n + "\";\n";
-        }
-        body += "extern int main() { return 0; }\n";
-
-        auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
-        tempPath = (std::filesystem::temp_directory_path() /
-                    ("cflat_symquery_" + std::to_string(stamp) + ".cb")).string();
-        std::ofstream out(tempPath, std::ios::binary);
-        out << body;
-        out.close();
-        sourcePath = tempPath;
-    }
-
-    LLVMBackend compiler;
-    compiler.SetRuntimeDir(runtimeDir);
-    compiler.SetVerbose(args.hasFlag("verbose"));
-    const char* symbolLocale = std::getenv("CFLAT_LOCALE");
-    compiler.SetLocale(args.getOption("locale").value_or(
-        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
-    compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
-        (std::filesystem::path(runtimeDir) / "locales").string()));
-    compiler.LoadLocale(args.hasFlag("verbose"));
-
-    LspSymbolIndex index;
-    compiler.SetSymbolSink(&index);
-    bool ok = compiler.Analyze(sourcePath, importDirs, runtimeDir);
-    compiler.SetSymbolSink(nullptr);
-
-    if (!tempPath.empty())
-    {
-        std::error_code ec;
-        std::filesystem::remove(tempPath, ec);
-    }
-
-    if (index.SymbolCount() == 0)
-    {
-        std::cout << "Error: no symbols indexed";
-        if (!ok) std::cout << std::format(" (analysis of '{}' failed)", sourcePath);
-        std::cout << ".\n";
-        return 1;
-    }
-    if (!ok && showProgress)
-        std::cout << "(note: analysis reported errors; results may be incomplete)\n";
-
-    bool first = true;
-    for (const auto& term : terms)
-    {
-        if (!first) std::cout << "\n";
-        first = false;
-
-        const SymbolDef* exact = index.Lookup(term);
-        if (!exact)
-        {
-            const std::string lcq = ToLower(term);
-            for (const auto& [name, def] : index.Symbols())
-                if (ToLower(name) == lcq) { exact = &def; break; }
-        }
-
-        if (exact)
-            PrintSymbolDetail(index, *exact);
-        else
-        {
-            std::cout << std::format("'{}': no exact match.\n", term);
-            if (!tempPath.empty())
-                std::cout << "  (no source file given, only showing symbols from core libraries; "
-                             "pass a .cb that imports your headers to search them)\n";
-            PrintSymbolSuggestions(index, term);
-        }
-    }
-    return 0;
-}
 
 /*
     The local cache root, <exe dir>/.cflat, or "" when the exe directory is unknown.
@@ -359,6 +116,7 @@ int main(int argc, char* argv[])
     args.addFlag("no-cache", 0, "Bypass the core bitcode cache and reparse core libraries from source");
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
+    args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
     args.addOption("dump-winmd", 0, "Read a WinRT metadata file (.winmd) into the projection model and dump it (diagnostic), then exit");
     args.addOption("emit-winmd", 0, "After compiling, write this program's [winrt] interfaces and classes to the given .winmd file");
     args.addFlag("winmd-sig-selftest", 0, "Validate the WinRT parameterized-type signature encoder and PIID derivation against reference IIDs, then exit");
@@ -591,6 +349,8 @@ int main(int argc, char* argv[])
     // check because it falls back to indexing the whole core library when no file is given.
     if (!args.getMultiOption("symbol").empty())
         return RunSymbolQuery(args, runtimeDir, !args.hasFlag("nologo"));
+    if (!args.getMultiOption("symbol-dump").empty())
+        return RunSymbolDumpQuery(args, runtimeDir, !args.hasFlag("nologo"));
 
     auto filename = args.getPositional(0);
     if (!filename)

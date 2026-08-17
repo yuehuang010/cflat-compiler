@@ -324,6 +324,22 @@ cflat.exe --symbol list --symbol "dictionary.set"
 cflat.exe app.cb -i lib --symbol Math
 ```
 
+## Symbol dump (`--symbol-dump`)
+
+| Switch | Value | Description |
+|--------|-------|-------------|
+| `--symbol-dump` | selector | Dump symbol info for source elements, then exit (repeatable). Requires a positional source file. |
+
+Selectors are:
+
+- `line:<n>` dumps one 1-based source line, for example `--symbol-dump line:49`.
+- `line:<a>-<b>` dumps an inclusive line range, for example `--symbol-dump line:41-49`.
+- `function:<name>` dumps the definition's function body, for example `--symbol-dump function:main`.
+
+Line dumps ignore comments and string or character literals; unresolved identifiers produce no
+symbol detail. Function dumps read the source file containing the indexed definition, including
+definitions from imported files.
+
 ## Informational (print and exit)
 
 | Switch | Short | Description |
