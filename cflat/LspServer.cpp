@@ -1398,7 +1398,7 @@ private:
                     return;
                 }
                 auto rawLine = filter["line"].get<int64_t>();
-                if (rawLine <= 0 || rawLine > std::numeric_limits<int>::max())
+                if (rawLine <= 0 || rawLine > (std::numeric_limits<int>::max)())
                 {
                     SendError(id, -32602, "Invalid cflat/viewAssembly line filter");
                     return;
