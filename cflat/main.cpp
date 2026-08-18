@@ -58,11 +58,11 @@ static std::optional<IsolatedPolicy> ConfigureIsolatedMode(LLVMBackend& compiler
                 "policy-restricted-language: --isolated-manifest requires --isolated");
         return std::nullopt;
     }
-#if !defined(__APPLE__)
-    // Isolated enforcement is verified on macOS hosts only; refuse rather than half-enforce.
+#if defined(__linux__)
+    // Isolated enforcement is verified on macOS and Windows hosts; Linux is still pending.
     compiler.ReportIsolatedPolicyError(std::format(
         "policy-output-unsupported: --isolated is not supported on this host platform yet "
-        "(verified on macOS only) (policy '{}')", *path));
+        "(verified on macOS and Windows only) (policy '{}')", *path));
     return std::nullopt;
 #endif
     if (!compiler.LoadIsolatedPolicy(*path)) return std::nullopt;

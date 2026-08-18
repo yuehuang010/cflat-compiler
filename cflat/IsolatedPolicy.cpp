@@ -152,9 +152,10 @@ const std::unordered_map<std::string, IsolatedCapability>& SymbolTable()
     static const auto table = [] {
         std::unordered_map<std::string, IsolatedCapability> result;
         // Inventory rules: fd read/write/close/fcntl are console I/O (Stdio), while
-        // open/fopen/CreateFile and file mappings are Filesystem. Memory, string, math,
-        // allocator, and atomic primitives are Pure. Sleep is Clock. Ambiguous OS calls
-        // use the more restrictive capability; dynamic loading is never approved.
+        // open/fopen/CreateFile and file mappings are Filesystem. Stream read/write on an
+        // already-open FILE* is Stdio; obtaining the handle is the Filesystem-gated step.
+        // Memory, string, math, allocator, and atomic primitives are Pure. Sleep is Clock.
+        // Ambiguous OS calls use the more restrictive capability; dynamic loading is never approved.
         AddSymbols(result, IsolatedCapability::Pure, {
             "_aligned_free", "_aligned_malloc", "_atoi64", "_controlfp_s", "__atomic_acquire_load_flag",
             "__atomic_acquire_load_i32", "__atomic_acquire_load_i64", "__atomic_counter_add",
@@ -177,12 +178,12 @@ const std::unordered_map<std::string, IsolatedCapability>& SymbolTable()
             "__acrt_iob_func", "__isoc99_vfscanf", "__isoc99_vsscanf", "__stdio_common_vfprintf",
             "__stdio_common_vfscanf", "__stdio_common_vsscanf", "__stdio_common_vsprintf",
             "__stderrp", "__stdinp", "__stdoutp", "__vfprintf_chk", "__vsnprintf_chk", "_getch",
-            "close", "fflush", "fgetc", "fprintf", "fputc", "fputs", "getc", "getchar",
+            "close", "fflush", "fgetc", "fread", "fprintf", "fputc", "fputs", "fwrite", "getc", "getchar",
             "GetConsoleMode", "GetConsoleOutputCP", "GetConsoleScreenBufferInfo", "GetNumberOfConsoleInputEvents",
             "GetStdHandle", "fcntl", "ioctl", "PeekConsoleInputA", "poll", "printf", "putc", "putchar", "putn", "puts",
             "ReadConsoleInputA", "ReadConsoleOutputA", "read", "SetConsoleCursorInfo", "SetConsoleMode",
             "SetConsoleOutputCP", "stderr", "stdin", "stdout", "tcgetattr", "tcsetattr", "vfprintf",
-            "vfscanf", "vprintf", "vscanf", "vsnprintf", "vsprintf", "vsscanf", "write", "sprintf", "snprintf",
+            "vfscanf", "vprintf", "vscanf", "vsnprintf", "vsprintf", "vsscanf", "write", "_write", "sprintf", "snprintf",
             "scanf", "sscanf", "WriteFile", "ReadFile",
             "WriteConsoleInputA", "_getch", "FlushConsoleInputBuffer"});
         AddSymbols(result, IsolatedCapability::Clock, {
@@ -195,7 +196,7 @@ const std::unordered_map<std::string, IsolatedCapability>& SymbolTable()
             "_access", "_chdir", "_fseeki64", "_ftelli64", "_getcwd", "_mkdir", "_rmdir", "_unlink",
             "access", "chdir", "closedir", "CopyFileA", "CreateFileA", "CreateFileMappingA",
             "FindClose", "FindFirstFileA", "FindNextFileA", "FlushViewOfFile", "fclose", "feof", "fgets", "fopen",
-            "fread", "fseek", "fseeko", "ftell", "ftello", "ftruncate", "fwrite", "GetFileAttributesA",
+            "fseek", "fseeko", "ftell", "ftello", "ftruncate", "GetFileAttributesA",
             "GetFileSizeEx", "GetFullPathNameA", "GetTempFileNameA", "GetTempPathA", "getcwd", "lseek",
             "MapViewOfFile", "mmap", "mkdir", "mkstemp", "msync", "munmap", "open", "opendir",
             "realpath", "readdir", "rename", "rmdir", "SetEndOfFile", "SetFilePointerEx", "stat", "unlink",
@@ -213,8 +214,10 @@ const std::unordered_map<std::string, IsolatedCapability>& SymbolTable()
             "PrintWindow",
             "RoActivateInstance", "RoGetActivationFactory", "RoInitialize", "RoUninitialize", "SetWindowTheme",
             "WideCharToMultiByte", "WindowsCreateString", "WindowsDeleteString", "WindowsGetStringRawBuffer"});
+        // CloseHandle only releases an already-audited OS handle.
+        AddSymbols(result, IsolatedCapability::Pure, {"CloseHandle"});
         AddSymbols(result, IsolatedCapability::Process, {
-            "CloseHandle", "CreatePipe", "CreateProcessA", "dup2", "execvp", "fork", "GetCurrentProcess", "GetExitCodeProcess",
+            "CreatePipe", "CreateProcessA", "dup2", "execvp", "fork", "GetCurrentProcess", "GetExitCodeProcess",
             "GetProcessAffinityMask", "K32GetProcessMemoryInfo", "kill", "OpenProcessToken",
             "pipe", "SetHandleInformation", "SetProcessAffinityMask", "signal",
             "TerminateProcess", "waitpid", "GetLastError", "getenv",

@@ -39,9 +39,9 @@ You can combine `-o` with `-l`/`-b` to emit the exe and the IR/bitcode in one pa
 ## Restricted policy (`--isolated`)
 
 `--isolated <policy.json>` validates a CFlat compilation against a versioned restricted
-policy. It is a compiler-side validation mode, not a new output mode. It is currently
-available on macOS hosts only; on Windows and Linux hosts the flag is rejected with
-`policy-output-unsupported` until enforcement is verified there. Use it with `--check`,
+policy. It is a compiler-side validation mode, not a new output mode. It is available on
+macOS and Windows hosts; Linux hosts reject the flag with `policy-output-unsupported` pending
+enforcement verification. Use it with `--check`,
 `--out-lli`/`-l`, or `--bitcode`/`-b`:
 
 ```bash

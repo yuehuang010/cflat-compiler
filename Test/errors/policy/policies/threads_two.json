@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "language": "restricted-v1",
+  "capabilities": {
+    "stdio": "allow",
+    "clock": "allow",
+    "random": "allow",
+    "filesystem": "deny",
+    "network": "deny",
+    "ui": "deny",
+    "process": "deny",
+    "threads": "allow"
+  },
+  "limits": { "max_threads": 2 }
+}

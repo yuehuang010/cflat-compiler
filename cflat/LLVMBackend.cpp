@@ -412,15 +412,20 @@ bool LLVMBackend::InstrumentIsolatedResources()
         // Stdio is optional: a denied policy uses abort without importing write.
         if (isolatedPolicy_->allow[static_cast<size_t>(IsolatedCapability::Stdio)])
         {
-            auto* writeType = llvm::FunctionType::get(i64, {i32, ptr, i64}, false);
-            auto* write = module->getFunction("write");
+            auto* writeType = targetWindows_
+                ? llvm::FunctionType::get(i32, {i32, ptr, i32}, false)
+                : llvm::FunctionType::get(i64, {i32, ptr, i64}, false);
+            auto writeName = targetWindows_ ? "_write" : "write";
+            auto* write = module->getFunction(writeName);
             if (!write)
                 write = llvm::Function::Create(writeType, llvm::GlobalValue::ExternalLinkage,
-                                               "write", module.get());
+                                               writeName, module.get());
             auto* messagePtr = b.CreateInBoundsGEP(messageType, messageGlobal,
                                                    {b.getInt64(0), b.getInt64(0)});
-            b.CreateCall(writeType, write,
-                         {b.getInt32(2), messagePtr, b.getInt64(message.size())});
+            llvm::Value* messageLength = targetWindows_
+                ? static_cast<llvm::Value*>(b.getInt32(static_cast<uint32_t>(message.size())))
+                : static_cast<llvm::Value*>(b.getInt64(message.size()));
+            b.CreateCall(writeType, write, {b.getInt32(2), messagePtr, messageLength});
         }
         auto* abortType = llvm::FunctionType::get(voidTy, {}, false);
         auto* abort = module->getFunction("abort");
@@ -785,14 +790,14 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* acquire = makeReserve("__cflat_isolated_thread_acquire", available,
                                     *isolatedPolicy_->maxThreads - 1, failure);
         auto* release = makeSubtractRelease("__cflat_isolated_thread_release", available);
+        auto* packetType = llvm::StructType::create(ctx, {ptr, ptr},
+                                                    "__cflat_isolated_thread_start");
+        auto* packetPtr = packetType->getPointerTo();
+        llvm::Function* threadAlloc = heapMalloc ? heapMalloc : realMalloc;
+        llvm::Function* threadFree = heapFree ? heapFree : realFree;
         auto* realCreate = getExternal("pthread_create");
         if (realCreate && realCreate->getFunctionType()->getNumParams() == 4)
         {
-            auto* packetType = llvm::StructType::create(ctx, {ptr, ptr},
-                                                        "__cflat_isolated_thread_start");
-            auto* packetPtr = packetType->getPointerTo();
-            llvm::Function* threadAlloc = heapMalloc ? heapMalloc : realMalloc;
-            llvm::Function* threadFree = heapFree ? heapFree : realFree;
             auto* trampoline = makeFunction(
                 "__cflat_isolated_thread_trampoline",
                 llvm::FunctionType::get(ptr, {ptr}, false));
@@ -847,7 +852,83 @@ bool LLVMBackend::InstrumentIsolatedResources()
             b.CreateRet(createResult);
             threadReplacements.emplace_back(realCreate, create);
         }
-    for (auto& [original, replacement] : threadReplacements)
+        auto* realCreateThread = getExternal("CreateThread");
+        if (realCreateThread && realCreateThread->getFunctionType()->getNumParams() == 6)
+        {
+            llvm::CallingConv::ID startCallingConv = realCreateThread->getCallingConv();
+            for (auto* user : realCreateThread->users())
+            {
+                auto* call = llvm::dyn_cast<llvm::CallBase>(user);
+                if (!call || call->arg_size() <= 2)
+                    continue;
+                auto* start = call->getArgOperand(2)->stripPointerCasts();
+                if (auto* function = llvm::dyn_cast<llvm::Function>(start))
+                {
+                    startCallingConv = function->getCallingConv();
+                    break;
+                }
+            }
+            auto* trampoline = makeFunction(
+                "__cflat_isolated_win_thread_trampoline",
+                llvm::FunctionType::get(i32, {ptr}, false));
+            trampoline->setCallingConv(startCallingConv);
+            auto* trampolineEntry = llvm::BasicBlock::Create(ctx, "entry", trampoline);
+            llvm::IRBuilder<> tb(trampolineEntry);
+            auto* packet = tb.CreateBitCast(trampoline->getArg(0), packetPtr);
+            auto* start = tb.CreateLoad(ptr, tb.CreateStructGEP(packetType, packet, 0));
+            auto* arg = tb.CreateLoad(ptr, tb.CreateStructGEP(packetType, packet, 1));
+            auto* threadStartType = llvm::FunctionType::get(i32, {ptr}, false);
+            auto* threadResult = tb.CreateCall(threadStartType, start, {arg});
+            threadResult->setCallingConv(startCallingConv);
+            tb.CreateCall(release, {tb.getInt64(1)});
+            if (threadFree)
+                tb.CreateCall(threadFree->getFunctionType(), threadFree, {trampoline->getArg(0)});
+            tb.CreateRet(threadResult);
+
+            auto* create = makeFunction("__cflat_isolated_CreateThread",
+                                        realCreateThread->getFunctionType());
+            create->setCallingConv(realCreateThread->getCallingConv());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", create);
+            auto* failed = llvm::BasicBlock::Create(ctx, "failed", create);
+            auto* noPacket = llvm::BasicBlock::Create(ctx, "no_packet", create);
+            llvm::IRBuilder<> b(entry);
+            b.CreateCall(acquire, {b.getInt64(1)});
+            llvm::Value* packetValue = llvm::ConstantPointerNull::get(ptr);
+            if (threadAlloc)
+                packetValue = b.CreateCall(threadAlloc->getFunctionType(), threadAlloc,
+                                           {b.getInt64(16)});
+            b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
+                           noPacket, llvm::BasicBlock::Create(ctx, "start", create));
+            auto* startBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                   ->getSuccessor(1);
+            b.SetInsertPoint(noPacket);
+            b.CreateCall(release, {b.getInt64(1)});
+            b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+            b.SetInsertPoint(startBlock);
+            auto* packetPtrValue = b.CreateBitCast(packetValue, packetPtr);
+            b.CreateStore(create->getArg(2), b.CreateStructGEP(packetType, packetPtrValue, 0));
+            b.CreateStore(create->getArg(3), b.CreateStructGEP(packetType, packetPtrValue, 1));
+            std::vector<llvm::Value*> args = {
+                create->getArg(0), create->getArg(1), trampoline, packetValue,
+                create->getArg(4), create->getArg(5)};
+            auto* createResult = b.CreateCall(realCreateThread->getFunctionType(),
+                                              realCreateThread, args);
+            createResult->setCallingConv(realCreateThread->getCallingConv());
+            realCalls.emplace_back(createResult, realCreateThread);
+            b.CreateCondBr(b.CreateICmpEQ(createResult, llvm::ConstantPointerNull::get(ptr)),
+                           failed, llvm::BasicBlock::Create(ctx, "success", create));
+            auto* success = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                ->getSuccessor(1);
+            b.SetInsertPoint(failed);
+            if (threadFree)
+                b.CreateCall(threadFree->getFunctionType(), threadFree, {packetValue});
+            b.CreateCall(release, {b.getInt64(1)});
+            b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+            b.SetInsertPoint(success);
+            b.CreateRet(createResult);
+            threadReplacements.emplace_back(realCreateThread, create);
+        }
+        for (auto& [original, replacement] : threadReplacements)
             original->replaceAllUsesWith(replacement);
     }
     for (auto& [call, original] : realCalls)

@@ -14,11 +14,14 @@ GetProcAddress/syscall) rejected under every policy; native macOS arm64 `-o` beh
 post-link audit that publishes the executable only after the audit passes (other targets:
 policy-output-unsupported); `--isolated-manifest` sidecar with SHA-256 digests;
 compiler-instrumented `heap_bytes`/`heap_mb` cap and `max_threads` permits via IR-level
-interposition of malloc/calloc/realloc/free/posix_memalign/pthread_create, with the module
-re-verified after instrumentation. `--isolated` is available on macOS hosts only; Windows and
-Linux hosts reject the flag (policy-output-unsupported) until enforcement is verified there.
+interposition of malloc/calloc/realloc/free/posix_memalign/pthread_create/CreateThread, with the module
+re-verified after instrumentation. `--isolated` is supported on macOS and Windows hosts (17+1
+policy tests pass through test.bat's probe path); Linux remains gated. `-o` remains macOS arm64
+only because no PE post-link audit exists. CloseHandle is Pure because it only releases an
+audited handle; fwrite/fread are Stdio because read/write on an already-open FILE* follows
+handle provenance, while opening remains Filesystem-gated.
 Test support: `.cb.flags` sidecar convention in test.sh (flags= / expect_exit= /
-expect_output=), 17 policy tests in Test/errors/policy/ including positive compile fixtures
+expect_output=), 17+1 policy tests in Test/errors/policy/ including positive compile fixtures
 and the review's bypass-shape regressions (cold+warm), pseudo-locale discovery coverage, and
 scratch matrices in scratch/isolated|s3-check|s4-check.
 
@@ -32,9 +35,8 @@ implemented. Duplicate-JSON-key rejection is SAX-based and done. An independent 
 (2026-08-17) fixed 13 findings, notably: heap release polarity, global-initializer address
 escapes, semantic int-to-pointer rejection with an IR inttoptr backstop, never-allowed
 dynamic-loading/syscall symbols, audit-before-publish for -o, post-instrumentation module
-verification, and positive policy fixtures. `--isolated` is additionally blocked outright on
-Windows and Linux HOST machines (policy-output-unsupported) until enforcement is verified
-there; macOS is the only supported host today.
+verification, and positive policy fixtures. The Windows host gate was subsequently lifted after enforcement verification; Linux remains
+gated pending the equivalent host verification.
 
 Original design intent below, revised 2026-08-17 after review (flat capability map replaces
 groups; sealed-export inventory its own stage; vtable dispatch in v1 scope via the

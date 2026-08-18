@@ -1,0 +1,15 @@
+import "thread.cb";
+
+int worker(move void* ctx)
+{
+    return 42;
+}
+
+extern int main()
+{
+    Thread t;
+    t.start(worker, nullptr);
+    i32 code = t.join();
+    printf("%d\n", code);
+    return 0;
+}

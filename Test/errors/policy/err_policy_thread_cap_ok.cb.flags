@@ -1,0 +1,2 @@
+flags=--isolated Test/errors/policy/policies/threads_two.json
+expect_exit=zero
