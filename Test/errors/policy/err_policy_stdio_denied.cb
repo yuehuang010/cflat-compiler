@@ -1,0 +1,5 @@
+extern int main()
+{
+    printf("stdio\n");
+    return 0;
+}

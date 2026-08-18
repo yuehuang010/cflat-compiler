@@ -1,0 +1,3 @@
+flags=--isolated Test/errors/policy/policies/allow_all.json
+expect_exit=nonzero
+expect_output=policy-restricted-language

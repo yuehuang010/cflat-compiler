@@ -1,0 +1,3 @@
+flags=--isolated Test/errors/policy/policies/unknown_top_level.json
+expect_exit=nonzero
+expect_output=policy-invalid

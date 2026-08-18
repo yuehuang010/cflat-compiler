@@ -1,0 +1,5 @@
+extern int main()
+{
+    int* manufactured = (int*)(4096);
+    return manufactured != nullptr;
+}

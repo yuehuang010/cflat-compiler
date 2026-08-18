@@ -1,0 +1,2 @@
+flags=--isolated Test/errors/policy/policies/deny_fsnet.json
+expect_exit=zero

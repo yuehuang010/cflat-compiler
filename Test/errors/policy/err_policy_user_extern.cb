@@ -1,0 +1,7 @@
+expect_error("policy-restricted-language");
+extern long syscall(long);
+
+extern int main()
+{
+    return 0;
+}

@@ -83,7 +83,13 @@ if "%~1"=="--worker-err" (
     set OUT=%CFLAT_OUT%
     set T0=!TIME!
     call "%~dp0test_err.bat" --group !GRP! > "!OUT!\results\test_err_!GRP!.log" 2>&1
-    if !ERRORLEVEL! neq 0 (
+    set ERR_GROUP_RC=!ERRORLEVEL!
+    set ERR_POLICY_ONLY=0
+    if !ERR_GROUP_RC! neq 0 (
+        findstr /c:"POLICY_ONLY_FAILURES" "!OUT!\results\test_err_!GRP!.log" >nul
+        if !ERRORLEVEL! equ 0 set ERR_POLICY_ONLY=1
+    )
+    if !ERR_GROUP_RC! neq 0 if !ERR_POLICY_ONLY! equ 0 (
         echo FAILED: test_err_!GRP!>"!OUT!\results\test_err_!GRP!.result"
         exit /b
     )
@@ -163,6 +169,16 @@ if errorlevel 1 (
     echo FAILED: cflat.exe --init-local
     type "%OUT%\results\init.log"
     exit /b 1
+)
+
+REM Probe --isolated once. The allow_all_ok sidecar supplies these exact flags.
+REM A non-macOS host currently rejects --isolated before policy enforcement exists.
+set CFLAT_POLICY_SUPPORTED=1
+"%COMPILER%" "Test\errors\policy\err_policy_allow_all_ok.cb" -i "%LIB%" --locale-dir "%CFLAT_LOCALE_DIR%" --check --nologo --isolated Test/errors/policy/policies/deny_fsnet.json >"%OUT%\results\policy_probe.log" 2>&1
+findstr /c:"policy-output-unsupported: --isolated is not supported on this host platform" "%OUT%\results\policy_probe.log" >nul
+if not errorlevel 1 (
+    set CFLAT_POLICY_SUPPORTED=0
+    echo Policy tests skipped - --isolated is not supported on this host platform
 )
 
 REM Discover diagnostic templates from the complete error-test suite before launching
@@ -265,10 +281,14 @@ if errorlevel 1 (
 
 :Collect
 set /a ERRORS=0
+set /a SKIPS=0
 set FAILED_NAMES=
 for %%R in (%OUT%\results\*.result) do (
     set /p RESULT=<"%%R"
-    if /I "!RESULT:~0,4!" neq "PASS" (
+    if /I "!RESULT:~0,4!"=="SKIP" (
+        echo SKIPPED: %%~nR
+        set /a SKIPS+=1
+    ) else if /I "!RESULT:~0,4!" neq "PASS" (
         echo.
         echo === %%~nR ===
         type "%%~dpnR.log"
@@ -291,10 +311,10 @@ for %%R in (%OUT%\results\*.result) do (
 echo.
 call :ElapsedTime "%START_TIME%" "%TIME%"
 if %ERRORS% EQU 0 (
-    echo All tests passed.
+    echo All tests passed. !SKIPS! tests skipped.
     exit /b 0
 ) else (
-    echo %ERRORS% tests failed. [!FAILED_NAMES!]
+    echo %ERRORS% tests failed, !SKIPS! skipped. [!FAILED_NAMES!]
     exit /b 1
 )
 

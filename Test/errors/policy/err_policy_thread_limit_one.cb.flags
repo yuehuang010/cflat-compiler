@@ -1,0 +1,3 @@
+flags=--isolated Test/errors/policy/policies/threads_limit_one.json
+expect_exit=nonzero
+expect_output=resource-limit

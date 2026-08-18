@@ -1922,6 +1922,10 @@ public:
     ForwardRefScanner(LLVMBackend* compiler);
     void SetTokens(antlr4::BufferedTokenStream* t);
 
+    // Reject statically integral operands of pointer casts before code generation. The scanner
+    // uses folded semantic constants and explicit scalar cast types, never source-text matching.
+    void ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree);
+
     /*
      * Record every file-scope pure-rename `using` alias BEFORE either pass walks the file, so
      * MangleTypeArg folds the same alias set in both. It cannot be left to the walk: ScanGenericTypeUses
@@ -2104,6 +2108,17 @@ private:
     inline LLVMBackend* Compiler() { return compilerLLVM; }
 
 public:
+    void enterTranslationUnit(CFlatParser::TranslationUnitContext* ctx) override
+    {
+        ForwardRefScanner scanner(Compiler(ctx));
+        scanner.ValidateIsolatedIntegralPointerCasts(ctx);
+    }
+
+    void enterProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) override
+    {
+        Compiler(ctx)->ValidateIsolatedProgram(ctx);
+    }
+
     // What the CALLER of an expression parse will do with the result. Threaded down the pure
     // single-child passthrough chain only; any operator context resets it to Value.
     //  Value        - the result is consumed (stored, passed, joined, tested). A void call here

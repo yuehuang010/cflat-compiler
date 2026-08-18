@@ -36,6 +36,66 @@ positionals are treated as additional `.c` inputs to link. See
 
 You can combine `-o` with `-l`/`-b` to emit the exe and the IR/bitcode in one pass.
 
+## Restricted policy (`--isolated`)
+
+`--isolated <policy.json>` validates a CFlat compilation against a versioned restricted
+policy. It is a compiler-side validation mode, not a new output mode. It is currently
+available on macOS hosts only; on Windows and Linux hosts the flag is rejected with
+`policy-output-unsupported` until enforcement is verified there. Use it with `--check`,
+`--out-lli`/`-l`, or `--bitcode`/`-b`:
+
+```bash
+cflat app.cb --isolated policy.json --check
+cflat app.cb --isolated policy.json --out-lli app.ll
+cflat app.cb --isolated policy.json -o app --isolated-manifest app.manifest.json
+```
+
+The policy is a UTF-8 JSON object with these required fields and optional `limits`:
+
+```json
+{
+  "version": 1,
+  "language": "restricted-v1",
+  "capabilities": {
+    "stdio": "allow", "clock": "deny", "random": "deny", "filesystem": "deny",
+    "network": "deny", "ui": "deny", "process": "deny", "threads": "deny"
+  },
+  "limits": { "heap_bytes": 1048576, "max_threads": 1 }
+}
+```
+
+`capabilities` must name all eight capabilities exactly, with each value set to `allow` or
+`deny`. `limits` is optional and may contain only positive integer `heap_bytes` or `heap_mb`
+(at most one), and positive integer `max_threads`. `heap_mb` is mebibytes. `max_threads` must
+be `1` when `threads` is `deny`. Unknown keys, duplicate keys, wrong types, zero, negative,
+floating-point, and overflowing numbers are invalid.
+
+The compiler enforces all eight denied capabilities: stdio, clock, random, filesystem, network,
+ui, process, and threads. The final LLVM module is checked against a sealed positive runtime
+export inventory; unknown external symbols and unknown LLVM intrinsics are rejected as
+`policy-module-denied`. Heap limits are enforced by compiler-inserted atomic accounting around
+the allocator, and `max_threads` limits concurrent CFlat threads including the main thread.
+Exceeding either limit writes `isolated runtime error: ... exceeded` to stderr when stdio is
+allowed, then aborts; with stdio denied it aborts without a message. These are compiler-side
+limits only and are not an OS security boundary.
+
+`--isolated` cannot be combined with `--run`, positional `.c` inputs,
+`--asan`, or `--heap-audit`. Native interop imports and prebuilt native library options are
+also outside the restricted profile.
+
+On native macOS arm64, `-o` is supported after a post-link Mach-O audit. Other target and host
+combinations still reject isolated `-o` as `policy-output-unsupported`; the audit checks load
+commands, imported symbols, and writable/executable segments.
+
+`--isolated-manifest <path>` requires `--isolated` and describes one compilation. It is rejected
+for a multi-file `--check` batch. The manifest records policy and module metadata and hashes the
+bound output. With multiple outputs, it binds to bitcode if present, otherwise to LLVM IR,
+otherwise to the executable; `--check` has no `output.sha256`.
+
+This is compiler-side validation only and is NOT a security boundary. It does not provide an
+OS sandbox or contain the compiler or generated program; a service must provide separate
+containment and runtime authorization.
+
 ## Execution (`--run`)
 
 | Switch | Value | Description |

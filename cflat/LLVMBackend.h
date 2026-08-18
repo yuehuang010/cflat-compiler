@@ -30,6 +30,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <optional>
 #if defined(_WIN32)
 #include <io.h>
 #endif
@@ -86,6 +87,7 @@
 #include <array>
 #include "CompilerManager.h"
 #include "MoveDataflow.h"
+#include "IsolatedPolicy.h"
 
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
@@ -2460,6 +2462,7 @@ private:
     bool verbose = false;
     bool batchMode_ = false;
     bool noCache_ = false;
+    std::optional<IsolatedPolicy> isolatedPolicy_;
     bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
     // --cpu/-mcpu (ISA + scheduling) and --tune/-mtune (scheduling only). Resolved and
     // validated in Compile so EmitExecutable and C interop can use them verbatim.
@@ -2800,6 +2803,7 @@ private:
     // line. Read only to tell a genuine redefinition apart from the same definition arriving twice.
     // Per-compile; cleared by ResetForReanalysis with the module it describes.
     std::unordered_map<std::string, std::pair<std::string, size_t>> functionBodyOrigin_;
+    std::unordered_set<std::string> isolatedCoreFunctions_;
     llvm::AllocaInst* autoVaListAlloca = nullptr;
 
     std::unique_ptr<llvm::DIBuilder> diBuilder;
@@ -3870,6 +3874,12 @@ private:
     void CheckPoisonedFunctionCalls();
 
     bool VerifyModule();
+    bool InstrumentIsolatedResources();
+    bool AuditIsolatedModule();
+    bool AuditIsolatedExecutable(const std::string& exePath);
+    bool WriteIsolatedManifest(const std::string& manifestPath, const std::string& kind,
+                               const std::optional<std::string>& outputPath);
+    void ValidateIsolatedParseTree(antlr4::tree::ParseTree* tree);
 
     // Build a TargetLibraryInfoImpl for `triple` with cflat's reimplemented C stdio format
     // family (vsnprintf/vfprintf/vsscanf/vfscanf) marked unavailable on non-Windows targets.
@@ -6895,6 +6905,14 @@ public:
     int  GetJitExitCode() const;
     void SetBatchMode(bool v);
     void SetNoCache(bool v);
+    bool LoadIsolatedPolicy(const std::string& path);
+    void SetIsolatedPolicy(const IsolatedPolicy& policy);
+    std::optional<IsolatedPolicy> GetIsolatedPolicy() const;
+    bool IsIsolated() const;
+    bool IsIsolatedCoreSource() const;
+    void ReportIsolatedPolicyError(const std::string& message) const;
+    void ValidateIsolatedExtern(CFlatParser::DeclarationContext* ctx);
+    void ValidateIsolatedProgram(antlr4::ParserRuleContext* ctx);
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v);

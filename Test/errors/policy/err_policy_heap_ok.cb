@@ -1,0 +1,14 @@
+import "memory.cb";
+
+extern int main()
+{
+    int i = 0;
+    while (i < 4)
+    {
+        void* p = malloc(1024);
+        if (p == nullptr) return 1;
+        free(p);
+        i++;
+    }
+    return 0;
+}

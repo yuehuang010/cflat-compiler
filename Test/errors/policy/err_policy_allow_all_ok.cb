@@ -1,0 +1,11 @@
+// Positive control: ordinary printf, string, and list use under a restricted policy.
+import "string.cb";
+import "list.cb";
+
+extern int main()
+{
+    string text = "ok";
+    list<int> values = {1, 2};
+    printf("%s %d\n", text.data(), values.count());
+    return 0;
+}

@@ -1,0 +1,8 @@
+function<void*(i64)> callback = malloc;
+void keep(function<void*(i64)> value) { }
+
+int main()
+{
+    keep(malloc);
+    return 0;
+}

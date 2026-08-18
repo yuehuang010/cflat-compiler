@@ -1,0 +1,2 @@
+flags=--isolated Test/errors/policy/policies/allow_heap_2mb.json
+expect_exit=zero

@@ -20,12 +20,15 @@
 #include <llvm/Object/Binary.h>
 #include <llvm/Object/Archive.h>
 #include <llvm/Object/COFFImportFile.h>
+#include <llvm/Object/MachO.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
+#include <llvm/Support/SHA256.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
+#include <llvm/IR/Intrinsics.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -33,12 +36,15 @@
 #include "LLVMBackend.h"
 #include "MainListener.h"
 #include "GrammarTreeListener.h"
+#include "Version.h"
 #include <filesystem>
 #include <optional>
 #include <algorithm>
 #include <cctype>
 #include <map>
 #include <set>
+#include <fstream>
+#include <nlohmann/json.hpp>
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -126,6 +132,19 @@ static std::string LowerExtension(const std::filesystem::path& p)
     std::string ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return (char)std::tolower(c); });
     return ext;
+}
+
+static bool IsPathUnderDirectory(const std::filesystem::path& path,
+                                 const std::filesystem::path& directory)
+{
+    std::error_code ec;
+    auto pathText = std::filesystem::weakly_canonical(path, ec).generic_string();
+    if (ec) return false;
+    auto directoryText = std::filesystem::weakly_canonical(directory, ec).generic_string();
+    if (ec) return false;
+    if (directoryText.empty() || pathText.size() <= directoryText.size()) return false;
+    return pathText.compare(0, directoryText.size(), directoryText) == 0
+        && pathText[directoryText.size()] == '/';
 }
 
 // LLVM data layout string for the target platform (32 = win32, else win64). Both little-endian MSVC.
@@ -219,6 +238,35 @@ static bool IsFrameworkImport(CFlatParser::ImportDeclarationContext* imp)
     return imp->children.size() >= 2 && imp->children[1]->getText() == "framework";
 }
 
+static bool IsIsolatedNativeImport(CFlatParser::ImportDeclarationContext* imp)
+{
+    return IsPackageVcpkgImport(imp) || IsPackageNugetImport(imp) || IsFrameworkImport(imp)
+        || !DequoteLibClauses(imp).empty() || !DequoteFrameworkClauses(imp).empty()
+        || !DequoteDefineClauses(imp).empty();
+}
+
+static bool IsAllowedIsolatedIntrinsic(llvm::StringRef name)
+{
+    static constexpr std::array<llvm::StringRef, 28> prefixes = {
+        "llvm.memcpy.", "llvm.memmove.", "llvm.memset.", "llvm.lifetime.", "llvm.dbg.",
+        "llvm.experimental.noalias.", "llvm.sadd.with.overflow.", "llvm.uadd.with.overflow.",
+        "llvm.ssub.with.overflow.", "llvm.usub.with.overflow.", "llvm.smul.with.overflow.",
+        "llvm.umul.with.overflow.", "llvm.fabs.", "llvm.sqrt.", "llvm.pow.", "llvm.sin.",
+        "llvm.cos.", "llvm.tan.", "llvm.exp.", "llvm.exp2.", "llvm.log.", "llvm.log2.",
+        "llvm.log10.", "llvm.round.", "llvm.floor.", "llvm.ceil.", "llvm.trunc.", "llvm.minnum."};
+    for (auto prefix : prefixes)
+        if (name.starts_with(prefix)) return true;
+    static constexpr std::array<llvm::StringRef, 23> exactOrFamilies = {
+        "llvm.assume", "llvm.expect", "llvm.trap", "llvm.eh.typeid.for", "llvm.stacksave",
+        "llvm.stackrestore", "llvm.readcyclecounter", "llvm.va_start", "llvm.va_end", "llvm.fma.",
+        "llvm.copysign.", "llvm.maxnum.", "llvm.ctlz.", "llvm.ctpop.", "llvm.cttz.", "llvm.fshl.",
+        "llvm.masked.", "llvm.prefetch.", "llvm.vector.reduce.", "llvm.invariant.start.",
+        "llvm.invariant.end.", "llvm.ptrmask.", "llvm.is.constant."};
+    for (auto prefix : exactOrFamilies)
+        if (name == prefix || name.starts_with(prefix)) return true;
+    return false;
+}
+
 // Dequoted port spec from `from "..."` on an import package-vcpkg line (empty if absent).
 static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
 {
@@ -245,6 +293,953 @@ static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
     stream.clear();
     stream.seekg(0);
     return lines;
+}
+
+bool LLVMBackend::LoadIsolatedPolicy(const std::string& path)
+{
+    IsolatedPolicy policy;
+    std::string error;
+    if (!ParseIsolatedPolicyFile(path, policy, error))
+    {
+        sourceFileName = path;
+        // Parser errors that already carry a category keep it; others are policy-invalid.
+        if (error.rfind("policy-", 0) == 0)
+            LogError(std::format("{} (policy '{}')", error, path));
+        else
+            LogError(std::format("policy-invalid: {} in policy '{}'", error, path));
+        return false;
+    }
+    isolatedPolicy_ = std::move(policy);
+    sourceFileName = path;
+    return true;
+}
+
+void LLVMBackend::SetIsolatedPolicy(const IsolatedPolicy& policy)
+{
+    isolatedPolicy_ = policy;
+}
+
+std::optional<IsolatedPolicy> LLVMBackend::GetIsolatedPolicy() const
+{
+    return isolatedPolicy_;
+}
+
+bool LLVMBackend::IsIsolated() const
+{
+    return isolatedPolicy_.has_value();
+}
+
+bool LLVMBackend::IsIsolatedCoreSource() const
+{
+    return isolatedPolicy_.has_value() && !currentSourceIsCore_ && !runtimeDir.empty()
+        && IsPathUnderDirectory(currentSourceFilePath_, std::filesystem::path(runtimeDir) / "core");
+}
+
+void LLVMBackend::ReportIsolatedPolicyError(const std::string& message) const
+{
+    LogError(message);
+}
+
+void LLVMBackend::ValidateIsolatedExtern(CFlatParser::DeclarationContext* ctx)
+{
+    if (!isolatedPolicy_ || currentSourceIsCore_ || IsIsolatedCoreSource() || ctx == nullptr) return;
+    currentLine = ctx->getStart()->getLine();
+    currentColumn = ctx->getStart()->getCharPositionInLine();
+    LogError(std::format("policy-restricted-language: user extern declarations are not allowed "
+                         "in isolated mode (policy '{}')", isolatedPolicy_->path));
+}
+
+void LLVMBackend::ValidateIsolatedParseTree(antlr4::tree::ParseTree* tree)
+{
+    if (!isolatedPolicy_ || currentSourceIsCore_ || IsIsolatedCoreSource() || tree == nullptr) return;
+    if (auto* program = dynamic_cast<CFlatParser::ProgramDefinitionContext*>(tree))
+    {
+        ValidateIsolatedProgram(program);
+        return;
+    }
+    if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(tree))
+    {
+        auto* specs = declaration->declarationSpecifiers();
+        if (specs)
+            for (auto* spec : specs->declarationSpecifier())
+                if (auto* storage = spec->storageClassSpecifier(); storage && storage->Extern() != nullptr)
+                {
+                    ValidateIsolatedExtern(declaration);
+                    break;
+                }
+    }
+    for (auto* child : tree->children)
+        ValidateIsolatedParseTree(child);
+}
+
+bool LLVMBackend::InstrumentIsolatedResources()
+{
+    if (!isolatedPolicy_) return true;
+
+    auto& ctx = *context;
+    auto* i1 = llvm::Type::getInt1Ty(ctx);
+    auto* i8 = llvm::Type::getInt8Ty(ctx);
+    auto* i32 = llvm::Type::getInt32Ty(ctx);
+    auto* i64 = llvm::Type::getInt64Ty(ctx);
+    auto* ptr = llvm::PointerType::get(ctx, 0);
+    auto* voidTy = llvm::Type::getVoidTy(ctx);
+    auto makeFunction = [&](llvm::StringRef name, llvm::FunctionType* type) {
+        return llvm::Function::Create(type, llvm::GlobalValue::InternalLinkage, name, module.get());
+    };
+    auto getExternal = [&](llvm::StringRef name) -> llvm::Function* {
+        auto* function = module->getFunction(name);
+        return function && function->isDeclaration() ? function : nullptr;
+    };
+
+    llvm::Function* realMalloc = getExternal("malloc");
+    llvm::Function* realCalloc = getExternal("calloc");
+    llvm::Function* realRealloc = getExternal("realloc");
+    llvm::Function* realFree = getExternal("free");
+    llvm::Function* realPosixMemalign = getExternal("posix_memalign");
+    llvm::Function* heapMalloc = nullptr;
+    llvm::Function* heapFree = nullptr;
+
+    auto makeFailure = [&](llvm::StringRef name, llvm::StringRef message) {
+        auto* function = makeFunction(name, llvm::FunctionType::get(voidTy, {}, false));
+        auto* block = llvm::BasicBlock::Create(ctx, "entry", function);
+        llvm::IRBuilder<> b(block);
+        auto* messageType = llvm::ArrayType::get(i8, message.size() + 1);
+        auto* messageValue = llvm::ConstantDataArray::getString(ctx, message, true);
+        auto* messageGlobal = new llvm::GlobalVariable(
+            *module, messageType, true, llvm::GlobalValue::PrivateLinkage, messageValue,
+            name + ".message");
+        messageGlobal->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        // Stdio is optional: a denied policy uses abort without importing write.
+        if (isolatedPolicy_->allow[static_cast<size_t>(IsolatedCapability::Stdio)])
+        {
+            auto* writeType = llvm::FunctionType::get(i64, {i32, ptr, i64}, false);
+            auto* write = module->getFunction("write");
+            if (!write)
+                write = llvm::Function::Create(writeType, llvm::GlobalValue::ExternalLinkage,
+                                               "write", module.get());
+            auto* messagePtr = b.CreateInBoundsGEP(messageType, messageGlobal,
+                                                   {b.getInt64(0), b.getInt64(0)});
+            b.CreateCall(writeType, write,
+                         {b.getInt32(2), messagePtr, b.getInt64(message.size())});
+        }
+        auto* abortType = llvm::FunctionType::get(voidTy, {}, false);
+        auto* abort = module->getFunction("abort");
+        if (!abort)
+            abort = llvm::Function::Create(abortType, llvm::GlobalValue::ExternalLinkage,
+                                           "abort", module.get());
+        b.CreateCall(abortType, abort, {});
+        b.CreateUnreachable();
+        return function;
+    };
+
+    auto makeReserve = [&](llvm::StringRef name, llvm::GlobalVariable* counter,
+                           uint64_t limit, llvm::Function* failure) {
+        auto* function = makeFunction(name, llvm::FunctionType::get(i1, {i64}, false));
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", function);
+        auto* retry = llvm::BasicBlock::Create(ctx, "retry", function);
+        auto* cas = llvm::BasicBlock::Create(ctx, "cas", function);
+        auto* success = llvm::BasicBlock::Create(ctx, "success", function);
+        auto* failed = llvm::BasicBlock::Create(ctx, "failed", function);
+        llvm::IRBuilder<> b(entry);
+        b.CreateBr(retry);
+        b.SetInsertPoint(retry);
+        auto* current = b.CreateLoad(i64, counter, "current");
+        current->setAtomic(llvm::AtomicOrdering::Monotonic);
+        auto* cap = b.getInt64(limit);
+        auto* remaining = b.CreateSub(cap, current, "remaining");
+        auto* tooHigh = b.CreateICmpUGT(current, cap);
+        auto* tooMuch = b.CreateICmpUGT(function->getArg(0), remaining);
+        b.CreateCondBr(b.CreateOr(tooHigh, tooMuch), failed, cas);
+        b.SetInsertPoint(cas);
+        auto* desired = b.CreateAdd(current, function->getArg(0), "desired");
+        auto* exchange = b.CreateAtomicCmpXchg(counter, current, desired, llvm::MaybeAlign(),
+                                               llvm::AtomicOrdering::AcquireRelease,
+                                               llvm::AtomicOrdering::Monotonic);
+        auto* exchanged = b.CreateExtractValue(exchange, 1, "reserved");
+        b.CreateCondBr(exchanged, success, retry);
+        b.SetInsertPoint(success);
+        b.CreateRet(b.getTrue());
+        b.SetInsertPoint(failed);
+        b.CreateCall(failure, {});
+        b.CreateUnreachable();
+        return function;
+    };
+
+    auto makeRelease = [&](llvm::StringRef name, llvm::GlobalVariable* counter) {
+        auto* function = makeFunction(name, llvm::FunctionType::get(voidTy, {i64}, false));
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", function);
+        llvm::IRBuilder<> b(entry);
+        b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, counter, function->getArg(0),
+                          llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+        b.CreateRetVoid();
+        return function;
+    };
+    auto makeSubtractRelease = [&](llvm::StringRef name, llvm::GlobalVariable* counter) {
+        auto* function = makeFunction(name, llvm::FunctionType::get(voidTy, {i64}, false));
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", function);
+        llvm::IRBuilder<> b(entry);
+        b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, counter, function->getArg(0),
+                          llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
+        b.CreateRetVoid();
+        return function;
+    };
+
+    llvm::StructType* headerType = nullptr;
+    llvm::GlobalVariable* heapCounter = nullptr;
+    llvm::Function* heapReserve = nullptr;
+    llvm::Function* heapRelease = nullptr;
+    if (isolatedPolicy_->heapBytes)
+    {
+        headerType = llvm::StructType::create(ctx, {i64, ptr}, "__cflat_isolated_heap_header");
+        heapCounter = new llvm::GlobalVariable(
+            *module, i64, false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i64, 0), "__cflat_isolated_heap_live");
+        heapCounter->setAlignment(llvm::Align(8));
+        auto* heapFailure = makeFailure("__cflat_isolated_heap_fail",
+                                         "isolated runtime error: restricted heap cap exceeded\n");
+        heapReserve = makeReserve("__cflat_isolated_heap_reserve", heapCounter,
+                                  *isolatedPolicy_->heapBytes, heapFailure);
+        heapRelease = makeRelease("__cflat_isolated_heap_release", heapCounter);
+    }
+
+    if (heapCounter && realFree && !realMalloc)
+        LogError(std::format("policy-module-denied: isolated heap accounting requires malloc "
+                             "when free is present in policy '{}'", isolatedPolicy_->path));
+
+    std::vector<std::pair<llvm::Function*, llvm::Function*>> replacements;
+    std::vector<std::pair<llvm::CallBase*, llvm::Function*>> realCalls;
+    auto headerFor = [&](llvm::IRBuilder<>& b, llvm::Value* user) {
+        auto* bytes = b.CreateConstInBoundsGEP1_64(i8, user, -16);
+        return b.CreateBitCast(bytes, headerType->getPointerTo());
+    };
+    auto headerSize = [&](llvm::IRBuilder<>& b, llvm::Value* header) {
+        return b.CreateStructGEP(headerType, header, 0);
+    };
+    auto headerRaw = [&](llvm::IRBuilder<>& b, llvm::Value* header) {
+        return b.CreateStructGEP(headerType, header, 1);
+    };
+    auto addUserPointer = [&](llvm::IRBuilder<>& b, llvm::Value* raw) {
+        return b.CreateConstInBoundsGEP1_64(i8, raw, 16);
+    };
+    const uint64_t maxPayload = std::numeric_limits<uint64_t>::max() - 16;
+
+    if (heapCounter && realMalloc && realMalloc->getFunctionType()->getNumParams() == 1)
+    {
+        heapMalloc = makeFunction("__cflat_isolated_malloc", realMalloc->getFunctionType());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", heapMalloc);
+        auto* fail = llvm::BasicBlock::Create(ctx, "overflow", heapMalloc);
+        auto* rawCall = llvm::BasicBlock::Create(ctx, "allocate", heapMalloc);
+        auto* null = llvm::BasicBlock::Create(ctx, "null", heapMalloc);
+        llvm::IRBuilder<> b(entry);
+        auto* size = heapMalloc->getArg(0);
+        b.CreateCondBr(b.CreateICmpUGT(size, b.getInt64(maxPayload)), fail, rawCall);
+        b.SetInsertPoint(fail);
+        auto* failFn = module->getFunction("__cflat_isolated_heap_fail");
+        b.CreateCall(failFn, {});
+        b.CreateUnreachable();
+        b.SetInsertPoint(rawCall);
+        b.CreateCall(heapReserve, {size});
+        auto* total = b.CreateAdd(size, b.getInt64(16));
+        auto* rawCallInst = b.CreateCall(realMalloc->getFunctionType(), realMalloc, {total});
+        realCalls.emplace_back(rawCallInst, realMalloc);
+        auto* raw = rawCallInst;
+        b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
+                       llvm::BasicBlock::Create(ctx, "store", heapMalloc));
+        auto* store = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                          ->getSuccessor(1);
+        b.SetInsertPoint(null);
+        b.CreateCall(heapRelease, {size});
+        b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+        b.SetInsertPoint(store);
+        auto* header = b.CreateBitCast(raw, headerType->getPointerTo());
+        b.CreateStore(size, headerSize(b, header));
+        b.CreateStore(raw, headerRaw(b, header));
+        b.CreateRet(addUserPointer(b, raw));
+        replacements.emplace_back(realMalloc, heapMalloc);
+    }
+
+    if (heapCounter && heapMalloc && realFree && realFree->getFunctionType()->getNumParams() == 1)
+    {
+        heapFree = makeFunction("__cflat_isolated_free", realFree->getFunctionType());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", heapFree);
+        auto* done = llvm::BasicBlock::Create(ctx, "done", heapFree);
+        llvm::IRBuilder<> b(entry);
+        auto* user = heapFree->getArg(0);
+        b.CreateCondBr(b.CreateICmpEQ(user, llvm::ConstantPointerNull::get(ptr)), done,
+                       llvm::BasicBlock::Create(ctx, "release", heapFree));
+        auto* release = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                            ->getSuccessor(1);
+        b.SetInsertPoint(release);
+        auto* header = headerFor(b, user);
+        auto* size = b.CreateLoad(i64, headerSize(b, header));
+        auto* raw = b.CreateLoad(ptr, headerRaw(b, header));
+        auto* freeCall = b.CreateCall(realFree->getFunctionType(), realFree, {raw});
+        realCalls.emplace_back(freeCall, realFree);
+        b.CreateCall(heapRelease, {size});
+        b.CreateBr(done);
+        b.SetInsertPoint(done);
+        b.CreateRetVoid();
+        replacements.emplace_back(realFree, heapFree);
+    }
+
+    if (heapCounter && realCalloc && heapMalloc
+        && realCalloc->getFunctionType()->getNumParams() == 2)
+    {
+        auto* wrapper = makeFunction("__cflat_isolated_calloc", realCalloc->getFunctionType());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", wrapper);
+        auto* overflow = llvm::BasicBlock::Create(ctx, "overflow", wrapper);
+        auto* call = llvm::BasicBlock::Create(ctx, "call", wrapper);
+        auto* null = llvm::BasicBlock::Create(ctx, "null", wrapper);
+        llvm::IRBuilder<> b(entry);
+        auto* product = b.CreateIntrinsic(llvm::Intrinsic::umul_with_overflow,
+                                          {i64}, {wrapper->getArg(0), wrapper->getArg(1)});
+        auto* productValue = b.CreateExtractValue(product, 0);
+        auto* productOverflow = b.CreateExtractValue(product, 1);
+        b.CreateCondBr(b.CreateOr(productOverflow,
+                                  b.CreateICmpUGT(productValue, b.getInt64(maxPayload))),
+                       overflow, call);
+        b.SetInsertPoint(overflow);
+        b.CreateCall(module->getFunction("__cflat_isolated_heap_fail"), {});
+        b.CreateUnreachable();
+        b.SetInsertPoint(call);
+        b.CreateCall(heapReserve, {productValue});
+        auto* total = b.CreateAdd(productValue, b.getInt64(16));
+        auto* rawCallInst = b.CreateCall(realCalloc->getFunctionType(), realCalloc,
+                                         {b.getInt64(1), total});
+        realCalls.emplace_back(rawCallInst, realCalloc);
+        auto* raw = rawCallInst;
+        b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
+                       llvm::BasicBlock::Create(ctx, "store", wrapper));
+        auto* store = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                          ->getSuccessor(1);
+        b.SetInsertPoint(null);
+        b.CreateCall(heapRelease, {productValue});
+        b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+        b.SetInsertPoint(store);
+        auto* header = b.CreateBitCast(raw, headerType->getPointerTo());
+        b.CreateStore(productValue, headerSize(b, header));
+        b.CreateStore(raw, headerRaw(b, header));
+        b.CreateRet(addUserPointer(b, raw));
+        replacements.emplace_back(realCalloc, wrapper);
+    }
+
+    if (heapCounter && realRealloc && heapMalloc && heapFree
+        && realRealloc->getFunctionType()->getNumParams() == 2)
+    {
+        auto* wrapper = makeFunction("__cflat_isolated_realloc", realRealloc->getFunctionType());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", wrapper);
+        auto* nullInput = llvm::BasicBlock::Create(ctx, "null_input", wrapper);
+        auto* nonNull = llvm::BasicBlock::Create(ctx, "non_null", wrapper);
+        auto* zero = llvm::BasicBlock::Create(ctx, "zero", wrapper);
+        auto* resize = llvm::BasicBlock::Create(ctx, "resize", wrapper);
+        auto* grow = llvm::BasicBlock::Create(ctx, "grow", wrapper);
+        auto* shrink = llvm::BasicBlock::Create(ctx, "shrink", wrapper);
+        auto* call = llvm::BasicBlock::Create(ctx, "call", wrapper);
+        auto* failed = llvm::BasicBlock::Create(ctx, "failed", wrapper);
+        auto* store = llvm::BasicBlock::Create(ctx, "store", wrapper);
+        llvm::IRBuilder<> b(entry);
+        auto* oldPtr = wrapper->getArg(0);
+        auto* newSize = wrapper->getArg(1);
+        b.CreateCondBr(b.CreateICmpEQ(oldPtr, llvm::ConstantPointerNull::get(ptr)), nullInput, nonNull);
+        b.SetInsertPoint(nullInput);
+        b.CreateRet(b.CreateCall(heapMalloc->getFunctionType(), heapMalloc, {newSize}));
+        b.SetInsertPoint(nonNull);
+        auto* oldHeader = headerFor(b, oldPtr);
+        auto* oldSize = b.CreateLoad(i64, headerSize(b, oldHeader));
+        auto* raw = b.CreateLoad(ptr, headerRaw(b, oldHeader));
+        b.CreateCondBr(b.CreateICmpEQ(newSize, b.getInt64(0)), zero, resize);
+        b.SetInsertPoint(zero);
+        auto* freeCall = b.CreateCall(realFree->getFunctionType(), realFree, {raw});
+        realCalls.emplace_back(freeCall, realFree);
+        b.CreateCall(heapRelease, {oldSize});
+        b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+        b.SetInsertPoint(resize);
+        b.CreateCondBr(b.CreateICmpUGT(newSize, oldSize), grow, shrink);
+        b.SetInsertPoint(grow);
+        b.CreateCall(heapReserve, {b.CreateSub(newSize, oldSize)});
+        b.CreateBr(call);
+        b.SetInsertPoint(shrink);
+        b.CreateBr(call);
+        b.SetInsertPoint(call);
+        b.CreateCondBr(b.CreateICmpUGT(newSize, oldSize),
+                       llvm::BasicBlock::Create(ctx, "call_grow", wrapper),
+                       llvm::BasicBlock::Create(ctx, "call_shrink", wrapper));
+        auto* callGrow = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                             ->getSuccessor(0);
+        auto* callShrink = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                               ->getSuccessor(1);
+        b.SetInsertPoint(callGrow);
+        auto* growTotal = b.CreateAdd(newSize, b.getInt64(16));
+        auto* grownCall = b.CreateCall(realRealloc->getFunctionType(), realRealloc, {raw, growTotal});
+        realCalls.emplace_back(grownCall, realRealloc);
+        auto* grownRaw = grownCall;
+        b.CreateCondBr(b.CreateICmpEQ(grownRaw, llvm::ConstantPointerNull::get(ptr)), failed, store);
+        b.SetInsertPoint(callShrink);
+        auto* shrinkTotal = b.CreateAdd(newSize, b.getInt64(16));
+        auto* shrunkCall = b.CreateCall(realRealloc->getFunctionType(), realRealloc, {raw, shrinkTotal});
+        realCalls.emplace_back(shrunkCall, realRealloc);
+        auto* shrunkRaw = shrunkCall;
+        b.CreateCondBr(b.CreateICmpEQ(shrunkRaw, llvm::ConstantPointerNull::get(ptr)), failed, store);
+        b.SetInsertPoint(failed);
+        b.CreateCall(heapRelease, {b.CreateSelect(b.CreateICmpUGT(newSize, oldSize),
+                                                   b.CreateSub(newSize, oldSize),
+                                                   b.getInt64(0))});
+        b.CreateRet(llvm::ConstantPointerNull::get(ptr));
+        b.SetInsertPoint(store);
+        auto* resizedRaw = b.CreatePHI(ptr, 2, "resized_raw");
+        resizedRaw->addIncoming(grownRaw, callGrow);
+        resizedRaw->addIncoming(shrunkRaw, callShrink);
+        auto* resizedHeader = b.CreateBitCast(resizedRaw, headerType->getPointerTo());
+        b.CreateStore(newSize, headerSize(b, resizedHeader));
+        b.CreateStore(resizedRaw, headerRaw(b, resizedHeader));
+        b.CreateCondBr(b.CreateICmpUGT(oldSize, newSize),
+                       llvm::BasicBlock::Create(ctx, "release_shrink", wrapper),
+                       llvm::BasicBlock::Create(ctx, "return", wrapper));
+        auto* releaseShrink = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                  ->getSuccessor(0);
+        auto* returnBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                ->getSuccessor(1);
+        b.SetInsertPoint(releaseShrink);
+        b.CreateCall(heapRelease, {b.CreateSub(oldSize, newSize)});
+        b.CreateBr(returnBlock);
+        b.SetInsertPoint(returnBlock);
+        b.CreateRet(addUserPointer(b, resizedRaw));
+        replacements.emplace_back(realRealloc, wrapper);
+    }
+
+    if (heapCounter && heapMalloc && realPosixMemalign
+        && realPosixMemalign->getFunctionType()->getNumParams() == 3)
+    {
+        auto* wrapper = makeFunction("__cflat_isolated_posix_memalign",
+                                     realPosixMemalign->getFunctionType());
+        auto* entry = llvm::BasicBlock::Create(ctx, "entry", wrapper);
+        auto* invalid = llvm::BasicBlock::Create(ctx, "invalid", wrapper);
+        auto* allocate = llvm::BasicBlock::Create(ctx, "allocate", wrapper);
+        auto* null = llvm::BasicBlock::Create(ctx, "null", wrapper);
+        auto* store = llvm::BasicBlock::Create(ctx, "store", wrapper);
+        llvm::IRBuilder<> b(entry);
+        auto* alignment = wrapper->getArg(1);
+        auto* size = wrapper->getArg(2);
+        auto* badAlign = b.CreateOr(
+            b.CreateICmpULT(alignment, b.getInt64(8)),
+            b.CreateICmpNE(b.CreateAnd(alignment, b.CreateSub(alignment, b.getInt64(1))),
+                           b.getInt64(0)));
+        b.CreateCondBr(badAlign, invalid, allocate);
+        b.SetInsertPoint(invalid);
+        b.CreateRet(b.getInt32(22));
+        b.SetInsertPoint(allocate);
+        auto* overflow = llvm::BasicBlock::Create(ctx, "overflow", wrapper);
+        auto* sizeAlignment = b.CreateIntrinsic(llvm::Intrinsic::uadd_with_overflow,
+                                                {i64}, {size, alignment});
+        auto* sizeAlignmentValue = b.CreateExtractValue(sizeAlignment, 0);
+        auto* sizeAlignmentOverflow = b.CreateExtractValue(sizeAlignment, 1);
+        auto* totalWithHeader = b.CreateIntrinsic(llvm::Intrinsic::uadd_with_overflow,
+                                                  {i64}, {sizeAlignmentValue, b.getInt64(15)});
+        auto* total = b.CreateExtractValue(totalWithHeader, 0);
+        auto* totalOverflow = b.CreateExtractValue(totalWithHeader, 1);
+        b.CreateCondBr(b.CreateOr(sizeAlignmentOverflow, totalOverflow), overflow, null);
+        b.SetInsertPoint(overflow);
+        b.CreateCall(module->getFunction("__cflat_isolated_heap_fail"), {});
+        b.CreateUnreachable();
+        b.SetInsertPoint(null);
+        b.CreateCall(heapReserve, {total});
+        auto* rawCallInst = b.CreateCall(realMalloc->getFunctionType(), realMalloc, {total});
+        realCalls.emplace_back(rawCallInst, realMalloc);
+        auto* raw = rawCallInst;
+        b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)),
+                       llvm::BasicBlock::Create(ctx, "alloc_fail", wrapper), store);
+        auto* allocFail = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                              ->getSuccessor(0);
+        b.SetInsertPoint(allocFail);
+        b.CreateCall(heapRelease, {total});
+        b.CreateRet(b.getInt32(12));
+        b.SetInsertPoint(store);
+        auto* rawInt = b.CreatePtrToInt(raw, i64);
+        auto* alignedInt = b.CreateAnd(b.CreateAdd(b.CreateAdd(rawInt, b.getInt64(16)),
+                                                    b.CreateSub(alignment, b.getInt64(1))),
+                                       b.CreateNot(b.CreateSub(alignment, b.getInt64(1))));
+        auto* user = b.CreateIntToPtr(alignedInt, ptr);
+        auto* header = b.CreateBitCast(b.CreateConstInBoundsGEP1_64(i8, user, -16),
+                                       headerType->getPointerTo());
+        b.CreateStore(total, headerSize(b, header));
+        b.CreateStore(raw, headerRaw(b, header));
+        b.CreateStore(user, wrapper->getArg(0));
+        b.CreateRet(b.getInt32(0));
+        replacements.emplace_back(realPosixMemalign, wrapper);
+    }
+
+    for (auto& [original, replacement] : replacements)
+        original->replaceAllUsesWith(replacement);
+
+    if (isolatedPolicy_->maxThreads && *isolatedPolicy_->maxThreads > 1
+        && !isolatedPolicy_->IsDenied(IsolatedCapability::Threads))
+    {
+        std::vector<std::pair<llvm::Function*, llvm::Function*>> threadReplacements;
+        auto* available = new llvm::GlobalVariable(
+            *module, i64, false, llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantInt::get(i64, 0),
+            "__cflat_isolated_thread_permits");
+        available->setAlignment(llvm::Align(8));
+        auto* failure = makeFailure("__cflat_isolated_thread_fail",
+                                    "isolated runtime error: max_threads exceeded\n");
+        auto* acquire = makeReserve("__cflat_isolated_thread_acquire", available,
+                                    *isolatedPolicy_->maxThreads - 1, failure);
+        auto* release = makeSubtractRelease("__cflat_isolated_thread_release", available);
+        auto* realCreate = getExternal("pthread_create");
+        if (realCreate && realCreate->getFunctionType()->getNumParams() == 4)
+        {
+            auto* packetType = llvm::StructType::create(ctx, {ptr, ptr},
+                                                        "__cflat_isolated_thread_start");
+            auto* packetPtr = packetType->getPointerTo();
+            llvm::Function* threadAlloc = heapMalloc ? heapMalloc : realMalloc;
+            llvm::Function* threadFree = heapFree ? heapFree : realFree;
+            auto* trampoline = makeFunction(
+                "__cflat_isolated_thread_trampoline",
+                llvm::FunctionType::get(ptr, {ptr}, false));
+            auto* trampolineEntry = llvm::BasicBlock::Create(ctx, "entry", trampoline);
+            llvm::IRBuilder<> tb(trampolineEntry);
+            auto* packet = tb.CreateBitCast(trampoline->getArg(0), packetPtr);
+            auto* start = tb.CreateLoad(ptr, tb.CreateStructGEP(packetType, packet, 0));
+            auto* arg = tb.CreateLoad(ptr, tb.CreateStructGEP(packetType, packet, 1));
+            auto* threadStartType = llvm::FunctionType::get(ptr, {ptr}, false);
+            auto* threadResult = tb.CreateCall(threadStartType, start, {arg});
+            tb.CreateCall(release, {tb.getInt64(1)});
+            if (threadFree)
+                tb.CreateCall(threadFree->getFunctionType(), threadFree, {trampoline->getArg(0)});
+            tb.CreateRet(threadResult);
+
+            auto* create = makeFunction("__cflat_isolated_pthread_create",
+                                        realCreate->getFunctionType());
+            auto* entry = llvm::BasicBlock::Create(ctx, "entry", create);
+            auto* failed = llvm::BasicBlock::Create(ctx, "failed", create);
+            auto* noPacket = llvm::BasicBlock::Create(ctx, "no_packet", create);
+            llvm::IRBuilder<> b(entry);
+            b.CreateCall(acquire, {b.getInt64(1)});
+            llvm::Value* packetValue = llvm::ConstantPointerNull::get(ptr);
+            if (threadAlloc)
+                packetValue = b.CreateCall(threadAlloc->getFunctionType(), threadAlloc,
+                                           {b.getInt64(16)});
+            b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
+                           noPacket, llvm::BasicBlock::Create(ctx, "start", create));
+            auto* startBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                   ->getSuccessor(1);
+            b.SetInsertPoint(noPacket);
+            b.CreateCall(release, {b.getInt64(1)});
+            b.CreateRet(b.getInt32(12));
+            b.SetInsertPoint(startBlock);
+            auto* packetPtrValue = b.CreateBitCast(packetValue, packetPtr);
+            b.CreateStore(create->getArg(2), b.CreateStructGEP(packetType, packetPtrValue, 0));
+            b.CreateStore(create->getArg(3), b.CreateStructGEP(packetType, packetPtrValue, 1));
+            std::vector<llvm::Value*> args = {
+                create->getArg(0), create->getArg(1), trampoline, packetValue};
+            auto* createResult = b.CreateCall(realCreate->getFunctionType(), realCreate, args);
+            realCalls.emplace_back(createResult, realCreate);
+            b.CreateCondBr(b.CreateICmpNE(createResult, b.getInt32(0)), failed,
+                           llvm::BasicBlock::Create(ctx, "success", create));
+            auto* success = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+                                ->getSuccessor(1);
+            b.SetInsertPoint(failed);
+            if (threadFree)
+                b.CreateCall(threadFree->getFunctionType(), threadFree, {packetValue});
+            b.CreateCall(release, {b.getInt64(1)});
+            b.CreateRet(createResult);
+            b.SetInsertPoint(success);
+            b.CreateRet(createResult);
+            threadReplacements.emplace_back(realCreate, create);
+        }
+    for (auto& [original, replacement] : threadReplacements)
+            original->replaceAllUsesWith(replacement);
+    }
+    for (auto& [call, original] : realCalls)
+        call->setCalledFunction(original->getFunctionType(), original);
+    return true;
+}
+
+bool LLVMBackend::AuditIsolatedModule()
+{
+    if (!isolatedPolicy_) return true;
+
+    auto auditCtorArray = [&](llvm::StringRef name) {
+        auto* array = module->getGlobalVariable(name);
+        if (!array) return;
+        auto* initializer = array->hasInitializer()
+            ? llvm::dyn_cast<llvm::ConstantArray>(array->getInitializer()) : nullptr;
+        if (!initializer)
+        {
+            if (array->hasInitializer()
+                && llvm::isa<llvm::ConstantAggregateZero>(array->getInitializer()))
+                return;
+            LogError(std::format("policy-module-denied: '{}' has no valid constructor array in policy '{}'",
+                                 name.str(), isolatedPolicy_->path));
+            return;
+        }
+        for (auto* element : initializer->operand_values())
+        {
+            auto* entry = llvm::dyn_cast<llvm::ConstantStruct>(element);
+            auto* functionValue = entry && entry->getNumOperands() > 1
+                ? entry->getAggregateElement(1) : nullptr;
+            auto* function = functionValue
+                ? llvm::dyn_cast<llvm::Function>(functionValue->stripPointerCasts()) : nullptr;
+            if (!function || function->isDeclaration())
+                LogError(std::format("policy-module-denied: external or invalid function in '{}' in policy '{}'",
+                                     name.str(), isolatedPolicy_->path));
+        }
+    };
+    auditCtorArray("llvm.global_ctors");
+    auditCtorArray("llvm.global_dtors");
+
+    if (!module->getModuleInlineAsm().empty())
+        LogError(std::format("policy-module-denied: module-level inline assembly is not allowed "
+                             "in policy '{}'", isolatedPolicy_->path));
+
+    for (auto& alias : module->aliases())
+    {
+        auto* target = alias.getAliasee()->stripPointerCasts();
+        auto* global = llvm::dyn_cast<llvm::GlobalValue>(target);
+        if (!global || global->isDeclaration() || global->getParent() != module.get())
+            LogError(std::format("policy-module-denied: alias '{}' targets an external or unknown "
+                                 "symbol in policy '{}'", alias.getName().str(), isolatedPolicy_->path));
+    }
+
+    auto auditUsedList = [&](llvm::StringRef name) {
+        auto* used = module->getGlobalVariable(name);
+        if (!used || !used->hasInitializer()) return;
+        auto* entries = llvm::dyn_cast<llvm::ConstantArray>(used->getInitializer());
+        if (!entries)
+        {
+            if (llvm::isa<llvm::ConstantAggregateZero>(used->getInitializer())) return;
+            LogError(std::format("policy-module-denied: '{}' has an invalid initializer in policy '{}'",
+                                 name.str(), isolatedPolicy_->path));
+            return;
+        }
+        for (auto* entry : entries->operand_values())
+        {
+            auto* global = llvm::dyn_cast<llvm::GlobalValue>(entry->stripPointerCasts());
+            if (!global || global->isDeclaration())
+                LogError(std::format("policy-module-denied: '{}' retains an external or unknown "
+                                     "symbol in policy '{}'", name.str(), isolatedPolicy_->path));
+        }
+    };
+    auditUsedList("llvm.used");
+    auditUsedList("llvm.compiler.used");
+
+    for (auto& function : module->functions())
+    {
+        if (function.isDeclaration())
+        {
+            auto name = function.getName();
+            if (name.starts_with("llvm."))
+            {
+                if (!IsAllowedIsolatedIntrinsic(name))
+                    LogError(std::format("policy-module-denied: unknown LLVM intrinsic '{}' in policy '{}'",
+                                         name.str(), isolatedPolicy_->path));
+            }
+            else
+            {
+                if (IsNeverAllowedIsolatedSymbol(name))
+                    LogError(std::format("policy-restricted-language: dynamic loading symbol '{}' is not allowed "
+                                         "in isolated mode (policy '{}')", name.str(), isolatedPolicy_->path));
+                auto capability = ClassifyIsolatedSymbol(function.getName().str());
+                if (!capability)
+                    LogError(std::format("policy-module-denied: unknown external symbol '{}' (policy '{}')",
+                                         name.str(), isolatedPolicy_->path));
+                if (capability && isolatedPolicy_->IsDenied(*capability))
+                    LogError(std::format("policy-module-denied: external symbol '{}' requires capability "
+                                         "'{}', denied by policy '{}'",
+                                         function.getName().str(), IsolatedCapabilityName(*capability),
+                                         isolatedPolicy_->path));
+            }
+        }
+    }
+    for (auto& global : module->globals())
+    {
+        if (!global.isDeclaration()) continue;
+        auto name = global.getName();
+        if (IsNeverAllowedIsolatedSymbol(name))
+            LogError(std::format("policy-restricted-language: dynamic loading symbol '{}' is not allowed "
+                                 "in isolated mode (policy '{}')", name.str(), isolatedPolicy_->path));
+        auto capability = ClassifyIsolatedSymbol(name.str());
+        if (!capability)
+            LogError(std::format("policy-module-denied: unknown external symbol '{}' (policy '{}')",
+                                 name.str(), isolatedPolicy_->path));
+        if (capability && isolatedPolicy_->IsDenied(*capability))
+        {
+            LogError(std::format("policy-module-denied: external symbol '{}' requires capability "
+                                 "'{}', denied by policy '{}'",
+                                 global.getName().str(), IsolatedCapabilityName(*capability),
+                                 isolatedPolicy_->path));
+        }
+    }
+
+    // A runtime export may be the direct callee of a call, but its address must not
+    // enter data or an indirect-call path. Defined CFlat functions remain closed-world targets.
+    for (auto& function : module->functions())
+    {
+        if (!function.isDeclaration() || function.getName().starts_with("llvm.")) continue;
+        std::unordered_set<const llvm::User*> visited;
+        auto auditAddressUse = [&](auto&& self, llvm::User* user) -> void {
+            if (!visited.insert(user).second) return;
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                if (call->getCalledOperand()->stripPointerCasts() == &function)
+                {
+                    for (auto& arg : call->args())
+                        if (arg->stripPointerCasts() == &function)
+                            LogError(std::format("policy-module-denied: address of external function '{}' "
+                                                 "escapes through a call argument (policy '{}')",
+                                                 function.getName().str(), isolatedPolicy_->path));
+                    return;
+                }
+                LogError(std::format("policy-module-denied: address of external function '{}' escapes "
+                                     "through an indirect call or argument (policy '{}')",
+                                     function.getName().str(), isolatedPolicy_->path));
+            }
+            if (auto* expression = llvm::dyn_cast<llvm::ConstantExpr>(user))
+            {
+                if (!expression->isCast())
+                    LogError(std::format("policy-module-denied: address of external function '{}' escapes "
+                                         "through a non-cast constant (policy '{}')",
+                                         function.getName().str(), isolatedPolicy_->path));
+                for (auto* next : user->users()) self(self, next);
+                return;
+            }
+            auto* valueName = user->getValueName();
+            LogError(std::format("policy-module-denied: address of external function '{}' escapes "
+                                 "through '{}' (policy '{}')",
+                                 function.getName().str(), valueName ? valueName->getKey().str() : "<unnamed>",
+                                 isolatedPolicy_->path));
+        };
+        for (auto* user : function.users()) auditAddressUse(auditAddressUse, user);
+    }
+
+    for (auto& function : module->functions())
+        for (auto& block : function)
+            for (auto& instruction : block)
+            {
+                bool synthesizedWrapper = function.getName().starts_with("__cflat_isolated_")
+                    || function.getName().starts_with("___")
+                    || isolatedCoreFunctions_.count(function.getName().str()) != 0;
+                if (llvm::isa<llvm::IntToPtrInst>(&instruction) && !synthesizedWrapper)
+                    LogError(std::format("policy-module-denied: inttoptr outside isolated wrapper '{}' "
+                                         "in policy '{}'", function.getName().str(), isolatedPolicy_->path));
+                if (auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction))
+                {
+                    auto* called = call->getCalledOperand()->stripPointerCasts();
+                    if (llvm::isa<llvm::InlineAsm>(called))
+                        LogError(std::format("policy-module-denied: inline assembly call in function '{}' "
+                                             "in policy '{}'", function.getName().str(), isolatedPolicy_->path));
+                }
+            }
+
+    return true;
+}
+
+bool LLVMBackend::AuditIsolatedExecutable(const std::string& exePath)
+{
+    if (!isolatedPolicy_) return true;
+#if !defined(__APPLE__) || !defined(__aarch64__)
+    (void)exePath;
+    LogError(std::format("policy-output-unsupported: isolated executable audit is only available "
+                         "for native macOS arm64 (policy '{}')", isolatedPolicy_->path));
+    return false;
+#else
+    auto bufferOrError = llvm::MemoryBuffer::getFile(exePath);
+    if (!bufferOrError)
+        LogError(std::format("policy-module-denied: cannot reopen isolated executable '{}' in policy '{}'",
+                             exePath, isolatedPolicy_->path));
+    auto buffer = std::move(*bufferOrError);
+    auto binaryOrError = llvm::object::createBinary(buffer->getMemBufferRef());
+    if (!binaryOrError)
+        LogError(std::format("policy-module-denied: isolated executable '{}' is not a valid Mach-O image "
+                             "in policy '{}'", exePath, isolatedPolicy_->path));
+    auto* object = llvm::dyn_cast<llvm::object::MachOObjectFile>(binaryOrError->get());
+    if (!object || !object->is64Bit() || object->getArch() != llvm::Triple::aarch64)
+        LogError(std::format("policy-module-denied: isolated executable '{}' is not native macOS arm64 "
+                             "in policy '{}'", exePath, isolatedPolicy_->path));
+
+    static constexpr auto baseCommand = [](uint32_t command) {
+        return command & ~static_cast<uint32_t>(LC_REQ_DYLD);
+    };
+    static const std::unordered_set<uint32_t> allowedCommands = {
+        baseCommand(LC_SEGMENT_64), baseCommand(LC_DYLD_INFO_ONLY), baseCommand(LC_SYMTAB),
+        baseCommand(LC_DYSYMTAB), baseCommand(LC_LOAD_DYLINKER), baseCommand(LC_UUID),
+        baseCommand(LC_BUILD_VERSION), baseCommand(LC_MAIN), baseCommand(LC_LOAD_DYLIB),
+        baseCommand(LC_FUNCTION_STARTS), baseCommand(LC_DATA_IN_CODE), baseCommand(LC_CODE_SIGNATURE)};
+    for (const auto& load : object->load_commands())
+    {
+        uint32_t command = baseCommand(load.C.cmd);
+        if (!allowedCommands.count(command))
+            LogError(std::format("policy-module-denied: Mach-O load command {} is not allowed in '{}' "
+                                 "(policy '{}')", command, exePath, isolatedPolicy_->path));
+        if (command == LC_LOAD_DYLIB)
+        {
+            auto dylib = object->getDylibIDLoadCommand(load);
+            auto pathOffset = dylib.dylib.name;
+            if (pathOffset >= load.C.cmdsize)
+                LogError(std::format("policy-module-denied: malformed Mach-O dylib command in '{}' "
+                                     "(policy '{}')", exePath, isolatedPolicy_->path));
+            llvm::StringRef path(load.Ptr + pathOffset, load.C.cmdsize - pathOffset);
+            path = path.split('\0').first;
+            if (path != "/usr/lib/libSystem.B.dylib")
+                LogError(std::format("policy-module-denied: Mach-O imports dylib '{}' in '{}' "
+                                     "(policy '{}')", path.str(), exePath, isolatedPolicy_->path));
+        }
+        if (command == LC_LOAD_DYLINKER)
+        {
+            auto linker = object->getDylinkerCommand(load);
+            auto pathOffset = linker.name;
+            llvm::StringRef path(load.Ptr + pathOffset, load.C.cmdsize - pathOffset);
+            path = path.split('\0').first;
+            if (path != "/usr/lib/dyld")
+                LogError(std::format("policy-module-denied: Mach-O uses dyld '{}' in '{}' "
+                                     "(policy '{}')", path.str(), exePath, isolatedPolicy_->path));
+        }
+        if (command == LC_SEGMENT_64)
+        {
+            auto segment = object->getSegment64LoadCommand(load);
+            constexpr uint32_t writable = 0x2;
+            constexpr uint32_t executable = 0x4;
+            if (((segment.initprot | segment.maxprot) & writable)
+                && ((segment.initprot | segment.maxprot) & executable))
+                LogError(std::format("policy-module-denied: Mach-O segment '{}' is writable and executable "
+                                     "in '{}' (policy '{}')", segment.segname, exePath,
+                                     isolatedPolicy_->path));
+        }
+    }
+
+    static const std::unordered_set<std::string> linkerSupport = {
+        "dyld_stub_binder", "_tlv_bootstrap"};
+    for (auto symbol : object->symbols())
+    {
+        auto flagsOrError = symbol.getFlags();
+        if (!flagsOrError)
+            LogError(std::format("policy-module-denied: cannot inspect Mach-O symbol in '{}' "
+                                 "(policy '{}')", exePath, isolatedPolicy_->path));
+        if (!(*flagsOrError & llvm::object::SymbolRef::SF_Undefined)) continue;
+        auto nameOrError = symbol.getName();
+        if (!nameOrError)
+            LogError(std::format("policy-module-denied: cannot name Mach-O import in '{}' "
+                                 "(policy '{}')", exePath, isolatedPolicy_->path));
+        std::string name = nameOrError->str();
+        if (!name.empty() && name.front() == '_') name.erase(name.begin());
+        if (linkerSupport.count(name)) continue;
+        auto capability = ClassifyIsolatedSymbol(name);
+        if (!capability)
+            LogError(std::format("policy-module-denied: Mach-O imports unknown symbol '{}' in '{}' "
+                                 "(policy '{}')", name, exePath, isolatedPolicy_->path));
+        if (isolatedPolicy_->IsDenied(*capability))
+            LogError(std::format("policy-module-denied: Mach-O import '{}' requires capability '{}' "
+                                 "denied by policy '{}'", name, IsolatedCapabilityName(*capability),
+                                 isolatedPolicy_->path));
+    }
+    return true;
+#endif
+}
+
+bool LLVMBackend::WriteIsolatedManifest(const std::string& manifestPath, const std::string& kind,
+                                        const std::optional<std::string>& outputPath)
+{
+    if (!isolatedPolicy_) return true;
+    nlohmann::json manifest = nlohmann::json::object();
+    manifest["format"] = "cflat-isolated-manifest";
+    manifest["format_version"] = 1;
+    manifest["compiler_build_id"] = CFLAT_VERSION_STRING;
+    manifest["llvm_major"] = LLVM_VERSION_MAJOR;
+    std::string targetTriple = module->getTargetTriple();
+    if (targetTriple.empty())
+        targetTriple = targetMacOS_ ? "arm64-apple-macosx11.0.0"
+            : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc"
+                                                   : "x86_64-pc-windows-msvc")
+                             : llvm::sys::getProcessTriple();
+    manifest["target_triple"] = targetTriple;
+    manifest["data_layout"] = module->getDataLayoutStr();
+    manifest["policy_version"] = 1;
+    manifest["policy_sha256"] = isolatedPolicy_->digestHex;
+
+    nlohmann::json output = nlohmann::json::object();
+    output["kind"] = kind;
+    if (outputPath)
+    {
+        std::ifstream input(*outputPath, std::ios::binary);
+        if (!input)
+            LogError(std::format("isolated-manifest-error: cannot read output '{}' for manifest '{}'",
+                                 *outputPath, manifestPath));
+        std::string bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        llvm::SHA256 sha;
+        sha.update(llvm::StringRef(bytes.data(), bytes.size()));
+        static constexpr char hex[] = "0123456789abcdef";
+        std::string digest;
+        for (uint8_t byte : sha.final())
+        {
+            digest.push_back(hex[byte >> 4]);
+            digest.push_back(hex[byte & 0x0f]);
+        }
+        output["sha256"] = digest;
+    }
+    manifest["output"] = std::move(output);
+
+    nlohmann::json resolved = nlohmann::json::object();
+    for (size_t i = 1; i < IsolatedPolicyCapabilityCount; ++i)
+    {
+        auto capability = static_cast<IsolatedCapability>(i);
+        resolved[IsolatedCapabilityName(capability)] = isolatedPolicy_->allow[i] ? "allow" : "deny";
+    }
+    manifest["resolved_capabilities"] = std::move(resolved);
+
+    std::set<std::string> required;
+    std::map<std::string, IsolatedCapability> exports;
+    auto recordExport = [&](llvm::StringRef symbol) {
+        auto capability = ClassifyIsolatedSymbol(symbol.str());
+        if (!capability) return;
+        required.insert(IsolatedCapabilityName(*capability));
+        exports.emplace(symbol.str(), *capability);
+    };
+    for (auto& function : module->functions())
+        if (function.isDeclaration() && !function.getName().starts_with("llvm."))
+            recordExport(function.getName());
+    for (auto& global : module->globals())
+        if (global.isDeclaration()) recordExport(global.getName());
+    manifest["required_capabilities"] = nlohmann::json::array();
+    for (const auto& name : required) manifest["required_capabilities"].push_back(name);
+    manifest["runtime_exports"] = nlohmann::json::array();
+    for (const auto& [symbol, capability] : exports)
+        manifest["runtime_exports"].push_back({{"symbol", symbol},
+                                                 {"capability", IsolatedCapabilityName(capability)}});
+
+    nlohmann::json limits = nlohmann::json::object();
+    nlohmann::json enforcement = nlohmann::json::object();
+    if (isolatedPolicy_->heapBytes)
+    {
+        limits["heap_bytes"] = *isolatedPolicy_->heapBytes;
+        enforcement["heap_bytes"] = "compiler-instrumented";
+    }
+    if (isolatedPolicy_->maxThreads)
+    {
+        limits["max_threads"] = *isolatedPolicy_->maxThreads;
+        enforcement["max_threads"] = "compiler-instrumented";
+    }
+    if (!limits.empty()) manifest["limits"] = std::move(limits);
+    if (!enforcement.empty()) manifest["enforcement"] = std::move(enforcement);
+
+    std::ofstream outputFile(manifestPath, std::ios::binary | std::ios::trunc);
+    if (!outputFile)
+        LogError(std::format("isolated-manifest-error: cannot write manifest '{}'", manifestPath));
+    outputFile << manifest.dump() << '\n';
+    if (!outputFile)
+        LogError(std::format("isolated-manifest-error: failed writing manifest '{}'", manifestPath));
+    return true;
+}
+
+void LLVMBackend::ValidateIsolatedProgram(antlr4::ParserRuleContext* ctx)
+{
+    if (!isolatedPolicy_ || currentSourceIsCore_ || IsIsolatedCoreSource() || ctx == nullptr) return;
+    currentLine = ctx->getStart()->getLine();
+    currentColumn = ctx->getStart()->getCharPositionInLine();
+    if (isolatedPolicy_->IsDenied(IsolatedCapability::Process))
+        LogError(std::format("policy-capability-denied: program requires capability 'process', "
+                             "denied by policy '{}'", isolatedPolicy_->path));
+    LogError(std::format("policy-restricted-language: 'program' is not available in restricted-v1 "
+                         "(policy '{}')", isolatedPolicy_->path));
 }
 
 void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnostics,
@@ -344,7 +1339,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
-    currentSourceIsCore_ = false;   // the root file is the user's program, never a core import
+    currentSourceIsCore_ = false;
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
@@ -388,6 +1383,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (exePath)             std::filesystem::remove(*exePath, rmEc);
         if (lliPath)             std::filesystem::remove(*lliPath, rmEc);
         if (!bitcodePath.empty()) std::filesystem::remove(bitcodePath, rmEc);
+        if (auto manifestPath = args.getOption("isolated-manifest"))
+            std::filesystem::remove(*manifestPath, rmEc);
     }
 
     // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean
@@ -471,7 +1468,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
         return true;
     };
-    if (!checkOutputDir(exePath, "-o") || !checkOutputDir(lliPath, "--out-lli"))
+    if (!checkOutputDir(exePath, "-o") || !checkOutputDir(lliPath, "--out-lli")
+        || !checkOutputDir(args.getOption("isolated-manifest"), "--isolated-manifest"))
         return false;
 
     if (!std::filesystem::exists(filename))
@@ -504,6 +1502,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Batch (--check) loads the cache too: ResetForReanalysis leaves each file in the same
     // state a fresh backend is in at this point, and the load replaces context/module wholesale.
     bool bitcodeLoaded = false;
+    // Isolated mode reparses core sources so import gating sees source import statements;
+    // warm-path capability gating is deferred to a later stage.
     if (!noCache_ && !runMode_ && !runtimeDir.empty() && !skipRuntimeImport
         && !RootFileNameIsCore(std::filesystem::path(filename).filename().string()))
     {
@@ -658,6 +1658,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         try
         {
 
+        ValidateIsolatedParseTree(computeUnit);
+
         // Process all top-level imports before scanning the main file so that
         // imported symbols are available to ForwardRefScanner.
         {
@@ -669,6 +1671,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         // before any real file is opened (there is no readable file behind it, e.g.
                         // a winmd), so without this it would report (0,0) instead of the import line.
                         SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                        if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
+                        {
+                            LogError(std::format("policy-restricted-language: native interop imports "
+                                                 "are not allowed in isolated mode (policy '{}')",
+                                                 isolatedPolicy_->path));
+                            return false;
+                        }
                         // `import { "a", "b" };` - a group of >1 plain imports. Each entry
                         // routes like a plain `import "x";` (no per-entry alias/lib/define). A
                         // trailing `cache` on the group applies to every entry (a no-op for
@@ -776,6 +1785,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             if (verbose) std::cout << std::format("[verbose] forward-ref scan ({})\n", sourceFileName);
             ForwardRefScanner scanner(this);
             scanner.SetTokens(&tokens);
+            scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // First pass: pre-declare opaque types and constructors for every
             // generic instantiation found anywhere in the file (including inside
             // function bodies), so uses like Box<MyType> b = Box__MyType() resolve.
@@ -945,6 +1955,22 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         RunGlobalDCE();
     }
 
+    if (isolatedPolicy_ && IsIsolatedCoreSource())
+        for (auto& function : module->functions())
+            if (!function.isDeclaration()) isolatedCoreFunctions_.insert(function.getName().str());
+
+    if (isolatedPolicy_ && !InstrumentIsolatedResources())
+        return false;
+
+    if (isolatedPolicy_ && !VerifyModule())
+    {
+        std::cout << "Error: module verification failed after isolated resource instrumentation.\n";
+        return false;
+    }
+
+    if (!AuditIsolatedModule())
+        return false;
+
     // Standalone --out-lli (no -o): dump the post-optimization IR here, since EmitExecutable
     // does not run. For an -o build the dump is deferred into EmitExecutable (after the target
     // triple/data layout are finalized, right before codegen) so the .ll matches the object.
@@ -1029,13 +2055,71 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (exePath)
     {
         llvm::TimeTraceScope emitScope("EmitExecutable", *exePath);
-        if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", *exePath);
-        if (!EmitExecutable(*exePath, platformOption, debugInfo, lliPath))
+        std::string emitPath = *exePath;
+        bool isolatedOutput = isolatedPolicy_.has_value();
+        if (isolatedOutput)
+        {
+            std::filesystem::path candidate = std::filesystem::path(*exePath);
+            candidate += ".isolated.tmp";
+            for (unsigned suffix = 1; std::filesystem::exists(candidate); ++suffix)
+                candidate = std::filesystem::path(*exePath)
+                    .concat(std::format(".isolated.tmp.{}", suffix));
+            emitPath = candidate.string();
+        }
+        struct IsolatedTempCleanup
+        {
+            std::string path;
+            bool active = true;
+            ~IsolatedTempCleanup()
+            {
+                if (active && !path.empty()) std::filesystem::remove(path);
+            }
+        } tempCleanup{isolatedOutput ? emitPath : std::string(), isolatedOutput};
+        if (verbose) std::cout << std::format("[verbose] emitting executable to {}\n", emitPath);
+        if (!EmitExecutable(emitPath, platformOption, debugInfo, lliPath))
         {
             std::cout << std::format("Error: failed to emit executable '{}'.\n", *exePath);
             return false;
         }
+        if (isolatedOutput)
+        {
+            if (!AuditIsolatedExecutable(emitPath))
+                return false;
+            std::error_code renameError;
+            std::filesystem::rename(emitPath, *exePath, renameError);
+            if (renameError)
+            {
+                LogError(std::format("policy-module-denied: cannot publish isolated executable '{}' "
+                                     "after audit: {}", *exePath, renameError.message()));
+                return false;
+            }
+            tempCleanup.active = false;
+        }
     }
+
+    if (isolatedPolicy_)
+        if (auto manifestPath = args.getOption("isolated-manifest"))
+        {
+            std::string kind = "check";
+            std::optional<std::string> outputPath;
+            if (!bitcodePath.empty())
+            {
+                kind = "bitcode";
+                outputPath = bitcodePath;
+            }
+            else if (lliPath)
+            {
+                kind = "llvm-ir";
+                outputPath = *lliPath;
+            }
+            else if (exePath)
+            {
+                kind = "executable";
+                outputPath = *exePath;
+            }
+            if (!WriteIsolatedManifest(*manifestPath, kind, outputPath))
+                return false;
+        }
 
     return true;
 }
@@ -1385,6 +2469,17 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
 
 bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, const std::string& importFilename, const std::string& namespaceName, const std::string& programAlias, const std::vector<std::string>& explicitLibs, const std::vector<std::string>& extraDefines, bool cacheHeader)
 {
+    if (isolatedPolicy_)
+    {
+        auto ext = LowerExtension(importFilename);
+        if (ext == ".c" || ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".winmd")
+        {
+            LogError(std::format("policy-restricted-language: native interop import '{}' is not "
+                                 "allowed in isolated mode (policy '{}')",
+                                 importFilename, isolatedPolicy_->path));
+            return false;
+        }
+    }
     // WinRT metadata (.winmd) is a Windows-only feature. Reject it up front when not
     // targeting Windows - otherwise path resolution fails with a generic "file not
     // found" that unhelpfully lists the (absent) Windows SDK / WinMetadata dirs.
@@ -1398,6 +2493,32 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     std::string canonicalStr;
     if (!ResolveImportPath(importingFilePath, importFilename, canonicalStr))
         return false;
+    if (isolatedPolicy_ && !runtimeDir.empty())
+    {
+        std::error_code coreEc;
+        auto coreDirectory = std::filesystem::canonical(
+            std::filesystem::path(runtimeDir) / "core", coreEc);
+        if (!coreEc)
+        {
+            auto capability = ClassifyIsolatedCoreModule(canonicalStr, coreDirectory);
+            if (capability && isolatedPolicy_->IsDenied(*capability))
+            {
+                LogError(std::format("policy-capability-denied: import '{}' requires capability "
+                                     "'{}', denied by policy '{}'",
+                                     importFilename, IsolatedCapabilityName(*capability),
+                                     isolatedPolicy_->path));
+                return false;
+            }
+            if (capability && *capability == IsolatedCapability::Threads
+                && isolatedPolicy_->maxThreads && *isolatedPolicy_->maxThreads == 1)
+            {
+                LogError(std::format("resource-limit: import '{}' contains a thread construct, "
+                                     "but policy 'max_threads' is 1 (policy '{}')",
+                                     importFilename, isolatedPolicy_->path));
+                return false;
+            }
+        }
+    }
     // Check circular import first (file currently being processed).
     auto cycleIt = std::find(importStack.begin(), importStack.end(), canonicalStr);
     if (cycleIt != importStack.end())
@@ -1527,10 +2648,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         std::error_code cec;
         auto coreDir = std::filesystem::canonical(std::filesystem::path(runtimeDir) / "core", cec);
         if (!cec)
-        {
-            auto coreStr = coreDir.string();
-            isCoreImport = canonicalStr.starts_with(coreStr);
-        }
+            isCoreImport = IsPathUnderDirectory(canonicalStr, coreDir);
     }
 
     // Get-or-parse the tree (cached for core, freshly parsed otherwise). Generic-template
@@ -1551,6 +2669,13 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             if (auto* imp = decl->importDeclaration())
             {
+                SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
+                {
+                    LogError(std::format("policy-restricted-language: native interop imports are not "
+                                         "allowed in isolated mode (policy '{}')", isolatedPolicy_->path));
+                    return false;
+                }
                 // Grouped import `import { "a", "b" };` - one TU for header entries, individual
                 // routing for .cb/.c entries (see CompileImportGroup).
                 auto groupedImports = DequoteImportGroup(imp);
@@ -1628,6 +2753,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     sourceFileName = std::filesystem::path(canonicalStr).filename().string();
     currentSourceFilePath_ = canonicalStr;
     currentSourceIsCore_ = isCoreImport;
+    ValidateIsolatedParseTree(computeUnit);
     // Files that follow this import are not scanned yet, so no interface-implementor claim made
     // while codegen'ing it can be proven complete (see InterfaceImplementorSetIsUncertain).
     ImportedFileCompileScope importDepthScope(this);
@@ -1638,6 +2764,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (verbose) std::cout << std::format("[verbose]   forward-ref scan: {}\n", importFilename);
         ForwardRefScanner scanner(this);
         scanner.SetTokens(tokensPtr);
+        scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
         // Pre-declare opaque types for all generic instantiations found in the file
         // (including inside function/program bodies) before scanning declarations.
         // Without this pass, program definitions that pre-declare run(Name*, list__string)
@@ -1667,6 +2794,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             myListener->ResolvePendingGlobalDefaultConstructions();
         }
     }
+    if (isCoreImport)
+        for (auto& function : module->functions())
+            if (!function.isDeclaration()) isolatedCoreFunctions_.insert(function.getName().str());
     if (verbose) std::cout << std::format("[verbose]   import done: {}\n", importFilename);
 
     // Register the file-scoped import alias.  The "$global$:<alias>" sentinel tells
@@ -2457,6 +3587,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         {
             ForwardRefScanner scanner(this);
             scanner.SetTokens(&tokens);
+            scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // Generic interface templates first: a use like Container<int> must not be
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
@@ -2499,6 +3630,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
 void LLVMBackend::ResetForReanalysis()
 {
+    isolatedPolicy_.reset();
     manifestFragments_.clear();
     compileTimeStringConstants_.clear();
     // Reset the LLVM context so named struct types from a previous analysis do
@@ -2562,6 +3694,7 @@ void LLVMBackend::ResetForReanalysis()
     // Body origins describe definitions in the module just discarded; a survivor would make the
     // next analysis of the same file report its own definition as a redefinition of itself.
     functionBodyOrigin_.clear();
+    isolatedCoreFunctions_.clear();
     // Memoized full-destructor wrappers are synthesized llvm::Function* objects that live
     // in `module`, so they MUST be discarded with it - a stale entry would hand the next
     // file's analysis a Function* into the freed module/context, which crashes the moment a

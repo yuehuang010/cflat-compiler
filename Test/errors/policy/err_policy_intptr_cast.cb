@@ -1,0 +1,6 @@
+extern int main()
+{
+    i64 address = 1;
+    int* manufactured = (int*)address;
+    return manufactured != nullptr;
+}

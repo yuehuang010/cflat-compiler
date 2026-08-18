@@ -1,0 +1,6 @@
+function<void*(i64)> callback = malloc;
+
+extern int main()
+{
+    return callback == nullptr;
+}

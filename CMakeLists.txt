@@ -138,6 +138,7 @@ add_custom_command(
 # ---------------------------------------------------------------------------
 set(CFLAT_SOURCES
   ${CFLAT_DIR}/main.cpp
+  ${CFLAT_DIR}/IsolatedPolicy.cpp
   ${CFLAT_DIR}/DiagnosticLocalization.cpp
   ${CFLAT_DIR}/LLVMBackend.cpp
   ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp

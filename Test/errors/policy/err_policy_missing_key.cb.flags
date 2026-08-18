@@ -1,0 +1,3 @@
+flags=--isolated Test/errors/policy/policies/missing_network.json
+expect_exit=nonzero
+expect_output=policy-invalid

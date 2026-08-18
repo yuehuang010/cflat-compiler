@@ -2,10 +2,47 @@
 
 ## Status
 
-Proposed design for compiler-side validation only. `--isolated` verifies that a CFlat program fits a
-restricted language profile and that the optimized LLVM module uses only a sealed set of approved
-runtime capabilities. It preserves the compiler's normal output choices and can optionally emit a
-manifest sidecar for an external runner.
+IMPLEMENTED 2026-08-17: all stages plus an independent review-fix round, macOS-verified
+(suite 707 passed / 0 failed / 8 skipped; scratch matrices 17/17, s3, s4 all green). Stage P,
+1, 2, 4, and 3 landed in that order. Enforced today: all eight capability denies via the
+sealed positive symbol table (355 classified core externs) and per-module import tags;
+user-extern/interop/int-to-pointer/`program` construct rejections in both passes (int-to-ptr
+is semantic, with an IR inttoptr audit backstop); closed-world address-taken module audit
+(incl. global initializers, aliases, llvm.used, module asm) with intrinsic allowlist and
+ctor/dtor coverage; never-allowed symbol set (dlopen/dlsym/dlclose/LoadLibraryA/
+GetProcAddress/syscall) rejected under every policy; native macOS arm64 `-o` behind a Mach-O
+post-link audit that publishes the executable only after the audit passes (other targets:
+policy-output-unsupported); `--isolated-manifest` sidecar with SHA-256 digests;
+compiler-instrumented `heap_bytes`/`heap_mb` cap and `max_threads` permits via IR-level
+interposition of malloc/calloc/realloc/free/posix_memalign/pthread_create, with the module
+re-verified after instrumentation. `--isolated` is available on macOS hosts only; Windows and
+Linux hosts reject the flag (policy-output-unsupported) until enforcement is verified there.
+Test support: `.cb.flags` sidecar convention in test.sh (flags= / expect_exit= /
+expect_output=), 17 policy tests in Test/errors/policy/ including positive compile fixtures
+and the review's bypass-shape regressions (cold+warm), pseudo-locale discovery coverage, and
+scratch matrices in scratch/isolated|s3-check|s4-check.
+
+Known limitations / remaining work: `stdio: deny` rejects most real programs at the module
+audit because the always-linked runtime's panic paths reference stdio externs (strict-and-
+honest; a leaner panic route would be a future refinement). test.bat has no sidecar support
+yet (Windows port is maintainer-owned; policy tests live in Test/errors/policy/ which its
+non-recursive glob does not pick up). Import gating under a warm --init cache is sidestepped:
+--isolated forces a cold core parse. Post-link audits for cross-compiled targets are not
+implemented. Duplicate-JSON-key rejection is SAX-based and done. An independent review round
+(2026-08-17) fixed 13 findings, notably: heap release polarity, global-initializer address
+escapes, semantic int-to-pointer rejection with an IR inttoptr backstop, never-allowed
+dynamic-loading/syscall symbols, audit-before-publish for -o, post-instrumentation module
+verification, and positive policy fixtures. `--isolated` is additionally blocked outright on
+Windows and Linux HOST machines (policy-output-unsupported) until enforcement is verified
+there; macOS is the only supported host today.
+
+Original design intent below, revised 2026-08-17 after review (flat capability map replaces
+groups; sealed-export inventory its own stage; vtable dispatch in v1 scope via the
+closed-world audit; cache/LSP/testing-harness realities added).
+
+`--isolated` verifies that a CFlat program fits a restricted language profile and that the
+optimized LLVM module uses only an approved set of runtime capabilities. It preserves the
+compiler's normal output choices and can later emit a manifest sidecar for an external runner.
 
 It is not an OS sandbox, does not enforce a filesystem, network, UI, process, wall-time, or total
 memory restriction at runtime, and must never be described as a security boundary. An external
@@ -23,10 +60,8 @@ during compilation and contain the resulting output during execution.
 
 - Add a strict, versioned `--isolated` policy mode.
 - Validate restricted CFlat semantics before code generation.
-- Audit the optimized LLVM module, including constructors, declarations, globals, intrinsics, and
-  the selected output's requirements.
-- Optionally emit a versioned manifest sidecar that lets an external runner choose and enforce its
-  own platform policy without rediscovering compiler intent.
+- Audit the optimized LLVM module: declarations, globals, constructors, intrinsics, call targets.
+- Optionally emit a versioned manifest sidecar for an external runner (later stage).
 - Preserve ordinary `--run` unchanged for trusted local development.
 - Produce clear `LogError` diagnostics rather than silently deleting features or falling back.
 
@@ -36,8 +71,7 @@ during compilation and contain the resulting output during execution.
   platform-specific enforcement backend.
 - Claim that source or LLVM validation alone prevents malicious native behavior.
 - Make the existing in-process `--run` safe for untrusted code.
-- Permit arbitrary native C, header binding, prebuilt native libraries, or host symbol lookup in
-  the first restricted profile.
+- Permit arbitrary native C, header binding, prebuilt native libraries, or host symbol lookup.
 - Add a new unrestricted capability merely because a policy names it.
 
 ## User interface
@@ -48,28 +82,29 @@ during compilation and contain the resulting output during execution.
 cflat app.cb --isolated policy.json --check
 cflat app.cb --isolated policy.json --out-lli app.ll
 cflat app.cb --isolated policy.json --bitcode app.bc
-cflat app.cb --isolated policy.json -o app
-cflat app.cb --isolated policy.json --bitcode app.bc --isolated-manifest app.manifest.json
+cflat app.cb --isolated policy.json -o app                      # later stage: needs post-link audit
+cflat app.cb --isolated policy.json --bitcode app.bc --isolated-manifest app.manifest.json   # later stage
 ```
 
 `--isolated` is a compilation modifier, not a new output mode. It reuses the normal `--check`,
 `--out-lli`/`-l`, `--bitcode`/`-b`, and `-o` output behavior, including their existing path and
-overwrite rules. With `--check`, it validates without producing a normal compiler output. It is
-suitable for an editor or web service's compile-only endpoint. It must not add a special output
-directory, payload format, or output-path rule.
+overwrite rules. With `--check`, it validates without producing output; that is the compile-only
+endpoint shape for a service.
 
-`--isolated` is deliberately not an alias for `--run` and is incompatible with the current
-in-process `--run`. A later external runner may consume an ordinary bitcode, IR, object, or
-executable output accompanied by an optional manifest; its command-line interface and OS policy
-are outside this design. Reject `--isolated` combined with `--run` with a diagnostic explaining
-that `--run` remains an unrestricted in-process execution path.
+Rejected combinations (each with a diagnostic naming the conflict):
 
-`--isolated-manifest <path>` is optional. It writes a canonical JSON sidecar for the selected
-ordinary output, or for the validated in-memory module with `--check`. It never changes output
-selection, is not needed for validation, and does not authorize execution. A service that has its
-own compiler-to-runner protocol may omit it. The compiler must not invoke an external runner,
-shell, linker selected by the input, package manager, or network resolver as part of isolated
-validation.
+- `--isolated` + `--run`: `--run` remains an unrestricted in-process execution path.
+- `--isolated` + `.c` positional inputs, `import` of `.c`/`.h` files, `import package` (vcpkg,
+  NuGet, WinMD), or prebuilt library binding: native interop is outside the restricted profile.
+- `--isolated` + `--heap-audit` or `--asan`: both link extra native objects/runtimes outside the
+  sealed surface.
+- `--isolated` + `-o` until the target-specific post-link audit exists for the selected target:
+  reject with `policy-output-unsupported`; never emit an executable on the LLVM audit alone.
+- `--isolated-manifest` without `--isolated`, and (when the manifest lands) `--isolated-manifest`
+  with a multi-file `--check` batch: one manifest describes one module.
+
+Flags register in `main.cpp` (the `args.addOption`/`args.addFlag` block; `ArgParser.h` is the
+generic parser and should not need changes).
 
 ## Trust and handoff model
 
@@ -78,59 +113,47 @@ untrusted CFlat source
         |
         v
 cflat --isolated policy.json [normal output flags]
-  1. semantic capability validation
+  1. semantic capability validation (both passes)
   2. restricted code generation
   3. optimized LLVM module audit
         |
         v
-ordinary requested compiler output (+ optional digest-bound manifest sidecar)
+ordinary requested compiler output (+ later: optional digest-bound manifest sidecar)
         |
         v
 external runner: independently enforces OS policy
 ```
 
-Neither an output nor its optional manifest asserts that it is safe. The manifest asserts only that
-a particular compiler build successfully applied a particular policy to a particular validated
-representation. The runner must treat both as untrusted input: verify sizes, hashes when present,
-version compatibility, target, and policy constraints before execution. It must not infer OS
-permissions from `approved` entries in the manifest.
-
-For a hosted service, compilation itself also consumes hostile input before compiler checks finish.
-The website operator must put the compiler in a separate external compile containment boundary.
-That deployment decision is intentionally outside this compiler plan.
+Neither an output nor its manifest asserts that it is safe. The runner must treat both as untrusted
+input and must not infer OS permissions from `allow` entries. For a hosted service, compilation
+itself also consumes hostile input before compiler checks finish; the operator must put the
+compiler in a separate compile containment boundary. That deployment decision is outside this plan.
 
 ## Policy schema
 
-Policies are UTF-8 JSON objects with closed keys at every level. Unknown keys, duplicate JSON
-object keys, duplicate array entries, and duplicate group members are errors. All numeric values
-are positive base-10 integers; zero, negative, floating-point, string, and overflowed values are
-errors. Paths, environment expansion, and platform-specific access-control semantics are not part
-of this schema because this compiler does not enforce them.
-
-Example starter policy:
+Policies are UTF-8 JSON objects with closed keys at every level. Unknown keys and wrong value
+types are `policy-invalid`. There is no group mechanism: the primitive namespace is closed and
+small, so decisions are written directly. A service that wants named bundles of capabilities can
+expand them client-side when generating the policy; a future schema version can add groups
+compatibly if a real need appears.
 
 ```json
 {
   "version": 1,
   "language": "restricted-v1",
-  "groups": {
-    "interactive": ["cap:stdio", "group:workers"],
-    "workers": ["cap:threads"],
-    "host-access": ["cap:filesystem", "cap:network", "cap:ui", "cap:process"]
-  },
   "capabilities": {
-    "allow": ["group:interactive"],
-    "deny": ["group:host-access", "cap:random", "cap:clock"]
+    "stdio": "allow",
+    "clock": "deny",
+    "random": "deny",
+    "filesystem": "deny",
+    "network": "deny",
+    "ui": "deny",
+    "process": "deny",
+    "threads": "deny"
   },
   "limits": {
     "heap_mb": 192,
-    "memory_mb": 256,
-    "wall_time_ms": 5000,
-    "max_processes": 1,
-    "max_threads": 4,
-    "max_tasks": 4,
-    "stdout_bytes": 65536,
-    "stderr_bytes": 65536
+    "max_threads": 1
   }
 }
 ```
@@ -139,540 +162,346 @@ Example starter policy:
 
 - `version`: required integer, currently `1`.
 - `language`: required string, currently `"restricted-v1"`.
-- `groups`: required object mapping a user-defined group name to a nonempty array of typed member
-  references. A group name matches `[a-z][a-z0-9-]{0,31}`. It is always referenced as
-  `group:<name>`, so it cannot be confused with a built-in capability or another JSON field.
-- `capabilities`: required object with exactly the two keys `allow` and `deny`; each is an array of
-  typed capability/group references. The arrays may be empty.
-- `limits`: required object with positive integer entries described below.
+- `capabilities`: required object. All eight keys are required and each value is exactly
+  `"allow"` or `"deny"`. Requiring every key explicitly avoids a default-direction dispute and
+  keeps a policy self-describing; there is no resolution algorithm, no ordering rule, and no
+  provenance machinery to specify or test.
+- `limits`: optional object holding only the compiler-enforced limits:
+  - `heap_bytes` or `heap_mb` (at most one): compiler-instrumented restricted-heap cap (later
+    stage). `heap_mb` is mebibytes.
+  - `max_threads`: concurrent CFlat thread budget including the main thread, enforced through the
+    sealed thread wrapper (later stage). Must be `1` when `threads` is `"deny"`; may exceed 1 only
+    when `threads` is `"allow"`.
 
-The built-in primitive capability namespace is closed in version 1: `stdio`, `clock`, `random`,
-`filesystem`, `network`, `ui`, `process`, and `threads`. A primitive is referenced only as
-`cap:<name>` (for example, `cap:network`); a group is referenced only as `group:<name>`. No policy
-can define a new primitive capability, alias an unknown primitive, or use an untyped reference.
-`pure` remains an internal compiler classification, not a policy capability and therefore cannot be
-named in this schema.
+  Runner-owned limits (total memory, wall time, process count, task count, stdout/stderr bytes)
+  are deliberately NOT in this schema. The compiler cannot enforce them, and validating numbers it
+  cannot enforce is fake authority; they belong in the runner's own configuration. If a service
+  wants them co-located with the policy file it can nest them under its own top-level file that
+  embeds this policy.
 
-`allow` means only that compiler validation may approve the matching sealed runtime API. It is not
-a runtime grant. For example, allowing `cap:network` says that the module may require a
-compiler-owned network API; it does not permit a socket, hostname, port, filesystem path, UI
-service, or subprocess on the host. The external runner must map the resolved primitive capabilities
-to an enforceable runtime policy or reject the request.
+Numeric values are positive base-10 integers; zero, negative, floating-point, string, and
+overflowed values are `policy-invalid`.
 
-### Group resolution and decisions
+Note on strict parsing: nlohmann::json (already used in this codebase) keeps the last duplicate
+object key rather than erroring. Duplicate-key rejection therefore needs a SAX-callback parse or
+equivalent; it is required for the final version and may be deferred in the prototype with a
+comment marking the gap.
 
-The parser validates all group definitions, including unused groups, before compilation. A member
-reference must be exactly `cap:<built-in-name>` or `group:<defined-group-name>`. A group can refer
-to a group declared before or after it. Self-reference and indirect cycles are invalid. Version 1
-caps policy complexity at 64 groups, 64 members per group, 1,024 total group-member references, 128
-references in each decision array, and a maximum group-reference depth of 16. Exceeding any cap is
-`policy-invalid`, rather than a partial expansion.
+`"allow"` means only that compiler validation may approve the matching sealed runtime API. It is
+not a runtime grant: allowing `network` says the module may require a compiler-owned network API;
+it does not permit a socket, hostname, port, or path on the host. The external runner maps allowed
+capabilities to an enforceable OS policy or rejects the request.
 
-Resolution expands every decision reference to a set of primitive capabilities. It always uses these
-fixed phases, in the stated order:
+## Sealed runtime export inventory (the load-bearing stage)
 
-1. Initialize every primitive capability to `deny`.
-2. Expand and apply every entry in `capabilities.allow`, setting each reached primitive to `allow`.
-3. Expand and apply every entry in `capabilities.deny`, setting each reached primitive to `deny`.
+This is the largest single work item in the plan and is scheduled as its own stage, not a bullet.
+The core library declares roughly 370 externs (`os.posix.cb` ~118, `os.windows.cb` ~104,
+`cruntime.cb` ~90, plus `math`, `atomic`, `network/socket*`, `filesystem`, `process`, `thread`),
+and `runtime.cb` is auto-imported into every program, so strings/collections bottom out in
+`cruntime` externs. The final model requires the transitive extern closure of every allowed core
+module to be classified.
 
-The deny phase is a final veto. Allow/deny overlap is intentional and valid, including a group or
-the same `cap:<name>` in both arrays; a primitive reached by deny cannot be re-allowed by this
-policy version. Direct primitive references have no special precedence over groups. The same typed
-reference may not appear twice in one array, but it may appear once in each array. Declaration
-order within either array never changes the result.
+Mechanism decision: classification lives in compiler-owned C++ tables, not in `.cb` annotations.
 
-The normalizer produces a canonical, lexically ordered final decision for all eight primitives
-before semantic validation, code generation, or LLVM auditing. It also records JSON Pointer paths
-for each allow and final-deny contribution, so diagnostics can explain an effective decision.
-Group names and decision arrays never reach later validation as authority; only this final primitive
-decision map does.
+1. **Per-symbol capability table** (authoritative for the module audit): a static table in a new
+   `IsolatedPolicy.cpp` mapping extern symbol name -> `IsolatedCapability`:
 
-For example, this policy allows `stdio` and `threads`, denies every host-access capability, and
-defaults any omitted primitive to deny:
+   ```cpp
+   enum class IsolatedCapability {
+       Pure, Stdio, Clock, Random, Filesystem, Network, Ui, Process, Threads
+   };
+   ```
 
-```json
-{
-  "version": 1,
-  "language": "restricted-v1",
-  "groups": {
-    "standard-io": ["cap:stdio"],
-    "parallel": ["cap:threads"],
-    "interactive": ["group:standard-io", "group:parallel"],
-    "host-access": ["cap:filesystem", "cap:network", "cap:ui", "cap:process"]
-  },
-  "capabilities": {
-    "allow": ["group:interactive"],
-    "deny": ["group:host-access", "cap:random", "cap:clock"]
-  },
-  "limits": {
-    "heap_mb": 192,
-    "memory_mb": 256,
-    "wall_time_ms": 5000,
-    "max_processes": 1,
-    "max_threads": 4,
-    "max_tasks": 4,
-    "stdout_bytes": 65536,
-    "stderr_bytes": 65536
-  }
-}
-```
+   `Pure` covers deterministic computation (memcpy, math, allocator internals). The final model is
+   a positive allowlist: an external symbol absent from the table rejects the module. The
+   prototype narrows this (see Stage P) because building the complete table IS the inventory work.
 
-The deliberate allow/deny overlap below resolves `network` to deny because the final deny phase
-wins:
+2. **Per-module capability tag** (for early, source-located diagnostics): a small table mapping
+   core module paths (`filesystem.cb`, `network/socket.cb`, `process.cb`, ...) to the capability
+   they primarily expose, checked at import processing so a denied import errors at the `import`
+   statement instead of surfacing later as an opaque module-audit failure. Mixed modules (`os.cb`
+   and friends carry filesystem + process + environment externs) are NOT force-classified; the
+   per-symbol audit is the backstop that actually holds.
 
-```json
-"capabilities": {
-  "allow": ["group:host-access"],
-  "deny": ["cap:network"]
-}
-```
+Do not infer access from imported filename text of user modules; user modules are subject to the
+semantic rules (no user externs, etc.), and only compiler-owned metadata classifies core modules.
+`GetForCurrentProcess()`-style broad process-symbol search must never make a module pass isolated
+validation.
 
-Likewise, a group may appear in both arrays. This is a useful policy convention for broad baseline
-allows followed by explicit deny groups; it is deterministic and does not depend on JSON order.
+The table controls semantic availability, codegen declarations, final-module validation, and later
+sidecar emission. A capability module must not smuggle a second capability: a clock export must
+not open a file.
 
-### Declared limits
+### Interaction with the `--init` bitcode cache (load-bearing)
 
-- `heap_bytes` or `heap_mb`, exactly one: a compiler-instrumented limit on allocations charged to
-  the restricted CFlat heap. `heap_mb` is normalized as mebibytes (1 MiB = 1,048,576 bytes).
-- `memory_bytes` or `memory_mb`, exactly one: declared whole-workload memory ceiling for the
-  external runner. It covers code, stacks, globals, runtime and allocator overhead, and memory the
-  compiler cannot observe. The compiler checks only syntax, normalization, and
-  `heap_bytes <= memory_bytes`; it cannot enforce this cap.
-- `wall_time_ms`: declared wall-clock ceiling for the external runner. It is recorded but not
-  enforced by the compiler.
-- `max_processes`: declared process ceiling. It must be `1` in restricted-v1 because process
-  creation is always rejected.
-- `max_threads`: concurrent CFlat thread budget, including the main thread. It is enforced through
-  the restricted runtime wrapper when threads are allowed.
-- `max_tasks`: declared total task ceiling for an external runner. It must be at least
-  `max_threads` and at least `max_processes`.
-- `stdout_bytes` and `stderr_bytes`: declared output ceilings for an external runner. CFlat's
-  restricted output helpers can account for their writes, but direct descriptor writes are not a
-  compiler-enforceable boundary, so an emitted manifest marks these as runner-enforced.
+Core libraries normally load as precompiled bitcode from the warm cache, not from source, and the
+repo rule stands: any state an analysis reads must round-trip through the hand-written serializer
+in `LLVMBackend.cpp` or it silently vanishes on a warm cache. Consequences:
 
-When resolved `threads` is `deny`, `max_threads` must be `1`. When it is `allow`, `max_threads` may
-be greater than one. `max_tasks` defaults to `max_threads` only if an explicit default is
-introduced; version 1 requires it to prevent accidental ambiguity.
+- The per-symbol and per-module capability tables are static C++ data keyed on names, so they do
+  NOT depend on the cache and need no serializer entries. Prefer keeping it that way: any future
+  per-declaration capability metadata stored on `TypeAndValue`/`StructData` MUST be added to the
+  cache round-trip in the same change.
+- Cached core bitcode was compiled without any policy. That is acceptable input to the module
+  audit because the audit runs on the final linked module, where denied-capability externs are
+  visible regardless of how they arrived. State this in code comments so nobody "fixes" it.
+- Import-level gating must fire on the cached-core path too (imports are still resolved by name
+  even when bodies come from bitcode). The prototype may instead force `--no-cache` semantics
+  under `--isolated` for simplicity; if so, print nothing extra, just take the slower path, and
+  remove the restriction when gating is verified on the warm path.
 
 ## Restricted CFlat profile
 
 The profile is a positive, closed-world language subset. Validation operates on semantic facts and
-generated module properties, never source-text keyword matching. Collect all independent violations
-where practical, then use `LogError` for the compilation failure.
+generated module properties, never source-text keyword matching. Collect all independent
+violations where practical, then fail the compilation via `LogError`.
 
 Reject in restricted-v1:
 
-- user-declared `extern` functions, globals, aliases, and externally supplied function pointers;
+- user-declared `extern` functions, globals, and aliases in user source files (core library files
+  under `runtimeDir` are exempt: their externs are governed by the sealed table). This closes the
+  trivial bypass of declaring `extern long syscall(...)` under a fresh name;
 - `.c` inputs and imports, header binding, WinMD, NuGet or package-native imports, prebuilt native
   libraries, dynamic loading, inline assembly, and user-selected linker inputs;
-- raw pointer-to-integer and integer-to-pointer conversions that can manufacture an address outside
-  a CFlat allocation; any other unsafe address-manufacturing primitive found during inventory;
+- raw pointer-to-integer and integer-to-pointer conversions that can manufacture an address
+  outside a CFlat allocation; any other address-manufacturing primitive found during inventory;
 - `program`, process creation, shell/open-URL helpers, and direct bindings to process APIs;
-- thread types, thread pools, task runtimes, detached threads, and implicit worker pools when
-  `threads` is denied; when allowed, any path other than sealed spawn/join runtime APIs;
-- imports of filesystem, network, UI, clock, random, or terminal APIs whose capability is denied;
-- runtime or generic features that allocate without the restricted allocator when `heap_bytes` is
-  enabled;
-- unresolved externals, unknown LLVM intrinsics, generated inline assembly, and direct calls that
-  cannot be mapped to a sealed manifest entry or a defined CFlat function.
+- thread constructs when `threads` is denied. When allowed, the existing `thread<T>` language
+  construct remains the surface syntax and is LOWERED onto the sealed spawn/join wrapper; users do
+  not call a new API. (Later stage.)
+- imports of core modules whose tagged capability is denied;
+- unresolved externals, unknown LLVM intrinsics, generated inline assembly, and calls that cannot
+  be mapped to a sealed-table entry or a defined CFlat function.
 
-Restricting imported C is essential to the first release: the compiler cannot reliably derive the
-behavior of arbitrary C objects or their constructors. A future native interop mode would require a
-separate reviewed ABI, an object-level audit, and an external runner policy; it is not a switch in
-restricted-v1.
+Interface dispatch is IN scope for v1: the closed-world address-escape property rejects external
+function addresses entering data or indirect-call paths, while defined CFlat targets remain valid.
+A v1 that cannot compile `interface` would reject most real CFlat programs and fail the Compiler
+Explorer use case; this is not per-site target-set validation.
 
-### Capability-owned runtime exports
-
-Every restricted runtime external must have one central declaration. The conceptual inventory is:
-
-```cpp
-enum class IsolatedCapability {
-    Pure, Stdio, Clock, Random, Filesystem, Network, Ui, Process, Threads
-};
-
-struct IsolatedRuntimeExport {
-    std::string_view symbol;
-    IsolatedCapability capability;
-    bool usesRestrictedHeap;
-    bool createsThread;
-};
-```
-
-The table is a positive allowlist, not a name blacklist. It controls semantic availability, codegen
-declarations, final-module validation, and optional sidecar emission. Each runtime module imports
-only the entries it needs. `GetForCurrentProcess()` and broad process-symbol search must never be
-used to make a module pass isolated validation.
-
-The initial default surface should contain deterministic computation, strings, collections, bounded
-stdio, arguments, and a small allocation API. Clock, random, files, network, UI, process, and
-threads are opt-in runtime modules. A capability module must not smuggle a second capability; for
-example, a clock export must not open a file, and an output export must not launch a UI program.
+Restricting imported C is essential: the compiler cannot derive the behavior of arbitrary C
+objects. A future native interop mode would require a separate reviewed ABI and object-level
+audit; it is not a switch in restricted-v1.
 
 ## Compiler policy validation
 
-Implement validation in both compiler passes where type and declaration information is consumed.
-`ForwardRefScanner` must reject forbidden declarations and imports early enough to avoid
-pre-registering unsupported forward references. `MainListener` must repeat the same declaration
-specifier and construct checks before it emits code. This repository's two-pass rule applies to all
-new type parsing and soft keyword handling.
+Implement validation in both compiler passes. `ForwardRefScanner` must reject forbidden
+declarations and imports early enough to avoid pre-registering unsupported forward references.
+`MainListener` must repeat the same checks before it emits code. The two-pass rule applies: a
+check added to one `ParseDeclarationSpecifiers()` copy alone is incorrect.
 
-Policy validation should create an `IsolatedPolicyContext` carried through import processing,
-semantic analysis, and code generation. It records:
+Policy validation creates an `IsolatedPolicyContext` (owned by `LLVMBackend`, populated in
+`Compile()` before imports run) recording:
 
-- normalized limits, the canonical final decision for every primitive capability, provenance for
-  the allow and deny expansions, and a canonical JSON digest;
+- the parsed policy: eight explicit capability decisions plus normalized limits;
 - every requested capability and its source locations;
-- restricted runtime exports selected by the program;
-- allocation and thread constructs that require instrumentation;
-- policy violations, so diagnostics can identify the denied rule and location.
+- sealed runtime exports selected by the program;
+- violations, so diagnostics identify the denied rule and location.
 
-Do not infer access from imported filename text. Standard-library modules must declare their required
-capability in compiler-owned metadata. User modules remain subject to the same semantic rules. An
-import of a denied module produces `policy-capability-denied` at the import and, when available, at
-the first use.
+`ResetForReanalysis` must clear the context along with all other transient per-call state (the
+`lastCallIsBonded` lesson). `--isolated` is not reachable from the LSP path; assert or ignore the
+context there rather than letting a stale policy leak into editor analysis.
 
-Before code generation, reject capability contradictions: a denied capability with any selected
-export, a process count other than one, `threads: "deny"` with thread constructs, or a heap-routed
-operation with no approved allocator. Check both `ParseDeclarationSpecifiers()` implementations in
-`MainListener.h`; a change to one pass alone is incorrect.
+## Compiler-instrumented memory and thread controls (later stage)
 
-## Compiler-instrumented memory and thread controls
+`heap_bytes`: all language heap allocation routes through a compiler-owned `IsolatedHeap` wrapper
+with checked, atomic reservation accounting. Exceeding the cap reports a runtime error and aborts.
+The accounting excludes allocator overhead, stacks, globals, and host runtime memory.
 
-### Restricted heap
+`max_threads`: spawn reserves a live-thread permit (main thread consumes one); join/reap releases
+it. No detached threads, implicit worker pools, or unbounded task queues.
 
-`heap_bytes` has deterministic CFlat semantics. In isolated mode, all language heap allocation,
-resize, and collection growth must route through a compiler-owned `IsolatedHeap` API. It atomically
-reserves requested usable bytes before calling its backing allocator, releases the recorded usable
-size on free, and reserves only the growth delta on realloc. Overflow, double free, or an allocation
-past the limit reports `resource-limit: restricted heap cap exceeded` and aborts the program.
-
-The accounting definition deliberately excludes allocator overhead, stacks, globals, JIT code,
-mappings, and host runtime memory. Those are accounted only by the external runner's declared
-`memory_bytes` limit. Before enabling this feature, inventory and redirect CFlat `new`, arrays,
-strings, closures, generic collections, exceptions if supported, and runtime-owned temporary
-buffers. The final module audit rejects calls to an allocator outside the sealed allocation exports.
-
-The implementation must use checked size and alignment arithmetic plus atomic reservation so
-allowed concurrent threads cannot oversubscribe the cap. This wrapper makes memory failures
-predictable for CFlat code; it does not contain arbitrary native code.
-
-### Threads
-
-When `max_threads` is one, semantic validation rejects every thread construct and thread runtime
-export. When it is greater than one, expose only `cflat_isolated_thread_spawn` and
-`cflat_isolated_thread_join`. Spawn reserves a live-thread permit before creating a thread; join or
-reap releases it. The main thread consumes one permit. Exceeding the budget reports
-`resource-limit: max_threads exceeded` at the spawn call.
-
-No detached threads, implicit runtime worker pools, or unbounded task queues are permitted in
-restricted-v1. A future task library may multiplex logical tasks on the permitted threads only with
-bounded queues charged to the restricted heap. LLVM materialization and compiler-owned support work
-must not silently consume program permits.
-
-The compiler can enforce the language path and instrument its own wrapper, but it cannot stop a
-memory-corruption defect from reaching a native thread primitive. An emitted manifest must
-therefore mark `max_threads` as `compiler-instrumented` and require an external runner to treat
-`max_tasks` as the hard runtime ceiling.
+Runtime error reporting is NOT `LogError` -- `LogError` is a compile-time facility and does not
+exist inside the compiled program. Specify the runtime side separately: message format
+(`isolated runtime error: restricted heap cap exceeded`), stream (stderr), and exit code, in the
+sealed wrapper implementation. The `resource-limit` diagnostic category below covers only the
+compile-time rejections (e.g. `max_threads` contradiction in the policy).
 
 ## Optimized LLVM module validation
 
-Run a mandatory audit after all CFlat code generation and the selected optimization pipeline, before
-writing `--out-lli` or `--bitcode` output. Source validation is not sufficient: optimization,
-lowering, generic instantiation, runtime declarations, and compiler mistakes can change the final
-module.
+Run a mandatory audit after all code generation and the selected optimization pipeline, before
+writing any output. Source validation is not sufficient: optimization, lowering, generic
+instantiation, and compiler mistakes can change the final module. The hook point is
+`LLVMBackend::Compile` after `OptimizeModule`/`RunGlobalDCE`, before the `--out-lli` /
+`--bitcode` writes and before `EmitExecutable`.
 
-The audit must inspect the entire module, including every function body, declaration, global,
-alias, named metadata, global constructor/destructor entry, and module flag. It rejects the module
-on any of the following:
+The audit inspects the entire module: every function declaration and body, global, alias, named
+metadata, global ctor/dtor entry, and module flag. It rejects on:
 
-- an external function, global, alias, or object requirement absent from the sealed runtime table;
-- an approved external whose required capability is denied by the policy;
-- a call, `invoke`, call-br instruction, indirect-call provenance, or function address that escapes
-  the set of defined CFlat functions plus approved runtime exports;
+- an external function or global absent from the sealed runtime table (final model), or present
+  but classified under a denied capability;
 - inline assembly in a module, function, or call site;
 - an LLVM intrinsic not in a small explicit allowlist justified by generated CFlat code;
-- allocator, thread, process, file, network, UI, or dynamic-loader symbol outside its approved
-  restricted runtime entry;
-- a global constructor or destructor that reaches a denied capability, an unapproved external, or a
-  forbidden allocator/thread API;
-- an object-file input, library, target feature, data layout, target triple, or module flag not
-  accepted by the selected isolated output format;
-- writable-and-executable section requests or equivalent code-generation properties if exposed by
-  the selected output format.
+- a call, `invoke`, or callbr whose target is neither a defined CFlat function nor an approved
+  runtime export;
+- a global constructor or destructor that reaches a denied capability or unapproved external;
+- writable-and-executable section requests or equivalent properties if exposed by the output.
 
-Direct symbol checks are necessary but not enough. Build a call graph rooted at `main`, global
-constructors, global destructors, and every address-taken function reachable from a global or
-approved runtime callback. Resolve defined functions transitively. For an indirect call, require a
-provable finite target set contained in that graph; otherwise reject it in restricted-v1. This may
-initially exclude flexible callbacks and virtual dispatch patterns until the compiler can preserve
-and validate their target sets correctly.
+Build the call graph rooted at `main`, global ctors/dtors, and every address-taken function
+reachable from a global or approved runtime callback; resolve defined functions transitively.
 
-Validate LLVM IR with LLVM's verifier before and after the isolated audit. The verifier confirms IR
-well-formedness; the isolated audit decides policy conformance. Neither proves memory safety or
-runtime isolation.
+Validate with LLVM's verifier before and after the isolated audit. The verifier confirms IR
+well-formedness; the isolated audit decides policy conformance. Neither proves memory safety.
 
-### Output-specific validation
+`-o` needs one additional stage: the linker can introduce imports, dependencies, constructors, and
+section permissions not present in the LLVM module. Until a target-specific post-link reader
+audits the final executable, reject `--isolated ... -o` with `policy-output-unsupported`.
 
-`--check`, `--out-lli`/`-l`, and `--bitcode`/`-b` validate the optimized LLVM module immediately
-before reporting success or writing the selected output. LLVM IR and bitcode are the preferred
-handoff representations in the initial implementation because the audited module remains directly
-inspectable by a runner.
+## Optional external runner handoff (later stage)
 
-`-o` must remain a supported ordinary output choice, but it needs one additional validation stage.
-The linker may introduce imports, library dependencies, constructors, section permissions, and
-other executable properties not present in the optimized LLVM module. Before `--isolated ... -o`
-can report success, the compiler must inspect the final linked executable using a target-specific
-reader and reject imports, load commands/dependencies, entry initializers, sections, and metadata
-outside the restricted output allowlist. If that post-link audit is not implemented for the selected
-target, reject this combination with `policy-output-unsupported`; do not silently emit an executable
-based only on the LLVM audit. This is staged support, not a new packaging format.
-
-The policy never controls output paths, bundled libraries, response files, or embedded objects.
-Existing output flags retain their ordinary path behavior. Size caps for an output are configuration
-of the caller or eventual runner, not a security property of this mode.
-
-## Optional external runner handoff
-
-When requested with `--isolated-manifest <path>`, the compiler writes a canonical JSON sidecar. It
-is optional for every output choice and is never required for compilation or validation. For
-`--out-lli`, `--bitcode`, or a post-link-audited `-o` output, it binds the normal output file with a
-SHA-256 digest. For `--check`, it records the policy and validated module metadata but has no output
-file digest. Its `output.kind` is respectively `llvm-ir`, `bitcode`, `executable`, or `check`, and
-`output.sha256` is omitted for `check`. It does not create a directory, bundle files, or establish
-a new output format.
-
-The sidecar contains at least:
-
-```json
-{
-  "format": "cflat-isolated-manifest",
-  "format_version": 1,
-  "compiler_build_id": "...",
-  "llvm_major": 0,
-  "target_triple": "...",
-  "data_layout": "...",
-  "policy_version": 1,
-  "policy_sha256": "...",
-  "output": {
-    "kind": "bitcode",
-    "sha256": "..."
-  },
-  "resolved_capabilities": {
-    "clock": "deny",
-    "filesystem": "deny",
-    "network": "deny",
-    "process": "deny",
-    "random": "deny",
-    "stdio": "allow",
-    "threads": "allow",
-    "ui": "deny"
-  },
-  "required_capabilities": ["stdio", "threads"],
-  "capability_provenance": {
-    "stdio": { "allow": ["/capabilities/allow/0 -> group:interactive"] },
-    "threads": { "allow": ["/capabilities/allow/0 -> group:interactive"] },
-    "network": { "allow": ["/capabilities/allow/0 -> group:host-access"], "deny": ["/capabilities/deny/1"] }
-  },
-  "runtime_exports": [
-    { "symbol": "cflat_isolated_alloc", "capability": "pure" },
-    { "symbol": "cflat_isolated_thread_spawn", "capability": "threads" }
-  ],
-  "limits": {
-    "heap_bytes": 201326592,
-    "memory_bytes": 268435456,
-    "wall_time_ms": 5000,
-    "max_processes": 1,
-    "max_threads": 4,
-    "max_tasks": 4,
-    "stdout_bytes": 65536,
-    "stderr_bytes": 65536
-  },
-  "enforcement": {
-    "heap_bytes": "compiler-instrumented",
-    "max_threads": "compiler-instrumented",
-    "memory_bytes": "external-runner-required",
-    "wall_time_ms": "external-runner-required",
-    "max_processes": "external-runner-required",
-    "max_tasks": "external-runner-required",
-    "stdout_bytes": "external-runner-required",
-    "stderr_bytes": "external-runner-required",
-    "filesystem": "external-runner-required",
-    "network": "external-runner-required",
-    "ui": "external-runner-required"
-  }
-}
-```
-
-`resolved_capabilities` is the complete normalized primitive decision map and is required. The
-optional `capability_provenance` is diagnostic metadata only; it may identify policy JSON Pointer
-paths and group expansions, but no runner may re-expand groups or reapply `allow`/`deny` entries.
-A runner consumes the resolved primitives and its own independently supported profile, or rejects
-the handoff.
-
-The external runner must reject a normal output and sidecar when their format, compiler/LLVM
-compatibility rules, target, data layout, policy hash, output digest when present, required
-capability set, or resource requirements do not fit the runner's own supported profile. The runner
-must resolve only `runtime_exports` that it has independently approved, and must apply its OS policy
-before executing code or constructors.
-
-The sidecar is descriptive and integrity-checkable, not an authorization token. A service should
-either keep outputs private to the request or bind them to its own authenticated job record. Do not
-treat the SHA-256 digest as a signature or permit a user to replace the sidecar with one for another
-output.
+`--isolated-manifest <path>` writes a canonical JSON sidecar binding the normal output with a
+SHA-256 digest (`llvm/Support/SHA256.h`). Sketch of the payload (details finalized when the stage
+lands): format/version, compiler build id, LLVM major, target triple, data layout, policy digest,
+`output.kind` (`llvm-ir` | `bitcode` | `executable` | `check`) and `output.sha256` (omitted for
+`check`), the eight resolved capability decisions, the required-capability subset, selected
+runtime exports, limits, and per-limit enforcement labels (`compiler-instrumented` vs
+`external-runner-required`). Runtime exports may carry `"capability": "pure"`; `pure` is an
+internal classification that policies cannot name, but the manifest reports it so a runner sees
+the full export list. The sidecar is descriptive and integrity-checkable, not an authorization
+token; the digest is not a signature.
 
 ## Diagnostics
 
 Use stable categories and `LogError`:
 
-- `policy-invalid`: invalid JSON, unknown key, duplicate, invalid typed reference, unknown
-  primitive/group, invalid group name, group cycle, expansion limit, invalid number, unsupported
-  policy version, or contradictory limits.
-- `policy-capability-denied`: source requires a capability denied by the policy.
-- `policy-restricted-language`: a CFlat construct or import is not available in restricted-v1.
-- `policy-runtime-denied`: selected runtime export is not in the sealed table or is denied.
+- `policy-invalid`: unreadable/invalid JSON, unknown key, missing required key, wrong type,
+  invalid number, unsupported version/language, or contradictory limits.
+- `policy-unsupported`: the policy is valid but requests something this compiler build cannot yet
+  enforce (e.g. denying a capability whose enforcement stage has not landed). Refusing loudly is
+  mandatory; silently accepting an unenforced deny would misrepresent the output.
+- `policy-capability-denied`: source requires a capability denied by the policy (reported at the
+  import or first use).
+- `policy-restricted-language`: a CFlat construct or import is not available in restricted-v1
+  (user externs, `.c` interop, inline asm, address manufacture, `program`, ...).
 - `policy-module-denied`: final LLVM module contains an unapproved external, intrinsic, call path,
-  constructor, object requirement, or output property.
-- `policy-output-unsupported`: the requested output needs a target-specific isolated audit that is
-  not implemented for this target.
-- `resource-limit`: deterministic restricted heap or thread permit limit was exceeded.
-- `isolated-manifest-error`: optional sidecar serialization, hashing, or writing failed.
+  constructor, or output property; identifies the LLVM symbol and the capability or rule.
+- `policy-output-unsupported`: the requested output needs an audit not implemented for this
+  target (currently any `-o`).
+- `resource-limit`: compile-time policy limit contradiction (runtime cap hits are reported by the
+  sealed runtime wrappers, not this category).
+- `isolated-manifest-error`: sidecar serialization, hashing, or writing failed (later stage).
 
-Every policy diagnostic includes the policy filename, line/column when the JSON parser can provide
-one, and an RFC 6901 JSON Pointer (for example `/groups/interactive/1` or
-`/capabilities/deny/0`). A source-level denial includes the CFlat source location plus the policy
-pointer(s) that caused the resolved deny; an IR-only failure identifies the LLVM function/global
-and the relevant resolved capability or sealed-table rule. Do not describe any diagnostic as a
-sandbox or OS denial.
+Every policy diagnostic includes the policy filename and, where the JSON parser provides one, a
+location. Source-level denials include the CFlat source location. Do not describe any diagnostic
+as a sandbox or OS denial.
 
 ## Implementation stages
 
-### Stage 1: policy model and CLI
+### Stage P: prototype -- filesystem and network enforcement (CURRENT)
 
-1. Add strict JSON parsing, typed group-reference validation, graph-cycle/size validation,
-   fixed-phase capability normalization, canonical serialization, and policy digest.
-2. Add `--isolated <policy>` and optional `--isolated-manifest <path>` validation in `ArgParser.h`
-   and `main.cpp`; retain the existing `--check`, `--out-lli`/`-l`, `--bitcode`/`-b`, and `-o`
-   output flags and explicitly reject the combination with `--run`.
-3. Define `IsolatedPolicyContext`, capability metadata, and stable error categories.
-4. Document the mode's non-security-boundary limitation in CLI help and `doc/CLI.md`.
+Scope: a working `--isolated` that parses the v1 policy and enforces `filesystem` and `network`
+denial end to end, with the honest `policy-unsupported` refusal for everything not yet enforced.
 
-Acceptance: malformed, incomplete, unknown-version, unknown-key, duplicate, unknown reference,
-cyclic or oversized group graph, overflowed, and contradictory policies fail before compilation;
-the final eight-capability decision map is fixed before semantic checks; existing output selection
-remains unchanged; `--run` behavior remains unchanged.
+1. New `cflat/IsolatedPolicy.h/.cpp` (add to the CMake source list if not globbed): policy struct,
+   nlohmann-based strict parse (closed keys, all eight capability keys required, `"allow"`/
+   `"deny"` values only; duplicate-key rejection deferred with a marked gap), and the capability
+   tables below.
+2. `--isolated <path>` flag in `main.cpp`; wire the parsed policy into `LLVMBackend` before
+   `Compile`. Reject the flag combinations listed in "User interface" (including `-o` via
+   `policy-output-unsupported` and `--run`, `.c` inputs, `--asan`, `--heap-audit`).
+3. Prototype enforcement rules:
+   - `filesystem` / `network`: `"deny"` is enforced (below); `"allow"` is accepted and simply
+     skips the denial checks.
+   - the other six capabilities: `"allow"` is accepted (no enforcement claimed); `"deny"` errors
+     with `policy-unsupported` naming the capability. This keeps the prototype honest: it never
+     accepts a restriction it does not enforce. (Exception: `threads: "deny"` may also be
+     accepted later in the prototype if the existing thread-construct rejection is trivial to
+     wire; do not stretch for it.)
+4. Semantic layer (both passes):
+   - reject user-file `extern` declarations (`policy-restricted-language`); core files under
+     `runtimeDir` are exempt;
+   - reject `import` of capability-tagged core modules when denied: `filesystem.cb` ->
+     filesystem; `network/socket.cb` + platform variants -> network (`policy-capability-denied`
+     at the import statement);
+   - reject `.c`/`.h`/package imports encountered in source (`policy-restricted-language`).
+5. Module audit (in `LLVMBackend::Compile`, after optimization, before IR/bitcode writes): walk
+   external declarations (functions and globals). Classify against a per-symbol table covering
+   the filesystem and network externs actually declared by the core library (harvest the symbol
+   lists from `filesystem.cb`, `os.cb`/`os.posix.cb`/`os.windows.cb` filesystem portions, and
+   `network/socket*.cb`: `fopen`/`fread`/`fwrite`/`fclose`/`open`/`stat`/`mkdir`/`remove`/
+   `rename`/`CreateFileW`/... and `socket`/`connect`/`bind`/`listen`/`accept`/`send`/`recv`/
+   `getaddrinfo`/`WSA*`/...). A denied-capability symbol that survives into the final module is
+   `policy-module-denied` naming the symbol. Unknown externs are NOT rejected in the prototype --
+   the complete positive allowlist is Stage 2's inventory -- and combined with the user-extern
+   semantic rejection this still closes the direct bypass routes for the two enforced
+   capabilities. Comment this narrowing explicitly at the audit site.
+6. Verification (see Testing): scratch/ repros driven manually plus the full host suite.
 
-### Stage 2: restricted semantic profile
+Acceptance: hello-world passes `--isolated policy.json --check` and `--out-lli` with fs/net
+denied; a program importing `filesystem.cb` (or calling into it via an allowed import path) fails
+with a located diagnostic; a socket program fails likewise; a user `extern` fails; `--run`, `.c`,
+and `-o` combinations are rejected; a policy denying `ui` fails with `policy-unsupported`; the
+full host suite stays green (`--isolated` off by default changes nothing).
 
-1. Add checks in both `ForwardRefScanner` and `MainListener`, including both
-   `ParseDeclarationSpecifiers()` implementations where relevant.
-2. Reject native interop, forbidden imports, externs, raw address manufacture, process APIs, and
-   disallowed threads before code generation.
-3. Replace broad runtime availability with the central sealed export table.
-4. Record source-level capability requests against the normalized primitive decisions for optional
-   sidecar emission.
+### Stage 1: policy model completion
 
-Acceptance: violations identify the restricted rule/capability and source location; permitted
-programs select only their required compiler-owned runtime exports.
+Strict duplicate-key rejection (SAX parse), `heap_bytes`/`heap_mb`/`max_threads` limit validation,
+policy digest, and `doc/CLI.md` documentation including the non-security-boundary statement.
+
+### Stage 2: sealed export inventory and full restricted profile
+
+The big one. Inventory the transitive extern closure of the allowed core surface (~370 externs)
+into the per-symbol table with `Pure`/`Stdio`/... classifications; flip the module audit from
+"reject known-denied symbols" to "reject anything not in the table"; add the remaining
+restricted-language rejections (address manufacture, `program`, process APIs); wire per-module
+tags for the remaining core modules; verify import gating on the warm `--init` cache path (or
+keep forcing cold parse under `--isolated` until then).
 
 ### Stage 3: restricted allocator and threads
 
-1. Inventory every allocation route and redirect isolated code to `IsolatedHeap`.
-2. Add checked atomic heap accounting, allocation-site diagnostics, and final-module allocator
-   validation.
-3. Add sealed spawn/join exports and live-thread permits; reject detached and implicit thread paths.
-4. Mark compiler-instrumented and external-runner-required limits accurately in an emitted sidecar.
+`IsolatedHeap` routing + atomic accounting; sealed spawn/join lowering for `thread<T>`;
+permit accounting; runtime error reporting spec (stderr format + exit code); flip `threads` and
+heap limits from `policy-unsupported` to enforced.
 
-Acceptance: heap and thread boundaries give deterministic CFlat diagnostics; no generated module
-can bypass the sealed allocator or thread exports.
+### Stage 4: full module audit, `-o`, and manifest
 
-### Stage 4: final module audit and output support
-
-1. Run LLVM verification and the isolated audit after optimization.
-2. Implement call-graph and indirect-call target validation, constructor/destructor coverage, and
-   intrinsic/external checks.
-3. Gate `--check`, `--out-lli`/`-l`, and `--bitcode`/`-b` on the optimized-module audit.
-4. Add a target-specific final executable/import audit before allowing `-o`, initially rejecting
-   unsupported targets with `policy-output-unsupported`.
-5. Emit an optional canonical manifest sidecar with output hashes, resolved primitive decisions,
-   and optional non-authoritative group provenance when there is an output file.
-
-Acceptance: an unapproved external declaration, constructor call, or target/data-layout field makes
-the module audit fail deterministically; a linked executable import or dependency outside the
-allowlist makes the post-link audit fail; an unsupported target cannot emit an isolated executable.
-When requested, an output or sidecar hash mismatch is detectable by a consumer.
+Closed-world address-escape validation; ctor/dtor coverage; intrinsic
+allowlist; target-specific post-link executable audit enabling `-o`; `--isolated-manifest`
+emission with digests and enforcement labels.
 
 ## Testing strategy
 
-Extend existing related test files and scripts; do not add new compiler integration test files unless
-explicitly requested. Add focused unit coverage where the repository already supports it.
+Honest constraint first: the existing harnesses cannot express policy-level negatives.
+`expect_error` arms from source text and `test.bat`/`test.sh` glob `Test/test_*.cb` and
+`Test/errors/err_*.cb` with a fixed command line -- there is no way to pass `--isolated
+policy.json` or assert a CLI-level failure today. Options, to be decided with the maintainer
+before Stage 1 hardening (do not silently invent a new harness):
 
-Required negative cases:
+- extend the error-test convention with a per-test flag sidecar (e.g. `err_foo.cb.flags`), or
+- add a small dedicated policy-test script alongside `test_lsp.bat`'s precedent, or
+- keep policy negatives as unit-style checks inside the compiler where the repo already supports
+  them.
 
-- invalid policy schema, unknown fields, duplicate keys/references, invalid group-name syntax,
-  untyped or unknown references, unknown primitive capability, self-reference, indirect cycle,
-  depth/member/total expansion limits, numeric overflow, and limit contradictions;
-- baseline default-deny behavior; group expansion; allow then deny final-veto behavior for direct
-  capabilities and groups; same group in both arrays; overlapping groups; order-independent output;
-  and a resolved decision map containing all eight primitives before source or IR validation;
-- user `extern`, `.c` input/import, header/package binding, prebuilt library, dynamic loader, and
-  inline assembly rejection;
-- denied filesystem, network, UI, process, clock, random, stdio, and thread module/import usage;
-- raw address casts and unsupported indirect-call targets;
-- forbidden calls from global constructors/destructors and address-taken callbacks;
-- unknown external, global, alias, intrinsic, allocator, thread primitive, target feature, and
-  object requirement in a final module;
-- one byte below, at, and above the restricted heap cap; overflow and realloc growth/shrink; racing
-  allocations near the cap;
-- `max_threads` at one and N, N concurrent permitted spawns, N+1 rejection, and permit reuse after
-  join;
-- IR and bitcode output is blocked when the optimized module audit fails;
-- executable output is blocked when final-link import/dependency/section audit fails, and rejected
-  with `policy-output-unsupported` where that audit has not been implemented;
-- optional sidecar output hash, target, data-layout, policy digest, resolved capability map,
-  runtime export, enforcement label, and non-authoritative group provenance tamper detection by a
-  consumer-side test helper; consumer coverage must prove that it never reinterprets groups.
+For Stage P, verification is manual and lives in `scratch/`: a set of `.cb` repros plus policy
+JSON files exercising the acceptance list above, driven by hand (or a throwaway scratch script),
+plus the standard completion bar -- the full host suite (`./test.sh Release` on macOS, `test.bat`
+on Windows) stays green because `--isolated` is opt-in and default-off.
 
-Required positive cases:
+Required negative coverage (accumulated across stages): invalid schema (missing key, unknown key,
+bad value, bad number, wrong version/language); `policy-unsupported` for unenforced denies;
+denied fs/net import and surviving symbol; user extern; `.c`/header/package interop; `--run`/
+`-o`/`--asan`/`--heap-audit` combinations; later: address casts, unknown externs vs the full
+table, ctor/dtor escapes, heap/thread cap boundaries, manifest tamper detection.
 
-- pure restricted program compiles under `--check`, `--out-lli`, and `--bitcode` with no optional
-  sidecar;
-- a group may reference a group declared later and resolves to the same primitive set regardless of
-  declaration order;
-- allowed stdio and an allowed bounded thread computation compile with exact required exports;
-- optional sidecars describe `--check`, IR, bitcode, and post-link-audited executable outputs with
-  complete resolved primitive capabilities, without changing their normal output paths;
-- program behavior and source locations are unchanged outside `--isolated` mode;
-- ordinary `--run` remains available only without `--isolated`.
-
-The full host suite remains the completion bar after compiler changes. No test in this plan asserts
-OS denial, process containment, or total memory enforcement because those properties belong to the
-external runner.
+Required positive coverage: pure and stdio programs under `--check`/`--out-lli`/`--bitcode`;
+behavior unchanged outside `--isolated`; `--run` untouched without the flag.
 
 ## Limitations and future boundary
 
 Compiler validation lowers risk and provides an auditable contract, but a compiler, LLVM, runtime,
 or generated-code defect can still produce behavior outside the model. It cannot stop raw machine
-code after an exploit, constrain inherited handles, prevent system calls, cap total process memory,
-or reliably contain threads. A public service must not rely on `--isolated` alone.
+code after an exploit, constrain inherited handles, prevent system calls, or cap total process
+memory. A public service must not rely on `--isolated` alone.
 
-Any future external runner integration must remain a separate design with a clear ownership split:
+Ownership split for any future runner integration: this compiler owns policy parsing, restricted
+semantics, LLVM audit, ordinary output emission, and sidecar accuracy; the runner owns runtime
+authorization, OS containment, and resource limits; the service operator owns compile
+containment, authentication, rate limits, and retention.
 
-- this compiler owns policy parsing, restricted CFlat semantics, LLVM audit, ordinary output
-  emission, and optional sidecar accuracy;
-- the runner owns runtime authorization, OS containment, total memory/time/output/task limits,
-  file/network/UI/process enforcement, and output admission;
-- the service operator owns compile containment, request authentication, rate limits, queues,
-  output retention, and deployment patching.
-
-Do not expand restricted-v1 to permit native interop, broad host symbol lookup, indirect calls with
-unknown targets, or a feature the compiler cannot trace to a sealed runtime export. A future policy
-version should be added rather than weakening version 1.
+Do not expand restricted-v1 to permit native interop, broad host symbol lookup, or indirect calls
+with unknown targets. Add a new policy version rather than weakening version 1.
 
 ## Primary API references
 
-LLVM:
-
 - [LLVM IR language reference](https://llvm.org/docs/LangRef.html)
 - [LLVM verifier API](https://llvm.org/doxygen/Verifier_8h.html)
-- [ORC design and `JITDylib::define`](https://llvm.org/docs/ORCv2.html)
 - [Bitcode format and reader/writer APIs](https://llvm.org/docs/BitCodeFormat.html)

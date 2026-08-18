@@ -3,7 +3,8 @@
 #
 # Compiles and runs the platform-portable subset of Test/*.cb against the
 # native ELF cflat built by `cmake --preset linux-x64-release` (deployed to
-# x64/<Config>/cflat), plus the Test/errors/*.cb negative tests. Runs in
+# x64/<Config>/cflat), plus the Test/errors/*.cb and explicit policy negatives.
+# Runs in
 # parallel with a per-test timeout and prints a PASS/FAIL/SKIP summary.
 #
 # Usage:
@@ -142,10 +143,46 @@ run_cb() {
   fi
 }
 
-# Worker: an err_*.cb passes when the compiler exits 0 (expect_error matched).
+load_err_flags() {
+  local sidecar="$1" line value
+  ERR_FLAGS=()
+  ERR_EXPECT_EXIT=""
+  ERR_EXPECT_OUTPUT=""
+  if [ -f "$sidecar" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        flags=*)
+          value="${line#flags=}"
+          local -a sidecar_flags=()
+          read -r -a sidecar_flags <<< "$value"
+          ERR_FLAGS+=("${sidecar_flags[@]}")
+          ;;
+        expect_exit=*) ERR_EXPECT_EXIT="${line#expect_exit=}" ;;
+        expect_output=*) ERR_EXPECT_OUTPUT="${line#expect_output=}" ;;
+      esac
+    done <"$sidecar"
+  fi
+}
+
+check_err_result() {
+  local rc="$1" log="$2"
+  if [ "$ERR_EXPECT_EXIT" = "nonzero" ]; then
+    [ "$rc" -ne 0 ] && [ -n "$ERR_EXPECT_OUTPUT" ] \
+      && grep -Fq -- "$ERR_EXPECT_OUTPUT" "$log"
+    return
+  fi
+  [ "$rc" -eq 0 ]
+}
+
+# Worker: an err_*.cb passes when expect_error matches, or when its sidecar expects
+# a nonzero exit and an output substring.
 run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
-  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check >"$RES/$n.log" 2>&1; then
+  local log="$RES/$n.log" rc=0
+  load_err_flags "$f.flags"
+  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
+    "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
+  if check_err_result "$rc" "$log"; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL" >"$RES/$n.result"
@@ -157,14 +194,18 @@ run_err() {
 # A ".warm" suffix keeps its result/log distinct from the cold run's.
 run_err_warm() {
   local f="$1" n; n="$(basename "$f" .cb).warm"
-  if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check >"$RES/$n.log" 2>&1; then
+  local log="$RES/$n.log" rc=0
+  load_err_flags "$f.flags"
+  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
+    "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
+  if check_err_result "$rc" "$log"; then
     echo "PASS" >"$RES/$n.result"
   else
     echo "FAIL" >"$RES/$n.result"
   fi
 }
 
-export -f run_cb run_err run_err_warm is_skipped
+export -f run_cb load_err_flags check_err_result run_err run_err_warm is_skipped
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE
 
 # The JIT path is deliberately opt-in. This list excludes fixtures that require a prebuilt C
@@ -194,25 +235,47 @@ else
 fi
 err_list=""
 err_files=()
+err_discovery_files=()
 if [ -d "$SRC/errors" ]; then
   for f in "$SRC"/errors/err_*.cb; do
     n="$(basename "$f" .cb)"
     is_err_skipped "$n" && continue
     err_list="$err_list$f"$'\n'
     err_files+=("$f")
+    err_discovery_files+=("$f")
   done
+  if [ -d "$SRC/errors/policy" ]; then
+    for f in "$SRC"/errors/policy/err_*.cb; do
+      [ -f "$f" ] || continue
+      n="$(basename "$f" .cb)"
+      is_err_skipped "$n" && continue
+      err_list="$err_list$f"$'\n'
+      err_files+=("$f")
+    done
+  fi
 fi
 
 # Discovery pass: the error suite is the authoritative diagnostic inventory. Run it
 # serially with pseudo output so expect_error continues to match source English while
 # --update-locale records every template encountered by the batch.
-if [ "$RUN_MODE" -eq 0 ] && [ "${#err_files[@]}" -gt 0 ]; then
+if [ "$RUN_MODE" -eq 0 ] && [ "${#err_discovery_files[@]}" -gt 0 ]; then
   if ! "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
-      --check -i "$LIB" "${err_files[@]}" >"$RES/_locale.log" 2>&1; then
+      --check -i "$LIB" "${err_discovery_files[@]}" >"$RES/_locale.log" 2>&1; then
     echo "FAIL: pseudo-locale diagnostic discovery failed"
     tail -n 20 "$RES/_locale.log"
     exit 1
   fi
+fi
+
+# Policy fixtures carry their own --isolated sidecars, so discover their diagnostic
+# templates one file at a time; expected failures are data, not discovery errors.
+if [ "$RUN_MODE" -eq 0 ] && [ -d "$SRC/errors/policy" ]; then
+  for f in "$SRC"/errors/policy/err_*.cb; do
+    [ -f "$f" ] || continue
+    load_err_flags "$f.flags"
+    "$CFLAT" --locale pseudo --update-locale en-pseudo --locale-dir "$LOCALE_DIR" \
+      --check -i "$LIB" "${ERR_FLAGS[@]}" "$f" >"$RES/$(basename "$f").locale.log" 2>&1 || true
+  done
 fi
 
 printf '%s' "$cb_list"  | grep -v '^$' | xargs -P "$JOBS" -I{} bash -c 'run_cb "$@"' _ {}

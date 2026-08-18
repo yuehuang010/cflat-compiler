@@ -723,6 +723,88 @@ ForwardRefScanner::ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compi
 
 void ForwardRefScanner::SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
 
+void ForwardRefScanner::ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree)
+{
+    if (!compilerLLVM->IsIsolated() || compilerLLVM->currentSourceIsCore_
+        || compilerLLVM->IsIsolatedCoreSource() || tree == nullptr)
+        return;
+    std::unordered_set<std::string> integralNames;
+    auto collectIntegralNames = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(node))
+        {
+            auto* specs = declaration->declarationSpecifiers();
+            std::string typeName;
+            bool pointer = false;
+            if (specs)
+                for (auto* spec : specs->declarationSpecifier())
+                {
+                    if (auto* type = spec->typeSpecifier(); type && typeName.empty())
+                        typeName = compilerLLVM->ResolveTypeAlias(type->getText());
+                    pointer = pointer || spec->pointer() != nullptr || spec->arrayTypeSuffix() != nullptr;
+                }
+            LLVMBackend::TypeAndValue type{ .TypeName = typeName, .Pointer = pointer };
+            if (!pointer && (type.IsInteger() != -1 || type.IsUnsignedInteger() != -1
+                             || type.TypeName == "bool"))
+                if (auto* list = declaration->initDeclaratorList())
+                    for (auto* init : list->initDeclarator())
+                        if (init->declarator())
+                            integralNames.insert(getDirectDeclName(init->declarator()->directDeclarator()));
+        }
+        if (auto* parameter = dynamic_cast<CFlatParser::ParameterDeclarationContext*>(node))
+        {
+            auto* specs = parameter->declarationSpecifiers();
+            std::string typeName;
+            bool pointer = false;
+            if (specs)
+                for (auto* spec : specs->declarationSpecifier())
+                {
+                    if (auto* type = spec->typeSpecifier(); type && typeName.empty())
+                        typeName = compilerLLVM->ResolveTypeAlias(type->getText());
+                    pointer = pointer || spec->pointer() != nullptr || spec->arrayTypeSuffix() != nullptr;
+                }
+            LLVMBackend::TypeAndValue type{ .TypeName = typeName, .Pointer = pointer };
+            if (!pointer && (type.IsInteger() != -1 || type.IsUnsignedInteger() != -1
+                             || type.TypeName == "bool") && parameter->declarator())
+                integralNames.insert(getDirectDeclName(parameter->declarator()->directDeclarator()));
+        }
+        for (auto* child : node->children)
+            self(self, child);
+    };
+    collectIntegralNames(collectIntegralNames, tree);
+    auto validateCasts = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+        if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+        {
+        auto* typeName = cast->typeName();
+        auto* targetDecl = typeName ? typeName->abstractDeclarator() : nullptr;
+        bool targetPointer = targetDecl != nullptr
+            && (targetDecl->pointer() != nullptr || targetDecl->arrayTypeSuffix() != nullptr);
+        bool sourceIntegral = cast->castExpression() != nullptr
+            && ScannerFoldIfConst(cast->castExpression()).has_value();
+        if (!sourceIntegral && cast->castExpression() != nullptr)
+            if (auto* sourceCast = dynamic_cast<CFlatParser::CastExpressionContext*>(cast->castExpression());
+                sourceCast != nullptr && sourceCast->typeName() != nullptr)
+            {
+                LLVMBackend::TypeAndValue source;
+                source.TypeName = compilerLLVM->ResolveTypeAlias(sourceCast->typeName()->getText());
+                sourceIntegral = source.IsInteger() != -1 || source.IsUnsignedInteger() != -1
+                    || source.TypeName == "bool";
+            }
+        if (!sourceIntegral && cast->castExpression() != nullptr)
+            sourceIntegral = integralNames.count(BareSourceText(cast->castExpression())) != 0;
+        if (targetPointer && sourceIntegral)
+        {
+            compilerLLVM->SetSourceLocation(cast->getStart()->getLine(),
+                                             cast->getStart()->getCharPositionInLine());
+            compilerLLVM->LogError("policy-restricted-language: integer-to-pointer casts are not allowed "
+                                   "in isolated mode (policy '" + compilerLLVM->GetIsolatedPolicy()->path + "')");
+        }
+        }
+        for (auto* child : node->children)
+            self(self, child);
+    };
+    validateCasts(validateCasts, tree);
+}
+
 void ForwardRefScanner::PreRegisterRenameAliases(antlr4::RuleContext* ctx) {
         for (auto* child : ctx->children)
         {
@@ -1524,6 +1606,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
 
 void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        compiler->ValidateIsolatedProgram(ctx);
         std::string name = ctx->directDeclarator()->getText();
 
         // Register opaque struct shell and default constructor

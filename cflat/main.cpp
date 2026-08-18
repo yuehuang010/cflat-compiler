@@ -7,6 +7,8 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <algorithm>
+#include <cctype>
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
@@ -45,6 +47,65 @@ static bool SameCacheRoot(const std::string& a, const std::string& b)
     return std::filesystem::path(a).lexically_normal() == std::filesystem::path(b).lexically_normal();
 }
 
+static std::optional<IsolatedPolicy> ConfigureIsolatedMode(LLVMBackend& compiler,
+                                                           const ArgParser& args)
+{
+    auto path = args.getOption("isolated");
+    if (!path)
+    {
+        if (args.getOption("isolated-manifest"))
+            compiler.ReportIsolatedPolicyError(
+                "policy-restricted-language: --isolated-manifest requires --isolated");
+        return std::nullopt;
+    }
+#if !defined(__APPLE__)
+    // Isolated enforcement is verified on macOS hosts only; refuse rather than half-enforce.
+    compiler.ReportIsolatedPolicyError(std::format(
+        "policy-output-unsupported: --isolated is not supported on this host platform yet "
+        "(verified on macOS only) (policy '{}')", *path));
+    return std::nullopt;
+#endif
+    if (!compiler.LoadIsolatedPolicy(*path)) return std::nullopt;
+
+    auto reject = [&](const char* category, const std::string& conflict) {
+        compiler.ReportIsolatedPolicyError(std::format("{}: {} (policy '{}')", category, conflict, *path));
+    };
+    if (args.hasFlag("run"))
+        reject("policy-restricted-language", "--isolated cannot be combined with --run");
+    if (args.getOption("output"))
+    {
+        bool nativeMacArm64 = false;
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+        auto platform = args.getOption("platform").value_or("macos");
+        nativeMacArm64 = platform == "macos" || platform == "macos-arm64";
+#endif
+        if (!nativeMacArm64)
+            reject("policy-output-unsupported", "isolated -o is supported only on native macOS arm64");
+    }
+    if (args.getOption("isolated-manifest") && args.hasFlag("check")
+        && args.positionalCount() > 1)
+        reject("policy-restricted-language",
+               "--isolated-manifest cannot be combined with multi-file --check");
+    if (args.hasFlag("asan"))
+        reject("policy-restricted-language", "--isolated cannot be combined with --asan");
+    if (args.hasFlag("heap-audit"))
+        reject("policy-restricted-language", "--isolated cannot be combined with --heap-audit");
+
+    for (size_t i = 0; i < args.positionalCount(); ++i)
+    {
+        auto ext = std::filesystem::path(*args.getPositional(i)).extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".c")
+            reject("policy-restricted-language", "--isolated cannot be combined with a positional .c input");
+    }
+    if (!args.getMultiOption("c-include").empty() || !args.getMultiOption("c-lib").empty()
+        || !args.getMultiOption("c-define").empty() || !args.getMultiOption("framework").empty())
+        reject("policy-restricted-language", "--isolated cannot be combined with native interop options");
+
+    return compiler.GetIsolatedPolicy();
+}
+
 int main(int argc, char* argv[])
 {
     if (argc >= 2 && std::string_view(argv[1]) == "lsp")
@@ -66,6 +127,8 @@ int main(int argc, char* argv[])
     args.addOption("output", 'o', "Output native executable path (.exe)");
     args.addOption("out-lli", 'l', "Output LLVM IR file path (.ll)");
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
+    args.addOption("isolated", 0, "Validate against a restricted compiler policy JSON file");
+    args.addOption("isolated-manifest", 0, "Write a digest-bound isolated compilation manifest JSON sidecar");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
     args.addFlag("sanitize-ownership", 0, "Debug-only ownership sanitizer (M1): instrument dereferences of moved-from owning pointer locals and report 'value moved at L:C, dereferenced after move at L:C' at runtime, then abort. Implies -g. Spellings: --sanitize=ownership, -fsanitize=ownership.");
@@ -421,8 +484,9 @@ int main(int argc, char* argv[])
         compiler.LoadLocale(args.hasFlag("verbose"));
         compiler.SetLocaleTemplateCollection(updateLocale.has_value());
         compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
+        auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
         compiler.SetBatchMode(true);
-        compiler.SetNoCache(args.hasFlag("no-cache"));
+        compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
         compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
 
         int failures = 0;
@@ -430,7 +494,10 @@ int main(int argc, char* argv[])
         {
             std::string file = *args.getPositional(i);
             if (i > 0)
+            {
                 compiler.ResetForReanalysis();  // clear per-file state; keep the core parse cache
+                if (isolatedPolicy) compiler.SetIsolatedPolicy(*isolatedPolicy);
+            }
             bool fileOk = false;
             try
             {
@@ -470,7 +537,8 @@ int main(int argc, char* argv[])
     compiler.LoadLocale(args.hasFlag("verbose"));
     compiler.SetLocaleTemplateCollection(updateLocale.has_value());
     compiler.SetSkipRuntimeImport(args.hasFlag("no-runtime"));
-    compiler.SetNoCache(args.hasFlag("no-cache"));
+    auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
+    compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
     compiler.SetAsan(args.hasFlag("asan"));
     compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));

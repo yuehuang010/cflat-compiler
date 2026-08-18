@@ -1,0 +1,7 @@
+import "time.cb";
+
+extern int main()
+{
+    TimePoint now = TimePoint.now();
+    return now.ticks() == 0;
+}

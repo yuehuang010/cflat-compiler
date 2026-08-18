@@ -1,0 +1,7 @@
+expect_error("policy-capability-denied");
+import "network/socket.cb";
+
+extern int main()
+{
+    return 0;
+}

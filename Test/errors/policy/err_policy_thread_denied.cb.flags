@@ -1,0 +1,3 @@
+flags=--isolated Test/errors/policy/policies/deny_threads.json
+expect_exit=nonzero
+expect_output=policy-capability-denied
