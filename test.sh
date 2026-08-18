@@ -53,6 +53,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+SCRIPT_START=$(date +%s)
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 CFLAT="$ROOT/x64/$CONFIG/cflat"
 SRC="$ROOT/Test"
@@ -122,25 +123,41 @@ is_err_skipped() {
   return 1
 }
 
+# Millisecond wall clock: bash's $SECONDS is too coarse and BSD date has no %N,
+# so use perl Time::HiRes (present on macOS and Linux), falling back to seconds.
+now_ms() {
+  if command -v perl >/dev/null 2>&1; then
+    perl -MTime::HiRes=time -e 'printf "%d", time()*1000'
+  else
+    echo $(( $(date +%s) * 1000 ))
+  fi
+}
+
+# write_result <name> <status> <start_ms> - one-line .result plus a .time sidecar.
+write_result() {
+  local ms; ms=$(( $(now_ms) - $3 ))
+  echo "$2" >"$RES/$1.result"
+  echo "$ms" >"$RES/$1.time"
+}
+
 # Worker: compile (and for .cb run) one test, writing a one-line .result file.
 run_cb() {
   local f="$1" n; n="$(basename "$f" .cb)"
-  local log="$RES/$n.log"
+  local log="$RES/$n.log" status t0; t0=$(now_ms)
   if [ "$RUN_MODE" -eq 1 ]; then
-    if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --run --nologo >"$log" 2>&1; then
-      echo "FAIL run" >"$RES/$n.result"; return
+    if $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --run --nologo >"$log" 2>&1; then
+      status="PASS"
+    else
+      status="FAIL run"
     fi
-    echo "PASS" >"$RES/$n.result"
-    return
-  fi
-  if ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" -o "$RES/$n.bin" >"$log" 2>&1; then
-    echo "FAIL compile" >"$RES/$n.result"; return
-  fi
-  if $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
-    echo "PASS" >"$RES/$n.result"
+  elif ! $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" -o "$RES/$n.bin" >"$log" 2>&1; then
+    status="FAIL compile"
+  elif $TIMEOUT "$RES/$n.bin" </dev/null >>"$log" 2>&1; then
+    status="PASS"
   else
-    echo "FAIL run(rc=$?)" >"$RES/$n.result"
+    status="FAIL run(rc=$?)"
   fi
+  write_result "$n" "$status" "$t0"
 }
 
 load_err_flags() {
@@ -178,14 +195,14 @@ check_err_result() {
 # a nonzero exit and an output substring.
 run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
-  local log="$RES/$n.log" rc=0
+  local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
   load_err_flags "$f.flags"
   $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
-    echo "PASS" >"$RES/$n.result"
+    write_result "$n" "PASS" "$t0"
   else
-    echo "FAIL" >"$RES/$n.result"
+    write_result "$n" "FAIL" "$t0"
   fi
 }
 
@@ -194,18 +211,19 @@ run_err() {
 # A ".warm" suffix keeps its result/log distinct from the cold run's.
 run_err_warm() {
   local f="$1" n; n="$(basename "$f" .cb).warm"
-  local log="$RES/$n.log" rc=0
+  local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
   load_err_flags "$f.flags"
   $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
-    echo "PASS" >"$RES/$n.result"
+    write_result "$n" "PASS" "$t0"
   else
-    echo "FAIL" >"$RES/$n.result"
+    write_result "$n" "FAIL" "$t0"
   fi
 }
 
-export -f run_cb load_err_flags check_err_result run_err run_err_warm is_skipped
+export -f run_cb load_err_flags check_err_result run_err run_err_warm is_skipped \
+  now_ms write_result
 export CFLAT LIB LOCALE_DIR RES TIMEOUT RUN_MODE
 
 # The JIT path is deliberately opt-in. This list excludes fixtures that require a prebuilt C
@@ -289,13 +307,14 @@ fi
 if [ "$RUN_MODE" -eq 1 ]; then
   rejected_name="run_prebuilt_c_rejected"
   rejected_log="$RES/$rejected_name.log"
+  rejected_t0=$(now_ms)
   if $TIMEOUT "$CFLAT" "$SRC/test_c_interop.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
       --run --nologo >"$rejected_log" 2>&1; then
-    echo "FAIL: prebuilt C library was accepted by --run" >"$RES/$rejected_name.result"
+    write_result "$rejected_name" "FAIL: prebuilt C library was accepted by --run" "$rejected_t0"
   elif grep -Fq "does not support prebuilt C libraries" "$rejected_log"; then
-    echo "PASS" >"$RES/$rejected_name.result"
+    write_result "$rejected_name" "PASS" "$rejected_t0"
   else
-    echo "FAIL: --run prebuilt-library diagnostic missing" >"$RES/$rejected_name.result"
+    write_result "$rejected_name" "FAIL: --run prebuilt-library diagnostic missing" "$rejected_t0"
   fi
 fi
 
@@ -327,31 +346,38 @@ run_tooling_probe() {
   $TIMEOUT sh -c 'trap "exit 134" ABRT; "$1" static-origin-check' sh "$tooling_bin" >>"$tooling_log" 2>&1
   return $?
 }
+tooling_t0=$(now_ms)
 if ! $TIMEOUT "$CFLAT" "$SRC/test_function_ptr.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
     --sanitize=ownership -o "$tooling_bin" --out-lli "$tooling_ll" >"$tooling_log" 2>&1; then
-  echo "FAIL compile" >"$RES/$tooling_name.result"
+  write_result "$tooling_name" "FAIL compile" "$tooling_t0"
 elif run_tooling_probe; then
-  echo "FAIL: sanitizer probe did not trap" >"$RES/$tooling_name.result"
+  write_result "$tooling_name" "FAIL: sanitizer probe did not trap" "$tooling_t0"
 elif ! grep -Fq "ownership violation: value moved at" "$tooling_log"; then
-  echo "FAIL: sanitizer probe lost the move origin" >"$RES/$tooling_name.result"
+  write_result "$tooling_name" "FAIL: sanitizer probe lost the move origin" "$tooling_t0"
 elif ! grep -Fq ".static.node.own_origin" "$tooling_ll" \
     || ! grep -Eq 'name: "node".*isLocal: true' "$tooling_ll"; then
-  echo "FAIL: static-local origin or debug metadata is missing" >"$RES/$tooling_name.result"
+  write_result "$tooling_name" "FAIL: static-local origin or debug metadata is missing" "$tooling_t0"
 else
-  echo "PASS" >"$RES/$tooling_name.result"
+  write_result "$tooling_name" "PASS" "$tooling_t0"
 fi
 fi
 
-# Collect.
+# Collect. Matches test.bat's per-test output: "PASSED: <name>  [<elapsed>]".
 pass=0; fail=0; failed_names=""
 for r in "$RES"/*.result; do
   n="$(basename "$r" .result)"
   read -r status <"$r"
+  elapsed=""
+  if [ -f "$RES/$n.time" ]; then
+    read -r ms <"$RES/$n.time"
+    elapsed="$(awk -v ms="$ms" 'BEGIN{printf "%.2fs", ms/1000}')"
+  fi
   if [ "$status" = "PASS" ]; then
     pass=$((pass+1))
+    echo "PASSED: $n  [$elapsed]"
   else
     fail=$((fail+1)); failed_names="$failed_names $n"
-    echo "=== $n ==="; tail -n 8 "$RES/$n.log" 2>/dev/null
+    echo; echo "=== $n ==="; tail -n 8 "$RES/$n.log" 2>/dev/null
     echo "$status"
   fi
 done
@@ -361,6 +387,7 @@ for s in $SKIP;     do [ "$s" = "test_helper" ] || skip=$((skip+1)); done
 for s in $ERR_SKIP; do skip=$((skip+1)); done
 
 echo
+echo "Elapsed: $(( $(date +%s) - SCRIPT_START ))s"
 echo "$(uname -s) ($CONFIG): $pass passed, $fail failed, $skip skipped (platform-specific)."
 if [ "$fail" -ne 0 ]; then
   echo "FAILED:$failed_names"
