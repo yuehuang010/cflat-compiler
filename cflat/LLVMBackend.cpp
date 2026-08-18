@@ -3512,7 +3512,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     importSearchDirs = importDirs;
     runtimeDir = runtimeDirPath;
     // verbose retains the value set by the LSP via SetVerbose() - left unmodified.
-    bool debugInfo = false;
+    bool debugInfo = analyzeDebugInfo_;
 
     platformValue = 64;
 #if defined(_WIN32)
@@ -3544,6 +3544,20 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         std::string bcCacheDir = GetRuntimeBitcodeDir(runtimeDir);
         if (!bcCacheDir.empty())
             bitcodeLoaded = LoadCoreBitcodeIfFresh(bcCacheDir, platformOption);
+    }
+
+    if (!bitcodeLoaded)
+    {
+        const char* dl = targetMacOS_
+            ? "e-m:o-i64:64-i128:128-n32:64-S128"
+            : PlatformDataLayout(platformValue);
+        module->setDataLayout(llvm::DataLayout(dl));
+    }
+
+    if (debugInfo)
+    {
+        std::filesystem::path filePathAbsolute = std::filesystem::absolute(filePath);
+        InitDebugInfo(filePathAbsolute.filename().string(), filePathAbsolute.parent_path().string());
     }
 
     // Pre-populate compile-time macros
@@ -3727,11 +3741,15 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     catch (CompilerAbortException&) { return false; }
     catch (ExpectedErrorReceived&)  { return false; }
 
+    if (debugInfo)
+        FinalizeDebugInfo();
+
     return true;
 }
 
 void LLVMBackend::ResetForReanalysis()
 {
+    analyzeDebugInfo_ = false;
     isolatedPolicy_.reset();
     manifestFragments_.clear();
     compileTimeStringConstants_.clear();
@@ -3761,12 +3779,13 @@ void LLVMBackend::ResetForReanalysis()
 
     // Debug-info state is bound to the (now-discarded) module: the DIBuilder, its DIFile/
     // DICompileUnit nodes, and the DIType/DIFile caches all point into the old module's
-    // metadata. The LSP Analyze path never calls InitDebugInfo so these are empty here,
-    // but clearing them keeps the "nothing module-bound survives the reset" invariant intact
+    // metadata. Clearing them keeps the "nothing module-bound survives the reset" invariant
+    // intact for both plain and debug-info analyses
     // (and would prevent the same dangling-pointer crash class if a reanalysis ever ran -g).
     diBuilder.reset();
     diFile = nullptr;
     compileUnit = nullptr;
+    currentSubprogram = nullptr;
     diTypeCache.clear();
     diFileCache_.clear();
     pendingGlobalDI_.clear();

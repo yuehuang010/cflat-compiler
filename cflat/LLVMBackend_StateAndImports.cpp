@@ -715,6 +715,9 @@ void LLVMBackend::SetSourceFileDir(const std::string& dir)
 void LLVMBackend::SetSourceDisplayName(const std::string& name)
 { sourceDisplayName_ = name; }
 
+void LLVMBackend::SetAnalyzeDebugInfo(bool enabled)
+{ analyzeDebugInfo_ = enabled; }
+
 void LLVMBackend::SetLocale(const std::string& locale)
 { diagnosticLocalization_.SetLocale(locale); }
 

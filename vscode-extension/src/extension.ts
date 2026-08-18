@@ -22,6 +22,12 @@ interface ViewChoice {
     currentFunction: boolean;
 }
 
+interface ViewMapping {
+    srcLine: number;
+    start: number;
+    end: number;
+}
+
 interface ViewState {
     uri: vscode.Uri;
     sourceUri: string;
@@ -29,6 +35,8 @@ interface ViewState {
     optimized: boolean;
     line?: number;
     text: string;
+    mappings: ViewMapping[];
+    decoration: vscode.TextEditorDecorationType;
 }
 
 const viewChoices: ViewChoice[] = [
@@ -48,18 +56,25 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
 
     createView(sourceUri: string, kind: ViewKind, choice: ViewChoice, line?: number): vscode.Uri {
         const key = `${sourceUri}|${kind}|${choice.id}|${line ?? ''}`;
+        // Name the tab after the source file with the output extension (foo.cb -> foo.ll / foo.s).
+        const sourceName = path.basename(vscode.Uri.parse(sourceUri).fsPath).replace(/\.[^.]+$/, '');
         const uri = vscode.Uri.from({
             scheme: 'cflat-view',
-            path: '/assembly',
+            path: `/${sourceName}${kind === 'ir' ? '.ll' : '.s'}`,
             query: `key=${encodeURIComponent(key)}`
         });
+        this.states.get(uri.toString())?.decoration.dispose();
         this.states.set(uri.toString(), {
             uri,
             sourceUri,
             kind,
             optimized: choice.optimized,
             line,
-            text: ''
+            text: '',
+            mappings: [],
+            decoration: vscode.window.createTextEditorDecorationType({
+                backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground')
+            })
         });
         return uri;
     }
@@ -87,13 +102,24 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         };
         if (state.line !== undefined) params.filter = { line: state.line };
         try {
-            const result = await activeClient.sendRequest<{ kind: string; text: string }>(
+            const result = await activeClient.sendRequest<{
+                kind: string;
+                text: string;
+                mappings?: ViewMapping[];
+            }>(
                 'cflat/viewAssembly', params);
             state.text = result.text;
+            state.mappings = Array.isArray(result.mappings)
+                ? result.mappings.filter(mapping => Number.isInteger(mapping.srcLine) &&
+                    Number.isInteger(mapping.start) && Number.isInteger(mapping.end) &&
+                    mapping.srcLine > 0 && mapping.start > 0 && mapping.end >= mapping.start)
+                : [];
         } catch (error) {
             state.text = `; view request failed\n; ${String(error)}`;
+            state.mappings = [];
         }
         this.changeEmitter.fire(uri);
+        this.refreshHighlights();
     }
 
     async refreshSource(sourceUri: string): Promise<void> {
@@ -107,7 +133,93 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         await Promise.all(refreshes);
     }
 
+    closeView(uri: vscode.Uri): void {
+        const key = uri.toString();
+        const state = this.states.get(key);
+        if (!state) return;
+        state.decoration.dispose();
+        this.states.delete(key);
+    }
+
+    updateSelection(editor: vscode.TextEditor): void {
+        const viewState = this.states.get(editor.document.uri.toString());
+        if (viewState) {
+            this.clearSourceHighlights(viewState.sourceUri);
+            this.clearViewHighlights(viewState);
+            const sourceLine = viewState.mappings.find(mapping =>
+                editor.selection.active.line + 1 >= mapping.start &&
+                editor.selection.active.line + 1 <= mapping.end)?.srcLine;
+            if (sourceLine === undefined) return;
+            const sourceEditor = vscode.window.visibleTextEditors.find(candidate =>
+                candidate.document.uri.toString() === viewState.sourceUri);
+            if (!sourceEditor) return;
+            const range = this.lineRange(sourceEditor.document, sourceLine);
+            if (!range) return;
+            sourceEditor.setDecorations(viewState.decoration, [range]);
+            sourceEditor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            return;
+        }
+
+        const states = [...this.states.values()].filter(state => state.sourceUri === editor.document.uri.toString());
+        for (const state of states) {
+            this.clearSourceHighlights(state.sourceUri);
+            this.clearViewHighlights(state);
+            const sourceLine = editor.selection.active.line + 1;
+            const ranges = state.mappings
+                .filter(mapping => mapping.srcLine === sourceLine)
+                .flatMap(mapping => this.viewRanges(state, mapping));
+            const viewEditor = vscode.window.visibleTextEditors.find(candidate =>
+                candidate.document.uri.toString() === state.uri.toString());
+            if (!viewEditor || ranges.length === 0) continue;
+            viewEditor.setDecorations(state.decoration, ranges);
+            viewEditor.revealRange(ranges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+        }
+    }
+
+    private clearSourceHighlights(sourceUri: string): void {
+        for (const editor of vscode.window.visibleTextEditors) {
+            if (editor.document.uri.toString() !== sourceUri) continue;
+            for (const state of this.states.values()) {
+                if (state.sourceUri === sourceUri) editor.setDecorations(state.decoration, []);
+            }
+        }
+    }
+
+    private clearViewHighlights(state: ViewState): void {
+        for (const editor of vscode.window.visibleTextEditors) {
+            if (editor.document.uri.toString() === state.uri.toString()) {
+                editor.setDecorations(state.decoration, []);
+            }
+        }
+    }
+
+    private lineRange(document: vscode.TextDocument, line: number): vscode.Range | undefined {
+        const lineIndex = line - 1;
+        if (lineIndex < 0 || lineIndex >= document.lineCount) return undefined;
+        return new vscode.Range(lineIndex, 0, lineIndex, document.lineAt(lineIndex).text.length);
+    }
+
+    private viewRanges(state: ViewState, mapping: ViewMapping): vscode.Range[] {
+        const viewEditor = vscode.window.visibleTextEditors.find(editor =>
+            editor.document.uri.toString() === state.uri.toString());
+        if (!viewEditor) return [];
+        const start = Math.max(1, mapping.start);
+        const end = Math.min(viewEditor.document.lineCount, mapping.end);
+        const ranges: vscode.Range[] = [];
+        for (let line = start; line <= end; line++) {
+            const range = this.lineRange(viewEditor.document, line);
+            if (range) ranges.push(range);
+        }
+        return ranges;
+    }
+
+    private refreshHighlights(): void {
+        const editor = vscode.window.activeTextEditor;
+        if (editor) this.updateSelection(editor);
+    }
+
     dispose(): void {
+        for (const state of this.states.values()) state.decoration.dispose();
         this.changeEmitter.dispose();
     }
 }
@@ -410,6 +522,12 @@ export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.workspace.registerTextDocumentContentProvider('cflat-view', viewProvider),
         viewProvider,
+        vscode.window.onDidChangeTextEditorSelection(event => {
+            viewProvider.updateSelection(event.textEditor);
+        }),
+        vscode.workspace.onDidCloseTextDocument(document => {
+            if (document.uri.scheme === 'cflat-view') viewProvider.closeView(document.uri);
+        }),
         vscode.workspace.onDidSaveTextDocument(document => {
             void viewProvider.refreshSource(document.uri.toString());
         })

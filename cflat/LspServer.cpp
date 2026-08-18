@@ -1653,6 +1653,7 @@ private:
             diagnostics.push_back(diag);
         });
         backend->SetSymbolSink(newIndex.get());
+        backend->SetAnalyzeDebugInfo(job.irRequest.has_value());
 
         bool ok = false;
         llvm::CrashRecoveryContext crc;
@@ -1779,21 +1780,22 @@ private:
             {
                 std::string displayName = std::filesystem::path(filePath).filename().string();
                 SendViewResult(job, "; " + displayName + ":"
-                    + std::to_string(*job.irRequest->line) + " has no function\n");
+                    + std::to_string(*job.irRequest->line) + " has no function\n", {});
                 return true;
             }
             functionName = ranges.front()->name;
         }
 
         std::string output;
+        std::vector<LLVMBackend::LineMapping> mappings;
         bool emitted = backend->PrintModuleView(output, job.irRequest->kind,
-                                                job.irRequest->optimized, functionName);
+                                                job.irRequest->optimized, functionName, &mappings);
         if (!emitted)
         {
             SendViewFailure(job, "failed to emit " + job.irRequest->kind);
             return true;
         }
-        SendViewResult(job, std::move(output));
+        SendViewResult(job, std::move(output), std::move(mappings));
         return true;
     }
 
@@ -1813,12 +1815,21 @@ private:
         return text;
     }
 
-    void SendViewResult(const AnalysisJob& job, std::string text)
+    void SendViewResult(const AnalysisJob& job, std::string text,
+                        std::vector<LLVMBackend::LineMapping> mappings = {})
     {
         if (!job.irRequest) return;
+        nlohmann::json mappingJson = nlohmann::json::array();
+        for (const auto& mapping : mappings)
+            mappingJson.push_back({
+                {"srcLine", mapping.srcLine},
+                {"start", mapping.viewStart},
+                {"end", mapping.viewEnd}
+            });
         SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
             {"kind", job.irRequest->kind},
-            {"text", std::move(text)}
+            {"text", std::move(text)},
+            {"mappings", std::move(mappingJson)}
         });
     }
 

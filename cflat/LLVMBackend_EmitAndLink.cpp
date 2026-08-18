@@ -2,6 +2,9 @@
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/AssemblyAnnotationWriter.h>
+#include <llvm/IR/DebugInfo.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
@@ -25,6 +28,7 @@
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/FormattedStream.h>
 #include <llvm/ADT/SmallString.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/JSON.h>
@@ -46,6 +50,53 @@
 #include <fstream>
 #include <cstdint>
 #include <vector>
+
+namespace {
+
+class LineMappingAnnotationWriter final : public llvm::AssemblyAnnotationWriter
+{
+public:
+    LineMappingAnnotationWriter(std::vector<LLVMBackend::LineMapping>& mappings,
+                                 const std::function<int(const llvm::DILocation*)>& sourceLine)
+        : mappings_(mappings), sourceLine_(sourceLine) {}
+
+    void emitInstructionAnnot(const llvm::Instruction* instruction,
+                              llvm::formatted_raw_ostream& stream) override
+    {
+        llvm::DebugLoc debugLoc = instruction->getDebugLoc();
+        if (!debugLoc) return;
+        int sourceLine = sourceLine_(debugLoc.get());
+        if (sourceLine <= 0) return;
+        int viewLine = baseLine_ + static_cast<int>(stream.getLine()) + 1;
+        mappings_.push_back({sourceLine, viewLine, viewLine});
+    }
+
+    // Function::print creates a fresh formatted_raw_ostream (line counter reset to 0)
+    // per call; set this to the lines already emitted before each per-function print.
+    void SetBaseLine(int baseLine) { baseLine_ = baseLine; }
+
+private:
+    std::vector<LLVMBackend::LineMapping>& mappings_;
+    const std::function<int(const llvm::DILocation*)>& sourceLine_;
+    int baseLine_ = 0;
+};
+
+void ConsolidateLineMappings(std::vector<LLVMBackend::LineMapping>& mappings)
+{
+    std::vector<LLVMBackend::LineMapping> consolidated;
+    for (const auto& mapping : mappings)
+    {
+        if (!consolidated.empty()
+            && consolidated.back().srcLine == mapping.srcLine
+            && consolidated.back().viewEnd + 1 == mapping.viewStart)
+            consolidated.back().viewEnd = mapping.viewEnd;
+        else
+            consolidated.push_back(mapping);
+    }
+    mappings = std::move(consolidated);
+}
+
+}
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -153,10 +204,12 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
     }
 
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
-                                  bool optimized, const std::string& functionName)
+                                  bool optimized, const std::string& functionName,
+                                  std::vector<LineMapping>* mappings)
 {
     if (!module || (kind != "ir" && kind != "asm"))
         return false;
+    if (mappings) mappings->clear();
 
     auto view = llvm::CloneModule(*module);
     if (!view)
@@ -275,30 +328,97 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         passes.run(*view, moduleAnalysis);
     }
 
+    const std::string rootPath = analyzedRootPath_;
+    const std::string rootName = std::filesystem::path(rootPath).filename().string();
+    std::string cuFileName;
+    std::string cuDirectory;
+    if (compileUnit && compileUnit->getFile())
+    {
+        cuFileName = compileUnit->getFile()->getFilename().str();
+        cuDirectory = compileUnit->getFile()->getDirectory().str();
+    }
+
+    auto isRootFile = [&](const llvm::DIFile* file) {
+        if (!file) return false;
+        const std::string filename = file->getFilename().str();
+        const std::string directory = file->getDirectory().str();
+        if (!cuFileName.empty() && filename == cuFileName && directory == cuDirectory)
+            return true;
+        if (!rootPath.empty())
+        {
+            std::filesystem::path candidate = std::filesystem::path(directory) / filename;
+            std::error_code ec;
+            if (std::filesystem::weakly_canonical(candidate, ec).string() == rootPath)
+                return true;
+            if (filename == rootName)
+                return true;
+        }
+        return false;
+    };
+
+    std::function<int(const llvm::DILocation*)> sourceLine = [&](const llvm::DILocation* location) {
+        for (auto* current = location; current; current = current->getInlinedAt())
+            if (isRootFile(current->getFile()))
+                return static_cast<int>(current->getLine());
+        return 0;
+    };
+
     if (kind == "ir")
     {
         out.clear();
+        auto matches = functionName.empty() ? std::vector<llvm::Function*>{} : matchingFunctions(*view);
+        if (!functionName.empty() && matches.empty())
+        {
+            out = optimizedAwayBanner(matches);
+            if (out.empty())
+                out = "; no matching function: " + functionName + "\n";
+            return true;
+        }
+
+        if (mappings)
+        {
+            auto mappingView = llvm::CloneModule(*view);
+            if (mappingView)
+            {
+                for (auto& function : *mappingView)
+                    for (auto& block : function)
+                        for (auto it = block.begin(); it != block.end(); )
+                        {
+                            auto current = it++;
+                            if (llvm::isa<llvm::DbgInfoIntrinsic>(&*current))
+                                current->eraseFromParent();
+                        }
+                std::string mappingText;
+                llvm::raw_string_ostream mappingStream(mappingText);
+                LineMappingAnnotationWriter writer(*mappings, sourceLine);
+                if (functionName.empty())
+                    mappingView->print(mappingStream, &writer);
+                else
+                    for (auto* function : matchingFunctions(*mappingView))
+                    {
+                        mappingStream << "; function: " << function->getName() << "\n";
+                        mappingStream.flush();
+                        writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
+                        function->print(mappingStream, &writer);
+                        mappingStream << "\n";
+                    }
+                mappingStream.flush();
+            }
+            llvm::StripDebugInfo(*view);
+        }
+
         llvm::raw_string_ostream stream(out);
         if (functionName.empty())
             view->print(stream, nullptr);
         else
-        {
-            auto matches = matchingFunctions(*view);
-            if (matches.empty())
-            {
-                out = optimizedAwayBanner(matches);
-                if (out.empty())
-                    out = "; no matching function: " + functionName + "\n";
-                return true;
-            }
             for (auto* function : matches)
             {
                 stream << "; function: " << function->getName() << "\n";
-                function->print(stream);
+                function->print(stream, nullptr);
                 stream << "\n";
             }
-        }
         stream.flush();
+        if (mappings) ConsolidateLineMappings(*mappings);
         return true;
     }
 
@@ -310,9 +430,127 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         return false;
     pass.run(*view);
     std::string assembly(buffer.data(), buffer.size());
+
+    auto parseQuotedStrings = [](const std::string& line, size_t pos) {
+        std::vector<std::string> values;
+        while (pos < line.size())
+        {
+            while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+            if (pos >= line.size() || line[pos] != '"') break;
+            ++pos;
+            std::string value;
+            while (pos < line.size() && line[pos] != '"')
+            {
+                if (line[pos] == '\\' && pos + 1 < line.size()) ++pos;
+                value += line[pos++];
+            }
+            if (pos < line.size()) ++pos;
+            values.push_back(std::move(value));
+        }
+        return values;
+    };
+    auto parseFileDirective = [&](const std::string& line, int& id,
+                                  std::vector<std::string>& values) {
+        size_t pos = 0;
+        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+        if (line.compare(pos, 5, ".file") != 0) return false;
+        pos += 5;
+        if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
+        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+        size_t start = pos;
+        while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
+        if (start == pos) return false;
+        id = std::stoi(line.substr(start, pos - start));
+        values = parseQuotedStrings(line, pos);
+        return !values.empty();
+    };
+    auto parseLocDirective = [&](const std::string& line, int& id, int& sourceLine) {
+        size_t pos = 0;
+        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+        if (line.compare(pos, 4, ".loc") != 0) return false;
+        pos += 4;
+        if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
+        auto nextInt = [&](int& value) {
+            while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+            size_t start = pos;
+            while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
+            if (start == pos) return false;
+            value = std::stoi(line.substr(start, pos - start));
+            return true;
+        };
+        return nextInt(id) && nextInt(sourceLine);
+    };
+    auto isRootAsmFile = [&](const std::vector<std::string>& values) {
+        if (values.empty() || rootName.empty()) return false;
+        std::filesystem::path candidate;
+        if (values.size() == 1)
+            candidate = values[0];
+        else
+            candidate = std::filesystem::path(values[0]) / values[1];
+        std::error_code ec;
+        if (!rootPath.empty() && std::filesystem::weakly_canonical(candidate, ec).string() == rootPath)
+            return true;
+        return candidate.filename().string() == rootName;
+    };
+    std::set<int> rootAsmFileIds;
+    {
+        size_t lineStart = 0;
+        while (lineStart < assembly.size())
+        {
+            size_t lineEnd = assembly.find('\n', lineStart);
+            if (lineEnd == std::string::npos) lineEnd = assembly.size();
+            int id = 0;
+            std::vector<std::string> values;
+            std::string line = assembly.substr(lineStart, lineEnd - lineStart);
+            if (parseFileDirective(line, id, values) && isRootAsmFile(values))
+                rootAsmFileIds.insert(id);
+            lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
+        }
+    }
+
+    auto appendAsmMappings = [&](const std::string& text) {
+        if (!mappings || rootAsmFileIds.empty()) return;
+        size_t lineStart = 0;
+        int lineNumber = 0;
+        int activeSourceLine = 0;
+        int activeStart = 0;
+        auto finish = [&](int endLine) {
+            if (activeSourceLine > 0 && activeStart <= endLine)
+                mappings->push_back({activeSourceLine, activeStart, endLine});
+            activeSourceLine = 0;
+            activeStart = 0;
+        };
+        while (lineStart < text.size())
+        {
+            size_t lineEnd = text.find('\n', lineStart);
+            if (lineEnd == std::string::npos) lineEnd = text.size();
+            ++lineNumber;
+            std::string line = text.substr(lineStart, lineEnd - lineStart);
+            size_t first = 0;
+            while (first < line.size() && std::isspace((unsigned char)line[first])) ++first;
+            int id = 0;
+            int source = 0;
+            if (parseLocDirective(line, id, source))
+            {
+                finish(lineNumber - 1);
+                if (rootAsmFileIds.contains(id) && source > 0)
+                {
+                    activeSourceLine = source;
+                    activeStart = lineNumber + 1;
+                }
+            }
+            else if (first < line.size() && line.back() == ':')
+                finish(lineNumber - 1);
+            lineStart = lineEnd == text.size() ? text.size() : lineEnd + 1;
+        }
+        finish(lineNumber);
+        ConsolidateLineMappings(*mappings);
+    };
+
     if (functionName.empty())
     {
         out = std::move(assembly);
+        appendAsmMappings(out);
         return true;
     }
 
@@ -369,6 +607,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         if (out.empty())
             out = "; no matching function label: " + functionName + "\n";
     }
+    appendAsmMappings(out);
     return true;
 }
 

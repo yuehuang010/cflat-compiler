@@ -82,7 +82,8 @@ void LLVMBackend::InitDebugInfo(const std::string& filename, const std::string& 
         module->addModuleFlag(llvm::Module::Warning, "Debug Info Version", llvm::DEBUG_METADATA_VERSION);
         // Target is *-pc-windows-msvc: emit CodeView so lld-link can produce a PDB.
         // DWARF would be ignored by VS / WinDbg / cppvsdbg on Windows.
-        module->addModuleFlag(llvm::Module::Warning, "CodeView", 1);
+        if (targetWindows_)
+            module->addModuleFlag(llvm::Module::Warning, "CodeView", 1);
         diFile = diBuilder->createFile(filename, directory);
         compileUnit = diBuilder->createCompileUnit(llvm::dwarf::DW_LANG_C99, diFile, "cflat", false, "", 0);
         // Seed cache so the primary translation unit's path resolves to the same

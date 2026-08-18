@@ -466,6 +466,13 @@ inline const std::string& CanonicalPrimitiveSpelling(const std::string& base)
 class LLVMBackend
 {
 public:
+    struct LineMapping
+    {
+        int srcLine = 0;
+        int viewStart = 0;
+        int viewEnd = 0;
+    };
+
     // Width of the `long` keyword, in bits. `long` follows the TARGET's native C ABI:
     // Windows is LLP64 (32-bit long), 64-bit POSIX is LP64 (64-bit long), 32-bit is 32.
     // Set by SetTargetLongWidth() when the target platform is resolved; a static because
@@ -2460,6 +2467,7 @@ private:
     // When true, disables auto-import of core/runtime.cb
     bool skipRuntimeImport = false;
     bool verbose = false;
+    bool analyzeDebugInfo_ = false;
     bool batchMode_ = false;
     bool noCache_ = false;
     std::optional<IsolatedPolicy> isolatedPolicy_;
@@ -6885,6 +6893,7 @@ public:
     // Overrides the file name shown in diagnostics (and baked into __FILE__) for the next
     // Analyze(). Used by the LSP so errors point at the real document, not the temp copy.
     void SetSourceDisplayName(const std::string& name);
+    void SetAnalyzeDebugInfo(bool enabled);
     void SetLocale(const std::string& locale);
     void SetLocaleDirectory(const std::string& directory);
     bool LoadLocale(bool verbose = false);
@@ -7176,7 +7185,8 @@ public:
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
     bool PrintModuleView(std::string& out, const std::string& kind, bool optimized,
-                         const std::string& functionName);
+                         const std::string& functionName,
+                         std::vector<LineMapping>* mappings = nullptr);
 
     /*
         Resolution order: (1) process override set via SetCacheDirOverride (used by
