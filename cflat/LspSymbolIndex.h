@@ -29,6 +29,14 @@ struct SymbolDef
     std::vector<std::string> overloadSignatures;
 };
 
+struct FunctionRange
+{
+    std::string name;
+    std::string file;
+    int startLine = 0;
+    int endLine = 0;
+};
+
 // A definition that is a candidate for the "unused code" check. Recorded during
 // analysis at each declaration site; consumed post-analysis by the LSP server,
 // which cross-references it against an identifier-occurrence scan of the document.
@@ -51,6 +59,8 @@ public:
                   const std::vector<std::string>& members = {},
                   const std::string& docComment = {});
     void RegisterDefinition(const SymbolDef& def);
+    void RegisterFunctionRange(const std::string& name, const std::string& file,
+                               int startLine, int endLine);
     void MergeFrom(const LspSymbolIndex& other);
     void MergeVariablesFrom(const LspSymbolIndex& other);
     const SymbolDef* Lookup(const std::string& name) const;
@@ -76,9 +86,11 @@ public:
     const std::unordered_map<std::string, VariableInfo>& Variables() const { return variables_; }
 
     size_t SymbolCount() const { return symbols_.size(); }
+    std::vector<const FunctionRange*> FunctionsEnclosing(const std::string& file, int line) const;
 
 private:
     std::unordered_map<std::string, SymbolDef> symbols_;
+    std::vector<FunctionRange> functionRanges_;
     std::unordered_map<std::string, VariableInfo> variables_;
     std::vector<UnusedCandidate> candidates_;
 };

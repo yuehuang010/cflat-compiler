@@ -13,6 +13,105 @@ let client: LanguageClient | undefined;
 let outputChannel: vscode.LogOutputChannel;
 let logFilePath: string;
 
+type ViewKind = 'ir' | 'asm';
+
+interface ViewChoice {
+    id: string;
+    label: string;
+    optimized: boolean;
+    currentFunction: boolean;
+}
+
+interface ViewState {
+    uri: vscode.Uri;
+    sourceUri: string;
+    kind: ViewKind;
+    optimized: boolean;
+    line?: number;
+    text: string;
+}
+
+const viewChoices: ViewChoice[] = [
+    { id: 'whole', label: 'Whole file', optimized: false, currentFunction: false },
+    { id: 'whole-optimized', label: 'Whole file (optimized)', optimized: true, currentFunction: false },
+    { id: 'function', label: 'Current function', optimized: false, currentFunction: true },
+    { id: 'function-optimized', label: 'Current function (optimized)', optimized: true, currentFunction: true }
+];
+let lastViewChoiceId: string | undefined;
+
+class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
+    private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
+    readonly onDidChange = this.changeEmitter.event;
+    private readonly states = new Map<string, ViewState>();
+
+    constructor(private readonly getClient: () => LanguageClient | undefined) {}
+
+    createView(sourceUri: string, kind: ViewKind, choice: ViewChoice, line?: number): vscode.Uri {
+        const key = `${sourceUri}|${kind}|${choice.id}|${line ?? ''}`;
+        const uri = vscode.Uri.from({
+            scheme: 'cflat-view',
+            path: '/assembly',
+            query: `key=${encodeURIComponent(key)}`
+        });
+        this.states.set(uri.toString(), {
+            uri,
+            sourceUri,
+            kind,
+            optimized: choice.optimized,
+            line,
+            text: ''
+        });
+        return uri;
+    }
+
+    async provideTextDocumentContent(uri: vscode.Uri): Promise<string> {
+        const state = this.states.get(uri.toString());
+        if (!state) return '';
+        if (state.text === '') await this.refresh(uri);
+        return state.text;
+    }
+
+    async refresh(uri: vscode.Uri): Promise<void> {
+        const state = this.states.get(uri.toString());
+        const activeClient = this.getClient();
+        if (!state || !activeClient) return;
+        const params: {
+            uri: string;
+            kind: ViewKind;
+            optimized: boolean;
+            filter?: { line: number };
+        } = {
+            uri: state.sourceUri,
+            kind: state.kind,
+            optimized: state.optimized
+        };
+        if (state.line !== undefined) params.filter = { line: state.line };
+        try {
+            const result = await activeClient.sendRequest<{ kind: string; text: string }>(
+                'cflat/viewAssembly', params);
+            state.text = result.text;
+        } catch (error) {
+            state.text = `; view request failed\n; ${String(error)}`;
+        }
+        this.changeEmitter.fire(uri);
+    }
+
+    async refreshSource(sourceUri: string): Promise<void> {
+        const refreshes: Thenable<void>[] = [];
+        for (const state of this.states.values()) {
+            if (state.sourceUri !== sourceUri) continue;
+            const visible = vscode.window.visibleTextEditors.some(
+                editor => editor.document.uri.toString() === state.uri.toString());
+            if (visible) refreshes.push(this.refresh(state.uri));
+        }
+        await Promise.all(refreshes);
+    }
+
+    dispose(): void {
+        this.changeEmitter.dispose();
+    }
+}
+
 // Resolve the compiler exe: an explicit cflat.executablePath setting always wins; otherwise
 // fall back to the path that `cflat --init` records in ~/.cflat/compiler_path.txt.
 function findCompilerExecutable(): string | undefined {
@@ -242,6 +341,47 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
     );
 }
 
+async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKind): Promise<void> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.languageId !== 'cflat' || !client) return;
+
+    const activeChoice = viewChoices.find(choice => choice.id === lastViewChoiceId);
+    const quickPick = vscode.window.createQuickPick<ViewChoice>();
+    quickPick.items = viewChoices;
+    quickPick.placeholder = 'Choose the compiler view scope';
+    if (activeChoice) quickPick.activeItems = [activeChoice];
+    const choice = await new Promise<ViewChoice | undefined>(resolve => {
+        let settled = false;
+        quickPick.onDidAccept(() => {
+            settled = true;
+            resolve(quickPick.selectedItems[0]);
+            quickPick.hide();
+        });
+        quickPick.onDidHide(() => {
+            if (!settled) resolve(undefined);
+            quickPick.dispose();
+        });
+        quickPick.show();
+    });
+    if (!choice) return;
+    lastViewChoiceId = choice.id;
+
+    const line = choice.currentFunction ? editor.selection.active.line + 1 : undefined;
+    const viewUri = provider.createView(editor.document.uri.toString(), kind, choice, line);
+    await provider.refresh(viewUri);
+    const document = await vscode.workspace.openTextDocument(viewUri);
+    const languages = await vscode.languages.getLanguages();
+    const language = kind === 'ir'
+        ? (languages.includes('llvm') ? 'llvm' : 'plaintext')
+        : (languages.includes('asm') ? 'asm' : 'plaintext');
+    await vscode.languages.setTextDocumentLanguage(document, language);
+    await vscode.window.showTextDocument(document, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: false,
+        preview: false
+    });
+}
+
 export function activate(context: vscode.ExtensionContext): void {
     // Must be a log channel: vscode-languageclient 10 types clientOptions.outputChannel
     // as LogOutputChannel, which extends OutputChannel.
@@ -266,6 +406,15 @@ export function activate(context: vscode.ExtensionContext): void {
 
     void startClient();
 
+    const viewProvider = new CflatViewContentProvider(() => client);
+    context.subscriptions.push(
+        vscode.workspace.registerTextDocumentContentProvider('cflat-view', viewProvider),
+        viewProvider,
+        vscode.workspace.onDidSaveTextDocument(document => {
+            void viewProvider.refreshSource(document.uri.toString());
+        })
+    );
+
     // Restart the LSP client when cflat.executablePath changes so the user
     // doesn't have to reload the window.
     context.subscriptions.push(
@@ -285,6 +434,15 @@ export function activate(context: vscode.ExtensionContext): void {
                     uri: editor.document.uri.toString()
                 });
             }
+        })
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand('cflat.showLlvmIr', () => {
+            void showCompilerView(viewProvider, 'ir');
+        }),
+        vscode.commands.registerCommand('cflat.showAssembly', () => {
+            void showCompilerView(viewProvider, 'asm');
         })
     );
 

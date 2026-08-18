@@ -1431,6 +1431,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // batch loop), so no output is emitted and no extra positional is linked.
     auto exePath = checkOnly ? std::optional<std::string>{} : args.getOption("output");
     auto lliPath = checkOnly ? std::optional<std::string>{} : args.getOption("out-lli");
+    auto asmPath = checkOnly ? std::optional<std::string>{} : args.getOption("out-asm");
     auto bitcodePath = checkOnly ? std::string{} : args.getOption("bitcode").value_or("");
     // --sanitize=ownership implies -g so the emitted move/use locations are meaningful.
     bool debugInfo = args.hasFlag("debug-info") || sanitizeOwnership_;
@@ -1463,6 +1464,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         std::error_code rmEc;
         if (exePath)             std::filesystem::remove(*exePath, rmEc);
         if (lliPath)             std::filesystem::remove(*lliPath, rmEc);
+        if (asmPath)             std::filesystem::remove(*asmPath, rmEc);
         if (!bitcodePath.empty()) std::filesystem::remove(bitcodePath, rmEc);
         if (auto manifestPath = args.getOption("isolated-manifest"))
             std::filesystem::remove(*manifestPath, rmEc);
@@ -1523,6 +1525,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         std::cout << std::format("[verbose] input:        {}\n", filename);
         std::cout << std::format("[verbose] output exe:   {}\n", exePath ? *exePath : "(none)");
         std::cout << std::format("[verbose] output lli:   {}\n", lliPath ? *lliPath : "(none)");
+        std::cout << std::format("[verbose] output asm:   {}\n", asmPath ? *asmPath : "(none)");
         std::cout << std::format("[verbose] runtime dir:  {}\n", runtimeDir);
         {
             std::string importDirsJoined;
@@ -1550,6 +1553,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         return true;
     };
     if (!checkOutputDir(exePath, "-o") || !checkOutputDir(lliPath, "--out-lli")
+        || !checkOutputDir(asmPath, "--out-asm")
         || !checkOutputDir(args.getOption("isolated-manifest"), "--isolated-manifest"))
         return false;
 
@@ -2066,6 +2070,23 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
+    // The module is already optimized at this point; do not ask PrintModuleView to optimize it again.
+    // PrintModuleView clones the module and creates its own target machine for assembly emission.
+    if (asmPath)
+    {
+        llvm::TimeTraceScope asmScope("WriteAssembly", *asmPath);
+        if (verbose) std::cout << std::format("[verbose] writing asm to {}\n", *asmPath);
+        std::string assembly;
+        std::ofstream output(*asmPath, std::ios::binary | std::ios::trunc);
+        if (!PrintModuleView(assembly, "asm", false, "")
+            || !output
+            || !(output.write(assembly.data(), static_cast<std::streamsize>(assembly.size()))))
+        {
+            std::cout << std::format("Error: failed to save asm to '{}'.\n", *asmPath);
+            return false;
+        }
+    }
+
     if (!bitcodePath.empty())
     {
         if (verbose) std::cout << std::format("[verbose] writing bitcode to {}\n", bitcodePath);
@@ -2120,7 +2141,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // -o (checked in main). Consumes the module, so it must come after IR/bitcode writes.
     //
     // NOTE: --run is read-only - it writes nothing to disk. No exe is produced; the disk-writing
-    // output flags (-o, -l/--out-lli, -b/--bitcode) are rejected up front in main(); and the
+    // output flags (-o, -l/--out-lli, --out-asm, -b/--bitcode) are rejected up front in main(); and the
     // on-disk caches (core/import bitcode, C-header import cache) are disabled under run mode
     // (see the gates in Compile() above and in CompileCHeader / CompileVcpkgImport). The
     // IR/bitcode write blocks above are therefore no-ops in run mode (their paths are empty).

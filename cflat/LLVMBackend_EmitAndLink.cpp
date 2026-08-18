@@ -11,6 +11,7 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
+#include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
@@ -23,6 +24,9 @@
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/ADT/SmallString.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/JSON.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
@@ -130,11 +134,13 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
 
         std::string triple = targetMacOS_
             ? std::string("arm64-apple-macosx")
-            : (platformValue == 32 ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
+            : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc")
+                             : llvm::sys::getProcessTriple();
         std::string cpu = !targetCpu_.empty()
             ? targetCpu_
             : (targetMacOS_ ? std::string("apple-m1")
-                            : (platformValue == 32 ? std::string("i686") : std::string("x86-64")));
+                            : targetWindows_ ? (platformValue == 32 ? std::string("i686") : std::string("x86-64"))
+                                             : llvm::sys::getHostCPUName().str());
 
         std::string err;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
@@ -145,6 +151,226 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
         return std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(triple, cpu, "", opt, llvm::Reloc::PIC_));
     }
+
+bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
+                                  bool optimized, const std::string& functionName)
+{
+    if (!module || (kind != "ir" && kind != "asm"))
+        return false;
+
+    auto view = llvm::CloneModule(*module);
+    if (!view)
+        return false;
+
+    auto matchingFunctions = [&](llvm::Module& m) {
+        std::vector<llvm::Function*> matches;
+        if (functionName.empty()) return matches;
+        for (auto& function : m)
+        {
+            if (function.isDeclaration()) continue;
+            llvm::StringRef name = function.getName();
+            const std::string mangledPrefix = "_" + functionName + "_";
+            const std::string qualifiedPrefix = "." + functionName + "_";
+            if (name == functionName
+                || name.starts_with(mangledPrefix)
+                || name.starts_with(functionName + "__")
+                || name.contains(qualifiedPrefix))
+                matches.push_back(&function);
+        }
+        return matches;
+    };
+
+    struct PreOptimizationMatch
+    {
+        std::string name;
+        std::set<std::string> callers;
+        bool addressTaken = false;
+    };
+    std::vector<PreOptimizationMatch> preOptimizationMatches;
+    for (auto* function : matchingFunctions(*view))
+    {
+        PreOptimizationMatch info;
+        info.name = function->getName().str();
+        std::vector<llvm::User*> pending;
+        for (auto* user : function->users()) pending.push_back(user);
+        std::set<const llvm::User*> visited;
+        while (!pending.empty())
+        {
+            llvm::User* user = pending.back();
+            pending.pop_back();
+            if (!visited.insert(user).second) continue;
+            if (auto* call = llvm::dyn_cast<llvm::CallBase>(user))
+            {
+                if (auto* caller = call->getFunction())
+                    info.callers.insert(caller->getName().str());
+                continue;
+            }
+            info.addressTaken = true;
+            for (auto* nested : user->users()) pending.push_back(nested);
+        }
+        preOptimizationMatches.push_back(std::move(info));
+    }
+
+    auto optimizedAwayBanner = [&](const std::vector<llvm::Function*>& postMatches) {
+        if (!optimized || preOptimizationMatches.empty() || !postMatches.empty())
+            return std::string();
+
+        std::string banner;
+        for (const auto& info : preOptimizationMatches)
+        {
+            banner += "; function " + info.name
+                + " was optimized away at O2 (inlined or removed)\n";
+            if (info.addressTaken)
+                banner += "; its address was also used\n";
+        }
+
+        std::set<std::string> survivingCallers;
+        for (const auto& info : preOptimizationMatches)
+            for (const auto& caller : info.callers)
+            {
+                auto* function = view->getFunction(caller);
+                if (function && !function->isDeclaration())
+                    survivingCallers.insert(caller);
+            }
+        if (!survivingCallers.empty())
+        {
+            banner += "; its code was inlined into: ";
+            size_t count = 0;
+            for (const auto& caller : survivingCallers)
+            {
+                if (count++ != 0) banner += ", ";
+                banner += caller;
+                if (count == 5) break;
+            }
+            banner += " - view those functions instead\n";
+        }
+        return banner;
+    };
+
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
+    if (optimized || kind == "asm")
+    {
+        targetMachine = CreateOptTargetMachine();
+        if (!targetMachine)
+            return false;
+        view->setTargetTriple(targetMachine->getTargetTriple().str());
+        view->setDataLayout(targetMachine->createDataLayout());
+    }
+
+    if (optimized)
+    {
+        llvm::PassBuilder passBuilder(targetMachine.get());
+        llvm::LoopAnalysisManager loopAnalysis;
+        llvm::FunctionAnalysisManager functionAnalysis;
+        llvm::CGSCCAnalysisManager cgsccAnalysis;
+        llvm::ModuleAnalysisManager moduleAnalysis;
+        llvm::TargetLibraryInfoImpl tli(llvm::Triple(view->getTargetTriple()));
+        functionAnalysis.registerPass([&] { return llvm::TargetLibraryAnalysis(tli); });
+        passBuilder.registerModuleAnalyses(moduleAnalysis);
+        passBuilder.registerCGSCCAnalyses(cgsccAnalysis);
+        passBuilder.registerFunctionAnalyses(functionAnalysis);
+        passBuilder.registerLoopAnalyses(loopAnalysis);
+        passBuilder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis, moduleAnalysis);
+        auto passes = passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+        passes.run(*view, moduleAnalysis);
+    }
+
+    if (kind == "ir")
+    {
+        out.clear();
+        llvm::raw_string_ostream stream(out);
+        if (functionName.empty())
+            view->print(stream, nullptr);
+        else
+        {
+            auto matches = matchingFunctions(*view);
+            if (matches.empty())
+            {
+                out = optimizedAwayBanner(matches);
+                if (out.empty())
+                    out = "; no matching function: " + functionName + "\n";
+                return true;
+            }
+            for (auto* function : matches)
+            {
+                stream << "; function: " << function->getName() << "\n";
+                function->print(stream);
+                stream << "\n";
+            }
+        }
+        stream.flush();
+        return true;
+    }
+
+    llvm::legacy::PassManager pass;
+    llvm::SmallString<0> buffer;
+    llvm::raw_svector_ostream stream(buffer);
+    if (targetMachine->addPassesToEmitFile(pass, stream, nullptr,
+                                           llvm::CodeGenFileType::AssemblyFile))
+        return false;
+    pass.run(*view);
+    std::string assembly(buffer.data(), buffer.size());
+    if (functionName.empty())
+    {
+        out = std::move(assembly);
+        return true;
+    }
+
+    auto matches = matchingFunctions(*view);
+    if (matches.empty())
+    {
+        out = optimizedAwayBanner(matches);
+        if (out.empty())
+            out = "; no matching function: " + functionName + "\n";
+        return true;
+    }
+
+    const bool darwin = targetMachine->getTargetTriple().isOSDarwin();
+    std::set<std::string> allLabels;
+    std::set<std::string> wantedLabels;
+    for (auto& function : *view)
+    {
+        if (function.isDeclaration()) continue;
+        std::string label = (darwin ? "_" : "") + function.getName().str();
+        allLabels.insert(label);
+        if (std::find(matches.begin(), matches.end(), &function) != matches.end())
+            wantedLabels.insert(label);
+    }
+
+    struct LabelPos { size_t offset; std::string label; };
+    std::vector<LabelPos> labels;
+    size_t lineStart = 0;
+    while (lineStart < assembly.size())
+    {
+        size_t lineEnd = assembly.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = assembly.size();
+        size_t first = lineStart;
+        while (first < lineEnd && (assembly[first] == ' ' || assembly[first] == '\t')) ++first;
+        std::string label = assembly.substr(first, lineEnd - first);
+        if (!label.empty() && label.back() == ':')
+        {
+            label.pop_back();
+            if (allLabels.contains(label)) labels.push_back({lineStart, std::move(label)});
+        }
+        lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
+    }
+
+    out.clear();
+    for (size_t i = 0; i < labels.size(); ++i)
+    {
+        if (!wantedLabels.contains(labels[i].label)) continue;
+        size_t end = i + 1 < labels.size() ? labels[i + 1].offset : assembly.size();
+        out.append(assembly, labels[i].offset, end - labels[i].offset);
+        if (end == assembly.size() && !out.empty() && out.back() != '\n') out += '\n';
+    }
+    if (out.empty())
+    {
+        out = optimizedAwayBanner(matches);
+        if (out.empty())
+            out = "; no matching function label: " + functionName + "\n";
+    }
+    return true;
+}
 
 
 bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,

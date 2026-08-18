@@ -7175,6 +7175,8 @@ public:
 
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
+    bool PrintModuleView(std::string& out, const std::string& kind, bool optimized,
+                         const std::string& functionName);
 
     /*
         Resolution order: (1) process override set via SetCacheDirOverride (used by

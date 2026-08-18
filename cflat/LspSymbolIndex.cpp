@@ -45,6 +45,14 @@ void LspSymbolIndex::RegisterDefinition(const SymbolDef& def)
     symbols_[def.name] = def;
 }
 
+void LspSymbolIndex::RegisterFunctionRange(const std::string& name, const std::string& file,
+                                           int startLine, int endLine)
+{
+    if (name.empty() || file.empty() || startLine <= 0 || endLine < startLine)
+        return;
+    functionRanges_.push_back({name, file, startLine, endLine});
+}
+
 void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
 {
     for (const auto& [name, def] : other.symbols_)
@@ -53,6 +61,7 @@ void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
     for (const auto& [name, info] : other.variables_)
         if (!variables_.contains(name))
             variables_.emplace(name, info);
+    functionRanges_.insert(functionRanges_.end(), other.functionRanges_.begin(), other.functionRanges_.end());
     candidates_.insert(candidates_.end(), other.candidates_.begin(), other.candidates_.end());
 }
 
@@ -77,7 +86,17 @@ void LspSymbolIndex::Clear()
 {
     symbols_.clear();
     variables_.clear();
+    functionRanges_.clear();
     candidates_.clear();
+}
+
+std::vector<const FunctionRange*> LspSymbolIndex::FunctionsEnclosing(const std::string& file, int line) const
+{
+    std::vector<const FunctionRange*> results;
+    for (const auto& range : functionRanges_)
+        if (range.file == file && line >= range.startLine && line <= range.endLine)
+            results.push_back(&range);
+    return results;
 }
 
 void LspSymbolIndex::RegisterCandidate(const UnusedCandidate& cand)
@@ -134,6 +153,9 @@ void LspSymbolIndex::RemapFile(const std::string& fromFile, const std::string& t
     for (auto& [name, info] : variables_)
         if (info.file == fromFile)
             info.file = toFile;
+    for (auto& range : functionRanges_)
+        if (range.file == fromFile)
+            range.file = toFile;
     for (auto& cand : candidates_)
         if (cand.file == fromFile)
             cand.file = toFile;

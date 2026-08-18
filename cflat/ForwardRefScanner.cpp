@@ -502,6 +502,9 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             s->Register(SymbolKind::Function, name, compiler->GetSourceFilePath(),
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
                         sig, {}, doc);
+            s->RegisterFunctionRange(name, compiler->GetSourceFilePath(),
+                                     (int)func->getStart()->getLine(),
+                                     (int)func->getStop()->getLine());
 
             // Namespace free functions also register under the unqualified name so a bare
             // hover/completion on "square" resolves to "Math.square" (mirrors the struct alias

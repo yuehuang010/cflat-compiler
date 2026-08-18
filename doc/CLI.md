@@ -30,11 +30,12 @@ positionals are treated as additional `.c` inputs to link. See
 |--------|-------|-------|-------------|
 | `--output` | `-o` | path | Output native executable (`.exe`). Linking is what merges `.c`/`.lib` inputs, so C interop requires this. |
 | `--out-lli` | `-l` | path | Write the LLVM IR (`.ll`) - the final, optimized IR that lands in the object. |
+| `--out-asm` | | path | Write host-target assembly (`.s`) and respect the selected `-O` level. |
 | `--bitcode` | `-b` | path | Write LLVM bitcode (`.bc`). |
 | `--nologo` | | | Hide the progress and summary lines (`PASS:`, `Checked N file(s)`, `Emitted ...`). Useful for scripting. |
 | `--version` | | | Print the version and exit. There is no startup banner; the version prints only here. |
 
-You can combine `-o` with `-l`/`-b` to emit the exe and the IR/bitcode in one pass.
+You can combine `-o` with `-l`/`--out-asm`/`-b` to emit the exe and the IR/assembly/bitcode in one pass.
 
 ## Restricted policy (`--isolated`)
 
@@ -129,7 +130,7 @@ program argument, so program args are never mistaken for compiler flags or sourc
 **Restrictions.**
 
 - *Read-only.* `--run` writes nothing to disk, so it cannot be combined with `-o`/`--output`,
-  `-l`/`--out-lli`, or `-b`/`--bitcode`. To get the IR *and* a run, do two invocations.
+  `-l`/`--out-lli`, `--out-asm`, or `-b`/`--bitcode`. To get the IR or assembly *and* a run, do two invocations.
 - *Single-threaded only.* A program that spawns a thread (via the `program` construct or
   `thread<T>`) is rejected - in-process JIT'd workers would need Windows SEH unwind tables the
   JIT cannot register. Compile to an exe instead. Importing `thread.cb` without spawning is fine.

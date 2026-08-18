@@ -123,6 +123,14 @@
         "title": "cflat: Run Diagnostics on Current File"
       },
       {
+        "command": "cflat.showLlvmIr",
+        "title": "CFlat: Show LLVM IR"
+      },
+      {
+        "command": "cflat.showAssembly",
+        "title": "CFlat: Show Assembly"
+      },
+      {
         "command": "cflat.showOutput",
         "title": "cflat: Show Language Server Output"
       },

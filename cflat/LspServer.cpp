@@ -22,6 +22,7 @@
 #include <csignal>
 #include <deque>
 #include <functional>
+#include <limits>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -579,6 +580,8 @@ private:
             HandleCompletion(msg, id);
         else if (method == "cflat/runDiagnostics")
             HandleRunDiagnostics(msg);
+        else if (method == "cflat/viewAssembly")
+            HandleViewAssembly(msg, id);
         else if (method == "shutdown")
         {
             shutdownReceived_ = true;
@@ -1339,6 +1342,86 @@ private:
             EnqueueAnalysis(uri, filePath, text);
     }
 
+    void HandleViewAssembly(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
+    {
+        const auto* params = GetParams(msg);
+        if (!id || !params || !params->contains("uri") || !(*params)["uri"].is_string()
+            || !params->contains("kind") || !(*params)["kind"].is_string()
+            || ((*params)["kind"] != "ir" && (*params)["kind"] != "asm"))
+        {
+            SendError(id, -32602, "Invalid cflat/viewAssembly parameters");
+            return;
+        }
+
+        const std::string uri = (*params)["uri"].get<std::string>();
+        const std::string kind = (*params)["kind"].get<std::string>();
+        bool optimized = false;
+        if (params->contains("optimized"))
+        {
+            if (!(*params)["optimized"].is_boolean())
+            {
+                SendError(id, -32602, "Invalid cflat/viewAssembly optimized parameter");
+                return;
+            }
+            optimized = (*params)["optimized"].get<bool>();
+        }
+
+        std::optional<std::string> function;
+        std::optional<int> line;
+        if (params->contains("filter"))
+        {
+            const auto& filter = (*params)["filter"];
+            if (!filter.is_object())
+            {
+                SendError(id, -32602, "Invalid cflat/viewAssembly filter");
+                return;
+            }
+            if (filter.contains("function"))
+            {
+                if (!filter["function"].is_string())
+                {
+                    SendError(id, -32602, "Invalid cflat/viewAssembly function filter");
+                    return;
+                }
+                function = filter["function"].get<std::string>();
+                if (function->empty())
+                {
+                    SendError(id, -32602, "Invalid cflat/viewAssembly function filter");
+                    return;
+                }
+            }
+            if (filter.contains("line"))
+            {
+                if (!filter["line"].is_number_integer())
+                {
+                    SendError(id, -32602, "Invalid cflat/viewAssembly line filter");
+                    return;
+                }
+                auto rawLine = filter["line"].get<int64_t>();
+                if (rawLine <= 0 || rawLine > std::numeric_limits<int>::max())
+                {
+                    SendError(id, -32602, "Invalid cflat/viewAssembly line filter");
+                    return;
+                }
+                line = static_cast<int>(rawLine);
+            }
+        }
+
+        OpenDocument doc;
+        {
+            std::lock_guard<std::mutex> lock(docsMutex_);
+            auto it = docs_.find(uri);
+            if (it == docs_.end())
+            {
+                SendError(id, -32602, "Unknown document URI");
+                return;
+            }
+            doc = it->second;
+        }
+        EnqueueAnalysis(uri, doc.filePath, doc.text,
+                        IrRequest{*id, kind, optimized, std::move(function), line});
+    }
+
     // -----------------------------------------------------------------------
     // Job dispatch - every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
@@ -1349,11 +1432,27 @@ private:
         std::string filePath;
         std::string text;
         uint64_t    generation = 0;
+        struct IrRequest
+        {
+            nlohmann::json id;
+            std::string kind;
+            bool optimized = false;
+            std::optional<std::string> function;
+            std::optional<int> line;
+        };
+        std::optional<IrRequest> irRequest;
     };
 
-    void EnqueueAnalysis(const std::string& uri, const std::string& filePath, const std::string& text)
+    using IrRequest = AnalysisJob::IrRequest;
+
+    void EnqueueAnalysis(const std::string& uri, const std::string& filePath, const std::string& text,
+                         std::optional<IrRequest> irRequest = std::nullopt)
     {
-        AnalysisJob job{uri, filePath, text};
+        AnalysisJob job;
+        job.uri = uri;
+        job.filePath = filePath;
+        job.text = text;
+        job.irRequest = std::move(irRequest);
         {
             std::lock_guard<std::mutex> lock(uriGenMutex_);
             job.generation = ++uriGeneration_[uri];
@@ -1442,7 +1541,7 @@ private:
             {
                 std::lock_guard<std::mutex> lock(uriGenMutex_);
                 auto it = uriGeneration_.find(job.uri);
-                if (it != uriGeneration_.end() && it->second != job.generation)
+                if (!job.irRequest && it != uriGeneration_.end() && it->second != job.generation)
                     continue;
             }
 
@@ -1458,16 +1557,21 @@ private:
             // A single analysis must never take down the whole server: any C++ exception
             // that escapes here would call std::terminate on this worker thread. Catch it,
             // and always release the backend slot so the pool can't deadlock.
+            bool responseSent = false;
             try
             {
-                RunAnalysisOnSlot(slot, job);
+                responseSent = RunAnalysisOnSlot(slot, job);
             }
             catch (const std::exception& e)
             {
+                if (job.irRequest && !responseSent)
+                    SendViewFailure(job, "analysis failed: " + std::string(e.what()));
                 if (verbose_) std::cerr << std::format("[lsp] analysis threw on slot {}: {}\n", slot, e.what());
             }
             catch (...)
             {
+                if (job.irRequest && !responseSent)
+                    SendViewFailure(job, "analysis failed");
                 if (verbose_) std::cerr << std::format("[lsp] analysis threw on slot {} (unknown)\n", slot);
             }
 
@@ -1479,7 +1583,7 @@ private:
         }
     }
 
-    void RunAnalysisOnSlot(size_t slot, const AnalysisJob& job)
+    bool RunAnalysisOnSlot(size_t slot, const AnalysisJob& job)
     {
         const std::string& uri      = job.uri;
         const std::string& filePath = job.filePath;
@@ -1500,7 +1604,11 @@ private:
 
         {
             std::ofstream tmp(tempPath, std::ios::binary);
-            if (!tmp) return;
+            if (!tmp)
+            {
+                if (job.irRequest) SendViewFailure(job, "could not create analysis input");
+                return !job.irRequest;
+            }
             tmp.write(text.data(), text.size());
         }
 
@@ -1651,6 +1759,73 @@ private:
         }
 
         PublishDiagnostics(uri, diagnostics);
+
+        if (!job.irRequest)
+            return true;
+
+        if (!recovered || !ok)
+        {
+            SendViewResult(job, BuildViewError(diagnostics));
+            return true;
+        }
+
+        std::string functionName;
+        if (job.irRequest->function)
+            functionName = *job.irRequest->function;
+        else if (job.irRequest->line)
+        {
+            auto ranges = newIndex->FunctionsEnclosing(filePath, *job.irRequest->line);
+            if (ranges.empty())
+            {
+                std::string displayName = std::filesystem::path(filePath).filename().string();
+                SendViewResult(job, "; " + displayName + ":"
+                    + std::to_string(*job.irRequest->line) + " has no function\n");
+                return true;
+            }
+            functionName = ranges.front()->name;
+        }
+
+        std::string output;
+        bool emitted = backend->PrintModuleView(output, job.irRequest->kind,
+                                                job.irRequest->optimized, functionName);
+        if (!emitted)
+        {
+            SendViewFailure(job, "failed to emit " + job.irRequest->kind);
+            return true;
+        }
+        SendViewResult(job, std::move(output));
+        return true;
+    }
+
+    static std::string BuildViewError(const std::vector<lsp::Diagnostic>& diagnostics)
+    {
+        std::string text = "; compile errors - view unavailable";
+        int count = 0;
+        for (const auto& diagnostic : diagnostics)
+        {
+            if (diagnostic.severity != lsp::DiagnosticSeverityError || count >= 5)
+                continue;
+            text += "\n; " + diagnostic.message;
+            ++count;
+        }
+        if (count == 0)
+            text += "\n; analysis failed";
+        return text;
+    }
+
+    void SendViewResult(const AnalysisJob& job, std::string text)
+    {
+        if (!job.irRequest) return;
+        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
+            {"kind", job.irRequest->kind},
+            {"text", std::move(text)}
+        });
+    }
+
+    void SendViewFailure(const AnalysisJob& job, const std::string& message)
+    {
+        if (!job.irRequest) return;
+        SendViewResult(job, "; view unavailable - " + message + "\n");
     }
 
     std::filesystem::path BeginTimeTrace(const AnalysisJob& job)
@@ -1871,6 +2046,16 @@ private:
             {"result",  std::move(result)}
         };
         loop_.Send(std::move(resp));
+    }
+
+    void SendError(const std::optional<nlohmann::json>& id, int code, const std::string& message)
+    {
+        if (!id) return;
+        loop_.Send({
+            {"jsonrpc", "2.0"},
+            {"id", *id},
+            {"error", {{"code", code}, {"message", message}}}
+        });
     }
 
     std::shared_ptr<LspSymbolIndex> GetCurrentIndex()
