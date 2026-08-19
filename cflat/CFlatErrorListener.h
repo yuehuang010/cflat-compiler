@@ -1,9 +1,13 @@
 #pragma once
 #include "platform/GeneratedParser.h" // antlr runtime + generated parser + kTokenEOF
+#include "DiagnosticLocalization.h"
 #include <string>
 #include <vector>
 #include <set>
 #include <sstream>
+#include <functional>
+#include <string_view>
+#include <utility>
 
 struct ParseDiagnostic
 {
@@ -17,9 +21,19 @@ struct ParseDiagnostic
 class CFlatErrorListener : public antlr4::BaseErrorListener
 {
 public:
-    CFlatErrorListener(std::string filename, std::vector<std::string> sourceLines)
+    CFlatErrorListener(
+        std::string filename, std::vector<std::string> sourceLines,
+        std::function<std::string(std::string, std::vector<std::string>)> localizeMessage = {})
         : filename_(std::move(filename)), sourceLines_(std::move(sourceLines))
-    {}
+    {
+        if (localizeMessage)
+            localizeMessage_ = std::move(localizeMessage);
+        else
+            localizeMessage_ = [](std::string englishTemplate,
+                                  std::vector<std::string> arguments) {
+                return DiagnosticLocalization::FormatSourceTemplate(englishTemplate, arguments);
+            };
+    }
 
     void syntaxError(antlr4::Recognizer* recognizer, antlr4::Token* offendingSymbol,
                      size_t line, size_t charPositionInLine,
@@ -32,7 +46,12 @@ public:
         d.file    = filename_;
         d.line    = static_cast<int>(line);
         d.col     = static_cast<int>(charPositionInLine);
-        d.message = humanizeMessage(msg);
+        static constexpr std::string_view lexerPrefix = "token recognition error at: ";
+        if (msg.rfind(lexerPrefix, 0) == 0)
+            d.message = localizeMessage_("unexpected character: {}",
+                                         {msg.substr(lexerPrefix.size())});
+        else
+            d.message = humanizeMessage(msg);
         d.hint    = buildHint(recognizer, offendingSymbol, e);
         diagnostics_.push_back(std::move(d));
     }
@@ -45,6 +64,7 @@ private:
     std::vector<std::string> sourceLines_;
     std::vector<ParseDiagnostic> diagnostics_;
     std::set<int> seenLines_;
+    std::function<std::string(std::string, std::vector<std::string>)> localizeMessage_;
 
     static std::string humanizeMessage(const std::string& msg)
     {
@@ -87,7 +107,8 @@ private:
                 {
                     std::string before = srcLine.substr(0, std::min(col, static_cast<int>(srcLine.size())));
                     if (before.find(':') != std::string::npos)
-                        return "structs cannot implement interfaces; use 'class' instead";
+                        return localizeMessage_(
+                            "structs cannot implement interfaces; use 'class' instead", {});
                 }
             }
         }
@@ -108,29 +129,30 @@ private:
                 dynamic_cast<CFlatParser::StatementContext*>(ctx)           ||
                 dynamic_cast<CFlatParser::DeclarationContext*>(ctx)         ||
                 dynamic_cast<CFlatParser::BlockItemContext*>(ctx))
-                return "missing ';' at end of statement";
+                return localizeMessage_("missing ';' at end of statement", {});
 
             if (dynamic_cast<CFlatParser::ParameterTypeListContext*>(ctx))
-                return "check parameter list - missing type or closing ')'?";
+                return localizeMessage_("check parameter list - missing type or closing ')'?", {});
 
             if (offendingIsEof &&
                 (dynamic_cast<CFlatParser::CompoundStatementContext*>(ctx) ||
                  dynamic_cast<CFlatParser::BlockItemListContext*>(ctx)))
-                return "unclosed '{' - check for a missing closing brace";
+                return localizeMessage_("unclosed '{' - check for a missing closing brace", {});
 
             if (dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx)       ||
                 dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(ctx) ||
                 dynamic_cast<CFlatParser::ClassDefinitionContext*>(ctx))
-                return "struct/class definitions require a trailing ';'";
+                return localizeMessage_("struct/class definitions require a trailing ';'", {});
 
             if (dynamic_cast<CFlatParser::ImportDeclarationContext*>(ctx))
-                return "import statements require a trailing ';'";
+                return localizeMessage_("import statements require a trailing ';'", {});
 
             if (dynamic_cast<CFlatParser::ProgramDefinitionContext*>(ctx))
-                return "program definitions require a trailing ';'";
+                return localizeMessage_("program definitions require a trailing ';'", {});
 
             if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(ctx))
-                return "check the function signature - missing return type or parameter type?";
+                return localizeMessage_(
+                    "check the function signature - missing return type or parameter type?", {});
 
             ctx = dynamic_cast<antlr4::RuleContext*>(ctx->parent);
         }

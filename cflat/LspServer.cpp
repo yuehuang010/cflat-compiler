@@ -1756,7 +1756,7 @@ private:
             for (const auto& d : diagnostics)
                 if (d.severity == lsp::DiagnosticSeverityError) { hasError = true; break; }
             if (!hasError)
-                AppendUnusedDiagnostics(text, filePath, *newIndex, diagnostics);
+                AppendUnusedDiagnostics(*backendPool_[slot], text, filePath, *newIndex, diagnostics);
         }
 
         PublishDiagnostics(uri, diagnostics);
@@ -1899,7 +1899,8 @@ private:
     // during analysis against an identifier-occurrence scan of the document. Only
     // declarations in this file are considered; the linkage/RAII guards were applied
     // at registration time (see UnusedCandidate). Underreports rather than misreports.
-    void AppendUnusedDiagnostics(const std::string& text, const std::string& filePath,
+    void AppendUnusedDiagnostics(const LLVMBackend& backend, const std::string& text,
+                                 const std::string& filePath,
                                  const LspSymbolIndex& index,
                                  std::vector<lsp::Diagnostic>& out)
     {
@@ -1938,19 +1939,20 @@ private:
             if (n > 1) continue;  // referenced somewhere beyond its declaration
 
             std::string what = (cand.kind == SymbolKind::Function)
-                ? "function '" + cand.name + "' is never used"
-                : "'" + cand.name + "' is never used";
+                ? backend.LocalizeMessage("function '{}' is never used", {cand.name})
+                : backend.LocalizeMessage("'{}' is never used", {cand.name});
             addFaded(cand.line, cand.col, (int)cand.name.size(), what);
         }
 
-        AppendUnusedImports(text, filePath, index, counts, out);
+        AppendUnusedImports(backend, text, filePath, index, counts, out);
     }
 
     // An `import "x.cb"` is flagged when none of the symbols that file defines are
     // referenced in this document. Caveat: a symbol used only transitively (never named
     // here) is invisible to the text scan, so a genuinely-needed import can be flagged;
     // the hint is faded and trivially dismissed. Unresolvable imports are left alone.
-    void AppendUnusedImports(const std::string& text, const std::string& filePath,
+    void AppendUnusedImports(const LLVMBackend& backend, const std::string& text,
+                             const std::string& filePath,
                              const LspSymbolIndex& index,
                              const std::unordered_map<std::string, int>& counts,
                              std::vector<lsp::Diagnostic>& out)
@@ -2024,7 +2026,7 @@ private:
             while (startCol < endCol && std::isspace((unsigned char)ln[startCol])) startCol++;
             lsp::Diagnostic d;
             d.range    = { { line, startCol }, { line, endCol } };
-            d.message  = "unused import '" + fname + "'";
+            d.message  = backend.LocalizeMessage("unused import '{}'", {fname});
             d.severity = lsp::DiagnosticSeverityHint;
             d.tags     = { lsp::DiagnosticTagUnnecessary };
             out.push_back(std::move(d));

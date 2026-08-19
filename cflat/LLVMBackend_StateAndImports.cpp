@@ -736,6 +736,14 @@ void LLVMBackend::SetLocaleTemplateCollection(bool enabled)
 bool LLVMBackend::WriteCollectedLocale(const std::string& locale, bool verbose) const
 { return diagnosticLocalization_.WriteCollectedCatalog(locale, verbose); }
 
+std::string LLVMBackend::LocalizeMessage(std::string englishTemplate,
+                                         std::vector<std::string> arguments) const
+{ return diagnosticLocalization_.Localize(englishTemplate, arguments); }
+
+std::function<std::string(std::string, std::vector<std::string>)>
+LLVMBackend::MakeDiagnosticLocalizer() const
+{ return [this](std::string t, std::vector<std::string> a) { return LocalizeMessage(std::move(t), std::move(a)); }; }
+
 void LLVMBackend::SetVerbose(bool v)
 { verbose = v; }
 

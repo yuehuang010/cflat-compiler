@@ -91,6 +91,7 @@
 
 #include "LspSymbolIndex.h"
 #include "CFlatErrorListener.h"
+#include "CFlatErrorStrategy.h"
 #include "VcpkgResolver.h"
 #include "NugetResolver.h"
 
@@ -6899,6 +6900,9 @@ public:
     bool LoadLocale(bool verbose = false);
     void SetLocaleTemplateCollection(bool enabled);
     bool WriteCollectedLocale(const std::string& locale, bool verbose = false) const;
+    std::string LocalizeMessage(std::string englishTemplate,
+                                std::vector<std::string> arguments = {}) const;
+    std::function<std::string(std::string, std::vector<std::string>)> MakeDiagnosticLocalizer() const;
     void SetVerbose(bool v);
     bool IsVerbose() const;
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
@@ -7297,6 +7301,8 @@ private:
         state.tokens = std::make_unique<antlr4::CommonTokenStream>(state.lexer.get());
         state.parser = std::make_unique<CFlatParser>(state.tokens.get());
         state.parser->removeErrorListeners();
+        auto localizeMessage = MakeDiagnosticLocalizer();
+        state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
         state.tokens->fill();
         auto* cu = state.parser->compilationUnit();
         CtxT* ctx = extract(cu);

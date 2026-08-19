@@ -423,9 +423,769 @@
       "bool",
       "Foo"
     ],
-    "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
+    ]
+  },
+  "argumentNames": {
+    "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
+      "functionName",
+      "std::to_string(params[i].AllocAlignValue)",
+      "std::to_string(args[i].AllocAlignment)"
+    ],
+    "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
+      "--run",
+      "main",
+      "int main()",
+      "int main(int argc, char** argv)"
+    ],
+    "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": [
+      "--asan",
+      "dllName",
+      "verRoot.string()"
+    ],
+    "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": [
+      "--asan",
+      "lib",
+      "msvcLibDir"
+    ],
+    "arg0couldnotdetecthostmachinearg1": [
+      "--run",
+      "llvm::toString(jtmb.takeError())"
+    ],
+    "arg0couldnotfindarg1arg2": [
+      "--run",
+      "main",
+      "llvm::toString(mainSym.takeError())"
+    ],
+    "arg0couldnotloadimportedcobjectarg1arg2": [
+      "--run",
+      "cObj",
+      "llvm::toString(std::move(err))"
+    ],
+    "arg0couldnotreadimportedcobjectarg1arg2": [
+      "--run",
+      "cObj",
+      "objOrErr.getError().message()"
+    ],
+    "arg0expectsarg1typeargumentsgotarg2": [
+      "base",
+      "std::to_string(tpl.genericParams.size())",
+      "std::to_string(cflatArgs.size())"
+    ],
+    "arg0failedtoaddmoduletojitarg1": [
+      "--run",
+      "llvm::toString(std::move(err))"
+    ],
+    "arg0failedtocopyasan...llarg1nexttoarg2arg3ea3156f7991b47b3": [
+      "--asan",
+      "asanDllToCopy",
+      "exePath",
+      "ec.message()"
+    ],
+    "arg0failedtocreatejitarg1": [
+      "--run",
+      "llvm::toString(jitOrErr.takeError())"
+    ],
+    "arg0failedtodefinearg1arg2": [
+      "--run",
+      "__emutls_get_address",
+      "llvm::toString(std::move(err))"
+    ],
+    "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": [
+      "--run",
+      "llvm::toString(gen.takeError())"
+    ],
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": [
+      "resolvedTypeName",
+      "count",
+      "parameterNames",
+      "resolvedTypeName + \"<\" + exampleArgs + \">\""
+    ],
+    "arg0isneverused": [
+      "cand.name"
+    ],
+    "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
+      "--asan"
+    ],
+    "arg0noarg1functiontoexecute": [
+      "--run",
+      "main"
+    ],
+    "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": [
+      "--asan"
+    ],
+    "arg0programarguments...arearg3toreceivetheme5d8489038a4ceae": [
+      "--run",
+      "--",
+      "main",
+      "int main(int argc, char** argv)"
+    ],
+    "arg0returncannotmixa...ndarg2infunctionarg3f056caa4cdfd26c2": [
+      "auto",
+      "return;",
+      "return <expr>;",
+      "functionName"
+    ],
+    "arg0returncannotunif...ntypesinfunctionarg1cee8e310e91ae8ae": [
+      "auto",
+      "functionName"
+    ],
+    "arg0returnfunctionar...iredfortypeinference0a009aac7b17b00f": [
+      "auto",
+      "functionName"
+    ],
+    "arg0returnrecursivec...returntypeexplicitlyc7029320f8dff132": [
+      "auto",
+      "functionName"
+    ],
+    "arg0returnrecursivec...rg1isnotyetsupportede5ac685786916a4a": [
+      "auto",
+      "functionName"
+    ],
+    "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": [
+      "auto",
+      "auto f<T>(T x)"
+    ],
+    "arg0staticinitializerexecutionfailedarg1": [
+      "--run",
+      "llvm::toString(std::move(err))"
+    ],
+    "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": [
+      "ifaceName",
+      "calleeDesc"
+    ],
+    "builtinssourcenotfoundarg0": [
+      "srcPath.str().str()"
+    ],
+    "callthroughafunction...sitetopassthepointee5550b0e566872e76": [
+      "std::to_string(index + 1)"
+    ],
+    "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": [
+      "ifaceName",
+      "methodName",
+      "params[i].VariableName",
+      "params[i].TypeName",
+      "std::format(\"{}*\", params[i].TypeName)",
+      "*",
+      "std::format(\"{}*\", params[i].TypeName)"
+    ],
+    "calltoarg0arg1cannot...retheparameterasarg6ee426562302ed0bf": [
+      "ifaceName",
+      "methodName",
+      "std::format(\"{}*\", shown)",
+      "params[i].VariableName",
+      "shown",
+      "*",
+      "std::format(\"{}*\", shown)"
+    ],
+    "calltoarg0arg1cannot...sitetopassthepointee20812a9d00c778b2": [
+      "ifaceName",
+      "methodName",
+      "std::format(\"{}*\", shown)",
+      "params[i].VariableName",
+      "shown",
+      "*"
+    ],
+    "calltoarg0arg1parame...itharg6atthecallsite7967178d07e90d77": [
+      "ifaceName",
+      "methodName",
+      "std::to_string(i)",
+      "params[i].VariableName",
+      "shown + \"*\"",
+      "argShown.empty() ? std::string(\"one more level of indirection\") : std::format(\"type '{}**'\", argShown)",
+      "*"
+    ],
+    "calltoarg0arg1parame...itharg6atthecallsitedf072eae06a105ca": [
+      "ifaceName",
+      "methodName",
+      "std::to_string(i)",
+      "params[i].VariableName",
+      "shown + \"**\"",
+      "argShown.empty() ? std::string(\"one fewer level of indirection\") : std::format(\"type '{}*'\", argShown)",
+      "&"
+    ],
+    "calltoarg0argumentar...rg2hasnoresolvedtype1b9c663e45646797": [
+      "functionName",
+      "std::to_string(argIndex)",
+      "candParamItr->VariableName"
+    ],
+    "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": [
+      "functionName",
+      "unique",
+      "candParamItr->VariableName",
+      "new",
+      "move"
+    ],
+    "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": [
+      "functionName",
+      "qualifier",
+      "candParamItr->VariableName",
+      "new",
+      "new"
+    ],
+    "calltoarg0moveargume...eclearedafterthemovecb9e409370205fa4": [
+      "functionName",
+      "std::to_string(i)"
+    ],
+    "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": [
+      "functionName",
+      "paramName",
+      "move",
+      "arg.CallerName.empty() ? arg.TypeAndValue.TypeName : arg.CallerName",
+      "move",
+      "move",
+      "paramType"
+    ],
+    "calltoarg0parametera...yorpassacopywitharg4f93457f5afd53b01": [
+      "functionName",
+      "params[i].VariableName",
+      "args[i].CallerName",
+      "move",
+      "copy()"
+    ],
+    "cannotarg0onlyanamed...thanexplicitcastarg28d664510c1990514": [
+      "action",
+      "function<>",
+      "(function<...>)value"
+    ],
+    "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": [
+      "DescribeNonFunctionArgument(arg)",
+      "function<>",
+      "destDesc",
+      "function<>",
+      "(function<...>)value"
+    ],
+    "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": [
+      "DescribeNonFunctionArgument(arg)",
+      "destDesc",
+      "function<>",
+      "(function<...>)value"
+    ],
+    "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": [
+      "srcIface",
+      "dstIface",
+      "srcIface",
+      "dstIface"
+    ],
+    "cannotconverttointer...0noclassimplementsit1e8c0aedb2889c6b": [
+      "site.DstInterface"
+    ],
+    "cannotconverttointer...g2declaredinsidearg380f17f1b4261ff04": [
+      "site.DstInterface",
+      "std::to_string(guardedCount)",
+      "guardedClass",
+      "guard"
+    ],
+    "cannotconverttointer...snottakeninthisbuild2453b841846c740d": [
+      "site.DstInterface",
+      "guardedClass",
+      "guard"
+    ],
+    "cannotconverttointer...thernestedinsidearg3506794770e818c8b": [
+      "site.DstInterface",
+      "guardedClass",
+      "guard",
+      "nest"
+    ],
+    "cannotconverttointer...thernestedinsidearg46fae2dfad80b2d3d": [
+      "site.DstInterface",
+      "std::to_string(guardedCount)",
+      "guardedClass",
+      "guard",
+      "nest"
+    ],
+    "cannotcopyarg0itsfie...ipinsteadofcopyingit932eb09febf31c17": [
+      "copyType",
+      "copyType",
+      "uniquePath",
+      "unique",
+      "copy()",
+      "copyType",
+      "move"
+    ],
+    "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
+      "args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName",
+      "std::format(\"new T[n] alignas(0, {})\", args[i].AllocAlignment)",
+      "move",
+      "functionName",
+      "std::format(\"alignas(0, {})\", args[i].AllocAlignment)"
+    ],
+    "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": [
+      "...",
+      "functionName"
+    ],
+    "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": [
+      "T*",
+      "candParamItr->VariableName",
+      "T[]",
+      "new T[n]",
+      "T[]",
+      "T[]",
+      "T*"
+    ],
+    "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": [
+      "structName.empty() ? \"<unknown>\" : structName",
+      "ifaceName",
+      "calleeDesc",
+      "ifaceName"
+    ],
+    "cannotpassarg0toarg1...thanexplicitcastarg44f72ac88eeb8cb84": [
+      "DescribeNonFunctionArgument(arg)",
+      "function<>",
+      "paramName",
+      "function<>",
+      "(function<...>)value"
+    ],
+    "cannotpassarg0toclos...hexpectsarg2arg3arg40481ee737758a21b": [
+      "FuncPtrShapeWord(arg.TypeAndValue, &arg)",
+      "param.VariableName",
+      "FuncPtrShapeWord(param, nullptr)",
+      "shapesAre",
+      "advice"
+    ],
+    "cannotpassarg0toclos...plytheshapeitexpects1c8eceeed89b1ffd": [
+      "FuncPtrShapeWord(arg.TypeAndValue, &arg)",
+      "param.VariableName",
+      "FuncPtrShapeWord(param, nullptr)",
+      "shapesAre"
+    ],
+    "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": [
+      "string",
+      "char*",
+      "candParamItr->VariableName",
+      "functionName",
+      "string",
+      "{ptr,len}",
+      "char*",
+      ".data()",
+      "string",
+      "string s = \"{{x}}\"",
+      "printf(\"%s\", s.data())"
+    ],
+    "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": [
+      "string",
+      "char*",
+      "std::to_string(index + 1)",
+      "string",
+      "{ptr,len}",
+      "char*",
+      ".data()"
+    ],
+    "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": [
+      "string",
+      "...",
+      "functionName",
+      "string",
+      "{ptr,len}",
+      "char*",
+      ".data()",
+      "printf(\"%s\", s.data())"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
+      "paramName",
+      "std::to_string(count)",
+      "count == 1 ? \"variable\" : \"variables\"",
+      "list"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": [
+      "paramName",
+      "std::to_string(count)",
+      "count == 1 ? \"variable\" : \"variables\"",
+      "list",
+      "std::to_string(count - shown)"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": [
+      "paramName"
+    ],
+    "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": [
+      "DescribeNonFunctionArgument(returnNV)",
+      "function<>",
+      "function<...>",
+      "(function<...>)value"
+    ],
+    "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": [
+      "DescribeNonFunctionArgument(returnNV)",
+      "function<>",
+      "(function<...>)value"
+    ],
+    "clangclexenotfoundca...otcompilecsourcearg0a024a70aad3d9a4c": [
+      "cSourcePath"
+    ],
+    "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
+      "implName",
+      "ifaceName",
+      "f.VariableName",
+      "InterfaceFieldTypeText(f)"
+    ],
+    "classarg0doesnotimplementarg1arg2": [
+      "structName",
+      "interfaceName",
+      "method.Name"
+    ],
+    "classarg0fieldarg1ha...arg3declaresitasarg48a734db922a905ed": [
+      "implName",
+      "f.VariableName",
+      "InterfaceFieldTypeText(*impl)",
+      "ifaceName",
+      "InterfaceFieldTypeText(f)"
+    ],
+    "classarg0fieldarg1is...10frominterfacearg115f0bea281623e0f5": [
+      "implName",
+      "f.VariableName",
+      "unique",
+      "ifaceName",
+      "unique",
+      "implName",
+      "unique",
+      "InterfaceFieldTypeText(f)",
+      "f.VariableName",
+      "implName",
+      "unique",
+      "ifaceName"
+    ],
+    "classarg0fieldarg1is...oparg9fromclassarg1031a6c739ed8c752e": [
+      "implName",
+      "f.VariableName",
+      "unique",
+      "ifaceName",
+      "unique",
+      "unique",
+      "InterfaceFieldTypeText(f)",
+      "f.VariableName",
+      "ifaceName",
+      "unique",
+      "implName"
+    ],
+    "classarg0methodarg1p...arg9oninterfacearg10ec4b10b44959142b": [
+      "implName",
+      "method.Name",
+      "pname",
+      "move",
+      "ifaceName",
+      "move",
+      "implName",
+      "move",
+      "implName",
+      "InterfaceMethodTypeText(cp, pname)",
+      "ifaceName"
+    ],
+    "classarg0methodarg1p...g9frominterfacearg109b5bbab5ec4e2cc0": [
+      "implName",
+      "method.Name",
+      "pname",
+      "move",
+      "ifaceName",
+      "move",
+      "implName",
+      "InterfaceMethodTypeText(ip, pname)",
+      "implName",
+      "move",
+      "ifaceName"
+    ],
+    "classarg0methodarg1p...twodeclarationsagreeb2b3fc055988d232": [
+      "implName",
+      "method.Name",
+      "pname",
+      "InterfaceMethodTypeText(cp)",
+      "ifaceName",
+      "InterfaceMethodTypeText(ip)",
+      "bond"
+    ],
+    "classarg0methodarg1p...twodeclarationsagreec4f2b930e72f8da1": [
+      "implName",
+      "method.Name",
+      "pname",
+      "InterfaceMethodTypeText(cp)",
+      "ifaceName",
+      "InterfaceMethodTypeText(ip)",
+      "alias"
+    ],
+    "classarg0methodarg1t...narg8oninterfacearg9186992c085ab2c1b": [
+      "implName",
+      "method.Name",
+      "alias",
+      "ifaceName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "alias",
+      "implName",
+      "InterfaceMethodTypeText(cr)",
+      "ifaceName"
+    ],
+    "classarg0methodarg1t...narg8oninterfacearg9c14b5c6a79fc450b": [
+      "implName",
+      "method.Name",
+      "move",
+      "ifaceName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "move",
+      "implName",
+      "InterfaceMethodTypeText(cr)",
+      "ifaceName"
+    ],
+    "classarg0methodarg1t...rg8frominterfacearg96e84ec7e43b58386": [
+      "implName",
+      "method.Name",
+      "move",
+      "ifaceName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "move",
+      "ifaceName"
+    ],
+    "classarg0methodarg1t...rg8frominterfacearg9a2c5150ebb3cca45": [
+      "implName",
+      "method.Name",
+      "alias",
+      "ifaceName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "InterfaceMethodTypeText(ir)",
+      "implName",
+      "alias",
+      "ifaceName"
+    ],
+    "classarg0methodarg1t...twodeclarationsagree1cbfbd8143256040": [
+      "implName",
+      "method.Name",
+      "InterfaceMethodTypeText(cr)",
+      "ifaceName",
+      "InterfaceMethodTypeText(ir)",
+      "bond"
+    ],
+    "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
+      "DescribeConditionType(cond->getType())"
+    ],
+    "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": [
+      "functionName"
+    ],
+    "crashhandlersourcenotfoundarg0": [
+      "srcPath.str().str()"
+    ],
+    "duplicatenamedargumentarg0": [
+      "binding.FailedName"
+    ],
+    "emitwinrtslotcallbadslotarg0onarg1": [
+      "slotName",
+      "className"
+    ],
+    "emitwinrtthinslotcal...abuiltwinrtinterface0ca118b6d5089a98": [
+      "thinName"
+    ],
+    "emitwinrtthinslotcallnoslotarg0onarg1": [
+      "slotName",
+      "thinName"
+    ],
+    "extraneousinputarg0expectingarg1": [
+      "displayToken(token)",
+      "getExpectedTokens(recognizer).toString(recognizer->getVocabulary())"
+    ],
+    "failedtodeploypriarg0toarg1arg2": [
+      "deployPriPath_",
+      "dest.string()",
+      "ec.message()"
+    ],
+    "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": [
+      "deployPriPath_"
+    ],
+    "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": [
+      "arg.CallerName",
+      "move",
+      "candParamItr->VariableName",
+      "move"
+    ],
+    "functionarg0isneverused": [
+      "cand.name"
+    ],
+    "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": [
+      "structName",
+      "ifaceName",
+      "method.Name"
+    ],
+    "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": [
+      "ifaceName"
+    ],
+    "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": [
+      "structName",
+      "ifaceName",
+      "method.Name"
+    ],
+    "getorcreatevtableunknowninterfacearg0": [
+      "ifaceName"
+    ],
+    "hintarg0": [
+      "d.hint"
+    ],
+    "importframeworkarg0i...edwhentargetingmacos87b3cf4f78248b14": [
+      "name"
+    ],
+    "importpackagenugetar...ainonlyhhpphhheaders72f905a6637813d5": [
+      "f"
+    ],
+    "importpackagenugetar...ifconstwindowsimport789d452e554d7842": [
+      "file"
+    ],
+    "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
+      "f"
+    ],
+    "importpackagenugetar...metadataaresupported3370cb2239fb3868": [
+      "file"
+    ],
+    "importpackagenugetco...ybedeployedperoutputa7f56436a9b7721b": [
+      "deployPriPath_",
+      "abs"
+    ],
+    "importpackagenugethe...helayoutisunexpected4c1e71153de5c0d4": [
+      "file",
+      "packageSpec"
+    ],
+    "importpackagenugethe...inapackagenugetgroup9f9f2fa9ca53a44d": [
+      "f",
+      "packageSpec"
+    ],
+    "importpackagenugetme...nmddirsofpackagearg1c11a3139d60ff884": [
+      "file",
+      "packageSpec"
+    ],
+    "importpackagenugetpr...ecursivesearchofarg34ee84adfe70135be": [
+      "priName",
+      "packageSpec",
+      "primary.string()",
+      "packageFolder"
+    ],
+    "importpackagevcpkghe...einstallisincomplete15726db706d2e602": [
+      "header",
+      "res.includeDir"
+    ],
+    "importpackagevcpkgpo...ltoletcflatinstallitab4c62772d38fab4": [
+      "header",
+      "res.includeDir"
+    ],
+    "interfacearg0collide...facecannotshareanamedce86607c550ad90": [
+      "name",
+      "name",
+      "aliasedName"
+    ],
+    "interfacearg0hasnomethodarg1": [
+      "ifaceName",
+      "methodName"
+    ],
+    "mismatchedinputarg0expectingarg1": [
+      "displayToken(offendingToken)",
+      "e.getExpectedTokens().toString(recognizer->getVocabulary())"
+    ],
+    "missingarg0atarg1": [
+      "getExpectedTokens(recognizer).toString(recognizer->getVocabulary())",
+      "displayToken(token)"
+    ],
+    "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
+      "binding.FailedName"
+    ],
+    "noccompilerdrivercla...otcompilecsourcearg076e7e322a4cb5cfa": [
+      "cSourcePath"
+    ],
+    "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": [
+      "ifaceName",
+      "methodName",
+      "why.empty() ? \"\" : \" - \" + why"
+    ],
+    "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": [
+      "ifaceName",
+      "methodName",
+      "std::to_string(args.size())",
+      "expected"
+    ],
+    "noviablealternativeatinputarg0": [
+      "escapeWSAndQuote(input)"
+    ],
+    "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
+      "candidate.Parameters[i].VariableName",
+      "move"
+    ],
+    "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": [
+      "functionName",
+      "firstFile",
+      "std::to_string(firstLine)"
+    ],
+    "reflectfailedtocreatefunctionforarg0": [
+      "structName"
+    ],
+    "reflectisnotsupportedonuniontypearg0": [
+      "structName"
+    ],
+    "reflectstructarg0hasnollvmtype": [
+      "structName"
+    ],
+    "reflectunknownstructarg0": [
+      "structName"
+    ],
+    "simdelementtypemustb...rarg4foramaskgotarg580538da9e2d1ea22": [
+      "i8..i64",
+      "u8..u64",
+      "float",
+      "double",
+      "bool",
+      "resolvedTypeName"
+    ],
+    "unexpectedcharacterarg0": [
+      "msg.substr(lexerPrefix.size())"
+    ],
+    "unknownfunctionarg0": [
+      "functionName"
+    ],
+    "unknowngenericfunctionarg0": [
+      "displayName"
+    ],
+    "unknowninterfacearg0": [
+      "ifaceName"
+    ],
+    "unknowninterfacearg0arg1": [
+      ":",
+      "interfaceName"
+    ],
+    "unknownoperationarg0": [
+      "operationText"
+    ],
+    "unknownparentinterfacearg0": [
+      "parentName"
+    ],
+    "unknowntypearg0": [
+      "resolvedTypeName"
+    ],
+    "unusedimportarg0": [
+      "fname"
+    ],
+    "winrtarg0arg1returns...unkdoesnotsupportyet6980a2c1fe3cfc1f": [
+      "className",
+      "m.Name"
+    ],
+    "winrtarg0arg1sugarne...tantiatedimportcomcb9be3328c7b2b468d": [
+      "className",
+      "slotName",
+      "im->ReturnType.TypeName"
+    ],
+    "winrtclassarg0doesnotimplementarg1arg2": [
+      "className",
+      "ifaceName",
+      "m.Name"
+    ],
+    "winrtdelegatearg0exp...typeargumentsgotarg225f1481dcd182eed": [
+      "base",
+      "std::to_string(tpl->genericParams.size())",
+      "std::to_string(cflatArgs.size())"
+    ],
+    "winrtdelegatearg0has...oidreturninghandlers9964ae377587538b": [
+      "base"
+    ],
+    "winrtdelegatearg0isn...ewinmdthatdeclaresit24f3bb6689d9aae5": [
+      "base"
+    ],
+    "winrtdelegatedelegat...g0hasnoiidinmetadata9ddc8cff04a9b2fe": [
+      "base"
     ]
   },
   "locale": "en-pseudo",
@@ -444,7 +1204,8 @@
     "arg0failedtocreatejitarg1": "{0}: failed to create JIT: {1}",
     "arg0failedtodefinearg1arg2": "{0}: failed to define {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: failed to install process symbol resolver: {1}",
-    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), for example {3}",
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), e.g. {3}",
+    "arg0isneverused": "'{0}' is never used",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
     "arg0noarg1functiontoexecute": "{0}: no '{1}' function to execute.",
     "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": "{0} on macOS requires the AddressSanitizer runtime from Xcode or the Command Line Tools (the SDK-free harvested-stub link cannot supply it); install one and retry.",
@@ -498,6 +1259,8 @@
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",
+    "checkparameterlistmissingtypeorclosing": "check parameter list - missing type or closing ')'?",
+    "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": "check the function signature - missing return type or parameter type?",
     "clangclexenotfoundca...ompilecflatbuiltinscb4e744afbeaed5bb": "clang-cl.exe not found - cannot compile cflat_builtins.c.",
     "clangclexenotfoundca...otcompilecsourcearg0a024a70aad3d9a4c": "clang-cl.exe not found - cannot compile C source '{0}'.",
     "clangclexenotfoundca...tcompilecrashhandler9af9927d8e1fc5d9": "clang-cl.exe not found - cannot compile crash handler.",
@@ -523,9 +1286,12 @@
     "emitwinrtslotcallbadslotarg0onarg1": "EmitWinrtSlotCall: bad slot '{0}' on '{1}'",
     "emitwinrtthinslotcal...abuiltwinrtinterface0ca118b6d5089a98": "EmitWinrtThinSlotCall: '{0}' is not a built WinRT interface",
     "emitwinrtthinslotcallnoslotarg0onarg1": "EmitWinrtThinSlotCall: no slot '{0}' on '{1}'",
+    "endoffile": "end of file",
+    "extraneousinputarg0expectingarg1": "extraneous input {0} expecting {1}",
     "failedtodeploypriarg0toarg1arg2": "failed to deploy pri '{0}' to '{1}': {2}",
     "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": "failed to deploy pri: source '{0}' no longer exists",
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": "function '{0}' has no overload matching the '{1}' modifiers required by parameter '{2}' - '{3}' is part of the function-pointer type",
+    "functionarg0isneverused": "function '{0}' is never used",
     "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": "GetOrCreateProgramVTable: '{0}' does not implement '{1}::{2}'",
     "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": "GetOrCreateProgramVTable: unknown interface '{0}'",
     "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": "GetOrCreateVTable: '{0}' does not implement '{1}::{2}'",
@@ -533,6 +1299,7 @@
     "gettypealignbytesnulltypepointer": "GetTypeAlignBytes: null type pointer",
     "gettypesizebytesnulltypepointer": "GetTypeSizeBytes: null type pointer",
     "heapauditheapauditen...cannotinstrumentmainfc56369fd43948ec": "--heap-audit: HeapAudit.enable/reportLeaks were not linked - diagnostic/heap_audit.cb failed to import; cannot instrument main.",
+    "hintarg0": "hint: {0}",
     "implicitinttoboolcon...akenarrowingexplicite9917fc29c162ecc": "implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit",
     "importframeworkarg0i...edwhentargetingmacos87b3cf4f78248b14": "import framework '{0}' is only supported when targeting macOS",
     "importpackagenugetar...ainonlyhhpphhheaders72f905a6637813d5": "import package-nuget: '{0}' - a multi-entry group may contain only .h/.hpp/.hh headers.",
@@ -546,13 +1313,19 @@
     "importpackagenugetpr...ecursivesearchofarg34ee84adfe70135be": "import package-nuget: pri file '{0}' was not found in package '{1}' (probed '{2}' and a recursive search of '{3}').",
     "importpackagevcpkghe...einstallisincomplete15726db706d2e602": "import package-vcpkg: header '{0}' not found under '{1}'.\n  The port may not own this header, or the install is incomplete.",
     "importpackagevcpkgpo...ltoletcflatinstallitab4c62772d38fab4": "import package-vcpkg: port for header '{0}' is not installed (no '{1}'), and 'vcpkg install' is disabled (--vcpkg-no-install).\n  Run 'vcpkg install' yourself, or drop --vcpkg-no-install to let cflat install it.",
+    "importstatementsrequireatrailing": "import statements require a trailing ';'",
     "interfacearg0collide...facecannotshareanamedce86607c550ad90": "interface '{0}' collides with the WinMD alias 'using {1} = {2};' - rename one of them (a WinMD type and a CFlat interface cannot share a name)",
     "interfacearg0hasnomethodarg1": "interface '{0}' has no method '{1}'",
+    "mismatchedinputarg0expectingarg1": "mismatched input {0} expecting {1}",
+    "missingarg0atarg1": "missing {0} at {1}",
+    "missingatendofstatement": "missing ';' at end of statement",
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": "named argument '{0}' does not match any parameter",
     "noccompilerdrivercla...otcompilecsourcearg076e7e322a4cb5cfa": "no C compiler driver (clang/cc/gcc) found - cannot compile C source '{0}'.",
     "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": "no method of '{0}.{1}' matches the given arguments{2}",
     "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": "no overload of interface method '{0}.{1}' takes {2} argument(s); expected {3}",
+    "noviablealternativeatinputarg0": "no viable alternative at input {0}",
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": "parameter '{0}': cannot pass bonded value to '{1}' parameter - bonded values cannot be transferred out of their source's scope",
+    "programdefinitionsrequireatrailing": "program definitions require a trailing ';'",
     "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": "redefinition of '{0}' - the same overload is already defined at {1}({2}). Two parameter lists that differ only in a SPELLING of one type ('int' and 'i32' name the same type) are one overload, not two.",
     "reflectfailedtocreatefunctionforarg0": "reflect: failed to create function for '{0}'",
     "reflectfailedtoretrievevisitoralloca": "reflect: failed to retrieve visitor alloca",
@@ -561,7 +1334,11 @@
     "reflectunknownstructarg0": "reflect: unknown struct '{0}'",
     "runcflatinitforthefi...imetofinishsettingup781292498c2143fa": "Run cflat --init for the first time to finish setting up.",
     "simdelementtypemustb...rarg4foramaskgotarg580538da9e2d1ea22": "simd element type must be a numeric scalar ({0}, {1}, {2}, {3}) or {4} for a mask, got '{5}'",
+    "structclassdefinitionsrequireatrailing": "struct/class definitions require a trailing ';'",
+    "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": "structs cannot implement interfaces; use 'class' instead",
     "switchexpressionmustbeanintegertype": "switch expression must be an integer type",
+    "unclosedcheckforamissingclosingbrace": "unclosed '{' - check for a missing closing brace",
+    "unexpectedcharacterarg0": "unexpected character: {0}",
     "unknownfunctionarg0": "unknown function '{0}'",
     "unknowngenericfunctionarg0": "unknown generic function '{0}'",
     "unknowninterfacearg0": "unknown interface '{0}'",
@@ -569,6 +1346,7 @@
     "unknownoperationarg0": "unknown operation '{0}'",
     "unknownparentinterfacearg0": "unknown parent interface: '{0}'",
     "unknowntypearg0": "unknown type '{0}'",
+    "unusedimportarg0": "unused import '{0}'",
     "windowssdkvisualstud...ationbutwerenotfound94074d79622a7b60": "Windows SDK / Visual Studio build tools are required for this build configuration but were not found.",
     "winrtarg0arg1returns...unkdoesnotsupportyet6980a2c1fe3cfc1f": "[winrt] '{0}::{1}' returns a struct via the sret ABI, which the WinRT thunk does not support yet",
     "winrtarg0arg1sugarne...tantiatedimportcomcb9be3328c7b2b468d": "[winrt] '{0}::{1}' sugar needs HResult<{2}> instantiated (import \"com.cb\")",
@@ -578,5 +1356,508 @@
     "winrtdelegatearg0isn...ewinmdthatdeclaresit24f3bb6689d9aae5": "winrtDelegate: '{0}' is not an imported WinRT delegate type (import the .winmd that declares it)",
     "winrtdelegatedelegat...g0hasnoiidinmetadata9ddc8cff04a9b2fe": "winrtDelegate: delegate '{0}' has no IID in metadata",
     "winrtdelegateoperato...ortacorelibraryfirsta2491578d800681c": "winrtDelegate: 'operator new' unavailable (import a core library first)"
+  },
+  "sites": {
+    "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
+      "LLVMBackend_WinRT.cpp:1662"
+    ],
+    "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
+      "LLVMBackend_EmitAndLink.cpp:1573"
+    ],
+    "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": [
+      "LLVMBackend_EmitAndLink.cpp:1837"
+    ],
+    "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": [
+      "LLVMBackend_EmitAndLink.cpp:1809"
+    ],
+    "arg0couldnotdetecthostmachinearg1": [
+      "LLVMBackend_EmitAndLink.cpp:1596"
+    ],
+    "arg0couldnotfindarg1arg2": [
+      "LLVMBackend_EmitAndLink.cpp:1745"
+    ],
+    "arg0couldnotloadimportedcobjectarg1arg2": [
+      "LLVMBackend_EmitAndLink.cpp:1711"
+    ],
+    "arg0couldnotreadimportedcobjectarg1arg2": [
+      "LLVMBackend_EmitAndLink.cpp:1703"
+    ],
+    "arg0expectsarg1typeargumentsgotarg2": [
+      "LLVMBackend_WinRT.cpp:774"
+    ],
+    "arg0failedtoaddmoduletojitarg1": [
+      "LLVMBackend_EmitAndLink.cpp:1729"
+    ],
+    "arg0failedtocopyasan...llarg1nexttoarg2arg3ea3156f7991b47b3": [
+      "LLVMBackend_EmitAndLink.cpp:1425"
+    ],
+    "arg0failedtocreatejitarg1": [
+      "LLVMBackend_EmitAndLink.cpp:1645"
+    ],
+    "arg0failedtodefinearg1arg2": [
+      "LLVMBackend_EmitAndLink.cpp:1689"
+    ],
+    "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": [
+      "LLVMBackend_EmitAndLink.cpp:1673"
+    ],
+    "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": [
+      "LLVMBackend_Lookup.cpp:285"
+    ],
+    "arg0isneverused": [
+      "LspServer.cpp:1943"
+    ],
+    "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
+      "LLVMBackend_EmitAndLink.cpp:1793"
+    ],
+    "arg0noarg1functiontoexecute": [
+      "LLVMBackend_EmitAndLink.cpp:1553"
+    ],
+    "arg0onmacosrequirest...itinstalloneandretrye35e64f15dcf4410": [
+      "LLVMBackend_EmitAndLink.cpp:893"
+    ],
+    "arg0programarguments...arearg3toreceivetheme5d8489038a4ceae": [
+      "LLVMBackend_EmitAndLink.cpp:1579"
+    ],
+    "arg0returncannotmixa...ndarg2infunctionarg3f056caa4cdfd26c2": [
+      "LLVMBackend_StateAndImports.cpp:119"
+    ],
+    "arg0returncannotunif...ntypesinfunctionarg1cee8e310e91ae8ae": [
+      "LLVMBackend_StateAndImports.cpp:129"
+    ],
+    "arg0returnfunctionar...iredfortypeinference0a009aac7b17b00f": [
+      "LLVMBackend_StateAndImports.cpp:102"
+    ],
+    "arg0returnrecursivec...returntypeexplicitlyc7029320f8dff132": [
+      "LLVMBackend_StateAndImports.cpp:231"
+    ],
+    "arg0returnrecursivec...rg1isnotyetsupportede5ac685786916a4a": [
+      "LLVMBackend_StateAndImports.cpp:149"
+    ],
+    "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": [
+      "ForwardRefScanner.cpp:421",
+      "MainListener_Declarations.cpp:2326"
+    ],
+    "arg0staticinitializerexecutionfailedarg1": [
+      "LLVMBackend_EmitAndLink.cpp:1737"
+    ],
+    "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": [
+      "LLVMBackend_Interfaces.cpp:1219"
+    ],
+    "builtinssourcenotfoundarg0": [
+      "LLVMBackend_CInterop.cpp:401"
+    ],
+    "callthroughafunction...sitetopassthepointee5550b0e566872e76": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:435"
+    ],
+    "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": [
+      "LLVMBackend_WinRT.cpp:2238"
+    ],
+    "calltoarg0arg1cannot...retheparameterasarg6ee426562302ed0bf": [
+      "LLVMBackend_WinRT.cpp:2218"
+    ],
+    "calltoarg0arg1cannot...sitetopassthepointee20812a9d00c778b2": [
+      "LLVMBackend_WinRT.cpp:2227"
+    ],
+    "calltoarg0arg1parame...itharg6atthecallsite7967178d07e90d77": [
+      "LLVMBackend_WinRT.cpp:2192"
+    ],
+    "calltoarg0arg1parame...itharg6atthecallsitedf072eae06a105ca": [
+      "LLVMBackend_WinRT.cpp:2201"
+    ],
+    "calltoarg0argumentar...rg2hasnoresolvedtype1b9c663e45646797": [
+      "LLVMBackend_Overloads.cpp:1089"
+    ],
+    "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": [
+      "LLVMBackend_Overloads.cpp:1044"
+    ],
+    "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": [
+      "LLVMBackend_Overloads.cpp:1166"
+    ],
+    "calltoarg0moveargume...eclearedafterthemovecb9e409370205fa4": [
+      "LLVMBackend_WinRT.cpp:1774"
+    ],
+    "calltoarg0parametera...theparameterarg5arg6cdcea6fb1f430195": [
+      "LLVMBackend_WinRT.cpp:1522"
+    ],
+    "calltoarg0parametera...yorpassacopywitharg4f93457f5afd53b01": [
+      "LLVMBackend_WinRT.cpp:1630"
+    ],
+    "cannotarg0onlyanamed...thanexplicitcastarg28d664510c1990514": [
+      "LLVMBackend_WinRT.cpp:1836"
+    ],
+    "cannotassignarg0toar...thanexplicitcastarg4fac024c4cf80f689": [
+      "LLVMBackend_WinRT.cpp:1889"
+    ],
+    "cannotassignarg0tocl...thanexplicitcastarg3b001825100666242": [
+      "LLVMBackend_WinRT.cpp:1904"
+    ],
+    "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": [
+      "LLVMBackend_Interfaces.cpp:1558"
+    ],
+    "cannotconverttointer...0noclassimplementsit1e8c0aedb2889c6b": [
+      "LLVMBackend_Interfaces.cpp:1766"
+    ],
+    "cannotconverttointer...g2declaredinsidearg380f17f1b4261ff04": [
+      "LLVMBackend_Interfaces.cpp:1752"
+    ],
+    "cannotconverttointer...snottakeninthisbuild2453b841846c740d": [
+      "LLVMBackend_Interfaces.cpp:1739"
+    ],
+    "cannotconverttointer...thernestedinsidearg3506794770e818c8b": [
+      "LLVMBackend_Interfaces.cpp:1744"
+    ],
+    "cannotconverttointer...thernestedinsidearg46fae2dfad80b2d3d": [
+      "LLVMBackend_Interfaces.cpp:1758"
+    ],
+    "cannotcopyarg0itsfie...ipinsteadofcopyingit932eb09febf31c17": [
+      "LLVMBackend_Overloads.cpp:667"
+    ],
+    "cannotlocatecflatbui...timedirectoryisunsetd6eb6b14f48bb579": [
+      "LLVMBackend_CInterop.cpp:393"
+    ],
+    "cannotlocatecrashhan...timedirectoryisunsetef91181cafe6b040": [
+      "LLVMBackend_CInterop.cpp:323"
+    ],
+    "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
+      "LLVMBackend_WinRT.cpp:1653"
+    ],
+    "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": [
+      "LLVMBackend_Overloads.cpp:1009"
+    ],
+    "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": [
+      "LLVMBackend_Overloads.cpp:1022"
+    ],
+    "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": [
+      "LLVMBackend_Interfaces.cpp:1202"
+    ],
+    "cannotpassarg0toarg1...thanexplicitcastarg44f72ac88eeb8cb84": [
+      "LLVMBackend_WinRT.cpp:1874"
+    ],
+    "cannotpassarg0toclos...hexpectsarg2arg3arg40481ee737758a21b": [
+      "LLVMBackend_Overloads.cpp:595"
+    ],
+    "cannotpassarg0toclos...plytheshapeitexpects1c8eceeed89b1ffd": [
+      "LLVMBackend_Overloads.cpp:603"
+    ],
+    "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": [
+      "LLVMBackend_Overloads.cpp:1117"
+    ],
+    "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:420"
+    ],
+    "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": [
+      "LLVMBackend_Overloads.cpp:1304"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
+      "LLVMBackend_WinRT.cpp:1953"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": [
+      "LLVMBackend_WinRT.cpp:1946"
+    ],
+    "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": [
+      "LLVMBackend_WinRT.cpp:1961"
+    ],
+    "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": [
+      "LLVMBackend_WinRT.cpp:1851"
+    ],
+    "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": [
+      "LLVMBackend_WinRT.cpp:1859"
+    ],
+    "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": [
+      "LLVMBackend_CInterop.cpp:865"
+    ],
+    "checkparameterlistmissingtypeorclosing": [
+      "CFlatErrorListener.h:135"
+    ],
+    "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": [
+      "CFlatErrorListener.h:154"
+    ],
+    "clangclexenotfoundca...ompilecflatbuiltinscb4e744afbeaed5bb": [
+      "LLVMBackend_CInterop.cpp:408"
+    ],
+    "clangclexenotfoundca...otcompilecsourcearg0a024a70aad3d9a4c": [
+      "LLVMBackend_CInterop.cpp:243"
+    ],
+    "clangclexenotfoundca...tcompilecrashhandler9af9927d8e1fc5d9": [
+      "LLVMBackend_CInterop.cpp:338"
+    ],
+    "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
+      "LLVMBackend_Interfaces.cpp:830"
+    ],
+    "classarg0doesnotimplementarg1arg2": [
+      "LLVMBackend_WinRT.cpp:2746"
+    ],
+    "classarg0fieldarg1ha...arg3declaresitasarg48a734db922a905ed": [
+      "LLVMBackend_Interfaces.cpp:838"
+    ],
+    "classarg0fieldarg1is...10frominterfacearg115f0bea281623e0f5": [
+      "LLVMBackend_Interfaces.cpp:859"
+    ],
+    "classarg0fieldarg1is...oparg9fromclassarg1031a6c739ed8c752e": [
+      "LLVMBackend_Interfaces.cpp:850"
+    ],
+    "classarg0methodarg1p...arg9oninterfacearg10ec4b10b44959142b": [
+      "LLVMBackend_Interfaces.cpp:918"
+    ],
+    "classarg0methodarg1p...g9frominterfacearg109b5bbab5ec4e2cc0": [
+      "LLVMBackend_Interfaces.cpp:909"
+    ],
+    "classarg0methodarg1p...twodeclarationsagreeb2b3fc055988d232": [
+      "LLVMBackend_Interfaces.cpp:930"
+    ],
+    "classarg0methodarg1p...twodeclarationsagreec4f2b930e72f8da1": [
+      "LLVMBackend_Interfaces.cpp:940"
+    ],
+    "classarg0methodarg1t...narg8oninterfacearg9186992c085ab2c1b": [
+      "LLVMBackend_Interfaces.cpp:987"
+    ],
+    "classarg0methodarg1t...narg8oninterfacearg9c14b5c6a79fc450b": [
+      "LLVMBackend_Interfaces.cpp:967"
+    ],
+    "classarg0methodarg1t...rg8frominterfacearg96e84ec7e43b58386": [
+      "LLVMBackend_Interfaces.cpp:959"
+    ],
+    "classarg0methodarg1t...rg8frominterfacearg9a2c5150ebb3cca45": [
+      "LLVMBackend_Interfaces.cpp:978"
+    ],
+    "classarg0methodarg1t...twodeclarationsagree1cbfbd8143256040": [
+      "LLVMBackend_Interfaces.cpp:998"
+    ],
+    "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:635"
+    ],
+    "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:1057"
+    ],
+    "crashhandlersourcenotfoundarg0": [
+      "LLVMBackend_CInterop.cpp:331"
+    ],
+    "duplicatenamedargumentarg0": [
+      "LLVMBackend_Overloads.cpp:451"
+    ],
+    "emitwinmdnowinrtinte...orclassesfoundtoemit3093b6c411af1dd1": [
+      "LLVMBackend_WinRT.cpp:1294"
+    ],
+    "emitwinrtslotcallbadslotarg0onarg1": [
+      "LLVMBackend_WinRT.cpp:247"
+    ],
+    "emitwinrtthinslotcal...abuiltwinrtinterface0ca118b6d5089a98": [
+      "LLVMBackend_WinRT.cpp:676"
+    ],
+    "emitwinrtthinslotcallnoslotarg0onarg1": [
+      "LLVMBackend_WinRT.cpp:689"
+    ],
+    "endoffile": [
+      "CFlatErrorStrategy.h:91",
+      "CFlatErrorStrategy.h:93"
+    ],
+    "extraneousinputarg0expectingarg1": [
+      "CFlatErrorStrategy.h:42"
+    ],
+    "failedtodeploypriarg0toarg1arg2": [
+      "LLVMBackend_EmitAndLink.cpp:1919"
+    ],
+    "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": [
+      "LLVMBackend_EmitAndLink.cpp:1914"
+    ],
+    "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": [
+      "LLVMBackend_Overloads.cpp:1203"
+    ],
+    "functionarg0isneverused": [
+      "LspServer.cpp:1942"
+    ],
+    "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": [
+      "LLVMBackend_Interfaces.cpp:1072"
+    ],
+    "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": [
+      "LLVMBackend_Interfaces.cpp:1051"
+    ],
+    "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": [
+      "LLVMBackend_Interfaces.cpp:1139"
+    ],
+    "getorcreatevtableunknowninterfacearg0": [
+      "LLVMBackend_Interfaces.cpp:1116"
+    ],
+    "gettypealignbytesnulltypepointer": [
+      "LLVMBackend_WinRT.cpp:2595"
+    ],
+    "gettypesizebytesnulltypepointer": [
+      "LLVMBackend_WinRT.cpp:2583"
+    ],
+    "heapauditheapauditen...cannotinstrumentmainfc56369fd43948ec": [
+      "LLVMBackend_EmitAndLink.cpp:1492"
+    ],
+    "hintarg0": [
+      "LLVMBackend.cpp:1335",
+      "LLVMBackend.cpp:1354"
+    ],
+    "implicitinttoboolcon...akenarrowingexplicite9917fc29c162ecc": [
+      "LLVMBackend_MoveDataflow.cpp:1342"
+    ],
+    "importframeworkarg0i...edwhentargetingmacos87b3cf4f78248b14": [
+      "LLVMBackend_EmitAndLink.cpp:746"
+    ],
+    "importpackagenugetar...ainonlyhhpphhheaders72f905a6637813d5": [
+      "LLVMBackend_StateAndImports.cpp:1565"
+    ],
+    "importpackagenugetar...ifconstwindowsimport789d452e554d7842": [
+      "LLVMBackend_StateAndImports.cpp:1701"
+    ],
+    "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
+      "LLVMBackend_StateAndImports.cpp:1557"
+    ],
+    "importpackagenugetar...metadataaresupported3370cb2239fb3868": [
+      "LLVMBackend_StateAndImports.cpp:1732"
+    ],
+    "importpackagenugetco...ybedeployedperoutputa7f56436a9b7721b": [
+      "LLVMBackend_StateAndImports.cpp:1518"
+    ],
+    "importpackagenugethe...helayoutisunexpected4c1e71153de5c0d4": [
+      "LLVMBackend_StateAndImports.cpp:1688"
+    ],
+    "importpackagenugethe...inapackagenugetgroup9f9f2fa9ca53a44d": [
+      "LLVMBackend_StateAndImports.cpp:1648"
+    ],
+    "importpackagenugetme...nmddirsofpackagearg1c11a3139d60ff884": [
+      "LLVMBackend_StateAndImports.cpp:1726"
+    ],
+    "importpackagenugetpr...ecursivesearchofarg34ee84adfe70135be": [
+      "LLVMBackend_StateAndImports.cpp:1508"
+    ],
+    "importpackagevcpkghe...einstallisincomplete15726db706d2e602": [
+      "LLVMBackend_StateAndImports.cpp:1405"
+    ],
+    "importpackagevcpkgpo...ltoletcflatinstallitab4c62772d38fab4": [
+      "LLVMBackend_StateAndImports.cpp:1398"
+    ],
+    "importstatementsrequireatrailing": [
+      "CFlatErrorListener.h:148"
+    ],
+    "interfacearg0collide...facecannotshareanamedce86607c550ad90": [
+      "LLVMBackend_Interfaces.cpp:121"
+    ],
+    "interfacearg0hasnomethodarg1": [
+      "LLVMBackend_WinRT.cpp:2263"
+    ],
+    "mismatchedinputarg0expectingarg1": [
+      "CFlatErrorStrategy.h:28"
+    ],
+    "missingarg0atarg1": [
+      "CFlatErrorStrategy.h:56"
+    ],
+    "missingatendofstatement": [
+      "CFlatErrorListener.h:132"
+    ],
+    "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
+      "LLVMBackend_Overloads.cpp:449"
+    ],
+    "noccompilerdrivercla...otcompilecsourcearg076e7e322a4cb5cfa": [
+      "LLVMBackend_CInterop.cpp:167"
+    ],
+    "nomethodofarg0arg1ma...hegivenargumentsarg2a415477190242074": [
+      "LLVMBackend_WinRT.cpp:2180"
+    ],
+    "nooverloadofinterfac...rgumentsexpectedarg3d19ec88ba7eb04a1": [
+      "LLVMBackend_WinRT.cpp:2288"
+    ],
+    "noviablealternativeatinputarg0": [
+      "CFlatErrorStrategy.h:78"
+    ],
+    "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
+      "LLVMBackend_Overloads.cpp:1337"
+    ],
+    "programdefinitionsrequireatrailing": [
+      "CFlatErrorListener.h:151"
+    ],
+    "redefinitionofarg0th...areoneoverloadnottwod3edf872df7d2d1d": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:1233"
+    ],
+    "reflectfailedtocreatefunctionforarg0": [
+      "LLVMBackend_WinRT.cpp:2820"
+    ],
+    "reflectfailedtoretrievevisitoralloca": [
+      "LLVMBackend_WinRT.cpp:2840"
+    ],
+    "reflectisnotsupportedonuniontypearg0": [
+      "LLVMBackend_WinRT.cpp:2791"
+    ],
+    "reflectstructarg0hasnollvmtype": [
+      "LLVMBackend_WinRT.cpp:2786"
+    ],
+    "reflectunknownstructarg0": [
+      "LLVMBackend_WinRT.cpp:2780"
+    ],
+    "runcflatinitforthefi...imetofinishsettingup781292498c2143fa": [
+      "LLVMBackend_EmitAndLink.cpp:1279"
+    ],
+    "simdelementtypemustb...rarg4foramaskgotarg580538da9e2d1ea22": [
+      "LLVMBackend_Lookup.cpp:312"
+    ],
+    "structclassdefinitionsrequireatrailing": [
+      "CFlatErrorListener.h:145"
+    ],
+    "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": [
+      "CFlatErrorListener.h:110"
+    ],
+    "switchexpressionmustbeanintegertype": [
+      "LLVMBackend_ControlFlowAndFunctions.cpp:596"
+    ],
+    "unclosedcheckforamissingclosingbrace": [
+      "CFlatErrorListener.h:140"
+    ],
+    "unexpectedcharacterarg0": [
+      "CFlatErrorListener.h:51"
+    ],
+    "unknownfunctionarg0": [
+      "LLVMBackend_Overloads.cpp:719"
+    ],
+    "unknowngenericfunctionarg0": [
+      "LLVMBackend_Overloads.cpp:721"
+    ],
+    "unknowninterfacearg0": [
+      "LLVMBackend_WinRT.cpp:2400"
+    ],
+    "unknowninterfacearg0arg1": [
+      "LLVMBackend_WinRT.cpp:2693"
+    ],
+    "unknownoperationarg0": [
+      "LLVMBackend_EmitAndLink.cpp:1956"
+    ],
+    "unknownparentinterfacearg0": [
+      "LLVMBackend_Interfaces.cpp:146"
+    ],
+    "unknowntypearg0": [
+      "LLVMBackend_Lookup.cpp:291"
+    ],
+    "unusedimportarg0": [
+      "LspServer.cpp:2029"
+    ],
+    "windowssdkvisualstud...ationbutwerenotfound94074d79622a7b60": [
+      "LLVMBackend_EmitAndLink.cpp:1281"
+    ],
+    "winrtarg0arg1returns...unkdoesnotsupportyet6980a2c1fe3cfc1f": [
+      "LLVMBackend_WinRT.cpp:455"
+    ],
+    "winrtarg0arg1sugarne...tantiatedimportcomcb9be3328c7b2b468d": [
+      "LLVMBackend_WinRT.cpp:265"
+    ],
+    "winrtclassarg0doesnotimplementarg1arg2": [
+      "LLVMBackend_WinRT.cpp:441"
+    ],
+    "winrtdelegatearg0exp...typeargumentsgotarg225f1481dcd182eed": [
+      "LLVMBackend_WinRT.cpp:998"
+    ],
+    "winrtdelegatearg0has...oidreturninghandlers9964ae377587538b": [
+      "LLVMBackend_WinRT.cpp:1004"
+    ],
+    "winrtdelegatearg0isn...ewinmdthatdeclaresit24f3bb6689d9aae5": [
+      "LLVMBackend_WinRT.cpp:992"
+    ],
+    "winrtdelegatedelegat...g0hasnoiidinmetadata9ddc8cff04a9b2fe": [
+      "LLVMBackend_WinRT.cpp:1029"
+    ],
+    "winrtdelegateoperato...ortacorelibraryfirsta2491578d800681c": [
+      "LLVMBackend_WinRT.cpp:1051"
+    ]
   }
 }

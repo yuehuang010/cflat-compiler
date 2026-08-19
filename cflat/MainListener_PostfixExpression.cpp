@@ -5294,6 +5294,8 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
                 antlr4::CommonTokenStream exprTokens(&exprLexer);
                 CFlatParser exprParser(&exprTokens);
                 exprParser.removeErrorListeners(); // we emit our own targeted diagnostic
+                auto localizeMessage = compilerLLVM->MakeDiagnosticLocalizer();
+                exprParser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
                 auto* exprCtx = exprParser.assignmentExpression();
 
                 // The braces must enclose exactly one complete expression. Leftover tokens

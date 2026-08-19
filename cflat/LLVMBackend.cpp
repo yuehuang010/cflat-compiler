@@ -1332,7 +1332,7 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
         {
             std::string msg = d.message;
             if (!d.hint.empty())
-                msg += "\nhint: " + d.hint;
+                msg += "\n" + LocalizeMessage("hint: {}", {d.hint});
             diagnosticSink_(d.file, static_cast<size_t>(d.line), static_cast<size_t>(d.col), msg, 1);
             // No throw - parse errors are pre-codegen; caller returns false.
         }
@@ -1351,7 +1351,7 @@ void LLVMBackend::ReportParseErrors(const std::vector<ParseDiagnostic>& diagnost
             }
 
             if (!d.hint.empty())
-                std::cout << std::format("hint: {}\n", d.hint);
+                std::cout << LocalizeMessage("hint: {}", {d.hint}) << "\n";
         }
     }
 }
@@ -1378,11 +1378,13 @@ bool LLVMBackend::CheckGrammar(const std::string& filename)
     antlr4::CommonTokenStream tokens(&lexer);
     CFlatParser parser(&tokens);
 
-    CFlatErrorListener errorListener(filename, sourceLines);
+    auto localizeMessage = MakeDiagnosticLocalizer();
+    CFlatErrorListener errorListener(filename, sourceLines, localizeMessage);
     lexer.removeErrorListeners();
     lexer.addErrorListener(&errorListener);
     parser.removeErrorListeners();
     parser.addErrorListener(&errorListener);
+    parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
     tokens.fill();
     auto* compilationUnit = parser.compilationUnit();
@@ -1696,11 +1698,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         antlr4::CommonTokenStream tokens(&lexer);
         CFlatParser parser(&tokens);
 
-        CFlatErrorListener errorListener(filename, sourceLines);
+        auto localizeMessage = MakeDiagnosticLocalizer();
+        CFlatErrorListener errorListener(filename, sourceLines, localizeMessage);
         lexer.removeErrorListeners();
         lexer.addErrorListener(&errorListener);
         parser.removeErrorListeners();
         parser.addErrorListener(&errorListener);
+        parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
         CFlatParser::CompilationUnitContext* computeUnit;
         {
@@ -2262,11 +2266,13 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     entry->tokens = std::make_unique<antlr4::CommonTokenStream>(entry->lexer.get());
     entry->parser = std::make_unique<CFlatParser>(entry->tokens.get());
 
-    CFlatErrorListener errorListener(canonicalPath, sourceLines);
+    auto localizeMessage = MakeDiagnosticLocalizer();
+    CFlatErrorListener errorListener(canonicalPath, sourceLines, localizeMessage);
     entry->lexer->removeErrorListeners();
     entry->lexer->addErrorListener(&errorListener);
     entry->parser->removeErrorListeners();
     entry->parser->addErrorListener(&errorListener);
+    entry->parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
     {
         llvm::TimeTraceScope parseScope("Parse", displayName);
@@ -2948,6 +2954,8 @@ void LLVMBackend::ProcessPendingMacroSources()
         // diagnostics for that would be confusing - drop the batch and log under -v.
         state.lexer->removeErrorListeners();
         state.parser->removeErrorListeners();
+        auto localizeMessage = MakeDiagnosticLocalizer();
+        state.parser->setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
         try { state.tokens->fill(); } catch (...) {
             if (verbose) std::cout << std::format("[verbose]   lex failed for {}, dropping batch\n", state.label);
@@ -3603,11 +3611,14 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         CFlatParser parser(&tokens);
 
         // Use the display name (real document) for parse diagnostics, not the temp copy.
-        CFlatErrorListener analyzeErrorListener(sourceFileName, analyzeSourceLines);
+        auto localizeMessage = MakeDiagnosticLocalizer();
+        CFlatErrorListener analyzeErrorListener(sourceFileName, analyzeSourceLines,
+                                                localizeMessage);
         lexer.removeErrorListeners();
         lexer.addErrorListener(&analyzeErrorListener);
         parser.removeErrorListeners();
         parser.addErrorListener(&analyzeErrorListener);
+        parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
         tokens.fill();
 

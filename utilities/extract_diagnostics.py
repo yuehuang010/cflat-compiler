@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Static inventory of localizable compiler diagnostics.
 
-Scans the C++ sources for LogErrorMessage() call sites and writes the complete
+Scans the C++ sources for localizable diagnostic call sites and writes the complete
 set of English templates, their argument expressions, and their source
 locations directly into cflat/locales/en-pseudo.json. This is the
 completeness half of the localization pipeline: the runtime
@@ -38,7 +38,7 @@ import os
 import re
 import sys
 
-CALL_NAME = "LogErrorMessage"
+CALL_NAMES = ("LogErrorMessage", "LocalizeMessage", "localizeMessage_")
 LEGACY_NAME = "LogError"
 
 # (state machine) Walk C++ text once, yielding only positions that are real
@@ -261,61 +261,65 @@ def scan_file(path, problems):
     name = os.path.basename(path)
     entries = []
 
-    for start in find_call_starts(text, code_positions, CALL_NAME):
-        paren = next_code_char(text, start + len(CALL_NAME), code_set)
-        if paren < 0 or text[paren] != '(':
-            continue
-        argument_text = extract_call_arguments(text, paren)
-        if argument_text is None:
-            problems.append("%s:%d: unbalanced argument list" % (name, line_of(text, start)))
-            continue
-        if looks_like_declaration(prev_code_token(text, start), argument_text):
-            continue
+    for call_name in CALL_NAMES:
+        for start in find_call_starts(text, code_positions, call_name):
+            paren = next_code_char(text, start + len(call_name), code_set)
+            if paren < 0 or text[paren] != '(':
+                continue
+            argument_text = extract_call_arguments(text, paren)
+            if argument_text is None:
+                problems.append("%s:%d: unbalanced argument list" % (name, line_of(text, start)))
+                continue
+            if (call_name == "LocalizeMessage"
+                    and ' '.join(argument_text.split()) == "std::move(t), std::move(a)"):
+                continue
+            if looks_like_declaration(prev_code_token(text, start), argument_text):
+                continue
 
-        site = "%s:%d" % (name, line_of(text, start))
-        parts = split_top_level(argument_text)
-        if not parts:
-            problems.append("%s: empty argument list" % site)
-            continue
+            site = "%s:%d" % (name, line_of(text, start))
+            parts = split_top_level(argument_text)
+            if not parts:
+                problems.append("%s: empty argument list" % site)
+                continue
 
-        template = parse_string_literal_sequence(parts[0])
-        if template is None:
-            problems.append("%s: template is not a string literal: %s"
-                            % (site, ' '.join(parts[0].split())[:80]))
-            continue
+            template = parse_string_literal_sequence(parts[0])
+            if template is None:
+                problems.append("%s: template is not a string literal: %s"
+                                % (site, ' '.join(parts[0].split())[:80]))
+                continue
 
-        arg_names = []
-        known_values = {}
-        if len(parts) > 1:
-            arg_expression = parts[1].strip()
-            if arg_expression.startswith('{') and arg_expression.endswith('}'):
-                for index, item in enumerate(split_top_level(arg_expression[1:-1])):
-                    if not item:
-                        continue
-                    literal = parse_string_literal_sequence(item)
-                    if literal is not None:
-                        # A literal argument is its own example value.
-                        arg_names.append(literal)
-                        known_values[str(index)] = literal
-                    else:
-                        arg_names.append(' '.join(item.split()))
-            elif arg_expression:
-                arg_names = None
-                problems.append("%s: argument list is not a brace-init list: %s"
-                                % (site, ' '.join(arg_expression.split())[:80]))
+            arg_names = []
+            known_values = {}
+            if len(parts) > 1:
+                arg_expression = parts[1].strip()
+                if arg_expression.startswith('{') and arg_expression.endswith('}'):
+                    for index, item in enumerate(split_top_level(arg_expression[1:-1])):
+                        if not item:
+                            continue
+                        literal = parse_string_literal_sequence(item)
+                        if literal is not None:
+                            # A literal argument is its own example value.
+                            arg_names.append(literal)
+                            known_values[str(index)] = literal
+                        else:
+                            arg_names.append(' '.join(item.split()))
+                elif arg_expression:
+                    arg_names = None
+                    problems.append("%s: argument list is not a brace-init list: %s"
+                                    % (site, ' '.join(arg_expression.split())[:80]))
 
-        placeholders = count_placeholders(template)
-        if arg_names is not None and placeholders != len(arg_names):
-            problems.append("%s: %d placeholders but %d arguments"
-                            % (site, placeholders, len(arg_names)))
+            placeholders = count_placeholders(template)
+            if arg_names is not None and placeholders != len(arg_names):
+                problems.append("%s: %d placeholders but %d arguments"
+                                % (site, placeholders, len(arg_names)))
 
-        entries.append({
-            "template": template,
-            "argNames": arg_names if arg_names is not None else [],
-            "knownValues": known_values,
-            "site": site,
-            "placeholders": placeholders,
-        })
+            entries.append({
+                "template": template,
+                "argNames": arg_names if arg_names is not None else [],
+                "knownValues": known_values,
+                "site": site,
+                "placeholders": placeholders,
+            })
 
     legacy = []
     for start in find_call_starts(text, code_positions, LEGACY_NAME):
