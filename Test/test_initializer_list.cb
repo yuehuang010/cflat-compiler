@@ -162,6 +162,37 @@ struct FadClo    { Lambda<int(int)> f = fadAddOne; };            // PRE: the zer
 FadS[2] fadGlobal = default;                       // frozen: a global still skips the ctor
 struct FadHost   { FadS[2] a; int z = 3; };        // field array defaults are constructed per element
 
+// ===== BRACED elements of a fixed array ('T[N] a = { {field = v}, ... }') =====
+// PRE, every element path read `fi->assignmentExpression(0)`, which a BRACED fieldInit
+// (CFlat.g4 fieldInit's '{' initializerList? '}' alternative) does not have: the compiler
+// walked a null context and SIGSEGV'd with no diagnostic, on `T[N]`, `T[N][M]`, the struct
+// FIELD spelling and the global spelling alike. POST the element is constructed and its list
+// goes through EmitFieldInitializer - the same machinery the scalar `T x = {field = v};`
+// spelling uses - so every field-store rule (ownership, string copy, interface rebox,
+// temp-field reject) reaches an array element for free.
+struct NbeP      { int a = 9; int b = 8; };                  // field DEFAULTS must survive a partial list
+struct NbeQ      { NbeP inner = default; };                  // brace nested inside a braced element
+struct NbeHost   { NbeP[2] items = { {a=1,b=2}, {a=3,b=4} }; };   // struct FIELD of array type
+interface NbeI   { int get(); };
+class NbeImpl : NbeI { int v = 0; int get() { return v; } };
+struct NbeW      { NbeI item = default; };                   // interface field: rebox through EmitOneFieldInit
+int nbeDtors = 0;
+struct NbeR      { int v = default; ~NbeR() { nbeDtors = nbeDtors + 1; } };
+struct NbeH      { NbeR r = default; };
+struct NbeStr    { string s = default; };                    // owning element: implicit copy per slot
+
+// Reject cell: the element type has no fields for a brace to name.
+expect_error("is not a struct, so there are no fields to initialize")
+{
+    void nbeScalarElementBrace() { int[2] bad = { {1}, 2 }; printf("%d", bad[0]); }
+}
+// Reject cell: a global element needs a runtime field-initializer, exactly as the scalar
+// global brace spelling does.
+expect_error("at global scope")
+{
+    NbeP[2] nbeGlobalBrace = { {a=1}, {a=2} };
+}
+
 int cNoCtorSum(CNoCtor v) { return v.a + v.b + v.c + v.d; }      // pass by value
 CNoCtor cNoCtorMake()     { CNoCtor t; return t; }               // return by value
 
@@ -765,6 +796,47 @@ extern int main()
                             fadH.a[0].k + fadH.a[1].k, 14);
     total++; passed += Test("frozen: fixed-array FIELD sibling scalar default", fadH.z, 3);
 
+    // ----- BRACED fixed-array elements: all SIGSEGV'd the compiler pre-fix -----
+    NbeP[2] nbeA = { {a=1,b=2}, {a=3,b=4} };
+    total++; passed += Test("braced elements of a fixed array",
+                            nbeA[0].a * 1000 + nbeA[0].b * 100 + nbeA[1].a * 10 + nbeA[1].b, 1234);
+    NbeP[2] nbeB = { {a=1}, {b=2} };
+    total++; passed += Test("braced element keeps the type's own field defaults",
+                            nbeB[0].a * 1000 + nbeB[0].b * 100 + nbeB[1].a * 10 + nbeB[1].b, 1892);
+    NbeP[2] nbeC = { {a=1,b=2} };
+    total++; passed += Test("short braced list zero-fills the tail",
+                            nbeC[1].a + nbeC[1].b, 0);
+    NbeP[2] nbeD = { {}, {} };
+    total++; passed += Test("empty braced elements construct defaults",
+                            nbeD[0].a + nbeD[1].b, 17);
+    NbeP[1] nbeE = { { a = 1 + 2, b = 4 } };
+    total++; passed += Test("braced element takes expressions", nbeE[0].a * 10 + nbeE[0].b, 34);
+    NbeP[2][2] nbeF = { { {a=1}, {a=2} }, { {a=3}, {a=4} } };
+    total++; passed += Test("braced elements at the innermost dimension of 'T[N][M]'",
+                            nbeF[0][0].a * 1000 + nbeF[0][1].a * 100 + nbeF[1][0].a * 10 + nbeF[1][1].a,
+                            1234);
+    NbeQ[1] nbeG = { { inner = { a = 1, b = 2 } } };
+    total++; passed += Test("brace NESTED inside a braced element", nbeG[0].inner.a * 10 + nbeG[0].inner.b, 12);
+    NbeHost nbeH = default;
+    total++; passed += Test("braced elements of a fixed-array FIELD",
+                            nbeH.items[0].a * 10 + nbeH.items[1].b, 14);
+    NbeImpl nbeIm = default; nbeIm.v = 3;
+    NbeW[1] nbeJ = { { item = nbeIm } };
+    total++; passed += Test("interface field of a braced element reboxes", nbeJ[0].item.get(), 3);
+    string nbeS = "abcdefghijklmnop" + "qrstuvwxyz";
+    {
+        NbeStr[2] nbeK = { { s = nbeS }, { s = nbeS } };
+        total++; passed += Test("owning string field copies per braced element",
+                                nbeK[0].s == nbeS && nbeK[1].s == nbeS, true);
+    }
+    total++; passed += Test("source string still readable after braced-element copies", nbeS, "abcdefghijklmnopqrstuvwxyz");
+    nbeDtors = 0;
+    {
+        NbeH[2] nbeL = { { r = { v = 1 } }, { r = { v = 2 } } };
+        total++; passed += Test("dtor-bearing braced elements carry their values",
+                                nbeL[0].r.v * 10 + nbeL[1].r.v, 12);
+    }
+    total++; passed += Test("one destruction per braced element", nbeDtors, 2);
     if (passed == total)
     {
         printf("ALL %d initializer-list tests passed.\n", total);

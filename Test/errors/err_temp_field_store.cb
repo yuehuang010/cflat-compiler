@@ -210,3 +210,15 @@ expect_error("taken from a temporary") {
         takeHolder({ slot = fields.get(0).inner });
     }
 }
+
+// The fixed-array BRACED element is a third field-store lowering: pre-fix it crashed the compiler
+// before any rule could run, and post-fix it routes through the same EmitFieldInitializer the two
+// spellings above use, so the temporary-field reject has to reach an array element too.
+expect_error("taken from a temporary") {
+    void braceArrayElementInit() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder[1] arr = { { slot = fields.get(0).inner } };
+        printf("%s", arr[0].slot.text.data());
+    }
+}

@@ -3426,7 +3426,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     if (arrInitList)
                         for (auto* fi : arrInitList->fieldInit())
                             if (fi->Identifier() == nullptr
-                                && (fi->assignmentExpression().size() == 1 || fi->initializerList() != nullptr))
+                                && (fi->assignmentExpression().size() == 1 || FieldInitIsBraceElement(fi)))
                             { positionalArray = true; break; }
 
                     bool emptyArrInit = (arrInitList == nullptr || arrInitList->fieldInit().empty());

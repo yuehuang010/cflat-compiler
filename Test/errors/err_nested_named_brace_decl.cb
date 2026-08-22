@@ -9,8 +9,13 @@ extern int main()
     expect_error("nested named brace initializer is not supported in container elements") {
         list<NestedNamedBraceCfg> values = { { inner = { count = 3 } } };
     }
+    // The FIXED-ARRAY spelling is no longer here: a braced element now routes through
+    // EmitFieldInitializer (the scalar `T x = {field = v};` machinery), which supports a
+    // nested named brace. Its accept legs live in Test/test_initializer_list.cb. The
+    // array-LEVEL named brace (`arr = { name = {...} }`) names a slot that has no name and
+    // is still rejected.
     expect_error("nested named brace initializer is not supported in positional fixed-array elements") {
-        NestedNamedBraceCfg[1] fixedValues = { { inner = { count = 3 } } };
+        NestedNamedBraceCfg[1] namedSlot = { inner = { count = 3 } , { count = 4 } };
     }
     expect_error("nested named brace initializer is not supported for inferred array-view elements") {
         NestedNamedBraceCfg[] viewValues = { { inner = { count = 3 } } };

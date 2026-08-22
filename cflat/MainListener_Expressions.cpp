@@ -7752,6 +7752,37 @@ bool MainListener::RejectNestedNamedBraceInitializer(
         return rejected;
     }
 
+bool MainListener::FieldInitIsBraceElement(CFlatParser::FieldInitContext* fi) {
+        return fi != nullptr && fi->Identifier() == nullptr && fi->assignmentExpression().empty();
+    }
+
+/*
+ * One fixed-array slot written as a brace (`T[N] a = { {f = v}, ... }`). The slot is CONSTRUCTED
+ * the way the scalar spelling constructs a local - default constructor if the type has one, else
+ * zeroed - so the element type's own field defaults survive a partial list; the list itself then
+ * goes through EmitFieldInitializer, which is the single place every field-store rule lives.
+ */
+void MainListener::EmitBraceElementIntoFixedSlot(
+        llvm::Value* elemPtr,
+        llvm::StructType* elemStructTy,
+        const std::string& elemTypeName,
+        CFlatParser::FieldInitContext* fi) {
+        auto* compiler = Compiler(fi);
+        // forceRoot: the GetFunction guard is an exact-key lookup, so a namespace walk here
+        // would call a same-named sibling type's constructor.
+        llvm::Value* seed = compiler->GetFunction(elemTypeName)
+            ? compiler->CreateOverloadedFunctionCall(elemTypeName, {}, true)
+            : nullptr;
+        if (seed != nullptr && seed->getType() == elemStructTy)
+            compiler->CreateAssignment(seed, elemPtr);
+        else
+            compiler->builder->CreateStore(llvm::Constant::getNullValue(elemStructTy), elemPtr);
+
+        auto* list = fi->initializerList();
+        if (list != nullptr && !list->fieldInit().empty())
+            EmitFieldInitializer(elemPtr, elemTypeName, list);
+    }
+
 /*
  * Build the value of a field whose default is a brace list. Mirrors the local declarator:
  * seed the slot with the field type's OWN default (so its scalar field defaults survive a
@@ -7824,7 +7855,7 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
         bool positional = false;
         for (auto* fi : list->fieldInit())
             if (fi->Identifier() == nullptr
-                && (fi->assignmentExpression().size() == 1 || fi->initializerList() != nullptr))
+                && (fi->assignmentExpression().size() == 1 || FieldInitIsBraceElement(fi)))
             { positional = true; break; }
         bool emptyList = list->fieldInit().empty();
 
@@ -8196,10 +8227,25 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         CFlatParser::InitializerListContext* initList,
         llvm::Value* arrAlloc) {
         auto* compiler = Compiler(initList);
-        if (RejectNestedNamedBraceInitializer(initList,
-                "nested named brace initializer is not supported in positional fixed-array elements")) return;
+        // `arr = { name = {...} }` names an ARRAY slot, which has no name. A brace element one
+        // level down is a struct element and is routed to EmitFieldInitializer below, so this
+        // check stays at the array level instead of recursing.
+        bool rejectedNamedBrace = false;
+        for (auto* fi : initList->fieldInit())
+            if (fi->Identifier() != nullptr && fi->initializerList() != nullptr)
+            {
+                LogErrorContext(fi,
+                    "nested named brace initializer is not supported in positional fixed-array elements");
+                rejectedNamedBrace = true;
+            }
+        if (rejectedNamedBrace) return;
         auto elements = initList->fieldInit();
         bool multidim = !tv.ConstInnerDimensions.empty();
+        // A STRUCT element type is the only one a braced element can construct.
+        auto* elemStructTy = (FixedArrayElementStars(tv) == 0 && !tv.IsArrayView
+                              && !compiler->IsInterfaceType(tv.TypeName))
+            ? compiler->GetDataStructure(tv.TypeName).StructType
+            : nullptr;
         uint64_t n = tv.ConstArraySize;
         for (uint64_t d : tv.ConstInnerDimensions) n *= d;
 
@@ -8277,7 +8323,10 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                         }
                         else
                         {
-                            if (fi->initializerList() != nullptr)
+                            // At the innermost dimension a brace IS the element for a struct
+                            // element type ('P[2][2] a = { { {x=1}, ... } }'); for any other
+                            // element type there is nothing a brace could construct.
+                            if (fi->initializerList() != nullptr && elemStructTy == nullptr)
                                 LogErrorContext(fi, "too many nested braces for fixed-array element");
                             flattened.push_back(fi);
                         }
@@ -8317,6 +8366,27 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
         for (size_t i = 0; i < elements.size(); i++)
         {
             auto* fi = elements[i];
+            // A BRACED element carries no assignmentExpression at all (CFlat.g4 fieldInit's
+            // '{' initializerList? '}' alternative), so it must be split off before the
+            // expression read - that read is what walked a null context and crashed.
+            if (FieldInitIsBraceElement(fi))
+            {
+                if (elemStructTy == nullptr)
+                {
+                    LogErrorContext(fi, std::format(
+                        "a brace initializer is not allowed for element {} of '{}': element type "
+                        "'{}' is not a struct, so there are no fields to initialize",
+                        i, name,
+                        tv.TypeName + std::string(FixedArrayElementStars(tv), '*')));
+                    continue;
+                }
+                llvm::Value* braceIdx = compiler->builder->getInt32((uint32_t)i);
+                auto* braceElemPtr = multidim
+                    ? elementPtrs[i]
+                    : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, braceIdx }, "arrelem");
+                EmitBraceElementIntoFixedSlot(braceElemPtr, elemStructTy, tv.TypeName, fi);
+                continue;
+            }
             auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
             llvm::Value* val = LoadNamedVariable(nv);
             if (!val) continue;
@@ -8666,9 +8736,19 @@ void MainListener::EmitGlobalFixedArrayInit(
             // loop would leave the insert point in `tmpFn` and skip the restore below.
             CFlatParser::FieldInitContext* codeValueElem = nullptr;
             size_t codeValueIndex = 0;
+            // A braced element ('{field = v}') needs a runtime field-initializer, which a global
+            // cannot have - the scalar spelling 'P g = {a = 1};' is rejected at global scope for
+            // the same reason. RECORDED, not raised: the builder is redirected into tmpFn here.
+            CFlatParser::FieldInitContext* braceElem = nullptr;
             for (size_t i = 0; i < elements.size(); i++)
             {
                 auto* fi = elements[i];
+                if (FieldInitIsBraceElement(fi))
+                {
+                    braceElem = fi;
+                    ok = false;
+                    break;
+                }
                 auto nv = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));
                 llvm::Value* val = LoadNamedVariable(nv);
                 if (codeValueElem == nullptr
@@ -8710,6 +8790,12 @@ void MainListener::EmitGlobalFixedArrayInit(
             tmpFn->eraseFromParent();
             savedState.restore();
 
+            if (braceElem != nullptr)
+                LogErrorContext(braceElem, std::format(
+                    "field initializers ('{{field = value}}') are not supported for elements of the "
+                    "global array '{}' of type '{}' at global scope; assign the elements at startup, "
+                    "or declare the array as a local",
+                    name, tv.TypeName));
             if (codeValueElem != nullptr)
                 LogErrorContext(codeValueElem, compiler->DescribeCodeValueIntoData(
                     CodeValueDestSpelling(globalElemTV), "brace-initialize",

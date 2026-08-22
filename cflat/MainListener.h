@@ -4498,6 +4498,20 @@ public:
         CFlatParser::InitializerListContext* list,
         const std::string& message);
 
+    // A `fieldInit` written as a brace (`{...}` / `{}`) rather than an expression: the grammar
+    // alternative that carries NO assignmentExpression, so every element path must screen for it
+    // before reading assignmentExpression(0).
+    static bool FieldInitIsBraceElement(CFlatParser::FieldInitContext* fi);
+
+    // Construct one fixed-array slot from a braced element and route it through the same
+    // field-initializer machinery the scalar `T x = {field = v};` spelling uses, so every
+    // field-store rule (ownership, string copy, interface rebox, temp-field reject) applies.
+    void EmitBraceElementIntoFixedSlot(
+        llvm::Value* elemPtr,
+        llvm::StructType* elemStructTy,
+        const std::string& elemTypeName,
+        CFlatParser::FieldInitContext* fi);
+
     // Coerce a parsed element value to the container's `string` element type.
     // Mirrors EmitFieldInitializer's string handling: a char* string-literal constant is
     // wrapped directly; any other char* runtime value goes through operator string(char*).
