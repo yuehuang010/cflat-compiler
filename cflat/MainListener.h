@@ -3909,7 +3909,8 @@ public:
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
-                              size_t trueOccurrence, size_t falseOccurrence);
+                              size_t trueOccurrence, size_t falseOccurrence,
+                              bool trueIsUnsigned = false, bool falseIsUnsigned = false);
 
     /*
      * Make one '?:' arm's string value an INDEPENDENT owned buffer inside the arm's own block.
@@ -4877,6 +4878,10 @@ public:
     std::string ProcessRawText(const std::string& rawText, bool foldBraces = false);
 
     llvm::Value* ParseExpression(CFlatParser::ExpressionContext* ctx);
+
+    // A '?:' arm parsed for its value, keeping the arm's signedness for the join (see the
+    // definition; the fallback is plain ParseExpression).
+    llvm::Value* ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx, bool& isUnsigned);
 
     // A discarded statement result (`makePlain(2);`) that is an unclaimed owning-struct rvalue
     // temp is claimed by nothing, so without this it leaks. Spill it and register for destruction

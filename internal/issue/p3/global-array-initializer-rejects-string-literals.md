@@ -1,16 +1,15 @@
-# A global `string[N]` cannot be initialised from string literals
+# Residual: global array-VIEW initializers, and global arrays of ctor-needing element types
 
-Filed 2026-08-21 from an external report (v0.11.0 issue 13 - a static table of ticker symbols).
-Reproduced on `39d4b38`.
+The `string[N]` half of this issue is FIXED (p3 bundle, off `819848e`): a global
+`string[2] g = { "AAPL", "MSFT" };` now folds each literal element into the borrowed
+`{ptr,len}` constant a scalar `string g = "AAPL";` global already used
+(`MainListener_Expressions.cpp`, `EmitGlobalFixedArrayInit`). Covered by
+`Test/test_core.cb` (`global string array element 0/1`).
 
-## Repro
+## What is left
 
-```cflat
-string[2] g_symbols = { "AAPL", "MSFT" };
-```
-```
-global array initializer elements must be compile-time constants
-```
+1. The array-VIEW spelling is still rejected outright:
+
 ```cflat
 string[] g_symbols = { "AAPL", "MSFT" };
 ```
@@ -18,30 +17,18 @@ string[] g_symbols = { "AAPL", "MSFT" };
 array-view initializer '= {}' is not allowed at global scope
 ```
 
-## Narrowing (measured on 39d4b38)
+A view needs backing storage the global has nowhere to put; the fix would be to synthesize a
+hidden fixed array and point the view at it. Not attempted - it is a storage-model decision.
 
-Global array initializers are NOT broken in general - these both compile and run:
+2. A global array whose element type needs a RUNTIME constructor is still rejected, but the
+   message now names the real cause instead of blaming the elements:
 
-```cflat
-int[3] g_ints = { 1, 2, 3 };
-const char* g_names[2] = { "AAPL", "MSFT" };
+```
+a global array of '<T>' can only be initialised from compile-time constants; this element needs
+a runtime constructor - assign it at startup, or use 'const char*[]' for a static table of
+literals
 ```
 
-So the gap is specific to `string`, i.e. an element type that owns a heap buffer. The message is
-also misleading: the elements here ARE compile-time constants (string literals live in the string
-pool); what is not constant is the `string` STRUCT that has to be built around each one, which
-needs a runtime initializer.
-
-## Fix direction
-
-1. **Preferred:** emit a static initializer for globals whose element type needs construction -
-   the same mechanism a global `string g = "AAPL";` already uses, applied per element. Check
-   whether that single-value case works today; if it does, the array case is the same code in a
-   loop and this is small.
-2. Failing that, fix the diagnostic to say what is actually wrong and name the workaround: "a
-   global array of 'string' cannot be initialised at file scope; use `const char*[]` for a static
-   table, or populate a `list<string>` at startup". The current text sends the reader looking for
-   a non-constant element that is not there.
-
-The `const char*[2]` form above is the workaround, and is genuinely fine for a fixed symbol table -
-worth mentioning in the docs alongside whichever fix lands.
+Emitting a real static initializer per element (the "preferred" direction in the original
+filing) is still open, and is the same machinery a global default-constructed struct would
+need.

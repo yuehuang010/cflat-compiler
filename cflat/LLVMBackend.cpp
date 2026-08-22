@@ -1580,6 +1580,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         auto dir = std::filesystem::path(*path).parent_path();
         if (!dir.empty() && !std::filesystem::exists(dir))
         {
+            // Create the LEAF output directory whose parent already exists (`-o out/x.exe` in a
+            // fresh clone); a deeper missing path is still a typo and still reports.
+            std::error_code ec;
+            auto parent = dir.parent_path();
+            if ((parent.empty() || std::filesystem::exists(parent))
+                && std::filesystem::create_directory(dir, ec) && !ec)
+                return true;
             std::cout << std::format("Error: output directory '{}' does not exist ({} {}).\n", dir.string(), flag, *path);
             return false;
         }

@@ -557,7 +557,46 @@ extern int main()
                        softImportIdentifiers(1, 2, 4, 8, 16, 32, 64), 127);
 
 
+    int promoPassed = promotionAndLiteralLegs();
+
     return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
-        && chainPassed == 11 && softPassed == 1) ? 0 : 1;
+        && chainPassed == 11 && softPassed == 1 && promoPassed == 11) ? 0 : 1;
+}
+
+// C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
+// sites (ternary arm, default parameter) that used to sign-extend a u-suffixed literal.
+i64 unsignedDefaultParam(i64 v = 4294967295u) { return v; }
+
+int promotionAndLiteralLegs()
+{
+    int passed = 0;
+    i8 nc = -1;
+    u8 uc = 3;
+    passed += Test("i8 vs u8 compare promotes to signed int", nc < uc, true);
+    passed += Test("i8 divided by u8 promotes to signed int", (int)(nc / uc), 0);
+    i16 ns = -1;
+    u16 us = 3;
+    passed += Test("i16 vs u16 compare promotes to signed int", ns < us, true);
+    passed += Test("i16 divided by u16 promotes to signed int", (int)(ns / us), 0);
+
+    // ACCEPT-SET: promotion must not change the width of a narrow result, the signed
+    // pure-signed case, the logical shift of an unsigned operand, or the 32-bit rule.
+    u8 bigByte = 200;
+    u8 halfByte = 100;
+    passed += Test("u8 addition still wraps in 8 bits", (int)(bigByte + halfByte), 44);
+    passed += Test("u8 multiply still wraps in 8 bits", (int)(bigByte * 2), 144);
+    i8 negByte = -8;
+    i8 twoByte = 2;
+    passed += Test("i8 divided by i8 stays signed", (int)(negByte / twoByte), -4);
+    passed += Test("u8 shifted right stays logical", (int)(bigByte >> 1), 100);
+    i32 negWord = -1;
+    u32 uWord = 3;
+    passed += Test("i32 vs u32 still compares unsigned", negWord < uWord, false);
+
+    i64 ternaryWide = true ? 4294967295u : 1;
+    passed += Test("ternary arm keeps literal unsignedness", ternaryWide == (i64)4294967295, true);
+    passed += Test("default parameter keeps literal unsignedness",
+        unsignedDefaultParam() == (i64)4294967295, true);
+    return passed;
 }

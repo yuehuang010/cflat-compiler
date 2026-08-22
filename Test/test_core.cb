@@ -1107,6 +1107,10 @@ int testHashsetChurn()
 
 // ── string / stringbuilder / string_view ─────────────────────────────────────
 
+// A static table of string literals at file scope: each element folds to a borrowed
+// {ptr,len} constant, the same shape a scalar `string g = "x";` global takes.
+string[2] g_symbolTable = { "AAPL", "MSFT" };
+
 struct StringRow { string name = default; };
 
 struct CPToken { string text = default; };
@@ -1501,6 +1505,23 @@ int testStringView()
     string_view* emptyStringView = emptySource.view();
     passed += Test("view_empty_length", emptyStringView->length(), 0);
     delete emptyStringView;
+
+    // string_view(ptr, len): the (char*, int) chunk a C callback hands over, with no copy.
+    // The literal length argument is typed i8, so this also pins the widening to i32.
+    char* raw = "hello world";
+    string_view chunk = string_view(raw, 5);
+    passed += Test("view_ptr_len_length", chunk.length(), 5);
+    passed += Test("view_ptr_len_get0", chunk.get(0), 'h');
+    passed += Test("view_ptr_len_get4", chunk.get(4), 'o');
+    string_view tailChunk = string_view(raw + 6, 5);
+    string owned = tailChunk.toString();
+    passed += Test("view_ptr_len_toString", owned, "world");
+    passed += Test("view_ptr_len_toString_length", owned.length(), 5);
+    string_view defaulted = default;
+    passed += Test("view_default_still_empty", defaulted.length(), 0);
+
+    passed += Test("global string array element 0", g_symbolTable[0], "AAPL");
+    passed += Test("global string array element 1", g_symbolTable[1], "MSFT");
 
     return passed;
 }
@@ -2686,7 +2707,7 @@ extern int main()
     r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;
     r = testStringBuilder();    passed += r; total += 20;
-    r = testStringView();       passed += r; total += 12;
+    r = testStringView();       passed += r; total += 20;
     r = testStringAPI();        passed += r; total += 116;
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;

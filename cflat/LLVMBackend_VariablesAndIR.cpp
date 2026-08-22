@@ -1899,12 +1899,26 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         if (left->getType()->isVectorTy() || right->getType()->isVectorTy())
             return CreateVectorOperation(op, left, right, leftIsUnsigned, rightIsUnsigned);
 
-        // C integer promotion for compile-time constants only (see PromoteToInt).
-        // Signedness preserved so unsigned narrow constants zero-extend.
-        if (llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right))
+        // C integer promotion: an i8/i16/u8/u16 operand becomes a SIGNED i32 before the usual
+        // arithmetic conversions, so `(i8)-1 < (u8)3` compares signed as C does.
+        unsigned preLeftBits  = left->getType()->isIntegerTy()  ? left->getType()->getIntegerBitWidth()  : 0;
+        unsigned preRightBits = right->getType()->isIntegerTy() ? right->getType()->getIntegerBitWidth() : 0;
+        bool leftNarrow  = (preLeftBits == 8 || preLeftBits == 16);
+        bool rightNarrow = (preRightBits == 8 || preRightBits == 16);
+        bool bothConstant = llvm::isa<llvm::ConstantInt>(left) && llvm::isa<llvm::ConstantInt>(right);
+        // Runtime narrow arithmetic narrows back so the expression keeps its narrow type; a
+        // constant fold keeps the promoted i32 so `1 << 20` does not overflow the literal width.
+        unsigned narrowBits = (!bothConstant && leftNarrow && rightNarrow)
+            ? std::max(preLeftBits, preRightBits) : 0;
+        if (leftNarrow)
         {
-            left  = PromoteToInt(left,  leftIsUnsigned);
+            left = PromoteToInt(left, leftIsUnsigned);
+            leftIsUnsigned = false;
+        }
+        if (rightNarrow)
+        {
             right = PromoteToInt(right, rightIsUnsigned);
+            rightIsUnsigned = false;
         }
 
         // C usual arithmetic conversions pick the result signedness from the operand widths:
@@ -1926,29 +1940,39 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
             return CreateOperation(op, left, right);
 
-        switch (op)
+        auto emitIntegerOp = [&]() -> llvm::Value*
         {
-        case Operation::DivideAssignment:
-        case Operation::Divide:
-            return resultIsUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
-        case Operation::Modulo:
-            return resultIsUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
-        case Operation::Greater:
-            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGT : llvm::ICmpInst::ICMP_SGT, left, right);
-        case Operation::GreaterEqual:
-            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGE : llvm::ICmpInst::ICMP_SGE, left, right);
-        case Operation::Less:
-            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
-        case Operation::LessEqual:
-            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
-        case Operation::ShiftRight:
-        case Operation::RightShiftAssignment:
-            // Shifts are NOT a usual-arithmetic-conversion op: the result type and signedness
-            // come from the LEFT operand alone, so `(i32)-8 >> 1u` stays an arithmetic shift.
-            return leftIsUnsigned ? builder->CreateLShr(left, right) : builder->CreateAShr(left, right);
-        default:
-            return CreateOperation(op, left, right);
-        }
+            switch (op)
+            {
+            case Operation::DivideAssignment:
+            case Operation::Divide:
+                return resultIsUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+            case Operation::Modulo:
+                return resultIsUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
+            case Operation::Greater:
+                return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGT : llvm::ICmpInst::ICMP_SGT, left, right);
+            case Operation::GreaterEqual:
+                return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGE : llvm::ICmpInst::ICMP_SGE, left, right);
+            case Operation::Less:
+                return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
+            case Operation::LessEqual:
+                return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
+            case Operation::ShiftRight:
+            case Operation::RightShiftAssignment:
+                // Shifts are NOT a usual-arithmetic-conversion op: the result type and signedness
+                // come from the LEFT operand alone, so `(i32)-8 >> 1u` stays an arithmetic shift.
+                return leftIsUnsigned ? builder->CreateLShr(left, right) : builder->CreateAShr(left, right);
+            default:
+                return CreateOperation(op, left, right);
+            }
+        };
+
+        llvm::Value* result = emitIntegerOp();
+        // Narrow the promoted result back so a sub-int expression keeps its declared width.
+        if (narrowBits != 0 && result != nullptr && result->getType()->isIntegerTy()
+            && result->getType()->getIntegerBitWidth() > narrowBits)
+            result = builder->CreateTrunc(result, llvm::Type::getIntNTy(*context, narrowBits));
+        return result;
     }
 
 llvm::Value* LLVMBackend::CreateOperation(std::string oper, llvm::Value* left, llvm::Value* right,

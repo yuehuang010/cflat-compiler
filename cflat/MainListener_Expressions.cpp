@@ -3534,11 +3534,38 @@ bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpre
         return true;
     }
 
+// A ternary arm parsed for its VALUE. Same lowering as ParseExpression (which forwards a
+// non-assignment expression straight to ParseConditionalExpression), but it keeps the arm's
+// signedness so the join can zero-extend an unsigned arm instead of sign-extending it.
+llvm::Value* MainListener::ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx,
+                                                     bool& isUnsigned) {
+        auto* assignCtx = ctx->assignmentExpression();
+        if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
+            && assignCtx->conditionalExpression() != nullptr)
+        {
+            auto tv = ParseConditionalExpression(assignCtx->conditionalExpression());
+            isUnsigned = tv.isUnsigned;
+            ProcessPlusPlus();
+            return tv.value;
+        }
+        return ParseExpression(ctx);
+    }
+
+// C usual arithmetic conversions for a '?:' join: the unsigned arm wins only when its width
+// covers the other's, so `cond ? (i64)-1 : 1u` stays signed.
+static bool TernaryJoinIsUnsigned(bool trueUnsigned, unsigned trueBits,
+                                  bool falseUnsigned, unsigned falseBits)
+{
+        if (trueUnsigned == falseUnsigned) return trueUnsigned;
+        return trueUnsigned ? trueBits >= falseBits : falseBits >= trueBits;
+    }
+
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
                               const std::function<void()>& atTrue,
                               const std::function<void()>& atFalse,
-                              size_t trueOccurrence, size_t falseOccurrence) {
+                              size_t trueOccurrence, size_t falseOccurrence,
+                              bool trueIsUnsigned, bool falseIsUnsigned) {
         auto* compiler = Compiler(ctx);
         if (!trueValue || !falseValue || trueValue->getType() == falseValue->getType())
             return true;
@@ -3550,8 +3577,10 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
         {
             unsigned fb = ft->getIntegerBitWidth();
             unsigned tb = tt->getIntegerBitWidth();
-            if (fb < tb) { atFalse(); falseValue = compiler->Upconvert(falseValue, tt); }
-            else         { atTrue();  trueValue  = compiler->Upconvert(trueValue,  ft); }
+            // The widened arm's OWN signedness picks zext vs sext, so a u-suffixed literal
+            // arm does not sign-extend into the wider arm's type.
+            if (fb < tb) { atFalse(); falseValue = compiler->Upconvert(falseValue, tt, falseIsUnsigned); }
+            else         { atTrue();  trueValue  = compiler->Upconvert(trueValue,  ft, trueIsUnsigned); }
         }
         else if (ft->isFloatingPointTy() && tt->isFloatingPointTy())
         {
@@ -3691,6 +3720,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         bool falseAlias = false;
         bool trueTempField = false;
         bool falseTempField = false;
+        bool trueUnsigned = false;
+        bool falseUnsigned = false;
         LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
         LLVMBackend::OwnedTempMark falseMark = trueMark;
         // Give each arm its OWN cast occurrence: both arms share the enclosing argument slot, so
@@ -3704,12 +3735,14 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 trueOcc   = armScope.Id;
                 if (use == ResultUse::Discard)
                 {
-                    trueValue = ParseAssignmentExpressionNamed(
-                        expressionTrueCtx->assignmentExpression(), use).Primary;
+                    auto trueNV = ParseAssignmentExpressionNamed(
+                        expressionTrueCtx->assignmentExpression(), use);
+                    trueValue = trueNV.Primary;
+                    trueUnsigned = trueNV.TypeAndValue.IsUnsignedInteger() != -1;
                     ProcessPlusPlus();
                 }
                 else
-                    trueValue = ParseExpression(expressionTrueCtx);
+                    trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
                 trueAlias = compiler->IsAliasValue(trueValue);
                 trueTempField = compiler->IsTempFieldValue(trueValue);
                 if (use == ResultUse::Discard)
@@ -3724,7 +3757,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 falseOcc   = armScope.Id;
-                falseValue = ParseConditionalExpression(expressionFalseCtx, use);
+                {
+                    auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
+                    falseValue = falseTv.value;
+                    falseUnsigned = falseTv.isUnsigned;
+                }
                 falseAlias = compiler->IsAliasValue(falseValue);
                 falseTempField = compiler->IsTempFieldValue(falseValue);
                 if (use == ResultUse::Discard)
@@ -3799,7 +3836,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (!trueLive && !falseLive) return {};
             llvm::Value* only = trueBr != nullptr ? trueValue : falseValue;
             compiler->PromoteCastOccurrence(only, trueBr != nullptr ? trueOcc : falseOcc);
-            return { only, false };
+            return { only, trueBr != nullptr ? trueUnsigned : falseUnsigned };
         }
 
         if (trueValue == nullptr || falseValue == nullptr)
@@ -3813,7 +3850,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // terminator.
         auto atTrue  = [&]() { compiler->builder->SetInsertPoint(trueEnd); };
         auto atFalse = [&]() { compiler->builder->SetInsertPoint(falseEnd); };
-        if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse, trueOcc, falseOcc))
+        bool joinUnsigned = TernaryJoinIsUnsigned(
+            trueUnsigned,  trueValue->getType()->isIntegerTy()  ? trueValue->getType()->getIntegerBitWidth()  : 0,
+            falseUnsigned, falseValue->getType()->isIntegerTy() ? falseValue->getType()->getIntegerBitWidth() : 0);
+        if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, atTrue, atFalse, trueOcc, falseOcc,
+                trueUnsigned, falseUnsigned))
         {
             atTrue(); compiler->CreateJump(resumeBlock);
             atFalse(); compiler->CreateJump(resumeBlock);
@@ -3920,7 +3961,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
-        LLVMBackend::TypedValue result{ phi, false };
+        LLVMBackend::TypedValue result{ phi, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
         return result;
     }
@@ -4090,17 +4131,25 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // one arm's condition is unsafe here - suppress the same-block moved-null guard.
                 llvm::Value* trueValue  = nullptr;
                 llvm::Value* falseValue = nullptr;
+                bool trueUnsigned = false;
+                bool falseUnsigned = false;
                 {
                     SuppressExplicitNullDerefGuardScope suppressGuard(compiler);
                     if (use == ResultUse::Discard)
                     {
-                        trueValue = ParseAssignmentExpressionNamed(
-                            expressionTrueCtx->assignmentExpression(), use).Primary;
+                        auto trueNV = ParseAssignmentExpressionNamed(
+                            expressionTrueCtx->assignmentExpression(), use);
+                        trueValue = trueNV.Primary;
+                        trueUnsigned = trueNV.TypeAndValue.IsUnsignedInteger() != -1;
                         ProcessPlusPlus();
                     }
                     else
-                        trueValue = ParseExpression(expressionTrueCtx);
-                    falseValue = ParseConditionalExpression(expressionFalseCtx, use);
+                        trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
+                    {
+                        auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
+                        falseValue = falseTv.value;
+                        falseUnsigned = falseTv.isUnsigned;
+                    }
                 }
 
                 // A branch that is a plain (non-`move`) string-returning CALL yields a fresh owned
@@ -4116,8 +4165,14 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 RegisterBorrowedStringOperandTemp(compiler, falseValue);
 
                 auto here = []() {};   // eager form: both arms already live in the current block
+                bool joinUnsigned = TernaryJoinIsUnsigned(
+                    trueUnsigned,  trueValue != nullptr && trueValue->getType()->isIntegerTy()
+                        ? trueValue->getType()->getIntegerBitWidth() : 0,
+                    falseUnsigned, falseValue != nullptr && falseValue->getType()->isIntegerTy()
+                        ? falseValue->getType()->getIntegerBitWidth() : 0);
                 if (!UnifyTernaryArmTypes(ctx, trueValue, falseValue, here, here,
-                        compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence()))
+                        compiler->CurrentCastOccurrence(), compiler->CurrentCastOccurrence(),
+                        trueUnsigned, falseUnsigned))
                     return {};
 
                 // LLVM's select requires an i1 condition; a non-bool CFlat condition
@@ -4151,7 +4206,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     compiler->ClearOwnedResultChannels();
                 compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
-                LLVMBackend::TypedValue result{ selectValue, false };
+                LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
                 return result;
             }
@@ -6996,6 +7051,20 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                             elementTV = typeValue;
                         }
                     }
+                    // `sizeof(a<b,c>d)` parses as a typeName and is then mangled ('a__b__c'),
+                    // so the reader is told about a type they never wrote. Name the spelling.
+                    if (!compiler->IsKnownTypeName(elementTV.TypeName))
+                    {
+                        std::string written = typeNameCtx->getText();
+                        size_t close = written.rfind('>');
+                        if (close != std::string::npos && close + 1 < written.size()
+                            && (std::isalnum(static_cast<unsigned char>(written[close + 1]))
+                                || written[close + 1] == '_'))
+                            LogErrorContext(ctx, std::format(
+                                "'{}' is not a type name; the operand of '{}' is read as a TYPE here, "
+                                "so a comparison or tuple expression is not accepted - bind it to a "
+                                "variable first and measure that", written, isSizeof ? "sizeof" : "alignof"));
+                    }
                     llvmType = compiler->GetType(elementTV, nullptr, true);
                 }
                 if (!llvmType)
@@ -8486,10 +8555,24 @@ void MainListener::EmitGlobalFixedArrayInit(
                     ok = false;
                     break;
                 }
+                // A `string` element written as a literal is a borrowed {ptr,len} pair: fold it
+                // exactly as a scalar `string g = "x";` global does instead of rejecting it.
+                if (val != nullptr && elemTy == llvm::StructType::getTypeByName(*compiler->context, "string")
+                    && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                {
+                    auto* lit = llvm::dyn_cast<llvm::Constant>(val);
+                    if (lit != nullptr && compiler->IsStringLiteralConstant(lit))
+                        val = compiler->WrapStringLiteralAsString(val);
+                }
                 auto* c = llvm::dyn_cast_or_null<llvm::Constant>(val);
                 if (c) c = CoerceConstantToArrayElement(compiler, c, elemTy);
                 if (!c)
                 {
+                    if (elemTy->isStructTy())
+                        LogErrorContext(fi, std::format(
+                            "a global array of '{}' can only be initialized from compile-time constants; "
+                            "this element needs a runtime constructor - assign it at startup, or use "
+                            "'const char*[]' for a static table of literals", tv.TypeName));
                     LogErrorContext(fi, "global array initializer elements must be compile-time constants");
                     ok = false;
                     break;

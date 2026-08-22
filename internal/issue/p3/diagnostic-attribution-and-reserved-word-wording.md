@@ -1,55 +1,29 @@
-# Parse errors attach to the FOLLOWING token, and reserved-word collisions never say "reserved"
+# Residual: parse errors still attach to the FOLLOWING token for some reserved words
 
-Filed 2026-08-21 from an external report (MemPressMonitor Win32 port, v0.11.0 issue 12).
-Reproduced on `cd847a3`, Release.
+The WORDING half and the wrong-hint half are FIXED (p3 bundle, off `819848e`), in
+`cflat/CFlatErrorListener.h`:
 
-## Symptom A - a reserved word used as an identifier reports the token but not the reason
+- A keyword token where an identifier was expected now reports
+  `'if' is a reserved word in CFlat and cannot be used as an identifier`
+  (verified for `if`, `while`, `return`, `enum`).
+- The blanket `hint: missing ';' at end of statement` is now emitted only when ANTLR's own
+  message says a `;` was inserted, or when the line is genuinely unterminated. `p = default;`
+  and other terminated lines no longer get a hint that points at the previous line; the real
+  missing-semicolon case (`int x = 3` / newline / `int y = 4;`) keeps it.
 
-```cflat
-extern int main() { int package = 3; return package; }
-```
-```
-t_res.cb(1,24): error: mismatched input 'package' expecting {'move', '(', Identifier}
-    extern int main() { int package = 3; return package; }
-                            ^
-hint: missing ';' at end of statement
-```
+## What is left
 
-The reader is told `package` is not an `Identifier` without being told WHY - that it is a reserved
-word. "`package` is a reserved word in CFlat and cannot be used as an identifier" is immediate.
+1. **Attribution.** When the parser consumes the reserved word as part of a type specifier, the
+   error still lands on the FOLLOWING token and the reserved-word wording cannot fire:
+   `int class = 3;` reports `found '=' but expected {'move', '(', Identifier}` at the `=`.
+   Same shape for `true` (its token has no literal name in the vocabulary, so the reserved-word
+   test does not recognise it). Fixing this needs the offending-token choice itself to change,
+   not the message text.
+2. **No regression test is possible for these.** A syntax error aborts the parse before the
+   listener walk, so `expect_error` never arms - measured: the diagnostic prints, the
+   expectation never fires, and the compile exits non-zero. Any coverage here has to be a
+   golden-output test, which the suite does not have.
 
-The set of affected words and the root cause (inline string literals in the import rules of
-`CFlat.g4` become implicit lexer tokens that shadow `Identifier` everywhere) are already recorded
-in [[import-clause-words-globally-reserved]] - fix that and this symptom disappears for those
-words, but the WORDING fix is worth having independently for every genuine keyword.
-
-## Symptom B - the caret lands past the real mistake, and the hint is wrong
-
-Both of these attach the error to the token AFTER the offending construct and then suggest a
-missing semicolon that is not missing:
-
-- `p = default;` -> caret on the `=`, `hint: missing ';' at end of statement`
-  (see [[default-is-initializer-only-and-is-not-an-expression]])
-- `int package = 3;` -> `hint: missing ';' at end of statement` on a line with a `;`
-
-An always-appended "missing `;`" hint is worse than no hint: it is wrong more often than it is
-right on these shapes, and it sends the reader to the previous line. The hint should be emitted
-only when the recovery actually inserted a semicolon, not as a default suffix on every
-`mismatched input`.
-
-## The counter-example worth preserving
-
-From the same reporter, cited as the best diagnostic they hit:
-
-```
-adjacent string literals are not concatenated. Join them with the '+' operator, e.g. "a" + "b".
-```
-
-It names the rule AND the fix. That is the target shape for the two above. Prior diagnostics work
-is recorded in the completed q04 bucket ("Diagnostics wording and attribution", `9062709`) - this
-is the next round of the same, driven by a second external report.
-
-## Regression test
-
-`Test/errors/` is the home: an `err_reserved_word_identifier.cb` asserting the new wording via
-`expect_error("reserved word")`.
+Note: the original symptom (`int package = 3;`) NO LONGER REPRODUCES - the import-clause soft
+keyword work on master made `package` a plain identifier again. Use `if` / `while` / `enum`
+for probes.

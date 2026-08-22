@@ -101,7 +101,16 @@ int test_sizeof_two_type_args()
     return (int)sizeof(SizeofPair<int, float>) == 8 ? 0 : 1;
 }
 
+// A discarded tuple-of-comparisons is read as a TYPE by 'sizeof'; the message must quote
+// what was written, not the mangled name the type lookup built from it.
 extern int main()
 {
+    int a = 1;
+    int b = 2;
+    int c = 3;
+    int d = 4;
+    expect_error("'a<b,c>d' is not a type name") {
+        i64 z = sizeof(a<b,c>d);
+    }
     return 0;
 }

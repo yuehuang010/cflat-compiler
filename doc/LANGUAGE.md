@@ -115,6 +115,18 @@ i64 bigNum = 200000;
 
 `i32` and `int` are the same type and are freely interchangeable.
 
+**Mixed-signedness arithmetic follows C's usual arithmetic conversions, with one deliberate
+difference in the RESULT width.** An `i8`/`i16`/`u8`/`u16` operand is promoted to a signed
+`i32` before the operation, so `(i8)-1 < (u8)3` is true and `(i8)-1 / (u8)3` is `0`, exactly as
+C computes them. Unlike C, when BOTH operands were sub-int the result is narrowed back to the
+wider operand's width, so a narrow expression keeps its narrow type: `(u8)200 + (u8)100` is
+`44`, not `300`. The narrowing is invisible when the result is stored back into a
+sub-int variable, but it IS visible when a widening operand overflows the narrow width and the
+result is read as an `int`: `(u8)200 * 1000` is `3392`, not `200000`, and `(u8)200 << 2` is `32`,
+not `800`. Signedness itself - `/`, `%`, the comparisons and `>>` - now follows C.
+At 32 bits and wider the C rule applies unchanged: the unsigned operand wins when its width
+covers the other's, so `(i32)-1 < (u32)3` is false.
+
 ### `string`
 
 `string` is a built-in value type with layout `{ i8* _ptr, i32 _len }`. String literals are automatically wrapped into a `string` when assigned to a `string` variable or passed to a `string` parameter.
@@ -1606,6 +1618,9 @@ Container access mirrors the local/parameter rules:
   extraction verb: `get(i)` already hands back the element, and transferring ownership out
   of a container is a deliberately undesigned operation.
 - `set(i, move value)` destructs the old owning element (if any) before storing the new one.
+- `insert(i, value)` / `insert(i, move value)` shift `[i, count)` up one slot and store;
+  `i == count()` appends. The shift is a raw slot move, so an owning element is neither
+  copied nor destructed by it.
 - `removeAt(i)` / `clear()` / the destructor free every owning element they discard.
 - `.copy()` on a `unique`-element list is a **compile error**: "cannot copy a list of
   unique elements; use move or copy elements explicitly" - a bitwise copy of an owning

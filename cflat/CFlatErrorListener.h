@@ -8,6 +8,7 @@
 #include <functional>
 #include <string_view>
 #include <utility>
+#include <cctype>
 
 struct ParseDiagnostic
 {
@@ -47,12 +48,15 @@ public:
         d.line    = static_cast<int>(line);
         d.col     = static_cast<int>(charPositionInLine);
         static constexpr std::string_view lexerPrefix = "token recognition error at: ";
+        std::string reserved = reservedWordMessage(recognizer, offendingSymbol, msg);
         if (msg.rfind(lexerPrefix, 0) == 0)
             d.message = localizeMessage_("unexpected character: {}",
                                          {msg.substr(lexerPrefix.size())});
+        else if (!reserved.empty())
+            d.message = reserved;
         else
             d.message = humanizeMessage(msg);
-        d.hint    = buildHint(recognizer, offendingSymbol, e);
+        d.hint    = buildHint(recognizer, offendingSymbol, e, msg);
         diagnostics_.push_back(std::move(d));
     }
 
@@ -86,9 +90,41 @@ private:
         return result;
     }
 
+    // A keyword token where an identifier was expected: say WHY, instead of listing the
+    // expected token set and leaving the reader to infer that the word is taken.
+    std::string reservedWordMessage(antlr4::Recognizer* recognizer,
+                                    antlr4::Token* offendingSymbol,
+                                    const std::string& msg)
+    {
+        auto* parser = dynamic_cast<antlr4::Parser*>(recognizer);
+        if (parser == nullptr || offendingSymbol == nullptr) return {};
+        if (msg.find("Identifier") == std::string::npos) return {};
+        std::string literal{ parser->getVocabulary().getLiteralName(offendingSymbol->getType()) };
+        if (literal.size() < 3 || literal.front() != '\'' || literal.back() != '\'') return {};
+        std::string word = literal.substr(1, literal.size() - 2);
+        // Only WORDS are reserved words; punctuation tokens are not misread as identifiers.
+        for (char ch : word)
+            if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) return {};
+        return localizeMessage_(
+            "'{}' is a reserved word in CFlat and cannot be used as an identifier", {word});
+    }
+
+    // True when the offending token's line already carries a ';' at or after the error column.
+    bool statementIsTerminated(antlr4::Token* offendingSymbol) const
+    {
+        if (offendingSymbol == nullptr) return false;
+        int lineIdx = static_cast<int>(offendingSymbol->getLine()) - 1;
+        if (lineIdx < 0 || lineIdx >= static_cast<int>(sourceLines_.size())) return false;
+        const std::string& srcLine = sourceLines_[lineIdx];
+        int col = static_cast<int>(offendingSymbol->getCharPositionInLine());
+        if (col < 0 || col > static_cast<int>(srcLine.size())) return false;
+        return srcLine.find(';', static_cast<size_t>(col)) != std::string::npos;
+    }
+
     std::string buildHint(antlr4::Recognizer* recognizer,
                           antlr4::Token* offendingSymbol,
-                          std::exception_ptr /*e*/)
+                          std::exception_ptr /*e*/,
+                          const std::string& msg)
     {
         // Check for struct-implements-interface before walking the context chain.
         // The parse error fires from ExternalDeclarationContext with the offending
@@ -129,7 +165,14 @@ private:
                 dynamic_cast<CFlatParser::StatementContext*>(ctx)           ||
                 dynamic_cast<CFlatParser::DeclarationContext*>(ctx)         ||
                 dynamic_cast<CFlatParser::BlockItemContext*>(ctx))
+            {
+                // Only when a ';' really is missing: ANTLR says so itself when its recovery
+                // inserted one. Otherwise a line that already carries a ';' would send the
+                // reader to the previous line looking for a semicolon that is not missing.
+                if (msg.find("missing ';'") == std::string::npos
+                    && statementIsTerminated(offendingSymbol)) return {};
                 return localizeMessage_("missing ';' at end of statement", {});
+            }
 
             if (dynamic_cast<CFlatParser::ParameterTypeListContext*>(ctx))
                 return localizeMessage_("check parameter list - missing type or closing ')'?", {});

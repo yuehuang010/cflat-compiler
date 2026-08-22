@@ -588,6 +588,45 @@ int testIsCopyable()
     return passed;
 }
 
+// insert(index, value): shifting must not copy, destruct or drop an element, so a
+// `unique` element list is the real test - the ids must survive the shift and be freed once.
+int testInsert()
+{
+    int passed = 0;
+    g_dtor = 0;
+    list<int> li = default;
+    li.add(1); li.add(3);
+    li.insert(1, 2);            // middle
+    li.insert(0, 0);            // front
+    li.insert(4, 4);            // index == count() appends
+    passed += Test("insert<int> count", li.count(), 5);
+    passed += Test("insert<int> front", li[0], 0);
+    passed += Test("insert<int> middle", li[2], 2);
+    passed += Test("insert<int> end", li[4], 4);
+
+    list<int> empty = default;
+    empty.insert(0, 9);
+    passed += Test("insert into empty list", empty[0], 9);
+
+    list<string> ls = default;
+    ls.add("b");
+    ls.insert(0, "a");
+    passed += Test("insert<string> front", ls[0], "a");
+    passed += Test("insert<string> shifted", ls[1], "b");
+
+    {
+        list<unique Res*> lu = default;
+        lu.add(new Res(1));
+        lu.add(new Res(3));
+        lu.insert(1, new Res(2));
+        passed += Test("insert<unique T*> shifted element survives", lu[2].id, 3);
+        passed += Test("insert<unique T*> inserted element", lu[1].id, 2);
+        passed += Test("insert<unique T*> shift frees nothing", g_dtor, 0);
+    }
+    passed += Test("insert<unique T*> owns each element once", g_dtor, 3);
+    return passed;
+}
+
 extern int main()
 {
     HeapAudit.enable();
@@ -618,6 +657,7 @@ extern int main()
     total += 3;  passed += testNonCopyableMoveOnly();
     total += 9;  passed += testIsCopyable();
     total += 7;  passed += testSort();
+    total += 11; passed += testInsert();
 
     // Every ownership rule above is only meaningful if nothing leaked.
     int leaks = (int)HeapAudit.reportLeaks();

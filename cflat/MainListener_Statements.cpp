@@ -2856,6 +2856,7 @@ void MainListener::GenerateDefaultParamOverloads(
             {
                 auto* initCtx = params[i].DefaultValue;
                 llvm::Value* defaultVal = nullptr;
+                bool defaultIsUnsigned = false;
                 if (auto* ae = initCtx->assignmentExpression())
                 {
                     // Default arguments are lowered in a synthesized forwarding wrapper, but a
@@ -2871,6 +2872,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     // code address in the omitted argument's slot and the body wrote through it.
                     auto defNV = ParseAssignmentExpressionNamed(ae);
                     defaultVal = LoadNamedVariable(defNV);
+                    defaultIsUnsigned = defNV.TypeAndValue.IsUnsignedInteger() != -1;
                     RejectCodeValueIntoDataSlot(ae, defNV, params[i], "default-initialize",
                         std::format("parameter '{}' of", params[i].VariableName));
                     // Thin-function sibling of the gate above: a data pointer default for a
@@ -2960,6 +2962,17 @@ void MainListener::GenerateDefaultParamOverloads(
                 namedVar.BaseType = defaultVal ? defaultVal->getType() : nullptr;
                 namedVar.TypeAndValue.TypeName = params[i].TypeName;
                 namedVar.TypeAndValue.Pointer = params[i].Pointer;
+                // Naming the PARAMETER type would sign-extend an unsigned default into a wider
+                // slot; carry the default expression's own unsigned width instead.
+                if (defaultIsUnsigned && defaultVal != nullptr && defaultVal->getType()->isIntegerTy()
+                    && namedVar.TypeAndValue.IsUnsignedInteger() == -1)
+                {
+                    unsigned bits = defaultVal->getType()->getIntegerBitWidth();
+                    if      (bits == 8)  namedVar.TypeAndValue.TypeName = "u8";
+                    else if (bits == 16) namedVar.TypeAndValue.TypeName = "u16";
+                    else if (bits == 32) namedVar.TypeAndValue.TypeName = "u32";
+                    else if (bits == 64) namedVar.TypeAndValue.TypeName = "u64";
+                }
                 callArgs.push_back(namedVar);
             }
 

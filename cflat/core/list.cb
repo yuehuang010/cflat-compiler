@@ -307,6 +307,52 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             _qsort(0, _size - 1, compare);
     }
 
+    // Insert value at index, shifting [index, count) up by one slot; index == count() appends.
+    // The shift is a raw slot move (no copy, no destructor), so it composes with `unique`
+    // elements exactly as removeAt() does; the store itself defers to T like add() above.
+    void insert(int index, T value)
+    {
+        if (index == _size)
+        {
+            add(value);
+            return;
+        }
+        _checkBounds(index, "insert");
+        if (_size >= _capacity) _grow();
+        int i = _size;
+        while (i > index)
+        {
+            _data[i] = move _data[i - 1];
+            i--;
+        }
+        _data[index] = value;
+        _size++;
+    }
+
+    // Transfer overload, mirroring add(move T) - same `!is_pointer(T)` design rule.
+    if const (!is_pointer(T))
+    {
+        void insert(int index, move T value)
+        {
+            if (index == _size)
+            {
+                add(move value);
+                return;
+            }
+            _checkBounds(index, "insert");
+            if (_size >= _capacity) _grow();
+            int i = _size;
+            while (i > index)
+            {
+                _data[i] = move _data[i - 1];
+                i--;
+            }
+            _data[index] = move value;
+            _size++;
+        }
+
+    }
+
     // Frees `unique` elements; bare pointers and bare interface values are left to their
     // real owner. Value elements are NOT released here - `delete[_size]` runs their
     // destructors as it frees the buffer, so doing it above would destruct them twice.

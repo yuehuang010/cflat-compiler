@@ -601,7 +601,25 @@ struct string_view
     i32 length()    { return _len; }
     // Byte at position i (unchecked).
     i8  get(i32 i)  { return _ptr[i]; }
+
+    // View over `len` borrowed bytes at `ptr` (C++ string_view(ptr, count)).  Nothing is
+    // copied and no NUL terminator is required; the caller keeps ownership of the bytes.
+    string_view(i8* ptr, i32 len)
+    {
+        this->_ptr = ptr;
+        this->_len = len;
+    }
 };
+
+// Owning copy of the viewed bytes - the counterpart of string_view(ptr, len).  The copy is
+// NUL-terminated; the view itself need not be.
+move string toString(string_view self)
+{
+    string borrowed = default;
+    borrowed._ptr = self._ptr;
+    borrowed._len = self._len;
+    return borrowed.copy();
+}
 
 // Return a view of the entire string, bonded to the source.
 string_view* view(bond string* this)
