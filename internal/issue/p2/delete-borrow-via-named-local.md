@@ -108,6 +108,55 @@ hold this element?"), the same capability approach A also lacked. Deferred until
 do NOT reintroduce a local-scope-only error for the bare spelling. The `alias` opt-in is the
 recommended path for callers who want the check today.
 
+## 2026-08-21: the E case, observed as a DANGLING READ rather than a double-free
+
+An external report (a quant backtester on v0.11.0; their issue 16) hit case E in its most ordinary
+form and, notably, did NOT reach a `delete` at all - the damage lands on the plain read:
+
+```cflat
+class Node { int v = 0; double pad[8] = default; };
+extern int main(int argc, char** argv) {
+    list<Node*> xs;                  // borrows; frees nothing
+    int i = 0;
+    while (i < 4) {
+        Node* n = new Node;          // owning local: freed at the end of THIS iteration
+        n->v = i * 10;
+        xs.add(n);                   // no diagnostic
+        i++;
+    }
+    i = 0;
+    while (i < xs.count()) { Node* n = xs.get(i); printf("xs[%d].v = %d\n", i, n->v); i++; }
+    return 0;
+}
+```
+
+Measured on `39d4b38`, Release - compiles clean, no diagnostic, and prints
+
+```
+xs[0].v = 5   (expected 0)
+xs[1].v = 5   (expected 10)
+xs[2].v = 5   (expected 20)
+xs[3].v = 5   (expected 30)
+```
+
+every element the same garbage value; the reporter's ASan run says `heap-use-after-free`.
+
+Why this is worth recording against the existing analysis:
+
+- **It raises the severity of the deferred item.** The file above frames case E as a DOUBLE-FREE
+  hazard, which needs the user to write a `delete` they did not have to write. This shape needs no
+  `delete` anywhere - "allocate in a loop, collect into a list" is the single most obvious way to
+  build a collection of heap objects, and it silently produces a container of dangling pointers.
+- **It does not change the ruling.** The owner here is a loop-body local, so it is the same
+  add-site provenance question, and rejected approach B (owner-linked local taint) is still
+  intra-procedural and still gives false coverage once the `add` moves into another function. Do
+  not re-spike it for this shape either.
+- **The docs are complicit.** "a local variable owns the pointer it allocates" and "`list<T*>`
+  borrows its elements" are each documented and each correct; nothing warns that composing them is
+  a use-after-free. Until the analysis exists, the container docs should state the rule outright
+  and lead with `list<unique Node*>` + `add(move n)` - which is what the reporter eventually found.
+  Tracked as part of [[docs-gaps-from-external-backtester-report]].
+
 ## Related
 - `internal/plan/unique-ownership.md` - the `alias` design.
 
