@@ -1,4 +1,5 @@
 import "array.cb";
+import "string.cb";
 
 struct Point { int x = 0; int y = 0; };
 
@@ -11,4 +12,65 @@ extern int main()
         Point* p = arr.get(0);
     }
     return 0;
+}
+
+// A string LITERAL is a `const char*`, never a `T*`. Every spelling below compiled clean on the
+// pre-fix binary and left the slot pointing at the character bytes, so the first member read
+// through it faulted (2026-08-21 p2 `n0.date?.length()` SIGSEGV - the `?.` lowering was fine,
+// the initializer was the hole). `string?` is `string*` plus a null marker, so it is the same
+// store; the `Point*` leg proves the gate is about the POINTEE being a struct, not about strings.
+struct LitBar { string? date = default; };
+
+expect_error("cannot store a string literal") {
+    void litIntoNullableStringLocal() {
+        string? s = "nn";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litIntoStructPointerLocal() {
+        Point* p = "nn";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litIntoNullableStringField() {
+        LitBar b = default;
+        b.date = "nn";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litIntoNullableStringBrace() {
+        LitBar b = { date = "nn" };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    struct LitDefaultBar { string? date = "nn"; };
+}
+
+expect_error("cannot store a string literal") {
+    string? litReturnedAsNullableString() { return "nn"; }
+}
+
+expect_error("cannot store a string literal") {
+    int litTakesNullableString(string? s) { return 0; }
+    void litPassesLiteral() { litTakesNullableString("nn"); }
+}
+
+expect_error("cannot store a string literal") {
+    void litIntoFixedArrayOfStructPointers() {
+        Point*[2] arr = { "nn", "mm" };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litIntoInferredArrayViewOfStructPointers() {
+        Point*[] arr = { "nn" };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    int litAsDefaultParameter(Point* p = "nn") { return 0; }
 }

@@ -148,6 +148,24 @@ int testStringMoveSemantics()
 struct TBar { string date = default; int n = 0; };
 struct TBox { string slot = default; };
 
+// An owning STRUCT (not a bare string) read out of a temporary in brace-init member position.
+// The `=` twin has always rejected the BORROW spelling and implied-moved the MOVE-temp one;
+// the brace spelling did neither, so it read a freed buffer (reject legs in
+// Test/errors/err_temp_field_store.cb) and double-freed the move-temp one (leg 8 below).
+struct TWrap { TBar inner = default; };
+struct THold { TBar slot = default; };
+TWrap makeTWrap() { TWrap w = default; w.inner.date = "2020-" + "01-01"; w.inner.n = 1; return w; }
+
+// A bare STRING field (not the owning struct itself) read out of a temporary in brace-init
+// member position. `braceMoveTempField` used to fire for `string` fields too - the string
+// store path already deep-copies, so the extra zero-store on the temp's field orphaned the
+// copy's buffer (leak, not a double free; see legs 9/10 below).
+struct Tok   { string text  = default; };
+struct SHold { string s     = default; };
+Tok mkTok() { Tok t = default; t.text = "c" + "d"; return t; }
+struct TokWrap { Tok inner = default; };
+TokWrap mkTokWrap() { TokWrap w = default; w.inner.text = "c" + "d"; return w; }
+
 string tbarDate(alias list<TBar> l) { return l.get(0).date; }
 // A whole ELEMENT returned through two levels: neither level may hand back a borrow.
 string telemFirstInner(alias list<string> l) { return l.get(0); }
@@ -184,6 +202,33 @@ int testStringTempFieldCopy()
 
         // The whole element is still intact after all five bindings.
         passed += Test("element unchanged after five copies", bars.get(0).date, "2020-01-01");
+    }
+    {
+        // 6/7. Brace-init of an OWNING STRUCT field from sources that are NOT a borrowed temp:
+        // a named local's field and an explicit `.copy()` both stay legal and independent.
+        TWrap named = default; named.inner.date = "2020-" + "01-01"; named.inner.n = 1;
+        THold fromNamed = { slot = named.inner };
+        passed += Test("named local owning field brace-initializes a field", fromNamed.slot.date, "2020-01-01");
+        THold fromCopy = { slot = named.inner.copy() };
+        passed += Test("copied owning field brace-initializes a field", fromCopy.slot.date, "2020-01-01");
+
+        // 8. A MOVE temp OWNS its field, so the brace store takes the same implied move the `=`
+        // path takes: the temp's field is nulled and the buffer is freed exactly once. Before the
+        // fix this aborted with a double free (rc 134) while the `=` spelling was already correct.
+        THold fromMoveTemp = { slot = makeTWrap().inner };
+        passed += Test("move-temp owning field brace-initializes a field", fromMoveTemp.slot.date, "2020-01-01");
+
+        // 9. A bare `string` field read off a MOVE temp binds by implicit COPY (the string
+        // store path already deep-copies) - it must NOT also take the struct-field implied
+        // move, or the extra zero-store orphans the copy's buffer (leak).
+        SHold fromMoveTempStr = { s = mkTok().text };
+        passed += Test("move-temp string field brace-initializes by copy", fromMoveTempStr.s, "cd");
+
+        // 10. Same shape one level deeper: `mk().inner.text` - the nested owning struct is
+        // itself the move temp's field, and `.text` is a string field of THAT struct.
+        SHold fromNestedMoveTempStr = { s = mkTokWrap().inner.text };
+        passed += Test("nested move-temp string field brace-initializes by copy",
+                        fromNestedMoveTempStr.s, "cd");
     }
     return passed;
 }
@@ -894,7 +939,7 @@ extern int main()
     total += 4;  passed += testValueCopySemantics();
     total += 2;  passed += testStringCopySemantics();
     total += 1;  passed += testStringMoveSemantics();
-    total += 7;  passed += testStringTempFieldCopy();
+    total += 12; passed += testStringTempFieldCopy();
     total += 8;  passed += testStringTempElementCopy();
     total += 4;  passed += testStringTempFieldBorrow();
     total += 5;  passed += testBarePointerBorrows();

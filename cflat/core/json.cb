@@ -707,7 +707,11 @@ struct JsonParser
         return nullptr;
     }
 
-    // Parse a top-level JSON object into a heap JsonNode tree; caller deletes it.
+    // Parse a top-level JSON value - object, array, string, number or literal - into a heap
+    // JsonNode tree; caller deletes it. Returns nullptr for empty/whitespace-only input and for
+    // input whose first non-space character starts no JSON value. Otherwise parsing is lenient
+    // and best-effort: an unterminated array or trailing garbage still yields a non-null node.
+    // This is pre-existing _parseValue behaviour; parse() validates nothing itself.
     static alias JsonNode* parse(string json)
     {
         JsonParser p;
@@ -715,7 +719,6 @@ struct JsonParser
         p._len = json.length();
         p._pos = 0;
         p._skipWs();
-        if (p._peek() != '{') return nullptr;
-        return p._parseObject();
+        return p._parseValue();
     }
 };

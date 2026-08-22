@@ -168,3 +168,45 @@ expect_error("taken from a temporary") {
         h.set();
     }
 }
+
+// Brace-init member position is a SECOND field-store lowering (EmitOneFieldInit), so the `=`
+// rejects above say nothing about it: every brace spelling below compiled clean on the pre-fix
+// binary and read the list's freed buffer (2026-08-21 p1 use-after-free). Each leg is a distinct
+// grammar spelling of the same store, not a retype of one shape.
+expect_error("taken from a temporary") {
+    Holder braceNamedInit() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder h = { slot = fields.get(0).inner };
+        return h;
+    }
+}
+
+expect_error("taken from a temporary") {
+    Holder braceBareInit() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder h { slot = fields.get(0).inner };
+        return h;
+    }
+}
+
+struct BraceWrap { Holder h = default; };
+
+expect_error("taken from a temporary") {
+    BraceWrap braceNestedInit() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        BraceWrap w = { h = { slot = fields.get(0).inner } };
+        return w;
+    }
+}
+
+expect_error("taken from a temporary") {
+    void takeHolder(Holder h) { }
+    void braceArgumentInit() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        takeHolder({ slot = fields.get(0).inner });
+    }
+}

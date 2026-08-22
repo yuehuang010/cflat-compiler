@@ -842,8 +842,7 @@ extern int main()
         total++; passed += Test("json_double_of_i64", nums.getDouble("rev") == 394328000000.0, true);
         delete nums;
     }
-    // By-INDEX accessors, reached through a nested array (a TOP-LEVEL array node crashes
-    // JsonNode._getIndex on master too - see internal/issue/p2/).
+    // By-INDEX accessors, reached through a nested array.
     {
         JsonNode* doc = JsonParser.parse("{\"xs\": [394328000000, 2.01]}");
         IJSONArray a = doc.getArray("xs");
@@ -851,6 +850,27 @@ extern int main()
         double ad = a.getDouble(1) - 2.01;
         if (ad < 0.0) ad = -ad;
         total++; passed += Test("json_array_double", ad < 0.000000001, true);
+        delete doc;
+    }
+    // The same accessors on a TOP-LEVEL array. `JsonParser.parse` used to bail out unless the
+    // first token was '{', so this document parsed to a NULL node and `doc.getInt64(0)` was a
+    // null dereference (SIGSEGV, no diagnostic) - it now parses any top-level JSON value.
+    {
+        JsonNode* doc = JsonParser.parse("[394328000000, 2.01]");
+        total++; passed += Test("json_toplevel_array_i64", doc.getInt64(0), (i64)394328000000);
+        double td = doc.getDouble(1) - 2.01;
+        if (td < 0.0) td = -td;
+        total++; passed += Test("json_toplevel_array_double", td < 0.000000001, true);
+        // Out of range still answers the documented 0 rather than walking off the child chain.
+        total++; passed += Test("json_toplevel_array_oob", doc.getInt(7), 0);
+        total++; passed += Test("json_toplevel_array_count", doc.count(), 2);
+        delete doc;
+    }
+    // A top-level SCALAR is a JSON value too, and it must not be mistaken for a document with
+    // fields: the by-key accessors answer their documented "absent" values on it.
+    {
+        JsonNode* doc = JsonParser.parse("42");
+        total++; passed += Test("json_toplevel_scalar_absent_key", doc.getInt("nope"), 0);
         delete doc;
     }
 

@@ -1344,6 +1344,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
             RejectOwningLocalIntoBorrowingContainer(functionName, candidate.Parameters, i,
                                                     candidate.IsMethod, matched[i]);
+            // A string LITERAL is a 'const char*', never a 'T*' - the ARGUMENT leg of the same
+            // gate the declarator, `=`, brace-init, field-default and return sites apply.
+            if (IsStringLiteralIntoStructPointer(candidate.Parameters[i], matched[i].Primary))
+                LogError(DescribeStringLiteralIntoStructPointer(
+                    candidate.Parameters[i],
+                    std::format("parameter '{}' of '{}'",
+                                candidate.Parameters[i].VariableName, functionName)));
         }
 
         // C-extern ABI lowering: when the resolved candidate has struct-by-value params or

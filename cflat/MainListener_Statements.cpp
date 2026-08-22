@@ -592,6 +592,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
         }
         auto right = LoadNamedVariable(returnNV);
+        // A string LITERAL is a 'const char*', never a 'T*' - the RETURN leg of the same gate the
+        // declarator, `=`, brace-init, field-default and argument sites apply.
+        RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
+                                             "the return value");
         // Coerce the returned value to the function-pointer return type (thin vs
         // fat): a named function, a thin function<> value, or a fat closure value.
         if (right && returnFnPtrTV.IsFunctionPointer)

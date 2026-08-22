@@ -4455,6 +4455,18 @@ public:
                                      const std::string& role,
                                      const std::string& what);
 
+    /*
+     * A string LITERAL is a 'const char*'; it is NOT a pointer to a struct. Storing one into a
+     * 'T*' / 'T?' slot leaves the slot pointing at character data, which the next member access
+     * reads as a 'T' (silent SIGSEGV, no diagnostic). Proven from the literal constant and a
+     * registered struct pointee alone, so every unproven source stays accepted.
+     * `destDesc` names the slot ("variable 'x'", "field 'S.f'", ...). Returns true after erroring.
+     */
+    bool RejectStringLiteralIntoStructPointer(antlr4::ParserRuleContext* ctx,
+                                              const LLVMBackend::TypeAndValue& destTV,
+                                              llvm::Value* right,
+                                              const std::string& destDesc);
+
     // 'new T()' is meaningful only for a SINGLE star over a known struct: there is no 'new void()',
     // and 'new S()' is the wrong shape for an 'S**'.
     bool CanSuggestAllocation(antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& tv);

@@ -4089,6 +4089,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                             }
 
+                            // A string LITERAL is a 'const char*', never a 'T*': catch it here or
+                            // the slot points at character data and the first member access faults.
+                            if (RejectStringLiteralIntoStructPointer(
+                                    assignmentExpression, typeAndValue, right,
+                                    std::format("variable '{}'", name)))
+                                right = nullptr;
+
                             // Pointer variable assigned a struct value: catch the mismatch here
                             // with a clear message rather than letting LLVM assert inside CreateCast.
                             if (right && typeAndValue.Pointer && !typeAndValue.IsFunctionPointer

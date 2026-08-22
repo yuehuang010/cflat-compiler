@@ -5108,6 +5108,18 @@ public:
     // Returns true if the given constant is a pooled string literal (length known at compile time).
     bool IsStringLiteralConstant(llvm::Constant* c) const;
 
+    /*
+     * A string LITERAL is a 'const char*'; it is NOT a pointer to a struct. Storing one into a
+     * 'T*' / 'T?' slot (variable, field, parameter, return) leaves the slot pointing at character
+     * data, which the next member access reads as a 'T' - a silent SIGSEGV with no diagnostic.
+     * Proven from the literal constant plus a registered struct pointee alone, so every unproven
+     * source (a runtime 'char*', a cast, a real 'T*') stays accepted. One copy of the predicate;
+     * the store sites differ only in how they name the slot and which LogError they call.
+     */
+    bool IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right);
+    std::string DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
+                                                       const std::string& destDesc) const;
+
     // Wraps a raw i8* string literal pointer in a string struct { _ptr, _len } by value.
     // Called automatically when assigning a string literal to a string-typed variable.
     // For a runtime (non-literal) char*, the length is not known at compile time: derive it

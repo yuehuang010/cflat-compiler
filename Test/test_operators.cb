@@ -146,6 +146,7 @@ bool operator!=(PtrNode* a, PtrKey b) { return a->v != b.v; }
 
 import "test_helper.cb";
 import "list.cb";
+import "string.cb";
 
 // Unsigned-literal regression support: field defaults, a global, and an indirect callee.
 struct UDefaults { u64 wide = 4294967295u; double asDouble = 4294967295u; };
@@ -338,6 +339,17 @@ extern int main()
     Box wn; wn.p = nullptr;
     Test("Box?. null field short-circuits", wn?.value,       0);
     Test("Box?. null with coalesce",        wn?.value ?? -1, -1);
+
+    // A `string?` slot holds a real `string*`, so `?.` through it must reach the pointee's
+    // method, and a null one must short-circuit to 0. Accept-set for the 2026-08-21 p2 SIGSEGV,
+    // whose cause was a `const char*` LITERAL silently accepted for the `string*` slot (that
+    // spelling is now rejected - see Test/errors/err_ptr_from_value.cb); `&s` is the spelling
+    // that always worked and must keep working.
+    string ncText = "ab" + "cd";
+    string? ncPtr  = &ncText;
+    string? ncNull = nullptr;
+    Test("string? ?. method (non-null)", (int)ncPtr?.length(),  4);
+    Test("string? ?. method (null)",     (int)ncNull?.length(), 0);
 
     // ── operator[] through a parenthesized deref ──────────────────────────────
     // `(*p)` is a struct receiver like any other, so `(*p)[i]` must find operator[].

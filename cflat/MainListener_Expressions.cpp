@@ -2141,6 +2141,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(right);
             }
 
+            // A string LITERAL is a 'const char*', never a 'T*': catch it here or the slot points
+            // at character data and the first member access through it faults.
+            if (operatorText == "=")
+                RejectStringLiteralIntoStructPointer(
+                    ctx, namedVar.TypeAndValue, right,
+                    namedVar.CallerName.empty() ? std::string("this location")
+                    : namedVar.IsElementAccess
+                        ? std::format("element of '{}'", namedVar.CallerName)
+                        : std::format("'{}'", namedVar.CallerName));
+
             // Pointer variable assigned a struct value: catch the mismatch here
             // with a clear message rather than letting LLVM assert inside CreateCast.
             // Interface targets are exempt: an interface slot legitimately holds a fat-ptr
@@ -7304,6 +7314,35 @@ bool MainListener::EmitOneFieldInit(
                 braceStringTempCopy = true;
         }
 
+        // Brace leg of the `=` path's owning-temp-FIELD rules (MainListener_Expressions ~2557).
+        // An owning VALUE field read off a temporary has its buffer owned by that temporary, so a
+        // second owner double-frees (a MOVE temp transfers instead - handled just below; a
+        // `string` binds by implicit copy - handled just above).
+        if (!braceStringTempCopy && rightNV.FromOwningTempField && !rightNV.MovableTempField
+            && !rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.IsMove
+            && rightNV.TypeAndValue.TypeName != "string"
+            && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName)
+            && compiler->IsOwningValueType(fieldType.TypeName))
+        {
+            // Same wording as the `=` twin, so the two spellings share one localized message.
+            LogErrorContext(errCtx, std::format(
+                "cannot store '{}.{}' taken from a temporary into a longer-lived location; its buffer "
+                "is owned elsewhere and would double-free. Use '.copy()' for an independent copy, or "
+                "bind the whole call result to a local first and assign from that.",
+                rightNV.OwningStructName, rightNV.FieldName));
+            return false;
+        }
+
+        // Brace leg of the `=` path's implied move out of a MOVE temp's owning field. The temp's
+        // own destructor still runs at end of statement, so the source field must be zeroed or the
+        // one buffer is freed twice. Only the source is nulled - brace-init builds a FRESH slot.
+        bool braceMoveTempField = rightNV.MovableTempField
+            && !rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.IsMove
+            && rightNV.MoveTempStructType != nullptr && rightNV.MoveTempStructAlloca != nullptr
+            && rightNV.TypeAndValue.TypeName != "string"
+            && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName)
+            && compiler->IsOwningValueType(fieldType.TypeName);
+
         // `unique` field initialized here: this is a second field-store path, so it needs the same
         // two source rejections the `=` path applies (Trap A, and field-to-field). No reassign-free
         // is needed - both callers construct a fresh slot, so there is no old pointee to release.
@@ -7352,11 +7391,27 @@ bool MainListener::EmitOneFieldInit(
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
 
+        // A string LITERAL is a 'const char*', never a 'T*' - the brace leg of the same gate the
+        // declarator and `=` paths apply, so no spelling can seed a struct pointer with characters.
+        if (RejectStringLiteralIntoStructPointer(
+                errCtx, fieldType, val, std::format("field '{}.{}'", typeName, fieldName)))
+            return false;
+
         // The implicit copy decided above. Emitted here because the deep copy needs the LOADED
         // {ptr,len,owned} aggregate; it also retires rightNV's borrow facts, so the alias/owning
         // rejects further down see an ordinary owned string temp.
         if (braceStringTempCopy)
             AdoptImplicitStringTempCopy(rightNV, val, errCtx);
+
+        // The implied move decided above; emitted here because zeroing needs the loaded value's
+        // type, and it must land after the read so the copy still sees the live buffer.
+        if (braceMoveTempField && val->getType()->isStructTy())
+        {
+            auto* srcGep = compiler->builder->CreateStructGEP(
+                rightNV.MoveTempStructType, rightNV.MoveTempStructAlloca,
+                rightNV.MoveTempFieldIndex, "movedfld");
+            compiler->builder->CreateStore(llvm::ConstantAggregateZero::get(val->getType()), srcGep);
+        }
 
         // The brace-init leg of the 2026-08-10 implicit-move ruling, kept in lockstep with the `=`
         // path. The destination slot is freshly constructed here, so only the source is nulled.
@@ -7631,6 +7686,10 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             *srcIsUnsigned = nv.TypeAndValue.IsUnsignedInteger() != -1;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
+        // A string LITERAL is a 'const char*', never a 'T*' - the field-DEFAULT leg of the same
+        // gate the declarator, `=`, brace-init, return and argument sites apply.
+        RejectStringLiteralIntoStructPointer(ae, field, val,
+            std::format("field '{}.{}'", structName, field.VariableName));
         // Aggregate field defaults use a shared path instead of the ordinary declaration upcast.
         // Box a concrete pointer here before the aggregate is assembled, otherwise an interface
         // field initialized with `new Impl()` is returned as a null fat value and its later
@@ -7886,6 +7945,16 @@ void MainListener::RejectCodeValueIntoDataSlot(antlr4::ParserRuleContext* ctx,
         if (!compiler->CodeValueIntoDataDestination(src, dest)) return;
         LogErrorContext(ctx, compiler->DescribeCodeValueIntoData(
             CodeValueDestSpelling(dest), role, CodeValueCastAdvice(dest), what));
+    }
+
+bool MainListener::RejectStringLiteralIntoStructPointer(antlr4::ParserRuleContext* ctx,
+                                     const LLVMBackend::TypeAndValue& destTV,
+                                     llvm::Value* right,
+                                     const std::string& destDesc) {
+        auto* compiler = Compiler(ctx);
+        if (!compiler->IsStringLiteralIntoStructPointer(destTV, right)) return false;
+        LogErrorContext(ctx, compiler->DescribeStringLiteralIntoStructPointer(destTV, destDesc));
+        return true;
     }
 
 bool MainListener::CanSuggestAllocation(antlr4::ParserRuleContext* ctx, const LLVMBackend::TypeAndValue& tv) {
@@ -8255,6 +8324,11 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
             // Aggregate leg of the code-value store gate: `Rec*[2] arr = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, fixedElemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+            // A string LITERAL is a 'const char*', never a 'T*' - the ELEMENT leg of the same gate
+            // the scalar store sites apply. The element's type is what a stored value must agree
+            // with, so this reads fixedElemTV, not the array's own type.
+            RejectStringLiteralIntoStructPointer(fi, fixedElemTV, val,
+                                        std::format("element {} of '{}'", i, name));
 
             // Thin sibling of the widen elsewhere: positional fixed-array brace-init into a
             // thin function<> element fed a raw pointer (spelled or generic-encoded).
@@ -8878,6 +8952,11 @@ void MainListener::EmitArrayViewInferredInit(
             // Aggregate leg of the code-value store gate: `Rec*[] v = { w, w };`.
             RejectCodeValueIntoDataSlot(fi, nv, elemTV, "brace-initialize",
                                         std::format("element {} of '{}' of", i, name));
+            // A string LITERAL is a 'const char*', never a 'T*' - the ELEMENT leg of the same gate
+            // the scalar store sites apply. The element's type is what a stored value must agree
+            // with, so this reads elemTV, not the array's own type.
+            RejectStringLiteralIntoStructPointer(fi, elemTV, val,
+                                        std::format("element {} of '{}'", i, name));
 
             // Thin sibling of the widen elsewhere: array-view brace-init into a thin
             // function<> element fed a raw pointer (spelled or generic-encoded).

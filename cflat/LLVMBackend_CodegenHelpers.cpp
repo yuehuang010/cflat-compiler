@@ -1315,6 +1315,32 @@ bool LLVMBackend::IsOwningValueOrClosureType(const std::string& typeName)
             || typeName == "__closure_fat_ptr" || IsEncodedClosureType(typeName);
     }
 
+bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right)
+{
+    if (right == nullptr || !destTV.Pointer) return false;
+    // Only a SINGLE star over a plain struct slot is provably wrong: a 'char**' element, a
+    // function pointer, an interface fat slot and an array view all read the value differently.
+    if (destTV.IsFunctionPointer || destTV.IsInterface || destTV.IsArrayView) return false;
+    if (destTV.PointerDepth > 1 || destTV.ElemPointer || destTV.ConstArraySize > 0) return false;
+    auto* c = llvm::dyn_cast<llvm::Constant>(right);
+    if (c == nullptr || !IsStringLiteralConstant(c)) return false;
+    return GetDataStructure(destTV.TypeName).StructType != nullptr;
+}
+
+std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
+                                                   const std::string& destDesc) const
+{
+    return std::format(
+        "cannot store a string literal into {} of type '{}{}' - a string literal is a "
+        "'const char*', not a pointer to a '{}', so reading a member through it would interpret "
+        "the characters as a '{}'. Bind the text to a '{}' value and store its address, or "
+        "declare the slot 'const char*'. A cast on the literal itself is still rejected (the "
+        "underlying pointer is unchanged); route it through a 'const char*' local first, e.g. "
+        "'const char* r = \"...\"; {}* q = ({}*)r;', to assert the reinterpret explicitly.",
+        destDesc, destTV.TypeName, destTV.IsNullable ? "?" : "*",
+        destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName);
+}
+
 bool LLVMBackend::IsOwningValueType(const std::string& typeName)
 {
         if (typeName.empty())
