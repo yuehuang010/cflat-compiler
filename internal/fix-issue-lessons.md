@@ -2913,3 +2913,28 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   container. Fixed by making both registration sites symmetric: `insert` when core, `erase`
   otherwise - confirmed safe against the `--init` warm-load ordering (`registerLazyTemplates`
   seeds the flag before any user file is walked, so a later user registration still erases it).
+
+## A container's fresh `new T[n]` buffer is default-CONSTRUCTED, not empty (2026-08-22)
+
+- **The measured root cause was NOT the filed one.** The issue guessed that `list<T>`'s destructor
+  skipped the element destructor for a `unique`-owning element. It does not - `_releaseAt` runs the
+  full element destructor for every live slot. `leaks --atExit` put all four leaked allocations in
+  `_grow`'s `new T[newCap]`: the buffer's slots are DEFAULT-CONSTRUCTED, so an element type whose
+  construction acquires (`unique Counter* p = new Counter();`) hands the container a buffer of LIVE
+  values. Every container slot store assumes an EMPTY slot and drops no old value, so each store
+  stranded the slot's constructed value and every never-filled tail slot was stranded at teardown.
+- **The compiler's container-slot contract is deliberate and stays.** `MainListener_Expressions.cpp`
+  Part 6 does NOT drop-old on a single-index GEP store, because `list.set` already does
+  `_releaseAt` then `_placeAt`; adding a drop-old there double-destructs. The EMPTY half of that
+  contract is the CORE library's obligation, and it was simply unmet. Fix: `_drainFresh` drains a
+  freshly allocated buffer once (`_ = move buf[k]`), skipped under
+  `if const (!is_primitive(T) && !is_pointer(T))` since those slots are plain zeroed scalars.
+  Applied to list, queue, stack, dictionary (both arrays), hashset, channel, spsc_queue.
+- **`array<T>` needed no change and must not get one.** Its destructor uses `delete[_len]`, which
+  runs the element destructor for EVERY slot including the never-set ones, so its buffer was always
+  accounted for. Measured 0 leaked pointees before and after.
+- **A destructor-count leg can encode the leak it was written next to.**
+  `test_list_ownership.cb`'s "list<Val> dtor count" asserted 2 for a `list<Val>` holding one
+  element - correct only while the four constructed buffer slots were never destructed. The
+  honest number is 6 (5 default constructions + 1 memberwise copy), and the leg now asserts the
+  ctor total beside it so the accounting is visible. Do not "restore" it to 2.

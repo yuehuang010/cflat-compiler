@@ -892,9 +892,13 @@ struct TrackedBag
 
 // A list element type that owns a `unique` has no copy(), so the pre-fix deep-copy-into-env
 // path rejected the capture outright with "cannot copy this list ...".
+// CellRes (not the shared value-only Counter) tracks live pointees, so the leg below can assert
+// that every element is FREED and not merely that the capture compiles.
+int uniqueCellLive = 0;
+struct CellRes { int value = 0; CellRes() { uniqueCellLive++; } ~CellRes() { uniqueCellLive--; } };
 struct UniqueCell
 {
-    unique Counter* p = new Counter();
+    unique CellRes* p = new CellRes();
 };
 
 bool testCaptureOwningContainerByReference()
@@ -944,11 +948,19 @@ bool testCaptureOwningContainerByReference()
 
     // A list whose elements own a `unique` has no copy(): pre-fix the capture itself was a hard
     // compile error ("cannot copy this list ..."). A reference capture needs no copy at all.
+    // The elements are also FREED. `list<UniqueCell>`'s cap-4 buffer comes from `new T[n]`, which
+    // default-CONSTRUCTS every slot, so until the container drain fix this leg stranded 4
+    // `new CellRes()` - 64 of this binary's 96 leaked bytes under `leaks --atExit`.
     {
-        list<UniqueCell> cells = default;
-        Lambda<void()> grow = () => { UniqueCell c = default; cells.add(c); };
-        grow(); grow();
-        result &= Test("ref capture list of unique-owning elems", cells.count(), 2);
+        uniqueCellLive = 0;
+        {
+            list<UniqueCell> cells = default;
+            Lambda<void()> grow = () => { UniqueCell c = default; cells.add(c); };
+            grow(); grow();
+            result &= Test("ref capture list of unique-owning elems", cells.count(), 2);
+            result &= Test("ref capture list of unique-owning elems live", uniqueCellLive, 2);
+        }
+        result &= Test("ref capture list of unique-owning elems freed", uniqueCellLive, 0);
     }
 
     // The capture BORROWS, so the source is destructed exactly once. The pre-fix env copy was a

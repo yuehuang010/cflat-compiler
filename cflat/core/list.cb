@@ -34,12 +34,31 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     int _size     = 0;
     int _capacity = 0;
 
+    // `new T[n]` default-CONSTRUCTS every slot, so a T whose default construction acquires
+    // (e.g. a field initialized with `new`) hands back a buffer of live values - but every
+    // container store here assumes an EMPTY slot and drops no old value. Drain the fresh buffer
+    // once so the "slots outside [0,_size) are empty" invariant holds. Skipped for primitives
+    // and pointers (bare/`unique`/`alias`/interface), whose fresh slots are plain zeroed scalars.
+    void _drainFresh(T* buf, int n)
+    {
+        if const (!is_primitive(T) && !is_pointer(T))
+        {
+            int k = 0;
+            while (k < n)
+            {
+                _ = move buf[k];
+                k++;
+            }
+        }
+    }
+
     // Double the backing buffer, moving existing elements over. Moving (not copying) is
     // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
         T* newData = new T[newCap];
+        _drainFresh(newData, newCap);
         int i = 0;
         while (i < _size)
         {

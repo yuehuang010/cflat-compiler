@@ -23,12 +23,31 @@ class queue<T>
     int _capacity = 0;
     int _front    = 0;
 
+    // `new T[n]` default-CONSTRUCTS every slot, so a T whose default construction acquires
+    // (e.g. a field initialized with `new`) hands back a buffer of live values - but every
+    // container store here assumes an EMPTY slot and drops no old value. Drain the fresh buffer
+    // once so the "slots outside the live range are empty" invariant holds. Skipped for
+    // primitives and pointers (bare/`unique`/`alias`/interface), whose fresh slots are zeroed.
+    void _drainFresh(T* buf, int n)
+    {
+        if const (!is_primitive(T) && !is_pointer(T))
+        {
+            int k = 0;
+            while (k < n)
+            {
+                _ = move buf[k];
+                k++;
+            }
+        }
+    }
+
     // Repack live elements to the front of a fresh buffer, doubling only when the live count
     // actually needs it - a queue drained from the front runs out of tail room with slack left.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : (_size + 1 > _capacity ? _capacity * 2 : _capacity);
         T* newData = new T[newCap];
+        _drainFresh(newData, newCap);
         int i = 0;
         while (i < _size)
         {

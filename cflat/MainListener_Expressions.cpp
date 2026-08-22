@@ -3266,7 +3266,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // keep their plain store below. This does NOT drop the old slot value: a container
             // releases a live slot itself (list.set -> `_releaseAt` then `_placeAt`) and only ever
             // stores into an EMPTY slot here, so a drop-old would double-destruct the (default-
-            // constructed) slot - `list<Val>` with a side-effecting dtor proved that. Returns early:
+            // constructed) slot - `list<Val>` with a side-effecting dtor proved that. The core
+            // containers uphold the EMPTY half by draining a fresh `new T[n]` buffer (_drainFresh),
+            // whose slots are default-CONSTRUCTED and can hold live values. Returns early:
             // it does the source-consume itself, so the generic Transfer*OnStore helpers must not run.
             // Fire ONLY for a NAMED owning source (a by-value param / local, alloca- or
             // global-backed) - `_data[i] = value` / `_data[i] = move value` in collapsed container

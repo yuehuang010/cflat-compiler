@@ -41,11 +41,26 @@ class spsc_queue<T>
     int _head = 0;         // next write position - producer writes, consumer reads
     int _tail = 0;         // next read  position - consumer writes, producer reads
 
+    // `new T[n]` default-CONSTRUCTS every slot, so a T whose default construction acquires
+    // (e.g. a field initialized with `new`) hands back a buffer of live values that the ring's
+    // bitwise hand-off then overwrites without dropping. Drain the fresh buffer once so every
+    // slot starts EMPTY. Skipped for primitives and pointers, whose fresh slots are zeroed.
+    void _drainFresh(T* buf, i64 n) {
+        if const (!is_primitive(T) && !is_pointer(T)) {
+            i64 k = (i64)0;
+            while (k < n) {
+                _ = move buf[k];
+                k = k + (i64)1;
+            }
+        }
+    }
+
     // Allocate the ring buffer.  Must be called before push/pop.
     // capacity is the number of usable slots; internally cap+1 slots are allocated.
     void init(int capacity) {
         _cap  = capacity + 1;   // +1 for the sentinel slot
         _buf  = new T[_cap];
+        _drainFresh(_buf, (i64)_cap);
         _head = 0;
         _tail = 0;
     }

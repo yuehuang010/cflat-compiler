@@ -44,10 +44,29 @@ struct hashset<T>
         return h;
     }
 
+    // `new T[n]` default-CONSTRUCTS every slot, so a key type whose default construction
+    // acquires (e.g. a field initialized with `new`) hands back a buffer of live values - but
+    // every slot store here assumes an EMPTY slot and drops no old value. Drain a fresh buffer
+    // once so the "an unoccupied slot is empty" invariant holds. Skipped for primitives and
+    // pointers (bare/`unique`/`alias`/interface), whose fresh slots are plain zeroed scalars.
+    void _drainFresh(T* buf, int n)
+    {
+        if const (!is_primitive(T) && !is_pointer(T))
+        {
+            int k = 0;
+            while (k < n)
+            {
+                _ = move buf[k];
+                k++;
+            }
+        }
+    }
+
     // Allocate empty key/status arrays of `cap` slots.
     void _init(int cap)
     {
         _keys   = new T[cap];
+        _drainFresh(_keys, cap);
         _status = new char[cap];
         int i = 0;
         while (i < cap)

@@ -36,6 +36,25 @@ struct LeakPair { string name = default; list<int> nums = default; };
 // element so a .copy() is independent (not a shared-buffer double-free). (Multi-dimensional array
 // FIELDS are not expressible in the grammar; the flattened walk is exercised by array LOCALS.)
 // See internal/issue/fixed-array-elements-not-destructed.md.
+// Bug 11: a container's backing buffer comes from `new T[n]`, which default-CONSTRUCTS every
+// slot. An element type that ACQUIRES during default construction (a `unique` field initialized
+// with `new`) therefore handed back a buffer of LIVE values, and every container slot store
+// assumes an EMPTY slot and drops no old value - so one element leaked per capacity slot, plus
+// every never-filled tail slot. The containers now drain a fresh buffer once (`_drainFresh`).
+// DrainRes counts live pointees; DrainCell is the acquiring element type; DrainKey adds the
+// hash()/==/copy() that hashset<T> requires of a value element.
+int _drainLive = 0;
+struct DrainRes  { int v = 0; DrainRes() { _drainLive++; } ~DrainRes() { _drainLive--; } };
+struct DrainCell { unique DrainRes* p = new DrainRes(); int tag = 0; };
+struct DrainKey
+{
+    unique DrainRes* p = new DrainRes();
+    int tag = 0;
+    int hash() { return tag; }
+    bool operator==(alias DrainKey other) { return tag == other.tag; }
+    DrainKey copy() { DrainKey r = default; r.tag = tag; return move r; }
+};
+
 struct ArrSBox   { string s = default; };
 struct ArrHolder { ArrSBox items[3] = default; };
 
@@ -3486,6 +3505,86 @@ extern int main()
             string armLoop = armCond ? makeTempTok(33).text : "-";
             total++; passed += Test("ternary arm owning-struct field read in loop", armLoop, "tok33");
         }
+    }
+
+    // === Bug 11: a freshly allocated container buffer is default-CONSTRUCTED, not empty ===
+    // Every leg below is a resource count, not a value: pre-fix each container leaked one
+    // DrainRes per capacity slot (list/queue/stack cap 4, dictionary/hashset cap 8), so
+    // _drainLive stayed at 4/4/4/8/8 instead of returning to 0. Placed before the HeapAudit
+    // oracle so the leaked `new DrainRes()` allocations also fail reportLeaks().
+    {
+        _drainLive = 0;
+        {
+            list<DrainCell> dl = default;
+            DrainCell dc = default;
+            dl.add(dc);
+            // In-scope, not just at teardown: one live pointee (the element), NOT 5. Pre-fix the
+            // three unfilled slots of the cap-4 buffer were live here too.
+            total++; passed += Test("drain list live in scope", _drainLive, 1);
+            total++; passed += Test("drain list count", dl.count(), 1);
+        }
+        total++; passed += Test("drain list live after teardown", _drainLive, 0);
+    }
+    {
+        // Two grows (cap 4 -> 8 -> 16): the old buffer's unfilled tail must not be stranded
+        // either, and the move loop must not overwrite a live fresh slot.
+        _drainLive = 0;
+        {
+            list<DrainCell> dl = default;
+            for (int di = 0; di < 9; di++) { DrainCell dc = default; dl.add(dc); }
+            total++; passed += Test("drain list grown live in scope", _drainLive, 9);
+            total++; passed += Test("drain list grown count", dl.count(), 9);
+        }
+        total++; passed += Test("drain list grown live after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { queue<DrainCell> dq = default; DrainCell dc = default; dq.enqueue(dc);
+          total++; passed += Test("drain queue live in scope", _drainLive, 1); }
+        total++; passed += Test("drain queue live after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { stack<DrainCell> ds = default; DrainCell dc = default; ds.push(dc);
+          total++; passed += Test("drain stack live in scope", _drainLive, 1); }
+        total++; passed += Test("drain stack live after teardown", _drainLive, 0);
+    }
+    {
+        // dictionary drains BOTH fresh arrays; V=DrainCell is the acquiring one here, and the
+        // `_missing` sentinel field accounts for the one extra live pointee in scope.
+        _drainLive = 0;
+        { dictionary<int, DrainCell> dd = default; DrainCell dc = default; dd.set(1, move dc);
+          total++; passed += Test("drain dict live in scope", _drainLive, 2);
+          total++; passed += Test("drain dict count", dd.count(), 1); }
+        total++; passed += Test("drain dict live after teardown", _drainLive, 0);
+    }
+    {
+        // hashset add() deep-copies the key, so in scope the caller's key and the slot copy are
+        // both live (2), not 10.
+        _drainLive = 0;
+        { hashset<DrainKey> dh = default; DrainKey dk = default; dk.tag = 3; dh.add(dk);
+          total++; passed += Test("drain hashset live in scope", _drainLive, 2);
+          total++; passed += Test("drain hashset count", dh.count(), 1); }
+        total++; passed += Test("drain hashset live after teardown", _drainLive, 0);
+    }
+    {
+        // array<T> was ALREADY correct (its `delete[_len]` destructs every slot): this leg pins
+        // that the drain change did not make it destruct twice - a double free aborts HeapAudit.
+        _drainLive = 0;
+        { array<DrainCell> da = default; da.init(4);
+          total++; passed += Test("drain array live in scope", _drainLive, 4); }
+        total++; passed += Test("drain array live after teardown", _drainLive, 0);
+    }
+    {
+        // The drain must not double-destruct a plain value element: set()/removeAt()/clear()
+        // already release live slots, and a drained slot is left empty. LeakRow owns a string,
+        // so a second destruct would be a double free HeapAudit aborts on.
+        list<LeakRow> dvr = default;
+        LeakRow dr0 = default; dr0.name = "row0".copy(); dvr.add(dr0);
+        LeakRow dr1 = default; dr1.name = "row1".copy(); dvr.set(0, dr1);
+        total++; passed += Test("drain value-elem set survives", dvr.get(0).name, "row1");
+        dvr.removeAt(0);
+        total++; passed += Test("drain value-elem removeAt count", dvr.count(), 0);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===
