@@ -2849,3 +2849,21 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   ownership and per-control caption ink; a single themeText predicate is insufficient after a
   re-sync or theme flip. Trackbar channel/ticks use dark NM_CUSTOMDRAW parts while the thumb
   stays default-themed.
+
+- **delete-borrow-via-named-local, closed sub-cases (2026-07-19..21; issue narrowed 2026-08-21).**
+  Recorded here so the issue file holds only the open bare-`list<T*>` provenance case. Do not
+  re-investigate: (1) `delete l.get(0)` / `delete l.take(0)` on the call result directly is
+  rejected (null Storage, decidable at the delete site). (2) `list<unique B*> l; B* g = l.get(0);
+  delete g;` is rejected by carrying element ownership on the accessor's monomorphized return
+  type (`TypeAndValue.IsBorrowOfUniqueElement`, `--init` key `"bue"`) into
+  `NamedVariable.BorrowsOwnedElement`, consulted ONLY by the delete check; the discriminator is
+  "does the container own the element", not "came from an accessor". Regression:
+  `Test/errors/err_delete_borrowed_owned_element.cb`. (3) Reassignment (`g = new B();`) clears the
+  borrow tag. (4) Opt-in `list<alias T*>`: `alias` is a legal generic type ARGUMENT again, a
+  distinct type from `list<T*>` (mangles `alias_`); every accessor result, including `take()`'s
+  plain-`T` return (gate is `substAliasArg`, not the return spelling), carries
+  `IsBorrowOfAliasElement` (`--init` key `"bae"`) and rejects `delete`. Regressions:
+  `err_delete_alias_borrow.cb`, `err_alias_type_arg_rejected.cb`, positive leg in
+  `test_list_ownership.cb`. Known residuals: the diagnostic says "its container" (no variable
+  name); borrow-ness is re-projected per accessor rather than riding the result's own type;
+  `queue<T>.dequeue()` not aligned.
