@@ -116,6 +116,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             {
                 auto tv = ParseConditionalExpression(condCtx, use);
                 result.Primary = tv.value;
+                result.TypeAndValue.IsAlias = tv.isAlias;
                 if (result.Primary)
                 {
                     result.BaseType = result.Primary->getType();
@@ -174,6 +175,14 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                         && result.Primary->getType()->isPointerTy();
                     result.TypeAndValue.IsInterfacePointer = false;
                 }
+            }
+            if (result.Primary != nullptr && compilerLLVM->IsAliasValue(result.Primary))
+                result.TypeAndValue.IsAlias = true;
+            if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
+            {
+                result.FromOwningTempField = true;
+                if (result.TypeAndValue.TypeName.empty())
+                    result.TypeAndValue.TypeName = LLVMTypeToTypeName(result.Primary->getType());
             }
             // A bare `x as T` whose T is x's own type reached here as a raw value. Restore the
             // operand's storage and provenance, matched on the exact node so `x as T + 1` cannot.
@@ -2575,6 +2584,25 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(right);
             }
 
+            // A string from an alias accessor is a borrowed view of the container slot;
+            // a field store would make that buffer outlive its owner.
+            if (operatorText == "=" && destIsStructField
+                && NamedVarIsString(namedVar)
+                && !namedVar.TypeAndValue.IsAlias
+                && rightNV.TypeAndValue.IsAlias
+                && !rightNV.TypeAndValue.IsMove)
+            {
+                const bool namedAliasLocal = rightNV.Storage != nullptr
+                    && !rightNV.IsElementAccess && !rightNV.CallerName.empty();
+                const char* sourceText = namedAliasLocal
+                    ? "an 'alias' string local" : "a string taken from a temporary";
+                LogErrorContext(ctx, std::format(
+                    "cannot store {} into a longer-lived location; "
+                    "its buffer is owned elsewhere and would be freed out from under the field. "
+                    "Use '.copy()' for an independent copy.", sourceText));
+                return finishStore(right);
+            }
+
             // Same escape into a BORROWING destination (field, local, global, array element) with
             // a dtor-LESS pointee. After the gate above, so a dtor-bearing pointee keeps its wording.
             if (operatorText == "=")
@@ -3659,6 +3687,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         llvm::BasicBlock* falseEnd = nullptr;
         bool trueOwnedString  = false;
         bool falseOwnedString = false;
+        bool trueAlias = false;
+        bool falseAlias = false;
+        bool trueTempField = false;
+        bool falseTempField = false;
         LLVMBackend::OwnedTempMark trueMark  = compiler->MarkOwnedTemps();
         LLVMBackend::OwnedTempMark falseMark = trueMark;
         // Give each arm its OWN cast occurrence: both arms share the enclosing argument slot, so
@@ -3678,6 +3710,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 }
                 else
                     trueValue = ParseExpression(expressionTrueCtx);
+                trueAlias = compiler->IsAliasValue(trueValue);
+                trueTempField = compiler->IsTempFieldValue(trueValue);
                 if (use == ResultUse::Discard)
                     compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
                 else
@@ -3691,6 +3725,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 falseOcc   = armScope.Id;
                 falseValue = ParseConditionalExpression(expressionFalseCtx, use);
+                falseAlias = compiler->IsAliasValue(falseValue);
+                falseTempField = compiler->IsTempFieldValue(falseValue);
                 if (use == ResultUse::Discard)
                     compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
                 else
@@ -3865,8 +3901,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (ownedString)
         {
             compiler->RegisterOwnedStringTemp(phi);
+            if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
             compiler->lastCallReturnsOwned = true;
-            return { phi, true };
+            LLVMBackend::TypedValue result{ phi, true };
+            result.isAlias = trueAlias || falseAlias;
+            return result;
         }
 
         // A ternary is a transparent wrapper: ownership rides out on the joined value.
@@ -3876,9 +3915,14 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
         if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
             compiler->ClearOwnedResultChannels();
+        compiler->PropagateAliasValue(trueValue, falseValue, phi);
+        if (trueAlias || falseAlias) compiler->RegisterAliasValue(phi);
+        if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
-        return { phi, false };
+        LLVMBackend::TypedValue result{ phi, false };
+        result.isAlias = trueAlias || falseAlias;
+        return result;
     }
 
 LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
@@ -3919,6 +3963,10 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
             compiler->SwitchToBlock(nullBlock);
             llvm::Value* rhs = nullptr;
+            bool lhsAlias = compiler->IsAliasValue(lhs);
+            bool rhsAlias = false;
+            bool lhsTempField = compiler->IsTempFieldValue(lhs);
+            bool rhsTempField = false;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
             LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
             llvm::BranchInst* rhsBr = nullptr;
@@ -3928,6 +3976,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     LLVMBackend::CastOccurrenceScope armScope(compiler);
                     rhsOcc = armScope.Id;
                     rhs = ParseConditionalExpression(ctx->conditionalExpression(), use);
+                    rhsAlias = compiler->IsAliasValue(rhs);
+                    rhsTempField = compiler->IsTempFieldValue(rhs);
                 }
                 // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
                 // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
@@ -3961,6 +4011,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
             compiler->SwitchToBlock(resumeBlock);
             auto* joined = compiler->CreateLoad(resultAlloca);
+            if (lhsAlias || rhsAlias) compiler->RegisterAliasValue(joined);
+            if (lhsTempField || rhsTempField) compiler->RegisterTempFieldValue(joined);
             // Ledger the arms for the interface-boxing path: this joins through a SLOT, so the
             // result is a plain load and the arms are unrecoverable from the IR afterwards.
             if (joined != nullptr && lhsBr != nullptr && rhsBr != nullptr
@@ -3969,6 +4021,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             {
                 compiler->RegisterNullCoalesceJoin(
                     joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                compiler->PropagateAliasValue(lhs, rhs, joined);
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
                 compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
                 compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
@@ -4000,7 +4053,9 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     compiler->PropagateTernaryOwnership(lhs, rhs, joined);
                 }
             }
-            return { joined, false };
+            LLVMBackend::TypedValue result{ joined, false };
+            result.isAlias = lhsAlias || rhsAlias;
+            return result;
         }
 
         // Grammar: logicalOrExpression ('?' expression ':' conditionalExpression)?
@@ -4094,8 +4149,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // and the other leaks regardless. See PropagateTernaryOwnership.
                 if (compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue))
                     compiler->ClearOwnedResultChannels();
+                compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
-                return { selectValue, false };
+                LLVMBackend::TypedValue result{ selectValue, false };
+                result.isAlias = compiler->IsAliasValue(selectValue);
+                return result;
             }
 
             return condTv;
@@ -4355,6 +4413,10 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
             elemType = Compiler(ctx)->GetType(elemTV);
         }
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
+        result.isAlias = namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow;
+        if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
+        if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
+            Compiler(ctx)->RegisterTempFieldValue(result.value);
         result.elemType = elemType;
         result.isArrayView = namedVar.TypeAndValue.IsArrayView;
         // Carry the depth so an operator's right operand keeps a claim the raw llvm::Value loses.
@@ -7117,6 +7179,17 @@ bool MainListener::EmitOneFieldInit(
         // assignment site, so `h.p = w` being rejected says nothing about `Holder h = { p = w }`.
         RejectCodeValueIntoDataSlot(errCtx, rightNV, fieldType, "brace-initialize",
                                     std::format("field '{}.{}' of", typeName, fieldName));
+
+        // Brace initialization is a separate field-store path from `field = value`.
+        // An alias string from a temporary must not escape through either spelling.
+        if (fieldType.TypeName == "string" && !fieldType.Pointer && !fieldType.IsAlias
+            && rightNV.TypeAndValue.IsAlias && !rightNV.TypeAndValue.IsMove)
+        {
+            LogErrorContext(errCtx,
+                "cannot store a string taken from a temporary into a longer-lived location; "
+                "its buffer is owned elsewhere and would be freed out from under the field. "
+                "Use '.copy()' for an independent copy.");
+        }
 
         // `unique` field initialized here: this is a second field-store path, so it needs the same
         // two source rejections the `=` path applies (Trap A, and field-to-field). No reassign-free

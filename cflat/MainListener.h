@@ -48,6 +48,69 @@ static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContex
     return false;
 }
 
+static std::string ImportProgramAlias(CFlatParser::ImportDeclarationContext* imp)
+{
+    if (imp == nullptr || imp->As() == nullptr) return {};
+    for (size_t i = 0; i + 1 < imp->children.size(); i++)
+        if (imp->children[i] == imp->As())
+            return imp->children[i + 1]->getText();
+    return {};
+}
+
+static std::string ImportNamespace(CFlatParser::ImportDeclarationContext* imp)
+{
+    if (imp == nullptr || imp->children.size() < 2) return {};
+    std::string first = imp->children[1]->getText();
+    if (first == "program" || first == "package" || first == "framework"
+        || first == "package-vcpkg" || first == "package-nuget")
+        return {};
+    auto ids = imp->Identifier();
+    return ids.empty() ? std::string{} : ids.front()->getText();
+}
+
+template <typename Fn>
+static void ForEachImportClause(CFlatParser::ImportDeclarationContext* imp, Fn&& fn)
+{
+    if (imp == nullptr) return;
+    fn(imp->libClause());
+    fn(imp->frameworkClause());
+    for (auto* clause : imp->defineClause())
+        fn(clause);
+    fn(imp->cacheClause());
+    fn(imp->fromClause());
+    fn(imp->priClause());
+}
+
+static bool ImportClauseHasWord(antlr4::ParserRuleContext* clause, const char* word)
+{
+    return clause != nullptr && !clause->children.empty() && clause->children.front()->getText() == word;
+}
+
+static std::string ValidateImportSoftKeywords(CFlatParser::ImportDeclarationContext* imp)
+{
+    std::string error;
+    ForEachImportClause(imp, [&](antlr4::ParserRuleContext* clause) {
+        if (!error.empty() || clause == nullptr || clause->children.empty()) return;
+        std::string actual = clause->children.front()->getText();
+        if (actual == "lib" || actual == "framework" || actual == "define"
+            || actual == "cache" || actual == "from" || actual == "pri")
+            return;
+        error = std::format("unknown '{}' in import clause", actual);
+    });
+    return error;
+}
+
+static std::string ValidateImportLeadingMarker(CFlatParser::ImportDeclarationContext* imp)
+{
+    if (imp == nullptr || imp->children.size() < 2) return "malformed import declaration";
+    std::string first = imp->children[1]->getText();
+    if (!first.empty() && (first.front() == '"' || first.front() == '{')) return {};
+    if (first == "program" || first == "package" || first == "framework"
+        || first == "package-vcpkg" || first == "package-nuget")
+        return {};
+    return std::format("unknown '{}' in import marker", first);
+}
+
 // Returns true when a function's entire body is a single 'return { ... };' statement,
 // marking it as a return-block function (to be inlined at every call site).
 static bool IsReturnBlockFunction(CFlatParser::FunctionDefinitionContext* func)

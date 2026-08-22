@@ -126,6 +126,7 @@ run_case "poisson_cg"    "$OUT/poisson_cg"    "example/hpc/poisson_cg.cb"
 run_case "interp"        "$OUT/interp"        "example/tools/interp.cb"
 run_case "json_config"   "$OUT/json_config"   "example/tools/json_config.cb"
 run_case "test_http"     "$OUT/test_http"     "example/restAPI/test_http.cb" $IREST
+run_case "https_get"     "$OUT/https_get"     "example/restAPI/https_get.cb" $IREST
 run_case "framework_link" "$OUT/framework_link" "$IMAC/framework_link.cb"       -i "$IMAC"
 run_case "hello_objc"    "$OUT/hello_objc"    "$IMAC/hello_objc.cb"           -i "$IMAC"
 run_case "sysinfo_mac"   "$OUT/sysinfo_mac"   "$IMAC/sysinfo_mac.cb"          -i "$IMAC"

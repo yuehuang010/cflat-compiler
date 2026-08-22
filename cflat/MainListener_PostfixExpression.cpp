@@ -499,6 +499,8 @@ std::optional<std::string> MainListener::FoldConstLiteral(
 LLVMBackend::NamedVariable MainListener::ParsePostfixExpression(CFlatParser::PostfixExpressionContext* ctx, bool lValue,
                                                        size_t dropTrailingChildren, ResultUse use) {
         auto namedVar = ParsePostfixExpressionInner(ctx, lValue, dropTrailingChildren, use);
+        if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
+            Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
         // Name the callee from the spelling: the chain up to its LAST top-level '(', so a call
         // on another call's result names the callee consumed here, not the first one in the chain.
         std::string text = ctx->getText();
@@ -1452,7 +1454,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             }
                                         }
                                         if (parentIsOwningTemp || structVar.FromOwningTempField)
+                                        {
                                             namedVar.FromOwningTempField = true;
+                                            if (namedVar.Primary != nullptr && !namedVar.OwningTempParent)
+                                                Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
+                                        }
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
@@ -2097,6 +2103,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 else
                                 {
                                     structVar = {};
+                                    interfaceVar = {};
                                 }
                                 break;
                             }
@@ -4893,6 +4900,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // nxt()'s result below, not the stale pre-call receiver type.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                structVar = {};
+                                interfaceVar = {};
                             }
                             else
                             {
@@ -4940,6 +4949,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // so that subsequent member access (->field) can resolve the struct.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
+                                // A primitive result has no aggregate classifier: clear the previous
+                                // receiver, else `box.get().toString()` reuses `box` as the receiver.
+                                structVar = {};
+                                interfaceVar = {};
                             }
 
                             if (namedVar.TypeAndValue.IsInterface)
@@ -6489,7 +6502,10 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             lastParenExprFieldName = nv.FieldName;
             lastParenExprCallerName = nv.CallerName;
             lastParenExprNamed = nv;
-            return LoadNamedVariable(nv);
+            auto* loaded = LoadNamedVariable(nv);
+            if (nv.FromOwningTempField && !nv.OwningTempParent)
+                compiler->RegisterTempFieldValue(loaded);
+            return loaded;
         }
         else if (stringLiteral.size() > 0)
         {

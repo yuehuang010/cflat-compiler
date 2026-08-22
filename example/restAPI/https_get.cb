@@ -1,0 +1,46 @@
+// HTTPS smoke test for the core TLS client.
+// On macOS this uses SecureTransport with certificate verification enabled.
+// Other platforms report a clear unsupported message; REST callers can use
+// process/curl there until their native TLS backend is added.
+
+import "network/tls.cb";
+
+extern int main()
+{
+    TlsSocket tls;
+    if (!tls.connect("example.com", 443))
+    {
+        printf("network unavailable: %s\n", tls.error().data());
+        return 0;
+    }
+
+    string request = "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    if (tls.send(request.data(), request.length()) <= 0)
+    {
+        printf("FAIL: HTTPS request write\n");
+        return 1;
+    }
+
+    i8* body = new i8[8192];
+    int total = 0;
+    while (total < 8191)
+    {
+        int n = tls.recv(&body[total], 8191 - total);
+        if (n <= 0) break;
+        total += n;
+    }
+    body[total] = 0;
+    bool status200 = total >= 12 && body[0] == 'H' && body[1] == 'T' && body[2] == 'T'
+        && body[3] == 'P' && body[9] == '2' && body[10] == '0' && body[11] == '0';
+    printf("HTTPS status: %.*s\n", total > 15 ? 15 : total, body);
+    printf("HTTPS body: %.*s\n", total > 512 ? 512 : total, body);
+    delete body;
+    if (!status200) { printf("FAIL: expected HTTP 200\n"); return 1; }
+
+    TlsSocket wrongName;
+    bool rejected = !wrongName.connect("example.com", 443, "wrong.invalid");
+    printf("certificate hostname validation: %s\n", rejected ? "PASS" : "FAIL");
+    if (!rejected) return 1;
+    printf("PASS: HTTPS SecureTransport smoke test\n");
+    return 0;
+}

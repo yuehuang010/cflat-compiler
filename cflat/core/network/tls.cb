@@ -1,0 +1,187 @@
+// core/network/tls.cb - synchronous TLS client over the Socket API.
+//
+// macOS uses SecureTransport through dynamically loaded Security.framework
+// symbols. Certificate and hostname verification stay enabled by default.
+// Windows and Linux expose the same surface but report that TLS is not yet
+// implemented on those platforms.
+
+import "string.cb";
+import "network/socket.cb";
+
+if const (__MACOS__) {
+    extern void* dlopen(const char* path, int mode);
+    extern void* dlsym(void* handle, const char* name);
+    extern int dlclose(void* handle);
+
+    void* __tlsSecurity = nullptr;
+    void* __tlsCoreFoundation = nullptr;
+    bool __tlsLoaded = false;
+    bool __tlsLoadFailed = false;
+
+    function<void*(void*, int, int)> __tlsCreateContext = default;
+    function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)> __tlsSetIOFuncs = default;
+    function<int(void*, void*)> __tlsSetConnection = default;
+    function<int(void*, i8*, u64)> __tlsSetPeerDomainName = default;
+    function<int(void*)> __tlsHandshake = default;
+    function<int(void*, i8*, u64, u64*)> __tlsRead = default;
+    function<int(void*, i8*, u64, u64*)> __tlsWrite = default;
+    function<int(void*)> __tlsClose = default;
+    function<void(void*)> __tlsRelease = default;
+
+    // SecureTransport callback: connection is the native socket descriptor.
+    int __tlsSocketRead(void* connection, i8* data, u64* length)
+    {
+        if (connection == nullptr || length == nullptr) return -9800;
+        int n = _wsa_recv(connection, data, (int)*length, 0);
+        if (n < 0) { *length = 0; return -9800; }
+        if (n == 0) { *length = 0; return -9805; }
+        *length = (u64)n;
+        return 0;
+    }
+
+    int __tlsSocketWrite(void* connection, i8* data, u64* length)
+    {
+        if (connection == nullptr || length == nullptr) return -9800;
+        int n = _wsa_send(connection, data, (int)*length, 0);
+        if (n < 0) { *length = 0; return -9800; }
+        *length = (u64)n;
+        return 0;
+    }
+
+    bool __tlsLoadSymbols()
+    {
+        if (__tlsLoaded) return true;
+        if (__tlsLoadFailed) return false;
+        __tlsSecurity = dlopen("/System/Library/Frameworks/Security.framework/Security", 2);
+        __tlsCoreFoundation = dlopen("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation", 2);
+        if (__tlsSecurity == nullptr || __tlsCoreFoundation == nullptr)
+        {
+            if (__tlsSecurity != nullptr) dlclose(__tlsSecurity);
+            if (__tlsCoreFoundation != nullptr) dlclose(__tlsCoreFoundation);
+            __tlsSecurity = nullptr;
+            __tlsCoreFoundation = nullptr;
+            __tlsLoadFailed = true;
+            return false;
+        }
+
+        __tlsCreateContext = (function<void*(void*, int, int)>)dlsym(__tlsSecurity, "SSLCreateContext");
+        __tlsSetIOFuncs = (function<int(void*, function<int(void*, i8*, u64*)>, function<int(void*, i8*, u64*)>)>)dlsym(__tlsSecurity, "SSLSetIOFuncs");
+        __tlsSetConnection = (function<int(void*, void*)>)dlsym(__tlsSecurity, "SSLSetConnection");
+        __tlsSetPeerDomainName = (function<int(void*, i8*, u64)>)dlsym(__tlsSecurity, "SSLSetPeerDomainName");
+        __tlsHandshake = (function<int(void*)>)dlsym(__tlsSecurity, "SSLHandshake");
+        __tlsRead = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLRead");
+        __tlsWrite = (function<int(void*, i8*, u64, u64*)>)dlsym(__tlsSecurity, "SSLWrite");
+        __tlsClose = (function<int(void*)>)dlsym(__tlsSecurity, "SSLClose");
+        __tlsRelease = (function<void(void*)>)dlsym(__tlsCoreFoundation, "CFRelease");
+        __tlsLoaded = __tlsCreateContext != nullptr && __tlsSetIOFuncs != nullptr
+            && __tlsSetConnection != nullptr && __tlsSetPeerDomainName != nullptr
+            && __tlsHandshake != nullptr && __tlsRead != nullptr && __tlsWrite != nullptr
+            && __tlsClose != nullptr && __tlsRelease != nullptr;
+        if (!__tlsLoaded)
+        {
+            dlclose(__tlsSecurity);
+            dlclose(__tlsCoreFoundation);
+            __tlsSecurity = nullptr;
+            __tlsCoreFoundation = nullptr;
+            __tlsLoadFailed = true;
+        }
+        return __tlsLoaded;
+    }
+}
+
+class TlsSocket
+{
+    Socket* _socket = nullptr;
+    void* _context = nullptr;
+    string _error = default;
+
+    void fail(string message)
+    {
+        _error = message;
+        close();
+    }
+
+    // Connect to host:port and verify the certificate for host.
+    bool connect(string host, int port)
+    {
+        return connect(host, port, host);
+    }
+
+    // Connect to a TCP host but verify the peer certificate against peerName.
+    // This is useful for callers that need an explicit hostname test; there is
+    // deliberately no API to disable certificate verification.
+    bool connect(string host, int port, string peerName)
+    {
+        close();
+        _error = "";
+        if const (__WINDOWS__) {
+            _error = "TLS is not implemented on this platform yet";
+            return false;
+        } else if const (__LINUX__) {
+            _error = "TLS is not implemented on this platform yet";
+            return false;
+        } else {
+            if (!__tlsLoadSymbols()) { _error = "TLS is unavailable: SecureTransport symbols could not be loaded"; return false; }
+            if (!Socket.initNetwork()) { _error = "network initialization failed"; return false; }
+            _socket = new Socket;
+            if (!_socket->createTcp()) { fail("TCP socket creation failed"); return false; }
+            if (!_socket->connect(host, port)) { fail("TCP connection failed"); return false; }
+
+            _context = __tlsCreateContext(nullptr, 1, 0);
+            if (_context == nullptr) { fail("TLS context creation failed"); return false; }
+            int ioStatus = __tlsSetIOFuncs(_context, __tlsSocketRead, __tlsSocketWrite);
+            if (ioStatus != 0) { fail("TLS callback setup failed: " + ioStatus.toString()); return false; }
+            int connectionStatus = __tlsSetConnection(_context, _socket->nativeHandle());
+            if (connectionStatus != 0) { fail("TLS socket binding failed: " + connectionStatus.toString()); return false; }
+            int peerStatus = __tlsSetPeerDomainName(_context, peerName.data(), (u64)peerName.length());
+            if (peerStatus != 0) { fail("TLS peer-name setup failed: " + peerStatus.toString()); return false; }
+            // Do not set kSSLSessionOptionBreakOnServerAuth: SecureTransport
+            // performs normal certificate-chain and hostname validation here.
+            int handshakeStatus = __tlsHandshake(_context);
+            if (handshakeStatus != 0) {
+                fail("TLS handshake failed (certificate or connection rejected): " + handshakeStatus.toString());
+                return false;
+            }
+            return true;
+        }
+    }
+
+    int write(const char* data, int length)
+    {
+        if const (__MACOS__) {
+            if (_context == nullptr) return -1;
+            u64 written = 0;
+            int status = __tlsWrite(_context, data, (u64)length, &written);
+            return status == 0 ? (int)written : -1;
+        }
+        return -1;
+    }
+
+    int send(const char* data, int length) { return write(data, length); }
+
+    int read(i8* data, int length)
+    {
+        if const (__MACOS__) {
+            if (_context == nullptr) return -1;
+            u64 received = 0;
+            int status = __tlsRead(_context, data, (u64)length, &received);
+            return status == 0 ? (int)received : 0;
+        }
+        return -1;
+    }
+
+    int recv(i8* data, int length) { return read(data, length); }
+
+    bool isValid() { return _context != nullptr && _socket != nullptr && _socket->isValid(); }
+    string error() { return _error; }
+
+    void close()
+    {
+        if const (__MACOS__) {
+            if (_context != nullptr) { __tlsClose(_context); __tlsRelease(_context); _context = nullptr; }
+        }
+        if (_socket != nullptr) { delete _socket; _socket = nullptr; }
+    }
+
+    ~TlsSocket() { close(); }
+};

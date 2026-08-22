@@ -179,6 +179,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
         s.uniqueFieldReadValues = std::move(uniqueFieldReadValues_);
         s.uniqueFieldReadJoins = std::move(uniqueFieldReadJoins_);
+        s.aliasValues = std::move(aliasValues_);
+        s.tempFieldValues = std::move(tempFieldValues_);
         // Mark the function we are leaving mid-body INCOMPLETE for the escape analysis
         // (see FunctionBodyIsComplete); RestoreBuilderState pops it back off.
         if (currentFunction != nullptr) suspendedFunctions_.push_back(currentFunction);
@@ -207,6 +209,8 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         nonOwningStructJoins_.clear();
         uniqueFieldReadValues_.clear();
         uniqueFieldReadJoins_.clear();
+        aliasValues_.clear();
+        tempFieldValues_.clear();
         return s;
     }
 
@@ -252,6 +256,8 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         nonOwningStructJoins_    = state.nonOwningStructJoins;
         uniqueFieldReadValues_   = state.uniqueFieldReadValues;
         uniqueFieldReadJoins_    = state.uniqueFieldReadJoins;
+        aliasValues_             = state.aliasValues;
+        tempFieldValues_         = state.tempFieldValues;
     }
 
 bool LLVMBackend::IsWinrtProjectedType(const std::string& name) const

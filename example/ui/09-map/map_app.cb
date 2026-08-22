@@ -335,8 +335,8 @@ class MapView
         this.lastAncestorDraws = ancestorDraws;
     }
 
-    // Build this render's CanvasView (FACTORY form - a raw `new CanvasView()`
-    // is a documented crash on the live Cocoa clone path). Rewired every render;
+    // Build this render's CanvasView (FACTORY form; raw construction is also
+    // supported, but the factory makes the paint callback explicit). Rewired every render;
     // reconcile keeps the native surface, the boxed paint closure captures `this`
     // which is stable for the app's lifetime.
     ICanvasView build(IUiContext ctx)

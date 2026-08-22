@@ -1276,6 +1276,7 @@ public:
         bool         isUnsigned = false;
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
+        bool         isAlias    = false;    // value is a borrow from an alias result or join
         // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;
@@ -1654,6 +1655,8 @@ public:
 
     std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues_;
     std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins_;
+    std::vector<llvm::Value*> aliasValues_;
+    std::vector<llvm::Value*> tempFieldValues_;
 
     std::vector<NullCoalesceJoin> nullCoalesceJoins_;
 
@@ -1667,6 +1670,15 @@ public:
                                   llvm::Value* joined);
     bool IsUniqueFieldReadValue(const llvm::Value* value) const;
     const UniqueFieldReadJoin* FindUniqueFieldReadJoin(const llvm::Value* value) const;
+
+    void RegisterAliasValue(llvm::Value* value);
+    bool IsAliasValue(const llvm::Value* value) const;
+    void PropagateAliasValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                             llvm::Value* joined);
+    void RegisterTempFieldValue(llvm::Value* value);
+    bool IsTempFieldValue(const llvm::Value* value) const;
+    void PropagateTempFieldValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                                 llvm::Value* joined);
 
     /*
      * The cast occurrence (see codeValueDataCasts_) each ARM of a join was evaluated under, keyed
@@ -4213,6 +4225,8 @@ public:
         std::vector<llvm::Value*> nonOwningStructJoins;
         std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues;
         std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins;
+        std::vector<llvm::Value*> aliasValues;
+        std::vector<llvm::Value*> tempFieldValues;
     };
 
     BuilderState SaveBuilderState();

@@ -1609,6 +1609,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
 
 void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        if (ctx->children.empty() || ctx->children[0]->getText() != "program")
+            compiler->LogError("expected 'program' at the start of a program definition");
         compiler->ValidateIsolatedProgram(ctx);
         std::string name = ctx->directDeclarator()->getText();
 
@@ -1875,7 +1877,7 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
         {
             if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
             {
-                std::string alias = imp->Identifier()->getText();
+                std::string alias = ImportProgramAlias(imp);
                 ScanImportedProgramDefinition(alias);
             }
         }

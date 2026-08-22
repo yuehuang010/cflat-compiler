@@ -1170,7 +1170,7 @@ switch (shape)
 
 ## Ownership / Lifetime (`move` keyword)
 
-CFlat uses **context-based ownership**: a local variable owns the pointer it allocates, and a function parameter borrows by default. A struct field owns nothing unless you say so, with [`unique`](#unique-ownership). A **container** of pointers or interfaces (`list<T*>`, `list<IShape>`) borrows its elements by default too - it never frees them - unless the element type itself is marked `unique` (`list<unique T*>`, `list<unique IShape>`); see [`unique` Ownership](#unique-ownership) for the container form and its rules.
+CFlat uses **context-based ownership**: a local variable owns the pointer it allocates, and a function parameter borrows by default. A struct field owns nothing unless you say so, with [`unique`](#unique-ownership). A **container** of pointers or interfaces (`list<T*>`, `list<IShape>`) borrows its elements by default too - it never frees them - unless the element type itself is marked `unique` (`list<unique T*>`, `list<unique IShape>`); see [`unique` Ownership](#unique-ownership) for the container form and its rules. `get()` and `[]` borrow a live slot, `take()` moves an element out and removes it, and `removeAt()` drops/removes it without returning it.
 
 The `move` keyword on a parameter definition transfers ownership into the callee - the resource is freed when the function returns:
 
@@ -2708,12 +2708,10 @@ variable, function, struct, or namespace names.
 **Soft keywords** (text-matched by the listener - reserved in the positions where
 they have syntactic meaning, but legal as identifiers in other positions):
 
-`bond`, `cache`, `define`, `from`, `lib`, `lock`, `program`, `vectorize`
+`bond`, `cache`, `define`, `from`, `framework`, `lib`, `lock`, `package`, `pri`, `program`, `vectorize`
 
-Note: `program` as a top-level keyword defines the managed-entry-point construct
-(see [`program` Keyword](#program-keyword)) and cannot be used as a variable name
-in the enclosing scope. `in` is a hard keyword and cannot be used as a variable
-name at all.
+Note: `program` remains required at the start of a managed-entry-point definition and
+`program`/`package`/`framework` remain fixed import-form markers (see [`program` Keyword](#program-keyword)); all are legal ordinary identifiers elsewhere. `lib`, `define`, `from`, `pri`, and `cache` are checked by text in their fixed import-clause positions. `in` is a hard keyword and cannot be used as a variable name at all.
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 

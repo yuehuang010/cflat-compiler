@@ -130,6 +130,46 @@ void LLVMBackend::RegisterNullCoalesceJoin(llvm::Value* joined, std::vector<Null
         nullCoalesceJoins_.push_back({ joined, std::move(arms) });
     }
 
+void LLVMBackend::RegisterAliasValue(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        if (std::find(aliasValues_.begin(), aliasValues_.end(), value) == aliasValues_.end())
+            aliasValues_.push_back(value);
+    }
+
+bool LLVMBackend::IsAliasValue(const llvm::Value* value) const
+{
+        return value != nullptr
+            && std::find(aliasValues_.begin(), aliasValues_.end(), value) != aliasValues_.end();
+    }
+
+void LLVMBackend::PropagateAliasValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                                      llvm::Value* joined)
+{
+        if (joined != nullptr && (IsAliasValue(trueValue) || IsAliasValue(falseValue)))
+            RegisterAliasValue(joined);
+    }
+
+void LLVMBackend::RegisterTempFieldValue(llvm::Value* value)
+{
+        if (value == nullptr) return;
+        if (std::find(tempFieldValues_.begin(), tempFieldValues_.end(), value) == tempFieldValues_.end())
+            tempFieldValues_.push_back(value);
+    }
+
+bool LLVMBackend::IsTempFieldValue(const llvm::Value* value) const
+{
+        return value != nullptr
+            && std::find(tempFieldValues_.begin(), tempFieldValues_.end(), value) != tempFieldValues_.end();
+    }
+
+void LLVMBackend::PropagateTempFieldValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                                          llvm::Value* joined)
+{
+        if (joined != nullptr && (IsTempFieldValue(trueValue) || IsTempFieldValue(falseValue)))
+            RegisterTempFieldValue(joined);
+    }
+
 const LLVMBackend::NullCoalesceJoin* LLVMBackend::FindNullCoalesceJoin(const llvm::Value* value) const
 {
         if (value == nullptr) return nullptr;
@@ -3144,7 +3184,9 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
-}
+        aliasValues_.clear();
+        tempFieldValues_.clear();
+    }
 
 void LLVMBackend::FlushOwnedTemps()
 {
@@ -3178,6 +3220,8 @@ void LLVMBackend::FlushOwnedTemps()
         nonOwningStructJoins_.clear();
         uniqueFieldReadValues_.clear();
         uniqueFieldReadJoins_.clear();
+        aliasValues_.clear();
+        tempFieldValues_.clear();
     }
 
 void LLVMBackend::DropValue(const NamedVariable& namedVar)

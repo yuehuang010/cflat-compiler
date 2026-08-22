@@ -2204,6 +2204,8 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
 
 void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        if (ctx->children.empty() || ctx->children[0]->getText() != "program")
+            compiler->LogError("expected 'program' at the start of a program definition");
         std::string name = ctx->directDeclarator()->getText();
 
         if (compiler->IsVerbose())

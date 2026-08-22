@@ -7,7 +7,7 @@
 // Differences from `program`:
 //   - `exe` must be set before run() - no user-defined main body.
 //   - Only stdio/out is supported (no allocator, no inbox, no >> wiring).
-//   - x64 only (STARTUPINFOA layout is Win64-specific).
+//   - Windows uses the x64 STARTUPINFOA layout; the POSIX path is supported on arm64 macOS/Linux.
 //
 // Usage:
 //   import "process.cb";

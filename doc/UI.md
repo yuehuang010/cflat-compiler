@@ -271,9 +271,9 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   custom widget). On a native host the view maps to a GDI-backed child window that invokes the
   boxed closure on `WM_PAINT`/`WM_PRINTCLIENT` (through the `CanvasBox` seam, an opaque `u64`
   like `ListRowBox`); on a ICanvas host, `paint()` delegates straight to `onPaint`. Build with
-  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (ICanvas c) => {...}`. (Prefer the
-  JSX form for a live native window: a raw `new CanvasView()` currently hits a pre-existing
-  onPaint box-clone crash on the Cocoa host; the framework factories/JSX are unaffected.)
+  `canvasView(onPaint)` or `<CanvasView .../>` + `.onPaint = (ICanvas c) => {...}`. A focused
+  arm64 Cocoa headless probe also passed with raw `new CanvasView()` plus a field-assigned
+  `onPaint`; the factory and JSX spellings remain the ergonomic forms.
 
 **Interactive CanvasView input (M1).** A `ICanvasView` may opt into pointer / wheel / pinch
 input. Handlers are installed via `setOn*` (never a bare field write - the installer also arms
@@ -1040,8 +1040,8 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 ### IElement x host parity matrix (v17)
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
-compile-checked (`--check --platform macos`); its runtime verification on an arm64 box is
-deferred (see the plan). On every host the data controls carry REAL items, and the `native*`
+compile-checked and runtime-verified on this arm64 Mac by `bash example_mac.sh Release`;
+the gate covers the gallery and map native self-tests. On every host the data controls carry REAL items, and the `native*`
 drivers read their answers back out of the control - an empty control cannot pass a driver assert.
 
 | IElement      | Win32                     | Cocoa (compile-checked)   | WinUI 3                              |
@@ -1265,8 +1265,8 @@ This is precisely what `example.bat`'s `--worker-uitest` does for the template.
   and its own heaps), single launch per process (a second `launch()` after teardown within one
   `Application.Start` session is unsupported - keep a WinUI suite to ONE case), and some readers
   answer from the element model rather than a live control (`isEnabled`, tooltip count).
-- **Cocoa** - compile-checked only (`--check --platform macos`) until an arm64 box exists; the
-  drivers are implemented but not yet runtime-verified.
+- **Cocoa** - runtime-verified on arm64 by the gallery/map self-tests and the native example gate;
+  the standalone `--probe` live-tile check remains environment-dependent.
 
 ## Hardening self-tests
 

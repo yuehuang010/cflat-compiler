@@ -145,6 +145,7 @@ bool operator!=(PtrNode* a, PtrKey b) { return a->v != b.v; }
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 import "test_helper.cb";
+import "list.cb";
 
 // Unsigned-literal regression support: field defaults, a global, and an indirect callee.
 struct UDefaults { u64 wide = 4294967295u; double asDouble = 4294967295u; };
@@ -155,6 +156,36 @@ u64 WidenUnsigned(u64 value) { return value; }
 // Records that it ran, so a ternary arm that must NOT execute can be detected.
 int g_sideEffects = 0;
 int bumpSideEffect(int amount) { g_sideEffects = g_sideEffects + amount; return amount; }
+
+// Primitive postfix results must become the receiver of the next link. These
+// value legs distinguish the result from the original aggregate receiver.
+struct ChainBox
+{
+    int value = 7;
+    int get() { return value; }
+    int doubleValue() { return value * 2; }
+};
+
+int doubleValue(int x) { return x * 100; }
+int chainAddOne(int x) { return x + 1; }
+
+struct PrimitiveResults
+{
+    double getDouble() { return 2.5; }
+    bool getBool() { return true; }
+    char getChar() { return 'A'; }
+};
+
+int softImportIdentifiers(int from, int lib, int cache, int define, int pri,
+                          int framework, int package)
+{
+    int program = from + lib + cache + define + pri + framework + package;
+    return program;
+}
+
+double addOneDouble(double x) { return x + 1.0; }
+bool flipBool(bool x) { return !x; }
+string charLabel(char x) { return "char"; }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -499,6 +530,34 @@ extern int main()
     unsignedAcceptPassed += Test("array index above 255u addresses the right slot",
         (int)indexedBytes[300u], 7);
 
+
+    int chainPassed = 0;
+    ChainBox cb;
+    ChainBox* cbp = &cb;
+    list<int> chainItems;
+    chainItems.add(1); chainItems.add(2);
+    list<int> xs;
+    xs.add(7);
+    string chainCount = chainItems.count().toString();
+    PrimitiveResults pr;
+    chainPassed += Test("primitive method result uses free receiver", cb.get().doubleValue(), 700);
+    chainPassed += Test("primitive pointer result uses free receiver", cbp->get().doubleValue(), 700);
+    chainPassed += Test("primitive result toString", chainItems.count().toString(), "2");
+    chainPassed += Test("list int get primitive toString", xs.get(0).toString(), "7");
+    chainPassed += Test("list int index primitive toString", xs[0].toString(), "7");
+    chainPassed += Test("primitive result length toString", chainCount.length().toString(), "1");
+    chainPassed += Test("primitive result as argument", chainAddOne(cb.get().doubleValue()), 701);
+    chainPassed += Test("three primitive links", cb.get().doubleValue().doubleValue(), 70000);
+    chainPassed += Test("double result receiver", pr.getDouble().addOneDouble() == 3.5, true);
+    chainPassed += Test("bool result receiver", pr.getBool().flipBool().toString(), "false");
+    chainPassed += Test("char result receiver", pr.getChar().charLabel(), "char");
+
+    int softPassed = 0;
+    softPassed += Test("soft import words remain identifiers",
+                       softImportIdentifiers(1, 2, 4, 8, 16, 32, 64), 127);
+
+
     return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
-        && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7) ? 0 : 1;
+        && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
+        && chainPassed == 11 && softPassed == 1) ? 0 : 1;
 }

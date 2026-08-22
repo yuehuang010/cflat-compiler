@@ -1774,7 +1774,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
         {
             if (imp->children.size() >= 2 && imp->children[1]->getText() == "program")
             {
-                std::string alias = imp->Identifier()->getText();
+                std::string alias = ImportProgramAlias(imp);
                 ParseImportedProgramDefinition(alias);
             }
         }
@@ -2029,6 +2029,14 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                 // Point diagnostics at this import statement (see ProcessImports): a not-found
                 // error has no readable file behind it and would otherwise report (0,0).
                 Compiler()->SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
+                    Compiler()->LogError(error);
+                    continue;
+                }
+                if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
+                    Compiler()->LogError(error);
+                    continue;
+                }
                 // `import framework "X";` / `import framework { ... };` inside an if-const
                 // branch. Dispatch before the importGroup routing since it reuses importGroup.
                 if (imp->children.size() >= 2 && imp->children[1]->getText() == "framework")
@@ -2036,6 +2044,8 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                     if (auto* grp = imp->importGroup())
                         for (auto* lit : grp->StringLiteral())
                             Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
+                    else if (auto* lit = imp->StringLiteral())
+                        Compiler()->AddFrameworkImport(DequoteStringLiteral(lit->getText()));
                     continue;
                 }
                 // A `framework "X"` clause on a header/package/group import (S3): link the
@@ -2135,7 +2145,7 @@ void MainListener::ParseIfConstDeclaration(CFlatParser::IfConstDeclarationContex
                     Compiler()->CompileVcpkgImport(Compiler()->RootVcpkgImportPath(Compiler()->currentSourceFilePath_), importFilename, portSpec, vcpkgDefines);
                     continue;
                 }
-                std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                std::string ns = ImportNamespace(imp);
                 std::vector<std::string> explicitLibs;
                 if (auto* lc = imp->libClause())
                     for (auto* lit : lc->StringLiteral())
@@ -3669,11 +3679,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 if (rightNV.FromOwningTempField && !srcMovableTempField
                                     && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
                                 {
-                                    LogErrorContext(assignmentExpression, std::format(
-                                        "cannot bind '{}.{}' taken from a temporary to a local; its buffer is owned "
-                                        "elsewhere and would be freed out from under the local. Bind the whole call "
-                                        "result first (e.g. `auto t = ...;`) or use '.copy()' for an independent copy.",
-                                        rightNV.OwningStructName, rightNV.FieldName));
+                                    if (rightNV.OwningStructName.empty() || rightNV.FieldName.empty())
+                                        LogErrorContext(assignmentExpression,
+                                            "cannot bind a field taken from a temporary to a local; its buffer is "
+                                            "owned elsewhere and would be freed out from under the local. Bind the "
+                                            "whole call result first (e.g. `auto t = ...;`) or use '.copy()' for "
+                                            "an independent copy.");
+                                    else
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot bind '{}.{}' taken from a temporary to a local; its buffer is owned "
+                                            "elsewhere and would be freed out from under the local. Bind the whole call "
+                                            "result first (e.g. `auto t = ...;`) or use '.copy()' for an independent copy.",
+                                            rightNV.OwningStructName, rightNV.FieldName));
                                 }
                                 // Same escape with a dtor-LESS pointee. Skipped at global scope,
                                 // where the compile-time-constant message is the truer one.
@@ -6194,6 +6211,10 @@ bool MainListener::FieldPathRootIsFrameLocal(llvm::Value* storage) {
 
 LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         LLVMBackend::NamedVariable nv, bool savedOwned) {
+        if (nv.Primary != nullptr && (nv.TypeAndValue.IsAlias || nv.IsAliasBorrow))
+            compilerLLVM->RegisterAliasValue(nv.Primary);
+        if (nv.Primary != nullptr && nv.FromOwningTempField && !nv.OwningTempParent)
+            compilerLLVM->RegisterTempFieldValue(nv.Primary);
         if (const auto* raw = compilerLLVM->FindRawArrayResult(nv.Primary))
         {
             nv.AllocatedByRawNewArray = true;

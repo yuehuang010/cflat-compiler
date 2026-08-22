@@ -10,6 +10,11 @@
 //   list<unique T*>      OWNS and frees        (std::vector<unique_ptr<T>>)
 //   list<unique IShape>  OWNS and frees
 //
+// get()/operator[] always return an alias to the live slot; they never transfer ownership.
+// take(index) moves the value out and removes the slot, so it is the ownership-transfer form.
+// removeAt(index) drops and removes the slot without returning it. For pointer elements, a
+// bare T*/IShape list borrows, while list<unique T*>/list<unique IShape> frees on drop/removeAt.
+//
 // Aligning on BORROW rather than OWN is forced, not preferred: boxing a STACK value into an
 // interface is idiomatic (`Circle c; shapes.add(c);`) and deleting a stack-boxed interface
 // value runs the destructor and then aborts.

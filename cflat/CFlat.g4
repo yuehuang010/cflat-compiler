@@ -711,12 +711,12 @@ usingDeclaration
     ;
 
 importDeclaration
-    : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* cacheClause? ';'
-    | Import 'program' StringLiteral As Identifier ';'
-    | Import 'package' StringLiteral libClause? frameworkClause? defineClause* cacheClause? ';'
+    : Import importGroup (As Identifier)? libClause? frameworkClause? defineClause* cacheClause? fromClause? ';'
+    | Import Identifier StringLiteral As Identifier ';'
+    | Import Identifier StringLiteral libClause? frameworkClause? defineClause* cacheClause? ';'
     | Import 'package-vcpkg' StringLiteral fromClause defineClause* ';'
     | Import 'package-nuget' importGroup fromClause priClause? defineClause* ';'
-    | Import 'framework' importGroup ';'
+    | Import Identifier importGroup ';'
     ;
 
 // A plain file import target: either a single bare filename or a brace-wrapped comma
@@ -742,8 +742,8 @@ importGroup
 // lib search paths (the Windows SDK dir cflat already discovered for the header). Kept as
 // a sub-rule so importDeclaration still has a single direct StringLiteral.
 libClause
-    : 'lib' StringLiteral
-    | 'lib' '{' StringLiteral (',' StringLiteral)* ','? '}'
+    : Identifier StringLiteral
+    | Identifier '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
 // Optional inline macOS framework(s) to link for a header binding (S3):
@@ -752,8 +752,8 @@ libClause
 // Mirrors libClause: the names route through the same AddFrameworkImport accumulator
 // (-> -framework at link). Standalone `import framework "X";` stays a separate form.
 frameworkClause
-    : 'framework' StringLiteral
-    | 'framework' '{' StringLiteral (',' StringLiteral)* ','? '}'
+    : Identifier StringLiteral
+    | Identifier '{' StringLiteral (',' StringLiteral)* ','? '}'
     ;
 
 // Optional inline preprocessor define(s) for a header binding, scoped to THIS
@@ -762,7 +762,7 @@ frameworkClause
 //   import package-vcpkg "SDL3/SDL.h" from "sdl3" define "SDL_MAIN_HANDLED";
 // Sub-rule (like libClause) so importDeclaration keeps a single direct StringLiteral.
 defineClause
-    : 'define' StringLiteral
+    : Identifier StringLiteral
     ;
 
 // Optional inline pri deployment for a package-nuget import (WinUI/MRT):
@@ -770,7 +770,7 @@ defineClause
 // The named .pri is located inside the resolved package and copied next to the
 // output exe as <exe>.pri. Only valid on the package-nuget import alternative.
 priClause
-    : 'pri' StringLiteral
+    : Identifier StringLiteral
     ;
 
 // Optional inline opt-in to the persistent C-header disk cache:
@@ -780,7 +780,7 @@ priClause
 // extracted declarations for this header are cached to %USERPROFILE%\.cflat\cheaders so
 // the next cold compile loads the JSON instead of re-running the clang header parse.
 cacheClause
-    : 'cache'
+    : Identifier
     ;
 
 // Required source spec on an `import package-vcpkg` / `import package-nuget` line:
@@ -789,7 +789,7 @@ cacheClause
 //   import package-nuget "WebView2.h" from "Microsoft.Web.WebView2/1.0.3179.45";  // nuget id[/version]
 // Sub-rule so importDeclaration keeps a single direct StringLiteral.
 fromClause
-    : 'from' StringLiteral
+    : Identifier StringLiteral
     ;
 
 namespaceDefinition
@@ -848,7 +848,7 @@ lockFieldGroup
     ;
 
 programDefinition
-    : 'program' directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
+    : Identifier directDeclarator (':' Identifier (',' Identifier)*)? '{' (declaration | functionDefinition | destructorDefinition)* '}' ';'
     ;
 
 genericIdentifier

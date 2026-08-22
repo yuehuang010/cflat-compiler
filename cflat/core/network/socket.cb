@@ -210,6 +210,9 @@ class Socket
 
     bool isValid() { return _handle != nullptr; }
 
+    // Native descriptor for platform shims such as SecureTransport.
+    void* nativeHandle() { return _handle; }
+
     void close()
     {
         if (_handle == nullptr) return;

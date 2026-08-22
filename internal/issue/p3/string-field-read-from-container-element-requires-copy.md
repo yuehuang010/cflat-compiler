@@ -32,10 +32,10 @@ backtester) hit it repeatedly.
 
 ## The important part: the sibling path is NOT checked
 
-The same borrow assigned to a struct FIELD compiles clean and use-after-frees -
-[[borrow-from-temp-escapes-into-struct-field]] (p1). Whatever is decided here must be applied to
-both paths; today they disagree, and the unchecked one is the unsafe one. **Fix the p1 issue
-first** - this file is the ergonomics follow-up, not the safety one.
+The same borrow assigned to a struct FIELD used to compile clean and use-after-free -
+[[borrow-from-temp-escapes-into-struct-field]] (p1). The p1 fix now rejects that sibling path,
+including named brace initialization; this file remains the ergonomics follow-up for the
+explicit `.copy()` required by the read-side diagnostics.
 
 ## Fix direction (options, not a ruling)
 

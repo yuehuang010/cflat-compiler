@@ -1404,6 +1404,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Cache the resolved return type so callers can populate TypeAndValue after the call.
         lastCallReturnType = candidate.ReturnType;
         lastCallReturnType.IsAlias = candidate.ReturnsAlias; // mark borrow-return result; inert until consumed
+        if (candidate.ReturnsAlias) RegisterAliasValue(result);
         // The call RESULT is now the current expression value, so a `new`/`move` that ran only in
         // the ARGUMENT list describes a different value: retire its sticky channels here.
         lastOwningResult = false;

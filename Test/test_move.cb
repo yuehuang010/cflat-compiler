@@ -293,6 +293,88 @@ string relayStringDeep(string s)
     return relayString(s);
 }
 
+move string makeOwnedStringForField()
+{
+    return "owned-return";
+}
+
+struct TempStringField
+{
+    string value = default;
+};
+
+struct AliasStringField
+{
+    alias string value = default;
+};
+
+int testTempStringFieldStores()
+{
+    int passed = 0;
+    list<string> fields;
+    fields.add("borrowed");
+    TempStringField copied = { value = fields.get(0).copy() };
+    passed += Test("temp_string_field_copy_value", copied.value, "borrowed");
+
+    string local = "local";
+    TempStringField fromLocal = { value = local };
+    passed += Test("temp_string_field_named_value", fromLocal.value, "local");
+
+    string moved = "moved-local";
+    TempStringField fromMove = default;
+    fromMove.value = move moved;
+    passed += Test("temp_string_field_moved_local", fromMove.value, "moved-local");
+
+    TempStringField fromReturn = { value = makeOwnedStringForField() };
+    passed += Test("temp_string_field_owned_return", fromReturn.value, "owned-return");
+    return passed;
+}
+
+int testAliasStringFieldStore()
+{
+    list<string> fields;
+    fields.add("borrowed-field");
+    AliasStringField borrowed = default;
+    borrowed.value = fields.get(0);
+    AliasStringField brace = { value = fields.get(0) };
+    int passed = Test("alias_string_destination_field", borrowed.value, "borrowed-field");
+    passed += Test("alias_string_destination_brace", brace.value, "borrowed-field");
+    return passed;
+}
+
+int testTernaryAliasStickyFieldStore()
+{
+    int passed = 0;
+    list<string> fields;
+    fields.add("left");
+    fields.add("right");
+
+    // An alias binding primes lastCallReturnType.IsAlias; a later ternary/?? whose arms make
+    // no call must not inherit that stale flag when storing into a plain (non-alias) field.
+    TempStringField litArm = default;
+    alias string a1 = fields.get(0);
+    bool pick1 = false;
+    litArm.value = pick1 ? "yes" : "no";
+    passed += Test("ternary_alias_sticky_literal_arms", litArm.value, "no");
+
+    TempStringField ownedArm = default;
+    alias string a2 = fields.get(0);
+    string o1 = "yes-owned";
+    string o2 = "no-owned";
+    bool pick2 = false;
+    ownedArm.value = pick2 ? o1 : o2;
+    passed += Test("ternary_alias_sticky_owned_arms", ownedArm.value, "no-owned");
+
+    TempStringField coalesceArm = default;
+    alias string a3 = fields.get(0);
+    string? maybeNull = nullptr;
+    coalesceArm.value = maybeNull ?? "fallback";
+    passed += Test("nullcoalesce_alias_sticky_literal_arm", coalesceArm.value, "fallback");
+
+    passed += Test("ternary_alias_sticky_aliases_still_readable", a1.data() + "|" + a2.data() + "|" + a3.data(), "left|left|left");
+    return passed;
+}
+
 int testListStringMove()
 {
     int passed = 0;
@@ -10741,6 +10823,15 @@ extern int main()
 
     passed += testListStringMove();
     total += 10;
+
+    passed += testTempStringFieldStores();
+    total += 4;
+
+    passed += testAliasStringFieldStore();
+    total += 2;
+
+    passed += testTernaryAliasStickyFieldStore();
+    total += 4;
 
     // Test 5: move T* return - caller receives ownership, pointer freed at scope exit
     dtorCount = 0;

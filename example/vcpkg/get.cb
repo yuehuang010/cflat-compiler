@@ -3,6 +3,8 @@
 // include dir, link libs, and runtime DLLs (libcurl.dll, z.dll, etc.) for the
 // declared port plus its transitive deps. No manual build.bat, no manual lib
 // paths.
+// For a dependency-free macOS HTTPS client, see example/restAPI/https_get.cb and
+// core/network/tls.cb (SecureTransport with hostname verification enabled).
 import package-vcpkg "curl/curl.h" from "curl";
 
 // curl_easy_setopt (variadic) and curl_easy_perform are auto-externed from the

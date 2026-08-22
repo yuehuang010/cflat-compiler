@@ -149,7 +149,7 @@
         },
         {
           "name": "storage.type.struct.cflat",
-          "match": "\\b(struct|union|enum|class|program)\\b"
+          "match": "\\b(struct|union|enum|class)\\b"
         }
       ]
     },
@@ -162,6 +162,18 @@
         {
           "name": "keyword.control.import.cflat",
           "match": "\\b(import|as)\\b"
+        },
+        {
+          "name": "keyword.control.import-clause.cflat",
+          "match": "\\b(lib|framework|define|cache|from|pri)\\b(?=\\s*(?:\"|\\{))"
+        },
+        {
+          "name": "keyword.control.program.cflat",
+          "match": "^\\s*(program)(?=\\s+[A-Za-z_][A-Za-z0-9_]*\\s*(?::|\\{))"
+        },
+        {
+          "name": "keyword.control.import-marker.cflat",
+          "match": "\\bimport\\s+(program|package(?:-vcpkg|-nuget)?|framework)\\b"
         },
         {
           "name": "keyword.other.namespace.cflat",
@@ -240,7 +252,7 @@
         {
           "comment": "struct/class/union/enum keyword followed by a type name - covers declarations AND type-usage positions (variable declarations, casts, parameters)",
           "name": "meta.struct.cflat",
-          "match": "\\b(struct|class|union|enum|program)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
+          "match": "\\b(struct|class|union|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)(?:\\s*:\\s*([A-Za-z_][A-Za-z0-9_]*))?",
           "captures": {
             "1": { "name": "storage.type.struct.cflat" },
             "2": { "name": "entity.name.type.cflat" },

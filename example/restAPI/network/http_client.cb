@@ -10,6 +10,9 @@
 //
 //   // POST/PUT take a string body (pass "" for none):
 //   HttpClientResponse* r = c.post(host, port, "/items", "{\"a\":1}");
+//
+// This client is plain HTTP. For HTTPS on macOS, use `network/tls.cb` directly;
+// the vcpkg example uses libcurl when a platform TLS backend is preferred.
 
 import "string.cb";
 import "network/socket.cb";

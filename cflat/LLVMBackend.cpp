@@ -159,12 +159,36 @@ static const char* PlatformDataLayout(int platformValue)
 // source order - one for the `lib "x.lib"` form, several for the `lib { "a", "b" }` brace
 // form. Empty when the import carries no lib clause. Each is resolved to a link argument
 // by ResolveCLinkLib at the header-bind site.
+static std::vector<antlr4::tree::TerminalNode*> ImportClauseStringLiterals(
+    CFlatParser::ImportDeclarationContext* imp, const char* word)
+{
+    std::vector<antlr4::tree::TerminalNode*> literals;
+    ForEachImportClause(imp, [&](antlr4::ParserRuleContext* clause) {
+        if (!ImportClauseHasWord(clause, word)) return;
+        if (auto* c = dynamic_cast<CFlatParser::LibClauseContext*>(clause))
+            for (auto* lit : c->StringLiteral()) literals.push_back(lit);
+        else if (auto* c = dynamic_cast<CFlatParser::FrameworkClauseContext*>(clause))
+            for (auto* lit : c->StringLiteral()) literals.push_back(lit);
+        else if (auto* c = dynamic_cast<CFlatParser::DefineClauseContext*>(clause))
+        {
+            if (c->StringLiteral()) literals.push_back(c->StringLiteral());
+        }
+        else if (auto* c = dynamic_cast<CFlatParser::FromClauseContext*>(clause))
+        {
+            if (c->StringLiteral()) literals.push_back(c->StringLiteral());
+        }
+        else if (auto* c = dynamic_cast<CFlatParser::PriClauseContext*>(clause))
+        {
+            if (c->StringLiteral()) literals.push_back(c->StringLiteral());
+        }
+    });
+    return literals;
+}
+
 static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> libs;
-    auto* lc = imp->libClause();
-    if (!lc) return libs;
-    for (auto* lit : lc->StringLiteral())
+    for (auto* lit : ImportClauseStringLiterals(imp, "lib"))
         libs.push_back(DequoteStringLiteral(lit->getText()));
     return libs;
 }
@@ -175,9 +199,7 @@ static std::vector<std::string> DequoteLibClauses(CFlatParser::ImportDeclaration
 static std::vector<std::string> DequoteFrameworkClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> fws;
-    auto* fc = imp->frameworkClause();
-    if (!fc) return fws;
-    for (auto* lit : fc->StringLiteral())
+    for (auto* lit : ImportClauseStringLiterals(imp, "framework"))
         fws.push_back(DequoteStringLiteral(lit->getText()));
     return fws;
 }
@@ -187,10 +209,9 @@ static std::vector<std::string> DequoteFrameworkClauses(CFlatParser::ImportDecla
 static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarationContext* imp)
 {
     std::vector<std::string> defines;
-    for (auto* dc : imp->defineClause())
+    for (auto* lit : ImportClauseStringLiterals(imp, "define"))
     {
-        if (!dc->StringLiteral()) continue;
-        std::string raw = dc->StringLiteral()->getText();
+        std::string raw = lit->getText();
         if (raw.size() < 2) continue;
         defines.push_back(DequoteStringLiteral(raw));
     }
@@ -201,7 +222,11 @@ static std::vector<std::string> DequoteDefineClauses(CFlatParser::ImportDeclarat
 // persistent C-header disk cache. Applies to the bare-header and `import package` forms.
 static bool HasCacheClause(CFlatParser::ImportDeclarationContext* imp)
 {
-    return imp->cacheClause() != nullptr;
+    bool found = false;
+    ForEachImportClause(imp, [&](antlr4::ParserRuleContext* clause) {
+        if (ImportClauseHasWord(clause, "cache")) found = true;
+    });
+    return found;
 }
 
 // Dequoted filenames from a grouped import `import { "a", "b" };`, in source order.
@@ -211,9 +236,17 @@ static std::vector<std::string> DequoteImportGroup(CFlatParser::ImportDeclaratio
 {
     std::vector<std::string> out;
     auto* grp = imp->importGroup();
-    if (!grp) return out;
-    for (auto* lit : grp->StringLiteral())
-        out.push_back(DequoteStringLiteral(lit->getText()));
+    if (grp != nullptr)
+    {
+        for (auto* lit : grp->StringLiteral())
+            out.push_back(DequoteStringLiteral(lit->getText()));
+        return out;
+    }
+    // Once `framework` is a soft identifier, its standalone form is parsed by the
+    // direct-string alternative rather than the old literal-specific alternative.
+    if (imp->children.size() >= 2 && imp->children[1]->getText() == "framework")
+        if (auto* lit = imp->StringLiteral())
+            out.push_back(DequoteStringLiteral(lit->getText()));
     return out;
 }
 
@@ -270,18 +303,16 @@ static bool IsAllowedIsolatedIntrinsic(llvm::StringRef name)
 // Dequoted port spec from `from "..."` on an import package-vcpkg line (empty if absent).
 static std::string DequoteFromClause(CFlatParser::ImportDeclarationContext* imp)
 {
-    auto* fc = imp->fromClause();
-    if (!fc || !fc->StringLiteral()) return "";
-    return DequoteStringLiteral(fc->StringLiteral()->getText());
+    auto literals = ImportClauseStringLiterals(imp, "from");
+    return literals.empty() ? "" : DequoteStringLiteral(literals.front()->getText());
 }
 
 // Dequoted .pri filename from `pri "..."` on an import package-nuget line (empty if
 // absent). The named .pri is deployed next to the exe as <exe>.pri.
 static std::string DequotePriClause(CFlatParser::ImportDeclarationContext* imp)
 {
-    auto* pc = imp->priClause();
-    if (!pc || !pc->StringLiteral()) return "";
-    return DequoteStringLiteral(pc->StringLiteral()->getText());
+    auto literals = ImportClauseStringLiterals(imp, "pri");
+    return literals.empty() ? "" : DequoteStringLiteral(literals.front()->getText());
 }
 
 static std::vector<std::string> ReadFileToLines(std::ifstream& stream)
@@ -1760,6 +1791,14 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                         // before any real file is opened (there is no readable file behind it, e.g.
                         // a winmd), so without this it would report (0,0) instead of the import line.
                         SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                        if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
+                            LogError(error);
+                            return false;
+                        }
+                        if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
+                            LogError(error);
+                            return false;
+                        }
                         if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
                         {
                             LogError(std::format("policy-restricted-language: native interop imports "
@@ -1825,9 +1864,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                                 return false;
                             continue;
                         }
-                        std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                        std::string ns = ImportNamespace(imp);
                         bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
-                        std::string alias = isProgram ? imp->Identifier()->getText() : "";
+                        std::string alias = isProgram ? ImportProgramAlias(imp) : "";
                         std::string impExt = LowerExtension(importFilename);
                         bool isCProgram = isProgram && impExt == ".c";
                         std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
@@ -2778,6 +2817,14 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             if (auto* imp = decl->importDeclaration())
             {
                 SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
+                    LogError(error);
+                    return false;
+                }
+                if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
+                    LogError(error);
+                    return false;
+                }
                 if (isolatedPolicy_ && IsIsolatedNativeImport(imp))
                 {
                     LogError(std::format("policy-restricted-language: native interop imports are not "
@@ -2832,7 +2879,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
                         return false;
                     continue;
                 }
-                std::string nestedNs = imp->Identifier() ? imp->Identifier()->getText() : "";
+                std::string nestedNs = ImportNamespace(imp);
                 std::vector<std::string> nestedLibs = DequoteLibClauses(imp);
                 std::vector<std::string> nestedDefines = DequoteDefineClauses(imp);
                 if (verbose) std::cout << std::format("[verbose]   nested import: {}{}\n", nested, nestedNs.empty() ? "" : " as " + nestedNs);
@@ -3637,6 +3684,14 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                     // Point diagnostics at this import statement (mirrors Compile's ProcessImports):
                     // a not-found error would otherwise report a stale location from a prior import.
                     SetSourceLocation(imp->getStart()->getLine(), imp->getStart()->getCharPositionInLine());
+                    if (auto error = ValidateImportLeadingMarker(imp); !error.empty()) {
+                        LogError(error);
+                        return false;
+                    }
+                    if (auto error = ValidateImportSoftKeywords(imp); !error.empty()) {
+                        LogError(error);
+                        return false;
+                    }
                     // Grouped import `import { "a", "b" };` - one TU for header entries (see
                     // CompileImportGroup); .cb/.c entries route individually.
                     auto groupedImports = DequoteImportGroup(imp);
@@ -3683,9 +3738,9 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                             return false;
                         continue;
                     }
-                    std::string ns = imp->Identifier() ? imp->Identifier()->getText() : "";
+                    std::string ns = ImportNamespace(imp);
                     bool isProgram = imp->children.size() >= 2 && imp->children[1]->getText() == "program";
-                    std::string alias = isProgram && imp->Identifier() ? imp->Identifier()->getText() : "";
+                    std::string alias = isProgram ? ImportProgramAlias(imp) : "";
                     std::string impExt = LowerExtension(importFilename);
                     bool isCProgram = isProgram && impExt == ".c";
                     std::vector<std::string> explicitLibs = DequoteLibClauses(imp);
@@ -3956,6 +4011,8 @@ void LLVMBackend::ResetForReanalysis()
     nonOwningStructJoins_.clear();
     uniqueFieldReadValues_.clear();
     uniqueFieldReadJoins_.clear();
+    aliasValues_.clear();
+    tempFieldValues_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();
