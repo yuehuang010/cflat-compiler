@@ -699,7 +699,7 @@ Lambda<int()> read = () => { return *p; };
 read();   // 77 - both sides access the same heap cell
 ```
 
-**Reference capture** - non-pointer struct and class values are captured by reference. The lambda holds a pointer to the outer variable; mutations on either side are immediately visible to the other:
+**Reference capture** - non-pointer struct and class values are captured by reference, and that includes the owning containers (`list<T>`, `dictionary<K,V>`, `queue<T>`, `stringbuilder`, ...), which are ordinary structs. The lambda holds a pointer to the outer variable; mutations on either side are immediately visible to the other:
 
 ```c
 struct Counter { int value = 0; };

@@ -5547,17 +5547,18 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
                                 ci.TV   = nv.TypeAndValue;
                                 ci.OuterStorage = nv.Storage;
                                 ci.SourceIsStaticLocal = nv.IsStaticLocal;
-                                // string is a value type ({i8*,i32}): its methods take string by value,
-                                // so it must be value-captured like primitives to avoid pointer mismatch.
-                                // Owning value types with a genuine deep copy (list/dictionary/owning
-                                // struct) are ALSO value-captured: they are deep-copied into the env so
-                                // the closure owns an independent buffer and can outlive its source
-                                // (an escaping closure that captured them by-reference would dangle).
+                                // Every non-pointer struct value captures BY REFERENCE, as
+                                // doc/LANGUAGE.md "Reference capture" documents - a container
+                                // (list/dictionary) is a struct like any other, and value-capturing
+                                // it silently discarded the body's mutations. Two exceptions stay by
+                                // value: 'string' is a {i8*,i32} value whose methods take it by value,
+                                // and '__closure_fat_ptr' (a captured lambda) is env-cloned so a
+                                // returned outer closure keeps its inner closure alive.
                                 ci.ByReference = !ci.TV.Pointer
                                     && !ci.TV.IsFunctionPointer
                                     && !ci.TV.IsPrimitive()
                                     && ci.TV.TypeName != "string"
-                                    && !compiler->ClosureCaptureDeepCopyable(ci.TV.TypeName)
+                                    && ci.TV.TypeName != "__closure_fat_ptr"
                                     && compiler->dataStructures.count(ci.TV.TypeName);
                                 captures.push_back(ci);
                             };
@@ -5653,9 +5654,8 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // A by-value capture of an owning value type is DEEP-COPIED into the env, which then OWNS
         // it (its cleanup fn frees it exactly once); the invoker's unpacked local only BORROWS it.
         // Both the deep-copy-at-store and the borrow-in-body decisions key off this one predicate.
-        // Deep copy goes through the type's own copy() (list.copy()/dictionary.copy()/string/user
-        // copy), so capturing an owning value behaves exactly like `T x = src;`. Admitted only when
-        // that copy is genuinely deep (ClosureCaptureDeepCopyable). A nested closure IS deep-copyable
+        // Only 'string' and a captured lambda reach here now (everything else is reference-captured
+        // above); the deep copy goes through the type's own copy(). A nested closure IS deep-copyable
         // via `__closure_fat_ptr.copy` (env clone), so its captured inner env has an independent
         // lifetime and does not dangle once the inner closure's scope closes; the invoker's unpacked
         // capture is marked IsAliasBorrow, which the indirect-call result path clears so the borrow
@@ -5860,6 +5860,9 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     // A by-reference capture BORROWS the source; the env never owns it. Without this,
                     // every CALL destructs the caller's struct through the borrowed pointer.
                     captureNV.IsAliasBorrow = true;
+                    // The OUTER frame owns it, so a `return` of an owning field read off this
+                    // capture must copy - see the ref-capture arm in ParseReturnStatement.
+                    captureNV.IsClosureRefCapture = true;
                 }
                 else
                 {

@@ -1162,6 +1162,9 @@ public:
         // type. The closure ENV owns the buffer; this local only borrows it, so handing it to a
         // caller (a `return`) must hand over an independent copy, not the env's storage.
         bool IsClosureValueCapture = false;
+        // compile-time: this local is a lambda body's unpacked BY-REFERENCE capture (or a field
+        // read off one). The OUTER frame owns the storage, so a `return` must hand over a copy.
+        bool IsClosureRefCapture = false;
         // The block a plain '=' recorded this borrow in (null when the borrow came from the
         // DECLARATION). An owned rebind in that same block retires it; see RetireAssignBorrow.
         llvm::BasicBlock* AssignBorrowBlock = nullptr;

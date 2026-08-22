@@ -1,3 +1,6 @@
+import "list.cb";
+import "dictionary.cb";
+
 // Returning a lambda that reference-captures a local struct must fail with a
 // bond escape error - the lambda would outlive the captured stack variable.
 
@@ -14,4 +17,43 @@ Lambda<void()> escape() {
 
 extern int main() {
     return 0;
+}
+
+// A list<T> is a non-pointer struct, so it reference-captures like the Counter above and the
+// closure is bonded to it. Pre-fix the list was deep-copied into the env, the return compiled,
+// and the body's mutations were silently discarded. One leg per function: the bare-semicolon
+// form arms the expectation for the rest of the enclosing scope.
+Lambda<void()> escapeList() {
+    expect_error("bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    Lambda<void()> add = () => { xs.add(1); };
+    return add;
+}
+
+// Same for a dictionary, and through an ASSIGNMENT to a wider scope rather than a return.
+void escapeDictToWiderScope() {
+    expect_error("'sink' is in a wider scope than its bond source 'd'");
+    Lambda<void()> sink = default;
+    {
+        dictionary<string, int> d = default;
+        sink = () => { d.set("a", 1); };
+    }
+    sink();
+}
+
+// A struct field is program-untrackable storage for a bond, whatever the captured type.
+struct ListHolder { Lambda<void()> f = default; };
+void escapeListIntoField() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+}
+
+// A global has program lifetime, so the closure would outlive the captured stack frame.
+Lambda<void()> gEscapedListLambda = default;
+void escapeListIntoGlobal() {
+    expect_error("cannot store a lambda with a by-reference capture of non-static local 'xs' into program-lifetime storage");
+    list<int> xs = default;
+    gEscapedListLambda = () => { xs.add(1); };
 }

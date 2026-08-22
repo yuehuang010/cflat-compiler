@@ -10415,6 +10415,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.IsAliasBorrow          = src.IsAliasBorrow;
         dst.BorrowsOwnedString     = src.BorrowsOwnedString;
         dst.IsClosureValueCapture  = src.IsClosureValueCapture;
+        dst.IsClosureRefCapture    = src.IsClosureRefCapture;
         dst.IsMoved                = src.IsMoved;
         // OWNERSHIP state. These travel together with the borrow facts above: a guard that reads
         // one and not the other reports the opposite of the truth - `delete (n)` on a `move`

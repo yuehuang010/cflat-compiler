@@ -1111,6 +1111,25 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         }
 
         /*
+         * Returning a `string` read through a BY-REFERENCE capture (`() => box.s`). The OUTER
+         * frame owns that buffer and destroys it when its scope closes, so handing the caller the
+         * borrow returns freed bytes (an empty string under MallocScribble). Deep-copy and keep
+         * the OWNED bit, exactly as the by-value-capture arm above does for the env's buffer. The
+         * non-string owning field of such a capture is rejected earlier as an `alias` return, and
+         * an `alias` function passes the borrow through deliberately.
+         */
+        if (right != nullptr
+            && returnNV.IsClosureRefCapture
+            && !returnNV.TypeAndValue.IsMove
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && NamedVarIsString(returnNV)
+            && right->getType() == llvm::StructType::getTypeByName(*compiler->context, "string"))
+        {
+            right = compiler->EmitOwnedStringDeepCopy(right);
+            clearReturnedStringBorrowBit = false;
+        }
+
+        /*
          * Returning a fixed-array `string` element (`return dst[0];`). The frame destroys the
          * array on the way out, so handing the caller the element's own {ptr,len,owned} pair both
          * double-freed the buffer (rc 133) and left the caller reading freed bytes - a WRONG VALUE,

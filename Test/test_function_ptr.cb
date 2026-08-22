@@ -593,6 +593,18 @@ string capturedFieldThroughFrame(string p)
     return g();
 }
 
+// Same shape on a struct that has ALWAYS been reference-captured (the raw pointer field kept it
+// off the by-value arm), so this leg covers the ref-capture half of the return copy on its own:
+// pre-fix the invoker handed back a borrow of `b.s` and the caller read freed bytes.
+class PtrFieldBox { string s = default; int* p = nullptr; ~PtrFieldBox() { } };
+string refCapturedFieldThroughFrame(string q)
+{
+    PtrFieldBox b = default;
+    b.s = q;
+    Lambda<string()> g = () => b.s;
+    return g();
+}
+
 bool testReturnCapturedOwningValue()
 {
     bool result = true;
@@ -684,6 +696,7 @@ bool testReturnCapturedOwningValue()
         result &= Test("captured struct field src intact",     b.s, "xyz");
         result &= Test("captured struct field buf distinct",   r.data() != b.s.data(), true);
         result &= Test("captured struct field past its frame", capturedFieldThroughFrame(s), "xyz");
+        result &= Test("ref-captured struct field past its frame", refCapturedFieldThroughFrame(s), "xyz");
     }
 
     // A captured CLOSURE (__closure_fat_ptr, the other owned-bit carve-out) returned the same
@@ -859,63 +872,96 @@ bool testCaptureStructRefBorrows()
     return result;
 }
 
-// Owning value type captured by an ESCAPING closure must be DEEP-COPIED into the env so
-// the closure owns an independent buffer that outlives the source scope. Before the fix,
-// list/dictionary/owning-struct captures were shallow by-reference and dangled (UAF under
-// --asan) once the source block closed.
+// An owning container / owning struct is a non-pointer struct, so it captures BY REFERENCE
+// like every other one (doc/LANGUAGE.md "Reference capture"): the body mutates the CALLER's
+// object, and the bond stops the closure escaping the source scope (the escape legs live in
+// Test/errors/err_bond_lambda_escape.cb). Value-capturing them silently discarded the
+// mutations, and a list of non-copyable elements was rejected outright at the capture site.
 struct OwningBag
 {
     string name = default;
     list<int> nums = default;
 };
 
-bool testCaptureOwningContainerEscapes()
+int trackedBagDtors = 0;
+struct TrackedBag
+{
+    list<int> nums = default;
+    ~TrackedBag() { trackedBagDtors = trackedBagDtors + 1; }
+};
+
+// A list element type that owns a `unique` has no copy(), so the pre-fix deep-copy-into-env
+// path rejected the capture outright with "cannot copy this list ...".
+struct UniqueCell
+{
+    unique Counter* p = new Counter();
+};
+
+bool testCaptureOwningContainerByReference()
 {
     bool result = true;
 
-    // list<int> captured by a closure that outlives the defining block.
+    // list<int>: the body's add() calls must land in the CALLER's list. Pre-fix the list was
+    // deep-copied into the env, so v.count() stayed 1 and the sum stayed 10.
     {
-        Lambda<int()> sumV = default;
-        {
-            list<int> v = default; v.add(10); v.add(20); v.add(30);
-            sumV = () => { int s = 0; for (int i = 0; i < v.count(); i = i + 1) s = s + v.get(i); return s; };
-        }
-        result &= Test("escaping list capture", sumV(), 60);
+        list<int> v = default; v.add(10);
+        Lambda<void()> push = () => { v.add(20); };
+        push(); push();
+        int s = 0; for (int i = 0; i < v.count(); i = i + 1) s = s + v.get(i);
+        result &= Test("ref capture list count", v.count(), 3);
+        result &= Test("ref capture list sum", s, 50);
     }
 
-    // dictionary<string,int> captured by an escaping closure.
+    // list<string>: the element type owns a buffer, so this also proves the reference-captured
+    // container is destructed exactly once (a second free would abort here).
     {
-        Lambda<int()> sumD = default;
-        {
-            dictionary<string, int> d = default;
-            d.set("a", 10); d.set("b", 20); d.set("c", 30);
-            sumD = () => { return d.get("a") + d.get("b") + d.get("c"); };
-        }
-        result &= Test("escaping dict capture", sumD(), 60);
+        list<string> names = default;
+        Lambda<void(string)> push = (string n) => { names.add(n); };
+        push("ab"); push("cde");
+        result &= Test("ref capture list<string> count", names.count(), 2);
+        result &= Test("ref capture list<string> back", names.get(1).length(), 3);
     }
 
-    // user struct with owning (string + list) fields captured by an escaping closure.
+    // dictionary<string,int>: pre-fix the set() calls went into an env copy and d.count() was 0.
     {
-        Lambda<int()> useBag = default;
-        {
-            OwningBag b = default;
-            b.name = "hi";
-            b.nums.add(5); b.nums.add(7);
-            useBag = () => { int s = b.name.length(); for (int i = 0; i < b.nums.count(); i = i + 1) s = s + b.nums.get(i); return s; };
-        }
-        result &= Test("escaping owning-struct capture", useBag(), 14);
+        dictionary<string, int> d = default;
+        Lambda<void(string, int)> put = (string k, int n) => { d.set(k, n); };
+        put("a", 10); put("b", 20); put("c", 30);
+        result &= Test("ref capture dict count", d.count(), 3);
+        result &= Test("ref capture dict sum", d.get("a") + d.get("b") + d.get("c"), 60);
     }
 
-    // Clone the closure, invoke both, and let both be destructed (no double free of the env buffer).
+    // user struct with owning (string + list) fields: mutations through the capture are visible.
     {
-        Lambda<int()> first = default;
+        OwningBag b = default;
+        b.name = "hi";
+        Lambda<void(int)> addNum = (int n) => { b.nums.add(n); };
+        addNum(5); addNum(7);
+        int s = b.name.length(); for (int i = 0; i < b.nums.count(); i = i + 1) s = s + b.nums.get(i);
+        result &= Test("ref capture owning-struct nums", b.nums.count(), 2);
+        result &= Test("ref capture owning-struct sum", s, 14);
+    }
+
+    // A list whose elements own a `unique` has no copy(): pre-fix the capture itself was a hard
+    // compile error ("cannot copy this list ..."). A reference capture needs no copy at all.
+    {
+        list<UniqueCell> cells = default;
+        Lambda<void()> grow = () => { UniqueCell c = default; cells.add(c); };
+        grow(); grow();
+        result &= Test("ref capture list of unique-owning elems", cells.count(), 2);
+    }
+
+    // The capture BORROWS, so the source is destructed exactly once. The pre-fix env copy was a
+    // second owner and this counted 2.
+    {
+        trackedBagDtors = 0;
         {
-            list<int> v = default; v.add(1); v.add(2); v.add(3);
-            first = () => { int s = 0; for (int i = 0; i < v.count(); i = i + 1) s = s + v.get(i); return s; };
+            TrackedBag t = default;
+            Lambda<void()> bump = () => { t.nums.add(1); };
+            bump(); bump();
+            result &= Test("ref capture tracked bag count", t.nums.count(), 2);
         }
-        Lambda<int()> second = first;
-        result &= Test("clone escaping closure a", first(),  6);
-        result &= Test("clone escaping closure b", second(), 6);
+        result &= Test("ref capture tracked bag dtors", trackedBagDtors, 1);
     }
 
     // A nested closure (an inner closure with its own heap env) captured by an ESCAPING outer
@@ -4311,7 +4357,7 @@ extern int main(int argc, char** argv)
     total++; passed += testCaptureString()             ? 1 : 0;
     total++; passed += testCaptureStructRef()          ? 1 : 0;
     total++; passed += testCaptureStructRefBorrows()   ? 1 : 0;
-    total++; passed += testCaptureOwningContainerEscapes() ? 1 : 0;
+    total++; passed += testCaptureOwningContainerByReference() ? 1 : 0;
     total++; passed += testCaptureMultiple()           ? 1 : 0;
     total++; passed += testCaptureRegression()         ? 1 : 0;
     total++; passed += testCaptureNameCollidesWithFunction() ? 1 : 0;
