@@ -117,6 +117,7 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 auto tv = ParseConditionalExpression(condCtx, use);
                 result.Primary = tv.value;
                 result.TypeAndValue.IsAlias = tv.isAlias;
+                result.Storage = tv.storage;
                 if (result.Primary)
                 {
                     result.BaseType = result.Primary->getType();
@@ -1565,6 +1566,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->pendingInitAllocAlign = targetAllocAlign;
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            bool rightStringImplicitCopied = false;
             RejectLambdaReferenceCaptureEscape(
                 IsProgramLifetimeStorage(namedVar), rightNV, ctx);
             if (operatorText == "=" && namedVar.TypeAndValue.IsFunctionPointer
@@ -2600,7 +2602,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // A `string` field instead stores by IMPLICIT COPY (see AdoptImplicitStringTempCopy).
             if (operatorText == "=" && rightNV.FromOwningTempField
                 && rightNV.TypeAndValue.TypeName == "string"
-                && AdoptImplicitStringTempCopy(rightNV, right, ctx))
+                && (rightStringImplicitCopied = AdoptImplicitStringTempCopy(rightNV, right, ctx)))
             {
             }
             else if (operatorText == "=" && rightNV.FromOwningTempField
@@ -2628,7 +2630,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // `alias` string local stays rejected: it is a deliberate borrow the user spelled,
                 // and silently copying it would turn that borrow into a second owner.
                 const bool copied = !namedAliasLocal
-                    && AdoptImplicitStringTempCopy(rightNV, right, ctx);
+                    && (rightStringImplicitCopied = AdoptImplicitStringTempCopy(rightNV, right, ctx));
                 if (!copied)
                 {
                     const char* sourceText = namedAliasLocal
@@ -2649,7 +2651,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.IsAlias
                 && IsImplicitCopyableStringTemp(rightNV))
             {
-                AdoptImplicitStringTempCopy(rightNV, right, ctx);
+                rightStringImplicitCopied = AdoptImplicitStringTempCopy(rightNV, right, ctx);
             }
 
             // Same escape into a BORROWING destination (field, local, global, array element) with
@@ -2675,10 +2677,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && (rightNV.IsOwningString || rightNV.BorrowsOwnedString)
                 && rightNV.Storage != nullptr
                 && !rightNV.TypeAndValue.IsMove
+                && !rightStringImplicitCopied
                 && !sameFieldStore)
             {
                 if (rightNV.IsOwningString && !rightNV.BorrowsOwnedString)
-                    right = compiler->EmitOwnedStringDeepCopy(right);
+                right = compiler->EmitOwnedStringDeepCopy(right);
                 else
                 {
                     LogErrorContext(ctx, std::format(
@@ -2704,7 +2707,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     // RejectOwningValueCopyIntoField above already copied this copyable owner
                     // (rejectCopied) - copying again would orphan (leak) the first copy. Only copy
                     // here when it bailed (e.g. a source with no CallerName it could not classify).
-                    if (!rejectCopied)
+                    if (!rejectCopied && !rightStringImplicitCopied)
                         right = EmitCopyableOwnerCopy(rightNV, right, ctx);
                 }
                 else
@@ -3009,6 +3012,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // arm above and returned, so it must not be dropped a second time here.
             bool destIsLocalOwningVar = namedVar.FieldName.empty()
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination));
+            // An `alias` CALL RESULT destination (`l[0] = ...`, `h.get() = ...`) is by construction
+            // a LIVE element the container handed out - not the EMPTY slot `_data[i] = v` writes
+            // into inside container code, which is why that single-index GEP stays excluded. A
+            // named-local source already dropped the old owner in the deref arm above and returned;
+            // an OWNED TEMP (`"x".copy()`, IsMove) skips that arm, so without this the old owner
+            // was orphaned. Rooted at the call itself, never at a raw GEP.
+            bool destIsAliasResultLvalue = namedVar.TypeAndValue.IsAlias
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsInterface
+                && !namedVar.TypeAndValue.IsArrayView
+                && !namedVar.BitfieldStorage && !namedVar.UnionFieldType
+                && llvm::isa_and_nonnull<llvm::CallBase>(destination);
             bool destIsDropOldElem = destIsFixedArrayElem
                 && namedVar.TypeAndValue.TypeName != "string"
                 && !namedVar.TypeAndValue.Pointer
@@ -3017,7 +3032,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // sameFieldStore, not selfFieldAssign: this EMITS a destruct, so it may only treat two
             // elements as distinct when both root in known-initialized stack/global storage.
             if (operatorText == "=" && right && right->getType()->isStructTy()
-                && (destIsStructField || destIsLocalOwningVar || destIsDropOldElem)
+                && (destIsStructField || destIsLocalOwningVar || destIsDropOldElem
+                    || destIsAliasResultLvalue)
                 && destination != rightNV.Storage
                 && !sameFieldStore
                 && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
@@ -3240,6 +3256,22 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     || llvm::isa<llvm::GlobalVariable>(destination))
                 && IsRawHeapStringElementRead(rightNV, right))
                 right = compiler->ClearStringOwnedBit(right);
+
+            // A direct non-pointer alias return is now represented by its source slot. Binding it
+            // to an ordinary string local still means copy, not a second owner of that slot.
+            if (operatorText == "=" && right
+                && NamedVarIsString(namedVar)
+                && namedVar.FieldName.empty()
+                && !namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsAlias
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
+                && llvm::isa_and_nonnull<llvm::CallBase>(rightNV.Storage)
+                && !rightNV.TypeAndValue.IsMove)
+            {
+                right = compiler->EmitOwnedStringDeepCopy(right);
+            }
 
             // Destruct the old value of an owning-string LOCAL before overwriting it. Closes the
             // reassignment leak where a pre-declared string local reassigned in a loop
@@ -3591,19 +3623,21 @@ bool MainListener::RejectCodeValueTernaryStringArm(CFlatParser::ConditionalExpre
 // A ternary arm parsed for its VALUE. Same lowering as ParseExpression (which forwards a
 // non-assignment expression straight to ParseConditionalExpression), but it keeps the arm's
 // signedness so the join can zero-extend an unsigned arm instead of sign-extending it.
-llvm::Value* MainListener::ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx,
-                                                     bool& isUnsigned) {
+LLVMBackend::TypedValue MainListener::ParseTernaryArmExpression(
+        CFlatParser::ExpressionContext* ctx) {
         auto* assignCtx = ctx->assignmentExpression();
         if (assignCtx != nullptr && assignCtx->assignmentOperator() == nullptr
             && assignCtx->conditionalExpression() != nullptr)
         {
             auto tv = ParseConditionalExpression(assignCtx->conditionalExpression());
-            isUnsigned = tv.isUnsigned;
             ProcessPlusPlus();
-            return tv.value;
+            return tv;
         }
-        return ParseExpression(ctx);
-    }
+        LLVMBackend::TypedValue tv;
+        tv.value = ParseExpression(ctx);
+        tv.isAlias = tv.value != nullptr && Compiler(ctx)->IsAliasValue(tv.value);
+        return tv;
+}
 
 bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const {
         if (ctx == nullptr) return false;
@@ -3817,6 +3851,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         bool falseOwnedString = false;
         bool trueAlias = false;
         bool falseAlias = false;
+        llvm::Value* trueStorage = nullptr;
+        llvm::Value* falseStorage = nullptr;
         bool trueTempField = false;
         bool falseTempField = false;
         bool trueUnsigned = false;
@@ -3850,12 +3886,24 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 auto trueNV = ParseAssignmentExpressionNamed(
                     expressionTrueCtx->assignmentExpression(), use);
                 trueValue = trueNV.Primary;
+                trueStorage = trueNV.Storage;
+                trueAlias = trueNV.TypeAndValue.IsAlias || trueNV.IsAliasBorrow;
                 trueUnsigned = trueNV.TypeAndValue.IsUnsignedInteger() != -1;
                 ProcessPlusPlus();
             }
             else
-                trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
-            trueAlias = compiler->IsAliasValue(trueValue);
+            {
+                auto trueTv = ParseTernaryArmExpression(expressionTrueCtx);
+                trueValue = trueTv.value;
+                trueStorage = trueTv.storage;
+                trueAlias = trueTv.isAlias;
+                trueUnsigned = trueTv.isUnsigned;
+            }
+            // An arm value loaded from storage keeps that storage, so the join stays an lvalue.
+            if (trueStorage == nullptr && trueValue != nullptr)
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(trueValue))
+                    trueStorage = load->getPointerOperand();
+            trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             trueTempField = compiler->IsTempFieldValue(trueValue);
             if (use == ResultUse::Discard)
                 compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
@@ -3877,7 +3925,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
             falseValue = falseTv.value;
             falseUnsigned = falseTv.isUnsigned;
-            falseAlias = compiler->IsAliasValue(falseValue);
+            falseStorage = falseTv.storage;
+            falseAlias = falseTv.isAlias;
+            if (falseStorage == nullptr && falseValue != nullptr)
+                if (auto* load = llvm::dyn_cast<llvm::LoadInst>(falseValue))
+                    falseStorage = load->getPointerOperand();
+            falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             falseTempField = compiler->IsTempFieldValue(falseValue);
             if (use == ResultUse::Discard)
                 compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
@@ -3956,7 +4009,10 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (!trueLive && !falseLive) return {};
             llvm::Value* only = trueBr != nullptr ? trueValue : falseValue;
             compiler->PromoteCastOccurrence(only, trueBr != nullptr ? trueOcc : falseOcc);
-            return { only, trueBr != nullptr ? trueUnsigned : falseUnsigned };
+            LLVMBackend::TypedValue result{ only, trueBr != nullptr ? trueUnsigned : falseUnsigned };
+            result.isAlias = trueBr != nullptr ? trueAlias : falseAlias;
+            result.storage = trueBr != nullptr ? trueStorage : falseStorage;
+            return result;
         }
 
         if (trueValue == nullptr || falseValue == nullptr)
@@ -4022,6 +4078,29 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 : compiler->builder->getInt64(-1);
         }
 
+        llvm::AllocaInst* trueAliasTemp = nullptr;
+        llvm::AllocaInst* falseAliasTemp = nullptr;
+        if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
+        {
+            if (trueStorage == nullptr)
+                trueAliasTemp = compiler->AllocaAtEntry(trueValue->getType(), nullptr, "alias_join_true");
+            if (falseStorage == nullptr)
+                falseAliasTemp = compiler->AllocaAtEntry(falseValue->getType(), nullptr, "alias_join_false");
+            // A mixed join has no one source slot on the owning arm. Keep that arm in a
+            // temporary slot so the alias-return path can preserve the old permissive shape;
+            // the borrowed arm still returns its real storage when selected.
+            if (trueAliasTemp != nullptr)
+            {
+                atTrue();
+                compiler->builder->CreateStore(trueValue, trueAliasTemp);
+            }
+            if (falseAliasTemp != nullptr)
+            {
+                atFalse();
+                compiler->builder->CreateStore(falseValue, falseAliasTemp);
+            }
+        }
+
         atTrue();
         trueBr = compiler->CreateJump(resumeBlock);
         atFalse();
@@ -4032,6 +4111,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         phi->addIncoming(falseValue, falseEnd);
         compiler->RegisterJoinArmCastOccurrence(phi, 0, trueOcc);
         compiler->RegisterJoinArmCastOccurrence(phi, 1, falseOcc);
+
+        llvm::Value* storageJoin = nullptr;
+        if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
+        {
+            auto* storagePhi = compiler->builder->CreatePHI(
+                compiler->builder->getPtrTy(), 2, "alias_storage_join");
+            storagePhi->addIncoming(trueStorage != nullptr
+                    ? trueStorage : static_cast<llvm::Value*>(trueAliasTemp), trueEnd);
+            storagePhi->addIncoming(falseStorage != nullptr
+                    ? falseStorage : static_cast<llvm::Value*>(falseAliasTemp), falseEnd);
+            storageJoin = storagePhi;
+        }
 
         if (rawArrayJoin)
         {
@@ -4066,6 +4157,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->lastCallReturnsOwned = true;
             LLVMBackend::TypedValue result{ phi, true };
             result.isAlias = trueAlias || falseAlias;
+            result.storage = storageJoin;
             return result;
         }
 
@@ -4083,6 +4175,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
         LLVMBackend::TypedValue result{ phi, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
+        result.storage = storageJoin;
         return result;
     }
 
@@ -4289,7 +4382,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         ProcessPlusPlus();
                     }
                     else
-                        trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
+                    {
+                        auto trueTv = ParseTernaryArmExpression(expressionTrueCtx);
+                        trueValue = trueTv.value;
+                        trueUnsigned = trueTv.isUnsigned;
+                    }
                 };
                 auto parseFalseArm = [&]() {
                     std::optional<DeclExpectedTypeScope> expectedScope;
@@ -4625,6 +4722,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         }
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
         result.isAlias = namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow;
+        result.storage = result.isAlias ? namedVar.Storage : nullptr;
         if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
             Compiler(ctx)->RegisterTempFieldValue(result.value);
@@ -6925,6 +7023,18 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 }
                 namedVar.Primary = namedVar.Storage;
                 namedVar.Storage = nullptr;
+                // `&` over an alias lvalue yields a PLAIN borrowed pointer - the same value the
+                // accessor spelling (`c.eqPtr()`) hands back, so it stores like any other pointer.
+                // The provenance moves to PointsToAliasBorrow, which the return/delete boundary
+                // gates below read; the alias markers themselves are dropped here.
+                if (namedVar.IsAliasBorrow || namedVar.TypeAndValue.IsAlias)
+                {
+                    namedVar.FromOwningTempField = false;
+                    namedVar.OwningTempParent = false;
+                    namedVar.PointsToAliasBorrow = true;
+                    namedVar.IsAliasBorrow = false;
+                    namedVar.TypeAndValue.IsAlias = false;
+                }
                 // The address of an element (e.g. &a[i]) is a raw pointer to one slot, never a
                 // whole-allocation array-view. Clear the flag so it cannot bind back into a `T[]`
                 // (which would forge an offset view that overlaps the original - the escape hatch
@@ -7103,6 +7213,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 return namedVar;
             }
 
+            PrepareAliasCallResult(ctx, namedVar);
             // A unary operator overload declared 'void' lands here with the same value-less
             // result a direct call does - same ruling, same wording.
             DiagnoseVoidResultConsumed(ctx, namedVar, use, std::format("'operator{}'", opText));
@@ -9728,11 +9839,14 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             }
 
             // Error: deleting the DIRECT result of a call whose callee returns 'alias' (a borrow the
-            // owner retains, e.g. list.get's `alias T get`). The owner still holds the pointer and
-            // frees it at its own dtor - deleting it here double-frees. A call result has null Storage
-            // (Primary holds the value); a named local has alloca Storage and is not flagged, so
-            // 'T* p = ...; delete p;' stays allowed. Covers the parenthesized/cast-laundered forms too.
-            if (namedVar.TypeAndValue.IsAlias && namedVar.Storage == nullptr)
+            // owner retains, e.g. list.get's `alias T get`). The owner still holds the slot and
+            // frees its resources at its own dtor - deleting it here would double-free. Non-pointer
+            // alias results now have Storage because the ABI is a reference; an alias local has a
+            // non-empty CallerName and is not this direct-call case.
+            // `&aliasResult` drops the alias markers (it is a plain borrowed pointer for stores),
+            // so the provenance flag is the form this gate sees for an address-of operand.
+            if ((namedVar.TypeAndValue.IsAlias || namedVar.PointsToAliasBorrow)
+                && (namedVar.Storage == nullptr || namedVar.CallerName.empty()))
             {
                 std::string calleeName = DeleteOperandCalleeName(ue);
                 // A borrowing container hands back a borrow even from take()/removeAt(), so
@@ -10286,6 +10400,19 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
         const std::string root = FieldPathRootName(srcNV);
         if (srcNV.RootIsAliasBorrowLocal && !srcNV.RootIsBorrowedByValueParam)
         {
+            // An alias local may refer to an owning local in this same frame. Consuming
+            // that field still updates the real owner's slot, so it is safe; the reject
+            // remains for aliases of globals, parameters, or other outliving storage.
+            bool aliasesFrameOwner = false;
+            auto rootStorage = compiler->FindVariableStorage(root).Storage;
+            if (rootStorage != nullptr && llvm::isa<llvm::AllocaInst>(rootStorage))
+                for (const auto& frame : compiler->stackNamedVariable)
+                    for (const auto& [name, binding] : frame.namedVariable)
+                        if (binding.Storage == rootStorage && !binding.IsAliasBorrow
+                            && !binding.IsBorrowedOwningValue)
+                            aliasesFrameOwner = true;
+            if (aliasesFrameOwner)
+                return false;
             LogErrorContext(ctx, std::format(
                 "cannot consume field '{}.{}' out of 'alias' borrow '{}' - the store nulls only "
                 "this shallow copy, so the real owner's field still frees the pointee (double-free). "
@@ -11509,9 +11636,10 @@ bool MainListener::ResolveTransparentAnonField(
 
 void MainListener::ClassifyPostfixCallResult(
         antlr4::ParserRuleContext* ctx,
-        const LLVMBackend::NamedVariable& result,
+        LLVMBackend::NamedVariable& result,
         LLVMBackend::NamedVariable& structVar,
         LLVMBackend::NamedVariable& interfaceVar) {
+        PrepareAliasCallResult(ctx, result);
         if (result.TypeAndValue.IsInterface)
         {
             interfaceVar = result;
@@ -11528,7 +11656,28 @@ void MainListener::ClassifyPostfixCallResult(
             structVar = result;
             interfaceVar = {};
         }
-    }
+}
+
+void MainListener::PrepareAliasCallResult(
+        antlr4::ParserRuleContext* ctx,
+        LLVMBackend::NamedVariable& result) {
+        if (!result.TypeAndValue.IsAlias || result.TypeAndValue.Pointer
+            || result.Primary == nullptr)
+            return;
+
+        auto* compiler = Compiler(ctx);
+        if (result.TypeAndValue.IsFunctionPointer
+            || compiler->GetEncodedClosureType(result.TypeAndValue.TypeName) != nullptr)
+            return;
+        if (!result.Primary->getType()->isPointerTy())
+            return;
+
+        auto* valueType = compiler->GetType(result.TypeAndValue);
+        if (valueType == nullptr) return;
+        result.BaseType = valueType;
+        result.Storage = result.Primary;
+        result.Primary = nullptr;
+}
 
 std::string MainListener::NextMemberName(CFlatParser::PostfixExpressionContext* ctx,
                                       antlr4::tree::ParseTree* opNode) {

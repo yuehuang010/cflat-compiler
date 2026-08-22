@@ -4819,9 +4819,15 @@ public:
     // after the normal (non-interface) call path; the caller clears both slots first.
     void ClassifyPostfixCallResult(
         antlr4::ParserRuleContext* ctx,
-        const LLVMBackend::NamedVariable& result,
+        LLVMBackend::NamedVariable& result,
         LLVMBackend::NamedVariable& structVar,
         LLVMBackend::NamedVariable& interfaceVar);
+
+    // Turn the pointer returned by a non-pointer `alias T` call into an lvalue. Pointer aliases
+    // keep their existing borrowed-pointer value semantics.
+    void PrepareAliasCallResult(
+        antlr4::ParserRuleContext* ctx,
+        LLVMBackend::NamedVariable& result);
 
     // Returns the member-name text immediately following `opNode` (a `.`/`->` token) in the
     // postfix child list, or "" if the next child is not an Identifier/`move` name. Used by
@@ -4947,7 +4953,7 @@ public:
 
     // A '?:' arm parsed for its value, keeping the arm's signedness for the join (see the
     // definition; the fallback is plain ParseExpression).
-    llvm::Value* ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx, bool& isUnsigned);
+    LLVMBackend::TypedValue ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx);
 
     bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const;
     LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);

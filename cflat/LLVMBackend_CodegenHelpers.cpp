@@ -1107,6 +1107,10 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         for (unsigned i = 0; i < dsIt->second.StructFields.size(); ++i)
         {
             const auto& f = dsIt->second.StructFields[i];
+            // An alias field is a borrowed reference to storage owned elsewhere. It must
+            // never participate in the containing value's synthesized destruction.
+            if (f.IsAlias)
+                continue;
             // `unique T* field`: the struct owns the pointee. Unlike a value member this is
             // pushed even when the pointee is trivially destructible - the block still needs freeing.
             // IsUniqueTypeArg matches the array arm below: a scalar field made `unique` by generic
@@ -1305,6 +1309,27 @@ void LLVMBackend::ResolvePendingAliasReturnInference()
                 if (!same) continue;
                 sym.ReturnsAlias = true;
                 sym.ReturnType.IsAlias = true;
+                // The forward-ref pass may have emitted this declaration before the
+                // struct fields were known well enough to infer the borrow return. Keep
+                // its LLVM ABI in sync before the main pass attaches the body.
+                if (sym.Function != nullptr && sym.Function->empty() && sym.Function->use_empty())
+                {
+                    auto* inferredType = GetFunctionType(sym.ReturnType, sym.Parameters,
+                                                         sym.Variadic, sym.External);
+                    if (inferredType != sym.Function->getFunctionType())
+                    {
+                        auto* oldFunction = sym.Function;
+                        std::string oldName = oldFunction->getName().str();
+                        oldFunction->setName(oldName + ".alias_old");
+                        auto* newFunction = llvm::Function::Create(
+                            inferredType, oldFunction->getLinkage(), oldName, *module);
+                        newFunction->setCallingConv(oldFunction->getCallingConv());
+                        newFunction->setAttributes(oldFunction->getAttributes());
+                        newFunction->addFnAttr(llvm::Attribute::NullPointerIsValid);
+                        oldFunction->eraseFromParent();
+                        sym.Function = newFunction;
+                    }
+                }
             }
         }
     }

@@ -362,7 +362,7 @@ llvm::Type* LLVMBackend::GetFunctionReturnType(const std::string& functionName) 
         auto it = functionTable.find(functionName);
         if (it == functionTable.end() || it->second.empty())
             return nullptr;
-        return GetType(it->second.front().ReturnType);
+        return GetFunctionReturnABIType(it->second.front().ReturnType);
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::GetFunctionReturnTypeInfo(const std::string& functionName) const
@@ -398,6 +398,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
         tv.FuncPtrReturnOwned = chosen->ReturnType.IsMove
             || (chosen->ReturnType.IsUniqueTypeArg && chosen->ReturnType.Pointer);
+        tv.FuncPtrReturnAlias = chosen->ReturnType.IsAlias;
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
         for (const auto& p : chosen->Parameters)
         {
@@ -487,7 +488,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
             if (ReturnCarriesRawArrayCount(retTV))
                 paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
-            auto* retTy   = GetType(retTV);
+            auto* retTy   = GetFunctionReturnABIType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
             auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
@@ -555,7 +556,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
         if (ReturnCarriesRawArrayCount(retTV))
             paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
-        auto* retTy     = GetType(retTV);
+        auto* retTy     = GetFunctionReturnABIType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
         auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
 
@@ -1167,9 +1168,10 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         retTV.TypeName = tv.FuncPtrReturnTypeName;
         retTV.Pointer  = tv.FuncPtrReturnPointer;
         retTV.IsMove   = tv.FuncPtrReturnOwned;
+        retTV.IsAlias  = tv.FuncPtrReturnAlias;
         if (ReturnCarriesRawArrayCount(retTV))
             paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
-        return llvm::FunctionType::get(GetType(retTV), paramTypes, false)->getPointerTo();
+        return llvm::FunctionType::get(GetFunctionReturnABIType(retTV), paramTypes, false)->getPointerTo();
     }
 
 bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
@@ -1233,9 +1235,18 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
         if (!externC && ReturnCarriesRawArrayCount(returnType))
             types.emplace_back(builder->getInt64Ty()->getPointerTo());
 
-        auto* retTy = externC ? GetCCompatibleType(returnType) : GetType(returnType);
+        auto* retTy = externC ? GetCCompatibleType(returnType) : GetFunctionReturnABIType(returnType);
         return llvm::FunctionType::get(retTy, types, varargs);
     }
+
+llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType) const
+{
+        auto* valueType = GetType(returnType);
+        if (valueType != nullptr && returnType.IsAlias && !returnType.Pointer
+            && !returnType.IsArrayView)
+            return valueType->getPointerTo();
+        return valueType;
+}
 
 std::string LLVMBackend::ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs)
 {

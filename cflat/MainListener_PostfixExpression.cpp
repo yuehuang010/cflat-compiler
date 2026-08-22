@@ -793,6 +793,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Primary      = arrowResult;
                                 namedVar.BaseType     = arrowResult->getType();
                                 namedVar.TypeAndValue = compiler->lastCallReturnType;
+                                PrepareAliasCallResult(ctx, namedVar);
 
                                 if (++arrowGuard > 32)
                                 {
@@ -1374,6 +1375,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
+                                        || structVar.IsAliasBorrow
+                                        || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
+                                    if (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer
+                                        && !structVar.IsAliasBorrow
+                                        && !structVar.RootIsAliasBorrowLocal)
+                                        namedVar.FromOwningTempField = true;
                                 }
                                 else
                                 {
@@ -1467,6 +1475,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
+                                        || structVar.IsAliasBorrow
+                                        || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
+                                    if (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer
+                                        && !structVar.IsAliasBorrow
+                                        && !structVar.RootIsAliasBorrowLocal)
+                                        namedVar.FromOwningTempField = true;
                                     // Mark this NamedVariable as a struct-field access so 'delete obj->field'
                                     // can reject it when invoked outside the owning struct's own methods.
                                     namedVar.OwningStructName = structVar.TypeAndValue.TypeName;
@@ -1484,8 +1499,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // does not masquerade as the original owner.
                                     const auto* rootBinding = Compiler(ctx)->FindVariableByStorage(
                                         structVar.Storage);
-                                    bool rootIsAliasLocal = rootBinding != nullptr
-                                        && IsAliasBorrowLocalBinding(*rootBinding);
+                                    bool rootIsAliasLocal = (structVar.TypeAndValue.IsAlias
+                                            && !structVar.TypeAndValue.Pointer
+                                            && !structVar.CallerName.empty())
+                                        || (rootBinding != nullptr
+                                            && IsAliasBorrowLocalBinding(*rootBinding));
                                     if (rootIsAliasLocal)
                                     {
                                         namedVar.FieldPathRoot = structVar.CallerName.empty()
@@ -2114,6 +2132,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Storage  = nullptr;
                                 namedVar.BaseType = result->getType();
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                PrepareAliasCallResult(ctx, namedVar);
                                 if (namedVar.TypeAndValue.IsInterface)
                                 {
                                     // operator[] returned an interface fat-ptr - expose as interfaceVar
@@ -2417,6 +2436,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Primary  = result;
                             namedVar.BaseType = result ? result->getType() : nullptr;
                             namedVar.TypeAndValue = compiler->lastCallReturnType;
+                            PrepareAliasCallResult(ctx, namedVar);
                             structVar = {};
                             interfaceVar = {};
                             functionArgCounter++;
@@ -2797,6 +2817,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         idxNV.Primary = idx2;
                                         idxNV.TypeAndValue.TypeName = "int";
                                         auto elemNV = compiler->CreateOverloadedFunctionCall("get", {selfNV, idxNV});
+                                        if (compiler->lastCallReturnType.IsAlias
+                                            && !compiler->lastCallReturnType.Pointer && elemNV != nullptr)
+                                        {
+                                            elemNV = compiler->builder->CreateLoad(
+                                                compiler->GetType(compiler->lastCallReturnType), elemNV,
+                                                "reflect_alias_value");
+                                            elemNV = compiler->ClearStringOwnedBit(elemNV);
+                                            elemNV = compiler->ClearStructOwnedBits(
+                                                elemNV, compiler->lastCallReturnType.TypeName);
+                                        }
                                         auto emptyNV = compiler->MakeStringLiteralNV("");
 
                                         // Dispatch element by type
@@ -3730,7 +3760,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             else if (namedVar.Storage != nullptr)
                                 funcPtr = Compiler(ctx)->CreateLoad(namedVar.Storage);
                             else if (namedVar.Primary != nullptr)
-                                funcPtr = namedVar.Primary;
+                            {
+                                if (namedVar.TypeAndValue.IsAlias && !namedVar.TypeAndValue.Pointer
+                                    && namedVar.Primary->getType()->isPointerTy())
+                                    funcPtr = Compiler(ctx)->CreateLoad(
+                                        Compiler(ctx)->GetType(namedVar.TypeAndValue), namedVar.Primary);
+                                else
+                                    funcPtr = namedVar.Primary;
+                            }
 
                             if (funcPtr != nullptr)
                             {
@@ -3753,6 +3790,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     {
                                         auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                        if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
+                                            && argNV.Primary != nullptr
+                                            && (argNV.TypeAndValue.IsFunctionPointer
+                                                || Compiler(ctx)->GetEncodedClosureType(argNV.TypeAndValue.TypeName) != nullptr))
+                                            argValue = Compiler(ctx)->CreateLoad(
+                                                Compiler(ctx)->GetType(argNV.TypeAndValue), argNV.Primary);
                                         if (argValue) callArgs.push_back(argValue);
                                         argNVs.push_back(argNV);
 
@@ -3831,6 +3874,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.Primary = result;
                                 namedVar.BaseType = result ? result->getType() : nullptr;
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                PrepareAliasCallResult(ctx, namedVar);
                                 /*
                                  * A VOID call through a function value yields no LLVM value at all
                                  * (CreateIndirectCall returns nullptr for a void invoker), so every
@@ -4075,6 +4119,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         }
                                     }
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                    if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
+                                        && argNV.Primary != nullptr
+                                        && (argNV.TypeAndValue.IsFunctionPointer
+                                            || Compiler(ctx)->GetEncodedClosureType(argNV.TypeAndValue.TypeName) != nullptr))
+                                        argValue = Compiler(ctx)->CreateLoad(
+                                            Compiler(ctx)->GetType(argNV.TypeAndValue), argNV.Primary);
                                     if (!argValue) { Compiler(ctx)->EndCastOccurrence(savedCastOcc); break; }
                                     // An owned-string CALL result passed as a by-value (borrow) argument
                                     // has no named owner and must be freed at end-of-full-expression -
@@ -4251,6 +4301,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // has no struct receiver and the chained call re-dispatches the stale name.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                PrepareAliasCallResult(ctx, namedVar);
                                 interfaceVar = {};
                                 structVar = {};
                                 ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
@@ -4357,7 +4408,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 llvm::Value* primVal = namedVar.Storage
                                     ? (namedVar.UnionFieldType
                                         ? Compiler(ctx)->CreateLoad(namedVar.UnionFieldType, namedVar.Storage)
-                                        : Compiler(ctx)->CreateLoad(namedVar.Storage))
+                                        : (namedVar.TypeAndValue.IsAlias && !namedVar.TypeAndValue.Pointer
+                                            ? Compiler(ctx)->CreateLoad(
+                                                Compiler(ctx)->GetType(namedVar.TypeAndValue), namedVar.Storage)
+                                            : Compiler(ctx)->CreateLoad(namedVar.Storage)))
                                     : namedVar.Primary;
 
                                 if (primVal != nullptr && primVal->getType()->isFloatingPointTy())
@@ -4637,6 +4691,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     // Load from storage if Primary isn't populated (simple variable reference)
                                     auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                    if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
+                                        && argNV.Primary != nullptr
+                                        && (argNV.TypeAndValue.IsFunctionPointer
+                                            || Compiler(ctx)->GetEncodedClosureType(argNV.TypeAndValue.TypeName) != nullptr))
+                                        argValue = Compiler(ctx)->CreateLoad(
+                                            Compiler(ctx)->GetType(argNV.TypeAndValue), argNV.Primary);
                                     lambdaExpectedType = {};
                                     // caller's block was terminated (e.g. return-block inline)
                                     if (!argValue) { Compiler(ctx)->EndCastOccurrence(savedCastOcc); break; }
@@ -4937,6 +4997,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // nxt()'s result below, not the stale pre-call receiver type.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
+                                PrepareAliasCallResult(ctx, namedVar);
                                 structVar = {};
                                 interfaceVar = {};
                             }
@@ -4986,6 +5047,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // so that subsequent member access (->field) can resolve the struct.
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
+                                PrepareAliasCallResult(primaryCtx, namedVar);
                                 // A primitive result has no aggregate classifier: clear the previous
                                 // receiver, else `box.get().toString()` reuses `box` as the receiver.
                                 structVar = {};

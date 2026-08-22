@@ -3766,10 +3766,19 @@ alias UniqueBox pickBorrowedBox(UniqueBox borrowed, bool c)
 int readBoxId(UniqueBox b) { return b.item->id; }
 
 // Handing a borrow LOCAL onward through an `alias` return: the sanctioned way to pass one along.
-alias UniqueBox handBorrow(BoxWrap* w) { UniqueBox k = w->borrow(); return k; }
+// The local must itself be declared `alias` - a plain copy lives in this frame, and returning a
+// reference to it would dangle.
+alias UniqueBox handBorrow(BoxWrap* w) { alias UniqueBox k = w->borrow(); return k; }
 
 // A real `move` sink: the callee owns the value and frees it on return.
 void sinkUniqueBox(move UniqueBox b) { }
+
+// An `extern` (C ABI) function keeps the BY-VALUE return shape even when declared `alias`:
+// GetFunctionType builds it with the C-compatible return type, so the return site must not emit
+// the non-pointer alias reference ABI there (that mismatch failed module verification outright).
+struct ExternAliasRow { int a = default; int b = default; };
+ExternAliasRow g_externAliasRow = default;
+extern alias ExternAliasRow externAliasRow() { return g_externAliasRow; }
 
 // A `move Resource*` sink for the re-bound-borrow legs: it adopts the pointee and frees it.
 void sinkBoxItem(move Resource* p) { }
@@ -3979,6 +3988,12 @@ int testOwningStructTernaryJoin()
         passed += Test("alias_borrow_passthrough_no_adoption", dtorCount, 0);
     }
     passed += Test("alias_borrow_passthrough_owner_freed_once", dtorCount, 1);
+
+    // `extern alias` keeps the C by-value return: both fields must survive the call.
+    g_externAliasRow.a = 5;
+    g_externAliasRow.b = 6;
+    passed += Test("extern_alias_return_first_field", externAliasRow().a, 5);
+    passed += Test("extern_alias_return_second_field", externAliasRow().b, 6);
 
     // The guards sit in front of the owning-value MOVE and `move`-argument paths, so the plain
     // OWNER spellings they share a site with must still transfer: `dest = ownedLocal` releases the
@@ -11108,7 +11123,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 105;
+    total += 107;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

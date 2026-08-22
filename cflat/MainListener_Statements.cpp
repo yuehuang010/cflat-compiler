@@ -524,17 +524,42 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
-        // Check before the implicit whole-local move below clears Storage. An alias
-        // return must preserve the borrow, so a frame-local string cannot be moved
-        // out as an owned value and then escape the frame.
-        if (compiler->currentFunctionReturnTV.IsAlias
-            && NamedVarIsString(returnNV)
-            && PointsIntoStackFrame(returnNV.Storage)
-            && !compiler->IsBorrowStringParamStorage(returnNV.Storage))
+        // GetFunctionType hands an `extern` (C ABI) function the by-value return shape, so the
+        // reference ABI holds only where the emitted function really returns a pointer. Comparing
+        // against the ABI type keeps this site and GetFunctionType from drifting apart.
+        auto* currentFn = compiler->builder->GetInsertBlock() != nullptr
+            ? compiler->builder->GetInsertBlock()->getParent() : nullptr;
+        const bool aliasRefReturn = compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->currentFunctionReturnTV.Pointer
+            && currentFn != nullptr
+            && currentFn->getReturnType()
+                == compiler->GetFunctionReturnABIType(compiler->currentFunctionReturnTV);
+
+        // A non-pointer alias return is a reference to the source slot. It must have storage,
+        // and that storage must outlive this frame; returning a by-value snapshot would silently
+        // restore the old broken ABI and returning an alloca would dangle immediately.
+        if (aliasRefReturn)
         {
-            LogErrorContext(errCtx,
-                "cannot return an 'alias' string value that borrows frame-local storage; "
-                "the buffer would dangle when the function returns");
+            if (returnNV.Storage == nullptr)
+                LogErrorContext(errCtx,
+                    "cannot return an 'alias' value without addressable storage; return a live "
+                    "lvalue rather than a temporary value");
+            if (PointsIntoStackFrame(returnNV.Storage))
+            {
+                // An alias LOCAL bound to a frame-local owner is still frame storage, so the
+                // borrow marker cannot excuse it - only a caller-owned by-value param can.
+                if (!IsBorrowedByValueParamBinding(compiler, returnNV))
+                {
+                    if (NamedVarIsString(returnNV))
+                        LogErrorContext(errCtx,
+                            "cannot return an 'alias' string value that borrows frame-local storage; "
+                            "the buffer would dangle when the function returns");
+                    else
+                        LogErrorContext(errCtx,
+                            "cannot return an 'alias' value that borrows frame-local storage; "
+                            "the referenced object would dangle when the function returns");
+                }
+            }
         }
 
         // Implicit move on `return <local>;` (C++-style, narrow). Triggers only when the
@@ -591,7 +616,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, compiler->DescribeCodeValueIntoData(
                 CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
         }
-        auto right = LoadNamedVariable(returnNV);
+        auto right = aliasRefReturn ? returnNV.Storage : LoadNamedVariable(returnNV);
         // A string LITERAL is a 'const char*', never a 'T*' - the RETURN leg of the same gate the
         // declarator, `=`, brace-init, field-default and argument sites apply.
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
@@ -1014,8 +1039,23 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // pointee is freed) or an owning value type (its destructor frees buffers the
         // real owner still holds). An alias of a primitive or a POD struct hands back a
         // plain value copy with nothing to free - e.g. `dict<string,u64>.get(k)`.
+        // PointsToAliasBorrow is the address-of form: `&rows.get(0)` is storable, but handing it
+        // across the return boundary from a non-alias function is the escape this rejects.
+        // A root that is an alias-borrow LOCAL excuses a borrowed POINTER (per the ruling, `&` over
+        // an alias lvalue is a plain borrowed pointer) or a value with nothing to free. It does NOT
+        // excuse an OWNING value type: that hands the caller a second destructor for the same
+        // buffers, unless the indirect-owning-lvalue arm below rewrites it into an owned copy/move.
+        const bool aliasBorrowRootExcused = returnNV.RootIsAliasBorrowLocal
+            && (returnNV.TypeAndValue.Pointer
+                || !compiler->IsOwningValueType(returnNV.TypeAndValue.TypeName)
+                || (right != nullptr && assignExpr != nullptr
+                    && right->getType()->isStructTy()
+                    && !returnNV.FromOwningTempField
+                    && !returnNV.IsClosureValueCapture
+                    && ReturnSourceIsIndirectOwningLvalue(returnNV, right)));
         if (!compiler->currentFunctionReturnTV.IsAlias
-            && SourceIsDanglingAliasBorrow(compiler, returnNV))
+            && (SourceIsDanglingAliasBorrow(compiler, returnNV) || returnNV.PointsToAliasBorrow)
+            && !aliasBorrowRootExcused)
         {
             LogErrorContext(errCtx, std::format(
                 "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
@@ -2166,6 +2206,14 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     else if (isFaceType)
                     {
                         elemVal = compiler->CallInterfaceMethod(ifacePtr, collNV.TypeAndValue.TypeName, "get", { indexNV });
+                        if (compiler->lastCallReturnType.IsAlias
+                            && !compiler->lastCallReturnType.Pointer && elemVal != nullptr)
+                        {
+                            elemVal = compiler->builder->CreateLoad(
+                                compiler->GetType(elemType), elemVal, "rangealiasvalue");
+                            elemVal = compiler->ClearStringOwnedBit(elemVal);
+                            elemVal = compiler->ClearStructOwnedBits(elemVal, elemType.TypeName);
+                        }
                     }
                     else
                     {

@@ -36,6 +36,30 @@ class Val
     ~Val() { g_dtor = g_dtor + 1; }
 };
 
+struct AliasRow { int value = default; string text = default; };
+// A pointer VIEW over an element the list owns. `&rows[0]` is a plain borrowed pointer - the
+// same value the accessor spelling hands back - so storing it in a field or a global is legal.
+struct AliasView { AliasRow* row = nullptr; };
+AliasRow* g_aliasRow = nullptr;
+
+// A user-written alias accessor hands out the same live-slot lvalue the container
+// accessors do, so assigning through it must drop the old owner exactly as `l[0] = v` does.
+class AliasHolder
+{
+    string t = default;
+    alias string get() { return this->t; }
+};
+
+// An owned TEMP source: a returned local is moved out, so the assignment has no named
+// source slot to fall back on - the destination must drop its own old value.
+Val makeVal(int id)
+{
+    Val v = default;
+    v.id = id;
+    return v;
+}
+
+
 // A non-copyable value type: it owns a `unique` pointer and has no copy(), so copy
 // synthesis is refused. is_copyable(NonCopyable) is 0 and list accepts it move-only.
 class NonCopyable
@@ -87,6 +111,119 @@ int testPrimitives()
     passed += Test("list<int> [0] after removeAt", l[0], 20);
     l.clear();
     passed += Test("list<int> count after clear", l.count(), 0);
+    return passed;
+}
+
+// Non-pointer alias returns are reference lvalues. Exercise direct access and declared alias
+// bindings over an owning struct and a primitive element. HeapAudit below proves the alias views
+// do not become owners.
+int testAliasLvalueSemantics()
+{
+    int passed = 0;
+
+    list<AliasRow> rows = default;
+    AliasRow row = default;
+    row.value = 10;
+    row.text = "alias";
+    rows.add(row);
+
+    rows[0].value = 11;
+    passed += Test("alias list index writes live slot", rows.get(0).value, 11);
+
+    alias AliasRow byBinding = rows.get(0);
+    byBinding.value = 12;
+    passed += Test("alias local writes source slot", rows[0].value, 12);
+    passed += Test("alias local reads owning fields", byBinding.text.length(), 5);
+
+    list<int> values = default;
+    values.add(20);
+    alias int byPrimitive = values.get(0);
+    byPrimitive = 21;
+    passed += Test("alias primitive binding writes live slot", values[0], 21);
+
+    // Address-of an alias element, stored into a struct field and into a global. Both write the
+    // list's live slot; neither view owns it (the heap audit below covers the teardown).
+    AliasView view = default;
+    view.row = &rows[0];
+    view.row->value = 13;
+    passed += Test("alias element address in a field writes live slot", rows.get(0).value, 13);
+    passed += Test("alias element address in a field reads owning field", view.row->text.length(), 5);
+
+    g_aliasRow = &rows.get(0);
+    g_aliasRow->value = 14;
+    passed += Test("alias element address in a global writes live slot", rows[0].value, 14);
+    g_aliasRow = nullptr;
+
+    // `.copy()` is exactly what the return-escape diagnostic tells the user to reach for, so it
+    // has to compile through an alias lvalue: the receiver is a by-value argument read OUT of
+    // the borrowed slot, not the slot's address. Passing the address emitted an unverifiable
+    // module, so both legs below are unreachable unless the argument is loaded.
+    AliasRow copied = rows.get(0).copy();
+    copied.value = 99;
+    passed += Test("alias result copy carries owning field", copied.text.length(), 5);
+    passed += Test("alias result copy leaves the element alone", rows[0].value, 14);
+
+    return passed;
+}
+
+// Assigning THROUGH an alias-result lvalue overwrites a LIVE element the container handed
+// out - unlike `_data[i] = v` inside container code, which fills an EMPTY slot. The old owner
+// must therefore be dropped exactly once: skipping it leaks the old buffer, doing it twice
+// double-destructs. The two RESOURCE legs are what discriminate the leak fix - each leaked its
+// old buffer before it, and only the HeapAudit oracle in main() sees that (both value
+// assertions passed while leaking). The two VALUE legs are the destructor-count tripwire for
+// the opposite direction, a widened drop-old destructing the slot twice.
+int testAliasLvalueAssignDropsOldOwner()
+{
+    int passed = 0;
+
+    // string element, OWNED TEMP source. The old "alpha" buffer has no other owner.
+    {
+        list<string> l = default;
+        l.add("alpha".copy());
+        l[0] = "beta".copy();
+        passed += Test("alias index assign temp replaces string element", l[0].length(), 4);
+    }
+
+    // Same shape through a user `alias string get()` rather than a container accessor.
+    {
+        AliasHolder h = default;
+        h.t = "alpha".copy();
+        h.get() = "beta".copy();
+        passed += Test("user alias accessor assign replaces string", h.t.length(), 4);
+    }
+
+    // Value element with a side-effecting destructor, OWNED TEMP source. This leg does NOT
+    // discriminate the leak fix (it counted 2 before it too): it is the tripwire for the
+    // OPPOSITE failure - widening the drop-old so the slot is destructed a second time, which
+    // is how an earlier attempt double-freed `list<Val>`. The two destructs here are the
+    // replaced element and the moved-out temp, in exactly that number.
+    {
+        g_dtor = 0;
+        list<Val> l = default;
+        l.add(makeVal(1));
+        g_dtor = 0;
+        l[0] = makeVal(2);
+        passed += Test("alias index assign temp destructs old value once", g_dtor, 2);
+        passed += Test("alias index assign temp stores new value", l[0].id, 2);
+    }
+
+    // Value element with a NAMED source: the copy path already dropped the old element, so
+    // this leg is the tripwire against a widened drop-old destructing it a second time.
+    {
+        list<Val> l = default;
+        Val a = default;
+        a.id = 1;
+        l.add(a);
+        Val b = default;
+        b.id = 2;
+        g_dtor = 0;
+        l.get(0) = b;
+        passed += Test("alias get assign named source destructs old once", g_dtor, 1);
+        passed += Test("alias get assign named source keeps source live", b.id, 2);
+        passed += Test("alias get assign named source stores value", l.get(0).id, 2);
+    }
+
     return passed;
 }
 
@@ -946,6 +1083,8 @@ extern int main()
     int total  = 0;
 
     total += 8;  passed += testPrimitives();
+    total += 9;  passed += testAliasLvalueSemantics();
+    total += 7;  passed += testAliasLvalueAssignDropsOldOwner();
     total += 5;  passed += testValueCopySemantics();
     total += 2;  passed += testStringCopySemantics();
     total += 1;  passed += testStringMoveSemantics();

@@ -2426,7 +2426,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // (needed for chaining a method on the result, e.g. `e.toJson().data()`).
         lastCallReturnType = methodInfo->ReturnType;
 
-        llvm::Type* retTy = GetType(methodInfo->ReturnType);
+        llvm::Type* retTy = GetFunctionReturnABIType(methodInfo->ReturnType);
         std::vector<llvm::Type*> paramTypes = { ptrTy };
         for (const auto& p : methodInfo->Parameters)
         {

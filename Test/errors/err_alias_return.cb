@@ -38,6 +38,19 @@ Token firstToken(list<Token> toks)
     return toks.get(0);                // alias borrow escaping via a non-alias return
 }
 
+// Same escape one level in: a field of a DECLARED alias local. The field path root is the
+// alias local, which is not on its own a licence to hand an owning value out - the returned
+// Inner would destruct a pointee the caller's Outer still owns (double free).
+class AliasNode { int id = default; };
+class Inner { unique AliasNode* item = nullptr; };
+class Outer { Inner slot = default; alias Outer self() { return *this; } };
+Inner stealSlot(Outer* w)
+{
+    alias Outer k = w->self();
+    expect_error("cannot return an 'alias' value");
+    return k.slot;
+}
+
 extern int main()
 {
     return 0;

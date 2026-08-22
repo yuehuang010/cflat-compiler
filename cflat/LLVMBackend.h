@@ -577,7 +577,7 @@ public:
         bool IsFatInterfaceValue() const { return IsInterface && !IsInterfacePointer && !IsArrayView; }
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
-        bool IsAlias = false;    // return/decl declared with 'alias' - by-value borrow; caller must not free the interior
+        bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         // This type came from a generic type argument qualified with `unique`. It records only
         // that provenance - it is set on ANY declaration whose type substitutes to `unique X*`
         // (locals and fields included), not just parameters, because the substitution branch has
@@ -1218,6 +1218,10 @@ public:
         // &w;`). Taking the address launders the field path past the root walk - it now roots at
         // `p`, a local - so the fact has to ride the local's binding to reach the field site.
         bool PointsToBorrowedByValueParam = false;
+        // This POINTER was produced by `&` over an alias (borrowed) lvalue. The pointer itself is
+        // an ordinary borrow - storing it is legal - but the function-boundary gates (return,
+        // delete) still need the provenance the `&` erased from the alias flags.
+        bool PointsToAliasBorrow = false;
         // POSITIVE provenance: this raw `T*` LOCAL holds a `new T[n]` allocation, whose elements
         // nothing ever frees. Only such a base takes the raw-heap borrow arms; every other binding
         // (a decayed fixed array, a join, a parameter, an unknown source) keeps the plain store.
@@ -1286,6 +1290,7 @@ public:
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
+        llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
         // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;
@@ -1425,7 +1430,7 @@ public:
         bool Variadic = false;
         bool External = false;
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
-        bool ReturnsAlias = false; // true when the function returns an 'alias' by-value borrow - caller must not free the interior
+        bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
@@ -5684,6 +5689,10 @@ public:
     llvm::Type* GetFunctionReturnType(const std::string& functionName) const;
 
     TypeAndValue GetFunctionReturnTypeInfo(const std::string& functionName) const;
+
+    // A non-pointer `alias T` return is a reference to a live T slot, not a T value.
+    // Keep this ABI rule at function boundaries; ordinary GetType() remains value-shaped.
+    llvm::Type* GetFunctionReturnABIType(const TypeAndValue& returnType) const;
 
     std::string CreateAnonFunctionName();
 

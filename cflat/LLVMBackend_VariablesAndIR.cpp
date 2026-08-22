@@ -599,8 +599,18 @@ llvm::Value* LLVMBackend::LoadArgStorage(const NamedVariable& arg)
 {
         if (arg.Storage == nullptr)
             return nullptr;
-        return arg.UnionFieldType ? CreateLoad(arg.UnionFieldType, arg.Storage)
-                                  : static_cast<llvm::Value*>(CreateLoad(arg.Storage));
+        if (arg.UnionFieldType)
+            return CreateLoad(arg.UnionFieldType, arg.Storage);
+        // A non-pointer `alias` lvalue keeps the SOURCE SLOT in Storage (a call/GEP), so the
+        // storage's own type is `ptr`, not the borrowed value's type. Load the declared value
+        // type instead - otherwise a by-value argument (`x.copy()`, `twice(x)`) passes the
+        // address where the callee expects the aggregate.
+        if (arg.TypeAndValue.IsAlias && !arg.TypeAndValue.Pointer && arg.BaseType != nullptr
+            && !arg.BaseType->isPointerTy()
+            && !llvm::isa<llvm::AllocaInst>(arg.Storage)
+            && !llvm::isa<llvm::GlobalVariable>(arg.Storage))
+            return CreateLoad(arg.BaseType, arg.Storage);
+        return static_cast<llvm::Value*>(CreateLoad(arg.Storage));
     }
 
 llvm::Value* LLVMBackend::Upconvert(llvm::Value* value, llvm::Value* destination, bool srcIsUnsigned) const

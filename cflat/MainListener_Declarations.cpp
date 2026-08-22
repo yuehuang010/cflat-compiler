@@ -3376,6 +3376,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // The local shallow-aliases storage it does not own, so its scope-exit destructor
                 // must be suppressed (IsAliasBorrow) - otherwise it double-frees the source's buffer.
                 bool srcIsAlias = false;
+                // A non-pointer alias declaration is a reference binding. Keep the RHS slot instead
+                // of copying its loaded value into the declaration's temporary alloca.
+                llvm::Value* aliasStorage = nullptr;
+                bool bindAliasReference = false;
                 // True when the initializer borrows an element the owning container frees
                 // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
                 bool srcBorrowsOwnedElement = false;
@@ -3550,6 +3554,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                             interfaceSourceNV = rightNV;
                             haveInterfaceSourceNV = true;
+                            if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
+                                && rightNV.Storage != nullptr)
+                            {
+                                aliasStorage = rightNV.Storage;
+                                bindAliasReference = true;
+                            }
                             // Interface decl-init is its OWN branch, so the escape gate in the
                             // else below never sees `IShape s = makeIBox().t;` (it dangled).
                             if (!global_scope)
@@ -3663,7 +3673,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
+                                if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
+                                    && rightNV.Storage != nullptr)
+                                {
+                                    aliasStorage = rightNV.Storage;
+                                    bindAliasReference = true;
+                                }
                                 right = LoadNamedVariable(rightNV);
+                                if (right && rightNV.TypeAndValue.IsAlias
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && rightNV.Primary != nullptr
+                                    && (rightNV.TypeAndValue.IsFunctionPointer
+                                        || compiler->GetEncodedClosureType(
+                                            rightNV.TypeAndValue.TypeName) != nullptr))
+                                    right = compiler->CreateLoad(
+                                        compiler->GetType(rightNV.TypeAndValue), rightNV.Primary);
                                 // A `move`-temp's owning field can be MOVED into the local (the temp owns it):
                                 // capture the source so the store site adopts it and zeros the temp's field.
                                 // POINTER fields excluded as at the `=` twin: the aggregate-zero
@@ -3682,6 +3706,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // and a borrow of a temporary is exactly the dangle this rejects.
                                 if (rightNV.FromOwningTempField && !srcMovableTempField
                                     && !typeAndValue.IsAlias
+                                    && !(rightNV.IsAliasBorrow && rightNV.TypeAndValue.Pointer)
                                     && rightNV.TypeAndValue.TypeName == "string"
                                     && AdoptImplicitStringTempCopy(rightNV, right, assignmentExpression))
                                 {
@@ -3696,7 +3721,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     initializerSourceNV = rightNV;
                                 }
+                                // The reference ABI keeps a direct alias return's Storage, so the
+                                // whole-element copy arm above can no longer rely on a null Storage
+                                // to identify that temporary. Preserve the old safe value binding for
+                                // a non-alias string destination; a named alias local remains a borrow.
+                                else if (!srcMovableTempField && !typeAndValue.IsAlias
+                                    && (rightNV.TypeAndValue.IsAlias || rightNV.IsAliasBorrow)
+                                    && llvm::isa_and_nonnull<llvm::CallBase>(rightNV.Storage)
+                                    && rightNV.TypeAndValue.TypeName == "string"
+                                    && !rightNV.TypeAndValue.IsMove)
+                                {
+                                    right = compiler->EmitOwnedStringDeepCopy(right);
+                                    initializerSourceNV = rightNV;
+                                }
                                 else if (rightNV.FromOwningTempField && !srcMovableTempField
+                                    && !(rightNV.IsAliasBorrow && rightNV.TypeAndValue.Pointer)
                                     && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
                                 {
                                     if (rightNV.OwningStructName.empty() || rightNV.FieldName.empty())
@@ -4598,7 +4637,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         TagInterfaceBoxProvenance(
                             name, right, haveInterfaceSourceNV ? &interfaceSourceNV : nullptr);
 
-                    if (needsArrayDefaultInit)
+                    if (bindAliasReference)
+                    {
+                        auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                        nv.Storage = aliasStorage;
+                        nv.BaseType = compiler->GetType(typeAndValue);
+                        nv.IsAliasBorrow = true;
+                        nv.IsOwning = false;
+                        nv.IsOwningString = false;
+                        RecordAliasBorrowDeclBlock(compiler, nv);
+                    }
+                    else if (needsArrayDefaultInit)
                         EmitFixedArrayDefaultInit(alloc, typeAndValue);
 
                     /*
@@ -4644,7 +4693,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         s->RegisterCandidate(cand);
                     }
 
-                    if (right != nullptr)
+                    if (right != nullptr && !bindAliasReference)
                     {
                         // Consume the container-element-slot move signal HERE, at the point common to
                         // both the interface and non-interface init branches (each parsed the RHS in
@@ -4929,7 +4978,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                        : "",
                                 name, name));
                         }
-                        else
+                        else if (!bindAliasReference)
                         {
                             compiler->CreateAssignment(right, alloc, srcIsUnsigned);
                         }
@@ -5535,6 +5584,7 @@ bool MainListener::AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, l
 
 bool MainListener::IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv) {
         if (nv.TypeAndValue.IsMove) return false;
+        if (nv.IsAliasBorrow && !nv.RootIsAliasBorrowLocal) return false;
         if (DeclaredOwningTempUniqueFieldRead(nv)) return true;
         return compilerLLVM != nullptr
             && compilerLLVM->JoinCarriesOwningTempUniqueField(nv.Primary);
@@ -6061,10 +6111,15 @@ void MainListener::ApplyCallResultBorrowProvenance(LLVMBackend* compiler,
 bool MainListener::BorrowAdoptionIsUnsound(LLVMBackend* compiler,
         const LLVMBackend::NamedVariable& nv) {
         if (!SourceIsDanglingAliasBorrow(compiler, nv)) return false;
+        if (nv.IsAliasBorrow) return true;
+        // A non-pointer alias call result now carries the live source slot in Storage. It is
+        // still a borrowed value at an owning adoption site, even though that Storage is a GEP.
+        if (nv.TypeAndValue.IsAlias && !nv.TypeAndValue.Pointer && !nv.IsAliasBorrow)
+            return true;
         return nv.Storage == nullptr
             || llvm::isa<llvm::AllocaInst>(nv.Storage)
             || llvm::isa<llvm::GlobalVariable>(nv.Storage);
-    }
+}
 
 void MainListener::RecordAliasBorrowDeclBlock(LLVMBackend* compiler,
         LLVMBackend::NamedVariable& nv) {
@@ -6075,11 +6130,15 @@ void MainListener::RecordAliasBorrowDeclBlock(LLVMBackend* compiler,
 
 bool MainListener::IsAliasBorrowLocalBinding(const LLVMBackend::NamedVariable& nv) {
         if (!nv.IsAliasBorrow) return false;
-        // OWN-SLOT only. A by-reference lambda capture is IsAliasBorrow too, but its Storage IS the
-        // outer owner's address, so writing/consuming through it reaches the one real owner.
-        return llvm::isa_and_nonnull<llvm::AllocaInst>(nv.Storage)
-            || llvm::isa_and_nonnull<llvm::GlobalVariable>(nv.Storage);
-    }
+        // A by-reference lambda capture is IsAliasBorrow too, but its Storage IS the outer owner's
+        // address. A declared non-pointer alias binding has the same reference shape, while its
+        // Storage may be a field GEP instead of an own slot; both must retain the borrow-root fact
+        // for field-consume diagnostics.
+        return (llvm::isa_and_nonnull<llvm::AllocaInst>(nv.Storage)
+                || llvm::isa_and_nonnull<llvm::GlobalVariable>(nv.Storage))
+            || (nv.TypeAndValue.IsAlias && !nv.TypeAndValue.Pointer
+                && !nv.CallerName.empty() && nv.Storage != nullptr);
+}
 
 bool MainListener::DestinationIsAliasBorrowLocal(LLVMBackend* compiler, llvm::Value* destination) {
         if (compiler == nullptr || destination == nullptr) return false;
@@ -6133,6 +6192,18 @@ bool MainListener::RejectAliasStoreIntoField(
         if (!(right && SourceIsDanglingAliasBorrow(compiler, rightNV)))
             return false;
 
+        // Let the dedicated unique-field gate below name this more specific ownership hazard.
+        if (IsUniqueTempFieldRead(rightNV)) return false;
+
+        if (rightNV.FromOwningTempField && rightNV.TypeAndValue.TypeName != "string")
+        {
+            LogErrorContext(ctx, std::format(
+                "cannot store '{}.{}' taken from a temporary into a field; its buffer is owned "
+                "elsewhere and would be freed. Use '.copy()' for an independent owned copy.",
+                rightNV.OwningStructName, rightNV.FieldName));
+            return true;
+        }
+
         LogErrorContext(ctx, std::format(
             "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
             "and would dangle. Use '.copy()' for an independent owned copy.",
@@ -6168,6 +6239,7 @@ bool MainListener::RejectOwningValueCopyIntoField(
             && !rightNV.TypeAndValue.IsArrayView
             && !rightNV.TypeAndValue.IsMove
             && rightNV.TypeAndValue.TypeName != "string"  // string members are never auto-destructed (leak, not double-free)
+            && right->getType() != llvm::StructType::getTypeByName(*compiler->context, "string")
             // The RHS must be an addressable lvalue (variable / parameter / field) whose backing
             // buffer is still owned by that source - that is what makes the shallow copy an alias.
             // A function-call result, '.copy()', or any temporary has null Storage (ownership was
@@ -6313,7 +6385,18 @@ bool MainListener::ReturnSourceIsIndirectOwningLvalue(
             return false;
         if (nv.TypeAndValue.TypeName.empty() || nv.TypeAndValue.TypeName == "string")
             return false;
-        if (SourceIsDanglingAliasBorrow(compiler, nv)) return false;
+        bool aliasesFrameOwner = false;
+        if (nv.IsAliasBorrow && nv.RootIsAliasBorrowLocal)
+        {
+            auto rootStorage = compiler->FindVariableStorage(FieldPathRootName(nv)).Storage;
+            if (rootStorage != nullptr && llvm::isa<llvm::AllocaInst>(rootStorage))
+                for (const auto& frame : compiler->stackNamedVariable)
+                    for (const auto& [name, binding] : frame.namedVariable)
+                        if (binding.Storage == rootStorage && !binding.IsAliasBorrow
+                            && !binding.IsBorrowedOwningValue)
+                            aliasesFrameOwner = true;
+        }
+        if (SourceIsDanglingAliasBorrow(compiler, nv) && !aliasesFrameOwner) return false;
         if (!compiler->IsOwningValueType(nv.TypeAndValue.TypeName)) return false;
         // Same type on both sides (alias-resolved). This arm rewrites the returned value, so a
         // mismatch must fall through to the existing return-type diagnostics untouched.
