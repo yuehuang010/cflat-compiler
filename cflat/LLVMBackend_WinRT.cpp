@@ -2882,12 +2882,12 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
                 if (!isPtr && !isInterface)
                 {
                     auto* raw = compiler->builder->CreateLoad(compiler->GetType(field), gep);
-                    auto* widened = compiler->Upconvert(raw, compiler->builder->getInt32Ty(),
+                    auto* widened = compiler->Upconvert(raw, compiler->builder->getInt64Ty(),
                         field.IsUnsignedInteger() != -1);
                     auto nameNV = compiler->MakeStringLiteralNV(displayName);
                     NamedVariable intNV;
                     intNV.Primary = widened;
-                    intNV.TypeAndValue.TypeName = "int";
+                    intNV.TypeAndValue.TypeName = "i64";
                     compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt",
                         {nameNV, intNV});
                 }
@@ -2907,13 +2907,13 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
             else if ((typeName == "float" || typeName == "double") && !isPtr && !isInterface)
             {
                 llvm::Value* raw = compiler->builder->CreateLoad(compiler->GetType(field), gep);
-                // Cast to float if necessary
-                if (typeName == "double")
-                    raw = compiler->builder->CreateFPCast(raw, compiler->builder->getFloatTy());
+                // visitFloat takes double, so widen a 'float' field instead of narrowing.
+                if (typeName == "float")
+                    raw = compiler->builder->CreateFPCast(raw, compiler->builder->getDoubleTy());
                 auto nameNV = compiler->MakeStringLiteralNV(displayName);
                 NamedVariable floatNV;
                 floatNV.Primary = raw;
-                floatNV.TypeAndValue.TypeName = "float";
+                floatNV.TypeAndValue.TypeName = "double";
                 compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat",
                     {nameNV, floatNV});
             }
@@ -3040,10 +3040,10 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
             else
             {
                 auto* widened = compiler->Upconvert(extracted,
-                    compiler->builder->getInt32Ty(), bf.IsUnsigned);
+                    compiler->builder->getInt64Ty(), bf.IsUnsigned);
                 NamedVariable intNV;
                 intNV.Primary = widened;
-                intNV.TypeAndValue.TypeName = "int";
+                intNV.TypeAndValue.TypeName = "i64";
                 compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt",
                     {nameNV, intNV});
             }

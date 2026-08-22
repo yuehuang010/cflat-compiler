@@ -619,11 +619,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             // block, so a null anywhere upstream skips the REST of the chain (merged at the end).
             llvm::BasicBlock* ncChainNullBlock = nullptr;
             std::optional<LLVMBackend::OwnedTempMark> ncTempMark;
+            // The block holding the FIRST '?.' branch: it dominates the merge, so owned temps
+            // created inside the chain are re-homed there instead of freed at the merge.
+            llvm::BasicBlock* ncHoistBlock = nullptr;
             auto ncEnterGuard = [&](llvm::Value* testPtr)
             {
                 auto* compiler = Compiler(ctx);
                 if (!ncTempMark.has_value())
                     ncTempMark = compiler->MarkOwnedTemps();
+                if (ncHoistBlock == nullptr)
+                    ncHoistBlock = compiler->builder->GetInsertBlock();
                 if (ncChainNullBlock == nullptr)
                     ncChainNullBlock = compiler->CreateBasicBlock("nc_null");
                 auto* accessBlock = compiler->CreateBasicBlock("nc_access");
@@ -1871,6 +1876,36 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (!literalType.TypeName.empty())
                                     namedVar.TypeAndValue = literalType;
                             }
+                            // `default` takes the destination's type - publish it so a following
+                            // suffix and the caller both see the right type, not an empty one.
+                            if (prevPrimary->Default() != nullptr && !declExpectedType.TypeName.empty())
+                                namedVar.TypeAndValue = declExpectedType;
+                            // A STRING LITERAL followed by `.method()` is an ordinary `string`
+                            // receiver: wrap the global into a {ptr,len} `string` and give it a
+                            // temp slot, the same materialization the two-statement workaround
+                            // (`string t = "abc"; t.length()`) performs. The wrapper points at a
+                            // global constant, so the temp owns NOTHING and needs no destruction.
+                            if (prevPrimary->StringLiteral().size() == 1
+                                && childLimit > 1 && ctx->children[1]->getText() == "."
+                                && namedVar.Primary != nullptr
+                                && namedVar.TypeAndValue.TypeName.empty())
+                            {
+                                auto* compilerP = Compiler(ctx);
+                                if (auto* strTy = llvm::StructType::getTypeByName(
+                                        *compilerP->context, "string"))
+                                {
+                                    llvm::Value* strVal = namedVar.Primary->getType() == strTy
+                                        ? namedVar.Primary
+                                        : compilerP->WrapStringLiteralAsString(namedVar.Primary);
+                                    auto* tmp = compilerP->CreateAlloca(strTy);
+                                    compilerP->builder->CreateStore(strVal, tmp);
+                                    namedVar.Primary  = strVal;
+                                    namedVar.Storage  = tmp;
+                                    namedVar.BaseType = strTy;
+                                    namedVar.TypeAndValue = {};
+                                    namedVar.TypeAndValue.TypeName = "string";
+                                }
+                            }
                             // If the primary is a parenthesized cast expression, propagate its type
                             // so that chained member access (e.g. ((Struct*)ptr)->field) works.
                             // The <Tag> element sugar uses the same channel to publish its node
@@ -2688,11 +2723,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         && !field.Pointer)
                                     {
                                         auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
-                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt32Ty(), false);
+                                        // Widen to i64: visitInt takes i64 so a 64-bit field is not truncated.
+                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt64Ty(), false);
                                         auto nameNV = compiler->MakeStringLiteralNV(displayName);
                                         intNV = {};
                                         intNV.Primary = widened;
-                                        intNV.TypeAndValue.TypeName = "int";
+                                        intNV.TypeAndValue.TypeName = "i64";
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, intNV});
                                     }
                                     else if (typeName == "string" && !field.Pointer)
@@ -2715,12 +2751,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else if ((typeName == "float" || typeName == "double") && !field.Pointer)
                                     {
                                         llvm::Value* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
-                                        if (typeName == "double")
-                                            val = compiler->builder->CreateFPCast(val, compiler->builder->getFloatTy());
+                                        // visitFloat takes double, so widen a 'float' field instead of narrowing.
+                                        if (typeName == "float")
+                                            val = compiler->builder->CreateFPCast(val, compiler->builder->getDoubleTy());
                                         auto nameNV = compiler->MakeStringLiteralNV(displayName);
                                         floatNV = {};
                                         floatNV.Primary = val;
-                                        floatNV.TypeAndValue.TypeName = "float";
+                                        floatNV.TypeAndValue.TypeName = "double";
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat", {nameNV, floatNV});
                                     }
                                     // ── list<T> field (value type, not pointer) ──────────────
@@ -2766,10 +2803,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         if ((elemTypeName == "int" || elemTypeName == "i8" || elemTypeName == "i16" || elemTypeName == "i32" || elemTypeName == "i64"
                                              || elemTypeName == "u8" || elemTypeName == "u16" || elemTypeName == "u32" || elemTypeName == "u64"))
                                         {
-                                            auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt32Ty(), false);
+                                            auto* widened = compiler->Upconvert(elemNV, compiler->builder->getInt64Ty(), false);
                                             LLVMBackend::NamedVariable elemIntNV;
                                             elemIntNV.Primary = widened;
-                                            elemIntNV.TypeAndValue.TypeName = "int";
+                                            elemIntNV.TypeAndValue.TypeName = "i64";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {emptyNV, elemIntNV});
                                         }
                                         else if (elemTypeName == "bool")
@@ -2782,11 +2819,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         else if (elemTypeName == "float" || elemTypeName == "double")
                                         {
                                             llvm::Value* val = elemNV;
-                                            if (elemTypeName == "double")
-                                                val = compiler->builder->CreateFPCast(val, compiler->builder->getFloatTy());
+                                            if (elemTypeName == "float")
+                                                val = compiler->builder->CreateFPCast(val, compiler->builder->getDoubleTy());
                                             LLVMBackend::NamedVariable elemFloatNV;
                                             elemFloatNV.Primary = val;
-                                            elemFloatNV.TypeAndValue.TypeName = "float";
+                                            elemFloatNV.TypeAndValue.TypeName = "double";
                                             compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitFloat", {emptyNV, elemFloatNV});
                                         }
                                         else if (elemTypeName == "string")
@@ -2825,10 +2862,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else if (!field.Pointer && !compiler->GetEnumBackingType(typeName).empty())
                                     {
                                         auto* val = compiler->builder->CreateLoad(compiler->GetType(field), gep);
-                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt32Ty(), false);
+                                        auto* widened = compiler->Upconvert(val, compiler->builder->getInt64Ty(), false);
                                         intNV = {};
                                         intNV.Primary = widened;
-                                        intNV.TypeAndValue.TypeName = "int";
+                                        intNV.TypeAndValue.TypeName = "i64";
                                         auto nameNV = compiler->MakeStringLiteralNV(displayName);
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, intNV});
                                     }
@@ -2924,10 +2961,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     else
                                     {
                                         auto* widened = compiler->Upconvert(extracted,
-                                            compiler->builder->getInt32Ty(), bf.IsUnsigned);
+                                            compiler->builder->getInt64Ty(), bf.IsUnsigned);
                                         LLVMBackend::NamedVariable iNV;
                                         iNV.Primary = widened;
-                                        iNV.TypeAndValue.TypeName = "int";
+                                        iNV.TypeAndValue.TypeName = "i64";
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "visitInt", {nameNV, iNV});
                                     }
                                 }
@@ -5006,7 +5043,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     llvm::Value* liveArrayPtr = namedVar.Storage;
                     auto* accessPred = compiler->builder->GetInsertBlock();
                     if (ncTempMark.has_value())
-                        compiler->FlushOwnedTempsSince(*ncTempMark, liveArrayPtr);
+                        compiler->FlushOwnedTempsSince(*ncTempMark, liveArrayPtr, ncHoistBlock);
                     compiler->CreateJump(resumeBlock);
 
                     compiler->SwitchToBlock(ncChainNullBlock);
@@ -5042,7 +5079,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         auto* resultAlloca = compiler->CreateAlloca(finalType);
                         compiler->CreateAssignment(namedVar.Primary, resultAlloca);
                         if (ncTempMark.has_value())
-                            compiler->FlushOwnedTempsSince(*ncTempMark, namedVar.Primary);
+                            compiler->FlushOwnedTempsSince(*ncTempMark, namedVar.Primary, ncHoistBlock);
                         compiler->CreateJump(resumeBlock);
 
                         compiler->SwitchToBlock(ncChainNullBlock);
@@ -5059,7 +5096,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     {
                         // Genuinely no result (void, or nothing at all) - merge control flow only.
                         if (ncTempMark.has_value())
-                            compiler->FlushOwnedTempsSince(*ncTempMark, nullptr);
+                            compiler->FlushOwnedTempsSince(*ncTempMark, nullptr, ncHoistBlock);
                         compiler->CreateJump(resumeBlock);
                         compiler->SwitchToBlock(ncChainNullBlock);
                         compiler->CreateJump(resumeBlock);
@@ -6358,6 +6395,24 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
         auto expressionCtx = ctx->expression();
         auto constant = ctx->Constant();
         auto stringLiteral = ctx->StringLiteral();
+
+        // `default` as an expression: the value is the destination type's default. Without a
+        // known destination there is nothing to default TO, so say that rather than emitting
+        // a parser mismatch on the token that follows.
+        if (ctx->Default() != nullptr)
+        {
+            if (declExpectedType.TypeName.empty() || declExpectedType.TypeName == "auto")
+            {
+                LogErrorContext(ctx,
+                    "'default' needs a known target type here - it takes its value from the "
+                    "destination, and this position supplies none. Write the type explicitly "
+                    "(e.g. 'T x = default;' and use 'x'), or cast the destination.");
+                return nullptr;
+            }
+            LLVMBackend::DeclTypeAndValue dtv;
+            static_cast<LLVMBackend::TypeAndValue&>(dtv) = declExpectedType;
+            return GenerateDefaultValue(dtv);
+        }
 
         if (ctx->TypeOf())
         {

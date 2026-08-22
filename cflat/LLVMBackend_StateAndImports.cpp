@@ -903,6 +903,9 @@ void LLVMBackend::SetNoCache(bool v)
 void LLVMBackend::SetCHeaderCacheDeep(bool v)
 { cHeaderCacheDeep_ = v; }
 
+void LLVMBackend::SetWindowsSubsystem(const std::string& v)
+{ windowsSubsystem_ = v; }
+
 void LLVMBackend::SetXthreadScanLevel(int n)
 { xthreadScanLevel_ = n; }
 

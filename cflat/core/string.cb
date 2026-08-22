@@ -772,19 +772,21 @@ struct stringbuilder
     // Append a signed 64-bit integer formatted as decimal.
     void append(i64 n)
     {
-        // Same digit-buffer approach as append(i32) - no heap alloc.
+        // Same digit-buffer approach as append(i32), but i64 has no wider
+        // type to widen into, so format in the negative domain instead:
+        // negating INT64_MIN overflows, but INT64_MIN itself is representable.
         i8[24] tmp;            // max "-9223372036854775808" is 20 chars
         i32 pos = 24;
         i64 v = n;
         bool neg = v < (i64)0;
-        if (neg) v = -v;
+        if (!neg) v = -v;
         pos = pos - 1;
-        tmp[pos] = (i8)((i32)'0' + (i32)(v % (i64)10));
+        tmp[pos] = (i8)((i32)'0' - (i32)(v % (i64)10));
         v = v / (i64)10;
-        while (v > (i64)0)
+        while (v != (i64)0)
         {
             pos = pos - 1;
-            tmp[pos] = (i8)((i32)'0' + (i32)(v % (i64)10));
+            tmp[pos] = (i8)((i32)'0' - (i32)(v % (i64)10));
             v = v / (i64)10;
         }
         if (neg)

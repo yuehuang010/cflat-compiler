@@ -2486,6 +2486,9 @@ private:
     bool noCache_ = false;
     std::optional<IsolatedPolicy> isolatedPolicy_;
     bool cHeaderCacheDeep_ = false;  // --c-header-cache-deep: transitive validation of cached C headers
+    // --subsystem: PE subsystem for the Windows link ("console" or "windows"). A GUI program
+    // needs "windows" or it ships a stray console window; ignored on ELF/Mach-O targets.
+    std::string windowsSubsystem_ = "console";
     // --cpu/-mcpu (ISA + scheduling) and --tune/-mtune (scheduling only). Resolved and
     // validated in Compile so EmitExecutable and C interop can use them verbatim.
     std::string targetCpu_;
@@ -3556,6 +3559,11 @@ private:
     // Zero `temp`'s storage in `hoistTo` (before its terminator) and re-key it there. False when
     // the temp is not an entry-block alloca of that function, i.e. cannot be hoisted.
     bool HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::BasicBlock* hoistTo);
+
+    // Re-home a `string` SSA owned temp into an alloca-backed STRUCT temp keyed to `hoistTo`, so
+    // its destructor runs at end-of-statement instead of inside a branch whose joined value
+    // outlives it (a `?.` chain ending on `.data()` freed the buffer before printf read it).
+    bool HoistOwnedStringTempTo(llvm::Value* value, llvm::BasicBlock* hoistTo);
 
     // Emit one struct temp's destructor. A hoisted temp (LiveFlag set) is guarded on that flag,
     // which OPENS BLOCKS - after one, the caller must re-read the insert block and drop any
@@ -6952,6 +6960,7 @@ public:
     // When true, headers opted into the disk cache (via the `cache` import clause) record and
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v);
+    void SetWindowsSubsystem(const std::string& v);
 
     void SetXthreadScanLevel(int n);
     int  GetXthreadScanLevel() const;

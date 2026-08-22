@@ -40,6 +40,21 @@ struct AllPrimitives {
     string s = default;
 };
 
+// Regression for the JSON/XML float-formatting fix: a double round-trips at
+// double precision (unless its value is exactly representable at float
+// precision, e.g. whole numbers), and a float must round-trip at float
+// precision (not widened to double's ~17 significant digits).
+struct FloatPrecision {
+    double d = 0;
+    float  f = 0;
+};
+
+// Regression: StringBuilder.append(i64) negated INT64_MIN before formatting,
+// which overflows and emitted "-(" instead of the correct decimal digits.
+struct WideInt {
+    i64 v = 0;
+};
+
 struct Address {
     [JsonName("street_name")]
     string street = default;
@@ -198,13 +213,13 @@ class Config {
 // -- Reflect visitor ----------------------------------------------------------
 
 class DebugReflector : IReflector {
-    void visitInt(string name, int value) {
-        printf("int:%s=%d;", name.data(), value);
+    void visitInt(string name, i64 value) {
+        printf("int:%s=%d;", name.data(), (int)value);
     }
     void visitBool(string name, bool value) {
         printf("bool:%s=%d;", name.data(), (int)value);
     }
-    void visitFloat(string name, float value) {
+    void visitFloat(string name, double value) {
         printf("float:%s=%.1f;", name.data(), value);
     }
     void visitString(string name, string value) {
@@ -236,7 +251,8 @@ class BfCollector : IReflector {
     int sawDelta = 0;
     int sawFlag = 0;
 
-    void visitInt(string name, int value) {
+    void visitInt(string name, i64 v64) {
+        int value = (int)v64;
         intCount = intCount + 1;
         if (name == "ready") { sawReady = value + 1; }
         else if (name == "mode") { sawMode = value + 1; }
@@ -247,7 +263,7 @@ class BfCollector : IReflector {
         boolCount = boolCount + 1;
         if (name == "flag") { sawFlag = (int)value + 1; }
     }
-    void visitFloat(string name, float value) { }
+    void visitFloat(string name, double value) { }
     void visitString(string name, string value) { }
     void visitNull(string name) { }
     void beginObject(string name) { }
@@ -530,6 +546,24 @@ extern int main()
     apFalse.s = "";
     total++; passed += Test("toJson_bool_false", JsonBuilder.toJson(apFalse), "{\"i\":-7,\"b\":false,\"f\":0,\"s\":\"\"}");
 
+    FloatPrecision fp;
+    fp.d = 2.01;
+    fp.f = 0.1f;
+    total++; passed += Test("toJson_float_precision", JsonBuilder.toJson(fp), "{\"d\":2.01,\"f\":0.1}");
+    total++; passed += Test("toXml_float_precision", XmlBuilder.toXml(fp, "FloatPrecision"),
+        "<FloatPrecision><d>2.01</d><f>0.1</f></FloatPrecision>");
+
+    WideInt wi;
+    wi.v = -9223372036854775807 - 1;   // INT64_MIN; the literal itself overflows i64
+    total++; passed += Test("toJson_i64_min", JsonBuilder.toJson(wi), "{\"v\":-9223372036854775808}");
+
+    double thirdA = 1.0; double thirdB = 3.0;
+    FloatPrecision fpThird;
+    fpThird.d = thirdA / thirdB;
+    fpThird.f = 0;
+    total++; passed += Test("toJson_double_full_precision", JsonBuilder.toJson(fpThird),
+        "{\"d\":0.3333333333333333,\"f\":0}");
+
     Employee e;
     e.name = "Alice";
     e.id = 42;
@@ -788,6 +822,37 @@ extern int main()
         }
     }
     total++; passed += Test("static_parse_no_leak", (i64)HeapAudit.reportLeaks(), (i64)0);
+
+    // p2: JSON numbers are double/i64, not float/i32. Pre-fix `rev` came back as
+    // -808991232 (i32 overflow in the parser) and `eps` as 2.0099999905 (f32).
+    {
+        JsonNode* nums = JsonParser.parse(
+            "{\"rev\": 394328000000, \"ts\": 1724284800, \"eps\": 2.01, \"neg\": -900000000000}");
+        total++; passed += Test("json_i64_revenue", nums.getInt64("rev"), (i64)394328000000);
+        total++; passed += Test("json_i64_negative", nums.getInt64("neg"), (i64)-900000000000);
+        total++; passed += Test("json_i32_still_fits", nums.getInt("ts"), 1724284800);
+        // getDouble must round-trip 2.01 exactly enough that the f32 answer cannot pass:
+        // (float)2.01 == 2.00999999046..., so a 1e-9 band discriminates the two.
+        double eps = nums.getDouble("eps");
+        double d = eps - 2.01;
+        if (d < 0.0) d = -d;
+        total++; passed += Test("json_double_precision", d < 0.000000001, true);
+        // A large integer read through the FLOAT accessor still narrows - that is the
+        // documented narrowing wrapper, and it proves getInt64/getDouble are the wide path.
+        total++; passed += Test("json_double_of_i64", nums.getDouble("rev") == 394328000000.0, true);
+        delete nums;
+    }
+    // By-INDEX accessors, reached through a nested array (a TOP-LEVEL array node crashes
+    // JsonNode._getIndex on master too - see internal/issue/p2/).
+    {
+        JsonNode* doc = JsonParser.parse("{\"xs\": [394328000000, 2.01]}");
+        IJSONArray a = doc.getArray("xs");
+        total++; passed += Test("json_array_i64", a.getInt64(0), (i64)394328000000);
+        double ad = a.getDouble(1) - 2.01;
+        if (ad < 0.0) ad = -ad;
+        total++; passed += Test("json_array_double", ad < 0.000000001, true);
+        delete doc;
+    }
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

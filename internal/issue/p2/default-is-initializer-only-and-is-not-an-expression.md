@@ -1,23 +1,21 @@
-# `default` works only in an initializer: not assignable, not an expression
+# `default` in a ternary arm still has no destination type
 
-Filed 2026-08-21 from an external report (MemPressMonitor Win32 port, v0.11.0 issue 03).
-Reproduced on `cd847a3`, Release.
+Filed 2026-08-21; the bulk of it was FIXED in the p2 bundle (`default` is now a
+`primaryExpression` in `CFlat.g4`, typed from `declExpectedType`). What remains is the ternary
+arm - and, generally, any position where the destination type has been withdrawn.
 
-## Repro A - not assignable
+## What now works (measured, Release)
 
-```cflat
-struct P { int a = 0; };
-extern int main() { P p = default; p = default; return 0; }
-```
+| Position | Result |
+|----------|--------|
+| `p = default;` (assignment RHS, struct) | OK - fields back to declared initializers |
+| `p = default;` with an owning field | OK, leak-clean (destructs first, no memset) |
+| `takes(default)` (call argument) | OK |
+| `return default;` (in a `P`-returning function) | OK |
+| `int i = default;` (primitive) | OK |
+| `P p = default;` (declaration, the original form) | OK |
 
-```
-t_default.cb(2,37): error: mismatched input '=' expecting ';'
-    extern int main() { P p = default; p = default; return 0; }
-                                         ^
-hint: missing ';' at end of statement
-```
-
-## Repro B - not an expression
+## Residual
 
 ```cflat
 struct P { int a = 0; };
@@ -25,37 +23,34 @@ extern int main() { bool h = true; P q = h ? default : default; return 0; }
 ```
 
 ```
-t_defexpr.cb(2,45): error: mismatched input 'default' expecting {'alignof', 'simd', ...}
+(2,45): 'default' needs a known target type here - it takes its value from the destination,
+and this position supplies none. Write the type explicitly (e.g. 'T x = default;' and use 'x'),
+or cast the destination.
 ```
 
-The reporter's real shape was `AppHistory old = hasOld ? _appHistory.get(key) : default;`, which
-had to become a declaration plus an `if`. Re-defaulting an accumulator between loop iterations
-(repro A) had to become a fresh declaration in an inner scope.
+This is now a clear, attributed diagnostic rather than the old parser mismatch
+("expecting {'alignof', 'simd', ...}"), so the discoverability half of the original report is
+addressed. The reporter's real shape - `AppHistory old = hasOld ? _appHistory.get(key) : default;`
+- still needs the declaration-plus-`if` rewrite.
 
-## Why it is worth fixing
+## Root cause of the residual
 
-`default` reads like a VALUE everywhere else the language uses it - field initializers,
-declarations, `= default` on a struct. Restricting it to declaration position makes every
-re-defaulting site a mechanical rewrite, and the restriction is not discoverable: the diagnostics
-blame the `=` or the following token and suggest a missing `;`, so nothing in the message says
-"`default` is not valid here". See [[diagnostic-attribution-and-reserved-word-wording]] for the
-general form of that mis-attribution.
+`DeclExpectedTypeGate` deliberately WITHDRAWS `declExpectedType` at the binary/ternary level unless
+the level is a pure pass-through, so by the time `ParsePrimaryExpression` sees the `default` token
+inside a ternary arm the destination type is empty and it takes the reject path.
 
-## Fix direction
+## Fix direction (attempted and reverted - read before retrying)
 
-Promote `default` from an initializer-only production in `CFlat.g4` to a primary expression whose
-type comes from the expected type at the use site - the same expected-type plumbing the brace
-initializer already rides. That covers both repros at once: assignment RHS, ternary arm, call
-argument, `return default;`.
+Plumbing a `ternaryOuterExpectedType` through `ParseConditionalExpression` /
+`ParseTernaryBranches` and re-publishing it for the arms was implemented and **measured not to
+fire** - the arm still reported the unknown-destination error, so the gate is not the only place
+the type is dropped. It was reverted rather than shipped as machinery no leg could exercise.
+Anyone retrying this must first find where the arm's expected type is actually lost (instrument
+`declExpectedType` at arm entry), and must keep a leg that FAILS before the change.
 
-Two constraints:
+Note the ternary must agree on ONE type across both arms; `h ? default : default` has no type at
+all from either side and should keep rejecting even after a fix.
 
-- **Where the expected type is unknown, reject with a message that says so** ("`default` needs a
-  known target type here"), not with a parser mismatch.
-- **Assignment must destruct first.** `p = default` on a struct with owning fields has to run the
-  existing destruct-before-overwrite path or it leaks. Do not implement repro A as a raw memset.
+## Regression coverage
 
-## Regression test
-
-Extend `Test/test_struct.cb` with `p = default` after mutation (assert fields are back to their
-declared initializers), a ternary `default` arm, and an owning-field leg checked leak-clean.
+`Test/test_core.cb::testDefaultAsExpression()` covers the accepted legs above by value.

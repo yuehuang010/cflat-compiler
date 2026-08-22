@@ -35,6 +35,7 @@ grammar CFlat;
 
 primaryExpression
     : Constant
+    | Default                                    // 'default' as a VALUE: type comes from the destination
     | Identifier DoubleColon genericIdentifier   // global:: scope-escape qualifier ('global' is a contextual soft keyword, checked in the listener)
     | simdTypeSpecifier                          // static methods on the simd type: simd<T,N>.load(...) / .store(...)
     | genericIdentifier
@@ -534,9 +535,11 @@ typedefName
     ;
 
 initializer
-    : assignmentExpression
+    // `Default` FIRST: `default` is also a primaryExpression now, and both alternatives match the
+    // bare token - ANTLR breaks that tie by alternative order, so the initializer form must win.
+    : Default
+    | assignmentExpression
     | '{' initializerList? ','? '}'
-    | Default
     ;
 
 initializerList
@@ -655,9 +658,9 @@ jumpStatement
     : (
         'continue'
         | 'break'
+        | 'return' Default
         | 'return' expression?
         | 'return' compoundStatement
-        | 'return' Default
     ) ';'
     ;
 

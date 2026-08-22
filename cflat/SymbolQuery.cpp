@@ -149,6 +149,36 @@ static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::strin
     }
 }
 
+// A real compile reaches a platform backend only through its umbrella's `if const (__WINDOWS__)`
+// dispatch (os.cb, network/socket.cb) or through an explicit user import (ui_native/win32.cb).
+// The --symbol synthesized import-all-core unit has no such gate, so it would pull BOTH
+// alternates in and collide on every shared name - and pull in backends that cannot even parse
+// on this host (win32 needs windows.h). Keep only the host's, by file stem.
+static bool IsForeignPlatformCoreFile(const std::string& rel, const std::string& stem)
+{
+    auto endsWith = [&](const std::string& hay, const char* suffix) {
+        std::string s(suffix);
+        return hay.size() > s.size() && hay.compare(hay.size() - s.size(), s.size(), s) == 0;
+    };
+    // ui_canvas/* and ui_native/* are MUTUALLY EXCLUSIVE UI backends selected by an explicit
+    // user import, not by a host gate - and they define the same canvas* names as each other.
+    // Only the host-native one can be indexed; the rest need `cflat yourapp.cb --symbol X`.
+    if (rel.rfind("ui_canvas/", 0) == 0) return true;
+#ifdef _WIN32
+    if (rel.rfind("ui_native/", 0) == 0) return stem != "win32" && stem != "host";
+    return endsWith(stem, ".posix");
+#else
+    // winrt.cb imports a .winmd, which only a Windows target can read.
+    if (stem == "winrt") return true;
+#ifdef __APPLE__
+    if (rel.rfind("ui_native/", 0) == 0) return stem != "cocoa" && stem != "host";
+#else
+    if (rel.rfind("ui_native/", 0) == 0) return true;
+#endif
+    return endsWith(stem, ".windows");
+#endif
+}
+
 int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProgress)
 {
     const std::vector<std::string> terms = args.getMultiOption("symbol");
@@ -179,6 +209,8 @@ int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProg
                 if (e.path().extension() != ".cb" || e.path().filename() == "runtime.cb")
                     continue;
                 std::string rel = std::filesystem::relative(e.path(), coreDir, ec).generic_string();
+                if (IsForeignPlatformCoreFile(rel, e.path().stem().string()))
+                    continue;
                 names.push_back(rel);
             }
             std::sort(names.begin(), names.end());
@@ -226,6 +258,8 @@ int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProg
     }
     if (!ok && showProgress)
         std::cout << "(note: analysis reported errors; results may be incomplete)\n";
+    // A failed analysis must be distinguishable from a clean lookup by exit code alone.
+    int exitCode = ok ? 0 : 1;
 
     bool first = true;
     for (const auto& term : terms)
@@ -252,7 +286,7 @@ int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProg
             PrintSymbolSuggestions(index, term);
         }
     }
-    return 0;
+    return exitCode;
 }
 
 struct SymbolLineToken

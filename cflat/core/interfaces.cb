@@ -209,12 +209,12 @@ interface IMessage { };
 
 // Visitor contract for walking a value's fields - used by reflection/serialization.
 interface IReflector {
-    // Visit a named int field.
-    void visitInt(string name, int value);
+    // Visit a named int field (widened to i64 so a 64-bit field is not truncated).
+    void visitInt(string name, i64 value);
     // Visit a named bool field.
     void visitBool(string name, bool value);
-    // Visit a named float field.
-    void visitFloat(string name, float value);
+    // Visit a named float field (widened to double so a 64-bit field is not narrowed).
+    void visitFloat(string name, double value);
     // Visit a named string field.
     void visitString(string name, string value);
     // Visit a named null field.
@@ -233,12 +233,16 @@ interface IReflector {
 interface IJSONArray {
     // Number of elements in the array.
     int    count();
-    // Element at the given index as an int.
+    // Element at the given index as an int (narrowing; use getInt64 for the full range).
     int    getInt(int index);
+    // Element at the given index as a 64-bit integer.
+    i64    getInt64(int index);
     // Element at the given index as a bool.
     bool   getBool(int index);
-    // Element at the given index as a float.
+    // Element at the given index as a float (narrowing; use getDouble for full precision).
     float  getFloat(int index);
+    // Element at the given index as a double.
+    double getDouble(int index);
     // Element at the given index as a string.
     string getString(int index);
     // Element at the given index as a nested object.
@@ -249,12 +253,16 @@ interface IJSONArray {
 interface IJSON {
     // True if the object has the given key.
     bool       hasField(string key);
-    // Value of the key as an int.
+    // Value of the key as an int (narrowing; use getInt64 for the full range).
     int        getInt(string key);
+    // Value of the key as a 64-bit integer.
+    i64        getInt64(string key);
     // Value of the key as a bool.
     bool       getBool(string key);
-    // Value of the key as a float.
+    // Value of the key as a float (narrowing; use getDouble for full precision).
     float      getFloat(string key);
+    // Value of the key as a double.
+    double     getDouble(string key);
     // Value of the key as a string.
     string     getString(string key);
     // Value of the key as a nested object.

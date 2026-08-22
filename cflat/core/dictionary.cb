@@ -15,6 +15,7 @@
 // and for `unique V*` the plain parameter is already a synthesized move sink).
 
 import "hashset.cb";
+import "list.cb";
 
 // dictionary<K,V> - open-addressing hash map; owns the values only when V is `unique`.
 struct dictionary<K, V>
@@ -318,6 +319,68 @@ struct dictionary<K, V>
     int count()
     {
         return _count;
+    }
+
+    // ---- enumeration -------------------------------------------------------
+    // Two shapes, both safe with respect to key ownership:
+    //   keys()  - a COPY of every live key, so the caller may mutate the dictionary while
+    //             iterating the returned list.
+    //   slotCount()/slotOccupied(i)/keyAt(i)/valueAt(i) - a zero-copy BORROW cursor over the
+    //             raw table. Any add()/set()/remove() during such a walk may rehash and
+    //             invalidate the slot indices; finish the walk before mutating.
+
+    // Number of raw table slots - the exclusive upper bound for keyAt/valueAt/slotOccupied.
+    int slotCount() { return _capacity; }
+
+    // True if raw slot `i` holds a live entry (not empty and not a tombstone).
+    bool slotOccupied(int i)
+    {
+        if (i < 0 || i >= _capacity) return false;
+        return _status[i] == 1;
+    }
+
+    // Borrow the key in raw slot `i`. Only valid when slotOccupied(i); the dictionary keeps
+    // ownership, so the caller must not destruct it.
+    alias K keyAt(int i)
+    {
+        return _keys[i];
+    }
+
+    // Borrow the value in raw slot `i`. Only valid when slotOccupied(i); same alias contract
+    // as get() - the dictionary keeps ownership.
+    alias V valueAt(int i)
+    {
+        return _values[i];
+    }
+
+    // A list holding a COPY of every live key, in unspecified (table) order. An owning key
+    // (string, owning struct) is deep-copied so the list owns independent buffers; a primitive
+    // or pointer key is copied by value (a pointer key stays borrowed, as everywhere else).
+    move list<K> keys()
+    {
+        list<K> result;
+        // Both dead branches keep `_keys[i].copy()` out of an instantiation that cannot run it,
+        // so the key-policy / copyability diagnostics of add()/set() still fire first.
+        if const (is_unique(K))
+        {
+            compile_error("dictionary keys cannot be 'unique'; keys() would have to move each key out of its slot");
+            return move result;
+        }
+        else if const (!is_copyable(K))
+        {
+            compile_error("cannot list the keys of this dictionary: its key type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/keyAt(i) instead");
+            return move result;
+        }
+        else
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1) result.add(_keys[i].copy());
+                i++;
+            }
+            return move result;
+        }
     }
 
     // Remove all entries. When V is `unique`, frees each owned value; a value type is

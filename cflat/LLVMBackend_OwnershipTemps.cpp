@@ -3081,9 +3081,51 @@ bool LLVMBackend::HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::Bas
         return true;
     }
 
+bool LLVMBackend::HoistOwnedStringTempTo(llvm::Value* value, llvm::BasicBlock* hoistTo)
+{
+        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+        if (value == nullptr || strTy == nullptr || value->getType() != strTy) return false;
+        if (hoistTo == nullptr || hoistTo->getTerminator() == nullptr) return false;
+        auto* inst = llvm::dyn_cast<llvm::Instruction>(value);
+        if (inst == nullptr || inst->getFunction() != hoistTo->getParent()) return false;
+        if (inst->isTerminator() || inst->getNextNode() == nullptr) return false;
+        EnsureStringDtorRegistered();
+        auto it = dataStructures.find("string");
+        if (it == dataStructures.end() || it->second.Destructor == nullptr) return false;
+
+        auto* saveBlock = builder->GetInsertBlock();
+        auto  savePoint = builder->GetInsertPoint();
+        auto* slot = AllocaAtEntry(strTy, nullptr, "nc.strtmp");
+        // Zero it in the dominating block: on the short-circuit path the store below never runs,
+        // and a zeroed string makes the destructor a no-op.
+        builder->SetInsertPoint(hoistTo->getTerminator());
+        builder->CreateStore(llvm::Constant::getNullValue(strTy), slot);
+        builder->SetInsertPoint(inst->getNextNode());
+        builder->CreateStore(value, slot);
+        if (saveBlock != nullptr) builder->SetInsertPoint(saveBlock, savePoint);
+        pendingOwnedStructTemps.push_back({ slot, "string", hoistTo, nullptr });
+        return true;
+    }
+
 void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* keep,
                                        llvm::BasicBlock* hoistTo)
 {
+        // String temps registered in the branch are SSA values the join cannot name; re-home them
+        // to `hoistTo` as alloca-backed struct temps so a joined value derived from one (a
+        // `.data()` pointer) is not left dangling by an early free.
+        if (hoistTo != nullptr)
+        {
+            for (size_t i = mark.Strings; i < pendingOwnedStringTemps.size(); )
+            {
+                auto& [value, bb] = pendingOwnedStringTemps[i];
+                if (value != nullptr && value != keep && HoistOwnedStringTempTo(value, hoistTo))
+                {
+                    pendingOwnedStringTemps.erase(pendingOwnedStringTemps.begin() + i);
+                    continue;
+                }
+                ++i;
+            }
+        }
         // Struct temps that can outlive the arm are pulled out of the range FIRST, then re-added
         // below, so neither the free loop nor the trim can retire them here.
         std::vector<PendingOwnedStructTemp> hoisted;

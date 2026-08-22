@@ -48,6 +48,7 @@ bool testImportAs()
     bool result = true;
     result &= Test("MyMath.square",    MyMath.square(5),     25);
     result &= Test("MyMath.add",       MyMath.add(3, 4),      7);
+    result &= Test("MyMath.main",      MyMath.main(),        99);
     MyMath.Point p;
     p.x = 10;
     p.y = 20;

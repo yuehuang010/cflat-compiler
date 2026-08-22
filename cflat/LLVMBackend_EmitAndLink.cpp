@@ -1199,8 +1199,12 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         std::vector<std::string> linkArgStrs = {
             lldLinkPath,
             "/out:" + exePath,
-            "/subsystem:console",
+            "/subsystem:" + windowsSubsystem_,
         };
+        // /subsystem:windows makes the linker look for WinMain. CFlat programs only ever have
+        // `main`, so name the entry point explicitly rather than making users write WinMain.
+        if (windowsSubsystem_ == "windows")
+            linkArgStrs.push_back("/entry:mainCRTStartup");
         if (debugInfo)
         {
             // /DEBUG embeds CodeView from the object into a PDB next to the EXE.

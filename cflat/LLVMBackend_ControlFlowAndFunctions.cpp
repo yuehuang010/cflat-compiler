@@ -1031,6 +1031,24 @@ unsigned LLVMBackend::SlotLLVMParamCount(const AbiSlot& s)
         return s.kind == AbiSlot::CoercePair ? 2u : 1u;
     }
 
+// A file-scope `main` with an entry-point signature IS the program entry point, so it keeps its
+// unmangled linkage symbol even without `extern` - otherwise the linker reports undefined _main.
+static bool IsImplicitEntryMain(const std::string& functionName,
+                                const LLVMBackend::TypeAndValue& returnType,
+                                const std::vector<LLVMBackend::TypeAndValue>& arguments,
+                                bool isMethod, bool varargs)
+{
+        if (functionName != "main" || isMethod || varargs) return false;
+        if (returnType.Pointer || returnType.IsInterface || returnType.IsMove || returnType.IsAlias) return false;
+        if (returnType.TypeName != "int" && returnType.TypeName != "i32") return false;
+        if (arguments.empty()) return true;
+        if (arguments.size() != 2) return false;
+        const auto& a0 = arguments[0];
+        const auto& a1 = arguments[1];
+        if (a0.Pointer || (a0.TypeName != "int" && a0.TypeName != "i32")) return false;
+        return a1.Pointer && a1.ElemPointer;
+    }
+
 void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
 {
         // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
@@ -1047,8 +1065,13 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
         llvm::FunctionType* functionType = useRecipe
             ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
             : GetFunctionType(returnType, arguments, varargs, external);
+        // Only a `main` declared in the root translation unit is the program entry point -
+        // an imported library's own `main` must mangle normally or it collides with the app's.
+        bool entryMain = !external && currentSourceFilePath_ == analyzedRootPath_
+            && IsImplicitEntryMain(functionName, returnType, arguments, isMethod, varargs);
         std::string mangledName = external ? (linkageName.empty() ? functionName : linkageName)
-                                           : ComputeMangledName(functionName, returnType, arguments, varargs);
+                                 : entryMain ? functionName
+                                             : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (llvm::Function* existing = module->getFunction(mangledName))
         {
@@ -1267,7 +1290,12 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 {
         llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
 
-        std::string mangledName = external ? functionName : ComputeMangledName(functionName, returnType, arguments, varargs);
+        // Only a `main` declared in the root translation unit is the program entry point -
+        // an imported library's own `main` must mangle normally or it collides with the app's.
+        bool entryMain = !external && currentSourceFilePath_ == analyzedRootPath_
+            && IsImplicitEntryMain(functionName, returnType, arguments, isMethod, varargs);
+        std::string mangledName = (external || entryMain) ? functionName
+                                : ComputeMangledName(functionName, returnType, arguments, varargs);
 
         if (functionType == nullptr)
         {

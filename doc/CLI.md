@@ -242,6 +242,7 @@ parse-verified only (no registration). Authoring COM objects with `[winrt] class
 | Switch | Short | Value | Description |
 |--------|-------|-------|-------------|
 | `--debug-info` | `-g` | | Emit DWARF debug information. |
+| `--subsystem` | | `console` \| `windows` | Windows PE subsystem for `-o` (default `console`). `windows` builds a GUI program with no console window; `/entry:mainCRTStartup` is passed for you, so the entry point stays `main` (no `WinMain`). Ignored when the target is ELF or Mach-O. |
 | `--asan` | | | Instrument with AddressSanitizer and link the asan runtime (pair with `-g` for source-line reports). Alias: `-fsanitize=address`. |
 | `--sanitize=ownership` | | | Debug-only ownership sanitizer: trap on a dereference of a moved-from owning pointer. Implies `-g`. Aliases: `-fsanitize=ownership`, `--fsanitize=ownership`. See [below](#ownership-sanitizer). |
 | `--heap-audit` | | | Instrument the program with the HeapAudit leak oracle (no source edits). Requires `-o`. See [below](#heap-audit). |

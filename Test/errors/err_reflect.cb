@@ -7,9 +7,9 @@ class BadVisitor {
 };
 
 class GoodVisitor : IReflector {
-    void visitInt(string name, int value) { }
+    void visitInt(string name, i64 value) { }
     void visitBool(string name, bool value) { }
-    void visitFloat(string name, float value) { }
+    void visitFloat(string name, double value) { }
     void visitString(string name, string value) { }
     void visitNull(string name) { }
     void beginObject(string name) { }

@@ -10772,6 +10772,53 @@ int testVariadicOwnershipBoundary()
     return passed;
 }
 
+// p2: a reinterpreting cast of a `new`-allocated local BORROWS - both names stay live and
+// the ORIGINAL stays the owner. Pre-fix the cast consumed the operand, so every later use of
+// `buffer` was "use of moved variable 'buffer'" and the order of two adjacent lines decided
+// whether the program compiled. A move parameter still TRANSFERS (see err_delete_borrowed_via_cast).
+struct CastItem { i64 a = 0; i64 b = 0; };
+
+int castBufferSum(move u8* raw)
+{
+    // Move-parameter leg: the cast keeps taking ownership here, so this delete is the only free.
+    CastItem* items = (CastItem*)raw;
+    items[0].a = 5;
+    int v = (int)items[0].a;
+    delete[_] items;
+    return v;
+}
+
+int testCastBorrowsOwningPointer()
+{
+    int passed = 0;
+
+    u8* buffer = new u8[64];
+    CastItem* items = (CastItem*)buffer;
+    items[0].a = 7;
+    items[0].b = 9;
+    // The ORIGINAL name is still readable after the cast - this is the filed repro.
+    passed += Test("cast_original_still_live", (int)(buffer != nullptr), 1);
+    // Both names see the same bytes: writing through the cast is visible through the original.
+    passed += Test("cast_aliases_same_bytes", (int)buffer[0], 7);
+    passed += Test("cast_field_via_view", (int)items[0].a, 7);
+    passed += Test("cast_second_field", (int)items[0].b, 9);
+    delete[] buffer;              // exactly one free - the original owns it
+    passed += Test("cast_owner_nulled_by_delete", (int)(buffer == nullptr), 1);
+
+    // void* round trip: also a borrow, and the original is still the owner.
+    CastItem* p = new CastItem;
+    void* v = (void*)p;
+    CastItem* q = (CastItem*)v;
+    q.a = 4;
+    passed += Test("cast_voidptr_roundtrip", (int)p.a, 4);
+    delete p;
+
+    u8* sunk = new u8[32];
+    passed += Test("cast_move_param_still_transfers", castBufferSum(move sunk), 5);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -11129,6 +11176,9 @@ extern int main()
 
     passed += testUniqueGlobalStorage();
     total += 16;
+
+    passed += testCastBorrowsOwningPointer();
+    total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

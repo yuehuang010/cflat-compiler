@@ -19,6 +19,20 @@
 //   p.run(args);
 //   p.WaitForExit();
 //   printf("exit: %d\n", p.exitCode);
+//
+// Collecting the output - use the BUILT-IN capture, not a capturing lambda:
+//   process p;
+//   p.exe = "ping";
+//   p.captureStdout = true;     // set before run()
+//   p.run(args);
+//   p.WaitForExit();
+//   printf("%s", p.stdoutText.data());
+//
+// An onStdout lambda CANNOT capture a stack-local accumulator (a stringbuilder / list):
+// the lambda's captures live in the closure's struct field, and storing a bonded value
+// there is rejected ("bonded value cannot be stored in a struct field or through a
+// pointer"). captureStdout exists so that shape is never needed. Both may be used at
+// once - the callback still sees every chunk while stdoutText accumulates.
 
 import "thread.cb";
 import "stop_token.cb";
@@ -104,6 +118,9 @@ struct _ProcessInfo {
 struct __ProcessReaderCtx {
     void*                     pipe    = nullptr;
     Lambda<void(char*, int)> callback = nullptr;
+    // BORROWED sink owned by the `process` (captureStdout). The process joins this thread
+    // before reading it, so no lock is needed; the thread never frees it.
+    stringbuilder*            sink    = nullptr;
 };
 
 // Context handed to the stdin writer thread: pipe handle plus the onStdin provider.
@@ -158,7 +175,11 @@ int __process_reader_fn(move void* rawCtx) {
     while (true) {
         int nRead = _proc_read(ctx->pipe, buf);
         if (nRead <= 0) break;
-        ctx->callback(buf, nRead);
+        if (ctx->sink != nullptr) {
+            int i = 0;
+            while (i < nRead) { ctx->sink->appendChar(buf[i]); i++; }
+        }
+        if (!(ctx->callback == nullptr)) ctx->callback(buf, nRead);
     }
     free((void*)buf);
     _proc_close(ctx->pipe);
@@ -234,6 +255,14 @@ class process : IProcess {
     Lambda<void(char*, int)> onStdout = nullptr;
     Lambda<char*()>          onStdin  = nullptr;
 
+    // Built-in stdout capture. Set `captureStdout = true` before run(); after WaitForExit()
+    // returns, `stdoutText` holds everything the child wrote to stdout. Works with or without
+    // an onStdout callback, and needs no lambda capture of a caller local (which the bond rules
+    // forbid - see the header comment above).
+    bool   captureStdout = false;
+    string stdoutText    = default;
+    stringbuilder* _capture = nullptr;
+
     // Private Win32 state.
     void* _proc_handle   = nullptr;
     void* _thread_handle = nullptr;
@@ -250,7 +279,8 @@ class process : IProcess {
     // Set onStdout / onStdin before calling run().
     void run(list<string>* pargs) {
         bool _want_stdin  = !(onStdin  == nullptr);
-        bool _want_stdout = !(onStdout == nullptr);
+        bool _want_stdout = !(onStdout == nullptr) || captureStdout;
+        if (captureStdout && _capture == nullptr) _capture = new stringbuilder;
 
         if const (__WINDOWS__) {
             // Create pipes.  Mark the parent-side handles as non-inheritable so the
@@ -361,6 +391,7 @@ class process : IProcess {
             __ProcessReaderCtx* rctx = new __ProcessReaderCtx;
             rctx->pipe     = _stdout_read;
             rctx->callback = onStdout;
+            rctx->sink     = _capture;   // borrowed; the process owns and frees it
             _stdout_read = nullptr;  // ownership transferred to thread
             _reader.start(__process_reader_fn, (void*)rctx);
             _has_reader = true;
@@ -390,6 +421,13 @@ class process : IProcess {
     void _joinIoThreads() {
         if (_has_reader) { _reader.join(); _has_reader = false; }
         if (_has_writer) { _writer.join(); _has_writer = false; }
+        // Publish the capture only after the reader thread is joined - that join is the
+        // happens-before edge that makes the accumulated bytes visible here.
+        if (_capture != nullptr) {
+            stdoutText = _capture->toString();
+            delete _capture;
+            _capture = nullptr;
+        }
     }
 
     // POSIX: reap the child via waitpid, writing exitCode. block=true waits;
@@ -521,6 +559,8 @@ class process : IProcess {
         // first (they hold references into this struct's callback fields).
         if (_has_reader) { _reader.terminate(); _has_reader = false; }
         if (_has_writer) { _writer.terminate(); _has_writer = false; }
+        // The sink is only reachable from a joined/terminated reader thread by now.
+        if (_capture != nullptr) { delete _capture; _capture = nullptr; }
         _closeHandles();
     }
 };

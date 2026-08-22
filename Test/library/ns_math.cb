@@ -1,6 +1,11 @@
 int square(int x) { return x * x; }
 int add(int a, int b) { return a + b; }
 
+// Regression: an imported library's own `main()` must not be treated as the
+// program's implicit entry point (that must be reserved for a `main` in the
+// root translation unit) - it should mangle like any other overload.
+int main() { return 99; }
+
 struct Point {
     int x = default;
     int y = default;

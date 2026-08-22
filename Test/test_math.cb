@@ -1,7 +1,12 @@
 import "test_helper.cb";
 import "math.cb";
 
-extern int main()
+// p2 REGRESSION LEG: `main` is deliberately declared WITHOUT `extern` here. A file-scope
+// `int main()` is the program entry point by definition, so the compiler exports it
+// implicitly. Pre-fix this file compiled clean and then failed in the linker with
+// "undefined symbol: _main" (and `--run` reported "no 'main' function to run"). Do NOT add
+// `extern` back - that would silently retire the only coverage of the implicit export.
+int main()
 {
     int passed = 0;
     int total = 0;

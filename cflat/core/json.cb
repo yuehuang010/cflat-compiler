@@ -52,7 +52,7 @@ class JsonBuilder : IReflector
     }
 
     // Emit an integer field.
-    void visitInt(string name, int value)
+    void visitInt(string name, i64 value)
     {
         emitKey(name);
         sb.append(value);
@@ -66,14 +66,53 @@ class JsonBuilder : IReflector
     }
 
     // Emit a float field, using integer form when the value is integral.
-    void visitFloat(string name, float value)
+    // Otherwise picks the shortest decimal that round-trips exactly, at
+    // float precision when the value originated from a 'float' field
+    // (detected by narrowing round-tripping cleanly) or double precision
+    // otherwise.
+    void visitFloat(string name, double value)
     {
         emitKey(name);
-        int ival = (int)value;
-        if ((float)ival == value) { sb.append(ival); return; }
+        i64 ival = (i64)value;
+        if ((double)ival == value) { sb.append(ival); return; }
         char[32] buf;
-        i32 len = sprintf(&buf[0], "%g", value);
-        buf[len] = 0;
+        i32 len = 0;
+        float fval = (float)value;
+        if ((double)fval == value)
+        {
+            len = sprintf(&buf[0], "%.6g", value);
+            buf[len] = 0;
+            if ((float)strtod(&buf[0], nullptr) != fval)
+            {
+                len = sprintf(&buf[0], "%.7g", value);
+                buf[len] = 0;
+            }
+            if ((float)strtod(&buf[0], nullptr) != fval)
+            {
+                len = sprintf(&buf[0], "%.8g", value);
+                buf[len] = 0;
+            }
+            if ((float)strtod(&buf[0], nullptr) != fval)
+            {
+                len = sprintf(&buf[0], "%.9g", value);
+                buf[len] = 0;
+            }
+        }
+        else
+        {
+            len = sprintf(&buf[0], "%.15g", value);
+            buf[len] = 0;
+            if (strtod(&buf[0], nullptr) != value)
+            {
+                len = sprintf(&buf[0], "%.16g", value);
+                buf[len] = 0;
+            }
+            if (strtod(&buf[0], nullptr) != value)
+            {
+                len = sprintf(&buf[0], "%.17g", value);
+                buf[len] = 0;
+            }
+        }
         sb.appendCStr(&buf[0]);
     }
 
@@ -198,9 +237,9 @@ class JsonBuilder : IReflector
 class JsonNode : IJSON, IJSONArray
 {
     int    kind       = 0;
-    int    intVal     = 0;
+    i64    intVal     = 0;
     bool   boolVal    = false;
-    float  floatVal   = 0;
+    double floatVal   = 0;
     string strVal     = default;
     string keyStr     = default;
     JsonNode* firstChild = nullptr;
@@ -280,12 +319,15 @@ class JsonNode : IJSON, IJSONArray
     bool hasField(string key) { return _findKey(key) != nullptr; }
 
     // Integer value of field `key`, or 0 if absent/non-numeric.
-    int getInt(string key)
+    int getInt(string key) { return (int)getInt64(key); }
+
+    // 64-bit integer value of field `key`, or 0 if absent/non-numeric.
+    i64 getInt64(string key)
     {
         JsonNode* n = _findKey(key);
         if (n == nullptr) return 0;
         if (n.kind == 2) return n.intVal;
-        if (n.kind == 3) return (int)n.floatVal;
+        if (n.kind == 3) return (i64)n.floatVal;
         return 0;
     }
 
@@ -298,12 +340,15 @@ class JsonNode : IJSON, IJSONArray
     }
 
     // Float value of field `key`, or 0 if absent/non-numeric.
-    float getFloat(string key)
+    float getFloat(string key) { return (float)getDouble(key); }
+
+    // Double value of field `key`, or 0 if absent/non-numeric.
+    double getDouble(string key)
     {
         JsonNode* n = _findKey(key);
         if (n == nullptr) return 0;
         if (n.kind == 3) return n.floatVal;
-        if (n.kind == 2) return (float)n.intVal;
+        if (n.kind == 2) return (double)n.intVal;
         return 0;
     }
 
@@ -341,12 +386,15 @@ class JsonNode : IJSON, IJSONArray
     int count() { return _count; }
 
     // Integer value of element `index`, or 0 if out of range/non-numeric.
-    int getInt(int index)
+    int getInt(int index) { return (int)getInt64(index); }
+
+    // 64-bit integer value of element `index`, or 0 if out of range/non-numeric.
+    i64 getInt64(int index)
     {
         JsonNode* n = _getIndex(index);
         if (n == nullptr) return 0;
         if (n.kind == 2) return n.intVal;
-        if (n.kind == 3) return (int)n.floatVal;
+        if (n.kind == 3) return (i64)n.floatVal;
         return 0;
     }
 
@@ -359,12 +407,15 @@ class JsonNode : IJSON, IJSONArray
     }
 
     // Float value of element `index`, or 0 if out of range/non-numeric.
-    float getFloat(int index)
+    float getFloat(int index) { return (float)getDouble(index); }
+
+    // Double value of element `index`, or 0 if out of range/non-numeric.
+    double getDouble(int index)
     {
         JsonNode* n = _getIndex(index);
         if (n == nullptr) return 0;
         if (n.kind == 3) return n.floatVal;
-        if (n.kind == 2) return (float)n.intVal;
+        if (n.kind == 2) return (double)n.intVal;
         return 0;
     }
 
@@ -540,13 +591,13 @@ struct JsonParser
             int bi = start;
             bool neg = false;
             if (_src[bi] == '-') { neg = true; bi++; }
-            float acc = 0;
+            double acc = 0;
             while (bi < _pos && _src[bi] >= '0' && _src[bi] <= '9') { acc = acc * 10 + (_src[bi] - '0'); bi++; }
             if (bi < _pos && _src[bi] == '.')
             {
                 bi++;
-                float frac = 0.1f;
-                while (bi < _pos && _src[bi] >= '0' && _src[bi] <= '9') { acc = acc + (_src[bi] - '0') * frac; frac = frac * 0.1f; bi++; }
+                double frac = 0.1;
+                while (bi < _pos && _src[bi] >= '0' && _src[bi] <= '9') { acc = acc + (_src[bi] - '0') * frac; frac = frac * 0.1; bi++; }
             }
             if (bi < _pos && (_src[bi] == 'e' || _src[bi] == 'E'))
             {
@@ -557,7 +608,7 @@ struct JsonParser
                 int exp = 0;
                 while (bi < _pos && _src[bi] >= '0' && _src[bi] <= '9') { exp = exp * 10 + (_src[bi] - '0'); bi++; }
                 int ei = 0;
-                while (ei < exp) { if (eneg) acc = acc / 10.0f; else acc = acc * 10.0f; ei++; }
+                while (ei < exp) { if (eneg) acc = acc / 10.0; else acc = acc * 10.0; ei++; }
             }
             node.floatVal = neg ? -acc : acc;
         }
@@ -567,7 +618,7 @@ struct JsonParser
             int bi = start;
             bool neg = false;
             if (_src[bi] == '-') { neg = true; bi++; }
-            int acc = 0;
+            i64 acc = 0;
             while (bi < _pos && _src[bi] >= '0' && _src[bi] <= '9') { acc = acc * 10 + (_src[bi] - '0'); bi++; }
             node.intVal = neg ? -acc : acc;
         }

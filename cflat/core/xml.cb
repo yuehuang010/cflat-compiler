@@ -67,7 +67,7 @@ class XmlBuilder : IReflector
     }
 
     // Emit an integer field as <tag>value</tag>.
-    void visitInt(string name, int value)
+    void visitInt(string name, i64 value)
     {
         string tag = name;
         if (tag.length() == 0) tag = "item";
@@ -87,21 +87,60 @@ class XmlBuilder : IReflector
     }
 
     // Emit a float field, using integer form when the value is integral.
-    void visitFloat(string name, float value)
+    // Otherwise picks the shortest decimal that round-trips exactly, at
+    // float precision when the value originated from a 'float' field
+    // (detected by narrowing round-tripping cleanly) or double precision
+    // otherwise.
+    void visitFloat(string name, double value)
     {
         string tag = name;
         if (tag.length() == 0) tag = "item";
         _openTag(tag);
-        int ival = (int)value;
-        if ((float)ival == value)
+        i64 ival = (i64)value;
+        if ((double)ival == value)
         {
             sb.append(ival);
         }
         else
         {
             char[32] buf;
-            i32 len = sprintf(&buf[0], "%g", value);
-            buf[len] = 0;
+            i32 len = 0;
+            float fval = (float)value;
+            if ((double)fval == value)
+            {
+                len = sprintf(&buf[0], "%.6g", value);
+                buf[len] = 0;
+                if ((float)strtod(&buf[0], nullptr) != fval)
+                {
+                    len = sprintf(&buf[0], "%.7g", value);
+                    buf[len] = 0;
+                }
+                if ((float)strtod(&buf[0], nullptr) != fval)
+                {
+                    len = sprintf(&buf[0], "%.8g", value);
+                    buf[len] = 0;
+                }
+                if ((float)strtod(&buf[0], nullptr) != fval)
+                {
+                    len = sprintf(&buf[0], "%.9g", value);
+                    buf[len] = 0;
+                }
+            }
+            else
+            {
+                len = sprintf(&buf[0], "%.15g", value);
+                buf[len] = 0;
+                if (strtod(&buf[0], nullptr) != value)
+                {
+                    len = sprintf(&buf[0], "%.16g", value);
+                    buf[len] = 0;
+                }
+                if (strtod(&buf[0], nullptr) != value)
+                {
+                    len = sprintf(&buf[0], "%.17g", value);
+                    buf[len] = 0;
+                }
+            }
             sb.appendCStr(&buf[0]);
         }
         _closeTag(tag);
@@ -264,33 +303,39 @@ class XmlNode : IJSON, IJSONArray
     }
 
     // Parse decimal text (with optional leading '-') into an int.
-    int _textToInt(string text)
+    int _textToInt(string text) { return (int)_textToInt64(text); }
+
+    // Parse decimal text into a 64-bit integer (the full JSON interoperable integer range).
+    i64 _textToInt64(string text)
     {
         i8* p = text.data();
         int len = text.length();
         int i = 0;
         bool neg = false;
         if (i < len && p[i] == '-') { neg = true; i++; }
-        int acc = 0;
+        i64 acc = 0;
         while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc * 10 + (p[i] - '0'); i++; }
         return neg ? -acc : acc;
     }
 
     // Parse decimal text with an optional fractional part into a float.
-    float _textToFloat(string text)
+    float _textToFloat(string text) { return (float)_textToDouble(text); }
+
+    // Parse decimal text with an optional fractional part into a double.
+    double _textToDouble(string text)
     {
         i8* p = text.data();
         int len = text.length();
         int i = 0;
         bool neg = false;
         if (i < len && p[i] == '-') { neg = true; i++; }
-        float acc = 0;
-        while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc * 10.0f + (float)(p[i] - '0'); i++; }
+        double acc = 0;
+        while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc * 10.0 + (double)(p[i] - '0'); i++; }
         if (i < len && p[i] == '.')
         {
             i++;
-            float frac = 0.1f;
-            while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc + (float)(p[i] - '0') * frac; frac = frac * 0.1f; i++; }
+            double frac = 0.1;
+            while (i < len && p[i] >= '0' && p[i] <= '9') { acc = acc + (double)(p[i] - '0') * frac; frac = frac * 0.1; i++; }
         }
         return neg ? -acc : acc;
     }
@@ -301,11 +346,14 @@ class XmlNode : IJSON, IJSONArray
     bool hasField(string key) { return _findTag(key) != nullptr; }
 
     // Integer value of child element `key`, or 0 if absent.
-    int getInt(string key)
+    int getInt(string key) { return (int)getInt64(key); }
+
+    // 64-bit integer value of child element `key`, or 0 if absent.
+    i64 getInt64(string key)
     {
         XmlNode* n = _findTag(key);
         if (n == nullptr) return 0;
-        return _textToInt(n._text);
+        return _textToInt64(n._text);
     }
 
     // Bool value of child element `key` ("true"), or false if absent.
@@ -317,11 +365,14 @@ class XmlNode : IJSON, IJSONArray
     }
 
     // Float value of child element `key`, or 0 if absent.
-    float getFloat(string key)
+    float getFloat(string key) { return (float)getDouble(key); }
+
+    // Double value of child element `key`, or 0 if absent.
+    double getDouble(string key)
     {
         XmlNode* n = _findTag(key);
         if (n == nullptr) return 0;
-        return _textToFloat(n._text);
+        return _textToDouble(n._text);
     }
 
     // Text value of child element `key`, or "" if absent.
@@ -358,11 +409,14 @@ class XmlNode : IJSON, IJSONArray
     int count() { return _childCount; }
 
     // Integer value of the child at `index`, or 0 if out of range.
-    int getInt(int index)
+    int getInt(int index) { return (int)getInt64(index); }
+
+    // 64-bit integer value of the child at `index`, or 0 if out of range.
+    i64 getInt64(int index)
     {
         XmlNode* n = _getIndex(index);
         if (n == nullptr) return 0;
-        return _textToInt(n._text);
+        return _textToInt64(n._text);
     }
 
     // Bool value of the child at `index` ("true"), or false if out of range.
@@ -374,11 +428,14 @@ class XmlNode : IJSON, IJSONArray
     }
 
     // Float value of the child at `index`, or 0 if out of range.
-    float getFloat(int index)
+    float getFloat(int index) { return (float)getDouble(index); }
+
+    // Double value of the child at `index`, or 0 if out of range.
+    double getDouble(int index)
     {
         XmlNode* n = _getIndex(index);
         if (n == nullptr) return 0;
-        return _textToFloat(n._text);
+        return _textToDouble(n._text);
     }
 
     // Text value of the child at `index`, or "" if out of range.

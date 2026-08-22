@@ -407,6 +407,16 @@ Mixed z = {};           // same - `= {}` is the empty-brace spelling of value-in
 
 The recommended style is still to give every field its own `= default` at the declaration (the standard library does this throughout), but a field that slips through is zeroed rather than left undefined.
 
+`default` is also a **value**, not only an initializer: it may appear on the right of an assignment, where it takes the type of the destination. Re-defaulting in place destructs the old contents first, so an owning field is freed rather than leaked:
+
+```c
+Mixed m = default;
+m.a = 42;
+m = default;            // back to a = 7, b = 0, c = 9, d = 0
+```
+
+A position with no known destination type (an untyped `auto`, for instance) has nothing to default to, and is reported as an error.
+
 ---
 
 ### Brace Initializers
@@ -2347,9 +2357,9 @@ Reflection walks a struct's fields at runtime and dispatches to visitor callback
 ```c
 interface IReflector
 {
-    void visitInt(string name, int value);
+    void visitInt(string name, i64 value);      // widened: a 64-bit field is not truncated
     void visitBool(string name, bool value);
-    void visitFloat(string name, float value);
+    void visitFloat(string name, double value); // widened: a double field is not narrowed
     void visitString(string name, string value);
     void visitNull(string name);
     void beginObject(string name);
@@ -2369,9 +2379,9 @@ struct Point { int x = 0; int y = 0; };
 // Implement IReflector
 class Printer : IReflector
 {
-    void visitInt(string name, int v)    { printf("%s=%d ", name.data(), v); }
+    void visitInt(string name, i64 v)    { printf("%s=%lld ", name.data(), v); }
     void visitBool(string name, bool v)  { }
-    void visitFloat(string name, float v){ }
+    void visitFloat(string name, double v){ }
     void visitString(string name, string v){ }
     void visitNull(string name)          { }
     void beginObject(string name)        { printf("%s:{", name.data()); }
@@ -3109,7 +3119,7 @@ need a real wall-clock or millisecond duration.
 | `cruntime.cb` | Raw C runtime bindings: `printf` family, stdout/stdin writers, `string.h`/`ctype.h` (hook-aware, VT-correct) |
 | `terminal.cb` | Win32 console terminal utilities |
 | `stream.cb` | Double-buffered text pipe between two `program` constructs |
-| `process.cb` | Launch and communicate with a child process |
+| `process.cb` | Launch and communicate with a child process (set `captureStdout = true` before `run()`, read `stdoutText` after `WaitForExit()`) |
 | `time.cb` | `TimePoint`, `Stopwatch`, `Timer`, `sleep`, `rdtscp`/`lfence` timing |
 | `os.cb` | Platform dispatcher (imports `os.windows.cb` on Windows) - stateless free functions behind `namespace os`, see below |
 | `os.windows.cb` | Windows platform externs: Win32 API and MSVC CRT |

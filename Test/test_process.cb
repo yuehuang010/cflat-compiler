@@ -95,6 +95,40 @@ extern int main(int argc, char** argv)
     }
     printf("PASS: test3 (WaitForExit(ms) returned %d, exitCode=%d)\n", (int)finished, p3.exitCode);
 
+    // Test 4: built-in stdout capture (p2 regression leg - captureStdout/stdoutText).
+    // Without the built-in capture the only way to collect output was a capturing
+    // lambda, which the compiler rejects for a bonded local.
+    list<string>* a4 = new list<string>;
+    string s4a = shellFlag();
+    string s4b = "echo hello-capture";
+    a4->add(s4a);
+    a4->add(s4b);
+
+    process p4;
+    p4.exe = shellExe();
+    p4.captureStdout = true;
+    p4.run(a4);
+    p4.WaitForExit();
+    delete a4;
+
+    if (p4.exitCode != 0)
+    {
+        printf("FAIL: test4 exitCode expected 0, got %d\n", p4.exitCode);
+        return 1;
+    }
+    string cap = p4.stdoutText;
+    if (cap.length() < 13)
+    {
+        printf("FAIL: test4 stdoutText too short (%d)\n", cap.length());
+        return 1;
+    }
+    if (!cap.startsWith("hello-capture"))
+    {
+        printf("FAIL: test4 stdoutText expected to start with hello-capture, got [%s]\n", cap.data());
+        return 1;
+    }
+    printf("PASS: test4 (captureStdout, len=%d)\n", cap.length());
+
     printf("All process tests passed.\n");
     return 0;
 }

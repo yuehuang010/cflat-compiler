@@ -435,6 +435,68 @@ int testHashset()
 
 // ── dictionary<int,int> ──────────────────────────────────────────────────────
 
+// -- p2: dictionary/hashset enumeration (keys/items + slot cursor) -----------
+// Pre-fix all of these were "Unknown identifier 'keys'/'items'/'slotCount'".
+int testDictEnumeration()
+{
+    int passed = 0;
+
+    dictionary<int, int> d;
+    d.add(1, 10); d.add(2, 20); d.add(3, 30);
+
+    list<int> ks = d.keys();
+    passed += Test("dictenum keys count", ks.count(), 3);
+    int keySum = 0;
+    for (int i = 0; i < ks.count(); i++) keySum = keySum + ks.get(i);
+    passed += Test("dictenum key sum", keySum, 6);          // order-independent
+
+    // Zero-copy slot cursor over the same table.
+    int visited = 0;
+    int valSum  = 0;
+    for (int i = 0; i < d.slotCount(); i++)
+    {
+        if (!d.slotOccupied(i)) continue;
+        visited++;
+        valSum = valSum + d.valueAt(i);
+        keySum = keySum - d.keyAt(i);
+    }
+    passed += Test("dictenum cursor visits", visited, d.count());
+    passed += Test("dictenum cursor value sum", valSum, 60);
+    passed += Test("dictenum cursor key sum matches keys()", keySum, 0);
+
+    // remove() must retire the slot for BOTH shapes.
+    d.remove(2);
+    list<int> ks2 = d.keys();
+    passed += Test("dictenum keys after remove", ks2.count(), 2);
+    int live = 0;
+    for (int i = 0; i < d.slotCount(); i++) if (d.slotOccupied(i)) live++;
+    passed += Test("dictenum cursor after remove", live, 2);
+
+    // An OWNING key is deep-copied by keys(): the copies must survive clear().
+    dictionary<string, int> sd;
+    sd.add("alpha", 1);
+    sd.add("bb", 2);
+    list<string> sk = sd.keys();
+    sd.clear();
+    int lenSum = 0;
+    for (int i = 0; i < sk.count(); i++) lenSum = lenSum + sk.get(i).length();
+    passed += Test("dictenum string keys count", sk.count(), 2);
+    passed += Test("dictenum string keys survive clear", lenSum, 7);
+
+    hashset<int> hs;
+    hs.add(5); hs.add(7); hs.add(5);
+    list<int> items = hs.items();
+    passed += Test("hashset items count", items.count(), 2);
+    int itemSum = 0;
+    for (int i = 0; i < items.count(); i++) itemSum = itemSum + items.get(i);
+    passed += Test("hashset items sum", itemSum, 12);
+    int hsLive = 0;
+    for (int i = 0; i < hs.slotCount(); i++) if (hs.slotOccupied(i)) hsLive = hsLive + hs.elementAt(i);
+    passed += Test("hashset cursor sum", hsLive, 12);
+
+    return passed;
+}
+
 int testDictionary()
 {
     int passed = 0;
@@ -1413,6 +1475,24 @@ int testStringBuilder()
     sb.append(-7);
     passed += Test("sb_append_int_neg",  sb.toString(), "-7");
 
+    // Regression: append(i64) negated before formatting, which overflows at
+    // INT64_MIN and emitted "-(" instead of the correct decimal digits.
+    sb.clear();
+    sb.append((i64)0);
+    passed += Test("sb_append_i64_zero", sb.toString(), "0");
+
+    sb.clear();
+    sb.append((i64)(-1));
+    passed += Test("sb_append_i64_neg_one", sb.toString(), "-1");
+
+    sb.clear();
+    sb.append((i64)9223372036854775807);
+    passed += Test("sb_append_i64_max", sb.toString(), "9223372036854775807");
+
+    sb.clear();
+    sb.append((i64)(-9223372036854775807 - 1));
+    passed += Test("sb_append_i64_min", sb.toString(), "-9223372036854775808");
+
     sb.clear();
     sb.append(true);
     passed += Test("sb_append_bool_true",  sb.toString(), "true");
@@ -1592,6 +1672,90 @@ move PtrOwned* makePtrOwned() { return new PtrOwned; }
 void sinkPtr(move PtrOwned* p) { delete p; }
 move string makeOwnedStr() { string s = "hello"; return s.copy(); }
 int viaClosureLen(function<int(string)> f, string s) { return f(s); }
+
+// -- p2: a STRING LITERAL is a valid method receiver, and a `?.` chain that yields an
+// owned string temp must not free it before the enclosing expression reads it.
+struct P2Person {
+    string name = default;
+    move string label() { return "hi-" + name; }
+};
+
+int testLiteralReceiverAndNullChain()
+{
+    int passed = 0;
+
+    // Pre-fix: "the function '\"\"' is not known." - the literal was read as the callee name.
+    string empty = "".copy();
+    passed += Test("litrecv empty copy length", empty.length(), 0);
+    passed += Test("litrecv literal length", "abc".length(), 3);
+    passed += Test("litrecv chained toLower", "HeLLo".toLower(), "hello");
+    passed += Test("litrecv chained substring", "abcdef".substring(2), "cdef");
+    string joined = "ab".copy() + "cd";
+    passed += Test("litrecv copy then concat", joined, "abcd");
+
+    // Pre-fix: printed garbage - the chain's owned string temp was freed at the '?.' merge,
+    // before .data() was read. Compare the BYTES, so a dangling pointer cannot pass.
+    P2Person person = default;
+    person.name = "world";
+    P2Person* p = &person;
+    passed += Test("nullchain owned string data", p?.label().data(), "hi-world");
+    passed += Test("nullchain owned string length", (int)p?.label().length(), 8);
+
+    // The null arm still short-circuits, and running the shape many times must not
+    // double-free (a double free aborts the process, so reaching the leg is the assertion).
+    P2Person* nil = nullptr;
+    int nilLen = 0;
+    int liveTotal = 0;
+    for (int i = 0; i < 64; i++)
+    {
+        nilLen = nilLen + (int)nil?.label().length();
+        liveTotal = liveTotal + (int)p?.label().length();
+    }
+    passed += Test("nullchain null arm length", nilLen, 0);
+    passed += Test("nullchain repeated live arm", liveTotal, 512);
+
+    return passed;
+}
+
+// -- p2: `default` is a VALUE, not just an initializer. `p = default` re-defaults in place
+// and must DESTRUCT the old contents first (an owning field would otherwise leak).
+struct P2Def     { int a = 5; int b = 7; };
+struct P2DefOwn  { string s = default; int n = 3; };
+
+int testDefaultAsExpression()
+{
+    int passed = 0;
+
+    // Pre-fix: "found '=' but expected ';'" - `default` was initializer-only.
+    P2Def p = default;
+    p.a = 100; p.b = 200;
+    p = default;
+    passed += Test("default_assign_field_a", p.a, 5);
+    passed += Test("default_assign_field_b", p.b, 7);
+
+    // Re-defaulting an accumulator between iterations - the reporter's real shape.
+    int rounds = 0;
+    for (int i = 0; i < 3; i++)
+    {
+        p.a = p.a + 1;
+        rounds = rounds + p.a;
+        p = default;
+    }
+    passed += Test("default_assign_in_loop", rounds, 18);   // 6 three times
+    passed += Test("default_assign_after_loop", p.a, 5);
+
+    // An OWNING field: `= default` must run the destructor for the old buffer and leave an
+    // empty string, not a dangling one. test.sh's leak pass covers the free itself.
+    P2DefOwn o = default;
+    o.s = "hello-world-buffer".copy();
+    o.n = 9;
+    passed += Test("default_own_before", o.s.length(), 18);
+    o = default;
+    passed += Test("default_own_cleared", o.s.length(), 0);
+    passed += Test("default_own_scalar_reset", o.n, 3);
+
+    return passed;
+}
 
 int testStringAPI()
 {
@@ -2796,13 +2960,16 @@ extern int main()
     r = testStringIString();    passed += r; total += 4;
     r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;
-    r = testStringBuilder();    passed += r; total += 20;
+    r = testStringBuilder();    passed += r; total += 24;
     r = testStringView();       passed += r; total += 20;
     r = testStringAPI();        passed += r; total += 116;
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
     r = testRawArrayRuntimeCount(); passed += r; total += 44;
+    r = testDictEnumeration();  passed += r; total += 12;
+    r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
+    r = testDefaultAsExpression(); passed += r; total += 7;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

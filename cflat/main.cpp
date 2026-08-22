@@ -131,6 +131,7 @@ int main(int argc, char* argv[])
     args.addOption("isolated", 0, "Validate against a restricted compiler policy JSON file");
     args.addOption("isolated-manifest", 0, "Write a digest-bound isolated compilation manifest JSON sidecar");
     args.addFlag("debug-info", 'g', "Emit DWARF debug information");
+    args.addOption("subsystem", 0, "Windows PE subsystem for -o: console (default) or windows (GUI, no console window)");
     args.addFlag("asan", 0, "Instrument with AddressSanitizer and link the asan runtime (pair with -g for source-line reports). Alias: -fsanitize=address");
     args.addFlag("sanitize-ownership", 0, "Debug-only ownership sanitizer (M1): instrument dereferences of moved-from owning pointer locals and report 'value moved at L:C, dereferenced after move at L:C' at runtime, then abort. Implies -g. Spellings: --sanitize=ownership, -fsanitize=ownership.");
     args.addFlag("heap-audit", 0, "Instrument the program with the HeapAudit leak oracle: auto-import diagnostic/heap_audit.cb, enable it at main entry, and report still-live allocations at every return. Report-only - leaks print to stderr but do not change the exit code or abort. No double-free detection; use --asan for double-free/use-after-free. Requires -o (links a C diagnostic object).");
@@ -542,6 +543,15 @@ int main(int argc, char* argv[])
     auto isolatedPolicy = ConfigureIsolatedMode(compiler, args);
     compiler.SetNoCache(args.hasFlag("no-cache") || isolatedPolicy.has_value());
     compiler.SetCHeaderCacheDeep(args.hasFlag("c-header-cache-deep"));
+    if (auto sub = args.getOption("subsystem"))
+    {
+        if (*sub != "console" && *sub != "windows")
+        {
+            std::cout << "Error: --subsystem must be 'console' or 'windows' (got '" << *sub << "').\n";
+            return 1;
+        }
+        compiler.SetWindowsSubsystem(*sub);
+    }
     compiler.SetAsan(args.hasFlag("asan"));
     compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
 

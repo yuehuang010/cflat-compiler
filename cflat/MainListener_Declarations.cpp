@@ -3767,11 +3767,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // source link was severed (Storage cleared) - typically by a cast.
                                 // Direct refs ('T* q = p') keep Storage set and follow today's
                                 // alias semantics in ParseDeclaration; we don't disturb them.
-                                srcIsOwningMove = rightNV.IsOwning
+                                bool severedOwningSource = rightNV.IsOwning
                                     && rightNV.TypeAndValue.Pointer
                                     && rightNV.Storage == nullptr
                                     && !rightNV.CallerName.empty();
+                                // A reinterpreting cast without `move` is a VIEW (borrow), like `T* q = p`.
+                                // Exception: a live `new`-allocated local has no other owner, so it keeps transferring.
+                                auto srcRef = compiler->FindVariableStorage(rightNV.CallerName);
+                                const auto* srcVar = srcRef.Storage != nullptr
+                                    ? compiler->FindVariableByStorage(srcRef.Storage) : nullptr;
+                                bool srcIsLiveNewLocal = srcVar != nullptr && srcVar->IsNewAllocated;
+                                srcIsOwningMove = severedOwningSource
+                                    && (rightNV.TypeAndValue.IsMove || !srcIsLiveNewLocal);
                                 srcOwningName = rightNV.CallerName;
+                                if (severedOwningSource && !srcIsOwningMove)
+                                {
+                                    srcBorrowsOwningLocal = true;
+                                    srcOwningLocalOrigin = rightNV.CallerName;
+                                    srcOwningLocalStorage = srcRef.Storage;
+                                }
                                 // A plain copy of a live OWNING local: the source still frees the
                                 // pointee at its own scope exit, so the copy owns nothing. Resolved by
                                 // STORAGE IDENTITY (a spelling that erased CallerName still resolves,

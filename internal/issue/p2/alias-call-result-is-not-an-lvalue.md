@@ -113,3 +113,78 @@ as an lvalue, or at minimum an in-place `xs.update(i, fn)`.
 
 Adjacent: [[list-has-no-insert]] (the same reporter reached for insert while building the
 workaround).
+
+## Phase A re-measurement, 2026-08-21 (p2 bundle) - NOT FIXED, deliberately deferred
+
+Re-verified on the p2-bundle binary; both symptoms reproduce unchanged:
+
+| Leg | Pre-fix (measured) |
+|-----|--------------------|
+| `s1.y = curves.get(0).eqPtr()` | OK, prints 1 |
+| `s2.y = &curves.get(0).eq` | `(6,22): Unable to get an Address-of an object without a Storage.` |
+| `rows.get(0).eps` as a READ | OK |
+| `rows.get(0).eps = 2.02` | `(6,4): Left side of assignment is not an addressable lvalue.` |
+
+### New finding: `alias` is BY VALUE at the ABI, so fix direction (1) is an ABI change
+
+The blocker is not the address-of check - it is that an `alias T` return does not carry an address
+to begin with. `alias T get(int)` on `list<Row>` lowers to:
+
+```
+define internal %Row @_get_Row_list__RowPtri32_(ptr %list__Row__, i32 %index)
+```
+
+i.e. the element is returned **by value**. There is no element address in the caller to hand to
+`Storage`, so "give the call result the element's storage" cannot be done as a front-end tweak.
+
+Worse, the by-value-ness already produces a SILENT wrong answer one step further out, with no
+diagnostic at all:
+
+```cflat
+list<Row> rows; Row r; r.a = 1; rows.add(r);
+alias Row e = rows.get(0);
+e.a = 77;
+printf("%d", rows.get(0).a);   // prints 1, not 77 - the write is lost
+```
+
+And the same is true of an `alias` binding to a plain local, so this is the alias machinery in
+general and not something about call results:
+
+```cflat
+Row r; r.a = 1;
+alias Row e = r;
+e.a = 77;
+printf("%d", r.a);             // prints 1 - the write is lost
+```
+
+That silent loss is a stronger argument for fix direction (1) than either rejection is, and it
+should be fixed in the same change (or `alias` bindings of struct values should be rejected until
+they are).
+
+### Recommended approach
+
+Make `alias T` a genuine reference at the ABI, in one change:
+
+1. Return `ptr` (the element address) from any function whose return is `IsAlias`, for the
+   non-pointer struct case that currently returns by value. Callers load through it for a read and
+   store through it for a write, so `Storage` is naturally populated and BOTH symptoms disappear
+   without touching the address-of or lvalue predicates at all.
+2. Bind `alias T x = <lvalue>` to the source storage instead of copying, so the local-binding
+   silent-write-loss above goes away by the same mechanism.
+3. Audit every site that reads `IsAlias` / `ReturnsAlias` / `FuncPtrReturnAlias` for the new
+   pointer-shaped return - notably `LLVMBackend_Interfaces.cpp` (interface-vs-class signature
+   match, ~lines 880/887/975), `LLVMBackend_Lookup.cpp:622` and the lambda/function-pointer alias
+   return at `MainListener_PostfixExpression.cpp:5621`, `LLVMBackend_Overloads.cpp:1406`, the
+   WinRT borrow checks in `LLVMBackend_WinRT.cpp:1607`, and the `--init` cache round-trip
+   (`LLVMBackend.cpp:5662/5736`).
+4. Re-check the ownership/borrow legs: `IsAliasBorrow` and `RootIsAliasBorrowLocal` currently lean
+   on the result being a value; a real reference means an alias binding can now outlive a
+   reallocation, so [[borrow-from-temp-escapes-into-struct-field]] becomes adjacent.
+
+### Why it was left out of the p2 bundle
+
+It is an ABI change to every `alias`-returning function in `core/` plus the interface-signature
+matcher, the lambda/function-pointer path and the cache serializer - not a guard that can be
+landed and audited alongside nine unrelated fixes. Landing a half-guard (e.g. accepting
+`&xs.get(0).f` by synthesising a temp) would convert the current honest rejection into the same
+silent write-loss demonstrated above, which is the outcome this issue exists to prevent.

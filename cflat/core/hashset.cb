@@ -11,6 +11,8 @@
 // read the element for hashing/equality, and a `unique` argument would be destructively moved out
 // by that read. Use a borrowed element and manage its lifetime separately.
 
+import "list.cb";   // keys()/items() hand back a list copy
+
 struct hashset<T>
 {
     T*    _keys   = nullptr;
@@ -214,6 +216,57 @@ struct hashset<T>
     int count()
     {
         return _count;
+    }
+
+    // ---- enumeration -------------------------------------------------------
+    // items() hands back a COPY of every live element (safe to mutate the set while iterating
+    // it); slotCount()/slotOccupied(i)/elementAt(i) is a zero-copy BORROW cursor over the raw
+    // table whose indices any add()/remove() may invalidate by rehashing.
+
+    // Number of raw table slots - the exclusive upper bound for elementAt/slotOccupied.
+    int slotCount() { return _capacity; }
+
+    // True if raw slot `i` holds a live element (not empty and not a tombstone).
+    bool slotOccupied(int i)
+    {
+        if (i < 0 || i >= _capacity) return false;
+        return _status[i] == 1;
+    }
+
+    // Borrow the element in raw slot `i`. Only valid when slotOccupied(i); the set keeps
+    // ownership, so the caller must not destruct it.
+    alias T elementAt(int i)
+    {
+        return _keys[i];
+    }
+
+    // A list holding a COPY of every live element, in unspecified (table) order. An owning
+    // element is deep-copied; a primitive or pointer element is copied by value.
+    move list<T> items()
+    {
+        list<T> result;
+        // Keep the table walk out of a non-copyable instantiation: eager codegen of
+        // `_keys[i].copy()` there would pre-empt add()/set()'s tailored diagnostic.
+        if const (is_unique(T))
+        {
+            compile_error("hashset elements cannot be 'unique'; items() would have to copy each element out of its slot");
+            return move result;
+        }
+        else if const (!is_copyable(T))
+        {
+            compile_error("cannot list the items of this hashset: its element type owns a 'unique' pointer and has no 'copy()'; give the type a 'copy()' method, or walk the table with slotCount()/slotOccupied(i)/elementAt(i) instead");
+            return move result;
+        }
+        else
+        {
+            int i = 0;
+            while (i < _capacity)
+            {
+                if (_status[i] == 1) result.add(_keys[i].copy());
+                i++;
+            }
+            return move result;
+        }
     }
 
     // Remove all elements. Backing arrays are kept - capacity is unchanged.
