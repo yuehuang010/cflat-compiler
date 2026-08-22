@@ -131,19 +131,24 @@ struct hashset<T>
         else
         {
             if (_capacity == 0) _init(8);
+            // `value` BORROWS the caller's object, and that object may BE a slot of this set's
+            // own element array (`s.add(s.elementAt(0))`). _maybeRehash frees that array, so
+            // take the independent copy FIRST and read only the copy afterwards. This
+            // restores the two-step (caller copy + slot copy) that the by-value ABI used to give.
+            T v = value.copy();
             _maybeRehash();
 
-            int slot = _slot(value);
+            int slot = _slot(v);
             int firstDeleted = -1;
             while (_status[slot] != 0)
             {
-                if (_status[slot] == 1 && _keys[slot] == value) return false;
+                if (_status[slot] == 1 && _keys[slot] == v) return false;
                 if (_status[slot] == 2 && firstDeleted == -1) firstDeleted = slot;
                 slot = (slot + 1) % _capacity;
             }
             int insertSlot = slot;
             if (firstDeleted != -1) { insertSlot = firstDeleted; _tombstones--; }
-            _placeAt(insertSlot, value);
+            _placeAt(insertSlot, v);
             _status[insertSlot] = 1;
             _count++;
         }

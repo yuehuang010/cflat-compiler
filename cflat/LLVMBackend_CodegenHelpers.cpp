@@ -109,9 +109,21 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             bool uniqueAutoSink = itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
                 && !itr_nameArg->IsBorrowOfUniqueElement;
 
+            // A non-pointer `alias T` param arrives as a POINTER to the caller's object: bind
+            // Storage to it directly so reads, writes and `&param` all reach the caller's slot.
+            if (ParameterIsAliasByPointer(*itr_nameArg))
+            {
+                NamedVariable namedVar{
+                    .TypeAndValue = *itr_nameArg,
+                    .BaseType = GetType(*itr_nameArg),
+                    .Primary = nullptr,
+                    .Storage = &arg,
+                };
+                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+            }
             // An `IFace[]` view arrives as a thin pointer to a run of fat structs, not as one
             // fat struct by value, so it must fall through to the pointer-parameter path below.
-            if (itr_nameArg->IsFatInterfaceValue())
+            else if (itr_nameArg->IsFatInterfaceValue())
             {
                 // Interface args arrive by value ({i8*,i8*}). Store in a temp alloca so
                 // Storage is a {i8*,i8*}* pointer suitable for CallInterfaceMethod GEP.

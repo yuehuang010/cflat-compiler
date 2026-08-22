@@ -7027,11 +7027,15 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 // accessor spelling (`c.eqPtr()`) hands back, so it stores like any other pointer.
                 // The provenance moves to PointsToAliasBorrow, which the return/delete boundary
                 // gates below read; the alias markers themselves are dropped here.
+                // A non-pointer `alias` PARAMETER is a borrow of the CALLER's object, so its
+                // address is the caller's - not frame-local, and legitimate to return or store.
+                const bool addrOfAliasParam = llvm::isa<llvm::Argument>(namedVar.Primary)
+                    && compiler->ParameterIsAliasByPointer(namedVar.TypeAndValue);
                 if (namedVar.IsAliasBorrow || namedVar.TypeAndValue.IsAlias)
                 {
                     namedVar.FromOwningTempField = false;
                     namedVar.OwningTempParent = false;
-                    namedVar.PointsToAliasBorrow = true;
+                    namedVar.PointsToAliasBorrow = !addrOfAliasParam;
                     namedVar.IsAliasBorrow = false;
                     namedVar.TypeAndValue.IsAlias = false;
                 }
@@ -10426,19 +10430,19 @@ bool MainListener::RejectConsumeOfBorrowedByValueParamField(
         {
             LogErrorContext(ctx, std::format(
                 "cannot consume field '{}.{}' through pointer '{}' - it points at a borrowed "
-                "by-value parameter, so the store nulls only the callee's copy and the caller's "
-                "struct still frees the pointee (double-free). Declare that parameter 'move' to "
-                "take ownership, or read the field without storing it.",
+                "parameter, which does not own the caller's struct, so the store cannot transfer "
+                "ownership and the caller's struct still frees the pointee (double-free). Declare "
+                "that parameter 'move' to take ownership, or read the field without storing it.",
                 srcNV.OwningStructName, srcNV.FieldName, root));
             return true;
         }
         // On `w.arr[0]` this names the owning ARRAY field rather than the slot: coarse, but the
         // field, the parameter and the remedy are all correct. IsElementAccess is not set here.
         LogErrorContext(ctx, std::format(
-            "cannot consume field '{}.{}' out of borrowed by-value parameter '{}' - the store nulls "
-            "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
-            "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
-            "field without storing it (a read borrows, a store consumes).",
+            "cannot consume field '{}.{}' out of borrowed parameter '{}' - the parameter binding "
+            "borrows the caller's struct and does not own it, so the caller's struct still frees the "
+            "pointee (double-free). Declare the parameter 'move {}' to take ownership of the caller's "
+            "struct, or read the field without storing it (a read borrows, a store consumes).",
             srcNV.OwningStructName, srcNV.FieldName, root, root));
         return true;
     }
@@ -10497,9 +10501,10 @@ bool MainListener::RejectStoreIntoBorrowedField(
         if (destNV.RootIsBorrowedByValueParam)
         {
             LogErrorContext(ctx, std::format(
-                "cannot assign owning field '{}.{}' of borrowed by-value parameter '{}' - "
-                "dropping the old value would free the caller's pointee through the callee's copy. "
-                "Declare the parameter 'move {}' to take ownership, or assign through the owner.",
+                "cannot assign owning field '{}.{}' of borrowed parameter '{}' - the parameter "
+                "binding only borrows, so dropping the old value would free a pointee the caller's "
+                "struct still owns. Declare the parameter 'move {}' to take ownership, or assign "
+                "through the owner.",
                 destNV.OwningStructName, destNV.FieldName, root, root));
         }
         else
@@ -10652,8 +10657,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 ? pointer + "." + argNV.FieldName : argNV.FieldPathText;
             LogErrorContext(ctx, std::format(
                 "cannot 'move' field '{}' through pointer '{}' - it points at a borrowed "
-                "by-value parameter, so the caller's struct still frees the pointee (double-free). "
-                "Declare that parameter 'move' to take ownership, or read the field without moving it.",
+                "parameter, which does not own the caller's struct, so the caller's struct still "
+                "frees the pointee (double-free). Declare that parameter 'move' to take ownership, "
+                "or read the field without moving it.",
                 fieldPath, pointer));
             return {};
         }
@@ -10661,10 +10667,10 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         {
             const std::string parent = FieldPathRootName(argNV);
             LogErrorContext(ctx, std::format(
-                "cannot 'move' field '{}.{}' out of borrowed by-value parameter '{}' - the move nulls "
-                "only the callee's copy, so the caller's struct still frees the pointee (double-free). "
-                "Declare the parameter 'move {}' to take ownership of the caller's struct, or read the "
-                "field without moving it (a read borrows, a move consumes).",
+                "cannot 'move' field '{}.{}' out of borrowed parameter '{}' - the parameter binding "
+                "borrows the caller's struct and does not own it, so the caller's struct still frees "
+                "the pointee (double-free). Declare the parameter 'move {}' to take ownership of the "
+                "caller's struct, or read the field without moving it (a read borrows, a move consumes).",
                 argNV.OwningStructName, argNV.FieldName, parent, parent));
             return {};
         }
@@ -10747,8 +10753,8 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 LogErrorContext(ctx, std::format(
                     "cannot 'move' '{}' - it aliases unique field '{}', and moving the alias does not "
                     "null the field, so the field's synthesized destructor still frees the pointee. "
-                    "'move {}' is not a remedy here either: '{}' is a borrowed by-value parameter, so "
-                    "it would null only the callee's copy. Declare the parameter 'move {}' to take "
+                    "'move {}' is not a remedy here either: '{}' is a borrowed parameter and does not "
+                    "own the caller's struct. Declare the parameter 'move {}' to take "
                     "ownership of the caller's struct.",
                     name, argNV.BorrowedUniqueField, argNV.BorrowedOrigin, root, root));
             else

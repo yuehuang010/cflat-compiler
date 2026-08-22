@@ -650,6 +650,12 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
         const NamedVariable& returnNV)
 {
         bool valIsStruct = val->getType()->isStructTy();   // fat closure value
+        // Same alias-param door as the declaration and argument sites: a named function whose
+        // by-value `alias` param rides a reference ABI has no function-pointer spelling.
+        if (auto* fnVal = llvm::dyn_cast<llvm::Function>(val))
+            if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+                RejectAliasParamFuncPtrBind(
+                    returnNV.CallerName.empty() ? fnSym->UniqueName : returnNV.CallerName, *fnSym);
         if (retTV.IsThinFnPtr())
         {
             if (auto* fn = llvm::dyn_cast<llvm::Function>(val)) return MakeThinFnPtrValue(fn, retTV);

@@ -1975,6 +1975,29 @@ llvm::Value* LLVMBackend::LowerClosureFatToThinFnPtr(llvm::Value* val, llvm::Typ
         return nullptr;   // unreachable: LogError above does not return
     }
 
+llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param)
+{
+        auto* paramTy = GetType(param);
+        // The caller's own slot is the borrow. Only an exact type match may be handed over -
+        // anything else (a coercion, a literal, a call result) is materialized into a temp,
+        // which is a copy, exactly as binding a C++ const-reference to a converted value is.
+        if (arg.Storage != nullptr && arg.BaseType == paramTy && !arg.TypeAndValue.Pointer
+            && !arg.TypeAndValue.IsInterface)
+            return arg.Storage;
+        llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
+        value = LowerByValueArg(value, param, arg);
+        if (value == nullptr)
+            return llvm::ConstantPointerNull::get(paramTy->getPointerTo());
+        auto* temp = AllocaAtEntry(paramTy, nullptr, "aliasarg");
+        CreateAssignment(value, temp, arg.TypeAndValue.IsUnsignedInteger() != -1);
+        // The materialized slot holds an rvalue nothing owns; an `alias` param borrows and never
+        // frees it, so without this it leaks. Registering THIS slot (not a fresh copy) keeps the
+        // destruction count at one. Owned string / closure temps are registered upstream at the
+        // argument-evaluation site and are not re-registered here.
+        RegisterBorrowedOwningStructTempAt(arg, temp);
+        return temp;
+    }
+
 llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg)
 {
         // Encoded closure param (list<function<...>>::add's `T value`, a substituted generic field).
@@ -2430,7 +2453,9 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         std::vector<llvm::Type*> paramTypes = { ptrTy };
         for (const auto& p : methodInfo->Parameters)
         {
-            paramTypes.push_back(GetType(p));
+            // Same alias-borrow param ABI the definition emitted (GetFunctionType).
+            paramTypes.push_back(ParameterIsAliasByPointer(p) ? GetType(p)->getPointerTo()
+                                                              : GetType(p));
             if (ParameterCarriesRawArrayCount(p))
                 paramTypes.push_back(builder->getInt64Ty());
         }
@@ -2496,6 +2521,11 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 // Interface -> interface: pass the fat struct by value, re-boxing on an upcast.
                 llvm::Value* val = nv.Primary ? nv.Primary : CreateLoad(nv.Storage);
                 callArgs.push_back(ReboxInterfaceIfNeeded(val, nv.TypeAndValue.TypeName, param.TypeName));
+            }
+            else if (ParameterIsAliasByPointer(param))
+            {
+                // Same alias-borrow ABI as the direct call path (CreateOverloadedFunctionCall).
+                callArgs.push_back(LowerAliasByPointerArg(nv, param));
             }
             else if (param.Pointer)
             {

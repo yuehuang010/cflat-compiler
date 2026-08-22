@@ -29,6 +29,16 @@ import "test_helper.cb";
 // Owning aggregates with managed fields and NO user copy() - exercise the synthesized
 // memberwise copy() and the field-reassignment destruct-old (Bugs 5 and 6 below).
 struct LeakRow { string name = default; };
+// Struct key for the self-aliasing hashset legs: an owning `string` field is what makes the
+// use-after-free observable (the freed slot's buffer is read through the borrow).
+struct SelfAliasKey
+{
+    int a = default;
+    string tag = default;
+    int hash() { return a; }
+    bool operator==(alias SelfAliasKey o) { return a == o.a; }
+    SelfAliasKey copy() { SelfAliasKey r = default; r.a = a; r.tag = tag.copy(); return r; }
+};
 struct LeakBox { list<int> nums = default; };
 struct LeakPair { string name = default; list<int> nums = default; };
 // Owning fixed-array FIELD (`ArrSBox items[3]`): the synthesized destructor must free EVERY element
@@ -739,6 +749,70 @@ extern int main()
         total++; passed += Test("dict<str,int> set value",          d.get("k3"), 99);
         d.remove("k2");                        // removed key's owned copy freed
         total++; passed += Test("dict<str,int> remove count",       d.count(), 5);
+    }
+
+    // === SELF-ALIASING key: the borrowed `alias K` argument may BE a slot of the container ===
+    // A non-pointer `alias K` parameter is a reference to the caller's object, so
+    // `d.add(d.keyAt(j), v)` / `s.add(s.elementAt(j))` hands add() a pointer INTO the container's
+    // own key array. add()/set() call _maybeRehash() first, and _rehash `delete[_]`s that array,
+    // so reading the key afterwards is a use-after-free. add()/set() now take the independent
+    // `key.copy()` BEFORE the rehash and read only the copy (_placeKeyAt/_placeAt move it in, so
+    // it is not a second copy). Discriminator: on commit 2fa0bb0 the string legs SIGSEGV
+    // (the freed buffer is unmapped); the primitive legs read freed memory. Sizes 6 / 12 / 24
+    // straddle three rehash points.
+    {
+        int n = 6;
+        int si = 0;
+        int intOk = 0; int strOk = 0;
+        while (si < 3)
+        {
+            dictionary<int, int> di = default;
+            hashset<int> hi = default;
+            int i = 0;
+            while (i < n) { di.add(i, i * 10); hi.add(i); i++; }
+            int dj = 0; while (!di.slotOccupied(dj)) dj++;
+            int hj = 0; while (!hi.slotOccupied(hj)) hj++;
+            int dupKey = di.keyAt(dj);
+            bool addedI = di.add(di.keyAt(dj), -1);       // self-aliased duplicate: refused
+            bool addedH = hi.add(hi.elementAt(hj));       // self-aliased duplicate: refused
+            if (di.count() == n && hi.count() == n && !addedI && !addedH
+                && di.get(dupKey) == dupKey * 10) intOk++;
+
+            dictionary<string, int> ds = default;
+            hashset<string> hs2 = default;
+            i = 0;
+            while (i < n) { ds.add("sk" + i.toString(), i); hs2.add("se" + i.toString()); i++; }
+            int dsj = 0; while (!ds.slotOccupied(dsj)) dsj++;
+            int hsj = 0; while (!hs2.slotOccupied(hsj)) hsj++;
+            string dupStr = ds.keyAt(dsj).copy();
+            string dupElem = hs2.elementAt(hsj).copy();
+            bool addedS = ds.add(ds.keyAt(dsj), -1);      // self-aliased duplicate: refused
+            bool addedHs = hs2.add(hs2.elementAt(hsj));   // self-aliased duplicate: refused
+            // add() may itself have rehashed, so re-find an occupied slot before set().
+            dsj = 0; while (!ds.slotOccupied(dsj)) dsj++;
+            string setStr = ds.keyAt(dsj).copy();
+            ds.set(ds.keyAt(dsj), 4242);                  // self-aliased set() overwrite
+            if (ds.count() == n && hs2.count() == n && !addedS && !addedHs
+                && ds.get(setStr) == 4242 && ds.get(dupStr) >= 0 && hs2.contains(dupElem)) strOk++;
+            n = n * 2;
+            si++;
+        }
+        total++; passed += Test("dict/hashset self-aliased int key at 6/12/24", intOk, 3);
+        total++; passed += Test("dict/hashset self-aliased string key at 6/12/24", strOk, 3);
+    }
+
+    // A self-aliased element of a STRUCT key type (owning `string` field): the same
+    // borrow-into-my-own-array shape, through the synthesized copy()/hash()/==.
+    {
+        hashset<SelfAliasKey> sk = default;
+        int i = 0;
+        while (i < 24) { SelfAliasKey k = default; k.a = i; k.tag = "t" + i.toString(); sk.add(k); i++; }
+        int j = 0; while (!sk.slotOccupied(j)) j++;
+        int wantA = sk.elementAt(j).a;
+        bool added = sk.add(sk.elementAt(j));             // self-aliased duplicate: refused
+        total++; passed += Test("hashset<struct> self-aliased add refused", added, false);
+        total++; passed += Test("hashset<struct> self-aliased add count", sk.count(), 24);
+        total++; passed += Test("hashset<struct> self-aliased add kept key", sk.elementAt(j).a, wantA);
     }
 
     // === Bug 9c: hashset<string> owns its string ELEMENTS (deep-copied), frees them ===

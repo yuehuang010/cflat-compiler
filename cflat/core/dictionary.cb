@@ -203,10 +203,14 @@ struct dictionary<K, V>
     bool add(alias K key, V value)
     {
         if (_capacity == 0) _init(8);
+        // `key` BORROWS the caller's object, and that object may BE a slot of this dictionary's
+        // own key array (`d.add(d.keyAt(0), v)`). _maybeRehash frees that array, so take the
+        // independent copy FIRST and read only the copy afterwards.
+        K k = key.copy();
         _maybeRehash();
-        int insertSlot = _insertSlotFor(key);
+        int insertSlot = _insertSlotFor(k);
         if (insertSlot == -1) return false;
-        _placeKeyAt(insertSlot, key);
+        _placeKeyAt(insertSlot, k);
         _values[insertSlot] = value;
         _status[insertSlot] = 1;
         _count++;
@@ -223,17 +227,19 @@ struct dictionary<K, V>
     void set(alias K key, V value)
     {
         if (_capacity == 0) _init(8);
+        // Self-aliasing guard, exactly as in add(): copy before the rehash frees _keys.
+        K k = key.copy();
         _maybeRehash();
 
-        int updateSlot = _insertSlotFor(key);
+        int updateSlot = _insertSlotFor(k);
         if (updateSlot == -1)
         {
-            updateSlot = _findSlot(key);
+            updateSlot = _findSlot(k);
             _releaseValueAt(updateSlot);
         }
         else
         {
-            _placeKeyAt(updateSlot, key);
+            _placeKeyAt(updateSlot, k);
             _status[updateSlot] = 1;
             _count++;
         }
@@ -252,11 +258,13 @@ struct dictionary<K, V>
         bool add(alias K key, move V value)
         {
             if (_capacity == 0) _init(8);
+            // Self-aliasing guard, exactly as in the plain add().
+            K k = key.copy();
             _maybeRehash();
 
-            int insertSlot = _insertSlotFor(key);
+            int insertSlot = _insertSlotFor(k);
             if (insertSlot == -1) return false;
-            _placeKeyAt(insertSlot, key);
+            _placeKeyAt(insertSlot, k);
             _values[insertSlot] = move value;
             _status[insertSlot] = 1;
             _count++;
@@ -266,17 +274,19 @@ struct dictionary<K, V>
         void set(alias K key, move V value)
         {
             if (_capacity == 0) _init(8);
+            // Self-aliasing guard, exactly as in the plain set().
+            K k = key.copy();
             _maybeRehash();
 
-            int updateSlot = _insertSlotFor(key);
+            int updateSlot = _insertSlotFor(k);
             if (updateSlot == -1)
             {
-                updateSlot = _findSlot(key);
+                updateSlot = _findSlot(k);
                 _releaseValueAt(updateSlot);
             }
             else
             {
-                _placeKeyAt(updateSlot, key);
+                _placeKeyAt(updateSlot, k);
                 _status[updateSlot] = 1;
                 _count++;
             }

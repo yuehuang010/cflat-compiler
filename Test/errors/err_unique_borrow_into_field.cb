@@ -38,11 +38,11 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {
  */
 Holder gByValDest = default;
 
-expect_error("cannot consume field 'Holder.slot' out of borrowed by-value parameter 'h'") {
+expect_error("cannot consume field 'Holder.slot' out of borrowed parameter 'h'") {
     void byValParamFieldAssign(Holder h) { gByValDest.slot = h.slot; }
 }
 
-expect_error("cannot consume field 'Holder.slot' out of borrowed by-value parameter 'h'") {
+expect_error("cannot consume field 'Holder.slot' out of borrowed parameter 'h'") {
     void byValParamFieldBraceInit(Holder h) { Holder d = { slot = h.slot }; }
 }
 

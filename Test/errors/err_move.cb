@@ -487,7 +487,7 @@ expect_error("cannot consume field 'JoinBox.item' out of 'alias' borrow 'k'") {
 }
 
 // The destination twin for a by-value struct parameter.
-expect_error("cannot assign owning field 'JoinHolder.box' of borrowed by-value parameter 'h'") {
+expect_error("cannot assign owning field 'JoinHolder.box' of borrowed parameter 'h'") {
     void byValueOwningFieldDestination(JoinHolder h) { h.box = makeJoinBox(); }
 }
 

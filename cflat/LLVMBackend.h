@@ -3551,6 +3551,14 @@ private:
     // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
     void RegisterBorrowedOwningStructTemp(const NamedVariable& arg);
 
+    // Shared gate: true when `arg` is an unowned produced rvalue of an owning struct type, i.e.
+    // one that a borrowing parameter will not free and no named local will either.
+    bool BorrowedOwningStructTempQualifies(const NamedVariable& arg);
+
+    // Same registration, but for a temp already spilled into `slot` by the caller (the
+    // alias-by-pointer arg path), so no second copy is made and the temp is freed exactly once.
+    void RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot);
+
     // Free all unnamed owned temporaries (string, closure, struct) at an end-of-full-expression
     // boundary. The return path keeps the three explicit (it interleaves Unregister between them).
     // Sizes of the four pending owned-temp ledgers, so a nested lowering can free exactly what
@@ -5349,6 +5357,10 @@ public:
     // call can arrive here with such a parameter.
     llvm::Value* LowerByValueArg(llvm::Value* value, const TypeAndValue& param, const NamedVariable& arg);
 
+    // Address handed to a non-pointer `alias T` parameter: the caller's own slot when the
+    // shapes match exactly, otherwise a materialized temp (a converted value has no slot).
+    llvm::Value* LowerAliasByPointerArg(const NamedVariable& arg, const TypeAndValue& param);
+
     /*
      * Is this argument PROVABLY unusable for this parameter? Deliberately one-sided, and NOT
      * "the overload scorer failed to rank it" - the scorer has no int->floating-point rule, so
@@ -5731,6 +5743,10 @@ public:
     // A non-pointer `alias T` return is a reference to a live T slot, not a T value.
     // Keep this ABI rule at function boundaries; ordinary GetType() remains value-shaped.
     llvm::Type* GetFunctionReturnABIType(const TypeAndValue& returnType) const;
+
+    // A non-pointer `alias T` PARAMETER borrows the caller's object, so it is passed as a
+    // pointer to that object. Every call emitter and the prologue must agree on this predicate.
+    bool ParameterIsAliasByPointer(const TypeAndValue& param) const;
 
     std::string CreateAnonFunctionName();
 
@@ -6307,6 +6323,10 @@ public:
      * One-sided over the overload set: refused only when EVERY overload is refuted, so a name the
      * comparator cannot resolve keeps binding exactly as before.
      */
+    // True (and reports) when the symbol has a by-reference `alias` param, which a
+    // function-pointer type cannot describe.
+    bool RejectAliasParamFuncPtrBind(const std::string& functionName, const FunctionSymbol& sym);
+
     llvm::Function* GetFunctionForFuncPtr(std::string functionName, int expectedParamCount = -1,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams = nullptr,
                                           const TypeAndValue* destSig = nullptr);

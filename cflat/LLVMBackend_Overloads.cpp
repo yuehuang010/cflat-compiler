@@ -1176,6 +1176,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 // function<T> parameter - dispatch depends on whether the callee is extern C.
                 llvm::Value* val = arg.Primary ? arg.Primary : LoadArgStorage(arg);
+                // A named function reaching a funcptr slot: same alias-param door as a declared
+                // `function<>` binding. The thin arm below never re-resolves, so check it here.
+                if (auto* fnVal = llvm::dyn_cast_or_null<llvm::Function>(val))
+                    if (const FunctionSymbol* fnSym = FindSymbolForFunction(fnVal))
+                        if (RejectAliasParamFuncPtrBind(
+                                arg.CallerName.empty() ? fnSym->UniqueName : arg.CallerName, *fnSym))
+                            return nullptr;
                 // Inspect the actual LLVM param type to distinguish fat struct vs C fn ptr.
                 unsigned llvmParamIndex = (unsigned)argList.size();
                 if (!candidate.External)
@@ -1243,6 +1250,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     }
                 }
                 argList.push_back(val);
+            }
+            else if (!inVariadicRange && ParameterIsAliasByPointer(*candParamItr))
+            {
+                argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
             }
             else
             {
@@ -1551,6 +1562,25 @@ bool LLVMBackend::HasFunctionWithMoveFlags(std::string functionName, const std::
         return !sawCountMatch;
     }
 
+bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
+                                              const FunctionSymbol& sym)
+{
+        // A non-pointer `alias` param is passed as a pointer to the caller's object, but a
+        // function-pointer type has no spelling for that, so an indirect call would pass the
+        // value itself and the callee would read it as an address.
+        for (const auto& p : sym.Parameters)
+        {
+            if (!ParameterIsAliasByPointer(p)) continue;
+            LogErrorMessage(
+                "function '{}' cannot be used as a function pointer: its parameter '{}' is "
+                "'{}', which is passed as a reference to the caller's object and has no "
+                "function-pointer spelling. Declare the parameter '{}' instead, or drop '{}'",
+                { functionName, p.VariableName, "alias " + p.TypeName, p.TypeName + "*", "alias" });
+            return true;
+        }
+        return false;
+    }
+
 llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int expectedParamCount,
                                           const std::vector<TypeAndValue::FuncPtrParam>* expectedParams,
                                           const TypeAndValue* destSig)
@@ -1583,8 +1613,16 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
         }
 
         const auto& overloads = viable;
+        // A bare name resolves through here on the ORDINARY call path too, so the alias-param
+        // rejection fires only when a function-pointer destination is actually being bound.
+        const bool bindingFuncPtr = expectedParams != nullptr
+            || (destSig != nullptr && !destSig->FuncPtrReturnTypeName.empty());
+        auto chosen = [&](const FunctionSymbol* sym) -> llvm::Function* {
+            if (bindingFuncPtr) RejectAliasParamFuncPtrBind(functionName, *sym);
+            return sym->Function;
+        };
         if (overloads.size() == 1)
-            return overloads.front()->Function;
+            return chosen(overloads.front());
 
         // When expectedParams is provided, prefer the overload whose per-param IsMove flags match exactly.
         auto moveFlagsMatch = [&](const FunctionSymbol& sym) -> bool {
@@ -1601,23 +1639,23 @@ llvm::Function* LLVMBackend::GetFunctionForFuncPtr(std::string functionName, int
             if (sym->IsMethod) continue;
             if (expectedParamCount >= 0 && (int)sym->Parameters.size() != expectedParamCount) continue;
             if (!moveFlagsMatch(*sym)) continue;
-            return sym->Function;
+            return chosen(sym);
         }
         // Pass 2: non-method, count only (legacy behavior when no expectedParams).
         for (const auto* sym : overloads)
         {
             if (sym->IsMethod) continue;
             if (expectedParamCount < 0 || (int)sym->Parameters.size() == expectedParamCount)
-                return sym->Function;
+                return chosen(sym);
         }
         // Fallback: any overload whose effective (non-self) param count matches.
         for (const auto* sym : overloads)
         {
             int effectiveCount = sym->IsMethod ? (int)sym->Parameters.size() - 1 : (int)sym->Parameters.size();
             if (expectedParamCount < 0 || effectiveCount == expectedParamCount)
-                return sym->Function;
+                return chosen(sym);
         }
-        return overloads.front()->Function;
+        return chosen(overloads.front());
     }
 
 LLVMBackend::NamedVariable LLVMBackend::GetLocalVariable(const std::string& name)

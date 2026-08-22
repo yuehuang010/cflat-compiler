@@ -3038,19 +3038,32 @@ void LLVMBackend::FlushOwnedPtrTemps()
         }
     }
 
-void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg)
+bool LLVMBackend::BorrowedOwningStructTempQualifies(const NamedVariable& arg)
 {
         const std::string& typeName = arg.TypeAndValue.TypeName;
-        if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return;
-        if (!IsProducedTempValue(arg.Primary)) return;   // only a produced temp, not a named local
-        if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return;
-        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return;
-        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
-        if (!IsOwningValueType(typeName)) return;
+        if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return false;
+        if (!IsProducedTempValue(arg.Primary)) return false;   // only a produced temp, not a named local
+        if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return false;
+        if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return false;
+        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return false;
+        return IsOwningValueType(typeName);
+    }
+
+void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg)
+{
+        if (!BorrowedOwningStructTempQualifies(arg)) return;
 
         auto* tempAlloca = AllocaAtEntry(arg.BaseType, nullptr, "argtemp");
         builder->CreateStore(arg.Primary, tempAlloca);
-        RegisterOwnedStructTemp(tempAlloca, typeName);
+        RegisterOwnedStructTemp(tempAlloca, arg.TypeAndValue.TypeName);
+    }
+
+void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot)
+{
+        // The alias-by-pointer arg path already spilled the rvalue into `slot`; registering that
+        // very slot (instead of a second copy) is what keeps the temp destructed exactly once.
+        if (slot == nullptr || !BorrowedOwningStructTempQualifies(arg)) return;
+        RegisterOwnedStructTemp(slot, arg.TypeAndValue.TypeName);
     }
 
 LLVMBackend::OwnedTempMark LLVMBackend::MarkOwnedTemps() const

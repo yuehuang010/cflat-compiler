@@ -87,11 +87,11 @@ expect_error("cannot consume field 'QWrap.b' through borrowed parameter 'w'") {
 
 // Taking the address launders the field path past the root walk: `p` is a LOCAL, so the
 // diagnostic must not call it a parameter, and 'move p' is not the remedy.
-expect_error("through pointer 'p' - it points at a borrowed by-value parameter") {
+expect_error("through pointer 'p' - it points at a borrowed parameter") {
     int qLaunder(QWrap w) { QWrap* p = &w; QBox o = p.b; return o.item->id; }
 }
 
-expect_error("through pointer 'q' - it points at a borrowed by-value parameter") {
+expect_error("through pointer 'q' - it points at a borrowed parameter") {
     int qLaunderAssign(QWrap w) {
         QWrap* p = &w;
         QWrap* q = nullptr;

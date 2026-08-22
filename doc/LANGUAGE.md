@@ -41,6 +41,7 @@
   - [Assignment (`dest = src`)](#assignment-dest--src)
   - [`move` Return Type](#move-return-type)
   - [`alias` Return Type (borrow)](#alias-return-type-borrow)
+  - [`alias` Parameter (borrow of the caller's object)](#alias-parameter-borrow-of-the-callers-object)
   - [`bond` Lifetime Keyword](#bond-lifetime-keyword)
   - [Ownership at Global and `static` Scope](#ownership-at-global-and-static-scope)
 - [Namespaces & Modules](#namespaces--modules)
@@ -1370,6 +1371,48 @@ void  stash(list<Token> toks, Holder h) { h.tok = toks.get(0); }   // error: sto
 - `alias` is a soft keyword detected by text matching, not an ANTLR token - identifiers named `alias` still work.
 - `alias` applies to **owning struct value types**. `string` (and closures) are excluded: they carry a runtime owned bit that already clears on a borrow return, so `return someList.get(i)` for a `string` is safe without `alias`.
 - The discriminator for choosing `alias`: tag it when the source **still owns** the element after the call (a peek, like `list.get`). If the call **consumes/releases** the element (the source no longer owns it, like `channel.receive`/`pop` whose producer side is `push(move T)`), leave it owning.
+
+### `alias` Parameter (borrow of the caller's object)
+
+`alias` on a **non-pointer parameter** makes it a borrow of the caller's object rather than a
+by-value copy: it is passed as a pointer to the caller's storage.
+
+```c
+void bump(alias Row r) { r.value = r.value + 1; }   // writes the CALLER's row
+Row* addressOf(alias Row r) { return &r; }          // the CALLER's address, safe to return
+```
+
+- **Writes reach the caller.** A plain by-value parameter is a copy and writes stay local.
+- **`&param` is the caller's address**, so it may be returned, stored into a field or a global,
+  and passed on to a `T*` parameter. The caller's storage is not frame-local, so no escape
+  diagnostic fires. Its lifetime is still the caller's - the usual borrow discipline applies.
+- **The borrow owns nothing**: no destructor runs at the callee's scope exit.
+- `alias T*`, `alias T[]`, interface and `function<>` parameters are unaffected - those spellings
+  already name a borrow in their own representation.
+- **A function with a by-value `alias` parameter cannot be used as a function pointer.**
+  `function<>` / `Lambda<>` types have no spelling for the reference ABI, so an indirect call
+  would pass the value where the callee expects an address; the binding is rejected with a
+  diagnostic that names `T*` as the remedy.
+- **An rvalue argument is materialized and destructed by the caller.** A literal, a converted
+  value or a call result has no storage to borrow, so the caller spills it into a slot and passes
+  that slot's address - exactly like binding a C++ `const&` to a temporary. The temporary is
+  destructed at the end of the full expression, so `f(makeOwner())` frees the owner once.
+
+**Self-aliasing caveat.** Because the parameter is a pointer to the caller's object, that object
+may be storage the callee itself owns and can reallocate - most commonly a slot of the container
+being called:
+
+```c
+d.add(d.keyAt(j), v);        // the borrowed key IS a slot of d's own key array
+s.add(s.elementAt(j));       // likewise for hashset
+```
+
+`dictionary.add/set` and `hashset.add` handle this: each takes an independent `key.copy()` before
+the call that can rehash, and reads only that copy afterwards, so growing the table cannot leave
+the borrow dangling. Any user container with the same shape - an `alias T` parameter read after a
+reallocation the same method performs - must do the same, because the borrow is a plain pointer
+and the compiler does not track it across the free. `list`, `queue`, `stack` and `channel` take
+their element by value or by `move`, so the copy already happens at the call site.
 
 **Inference and mixed returns for owning value structs.** When a function returns an owning struct *by value* whose type transitively owns a `unique` pointer, the compiler analyses every return to decide whether the caller frees the result:
 

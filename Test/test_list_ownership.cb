@@ -114,6 +114,150 @@ int testPrimitives()
     return passed;
 }
 
+// --- alias PARAMETERS ------------------------------------------------------------
+//
+// A non-pointer `alias T` parameter borrows the CALLER's object, so it is passed as a
+// pointer to it: `&param` is the caller's address, writes reach the caller, and the
+// address may leave the callee (the caller's storage is not frame-local). Pre-fix every
+// leg below saw the callee's frame copy: the address legs answered 0 and the mutation
+// legs left the caller unchanged.
+i64 apAddrRow(alias AliasRow r)       { return (i64)&r; }
+i64 apAddrInt(alias int v)            { return (i64)&v; }
+i64 apAddrStr(alias string s)         { return (i64)&s; }
+i64 apAddrGeneric<T>(alias T x)       { return (i64)&x; }
+i64 apAddrForward(alias AliasRow r)   { return apAddrRow(r); }
+AliasRow* apReturnAddr(alias AliasRow r) { return &r; }
+// The accept-set contrast: a PLAIN by-value parameter is still a COPY, so its address is
+// its own frame slot. This leg fails if the pointer ABI is ever widened past `alias`.
+i64 apAddrByValue(AliasRow r)         { return (i64)&r; }
+void apBumpRow(alias AliasRow r)      { r.value = r.value + 5; }
+void apBumpInt(alias int v)           { v = v + 5; }
+void apWriteThroughPtr(AliasRow* p)   { p->value = 77; }
+void apPassAddr(alias AliasRow r)     { apWriteThroughPtr(&r); }
+int  apReadText(alias AliasRow r)     { return r.text.length(); }
+int  apDtorProbe(alias Res r)         { return r.id; }
+
+int testAliasParameterBorrows()
+{
+    int passed = 0;
+
+    AliasRow row = default;
+    row.value = 30;
+    row.text = "alias";
+
+    passed += Test("alias struct param address is the caller's",
+        apAddrRow(row) == (i64)&row ? 1 : 0, 1);
+    passed += Test("alias struct param forwarded keeps the caller's address",
+        apAddrForward(row) == (i64)&row ? 1 : 0, 1);
+    passed += Test("alias param address returned is the caller's",
+        apReturnAddr(row) == &row ? 1 : 0, 1);
+    passed += Test("by-value param address is NOT the caller's",
+        apAddrByValue(row) == (i64)&row ? 1 : 0, 0);
+
+    apBumpRow(row);
+    passed += Test("write through an alias struct param reaches the caller", row.value, 35);
+    apPassAddr(row);
+    passed += Test("address of an alias param passed on writes the caller", row.value, 77);
+    passed += Test("alias param reads the caller's owning field", apReadText(row), 5);
+
+    int n = 40;
+    passed += Test("alias primitive param address is the caller's",
+        apAddrInt(n) == (i64)&n ? 1 : 0, 1);
+    apBumpInt(n);
+    passed += Test("write through an alias primitive param reaches the caller", n, 45);
+
+    string s = "borrowed";
+    passed += Test("alias string param address is the caller's",
+        apAddrStr(s) == (i64)&s ? 1 : 0, 1);
+
+    passed += Test("generic alias param address is the caller's (struct)",
+        apAddrGeneric<AliasRow>(row) == (i64)&row ? 1 : 0, 1);
+    passed += Test("generic alias param address is the caller's (primitive)",
+        apAddrGeneric<int>(n) == (i64)&n ? 1 : 0, 1);
+
+    // The address may also be stored OUT of the callee: the caller's slot outlives the call.
+    g_aliasRow = apReturnAddr(row);
+    g_aliasRow->value = 78;
+    passed += Test("alias param address stored in a global writes the caller", row.value, 78);
+    g_aliasRow = nullptr;
+
+    // The borrow must not destruct the caller's object: the parameter owns nothing.
+    int before = g_dtor;
+    Res* r = new Res(9);
+    int id = apDtorProbe(*r);
+    passed += Test("alias param reads the borrowed object", id, 9);
+    passed += Test("alias param runs no destructor", g_dtor - before, 0);
+    delete r;
+    passed += Test("the real owner still destructs once", g_dtor - before, 1);
+
+    return passed;
+}
+
+// --- alias parameter TEMPS (resource legs) ---------------------------------------
+//
+// An RVALUE bound to an `alias` parameter has no named owner and the borrow never frees it,
+// so the materialized argument slot must be destructed at end-of-full-expression. Pre-fix
+// (commit 2fa0bb0) every ApRes leg below counted 0 destructor runs and leaked its pointee;
+// the by-value control counted 1 all along, and the HeapAudit oracle in main() saw the leak.
+int g_apDtor = 0;
+struct ApRes
+{
+    int* p = nullptr;
+    ~ApRes() { g_apDtor = g_apDtor + 1; if (p != nullptr) delete p; }
+};
+ApRes apMakeRes(int v) { ApRes r = default; r.p = new int; *r.p = v; return r; }
+struct ApHolder { int id = default; ApRes make(int v) { return apMakeRes(v); } };
+int apTakeAliasRes(alias ApRes r) { return *r.p; }
+int apTakeValueRes(ApRes r)       { return *r.p; }
+int apAliasIsNull(alias ApRes r)  { return r.p == nullptr ? 1 : 0; }
+int apNestForward(alias ApRes r)  { return apTakeAliasRes(r); }
+int apAliasStrLen(alias string s) { return s.length(); }
+int apAliasIntPlus(alias int v)   { return v + 1; }
+
+int testAliasParameterTempsDestruct()
+{
+    int passed = 0;
+
+    g_apDtor = 0;
+    passed += Test("rvalue temp read through an alias param", apTakeAliasRes(apMakeRes(7)), 7);
+    passed += Test("rvalue temp bound to an alias param is destructed", g_apDtor, 1);
+
+    // Accept-set contrast: the by-value spelling already destructed its temp.
+    g_apDtor = 0;
+    passed += Test("by-value control reads the temp", apTakeValueRes(apMakeRes(7)), 7);
+    passed += Test("by-value control destructs the temp once", g_apDtor, 1);
+
+    // A literal has no destructor: these pin that the registration is TYPE-gated (an owning
+    // struct only) and neither fires nor mis-lowers on a string / primitive argument.
+    passed += Test("string literal into an alias string param", apAliasStrLen("hello"), 5);
+    passed += Test("int literal into an alias int param", apAliasIntPlus(3), 4);
+
+    // A temp produced by a '?.' chain reaches the argument as a MERGED load, not a CallInst,
+    // so the registration must consult IsProducedTempValue rather than isa<CallInst>.
+    g_apDtor = 0;
+    ApHolder h = default;
+    ApHolder* hp = &h;
+    passed += Test("'?.' temp read through an alias param", apTakeAliasRes(hp?.make(11)), 11);
+    passed += Test("'?.' temp bound to an alias param is destructed", g_apDtor, 1);
+
+    // The null-receiver twin: the merged record is zeroed, so its destructor runs once and
+    // frees nothing (a null `p`).
+    g_apDtor = 0;
+    ApHolder* hnull = nullptr;
+    passed += Test("null '?.' temp into an alias param is the zero value",
+        apAliasIsNull(hnull?.make(5)), 1);
+    passed += Test("null '?.' temp destructs its zeroed record once", g_apDtor, 1);
+
+    // Forwarding an alias param to another alias param hands over the SAME slot, so the temp
+    // must be destructed exactly ONCE - a second registration would double-free and abort
+    // the HeapAudit oracle.
+    g_apDtor = 0;
+    passed += Test("temp forwarded through two alias params", apNestForward(apMakeRes(21)), 21);
+    passed += Test("temp forwarded through two alias params destructs once", g_apDtor, 1);
+
+    return passed;
+}
+
 // Non-pointer alias returns are reference lvalues. Exercise direct access and declared alias
 // bindings over an owning struct and a primitive element. HeapAudit below proves the alias views
 // do not become owners.
@@ -1084,6 +1228,8 @@ extern int main()
 
     total += 8;  passed += testPrimitives();
     total += 9;  passed += testAliasLvalueSemantics();
+    total += 16; passed += testAliasParameterBorrows();
+    total += 12; passed += testAliasParameterTempsDestruct();
     total += 7;  passed += testAliasLvalueAssignDropsOldOwner();
     total += 5;  passed += testValueCopySemantics();
     total += 2;  passed += testStringCopySemantics();

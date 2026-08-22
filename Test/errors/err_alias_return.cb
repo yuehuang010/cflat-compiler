@@ -55,3 +55,59 @@ extern int main()
 {
     return 0;
 }
+
+// A non-pointer `alias T` PARAMETER is passed as a pointer to the CALLER's object, and a
+// function-pointer type has no spelling for that - an indirect call would hand the callee
+// the value itself and it would read it as an address. Both doors are closed: a declared
+// `function<>`/`Lambda<>` binding, and a `function<>` parameter fed the name at a call.
+struct AliasParamRow { int value = default; };
+int aliasParamTaker(alias AliasParamRow r) { return r.value; }
+
+expect_error("cannot be used as a function pointer") {
+    void aliasParamFnBind()
+    {
+        function<int(AliasParamRow)> fp = aliasParamTaker;
+    }
+}
+
+expect_error("cannot be used as a function pointer") {
+    int aliasParamCallThru(function<int(AliasParamRow)> g, AliasParamRow r) { return g(r); }
+    int aliasParamFnArg()
+    {
+        AliasParamRow r;
+        return aliasParamCallThru(aliasParamTaker, r);
+    }
+}
+
+expect_error("cannot be used as a function pointer") {
+    function<int(AliasParamRow)> aliasParamFnReturn() { return aliasParamTaker; }
+}
+
+expect_error("cannot be used as a function pointer") {
+    struct AliasParamHolder { function<int(AliasParamRow)> f = nullptr; };
+    void aliasParamFnField()
+    {
+        AliasParamHolder h;
+        h.f = aliasParamTaker;
+    }
+}
+
+expect_error("cannot be used as a function pointer") {
+    void aliasParamLambdaBind()
+    {
+        Lambda<int(AliasParamRow)> lam = aliasParamTaker;
+    }
+}
+
+// ACCEPT-SET: the rejection is scoped to a BY-VALUE `alias` parameter. A plain by-value
+// parameter and an `alias T*` parameter both keep their existing representation, so both
+// still bind to a function pointer. These must compile.
+int plainParamTaker(AliasParamRow r)        { return r.value; }
+int aliasPtrParamTaker(alias AliasParamRow* r) { return r->value; }
+int aliasParamAcceptSet()
+{
+    function<int(AliasParamRow)>  a = plainParamTaker;
+    function<int(AliasParamRow*)> b = aliasPtrParamTaker;
+    AliasParamRow r;
+    return a(r) + b(&r);
+}

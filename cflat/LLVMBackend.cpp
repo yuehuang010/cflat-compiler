@@ -6305,9 +6305,10 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     {
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
-    // than silently reused (v6 includes the LSP core-variable replay state; v7 is the
-    // non-pointer `alias T` reference ABI, which changes how cached core code is called).
-    root["version"]   = 7;
+    // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
+    // `alias T` parameter reference ABI - such a parameter is now passed as a pointer to the
+    // caller's object, so cached v7 core bitcode has the wrong calling convention for it).
+    root["version"]   = 8;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -6698,7 +6699,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 7) return false;
+    if (!ver || *ver != 8) return false;   // v7 predates the `alias T` reference ABI (see writer)
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
 

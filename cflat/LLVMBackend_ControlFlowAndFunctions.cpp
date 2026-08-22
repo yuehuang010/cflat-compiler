@@ -1230,7 +1230,10 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
 
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
-            types.emplace_back(externC ? GetCCompatibleType(arg) : GetType(arg));
+            if (!externC && ParameterIsAliasByPointer(arg))
+                types.emplace_back(GetType(arg)->getPointerTo());
+            else
+                types.emplace_back(externC ? GetCCompatibleType(arg) : GetType(arg));
             if (!externC && ParameterCarriesRawArrayCount(arg))
                 types.emplace_back(builder->getInt64Ty());
         }
@@ -1249,6 +1252,17 @@ llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType
             && !returnType.IsArrayView)
             return valueType->getPointerTo();
         return valueType;
+}
+
+bool LLVMBackend::ParameterIsAliasByPointer(const TypeAndValue& param) const
+{
+        // `alias` on a POINTER/view/interface/closure param already names a borrow in its own
+        // representation; only the by-value shapes need the address to reach the caller's object.
+        if (!param.IsAlias || param.Pointer || param.IsArrayView || param.IsInterface
+            || param.IsFunctionPointer || param.IsMove)
+            return false;
+        auto* valueType = GetType(param);
+        return valueType != nullptr && !valueType->isVoidTy() && !valueType->isPointerTy();
 }
 
 std::string LLVMBackend::ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs)
