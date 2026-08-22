@@ -1760,6 +1760,47 @@ P2TernaryOwn p2TernaryMakeOwn()
 
 bool p2TernaryPick(int k) { return k > 0; }
 
+// -- p3: `return default;` is the same VALUE as `T x = default;`. It used to lower to a flat
+// zero of the return type, so every field initializer below was skipped on the return leg only.
+struct RdNest { int x = 7; int y = 8; };
+struct RdOuter { RdNest inner = default; int w = 9; };
+struct RdCtor { int a = 0; int b = 0; RdCtor() { a = 11; b = 12; } };
+struct RdBox<T> { T v = default; int tag = 6; };
+class RdCls { int a = 2; int b = 6; };
+namespace RdNs { struct RdQ { int a = 2; int b = 5; }; }
+int g_rd_own_dtor = 0;
+int g_rd_own_buffer = 0;
+struct RdOwn
+{
+    string s = "seedseed".copy();
+    int n = 3;
+    ~RdOwn() { g_rd_own_dtor++; if (s._ptr != nullptr) g_rd_own_buffer++; }
+};
+int g_rd_node_dtor = 0;
+class RdNode { int v = 4; ~RdNode() { g_rd_node_dtor++; } };
+struct RdHold { unique RdNode* n = new RdNode(); int k = 9; };
+
+P2Def   rdReturnDefault()        { return default; }
+RdOuter rdReturnNested()         { return default; }
+RdCtor  rdReturnCtor()           { return default; }
+RdBox<int> rdReturnBox()         { return default; }
+RdCls   rdReturnClass()          { return default; }
+RdNs.RdQ rdReturnNamespaced()    { return default; }
+P2DefOwn rdReturnStringField()   { return default; }
+RdOwn   rdReturnOwning()         { return default; }
+RdHold  rdReturnUnique()         { return default; }
+T       rdReturnGeneric<T>()     { return default; }
+int     rdReturnPrimitive()      { return default; }
+P2Def*  rdReturnPointer()        { return default; }
+struct RdFactory
+{
+    P2Def make() { return default; }
+};
+struct RdGenFactory<T>
+{
+    T make() { return default; }
+};
+
 int testDefaultAsExpression()
 {
     int passed = 0;
@@ -1918,6 +1959,81 @@ int testDefaultAsExpression()
     }
     passed += Test("default_ternary_owned_join_nested_dtor", g_p2_ternary_dtor, 1);
     passed += Test("default_ternary_owned_join_nested_buffer", g_p2_ternary_buffer_dtor, 0);
+
+    // -- p3: `return default;` runs the field initializers. Every leg below read 0 pre-fix
+    // (a flat zero of the return type) while its `= default` twin already read the initializer.
+    P2Def returned = rdReturnDefault();
+    passed += Test("default_return_field_a", returned.a, 5);
+    passed += Test("default_return_field_b", returned.b, 7);
+
+    RdOuter returnedNested = rdReturnNested();
+    passed += Test("default_return_nested_inner_x", returnedNested.inner.x, 7);
+    passed += Test("default_return_nested_inner_y", returnedNested.inner.y, 8);
+    passed += Test("default_return_nested_outer_w", returnedNested.w, 9);
+
+    // A user-written default ctor, not just field initializers: pre-fix its body never ran.
+    RdCtor returnedCtor = rdReturnCtor();
+    passed += Test("default_return_ctor_a", returnedCtor.a, 11);
+    passed += Test("default_return_ctor_b", returnedCtor.b, 12);
+
+    RdBox<int> returnedBox = rdReturnBox();
+    passed += Test("default_return_generic_tag", returnedBox.tag, 6);
+    passed += Test("default_return_generic_v", returnedBox.v, 0);
+
+    RdCls returnedClass = rdReturnClass();
+    passed += Test("default_return_class_a", returnedClass.a, 2);
+    passed += Test("default_return_class_b", returnedClass.b, 6);
+
+    RdNs.RdQ returnedNs = rdReturnNamespaced();
+    passed += Test("default_return_namespaced_a", returnedNs.a, 2);
+    passed += Test("default_return_namespaced_b", returnedNs.b, 5);
+
+    P2Def returnedGeneric = rdReturnGeneric<P2Def>();
+    passed += Test("default_return_generic_function_a", returnedGeneric.a, 5);
+    passed += Test("default_return_generic_function_b", returnedGeneric.b, 7);
+
+    RdFactory factory = default;
+    P2Def methodReturned = factory.make();
+    passed += Test("default_return_method_a", methodReturned.a, 5);
+    RdGenFactory<P2Def> genFactory = default;
+    P2Def genMethodReturned = genFactory.make();
+    passed += Test("default_return_generic_method_a", genMethodReturned.a, 5);
+
+    function<P2Def()> lambdaReturn = () => { return default; };
+    P2Def lambdaReturned = lambdaReturn();
+    passed += Test("default_return_lambda_a", lambdaReturned.a, 5);
+    passed += Test("default_return_lambda_b", lambdaReturned.b, 7);
+
+    // An owning string FIELD whose default allocates: the returned value must own the buffer,
+    // and it must be destructed exactly once (no early free, no leak, no double free).
+    P2DefOwn returnedStringField = rdReturnStringField();
+    passed += Test("default_return_string_field_len", returnedStringField.s.length(), 0);
+    passed += Test("default_return_string_field_scalar", returnedStringField.n, 3);
+
+    g_rd_own_dtor = 0;
+    g_rd_own_buffer = 0;
+    {
+        RdOwn returnedOwning = rdReturnOwning();
+        passed += Test("default_return_owning_string", returnedOwning.s.length(), 8);
+        passed += Test("default_return_owning_scalar", returnedOwning.n, 3);
+        passed += Test("default_return_owning_no_early_dtor", g_rd_own_dtor, 0);
+    }
+    passed += Test("default_return_owning_dtor", g_rd_own_dtor, 1);
+    passed += Test("default_return_owning_buffer", g_rd_own_buffer, 1);
+
+    // A unique-pointer field default: the returned struct owns the node and frees it once.
+    g_rd_node_dtor = 0;
+    {
+        RdHold returnedUnique = rdReturnUnique();
+        passed += Test("default_return_unique_scalar", returnedUnique.k, 9);
+        passed += Test("default_return_unique_value", returnedUnique.n->v, 4);
+        passed += Test("default_return_unique_no_early_dtor", g_rd_node_dtor, 0);
+    }
+    passed += Test("default_return_unique_dtor", g_rd_node_dtor, 1);
+
+    // Accept set: a primitive and a pointer return still default to zero / null.
+    passed += Test("default_return_primitive", rdReturnPrimitive(), 0);
+    passed += Test("default_return_pointer", rdReturnPointer() == nullptr, true);
 
     return passed;
 }
@@ -3134,7 +3250,7 @@ extern int main()
     r = testRawArrayRuntimeCount(); passed += r; total += 44;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
-    r = testDefaultAsExpression(); passed += r; total += 50;
+    r = testDefaultAsExpression(); passed += r; total += 82;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

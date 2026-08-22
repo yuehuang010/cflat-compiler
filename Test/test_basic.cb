@@ -1367,9 +1367,10 @@ bool testReturnDefaultStruct()
 {
     bool result = true;
     RdPoint pt = rdStruct();
-    // return default; zero-initializes - fields are 0, not declared defaults (10, 20)
-    result &= Test("rd_struct_x", pt.x, 0);
-    result &= Test("rd_struct_y", pt.y, 0);
+    // return default; is the same VALUE as `RdPoint p = default;` - the declared field
+    // initializers run (10, 20). It used to zero-fill the return type instead.
+    result &= Test("rd_struct_x", pt.x, 10);
+    result &= Test("rd_struct_y", pt.y, 20);
     return result;
 }
 
@@ -1392,8 +1393,8 @@ bool testReturnDefaultConditional()
     result &= Test("rd_cond_struct_y", p1.y, 8);
 
     RdPoint p2 = rdCondStruct(false);
-    result &= Test("rd_cond_struct_zero_x", p2.x, 0);
-    result &= Test("rd_cond_struct_zero_y", p2.y, 0);
+    result &= Test("rd_cond_struct_zero_x", p2.x, 10);
+    result &= Test("rd_cond_struct_zero_y", p2.y, 20);
     return result;
 }
 

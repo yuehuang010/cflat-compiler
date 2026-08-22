@@ -2879,9 +2879,12 @@ public:
 
     // The shared `return <expr>;` lowering, used by the return statement and by an
     // expression-body lambda (`=> expr`, which is `=> { return expr; }`).
+    // `defaultValue` is the `return default;` spelling: there is no expression node, so the
+    // operand is built by the shared default-value emitter under the return type.
     void EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                               CFlatParser::AssignmentExpressionContext* assignExpr,
-                              const std::string& retText);
+                              const std::string& retText,
+                              bool defaultValue = false);
 
     void ParseStatement(CFlatParser::StatementContext* statement);
 

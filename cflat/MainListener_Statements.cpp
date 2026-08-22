@@ -489,7 +489,8 @@ void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, cons
  */
 void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                                         CFlatParser::AssignmentExpressionContext* assignExpr,
-                                        const std::string& retText) {
+                                        const std::string& retText,
+                                        bool defaultValue) {
         auto* compiler = Compiler(errCtx);
         // Evaluate via NV path so we can inspect bond info alongside ownership.
         LLVMBackend::NamedVariable returnNV;
@@ -520,6 +521,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV);
         if (assignExpr != nullptr)
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
+        else if (defaultValue)
+        {
+            // `return default;` - the same emitter `T x = default;` and a `default` ternary arm
+            // use, so a struct runs its field initializers instead of being zero-filled.
+            LLVMBackend::DeclTypeAndValue dtv;
+            static_cast<LLVMBackend::TypeAndValue&>(dtv) = compiler->currentFunctionReturnTV;
+            returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+            returnNV.Primary = GenerateDefaultValue(dtv);
+        }
         returnExpectedScope.reset();
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
@@ -1621,10 +1631,20 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 straightLineReturned_ = true;
                 if (jump->Default() != nullptr)
                 {
-                    // return default; - zero-initialize the return type (null for pointers/interfaces, 0 for integers)
+                    // return default; - the declared return type's default VALUE, built by the
+                    // shared emitter so a struct runs its field initializers (see the `default`
+                    // primaryExpression). A void / 'auto' / untyped return has nothing to default
+                    // to, so it keeps the flat zero (or no value at all).
                     auto* retTy = compiler->currentFunction->getReturnType();
-                    auto* defaultVal = retTy->isVoidTy() ? nullptr : llvm::Constant::getNullValue(retTy);
-                    compiler->CreateReturnCall(defaultVal);
+                    const auto& retTV = compiler->currentFunctionReturnTV;
+                    bool typedReturn = !retTy->isVoidTy()
+                        && !compiler->IsAutoReturnCaptureActive()
+                        && !retTV.TypeName.empty() && retTV.TypeName != "auto";
+                    if (typedReturn)
+                        EmitReturnExpression(jump, nullptr, "", true);
+                    else
+                        compiler->CreateReturnCall(
+                            retTy->isVoidTy() ? nullptr : llvm::Constant::getNullValue(retTy));
                 }
                 else if (auto* blockBody = jump->compoundStatement())
                 {
@@ -1650,7 +1670,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             && !compiler->currentFunction->getReturnType()->isVoidTy())
                             LogErrorContext(jump, std::format(
                                 "cannot 'return' without a value from a function that returns "
-                                "'{}' - return a value, or 'return default;' for a zeroed one",
+                                "'{}' - return a value, or 'return default;' for the type's default value",
                                 CurrentReturnTypeSpelling(compiler)));
                         compiler->CreateReturnCall(nullptr);
                     }
