@@ -3264,6 +3264,22 @@ public:
         antlr4::ParserRuleContext* ctx);
 
     /*
+     * The local-reassignment twin of RejectFieldAllocAlignMismatch. A local whose OWN declared type
+     * carries `alignas(0, N)` promises every block it ever holds is N-aligned; the declaration path
+     * already verifies the initializer, but a later `local = rhs` re-derived the tracked alignment
+     * from the RHS with no check, so the clause became a lie. Gated on the DECLARED clause
+     * (TypeAndValue.AllocAlignValue), never the mutable tracked NamedVariable.AllocAlignment: a
+     * clause-free local records whatever the RHS carried and frees correctly, so it needs no
+     * diagnostic. Null stores and an over-aligned pointee TYPE are exempt for the field path's
+     * reasons. Returns true when an error was logged.
+     */
+    bool RejectLocalAllocAlignMismatch(
+        const LLVMBackend::NamedVariable& namedVar,
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx);
+
+    /*
      * Ownership bookkeeping for storing an owning pointer into a slot. Two mechanisms, exactly as
      * the `=` path has always applied them: a new-allocated local escaping to a NON-local slot
      * (struct field, heap object) gets a lazy refcount so both sides validly hold the pointer and

@@ -3,3 +3,38 @@ import "manifest.cb";
 expect_error("manifest initializer must be a compile-time literal") {
     manifest ManifestDoc appManifest = default;
 }
+
+// The ROOT <assemblyIdentity> is what Windows builds the process activation context from, so a
+// malformed one is rejected at the declaration rather than at process launch (Win32 14001).
+expect_error("empty 'publicKeyToken'") {
+    manifest ManifestDoc emptyTokenManifest = { assembly = {
+        assemblyIdentity = { type = "win32", name = "Test.App",
+            version = "1.0.0.0", publicKeyToken = "" }
+    } };
+}
+
+expect_error("is not a 16 hex digit token") {
+    manifest ManifestDoc shortTokenManifest = { assembly = {
+        assemblyIdentity = { type = "win32", name = "Test.App",
+            version = "1.0.0.0", publicKeyToken = "abc" }
+    } };
+}
+
+expect_error("which is not a four-part version") {
+    manifest ManifestDoc shortVersionManifest = { assembly = {
+        assemblyIdentity = { type = "win32", name = "Test.App", version = "1.0" }
+    } };
+}
+
+expect_error("The only type a desktop application manifest may declare") {
+    manifest ManifestDoc badTypeManifest = { assembly = {
+        assemblyIdentity = { type = "win64", name = "Test.App", version = "1.0.0.0" }
+    } };
+}
+
+expect_error("declares processorArchitecture") {
+    manifest ManifestDoc badArchManifest = { assembly = {
+        assemblyIdentity = { type = "win32", name = "Test.App",
+            version = "1.0.0.0", processorArchitecture = "x64" }
+    } };
+}

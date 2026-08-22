@@ -2463,6 +2463,86 @@ int runRawCountMoveReassign()
     return g_raw_count_dtors;
 }
 
+// Accept-set for the local `alignas(0, N)` reassignment guard: every shape below stays legal.
+int runLocalAlignAcceptSet()
+{
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* wide;
+        unique alignas(0, 64) RawCountElem* source = new RawCountElem[2] alignas(0, 64);
+        wide = move source;
+    }
+    {
+        // A plain `new` on the reassignment door inherits the local's declared clause.
+        unique alignas(0, 64) RawCountElem* values;
+        values = new RawCountElem[3];
+    }
+    {
+        unique alignas(0, 64) RawCountElem* values = new RawCountElem[1] alignas(0, 64);
+        values = nullptr;
+    }
+    return g_raw_count_dtors;
+}
+
+// A clause-FREE local records whatever the source carried and frees it through the matching
+// deallocator, so receiving an over-aligned block needs no diagnostic.
+int runLocalAlignPlainDestAccept()
+{
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
+        unique RawCountElem* plain = nullptr;
+        plain = move owner;
+    }
+    return g_raw_count_dtors;
+}
+
+// Regression for the false-rejection bug: the reassignment guard used to compare only the
+// source's TRACKED block alignment (NamedVariable.AllocAlignment), which is never established
+// for a plain (non-move) read of a parameter, global, or ternary-join arm - so a correctly
+// aligned source of any of those three shapes was rejected with an untrue "ordinary alignment"
+// diagnostic. The guard must also accept on the source's DECLARED 'alignas' clause, and must
+// fail open when neither the tracked field nor the declared clause carries any evidence.
+void runLocalAlignParamSink(alignas(0, 64) RawCountElem* src)
+{
+    alignas(0, 64) RawCountElem* p;
+    p = src;
+}
+int runLocalAlignParamAccept()
+{
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
+        runLocalAlignParamSink(owner);
+    }
+    return g_raw_count_dtors;
+}
+
+unique alignas(0, 64) RawCountElem* g_local_align_wide = default;
+int runLocalAlignGlobalAccept()
+{
+    resetRawCountState();
+    g_local_align_wide = new RawCountElem[2] alignas(0, 64);
+    {
+        alignas(0, 64) RawCountElem* p;
+        p = g_local_align_wide;
+    }
+    g_local_align_wide = nullptr;
+    return g_raw_count_dtors;
+}
+
+int runLocalAlignTernaryAccept(int choose)
+{
+    resetRawCountState();
+    {
+        unique alignas(0, 64) RawCountElem* a = new RawCountElem[2] alignas(0, 64);
+        unique alignas(0, 64) RawCountElem* b = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* p;
+        p = choose != 0 ? a : b;
+    }
+    return g_raw_count_dtors;
+}
+
 int testRawArrayRuntimeCount()
 {
     int passed = 0;
@@ -2666,6 +2746,16 @@ int testRawArrayRuntimeCount()
         runRawCountMoveAligned(2) * 10 + runRawCountMoveAligned(4), 24);
     passed += Test("raw count move parameter after reassignment",
         runRawCountMoveReassign(), 6);
+    passed += Test("local alignas reassignment accept-set",
+        runLocalAlignAcceptSet(), 6);
+    passed += Test("local alignas clause-free destination accepted",
+        runLocalAlignPlainDestAccept(), 2);
+    passed += Test("local alignas reassignment from a same-clause parameter",
+        runLocalAlignParamAccept(), 2);
+    passed += Test("local alignas reassignment from a same-clause global",
+        runLocalAlignGlobalAccept(), 1);
+    passed += Test("local alignas reassignment from a same-clause ternary join",
+        runLocalAlignTernaryAccept(1), 4);
 
     return passed;
 }
@@ -2712,7 +2802,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 39;
+    r = testRawArrayRuntimeCount(); passed += r; total += 44;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

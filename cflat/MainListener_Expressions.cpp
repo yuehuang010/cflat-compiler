@@ -3243,6 +3243,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && (llvm::isa_and_nonnull<llvm::AllocaInst>(namedVar.Storage)
                     || llvm::isa_and_nonnull<llvm::GlobalVariable>(namedVar.Storage)))
             {
+                // The declaration path verifies the initializer against the declared clause; this
+                // is the same check for the reassignment door, before the re-derive below.
+                RejectLocalAllocAlignMismatch(namedVar, rightNV, right, ctx);
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
                 bool rhsIsRawArray = (asgNewArr != nullptr
                     && asgNewArr->assignmentExpression() != nullptr)

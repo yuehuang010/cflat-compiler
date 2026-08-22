@@ -361,6 +361,124 @@ std::string LLVMBackend::GetSourceFileName() const
 std::string LLVMBackend::GetSourceFilePath() const
 { return currentSourceFilePath_; }
 
+/*
+ * The ROOT <assemblyIdentity> of a manifest is the one Windows uses to build the process
+ * activation context, and a malformed one fails at PROCESS LAUNCH with Win32 error 14001
+ * (ERROR_SXS_CANT_GEN_ACTCTX) - outside the compiler, naming no field. These checks are pure
+ * string shape over the folded XML, so they are decidable on any host and fire under --check.
+ * Nested (dependentAssembly) identities are deliberately not checked here: they name a foreign,
+ * signed assembly whose token vocabulary the compiler cannot enumerate.
+ */
+bool LLVMBackend::ValidateManifestIdentity(const std::string& xml, const std::string& sourceFile,
+                                           size_t line) const
+{
+    // Locate the root <assemblyIdentity>: the direct child of <assembly>, i.e. depth 1.
+    std::string rootTag;
+    int depth = 0;
+    for (size_t pos = 0; (pos = xml.find('<', pos)) != std::string::npos; )
+    {
+        size_t end = xml.find('>', pos);
+        if (end == std::string::npos) break;
+        std::string_view tag(xml.data() + pos, end - pos + 1);
+        pos = end + 1;
+        if (tag.size() < 3 || tag[1] == '?' || tag[1] == '!') continue;
+        if (tag[1] == '/') { --depth; continue; }
+        if (depth == 1 && tag.starts_with("<assemblyIdentity"))
+        {
+            rootTag.assign(tag);
+            break;
+        }
+        if (tag[tag.size() - 2] != '/') ++depth;
+    }
+    if (rootTag.empty()) return true;
+
+    auto attribute = [&rootTag](std::string_view name) -> std::optional<std::string> {
+        std::string needle = std::string(name) + "=\"";
+        size_t at = rootTag.find(needle);
+        if (at == std::string::npos || at == 0) return std::nullopt;
+        char before = rootTag[at - 1];
+        if (before != ' ') return std::nullopt;   // never match a suffix of a longer attribute
+        size_t start = at + needle.size();
+        size_t end = rootTag.find('"', start);
+        if (end == std::string::npos) return std::nullopt;
+        return rootTag.substr(start, end - start);
+    };
+    // LogError already stamps the manifest declaration's file/line, so the detail must not
+    // repeat it; sourceFile/line only back the fallback when there is no ambient location.
+    auto fail = [&](const std::string& detail) {
+        if (sourceFileName.empty())
+            LogError(std::format("manifest at {}:{}: {}",
+                                 sourceFile.empty() ? "<unknown>" : sourceFile, line, detail));
+        else
+            LogError("manifest: " + detail);
+        return false;
+    };
+
+    auto name = attribute("name");
+    if (name && name->empty())
+        return fail("the root <assemblyIdentity> has an empty 'name'. An assemblyIdentity must "
+                    "name the assembly, e.g. name = \"Contoso.MyApp\", or omit the identity "
+                    "entirely - a root identity is optional and most desktop apps do not need one.");
+
+    auto version = attribute("version");
+    if (version)
+    {
+        size_t parts = 1, digits = 0;
+        bool wellFormed = !version->empty();
+        for (char c : *version)
+        {
+            if (c == '.') { wellFormed = wellFormed && digits > 0; ++parts; digits = 0; }
+            else if (c >= '0' && c <= '9') ++digits;
+            else wellFormed = false;
+        }
+        if (!wellFormed || digits == 0 || parts != 4)
+            return fail(std::format(
+                "the root <assemblyIdentity> declares version = \"{}\", which is not a four-part "
+                "version. It must be four dot-separated decimal numbers, e.g. \"1.0.0.0\".",
+                *version));
+    }
+
+    auto token = attribute("publicKeyToken");
+    if (token && token->empty())
+        return fail("the root <assemblyIdentity> declares an empty 'publicKeyToken'. Windows "
+                    "cannot build an activation context from it and the program fails at launch "
+                    "with Win32 error 14001 (ERROR_SXS_CANT_GEN_ACTCTX), naming no field. Drop "
+                    "'publicKeyToken' from the ROOT identity - only a dependentAssembly needs one "
+                    "- or give the signing key's 16 hex digit token.");
+    if (token && !token->empty())
+    {
+        bool hex = token->size() == 16;
+        for (char c : *token)
+            hex = hex && ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'));
+        if (!hex)
+            return fail(std::format(
+                "the root <assemblyIdentity> declares publicKeyToken = \"{}\", which is not a "
+                "16 hex digit token. Give the signing key's token (e.g. \"6595b64144ccf1df\") or "
+                "drop 'publicKeyToken' from the root identity.", *token));
+    }
+
+    auto type = attribute("type");
+    if (type && !type->empty() && *type != "win32")
+        return fail(std::format(
+            "the root <assemblyIdentity> declares type = \"{}\". The only type a desktop "
+            "application manifest may declare is \"win32\".", *type));
+
+    auto arch = attribute("processorArchitecture");
+    if (arch && !arch->empty())
+    {
+        static constexpr std::string_view kArches[] = {
+            "*", "x86", "amd64", "ia64", "arm", "arm64", "msil" };
+        bool known = false;
+        for (auto candidate : kArches) known = known || *arch == candidate;
+        if (!known)
+            return fail(std::format(
+                "the root <assemblyIdentity> declares processorArchitecture = \"{}\". It must be "
+                "one of \"*\", \"x86\", \"amd64\", \"ia64\", \"arm\", \"arm64\", \"msil\".",
+                *arch));
+    }
+    return true;
+}
+
 void LLVMBackend::RecordManifestFragment(const std::string& sourceFile, size_t line,
                                          const std::string& xml,
                                          std::vector<ManifestFragment::Leaf> leaves)
@@ -368,6 +486,8 @@ void LLVMBackend::RecordManifestFragment(const std::string& sourceFile, size_t l
     for (const auto& fragment : manifestFragments_)
         if (fragment.Xml == xml)
             return;
+
+    if (!ValidateManifestIdentity(xml, sourceFile, line)) return;
 
     auto location = [](const ManifestFragment::Leaf& leaf) {
         return std::format("{}:{}", leaf.SourceFile, leaf.Line);

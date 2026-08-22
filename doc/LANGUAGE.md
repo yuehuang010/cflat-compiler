@@ -75,6 +75,7 @@
 - [`program` Keyword](#program-keyword)
 - [C Interop](#c-interop) ([full reference](C_INTEROP.md))
 - [WinMD / COM](#winmd--com) ([full reference](WINMD.md))
+- [Windows Application Manifest](#windows-application-manifest-manifest-declaration) (`manifest`)
 - [JSON](#json-libjsoncb)
 - [Debug Info](#debug-info)
 - [Compiler CLI](#compiler-cli) ([full reference](CLI.md))
@@ -2862,6 +2863,73 @@ CFlat can compile your own `.c` source, import another file's `main` as a progra
 ## WinMD / COM
 
 CFlat can author a COM/WinRT object with `[winrt] class` (it lowers to a thin-pointer COM object with the WinRT HRESULT ABI and `HResult<T>`), consume WinRT metadata with `import "Foo.winmd";`, and emit a `.winmd` with `--emit-winmd`. See [`WINMD.md`](WINMD.md) for the full reference.
+
+---
+
+## Windows Application Manifest (`manifest` declaration)
+
+A **file-scope `manifest` declaration** embeds a Win32 side-by-side application manifest directly into the emitted `.exe` as its `RT_MANIFEST` resource - no separate `app.manifest` file, no `mt.exe` step, no linker flag. It is the supported way to get **comctl32 v6 theming** and **per-monitor DPI awareness**.
+
+```cflat
+import "manifest.cb";
+
+manifest ManifestDoc appManifest = { assembly = {
+    dependency = { { dependentAssembly = { assemblyIdentity = {
+        type = "win32", name = Manifest.commonControlsName,
+        version = Manifest.commonControlsVersion, processorArchitecture = "*",
+        publicKeyToken = Manifest.commonControlsToken, language = "*"
+    } } } },
+    application = { settings2016 = {
+        dpiAwareness = DpiAwareness.PerMonitorV2, longPathAware = true
+    } }
+} };
+```
+
+That is the whole recipe most desktop apps want: the `dependency` block is comctl32 v6 (themed common controls), the `settings2016` block is PerMonitorV2 DPI. `core/ui_native/win32.cb` already declares exactly this, so an app built on `ui_native` inherits it and needs no `manifest` declaration of its own.
+
+### Rules
+
+- The declaration is **file scope only**, and its initializer must be a **compile-time literal** (a brace initializer over constants and enum values). No runtime expression can reach it - the XML is folded during compilation.
+- The type is `ManifestDoc` from `core/manifest.cb`, whose field names **map one-to-one onto manifest XML elements and attributes**; a nested struct is a child element, a `string`/`bool`/enum field is an attribute, and a `[JsonText]` field is element text. So the struct tree in `core/manifest.cb` *is* the schema reference.
+- A struct left entirely at `default` is **elided** from the XML, so you only pay for the blocks you fill in.
+- **Fragments merge.** Several declarations - typically yours plus a core library's - are combined into one document. Two fragments that give a *different* text for the same `[JsonText]` setting are a compile error naming both locations.
+
+### Field map (the blocks people actually use)
+
+| `ManifestDoc` path | Manifest XML | Use it for |
+|---|---|---|
+| `assembly.assemblyIdentity` | root `<assemblyIdentity>` | naming a **signed** assembly - optional, and see the warning below |
+| `assembly.dependency[].dependentAssembly.assemblyIdentity` | `<dependency><dependentAssembly><assemblyIdentity>` | comctl32 v6 themed controls |
+| `assembly.application.settings2005.dpiAware` | `<ws2005:dpiAware>` | legacy DPI opt-in (`"true/pm"`) |
+| `assembly.application.settings2016.dpiAwareness` | `<ws2016:dpiAwareness>` | `DpiAwareness.PerMonitorV2` |
+| `assembly.application.settings2016.longPathAware` | `<ws2016:longPathAware>` | paths past `MAX_PATH` |
+| `assembly.application.settings2019.activeCodePage` | `<ws2019:activeCodePage>` | `"UTF-8"` process code page |
+| `assembly.trustInfo.security.requestedPrivileges.requestedExecutionLevel.level` | `<requestedExecutionLevel level=...>` | UAC elevation (`ExecutionLevel.requireAdministrator`) |
+| `assembly.compatibility.application.supportedOS[].Id` | `<supportedOS Id=...>` | OS compatibility GUIDs (`Manifest.osWindows10`, ...) |
+
+The `Manifest` namespace in `core/manifest.cb` carries the constants you would otherwise transcribe: `commonControlsName` / `commonControlsVersion` / `commonControlsToken`, and the `osWindows*` GUIDs.
+
+### The root `assemblyIdentity` (and Win32 error 14001)
+
+**Most desktop applications should not declare a root `assemblyIdentity` at all.** It names a *signed, side-by-side* assembly, and Windows validates it when it builds the process activation context - at **launch**, long after the compiler is done. A malformed one produces an exe that refuses to start with Win32 error **14001** (`ERROR_SXS_CANT_GEN_ACTCTX`), naming no field.
+
+The compiler therefore checks the shape of the root identity **at the declaration**, on any host:
+
+- `publicKeyToken` must be omitted, or be a 16 hex digit token - an **empty** `publicKeyToken` is the classic 14001 cause and is rejected by name.
+- `version` must be four dot-separated decimal numbers (`"1.0.0.0"`).
+- `name` must be non-empty.
+- `type` must be `"win32"`.
+- `processorArchitecture` must be one of `*`, `x86`, `amd64`, `ia64`, `arm`, `arm64`, `msil`.
+
+A `dependentAssembly` identity is **not** checked this way - it names a foreign signed assembly whose token the compiler cannot verify. (`Manifest.commonControlsToken` is the correct one for comctl32.)
+
+### Inspecting the generated XML
+
+`--dump-manifest` writes the exact document that would be embedded as the resource, to a file or to stdout with `-`. It works with `--check`, and on any host:
+
+```bash
+cflat app.cb --check --dump-manifest -
+```
 
 ---
 

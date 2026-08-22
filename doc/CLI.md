@@ -224,6 +224,7 @@ Cache design and troubleshooting: [`doc/CACHING.md`](CACHING.md).
 
 | Switch | Value | Description |
 |--------|-------|-------------|
+| `--dump-manifest` | path or `-` | Write the merged Win32 application manifest XML - exactly what is embedded as the `RT_MANIFEST` resource - to a file, or to stdout with `-`. Works with `--check`, and on any host. See [the `manifest` declaration](LANGUAGE.md#windows-application-manifest-manifest-declaration). |
 | `--emit-winmd` | path | After compiling, write the program's `[winrt]` interfaces and classes to a `.winmd` file. |
 | `--dump-winmd` | path | Read a `.winmd` into the projection model and print it (diagnostic), then exit. |
 | `--winmd-instantiate` | path | Import a `.winmd` and instantiate well-known parameterized interfaces (`IVector<i32>`, `IReference<i32>`, ...), checking each derived PIID + vtable shape, then exit. |

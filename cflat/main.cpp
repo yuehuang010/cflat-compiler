@@ -181,6 +181,7 @@ int main(int argc, char* argv[])
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
+    args.addOption("dump-manifest", 0, "Write the merged Win32 manifest XML (exactly what is embedded as the RT_MANIFEST resource) to the given file, or to stdout with '-'. Works with --check");
     args.addOption("dump-winmd", 0, "Read a WinRT metadata file (.winmd) into the projection model and dump it (diagnostic), then exit");
     args.addOption("emit-winmd", 0, "After compiling, write this program's [winrt] interfaces and classes to the given .winmd file");
     args.addFlag("winmd-sig-selftest", 0, "Validate the WinRT parameterized-type signature encoder and PIID derivation against reference IIDs, then exit");

@@ -14,3 +14,35 @@ extern int main()
     m.data = new double[8] alignas(0, 32);
     return 0;
 }
+
+// The LOCAL twin of the same rule: a local whose own declared type carries `alignas(0, N)`
+// promises every block it holds is N-aligned, so a later reassignment must agree too.
+struct AlignElem { int id = default; };
+
+expect_error("alignment mismatch assigning to 'values'") {
+    void runLocalAlignFromOrdinary()
+    {
+        unique alignas(0, 64) AlignElem* values;
+        unique AlignElem* other = new AlignElem[2];
+        values = move other;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'wide'") {
+    void runLocalAlignDisagree()
+    {
+        unique alignas(0, 64) AlignElem* wide;
+        unique alignas(0, 32) AlignElem* narrow = new AlignElem[2] alignas(0, 32);
+        wide = move narrow;
+    }
+}
+
+// A plain (non-`move`) read of a same-shape source reaches the same door: the source's DECLARED
+// clause disagrees with the destination local's, so the assignment is rejected too.
+expect_error("alignment mismatch assigning to 'narrowSink'") {
+    void runLocalAlignFromParameter(alignas(0, 64) AlignElem* src)
+    {
+        alignas(0, 32) AlignElem* narrowSink;
+        narrowSink = src;
+    }
+}

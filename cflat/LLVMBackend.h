@@ -6834,6 +6834,10 @@ public:
     const std::vector<ManifestFragment>& GetManifestFragments() const;
     std::optional<std::string> MergeManifestFragments() const;
     bool ValidateManifestActivationContext(const std::string& xml) const;
+    // Host-independent shape check of the ROOT <assemblyIdentity> of one manifest fragment.
+    // Runs at declaration time so --check and expect_error see it on any platform.
+    bool ValidateManifestIdentity(const std::string& xml, const std::string& sourceFile,
+                                  size_t line) const;
     void RecordCompileTimeStringConstant(const std::string& name, const std::string& value);
     std::optional<std::string> GetCompileTimeStringConstant(const std::string& name) const;
 

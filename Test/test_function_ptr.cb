@@ -4233,6 +4233,43 @@ bool testNestedLambdaOwnContext()
     return result;
 }
 
+struct CallbackCtx
+{
+    list<int> seen = default;
+    int calls = default;
+};
+
+// Mimics a C enumeration API: a bare stdcall code address plus an opaque context slot.
+extern stdcall i32 cbCollectItem(void* handle, i64 context)
+{
+    CallbackCtx* ctx = (CallbackCtx*)context;
+    ctx.seen.add((int)(i64)handle);
+    ctx.calls = ctx.calls + 1;
+    return 1;
+}
+
+int cbEnumerate(i64 context)
+{
+    for (int i = 1; i <= 3; i++) cbCollectItem((void*)(i64)i, context);
+    return 0;
+}
+
+bool testCallbackContextSlot()
+{
+    bool result = true;
+    CallbackCtx ctx;
+    // `(i64)&ctx` is a BORROW: it must not consume ctx nor its owning `list<int>` member.
+    cbEnumerate((i64)&ctx);
+    result &= Test("cbctx_calls", ctx.calls, 3);
+    result &= Test("cbctx_count", ctx.seen.count(), 3);
+    result &= Test("cbctx_first", ctx.seen[0], 1);
+    result &= Test("cbctx_last", ctx.seen[2], 3);
+    // The context is still fully usable after the enumeration - no move happened.
+    ctx.seen.add(9);
+    result &= Test("cbctx_live_after", ctx.seen.count(), 4);
+    return result;
+}
+
 extern int main(int argc, char** argv)
 {
     // The tooling regression harness passes one argument and calls this twice. The second call
@@ -4400,6 +4437,12 @@ extern int main(int argc, char** argv)
     // An immediately-invoked lambda literal nested in another literal's body takes its return
     // type from its OWN call context, not from the enclosing literal (fix/q15).
     total++; passed += testNestedLambdaOwnContext()         ? 1 : 0;
+
+    // A `stdcall` callback cannot capture, so the sanctioned way to carry state is to round-trip
+    // the ADDRESS of a context struct through the API's integer context slot (Win32 `lParam`,
+    // `void* userdata`, ...). The cast out must borrow, not consume: the context stays live and
+    // owning members survive. Documented in doc/C_INTEROP.md.
+    total++; passed += testCallbackContextSlot()            ? 1 : 0;
 
     printf("Function pointer / lambda tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -2249,6 +2249,32 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
+    // --dump-manifest: emit the merged XML document that would be embedded as the RT_MANIFEST
+    // resource. Independent of the target OS, and runs under --check, so a bad identity is
+    // inspectable without a Windows launch.
+    if (auto dumpPath = args.getOption("dump-manifest"))
+    {
+        if (manifestFragments_.empty())
+            std::cout << "No manifest declaration in this program.\n";
+        else if (auto merged = MergeManifestFragments())
+        {
+            std::string document =
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + *merged + "\n";
+            if (dumpPath->empty() || *dumpPath == "-")
+                std::cout << document;
+            else
+            {
+                std::ofstream out(*dumpPath, std::ios::binary | std::ios::trunc);
+                out.write(document.data(), static_cast<std::streamsize>(document.size()));
+                if (!out)
+                {
+                    LogError(std::format("could not write manifest dump '{}'", *dumpPath));
+                    return false;
+                }
+            }
+        }
+    }
+
     if (isolatedPolicy_)
         if (auto manifestPath = args.getOption("isolated-manifest"))
         {

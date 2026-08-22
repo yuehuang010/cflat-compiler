@@ -112,6 +112,20 @@ extern int main()
 
 A source-location filter keeps only **functions / enum constants / macros** declared under the `--c-include` roots / the header's own directory, so the transitively-included SDK/CRT API surface is excluded. **Structs are an exception**: an in-scope struct often embeds a struct defined in a sibling SDK directory by value (e.g. `MSG` contains a `POINT`, which lives in the SDK `shared/` dir), so the compiler additionally registers the transitive by-value dependency closure of the in-scope structs. You therefore get `MSG`, `RECT`, `POINT`, `WNDCLASSEXA`, ... from `import "windows.h"` without hand-declaring them. **The Windows SDK `shared/` dir is another exception**: when the bound header sits in the SDK `um/` dir, the sibling `shared/` dir is treated as in-scope too (and vice versa), so the constants MSDN-style code reaches for immediately - `ERROR_SUCCESS` and the other `winerror.h` codes, `MAX_PATH`, HRESULTs like `E_FAIL` - fold without hand-transcribing. Variadics are supported. **Object-like `#define` constants are folded** and surfaced as bare globals (e.g. `WM_DESTROY`, `WS_OVERLAPPEDWINDOW`, `SW_SHOW` resolve to their numeric values), provided the macro body folds to an integer / float / string constant; a macro that does not fold to a constant (e.g. one that expands to a function name or token paste) is skipped. A folded integer macro keeps its **natural C type** (`((DWORD)-10)` registers as `u32`, not a width-guessed `i64`), so it passes to the corresponding API parameter without a cast, and a pseudo-handle cast macro (`HKEY_LOCAL_MACHINE`, `INVALID_HANDLE_VALUE`) folds to a `void*` constant. After a successful link, a sibling runtime DLL of each `--c-lib` is auto-copied next to the exe.
 
+#### Macros: object-like and function-like
+
+Both kinds come through, by two different mechanisms, and it is worth knowing which one you are getting.
+
+- **Object-like** `#define NAME <expr>` is *folded to a constant* by clang and surfaced as a bare global with its natural C type (the paragraph above). If the body does not fold to an integer / float / string / pointer constant - it expands to a type name, a function name, or a token paste - the macro is skipped and the name simply does not exist.
+- **Function-like** `#define NAME(a, b) <expr>` is *translated to a generic CFlat function*: `auto NAME<T0, T1>(T0 a, T1 b) { return (<expr>); }`. So `ListView_GetItemCount(list)`, `MAKEINTRESOURCE(id)` and the rest of the single-expression Win32 macro families are callable by name, with the argument types deduced at the call site, and there is no need to hand-transcribe them into raw `SendMessageW(...)` calls. Because the wrapper is a real function, the macro's arguments are evaluated exactly once - unlike in C, where a macro that names a parameter twice evaluates it twice.
+
+A function-like macro is translated only when its body is a **single expression over known names**. It is dropped when the body contains any of: `##` token pasting, `#` stringizing, a line comment, a statement or a `{ ... }` block, a `,` outside a call argument list (the comma operator), a string/char literal glue, a hex float, or an identifier that is neither a parameter, nor an already-registered C function being called, nor an already-registered constant or global. Dropped macros are silent by default; run with `-v` to see `reject macro <NAME>: body uses unsupported tokens` for each one, and a `function-like C macros: N translated, M rejected` tally per header. A macro whose name collides with an existing function or global is skipped rather than shadowing it (`-v` reports `name already defined`).
+
+Two gaps to be aware of:
+
+- A **bare alias** macro - `#define GetPerformanceInfo K32GetPerformanceInfo`, i.e. an object-like macro whose body is just the name of a known function - is neither folded (it is not a constant) nor translated (it is not function-like), so it does not come through. Call the underlying function by its real name.
+- Because a translated macro is a **generic function**, it participates in overload resolution rather than in preprocessing. A macro that is only ever meaningful in a `#if` or that expands to a declaration has no CFlat equivalent and is dropped.
+
 A C **function-pointer field** (e.g. `WNDPROC lpfnWndProc` in `WNDCLASSEXA`, or a slot in a COM `*Vtbl`) is registered as a **callable thin `function<...>`** carrying the field's real signature - a C callback slot is a single bare code address, the same 8 bytes a thin `function<T>` is, so the struct layout is unchanged. You can therefore **call straight through the field**: `obj->lpVtbl->Method(obj, ...)`. Storing a CFlat callback still works the familiar way - `wc.lpfnWndProc = (void*)WndProc;` - because a `void*` coerces into the thin slot; assigning the function by name (`wc.lpfnWndProc = WndProc;`) works too. See [Passing a CFlat function as a C callback](#passing-a-cflat-function-as-a-c-callback).
 
 A **pointer-to-struct field** whose pointee is a known (registered) record keeps its **typed pointer** rather than decaying to `void*`. Combined with the callable function-pointer slots above, this makes a Windows COM interface usable **straight from its header** with no hand-modeled vtable: `import "d3d12.h";` then drive `ID3D12Device` through `dev->lpVtbl->CreateCommandQueue(dev, ...)`. The dual-mode SDK headers expose the explicit `<Interface>Vtbl` struct (a struct of function pointers) and the `{ const <Interface>Vtbl* lpVtbl; }` object struct in their C path, which is exactly what cflat parses (headers are extracted as C). A pointer to an *unknown*/opaque pointee still falls back to `void*`.
@@ -238,6 +252,56 @@ A `Lambda<T>` value cannot implicitly become a C function pointer either; call `
 ```c
 stdcall i64 WndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam) { ... }
 ```
+
+### Carrying context through a callback's `lParam` / `userdata`
+
+A `stdcall` callback cannot capture, but almost every C callback API compensates with an
+opaque integer- or pointer-width **context slot** it hands back verbatim: `EnumWindows`'s
+`lParam`, `SetWindowLongPtr(GWLP_USERDATA)`, `EnumDisplayMonitors`, a timer or hook proc, the
+`void* userdata` of most portable C libraries. The sanctioned CFlat idiom is to round-trip the
+**address of a context struct** through that slot. This is the supported alternative to a
+file-scope global, and unlike a global it is re-entrant: two concurrent enumerations each carry
+their own context.
+
+```c
+import "hashset.cb";
+
+struct EnumCtx { hashset<u32> seen = default; int calls = default; };
+
+extern stdcall i32 onItem(void* handle, i64 lParam)
+{
+    EnumCtx* ctx = (EnumCtx*)lParam;         // borrow the caller's object back
+    ctx.seen.add((u32)(i64)handle);
+    ctx.calls = ctx.calls + 1;
+    return 1;                                 // keep enumerating
+}
+
+extern int main()
+{
+    EnumCtx ctx;
+    EnumWindows(onItem, (i64)&ctx);           // hand out the address, do NOT transfer ownership
+    return ctx.calls;                         // ctx is still fully usable here
+}
+```
+
+Three things make this legal and safe:
+
+- **`(i64)&ctx` does not consume `ctx`.** Taking the address of a local is a borrow; the
+  ownership analysis does not treat the cast as a move, so the local is still live - and still
+  destroyed exactly once at scope exit - after the call. A context struct may therefore hold
+  owning members (the `hashset<u32>` above) and they are freed normally.
+- **The cast back inside the callback borrows.** `(EnumCtx*)lParam` yields a plain, non-owning
+  `EnumCtx*`. It must not be `delete`d and must not be stored into a `unique` slot.
+- **The lifetime contract is yours, not the compiler's.** The caller guarantees the context
+  outlives the enumeration. That is the same contract a C or C++ caller works under; the
+  compiler cannot prove it through an integer slot and does not try. Keep the context in a scope
+  that plainly encloses the call - a local of the enclosing function, as above - and never hand
+  out the address of a local that returns before the callback can fire (an async or
+  timer/hook callback outliving its frame is the one shape to watch).
+
+There is deliberately **no core helper** wrapping this. A generic `f<T>(alias T v) { return (i64)&v; }`
+would look tidier but is unsound - it yields the address of the parameter binding, not of the
+caller's object - so write the `(i64)&ctx` / `(T*)slot` pair directly, where it is visible.
 
 ## Binding via vcpkg (`import package-vcpkg`)
 

@@ -5745,6 +5745,56 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         return true;
     }
 
+bool MainListener::RejectLocalAllocAlignMismatch(
+        const LLVMBackend::NamedVariable& namedVar,
+        const LLVMBackend::NamedVariable& rightNV,
+        llvm::Value* right,
+        antlr4::ParserRuleContext* ctx) {
+        uint64_t localAlign = namedVar.TypeAndValue.AllocAlignValue;
+        if (localAlign <= LLVMBackend::kDefaultNewAlign) return false;
+        if (localAlign == rightNV.AllocAlignment) return false;
+        // The tracked block alignment (AllocAlignment) is only ever populated by a `new` /
+        // `move` / reassignment that ran through the alignment channel - a plain read of a
+        // parameter, global, or ternary-join arm never touches it and leaves it at 0 even when
+        // the source's own DECLARED type carries a matching 'alignas' clause. Accept on that
+        // declared clause too, so a correctly-aligned parameter/global source is not rejected
+        // just because its tracked field was never (re)established.
+        if (localAlign == rightNV.TypeAndValue.AllocAlignValue) return false;
+        // A null store carries no block, and an over-aligned pointee TYPE routes both `new` and
+        // `delete` off the static type, so neither can reach a mismatched free site.
+        if (right == nullptr || llvm::isa<llvm::ConstantPointerNull>(right)) return false;
+        if (!right->getType()->isPointerTy()) return false;
+        if (ElementTypeIsOverAligned(namedVar.TypeAndValue)) return false;
+        // Fire only on POSITIVE provenance: the RHS must actually be known to carry a different
+        // block alignment - a tracked over-aligned block, a declared 'alignas' clause (already
+        // proven different above), or a raw allocation whose ordinary (0) alignment is itself
+        // known (e.g. `new T[n]` with no clause, moved into a clause-bearing local). A bare
+        // named-variable read whose tracked field was simply never established (the ternary-join
+        // arms above, or any other untracked source) fails open - the same as master, which has
+        // no data to disagree with.
+        bool rhsAlignKnown = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
+            || rightNV.TypeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+            || rightNV.AllocatedByRawNewArray;
+        if (!rhsAlignKnown) return false;
+
+        const std::string& name = namedVar.CallerName;
+        if (rightNV.AllocAlignment <= LLVMBackend::kDefaultNewAlign)
+            LogErrorContext(ctx, std::format(
+                "alignment mismatch assigning to '{}': the local is declared 'alignas(0, {})' but the "
+                "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
+                "Allocate it with 'new T[n] alignas(0, {})', or declare the source 'alignas(0, {})' so "
+                "its 'new' inherits the alignment, or over-align the pointee TYPE instead "
+                "('struct alignas({}) T {{ ... }};') and drop the local's clause.",
+                name, localAlign, localAlign, localAlign, localAlign));
+        else
+            LogErrorContext(ctx, std::format(
+                "alignment mismatch assigning to '{}': the local is declared 'alignas(0, {})' but the "
+                "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
+                "the correct alignment.",
+                name, localAlign, rightNV.AllocAlignment));
+        return true;
+    }
+
 void MainListener::TransferPointerOwnershipOnStore(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* destination,
