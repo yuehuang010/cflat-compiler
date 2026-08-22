@@ -52,7 +52,9 @@
 
 // ---- Definitions moved out of LLVMBackend.h (VariablesAndIR) ----
 
-llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal, uint64_t userAlign, bool externalDecl)
+llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue,
+                                                        bool threadLocal, uint64_t userAlign,
+                                                        bool externalDecl, bool srcIsUnsigned)
 {
         // A file-scope global never passes through CreateLocalVariable.
         if (!typeValue.Pointer)
@@ -66,17 +68,18 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 // the int path below asks a non-integer type for its bit width.
                 if (destinationType->isFloatingPointTy())
                 {
-                    initValue = llvm::ConstantFP::get(destinationType,
-                        (double)intValue->getSExtValue());
+                    double converted = srcIsUnsigned
+                        ? static_cast<double>(intValue->getZExtValue())
+                        : static_cast<double>(intValue->getSExtValue());
+                    initValue = llvm::ConstantFP::get(destinationType, converted);
                 }
                 else if (destinationType->isIntegerTy()
                     && intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
                 {
-                    // Sign-extend, not zero-extend: a negative literal (e.g. the unary-minus
-                    // fold that narrows -150 to i16) must widen via its signed value or the
-                    // sign bit is lost and the constant reads back as a large positive number.
+                    uint64_t converted = srcIsUnsigned
+                        ? intValue->getZExtValue() : intValue->getSExtValue();
                     initValue = builder->getIntN(destinationType->getIntegerBitWidth(),
-                        (uint64_t)intValue->getSExtValue());
+                        converted);
                 }
             }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
@@ -636,8 +639,14 @@ llvm::Value* LLVMBackend::Upconvert(llvm::Value* value, llvm::Type* destType, bo
         {
             // Integer literal initializer for a float/double field (e.g. float x = 0)
             if (auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(value))
-                return llvm::ConstantFP::get(destType, (double)(int64_t)constInt->getZExtValue());
-            return builder->CreateSIToFP(value, destType);
+            {
+                double converted = srcIsUnsigned
+                    ? static_cast<double>(constInt->getZExtValue())
+                    : static_cast<double>(constInt->getSExtValue());
+                return llvm::ConstantFP::get(destType, converted);
+            }
+            return srcIsUnsigned ? builder->CreateUIToFP(value, destType)
+                                 : builder->CreateSIToFP(value, destType);
         }
         else if (srcType->isIntegerTy() && destType->isPointerTy())
         {
@@ -812,7 +821,8 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // Integer -> Float
         if (srcType->isIntegerTy() && destType->isFloatingPointTy())
         {
-            return builder->CreateSIToFP(value, destType);
+            return isSigned ? builder->CreateSIToFP(value, destType)
+                            : builder->CreateUIToFP(value, destType);
         }
 
         // Float -> Integer
@@ -1297,7 +1307,15 @@ llvm::Value* LLVMBackend::CreateConstant(ConstantVariant constantVariant)
         {
             value = builder->getInt8(*v);
         }
+        else if (auto* v = std::get_if<unsigned char>(&constantVariant))
+        {
+            value = builder->getInt8(*v);
+        }
         else if (auto* v = std::get_if<short>(&constantVariant))
+        {
+            value = builder->getInt16(*v);
+        }
+        else if (auto* v = std::get_if<unsigned short>(&constantVariant))
         {
             value = builder->getInt16(*v);
         }
@@ -1305,7 +1323,15 @@ llvm::Value* LLVMBackend::CreateConstant(ConstantVariant constantVariant)
         {
             value = builder->getInt32(*v);
         }
+        else if (auto* v = std::get_if<unsigned int>(&constantVariant))
+        {
+            value = builder->getInt32(*v);
+        }
         else if (auto* v = std::get_if<int64_t>(&constantVariant))
+        {
+            value = builder->getInt64(*v);
+        }
+        else if (auto* v = std::get_if<uint64_t>(&constantVariant))
         {
             value = builder->getInt64(*v);
         }
@@ -1881,10 +1907,21 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             right = PromoteToInt(right, rightIsUnsigned);
         }
 
+        // C usual arithmetic conversions pick the result signedness from the operand widths:
+        // a wider signed type covers the unsigned range, so `(i64)-1 < 1u` stays a signed compare.
+        unsigned leftBits  = left->getType()->isIntegerTy()  ? left->getType()->getIntegerBitWidth()  : 0;
+        unsigned rightBits = right->getType()->isIntegerTy() ? right->getType()->getIntegerBitWidth() : 0;
+
         left  = Upconvert(left,  right, leftIsUnsigned);
         right = Upconvert(right, left,  rightIsUnsigned);
 
-        bool anyUnsigned = leftIsUnsigned || rightIsUnsigned;
+        bool resultIsUnsigned;
+        if (leftIsUnsigned == rightIsUnsigned)
+            resultIsUnsigned = leftIsUnsigned;
+        else if (leftIsUnsigned)
+            resultIsUnsigned = leftBits >= rightBits;
+        else
+            resultIsUnsigned = rightBits >= leftBits;
 
         if (left->getType()->isFloatingPointTy() || right->getType()->isFloatingPointTy())
             return CreateOperation(op, left, right);
@@ -1893,20 +1930,22 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
         {
         case Operation::DivideAssignment:
         case Operation::Divide:
-            return anyUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+            return resultIsUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
         case Operation::Modulo:
-            return anyUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
+            return resultIsUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
         case Operation::Greater:
-            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_UGT : llvm::ICmpInst::ICMP_SGT, left, right);
+            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGT : llvm::ICmpInst::ICMP_SGT, left, right);
         case Operation::GreaterEqual:
-            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_UGE : llvm::ICmpInst::ICMP_SGE, left, right);
+            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_UGE : llvm::ICmpInst::ICMP_SGE, left, right);
         case Operation::Less:
-            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
+            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULT : llvm::ICmpInst::ICMP_SLT, left, right);
         case Operation::LessEqual:
-            return builder->CreateICmp(anyUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
+            return builder->CreateICmp(resultIsUnsigned ? llvm::ICmpInst::ICMP_ULE : llvm::ICmpInst::ICMP_SLE, left, right);
         case Operation::ShiftRight:
         case Operation::RightShiftAssignment:
-            return anyUnsigned ? builder->CreateLShr(left, right) : builder->CreateAShr(left, right);
+            // Shifts are NOT a usual-arithmetic-conversion op: the result type and signedness
+            // come from the LEFT operand alone, so `(i32)-8 >> 1u` stays an arithmetic shift.
+            return leftIsUnsigned ? builder->CreateLShr(left, right) : builder->CreateAShr(left, right);
         default:
             return CreateOperation(op, left, right);
         }

@@ -4282,7 +4282,8 @@ public:
     llvm::Value* ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
-        CFlatParser::AssignmentExpressionContext* ae);
+        CFlatParser::AssignmentExpressionContext* ae,
+        bool* srcIsUnsigned = nullptr);
 
     /*
      * The brace-list spelling of a field default (`Inner i = { x = 1 };` and the bare
@@ -5013,6 +5014,8 @@ public:
     std::vector<LLVMBackend::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList);
 
     LLVMBackend::ConstantVariant ParseNumberConstant(std::string rawNumber);
+
+    LLVMBackend::TypeAndValue ParseLiteralTypeAndValue(const std::string& rawNumber);
 
     void LogErrorContext(antlr4::tree::TerminalNode* ctx, std::string errorMessage);
 

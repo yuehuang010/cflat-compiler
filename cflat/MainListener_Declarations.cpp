@@ -4422,7 +4422,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     }
 
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,
-                        typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly);
+                        typeAndValue.threadLocal, typeAndValue.UserAlignValue, externDeclOnly,
+                        srcIsUnsigned);
                     if (pendingGlobalDefaultConstruction && !externDeclOnly)
                         pendingGlobalDefaultConstructions_.push_back({global, typeAndValue, direct});
                     if (!externDeclOnly && DeclSpecHasConst(declSpec)

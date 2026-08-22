@@ -449,6 +449,14 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
             index + 1, index + 1, shown, advice));
     }
 
+// Argument signedness for an indirect call: a u32 literal/expression must zero-extend
+// into a wider parameter, exactly as the direct-call path does.
+static bool IndirectArgIsUnsigned(const std::vector<LLVMBackend::NamedVariable>* argNVs, size_t i)
+{
+        return argNVs != nullptr && i < argNVs->size()
+            && (*argNVs)[i].TypeAndValue.IsUnsignedInteger() != -1;
+    }
+
 llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                              std::vector<llvm::Value*> args,
                                              const std::vector<NamedVariable>* argNVs)
@@ -485,7 +493,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                     args[i] = WrapStringLiteralAsString(args[i]);
                 else
-                    args[i] = Upconvert(args[i], destTy);
+                    args[i] = Upconvert(args[i], destTy, IndirectArgIsUnsigned(argNVs, i));
                 CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
                 abiArgs.push_back(args[i]);
                 TypeAndValue pTV;
@@ -557,7 +565,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             if (strTy && destTy == strTy && args[i]->getType()->isPointerTy())
                 args[i] = WrapStringLiteralAsString(args[i]);
             else
-                args[i] = Upconvert(args[i], destTy);
+                args[i] = Upconvert(args[i], destTy, IndirectArgIsUnsigned(argNVs, i));
             CheckIndirectCallArgShape(args[i], destTy, i, funcPtrType.FuncPtrParams[i].TypeName);
             userArgs.push_back(args[i]);
             TypeAndValue pTV;

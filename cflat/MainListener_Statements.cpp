@@ -1379,7 +1379,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 rawCountOut);
         }
 
-        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName);
+        compiler->CreateReturnCall(right, retStorage, interfaceReturnStructName,
+                                   returnNV.TypeAndValue.IsUnsignedInteger() != -1);
     }
 
 void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {

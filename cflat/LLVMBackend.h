@@ -1428,7 +1428,8 @@ public:
         std::vector<TypeAndValue> Parameters; // excludes the implicit 'this' pointer
     };
 
-    using ConstantVariant = std::variant<bool, char, short, int, int64_t, float, double>;
+    using ConstantVariant = std::variant<bool, char, unsigned char, short, unsigned short,
+                                         int, unsigned int, int64_t, uint64_t, float, double>;
 
     struct ReturnBlockEntry
     {
@@ -5352,7 +5353,9 @@ public:
 
     llvm::Function* SynthesizeReflectFunction(const std::string& structName);
 
-    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue, bool threadLocal = false, uint64_t userAlign = 0, bool externalDecl = false);
+    llvm::GlobalVariable* CreateGlobalVariable(TypeAndValue typeValue, llvm::Constant* initValue,
+                                               bool threadLocal = false, uint64_t userAlign = 0,
+                                               bool externalDecl = false, bool srcIsUnsigned = false);
 
     // Emit alloca in the function entry block - loop-body allocas would grow the stack unboundedly.
     // VLAs (non-null arraySize) must stay at the current point (dynamic size).
@@ -6733,7 +6736,9 @@ public:
     // returned (the return expression's NamedVariable.Storage). It lets the struct-return
     // move detection below work even when the by-value return is materialized field-wise
     // (insertvalue) rather than as a single `load %Struct`, which dyn_cast<LoadInst> misses.
-    void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr, const std::string& interfaceReturnStructName = "");
+    void CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage = nullptr,
+                          const std::string& interfaceReturnStructName = "",
+                          bool srcIsUnsigned = false);
 
     void BeginAutoReturnCapture();
     std::vector<AutoReturnSite> EndAutoReturnCapture();

@@ -2160,7 +2160,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     auto elemTV = namedVar.TypeAndValue;
                     elemTV.ElemPointer ? (elemTV.ElemPointer = false) : (elemTV.Pointer = false, elemTV.IsInterfacePointer = false);
                     auto* et = compiler->GetType(elemTV);
-                    auto* idx = compiler->Upconvert(right, compiler->builder->getInt64Ty());
+                    // Pointer arithmetic offset: a u32 operand widens unsigned, so `p += 4294967295u`
+                    // steps forward rather than back one element.
+                    auto* idx = compiler->Upconvert(right, compiler->builder->getInt64Ty(), rhsUnsigned);
                     if (operatorText == "-=")
                         idx = compiler->builder->CreateNeg(idx, "neg");
                     right = compiler->CreateGEP(et, left, idx, "ptrarith");
@@ -4223,7 +4225,8 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
                 auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value,
+                                                     lv.isUnsigned, rv.isUnsigned);
             }
             return { acc, lv.isUnsigned };
         }
@@ -4245,7 +4248,8 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
                 auto rv = ParseAndExpression(andCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value,
+                                                     lv.isUnsigned, rv.isUnsigned);
             }
             return { acc, lv.isUnsigned };
         }
@@ -4267,7 +4271,8 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 auto rv = ParseEqualityExpression(nextCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value);
+                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value,
+                                                     lv.isUnsigned, rv.isUnsigned);
             }
             return { acc, lv.isUnsigned };
         }
@@ -6765,9 +6770,13 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 }
                 else
                 {
-                    // Fold negation of integer constants into the smallest fitting type.
-                    // e.g. 32768 is i32, but -32768 fits in i16 (INT16_MIN).
-                    if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
+                    // Fold negation of signed integer constants into the smallest fitting type
+                    // (-32768 fits i16); an unsigned operand instead wraps at its own width (-5u).
+                    if (namedVar.TypeAndValue.IsUnsignedInteger() != -1)
+                    {
+                        namedVar.Primary = compiler->CreateNeg(newValue);
+                    }
+                    else if (auto* ci = llvm::dyn_cast<llvm::ConstantInt>(newValue))
                     {
                         int64_t neg = -(int64_t)ci->getSExtValue();
                         if (neg >= std::numeric_limits<int8_t>::min() && neg <= std::numeric_limits<int8_t>::max())
@@ -7287,12 +7296,24 @@ bool MainListener::EmitOneFieldInit(
                     std::format("'{}.{}'", compiler->DisplayNameOfMangledType(typeName), fieldName));
         }
 
+        // Numeric field brace-init: widen the source to the field's own type. A raw store of a
+        // narrower integer would leave the rest of a wider field holding stale bytes.
+        bool rightIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
+        if (val != nullptr && val->getType()->isIntegerTy() && !val->getType()->isIntegerTy(1)
+            && !fieldType.Pointer && fieldType.ConstArraySize == 0)
+        {
+            auto* fieldLLVMType = compiler->GetType(fieldType);
+            if (fieldLLVMType != nullptr && fieldLLVMType != val->getType()
+                && (fieldLLVMType->isIntegerTy() || fieldLLVMType->isFloatingPointTy()))
+                val = compiler->Upconvert(val, fieldLLVMType, rightIsUnsigned);
+        }
+
         llvm::Value* destination = nullptr;
         if (sd.IsUnion)
         {
             // Union: all fields alias at offset 0. Store through the raw pointer with the explicit field type.
             auto* fieldLLVMType = compiler->GetType(fieldType);
-            compiler->CreateAssignment(val, structPtr, false, fieldLLVMType);
+            compiler->CreateAssignment(val, structPtr, rightIsUnsigned, fieldLLVMType);
             destination = structPtr;
         }
         else
@@ -7409,10 +7430,13 @@ std::string MainListener::CodeValueCastAdvice(const LLVMBackend::TypeAndValue& d
 llvm::Value* MainListener::ParseFieldDefaultInitializer(
         const std::string& structName,
         const LLVMBackend::TypeAndValue& field,
-        CFlatParser::AssignmentExpressionContext* ae) {
+        CFlatParser::AssignmentExpressionContext* ae,
+        bool* srcIsUnsigned) {
         auto* compiler = Compiler(ae);
         auto nv = ParseAssignmentExpressionNamed(ae);
         llvm::Value* val = LoadNamedVariable(nv);
+        if (srcIsUnsigned != nullptr)
+            *srcIsUnsigned = nv.TypeAndValue.IsUnsignedInteger() != -1;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
             std::format("field '{}.{}' of", structName, field.VariableName));
         // Aggregate field defaults use a shared path instead of the ordinary declaration upcast.
@@ -8071,7 +8095,8 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 ? elementPtrs[i]
                 : compiler->builder->CreateInBoundsGEP(arrTy, arrAlloc, { zero, idx }, "arrelem");
             ConsumeOwningBraceElementSource(nv, val, elemPtr, fixedElemTV, tv.TypeName, fi);
-            compiler->CreateAssignment(val, elemPtr, false, elemTy);
+            compiler->CreateAssignment(val, elemPtr,
+                nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy);
         }
     }
 
@@ -8676,7 +8701,8 @@ void MainListener::EmitArrayViewInferredInit(
 
             llvm::Value* idx = compiler->builder->getInt32((uint32_t)i);
             auto* elemPtr = compiler->builder->CreateInBoundsGEP(arrTy, backing, { zero, idx }, "arrview_elem");
-            compiler->CreateAssignment(val, elemPtr, false, elemTy);
+            compiler->CreateAssignment(val, elemPtr,
+                nv.TypeAndValue.IsUnsignedInteger() != -1, elemTy);
         }
 
         // Create the T* local and point it at element 0 of the backing array.

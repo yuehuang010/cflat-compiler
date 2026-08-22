@@ -146,6 +146,12 @@ bool operator!=(PtrNode* a, PtrKey b) { return a->v != b.v; }
 
 import "test_helper.cb";
 
+// Unsigned-literal regression support: field defaults, a global, and an indirect callee.
+struct UDefaults { u64 wide = 4294967295u; double asDouble = 4294967295u; };
+UDefaults g_unsignedDefaults = default;
+u64[2] g_unsignedArray = {4294967295u, 1u};
+u64 WidenUnsigned(u64 value) { return value; }
+
 // Records that it ran, so a ternary arm that must NOT execute can be detected.
 int g_sideEffects = 0;
 int bumpSideEffect(int amount) { g_sideEffects = g_sideEffects + amount; return amount; }
@@ -437,5 +443,62 @@ extern int main()
     uPassed += Test("u64 operator+ result divides unsigned",  (ub + 0) / 2 == (u64)4611686018427387904, true);
     uPassed += Test("u64 operator* result compares unsigned", (ub * 1) > 1000, true);
 
-    return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3) ? 0 : 1;
+    // Unsigned literals keep their zero-extension and unsigned integer-to-double conversion.
+    int unsignedLiteralPassed = 0;
+    u64 literalMaskValue = 4294967296u;
+    unsignedLiteralPassed += Test("u32 literal widens without sign extension",
+        (literalMaskValue & 4294967295u) == 0, true);
+    unsignedLiteralPassed += Test("u64 max unsigned-to-double",
+        (double)18446744073709551615u > 1.8e19, true);
+
+    // Aggregate initializers must carry the source's unsignedness into the widening store.
+    u64[1] braceArray = {4294967295u};
+    unsignedLiteralPassed += Test("fixed-array brace element zero-extends",
+        braceArray[0] == (u64)4294967295, true);
+    UDefaults defaulted = default;
+    unsignedLiteralPassed += Test("struct field default zero-extends",
+        defaulted.wide == (u64)4294967295, true);
+    UDefaults named = {wide = 4294967295u};
+    unsignedLiteralPassed += Test("named brace field zero-extends",
+        named.wide == (u64)4294967295, true);
+    unsignedLiteralPassed += Test("global field default zero-extends",
+        g_unsignedDefaults.wide == (u64)4294967295, true);
+
+    // Indirect calls widen arguments with the argument's own signedness.
+    function<u64(u64)> widenFn = WidenUnsigned;
+    unsignedLiteralPassed += Test("function-pointer argument zero-extends",
+        widenFn(4294967295u) == (u64)4294967295, true);
+
+    // Unary minus on an unsigned literal wraps modulo the literal's own width (C semantics),
+    // so it must NOT be folded down into a narrower signed type.
+    u64 negatedUnsigned = -5u;
+    unsignedLiteralPassed += Test("unary minus on u32 literal wraps modulo 2^32",
+        negatedUnsigned == (u64)4294967291, true);
+
+    // ACCEPT-SET (these already hold before the unsigned-literal fix; they are anti-regression
+    // guards that the new unsignedness plumbing must not flip).
+    int unsignedAcceptPassed = 0;
+    u32 variableValue = 4294967295u;
+    u64 variableWidened = variableValue;
+    unsignedAcceptPassed += Test("u32 variable widening remains unsigned",
+        variableWidened == (u64)4294967295, true);
+    i32 negativeShifted = -8;
+    unsignedAcceptPassed += Test("signed >> unsigned stays an arithmetic shift",
+        (negativeShifted >> 1u) == -4, true);
+    i64 negativeWide = -1;
+    unsignedAcceptPassed += Test("wider signed vs narrower unsigned compares signed",
+        negativeWide < 1u, true);
+    unsignedAcceptPassed += Test("global array brace element already zero-extended",
+        g_unsignedArray[0] == (u64)4294967295, true);
+    unsignedAcceptPassed += Test("u32 vs signed zero compares unsigned",
+        variableValue > 0, true);
+    unsignedAcceptPassed += Test("unsigned field default to double stays positive",
+        defaulted.asDouble > 4.0e9, true);
+    u8[400] indexedBytes = default;
+    indexedBytes[300u] = 7;
+    unsignedAcceptPassed += Test("array index above 255u addresses the right slot",
+        (int)indexedBytes[300u], 7);
+
+    return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
+        && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7) ? 0 : 1;
 }

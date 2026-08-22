@@ -250,6 +250,8 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
                 long long sval = -static_cast<long long>(uval);
                 return static_cast<int64_t>(sval);
             }
+            if (hasU)
+                return static_cast<uint64_t>(uval);
             else
             {
                 return static_cast<int64_t>(uval);
@@ -271,12 +273,10 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
 
         if (hasU)
         {
-            if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
-                return static_cast<int>(uval);
-            // u suffix on hex/value fitting in u32: reinterpret bits as i32 (same bit pattern).
+            // A plain u suffix is a u32 literal, even when its value fits in signed int.
             if (uval <= 0xFFFFFFFFull)
-                return static_cast<int>(static_cast<uint32_t>(uval));
-            return static_cast<int64_t>(uval);
+                return static_cast<unsigned int>(static_cast<uint32_t>(uval));
+            return static_cast<uint64_t>(uval);
         }
 
         if (uval <= static_cast<unsigned long long>(std::numeric_limits<int8_t>::max()))
@@ -285,12 +285,25 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             return static_cast<short>(uval);
         if (uval <= static_cast<unsigned long long>(std::numeric_limits<int>::max()))
             return static_cast<int>(uval);
-        // C++ rule: hex literals that exceed i32 positive range but fit in u32 are typed as
-        // unsigned int. Since ConstantVariant has no uint32_t, reinterpret bits as i32.
-        // This preserves the bit pattern: 0xBA63E001 -> i32(-1168474111) with correct bits.
+        // C++ rule: a hex literal past i32 range but inside u32 is unsigned; with no 'u' suffix
+        // it stays i32 here, preserving the bit pattern (0xBA63E001 -> i32(-1168474111)).
         if (isHex && uval <= 0xFFFFFFFFull)
             return static_cast<int>(static_cast<uint32_t>(uval));
         return static_cast<int64_t>(uval);
+    }
+
+LLVMBackend::TypeAndValue MainListener::ParseLiteralTypeAndValue(const std::string& rawNumber) {
+        LLVMBackend::TypeAndValue type;
+        auto constant = ParseNumberConstant(rawNumber);
+        if (std::get_if<unsigned char>(&constant) != nullptr)
+            type.TypeName = "u8";
+        else if (std::get_if<unsigned short>(&constant) != nullptr)
+            type.TypeName = "u16";
+        else if (std::get_if<unsigned int>(&constant) != nullptr)
+            type.TypeName = "u32";
+        else if (std::get_if<uint64_t>(&constant) != nullptr)
+            type.TypeName = "u64";
+        return type;
     }
 
 void MainListener::LogWarningContext(antlr4::ParserRuleContext* ctx, std::string warningMessage) {
@@ -304,4 +317,3 @@ void MainListener::PrintContext(antlr4::ParserRuleContext* ctx, std::string suff
         size_t column = ctx->getStart()->getCharPositionInLine();
         std::cout << std::format("[{},{}] {} : {} : {}\n", line, column, parser->getRuleNames()[ctx->getRuleIndex()], ctx->getText(), suffix);
     }
-

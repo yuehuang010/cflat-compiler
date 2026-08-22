@@ -1176,7 +1176,9 @@ bool LLVMBackend::IsBorrowStringParamStorage(llvm::Value* storage)
         return false;
     }
 
-void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage, const std::string& interfaceReturnStructName)
+void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLocalStorage,
+                                   const std::string& interfaceReturnStructName,
+                                   bool srcIsUnsigned)
 {
         if (!IsInsertBlockLive())
             return;
@@ -1334,7 +1336,7 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                     }
                 }
             }
-            value = Upconvert(value, retTy);
+            value = Upconvert(value, retTy, srcIsUnsigned);
             // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).
             // Warn: CFlat requires explicit narrowing - write "return expr != 0;" instead.
             if (retTy == builder->getInt1Ty() && value->getType()->isIntegerTy() && value->getType() != retTy)

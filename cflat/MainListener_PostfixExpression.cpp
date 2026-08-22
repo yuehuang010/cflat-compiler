@@ -1859,6 +1859,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Primary = ParsePrimaryExpression(
                                 prevPrimary, childLimit == 1 ? use : ResultUse::Value);
                             namedVar.Storage = nullptr;
+                            if (auto* literal = prevPrimary->Constant())
+                            {
+                                auto literalType = ParseLiteralTypeAndValue(literal->getText());
+                                if (!literalType.TypeName.empty())
+                                    namedVar.TypeAndValue = literalType;
+                            }
                             // If the primary is a parenthesized cast expression, propagate its type
                             // so that chained member access (e.g. ((Struct*)ptr)->field) works.
                             // The <Tag> element sugar uses the same channel to publish its node

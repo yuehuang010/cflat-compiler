@@ -316,10 +316,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             else
             {
                 std::vector<llvm::Value*> initializers;
+                std::vector<char> initializerUnsigned;
                 for (auto& typeValue : declList)
                 {
                     auto initializer = typeValue.Initializer;
                     llvm::Value* rvalue = nullptr;
+                    bool fieldSrcUnsigned = false;
                     if (auto* braceList = FieldDefaultBraceList(typeValue))
                     {
                         // Emitting a real function body; clear the stale file-scope global_scope
@@ -333,7 +335,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         if (assignmentExpression != nullptr)
                         {
                             rvalue = ParseFieldDefaultInitializer(
-                                structName, typeValue, assignmentExpression);
+                                structName, typeValue, assignmentExpression, &fieldSrcUnsigned);
                             if (typeValue.TypeName == "auto")
                             {
                                 typeValue.TypeName = rvalue->getType()->getStructName();
@@ -358,6 +360,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                         rvalue = GenerateDefaultValue(typeValue);
                     }
                     initializers.push_back(rvalue);
+                    initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
                 }
 
                 // Seed with zero (not undef) so fields lacking an explicit initializer read as
@@ -396,7 +399,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     }
                     if (rvalue != nullptr)
                     {
-                        rvalue = compiler->Upconvert(rvalue, destType);
+                        rvalue = compiler->Upconvert(rvalue, destType,
+                            structIndex < initializerUnsigned.size() && initializerUnsigned[structIndex] != 0);
                         if (rvalue->getType() != destType)
                         {
                             if (destType->isStructTy())
@@ -636,6 +640,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
             }
         }
 
+        bool unionFieldSrcUnsigned = false;
         llvm::Value* rvalue = nullptr;
         llvm::Type* fieldType = nullptr;
         if (chosen < declList.size())
@@ -647,7 +652,8 @@ void MainListener::EmitUnionDefaultConstructorBody(
             if (auto* braceList = FieldDefaultBraceList(tv))
                 rvalue = ParseFieldDefaultBraceInitializer(structName, tv, braceList);
             else if (tv.Initializer != nullptr && tv.Initializer->assignmentExpression() != nullptr)
-                rvalue = ParseFieldDefaultInitializer(structName, tv, tv.Initializer->assignmentExpression());
+                rvalue = ParseFieldDefaultInitializer(structName, tv,
+                    tv.Initializer->assignmentExpression(), &unionFieldSrcUnsigned);
             else
                 rvalue = GenerateDefaultValue(tv);
             fieldType = compiler->GetType(tv);
@@ -663,7 +669,7 @@ void MainListener::EmitUnionDefaultConstructorBody(
         }
         auto* slot = compiler->AllocaAtEntry(structType, nullptr, "uniondef");
         compiler->builder->CreateStore(llvm::Constant::getNullValue(structType), slot);
-        compiler->CreateAssignment(rvalue, slot, false, fieldType);
+        compiler->CreateAssignment(rvalue, slot, unionFieldSrcUnsigned, fieldType);
         compiler->CreateReturnCall(compiler->CreateLoad(structType, slot));
     }
 
@@ -2010,9 +2016,11 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             compiler->CreateFunctionDefinition(name, returnType, {});
 
             std::vector<llvm::Value*> initializers;
+            std::vector<char> initializerUnsigned;
             for (auto& typeValue : declList)
             {
                 llvm::Value* rvalue = nullptr;
+                bool fieldSrcUnsigned = false;
                 auto* initializer = typeValue.Initializer;
                 // Unreachable today: this emitter's declList is entirely synthetic; wired for symmetry.
                 if (auto* braceList = FieldDefaultBraceList(typeValue))
@@ -2025,7 +2033,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
                 else if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
-                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
+                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae, &fieldSrcUnsigned);
                     else if (initializer->Default())
                     {
                         // Synthetic default-ctor body: clear the stale file-scope global_scope so a
@@ -2041,6 +2049,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
                     rvalue = GenerateDefaultValue(typeValue);
                 }
                 initializers.push_back(rvalue);
+                initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
             }
 
             // Seed with zero (not undef) so fields lacking an explicit initializer read as
@@ -2054,7 +2063,8 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
                 if (rvalue)
                 {
                     auto* destType = structType->getTypeAtIndex(idx);
-                    rvalue = compiler->Upconvert(rvalue, destType);
+                    rvalue = compiler->Upconvert(rvalue, destType,
+                        idx < initializerUnsigned.size() && initializerUnsigned[idx] != 0);
                     if (rvalue->getType() != destType && destType->isStructTy())
                     {
                         std::string fieldTypeName = declList[idx].TypeName;
@@ -2352,9 +2362,11 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             compiler->CreateFunctionDefinition(name, returnType, {});
 
             std::vector<llvm::Value*> initializers;
+            std::vector<char> initializerUnsigned;
             for (auto& typeValue : declList)
             {
                 llvm::Value* rvalue = nullptr;
+                bool fieldSrcUnsigned = false;
                 auto* initializer = typeValue.Initializer;
                 if (auto* braceList = FieldDefaultBraceList(typeValue))
                 {
@@ -2366,7 +2378,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                 else if (initializer)
                 {
                     if (auto* ae = initializer->assignmentExpression())
-                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae);
+                        rvalue = ParseFieldDefaultInitializer(name, typeValue, ae, &fieldSrcUnsigned);
                     else if (initializer->Default())
                     {
                         // Synthetic default-ctor body: clear the stale file-scope global_scope so a
@@ -2377,6 +2389,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                     }
                 }
                 initializers.push_back(rvalue);
+                initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
             }
 
             // Seed with zero (not undef) so fields lacking an explicit initializer read as
@@ -2402,7 +2415,8 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                 }
                 if (rvalue)
                 {
-                    rvalue = compiler->Upconvert(rvalue, destType);
+                    rvalue = compiler->Upconvert(rvalue, destType,
+                        idx < initializerUnsigned.size() && initializerUnsigned[idx] != 0);
                     if (rvalue->getType() != destType)
                     {
                         if (destType->isStructTy())
@@ -2912,10 +2926,12 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             auto funcDef = compiler->CreateFunctionDefinition(structName, returnType, {});
 
             std::vector<llvm::Value*> initializers;
+            std::vector<char> initializerUnsigned;
             for (auto& typeValue : declList)
             {
                 auto initializer = typeValue.Initializer;
                 llvm::Value* rvalue = nullptr;
+                bool fieldSrcUnsigned = false;
                 if (auto* braceList = FieldDefaultBraceList(typeValue))
                 {
                     // Emitting a real function body; clear the stale file-scope global_scope
@@ -2929,7 +2945,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (assignmentExpression != nullptr)
                     {
                         rvalue = ParseFieldDefaultInitializer(
-                            structName, typeValue, assignmentExpression);
+                            structName, typeValue, assignmentExpression, &fieldSrcUnsigned);
                         if (typeValue.TypeName == "auto")
                         {
                             typeValue.TypeName = rvalue->getType()->getStructName();
@@ -2946,6 +2962,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     }
                 }
                 initializers.push_back(rvalue);
+                initializerUnsigned.push_back(fieldSrcUnsigned ? 1 : 0);
             }
 
             // Seed with zero (not undef) so fields lacking an explicit initializer read as
@@ -2976,7 +2993,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 }
                 if (rvalue != nullptr)
                 {
-                    rvalue = compiler->Upconvert(rvalue, destType);
+                    rvalue = compiler->Upconvert(rvalue, destType,
+                        structIndex < initializerUnsigned.size() && initializerUnsigned[structIndex] != 0);
                     if (rvalue->getType() != destType)
                     {
                         if (destType->isStructTy())
@@ -3371,6 +3389,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     break;
                 auto* destType = structLLVMType->getTypeAtIndex(fieldIdx);
                 llvm::Value* fieldVal = nullptr;
+                bool fieldValSrcUnsigned = false;
                 bool fromBraceList = false;
                 if (auto* braceList = FieldDefaultBraceList(field))
                 {
@@ -3384,7 +3403,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                     auto* assignExpr = field.Initializer->assignmentExpression();
                     if (assignExpr != nullptr)
                     {
-                        fieldVal = ParseFieldDefaultInitializer(structName, field, assignExpr);
+                        fieldVal = ParseFieldDefaultInitializer(structName, field, assignExpr,
+                            &fieldValSrcUnsigned);
                     }
                     else if (field.Initializer->Default() != nullptr)
                     {
@@ -3407,7 +3427,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                 if (fieldVal != nullptr)
                 {
                     if (!fromBraceList)
-                        fieldVal = compiler->Upconvert(fieldVal, destType);
+                        fieldVal = compiler->Upconvert(fieldVal, destType, fieldValSrcUnsigned);
                     // Same type-mismatch arms the synthetic default ctor runs (:342-369); without
                     // them the store is dropped and the field keeps the seeding zero.
                     if (fieldVal->getType() != destType)
