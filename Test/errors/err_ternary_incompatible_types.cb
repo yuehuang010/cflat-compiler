@@ -25,4 +25,15 @@ expect_error("condition must be a scalar") {
     }
 }
 
+
+// Both arms `default` is accepted when the destination type is known, but here the join sits in a
+// varargs argument that supplies no destination at all, so there is nothing to take a type from.
+expect_error("'default' needs a known target type here") {
+    int untypedBothDefaultArms() {
+        bool h = true;
+        printf("%d\n", h ? default : default);
+        return 0;
+    }
+}
+
 extern int main() { return 0; }

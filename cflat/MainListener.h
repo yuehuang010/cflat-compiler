@@ -3986,7 +3986,8 @@ public:
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx,
-        ResultUse use = ResultUse::Value);
+        ResultUse use = ResultUse::Value,
+        const LLVMBackend::TypeAndValue& outerExpected = {});
 
     LLVMBackend::TypedValue ParseConditionalExpression(CFlatParser::ConditionalExpressionContext* ctx,
                                                         ResultUse use = ResultUse::Value);
@@ -4947,6 +4948,9 @@ public:
     // A '?:' arm parsed for its value, keeping the arm's signedness for the join (see the
     // definition; the fallback is plain ParseExpression).
     llvm::Value* ParseTernaryArmExpression(CFlatParser::ExpressionContext* ctx, bool& isUnsigned);
+
+    bool IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const;
+    LLVMBackend::TypeAndValue InferTernaryArmType(llvm::Value* value);
 
     // A discarded statement result (`makePlain(2);`) that is an unclaimed owning-struct rvalue
     // temp is claimed by nothing, so without this it leaks. Spill it and register for destruction

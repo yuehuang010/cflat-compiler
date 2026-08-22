@@ -1721,6 +1721,44 @@ int testLiteralReceiverAndNullChain()
 // and must DESTRUCT the old contents first (an owning field would otherwise leak).
 struct P2Def     { int a = 5; int b = 7; };
 struct P2DefOwn  { string s = default; int n = 3; };
+int g_p2_ternary_dtor = 0;
+int g_p2_ternary_buffer_dtor = 0;
+struct P2TernaryOwn
+{
+    string s = default;
+    int n = 3;
+    ~P2TernaryOwn()
+    {
+        g_p2_ternary_dtor++;
+        if (s._ptr != nullptr) g_p2_ternary_buffer_dtor++;
+    }
+};
+int g_p2_ternary_eager = true ? default : 4;
+// Both arms 'default' is pointless but logically correct: the destination type is known, so the
+// join takes its type from there rather than reporting an untyped 'default'.
+int g_p2_ternary_both_default = true ? default : default;
+
+P2Def p2TernaryReturn(bool h)
+{
+    P2Def other = default;
+    other.a = 9;
+    return h ? default : other;
+}
+
+P2Def p2TernaryArgument(P2Def value) { return value; }
+T p2TernaryGeneric<T>(T value) { return value; }
+
+// Both arms owning, so the join keeps ownership: whichever arm runs must be destructed exactly
+// once. A 'default' arm mis-scored as borrowing would suppress the join and skip the destructor.
+P2TernaryOwn p2TernaryMakeOwn()
+{
+    P2TernaryOwn made = default;
+    made.s = "made".copy();
+    made.n = 8;
+    return made;
+}
+
+bool p2TernaryPick(int k) { return k > 0; }
 
 int testDefaultAsExpression()
 {
@@ -1753,6 +1791,133 @@ int testDefaultAsExpression()
     o = default;
     passed += Test("default_own_cleared", o.s.length(), 0);
     passed += Test("default_own_scalar_reset", o.n, 3);
+
+    P2Def other = default;
+    other.a = 11;
+    bool h = true;
+    P2Def trueArm = h ? default : other;
+    passed += Test("default_ternary_true_arm", trueArm.a, 5);
+    h = false;
+    P2Def falseArm = h ? other : default;
+    passed += Test("default_ternary_false_arm", falseArm.a, 5);
+
+    bool k = true;
+    P2Def nestedTrue = h ? other : (k ? default : other);
+    passed += Test("default_ternary_nested_true", nestedTrue.a, 5);
+    k = false;
+    P2Def nestedFalse = h ? other : (k ? other : default);
+    passed += Test("default_ternary_nested_false", nestedFalse.a, 5);
+
+    h = true;
+    trueArm.a = 9;
+    trueArm = h ? default : other;
+    passed += Test("default_ternary_assignment", trueArm.a, 5);
+    passed += Test("default_ternary_return", p2TernaryReturn(true).a, 5);
+    passed += Test("default_ternary_argument", p2TernaryArgument(h ? default : other).a, 5);
+    passed += Test("default_ternary_generic_argument",
+        p2TernaryGeneric<P2Def>(h ? default : other).a, 5);
+
+    int primitive = h ? default : 4;
+    passed += Test("default_ternary_primitive_true", primitive, 0);
+    h = false;
+    primitive = h ? 4 : default;
+    passed += Test("default_ternary_primitive_false", primitive, 0);
+    passed += Test("default_ternary_global_eager", g_p2_ternary_eager, 0);
+
+    // Both arms 'default': the destination type is known on every one of these, so each arm takes
+    // its value from the declared type - field initializers for a struct, zero for a primitive.
+    h = true;
+    P2Def bothDefaultTrue = h ? default : default;
+    passed += Test("default_ternary_both_default_a", bothDefaultTrue.a, 5);
+    passed += Test("default_ternary_both_default_b", bothDefaultTrue.b, 7);
+    h = false;
+    P2Def bothDefaultFalse = h ? default : default;
+    passed += Test("default_ternary_both_default_false", bothDefaultFalse.a, 5);
+    int bothDefaultPrimitive = h ? default : default;
+    passed += Test("default_ternary_both_default_primitive", bothDefaultPrimitive, 0);
+    string bothDefaultString = h ? default : default;
+    passed += Test("default_ternary_both_default_string", bothDefaultString.length(), 0);
+    P2Def* bothDefaultPointer = h ? default : default;
+    passed += Test("default_ternary_both_default_pointer", bothDefaultPointer == nullptr, true);
+    passed += Test("default_ternary_both_default_global", g_p2_ternary_both_default, 0);
+
+    string stringOther = "ternary";
+    h = true;
+    string stringResult = h ? default : stringOther;
+    passed += Test("default_ternary_string_default", stringResult.length(), 0);
+
+    P2Def* pointerOther = nullptr;
+    P2Def* pointerResult = pointerOther ?? default;
+    passed += Test("default_coalesce_pointer_default", pointerResult == nullptr, true);
+
+    list<int> listOther;
+    listOther.add(7);
+    list<int> listResult = h ? default : listOther;
+    passed += Test("default_ternary_generic_default", listResult.count(), 0);
+
+    P2Def parenthesized = default;
+    parenthesized.a = 9;
+    passed += Test("default_ternary_parenthesized", (h ? default : parenthesized).a, 5);
+
+    dictionary<string, P2Def> map;
+    map.add("key", other);
+    h = true;
+    P2Def customerTrue = h ? map.get("key") : default;
+    passed += Test("default_ternary_customer_true", customerTrue.a, 11);
+    h = false;
+    P2Def customer = h ? map.get("key") : default;
+    passed += Test("default_ternary_customer_default", customer.a, 5);
+
+    g_p2_ternary_dtor = 0;
+    g_p2_ternary_buffer_dtor = 0;
+    {
+        P2TernaryOwn owningOther = default;
+        owningOther.s = "owned".copy();
+        bool owningChoose = true;
+        P2TernaryOwn owningResult = owningChoose ? default : owningOther;
+        passed += Test("default_ternary_owning_source_live", owningOther.s.length(), 5);
+        passed += Test("default_ternary_owning_no_early_dtor", g_p2_ternary_dtor, 0);
+        passed += Test("default_ternary_owning_string_value", owningResult.s.length(), 0);
+        passed += Test("default_ternary_owning_struct_value", owningResult.n, 3);
+    }
+    passed += Test("default_ternary_owning_destructors", g_p2_ternary_dtor, 1);
+    passed += Test("default_ternary_owning_buffers", g_p2_ternary_buffer_dtor, 1);
+
+    // Both arms own, so the joined value is owned: exactly one destructor and exactly one heap
+    // buffer freed on the call arm, one destructor and no buffer on the 'default' arm.
+    g_p2_ternary_dtor = 0;
+    g_p2_ternary_buffer_dtor = 0;
+    {
+        P2TernaryOwn ownedCall = p2TernaryPick(1) ? p2TernaryMakeOwn() : default;
+        passed += Test("default_ternary_owned_join_call_value", ownedCall.n, 8);
+        passed += Test("default_ternary_owned_join_call_string", ownedCall.s.length(), 4);
+        passed += Test("default_ternary_owned_join_call_no_early_dtor", g_p2_ternary_dtor, 0);
+    }
+    passed += Test("default_ternary_owned_join_call_dtor", g_p2_ternary_dtor, 1);
+    passed += Test("default_ternary_owned_join_call_buffer", g_p2_ternary_buffer_dtor, 1);
+
+    g_p2_ternary_dtor = 0;
+    g_p2_ternary_buffer_dtor = 0;
+    {
+        P2TernaryOwn ownedDefault = p2TernaryPick(0) ? p2TernaryMakeOwn() : default;
+        passed += Test("default_ternary_owned_join_default_value", ownedDefault.n, 3);
+        passed += Test("default_ternary_owned_join_default_string", ownedDefault.s.length(), 0);
+        passed += Test("default_ternary_owned_join_default_no_early_dtor", g_p2_ternary_dtor, 0);
+    }
+    passed += Test("default_ternary_owned_join_default_dtor", g_p2_ternary_dtor, 1);
+    passed += Test("default_ternary_owned_join_default_buffer", g_p2_ternary_buffer_dtor, 0);
+
+    // Nested owning join: the inner 'default' arm still joins as owned through the outer join.
+    g_p2_ternary_dtor = 0;
+    g_p2_ternary_buffer_dtor = 0;
+    {
+        P2TernaryOwn ownedNested = p2TernaryPick(0)
+            ? p2TernaryMakeOwn()
+            : (p2TernaryPick(0) ? p2TernaryMakeOwn() : default);
+        passed += Test("default_ternary_owned_join_nested_value", ownedNested.n, 3);
+    }
+    passed += Test("default_ternary_owned_join_nested_dtor", g_p2_ternary_dtor, 1);
+    passed += Test("default_ternary_owned_join_nested_buffer", g_p2_ternary_buffer_dtor, 0);
 
     return passed;
 }
@@ -2969,7 +3134,7 @@ extern int main()
     r = testRawArrayRuntimeCount(); passed += r; total += 44;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
-    r = testDefaultAsExpression(); passed += r; total += 7;
+    r = testDefaultAsExpression(); passed += r; total += 50;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

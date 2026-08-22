@@ -178,6 +178,20 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             }
             if (result.Primary != nullptr && compilerLLVM->IsAliasValue(result.Primary))
                 result.TypeAndValue.IsAlias = true;
+            // A '?:' / '??' result reaches here as a raw join with no type name; fill only the
+            // type identity so flags already decided above (IsAlias) are not overwritten.
+            if (result.Primary != nullptr && result.TypeAndValue.TypeName.empty()
+                && condCtx != nullptr
+                && (condCtx->Question() != nullptr || condCtx->QuestionQuestion() != nullptr))
+            {
+                auto inferred = InferTernaryArmType(result.Primary);
+                if (!inferred.TypeName.empty())
+                {
+                    result.TypeAndValue.TypeName = inferred.TypeName;
+                    result.TypeAndValue.Pointer = inferred.Pointer;
+                    result.TypeAndValue.IsInterface = inferred.IsInterface;
+                }
+            }
             if (result.Primary != nullptr && compilerLLVM->IsTempFieldValue(result.Primary))
             {
                 result.FromOwningTempField = true;
@@ -3589,6 +3603,50 @@ llvm::Value* MainListener::ParseTernaryArmExpression(CFlatParser::ExpressionCont
         return ParseExpression(ctx);
     }
 
+bool MainListener::IsDefaultOnlyExpression(antlr4::ParserRuleContext* ctx) const {
+        if (ctx == nullptr) return false;
+        std::string text = ctx->getText();
+        while (text.size() >= 2 && text.front() == '(' && text.back() == ')')
+        {
+            int depth = 0;
+            bool wrapsAll = true;
+            for (size_t i = 0; i < text.size(); i++)
+            {
+                if (text[i] == '(') depth++;
+                else if (text[i] == ')' && --depth == 0 && i + 1 != text.size())
+                {
+                    wrapsAll = false;
+                    break;
+                }
+            }
+            if (!wrapsAll || depth != 0) break;
+            text = text.substr(1, text.size() - 2);
+        }
+        return text == "default";
+    }
+
+LLVMBackend::TypeAndValue MainListener::InferTernaryArmType(llvm::Value* value) {
+        LLVMBackend::TypeAndValue result;
+        if (value == nullptr) return result;
+        auto* compiler = compilerLLVM;
+        auto* type = value->getType();
+        if (type->isPointerTy())
+        {
+            result.TypeName = compiler->ResolvePointerElementTypeName(value);
+            if (!result.TypeName.empty()) result.Pointer = true;
+            return result;
+        }
+        if (type == compiler->GetFatPtrType())
+        {
+            result.TypeName = compiler->FindFatInterfaceValueTypeName(value);
+            result.IsInterface = !result.TypeName.empty()
+                && result.TypeName != LLVMBackend::kAmbiguousFatInterface;
+            return result;
+        }
+        result.TypeName = LLVMTypeToTypeName(type);
+        return result;
+    }
+
 // C usual arithmetic conversions for a '?:' join: the unsigned arm wins only when its width
 // covers the other's, so `cond ? (i64)-1 : 1u` stays signed.
 static bool TernaryJoinIsUnsigned(bool trueUnsigned, unsigned trueBits,
@@ -3732,7 +3790,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
         CFlatParser::ExpressionContext* expressionTrueCtx,
-        CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use) {
+        CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use,
+        const LLVMBackend::TypeAndValue& outerExpected) {
         auto* compiler = Compiler(ctx);
         if (condTv.value == nullptr) return {};
 
@@ -3766,48 +3825,68 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // without this a cast on one arm launders a bare sibling naming the same constant.
         size_t trueOcc  = compiler->CurrentCastOccurrence();
         size_t falseOcc = trueOcc;
+        bool trueDefault = IsDefaultOnlyExpression(expressionTrueCtx);
+        bool falseDefault = IsDefaultOnlyExpression(expressionFalseCtx);
+        auto expectedForDefault = [&](llvm::Value* otherValue, bool otherIsDefault) {
+            auto expected = otherIsDefault ? LLVMBackend::TypeAndValue{} : InferTernaryArmType(otherValue);
+            if (expected.TypeName.empty()) expected = outerExpected;
+            return expected;
+        };
+        auto parseTrueArm = [&]() {
+            compiler->SwitchToBlock(trueBlock);
+            trueMark = compiler->MarkOwnedTemps();
+            LLVMBackend::CastOccurrenceScope armScope(compiler);
+            trueOcc = armScope.Id;
+            std::optional<DeclExpectedTypeScope> expectedScope;
+            if (trueDefault)
+            {
+                auto expected = expectedForDefault(falseValue, falseDefault);
+                if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
+            }
+            if (use == ResultUse::Discard)
+            {
+                auto trueNV = ParseAssignmentExpressionNamed(
+                    expressionTrueCtx->assignmentExpression(), use);
+                trueValue = trueNV.Primary;
+                trueUnsigned = trueNV.TypeAndValue.IsUnsignedInteger() != -1;
+                ProcessPlusPlus();
+            }
+            else
+                trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
+            trueAlias = compiler->IsAliasValue(trueValue);
+            trueTempField = compiler->IsTempFieldValue(trueValue);
+            if (use == ResultUse::Discard)
+                compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
+            else
+                FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
+            trueEnd = compiler->builder->GetInsertBlock();
+        };
+        auto parseFalseArm = [&]() {
+            compiler->SwitchToBlock(falseBlock);
+            falseMark = compiler->MarkOwnedTemps();
+            LLVMBackend::CastOccurrenceScope armScope(compiler);
+            falseOcc = armScope.Id;
+            std::optional<DeclExpectedTypeScope> expectedScope;
+            if (falseDefault)
+            {
+                auto expected = expectedForDefault(trueValue, trueDefault);
+                if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
+            }
+            auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
+            falseValue = falseTv.value;
+            falseUnsigned = falseTv.isUnsigned;
+            falseAlias = compiler->IsAliasValue(falseValue);
+            falseTempField = compiler->IsTempFieldValue(falseValue);
+            if (use == ResultUse::Discard)
+                compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
+            else
+                FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
+            falseEnd = compiler->builder->GetInsertBlock();
+        };
         try
         {
-            {
-                LLVMBackend::CastOccurrenceScope armScope(compiler);
-                trueOcc   = armScope.Id;
-                if (use == ResultUse::Discard)
-                {
-                    auto trueNV = ParseAssignmentExpressionNamed(
-                        expressionTrueCtx->assignmentExpression(), use);
-                    trueValue = trueNV.Primary;
-                    trueUnsigned = trueNV.TypeAndValue.IsUnsignedInteger() != -1;
-                    ProcessPlusPlus();
-                }
-                else
-                    trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
-                trueAlias = compiler->IsAliasValue(trueValue);
-                trueTempField = compiler->IsTempFieldValue(trueValue);
-                if (use == ResultUse::Discard)
-                    compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
-                else
-                    FinishTernaryArm(compiler, trueValue, trueMark, trueOwnedString, branchBlock);
-            }
-            trueEnd = compiler->builder->GetInsertBlock();
-
-            compiler->SwitchToBlock(falseBlock);
-            falseMark  = compiler->MarkOwnedTemps();
-            {
-                LLVMBackend::CastOccurrenceScope armScope(compiler);
-                falseOcc   = armScope.Id;
-                {
-                    auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
-                    falseValue = falseTv.value;
-                    falseUnsigned = falseTv.isUnsigned;
-                }
-                falseAlias = compiler->IsAliasValue(falseValue);
-                falseTempField = compiler->IsTempFieldValue(falseValue);
-                if (use == ResultUse::Discard)
-                    compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
-                else
-                    FinishTernaryArm(compiler, falseValue, falseMark, falseOwnedString, branchBlock);
-            }
-            falseEnd = compiler->builder->GetInsertBlock();
+            if (trueDefault) { parseFalseArm(); parseTrueArm(); }
+            else { parseTrueArm(); parseFalseArm(); }
             if (use == ResultUse::Discard)
             {
                 LLVMBackend::NamedVariable arm;
@@ -3832,7 +3911,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             // Drop, without emitting anything, whatever the aborted arms registered: those
             // entries are keyed to arm blocks and would otherwise outlive this expression.
             compiler->DiscardOwnedTempsSince(falseMark);
-            compiler->DiscardOwnedTempsSince(trueMark);
+            if (!trueDefault || trueEnd != nullptr)
+                compiler->DiscardOwnedTempsSince(trueMark);
             throw;
         }
 
@@ -4006,6 +4086,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
 LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
         CFlatParser::ConditionalExpressionContext* ctx, ResultUse use) {
+        LLVMBackend::TypeAndValue outerExpected = declExpectedType;
         DeclExpectedTypeGate declExpectedGate(&declExpectedType, ctx->children.size() == 1);
         auto* compiler = Compiler(ctx);
         auto logicCtx = ctx->logicalOrExpression();
@@ -4054,6 +4135,16 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 {
                     LLVMBackend::CastOccurrenceScope armScope(compiler);
                     rhsOcc = armScope.Id;
+                    // Only a bare `default` rhs needs a published type; any other rhs keeps the
+                    // withdrawn context, exactly as the '?:' arms do.
+                    std::optional<DeclExpectedTypeScope> expectedScope;
+                    if (IsDefaultOnlyExpression(ctx->conditionalExpression()))
+                    {
+                        auto rhsExpected = InferTernaryArmType(lhs);
+                        if (rhsExpected.TypeName.empty()) rhsExpected = outerExpected;
+                        if (!rhsExpected.TypeName.empty())
+                            expectedScope.emplace(&declExpectedType, rhsExpected);
+                    }
                     rhs = ParseConditionalExpression(ctx->conditionalExpression(), use);
                     rhsAlias = compiler->IsAliasValue(rhs);
                     rhsTempField = compiler->IsTempFieldValue(rhs);
@@ -4162,7 +4253,8 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     && compiler->currentFunction != nullptr
                     && insertBB->getParent() == compiler->currentFunction)
                 {
-                    return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx, use);
+                    return ParseTernaryBranches(ctx, condTv, expressionTrueCtx, expressionFalseCtx,
+                        use, outerExpected);
                 }
 
                 // Eager fallback: BOTH arms execute unconditionally, so a deref only sound under
@@ -4171,8 +4263,21 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 llvm::Value* falseValue = nullptr;
                 bool trueUnsigned = false;
                 bool falseUnsigned = false;
-                {
-                    SuppressExplicitNullDerefGuardScope suppressGuard(compiler);
+                bool trueDefault = IsDefaultOnlyExpression(expressionTrueCtx);
+                bool falseDefault = IsDefaultOnlyExpression(expressionFalseCtx);
+                auto expectedForDefault = [&](llvm::Value* otherValue, bool otherIsDefault) {
+                    auto expected = otherIsDefault ? LLVMBackend::TypeAndValue{}
+                        : InferTernaryArmType(otherValue);
+                    if (expected.TypeName.empty()) expected = outerExpected;
+                    return expected;
+                };
+                auto parseTrueArm = [&]() {
+                    std::optional<DeclExpectedTypeScope> expectedScope;
+                    if (trueDefault)
+                    {
+                        auto expected = expectedForDefault(falseValue, falseDefault);
+                        if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
+                    }
                     if (use == ResultUse::Discard)
                     {
                         auto trueNV = ParseAssignmentExpressionNamed(
@@ -4183,11 +4288,22 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                     }
                     else
                         trueValue = ParseTernaryArmExpression(expressionTrueCtx, trueUnsigned);
+                };
+                auto parseFalseArm = [&]() {
+                    std::optional<DeclExpectedTypeScope> expectedScope;
+                    if (falseDefault)
                     {
-                        auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
-                        falseValue = falseTv.value;
-                        falseUnsigned = falseTv.isUnsigned;
+                        auto expected = expectedForDefault(trueValue, trueDefault);
+                        if (!expected.TypeName.empty()) expectedScope.emplace(&declExpectedType, expected);
                     }
+                    auto falseTv = ParseConditionalExpression(expressionFalseCtx, use);
+                    falseValue = falseTv.value;
+                    falseUnsigned = falseTv.isUnsigned;
+                };
+                {
+                    SuppressExplicitNullDerefGuardScope suppressGuard(compiler);
+                    if (trueDefault) { parseFalseArm(); parseTrueArm(); }
+                    else { parseTrueArm(); parseFalseArm(); }
                 }
 
                 // A branch that is a plain (non-`move`) string-returning CALL yields a fresh owned
