@@ -389,6 +389,13 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
+    "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": [
+      "aliasParamTaker",
+      "r",
+      "alias AliasParamRow",
+      "AliasParamRow*",
+      "alias"
+    ],
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": [
       "borrowsOnly",
       "move",
@@ -537,6 +544,7 @@
     "extraneousinputarg0expectingarg1": "extraneous input {0} expecting {1}",
     "failedtodeploypriarg0toarg1arg2": "failed to deploy pri '{0}' to '{1}': {2}",
     "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": "failed to deploy pri: source '{0}' no longer exists",
+    "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": "function '{0}' cannot be used as a function pointer: its parameter '{1}' is '{2}', which is passed as a reference to the caller's object and has no function-pointer spelling. Declare the parameter '{3}' instead, or drop '{4}'",
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": "function '{0}' has no overload matching the '{1}' modifiers required by parameter '{2}' - '{3}' is part of the function-pointer type",
     "functionarg0isneverused": "function '{0}' is never used",
     "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": "GetOrCreateProgramVTable: '{0}' does not implement '{1}::{2}'",

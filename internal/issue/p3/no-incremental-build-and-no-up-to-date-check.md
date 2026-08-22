@@ -4,7 +4,10 @@ Filed 2026-08-21 from an external report (MemPressMonitor Win32 port, v0.11.0 is
 bullet). Measured on `cd847a3`, Release, on this repo - the two cases below are the actionable
 split, because they have DIFFERENT fix costs and case 1 is nearly free.
 
-## Case 1 - NO source file changed: the full build runs again
+## Case 1 - NO source file changed: the full build runs again (LANDED 2026-08-22, `8c6ee5e`)
+
+**Done.** `<out>.cflat-dep.json` manifest next to the output; `up to date: <out>` in ~10 ms when
+no input/arg/compiler changed; `--force` / `-B` bypasses. What remains in this file is case 2.
 
 There is no up-to-date check at all. Re-invoking with an unchanged input and an existing output
 recompiles and relinks from scratch.
