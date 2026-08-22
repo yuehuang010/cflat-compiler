@@ -225,6 +225,7 @@ bool LLVMBackend::CompileCFileElf(const std::string& cSourcePath, const std::str
 
 bool LLVMBackend::CompileCFile(const std::string& cSourcePath, const std::string& programAlias)
 {
+        RecordDependency(cSourcePath);
         // Auto-discover C function signatures so the importing .cb needs no hand-written extern declarations.
         // When programAlias is set, registers C `main` as `__imported_main_<Alias>` in programTable.
         ExtractCSignatures(cSourcePath, programAlias);
@@ -2086,6 +2087,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         {
             llvm::SmallString<256> rp;
             realPaths.push_back(!llvm::sys::fs::real_path(h, rp) ? rp.str().str() : h);
+            RecordDependency(realPaths.back());
         }
         const std::string& fileForLsp = realPaths.front();
 
@@ -2249,6 +2251,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 std::unordered_set<std::string> seen;
                 for (const auto& inc : includes)
                 {
+                    RecordDependency(inc);
                     std::error_code dec;
                     auto dm = std::filesystem::last_write_time(inc, dec);
                     if (dec) continue;

@@ -134,6 +134,146 @@ static std::string LowerExtension(const std::filesystem::path& p)
     return ext;
 }
 
+namespace {
+
+std::filesystem::path DependencyManifestPath(const std::filesystem::path& output)
+{
+    std::error_code ec;
+    if (std::filesystem::is_directory(output, ec))
+        return output / "cflat-dep.json";
+    auto manifest = output;
+    manifest.replace_extension(".cflat-dep.json");
+    return manifest;
+}
+
+std::filesystem::path ExistingAbsolutePath(const std::filesystem::path& path,
+                                            std::error_code& ec)
+{
+    auto result = std::filesystem::weakly_canonical(path, ec);
+    if (ec)
+        result = std::filesystem::absolute(path, ec);
+    return result;
+}
+
+bool ReadFileStamp(const std::filesystem::path& path, int64_t& mtime, int64_t& size)
+{
+    std::error_code ec;
+    auto mt = std::filesystem::last_write_time(path, ec);
+    if (ec) return false;
+    auto bytes = std::filesystem::file_size(path, ec);
+    if (ec) return false;
+    mtime = static_cast<int64_t>(mt.time_since_epoch().count());
+    size = static_cast<int64_t>(bytes);
+    return true;
+}
+
+} // namespace
+
+void LLVMBackend::RecordDependency(const std::string& path)
+{
+    if (path.empty()) return;
+    std::error_code ec;
+    auto absolute = ExistingAbsolutePath(path, ec);
+    if (ec || !std::filesystem::is_regular_file(absolute, ec) || ec) return;
+    auto text = absolute.string();
+    if (std::find(dependencyFiles_.begin(), dependencyFiles_.end(), text) == dependencyFiles_.end())
+        dependencyFiles_.push_back(std::move(text));
+}
+
+bool LLVMBackend::IsOutputUpToDate(const std::string& outputPath,
+                                   const std::vector<std::string>& normalizedArgs)
+{
+    std::filesystem::path output(outputPath);
+    std::filesystem::path manifestPath = DependencyManifestPath(output);
+    std::error_code ec;
+    if (!std::filesystem::exists(output, ec) || ec
+        || !std::filesystem::exists(manifestPath, ec) || ec)
+        return false;
+
+    nlohmann::json manifest;
+    try
+    {
+        std::ifstream input(manifestPath, std::ios::binary);
+        if (!input) return false;
+        input >> manifest;
+        if (manifest.value("format", "") != "cflat-dep"
+            || manifest.value("format_version", 0) != 1
+            || !manifest.contains("compiler") || !manifest.contains("output")
+            || !manifest.contains("args") || !manifest.contains("inputs"))
+            return false;
+        if (manifest.at("args").get<std::vector<std::string>>() != normalizedArgs)
+            return false;
+
+        std::error_code pathEc;
+        auto compilerPath = ExistingAbsolutePath(PlatformExePath(), pathEc);
+        if (pathEc || manifest.at("compiler").at("path").get<std::string>()
+                != compilerPath.string())
+            return false;
+        int64_t compilerMtime = 0, compilerSize = 0;
+        if (!ReadFileStamp(compilerPath, compilerMtime, compilerSize)
+            || manifest.at("compiler").at("mtime").get<int64_t>() != compilerMtime
+            || manifest.at("compiler").at("size").get<int64_t>() != compilerSize)
+            return false;
+
+        int64_t outputMtime = 0, outputSize = 0;
+        if (!ReadFileStamp(output, outputMtime, outputSize)
+            || outputMtime < manifest.at("output").at("mtime").get<int64_t>())
+            return false;
+
+        for (const auto& entry : manifest.at("inputs"))
+        {
+            auto path = entry.at("path").get<std::string>();
+            int64_t mtime = 0, size = 0;
+            if (!ReadFileStamp(path, mtime, size)
+                || mtime != entry.at("mtime").get<int64_t>()
+                || size != entry.at("size").get<int64_t>())
+                return false;
+        }
+    }
+    catch (...) { return false; }
+    return true;
+}
+
+bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
+                                          const std::vector<std::string>& normalizedArgs,
+                                          const std::vector<std::string>& dependencyFiles)
+{
+    std::error_code ec;
+    auto output = ExistingAbsolutePath(outputPath, ec);
+    if (ec) return false;
+    auto compiler = ExistingAbsolutePath(PlatformExePath(), ec);
+    if (ec) return false;
+    int64_t outputMtime = 0, outputSize = 0;
+    int64_t compilerMtime = 0, compilerSize = 0;
+    if (!ReadFileStamp(output, outputMtime, outputSize)
+        || !ReadFileStamp(compiler, compilerMtime, compilerSize))
+        return false;
+
+    nlohmann::json manifest;
+    manifest["format"] = "cflat-dep";
+    manifest["format_version"] = 1;
+    manifest["compiler"] = { {"path", compiler.string()},
+                              {"mtime", compilerMtime}, {"size", compilerSize} };
+    manifest["output"] = { {"path", output.string()}, {"mtime", outputMtime} };
+    manifest["args"] = normalizedArgs;
+    manifest["inputs"] = nlohmann::json::array();
+    for (const auto& dependency : dependencyFiles)
+    {
+        auto path = ExistingAbsolutePath(dependency, ec);
+        if (ec) return false;
+        int64_t mtime = 0, size = 0;
+        if (!ReadFileStamp(path, mtime, size)) return false;
+        manifest["inputs"].push_back({ {"path", path.string()},
+                                       {"mtime", mtime}, {"size", size} });
+    }
+
+    auto manifestPath = DependencyManifestPath(outputPath);
+    std::ofstream file(manifestPath, std::ios::binary | std::ios::trunc);
+    if (!file) return false;
+    file << manifest.dump() << '\n';
+    return static_cast<bool>(file);
+}
+
 static bool IsPathUnderDirectory(const std::filesystem::path& path,
                                  const std::filesystem::path& directory)
 {
@@ -1448,6 +1588,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // --check: parse and codegen for diagnostics only, emitting no outputs.
     bool checkOnly = args.hasFlag("check");
     auto filename = inputOverride.empty() ? args.getPositional(0).value_or("") : inputOverride;
+    dependencyFiles_.clear();
+    for (size_t i = 0; i < args.positionalCount(); ++i)
+        RecordDependency(*args.getPositional(i));
     sourceFileName = std::filesystem::path(filename).filename().string();
     llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
@@ -1642,6 +1785,13 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             bitcodeLoaded = LoadCoreBitcodeIfFresh(bcCacheDir, platformOption);
             if (verbose)
                 std::cout << std::format("[verbose] core bitcode cache: {}\n", bitcodeLoaded ? "hit" : "miss");
+            if (bitcodeLoaded)
+            {
+                RecordDependency((std::filesystem::path(bcCacheDir)
+                                  / ("core_" + platformOption + ".bc")).string());
+                for (const auto& imported : importedFiles)
+                    RecordDependency(imported);
+            }
         }
     }
 
@@ -2187,6 +2337,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         return false;
     }
 
+    for (const auto& lib : cLinkLibs_)
+        RecordDependency(lib);
+
     // --run: JIT and execute in-process, emitting nothing to disk. Mutually exclusive with
     // -o (checked in main). Consumes the module, so it must come after IR/bitcode writes.
     //
@@ -2617,6 +2770,7 @@ bool LLVMBackend::CompileImportGroup(const std::string& importingFilePath,
         std::string canonicalStr;
         if (!ResolveImportPath(importingFilePath, entry, canonicalStr))
             return false;
+        RecordDependency(canonicalStr);
         headerCanonicals.push_back(canonicalStr);
         if (importedFiles.count(canonicalStr))
         {
@@ -2673,6 +2827,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     std::string canonicalStr;
     if (!ResolveImportPath(importingFilePath, importFilename, canonicalStr))
         return false;
+    RecordDependency(canonicalStr);
     if (isolatedPolicy_ && !runtimeDir.empty())
     {
         std::error_code coreEc;

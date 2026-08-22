@@ -125,6 +125,7 @@ int main(int argc, char* argv[])
     ArgParser args;
     args.addPositional("filename", "Source file to compile");
     args.addOption("output", 'o', "Output native executable path (.exe)");
+    args.addFlag("force", 'B', "Rebuild even when the -o output is up to date");
     args.addOption("out-lli", 'l', "Output LLVM IR file path (.ll)");
     args.addOption("out-asm", 0, "Output host-target assembly file path (.s)");
     args.addOption("bitcode", 'b', "Output bitcode file path (.bc)");
@@ -193,6 +194,35 @@ int main(int argc, char* argv[])
         if (!args.getError().empty())
             std::cout << args.getError() << "\n";
         return 1;
+    }
+
+    // Whole-output dependency manifests are consulted before runtime discovery, parsing, or
+    // compiler construction. Read-only and non-executable modes deliberately bypass this path.
+    const bool manifestEligible = args.getOption("output").has_value()
+        && !args.showVersion()
+        && !args.hasFlag("run") && !args.hasFlag("check") && !args.hasFlag("grammar")
+        && !args.hasFlag("init") && !args.hasFlag("init-local")
+        && !args.hasFlag("init-clear") && !args.hasFlag("init-clear-local")
+        && !args.hasFlag("print-supported-cpus") && !args.hasFlag("print-host-cpu")
+        && !args.hasFlag("winmd-sig-selftest")
+        && !args.getOption("dump-winmd") && !args.getOption("winmd-instantiate")
+        && !args.getOption("out-lli") && !args.getOption("out-asm")
+        && !args.getOption("bitcode") && args.getMultiOption("symbol").empty()
+        && args.getMultiOption("symbol-dump").empty();
+    if (manifestEligible && !args.hasFlag("force"))
+    {
+        std::string effectiveOutput = *args.getOption("output");
+#if defined(_WIN32)
+        auto platform = args.getOption("platform").value_or("win64");
+        if ((platform == "win32" || platform == "win64")
+            && !std::filesystem::path(effectiveOutput).has_extension())
+            effectiveOutput += ".exe";
+#endif
+        if (LLVMBackend::IsOutputUpToDate(effectiveOutput, args.normalizedArguments()))
+        {
+            std::cout << std::format("up to date: {}\n", *args.getOption("output"));
+            return 0;
+        }
     }
 
     if (args.showVersion())
@@ -593,6 +623,23 @@ int main(int argc, char* argv[])
     {
         std::cout << "Compilation failed.\n";
         return 1;
+    }
+
+    if (manifestEligible)
+    {
+        std::string effectiveOutput = *args.getOption("output");
+#if defined(_WIN32)
+        auto platform = args.getOption("platform").value_or("win64");
+        if ((platform == "win32" || platform == "win64")
+            && !std::filesystem::path(effectiveOutput).has_extension())
+            effectiveOutput += ".exe";
+#endif
+        // The build already succeeded; a manifest that cannot be written only costs the
+        // next run its up-to-date short-circuit, so it is reported and not treated as failure.
+        if (!LLVMBackend::WriteDependencyManifest(effectiveOutput, args.normalizedArguments(),
+                                                  compiler.GetDependencyFiles()))
+            std::cout << std::format("note: could not write dependency manifest for '{}'; the next build will not be skipped.\n",
+                                     effectiveOutput);
     }
 
     // --run: the process exit code is the JIT'd program's exit code, and the output is

@@ -2576,6 +2576,8 @@ private:
     std::vector<std::string> cIncludeDirs_;
     std::vector<std::string> cLinkLibs_;
     std::vector<std::string> cDefines_;
+    std::vector<std::string> dependencyFiles_;
+    void RecordDependency(const std::string& path);
     // A positional `.c` input, noted at arg-parse time because clang is only invoked for it
     // AFTER the module-end analyses run. Read by RunNullIfaceGlobalCheck.
     bool positionalCSource_ = false;
@@ -7003,6 +7005,13 @@ public:
     // validate every transitively-included file's mtime/hash rather than just the top header.
     void SetCHeaderCacheDeep(bool v);
     void SetWindowsSubsystem(const std::string& v);
+
+    const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }
+    static bool IsOutputUpToDate(const std::string& outputPath,
+                                 const std::vector<std::string>& normalizedArgs);
+    static bool WriteDependencyManifest(const std::string& outputPath,
+                                        const std::vector<std::string>& normalizedArgs,
+                                        const std::vector<std::string>& dependencyFiles);
 
     void SetXthreadScanLevel(int n);
     int  GetXthreadScanLevel() const;

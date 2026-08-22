@@ -188,3 +188,9 @@ matcher, the lambda/function-pointer path and the cache serializer - not a guard
 landed and audited alongside nine unrelated fixes. Landing a half-guard (e.g. accepting
 `&xs.get(0).f` by synthesising a temp) would convert the current honest rejection into the same
 silent write-loss demonstrated above, which is the outcome this issue exists to prevent.
+
+## Fix requested (2026-08-22)
+
+The MemPressMonitor customer asked for this fixed explicitly (second report). Promoted p2 -> p1
+and queued for the next fix-issue round. Re-reproduced on `9191f27`: `l[0].b = 5;` and `&l[0]`
+still refused for `list<P>` (alias issue); ternary-arm `default` still refused (default issue).

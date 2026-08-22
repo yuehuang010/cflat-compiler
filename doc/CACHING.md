@@ -68,6 +68,14 @@ the VS and Windows SDK installation trees. The cached paths are loaded in micros
 The compiled IR for all 20 core `.cb` libraries is stored as a single LLVM bitcode file.
 Loading from cache is ~44% faster than parsing the libraries from source on every compile.
 
+## Up-to-date check
+
+Executable builds with `-o` write a `*.cflat-dep.json` manifest beside the output. It records the
+normalized arguments, the compiler identity, and every source/header/library/cache file observed
+during the successful build. A later identical invocation skips compilation when all recorded
+files still have the same mtime and size. `--force` or `-B` bypasses the check; IR-only, check,
+run, symbol, and LSP modes do not read or write these manifests.
+
 ## Cache directory layout
 
 ```

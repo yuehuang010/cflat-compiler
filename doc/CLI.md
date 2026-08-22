@@ -29,6 +29,7 @@ positionals are treated as additional `.c` inputs to link. See
 | Switch | Short | Value | Description |
 |--------|-------|-------|-------------|
 | `--output` | `-o` | path | Output native executable (`.exe`). Linking is what merges `.c`/`.lib` inputs, so C interop requires this. A missing LEAF output directory is created; a deeper missing path is still an error. |
+| `--force` | `-B` | | Rebuild a `-o` executable even when its dependency manifest says it is up to date. |
 | `--out-lli` | `-l` | path | Write the LLVM IR (`.ll`) - the final, optimized IR that lands in the object. |
 | `--out-asm` | | path | Write host-target assembly (`.s`) and respect the selected `-O` level. |
 | `--bitcode` | `-b` | path | Write LLVM bitcode (`.bc`). |

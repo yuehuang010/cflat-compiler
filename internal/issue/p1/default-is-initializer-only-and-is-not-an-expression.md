@@ -54,3 +54,9 @@ all from either side and should keep rejecting even after a fix.
 ## Regression coverage
 
 `Test/test_core.cb::testDefaultAsExpression()` covers the accepted legs above by value.
+
+## Fix requested (2026-08-22)
+
+The MemPressMonitor customer asked for this fixed explicitly (second report). Promoted p2 -> p1
+and queued for the next fix-issue round. Re-reproduced on `9191f27`: `l[0].b = 5;` and `&l[0]`
+still refused for `list<P>` (alias issue); ternary-arm `default` still refused (default issue).

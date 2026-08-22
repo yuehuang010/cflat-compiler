@@ -59,6 +59,12 @@
       "type 'DpCircle**'",
       "*"
     ],
+    "calltoarg0arg1stillo...sothecontainerownsit3a125e8aa8e103e7": [
+      "add",
+      "p",
+      "add(move p)",
+      "unique T*"
+    ],
     "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": [
       "sink",
       "unique",
@@ -465,6 +471,7 @@
     "calltoarg0arg1cannot...sitetopassthepointee20812a9d00c778b2": "call to '{0}.{1}': cannot pass a '{2}' to by-value parameter '{3}' of type '{4}' - there is no implicit dereference. Write '{5}' at the call site to pass the pointee.",
     "calltoarg0arg1parame...itharg6atthecallsite7967178d07e90d77": "call to '{0}.{1}': parameter {2} '{3}' has type '{4}' and the argument has {5} - there is no implicit dereference. Dereference it with '{6}' at the call site.",
     "calltoarg0arg1parame...itharg6atthecallsitedf072eae06a105ca": "call to '{0}.{1}': parameter {2} '{3}' has type '{4}' and the argument has {5} - there is no implicit address-of. Take its address with '{6}' at the call site.",
+    "calltoarg0arg1stillo...sothecontainerownsit3a125e8aa8e103e7": "call to '{0}': '{1}' still owns the object it was given, and frees it when it goes out of scope - but this container only BORROWS its elements and never frees them, so the stored element would dangle. Transfer the object with '{2}', or declare the container's element '{3}' so the container owns it.",
     "calltoarg0argumentar...rg2hasnoresolvedtype1b9c663e45646797": "call to '{0}': argument {1} (interface parameter '{2}') has no resolved type",
     "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": "call to '{0}': cannot pass a stack value to {1} interface parameter '{2}' - it takes ownership and frees the object at scope exit, so the source must be a heap '{3}' (or a '{4}' of an owned interface value), not a stack value",
     "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": "call to '{0}': cannot pass the address of a stack or global value to {1} parameter '{2}' - it takes ownership and frees the pointee at scope exit, but neither is heap-allocated and freeing it is undefined. Use '{3}' to allocate on the heap, or drop '{4}' if the callee only borrows.",

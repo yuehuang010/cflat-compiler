@@ -65,6 +65,83 @@ nothing that another CFlat compile can consume as a prebuilt input.
 This is a prerequisite for case 2, not a separate wish: per-file reuse and "build this module once,
 link it into N programs" are the same missing mechanism. Whatever design lands must cover both.
 
+## Where the tracking state lives (RULED 2026-08-22)
+
+**Maintainer ruling: incremental tracking information is stored next to the output - derived
+from the `-o` path by swapping the extension (e.g. `app.exe` -> `app.cflat-dep` or similar), or
+inside the output directory when the output is a directory.** No state under the source tree, no
+per-user cache entry, no build-system file the user has to know about. Deleting the output (or its
+sidecar) is the whole "clean" story, and two outputs built from the same source never share or
+clobber state.
+
+This applies to case 1 immediately: the sidecar records the input, every transitively imported
+`.cb`, every bound header/lib, the compiler binary, and the flag set, each with the mtime seen at
+the last successful build. A rerun compares the sidecar against the filesystem and exits "up to
+date" when nothing is newer. Without a sidecar (first build, or output produced by an older
+compiler) the build runs unconditionally and writes one.
+
+Case 2 must use the same location: per-module artifacts (bitcode, resolved signatures) go in the
+same sidecar directory keyed off the output path, so the mtime-keyed design above and this placement
+rule are the two fixed points any plan has to satisfy.
+
+## Scope and mechanism (RULED 2026-08-22)
+
+**Maintainer ruling: import-level + whole-output incremental is enough. No function-level
+hashing.** Two tiers only:
+
+1. **Whole-output up-to-date check** (case 1): sidecar manifest next to `-o`; if nothing is newer,
+   exit "up to date".
+2. **Per-import reuse** (case 2, module tier): each transitively imported `.cb` gets its own
+   `.meta.json` + `.bc` pair in the sidecar, in the SAME format `--init` already writes for
+   `core/` (`core_<os>.meta.json` = serialized declarations, `core_<os>.bc` = bitcode). NOTE
+   (exploration 2026-08-22, `scratch/inc/import-cache-design.md`): there is NO `linkModules` call
+   in the compiler. `LoadCoreBitcodeIfFresh` (LLVMBackend.cpp ~6520) parses the `.bc` into a fresh
+   context and ADOPTS it as the module, re-binding tables by name; it works only because exactly
+   one cached unit is adopted before any user IR exists. So the first cut of the import tier is
+   ONE pair for the root file's whole import closure (reuses adopt-the-module verbatim), and
+   true per-file pairs need new `llvm::Linker` plumbing plus named-struct collision handling. An import whose file mtime/hash and transitive-import
+   mtimes/hashes match the manifest is loaded from the pair and skips parse, ForwardRefScan and
+   codegen entirely; a changed import is rebuilt and its pair rewritten. The manifest is the
+   existing `--init` JSON with per-file `{path, mtime, hash}` entries added - no new format.
+
+Why this is the right cut (measured 2026-08-22, `Test/test_basic.cb`, Release, warm cache,
+1.17 s total via `-ftime-trace`):
+
+| Phase | ms |
+|-------|----|
+| Parse (ANTLR) | 238 |
+| ForwardRefScan | 200 |
+| CodeGeneration (listener -> IR) | 442 |
+| OptModule + EmitExecutable (LLVM + link) | 216 |
+
+~75% of the build is the CFlat front end, so the win is in skipping parse/scan/codegen for
+untouched imports - which the module tier does. A function-level hash tree (hash each definition's
+source span plus the signature hashes of what it references, pull unchanged bodies from cached
+bitcode) would only refine the codegen slice inside one touched file and drags in generic
+instantiation dedup, `returnBlockTable` / `stringPool` / global-ctor side effects, and a much wider
+serializer surface. Not worth it at current scale; revisit only if a single huge file becomes the
+bottleneck. LLVM-side IR hashing (ThinLTO-style) is ruled out: it only covers the 216 ms back end.
+
+Prior-art check: Rust's crate = compilation unit with rlib metadata carrying generic definitions
+for downstream instantiation, incremental state in `target/` next to the output; Zig = whole-program
+with decl-level in-process incremental and a content-hashed cache dir. CFlat has no build manager
+(no Cargo), so the compiler is its own fingerprinter and the sidecar is the package; the import
+tier is the Rust rlib shape at file granularity, which is what the `--init` core cache already
+implements for `core/*.cb`.
+
+Further blockers found by the exploration: field initializers (`Initializer`/`BraceInitializer`
+ANTLR pointers) are not serialized (fix: store source text, re-parse lazily, as generic templates
+already do); `importCompileDepth_` / `uncertainInterfaceImpls` / `ifConstGuardedImpls_` are
+cleared on cache load and never restored; `returnBlockTable` and `stringPool` are not restored;
+`FunctionSymbol::Recipe` and `AliasArraySize` / `AliasInnerDims` / `NoaliasScopeId` /
+`ParentVariableName` are missing from the serializer. Import graph is a DAG (cycles are an error),
+so no SCC unit is needed.
+
+Hazards carried over from `--init` (see `internal/testing-notes.md`): every `TypeAndValue` /
+`StructData` / `AnnotationValue` field an analysis reads must round-trip through the serializer,
+or a warm sidecar silently drops it for user code too. Generic instantiations emitted into the
+importer must be `linkonce_odr` / COMDAT so `linkModules` dedupes them across cached imports.
+
 ## Related observation - output is not reproducible (RULED: fine for now)
 
 **Maintainer ruling 2026-08-21: CFlat is not deterministic, and that is accepted for now.** Do not

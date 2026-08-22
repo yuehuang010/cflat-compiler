@@ -58,8 +58,12 @@ public:
 			// This keeps program args from being mistaken for compiler flags or source files.
 			if (arg == "--")
 			{
+				m_normalizedArguments.push_back("--");
 				for (int j = i + 1; j < argc; ++j)
+				{
 					m_passthrough.push_back(argv[j]);
+					m_normalizedArguments.push_back(argv[j]);
+				}
 				break;
 			}
 
@@ -68,6 +72,7 @@ public:
 			if (arg == "-fsanitize=address" || arg == "--fsanitize=address")
 			{
 				m_flagValues["asan"] = true;
+				m_normalizedArguments.push_back("--asan");
 				continue;
 			}
 
@@ -77,6 +82,7 @@ public:
 				|| arg == "--sanitize=ownership")
 			{
 				m_flagValues["sanitize-ownership"] = true;
+				m_normalizedArguments.push_back("--sanitize-ownership");
 				continue;
 			}
 
@@ -99,16 +105,23 @@ public:
 				if (isFlag(name))
 				{
 					m_flagValues[name] = true;
+					// --force only decides whether the manifest is consulted; it is not part
+					// of the build's identity, so it must not make the next run rebuild.
+					if (name != "force") m_normalizedArguments.push_back("--" + name);
 				}
 				else if (isOption(name))
 				{
 					if (i + 1 >= argc) { m_errorMsg = "Error: " + display + " requires a value."; return false; }
 					m_optionValues[name] = argv[++i];
+					m_normalizedArguments.push_back("--" + name);
+					m_normalizedArguments.push_back(m_optionValues[name]);
 				}
 				else if (isMultiOption(name))
 				{
 					if (i + 1 >= argc) { m_errorMsg = "Error: " + display + " requires a value."; return false; }
 					m_multiOptionValues[name].push_back(argv[++i]);
+					m_normalizedArguments.push_back("--" + name);
+					m_normalizedArguments.push_back(m_multiOptionValues[name].back());
 				}
 				else
 				{
@@ -141,7 +154,10 @@ public:
 					// Allow single-dash long flags like -O2, -O1
 					std::string name = arg.substr(1);
 					if (isFlag(name))
+					{
 						m_flagValues[name] = true;
+						if (name != "force") m_normalizedArguments.push_back("--" + name);
+					}
 					else
 					{
 						m_errorMsg = "Error: unknown argument '" + arg + "'.";
@@ -152,6 +168,7 @@ public:
 			else
 			{
 				m_positionalValues.push_back(arg);
+				m_normalizedArguments.push_back(arg);
 			}
 		}
 		return true;
@@ -194,6 +211,10 @@ public:
 	// Program arguments collected after a bare "--" (empty if none). Meaningful only under
 	// --run, where they become argv[1..] of the JIT'd program.
 	const std::vector<std::string>& passthrough() const { return m_passthrough; }
+
+	// Canonical argument spellings used by output dependency manifests. Short options and
+	// accepted sanitizer aliases are normalized to their long names while preserving order.
+	const std::vector<std::string>& normalizedArguments() const { return m_normalizedArguments; }
 
 	int getOptimizationLevel() const
 	{
@@ -275,6 +296,7 @@ private:
 	std::unordered_map<std::string, std::vector<std::string>> m_multiOptionValues;
 	std::vector<std::string>                                  m_positionalValues;
 	std::vector<std::string>                                  m_passthrough;
+	std::vector<std::string>                                  m_normalizedArguments;
 	std::string                                  m_program;
 	mutable std::string                          m_errorMsg;
 	bool                                         m_showVersion = false;
