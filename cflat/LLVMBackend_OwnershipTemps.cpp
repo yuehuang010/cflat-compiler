@@ -1226,7 +1226,10 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // path does, and any per-site `new T[n] alignas(N)` excess carried on the local.
         auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
         auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
-        uint64_t effAlign = namedVar.AllocAlignment;
+        // The DECLARED clause counts too: a global has no mutable NamedVariable, so its tracked
+        // AllocAlignment is never established and only 'alignas(0, N)' on the declaration records
+        // that the block came from the aligned allocator.
+        uint64_t effAlign = std::max(namedVar.AllocAlignment, namedVar.TypeAndValue.AllocAlignValue);
         if (!namedVar.TypeAndValue.TypeName.empty() && !namedVar.TypeAndValue.ElemPointer)
         {
             TypeAndValue tv{ .TypeName = namedVar.TypeAndValue.TypeName };
