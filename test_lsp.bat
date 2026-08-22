@@ -17,6 +17,8 @@ rem LSP backend/worker pool size. Defaults to 4 (the diminishing-returns sweet s
 rem for this suite); override by passing a count, e.g. "test_lsp.bat Release 8".
 if "%_POOL_ARG%"=="" set _POOL_ARG=4
 set _POOL=--lsp-pool-size %_POOL_ARG%
+rem Fixtures assert the source diagnostic templates, so pin the pseudo locale.
+set CFLAT_LOCALE=pseudo
 
 echo === LSP smoke tests ===
 python vscode-extension\test\lsp_test.py %COMPILER% %_POOL%

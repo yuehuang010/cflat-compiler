@@ -46,6 +46,8 @@ if [ -z "$PY" ]; then
     exit 1
 fi
 
+# Fixtures assert the source diagnostic templates, so pin the pseudo locale.
+export CFLAT_LOCALE=pseudo
 POOL_ARG="--lsp-pool-size $POOL"
 T="vscode-extension/test"
 rc=0
