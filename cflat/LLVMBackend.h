@@ -5127,6 +5127,19 @@ public:
      * the store sites differ only in how they name the slot and which LogError they call.
      */
     bool IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right);
+
+    // One ARM of the string-literal question: 1 = proven string literal, 0 = neutral (a null
+    // constant carries no data), -1 = unproven, which alone leaves the whole join unproven.
+    int JoinArmStringLiteralKind(const llvm::Value* value, int depth) const;
+
+    /*
+     * Does a '?:' / '??' JOIN deliver a value proven to be a string LITERAL on every path? The
+     * arms are joined into one SSA value before any store site sees them, so the direct-constant
+     * test in IsStringLiteralIntoStructPointer cannot see them. EVERY arm must be proven (or
+     * neutral) and at least one proven: an ANY-arm quantifier would reject 'g ? &pt : "b"',
+     * which the merge base compiles and runs correctly on its pointer arm.
+     */
+    bool JoinIsAllStringLiterals(const llvm::Value* value, int depth = 0) const;
     std::string DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                        const std::string& destDesc) const;
 

@@ -74,3 +74,104 @@ expect_error("cannot store a string literal") {
 expect_error("cannot store a string literal") {
     int litAsDefaultParameter(Point* p = "nn") { return 0; }
 }
+
+// A '?:' / '??' JOIN of literals reached the same eight store sites and slipped the gate: the
+// arms are merged into one PHI (or, for '??', a slot load) before any site sees the value, so
+// the direct-constant test never fired and the slot took the character bytes (2026-08-21 p3
+// `Q* q = g ? "aaaa" : "bbbb"` returning 97 = 'a'). Every arm must be a literal (or a null
+// carrying no data); a join with a real pointer arm stays accepted - see test_operators.cb.
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoStructPointerLocal() {
+        bool g = true;
+        Point* p = g ? "nn" : "mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litNestedJoinIntoStructPointerLocal() {
+        bool g = true;
+        bool h = false;
+        Point* p = g ? "nn" : (h ? "mm" : "oo");
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litCoalesceJoinIntoStructPointerLocal() {
+        Point* p = "nn" ?? "mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinWithDefaultArm() {
+        bool g = true;
+        Point* p = g ? "nn" : default;
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinWithNullArm() {
+        bool g = true;
+        Point* p = g ? nullptr : "mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinOfCastLiterals() {
+        bool g = true;
+        Point* p = g ? (Point*)"nn" : (Point*)"mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoNullableStringLocal() {
+        bool g = true;
+        string? s = g ? "nn" : "mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoNullableStringField() {
+        bool g = true;
+        LitBar b = default;
+        b.date = g ? "nn" : "mm";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoNullableStringBrace() {
+        bool g = true;
+        LitBar b = { date = g ? "nn" : "mm" };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    struct LitJoinDefaultBar { string? date = true ? "nn" : "mm"; };
+}
+
+expect_error("cannot store a string literal") {
+    string? litJoinReturnedAsNullableString(bool g) { return g ? "nn" : "mm"; }
+}
+
+expect_error("cannot store a string literal") {
+    int litJoinTakesNullableString(string? s) { return 0; }
+    void litJoinPassesJoin() { bool g = true; litJoinTakesNullableString(g ? "nn" : "mm"); }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoFixedArrayOfStructPointers() {
+        bool g = true;
+        Point*[2] arr = { g ? "nn" : "mm", nullptr };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litJoinIntoInferredArrayViewOfStructPointers() {
+        bool g = true;
+        Point*[] arr = { g ? "nn" : "mm" };
+    }
+}
+
+expect_error("cannot store a string literal") {
+    int litJoinAsDefaultParameter(Point* p = true ? "nn" : "mm") { return 0; }
+}

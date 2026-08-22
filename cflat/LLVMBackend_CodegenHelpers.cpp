@@ -1340,6 +1340,50 @@ bool LLVMBackend::IsOwningValueOrClosureType(const std::string& typeName)
             || typeName == "__closure_fat_ptr" || IsEncodedClosureType(typeName);
     }
 
+int LLVMBackend::JoinArmStringLiteralKind(const llvm::Value* value, int depth) const
+{
+    if (value == nullptr) return -1;
+    if (auto* c = llvm::dyn_cast<llvm::Constant>(value))
+    {
+        // A null arm carries no data, so it neither proves nor blocks - the same neutral
+        // reading JoinArmDataKind gives it. `default` on a pointer lowers to this null.
+        if (c->isNullValue()) return 0;
+        if (IsStringLiteralConstant(const_cast<llvm::Constant*>(c))) return 1;
+    }
+    return JoinIsAllStringLiterals(value, depth) ? 1 : -1;
+}
+
+bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) const
+{
+    if (value == nullptr || depth > kMaxJoinArmDepth) return false;
+    bool proven = false;
+    // A '?:' joins through a PHI whose incoming values ARE the arms; a '??' joins through a
+    // slot, so its arms survive only in the nullCoalesceJoins_ ledger.
+    if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
+    {
+        if (phi->getNumIncomingValues() == 0) return false;
+        for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
+        {
+            const int kind = JoinArmStringLiteralKind(phi->getIncomingValue(i), depth + 1);
+            if (kind < 0) return false;
+            if (kind > 0) proven = true;
+        }
+        return proven;
+    }
+    if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
+    {
+        if (join->Arms.empty()) return false;
+        for (const auto& arm : join->Arms)
+        {
+            const int kind = JoinArmStringLiteralKind(arm.Value, depth + 1);
+            if (kind < 0) return false;
+            if (kind > 0) proven = true;
+        }
+        return proven;
+    }
+    return false;
+}
+
 bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, llvm::Value* right)
 {
     if (right == nullptr || !destTV.Pointer) return false;
@@ -1348,7 +1392,9 @@ bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, l
     if (destTV.IsFunctionPointer || destTV.IsInterface || destTV.IsArrayView) return false;
     if (destTV.PointerDepth > 1 || destTV.ElemPointer || destTV.ConstArraySize > 0) return false;
     auto* c = llvm::dyn_cast<llvm::Constant>(right);
-    if (c == nullptr || !IsStringLiteralConstant(c)) return false;
+    const bool literal = (c != nullptr && IsStringLiteralConstant(c))
+        || JoinIsAllStringLiterals(right);
+    if (!literal) return false;
     return GetDataStructure(destTV.TypeName).StructType != nullptr;
 }
 
