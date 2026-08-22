@@ -82,3 +82,10 @@ void cb_init_obj(CbObj* obj, int start)
     obj->vtbl = &cb_global_vtbl;
     obj->value = start;
 }
+
+/* Targets for the alias-macro legs in c_macro_helpers.h (Section U of
+   test_c_interop.cb). Kept trivial: the legs assert the alias reaches THIS body. */
+int c_triple(int x) { return x * 3; }
+int c_quad(int x)   { return x * 4; }
+int c_alias_victim(int x) { return x * 10; }
+int c_negate(int x)       { return -x; }

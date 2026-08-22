@@ -98,6 +98,7 @@ namespace cflat_cinterop
         {
             std::string name;
             std::string file;
+            std::string aliasTarget;   // body is exactly one identifier token (`#define A B`)
             int line = 1;
             int col = 0;
         };
@@ -107,6 +108,7 @@ namespace cflat_cinterop
             const ExtractRequest& req;
             ExtractResult& out;
             std::vector<MacroProbe> probes;   // index == probe slot
+            std::unordered_set<unsigned> emittedProbes;  // probe slots that produced a RawMacro
             std::unordered_set<std::string> emittedGlobals;  // dedup global var redeclarations by name
             std::unordered_set<std::string> emittedOpaqueForward;  // dedup opaque forward-decl records by tag
             std::vector<std::string> normDirs; // req.inScopeDirs normalized once (NormPath + trailing-/ stripped)
@@ -166,8 +168,34 @@ namespace cflat_cinterop
 
                 if (mi->getNumTokens() == 0) return;   // include guard / empty define: nothing to fold
 
+                // A one-token identifier body is an alias spelling; keep the spelling so a
+                // macro whose probe cannot fold (a function, extern data, a type) still binds.
+                std::string aliasTarget;
+                bool targetIsFuncMacro = false;
+                if (mi->getNumTokens() == 1 && mi->tokens().front().isAnyIdentifier())
+                {
+                    const Token& body = mi->tokens().front();
+                    aliasTarget = pp.getSpelling(body);
+                    if (const IdentifierInfo* bii = body.getIdentifierInfo())
+                        if (const MacroInfo* bmi = pp.getMacroInfo(bii))
+                            targetIsFuncMacro = bmi->isFunctionLike();
+                }
+
+                // Aliasing a function-like macro: the probe would read the bare target name,
+                // which clang error-recovers into a bogus constant. Report it, inject no probe.
+                if (targetIsFuncMacro)
+                {
+                    RawMacro m;
+                    m.name = name; m.file = file; m.line = line; m.col = col;
+                    m.aliasTarget = aliasTarget;
+                    m.kind = RawMacro::Skip;
+                    st.out.macros.push_back(std::move(m));
+                    return;
+                }
+
                 MacroProbe mp;
                 mp.name = name; mp.file = file; mp.line = line; mp.col = col;
+                mp.aliasTarget = aliasTarget;
                 st.probes.push_back(std::move(mp));
             }
         };
@@ -485,13 +513,24 @@ namespace cflat_cinterop
                 unsigned idx = 0;
                 if (nm.drop_front(sizeof(kProbePrefix) - 1).getAsInteger(10, idx)) return true;
                 if (idx >= st.probes.size()) return true;
-                const Expr* init = vd->getInit();
-                if (!init) return true;
-
                 const MacroProbe& mp = st.probes[idx];
                 RawMacro m;
                 m.name = mp.name; m.file = mp.file; m.line = mp.line; m.col = mp.col;
+                m.aliasTarget = mp.aliasTarget;
                 m.kind = RawMacro::Skip;
+
+                // No usable initializer: the probe did not parse (a type name, an unknown
+                // identifier). An alias-shaped body is still worth reporting to the binder.
+                const Expr* init = vd->getInit();
+                if (!init)
+                {
+                    if (!m.aliasTarget.empty())
+                    {
+                        st.emittedProbes.insert(idx);
+                        st.out.macros.push_back(std::move(m));
+                    }
+                    return true;
+                }
 
                 // EvaluateAsRValue must not be called on an error-recovery or value-dependent
                 // initializer (it can assert on the inconsistent node). Probes for non-value
@@ -499,6 +538,7 @@ namespace cflat_cinterop
                 // (handled above), but skip defensively here for any that still produce one.
                 if (init->containsErrors() || init->isValueDependent())
                 {
+                    st.emittedProbes.insert(idx);
                     st.out.macros.push_back(std::move(m));
                     return true;
                 }
@@ -511,6 +551,7 @@ namespace cflat_cinterop
                         m.stringValue = sl->getString().str();
                         m.naturalType = "char *";
                     }
+                    st.emittedProbes.insert(idx);
                     st.out.macros.push_back(std::move(m));
                     return true;
                 }
@@ -537,6 +578,7 @@ namespace cflat_cinterop
                     else if (v.isLValue() && v.getLValueBase().isNull())
                                           { m.kind = RawMacro::Int;   m.intValue = v.getLValueOffset().getQuantity(); }
                 }
+                st.emittedProbes.insert(idx);
                 st.out.macros.push_back(std::move(m));
                 return true;
             }
@@ -766,7 +808,22 @@ namespace cflat_cinterop
         {
             llvm::TimeTraceScope parseScope("FullParse", req.mainFileName.empty() ? req.realPath : req.mainFileName);
             ExtractAction extract(st);
-            return RunAction(req, fullSource, extract, err, &out.prereqErrors, &out.firstPrereqError);
+            bool ok = RunAction(req, fullSource, extract, err, &out.prereqErrors, &out.firstPrereqError);
+
+            // A probe whose injected variable never reached the AST (the body is a type name or
+            // an unknown identifier) still reports its alias spelling; the binder decides.
+            for (size_t i = 0; i < st.probes.size(); ++i)
+            {
+                const MacroProbe& mp = st.probes[i];
+                if (mp.aliasTarget.empty()) continue;
+                if (st.emittedProbes.count((unsigned)i)) continue;
+                RawMacro m;
+                m.name = mp.name; m.file = mp.file; m.line = mp.line; m.col = mp.col;
+                m.aliasTarget = mp.aliasTarget;
+                m.kind = RawMacro::Skip;
+                out.macros.push_back(std::move(m));
+            }
+            return ok;
         }
     }
 }

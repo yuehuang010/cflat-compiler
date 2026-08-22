@@ -1232,6 +1232,7 @@ nlohmann::json LLVMBackend::MacroToJson(const CMacroEntry& m)
         if (m.isString) { j["iss"]  = true; j["sv"]   = m.stringValue; }
         if (m.isFuncPtr){ j["isfp"] = true; j["fptv"] = TvToJson(m.funcPtrTV); }
         if (!m.intTypeName.empty()) j["ity"] = m.intTypeName;
+        if (!m.aliasTarget.empty()) j["al"] = m.aliasTarget;
         return j;
     }
 
@@ -1255,6 +1256,7 @@ LLVMBackend::CMacroEntry LLVMBackend::MacroFromJson(const SjVal& j)
         m.isFuncPtr = j.value("isfp", false);
         if (m.isFuncPtr && j.contains("fptv")) m.funcPtrTV = TvFromJson(j["fptv"]);
         m.intTypeName = j.value("ity", std::string{});
+        m.aliasTarget = j.value("al", std::string{});
         return m;
     }
 
@@ -1335,7 +1337,8 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // the narrower record set, so CGPoint/CGRect-style signature-only dependency records
         // (defined in a sibling out-of-scope header, named only by a function's params/return)
         // would still be missing.
-        if (version != 10) return false;
+        // v11 carries alias macros (`#define A B`); a v10 entry dropped every one of them.
+        if (version != 11) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -1397,7 +1400,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 10;
+        j["version"] = 11;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

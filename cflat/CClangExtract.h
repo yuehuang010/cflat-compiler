@@ -88,6 +88,9 @@ namespace cflat_cinterop
         double floatValue = 0.0;
         std::string stringValue;     // decoded characters (string kind)
         std::string naturalType;     // canonical type spelling of the folded expression
+        // Object-like macro whose whole body is a single identifier (`#define A B`). Carried
+        // even when the probe did not fold, so the binder can alias A onto whatever B names.
+        std::string aliasTarget;
         std::string file;
         int line = 1;
         int col = 0;

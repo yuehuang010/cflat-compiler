@@ -47,3 +47,26 @@ typedef void (*CB_DTOR_FN)(void*);
 #define CB_REJECT_CALL(x)   (some_func(x))      /* call into an UNKNOWN function */
 #define CB_REJECT_STRING(x) (x ? "y" : "n")     /* string literal */
 #define CB_REJECT_MEMBER(p) ((p)->field)        /* member access */
+
+/* Alias macros: an object-like macro whose ENTIRE body is a single identifier
+   (`#define A B`). A has no parameter list, so the function-like translator never
+   sees it, and its body folds to no constant, so the object-like probe dropped it -
+   the name simply did not exist in CFlat. Each must now bind onto whatever B names:
+   a function, extern data, another alias, or a function-like macro. An unknown
+   target must stay silently unimported (no diagnostic). See Section U. */
+int c_triple(int x);                  /* defined in cinterop.c */
+#define CB_ALIAS_ADD     c_add        /* -> C function */
+#define CB_ALIAS_CHAIN   CB_ALIAS_ADD /* -> alias -> C function */
+#define CB_ALIAS_EARLY   c_quad       /* alias precedes its target's declaration */
+int c_quad(int x);                    /* defined in cinterop.c */
+#define CB_ALIAS_COUNTER c_global_counter  /* -> extern data (shares storage) */
+#define CB_ALIAS_MIN     CB_MIN       /* -> function-like macro template */
+#define CB_ALIAS_TRAIL   c_triple     /* trailing comment must not defeat the match */
+#define CB_ALIAS_UNKNOWN cb_no_such_name_anywhere  /* unknown: dropped, no error */
+#define CB_BASE_VAL      100
+#define CB_ALIAS_CONST   CB_BASE_VAL  /* folds to a constant: unchanged accept-set */
+int c_alias_victim(int x);            /* defined in cinterop.c; called ONLY by leg 249 */
+int c_negate(int x);                  /* defined in cinterop.c */
+/* Colliding name whose target has the SAME arity, so an alias that did not lose to the
+   real declaration would be a live overload candidate for the call in leg 249. */
+#define c_alias_victim   c_negate

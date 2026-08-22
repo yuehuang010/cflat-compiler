@@ -549,5 +549,34 @@ extern int main()
     if (cbo.vtbl->get(&cbo) != 15)               return 232;   // mutation landed via `this`
     if (cbo.vtbl->add(&cbo, 100, 0) != 115)      return 233;   // accumulates
 
+    // ---- Section U: alias macros (`#define A B`, body is one identifier) -----
+    // Such a macro has no parameter list (the function-like translator never sees it)
+    // and folds to no constant (the object-like probe dropped it), so the name did not
+    // exist in CFlat at all. Legs 240-247 each failed to COMPILE before the fix
+    // ("Undefined variable X." / "the function 'X' is not known").
+    if (CB_ALIAS_ADD(40, 2) != 42)               return 240;   // alias -> C function
+    if (CB_ALIAS_CHAIN(20, 3) != 23)             return 241;   // alias -> alias -> function
+    if (CB_ALIAS_EARLY(6) != 24)                 return 242;   // alias precedes target's decl
+    if (CB_ALIAS_TRAIL(7) != 21)                 return 243;   // trailing comment after body
+    if (CB_ALIAS_MIN(3, 7) != 3)                 return 244;   // alias -> function-like macro
+    if (CB_ALIAS_MIN(9, 2) != 2)                 return 245;
+
+    // Alias to extern data must share the TARGET's storage: a write through one name is
+    // visible through the other (a freshly created global would read 0, not 4243/1005).
+    c_global_counter = 4243;
+    if (CB_ALIAS_COUNTER != 4243)                return 246;
+    CB_ALIAS_COUNTER = 1005;
+    if (c_global_counter != 1005)                return 247;
+
+    // Accept-set (identical before and after). 248 pins that an alias-SHAPED body which
+    // still folds keeps its constant (the fold path wins); it cannot distinguish fold from
+    // alias, since aliasing a constant lands on the same global. 249 is the discriminating
+    // one: a real declaration wins over a colliding alias macro.
+    // `#define c_alias_victim c_negate` has that function's exact arity, so an alias that
+    // did NOT lose to the real declaration would be a live overload candidate here. This is
+    // the ONLY call to c_alias_victim in the file, so no earlier leg can absorb the failure.
+    if (CB_ALIAS_CONST != 100)                   return 248;
+    if (c_alias_victim(5) != 50)                 return 249;
+
     return 0;
 }

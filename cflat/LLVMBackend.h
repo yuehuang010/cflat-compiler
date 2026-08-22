@@ -2654,6 +2654,9 @@ private:
         // fat struct {thunk, env=intToPtr(value)}, same wire format as a C-returned fn ptr.
         bool isFuncPtr = false;
         TypeAndValue funcPtrTV;
+        // Object-like macro whose body is a single identifier (`#define A B`) that did not fold
+        // to a constant. Bound by RegisterCMacroAliases once every C entity is registered.
+        std::string aliasTarget;
     };
     // Field types kept as raw C spellings so they can be re-resolved after all records in the
     // TU are registered (handles forward references between structs).
@@ -4097,6 +4100,9 @@ private:
     void RegisterCRecords(const std::vector<CRecordEntry>& records, const std::string& fileForLsp);
 
     void RegisterCMacros(const std::vector<CMacroEntry>& macros);
+    void RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
+                               const std::vector<CFunctionMacroEntry>& funcMacros,
+                               const std::string& fileForLsp);
 
     bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const;
 

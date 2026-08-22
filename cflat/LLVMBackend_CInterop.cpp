@@ -937,9 +937,15 @@ bool LLVMBackend::MapRawGlobal(const cflat_cinterop::RawGlobalVar& r, CGlobalEnt
 bool LLVMBackend::ClassifyRawMacro(const cflat_cinterop::RawMacro& r, CMacroEntry& e)
 {
         using K = cflat_cinterop::RawMacro;
-        if (r.kind == K::Skip) return false;
+        if (r.kind == K::Skip && r.aliasTarget.empty()) return false;
         e = CMacroEntry();
         e.name = r.name; e.file = r.file; e.line = r.line ? r.line : 1; e.col = 0;
+        if (r.kind == K::Skip)
+        {
+            // Did not fold, but the body is one identifier: carry the spelling for the alias pass.
+            e.aliasTarget = r.aliasTarget;
+            return true;
+        }
         if (r.kind == K::String) { e.isString = true; e.stringValue = r.stringValue; return true; }
         if (r.kind == K::Float)  { e.isFloat = true;  e.floatValue  = r.floatValue;  return true; }
 
@@ -1709,6 +1715,7 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
         for (const CMacroEntry& m : macros)
         {
             if (m.name.empty()) continue;
+            if (!m.aliasTarget.empty()) continue;   // no folded value; RegisterCMacroAliases binds it
             if (globalNamedVariable.count(m.name)) continue;
 
             TypeAndValue tv;
@@ -1791,6 +1798,100 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
         if (verbose && !macros.empty())
             std::cout << std::format("[verbose]   registered {} C macro constant(s) (of {} object-like candidates)\n",
                 registered, macros.size());
+    }
+
+// Bind object-like macros whose body is a single identifier (`#define A B`). Runs after every
+// C entity of the import is registered, so B is resolvable whatever kind of thing it names.
+void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
+                                        const std::vector<CFunctionMacroEntry>& funcMacros,
+                                        const std::string& fileForLsp)
+{
+        std::unordered_map<std::string, std::string> aliasMap;
+        for (const CMacroEntry& m : macros)
+            if (!m.name.empty() && !m.aliasTarget.empty()) aliasMap.emplace(m.name, m.aliasTarget);
+        if (aliasMap.empty()) return;
+
+        std::unordered_map<std::string, const CFunctionMacroEntry*> funcMacroByName;
+        for (const CFunctionMacroEntry& f : funcMacros) funcMacroByName.emplace(f.name, &f);
+
+        // An alias may name another alias (`#define A B` / `#define B fn`). Walk the chain to
+        // the first name that resolves to something real; the hop cap breaks a self-reference.
+        auto resolvable = [&](const std::string& n) {
+            return functionTable.count(n) != 0 || globalNamedVariable.count(n) != 0
+                || funcMacroByName.count(n) != 0 || dataStructures.count(n) != 0
+                || ResolveTypeAlias(n) != n;
+        };
+
+        size_t bound = 0;
+        std::vector<CFunctionMacroEntry> macroTemplateAliases;
+        for (const CMacroEntry& m : macros)
+        {
+            if (m.name.empty() || m.aliasTarget.empty()) continue;
+            // A real declaration of the same name always wins over the alias spelling.
+            if (functionTable.count(m.name) || globalNamedVariable.count(m.name)) continue;
+
+            std::string target = m.aliasTarget;
+            for (int hop = 0; hop < 16 && !resolvable(target); ++hop)
+            {
+                auto next = aliasMap.find(target);
+                if (next == aliasMap.end() || next->second == target) break;
+                target = next->second;
+            }
+            if (target == m.name) continue;   // self-reference
+
+            if (auto fn = functionTable.find(target); fn != functionTable.end())
+            {
+                // Reuse the target's llvm::Function and its whole signature: the alias is a
+                // second lookup name for one linkage symbol, never a new external symbol.
+                for (const FunctionSymbol& sym : fn->second) functionTable[m.name].push_back(sym);
+                if (auto* sink = GetSymbolSink())
+                    sink->Register(SymbolKind::Function, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
+                                   "#define " + m.name + " " + target);
+                ++bound;
+            }
+            else if (auto gv = globalNamedVariable.find(target); gv != globalNamedVariable.end())
+            {
+                globalNamedVariable[m.name] = gv->second;
+                auto gt = globalVariableTypes.find(target);
+                if (gt != globalVariableTypes.end())
+                {
+                    TypeAndValue tv = gt->second;
+                    tv.VariableName = m.name;
+                    globalVariableTypes[m.name] = tv;
+                }
+                if (auto* sink = GetSymbolSink())
+                    sink->Register(SymbolKind::Variable, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
+                                   "#define " + m.name + " " + target);
+                ++bound;
+            }
+            else if (auto fm = funcMacroByName.find(target); fm != funcMacroByName.end())
+            {
+                // A function-like macro is a generated CFlat template, so the alias is a second
+                // template with the same parameters and body.
+                CFunctionMacroEntry copy = *fm->second;
+                copy.name = m.name;
+                copy.file = m.file; copy.line = m.line; copy.col = m.col < 0 ? 0 : m.col;
+                macroTemplateAliases.push_back(std::move(copy));
+                ++bound;
+            }
+            else if (dataStructures.count(target) || ResolveTypeAlias(target) != target)
+            {
+                if (ResolveTypeAlias(m.name) == m.name && !dataStructures.count(m.name))
+                {
+                    RegisterTypeAlias(m.name, target);
+                    ++bound;
+                }
+            }
+            // Anything else (an unknown identifier) stays unimported, silently: a header is
+            // full of aliases for names CFlat has no business binding.
+        }
+
+        if (!macroTemplateAliases.empty())
+            RegisterCFunctionMacros(macroTemplateAliases, fileForLsp + "@aliases");
+
+        if (verbose && bound)
+            std::cout << std::format("[verbose]   bound {} alias macro(s) (of {} candidate(s)) from {}\n",
+                bound, aliasMap.size(), fileForLsp);
     }
 
 bool LLVMBackend::TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const
@@ -2171,6 +2272,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCMacros(hitMacros);
             RegisterCFunctionMacros(hitFuncMacros, fileForLsp);
             RegisterCGlobals(hitGlobals, fileForLsp);
+            RegisterCMacroAliases(hitMacros, hitFuncMacros, fileForLsp);
             return true;
         }
 
@@ -2202,6 +2304,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 RegisterCMacros(diskEntry.macros);
                 RegisterCFunctionMacros(diskEntry.funcMacros, fileForLsp);
                 RegisterCGlobals(diskEntry.globals, fileForLsp);
+                RegisterCMacroAliases(diskEntry.macros, diskEntry.funcMacros, fileForLsp);
                 return true;
             }
         }
@@ -2279,6 +2382,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCMacros(macros);
             RegisterCFunctionMacros(funcMacros, fileForLsp);
             RegisterCGlobals(globals, fileForLsp);
+            RegisterCMacroAliases(macros, funcMacros, fileForLsp);
         }
         return true;
     }
