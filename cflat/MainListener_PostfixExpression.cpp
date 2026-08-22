@@ -4130,7 +4130,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // has no named owner and must be freed at end-of-full-expression -
                                     // same rule as the direct-call arg loop. string.dtor's owned-bit
                                     // check makes this a safe no-op for a borrowed (alias) result.
-                                    if (llvm::isa<llvm::CallInst>(argValue)
+                                    if (Compiler(ctx)->IsProducedTempValue(argValue)
                                         && argValue->getType() == llvm::StructType::getTypeByName(
                                                *Compiler(ctx)->context, "string"))
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
@@ -4833,7 +4833,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // param unregisters it in the call dispatch, and string.dtor's
                                     // owned-bit check makes a borrowed (alias) result a safe no-op.
                                     // Mirrors RegisterBorrowedStringOperandTemp for operator operands.
-                                    if (argValue && llvm::isa<llvm::CallInst>(argValue)
+                                    if (argValue && Compiler(ctx)->IsProducedTempValue(argValue)
                                         && argValue->getType() == llvm::StructType::getTypeByName(
                                                *Compiler(ctx)->context, "string"))
                                         Compiler(ctx)->RegisterOwnedStringTemp(argValue);
@@ -5150,6 +5150,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
 
                         compiler->SwitchToBlock(resumeBlock);
                         auto* result = compiler->CreateLoad(resultAlloca);
+                        compiler->PropagateNullConditionalOwnership(namedVar.Primary, result);
                         namedVar.Storage = nullptr;
                         namedVar.Primary = result;
                         namedVar.BaseType = result->getType();

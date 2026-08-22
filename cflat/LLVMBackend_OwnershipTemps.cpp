@@ -1398,6 +1398,31 @@ void LLVMBackend::PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to)
         ownedReturnReleaseTemps_.push_back(copy);
 }
 
+bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
+{
+        if (value == nullptr) return false;
+        if (llvm::isa<llvm::CallInst>(value)) return true;
+        return std::find(nullConditionalTempResults_.begin(), nullConditionalTempResults_.end(),
+                         value) != nullConditionalTempResults_.end();
+}
+
+void LLVMBackend::PropagateNullConditionalOwnership(llvm::Value* from, llvm::Value* to)
+{
+        if (from == nullptr || to == nullptr || from == to) return;
+        // The merged load stands in for the access arm's produced temp, so the registration
+        // sites downstream must see it as one.
+        if (IsProducedTempValue(from)) nullConditionalTempResults_.push_back(to);
+        PropagateOwnedReturnTemp(from, to);
+        // A closure temp is registered by the CALL and has no consumer-side registration site to
+        // re-find it, so its ledger entry must MOVE to the merged value (a string's does not:
+        // the produced-temp sites above re-register that one where it matters).
+        if (IsOwnedClosureTemp(from))
+        {
+            UnregisterOwnedClosureTemp(from);
+            RegisterOwnedClosureTemp(to);
+        }
+}
+
 const LLVMBackend::OwnedReturnReleaseTemp* LLVMBackend::FindOwnedReturnEntry(llvm::Value* value) const
 {
         if (value == nullptr) return nullptr;
@@ -3017,7 +3042,7 @@ void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg)
 {
         const std::string& typeName = arg.TypeAndValue.TypeName;
         if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return;
-        if (!llvm::isa<llvm::CallInst>(arg.Primary)) return;   // only a produced temp, not a named local
+        if (!IsProducedTempValue(arg.Primary)) return;   // only a produced temp, not a named local
         if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return;
         if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return;
         if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
@@ -3223,6 +3248,7 @@ void LLVMBackend::DiscardOwnedTempsSince(const OwnedTempMark& mark)
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        nullConditionalTempResults_.clear();
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
@@ -3245,6 +3271,7 @@ void LLVMBackend::FlushOwnedTemps()
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        nullConditionalTempResults_.clear();
         rawArrayResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();

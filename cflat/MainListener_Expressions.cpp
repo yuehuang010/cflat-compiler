@@ -3807,7 +3807,7 @@ llvm::Value* MainListener::AdoptTernaryStringArm(LLVMBackend* compiler, llvm::Va
         deepCopied = true;
         // A temp nothing else owns: already registered, or a plain (non-`move`) string-returning
         // CALL, which the call path does not register. A local/field read is neither - its owner frees it.
-        if (compiler->IsPendingOwnedStringTemp(value) || llvm::isa<llvm::CallInst>(value))
+        if (compiler->IsPendingOwnedStringTemp(value) || compiler->IsProducedTempValue(value))
         {
             compiler->UnregisterOwnedStringTemp(value);
             compiler->EmitOwnedStringTempFree(value);
@@ -6150,7 +6150,7 @@ void MainListener::TrackOwnedStringOperatorResult(LLVMBackend* compiler, llvm::V
     }
 
 void MainListener::RegisterBorrowedStringOperandTemp(LLVMBackend* compiler, llvm::Value* operand) {
-        if (operand == nullptr || !llvm::isa<llvm::CallInst>(operand)) return;
+        if (operand == nullptr || !compiler->IsProducedTempValue(operand)) return;
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
         if (strTy != nullptr && operand->getType() == strTy)
             compiler->RegisterOwnedStringTemp(operand);

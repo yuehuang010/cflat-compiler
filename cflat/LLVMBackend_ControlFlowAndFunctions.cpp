@@ -159,6 +159,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         s.ownedReturnTemps    = std::move(ownedReturnTemps_);
         s.ownedReturnReleaseTemps = std::move(ownedReturnReleaseTemps_);
         s.ownedNewTemps       = std::move(ownedNewTemps_);
+        s.nullConditionalTempResults = std::move(nullConditionalTempResults_);
         s.valueElementTypeNames = std::move(valueElementTypeNames_);
         s.fatInterfaceValueTypeNames = std::move(fatInterfaceValueTypeNames_);
         s.interfaceBoxRecords = std::move(interfaceBoxRecords_);
@@ -191,6 +192,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         ownedReturnTemps_.clear();
         ownedReturnReleaseTemps_.clear();
         ownedNewTemps_.clear();
+        nullConditionalTempResults_.clear();
         valueElementTypeNames_.clear();
         fatInterfaceValueTypeNames_.clear();
         interfaceBoxRecords_.clear();
@@ -237,6 +239,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         ownedReturnTemps_        = state.ownedReturnTemps;
         ownedReturnReleaseTemps_ = state.ownedReturnReleaseTemps;
         ownedNewTemps_           = state.ownedNewTemps;
+        nullConditionalTempResults_ = state.nullConditionalTempResults;
         valueElementTypeNames_   = state.valueElementTypeNames;
         fatInterfaceValueTypeNames_ = state.fatInterfaceValueTypeNames;
         interfaceBoxRecords_    = state.interfaceBoxRecords;

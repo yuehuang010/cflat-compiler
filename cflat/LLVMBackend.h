@@ -1518,6 +1518,12 @@ public:
     };
     std::vector<OwnedReturnReleaseTemp> ownedReturnReleaseTemps_;
 
+    // A '?.' merge re-loads its result through an alloca, so the produced-temp tests that ask
+    // `isa<CallInst>` stop recognising a chain whose access arm WAS a call. These are the merged
+    // values of exactly those chains; statement-scoped, cleared by FlushOwnedTemps and parked
+    // across a nested emission by SaveBuilderState (a lambda body's flush must not drop them).
+    std::vector<llvm::Value*> nullConditionalTempResults_;
+
     // Owning-POINTER SSA values produced by `new`, keyed by value identity, plus any value they
     // propagate onto (a '?:' phi/select whose arm is one). Lets a `unique T*` assignment ask
     // "does the RHS VALUE carry ownership" instead of "what does the RHS look like". A value
@@ -2978,6 +2984,18 @@ private:
     void PropagateOwnedReturnTemp(llvm::Value* from, llvm::Value* to);
 
     /*
+     * Carry the '?.' access arm's ownership facts onto the value the chain's merge yields. The
+     * merge re-loads through an alloca, so every ledger keyed on the pre-merge SSA value stops
+     * matching: the temp is neither freed at end of statement nor claimable by a consumer.
+     */
+    void PropagateNullConditionalOwnership(llvm::Value* from, llvm::Value* to);
+
+    // True for a value that is an unowned PRODUCED temp: a call result, or the '?.' merge of a
+    // chain whose access arm was one. The temp-registration sites test this, never isa<CallInst>
+    // directly, or a '?.' result silently stops being registered and leaks.
+    bool IsProducedTempValue(llvm::Value* value) const;
+
+    /*
      * Ledger lookup for every OWNERSHIP question: the entry if `value` is a still-unconsumed
      * owning return, else nullptr. A CallerReleaseSuppressed entry reads as ABSENT here - it
      * survives only to keep the no-discard diagnostic firing, and treating its presence as
@@ -4233,6 +4251,7 @@ public:
         std::vector<OwnedReturnTemp> ownedReturnTemps;
         std::vector<OwnedReturnReleaseTemp> ownedReturnReleaseTemps;
         std::vector<OwnedNewTemp> ownedNewTemps;
+        std::vector<llvm::Value*> nullConditionalTempResults;
         std::vector<std::pair<llvm::Value*, std::string>> valueElementTypeNames;
         std::vector<std::pair<llvm::Value*, std::string>> fatInterfaceValueTypeNames;
         std::vector<InterfaceBoxRecord> interfaceBoxRecords;

@@ -4179,6 +4179,7 @@ void LLVMBackend::ResetForReanalysis()
     ownedReturnTemps_.clear();
     ownedReturnReleaseTemps_.clear();
     ownedNewTemps_.clear();
+    nullConditionalTempResults_.clear();
     valueElementTypeNames_.clear();
     fatInterfaceValueTypeNames_.clear();
     interfaceBoxRecords_.clear();

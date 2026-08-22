@@ -781,7 +781,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         // it set for an owned return (`return "k" + s;`). Re-clearing here would orphan
         // a buffer the caller must free - the leak in `return makeOwned();`. Genuine
         // borrows are loads from storage (field/element GEP), never a CallInst.
-        bool returnIsCallResult = right != nullptr && llvm::isa<llvm::CallInst>(right);
+        bool returnIsCallResult = right != nullptr && compiler->IsProducedTempValue(right);
         // A borrow string PARAMETER (`string echo(string s){return s;}`) has an
         // alloca Storage so it looks like a movable whole-local, but the frame does
         // not own its buffer - returning it must clear the OWNED bit so the caller

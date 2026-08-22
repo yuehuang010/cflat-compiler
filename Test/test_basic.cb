@@ -2692,6 +2692,49 @@ struct NcNode
     int get() { return v; }
 };
 
+// An OWNING struct temp produced by a '?.' call and passed by value: the argument site
+// materializes an 'argtemp' and destructs it exactly once, on the access path and on the
+// short-circuit path alike (the null path merges a ZEROED value, so its destruct is a no-op).
+// Before the fix the '?.' merge re-loaded its result through an alloca, so the produced-temp
+// test (isa<CallInst>) no longer matched and no temp was registered at all - ~NcOwnBox never
+// ran (count 0) and tag's buffer leaked 32 bytes under 'leaks --atExit'.
+int ncBoxDtorCount = 0;
+struct NcOwnBox
+{
+    string tag = default;
+    ~NcOwnBox() { ncBoxDtorCount = ncBoxDtorCount + 1; }
+};
+struct NcBoxMaker
+{
+    NcOwnBox make(string s) { NcOwnBox b; b.tag = s + "_owned_payload"; return b; }
+};
+int ncTakeBox(NcOwnBox b) { return (int)b.tag.length(); }
+
+bool testNullConditionalOwnedTemp()
+{
+    bool result = true;
+
+    NcBoxMaker mk;
+    NcBoxMaker* mp = &mk;
+    ncBoxDtorCount = 0;
+    result &= Test("?. owned struct temp arg value", ncTakeBox(mp?.make("ab")), 16);
+    result &= Test("?. owned struct temp arg destructed once", ncBoxDtorCount, 1);
+
+    NcBoxMaker* nmp = nullptr;
+    ncBoxDtorCount = 0;
+    result &= Test("?. owned struct temp null-receiver arg value", ncTakeBox(nmp?.make("ab")), 0);
+    result &= Test("?. owned struct temp null-receiver destructed once", ncBoxDtorCount, 1);
+
+    // Accept-set control: the same shape WITHOUT '?.' already destructed exactly once and must
+    // still do so - a fix that over-registers the merged temp would show up here as 2.
+    NcBoxMaker mk2;
+    ncBoxDtorCount = 0;
+    result &= Test("plain owned struct temp arg value", ncTakeBox(mk2.make("ab")), 16);
+    result &= Test("plain owned struct temp arg destructed once", ncBoxDtorCount, 1);
+
+    return result;
+}
+
 bool testNullableTypes()
 {
     bool result = true;
@@ -2791,6 +2834,7 @@ bool testNullableTypes()
     result &= Test("?. chain to whole array on null receiver", arrTotalNull, 0);
 
     result &= testNullConditionalArgOrder();
+    result &= testNullConditionalOwnedTemp();
 
     return result;
 }

@@ -549,6 +549,22 @@ dictionary<string, string> _gMap     = default;
 // out on some path. Before the 8a thin-unique fix the not-moved-out path LEAKED (a plain unique
 // pointer param entered as a borrow and was never released); now it is owning at entry and the
 // scope-exit drop frees it exactly once. The moved-out path transfers into the caller's list.
+// Bug 12: a '?.' chain merges its result through an alloca store/reload, so the produced-temp
+// tests that ask "is this a call result" stopped matching and the owned STRING temp was never
+// registered - it leaked 32 bytes in argument, ternary-arm, comparison-operand and return
+// position. Leaks-only: the VALUE is correct either way, so only the HeapAudit oracle sees it.
+struct NcStrSrc
+{
+    string name = default;
+    string label() { return name + "_suffix_long_enough"; }
+};
+int _ncTakeLen(string s) { return (int)s.length(); }
+int _ncApply(function<int(int)> f, int k) { return f(k); }
+struct NcOwnRow { string tag = default; };
+struct NcRowSrc { NcOwnRow make(string t) { NcOwnRow r; r.tag = t + "_owned_payload"; return r; } };
+int _ncTakeRow(NcOwnRow r, int k) { return (int)r.tag.length() + k; }
+string _ncReturnChain(NcStrSrc* p) { return p?.label(); }
+
 bool _r3UniqueSink(bool consume, unique PtrLeak* p, list<unique PtrLeak*>* out)
 {
     if (!consume) return false;     // not moved out - scope-exit drop frees p once
@@ -3585,6 +3601,29 @@ extern int main()
         total++; passed += Test("drain value-elem set survives", dvr.get(0).name, "row1");
         dvr.removeAt(0);
         total++; passed += Test("drain value-elem removeAt count", dvr.count(), 0);
+    }
+
+    // === Bug 12: a '?.'-produced owned string temp is registered for end-of-statement free ===
+    {
+        NcStrSrc src; src.name = "ab";
+        NcStrSrc* sp = &src;
+        NcStrSrc* snull = nullptr;
+        int k = 1;
+        total++; passed += Test("nc string temp arg", _ncTakeLen(sp?.label()), 21);
+        total++; passed += Test("nc string temp arg null", _ncTakeLen(snull?.label()), 0);
+        total++; passed += Test("nc string temp ternary arm", _ncTakeLen(k > 0 ? sp?.label() : "zz"), 21);
+        total++; passed += Test("nc string temp comparison", sp?.label() == "ab_suffix_long_enough", true);
+        total++; passed += Test("nc string temp return", _ncReturnChain(sp), "ab_suffix_long_enough");
+        // A lambda LATER in the same statement emits a nested body whose own flush must not drop
+        // the outer statement's '?.' entry (the ledger is parked across the nested emission).
+        int nested = _ncTakeLen(sp?.label())
+                   + _ncApply((int x) => { return x; }, 1);
+        total++; passed += Test("nc string temp with nested lambda", nested, 22);
+        // An owning STRUCT temp registered AFTER a sibling lambda argument's nested body was
+        // emitted: the nested emission parks the '?.' ledger, so the entry is still there.
+        NcRowSrc rs; NcRowSrc* rp = &rs;
+        int nestedRow = _ncTakeRow(rp?.make("ab"), _ncApply((int x) => { return x; }, 1));
+        total++; passed += Test("nc struct temp with nested lambda", nestedRow, 17);
     }
 
     // === Leak oracle: everything above must have freed on scope exit ===
