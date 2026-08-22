@@ -2573,7 +2573,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // Storing an owning field of a NON-move (alias) temp (`x = aliasTok().text`) into a longer-
             // lived slot REJECTED: the buffer is owned elsewhere, so a 2nd owner double-frees. (Move-temps
             // took the implied-move branch above.)
+            // A `string` field instead stores by IMPLICIT COPY (see AdoptImplicitStringTempCopy).
             if (operatorText == "=" && rightNV.FromOwningTempField
+                && rightNV.TypeAndValue.TypeName == "string"
+                && AdoptImplicitStringTempCopy(rightNV, right, ctx))
+            {
+            }
+            else if (operatorText == "=" && rightNV.FromOwningTempField
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
             {
                 LogErrorContext(ctx, std::format(
@@ -2594,13 +2600,32 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 const bool namedAliasLocal = rightNV.Storage != nullptr
                     && !rightNV.IsElementAccess && !rightNV.CallerName.empty();
-                const char* sourceText = namedAliasLocal
-                    ? "an 'alias' string local" : "a string taken from a temporary";
-                LogErrorContext(ctx, std::format(
-                    "cannot store {} into a longer-lived location; "
-                    "its buffer is owned elsewhere and would be freed out from under the field. "
-                    "Use '.copy()' for an independent copy.", sourceText));
-                return finishStore(right);
+                // A string taken from a TEMPORARY stores by IMPLICIT COPY under the ruling. A NAMED
+                // `alias` string local stays rejected: it is a deliberate borrow the user spelled,
+                // and silently copying it would turn that borrow into a second owner.
+                const bool copied = !namedAliasLocal
+                    && AdoptImplicitStringTempCopy(rightNV, right, ctx);
+                if (!copied)
+                {
+                    const char* sourceText = namedAliasLocal
+                        ? "an 'alias' string local" : "a string taken from a temporary";
+                    LogErrorContext(ctx, std::format(
+                        "cannot store {} into a longer-lived location; "
+                        "its buffer is owned elsewhere and would be freed out from under the field. "
+                        "Use '.copy()' for an independent copy.", sourceText));
+                    return finishStore(right);
+                }
+            }
+
+            // The whole-ELEMENT sibling for a destination the struct-field gate above does not
+            // cover (`a = fields.get(0);` into a plain string local, a global, an array slot):
+            // the borrow outlives the expression there too, so it takes the same implicit copy.
+            // A DECLARED `alias` destination keeps the borrow the user spelled.
+            if (operatorText == "=" && right != nullptr && !destIsStructField
+                && !namedVar.TypeAndValue.IsAlias
+                && IsImplicitCopyableStringTemp(rightNV))
+            {
+                AdoptImplicitStringTempCopy(rightNV, right, ctx);
             }
 
             // Same escape into a BORROWING destination (field, local, global, array element) with
@@ -7254,13 +7279,29 @@ bool MainListener::EmitOneFieldInit(
 
         // Brace initialization is a separate field-store path from `field = value`.
         // An alias string from a temporary must not escape through either spelling.
+        // A string taken from a TEMPORARY binds by IMPLICIT COPY here as at the `=` twin (the copy
+        // itself needs the loaded value, so it is emitted just after LoadNamedVariable below); only
+        // a NAMED `alias` string local - a borrow the user spelled - stays rejected. The
+        // FromOwningTempField leg is the brace sibling of the `=` temp-FIELD store, which used to
+        // slip through here entirely and store a borrowed view into the fresh field.
+        bool braceStringTempCopy = false;
         if (fieldType.TypeName == "string" && !fieldType.Pointer && !fieldType.IsAlias
-            && rightNV.TypeAndValue.IsAlias && !rightNV.TypeAndValue.IsMove)
+            && !rightNV.TypeAndValue.IsMove
+            && !rightNV.MovableTempField
+            && (rightNV.TypeAndValue.IsAlias
+                || (rightNV.FromOwningTempField && rightNV.TypeAndValue.TypeName == "string")))
         {
-            LogErrorContext(errCtx,
-                "cannot store a string taken from a temporary into a longer-lived location; "
-                "its buffer is owned elsewhere and would be freed out from under the field. "
-                "Use '.copy()' for an independent copy.");
+            const bool namedAliasLocal = rightNV.Storage != nullptr
+                && !rightNV.IsElementAccess && !rightNV.CallerName.empty()
+                && !rightNV.FromOwningTempField;
+            if (namedAliasLocal)
+                // Same template as the `=` twin, so the two spellings share one localized message.
+                LogErrorContext(errCtx, std::format(
+                    "cannot store {} into a longer-lived location; "
+                    "its buffer is owned elsewhere and would be freed out from under the field. "
+                    "Use '.copy()' for an independent copy.", "an 'alias' string local"));
+            else
+                braceStringTempCopy = true;
         }
 
         // `unique` field initialized here: this is a second field-store path, so it needs the same
@@ -7310,6 +7351,12 @@ bool MainListener::EmitOneFieldInit(
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        // The implicit copy decided above. Emitted here because the deep copy needs the LOADED
+        // {ptr,len,owned} aggregate; it also retires rightNV's borrow facts, so the alias/owning
+        // rejects further down see an ordinary owned string temp.
+        if (braceStringTempCopy)
+            AdoptImplicitStringTempCopy(rightNV, val, errCtx);
 
         // The brace-init leg of the 2026-08-10 implicit-move ruling, kept in lockstep with the `=`
         // path. The destination slot is freshly constructed here, so only the source is nulled.

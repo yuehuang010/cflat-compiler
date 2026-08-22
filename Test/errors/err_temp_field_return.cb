@@ -1,15 +1,19 @@
-// Returning an owning field extracted from an `alias` (borrow) by-value temp must be rejected: a
+// Returning an OWNING field extracted from an `alias` (borrow) by-value temp must be rejected: a
 // borrow accessor's temp does not own the field buffer (the list still owns it), so returning a
 // shallow copy dangles/double-frees. The fix is '.copy()'. A `move`/plain OWNING return instead
 // does an implied move out of the return (Phase B) - see test_collection_leaks.cb. (Under the
 // three-form model a plain non-move return is OWNING; only `alias` is a borrow.)
+//
+// The field type is an owning STRUCT (`Tok`). A `string` field returns by IMPLICIT COPY as of the
+// 2026-08-21 ruling; that accept leg lives in Test/test_list_ownership.cb.
 import "string.cb";
 import "list.cb";
 
 struct Tok { string text = default; };
+struct Outer { Tok inner = default; };
 
 expect_error("taken from a temporary") {
-    string getName(list<Tok> toks) { return toks.get(0).text; }   // REJECTED - field of an alias borrow
+    Tok getInner(list<Outer> outers) { return outers.get(0).inner; }   // REJECTED - field of an alias borrow
 }
 
 extern int main() { return 0; }

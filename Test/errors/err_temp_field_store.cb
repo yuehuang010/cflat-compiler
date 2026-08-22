@@ -1,39 +1,49 @@
-// Storing an owning field extracted from an `alias` (borrow) by-value temp into a longer-lived slot
+// Storing an OWNING field extracted from an `alias` (borrow) by-value temp into a longer-lived slot
 // must be rejected: a borrow accessor's temp does not own the field buffer (the list still owns it),
 // so a shallow copy into a second owner double-frees at teardown. The fix is '.copy()'. A `move`/plain
 // OWNING return instead does an implied move (the temp owns the field) - see test_collection_leaks.cb.
 // (Under the three-form model a plain non-move return is OWNING; only `alias` is a borrow.)
+//
+// The field type here is an owning STRUCT (`Tok`, which owns a string). A `string` field is the one
+// owning type this reject no longer covers: as of the 2026-08-21 ruling it binds by IMPLICIT COPY
+// instead - those legs are accept legs in Test/test_list_ownership.cb (testStringTempFieldCopy*).
+// A NAMED `alias` string local stays rejected here through both field-store spellings, because it
+// is a borrow the user spelled and copying it would silently make a second owner.
 import "string.cb";
 import "list.cb";
 
 struct Tok { string text = default; };
+struct Outer { Tok inner = default; };
+struct Holder { Tok slot = default; };
+struct GenericField<T> { Tok slot = default; };
 struct Box { string slot = default; };
-struct GenericField<T> { string slot = default; };
 bool gRuntimePick = false;
 bool RuntimePick() { return gRuntimePick; }
 
-alias string ReturnAliasString(alias string value) { return value; }
+alias Tok ReturnAliasTok(alias Tok value) { return value; }
 
 extern int main()
 {
-    list<Tok> toks = default;
-    Tok t = default; t.text = "x" + "y"; toks.add(t);
+    list<Outer> outers = default;
+    Outer o = default; o.inner.text = "x" + "y"; outers.add(o);
     expect_error("taken from a temporary");
-    Box b = default;
-    b.slot = toks.get(0).text;       // REJECTED - field of an alias borrow, use .copy()
+    Holder h = default;
+    h.slot = outers.get(0).inner;    // REJECTED - field of an alias borrow, use .copy()
 }
 
-// Direct alias-string element stores are the sibling path that used to bypass
-// the field-of-temporary guard. Keep each leg in its own expect_error scope.
+// Direct alias-element stores are the sibling path that used to bypass the
+// field-of-temporary guard. Keep each leg in its own expect_error scope.
 expect_error("taken from a temporary") {
-    void directStringElementStore() {
-        list<string> fields;
-        fields.add("x");
-        Box b = default;
-        b.slot = fields.get(0);
+    void directElementStore() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder h = default;
+        h.slot = fields.get(0).inner;
     }
 }
 
+// The one string leg that is still a REJECT: a NAMED `alias` string local is a borrow the
+// user spelled, so the field store must not silently copy it into a second owner.
 expect_error("cannot store an 'alias' string local") {
     void namedAliasStringStore() {
         list<string> fields;
@@ -44,31 +54,60 @@ expect_error("cannot store an 'alias' string local") {
     }
 }
 
-expect_error("taken from a temporary") {
-    void aliasFunctionResultStore() {
+// Its BRACE twin: the same borrow through the other field-store spelling.
+expect_error("cannot store an 'alias' string local") {
+    void namedAliasStringBraceStore() {
         list<string> fields;
         fields.add("x");
+        alias string a = fields.get(0);
+        Box b = { slot = a };
+    }
+}
+
+// A user-spelled `alias` string local BOUND to a temp's string FIELD is rejected at the BINDING.
+// The 2026-08-21 implicit copy is for bindings that OWN; a declared `alias` asks for the borrow,
+// and a borrow of a temporary is exactly the dangle this guard exists for. Without the declared-
+// `alias` exclusion the binding is silently upgraded to an owned copy and the only diagnostic left
+// is the later store's "its buffer is owned elsewhere", which by then is not true.
+expect_error("taken from a temporary") {
+    void aliasLocalFromTempStringField() {
+        list<Tok> toks;
+        Tok t = default; t.text = "x" + "y"; toks.add(t);
+        alias string a = toks.get(0).text;
         Box b = default;
-        b.slot = ReturnAliasString(fields.get(0));
+        b.slot = a;
+    }
+}
+
+// An `alias`-returning FUNCTION result: for an owning struct the truer diagnosis is the
+// alias-value store reject, which fires first and says the same thing about the same borrow.
+expect_error("borrows storage it does not own") {
+    void aliasFunctionResultStore() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder h = default;
+        h.slot = ReturnAliasTok(fields.get(0).inner);
     }
 }
 
 expect_error("taken from a temporary") {
     void genericStructFieldStore() {
-        list<string> fields;
-        fields.add("x");
-        GenericField<int> b = default;
-        b.slot = fields.get(0);
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        GenericField<int> g = default;
+        g.slot = fields.get(0).inner;
     }
 }
 
-expect_error("taken from a temporary") {
-    void ternaryStringElementStore() {
-        list<string> fields;
-        fields.add("left");
-        fields.add("right");
-        Box b = default;
-        b.slot = RuntimePick() ? fields.get(0) : fields.get(1);
+// A '?:' join of two borrowed element fields: the mixed-arm reject fires first for an
+// owning struct and diagnoses the same escape.
+expect_error("mixes an owning and a borrowed") {
+    void ternaryElementStore() {
+        list<Outer> fields;
+        Outer left = default;  left.inner.text  = "le" + "ft";  fields.add(left);
+        Outer right = default; right.inner.text = "ri" + "ght"; fields.add(right);
+        Holder h = default;
+        h.slot = RuntimePick() ? fields.get(0).inner : fields.get(1).inner;
     }
 }
 
@@ -76,64 +115,56 @@ expect_error("taken from a temporary") {
 // RuntimePick keeps both arms live in the generated control flow; this is not a constant-folded
 // acceptance probe.
 expect_error("taken from a temporary") {
-    void ternaryStringLocalBinding() {
-        list<Tok> fields;
-        Tok left = default; left.text = "left"; fields.add(left);
-        Tok right = default; right.text = "right"; fields.add(right);
-        string d = RuntimePick() ? fields.get(0).text : fields.get(1).text;
-        printf("%s", d.data());
+    void ternaryLocalBinding() {
+        list<Outer> fields;
+        Outer left = default;  left.inner.text  = "le" + "ft";  fields.add(left);
+        Outer right = default; right.inner.text = "ri" + "ght"; fields.add(right);
+        Tok d = RuntimePick() ? fields.get(0).inner : fields.get(1).inner;
+        printf("%s", d.text.data());
     }
 }
 
 expect_error("taken from a temporary") {
-    void braceStringElementStore() {
-        list<string> fields;
-        fields.add("x");
-        Box b = { slot = fields.get(0) };
+    void indexedElementStore() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder h = default;
+        h.slot = fields[0].inner;
     }
 }
 
 expect_error("taken from a temporary") {
-    void indexedStringElementStore() {
-        list<string> fields;
-        fields.add("x");
-        Box b = default;
-        b.slot = fields[0];
+    void pointerElementStore() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        Holder* h = new Holder;
+        h->slot = fields.get(0).inner;
+        delete h;
+    }
+}
+
+struct NestedHolder { Holder inner = default; };
+
+expect_error("taken from a temporary") {
+    void nestedElementStore() {
+        list<Outer> fields;
+        Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+        NestedHolder h = default;
+        h.inner.slot = fields.get(0).inner;
     }
 }
 
 expect_error("taken from a temporary") {
-    void pointerStringElementStore() {
-        list<string> fields;
-        fields.add("x");
-        Box* b = new Box;
-        b->slot = fields.get(0);
-        delete b;
-    }
-}
-
-struct NestedBox { Box inner = default; };
-
-expect_error("taken from a temporary") {
-    void nestedStringElementStore() {
-        list<string> fields;
-        fields.add("x");
-        NestedBox b = default;
-        b.inner.slot = fields.get(0);
-    }
-}
-
-expect_error("taken from a temporary") {
-    struct MethodBox {
-        Box inner = default;
+    struct MethodHolder {
+        Holder inner = default;
         void set() {
-            list<string> fields;
-            fields.add("x");
-            inner.slot = fields.get(0);
+            list<Outer> fields;
+            Outer o = default; o.inner.text = "x" + "y"; fields.add(o);
+            inner.slot = fields.get(0).inner;
         }
     };
-    void methodStringElementStore() {
-        MethodBox b = default;
-        b.set();
+    void methodElementStore() {
+        MethodHolder h = default;
+        h.set();
     }
 }

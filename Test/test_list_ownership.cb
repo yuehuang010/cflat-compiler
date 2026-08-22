@@ -133,6 +133,107 @@ int testStringMoveSemantics()
     return passed;
 }
 
+// --- string read out of a TEMPORARY: borrow in rvalue position, implicit COPY when bound ---
+//
+// The 2026-08-21 ruling (was internal/issue/p3 string-field-read-from-container-element-requires-copy).
+// `bars.get(0).date` and `fields.get(0)` name a buffer the CONTAINER owns. Consumed inside the full
+// expression it is a plain BORROW; bound to anything that outlives the expression it is copied, so
+// the binding owns an independent buffer. Mutating the copy must leave the element untouched - that
+// is what separates a real copy from the borrow the compiler used to store silently - and the
+// HeapAudit oracle in main() is what proves the copy is neither leaked nor double-freed.
+
+struct TBar { string date = default; int n = 0; };
+struct TBox { string slot = default; };
+
+string tbarDate(alias list<TBar> l) { return l.get(0).date; }
+// A whole ELEMENT returned through two levels: neither level may hand back a borrow.
+string telemFirstInner(alias list<string> l) { return l.get(0); }
+string telemFirst(alias list<string> l) { return telemFirstInner(l); }
+int tbarLen(string s) { return (int)s.length(); }
+
+int testStringTempFieldCopy()
+{
+    int passed = 0;
+    {
+        list<TBar> bars = default;
+        TBar b = default; b.date = "2020-" + "01-01"; b.n = 1; bars.add(b);
+
+        // 1. local init, and the copy is INDEPENDENT of the element.
+        string d = bars.get(0).date;
+        passed += Test("temp string field binds to a local", d, "2020-01-01");
+        d = d + "-MUT";
+        passed += Test("mutating the copy leaves the element intact", bars.get(0).date, "2020-01-01");
+
+        // 2. assignment to an existing string local.
+        string e = "old";
+        e = bars.get(0).date;
+        passed += Test("temp string field assigns to a local", e, "2020-01-01");
+
+        // 3. struct field store, and 4. brace-init member.
+        TBox f = default;
+        f.slot = bars.get(0).date;
+        passed += Test("temp string field stores into a field", f.slot, "2020-01-01");
+        TBox g = { slot = bars.get(0).date };
+        passed += Test("temp string field brace-initializes a field", g.slot, "2020-01-01");
+
+        // 5. return.
+        passed += Test("temp string field returns by copy", tbarDate(bars), "2020-01-01");
+
+        // The whole element is still intact after all five bindings.
+        passed += Test("element unchanged after five copies", bars.get(0).date, "2020-01-01");
+    }
+    return passed;
+}
+
+// The whole-element sibling: `fields.get(0)` on a list<string> is the same borrow without a
+// field access, and the two BINDING spellings that used to be rejected are the field stores.
+int testStringTempElementCopy()
+{
+    int passed = 0;
+    {
+        list<string> fields = default;
+        fields.add("el" + "em0");
+        TBox a = default;
+        a.slot = fields.get(0);
+        passed += Test("temp string element stores into a field", a.slot, "elem0");
+        TBox b = { slot = fields.get(0) };
+        passed += Test("temp string element brace-initializes a field", b.slot, "elem0");
+        a.slot = a.slot + "-MUT";
+        passed += Test("mutating the field copy leaves the element intact", fields.get(0), "elem0");
+
+        // The three BINDING sites for the ELEMENT itself. Each must own an independent buffer:
+        // `clear()` frees the one the container owns, and every binding must still read back.
+        string c = fields[0];                 // local init, index spelling
+        string d = fields.get(0);             // local init, accessor spelling
+        string e = "old"; e = fields.get(0);  // assignment
+        string h = telemFirst(fields);        // return
+        fields.clear();
+        passed += Test("bound element survives clear (local init, [])", c, "elem0");
+        passed += Test("bound element survives clear (local init, get)", d, "elem0");
+        passed += Test("bound element survives clear (assignment)", e, "elem0");
+        passed += Test("bound element survives clear (return)", h, "elem0");
+        d = d + "-MUT";
+        passed += Test("mutating one bound copy leaves the others intact", c, "elem0");
+    }
+    return passed;
+}
+
+// RVALUE position: consumed inside the full expression, so it stays a BORROW - no copy, no
+// diagnostic. These spellings must keep working and must not start allocating.
+int testStringTempFieldBorrow()
+{
+    int passed = 0;
+    {
+        list<TBar> bars = default;
+        TBar b = default; b.date = "2020-" + "01-01"; bars.add(b);
+        passed += Test("concat operand", "date=" + bars.get(0).date, "date=2020-01-01");
+        passed += Test("function argument", tbarLen(bars.get(0).date), 10);
+        passed += Test("comparison operand", bars.get(0).date == "2020-01-01", true);
+        passed += Test("method receiver", (int)bars.get(0).date.length(), 10);
+    }
+    return passed;
+}
+
 // --- bare pointer: BORROWS --------------------------------------------------------
 
 int testBarePointerBorrows()
@@ -638,6 +739,9 @@ extern int main()
     total += 4;  passed += testValueCopySemantics();
     total += 2;  passed += testStringCopySemantics();
     total += 1;  passed += testStringMoveSemantics();
+    total += 7;  passed += testStringTempFieldCopy();
+    total += 8;  passed += testStringTempElementCopy();
+    total += 4;  passed += testStringTempFieldBorrow();
     total += 5;  passed += testBarePointerBorrows();
     total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 7;  passed += testAliasPointerElementBorrows();

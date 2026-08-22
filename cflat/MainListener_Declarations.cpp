@@ -3676,7 +3676,27 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcMoveTempFieldIndex = rightNV.MoveTempFieldIndex;
                                 // Binding an owning field of a NON-move (alias) temp to a local REJECTED: its
                                 // buffer is owned elsewhere and would be freed out from under the local.
+                                // A `string` field instead binds by IMPLICIT COPY (see the ruling on
+                                // AdoptImplicitStringTempCopy) - the reject stays for every other owner.
+                                // A DECLARED `alias` local is excluded: the user spelled a borrow,
+                                // and a borrow of a temporary is exactly the dangle this rejects.
                                 if (rightNV.FromOwningTempField && !srcMovableTempField
+                                    && !typeAndValue.IsAlias
+                                    && rightNV.TypeAndValue.TypeName == "string"
+                                    && AdoptImplicitStringTempCopy(rightNV, right, assignmentExpression))
+                                {
+                                    initializerSourceNV = rightNV;
+                                }
+                                // The whole-ELEMENT sibling (`string a = fields.get(0);`), which has no
+                                // field access to mark it and used to bind a borrow that dangled once
+                                // the container was cleared. Same copy, same `alias` exclusion.
+                                else if (!srcMovableTempField && !typeAndValue.IsAlias
+                                    && IsImplicitCopyableStringTemp(rightNV)
+                                    && AdoptImplicitStringTempCopy(rightNV, right, assignmentExpression))
+                                {
+                                    initializerSourceNV = rightNV;
+                                }
+                                else if (rightNV.FromOwningTempField && !srcMovableTempField
                                     && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
                                 {
                                     if (rightNV.OwningStructName.empty() || rightNV.FieldName.empty())
@@ -5454,6 +5474,56 @@ bool MainListener::IsUniqueTempFieldRead(const LLVMBackend::NamedVariable& nv) {
         if (!nv.MovableTempField && !nv.FromOwningTempField) return false;
         if (nv.TypeAndValue.IsMove) return false;
         return IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
+    }
+
+bool MainListener::IsImplicitCopyableStringTemp(const LLVMBackend::NamedVariable& nv) {
+        if (nv.TypeAndValue.TypeName != "string") return false;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove) return false;
+        // The borrow marker an `alias` accessor result carries; a `.copy()` result is owned and
+        // never has it, so an explicit copy is never copied a second time.
+        if (!nv.TypeAndValue.IsAlias) return false;
+        if (nv.MovableTempField) return false;
+        // A NAMED `alias` string local (`alias string a = ...; ... = a;`) keeps its reject.
+        const bool namedAliasLocal = nv.Storage != nullptr
+            && !nv.IsElementAccess && !nv.CallerName.empty();
+        return !namedAliasLocal;
+    }
+
+bool MainListener::AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, llvm::Value*& value,
+                                               antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (compiler == nullptr || value == nullptr) return false;
+        // By REPRESENTATION, not by spelling: a temp field's NamedVariable can carry the declared
+        // name while a joined/laundered value carries none, and only the LLVM type is reliable.
+        auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        if (strTy == nullptr || value->getType() != strTy) return false;
+        if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsMove) return false;
+        auto* copied = compiler->EmitOwnedStringDeepCopy(value);
+        if (copied == value) return false;   // no 'operator new' in this module - keep the reject
+        value = copied;
+        // Retire every borrow/temp fact: the value is now an independently OWNED string temp, so
+        // downstream rejects must not fire and the copy paths must not copy it a second time.
+        nv.Primary = copied;
+        nv.Storage = nullptr;
+        nv.FromOwningTempField = false;
+        nv.OwningTempParent = false;
+        nv.MovableTempField = false;
+        nv.IsBorrowed = false;
+        nv.BorrowsOwnedString = false;
+        // An OWNED temp with no Storage: the two field-store paths both read that pair as
+        // "already hands us sole ownership", which is exactly what the copy is, and so neither
+        // emits a second deep copy on top of it.
+        nv.IsOwningString = true;
+        nv.IsElementAccess = false;
+        nv.BorrowedOrigin.clear();
+        nv.OwningStructName.clear();
+        nv.FieldName.clear();
+        nv.FieldPathText.clear();
+        nv.FieldPathRoot.clear();
+        nv.CallerName.clear();
+        nv.TypeAndValue.IsAlias = false;
+        nv.TypeAndValue.TypeName = "string";
+        return true;
     }
 
 bool MainListener::IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv) {

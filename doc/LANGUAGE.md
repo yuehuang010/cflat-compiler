@@ -1249,6 +1249,28 @@ This is the same drop-old-then-store rule already shown for
 node) - it applies uniformly to local reassignment, struct-field stores, and container
 element stores; there is no separate "container" or "field" special case to learn.
 
+#### A `string` read out of a temporary
+
+Reading a `string` - or a `string` field - out of a **temporary** (a call result, a container
+accessor result such as `bars.get(0).date` or `fields[0]`, an `alias` return) follows the same
+rule by POSITION:
+
+- **In rvalue position** - a function argument, a `+` concat operand, a comparison, a `printf` /
+  interpolation operand, a method receiver - the value is consumed inside the full expression, so
+  it is a plain **borrow**: no copy, no allocation, no diagnostic.
+- **Bound to something that outlives the expression** - a local, an assignment, a struct-field
+  store, a brace-init member, a return - it is **copied implicitly**, exactly as `.copy()` would.
+  The binding owns an independent buffer, so mutating it never touches the container's element and
+  nothing is double-freed. Writing `.copy()` explicitly still works and does not copy twice.
+
+This applies to `string` only, because it is the one owning type with a cheap total deep copy.
+Every other owning value read off a temporary is still rejected (`unique T*` fields, structs that
+own a resource): those have no safe implicit duplicate, so bind the whole call result to a local
+first, or write `.copy()`. Declaring the binding **`alias`** opts out of the implicit copy and keeps
+the borrow you asked for, so `alias string a = bars.get(0).date;` is still rejected at the binding,
+and a named `alias` string local is still rejected at a field store - copying either one silently
+would make a second owner.
+
 ### `move` Return Type
 
 `move T*` on a function's return type declares that the caller receives ownership of the returned pointer - the caller is responsible for freeing it (or passing it along).

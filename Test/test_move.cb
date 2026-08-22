@@ -5177,9 +5177,13 @@ int testOwningAssignIntoArrayViewElement()
 
     // 14. ACCEPT SET for the read arm, and the LOAD-BEARING INVARIANT next to it. A raw heap
     // `string*` is not a view - `new string[n]` does not take ownership of assigned strings, so
-    // its element read must stay a borrow - and a container's internal slot must keep sharing the
-    // buffer through `get`, which is the contract list `sort`/`_partition` and the dictionary
-    // rehash bit-shuffles depend on. Both are byte-identical before and after the fix.
+    // its element read must stay a borrow, byte-identical before and after the fix.
+    // A CONTAINER's `get` is the opposite case as of the 2026-08-21 string-from-a-temporary
+    // ruling: the accessor still hands back an `alias` view of the slot in RVALUE position (which
+    // is the contract list `sort`/`_partition` and the dictionary rehash bit-shuffles depend on -
+    // they never bind it to a longer-lived `string`), but BINDING it to a local now copies, so the
+    // local owns an independent buffer and survives the container being cleared. Binding used to
+    // share the slot's pointer, which dangled the moment the list freed it.
     {
         string* h = new string[2];
         h[0] = "lit";
@@ -5191,7 +5195,9 @@ int testOwningAssignIntoArrayViewElement()
         ls.add("aa" + "bb");
         string lq = ls.get(0);
         passed += Test("avelr_list_get_value", lq, "aabb");
-        passed += Test("avelr_list_get_still_borrows", lq.data() == ls.get(0).data(), true);
+        passed += Test("avelr_list_get_binding_copies", lq.data() != ls.get(0).data(), true);
+        ls.clear();
+        passed += Test("avelr_list_get_binding_survives_clear", lq, "aabb");
     }
 
     /*
@@ -11141,7 +11147,7 @@ extern int main()
     total += 92;
 
     passed += testOwningAssignIntoArrayViewElement();
-    total += 78;
+    total += 79;
 
     passed += testOwningBraceInitFixedArray();
     total += 63;

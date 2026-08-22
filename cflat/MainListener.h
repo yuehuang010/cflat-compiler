@@ -3136,6 +3136,29 @@ public:
      */
     bool IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv);
 
+    /*
+     * The 2026-08-21 string-from-a-temporary ruling. A `string` (or string-typed field) read out
+     * of a TEMPORARY is a BORROW in rvalue position and an IMPLICIT COPY when it is BOUND to
+     * something that outlives the full expression (local, assignment, field store, brace-init
+     * member, return). This is the one owning type with a cheap, total deep copy, so the sibling
+     * rejects - which stay for `unique` pointer fields and other owning value types - are
+     * needlessly hostile here. Returns true when it emitted the copy, in which case `value` has
+     * been replaced by an OWNED string temp and `nv`'s temp/borrow provenance has been retired so
+     * no downstream reject fires and no second copy is emitted.
+     */
+    bool AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, llvm::Value*& value,
+                                     antlr4::ParserRuleContext* ctx);
+
+    /*
+     * The whole-ELEMENT sibling of the temp-FIELD case above: `fields.get(0)` / `fields[0]` on a
+     * `list<string>` hands back an `alias` view of a buffer the CONTAINER owns, with no field
+     * access to mark it. Bound to a local, an assignment target or a return slot it dangles the
+     * moment the container is cleared, so it takes the same implicit copy. A NAMED `alias` string
+     * local is excluded: that borrow is one the user spelled, and copying it silently would make a
+     * second owner.
+     */
+    static bool IsImplicitCopyableStringTemp(const LLVMBackend::NamedVariable& nv);
+
     // The DECLARED half of the predicate above, read straight off the NamedVariable the
     // member-access branch built. Also the condition under which the read is ledgered.
     static bool DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVariable& nv);

@@ -978,6 +978,14 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 compiler->builder->CreateStore(
                     llvm::ConstantAggregateZero::get(right->getType()), srcGep);
             }
+            // A `string` field is returned by IMPLICIT COPY instead (see
+            // AdoptImplicitStringTempCopy); the reject stays for every other owning type.
+            else if (returnNV.TypeAndValue.TypeName == "string"
+                && AdoptImplicitStringTempCopy(returnNV, right, errCtx))
+            {
+                // The copy owns its buffer, so the returned value must keep its owned bit.
+                clearReturnedStringBorrowBit = false;
+            }
             else
             {
                 LogErrorContext(errCtx, std::format(
@@ -1115,6 +1123,24 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && IsOwningArrayStringElementRead(returnNV, right))
         {
             right = compiler->EmitOwnedStringDeepCopy(right);
+            clearReturnedStringBorrowBit = false;
+        }
+
+        /*
+         * Returning a whole `string` ELEMENT borrowed from a container (`return fields.get(0);`).
+         * The accessor hands back an `alias` view of a buffer the container owns, so the caller
+         * was left reading freed bytes the moment the container was cleared - a silent wrong
+         * value. Copy, and keep the OWNED bit so the caller owns the copy. An `alias` function
+         * passes the borrow through deliberately.
+         */
+        if (right != nullptr
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && compiler->currentFunction != nullptr
+            && compiler->currentFunction->getReturnType()
+                == llvm::StructType::getTypeByName(*compiler->context, "string")
+            && IsImplicitCopyableStringTemp(returnNV)
+            && AdoptImplicitStringTempCopy(returnNV, right, errCtx))
+        {
             clearReturnedStringBorrowBit = false;
         }
 
