@@ -6450,6 +6450,11 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             if (auto nsIt = gts.genericTemplateNamespace.find(name);
                 nsIt != gts.genericTemplateNamespace.end() && !nsIt->second.empty())
                 to["decl_ns"] = nsIt->second;
+            // "core": the template was DECLARED in a core library file. Load-bearing for the
+            // warm cache - the core sources are never re-read, so the origin marker that
+            // IsBorrowingContainerElementSink reads has to survive the round-trip.
+            if (gts.coreGenericTemplates.count(name) != 0)
+                to["core"] = true;
             arr.push_back(std::move(to));
         }
         root[jsonKey] = std::move(arr);
@@ -6922,6 +6927,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 packIndexMap[name] = static_cast<size_t>(*v);
             if (auto dns = to->getString("decl_ns"))
                 gts.genericTemplateNamespace[name] = dns->str();
+            if (auto isCore = to->getBoolean("core"); isCore && *isCore)
+                gts.coreGenericTemplates.insert(name);
             gts.lazyTemplateSource[name] = tsource->str();
         }
     };

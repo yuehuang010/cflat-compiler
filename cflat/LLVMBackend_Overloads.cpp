@@ -1336,7 +1336,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });
-            DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
+            // The element slot of a borrowing container is a legal `move` destination: the
+            // container keeps the ONLY handle afterwards (manual-free idiom), so the generic
+            // "move into a borrow parameter transfers nothing" diagnostic is wrong there.
+            if (!IsBorrowingContainerElementSink(functionName, candidate.Parameters, i,
+                                                 candidate.IsMethod))
+                DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
+            RejectOwningLocalIntoBorrowingContainer(functionName, candidate.Parameters, i,
+                                                    candidate.IsMethod, matched[i]);
         }
 
         // C-extern ABI lowering: when the resolved candidate has struct-by-value params or
@@ -1462,7 +1469,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         }
 
         // Null out caller's storage for move parameters; mark the source moved (shared helper).
-        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched);
+        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
+                               candidate.IsMethod);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter. Runs AFTER the sink reject
         // above, so `unique` / `move` parameters never reach the callee-side question.
@@ -1865,6 +1873,93 @@ void LLVMBackend::ClearVariableBond(const std::string& name)
                 return;
             }
         }
+    }
+
+bool LLVMBackend::IsBorrowingContainerElementSink(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod) const
+{
+        // The receiver occupies params[0], so an element slot is never index 0. In every core
+        // element-storing method the element is the LAST parameter (`set`/`insert`/dictionary
+        // `add` take the index/key first), which pins the slot without a per-method table.
+        if (!isMethod || paramIndex == 0 || params.size() < 2) return false;
+        if (paramIndex != params.size() - 1) return false;
+
+        std::string receiver = params[0].TypeName;
+        if (!params[0].Pointer) return false;
+        size_t sep = receiver.find("__");
+        if (sep == std::string::npos) return false;   // not a generic instantiation
+        // The template key keeps its namespace ("mylib.list"); the method table below is keyed
+        // on the bare name.
+        std::string qualified = receiver.substr(0, sep);
+        std::string base = qualified;
+        if (size_t dot = base.rfind('.'); dot != std::string::npos)
+            base = base.substr(dot + 1);
+        // Origin gate: only a template DECLARED in a core library file has the borrow semantics
+        // this predicate encodes. A user-defined `stack<T>` (or `mylib.list<T>`) owns whatever
+        // its own code says it owns and is none of this rule's business.
+        if (gts.coreGenericTemplates.count(qualified) == 0) return false;
+
+        // The element-storing methods, exactly as core/list.cb, dictionary.cb, queue.cb and
+        // stack.cb declare them. hashset's `add(alias T value)` is deliberately absent: it
+        // declares its parameter a borrow and offers no `move` overload for a pointer element,
+        // so there would be no remedy to name.
+        bool storing =
+            (base == "list"       && (functionName == "add" || functionName == "set"
+                                      || functionName == "insert"))
+            || (base == "dictionary" && (functionName == "add" || functionName == "set"))
+            || (base == "queue"      && functionName == "enqueue")
+            || (base == "stack"      && functionName == "push");
+        if (!storing) return false;
+
+        // Bare pointer element only. `unique` (a real sink), `alias` (the opt-in borrow
+        // spelling), an interface fat value and any by-value element all answer false.
+        const TypeAndValue& elem = params[paramIndex];
+        if (!elem.Pointer || elem.IsArrayView) return false;
+        if (elem.IsInterfacePointer || elem.IsFatInterfaceValue() || elem.IsFunctionPointer)
+            return false;
+        if (elem.IsMove || elem.IsAlias || elem.IsUnique || elem.IsUniqueTypeArg) return false;
+        if (elem.IsBorrowOfUniqueElement || elem.IsBorrowOfAliasElement) return false;
+        return true;
+    }
+
+bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod,
+        const NamedVariable& arg)
+{
+        if (!IsBorrowingContainerElementSink(functionName, params, paramIndex, isMethod))
+            return false;
+        // `add(move p)` IS the remedy - it must reach the transfer, not this reject.
+        if (arg.IsExplicitMove || arg.TypeAndValue.IsMove) return false;
+        // Prove an owning POINTER binding. Everything unproven accepts.
+        if (!arg.TypeAndValue.Pointer || arg.TypeAndValue.IsArrayView) return false;
+        if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg) return false;
+        if (arg.IsBorrowed || arg.IsAliasBorrow || arg.BorrowsOwnedElement) return false;
+        if (!arg.IsOwning) return false;
+        // Not live any more: already transferred, or handed to an interface box.
+        if (arg.IsMoved || arg.ExplicitlyMovedNull || arg.MovedIntoInterface) return false;
+        // A NAMED local of this frame: an rvalue (`new B()`) has no name, a global/static has
+        // non-alloca storage, and a parameter (borrowed or `move`) is the caller's business.
+        if (arg.CallerName.empty() || !arg.FieldName.empty()) return false;
+        if (arg.IsStaticLocal) return false;
+        if (arg.Storage == nullptr || !llvm::isa<llvm::AllocaInst>(arg.Storage)) return false;
+        if (IsFunctionParameter(arg.CallerName)) return false;
+        // The binding must still be the owning one the flags describe.
+        if (!IsVariableOwning(arg.CallerName)) return false;
+        // A `unique T*` local is an owner with a DECLARED policy: it is the spelling the ruling
+        // keeps for "this object is owned here and the container borrows it", so a borrow-add
+        // from one is the sanctioned borrow-collection shape and stays legal. The written
+        // qualifier lives on the DECLARATION - a read hands out a plain pointer value.
+        if (const NamedVariable* decl = FindVariableByStorage(arg.Storage))
+            if (decl->TypeAndValue.IsUnique || decl->TypeAndValue.IsUniqueTypeArg) return false;
+
+        LogErrorMessage(
+            "call to '{}': '{}' still owns the object it was given, and frees it when it goes out "
+            "of scope - but this container only BORROWS its elements and never frees them, so the "
+            "stored element would dangle. Transfer the object with '{}', or declare the container's "
+            "element '{}' so the container owns it.",
+            { functionName, arg.CallerName,
+              std::format("{}({} {})", functionName, "move", arg.CallerName), "unique T*" });
+        return true;
     }
 
 void LLVMBackend::MarkVariableMoved(const std::string& name)

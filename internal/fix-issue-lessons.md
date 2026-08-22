@@ -2867,3 +2867,49 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   `test_list_ownership.cb`. Known residuals: the diagnostic says "its container" (no variable
   name); borrow-ness is re-projected per accessor rather than riding the result's own type;
   `queue<T>.dequeue()` not aligned.
+
+- **Add-site rule: an owning local needs `move` to enter a BORROWING container (2026-08-21,
+  `fix/add-owning-local-needs-move`).** `list<T*>` / `dictionary<K,T*>` / `queue<T*>` /
+  `stack<T*>` carry no ownership policy, so `l.add(p)` with `p` a live owning named local is now
+  rejected at the ADD (not tainted for a later delete - that was reverted approach B, and a check
+  that only catches the same-function shape is false coverage). Guard:
+  `IsBorrowingContainerElementSink` (receiver is a generic instantiation whose base name is one of
+  the four containers, method is one of `add`/`set`/`insert`/`enqueue`/`push`, element parameter is
+  the LAST one and is a BARE pointer - `unique`/`alias`/interface/value all answer false) plus
+  `RejectOwningLocalIntoBorrowingContainer`, which rejects only a PROVEN owning named local of this
+  frame (alloca storage, no `FieldName`, not a parameter, not moved, not `unique`-declared).
+  Everything unproven accepts. **Two things were load-bearing and must not be "fixed" back:**
+  (1) `hashset` is OUT: its `add(alias T value)` declares a borrow and it has no pointer `move`
+  overload, so the diagnostic would name a remedy that does not compile. (2) `move` into a
+  bare-pointer element slot had to become LEGAL in the same change - master rejected it with
+  "move transfers nothing", so the remedy the ruling names did not exist. Both the diagnostic
+  suppression and the actual transfer (null the source + `MarkVariableMoved`, via a
+  `movesIntoBorrowingElement` leg in `ApplyMoveParamTransfer`) are gated on the same predicate,
+  and `ApplyMoveParamTransfer` gained a `calleeIsMethod` argument that only the direct-call path
+  passes so no other call site can reach the new leg.
+  **A `unique` LOCAL is deliberately excluded, and that exclusion is what keeps the
+  borrow-collection idiom alive.** `unique Res* p = new Res(); l.add(p);` is the sanctioned
+  spelling for "owned here, borrowed by the container"; the qualifier lives on the DECLARATION
+  (a read hands out a plain pointer), so the guard recovers it with `FindVariableByStorage`.
+  Three suite files asserted the borrow semantics with a BARE owning local and had to move to the
+  `unique` spelling (`test_list_ownership`, `test_generics`, `test_collection_leaks`, 7 sites) -
+  every assertion survived verbatim, since a `unique` local frees exactly once at scope exit
+  instead of at an explicit `delete` (an explicit `delete` of a `unique` local is itself an error).
+  Residual, filed: `Bag.put(p)` across a function boundary still dangles - inside `put` the
+  argument is a borrowed parameter.
+  **Origin gate (name matching alone was a bug).** The four base names are matched only when the
+  TEMPLATE was declared in a core library file: `GenericTemplateState::coreGenericTemplates` is
+  filled at template registration in `MainListener::ParseStructDefinition` /
+  `ParseClassDefinition` when `currentSourceIsCore_`, and rides the `--init` round-trip as a
+  per-template `"core"` flag (a warm cache never re-reads the core sources). Origin follows the
+  DECLARATION, so a core `list<T>` monomorphized in a user file is still core, while a
+  user-defined `stack<T>` or a namespaced `mylib.list<T>` (matched on the QUALIFIED key) is not.
+  Accept legs in `test_list_ownership.cb`.
+  **The marker is authoritative: a user re-registration must erase it, not just skip setting
+  it.** `coreGenericTemplates.insert(name)` only ever ran when `currentSourceIsCore_`, so a user
+  file re-declaring a GLOBAL template with a core base name (e.g. a bare `struct list<T> {...}`,
+  reachable any time core is transitively imported) overwrote `genericStructTemplates[name]` but
+  left the stale core flag standing, so the add-site rule kept treating the user type as the core
+  container. Fixed by making both registration sites symmetric: `insert` when core, `erase`
+  otherwise - confirmed safe against the `--init` warm-load ordering (`registerLazyTemplates`
+  seeds the flag before any user file is walked, so a later user registration still erases it).

@@ -215,6 +215,12 @@ struct GenericTemplateState
     // the source on first instantiation. Lives here so Clear() drops it with the maps it backs.
     std::unordered_map<std::string, std::string>                                lazyTemplateSource;
 
+    // Template keys whose DECLARATION was read from a core library file (under runtimeDir/core),
+    // recorded at registration. Origin follows the template, not the instantiation site, so a
+    // core generic monomorphized in a user file is still core. Part of the --init round-trip
+    // ("core" flag per template): a warm cache never re-reads the core sources.
+    std::unordered_set<std::string>                                             coreGenericTemplates;
+
     void Clear() { *this = GenericTemplateState{}; }
 };
 
@@ -5152,11 +5158,35 @@ public:
     void RejectOwningTempUniqueFieldIntoSinkParam(const std::string& functionName,
         const TypeAndValue& param, const NamedVariable& arg);
 
+    /*
+     * True when params[paramIndex] is the ELEMENT slot of an element-storing method of a core
+     * container instantiated on a BARE pointer element (`list<T*>`, `dictionary<K,T*>`,
+     * `queue<T*>`, `stack<T*>`) - the shape that neither owns nor frees its elements. A
+     * `unique` / `alias` / interface / value element answers false, so does every non-container
+     * receiver. isMethod must be the callee's own method-ness: the receiver is params[0].
+     */
+    bool IsBorrowingContainerElementSink(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod) const;
+
+    /*
+     * Add-site rule (internal/issue/p2/delete-borrow-via-named-local.md): a bare `list<T*>`
+     * carries no ownership policy, so handing it a LIVE OWNING named local by borrow leaves the
+     * element dangling the moment that local dies. Rejected here, at the add, with `move` as the
+     * remedy. Polarity: only a PROVEN owning named local of this frame rejects - a borrow, a
+     * parameter, a field, a global, an rvalue, a `unique` local, and anything of unknown
+     * provenance all accept.
+     */
+    bool RejectOwningLocalIntoBorrowingContainer(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod,
+        const NamedVariable& arg);
+
     // paramsCarryAllocAlign=false only for ABI signatures that do not carry source allocation
     // alignment (for example C interop). Named function-pointer signatures carry the fact.
+    // calleeIsMethod enables the borrowing-container element leg (an explicit `move` into a
+    // bare-pointer element slot transfers), and is passed only by the direct-call path.
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign = true);
+        bool paramsCarryAllocAlign = true, bool calleeIsMethod = false);
 
     // Indirect-call twin: a lambda literal's inferred owning sinks ride the funcptr TYPE
     // (FuncPtrParam::IsOwningSink), so the caller's source must be transferred exactly as a direct

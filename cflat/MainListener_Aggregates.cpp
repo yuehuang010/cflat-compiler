@@ -50,6 +50,13 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     structName));
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericStructTemplates[structName] = ctx;
+            // Origin marker: a template DECLARED in a core library file. Read by
+            // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
+            // for the core container.
+            if (Compiler()->currentSourceIsCore_)
+                Compiler()->gts.coreGenericTemplates.insert(structName);
+            else
+                Compiler()->gts.coreGenericTemplates.erase(structName);
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
@@ -2661,6 +2668,13 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     structName));
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
             genericClassTemplates[structName] = ctx;
+            // Origin marker: a template DECLARED in a core library file. Read by
+            // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
+            // for the core container.
+            if (Compiler()->currentSourceIsCore_)
+                Compiler()->gts.coreGenericTemplates.insert(structName);
+            else
+                Compiler()->gts.coreGenericTemplates.erase(structName);
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;

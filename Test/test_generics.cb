@@ -823,8 +823,11 @@ bool testListBorrowedPointer()
         // The borrowing list: add() does not consume, and the list frees nothing.
         list<Employee*> borrowing;
 
-        Employee* e1 = new Employee; e1->id = 1;
-        Employee* e2 = new Employee; e2->id = 2;
+        // `unique` is what makes "these objects are owned HERE and the list only borrows them"
+        // a declared fact; a bare `Employee* e1 = new Employee` is an owning local with no
+        // policy and the add-site rule rejects handing it to a borrowing container.
+        unique Employee* e1 = new Employee; e1->id = 1;
+        unique Employee* e2 = new Employee; e2->id = 2;
         borrowing.add(e1);
         borrowing.add(e2);
 
@@ -838,11 +841,11 @@ bool testListBorrowedPointer()
         borrowing.removeAt(0);
         result &= Test("borrowed list<ptr> removeAt no dtor", empDtorCount, 0);
 
-        delete e1;
-        delete e2;
-        result &= Test("borrowed list<ptr> caller frees", empDtorCount, 2);
+        result &= Test("borrowed list<ptr> caller has not freed yet", empDtorCount, 0);
     }
-    // The borrowing list's destructor freed nothing extra.
+    // The unique owners freed exactly once each at scope exit; the borrowing list's
+    // destructor freed nothing extra.
+    result &= Test("borrowed list<ptr> caller frees", empDtorCount, 2);
     result &= Test("borrowed list<ptr> dtor frees nothing", empDtorCount, 2);
 
     return result;

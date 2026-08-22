@@ -1673,26 +1673,29 @@ Container access mirrors the local/parameter rules:
 > keyed containers stay borrowed regardless - a key is read for comparison on every lookup,
 > so it can never be an owning slot.
 
-**Pitfall: feeding a borrowed list from a named owning local leaks.** `list<T>.add`
-takes `move T`, so adding a *named* pointer local always nulls the source - even when
-the target list is a bare (borrowed) list that will never free it:
+**An owning local needs `move` to enter a borrowed container.** A borrowed view frees
+nothing, so an element it was handed by a *live owning local* dangles the moment that
+local goes out of scope. Because the caller - not the container - carries the ownership
+policy here, the compiler rejects the borrow at the storing call (`add`, `set`, `insert`,
+`dictionary.set`, `queue.enqueue`, `stack.push`) and names the two remedies:
 
 ```c
 list<Payload*> view;               // borrowed - never frees
 Payload* p = new Payload();
-view.add(p);                       // p is nulled; nobody owns the Payload anymore - LEAK
+view.add(p);                       // ERROR: 'p' still owns it and frees it at scope exit
+view.add(move p);                  // OK: p is nulled, the element is the only handle left
+view.add(new Payload());           // OK: an rvalue has no other handle either
+
+unique Payload* owned = new Payload();
+view.add(owned);                   // OK: `unique` DECLARES an owner elsewhere - a real borrow
 ```
 
-Feed a borrowed list from an rvalue borrow instead (e.g. `owner[i]`, which is already a
-borrow and is not nulled by `add`):
-
-```c
-list<unique Payload*> owner;
-owner.add(new Payload());
-
-list<Payload*> view;
-view.add(owner[0]);                // OK: owner[0] is a borrow; owner still owns it
-```
+The rule proves what it rejects: only a live owning *named local of this frame* is
+refused. A borrowed parameter, a `get()` / `[]` result, a field, a global, an already-moved
+local, an rvalue, and a `unique`-declared owner are all accepted, and `list<unique T*>` /
+`list<alias T*>` keep their own element policies. One shape it deliberately does not
+catch: passing the local to a helper first (`bag.put(p)`), where the add sees a borrowed
+parameter and the object still dies with the caller's local.
 
 #### `is_unique(T)` and `compile_error`
 

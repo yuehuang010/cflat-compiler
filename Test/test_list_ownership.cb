@@ -11,6 +11,9 @@
 // value stays intact), with `move` at the call site to transfer instead.
 import "string.cb";
 import "list.cb";
+import "dictionary.cb";
+import "queue.cb";
+import "stack.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
@@ -240,18 +243,22 @@ int testBarePointerBorrows()
 {
     int passed = 0;
     g_dtor = 0;
-    Res* p = new Res(1);
+    // The owner is spelled `unique`: that is what makes "someone else owns this element" a
+    // DECLARED fact, so handing it to a borrowing container is legal. A bare `Res* p = new Res(1)`
+    // is an owning local with no policy and the add-site rule rejects it (err_delete_borrowed_owned_element).
     {
-        list<Res*> l = default;
-        l.add(p);
-        // The source is NOT consumed - a borrowing container leaves it usable.
-        passed += Test("list<T*> source usable after add", p.id, 1);
-        passed += Test("list<T*> stored", l[0].id, 1);
-        l.clear();
-        passed += Test("list<T*> clear frees nothing", g_dtor, 0);
+        unique Res* p = new Res(1);
+        {
+            list<Res*> l = default;
+            l.add(p);
+            // The source is NOT consumed - a borrowing container leaves it usable.
+            passed += Test("list<T*> source usable after add", p.id, 1);
+            passed += Test("list<T*> stored", l[0].id, 1);
+            l.clear();
+            passed += Test("list<T*> clear frees nothing", g_dtor, 0);
+        }
+        passed += Test("list<T*> dtor frees nothing", g_dtor, 0);
     }
-    passed += Test("list<T*> dtor frees nothing", g_dtor, 0);
-    delete p;
     passed += Test("list<T*> caller frees exactly once", g_dtor, 1);
     return passed;
 }
@@ -262,15 +269,16 @@ int testBorrowedPointerElementBorrows()
 {
     int passed = 0;
     g_dtor = 0;
-    Res* p = new Res(2);
     {
-        list<Res*> l = default;
-        l.add(p);
-        passed += Test("borrowed list<T*> source usable", p.id, 2);
-        passed += Test("borrowed list<T*> stored", l[0].id, 2);
+        unique Res* p = new Res(2);
+        {
+            list<Res*> l = default;
+            l.add(p);
+            passed += Test("borrowed list<T*> source usable", p.id, 2);
+            passed += Test("borrowed list<T*> stored", l[0].id, 2);
+        }
+        passed += Test("borrowed list<T*> dtor frees nothing", g_dtor, 0);
     }
-    passed += Test("borrowed list<T*> dtor frees nothing", g_dtor, 0);
-    delete p;
     passed += Test("borrowed list<T*> caller frees once", g_dtor, 1);
     return passed;
 }
@@ -477,18 +485,19 @@ int testCopyBorrowedPointer()
 {
     int passed = 0;
     g_dtor = 0;
-    Res* p = new Res(9);
     {
-        list<Res*> src = default;
-        src.add(p);
-        list<Res*> dst = src.copy();
-        passed += Test("list<T*> copy count", dst.count(), 1);
-        // Both containers borrow the SAME pointee - a borrowing copy is a shallow alias.
-        passed += Test("list<T*> copy aliases same element", dst[0].id, 9);
-        passed += Test("list<T*> copy source intact", src[0].id, 9);
+        unique Res* p = new Res(9);
+        {
+            list<Res*> src = default;
+            src.add(p);
+            list<Res*> dst = src.copy();
+            passed += Test("list<T*> copy count", dst.count(), 1);
+            // Both containers borrow the SAME pointee - a borrowing copy is a shallow alias.
+            passed += Test("list<T*> copy aliases same element", dst[0].id, 9);
+            passed += Test("list<T*> copy source intact", src[0].id, 9);
+        }
+        passed += Test("list<T*> two borrowing copies free nothing", g_dtor, 0);
     }
-    passed += Test("list<T*> two borrowing copies free nothing", g_dtor, 0);
-    delete p;
     passed += Test("list<T*> owner frees exactly once", g_dtor, 1);
     return passed;
 }
@@ -548,15 +557,16 @@ int testTake()
 
     // bare pointer element: take returns a borrow; the real owner frees.
     g_dtor = 0;
-    Res* owner = new Res(9);
     {
-        list<Res*> l = default;
-        l.add(owner);
-        Res* borrowed = l.take(0);
-        passed += Test("take borrow returns the element", borrowed.id, 9);
-    }                                                  // list frees nothing (borrow)
-    passed += Test("take borrow list freed nothing", g_dtor, 0);
-    delete owner;
+        unique Res* owner = new Res(9);
+        {
+            list<Res*> l = default;
+            l.add(owner);
+            Res* borrowed = l.take(0);
+            passed += Test("take borrow returns the element", borrowed.id, 9);
+        }                                              // list frees nothing (borrow)
+        passed += Test("take borrow list freed nothing", g_dtor, 0);
+    }
     passed += Test("take borrow owner frees once", g_dtor, 1);
 
     // unique element through the IList<T> interface (virtual dispatch preserves ownership).
@@ -638,19 +648,20 @@ int testSort()
     passed += Test("sort<int> [0]", li[0], 10);
     passed += Test("sort<int> [2]", li[2], 30);
 
-    Res* r1 = new Res(3);
-    Res* r2 = new Res(1);
-    Res* r3 = new Res(2);
     {
-        list<Res*> lp = default;
-        lp.add(r1); lp.add(r2); lp.add(r3);
-        lp.sort((Res* a, Res* b) => { return a.id < b.id; });
-        passed += Test("sort<T*> [0]", lp[0].id, 1);
-        passed += Test("sort<T*> [2]", lp[2].id, 3);
-        passed += Test("sort<T*> freed nothing", g_dtor, 0);
+        unique Res* r1 = new Res(3);
+        unique Res* r2 = new Res(1);
+        unique Res* r3 = new Res(2);
+        {
+            list<Res*> lp = default;
+            lp.add(r1); lp.add(r2); lp.add(r3);
+            lp.sort((Res* a, Res* b) => { return a.id < b.id; });
+            passed += Test("sort<T*> [0]", lp[0].id, 1);
+            passed += Test("sort<T*> [2]", lp[2].id, 3);
+            passed += Test("sort<T*> freed nothing", g_dtor, 0);
+        }
+        passed += Test("sort<T*> dtor freed nothing", g_dtor, 0);
     }
-    passed += Test("sort<T*> dtor freed nothing", g_dtor, 0);
-    delete r1; delete r2; delete r3;
     passed += Test("sort<T*> owner frees each once", g_dtor, 3);
     return passed;
 }
@@ -728,6 +739,150 @@ int testInsert()
     return passed;
 }
 
+// --- add-site rule: an owning local needs `move` -----------------------------------
+//
+// A bare `list<T*>` neither owns nor frees its elements, so handing it a LIVE OWNING named
+// local by borrow is rejected at the add (err_delete_borrowed_owned_element.cb pins the
+// rejections). These are the shapes that must STAY accepted, each with its own free count.
+int testAddSiteAcceptSet()
+{
+    int passed = 0;
+
+    // Idiom F: the rvalue has no other handle, so the element IS the sole handle and the
+    // manual free through get() is the one free.
+    g_dtor = 0;
+    {
+        list<Res*> l = default;
+        l.add(new Res(1));
+        Res* o = l.get(0);
+        passed += Test("add(rvalue) stored", o.id, 1);
+        delete o;
+    }
+    passed += Test("add(rvalue) frees exactly once", g_dtor, 1);
+
+    // `move` hands the sole handle to the container: the local is nulled, so the caller's
+    // scope exit frees nothing and the manual free through get() is again the one free.
+    g_dtor = 0;
+    {
+        list<Res*> l = default;
+        Res* p = new Res(2);
+        l.add(move p);
+        Res* o = l.get(0);
+        passed += Test("add(move p) stored", o.id, 2);
+        delete o;
+    }
+    passed += Test("add(move p) frees exactly once", g_dtor, 1);
+
+    // A borrowed PARAMETER is the caller's business - accepted (the filed residual).
+    g_dtor = 0;
+    {
+        unique Res* p = new Res(3);
+        list<Res*> l = default;
+        addBorrowedParam(&l, p);
+        passed += Test("add(borrowed param) stored", l[0].id, 3);
+        passed += Test("add(borrowed param) frees nothing yet", g_dtor, 0);
+    }
+    passed += Test("add(borrowed param) owner frees once", g_dtor, 1);
+
+    // An owning element with a DECLARED policy: `unique` on the container consumes the local
+    // with no `move` keyword, and `move` is accepted there too.
+    g_dtor = 0;
+    {
+        list<unique Res*> l = default;
+        Res* p = new Res(4);
+        l.add(p);
+        unique Res* q = new Res(5);
+        l.add(move q);
+        passed += Test("unique element list count", l.count(), 2);
+        passed += Test("unique element frees nothing yet", g_dtor, 0);
+    }
+    passed += Test("unique element list frees both", g_dtor, 2);
+
+    // The same rule and the same `move` remedy on dictionary and queue.
+    g_dtor = 0;
+    {
+        dictionary<int, Res*> d = default;
+        Res* p = new Res(6);
+        d.add(1, move p);
+        Res* o = d.get(1);
+        passed += Test("dictionary add(move p) stored", o.id, 6);
+        delete o;
+    }
+    passed += Test("dictionary add(move p) frees exactly once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        queue<Res*> q = default;
+        Res* p = new Res(7);
+        q.enqueue(move p);
+        Res* o = q.dequeue();
+        passed += Test("queue enqueue(move p) stored", o.id, 7);
+        delete o;
+    }
+    passed += Test("queue enqueue(move p) frees exactly once", g_dtor, 1);
+
+    return passed;
+}
+
+// A USER-DEFINED container of the same name as a core one is none of the borrow rule's
+// business: only a template DECLARED in a core library file carries the borrow semantics the
+// add-site rule encodes. `stack<T>` here re-declares the core stack (stack.cb IS imported
+// above), so this also exercises that the stale "core" origin marker left behind by the core
+// registration gets erased when the user's global template overwrites it - otherwise the
+// add-site rule would still see this as the core container. `mylib.list<T>` is a distinct
+// namespaced template - both store a plain pointer and must accept a live owning local
+// without a `move`.
+class stack<T>
+{
+    T item = default;
+    void push(T value) { item = value; }
+    T peek() { return item; }
+};
+
+namespace mylib
+{
+    class list<T>
+    {
+        T item = default;
+        void add(T value) { item = value; }
+        T get() { return item; }
+    };
+}
+
+int testUserDefinedContainersAccept()
+{
+    int passed = 0;
+
+    g_dtor = 0;
+    {
+        stack<Res*> s = default;
+        Res* p = new Res(11);
+        s.push(p);
+        passed += Test("user stack push(p) stored", s.peek().id, 11);
+        delete p;
+    }
+    passed += Test("user stack push(p) frees exactly once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        mylib.list<Res*> l = default;
+        Res* p = new Res(12);
+        l.add(p);
+        passed += Test("user namespaced list add(p) stored", l.get().id, 12);
+        delete p;
+    }
+    passed += Test("user namespaced list add(p) frees exactly once", g_dtor, 1);
+
+    return passed;
+}
+
+// The residual the rule deliberately accepts: inside this function the argument is a BORROWED
+// parameter, so the add is legal here and the caller stays responsible for the object.
+void addBorrowedParam(list<Res*>* l, Res* borrowed)
+{
+    l->add(borrowed);
+}
+
 extern int main()
 {
     HeapAudit.enable();
@@ -762,6 +917,8 @@ extern int main()
     total += 9;  passed += testIsCopyable();
     total += 7;  passed += testSort();
     total += 11; passed += testInsert();
+    total += 14; passed += testAddSiteAcceptSet();
+    total += 4;  passed += testUserDefinedContainersAccept();
 
     // Every ownership rule above is only meaningful if nothing leaked.
     int leaks = (int)HeapAudit.reportLeaks();

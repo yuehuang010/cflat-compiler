@@ -26,4 +26,41 @@ expect_error("cannot delete 'taken' - it aliases borrowed parameter 'n'") {
     }
 }
 
+// Add-site rule: a bare `list<B*>` neither owns nor frees its elements, so handing it a LIVE
+// OWNING named local by borrow leaves the element dangling the moment that local dies. Rejected
+// at the add, with `move` as the remedy (internal/issue/p2/delete-borrow-via-named-local.md).
+// Same-scope spelling - the ruling's case E, whose delete-site twin is undecidable.
+expect_error("Transfer the object with 'add(move p)'") {
+    void addOwningLocal() {
+        list<B*> l;
+        B* p = new B();
+        l.add(p);
+    }
+}
+
+// The filed repro: the owner is declared INSIDE the loop body and freed at the end of every
+// iteration, while the list outlives it - a use-after-free with no delete anywhere.
+expect_error("this container only BORROWS its elements") {
+    void addOwningLoopLocal() {
+        list<B*> xs;
+        int i = 0;
+        while (i < 4) {
+            B* n = new B();
+            n->v = i;
+            xs.add(n);
+            i = i + 1;
+        }
+    }
+}
+// The rule reaches every element-storing method of every borrowing container, not just
+// list.add: set / insert / queue.enqueue / stack.push and dictionary's value slot.
+expect_error("Transfer the object with 'insert(move p)'") {
+    void insertOwningLocal() {
+        list<B*> l;
+        l.add(new B());
+        B* p = new B();
+        l.insert(0, p);
+    }
+}
+
 extern int main() { return 0; }

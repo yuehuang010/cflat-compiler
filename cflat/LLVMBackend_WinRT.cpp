@@ -1589,7 +1589,7 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign)
+        bool paramsCarryAllocAlign, bool calleeIsMethod)
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
@@ -1637,7 +1637,17 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
             // so the caller's source must be nulled exactly as for an explicit `move` param.
             // Without this, `list<unique T*>::add(T value)` leaves the caller owning too.
-            if (params[i].IsMove || params[i].IsUniqueTypeArg || isOwningSink)
+            // An explicit `move` into the element slot of a BORROWING container (bare
+            // `list<T*>` and friends) is a real transfer: the container becomes the only handle,
+            // so the caller's local must be nulled exactly as a declared `move` param nulls it.
+            // Without this the source would still free at scope exit and the element dangle -
+            // which is the very thing the `move` was written to prevent.
+            bool movesIntoBorrowingElement = args[i].IsExplicitMove && !argIsBorrow
+                && args[i].TypeAndValue.Pointer
+                && IsBorrowingContainerElementSink(functionName, params, i, calleeIsMethod)
+                && (args[i].IsOwning || IsVariableOwning(args[i].CallerName));
+            if (params[i].IsMove || params[i].IsUniqueTypeArg || isOwningSink
+                || movesIntoBorrowingElement)
             {
                 // A `move` param takes ownership and frees the block itself. The allocation alignment
                 // of an over-aligned `new T[n]` is not in the element type, so the callee can recover
