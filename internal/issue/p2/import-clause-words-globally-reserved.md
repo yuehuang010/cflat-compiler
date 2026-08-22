@@ -66,3 +66,10 @@ it under-reports.
 
 `Test/errors/` is the wrong home (this should COMPILE). Add a function using `from`, `lib`,
 `cache`, `define` as parameter names to an existing positive test.
+
+## Second report, 2026-08-21 (MemPressMonitor Win32 port, v0.11.0 issue 12)
+
+`int package = 3;` hit independently by a second external project. Beyond the reservation itself,
+they flagged the WORDING: the message says `package` is not an `Identifier` but never says it is a
+reserved word. That half is tracked in [[diagnostic-attribution-and-reserved-word-wording]] and is
+worth fixing for genuine keywords even if this issue removes the accidental ones.

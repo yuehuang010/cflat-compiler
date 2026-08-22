@@ -45,3 +45,9 @@ allocates" and "`list<T*>` borrows its elements" are both documented and both co
 them in a loop silently yields a container of dangling pointers with no diagnostic. Until the
 analysis in [[delete-borrow-via-named-local]] exists, the container docs must state the rule
 outright and lead with `list<unique Node*>` + `add(move n)`. See that file for the measured repro.
+
+## 6. The `manifest` declaration is documented nowhere
+
+Added 2026-08-21 (MemPressMonitor Win32 port). Filed separately as
+[[manifest-declaration-is-undocumented-and-unvalidated]] because it has a code half (validation /
+`--dump-manifest`) as well as a docs half.

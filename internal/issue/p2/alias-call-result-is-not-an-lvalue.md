@@ -91,3 +91,25 @@ dangle. Worth re-probing if the list growth strategy ever changes to move elemen
 
 Do NOT close this by rejecting the accessor path instead - returning `&field` from a method is a
 normal, useful idiom and is how the reporter worked around it.
+
+## Second report, 2026-08-21 (MemPressMonitor Win32 port, v0.11.0 issue 02)
+
+Independently hit by a second external project, which named it the HIGHEST TOTAL COST item of the
+whole port - and it produced a silent wrong answer, not just friction. `xs.get(0) = 5` gives "Left
+side of assignment is not an addressable lvalue", so the correct idiom for a `list<Struct>`
+accumulator is read-copy-write:
+
+```cflat
+AppEntry app = apps->get(i).copy();
+app.workingSet = app.workingSet + process->workingSet;
+apps->set(i, move app);
+```
+
+Their FIRST workaround was a hand-rolled remove/insert rotation that was subtly wrong and reported
+one app at 2,722 MB against a true 13 MB. The compiler cannot catch that, and the language offers
+no safe alternative - which is the argument for fix direction (1) below over a diagnostics-only
+fix. Their requests, in preference order, match it: a `ref`-returning `xs.at(i)`, or `operator[]`
+as an lvalue, or at minimum an in-place `xs.update(i, fn)`.
+
+Adjacent: [[list-has-no-insert]] (the same reporter reached for insert while building the
+workaround).

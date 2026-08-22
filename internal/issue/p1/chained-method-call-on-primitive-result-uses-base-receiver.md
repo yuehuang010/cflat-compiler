@@ -89,3 +89,14 @@ will silently pick a same-named method on the base type.
 
 Extend an existing test (`Test/test_generics.cb` or `Test/test_operators.cb`) with repro A asserting
 `700`, plus `xs.count().toString() == "2"`.
+
+## Second report, 2026-08-21 (MemPressMonitor Win32 port, v0.11.0 issue 01)
+
+Independently hit by a second external project, in the exact repro B shape:
+`ids.count().toString()` -> "no overload of 'toString' matches", receiver rendered as the container.
+They called it the only outright miscompile-class defect found in a ~2.0k-line port, and named
+`.count().toString()` / `.length().toString()` as natural idioms given UFCS plus interpolation.
+Same workaround (bind to a local first). Raises the priority; nothing new about the root cause.
+
+The literal-receiver case ([[method-call-on-string-literal-receiver-rejected]]) is likely the same
+re-seating defect - check whether one fix covers both.
