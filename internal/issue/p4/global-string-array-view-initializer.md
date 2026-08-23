@@ -1,3 +1,18 @@
+# p4: global array-VIEW initializer from literals (ruling needed)
+
+Moved from p3 2026-08-23. The fixed-size `string[2] g = { ... }` form already works; this is the
+convenience of omitting the count on a global view, plus globals of ctor-needing element types.
+
+- Proposed: `string[] g_symbols = { "AAPL", "MSFT" };` at file scope infers a 2-element backing
+  array and binds the view to it, exactly as the local form does.
+- Alternative: keep rejecting and require the counted form (document it); or accept only for
+  element types that fold to constants and keep rejecting ctor-needing element types.
+- Acceptance: global view length/indexing match the counted form; ctor-needing element types
+  either work via a static initializer or get a clear diagnostic; leg in Test/test_core.cb next
+  to `global string array element 0/1`.
+
+---
+
 # Residual: global array-VIEW initializers, and global arrays of ctor-needing element types
 
 The `string[N]` half of this issue is FIXED (p3 bundle, off `819848e`): a global

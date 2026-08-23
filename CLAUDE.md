@@ -129,7 +129,7 @@ Current skills:
 
 ## Localization
 
-- Do NOT hand-edit the locale JSON files under `cflat/locales/` (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, or en-simple/en-pseudo). Translations are maintained externally from `en-pseudo.json`. When adding or changing a diagnostic message, just write the new `LogError*` format string in code; the locale files are regenerated outside this repo workflow.
+- Do NOT edit the locale JSON files under `cflat/locales/` directly - not by hand, not with sed/scripts, and not from an agent. This covers every file there (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, en-simple, en-pseudo). They are GENERATED: `en-pseudo.json` is produced by the build/test tooling from the `LogError*` format strings in code, and the translations are maintained externally from it. When adding or changing a diagnostic, write only the new `LogError*` format string in code; let the scripts/tests regenerate the locale files, and commit the regenerated result as-is. A diff under `cflat/locales/` that did not come from the generator is a review defect.
 
 ## Debugging Workflow
 
@@ -137,7 +137,7 @@ Current skills:
 
 - After finding the root cause of the issue, consider writing a regression test.
 - When encountering a LLVM assert, after identifying the root cause, then write an proper error message in the compiler to avoid that case.
-- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (tracked in git, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed. `internal/issue/` holds ACTIVE items only (one file per issue under `p1/`,`p2/`, `p3/`, `ui/`); the landed design records (ratified behaviour changes and approaches that must not be retried) live in the digest at the bottom of `internal/fix-issue-lessons.md`.
+- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (tracked in git, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed. `internal/issue/` holds ACTIVE items only (one file per issue under `p1/`, `p2/`, `p3/`, `p4/`, `ui/`). `p1/`-`p3/` are bugs and gaps by severity; `p4/` is small quality-of-life FEATURES - language or library conveniences (e.g. `arr.length()` on a fixed array) that are too small to justify an `internal/plan/` entry but still need a maintainer ruling on the surface before they are built. A `p4/` file records the proposed spelling, the alternatives, and the acceptance; once the maintainer ratifies it, work it with the same fix-issue workflow (it may land with or without a plan). Do not file a bug under `p4/`, and do not start a `p4/` item without the ruling. The landed design records (ratified behaviour changes and approaches that must not be retried) live in the digest at the bottom of `internal/fix-issue-lessons.md`.
 - Durable lessons from past fix rounds - review sequencing, guard polarity, what to distrust in an agent report, how tests go vacuous - live in `internal/fix-issue-lessons.md`. Read it before starting a non-trivial compiler fix; add to it when a lesson changes an outcome twice.
 
 ## Building

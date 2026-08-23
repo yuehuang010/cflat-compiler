@@ -1,3 +1,18 @@
+# p4: raw string literal prefix (ruling needed)
+
+Moved from p3 2026-08-23 (was `papercuts-from-the-mempress-port`). Not a bug: every string
+literal is interpolated by design; this is the opt-out convenience.
+
+- Proposed spelling: `r"..."` - no interpolation, `{` / `}` are literal, backslash escapes still
+  apply. No effect on any existing literal.
+- Alternatives: `@"..."` (C# verbatim, also disables backslash escapes - a bigger change);
+  a file-level pragma (rejected: action at a distance).
+- Acceptance: `r"{ \"a\": 1 }"` prints the braces once; `r"x"` + `"y{v}"` still
+  interpolates only the second; lexer-only change, both ParseDeclarationSpecifiers copies
+  untouched; legs in the closest existing string test.
+
+---
+
 # Residual: no raw-string opt-out from interpolation
 
 Filed 2026-08-21 from an external report (MemPressMonitor Win32 port, v0.11.0 issue 13).

@@ -9,7 +9,7 @@ file is deleted when its bug is fixed; a lesson that changed an outcome more tha
 not be deleted with it. Every note below cost at least one confirmed defect to learn, and most
 of them cost the same defect twice.
 
-Active issues live one file per issue under `internal/issue/` (`p2/`, `p3/`, `ui/`). The old
+Active issues live one file per issue under `internal/issue/` (`p1/`-`p3/` bugs by severity, `p4/` small ratified-first features, `ui/`). The old
 `internal/issue/interface-issue-queue.md` index was retired on 2026-08-08; its durable lessons
 were folded in below and its landed design records survive as the digest at the bottom of this
 file. `internal/testing-notes.md` holds the mechanics of the suites.
@@ -2938,3 +2938,12 @@ history of `internal/issue/interface-issue-queue.md` before its 2026-08-08 delet
   element - correct only while the four constructed buffer slots were never destructed. The
   honest number is 6 (5 default constructions + 1 memberwise copy), and the leg now asserts the
   ctor total beside it so the accounting is visible. Do not "restore" it to 2.
+
+## Bond and ownership do NOT extend through varargs (ruling 2026-08-23)
+
+A value passed in the `...` tail of a variadic call carries neither its bond nor its ownership
+into the callee: the compiler does not diagnose a bonded closure (or any bonded / owning value)
+handed to an `extern f(int, ...)`, and it must not start to. Varargs are an opaque C boundary,
+like a raw pointer; the caller is responsible. Reviewer-found "bonded closure through varargs
+escapes" (after d730964) was filed as a p3 and withdrawn on this ruling - do not re-file it, and
+do not add a fail-closed check for the variadic tail.

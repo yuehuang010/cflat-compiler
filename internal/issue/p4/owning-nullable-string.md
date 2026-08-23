@@ -1,3 +1,18 @@
+# p4: owning `string?` (ruling needed)
+
+Moved from p3 2026-08-23. Not a bug: `T?` is a nullable pointer by definition; `string?` holding
+text is a convenience the type system does not offer yet.
+
+- Proposed: option 2 below - `string?` becomes an owning `string` plus a present bit, so
+  `string? s = "ab" + "cd";` and `string? t = nullptr;` both work and `s?.length()` reads as today.
+- Alternative: option 1 below - document `string?` as a borrowed pointer and recommend an empty
+  `string` for "no text"; zero compiler work, ergonomics unchanged.
+- Acceptance (if option 2): assignment from a string temp, `nullptr`, and another `string?`;
+  `?.` / `??` over it; destructor runs once; `--init` round-trip if TypeAndValue gains a field;
+  legs in the closest existing nullable test.
+
+---
+
 # `string?` can only be null or `&someStringLocal` - there is no owning optional string
 
 Filed 2026-08-21 alongside the fix that closed the `string?` SIGSEGV. This is the RESIDUAL of
