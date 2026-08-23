@@ -143,7 +143,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
 {
         BuilderState s{ builder->saveIP(), currentFunction, currentSubprogram, builder->getCurrentDebugLocation(),
                         currentFunctionReturnsOwned, currentFunctionReturnIsArrayView, currentFunctionReturnTypeName,
-                        currentFunctionReturnTV };
+                        currentFunctionReturnTV, currentFunctionAbiRecipe };
         s.aliasDomain = aliasDomain_;
         s.aliasScopes = std::move(aliasScopes_);
         s.viewScopeByOrigin = std::move(viewScopeByOrigin_);
@@ -229,6 +229,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         currentFunctionReturnIsArrayView = state.returnIsArrayView;
         currentFunctionReturnTypeName = state.returnTypeName;
         currentFunctionReturnTV  = state.returnTV;
+        currentFunctionAbiRecipe = state.abiRecipe;
         aliasDomain_             = state.aliasDomain;
         aliasScopes_             = state.aliasScopes;
         viewScopeByOrigin_       = state.viewScopeByOrigin;
@@ -1326,7 +1327,21 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
 
 llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
 {
-        llvm::FunctionType* functionType = GetFunctionType(returnType, arguments, varargs, external);
+        AbiRecipe recipe;
+        bool useRecipe = false;
+        if (external)
+        {
+            recipe = ComputeAbiRecipe(returnType, arguments);
+            useRecipe = recipe.hasLowering;
+            for (const AbiSlot& slot : recipe.paramSlots)
+            {
+                if (slot.kind != AbiSlot::Direct)
+                    LogErrorMessage("extern definition '{}' has a by-value parameter that requires C ABI lowering; declare it without a body and implement it in C", { functionName });
+            }
+        }
+        llvm::FunctionType* functionType = useRecipe
+            ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
+            : GetFunctionType(returnType, arguments, varargs, external);
 
         // Only a `main` declared in the root translation unit is the program entry point -
         // an imported library's own `main` must mangle normally or it collides with the app's.
@@ -1341,6 +1356,34 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         }
 
         auto fn = module->getFunction(mangledName);
+        if (external && fn != nullptr && fn->getFunctionType() != functionType)
+        {
+            // ForwardRefScanner may have emitted a natural declaration before the returned
+            // record was completed. Replace that body-less placeholder once the real ABI recipe
+            // is available; retaining it would force the definition and every caller onto the
+            // wrong C ABI signature.
+            if (fn->empty() && fn->use_empty())
+            {
+                fn->setName(mangledName + ".preabi");
+                fn = createFunctionProto(mangledName, functionType);
+                auto it = functionTable.find(functionName);
+                if (it != functionTable.end())
+                    for (auto& sym : it->second)
+                        if (sym.UniqueName == mangledName)
+                        {
+                            sym.Function = fn;
+                            sym.Recipe = recipe;
+                        }
+            }
+            else
+            {
+                LogErrorMessage(
+                    "cannot repair the extern '{}' declaration after ABI lowering was selected: "
+                    "the old declaration is already used",
+                    { functionName });
+                return fn;
+            }
+        }
         bool alreadyDeclared = false;
 
         if (fn != nullptr)
@@ -1395,6 +1438,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             fn->setCallingConv(llvm::CallingConv::X86_StdCall);
         else if (callConv == CallingConv::Cdecl)
             fn->setCallingConv(llvm::CallingConv::C);
+        if (useRecipe)
+            ApplyAbiAttributes(fn, recipe);
 
         // Thin `int[]` array-view params carry a noalias contract (distinct views point at
         // distinct whole allocations). Stamp LLVM noalias so the loop vectorizer can drop its
@@ -1411,7 +1456,8 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             }
         }
 
-        createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView, returnType.TypeName);
+        createFunctionBlock(fn, functionName, arguments, returnsOwned, returnType.IsArrayView,
+                            returnType.TypeName, useRecipe ? &recipe : nullptr);
         // Sibling of the currentFunctionReturn* fields set inside createFunctionBlock: retain the
         // full return TypeAndValue so a returned lambda literal can adopt a function<> return type.
         currentFunctionReturnTV = returnType;
@@ -1488,6 +1534,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
                 .ReturnsOwned = returnsOwned,
                 .ReturnsAlias = returnType.IsAlias, // 'alias' return: caller must not free the interior
                 .IsMethod = isMethod,
+                .Recipe = recipe,
             };
 
             for (const auto& arg : arguments)

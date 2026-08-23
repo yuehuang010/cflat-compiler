@@ -1441,6 +1441,7 @@ public:
         bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
         bool IsCInteropAlias = false;
+        bool IsCInteropDeclaration = false;
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
     };
@@ -1496,6 +1497,7 @@ public:
     bool currentFunctionReturnIsArrayView = false; // true when the current function's return type is a `T[]` array-view
     std::string currentFunctionReturnTypeName; // declared return TypeName of the current function (e.g. an interface name); used to box a returned concrete pointer into the interface fat pointer
     TypeAndValue currentFunctionReturnTV; // full declared return TypeAndValue of the current function; used to thread a function<> return type into a returned lambda literal's expected type
+    AbiRecipe currentFunctionAbiRecipe; // active extern C ABI recipe for the current function definition
 
     // Returning a struct by value hands its member pointers to the caller; running the local's
     // dtor on the return path would dangle them. EmitDestructorsForScope skips this alloca.
@@ -2861,6 +2863,7 @@ private:
     // reach the verifier bodyless (internal linkage), so it is emitted on the spot instead.
     bool deferredIfaceReboxDrained_ = false;
     std::unordered_map<std::string, llvm::Function*> memberwiseCopyCache_;
+    std::unordered_map<std::string, llvm::Function*> cAbiFunctionThunkCache_;
     std::function<void(const std::string&, size_t, size_t, const std::string&, int)> diagnosticSink_;
     DiagnosticLocalization diagnosticLocalization_;
     std::function<void(int, int, int, int, const std::string&)> hintRegionSink_;
@@ -3677,7 +3680,7 @@ private:
 
     int GetOrMintViewScope(const std::string& originKey);
 
-    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false, const std::string& returnTypeName = "");
+    void createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned = false, bool returnIsArrayView = false, const std::string& returnTypeName = "", const AbiRecipe* abiRecipe = nullptr);
 
     llvm::DIType* GetDIType(const TypeAndValue& tv);
 
@@ -4290,6 +4293,7 @@ public:
         // Leaving it unsaved let a nested emission's function<>/Lambda<> return type steer the
         // ENCLOSING function's `return` through CoerceToFuncPtrReturn.
         TypeAndValue returnTV;
+        AbiRecipe abiRecipe;
         // The enclosing function's array-view alias registry. Nested emission starts empty.
         llvm::MDNode* aliasDomain = nullptr;
         std::vector<llvm::MDNode*> aliasScopes;
@@ -4564,6 +4568,10 @@ public:
     // Wraps a bare C function pointer as a closure {thunk, env=cfnptr}. The env slot carries
     // the real C fn ptr; the thunk reads env back, bitcasts to C signature, and tail-calls through it.
     llvm::Function* GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy);
+
+    // Adapt an extern function's lowered C ABI to the natural CFlat function-pointer ABI.
+    llvm::Function* GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
+                                                  const TypeAndValue& fpTV);
 
     llvm::Value* WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV);
 

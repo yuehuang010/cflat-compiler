@@ -891,7 +891,9 @@ deleteArraySize
 
 operatorFunctionId
     : Operator (New | Delete | String
-               | Plus | Minus | Star | Div | Mod
+               | Plus | Minus | Star | Div | Mod | And | Or | Caret
+               | PlusAssign | MinusAssign | StarAssign | DivAssign | ModAssign
+               | LeftShiftAssign | RightShiftAssign | AndAssign | XorAssign | OrAssign
                | Equal | NotEqual | Less | LessEqual | Greater | GreaterEqual
                | LeftShift | Greater Greater
                | LeftBracket RightBracket

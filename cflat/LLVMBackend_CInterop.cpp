@@ -799,6 +799,10 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             CreateFunctionDeclaration(regName, e.ret, e.params, /*external=*/true, e.variadic,
                                       /*returnsOwned=*/false, /*isMethod=*/false,
                                       CallingConv::Cdecl);
+            if (auto fit = functionTable.find(regName); fit != functionTable.end())
+                for (FunctionSymbol& sym : fit->second)
+                    if (sym.External)
+                        sym.IsCInteropDeclaration = true;
 
             if (isProgMain)
             {
@@ -1902,8 +1906,17 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
 
         // An alias may name another alias (`#define A B` / `#define B fn`). Walk the chain to
         // the first name that resolves to something real; the hop cap breaks a self-reference.
+        auto isCFunctionTarget = [](const std::vector<FunctionSymbol>& syms) {
+            for (const FunctionSymbol& sym : syms)
+                if (sym.IsCInteropDeclaration || sym.IsCInteropAlias)
+                    return true;
+            return false;
+        };
+
         auto resolvable = [&](const std::string& n) {
-            return functionTable.count(n) != 0 || globalNamedVariable.count(n) != 0
+            auto fit = functionTable.find(n);
+            return (fit != functionTable.end() && isCFunctionTarget(fit->second))
+                || globalNamedVariable.count(n) != 0
                 || funcMacroByName.count(n) != 0 || dataStructures.count(n) != 0
                 || ResolveTypeAlias(n) != n;
         };
@@ -1926,12 +1939,14 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
             }
             if (target == m.name) continue;   // self-reference
 
-            if (auto fn = functionTable.find(target); fn != functionTable.end())
+            if (auto fn = functionTable.find(target);
+                fn != functionTable.end() && isCFunctionTarget(fn->second))
             {
                 // Reuse the target's llvm::Function and its whole signature: the alias is a
                 // second lookup name for one linkage symbol, never a new external symbol.
                 for (const FunctionSymbol& sym : fn->second)
                 {
+                    if (!sym.IsCInteropDeclaration && !sym.IsCInteropAlias) continue;
                     FunctionSymbol aliasSym = sym;
                     aliasSym.IsCInteropAlias = true;
                     functionTable[m.name].push_back(std::move(aliasSym));

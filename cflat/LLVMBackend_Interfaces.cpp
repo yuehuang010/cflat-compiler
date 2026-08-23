@@ -574,6 +574,94 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
         return thunk;
     }
 
+llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& symbol,
+                                                          const TypeAndValue& fpTV)
+{
+        std::string key = "__cflat_abi_fnptr_" + symbol.Function->getName().str();
+        for (char& c : key)
+            if (!std::isalnum((unsigned char)c)) c = '_';
+        if (auto it = cAbiFunctionThunkCache_.find(key); it != cAbiFunctionThunkCache_.end())
+            return it->second;
+
+        std::vector<TypeAndValue> params;
+        for (const auto& p : fpTV.FuncPtrParams)
+        {
+            TypeAndValue tv;
+            tv.TypeName = p.TypeName;
+            tv.Pointer = p.Pointer;
+            tv.IsMove = p.IsMove;
+            params.push_back(tv);
+        }
+        TypeAndValue ret;
+        ret.TypeName = fpTV.FuncPtrReturnTypeName;
+        ret.Pointer = fpTV.FuncPtrReturnPointer;
+        ret.IsMove = fpTV.FuncPtrReturnOwned;
+        ret.IsAlias = fpTV.FuncPtrReturnAlias;
+        auto* naturalTy = GetFunctionType(ret, params, false, false);
+        auto* thunk = llvm::Function::Create(
+            naturalTy, llvm::Function::InternalLinkage, key, *module);
+        cAbiFunctionThunkCache_[key] = thunk;
+
+        auto* entry = llvm::BasicBlock::Create(*context, "entry", thunk);
+        llvm::IRBuilder<> b(entry);
+        std::vector<llvm::Value*> loweredArgs;
+        unsigned sourceArg = 0;
+        llvm::AllocaInst* sretSlot = nullptr;
+        const AbiRecipe& recipe = symbol.Recipe;
+        if (recipe.retSlot.kind == AbiSlot::SRetReturn)
+        {
+            sretSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "sret");
+            loweredArgs.push_back(sretSlot);
+        }
+
+        for (size_t i = 0; i < recipe.paramSlots.size(); ++i)
+        {
+            llvm::Value* value = thunk->getArg(sourceArg++);
+            if (i < params.size() && ParameterCarriesRawArrayCount(params[i])) ++sourceArg;
+            const AbiSlot& slot = recipe.paramSlots[i];
+            if (slot.kind == AbiSlot::Direct)
+                loweredArgs.push_back(value);
+            else if (slot.kind == AbiSlot::ByVal)
+            {
+                auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.byval");
+                b.CreateStore(value, copy);
+                loweredArgs.push_back(copy);
+            }
+            else if (slot.kind == AbiSlot::CoercePair)
+            {
+                auto* pairTy = llvm::StructType::get(*context, { slot.coerceTy, slot.coerceTy2 });
+                auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
+                b.CreateStore(value, copy);
+                auto* pairPtr = b.CreateBitCast(copy, pairTy->getPointerTo());
+                auto* pair = b.CreateLoad(pairTy, pairPtr);
+                loweredArgs.push_back(b.CreateExtractValue(pair, { 0u }));
+                loweredArgs.push_back(b.CreateExtractValue(pair, { 1u }));
+            }
+            else
+            {
+                auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
+                b.CreateStore(value, copy);
+                auto* coercePtr = b.CreateBitCast(copy, slot.coerceTy->getPointerTo());
+                loweredArgs.push_back(b.CreateLoad(slot.coerceTy, coercePtr));
+            }
+        }
+
+        auto* call = b.CreateCall(symbol.Function->getFunctionType(), symbol.Function, loweredArgs);
+        ApplyAbiCallAttributes(call, recipe);
+        if (recipe.retSlot.kind == AbiSlot::Direct)
+            b.CreateRet(call);
+        else if (sretSlot != nullptr)
+            b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, sretSlot));
+        else
+        {
+            auto* resultSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "abi.ret");
+            auto* resultPtr = b.CreateBitCast(resultSlot, call->getType()->getPointerTo());
+            b.CreateStore(call, resultPtr);
+            b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, resultSlot));
+        }
+        return thunk;
+    }
+
 llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
 {
         auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
@@ -601,6 +689,10 @@ llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, cons
 
 llvm::Value* LLVMBackend::MakeThinFnPtrValue(llvm::Value* fn, const TypeAndValue& fpTV)
 {
+        if (auto* original = llvm::dyn_cast<llvm::Function>(fn))
+            if (const auto* symbol = FindSymbolForFunction(original);
+                symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+                fn = GetOrCreateCAbiFunctionThunk(*symbol, fpTV);
         return builder->CreateBitCast(fn, BuildThinFnPtrType(fpTV), "thinfn");
     }
 
@@ -691,6 +783,9 @@ llvm::Value* LLVMBackend::WidenThinToFat(llvm::Value* thinPtr)
 
 llvm::Value* LLVMBackend::WrapBareValueAsFatStruct(llvm::Function* original)
 {
+        if (const auto* symbol = FindSymbolForFunction(original);
+            symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
+            original = GetOrCreateCAbiFunctionThunk(*symbol, FuncPtrSigOfSymbol(*symbol));
         auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
         auto* shim     = GetOrCreateFunctionShim(original);
         auto* shimAsI8 = builder->CreateBitCast(shim, i8PtrTy, "shim_i8");

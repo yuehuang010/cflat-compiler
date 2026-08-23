@@ -660,8 +660,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
          * the void-typed expression is still proven, but the message must say 'auto'.
          */
         bool autoReturn = compiler->IsAutoReturnCaptureActive();
+        bool abiReturnsValue = compiler->currentFunctionAbiRecipe.hasLowering
+            && compiler->currentFunctionAbiRecipe.retSlot.kind != LLVMBackend::AbiSlot::Direct;
         bool fnReturnsVoid = !autoReturn && compiler->currentFunction != nullptr
-            && compiler->currentFunction->getReturnType()->isVoidTy();
+            && compiler->currentFunction->getReturnType()->isVoidTy() && !abiReturnsValue;
         // Void-ness reaches here two ways. A void CALL is a void-typed value. A void CLOSURE call
         // and a `(void)` cast both yield no LLVM value at all, so their void-ness rides the
         // NamedVariable instead (`int f() { return g(); }` on a `Lambda<void()>` g). The
@@ -712,6 +714,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         if (!autoReturn && right != nullptr && compiler->currentFunction != nullptr)
         {
             auto* returnTy = compiler->currentFunction->getReturnType();
+            if (abiReturnsValue)
+                returnTy = compiler->currentFunctionAbiRecipe.retSlot.structTy;
             auto* stringTy = llvm::StructType::getTypeByName(*compiler->context, "string");
             bool aggregateFromScalar = returnTy->isStructTy() && returnTy != stringTy
                 && !right->getType()->isStructTy() && !right->getType()->isPointerTy();
@@ -1641,7 +1645,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // to, so it keeps the flat zero (or no value at all).
                     auto* retTy = compiler->currentFunction->getReturnType();
                     const auto& retTV = compiler->currentFunctionReturnTV;
-                    bool typedReturn = !retTy->isVoidTy()
+                    bool abiReturnsValue = compiler->currentFunctionAbiRecipe.hasLowering
+                        && compiler->currentFunctionAbiRecipe.retSlot.kind
+                            != LLVMBackend::AbiSlot::Direct;
+                    bool typedReturn = (!retTy->isVoidTy() || abiReturnsValue)
                         && !compiler->IsAutoReturnCaptureActive()
                         && !retTV.TypeName.empty() && retTV.TypeName != "auto";
                     if (typedReturn)

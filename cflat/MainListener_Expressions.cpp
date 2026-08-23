@@ -35,6 +35,8 @@ static bool TernaryIsBinaryOperand(CFlatParser::ConditionalExpressionContext* ct
         if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent))
             if (postfix->children.size() > 1) return false;
         if (IsBinaryExpressionRuleWithOperator(parent)) return true;
+        if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(parent))
+            if (assignment->assignmentOperator() != nullptr) return true;
     }
     return false;
 }
@@ -2409,6 +2411,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             }
 
             bool rhsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
+            bool usedCompoundOverload = false;
             if (operatorText != "=")
             {
                 auto left = derefLoad();
@@ -2431,8 +2434,72 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 }
                 else
                 {
-                    right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
+                    static const std::array<std::pair<std::string_view, std::string_view>, 9> compoundOperators = {{
+                        { "+=", "+" }, { "-=", "-" }, { "*=", "*" }, { "/=", "/" },
+                        { "%=", "%" }, { "&=", "&" }, { "|=", "|" }, { "^=", "^" },
+                        { "<<=", "<<" }
+                    }};
+                    static const std::pair<std::string_view, std::string_view> rightShift = { ">>=", ">>" };
+                    std::string_view binaryOp;
+                    for (const auto& [compoundOp, op] : compoundOperators)
+                        if (operatorText == compoundOp) { binaryOp = op; break; }
+                    if (binaryOp.empty() && operatorText == rightShift.first)
+                        binaryOp = rightShift.second;
+
+                    llvm::Value* overload = nullptr;
+                    bool compoundOverloadExists = false;
+                    if (!binaryOp.empty() && left != nullptr && left->getType()->isStructTy())
+                    {
+                        std::string leftType = namedVar.TypeAndValue.TypeName;
+                        if (leftType.empty())
+                            leftType = llvm::cast<llvm::StructType>(left->getType())->getName().str();
+                        compoundOverloadExists = HasOperatorOverloadForFirstParam(
+                            "operator" + operatorText, leftType);
+                        if (compoundOverloadExists)
+                            overload = TryBinaryOperatorOverload(
+                                left, operatorText, right, ctx, namedVar.BaseType,
+                                rightNV.TypeAndValue.DepthIsAboutThisValue()
+                                    ? rightNV.TypeAndValue.PointerDepth : 0,
+                                rightNV.TypeAndValue.ElemPointer);
+                    }
+                    if (overload == nullptr && !compoundOverloadExists && !binaryOp.empty())
+                        overload = TryBinaryOperatorOverload(
+                            left, std::string(binaryOp), right, ctx, namedVar.BaseType,
+                            rightNV.TypeAndValue.DepthIsAboutThisValue()
+                                ? rightNV.TypeAndValue.PointerDepth : 0,
+                            rightNV.TypeAndValue.ElemPointer);
+                    if (overload != nullptr)
+                    {
+                        right = overload;
+                        usedCompoundOverload = true;
+                    }
+                    else if (!binaryOp.empty() && left != nullptr && left->getType()->isStructTy())
+                    {
+                        LogErrorContext(unaryCtx, std::format(
+                            "no overload for compound assignment '{}' on type '{}'",
+                            operatorText, namedVar.TypeAndValue.TypeName));
+                    }
+                    else
+                    {
+                        right = compiler->CreateOperation(operatorText, left, right, lhsUnsigned, rhsUnsigned);
+                    }
                 }
+            }
+
+            // An overloaded compound assignment replaces the live LHS with its returned value.
+            // Release the old owner first; this covers locals, fields, arrays and dereferences.
+            if (usedCompoundOverload && right != nullptr && right->getType()->isStructTy())
+            {
+                if (compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+                    if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                        compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->UnregisterOwnedStringTemp(right);
+                compiler->SuppressCallerRelease(right);
+                // derefAssign, not CreateAssignment: a '*p op= x' destination is a raw loaded
+                // pointer whose storage type cannot be inferred (it stores through BaseType).
+                derefAssign(right, rhsUnsigned);
+                // Return the stored value so a call argument cannot register the produced result twice.
+                return finishStore(derefLoad());
             }
 
             // X4 guard: copying a named owning-value into a struct field aliases its buffer (double-free).
@@ -3936,9 +4003,19 @@ LLVMBackend::TypeAndValue MainListener::InferTernaryArmType(llvm::Value* value) 
 static bool TernaryJoinIsUnsigned(bool trueUnsigned, unsigned trueBits,
                                   bool falseUnsigned, unsigned falseBits)
 {
-        if (trueUnsigned == falseUnsigned) return trueUnsigned;
-        return trueUnsigned ? trueBits >= falseBits : falseBits >= trueBits;
-    }
+    if (trueUnsigned == falseUnsigned) return trueUnsigned;
+    return trueUnsigned ? trueBits >= falseBits : falseBits >= trueBits;
+}
+
+static bool BinaryJoinIsUnsigned(bool leftUnsigned, llvm::Value* left,
+                                 bool rightUnsigned, llvm::Value* right)
+{
+    unsigned leftBits = left != nullptr && left->getType()->isIntegerTy()
+        ? left->getType()->getIntegerBitWidth() : 0;
+    unsigned rightBits = right != nullptr && right->getType()->isIntegerTy()
+        ? right->getType()->getIntegerBitWidth() : 0;
+    return TernaryJoinIsUnsigned(leftUnsigned, leftBits, rightUnsigned, rightBits);
+}
 
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
                               llvm::Value*& trueValue, llvm::Value*& falseValue,
@@ -4901,13 +4978,41 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
 
         if (exclusiveCtxs.size() > 1)
         {
+            auto* compiler = Compiler(ctx);
+            compiler->lastCallReturnsOwned = false;
             auto lv = ParseExclusiveOrExpression(exclusiveCtxs[0], ResultUse::Value);
+            RegisterBorrowedStringOperandTemp(compiler, lv.value);
+            compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
+                compiler->lastCallReturnsOwned = false;
                 auto rv = ParseExclusiveOrExpression(exclusiveCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value,
+                RegisterBorrowedStringOperandTemp(compiler, rv.value);
+                compiler->RegisterOwnedPtrTemp(rv.value);
+                // A struct operand routes to 'operator|' the way the shift/relational paths do;
+                // without it an overloaded receiver reaches the raw integer op and fails the verifier.
+                auto* overload = TryBinaryOperatorOverload(acc, "|", rv.value, ctx, lv.elemType,
+                                                           rv.pointerDepth, rv.elemPointer);
+                if (overload == nullptr && acc != nullptr && rv.value != nullptr
+                    && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
+                    LogErrorContext(ctx, "no overload of 'operator|' matches the given arguments.");
+                if (overload != nullptr)
+                {
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = overload;
+                    resultNV.TypeAndValue = compiler->lastCallReturnType;
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator|'");
+                    acc = overload;
+                    lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
+                }
+                else
+                {
+                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    lv.isUnsigned = resultUnsigned;
+                }
             }
             return { acc, lv.isUnsigned };
         }
@@ -4924,13 +5029,41 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
 
         if (andCtxs.size() > 1)
         {
+            auto* compiler = Compiler(ctx);
+            compiler->lastCallReturnsOwned = false;
             auto lv = ParseAndExpression(andCtxs[0], ResultUse::Value);
+            RegisterBorrowedStringOperandTemp(compiler, lv.value);
+            compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
+                compiler->lastCallReturnsOwned = false;
                 auto rv = ParseAndExpression(andCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value,
+                RegisterBorrowedStringOperandTemp(compiler, rv.value);
+                compiler->RegisterOwnedPtrTemp(rv.value);
+                // A struct operand routes to 'operator^' the way the shift/relational paths do;
+                // without it an overloaded receiver reaches the raw integer op and fails the verifier.
+                auto* overload = TryBinaryOperatorOverload(acc, "^", rv.value, ctx, lv.elemType,
+                                                           rv.pointerDepth, rv.elemPointer);
+                if (overload == nullptr && acc != nullptr && rv.value != nullptr
+                    && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
+                    LogErrorContext(ctx, "no overload of 'operator^' matches the given arguments.");
+                if (overload != nullptr)
+                {
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = overload;
+                    resultNV.TypeAndValue = compiler->lastCallReturnType;
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator^'");
+                    acc = overload;
+                    lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
+                }
+                else
+                {
+                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    lv.isUnsigned = resultUnsigned;
+                }
             }
             return { acc, lv.isUnsigned };
         }
@@ -4947,13 +5080,41 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
 
         if (nextCtxs.size() > 1)
         {
+            auto* compiler = Compiler(ctx);
+            compiler->lastCallReturnsOwned = false;
             auto lv = ParseEqualityExpression(nextCtxs[0], ResultUse::Value);
+            RegisterBorrowedStringOperandTemp(compiler, lv.value);
+            compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
+                compiler->lastCallReturnsOwned = false;
                 auto rv = ParseEqualityExpression(nextCtxs[i], ResultUse::Value);
-                acc = Compiler(ctx)->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value,
+                RegisterBorrowedStringOperandTemp(compiler, rv.value);
+                compiler->RegisterOwnedPtrTemp(rv.value);
+                // A struct operand routes to 'operator&' the way the shift/relational paths do;
+                // without it an overloaded receiver reaches the raw integer op and fails the verifier.
+                auto* overload = TryBinaryOperatorOverload(acc, "&", rv.value, ctx, lv.elemType,
+                                                           rv.pointerDepth, rv.elemPointer);
+                if (overload == nullptr && acc != nullptr && rv.value != nullptr
+                    && (acc->getType()->isStructTy() || rv.value->getType()->isStructTy()))
+                    LogErrorContext(ctx, "no overload of 'operator&' matches the given arguments.");
+                if (overload != nullptr)
+                {
+                    LLVMBackend::NamedVariable resultNV;
+                    resultNV.Primary = overload;
+                    resultNV.TypeAndValue = compiler->lastCallReturnType;
+                    DiagnoseVoidResultConsumed(ctx, resultNV, use, "'operator&'");
+                    acc = overload;
+                    lv.isUnsigned = resultNV.TypeAndValue.IsUnsignedInteger() != -1;
+                }
+                else
+                {
+                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    lv.isUnsigned = resultUnsigned;
+                }
             }
             return { acc, lv.isUnsigned };
         }

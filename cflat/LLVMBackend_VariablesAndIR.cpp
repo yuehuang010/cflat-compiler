@@ -1783,6 +1783,7 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             {
                 return builder->CreateFDiv(left, right);
             }
+            case Operation::ModAssignment:
             case Operation::Modulo:
             {
                 return builder->CreateFRem(left, right);
@@ -1837,6 +1838,7 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             {
                 return builder->CreateSDiv(left, right);
             }
+            case Operation::ModAssignment:
             case Operation::Modulo:
             {
                 return builder->CreateSRem(left, right);
@@ -1988,6 +1990,7 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             case Operation::DivideAssignment:
             case Operation::Divide:
                 return resultIsUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
+            case Operation::ModAssignment:
             case Operation::Modulo:
                 return resultIsUnsigned ? builder->CreateURem(left, right) : builder->CreateSRem(left, right);
             case Operation::Greater:

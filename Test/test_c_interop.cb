@@ -43,11 +43,13 @@ import "library/c_alias_late_chain_target.h";
 import { "library/c_alias_group_late_alias.h", "library/c_alias_group_late_target.h" };
 import "library/c_alias_late_diff.h";
 import "library/c_alias_late_diff_target.h";
+import "library/testmodule.cb";
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
 import "library/c_macro_helpers.h";
 import "library/float_macros.h";
+import "string.cb";
 
 // Section B: hand-written extern alongside auto-extern. Same signatures the auto-
 // extern path infers; first-writer-wins resolves the duplicate without diagnostic.
@@ -62,6 +64,16 @@ extern int  strcmp(const char* a, const char* b);
 int my_add_cb(int a, int b) { return a + b; }
 int my_sub_cb(int a, int b) { return a - b; }
 int my_inc_cb(int x) { return x + 1; }
+
+string abiStringGlobal = default;
+extern string abiExternStringValue() { return abiStringGlobal; }
+extern alias string abiExternAliasStringValue() { return abiStringGlobal; }
+// Taken as a function-pointer value below: an extern whose return is C-ABI lowered needs an
+// adapter thunk, while the CFlat sibling on the same signature must stay unwrapped.
+extern string abiExternStringOf(int n) { return abiStringGlobal; }
+string abiCFlatStringOf(int n) { return abiStringGlobal; }
+struct AbiPair { int x = 0; int y = 0; };
+extern AbiPair abiExternPairOf(int n) { AbiPair p; p.x = 7; p.y = n; return p; }
 
 // Section L: float/double #define macro extraction.
 static bool near(double actual, double expected, double tol)
@@ -128,6 +140,21 @@ extern int main()
 
     // ---- Section B: hand-written extern (same calls, validates coexistence) --
     if (c_add(1, 2) != 3)               return 10;
+
+    abiStringGlobal = "hello".copy();
+    if ((int)abiExternStringValue().length() != 5)      return 11;
+    if ((int)abiExternAliasStringValue().length() != 5) return 12;
+    function<string(int)> abiFp = abiExternStringOf;
+    string abiViaPtr = abiFp(0);
+    if ((int)abiViaPtr.length() != 5)   return 13;   // extern string through function<>
+    function<string(int)> abiFpCb = abiCFlatStringOf;
+    string abiViaPtrCb = abiFpCb(0);
+    if ((int)abiViaPtrCb.length() != 5) return 14;   // CFlat sibling unaffected
+    AbiPair abiDirect = abiExternPairOf(3);
+    if (abiDirect.x != 7 || abiDirect.y != 3) return 15;
+    function<AbiPair(int)> abiFpPair = abiExternPairOf;
+    AbiPair abiViaPtrPair = abiFpPair(4);
+    if (abiViaPtrPair.x != 7 || abiViaPtrPair.y != 4) return 16;
 
     // ---- Section C: import package (header + .lib + enum constants) ----------
     if (ml_add(40, 2) != 42)            return 20;       // plain function
@@ -605,6 +632,9 @@ extern int main()
 
     expect_error("'CAA_GetObject' is a function used as a value") {
         int bad = CAA_GetObject;
+    }
+    expect_error("Undefined variable CB_ALIAS_CFLAT_TARGET.") {
+        int badCFlatAlias = CB_ALIAS_CFLAT_TARGET(1);
     }
 
     // These aliases are declared before their targets in later separate imports. They are

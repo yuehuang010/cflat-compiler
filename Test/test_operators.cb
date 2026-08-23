@@ -101,6 +101,49 @@ struct Counter
     bool operator<(Counter other)    { return value < other.value; }
 };
 
+struct CompoundBox
+{
+    int value = 0;
+    CompoundBox operator+(CompoundBox other)  { CompoundBox r; r.value = value + other.value; return r; }
+    CompoundBox operator-(CompoundBox other)  { CompoundBox r; r.value = value - other.value; return r; }
+    CompoundBox operator*(CompoundBox other)  { CompoundBox r; r.value = value * other.value; return r; }
+    CompoundBox operator/(CompoundBox other)  { CompoundBox r; r.value = value / other.value; return r; }
+    CompoundBox operator%(CompoundBox other)  { CompoundBox r; r.value = value % other.value; return r; }
+    CompoundBox operator<<(CompoundBox other) { CompoundBox r; r.value = value << other.value; return r; }
+    CompoundBox operator>>(CompoundBox other) { CompoundBox r; r.value = value >> other.value; return r; }
+};
+
+struct NoCompoundBox { int value = 0; };
+
+// Bitwise overloads: '&' '|' '^' are declarable, and '&=' '|=' '^=' fall back to them.
+struct BitBox
+{
+    int value = 0;
+    BitBox operator&(BitBox other) { BitBox r; r.value = value & other.value; return r; }
+    BitBox operator|(BitBox other) { BitBox r; r.value = value | other.value; return r; }
+    BitBox operator^(BitBox other) { BitBox r; r.value = value ^ other.value; return r; }
+};
+
+// Only a compound overload is declared - the binary form must not be required.
+struct OnlyCompoundBox
+{
+    int value = 0;
+    OnlyCompoundBox operator+=(OnlyCompoundBox other)
+    { OnlyCompoundBox r; r.value = value + other.value + 100; return r; }
+};
+
+// Both declared: the compound overload wins over the binary one.
+struct BothCompoundBox
+{
+    int value = 0;
+    BothCompoundBox operator+(BothCompoundBox other)
+    { BothCompoundBox r; r.value = value + other.value; return r; }
+    BothCompoundBox operator+=(BothCompoundBox other)
+    { BothCompoundBox r; r.value = value + other.value + 1000; return r; }
+};
+
+struct CompoundHolder { CompoundBox f = default; };
+
 // ── operator->: forwarding / drill-down member access ────────────────────────
 
 struct Inner
@@ -254,6 +297,49 @@ extern int main()
     Test("Counter == (eq)",  p == p,  true);
     Test("Counter == (ne)",  p == q,  false);
     Test("Counter <  ",      q < p,   true);
+
+    CompoundBox copA; copA.value = 10;
+    CompoundBox copB; copB.value = 3;
+    copA += copB; Test("compound overload +=", copA.value, 13);
+    copA -= copB; Test("compound overload -=", copA.value, 10);
+    copA *= copB; Test("compound overload *=", copA.value, 30);
+    copA /= copB; Test("compound overload /=", copA.value, 10);
+    copA %= copB; Test("compound overload %=", copA.value, 1);
+    copA.value = 3; copA <<= copB; Test("compound overload <<=", copA.value, 24);
+    copA >>= copB; Test("compound overload >>=", copA.value, 3);
+
+    int primitiveMod = 5;
+    primitiveMod %= 4;
+    Test("primitive %=", primitiveMod, 1);
+
+    // Bitwise: binary overload used directly, and reached through the compound spelling.
+    BitBox bitA; bitA.value = 12;
+    BitBox bitB; bitB.value = 10;
+    BitBox bitAnd = bitA & bitB; Test("BitBox binary &", bitAnd.value, 8);
+    BitBox bitOr  = bitA | bitB; Test("BitBox binary |", bitOr.value, 14);
+    BitBox bitXor = bitA ^ bitB; Test("BitBox binary ^", bitXor.value, 6);
+    BitBox bitC = bitA; bitC &= bitB; Test("compound overload &=", bitC.value, 8);
+    BitBox bitD = bitA; bitD |= bitB; Test("compound overload |=", bitD.value, 14);
+    BitBox bitE = bitA; bitE ^= bitB; Test("compound overload ^=", bitE.value, 6);
+
+    // Only a compound overload declared, and compound-beats-binary precedence.
+    OnlyCompoundBox onlyA; onlyA.value = 1;
+    OnlyCompoundBox onlyB; onlyB.value = 2;
+    onlyA += onlyB; Test("compound-only overload +=", onlyA.value, 103);
+    BothCompoundBox bothA; bothA.value = 1;
+    BothCompoundBox bothB; bothB.value = 2;
+    BothCompoundBox bothSum = bothA + bothB; Test("both: binary + used", bothSum.value, 3);
+    bothA += bothB; Test("both: compound += wins", bothA.value, 1003);
+
+    // Compound overload on a field, an array element, and through a pointer deref.
+    CompoundHolder copH = default; copH.f.value = 4;
+    copH.f *= copB; Test("compound overload on field", copH.f.value, 12);
+    CompoundBox[3] copArr = default;
+    copArr[1].value = 5;
+    copArr[1] *= copB; Test("compound overload on array element", copArr[1].value, 15);
+    CompoundBox copTarget; copTarget.value = 7;
+    CompoundBox* copPtr = &copTarget;
+    *copPtr *= copB; Test("compound overload through pointer", copTarget.value, 21);
 
     // Chained: (a + b) + c  ==  a + (1,2) + (3,4)+(1,2) = (5,8)+(1,2) but let's just check addition chaining
     Vec2 chain = a + b + c;    // (1+3+1, 2+4+2) = (5, 8)

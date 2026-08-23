@@ -23,6 +23,8 @@ import "hpc/btree.cb";
 import "array.cb";
 import "queue.cb";
 import "stack.cb";
+import "channel.cb";
+import "spsc_queue.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
@@ -56,6 +58,18 @@ struct LeakPair { string name = default; list<int> nums = default; };
 int _drainLive = 0;
 struct DrainRes  { int v = 0; DrainRes() { _drainLive++; } ~DrainRes() { _drainLive--; } };
 struct DrainCell { unique DrainRes* p = new DrainRes(); int tag = 0; };
+// Compound assignment through an operator overload replaces the LHS: the old owner must be
+// destructed exactly once, whatever lvalue form (local, field, element, deref) the LHS takes.
+struct DrainSum
+{
+    unique DrainRes* p = new DrainRes();
+    int tag = 0;
+    DrainSum operator+(alias DrainSum other)
+    { DrainSum r = default; r.tag = tag + other.tag; return move r; }
+};
+struct DrainSumHolder { DrainSum f = default; };
+DrainSum makeDrainSum(int t) { DrainSum r = default; r.tag = t; return move r; }
+
 struct DrainKey
 {
     unique DrainRes* p = new DrainRes();
@@ -3638,6 +3652,127 @@ extern int main()
         { stack<DrainCell> ds = default; DrainCell dc = default; ds.push(dc);
           total++; passed += Test("drain stack live in scope", _drainLive, 1); }
         total++; passed += Test("drain stack live after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { channel<DrainCell> ch = default; ch.init(4); ch.destroy(); ch.destroy();
+          total++; passed += Test("drain channel zero undelivered in scope", _drainLive, 0); }
+        total++; passed += Test("drain channel zero undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { channel<DrainCell> ch = default; ch.init(4);
+          DrainCell c0 = default; ch.push(move c0);
+          total++; passed += Test("drain channel one undelivered in scope", _drainLive, 1); }
+        total++; passed += Test("drain channel one undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { channel<DrainCell> ch = default; ch.init(4);
+          DrainCell c0 = default; DrainCell c1 = default; DrainCell c2 = default;
+          ch.push(move c0); ch.push(move c1); ch.push(move c2);
+          total++; passed += Test("drain channel many undelivered in scope", _drainLive, 3); }
+        total++; passed += Test("drain channel many undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { channel<DrainCell> ch = default; ch.init(4);
+          DrainCell c0 = default; ch.push(move c0);
+          { DrainCell out = ch.receive();
+            total++; passed += Test("drain channel drained item live", _drainLive, 1); }
+          total++; passed += Test("drain channel fully drained in scope", _drainLive, 0); }
+        total++; passed += Test("drain channel fully drained after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { spsc_queue<DrainCell> sq = default; sq.init(4); sq.destroy(); sq.destroy();
+          total++; passed += Test("drain spsc zero undelivered in scope", _drainLive, 0); }
+        total++; passed += Test("drain spsc zero undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { spsc_queue<DrainCell> sq = default; sq.init(4);
+          DrainCell c0 = default; sq.push(move c0);
+          total++; passed += Test("drain spsc one undelivered in scope", _drainLive, 1); }
+        total++; passed += Test("drain spsc one undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { spsc_queue<DrainCell> sq = default; sq.init(4);
+          DrainCell c0 = default; DrainCell c1 = default; DrainCell c2 = default;
+          sq.push(move c0); sq.push(move c1); sq.push(move c2);
+          total++; passed += Test("drain spsc many undelivered in scope", _drainLive, 3); }
+        total++; passed += Test("drain spsc many undelivered after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { spsc_queue<DrainCell> sq = default; sq.init(4);
+          DrainCell c0 = default; sq.push(move c0);
+          { DrainCell out = sq.pop();
+            total++; passed += Test("drain spsc drained item live", _drainLive, 1); }
+          total++; passed += Test("drain spsc fully drained in scope", _drainLive, 0); }
+        total++; passed += Test("drain spsc fully drained after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSum a = default; a.tag = 1;
+          DrainSum b = default; b.tag = 2;
+          a += b;
+          total++; passed += Test("compound overload local owner live", _drainLive, 2);
+          total++; passed += Test("compound overload local owner value", a.tag, 3); }
+        total++; passed += Test("compound overload local owner after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSumHolder h = default; h.f.tag = 4;
+          DrainSum b = default; b.tag = 5;
+          h.f += b;
+          total++; passed += Test("compound overload field owner live", _drainLive, 2);
+          total++; passed += Test("compound overload field owner value", h.f.tag, 9); }
+        total++; passed += Test("compound overload field owner after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSum[2] arr = default; arr[1].tag = 6;
+          DrainSum b = default; b.tag = 1;
+          arr[1] += b;
+          total++; passed += Test("compound overload element owner live", _drainLive, 3);
+          total++; passed += Test("compound overload element owner value", arr[1].tag, 7); }
+        total++; passed += Test("compound overload element owner after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSum a = default; a.tag = 8;
+          DrainSum b = default; b.tag = 2;
+          DrainSum* pa = &a;
+          *pa += b;
+          total++; passed += Test("compound overload deref owner live", _drainLive, 2);
+          total++; passed += Test("compound overload deref owner value", a.tag, 10); }
+        total++; passed += Test("compound overload deref owner after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSum a = default; a.tag = 3;
+          a += a;
+          total++; passed += Test("compound overload self-assign live", _drainLive, 1);
+          total++; passed += Test("compound overload self-assign value", a.tag, 6); }
+        total++; passed += Test("compound overload self-assign after teardown", _drainLive, 0);
+    }
+    {
+        _drainLive = 0;
+        { DrainSum a = default; a.tag = 3;
+          a += makeDrainSum(4);
+          total++; passed += Test("compound overload produced-temp rhs live", _drainLive, 1);
+          total++; passed += Test("compound overload produced-temp rhs value", a.tag, 7); }
+        total++; passed += Test("compound overload produced-temp rhs after teardown", _drainLive, 0);
+    }
+    {
+        string s = "old-buffer-that-must-be-freed";
+        string other = "-other-buffer";
+        s += "x";
+        s += other;
+        total++; passed += Test("string compound += value", s, "old-buffer-that-must-be-freedx-other-buffer");
+        total++; passed += Test("string compound += length", (int)s.length(), 43);
     }
     {
         // dictionary drains BOTH fresh arrays; V=DrainCell is the acquiring one here, and the

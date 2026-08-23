@@ -71,6 +71,7 @@ int c_quad(int x);                    /* defined in cinterop.c */
 #define CB_PARAM_COLLISION(CB_PARAM_TARGET) CB_PARAM_TARGET + CB_PARAM_CONST
 #define CB_ALIAS_TRAIL   c_triple     /* trailing comment must not defeat the match */
 #define CB_ALIAS_UNKNOWN cb_no_such_name_anywhere  /* unknown: dropped, no error */
+#define CB_ALIAS_CFLAT_TARGET CB_CFlatAliasTarget  /* must not bind to imported CFlat */
 #define CB_BASE_VAL      100
 #define CB_ALIAS_CONST   CB_BASE_VAL  /* folds to a constant: unchanged accept-set */
 int c_alias_victim(int x);            /* defined in cinterop.c; called ONLY by leg 249 */

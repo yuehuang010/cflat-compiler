@@ -1319,7 +1319,9 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
             auto* retTy = currentFunction->getReturnType();
             // Wrap raw i8* string literals into string struct when returning string
             auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-            if (strTy && retTy == strTy && value->getType() != strTy)
+            llvm::StructType* abiRetStructTy = currentFunctionAbiRecipe.hasLowering
+                ? currentFunctionAbiRecipe.retSlot.structTy : nullptr;
+            if (strTy && (retTy == strTy || abiRetStructTy == strTy) && value->getType() != strTy)
             {
                 auto* ptrTy = builder->getInt8Ty()->getPointerTo();
                 if (value->getType() == ptrTy)
@@ -1335,6 +1337,40 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                         value = CreateOverloadedFunctionCall("operator string", { argNV });
                     }
                 }
+            }
+            if (currentFunctionAbiRecipe.hasLowering
+                && currentFunctionAbiRecipe.retSlot.kind != AbiSlot::Direct)
+            {
+                const AbiSlot& s = currentFunctionAbiRecipe.retSlot;
+                if (s.structTy == nullptr)
+                    LogErrorMessage("cannot lower extern return value for the active C ABI recipe");
+                value = Upconvert(value, s.structTy, srcIsUnsigned);
+                if (value == nullptr || value->getType() != s.structTy)
+                    LogErrorMessage("cannot return this value from extern function: it does not match the C ABI return aggregate");
+                if (s.kind == AbiSlot::SRetReturn)
+                {
+                    if (currentFunction->arg_empty())
+                        LogErrorMessage("cannot lower extern sret return: missing hidden return slot");
+                    builder->CreateStore(value, &*currentFunction->arg_begin());
+                    builder->CreateRetVoid();
+                    return;
+                }
+                auto* slot = AllocaAtEntry(s.structTy, nullptr, "abi.ret", s.align);
+                builder->CreateStore(value, slot);
+                if (s.kind == AbiSlot::CoerceToInt)
+                {
+                    builder->CreateRet(LoadCoerceAt(slot, s.coerceTy, 0));
+                    return;
+                }
+                if (s.kind == AbiSlot::CoercePair)
+                {
+                    llvm::Value* aggregate = llvm::UndefValue::get(retTy);
+                    aggregate = builder->CreateInsertValue(aggregate, LoadCoerceAt(slot, s.coerceTy, 0), { 0u });
+                    aggregate = builder->CreateInsertValue(aggregate, LoadCoerceAt(slot, s.coerceTy2, 8), { 1u });
+                    builder->CreateRet(aggregate);
+                    return;
+                }
+                LogErrorMessage("cannot lower extern return value for the active C ABI recipe");
             }
             value = Upconvert(value, retTy, srcIsUnsigned);
             // Upconvert only widens; handle narrowing int -> bool explicitly (same as CreateAssignment).

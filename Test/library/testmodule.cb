@@ -25,6 +25,7 @@ int getImportedDefaultFold()
 
 int moduleAdd(int a, int b) { return a + b; }
 int moduleMultiply(int a, int b) { return a * b; }
+int CB_CFlatAliasTarget(int x) { return x + 9000; }
 
 struct ModulePoint
 {

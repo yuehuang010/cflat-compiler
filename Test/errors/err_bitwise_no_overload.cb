@@ -1,0 +1,8 @@
+struct NoBitsBox { int value = 0; };
+extern int main()
+{
+    NoBitsBox lhs = default;
+    NoBitsBox rhs = default;
+    expect_error("no overload of 'operator&' matches the given arguments.");
+    NoBitsBox result = lhs & rhs;
+}

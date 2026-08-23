@@ -52,7 +52,7 @@
 
 // ---- Definitions moved out of LLVMBackend.h (CodegenHelpers) ----
 
-void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned, bool returnIsArrayView, const std::string& returnTypeName)
+void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& friendlyName, std::vector<LLVMBackend::TypeAndValue> arguments, bool returnsOwned, bool returnIsArrayView, const std::string& returnTypeName, const AbiRecipe* abiRecipe)
 {
         // all function starts at "entry" block
         auto entry = CreateBasicBlock("entry", fn);
@@ -69,6 +69,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         currentFunctionReturnsOwned = returnsOwned;
         currentFunctionReturnIsArrayView = returnIsArrayView;
         currentFunctionReturnTypeName = returnTypeName;
+        currentFunctionAbiRecipe = abiRecipe != nullptr ? *abiRecipe : AbiRecipe{};
         // The bond side channel is per-call: a value left set by a swallowed diagnostic (or by a
         // deferred lambda body) must never answer the next function's return/assign checks.
         lastCallIsBonded = false;
@@ -96,6 +97,9 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         // populate function arguments
         auto itr_nameArg = arguments.begin();
         auto llvmArgIt = fn->arg_begin();
+        if (abiRecipe != nullptr && abiRecipe->retSlot.kind == AbiSlot::SRetReturn
+            && llvmArgIt != fn->arg_end())
+            ++llvmArgIt;
         for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end(); ++itr_nameArg)
         {
             auto& arg = *llvmArgIt++;

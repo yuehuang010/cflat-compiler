@@ -4061,6 +4061,7 @@ void LLVMBackend::ResetForReanalysis()
 
     functionTable.clear();
     pendingCInteropAliases_.clear();
+    cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
@@ -4175,6 +4176,7 @@ void LLVMBackend::ResetForReanalysis()
     currentFunctionReturnIsArrayView = false;
     currentFunctionReturnTypeName.clear();
     currentFunctionReturnTV = TypeAndValue{};
+    currentFunctionAbiRecipe = AbiRecipe{};
     pendingOwnedStringTemps.clear();
     pendingOwnedStructTemps.clear();
     pendingOwnedPtrTemps.clear();
@@ -6234,6 +6236,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         builder.reset();
         module.reset();
         functionTable.clear();
+        cAbiFunctionThunkCache_.clear();
         dataStructures.clear();
         DropModuleEscapeMemo();   // every llvm::Function* just died with the module
         context = std::make_unique<llvm::LLVMContext>();
@@ -6732,6 +6735,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     // Clear tables populated by Init()/RegisterBuiltinString() whose LLVM pointers
     // now dangle (they pointed into the old module/context we just destroyed).
     functionTable.clear();
+    cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
     DropModuleEscapeMemo();   // every llvm::Function* just died with the old module
     interfaceTable.clear();
@@ -6903,6 +6907,15 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
         }
 
     } // end CoreDes:Structs
+
+    // AbiRecipe contains LLVM type pointers and is recomputed after struct metadata is restored.
+    for (auto& entry : functionTable)
+        for (auto& sym : entry.second)
+            if (sym.External)
+            {
+                auto recipe = ComputeAbiRecipe(sym.ReturnType, sym.Parameters);
+                if (recipe.hasLowering) sym.Recipe = std::move(recipe);
+            }
 
     // interfaceTable + interfaceParents
     { llvm::TimeTraceScope s("CoreDes:Interfaces", jsonPath);
