@@ -41,13 +41,97 @@ void escapeDictToWiderScope() {
     sink();
 }
 
-// A struct field is program-untrackable storage for a bond, whatever the captured type.
+// A struct field is safe only when its holder dies no later than the source.
 struct ListHolder { Lambda<void()> f = default; };
 void escapeListIntoField() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    ListHolder h = default;
+    {
+        list<int> xs = default;
+        h.f = () => { xs.add(1); };
+    }
+}
+
+void rejectSameScopeHolderBeforeSource() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    ListHolder h = default;
+    list<int> xs = default;
+    h.f = () => { xs.add(1); };
+}
+
+struct HolderOuter { ListHolder p = default; };
+
+void escapeCopiedHolderField() {
     expect_error("bonded value cannot be stored in a struct field or through a pointer");
     list<int> xs = default;
     ListHolder h = default;
     h.f = () => { xs.add(1); };
+    HolderOuter q = default;
+    q.p = h;
+}
+
+void escapeCopiedHolderPointer() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    HolderOuter q = default;
+    ListHolder* pp = &q.p;
+    *pp = h;
+}
+
+void escapeCopiedHolderBrace() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    HolderOuter q = { p = h };
+}
+
+void escapeCopiedHolderList() {
+    expect_error("cannot pass a holder containing a bonded closure to a function");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    list<ListHolder> holders = default;
+    holders.add(h);
+}
+
+void receiveBondedHolderValue(ListHolder h) { }
+void receiveBondedHolderAlias(alias ListHolder h) { }
+
+void escapeCopiedHolderValueArg() {
+    expect_error("cannot pass a holder containing a bonded closure to a function");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    receiveBondedHolderValue(h);
+}
+
+void escapeCopiedHolderAliasArg() {
+    expect_error("cannot pass a holder containing a bonded closure to a function");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    receiveBondedHolderAlias(h);
+}
+
+void receiveBondedHolderPointer(ListHolder* h) { }
+
+void escapeCopiedHolderPointerArg() {
+    expect_error("cannot pass a holder containing a bonded closure to a function");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    receiveBondedHolderPointer(&h);
+}
+
+ListHolder returnBondedHolderPlain() {
+    expect_error("cannot return a holder containing a bonded closure");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    return h;
 }
 
 // A global has program lifetime, so the closure would outlive the captured stack frame.
@@ -56,4 +140,122 @@ void escapeListIntoGlobal() {
     expect_error("cannot store a lambda with a by-reference capture of non-static local 'xs' into program-lifetime storage");
     list<int> xs = default;
     gEscapedListLambda = () => { xs.add(1); };
+}
+
+// A holder in an outer scope outlives a bonded source in an inner scope.
+void escapeOuterHolder() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    ListHolder h = default;
+    {
+        list<int> xs = default;
+        h.f = () => { xs.add(1); };
+    }
+}
+
+// Heap and pointer-reached holders are not statically lifetime-bounded by the source frame.
+void escapeHeapHolder() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder* h = new ListHolder;
+    h->f = () => { xs.add(1); };
+    delete h;
+}
+
+void escapePointerHolder() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    ListHolder* p = &h;
+    p->f = () => { xs.add(1); };
+}
+
+struct OwnerBondedHolder { unique ListHolder* holder = nullptr; };
+
+void escapeUniqueHolderField() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    OwnerBondedHolder owner = default;
+    owner.holder = new ListHolder;
+    owner.holder->f = () => { xs.add(1); };
+    delete owner.holder;
+    owner.holder = nullptr;
+}
+
+struct ReturnBondedHolder { Lambda<void()> f = default; };
+
+ReturnBondedHolder returnBondedHolder() {
+    expect_error("cannot move a holder containing a bonded closure");
+    list<int> xs = default;
+    ReturnBondedHolder h = default;
+    h.f = () => { xs.add(1); };
+    return move h;
+}
+
+void receiveBondedHolder(ReturnBondedHolder* h) { }
+
+void passBondedHolderPointer() {
+    expect_error("cannot pass a holder containing a bonded closure to a function");
+    list<int> xs = default;
+    ReturnBondedHolder h = default;
+    h.f = () => { xs.add(1); };
+    receiveBondedHolder(&h);
+}
+
+void consumeBondedHolder(move ReturnBondedHolder h) { }
+
+void passBondedHolderMove() {
+    expect_error("cannot move a holder containing a bonded closure");
+    list<int> xs = default;
+    ReturnBondedHolder h = default;
+    h.f = () => { xs.add(1); };
+    consumeBondedHolder(move h);
+}
+
+void escapeFixedArrayHolder() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder[1] arr = default;
+    arr[0].f = () => { xs.add(1); };
+}
+
+void captureHolderContainingClosure() {
+    expect_error("cannot capture 'h' in a lambda");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    ListHolder q = default;
+    q.f = () => { h.f(); };
+}
+
+struct CopyHolder { Lambda<void()> f = default; };
+
+struct BondCounter { int value = 0; };
+
+// A copy of a holder carrying a bonded closure escapes the tracking.
+void copyBondedHolderIntoNewLocal() {
+    expect_error("cannot copy a holder containing a bonded closure");
+    BondCounter c = default;
+    CopyHolder h = default;
+    h.f = () => { c.value = 1; };
+    CopyHolder h2 = h;
+}
+
+// Taking the holder's address is the same copy-out through a pointer local.
+void addressOfBondedHolder() {
+    expect_error("cannot copy a holder containing a bonded closure");
+    BondCounter c = default;
+    CopyHolder h = default;
+    h.f = () => { c.value = 1; };
+    CopyHolder* p = &h;
+}
+
+void takeClosure(Lambda<void()> f) { }
+
+// A second lambda capturing the holder transitively borrows the same frame.
+void secondLambdaCapturesHolder() {
+    expect_error("cannot capture 'h' in a lambda");
+    BondCounter c = default;
+    CopyHolder h = default;
+    h.f = () => { c.value = 1; };
+    takeClosure(() => { h.f(); });
 }

@@ -1035,6 +1035,8 @@ public:
     {
     public:
         LLVMBackend::TypeAndValue TypeAndValue;
+        // Monotonic local declaration order used for lifetime checks and cleanup order.
+        uint64_t DeclSequence = 0;
         llvm::Type* BaseType = nullptr;  // The type of the value, even if it is a pointer.
         llvm::Value* Primary = nullptr;  // The value or result
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
@@ -1132,6 +1134,8 @@ public:
         bool IsBonded = false;           // compile-time: true when this variable holds a bonded (borrowed) return value
         bool BondByAddress = false;      // bond originates from a by-address lambda capture; reassigning the source is safe
         std::vector<std::string> BondedSources; // names of bond parameters this value borrows from
+        bool ContainsBondedClosure = false; // a field stores a closure borrowing the holder's frame
+        bool FieldPathThroughPointer = false; // a field path crossed a pointer or heap object
         // The block that established the bond. A rebind in a nested block is conditional at the
         // later source use and must not retire the bond for the whole function.
         llvm::BasicBlock* BondDeclBlock = nullptr;
@@ -2316,6 +2320,7 @@ private:
     std::unique_ptr<llvm::LLVMContext> context;
 
     std::vector<StackState> stackNamedVariable;
+    uint64_t nextDeclSequence = 1;
     // Per-llvm::Function move-event log (move-dataflow). Appended in emission
     // order; consumed and cleared by RunMoveDataflow. Cleared by ResetForReanalysis.
     std::unordered_map<llvm::Function*, std::vector<movedf::Event>> moveEventLog_;
@@ -5513,6 +5518,12 @@ public:
     // Returns the variable's STORAGE: an alloca normally, or an internal module global when the
     // pending-static request below matches this declaration (a `static` local).
     llvm::Value* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
+
+    // Return a live local binding, assigning its declaration sequence on first insertion.
+    NamedVariable& GetOrCreateStackVariable(const std::string& name);
+
+    // Register a complete local binding while preserving its declaration sequence on overwrite.
+    void SetStackVariable(const std::string& name, NamedVariable namedVar);
 
     // Set by the declaration path just before it creates a `static` local's storage; consumed by
     // the first CreateLocalVariable whose name, type, enclosing FUNCTION and scope depth all match.

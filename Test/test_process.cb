@@ -129,6 +129,29 @@ extern int main(int argc, char** argv)
     }
     printf("PASS: test4 (captureStdout, len=%d)\n", cap.length());
 
+    // WaitForExit joins the reader before these same-scope locals are destroyed.
+    list<string>* a5 = new list<string>;
+    string s5a = shellFlag();
+    string s5b = "echo bonded-callback";
+    a5->add(s5a);
+    a5->add(s5b);
+    stringbuilder response5 = default;
+    process p5;
+    p5.exe = shellExe();
+    p5.onStdout = (char* buf, int len) => {
+        if (len > 0) response5.appendChar(buf[0]);
+    };
+    p5.run(a5);
+    p5.WaitForExit();
+    delete a5;
+    if (p5.exitCode != 0 || response5.length() == 0)
+    {
+        printf("FAIL: test5 bonded callback expected output, got exit=%d len=%d\n",
+               p5.exitCode, response5.length());
+        return 1;
+    }
+    printf("PASS: test5 (bonded callback, len=%d)\n", response5.length());
+
     printf("All process tests passed.\n");
     return 0;
 }

@@ -2095,6 +2095,107 @@ bool testClosureFieldReadIntoLocal()
     return result;
 }
 
+// A bonded reference capture may live in a stack holder whose lifetime is no longer than the source.
+struct BondedFieldBox { Lambda<int()> f = default; Lambda<int()> g = default; };
+struct BondedFieldOuter { BondedFieldBox box = default; };
+struct BondedVoidFieldBox { Lambda<void()> f = default; };
+
+bool testBondedClosureFieldLifetime()
+{
+    bool result = true;
+
+    {
+        Counter c = default; c.value = 31;
+        BondedFieldBox h = default;
+        h.f = () => { return c.value; };
+        result &= Test("bonded field same scope", h.f(), 31);
+    }
+    {
+        Counter c = default; c.value = 33;
+        {
+            BondedFieldBox h = default;
+            h.f = () => { return c.value; };
+            result &= Test("bonded field inner scope", h.f(), 33);
+        }
+    }
+    {
+        Counter c = default; c.value = 34;
+        BondedFieldBox h = default;
+        h.f = () => { return c.value; };
+        result &= Test("bonded user struct capture", h.f(), 34);
+    }
+    {
+        list<int> xs = default; xs.add(35);
+        BondedFieldBox h = default;
+        h.f = () => { return xs.get(0); };
+        result &= Test("bonded list capture", h.f(), 35);
+    }
+    {
+        stringbuilder response = default;
+        response.appendChar('X');
+        BondedFieldBox h = default;
+        h.f = () => { return response.length(); };
+        result &= Test("bonded stringbuilder capture", h.f(), 1);
+    }
+    {
+        Counter c = default; c.value = 36;
+        BondedFieldBox h = default;
+        h.f = () => { return c.value; };
+        int first = h.f();
+        h.f = () => { return c.value + 1; };
+        h.g = () => { return c.value + 2; };
+        result &= Test("bonded field reassignment", first * 100 + h.f(), 3637);
+        result &= Test("bonded field second capture", h.g(), 38);
+    }
+    {
+        Counter c = default; c.value = 39;
+        BondedFieldOuter o = default;
+        o.box.f = () => { return c.value; };
+        result &= Test("bonded nested holder field", o.box.f(), 39);
+    }
+    {
+        Counter c = default; c.value = 40;
+        BondedFieldBox h = { f = () => { return c.value; } };
+        result &= Test("bonded brace field", h.f(), 40);
+    }
+    {
+        BondedFieldBox h = default;
+        h.f = () => { return 41; };
+        BondedFieldOuter q = default;
+        q.box = h;
+        result &= Test("non-bonded holder field copy", q.box.f(), 41);
+        BondedFieldBox* p = &q.box;
+        *p = h;
+        result &= Test("non-bonded holder pointer copy", q.box.f(), 41);
+    }
+    {
+        BondedFieldBox h = { f = () => { return 42; } };
+        BondedFieldOuter q = { box = h };
+        result &= Test("non-bonded holder brace copy", q.box.f(), 42);
+    }
+    {
+        BondedFieldBox[1] arr = default;
+        arr[0].f = () => { return 43; };
+        result &= Test("non-bonded fixed-array holder", arr[0].f(), 43);
+    }
+    {
+        BondedFieldBox h = default;
+        h.f = () => { return 44; };
+        BondedFieldBox q = default;
+        q.f = () => { return h.f() + 1; };
+        result &= Test("non-bonded holder second capture", q.f(), 45);
+    }
+    {
+        list<int> xs = default;
+        BondedVoidFieldBox h = default;
+        h.f = () => { xs.add(46); };
+        h.f();
+        result &= Test("same-scope field assertion shape", xs.get(0), 46);
+    }
+
+    return result;
+}
+
 // A nested (inner) lambda that references a local of the ENCLOSING FUNCTION reaches it
 // TRANSITIVELY through the outer lambda. The outer lambda must capture it too, so the inner
 // closure reads it out of the outer env (which dominates in the outer body) rather than the
@@ -4440,6 +4541,7 @@ extern int main(int argc, char** argv)
     // Brace-init of a closure field auto-clones the env, same as the `=` store
     total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
     total++; passed += testClosureFieldReadIntoLocal()   ? 1 : 0;
+    total++; passed += testBondedClosureFieldLifetime()  ? 1 : 0;
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;

@@ -1395,6 +1395,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
+                                        && IsBondedClosureContainer(Compiler(ctx), fieldType);
                                     namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
                                         || structVar.IsAliasBorrow
                                         || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
@@ -1495,6 +1497,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     namedVar.TypeAndValue = fieldType;
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
+                                    namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
+                                        && IsBondedClosureContainer(Compiler(ctx), fieldType);
                                     namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
                                         || structVar.IsAliasBorrow
                                         || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
@@ -1513,6 +1517,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // of `.b` is the field `a`, whose own root is still `w`.
                                     namedVar.FieldPathRoot = structVar.FieldPathRoot.empty()
                                         ? structVar.TypeAndValue.VariableName : structVar.FieldPathRoot;
+                                    namedVar.FieldPathThroughPointer = structVar.FieldPathThroughPointer
+                                        || structVar.TypeAndValue.Pointer;
                                     // An alias-return binding can retain the source owner's path label
                                     // while its own alloca is being introduced. Re-resolve the first
                                     // field hop against the local binding so the shallow-copy borrow
@@ -2293,12 +2299,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             namedVar.Storage = elemPtr;
                             namedVar.BaseType = arrTy->getElementType();
                             namedVar.TypeAndValue.ConstArraySize = 0;
+                            namedVar.FieldPathThroughPointer = true;
                             // The GEP above already resolved the union reinterpret; leaving the
                             // whole FIELD type set would load/store the element as the whole array.
                             namedVar.UnionFieldType = nullptr;
                         }
                         else if (namedVar.TypeAndValue.Pointer)
                         {
+                            namedVar.FieldPathThroughPointer = true;
                             // Indexing through a pointer (e.g. char* p; p[i]).
                             auto elementTypeAndValue = namedVar.TypeAndValue;
                             // Array-view element access: tag the element's load/store with this view's
@@ -3822,6 +3830,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         CallArgumentScope callArgumentScope(
                                             inCallArgument_, ternaryCallArgumentDepth_);
                                         auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
+                                        if (argNV.ContainsBondedClosure)
+                                            Compiler(ctx)->LogError(
+                                                "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                         if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
                                             && argNV.Primary != nullptr
@@ -4221,6 +4232,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
+                                    argVar.ContainsBondedClosure = argNV.ContainsBondedClosure;
                                     // Propagate lambda capture names so a capturing lambda passed to a
                                     // thin `function<>` parameter names its captures in the rejection
                                     // diagnostic, exactly as the direct call path does.
@@ -4721,6 +4733,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         inCallArgument_, ternaryCallArgumentDepth_);
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                     argExpectedScope.reset();
+                                    if (argNV.ContainsBondedClosure)
+                                        Compiler(ctx)->LogError(
+                                            "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
@@ -4798,6 +4813,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsBonded = argNV.IsBonded;
                                     argVar.BondByAddress = argNV.BondByAddress;
                                     argVar.BondedSources = argNV.BondedSources;
+                                    argVar.ContainsBondedClosure = argNV.ContainsBondedClosure;
                                     // Propagate lambda capture names: when the lambda arg went through
                                     // postfix processing, the names land on argNV (the line below covers
                                     // the direct-arg path where they arrive via the side-channel instead).
@@ -5943,7 +5959,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     continue;
                 }
 
-                auto& captureNV = compiler->stackNamedVariable.back().namedVariable[cap.Name];
+                auto& captureNV = compiler->GetOrCreateStackVariable(cap.Name);
                 compiler->RecordMoveGenBind(cap.Name); // fresh capture binding in the lambda body
 
                 if (cap.ByReference)
@@ -6213,6 +6229,18 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             {
                 result.IsBonded = true;
                 result.BondedSources.push_back(cap.Name);
+                // The captured holder already stores a bonded closure, so this lambda
+                // transitively borrows that frame and cannot be tracked from here.
+                for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                {
+                    auto it = frame.namedVariable.find(cap.Name);
+                    if (it == frame.namedVariable.end()) continue;
+                    if (it->second.ContainsBondedClosure)
+                        LogErrorContext(ctx, std::format(
+                            "cannot capture '{}' in a lambda - it holds a bonded closure that would outlive its captured local",
+                            cap.Name));
+                    break;
+                }
             }
         }
         if (result.IsBonded)

@@ -3414,10 +3414,15 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
                 *context, currentSubprogram->getLine(), 0, currentSubprogram));
         }
 
-        for (const auto& [varName, namedVar] : frame.namedVariable)
-        {
-            DropValue(namedVar);
-        }
+        std::vector<const NamedVariable*> locals;
+        locals.reserve(frame.namedVariable.size());
+        for (const auto& entry : frame.namedVariable)
+            locals.push_back(&entry.second);
+        std::ranges::sort(locals, [](const auto* left, const auto* right) {
+            return left->DeclSequence > right->DeclSequence;
+        });
+        for (const auto* namedVar : locals)
+            DropValue(*namedVar);
 
         // Clean up owning function parameters (move params)
         for (const auto& [varName, namedVar] : frame.functionArgument)

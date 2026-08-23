@@ -1,5 +1,128 @@
 #include "MainListener.h"
 
+bool MainListener::AllowBondedClosureFieldStore(
+        LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& destination,
+        llvm::Value* fieldStorage,
+        const std::vector<std::string>& sources,
+        antlr4::ParserRuleContext* /*errCtx*/) {
+        if (destination.FieldPathThroughPointer || sources.empty()) return false;
+
+        for (const auto& source : sources)
+        {
+            for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+            {
+                auto it = frame.namedVariable.find(source);
+                if (it == frame.namedVariable.end()) continue;
+                if (it->second.ContainsBondedClosure) return false;
+                break;
+            }
+        }
+
+        std::string holderName = destination.FieldPathRoot;
+        const LLVMBackend::NamedVariable* holder = nullptr;
+        if (!holderName.empty())
+        {
+            for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+            {
+                auto it = frame.namedVariable.find(holderName);
+                if (it != frame.namedVariable.end())
+                {
+                    holder = &it->second;
+                    break;
+                }
+            }
+        }
+
+        // Brace initialization passes the holder storage directly, so recover its root alloca.
+        if (holder == nullptr && fieldStorage != nullptr)
+        {
+            llvm::Value* rootStorage = fieldStorage;
+            while (auto* gep = llvm::dyn_cast<llvm::GetElementPtrInst>(rootStorage))
+                rootStorage = gep->getPointerOperand();
+            while (auto* bitcast = llvm::dyn_cast<llvm::BitCastInst>(rootStorage))
+                rootStorage = bitcast->getOperand(0);
+            if (!llvm::isa<llvm::AllocaInst>(rootStorage)) return false;
+            holderName = compiler->FindVariableNameByStorage(rootStorage);
+            if (holderName.empty()) return false;
+            for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+            {
+                auto it = frame.namedVariable.find(holderName);
+                if (it != frame.namedVariable.end())
+                {
+                    holder = &it->second;
+                    break;
+                }
+            }
+        }
+
+        if (holder == nullptr || holder->Storage == nullptr
+            || !llvm::isa<llvm::AllocaInst>(holder->Storage)
+            || holder->TypeAndValue.Pointer)
+            return false;
+
+        const size_t holderDepth = compiler->FindVariableScopeDepth(holderName);
+        if (holderDepth == SIZE_MAX) return false;
+        for (const auto& source : sources)
+        {
+            const size_t sourceDepth = compiler->FindVariableScopeDepth(source);
+            if (sourceDepth == SIZE_MAX || holderDepth < sourceDepth) return false;
+            if (holderDepth == sourceDepth)
+            {
+                const LLVMBackend::NamedVariable* sourceNV = nullptr;
+                for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                {
+                    auto it = frame.namedVariable.find(source);
+                    if (it == frame.namedVariable.end()) continue;
+                    sourceNV = &it->second;
+                    break;
+                }
+                if (holder->DeclSequence == 0 || sourceNV == nullptr
+                    || sourceNV->DeclSequence == 0 || holder->DeclSequence <= sourceNV->DeclSequence)
+                    return false;
+            }
+        }
+
+        // Store the fact on the live binding so later moves, returns, and calls can reject it.
+        for (auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(holderName);
+            if (it == frame.namedVariable.end()) continue;
+            it->second.ContainsBondedClosure = true;
+            return true;
+        }
+        return false;
+    }
+
+bool MainListener::IsBondedClosureContainer(
+        LLVMBackend* compiler, const LLVMBackend::DeclTypeAndValue& type) {
+        std::unordered_set<std::string> visiting;
+        auto contains = [&](auto&& self, const LLVMBackend::DeclTypeAndValue& current) -> bool {
+            if (current.Pointer || current.IsFunctionPointer || current.TypeName.empty()
+                || compiler->GetEncodedClosureType(current.TypeName) != nullptr)
+                return false;
+            if (!visiting.insert(current.TypeName).second) return false;
+            auto it = compiler->dataStructures.find(current.TypeName);
+            if (it == compiler->dataStructures.end())
+            {
+                visiting.erase(current.TypeName);
+                return false;
+            }
+            for (const auto& field : it->second.StructFields)
+            {
+                if (field.IsFunctionPointer || compiler->GetEncodedClosureType(field.TypeName) != nullptr
+                    || self(self, field))
+                {
+                    visiting.erase(current.TypeName);
+                    return true;
+                }
+            }
+            visiting.erase(current.TypeName);
+            return false;
+        };
+        return contains(contains, type);
+    }
+
 LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatParser::AssignmentExpressionContext* ctx,
                                                               ResultUse use) {
         // Snapshot and clear the owned-return flag so FinishAssignmentExpressionNamed
@@ -2010,15 +2133,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             : std::format("'{}.{}'", namedVar.CallerName, namedVar.FieldName)));
             }
 
-            // Bond escape check: bonded value cannot be assigned to a variable in a wider scope
-            // than its bond source, and cannot be stored into struct fields (GEP destinations).
-            if (operatorText == "=" && (rightNV.IsBonded || compiler->lastCallIsBonded))
+            // Bond escape check: a bonded closure may use a proven stack holder only.
+            if (operatorText == "=" && (rightNV.IsBonded || rightNV.ContainsBondedClosure
+                                          || compiler->lastCallIsBonded))
             {
                 const auto& bondedSources = rightNV.IsBonded ? rightNV.BondedSources : compiler->lastCallBondedSources;
-                if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
+                if (rightNV.ContainsBondedClosure)
+                    LogErrorContext(ctx,
+                        "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
+                else if (!llvm::isa<llvm::AllocaInst>(destination) && !llvm::isa<llvm::GlobalVariable>(destination))
                 {
-                    // Struct field or heap dereference - bonded values cannot be stored there.
-                    LogErrorContext(ctx, "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
+                    if (!AllowBondedClosureFieldStore(compiler, namedVar, destination,
+                                                       bondedSources, ctx))
+                        LogErrorContext(ctx, "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
                 }
                 else if (!namedVar.CallerName.empty())
                 {
@@ -5670,8 +5797,8 @@ void MainListener::EmitProgramToProgramStreamWire(const std::string& producerNam
             nv.TypeAndValue.TypeName = "stream";
             nv.TypeAndValue.Pointer  = false;
             nv.Storage               = streamStorage;
-            compiler->stackNamedVariable.back().namedVariable[
-                "__pipe_stream_" + std::to_string(compiler->pipeStreamCounter++)] = nv;
+            compiler->SetStackVariable(
+                "__pipe_stream_" + std::to_string(compiler->pipeStreamCounter++), nv);
         }
 
         // Reuse the explicit-form wiring for both directions.
@@ -7662,6 +7789,17 @@ bool MainListener::EmitOneFieldInit(
             GuardOwningTempUniqueFieldEscape(
                 rightNV, std::format("{}field '{}.{}'", braceDestOwns ? "unique " : "",
                                      typeName, fieldName), errCtx);
+        }
+
+        if (rightNV.IsBonded || rightNV.ContainsBondedClosure || compiler->lastCallIsBonded)
+        {
+            const auto& bondedSources = rightNV.IsBonded
+                ? rightNV.BondedSources : compiler->lastCallBondedSources;
+            if (rightNV.ContainsBondedClosure
+                || !AllowBondedClosureFieldStore(compiler, rightNV, structPtr,
+                                                  bondedSources, errCtx))
+                LogErrorContext(errCtx,
+                    "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
         }
 
         llvm::Value* val = LoadNamedVariable(rightNV);
@@ -10630,6 +10768,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.OwnedElementBorrowFunction     = src.OwnedElementBorrowFunction;
         dst.BondDeclBlock                  = src.BondDeclBlock;
         dst.BondDeclFunction               = src.BondDeclFunction;
+        dst.ContainsBondedClosure          = src.ContainsBondedClosure;
         dst.LambdaCaptureNames             = src.LambdaCaptureNames;
         dst.LambdaReferenceCaptureNames    = src.LambdaReferenceCaptureNames;
     }
@@ -10675,6 +10814,10 @@ CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
+
+        if (argNV.ContainsBondedClosure)
+            LogErrorContext(ctx,
+                "cannot move a holder containing a bonded closure - the closure would outlive its captured local");
 
         // Reject 'move' through a temp spill (`move mk().vals[i]`): the subscript spilled a SHALLOW
         // copy of the extracted array, so nulling a slot there leaves the original temporary still

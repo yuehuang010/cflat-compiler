@@ -3757,6 +3757,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     GuardOwningTempUniqueFieldEscape(rightNV, "a local", assignmentExpression);
                                 srcIsUnsigned = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                                 genericFuncCallerName = rightNV.CallerName;
+                                // A copy of a holder carrying a bonded closure escapes the tracking:
+                                // the copy could then be returned or stored past the captured local.
+                                if (rightNV.ContainsBondedClosure)
+                                    LogErrorContext(assignmentExpression,
+                                        "cannot copy a holder containing a bonded closure - the copy would outlive its captured local");
                                 srcIsBorrowed = rightNV.IsBorrowed;
                                 srcBorrowedOrigin = rightNV.BorrowedOrigin.empty()
                                     ? rightNV.CallerName
@@ -4573,7 +4578,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
                     if (typeAndValue.IsFunctionPointer)
                     {
-                        auto& local = compiler->stackNamedVariable.back().namedVariable[name];
+                        auto& local = compiler->GetOrCreateStackVariable(name);
                         local.LambdaCaptureNames = rhsLambdaCaptureNames;
                         local.LambdaReferenceCaptureNames = rhsLambdaReferenceCaptureNames;
                     }
@@ -4616,7 +4621,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 : srcRhsExprText)
                             : std::string();
                         compiler->SetViewOfFixedArrayStorage(name, boundFromFixedArray, srcDesc);
-                        auto& viewNV = compiler->stackNamedVariable.back().namedVariable[name];
+                        auto& viewNV = compiler->GetOrCreateStackVariable(name);
                         if (boundFromFixedArray)
                             compiler->StoreRawArrayLength(
                                 viewNV, compiler->builder->getInt64(srcConstArraySize));
@@ -4639,7 +4644,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
                     if (bindAliasReference)
                     {
-                        auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                         nv.Storage = aliasStorage;
                         nv.BaseType = compiler->GetType(typeAndValue);
                         nv.IsAliasBorrow = true;
@@ -4828,7 +4833,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 // `string` frees its local via the IsOwningString gate; a copied or
                                 // moved-in local owns its buffer, so mark it owning.
                                 if (typeAndValue.TypeName == "string")
-                                    compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                                    compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                             }
                         }
                         // String BORROW bound to an owning local via a DIRECT read of an owning string
@@ -4856,7 +4861,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && srcBorrowsOwnedString)
                         {
                             right = compiler->EmitOwnedStringDeepCopy(right);
-                            compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                            compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                             didDeepCopyBorrowString = true;
                         }
                         // The ELEMENT twin of the field arm above (`string q = dst[0];`). A fixed-array or view
@@ -4878,7 +4883,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 == llvm::StructType::getTypeByName(*compiler->context, "string"))
                         {
                             right = compiler->EmitOwnedStringDeepCopy(right);
-                            compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                            compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                         }
                         // Raw `new string[n]` twin of the arm above: the read BORROWS, so clear the
                         // owned bit. Same whole-`%string`-local destination gate as that arm.
@@ -4992,7 +4997,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->builder->CreateStore(
                                 llvm::ConstantAggregateZero::get(right->getType()), srcGep);
                             if (typeAndValue.TypeName == "string")
-                                compiler->stackNamedVariable.back().namedVariable[name].IsOwningString = true;
+                                compiler->GetOrCreateStackVariable(name).IsOwningString = true;
                         }
 
                         // A closure local now owns its env (its scope-exit dtor frees it), so drop
@@ -5011,7 +5016,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && typeAndValue.TypeName != "string"
                             && typeAndValue.TypeName != "__closure_fat_ptr")
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.IsAliasBorrow = true;
                             // The source may carry the owner's field path through an alias-return
                             // call. This local is a shallow copy with its own borrow identity, so
@@ -5038,7 +5043,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && compiler->IsNonOwningStructJoin(right)
                             && compiler->IsOwningValueType(typeAndValue.TypeName))
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.IsAliasBorrow = true;
                             nv.IsOwningString = false;
                             nv.IsOwning = false;
@@ -5092,7 +5097,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // mark this local as owning so the destructor frees the buffer on scope exit.
                         if (typeAndValue.TypeName == "string" && compiler->lastCallReturnsOwned)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.IsOwningString = true;
                             // The named local now owns this buffer and frees it on scope
                             // exit; drop it from the unnamed-temporary cleanup list so it
@@ -5110,7 +5115,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             bool isRawArray = (initNewArr != nullptr
                                 && initNewArr->assignmentExpression() != nullptr)
                                 || srcPtrCopyIsRawNewArray;
-                            auto& local = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& local = compiler->GetOrCreateStackVariable(name);
                             local.AllocatedByRawNewArray = isRawArray;
                             compiler->StoreRawArrayLength(
                                 local, isRawArray ? srcRawArrayLength : nullptr);
@@ -5123,7 +5128,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // mark this local as owning so it is freed on scope exit.
                         if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
                         {
-                            compiler->stackNamedVariable.back().namedVariable[name].IsOwning = true;
+                            compiler->GetOrCreateStackVariable(name).IsOwning = true;
                             compiler->lastCallReturnsOwned = false;
                         }
 
@@ -5134,7 +5139,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (!typeAndValue.Pointer && compiler->lastCallReturnsOwned
                             && compiler->IsInterfaceType(typeAndValue.TypeName))
                         {
-                            compiler->stackNamedVariable.back().namedVariable[name].IsOwning = true;
+                            compiler->GetOrCreateStackVariable(name).IsOwning = true;
                             compiler->lastCallReturnsOwned = false;
                         }
 
@@ -5195,7 +5200,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             }
                             if (!borrowMoveKeepsBorrow)
                             {
-                                auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                                auto& nv = compiler->GetOrCreateStackVariable(name);
                                 nv.IsOwning = true;
                                 nv.IsNewAllocated = true;
                                 // Carry per-site over-alignment so scope-exit / delete free via __delete_aligned.
@@ -5228,7 +5233,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // shared recovery the `_ = move _data[i]` discard form also uses). An owning
                             // element frees once (EmitOwningPtrCleanup for a thin ptr, the vtable dtor
                             // for a fat one); a bare borrow element clears the spuriously-set ownership.
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             ApplyMovedSlotOwnership(nv, typeAndValue);
                         }
 
@@ -5237,7 +5242,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // an explicit `delete[]` (or scope-exit free) routes to __delete_aligned.
                         if (compiler->lastCallReturnsAllocAlign > 0)
                         {
-                            compiler->stackNamedVariable.back().namedVariable[name].AllocAlignment =
+                            compiler->GetOrCreateStackVariable(name).AllocAlignment =
                                 compiler->lastCallReturnsAllocAlign;
                             compiler->lastCallReturnsAllocAlign = 0;
                         }
@@ -5250,7 +5255,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // it. Anything else could not carry the alignment: error rather than corrupt.
                         if (typeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.TypeAndValue.AllocAlignValue = typeAndValue.AllocAlignValue;
                             auto* initAssignExpr = initializer ? initializer->assignmentExpression() : nullptr;
                             if (initAssignExpr != nullptr
@@ -5275,7 +5280,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // Propagate bond: if the RHS was a bonded call result, tag this local.
                         if (compiler->lastCallIsBonded)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.IsBonded = true;
                             nv.BondByAddress = compiler->lastCallBondByAddress;
                             nv.BondedSources = compiler->lastCallBondedSources;
@@ -5293,7 +5298,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // sources override this (handled above by clearing in those branches).
                         if (srcIsBorrowed && typeAndValue.Pointer && !compiler->lastOwningResult)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                             {
                                 nv.IsBorrowed = true;
@@ -5310,7 +5315,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (srcBorrowsOwningLocal && typeAndValue.Pointer
                             && !srcOwningLocalOrigin.empty() && srcOwningLocalStorage != nullptr)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                             {
                                 nv.BorrowsOwningLocal = true;
@@ -5324,7 +5329,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // lastOwningResult and is skipped; the tag is delete-only (see BorrowsOwnedElement).
                         if (srcBorrowsOwnedElement && typeAndValue.Pointer && !compiler->lastOwningResult)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                                 compiler->SetVariableBorrowsOwnedElement(
                                     name, true, srcOwnedElementContainer, srcElementExternallyOwned);
@@ -5342,7 +5347,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             std::string joinOwner = JoinArmsKeepOwner(right, &joinSlots);
                             if (!joinOwner.empty() && !joinSlots.empty())
                             {
-                                auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                                auto& nv = compiler->GetOrCreateStackVariable(name);
                                 if (!nv.IsOwning && !nv.IsNewAllocated && !nv.IsBorrowed
                                     && !nv.BorrowsOwningLocal && !nv.BorrowsOwnedElement)
                                 {
@@ -5362,7 +5367,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // Move params are treated like new-allocated for this purpose.
                         if (srcIsOwningMove && typeAndValue.Pointer && !compiler->lastOwningResult)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning)
                             {
                                 nv.IsOwning = true;
@@ -5395,7 +5400,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         if (initializer && typeAndValue.IsUnique && destUniqueLoc
                             && !srcIsMove && !srcIsNullLiteral)
                         {
-                            auto& nv = compiler->stackNamedVariable.back().namedVariable[name];
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
                                 LogErrorContext(initDecl, std::format(
                                     "cannot initialize unique '{}' from a borrowed value - the source still "

@@ -333,6 +333,23 @@ bool LLVMBackend::MatchesStaticLocalRequest(const TypeAndValue& typeValue) const
         return pendingStaticLocalFn_ == (bb != nullptr ? bb->getParent() : nullptr);
     }
 
+LLVMBackend::NamedVariable& LLVMBackend::GetOrCreateStackVariable(const std::string& name)
+{
+        auto& variables = stackNamedVariable.back().namedVariable;
+        auto [it, inserted] = variables.try_emplace(name);
+        if (inserted)
+            it->second.DeclSequence = nextDeclSequence++;
+        return it->second;
+    }
+
+void LLVMBackend::SetStackVariable(const std::string& name, NamedVariable namedVar)
+{
+        auto& slot = GetOrCreateStackVariable(name);
+        const uint64_t sequence = slot.DeclSequence;
+        slot = std::move(namedVar);
+        slot.DeclSequence = sequence;
+    }
+
 llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
 {
         // No enclosing scope means a file-scope declaration reached the local path (a stale
@@ -383,7 +400,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
                 *module, type, false, llvm::GlobalValue::InternalLinkage,
                 llvm::Constant::getNullValue(type), owner + ".static." + typeValue.VariableName);
             if (effAlign > 0) gv->setAlignment(llvm::Align(effAlign));
-            auto& staticVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+            auto& staticVariable = GetOrCreateStackVariable(typeValue.VariableName);
             staticVariable.Storage = gv;
             staticVariable.TypeAndValue = typeValue;
             staticVariable.BaseType = type;
@@ -416,7 +433,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
             ? module->getDataLayout().getABITypeAlign(type).value() : 0;
         uint64_t allocaAlign = (effAlign > abiAlign) ? effAlign : 0;
         auto alloc = AllocaAtEntry(type, arraySize, typeValue.VariableName, allocaAlign);
-        auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+        auto& namedVariable = GetOrCreateStackVariable(typeValue.VariableName);
         namedVariable.Storage = alloc;
         namedVariable.TypeAndValue = typeValue;
         namedVariable.BaseType = type;
@@ -456,7 +473,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type
 
 void LLVMBackend::RegisterPrimaryVariable(const TypeAndValue& typeValue, llvm::Value* value)
 {
-        auto& namedVariable = stackNamedVariable.back().namedVariable[typeValue.VariableName];
+        auto& namedVariable = GetOrCreateStackVariable(typeValue.VariableName);
         namedVariable.Primary = value;
         namedVariable.Storage = nullptr;
         namedVariable.TypeAndValue = typeValue;

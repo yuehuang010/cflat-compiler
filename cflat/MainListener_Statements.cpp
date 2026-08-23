@@ -218,7 +218,7 @@ void MainListener::ParseDestructuringDeclaration(CFlatParser::DestructuringDecla
             namedVar.TypeAndValue = declType;
             namedVar.Storage = alloca;
             namedVar.BaseType = fieldLLVMType;
-            compiler->stackNamedVariable.back().namedVariable[varName] = namedVar;
+            compiler->SetStackVariable(varName, namedVar);
             compiler->RecordMoveGenBind(varName); // fresh tuple-destructure binding
         }
     }
@@ -533,6 +533,10 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         returnExpectedScope.reset();
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
+
+        if (returnNV.ContainsBondedClosure)
+            LogErrorContext(errCtx,
+                "cannot return a holder containing a bonded closure - the closure would outlive its captured local");
 
         // GetFunctionType hands an `extern` (C ABI) function the by-value return shape, so the
         // reference ABI holds only where the emitted function really returns a pointer. Comparing
@@ -1609,7 +1613,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     nv.TypeAndValue.TypeName = it->second.typeCaseName;
                     nv.TypeAndValue.Pointer  = true;
                     nv.IsOwning    = false;
-                    compiler->stackNamedVariable.back().namedVariable[it->second.boundVarName] = nv;
+                    compiler->SetStackVariable(it->second.boundVarName, nv);
                     compiler->RecordMoveGenBind(it->second.boundVarName); // fresh type-case arm binding
                 }
 
@@ -2148,7 +2152,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                     // Pre-allocate the element variable in the init block (one alloca for all iterations)
                     auto elemAlloca = compiler->CreateLocalVariable(elemType);
-                    compiler->stackNamedVariable.back().namedVariable[varName].IsRangeForBorrow = true;
+                    compiler->GetOrCreateStackVariable(varName).IsRangeForBorrow = true;
 
                     compiler->CreateBlockBreak(blockCond, false);
 
@@ -2242,7 +2246,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         elemVal = compiler->CreateOverloadedFunctionCall("get", { selfArg, indexNV });
                     }
 
-                    auto& rangeVariable = compiler->stackNamedVariable.back().namedVariable[varName];
+                    auto& rangeVariable = compiler->GetOrCreateStackVariable(varName);
                     if (elemStorage != nullptr)
                     {
                         // Keep reads and writes of the loop variable on the live element slot. The

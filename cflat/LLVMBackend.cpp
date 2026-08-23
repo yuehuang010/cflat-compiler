@@ -4137,6 +4137,7 @@ void LLVMBackend::ResetForReanalysis()
     namespaceTable.clear();
     stringPool.clear();
     stackNamedVariable.clear();
+    nextDeclSequence = 1;
     namespaceAliasTable.clear();
     returnBlockTable.clear();
     compileTimeMacros.clear();

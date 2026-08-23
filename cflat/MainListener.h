@@ -4946,6 +4946,17 @@ public:
 
     LLVMBackend::NamedVariable ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx);
 
+    // Accept a bonded closure field only when the holder's stack lifetime is provable.
+    bool AllowBondedClosureFieldStore(
+        LLVMBackend* compiler,
+        LLVMBackend::NamedVariable& destination,
+        llvm::Value* fieldStorage,
+        const std::vector<std::string>& sources,
+        antlr4::ParserRuleContext* errCtx);
+
+    bool IsBondedClosureContainer(
+        LLVMBackend* compiler, const LLVMBackend::DeclTypeAndValue& type);
+
     // Map an LLVM type to its CFlat canonical type name for tuple construction.
     std::string LLVMTypeToTypeName(llvm::Type* ty, const std::string& structHint = "");
 
