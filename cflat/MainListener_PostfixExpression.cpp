@@ -1714,6 +1714,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                     case CFlatParser::RulePrimaryExpression:
                     {
                         auto prevPrimary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(parseTree);
+                        std::optional<CallArgumentScope> receiverTernaryScope;
+                        if (childLimit > 1
+                            && (ctx->children[1]->getText() == "."
+                                || ctx->children[1]->getText() == "->"
+                                || ctx->children[1]->getText() == "?."))
+                            receiverTernaryScope.emplace(inCallArgument_, ternaryCallArgumentDepth_);
 
                         // `global::name` scope-escape qualifier: resolve the following name at the
                         // ROOT (file/global) scope, bypassing the enclosing-namespace lookup. The
@@ -4197,6 +4203,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
                                     argVar.IsOwningString = argNV.IsOwningString;
@@ -4671,6 +4678,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             {
                                                 auto* alloca = Compiler(ctx)->CreateAlloca(defaultVal->getType());
                                                 Compiler(ctx)->CreateAssignment(defaultVal, alloca);
+                                                CallArgumentScope braceTernaryScope(
+                                                    inCallArgument_, ternaryCallArgumentDepth_);
                                                 EmitFieldInitializer(alloca, structType, namedArgument->initializerList());
                                                 llvm::Value* loaded = Compiler(ctx)->CreateLoad(alloca);
                                                 LLVMBackend::NamedVariable argVar;
@@ -4768,6 +4777,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.VariableName = argName->getText();
                                     argVar.Primary = argValue;
                                     argVar.BaseType = argValue->getType();
+                                    argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     // Propagate caller variable name for compile-time move tracking.
                                     argVar.CallerName = argNV.CallerName;
                                     // Propagate the field name (and inherited per-field move set) so that

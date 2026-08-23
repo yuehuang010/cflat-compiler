@@ -1284,7 +1284,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         || (OwningSinkConsumesConcrete(*candParamItr)
                             && (candParamItr->TypeName == "string" || IsOwningValueType(candParamItr->TypeName)));
                     if (!paramTakesOwnership)
-                        RegisterBorrowedOwningStructTemp(arg);
+                    {
+                        bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
+                            && llvm::isa<llvm::PHINode>(arg.Primary)
+                            && !arg.TernaryTempAlreadyRegistered;
+                        RegisterBorrowedOwningStructTemp(arg, ternaryJoinNeedsRegistration);
+                    }
                 }
                 else if (value->getType()->isIntegerTy(1))
                 {

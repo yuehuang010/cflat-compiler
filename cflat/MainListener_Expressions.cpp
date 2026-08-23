@@ -1,5 +1,54 @@
 #include "MainListener.h"
 
+static bool IsBinaryExpressionRuleWithOperator(antlr4::tree::ParseTree* node)
+{
+    if (auto* p = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
+        return p->castExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
+        return p->multiplicativeExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
+        return p->additiveExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+        return p->shiftExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+        return p->typeCheckExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
+        return p->equalityExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
+        return p->andExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+        return p->exclusiveOrExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+        return p->inclusiveOrExpression().size() > 1;
+    if (auto* p = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+        return p->logicalAndExpression().size() > 1;
+    return false;
+}
+
+static bool TernaryIsBinaryOperand(CFlatParser::ConditionalExpressionContext* ctx)
+{
+    for (auto* parent = ctx != nullptr ? ctx->parent : nullptr; parent != nullptr;
+         parent = parent->parent)
+    {
+        // A postfix suffix consumes the ternary before any surrounding built-in operator sees it;
+        // only a bare parenthesized ternary is an operand of that operator.
+        if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(parent))
+            if (postfix->children.size() > 1) return false;
+        if (IsBinaryExpressionRuleWithOperator(parent)) return true;
+    }
+    return false;
+}
+
+static bool ParseTreeContainsTernary(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return false;
+    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        if (conditional->Question() != nullptr) return true;
+    for (auto* child : node->children)
+        if (ParseTreeContainsTernary(child)) return true;
+    return false;
+}
+
 bool MainListener::AllowBondedClosureFieldStore(
         LLVMBackend* compiler,
         LLVMBackend::NamedVariable& destination,
@@ -322,6 +371,9 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 if (result.TypeAndValue.TypeName.empty())
                     result.TypeAndValue.TypeName = LLVMTypeToTypeName(result.Primary->getType());
             }
+            result.TernaryTempAlreadyRegistered = inCallArgument_
+                && result.Primary != nullptr && llvm::isa<llvm::PHINode>(result.Primary)
+                && !TernaryIsBinaryOperand(condCtx);
             // A bare `x as T` whose T is x's own type reached here as a raw value. Restore the
             // operand's storage and provenance, matched on the exact node so `x as T + 1` cannot.
             if (condCtx != nullptr && lastRedundantAsCtx_ != nullptr
@@ -4066,13 +4118,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     trueStorage = load->getPointerOperand();
             trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             trueTempField = compiler->IsTempFieldValue(trueValue);
-            if (ternaryDepth.IsOutermost() && trueValue != nullptr && !outerExpected.IsMove
+            if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
+                && trueValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
             {
                 LLVMBackend::NamedVariable armNV;
                 armNV.Primary = trueValue;
                 armNV.BaseType = trueValue->getType();
                 armNV.TypeAndValue = outerExpected;
+                if (armNV.TypeAndValue.TypeName.empty())
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(trueValue->getType()); st && st->hasName())
+                        armNV.TypeAndValue.TypeName = st->getName().str();
                 armNV.TypeAndValue.Pointer = false;
                 armNV.TypeAndValue.IsAlias = false;
                 armNV.TypeAndValue.IsMove = false;
@@ -4105,13 +4161,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     falseStorage = load->getPointerOperand();
             falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             falseTempField = compiler->IsTempFieldValue(falseValue);
-            if (ternaryDepth.IsOutermost() && falseValue != nullptr && !outerExpected.IsMove
+            if (ternaryDepth.IsOutermost() && !TernaryIsBinaryOperand(ctx)
+                && falseValue != nullptr && !outerExpected.IsMove
                 && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
             {
                 LLVMBackend::NamedVariable armNV;
                 armNV.Primary = falseValue;
                 armNV.BaseType = falseValue->getType();
                 armNV.TypeAndValue = outerExpected;
+                if (armNV.TypeAndValue.TypeName.empty())
+                    if (auto* st = llvm::dyn_cast<llvm::StructType>(falseValue->getType()); st && st->hasName())
+                        armNV.TypeAndValue.TypeName = st->getName().str();
                 armNV.TypeAndValue.Pointer = false;
                 armNV.TypeAndValue.IsAlias = false;
                 armNV.TypeAndValue.IsMove = false;
@@ -6439,6 +6499,72 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
 
+        bool receiverConsumes = false;
+        if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
+            for (const auto& candidate : it->second)
+                if (!candidate.Parameters.empty()
+                    && candidate.Parameters[0].TypeName == typeName
+                    && !candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                {
+                    receiverConsumes = true;
+                    break;
+                }
+        // A ternary PHI inside a call argument is either covered per arm or by this operator;
+        // keep the receiver's cleanup identity single-source.
+        bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(lvalue)
+            && !ParseTreeContainsTernary(ctx);
+        bool receiverTempAlreadyRegistered = receiverArmsAlreadyRegistered;
+        if (!receiverConsumes && !receiverArmsAlreadyRegistered)
+        {
+            LLVMBackend::NamedVariable receiverNV;
+            receiverNV.Primary = lvalue;
+            receiverNV.BaseType = structTy;
+            receiverNV.TypeAndValue.TypeName = typeName;
+            compiler->RegisterBorrowedOwningStructTemp(receiverNV, true);
+            receiverTempAlreadyRegistered = true;
+        }
+
+        // Determine whether to pass lvalue by pointer or by value by inspecting the
+        // registered candidates - check if any candidate's first param is a pointer to
+        // this struct type. If so use pointer dispatch; otherwise use value dispatch.
+        bool usePointer = false;
+        {
+            auto funcSym = compiler->functionTable.find(opName);
+            if (funcSym != compiler->functionTable.end())
+            {
+                for (const auto& candidate : funcSym->second)
+                {
+                    if (!candidate.Parameters.empty()
+                        && candidate.Parameters[0].TypeName == typeName
+                        && candidate.Parameters[0].Pointer)
+                    {
+                        usePointer = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        bool rhsConsumes = false;
+        bool rhsIsAlias = false;
+        if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
+        {
+            for (const auto& candidate : it->second)
+            {
+                if (candidate.Parameters.size() < 2
+                    || candidate.Parameters[0].TypeName != typeName
+                    || candidate.Parameters[0].Pointer != usePointer)
+                    continue;
+                const auto& rhsParam = candidate.Parameters[1];
+                rhsIsAlias = rhsIsAlias || compiler->ParameterIsAliasByPointer(rhsParam);
+                if (rhsParam.IsMove
+                    || (compiler->OwningSinkConsumesConcrete(rhsParam)
+                        && (rhsParam.TypeName == "string"
+                            || compiler->IsOwningValueType(rhsParam.TypeName))))
+                    rhsConsumes = true;
+            }
+        }
+
         auto makeRightNV = [&]() {
             LLVMBackend::NamedVariable rightNV;
             rightNV.Primary  = rvalue;
@@ -6471,28 +6597,18 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
                     rightNV.TypeAndValue.ElemPointer  = rhsElemPointer;
                 }
             }
+            rightNV.TernaryTempAlreadyRegistered = inCallArgument_
+                && rvalue != nullptr && llvm::isa<llvm::PHINode>(rvalue)
+                && !ParseTreeContainsTernary(ctx);
             return rightNV;
         };
 
-        // Determine whether to pass lvalue by pointer or by value by inspecting the
-        // registered candidates - check if any candidate's first param is a pointer to
-        // this struct type. If so use pointer dispatch; otherwise use value dispatch.
-        bool usePointer = false;
+        auto rightNV = makeRightNV();
+        if (!rhsConsumes && !rhsIsAlias && llvm::isa<llvm::PHINode>(rvalue)
+            && !rightNV.TernaryTempAlreadyRegistered)
         {
-            auto funcSym = compiler->functionTable.find(opName);
-            if (funcSym != compiler->functionTable.end())
-            {
-                for (const auto& candidate : funcSym->second)
-                {
-                    if (!candidate.Parameters.empty()
-                        && candidate.Parameters[0].TypeName == typeName
-                        && candidate.Parameters[0].Pointer)
-                    {
-                        usePointer = true;
-                        break;
-                    }
-                }
-            }
+            compiler->RegisterBorrowedOwningStructTemp(rightNV, true);
+            rightNV.TernaryTempAlreadyRegistered = true;
         }
 
         if (usePointer)
@@ -6505,8 +6621,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.Primary = tempAlloca;
+            thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
-            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
         }
@@ -6519,8 +6636,9 @@ llvm::Value* MainListener::TryBinaryOperatorOverload(
             thisNV.TypeAndValue.Pointer  = false;
             thisNV.Primary  = lvalue;
             thisNV.BaseType = structTy;
+            thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
-            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, makeRightNV() });
+            auto* result = compiler->CreateOverloadedFunctionCall(opName, { thisNV, rightNV });
             TrackOwnedStringOperatorResult(compiler, result);
             return result;
         }

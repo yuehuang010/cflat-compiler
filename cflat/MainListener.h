@@ -2457,8 +2457,8 @@ private:
         ~DeclExpectedTypeScope() { *slot = saved; }
     };
 
-    // Marks an expression parsed in a call argument, where a ternary owning temp may need
-    // per-arm cleanup before its value is joined with a borrowed arm.
+    // Marks an expression position where a ternary owning temp may need per-arm cleanup
+    // before its value is joined with a borrowed consumer.
     bool inCallArgument_ = false;
     int ternaryCallArgumentDepth_ = 0;
     struct CallArgumentScope {
@@ -2474,8 +2474,8 @@ private:
         ~CallArgumentScope() { ternaryDepth = savedTernaryDepth; slot = saved; }
     };
 
-    // A nested function body is NOT part of the enclosing argument expression: a ternary declared
-    // inside a lambda passed as an argument owns its temp, so the arm registration must not fire.
+    // A nested function body is NOT part of the enclosing expression: a ternary declared inside
+    // a lambda owns its temp, so the arm registration must not fire.
     struct CallArgumentSuspendScope {
         bool& slot;
         int& ternaryDepth;

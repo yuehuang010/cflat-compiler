@@ -3069,11 +3069,12 @@ void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg, boo
         RegisterOwnedStructTemp(tempAlloca, arg.TypeAndValue.TypeName);
     }
 
-void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot)
+void LLVMBackend::RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot,
+                                                     bool fromTernaryArm)
 {
         // The alias-by-pointer arg path already spilled the rvalue into `slot`; registering that
         // very slot (instead of a second copy) is what keeps the temp destructed exactly once.
-        if (slot == nullptr || !BorrowedOwningStructTempQualifies(arg)) return;
+        if (slot == nullptr || !BorrowedOwningStructTempQualifies(arg, fromTernaryArm)) return;
         RegisterOwnedStructTemp(slot, arg.TypeAndValue.TypeName);
     }
 

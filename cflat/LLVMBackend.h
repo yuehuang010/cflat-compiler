@@ -1275,6 +1275,9 @@ public:
         // extracted out of a returned temp). The copy is shallow and dies with the full expression,
         // so reads are fine but 'move' and stores through it are rejected.
         bool IsTempSpillStorage = false;
+        // The ternary result is already covered by a temp registration. Alias lowering uses this
+        // to avoid registering its materialized copy a second time.
+        bool TernaryTempAlreadyRegistered = false;
 
         llvm::Value* GetValue() const
         {
@@ -3580,7 +3583,8 @@ private:
 
     // Same registration, but for a temp already spilled into `slot` by the caller (the
     // alias-by-pointer arg path), so no second copy is made and the temp is freed exactly once.
-    void RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot);
+    void RegisterBorrowedOwningStructTempAt(const NamedVariable& arg, llvm::Value* slot,
+                                            bool fromTernaryArm = false);
 
     // Free all unnamed owned temporaries (string, closure, struct) at an end-of-full-expression
     // boundary. The return path keeps the three explicit (it interleaves Unregister between them).

@@ -1994,7 +1994,10 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
         // frees it, so without this it leaks. Registering THIS slot (not a fresh copy) keeps the
         // destruction count at one. Owned string / closure temps are registered upstream at the
         // argument-evaluation site and are not re-registered here.
-        RegisterBorrowedOwningStructTempAt(arg, temp);
+        bool ternaryJoinNeedsRegistration = arg.Primary != nullptr
+            && llvm::isa<llvm::PHINode>(arg.Primary)
+            && !arg.TernaryTempAlreadyRegistered;
+        RegisterBorrowedOwningStructTempAt(arg, temp, ternaryJoinNeedsRegistration);
         return temp;
     }
 
