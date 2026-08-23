@@ -1406,12 +1406,20 @@ bool LLVMBackend::IsProducedTempValue(llvm::Value* value) const
                          value) != nullConditionalTempResults_.end();
 }
 
+void LLVMBackend::PropagateProducedTempValue(llvm::Value* from, llvm::Value* to)
+{
+        if (from == nullptr || to == nullptr || from == to || !IsProducedTempValue(from)) return;
+        if (std::find(nullConditionalTempResults_.begin(), nullConditionalTempResults_.end(), to)
+            == nullConditionalTempResults_.end())
+            nullConditionalTempResults_.push_back(to);
+}
+
 void LLVMBackend::PropagateNullConditionalOwnership(llvm::Value* from, llvm::Value* to)
 {
         if (from == nullptr || to == nullptr || from == to) return;
         // The merged load stands in for the access arm's produced temp, so the registration
         // sites downstream must see it as one.
-        if (IsProducedTempValue(from)) nullConditionalTempResults_.push_back(to);
+        PropagateProducedTempValue(from, to);
         PropagateOwnedReturnTemp(from, to);
         // A closure temp is registered by the CALL and has no consumer-side registration site to
         // re-find it, so its ledger entry must MOVE to the merged value (a string's does not:
@@ -3038,20 +3046,23 @@ void LLVMBackend::FlushOwnedPtrTemps()
         }
     }
 
-bool LLVMBackend::BorrowedOwningStructTempQualifies(const NamedVariable& arg)
+bool LLVMBackend::BorrowedOwningStructTempQualifies(const NamedVariable& arg, bool fromTernaryArm)
 {
         const std::string& typeName = arg.TypeAndValue.TypeName;
         if (arg.Primary == nullptr || arg.Storage != nullptr || arg.BaseType == nullptr) return false;
         if (!IsProducedTempValue(arg.Primary)) return false;   // only a produced temp, not a named local
+        // A ternary PHI is registered per produced arm while the argument is parsed. Do not
+        // register the joined value again when the call lowering sees the same argument.
+        if (!fromTernaryArm && llvm::isa<llvm::PHINode>(arg.Primary)) return false;
         if (!arg.BaseType->isStructTy() || arg.Primary->getType() != arg.BaseType) return false;
         if (arg.TypeAndValue.Pointer || arg.TypeAndValue.IsAlias || arg.FromOwningTempField) return false;
         if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return false;
         return IsOwningValueType(typeName);
     }
 
-void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg)
+void LLVMBackend::RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm)
 {
-        if (!BorrowedOwningStructTempQualifies(arg)) return;
+        if (!BorrowedOwningStructTempQualifies(arg, fromTernaryArm)) return;
 
         auto* tempAlloca = AllocaAtEntry(arg.BaseType, nullptr, "argtemp");
         builder->CreateStore(arg.Primary, tempAlloca);
@@ -3315,6 +3326,10 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
         // not destruct it. Policy: a static local is destructed NEVER - no atexit machinery.
         if (namedVar.IsStaticLocal) return;
         if (namedVar.IsRangeForBorrow) return;
+        // A plain pointer parameter can be represented by a raw pointer slot even when its
+        // TypeAndValue pointer bit was stripped by an lvalue walk. It borrows the pointee and
+        // must never fall through to a value destructor.
+        if (!namedVar.IsOwning && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return;
         // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
         // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
         if (IsOwningUniqueArray(namedVar))
@@ -3372,6 +3387,7 @@ bool LLVMBackend::OwnsDroppableResource(const NamedVariable& namedVar) const
 {
         if (namedVar.IsStaticLocal) return false;   // never dropped; see DropValue
         if (namedVar.IsRangeForBorrow) return false;
+        if (!namedVar.IsOwning && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return false;
         if (IsOwningUniqueArray(namedVar)) return true;
         if (IsOwningInterfaceValue(namedVar)) return true;
         if (namedVar.TypeAndValue.Pointer && namedVar.IsOwning) return true;

@@ -610,6 +610,14 @@ llvm::Value* LLVMBackend::LoadArgStorage(const NamedVariable& arg)
             && !llvm::isa<llvm::AllocaInst>(arg.Storage)
             && !llvm::isa<llvm::GlobalVariable>(arg.Storage))
             return CreateLoad(arg.BaseType, arg.Storage);
+        // A member receiver reached through a raw pointer has the pointee address in Storage,
+        // not an alloca/GEP whose element type can be inferred. Use the resolved struct type;
+        // opaque pointers otherwise make this load look like a char* and trigger string wrapping.
+        if (!arg.TypeAndValue.Pointer && arg.BaseType != nullptr
+            && !llvm::isa<llvm::AllocaInst>(arg.Storage)
+            && !llvm::isa<llvm::GlobalVariable>(arg.Storage)
+            && !llvm::isa<llvm::GetElementPtrInst>(arg.Storage))
+            return CreateLoad(arg.BaseType, arg.Storage);
         return static_cast<llvm::Value*>(CreateLoad(arg.Storage));
     }
 

@@ -3,6 +3,7 @@ import "list.cb";
 import "stack.cb";
 import "queue.cb";
 import "dictionary.cb";
+import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
 int dtorCount = 0;
@@ -3788,6 +3789,15 @@ void sinkBoxItem(move Resource* p) { }
 struct BoxHolder { UniqueBox b; };
 BoxHolder makeBoxHolder(int id) { BoxHolder h; h.b = makeUniqueBox(id); return h; }
 
+move string bucketMakeString() { return "bucket" + "!"; }
+void bucketFillString(string* out) { *out = bucketMakeString(); }
+int bucketStringArrowLength(string* p) { return p->length(); }
+int bucketStringDerefLength(string* p) { return (*p).length(); }
+int bucketStringValueLength(string s) { return s.length(); }
+int bucketTakeValue(UniqueBox a) { return a.item->id; }
+int bucketTakeAlias(alias UniqueBox a) { return a.item->id; }
+int bucketRun(function<int()> f) { return f(); }
+
 // Keeps a conditional rebind genuinely conditional at run time (the flag is set at run time).
 bool aliasRebindFlag = false;
 bool aliasRebindTaken() { return aliasRebindFlag; }
@@ -4199,6 +4209,124 @@ int testOwningStructTernaryJoin()
         passed += Test("alias_join_rebind_new_freed_at_exit", dtorCount, 1);
     }
     passed += Test("alias_join_rebind_total", dtorCount, 2);
+
+    return passed;
+}
+
+int testBucketAExpressionOwnership()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    HeapAudit.enable();
+    {
+        string body = "old" + " buffer";
+        bucketFillString(&body);
+        passed += Test("bucket_pointer_move_string_value", body, "bucket!");
+        passed += Test("bucket_pointer_move_string_length", body.length(), 7);
+    }
+    passed += Test("bucket_pointer_move_string_freed_once_no_slot_dtor",
+                   (int)HeapAudit.reportLeaks(), 0);
+
+    string receiver = "abc";
+    passed += Test("bucket_string_pointer_arrow_length", bucketStringArrowLength(&receiver), 3);
+    passed += Test("bucket_string_pointer_deref_length", bucketStringDerefLength(&receiver), 3);
+    passed += Test("bucket_string_value_length", bucketStringValueLength(receiver), 3);
+
+    // Embedded NUL: strlen disagrees with the stored length, so a receiver rebuilt from the
+    // char* answers 2 here while the whole-string load answers 5.
+    string embeddedNul = "ab";
+    embeddedNul = embeddedNul + "\0cd";
+    passed += Test("bucket_string_pointer_arrow_embedded_nul",
+                   bucketStringArrowLength(&embeddedNul), 5);
+    passed += Test("bucket_string_pointer_deref_embedded_nul",
+                   bucketStringDerefLength(&embeddedNul), 5);
+    passed += Test("bucket_string_value_embedded_nul",
+                   bucketStringValueLength(embeddedNul), 5);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(1);
+        passed += Test("bucket_ternary_value_temp_arm_value",
+                       bucketTakeValue(identityBool(false) ? named : makeUniqueBox(8)), 8);
+        passed += Test("bucket_ternary_value_temp_arm_live", dtorCount, 1);
+    }
+    passed += Test("bucket_ternary_value_temp_arm_freed", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(1);
+        passed += Test("bucket_ternary_value_named_arm_value",
+                       bucketTakeValue(identityBool(true) ? named : makeUniqueBox(8)), 1);
+        passed += Test("bucket_ternary_value_named_arm_live", dtorCount, 0);
+    }
+    passed += Test("bucket_ternary_value_named_arm_freed", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(1);
+        passed += Test("bucket_ternary_alias_temp_arm_value",
+                       bucketTakeAlias(identityBool(false) ? named : makeUniqueBox(8)), 8);
+        passed += Test("bucket_ternary_alias_temp_arm_live", dtorCount, 1);
+    }
+    passed += Test("bucket_ternary_alias_temp_arm_freed", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(1);
+        passed += Test("bucket_ternary_alias_named_arm_value",
+                       bucketTakeAlias(identityBool(true) ? named : makeUniqueBox(8)), 1);
+        passed += Test("bucket_ternary_alias_named_arm_live", dtorCount, 0);
+    }
+    passed += Test("bucket_ternary_alias_named_arm_freed", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(1);
+        int got = bucketTakeValue(identityBool(false) ? named
+            : (identityBool(true) ? makeUniqueBox(10) : makeUniqueBox(11)));
+        passed += Test("bucket_nested_ternary_inner_left_value", got, 10);
+        passed += Test("bucket_nested_ternary_inner_left_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("bucket_nested_ternary_inner_left_named_freed_at_scope", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(2);
+        int got = bucketTakeValue(identityBool(false) ? named
+            : (identityBool(false) ? makeUniqueBox(20) : makeUniqueBox(21)));
+        passed += Test("bucket_nested_ternary_inner_right_value", got, 21);
+        passed += Test("bucket_nested_ternary_inner_right_freed_at_call", dtorCount, 1);
+    }
+    passed += Test("bucket_nested_ternary_inner_right_named_freed_at_scope", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        UniqueBox named = makeUniqueBox(3);
+        int got = bucketTakeValue(identityBool(true) ? named
+            : (identityBool(true) ? makeUniqueBox(30) : makeUniqueBox(31)));
+        passed += Test("bucket_nested_ternary_outer_named_value", got, 3);
+        passed += Test("bucket_nested_ternary_outer_named_no_temp_free", dtorCount, 0);
+    }
+    passed += Test("bucket_nested_ternary_outer_named_freed_at_scope", dtorCount, 1);
+
+    // A lambda BODY is not part of the argument expression it sits in: the ternary below
+    // initializes a local that owns its temp, so exactly one dtor must run.
+    dtorCount = 0;
+    int lambdaTernary = bucketRun(() => {
+        UniqueBox owned = identityBool(false) ? makeUniqueBox(40) : makeUniqueBox(41);
+        return owned.item->id;
+    });
+    passed += Test("bucket_lambda_body_ternary_value", lambdaTernary, 41);
+    passed += Test("bucket_lambda_body_ternary_dtor", dtorCount, 1);
+
+    // An INDIRECT call (through a function<> value) scopes its argument ternary like a direct
+    // call does: the produced temp arm is destructed exactly once.
+    dtorCount = 0;
+    function<int(UniqueBox)> indirectTake = bucketTakeValue;
+    int indirectGot = indirectTake(identityBool(false) ? makeUniqueBox(50) : makeUniqueBox(51));
+    passed += Test("bucket_indirect_call_ternary_value", indirectGot, 51);
+    passed += Test("bucket_indirect_call_ternary_dtor", dtorCount, 1);
 
     return passed;
 }
@@ -11124,6 +11252,9 @@ extern int main()
 
     passed += testOwningStructTernaryJoin();
     total += 107;
+
+    passed += testBucketAExpressionOwnership();
+    total += 34;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

@@ -3788,6 +3788,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto namedArgCtx = argumentList[functionArgCounter]->argumentNamedExpression();
                                     for (const auto& namedArgument : namedArgCtx)
                                     {
+                                        size_t argParamIndex = argNVs.size();
+                                        std::optional<DeclExpectedTypeScope> argExpectedScope;
+                                        if (argParamIndex < funcPtrTV.FuncPtrParams.size())
+                                        {
+                                            auto argExpectedDest = LLVMBackend::FuncPtrParamAsTypeAndValue(
+                                                funcPtrTV.FuncPtrParams[argParamIndex], argParamIndex);
+                                            argExpectedScope.emplace(&declExpectedType, argExpectedDest);
+                                        }
+                                        CallArgumentScope callArgumentScope(
+                                            inCallArgument_, ternaryCallArgumentDepth_);
                                         auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
                                         if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
@@ -4100,6 +4110,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     std::optional<DeclExpectedTypeScope> ifaceArgExpectedScope;
                                     ifaceArgExpectedScope.emplace(&declExpectedType, ifaceArgExpectedDest);
+                                    CallArgumentScope callArgumentScope(
+                                        inCallArgument_, ternaryCallArgumentDepth_);
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                     ifaceArgExpectedScope.reset();
                                     lambdaExpectedType = {};
@@ -4672,6 +4684,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     size_t thisCastOcc = Compiler(ctx)->CurrentCastOccurrence();
                                     std::optional<DeclExpectedTypeScope> argExpectedScope;
                                     argExpectedScope.emplace(&declExpectedType, argExpectedDest);
+                                    CallArgumentScope callArgumentScope(
+                                        inCallArgument_, ternaryCallArgumentDepth_);
                                     auto argNV = this->ParseAssignmentExpressionNamed(namedArgument->assignmentExpression());
                                     argExpectedScope.reset();
                                     // Use-after-move check: a field access carries a populated Primary, so the
@@ -5651,6 +5665,9 @@ std::vector<MainListener::CaptureInfo> MainListener::CollectLambdaCaptures(
 
 LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::LambdaExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+
+        // The body is a function body, not part of the argument expression the literal sits in.
+        CallArgumentSuspendScope lambdaArgumentScope(inCallArgument_, ternaryCallArgumentDepth_);
 
         // Parse lambda parameter list
         std::vector<LLVMBackend::DeclTypeAndValue> params;

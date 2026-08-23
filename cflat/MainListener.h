@@ -2457,6 +2457,38 @@ private:
         ~DeclExpectedTypeScope() { *slot = saved; }
     };
 
+    // Marks an expression parsed in a call argument, where a ternary owning temp may need
+    // per-arm cleanup before its value is joined with a borrowed arm.
+    bool inCallArgument_ = false;
+    int ternaryCallArgumentDepth_ = 0;
+    struct CallArgumentScope {
+        bool& slot;
+        int& ternaryDepth;
+        bool saved;
+        int savedTernaryDepth;
+        explicit CallArgumentScope(bool& s, int& d)
+            : slot(s), ternaryDepth(d), saved(s), savedTernaryDepth(d) {
+            slot = true;
+            ternaryDepth = 0;
+        }
+        ~CallArgumentScope() { ternaryDepth = savedTernaryDepth; slot = saved; }
+    };
+
+    // A nested function body is NOT part of the enclosing argument expression: a ternary declared
+    // inside a lambda passed as an argument owns its temp, so the arm registration must not fire.
+    struct CallArgumentSuspendScope {
+        bool& slot;
+        int& ternaryDepth;
+        bool saved;
+        int savedTernaryDepth;
+        CallArgumentSuspendScope(bool& s, int& d)
+            : slot(s), ternaryDepth(d), saved(s), savedTernaryDepth(d) {
+            slot = false;
+            ternaryDepth = 0;
+        }
+        ~CallArgumentSuspendScope() { ternaryDepth = savedTernaryDepth; slot = saved; }
+    };
+
     // A destination type describes the WHOLE expression, never one operand of it: `string s =
     // "n=" + (() => 2)()` must not type the literal 'string' (measured: module verification
     // failure). Every binary/ternary level withdraws the context unless it is a pure pass-through.

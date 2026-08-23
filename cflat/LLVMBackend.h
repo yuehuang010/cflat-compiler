@@ -1518,10 +1518,10 @@ public:
     };
     std::vector<OwnedReturnReleaseTemp> ownedReturnReleaseTemps_;
 
-    // A '?.' merge re-loads its result through an alloca, so the produced-temp tests that ask
-    // `isa<CallInst>` stop recognising a chain whose access arm WAS a call. These are the merged
-    // values of exactly those chains; statement-scoped, cleared by FlushOwnedTemps and parked
-    // across a nested emission by SaveBuilderState (a lambda body's flush must not drop them).
+    // A join re-loads or merges its result, so the produced-temp tests that ask `isa<CallInst>`
+    // stop recognising a chain or ternary whose arm WAS a call. These are the merged values;
+    // statement-scoped, cleared by FlushOwnedTemps and parked across nested emission by
+    // SaveBuilderState (a lambda body's flush must not drop them).
     std::vector<llvm::Value*> nullConditionalTempResults_;
 
     // Owning-POINTER SSA values produced by `new`, keyed by value identity, plus any value they
@@ -2991,9 +2991,12 @@ private:
     void PropagateNullConditionalOwnership(llvm::Value* from, llvm::Value* to);
 
     // True for a value that is an unowned PRODUCED temp: a call result, or the '?.' merge of a
-    // chain whose access arm was one. The temp-registration sites test this, never isa<CallInst>
-    // directly, or a '?.' result silently stops being registered and leaks.
+    // chain or ternary whose arm was one. The temp-registration sites test this, never
+    // isa<CallInst> directly, or a merged result silently stops being registered and leaks.
     bool IsProducedTempValue(llvm::Value* value) const;
+
+    // Carry produced-temp identity through a value join, including nested ternaries.
+    void PropagateProducedTempValue(llvm::Value* from, llvm::Value* to);
 
     /*
      * Ledger lookup for every OWNERSHIP question: the entry if `value` is a still-unconsumed
@@ -3549,11 +3552,11 @@ private:
     // distinction is essential because an operator operand reaches here with Storage cleared, so
     // Storage alone cannot tell a named operand from a temp. Alias/pointer/string/closure values and
     // fields of an already-registered owning temp (FromOwningTempField) run their own paths.
-    void RegisterBorrowedOwningStructTemp(const NamedVariable& arg);
+    void RegisterBorrowedOwningStructTemp(const NamedVariable& arg, bool fromTernaryArm = false);
 
     // Shared gate: true when `arg` is an unowned produced rvalue of an owning struct type, i.e.
     // one that a borrowing parameter will not free and no named local will either.
-    bool BorrowedOwningStructTempQualifies(const NamedVariable& arg);
+    bool BorrowedOwningStructTempQualifies(const NamedVariable& arg, bool fromTernaryArm = false);
 
     // Same registration, but for a temp already spilled into `slot` by the caller (the
     // alias-by-pointer arg path), so no second copy is made and the temp is freed exactly once.

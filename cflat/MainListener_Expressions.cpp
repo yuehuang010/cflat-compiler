@@ -1390,7 +1390,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return namedVar.BaseType
                     && !llvm::isa<llvm::AllocaInst>(destination)
                     && !llvm::isa<llvm::GlobalVariable>(destination)
-                    && !llvm::isa<llvm::GetElementPtrInst>(destination);
+                    && (!llvm::isa<llvm::GetElementPtrInst>(destination)
+                        || (namedVar.IsBorrowed && !namedVar.IsElementAccess));
             };
             auto derefLoad = [&]() -> llvm::Value* {
                 // Bitfield: the extracted value was already computed at field-access time.
@@ -1824,7 +1825,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && compiler->lastCallReturnsOwned)
             {
                 if (NamedVarIsString(namedVar) && !namedVar.CallerName.empty()
-                    && namedVar.FieldName.empty())
+                    && namedVar.FieldName.empty() && !isDerefStorage()
+                    && !namedVar.IsBorrowed)
                     compiler->MarkVariableOwningString(namedVar.CallerName);
                 compiler->lastCallReturnsOwned = false;
             }
@@ -2948,8 +2950,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // would alias owned buffers (double-free) and orphan the destination's old value (leak).
             // A deref lvalue is neither an alloca/global (destIsLocalOwningVar) nor a 2-index
             // struct-field GEP (destIsStructField), so both paths above skip it. Container element
-            // stores are single-index GEPs, which isDerefStorage() excludes (it rejects every GEP),
-            // so they never reach here. Destruct the old destination, move the source bits in, then
+            // stores remain excluded; pointer-parameter array spelling is not an element-access
+            // value and still carries the raw pointee storage needed here. Destruct the old
+            // destination, move the source bits in, then
             // zero the source so its scope-exit dtor is a no-op. Use-after-move through a pointer is
             // left unenforced - a deref source (`*pa`) has no name to MarkVariableMoved.
             if (operatorText == "=" && right && destination
@@ -2963,9 +2966,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.TypeAndValue.IsArrayView
                 // Same clause the alloca/global arm carries: a `move` PARAMETER is an owner
                 // (IsOwningStruct) that destructs at function exit, so it must TRANSFER here too.
-                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct)
+                && (!rightNV.TypeAndValue.IsMove || rightNV.IsOwningStruct
+                    || compiler->IsProducedTempValue(right)
+                    || rightNV.Storage == nullptr)
                 && destination != rightNV.Storage
-                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+                && (compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                    || NamedVarIsString(namedVar)))
             {
                 // THE FLIP via the shared decision: a copyable owner COPIES into the deref lvalue
                 // (source stays live - no zero, no mark-moved); a non-copyable owner MOVES. Produce
@@ -3831,6 +3837,17 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         auto* compiler = Compiler(ctx);
         if (condTv.value == nullptr) return {};
 
+        struct TernaryCallArgumentDepthScope
+        {
+            int& depth;
+            bool active;
+            TernaryCallArgumentDepthScope(int& d, bool enabled) : depth(d), active(enabled) {
+                if (active) ++depth;
+            }
+            ~TernaryCallArgumentDepthScope() { if (active) --depth; }
+            bool IsOutermost() const { return active && depth == 1; }
+        } ternaryDepth(ternaryCallArgumentDepth_, inCallArgument_);
+
         auto* trueBlock   = compiler->CreateBasicBlock("ternary_true");
         auto* falseBlock  = compiler->CreateBasicBlock("ternary_false");
         auto* resumeBlock = compiler->CreateBasicBlock("ternary_resume");
@@ -3905,6 +3922,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     trueStorage = load->getPointerOperand();
             trueAlias = trueAlias || compiler->IsAliasValue(trueValue);
             trueTempField = compiler->IsTempFieldValue(trueValue);
+            if (ternaryDepth.IsOutermost() && trueValue != nullptr && !outerExpected.IsMove
+                && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
+            {
+                LLVMBackend::NamedVariable armNV;
+                armNV.Primary = trueValue;
+                armNV.BaseType = trueValue->getType();
+                armNV.TypeAndValue = outerExpected;
+                armNV.TypeAndValue.Pointer = false;
+                armNV.TypeAndValue.IsAlias = false;
+                armNV.TypeAndValue.IsMove = false;
+                compiler->RegisterBorrowedOwningStructTemp(armNV, true);
+            }
             if (use == ResultUse::Discard)
                 compiler->FlushOwnedTempsSince(trueMark, nullptr, branchBlock);
             else
@@ -3932,6 +3961,18 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     falseStorage = load->getPointerOperand();
             falseAlias = falseAlias || compiler->IsAliasValue(falseValue);
             falseTempField = compiler->IsTempFieldValue(falseValue);
+            if (ternaryDepth.IsOutermost() && falseValue != nullptr && !outerExpected.IsMove
+                && !(outerExpected.IsOwningSink && compiler->OwningSinkConsumesConcrete(outerExpected)))
+            {
+                LLVMBackend::NamedVariable armNV;
+                armNV.Primary = falseValue;
+                armNV.BaseType = falseValue->getType();
+                armNV.TypeAndValue = outerExpected;
+                armNV.TypeAndValue.Pointer = false;
+                armNV.TypeAndValue.IsAlias = false;
+                armNV.TypeAndValue.IsMove = false;
+                compiler->RegisterBorrowedOwningStructTemp(armNV, true);
+            }
             if (use == ResultUse::Discard)
                 compiler->FlushOwnedTempsSince(falseMark, nullptr, branchBlock);
             else
@@ -4111,6 +4152,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         phi->addIncoming(falseValue, falseEnd);
         compiler->RegisterJoinArmCastOccurrence(phi, 0, trueOcc);
         compiler->RegisterJoinArmCastOccurrence(phi, 1, falseOcc);
+        compiler->PropagateProducedTempValue(trueValue, phi);
+        compiler->PropagateProducedTempValue(falseValue, phi);
 
         llvm::Value* storageJoin = nullptr;
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
