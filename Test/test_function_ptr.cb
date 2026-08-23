@@ -2999,6 +2999,115 @@ bool testFuncPtrCallResultIntoClosureParam()
     return result;
 }
 
+// A function<> call result remains the receiver for every postfix-chain shape.
+struct ChainPostfixRec
+{
+    int field = default;
+    int m() { return field + 1; }
+};
+
+int[3] chainPostfixValues = { 4, 5, 6 };
+int chainPostfixDtors = 0;
+int chainPostfixStructDtors = 0;
+class ChainPostfixDtor
+{
+    int value = default;
+    ~ChainPostfixDtor() { chainPostfixDtors = chainPostfixDtors + 1; }
+};
+class ChainPostfixOwnedStruct
+{
+    string text = default;
+    ~ChainPostfixOwnedStruct() { chainPostfixStructDtors = chainPostfixStructDtors + 1; }
+};
+
+string chainPostfixString(int n) { return "abc"; }
+ChainPostfixRec chainPostfixValue(int n)
+{
+    ChainPostfixRec r = default;
+    r.field = n;
+    return r;
+}
+int* chainPostfixArray(int n) { return &chainPostfixValues[0]; }
+function<int(int)> chainPostfixNested(int n) { return doubleIt; }
+ChainPostfixRec* chainPostfixPtr(int n)
+{
+    ChainPostfixRec* r = new ChainPostfixRec();
+    r.field = n;
+    return r;
+}
+move ChainPostfixDtor* chainPostfixOwned(int n)
+{
+    ChainPostfixDtor* r = new ChainPostfixDtor();
+    r.value = n;
+    return r;
+}
+ChainPostfixOwnedStruct chainPostfixOwnedStruct(int n)
+{
+    ChainPostfixOwnedStruct r = default;
+    r.text = "abc";
+    return r;
+}
+int chainPostfixPassArg(int n) { return n; }
+struct ChainPostfixObj { function<ChainPostfixRec(int)> fp = default; };
+struct ChainPostfixMethodObj
+{
+    function<ChainPostfixRec(int)> fp = default;
+    int run() { return this->fp(0).m(); }
+};
+
+bool testFuncPtrPostfixChain()
+{
+    bool result = true;
+
+    function<string(int)> text = chainPostfixString;
+    result &= Test("funcptr chain string length", (int)text(0).length(), 3);
+
+    function<ChainPostfixRec(int)> value = chainPostfixValue;
+    result &= Test("funcptr chain field", value(7).field, 7);
+    result &= Test("funcptr chain ternary arm", true ? value(5).m() : value(6).m(), 6);
+
+    function<int*(int)> array = chainPostfixArray;
+    result &= Test("funcptr chain index", array(0)[1], 5);
+
+    function<function<int(int)>(int)> nested = chainPostfixNested;
+    result &= Test("funcptr chain call result call", nested(0)(4), 8);
+
+    ChainPostfixObj obj = default;
+    obj.fp = chainPostfixValue;
+    result &= Test("funcptr field chain method", obj.fp(0).m(), 1);
+
+    ChainPostfixObj* objPtr = new ChainPostfixObj();
+    objPtr.fp = chainPostfixValue;
+    result &= Test("funcptr pointer field chain method", objPtr.fp(0).m(), 1);
+    delete objPtr;
+
+    ChainPostfixMethodObj methodObj = default;
+    methodObj.fp = chainPostfixValue;
+    result &= Test("funcptr this field chain method", methodObj.run(), 1);
+
+    function<ChainPostfixRec*(int)> maybe = chainPostfixPtr;
+    result &= Test("funcptr chain null conditional", maybe(0)?.m(), 1);
+
+    chainPostfixDtors = 0;
+    {
+        function<move ChainPostfixDtor*(int)> owned = chainPostfixOwned;
+        int ownedValue = owned(7)->value;
+        result &= Test("funcptr owning chain value", ownedValue, 7);
+    }
+    result &= Test("funcptr owning chain dtor once", chainPostfixDtors, 1);
+
+    chainPostfixStructDtors = 0;
+    function<ChainPostfixOwnedStruct(int)> owningStruct = chainPostfixOwnedStruct;
+    result &= Test("funcptr owning struct chain value", owningStruct(0).text.length(), 3);
+    result &= Test("funcptr owning struct chain dtor once", chainPostfixStructDtors, 1);
+
+    chainPostfixStructDtors = 0;
+    result &= Test("funcptr chain call argument", chainPostfixPassArg(owningStruct(0).text.length()), 3);
+    result &= Test("funcptr chain argument dtor once", chainPostfixStructDtors, 1);
+
+    return result;
+}
+
 /*
  * Accept set for the code-value STORE gate (a code VALUE into a data-pointer destination at a
  * declarator initializer, an assignment - which also carries the field, element and global stores
@@ -4733,6 +4842,9 @@ extern int main(int argc, char** argv)
 
     // A `function<>` CALL RESULT into a closure parameter (fat and thin)
     total++; passed += testFuncPtrCallResultIntoClosureParam() ? 1 : 0;
+
+    // Postfix chains keep the result of an indirect function call as their receiver.
+    total++; passed += testFuncPtrPostfixChain()          ? 1 : 0;
 
     // Accept set for the code-value STORE gate (decl-init / assignment / field / return)
     total++; passed += testCodeValueStoreAccepts()        ? 1 : 0;

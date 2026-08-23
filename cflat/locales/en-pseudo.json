@@ -12,6 +12,9 @@
       "T",
       "MyClass<int>"
     ],
+    "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": [
+      "class"
+    ],
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": [
       "--asan"
     ],
@@ -394,6 +397,10 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
+    "extraneousinputarg0expectingarg1": [
+      "'}'",
+      "<EOF>"
+    ],
     "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": [
       "aliasParamTaker",
       "r",
@@ -410,6 +417,15 @@
     "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
       "Bar.winmd"
     ],
+    "mismatchedinputarg0expectingarg1": [
+      "'='",
+      "{'move', '(', Identifier}"
+    ],
+    "missingarg0atarg1": [
+      "')'",
+      "'{'"
+    ],
+    "missingatendofstatement": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
     ],
@@ -423,6 +439,9 @@
       "go",
       "0",
       "1"
+    ],
+    "noviablealternativeatinputarg0": [
+      "'int true'"
     ],
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
       "p",
@@ -463,6 +482,7 @@
     "arg0failedtodefinearg1arg2": "{0}: failed to define {1}: {2}",
     "arg0failedtoinstallp...sssymbolresolverarg1fc80b8f9f6712b7c": "{0}: failed to install process symbol resolver: {1}",
     "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": "'{0}' is a generic type; type arguments are required (expects {1}: {2}), e.g. {3}",
+    "arg0isareservedwordi...beusedasanidentifiera2a00aed272d893f": "'{0}' is a reserved word in CFlat and cannot be used as an identifier",
     "arg0isneverused": "'{0}' is never used",
     "arg0msvclibdirectory...componentisinstalled740fffb28d2f2687": "{0}: MSVC lib directory not found, cannot locate the asan runtime (clang_rt.asan_dynamic). Ensure Visual Studio with the C++ AddressSanitizer component is installed.",
     "arg0noarg1functiontoexecute": "{0}: no '{1}' function to execute.",

@@ -1904,6 +1904,54 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         if (errorListener.hasErrors())
         {
+            std::vector<std::string> parserExpectedErrors;
+            if (auto* tu = computeUnit->translationUnit())
+            {
+                for (auto* decl : tu->externalDeclaration())
+                {
+                    if (auto* expectDecl = decl->expectErrorDeclaration())
+                        parserExpectedErrors.push_back(
+                            DequoteStringLiteral(expectDecl->StringLiteral()->getText()));
+                }
+            }
+            std::vector<int> diagnosticMatches(errorListener.getDiagnostics().size(), -1);
+            auto matchExpectation = [&](auto&& self, size_t expectedIndex,
+                                         std::vector<bool>& visited) -> bool
+            {
+                for (size_t diagnosticIndex = 0;
+                     diagnosticIndex < errorListener.getDiagnostics().size(); ++diagnosticIndex)
+                {
+                    if (visited[diagnosticIndex]) continue;
+                    const auto& diagnostic = errorListener.getDiagnostics()[diagnosticIndex];
+                    if (diagnostic.message.find(parserExpectedErrors[expectedIndex]) == std::string::npos)
+                        continue;
+                    visited[diagnosticIndex] = true;
+                    if (diagnosticMatches[diagnosticIndex] == -1 ||
+                        self(self, diagnosticMatches[diagnosticIndex], visited))
+                    {
+                        diagnosticMatches[diagnosticIndex] = static_cast<int>(expectedIndex);
+                        return true;
+                    }
+                }
+                return false;
+            };
+            size_t matchedExpectations = 0;
+            for (size_t expectedIndex = 0; expectedIndex < parserExpectedErrors.size(); ++expectedIndex)
+            {
+                std::vector<bool> visited(errorListener.getDiagnostics().size(), false);
+                if (matchExpectation(matchExpectation, expectedIndex, visited))
+                    ++matchedExpectations;
+            }
+            bool parserExpectationsMatch =
+                !parserExpectedErrors.empty() &&
+                matchedExpectations == parserExpectedErrors.size() &&
+                matchedExpectations == errorListener.getDiagnostics().size();
+            if (parserExpectationsMatch)
+            {
+                for (size_t i = 0; i < parserExpectedErrors.size(); ++i)
+                    std::cout << "PASS: expected error received\n";
+                return true;
+            }
             ReportParseErrors(errorListener.getDiagnostics(), sourceLines);
             return false;
         }

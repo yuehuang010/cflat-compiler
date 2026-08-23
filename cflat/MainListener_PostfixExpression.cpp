@@ -3953,6 +3953,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 namedVar.BaseType = result ? result->getType() : nullptr;
                                 namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 PrepareAliasCallResult(ctx, namedVar);
+                                structVar = {};
+                                interfaceVar = {};
+                                ClassifyPostfixCallResult(ctx, namedVar, structVar, interfaceVar);
                                 /*
                                  * A VOID call through a function value yields no LLVM value at all
                                  * (CreateIndirectCall returns nullptr for a void invoker), so every

@@ -1,0 +1,16 @@
+// A keyword after a type is not always an identifier misuse: these two lines must keep
+// reporting their real syntax error, not a bogus reserved-word diagnostic.
+expect_error("missing ')' at '{'");
+int castNotReserved() { int q = (int)true; if (q { return 0; } return 1; }
+struct Buf { int a; };
+// Expectations here match parse diagnostics, so keep them locale-stable.
+expect_error("missing ';' at 'return'");
+void unnamedMoveParam(int, move Buf b) { int y = 1 return y; }
+expect_error("'class' is a reserved word in CFlat");
+int reservedDecl() { int class = 3; return 0; }
+expect_error("'true' is a reserved word in CFlat");
+struct ReservedField { int true; };
+expect_error("'default' is a reserved word in CFlat");
+int reservedFor() { for (int default = 0; default < 1; default++) { } return 0; }
+expect_error("'if' is a reserved word in CFlat");
+void reservedParam(int if) { return; }

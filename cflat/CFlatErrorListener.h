@@ -43,12 +43,19 @@ public:
         if (!seenLines_.insert(static_cast<int>(line)).second)
             return;
 
+        antlr4::Token* diagnosticToken = offendingSymbol;
         ParseDiagnostic d;
         d.file    = filename_;
-        d.line    = static_cast<int>(line);
-        d.col     = static_cast<int>(charPositionInLine);
+        d.line    = diagnosticToken ? static_cast<int>(diagnosticToken->getLine())
+                                    : static_cast<int>(line);
+        d.col     = diagnosticToken
+            ? static_cast<int>(diagnosticToken->getCharPositionInLine())
+            : static_cast<int>(charPositionInLine);
         static constexpr std::string_view lexerPrefix = "token recognition error at: ";
-        std::string reserved = reservedWordMessage(recognizer, offendingSymbol, msg);
+        int sourceReservedCol = -1;
+        std::string reserved = reservedWordFromSource(line, charPositionInLine, sourceReservedCol);
+        if (sourceReservedCol >= 0)
+            d.col = sourceReservedCol;
         if (msg.rfind(lexerPrefix, 0) == 0)
             d.message = localizeMessage_("unexpected character: {}",
                                          {msg.substr(lexerPrefix.size())});
@@ -56,7 +63,7 @@ public:
             d.message = reserved;
         else
             d.message = humanizeMessage(msg);
-        d.hint    = buildHint(recognizer, offendingSymbol, e, msg);
+        d.hint    = reserved.empty() ? buildHint(recognizer, diagnosticToken, e, msg) : std::string();
         diagnostics_.push_back(std::move(d));
     }
 
@@ -69,6 +76,83 @@ private:
     std::vector<ParseDiagnostic> diagnostics_;
     std::set<int> seenLines_;
     std::function<std::string(std::string, std::vector<std::string>)> localizeMessage_;
+
+    static bool isKnownReservedWord(const std::string& word)
+    {
+        static constexpr const char* words[] = {
+            "alignas", "alignof", "annotation", "as", "atomic", "bool", "break", "case",
+            "char", "class", "const", "continue", "default", "delete", "do", "double",
+            "else", "enum", "extern", "false", "float", "for", "function", "goto", "if",
+            "import", "in", "inline", "int", "interface", "is", "long", "move", "namespace",
+            "nullptr", "register", "return", "short", "signed", "sizeof", "static", "struct",
+            "switch", "true", "typedef", "typeof", "union", "unsigned", "void", "volatile", "while"
+        };
+        for (const char* candidate : words)
+            if (word == candidate) return true;
+        return false;
+    }
+
+    std::string reservedWordFromSource(size_t line, size_t col, int& wordCol) const
+    {
+        if (line == 0 || line > sourceLines_.size()) return {};
+        const std::string& source = sourceLines_[line - 1];
+        static constexpr const char* typeWords[] = {
+            "auto", "bool", "char", "double", "float", "int", "long", "short", "string",
+            "signed", "unsigned", "void", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"
+        };
+        auto isTypeWord = [&](const std::string& candidate) {
+            for (const char* typeWord : typeWords)
+                if (candidate == typeWord) return true;
+            return false;
+        };
+        std::string previousWord;
+        size_t previousEnd = 0;
+        // Only a declaration-shaped gap ("int class", "int* class") counts. A ',' or ')'
+        // between them means the keyword is a legal use ("(int)true", "int, move Buf b").
+        auto gapIsDeclarationLike = [&](size_t from, size_t to) {
+            if (to <= from) return false;
+            for (size_t k = from; k < to; ++k)
+                if (source[k] != ' ' && source[k] != '\t' && source[k] != '*'
+                    && source[k] != '&' && source[k] != '?')
+                    return false;
+            return true;
+        };
+        for (size_t i = 0; i < source.size(); )
+        {
+            if (source[i] == '"' || source[i] == '\'')
+            {
+                char quote = source[i++];
+                while (i < source.size())
+                {
+                    if (source[i] == '\\' && i + 1 < source.size()) { i += 2; continue; }
+                    if (source[i++] == quote) break;
+                }
+                continue;
+            }
+            if (source[i] == '/' && i + 1 < source.size() && source[i + 1] == '/') break;
+            while (i < source.size()
+                   && !(std::isalnum(static_cast<unsigned char>(source[i])) || source[i] == '_')
+                   && source[i] != '"' && source[i] != '\'')
+                ++i;
+            if (i == source.size()) break;
+            size_t begin = i++;
+            while (i < source.size()
+                   && (std::isalnum(static_cast<unsigned char>(source[i])) || source[i] == '_'))
+                ++i;
+            std::string word = source.substr(begin, i - begin);
+            if (isKnownReservedWord(word) && !isTypeWord(word) && isTypeWord(previousWord)
+                && gapIsDeclarationLike(previousEnd, begin))
+            {
+                wordCol = static_cast<int>(begin);
+                return localizeMessage_("'{}' is a reserved word in CFlat and cannot be used as an identifier",
+                                        {word});
+            }
+            previousWord = word;
+            previousEnd = i;
+        }
+        (void)col;
+        return {};
+    }
 
     static std::string humanizeMessage(const std::string& msg)
     {
@@ -88,25 +172,6 @@ private:
             }
         }
         return result;
-    }
-
-    // A keyword token where an identifier was expected: say WHY, instead of listing the
-    // expected token set and leaving the reader to infer that the word is taken.
-    std::string reservedWordMessage(antlr4::Recognizer* recognizer,
-                                    antlr4::Token* offendingSymbol,
-                                    const std::string& msg)
-    {
-        auto* parser = dynamic_cast<antlr4::Parser*>(recognizer);
-        if (parser == nullptr || offendingSymbol == nullptr) return {};
-        if (msg.find("Identifier") == std::string::npos) return {};
-        std::string literal{ parser->getVocabulary().getLiteralName(offendingSymbol->getType()) };
-        if (literal.size() < 3 || literal.front() != '\'' || literal.back() != '\'') return {};
-        std::string word = literal.substr(1, literal.size() - 2);
-        // Only WORDS are reserved words; punctuation tokens are not misread as identifiers.
-        for (char ch : word)
-            if (!(std::isalpha(static_cast<unsigned char>(ch)) || ch == '_')) return {};
-        return localizeMessage_(
-            "'{}' is a reserved word in CFlat and cannot be used as an identifier", {word});
     }
 
     // True when the offending token's line already carries a ';' at or after the error column.
