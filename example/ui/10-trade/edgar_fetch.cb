@@ -1,0 +1,402 @@
+// Download SEC company-concept diluted EPS facts and normalize them to the
+// PEAD earnings CSV contract.  The fact array is read with core json.cb.
+import "process.cb";
+import "filesystem.cb";
+import "string.cb";
+import "os.cb";
+import "json.cb";
+
+
+const int UNIVERSE_COUNT = 30;
+string[30] g_universe = { "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA", "JPM", "V", "JNJ",
+                        "WMT", "PG", "XOM", "UNH", "HD", "MA", "CVX", "KO", "PEP", "COST",
+                        "ABBV", "MRK", "BAC", "ORCL", "CSCO", "NFLX", "ADBE", "CRM", "AMD", "INTC" };
+
+struct EdgarFact
+{
+    string start = default;
+    string end = default;
+    string filed = default;
+    string fp = default;
+    double val = 0.0;
+    int fiscal_year = 0;
+};
+
+struct EarningsRow
+{
+    string period_end = default;
+    string filed = default;
+    string fiscal_period = default;
+    int fiscal_year = 0;
+    double eps = 0.0;
+};
+
+int skipSpace(string text, int p)
+{
+    while (p < text.length())
+    {
+        i8 c = text.charAt(p);
+        if (c != ' ' && c != '\n' && c != '\r' && c != '\t') break;
+        p++;
+    }
+    return p;
+}
+
+move list<EdgarFact>* scanFacts(string text)
+{
+    list<EdgarFact>* facts = new list<EdgarFact>;
+    JsonNode* root = JsonParser.parse(text);
+    if (root == nullptr) return facts;
+    IJSON units = root.getObject("units");
+    if (units == nullptr) { delete root; return facts; }
+    // Companies with no diluted-EPS facts report "USD/shares": {} (an empty object).
+    IJSONArray arr = units.getArray("USD/shares");
+    if (arr == nullptr) { delete root; return facts; }
+    int i = 0;
+    while (i < arr.count())
+    {
+        IJSON o = arr.getObject(i);
+        i++;
+        if (!o.hasField("start") || !o.hasField("end") || !o.hasField("filed") ||
+            !o.hasField("fp") || !o.hasField("val")) continue;
+        EdgarFact fact;
+        fact.start = o.getString("start").copy();
+        fact.end = o.getString("end").copy();
+        fact.filed = o.getString("filed").copy();
+        fact.fp = o.getString("fp").copy();
+        fact.val = o.getDouble("val");
+        fact.fiscal_year = o.hasField("fy") ? (int)o.getInt64("fy") : 0;
+        facts->add(move fact);
+    }
+    delete root;
+    return facts;
+}
+
+i64 dateDays(string date)
+{
+    if (date.length() < 10) return 0;
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int i = 0;
+    while (i < 4) { year = year * 10 + ((int)date.charAt(i) - (int)'0'); i++; }
+    i = 5;
+    while (i < 7) { month = month * 10 + ((int)date.charAt(i) - (int)'0'); i++; }
+    i = 8;
+    while (i < 10) { day = day * 10 + ((int)date.charAt(i) - (int)'0'); i++; }
+
+    // Howard Hinnant's civil-date calculation, returning days since 1970-01-01.
+    i64 y = (i64)year;
+    y = y - (month <= 2 ? 1 : 0);
+    i64 era = (y >= 0 ? y : y - 399) / 400;
+    i64 yoe = y - era * 400;
+    i64 mp = (i64)month + (month > 2 ? -3 : 9);
+    i64 doy = (153 * mp + 2) / 5 + (i64)day - 1;
+    i64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+bool sameDate(list<string>* dates, string date)
+{
+    int i = 0;
+    while (i < dates->count())
+    {
+        if (dates->get(i) == date) return true;
+        i++;
+    }
+    return false;
+}
+
+int rowAt(list<EarningsRow>* rows, string periodEnd)
+{
+    int i = 0;
+    while (i < rows->count())
+    {
+        if (rows->get(i).period_end == periodEnd) return i;
+        i++;
+    }
+    return -1;
+}
+
+void addOrKeepRow(list<EarningsRow>* rows, string periodEnd, string filed, int fiscalYear, string fp, double eps)
+{
+    int existing = rowAt(rows, periodEnd);
+    if (existing >= 0)
+    {
+        if (filed < rows->get(existing).filed)
+        {
+            rows->get(existing).filed = filed.copy();
+            rows->get(existing).fiscal_period = fp.copy();
+            rows->get(existing).fiscal_year = fiscalYear;
+            rows->get(existing).eps = eps;
+        }
+        return;
+    }
+
+    EarningsRow row;
+    row.period_end = periodEnd.copy();
+    row.filed = filed.copy();
+    row.fiscal_period = fp.copy();
+    row.fiscal_year = fiscalYear;
+    row.eps = eps;
+    rows->add(move row);
+}
+
+bool isQuarterPeriod(string fp)
+{
+    return fp == "Q1" || fp == "Q2" || fp == "Q3" || fp == "Q4";
+}
+
+move list<EarningsRow>* buildRows(list<EdgarFact>* facts)
+{
+    list<EarningsRow>* rows = new list<EarningsRow>;
+    list<string>* quarterEnds = new list<string>;
+
+    int i = 0;
+    while (i < facts->count())
+    {
+        EdgarFact fact = facts->get(i);
+        i64 duration = dateDays(fact.end) - dateDays(fact.start);
+        if (duration >= 80 && duration <= 100 && isQuarterPeriod(fact.fp))
+        {
+            addOrKeepRow(rows, fact.end, fact.filed, fact.fiscal_year, fact.fp, fact.val);
+            if (!sameDate(quarterEnds, fact.end)) quarterEnds->add(fact.end);
+        }
+        i++;
+    }
+
+    // A 10-K's FY value is annual, so recover Q4 only when exactly three
+    // quarter facts lie strictly inside the FY start/end interval.
+    i = 0;
+    while (i < facts->count())
+    {
+        EdgarFact annual = facts->get(i);
+        i64 duration = dateDays(annual.end) - dateDays(annual.start);
+        if (annual.fp == "FY" && duration >= 350 && duration <= 380 &&
+            !sameDate(quarterEnds, annual.end))
+        {
+            i64 startDay = dateDays(annual.start);
+            i64 endDay = dateDays(annual.end);
+            int count = 0;
+            double sum = 0.0;
+            int j = 0;
+            while (j < rows->count())
+            {
+                i64 qDay = dateDays(rows->get(j).period_end);
+                if (qDay > startDay && qDay < endDay)
+                {
+                    count++;
+                    sum = sum + rows->get(j).eps;
+                }
+                j++;
+            }
+            if (count == 3)
+            {
+                addOrKeepRow(rows, annual.end, annual.filed, annual.fiscal_year, "Q4", annual.val - sum);
+            }
+        }
+        i++;
+    }
+
+    rows->sort((EarningsRow a, EarningsRow b) => { return a.period_end < b.period_end; });
+    delete quarterEnds;
+    return rows;
+}
+
+move string zeroPadCik(i64 cik)
+{
+    string digits = cik.toString();
+    stringbuilder out;
+    int zeros = 10 - digits.length();
+    while (zeros > 0) { out.append("0"); zeros--; }
+    out.append(digits);
+    return out.toString();
+}
+
+i64 scanIntegerAt(string text, int p)
+{
+    p = skipSpace(text, p);
+    int q = p;
+    while (q < text.length())
+    {
+        i8 c = text.charAt(q);
+        if (c < '0' || c > '9') break;
+        q++;
+    }
+    if (q <= p) return 0;
+    return text.substring(p, q - p).toLong();
+}
+
+move string findCik(string tickerJson, string symbol)
+{
+    string tickerKey = "\"ticker\":\"" + symbol + "\"";
+    int tickerPos = tickerJson.indexOf(tickerKey);
+    if (tickerPos < 0) return "";
+    string cikKey = "\"cik_str\"";
+    // The ticker file is an array of flat objects. Restrict the backwards
+    // search to the cik field belonging to this ticker's object.
+    string prefix = tickerJson.substring(0, tickerPos);
+    int cikPos = prefix.lastIndexOf(cikKey);
+    if (cikPos < 0) return "";
+    i64 cik = scanIntegerAt(prefix, cikPos + cikKey.length() + 1);
+    if (cik <= 0) return "";
+    return zeroPadCik(cik);
+}
+
+move string downloadText(string url, string userAgent)
+{
+    stringbuilder response;
+    process p;
+    p.exe = "/usr/bin/curl";
+    p.onStdout = (char* buf, int len) => {
+        int i = 0;
+        while (i < len) { response.appendChar(buf[i]); i++; }
+    };
+    list<string> args;
+    args.add("-sS");
+    args.add("-A");
+    args.add(userAgent);
+    args.add(url);
+    p.run(&args);
+    p.WaitForExit();
+    if (p.exitCode != 0 || response.length() == 0) return "";
+    return response.toString();
+}
+
+// Returns the cached or freshly downloaded text; empty on failure.
+move string loadOrFetch(string path, string url, bool refresh, string userAgent)
+{
+    if (!refresh && File.exists(path)) return File.readAllText(path);
+    string downloaded = downloadText(url, userAgent);
+    if (downloaded.length() == 0) return "";
+    if (!File.writeAllText(path, downloaded)) return "";
+    return downloaded;
+}
+
+bool runPrices(string symbol)
+{
+    process p;
+    p.exe = "./bin/fetch";
+    p.onStdout = (char* buf, int len) => { printf("%.*s", len, buf); };
+    list<string> args;
+    args.add(symbol);
+    p.run(&args);
+    p.WaitForExit();
+    if (p.exitCode != 0)
+    {
+        printf("prices %s failed (exit %d)\n", symbol.data(), p.exitCode);
+        return false;
+    }
+    return true;
+}
+
+bool writeEarnings(string symbol, list<EarningsRow>* rows)
+{
+    if (rows->count() == 0) return false;
+    stringbuilder csv;
+    csv.append("period_end,filed,fiscal_year,fiscal_period,eps\n");
+    int i = 0;
+    while (i < rows->count())
+    {
+        EarningsRow row = rows->get(i);
+        csv.append(row.period_end);
+        csv.append(",");
+        csv.append(row.filed);
+        csv.append(",");
+        csv.append(row.fiscal_year.toString());
+        csv.append(",");
+        csv.append(row.fiscal_period);
+        csv.append(",");
+        csv.append(row.eps.toString());
+        csv.append("\n");
+        i++;
+    }
+    return File.writeAllText("data/earnings/" + symbol + ".csv", csv.toString());
+}
+
+bool processSymbol(string symbol, string tickerJson, bool refresh, bool prices)
+{
+    string cik = findCik(tickerJson, symbol);
+    if (cik.length() == 0)
+    {
+        printf("%s: ticker not found\n", symbol.data());
+        if (prices) runPrices(symbol);
+        return false;
+    }
+
+    string rawPath = "data/earnings/raw/" + symbol + ".json";
+    string url = "https://data.sec.gov/api/xbrl/companyconcept/CIK" + cik +
+                 "/us-gaap/EarningsPerShareDiluted.json";
+    string body = loadOrFetch(rawPath, url, refresh, "trade-research yuehuang010@gmail.com");
+    bool ok = body.length() > 0;
+    if (ok) os.sleep_ms(150);
+    if (!ok)
+    {
+        printf("%s: SEC download failed\n", symbol.data());
+        if (prices && !runPrices(symbol)) ok = false;
+        return false;
+    }
+
+    list<EdgarFact>* facts = scanFacts(body);
+    list<EarningsRow>* rows = buildRows(facts);
+    if (rows->count() == 0 || !writeEarnings(symbol, rows))
+    {
+        printf("%s: no usable EPS quarters\n", symbol.data());
+        ok = false;
+    }
+    else
+    {
+        printf("%s: %d quarters, first %s last %s\n", symbol.data(), rows->count(),
+               rows->get(0).period_end.data(), rows->get(rows->count() - 1).period_end.data());
+    }
+    delete rows;
+    delete facts;
+
+    if (prices && !runPrices(symbol)) ok = false;
+    return ok;
+}
+
+extern int main(int argc, char** argv)
+{
+    bool prices = false;
+    bool refresh = false;
+    list<string>* symbols = new list<string>;
+    int i = 1;
+    while (i < argc)
+    {
+        string arg = (string)argv[i];
+        if (arg == "--prices") prices = true;
+        else if (arg == "--refresh") refresh = true;
+        else symbols->add(arg.toUpper());
+        i++;
+    }
+
+    if (symbols->count() == 0)
+    {
+        for (int u = 0; u < UNIVERSE_COUNT; u++) symbols->add(g_universe[u]);
+    }
+
+    Directory.createAll("data/earnings/raw");
+    string tickerJson = loadOrFetch("data/earnings/company_tickers.json",
+        "https://www.sec.gov/files/company_tickers.json", refresh,
+        "trade-research yuehuang010@gmail.com");
+    bool tickerOk = tickerJson.length() > 0;
+    if (tickerOk) os.sleep_ms(150);
+    if (!tickerOk)
+    {
+        printf("company_tickers.json download failed\n");
+        delete symbols;
+        return 1;
+    }
+
+    int failures = 0;
+    i = 0;
+    while (i < symbols->count())
+    {
+        if (!processSymbol(symbols->get(i), tickerJson, refresh, prices)) failures++;
+        i++;
+    }
+    printf("edgar_fetch: %d symbols, %d failures\n", symbols->count(), failures);
+    delete symbols;
+    return failures == 0 ? 0 : 1;
+}

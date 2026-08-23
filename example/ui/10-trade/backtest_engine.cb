@@ -1,0 +1,329 @@
+// Reusable backtest engine.  The command-line driver lives in backtest.cb.
+import "list.cb";
+import "string.cb";
+import "filesystem.cb";
+import "math.cb";
+
+// Format a double with exactly dec decimal places using half-up rounding.
+move string fmtF(double v, int dec)
+{
+    stringbuilder sb;
+    if (v != v) return "n/a";
+    if (v > 1.0e15 || v < -1.0e15) return "n/a";
+    if (v < 0.0) { sb.appendChar('-'); v = -v; }
+
+    double scale = 1.0;
+    int k = 0;
+    while (k < dec) { scale = scale * 10.0; k++; }
+
+    i64 iscale = (i64)scale;
+    i64 scaled = (i64)(v * scale + 0.5);
+    i64 ip = scaled / iscale;
+    i64 fp = scaled % iscale;
+
+    sb.append(ip);
+    if (dec > 0)
+    {
+        sb.appendChar('.');
+        i64 p = iscale / 10;
+        while (p > 0)
+        {
+            i64 digit = (fp / p) % 10;
+            sb.appendChar((i8)(48 + (int)digit));
+            p = p / 10;
+        }
+    }
+    return sb.toString();
+}
+
+struct Bar
+{
+    string date;
+    double open;
+    double high;
+    double low;
+    double close;
+    double adj_close;
+    i64 volume;
+};
+
+interface IStrategy
+{
+    string name();
+    double target(int i, list<Bar>* bars);
+};
+
+// A small, deliberately forgiving CSV reader.  The input contract has no quoted
+// fields, so splitting each line is both faster and easier to audit than a full CSV
+// parser.
+move list<Bar>* loadCsv(string path)
+{
+    list<Bar>* bars = new list<Bar>;
+    File* f = new File;
+    if (!f->openRead(path))
+    {
+        delete f;
+        return bars;
+    }
+
+    string header = f->readLine();
+    while (!f->atEnd())
+    {
+        string line = f->readLine();
+        if (line.length() == 0) continue;
+        list<string> fields = line.split(",");
+        if (fields.count() < 7) continue;
+        Bar b = Bar();
+        b.date = fields.get(0).copy();
+        b.open = fields.get(1).toDouble();
+        b.high = fields.get(2).toDouble();
+        b.low = fields.get(3).toDouble();
+        b.close = fields.get(4).toDouble();
+        b.adj_close = fields.get(5).toDouble();
+        b.volume = fields.get(6).toLong();
+        if (b.adj_close > 0.0) bars->add(move b);
+    }
+    f->close();
+    delete f;
+    return bars;
+}
+
+double clampPosition(double p)
+{
+    if (p < -1.0) return -1.0;
+    if (p > 1.0) return 1.0;
+    return p;
+}
+
+class BuyAndHold : IStrategy
+{
+    string name() { return "buyhold"; }
+    double target(int i, list<Bar>* bars) { return 1.0; }
+};
+
+class SmaCross : IStrategy
+{
+    int fast;
+    int slow;
+
+    SmaCross(int f, int s) { fast = f; slow = s; }
+    string name() { return "sma"; }
+
+    double _sma(int i, int n, list<Bar>* bars)
+    {
+        if (n <= 0 || i + 1 < n) return 0.0;
+        double sum = 0.0;
+        int j = i - n + 1;
+        while (j <= i) { sum += bars->get(j).adj_close; j++; }
+        return sum / (double)n;
+    }
+
+    double target(int i, list<Bar>* bars)
+    {
+        if (i < slow - 1) return 0.0;
+        return _sma(i, fast, bars) > _sma(i, slow, bars) ? 1.0 : 0.0;
+    }
+};
+
+class Momentum : IStrategy
+{
+    int lookback;
+    double threshold;
+
+    Momentum(int n, double t) { lookback = n; threshold = t; }
+    string name() { return "momentum"; }
+
+    double target(int i, list<Bar>* bars)
+    {
+        if (lookback <= 0 || i < lookback) return 0.0;
+        double oldp = bars->get(i - lookback).adj_close;
+        if (oldp <= 0.0) return 0.0;
+        double ret = bars->get(i).adj_close / oldp - 1.0;
+        if (ret > threshold) return 1.0;
+        if (ret < -threshold) return -1.0;
+        return 0.0;
+    }
+};
+
+double _rsi(int i, int period, list<Bar>* bars)
+{
+    if (period <= 0 || i < period) return 50.0;
+    double gains = 0.0;
+    double losses = 0.0;
+    int j = i - period + 1;
+    while (j <= i)
+    {
+        double d = bars->get(j).adj_close - bars->get(j - 1).adj_close;
+        if (d > 0.0) gains += d;
+        else losses -= d;
+        j++;
+    }
+    if (losses == 0.0) return gains > 0.0 ? 100.0 : 50.0;
+    double rs = gains / losses;
+    return 100.0 - 100.0 / (1.0 + rs);
+}
+
+class MeanReversion : IStrategy
+{
+    int period;
+    double buy;
+    double sell;
+
+    MeanReversion(int p, double b, double s) { period = p; buy = b; sell = s; }
+    string name() { return "meanrev"; }
+    double target(int i, list<Bar>* bars)
+    {
+        double rsi = _rsi(i, period, bars);
+        if (rsi < buy) return 1.0;
+        if (rsi > sell) return -1.0;
+        return 0.0;
+    }
+};
+
+class Donchian : IStrategy
+{
+    int n;
+    Donchian(int period) { n = period; }
+    string name() { return "donchian"; }
+
+    double target(int i, list<Bar>* bars)
+    {
+        if (n <= 0 || i < n) return 0.0;
+        double hi = bars->get(i - n).high;
+        double lo = bars->get(i - n).low;
+        int j = i - n + 1;
+        while (j < i)
+        {
+            if (bars->get(j).high > hi) hi = bars->get(j).high;
+            if (bars->get(j).low < lo) lo = bars->get(j).low;
+            j++;
+        }
+        if (bars->get(i).close > hi) return 1.0;
+        if (bars->get(i).close < lo) return -1.0;
+        return 0.0;
+    }
+};
+
+struct BacktestResult
+{
+    double total_return;
+    double cagr;
+    double vol;
+    double sharpe;
+    double sortino;
+    double max_dd;
+    string max_dd_start;
+    string max_dd_end;
+    double calmar;
+    int trades;
+    double win_rate;
+    double avg_trade_pnl;
+    double exposure;
+    list<double> equity;
+    list<double> position;
+    list<double> drawdown;
+};
+
+// Run at daily frequency.  A signal at close i is stored and applied at open
+// i+1; the return from adj_close[i] to adj_close[i+1] therefore uses the position
+// that was filled at the latter open.  Costs are charged on absolute turnover.
+BacktestResult runBacktest(list<Bar>* bars, IStrategy strat, double commissionBps, double slippageBps)
+{
+    BacktestResult r = BacktestResult();
+    int n = bars == nullptr ? 0 : bars->count();
+    if (n == 0) return r;
+
+    double equity = 1.0;
+    double peak = 1.0;
+    double pos = 0.0;
+    double pending = clampPosition(strat.target(0, bars));
+    double costRate = (commissionBps + slippageBps) / 10000.0;
+    int exposed = 0;
+    double sumReturns = 0.0;
+    double sumSq = 0.0;
+    double sumDownSq = 0.0;
+    int returnCount = 0;
+    double worst = 0.0;
+    int worstStart = 0;
+    int worstEnd = 0;
+    int currentPeak = 0;
+    double entryEquity = 1.0;
+    bool inTrade = false;
+    int wins = 0;
+    double sumTradePnl = 0.0;
+
+    r.equity.add(equity);
+    r.position.add(pos);
+    r.drawdown.add(0.0);
+
+    int i = 1;
+    while (i < n)
+    {
+        double newPos = pending;
+        if (newPos != pos)
+        {
+            double turnover = newPos - pos;
+            equity *= 1.0 - Math.abs(turnover) * costRate;
+            if (pos == 0.0 && newPos != 0.0)
+            {
+                entryEquity = equity;
+                inTrade = true;
+            }
+            if (inTrade && newPos == 0.0)
+            {
+                double pnl = equity / entryEquity - 1.0;
+                sumTradePnl += pnl;
+                if (pnl > 0.0) wins++;
+                r.trades++;
+                inTrade = false;
+            }
+            pos = newPos;
+        }
+
+        if (pos != 0.0) exposed++;
+        double previous = equity;
+        double ratio = bars->get(i).adj_close / bars->get(i - 1).adj_close;
+        equity *= 1.0 + pos * (ratio - 1.0);
+        double daily = previous == 0.0 ? 0.0 : equity / previous - 1.0;
+        sumReturns += daily;
+        sumSq += daily * daily;
+        if (daily < 0.0) sumDownSq += daily * daily;
+        returnCount++;
+
+        if (equity > peak) { peak = equity; currentPeak = i; }
+        double dd = equity / peak - 1.0;
+        if (dd < worst) { worst = dd; worstStart = currentPeak; worstEnd = i; }
+        r.equity.add(equity);
+        r.position.add(pos);
+        r.drawdown.add(dd);
+
+        pending = clampPosition(strat.target(i, bars));
+        i++;
+    }
+    if (inTrade)
+    {
+        double pnl = equity / entryEquity - 1.0;
+        sumTradePnl += pnl;
+        if (pnl > 0.0) wins++;
+        r.trades++;
+    }
+
+    r.total_return = equity - 1.0;
+    double years = (double)(n - 1) / 252.0;
+    r.cagr = years > 0.0 ? Math.pow(equity, 1.0 / years) - 1.0 : 0.0;
+    double mean = returnCount > 0 ? sumReturns / (double)returnCount : 0.0;
+    double variance = returnCount > 1 ? (sumSq / (double)returnCount - mean * mean) : 0.0;
+    if (variance < 0.0) variance = 0.0;
+    r.vol = Math.sqrt(variance) * Math.sqrt(252.0);
+    r.sharpe = r.vol > 0.0 ? mean * 252.0 / r.vol : 0.0;
+    double downside = returnCount > 0 ? Math.sqrt(sumDownSq / (double)returnCount) * Math.sqrt(252.0) : 0.0;
+    r.sortino = downside > 0.0 ? mean * 252.0 / downside : 0.0;
+    r.max_dd = worst;
+    r.max_dd_start = bars->get(worstStart).date.copy();
+    r.max_dd_end = bars->get(worstEnd).date.copy();
+    r.calmar = r.max_dd < 0.0 ? r.cagr / -r.max_dd : 0.0;
+    r.win_rate = r.trades > 0 ? (double)wins / (double)r.trades : 0.0;
+    r.avg_trade_pnl = r.trades > 0 ? sumTradePnl / (double)r.trades : 0.0;
+    r.exposure = n > 1 ? (double)exposed / (double)(n - 1) : 0.0;
+    return r;
+}

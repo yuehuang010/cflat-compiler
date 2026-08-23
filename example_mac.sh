@@ -115,6 +115,9 @@ selftest_case "fedit"           "$OUT/fedit_mac"      "$IUI/08-fedit/fedit.cb"  
 selftest_case "fedit_jsx"       "$OUT/fedit_jsx_mac"  "$IUI/08-fedit/fedit_jsx.cb"        -i "$IUI" -i "$IMAC"
 selftest_case "gallery"         "$OUT/gallery_mac"    "$IUI/05-gallery/gallery.cb"        -i "$IUI" -i "$IMAC"
 selftest_case "map"             "$OUT/map_mac"        "$IUI/09-map/map.cb"                -i "$IUI" -i "$IMAC"
+selftest_case "trade_charts"    "$OUT/trade_charts"   "$IUI/10-trade/charts.cb"
+selftest_case "trade_pead"      "$OUT/trade_pead"     "$IUI/10-trade/pead.cb"
+selftest_case "trade_chart_export" "$OUT/trade_chart_export" "$IUI/10-trade/chart_export.cb"
 
 echo "-- compile-and-run (headless, exit 0) --"
 run_case "raytracer"     "$OUT/raytracer"     "example/graphics/raytracer.cb"
@@ -148,10 +151,36 @@ build_case "shell_ren"   "$OUT/sh_ren"        "example/shell/ren.cb"
 build_case "shell_rmdir" "$OUT/sh_rmdir"      "example/shell/rmdir.cb"
 build_case "shell_type"  "$OUT/sh_type"       "example/shell/type.cb"
 build_case "shell_wc"    "$OUT/sh_wc"         "example/shell/wc.cb"
+build_case "trade_fetch"      "$OUT/trade_fetch"      "$IUI/10-trade/fetch.cb"
+build_case "trade_backtest"   "$OUT/trade_backtest"   "$IUI/10-trade/backtest.cb"
+build_case "trade_analysis"   "$OUT/trade_analysis"   "$IUI/10-trade/analysis.cb"
+build_case "trade_edgar_fetch" "$OUT/trade_edgar_fetch" "$IUI/10-trade/edgar_fetch.cb"
 
 # Remove artifacts the run_case demos write into the tree (raytracer -> render.bmp
 # in cwd; json_config -> config.out.json next to its input) so the gate is clean.
 rm -f render.bmp example/tools/config.out.json
+rm -f results/pead_selftest_ar_by_quintile.bmp results/pead_selftest_cum_ar.bmp
+rm -f results/pead_selftest_equity.bmp results/pead_selftest_events.csv
+rm -f results/pead_selftest_report.md
+rm -f data/earnings_test/prices/SPY.csv
+rm -f data/earnings_test/prices/TS01.csv data/earnings_test/prices/TS02.csv
+rm -f data/earnings_test/prices/TS03.csv data/earnings_test/prices/TS04.csv
+rm -f data/earnings_test/prices/TS05.csv data/earnings_test/prices/TS06.csv
+rm -f data/earnings_test/prices/TS07.csv data/earnings_test/prices/TS08.csv
+rm -f data/earnings_test/prices/TS09.csv data/earnings_test/prices/TS10.csv
+rm -f data/earnings_test/prices/TS11.csv data/earnings_test/prices/TS12.csv
+rm -f data/earnings_test/prices/TS13.csv data/earnings_test/prices/TS14.csv
+rm -f data/earnings_test/prices/TS15.csv
+rm -f data/earnings_test/TS01.csv data/earnings_test/TS02.csv
+rm -f data/earnings_test/TS03.csv data/earnings_test/TS04.csv
+rm -f data/earnings_test/TS05.csv data/earnings_test/TS06.csv
+rm -f data/earnings_test/TS07.csv data/earnings_test/TS08.csv
+rm -f data/earnings_test/TS09.csv data/earnings_test/TS10.csv
+rm -f data/earnings_test/TS11.csv data/earnings_test/TS12.csv
+rm -f data/earnings_test/TS13.csv data/earnings_test/TS14.csv
+rm -f data/earnings_test/TS15.csv
+rmdir data/earnings_test/prices data/earnings_test data 2>/dev/null || true
+rmdir results 2>/dev/null || true
 
 echo "== summary: $PASS passed, $FAIL failed =="
 if [ $FAIL -ne 0 ]; then

@@ -1,0 +1,1341 @@
+// ---------------------------------------------------------------------------
+// pead.cb  --  Post-Earnings Announcement Drift (PEAD) research tool.
+//
+// Reads quarterly EPS histories (data/earnings/<SYM>.csv, written by
+// bin/edgar_fetch) plus the matching daily price bars (data/<SYM>.csv) and:
+//
+//   1. builds a YoY standardised-unexpected-earnings (SUE) score per quarter,
+//   2. runs an event study of abnormal returns (stock minus SPY) around the
+//      filing date, bucketed by SUE quintile,
+//   3. backtests a long-only "buy the top SUE quintile, hold N days" strategy
+//      plus the mirror bottom-quintile control,
+//   4. writes results/pead_events.csv, results/pead_report.md and three BMP
+//      charts rendered through plot.cb.
+//
+// Usage:
+//   bin/pead [--hold 60] [--top 0.2] [--min-sue 0] [--slots 10]
+//            [--dir data/earnings] [--prices data] [--out results/pead]
+//   bin/pead --selftest      (generates synthetic fixtures with planted drift)
+// ---------------------------------------------------------------------------
+
+import "list.cb";
+import "string.cb";
+import "filesystem.cb";
+import "math.cb";
+
+import "backtest_engine.cb";
+import "plot.cb";
+
+move string fmtPct(double v, int dec)
+{
+    string body = fmtF(v * 100.0, dec);
+    return body + "%";
+}
+
+// ---------------------------------------------------------------------------
+// Per-symbol container: price bars plus the quarterly EPS history.
+// ---------------------------------------------------------------------------
+
+// `bars` is `unique` so the synthesized destructor frees it; a plain `T*` field
+// owns nothing in CFlat.  Instances live in a `list<unique SymSeries*>`, which is
+// what actually keeps them alive - a bare `SymSeries* s = new SymSeries;` local is
+// freed at scope exit even after being added to a non-unique container.
+class SymSeries
+{
+    string sym;
+    unique list<Bar>* bars = nullptr;
+    list<string> periodEnd;
+    list<string> filed;
+    list<double> eps;
+};
+
+// Read data/earnings/<SYM>.csv:  period_end,filed,fiscal_year,fiscal_period,eps
+bool loadEarnings(SymSeries* s, string path)
+{
+    File* f = new File;
+    if (!f->openRead(path)) { delete f; return false; }
+    string header = f->readLine();
+    while (!f->atEnd())
+    {
+        string line = f->readLine();
+        if (line.length() == 0) continue;
+        list<string> fields = line.split(",");
+        if (fields.count() < 5) continue;
+        string pe = fields.get(0);
+        string fl = fields.get(1);
+        string ep = fields.get(4);
+        if (pe.length() < 10) continue;
+        s->periodEnd.add(move pe);
+        s->filed.add(move fl);
+        s->eps.add(ep.toDouble());
+    }
+    f->close();
+    delete f;
+    return s->eps.count() > 0;
+}
+
+// ---------------------------------------------------------------------------
+// Date lookups.  Bars are sorted ascending by date, so a lower-bound binary
+// search gives "first trading day >= date" directly.
+// ---------------------------------------------------------------------------
+
+int lowerBoundDate(list<Bar>* bars, string date)
+{
+    int lo = 0;
+    int hi = bars->count();
+    while (lo < hi)
+    {
+        int mid = lo + (hi - lo) / 2;
+        string d = bars->get(mid).date;
+        if (d < date) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+double adjAt(list<Bar>* bars, int i)
+{
+    if (i < 0 || i >= bars->count()) return 0.0;
+    return bars->get(i).adj_close;
+}
+
+move string dateAt(list<Bar>* bars, int i)
+{
+    if (i < 0 || i >= bars->count()) return "";
+    return bars->get(i).date;
+}
+
+// ---------------------------------------------------------------------------
+// SUE
+//
+// SUE(q) = (eps[q] - eps[q-4]) / stdev(last 8 available YoY diffs ending at q-1)
+// with a minimum of 4 diffs in the denominator.  Returns false when the quarter
+// does not have enough history (or the denominator collapses to zero).
+// ---------------------------------------------------------------------------
+
+bool sueFor(list<double>* eps, int q, double* sueOut, double* diffOut)
+{
+    if (q < 8) return false;
+    if (q >= eps->count()) return false;
+
+    double diff = eps->get(q) - eps->get(q - 4);
+    *diffOut = diff;
+
+    // Collect the YoY diffs for quarters q-1 .. q-8 (those that exist).
+    list<double> hist;
+    int j = q - 1;
+    while (j >= 4 && hist.count() < 8)
+    {
+        hist.add(eps->get(j) - eps->get(j - 4));
+        j--;
+    }
+    if (hist.count() < 4) return false;
+
+    double sum = 0.0;
+    int i = 0;
+    while (i < hist.count()) { sum += hist.get(i); i++; }
+    double mean = sum / (double)hist.count();
+    double sq = 0.0;
+    i = 0;
+    while (i < hist.count())
+    {
+        double d = hist.get(i) - mean;
+        sq += d * d;
+        i++;
+    }
+    double sd = Math.sqrt(sq / (double)(hist.count() - 1));
+    if (sd <= 1.0e-12) return false;
+
+    *sueOut = diff / sd;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Events
+//
+// Deliberately free of `string` fields so the list can be sorted and copied
+// without ownership subtleties; the symbol / dates are recovered from the
+// SymSeries by (sym, q).
+// ---------------------------------------------------------------------------
+
+const int CAR_LEN = 61;      // cumulative AR days 0..60
+
+struct Event
+{
+    int sym = 0;
+    int q = 0;
+    int t0 = 0;          // index into the symbol's bars of the event day
+    int spyT0 = 0;
+    int spyEntry = 0;    // SPY index of the entry day (t0 + 1)
+    double eps = 0.0;
+    double epsYoy = 0.0;
+    double sue = 0.0;
+    int quintile = 0;
+    double arPre = 0.0;
+    double arAnn = 0.0;
+    double ar5 = 0.0;
+    double ar20 = 0.0;
+    double ar60 = 0.0;
+};
+
+// Sortable helper: an event index keyed by its entry day.
+struct EvKey
+{
+    int day = 0;
+    int ev = 0;
+    double sue = 0.0;
+};
+
+// Abnormal return of `bars` over [a, b] minus SPY over the same calendar span.
+double abnormal(list<Bar>* bars, list<Bar>* spy, int a, int b)
+{
+    double pa = adjAt(bars, a);
+    double pb = adjAt(bars, b);
+    if (pa <= 0.0 || pb <= 0.0) return 0.0;
+    string da = dateAt(bars, a);
+    string db = dateAt(bars, b);
+    int sa = lowerBoundDate(spy, da);
+    int sb = lowerBoundDate(spy, db);
+    if (sa >= spy->count()) sa = spy->count() - 1;
+    if (sb >= spy->count()) sb = spy->count() - 1;
+    double qa = adjAt(spy, sa);
+    double qb = adjAt(spy, sb);
+    if (qa <= 0.0 || qb <= 0.0) return 0.0;
+    return (pb / pa) - (qb / qa);
+}
+
+// Build every usable event for one symbol; appends to `events` and pushes a
+// 61-element cumulative-AR path onto `cars` for each event added.
+void buildEvents(int symIdx, SymSeries* s, list<Bar>* spy, list<Event>* events, list<double>* cars)
+{
+    list<Bar>* bars = s->bars;
+    int nb = bars->count();
+    if (nb < 100) return;
+
+    int nq = s->eps.count();
+    int q = 8;
+    while (q < nq)
+    {
+        double sue = 0.0;
+        double diff = 0.0;
+        if (!sueFor(&s->eps, q, &sue, &diff)) { q++; continue; }
+
+        string filedDate = s->filed.get(q);
+        if (filedDate.length() < 10) { q++; continue; }
+        int t0 = lowerBoundDate(bars, filedDate);
+        if (t0 < 5 || t0 + CAR_LEN >= nb) { q++; continue; }
+
+        Event e = default;
+        e.sym = symIdx;
+        e.q = q;
+        e.t0 = t0;
+        e.eps = s->eps.get(q);
+        e.epsYoy = diff;
+        e.sue = sue;
+        e.arPre = abnormal(bars, spy, t0 - 5, t0 - 1);
+        e.arAnn = abnormal(bars, spy, t0 - 1, t0 + 1);
+        e.ar5 = abnormal(bars, spy, t0 + 1, t0 + 5);
+        e.ar20 = abnormal(bars, spy, t0 + 1, t0 + 20);
+        e.ar60 = abnormal(bars, spy, t0 + 1, t0 + 60);
+
+        string d0 = dateAt(bars, t0);
+        string d1 = dateAt(bars, t0 + 1);
+        e.spyT0 = lowerBoundDate(spy, d0);
+        e.spyEntry = lowerBoundDate(spy, d1);
+
+        // Cumulative AR path, day 0 .. 60, measured from the event-day close.
+        int k = 0;
+        while (k < CAR_LEN)
+        {
+            cars->add(abnormal(bars, spy, t0, t0 + k));
+            k++;
+        }
+        events->add(e);
+        q++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Quintiles
+// ---------------------------------------------------------------------------
+
+double percentileSorted(list<double>* sorted, double p)
+{
+    int n = sorted->count();
+    if (n == 0) return 0.0;
+    int idx = (int)(p * (double)n);
+    if (idx < 0) idx = 0;
+    if (idx >= n) idx = n - 1;
+    return sorted->get(idx);
+}
+
+void assignQuintiles(list<Event>* events)
+{
+    list<double> sues;
+    int i = 0;
+    while (i < events->count()) { sues.add(events->get(i).sue); i++; }
+    sues.sort((double a, double b) => { return a < b; });
+
+    double b1 = percentileSorted(&sues, 0.2);
+    double b2 = percentileSorted(&sues, 0.4);
+    double b3 = percentileSorted(&sues, 0.6);
+    double b4 = percentileSorted(&sues, 0.8);
+
+    i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        int qi = 1;
+        if (e.sue >= b1) qi = 2;
+        if (e.sue >= b2) qi = 3;
+        if (e.sue >= b3) qi = 4;
+        if (e.sue >= b4) qi = 5;
+        e.quintile = qi;
+        events->set(i, e);
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-quintile statistics for one AR window.
+// ---------------------------------------------------------------------------
+
+struct WinStats
+{
+    int n = 0;
+    double mean = 0.0;
+    double sd = 0.0;
+    double hit = 0.0;
+    double t = 0.0;
+};
+
+// `which` selects the window: 0 pre, 1 announce, 2 +1..+5, 3 +1..+20, 4 +1..+60.
+double arOf(Event e, int which)
+{
+    if (which == 0) return e.arPre;
+    if (which == 1) return e.arAnn;
+    if (which == 2) return e.ar5;
+    if (which == 3) return e.ar20;
+    return e.ar60;
+}
+
+// quint == 0 means "all events".
+WinStats statsFor(list<Event>* events, int quint, int which)
+{
+    WinStats w = default;
+    double sum = 0.0;
+    int wins = 0;
+    int i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        if (quint == 0 || e.quintile == quint)
+        {
+            double v = arOf(e, which);
+            sum += v;
+            if (v > 0.0) wins++;
+            w.n++;
+        }
+        i++;
+    }
+    if (w.n == 0) return w;
+    w.mean = sum / (double)w.n;
+    w.hit = (double)wins / (double)w.n;
+
+    double sq = 0.0;
+    i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        if (quint == 0 || e.quintile == quint)
+        {
+            double d = arOf(e, which) - w.mean;
+            sq += d * d;
+        }
+        i++;
+    }
+    if (w.n > 1)
+    {
+        w.sd = Math.sqrt(sq / (double)(w.n - 1));
+        if (w.sd > 0.0) w.t = w.mean / (w.sd / Math.sqrt((double)w.n));
+    }
+    return w;
+}
+
+// Mean cumulative-AR path for one quintile (61 points).
+void meanCar(list<Event>* events, list<double>* cars, int quint, list<double>* out)
+{
+    int k = 0;
+    while (k < CAR_LEN) { out->add(0.0); k++; }
+    int n = 0;
+    int i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        if (e.quintile == quint)
+        {
+            n++;
+            k = 0;
+            while (k < CAR_LEN)
+            {
+                out->set(k, out->get(k) + cars->get(i * CAR_LEN + k));
+                k++;
+            }
+        }
+        i++;
+    }
+    if (n == 0) return;
+    k = 0;
+    while (k < CAR_LEN) { out->set(k, out->get(k) / (double)n); k++; }
+}
+
+// ---------------------------------------------------------------------------
+// Strategy backtest
+// ---------------------------------------------------------------------------
+
+struct Position
+{
+    int sym = 0;
+    int entryIdx = 0;      // stock bar index of the entry close
+    double entryPrice = 0.0;
+    double notional = 0.0; // capital committed, net of the entry cost
+    int exitSpy = 0;       // SPY index at which the position is closed
+};
+
+struct PerfStats
+{
+    double totalReturn = 0.0;
+    double cagr = 0.0;
+    double vol = 0.0;
+    double sharpe = 0.0;
+    double maxdd = 0.0;
+    int positions = 0;
+    double winRate = 0.0;
+};
+
+const double HALF_COST = 0.0005;   // 10 bps round trip
+
+// Index of the stock bar to mark at SPY date `d` (last bar with date <= d).
+int markIndex(list<Bar>* bars, string d)
+{
+    int i = lowerBoundDate(bars, d);
+    if (i >= bars->count()) i = bars->count() - 1;
+    else
+    {
+        string bd = dateAt(bars, i);
+        if (bd > d) i--;
+    }
+    if (i < 0) i = 0;
+    return i;
+}
+
+// side == 1: long the top SUE quintile.  side == -1: long the bottom quintile
+// (the mirror control portfolio).
+PerfStats runStrategy(list<Event>* events, list<unique SymSeries*>* syms, list<Bar>* spy,
+                      int side, int hold, double topFrac, double minSue, int slots,
+                      list<double>* equityOut, list<string>* datesOut)
+{
+    PerfStats perf = default;
+
+    // Events keyed by entry day, ascending.
+    list<EvKey> keys;
+    int i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        EvKey k = default;
+        k.day = e.spyEntry;
+        k.ev = i;
+        k.sue = e.sue;
+        keys.add(k);
+        i++;
+    }
+    if (keys.count() == 0) return perf;
+    keys.sort((EvKey a, EvKey b) => { return a.day < b.day; });
+
+    // Events keyed by announcement day: the expanding-window quintile boundary
+    // may only look at events that were already public.
+    list<EvKey> byT0;
+    i = 0;
+    while (i < events->count())
+    {
+        Event e = events->get(i);
+        EvKey k = default;
+        k.day = e.spyT0;
+        k.ev = i;
+        k.sue = e.sue;
+        byT0.add(k);
+        i++;
+    }
+    byT0.sort((EvKey a, EvKey b) => { return a.day < b.day; });
+
+    int startDay = keys.get(0).day;
+    int nSpy = spy->count();
+    if (startDay >= nSpy) return perf;
+
+    list<Position> open;
+    list<double> known;      // SUEs of already-announced events (kept sorted)
+    double equity = 1.0;
+    double peak = 1.0;
+    double worst = 0.0;
+    double sumR = 0.0;
+    double sumR2 = 0.0;
+    int nR = 0;
+    int wins = 0;
+
+    int ki = 0;              // cursor into `keys`
+    int ti = 0;              // cursor into `byT0`
+    // Seed the "known" pool with everything announced before the first entry.
+    while (ti < byT0.count() && byT0.get(ti).day < startDay)
+    {
+        known.add(byT0.get(ti).sue);
+        ti++;
+    }
+    known.sort((double a, double b) => { return a < b; });
+
+    int d = startDay;
+    while (d < nSpy)
+    {
+        string today = dateAt(spy, d);
+
+        // 1. mark the book to market and close whatever matured today.
+        double invested = 0.0;
+        int p = 0;
+        while (p < open.count())
+        {
+            Position pos = open.get(p);
+            SymSeries* ss = syms->get(pos.sym);
+            int mi = markIndex(ss->bars, today);
+            double px = adjAt(ss->bars, mi);
+            double value = pos.entryPrice > 0.0 ? pos.notional * px / pos.entryPrice : pos.notional;
+            if (d >= pos.exitSpy)
+            {
+                value = value * (1.0 - HALF_COST);
+                equity += value;                 // back to cash
+                if (value > pos.notional) wins++;
+                perf.positions++;
+                open.removeAt(p);
+                continue;
+            }
+            invested += value;
+            p++;
+        }
+
+        double totalBefore = equity + invested;
+
+        // 2. absorb every announcement that became public on or before today.
+        while (ti < byT0.count() && byT0.get(ti).day <= d)
+        {
+            known.add(byT0.get(ti).sue);
+            ti++;
+        }
+        known.sort((double a, double b) => { return a < b; });
+
+        // 3. today's candidates.
+        list<EvKey> cands;
+        while (ki < keys.count() && keys.get(ki).day < d) ki++;
+        int scan = ki;
+        while (scan < keys.count() && keys.get(scan).day == d)
+        {
+            cands.add(keys.get(scan));
+            scan++;
+        }
+
+        if (cands.count() > 0 && open.count() < slots)
+        {
+            // Expanding-window boundary; fall back to --min-sue early on.
+            double bound = minSue;
+            if (known.count() >= 20)
+            {
+                bound = side > 0 ? percentileSorted(&known, 1.0 - topFrac)
+                                 : percentileSorted(&known, topFrac);
+            }
+            if (side > 0) cands.sort((EvKey a, EvKey b) => { return a.sue > b.sue; });
+            else cands.sort((EvKey a, EvKey b) => { return a.sue < b.sue; });
+
+            int c = 0;
+            while (c < cands.count() && open.count() < slots)
+            {
+                EvKey ck = cands.get(c);
+                bool ok = side > 0 ? (ck.sue >= bound && ck.sue >= minSue)
+                                   : (ck.sue <= bound);
+                if (ok)
+                {
+                    Event e = events->get(ck.ev);
+                    SymSeries* ss = syms->get(e.sym);
+                    int entryIdx = e.t0 + 1;
+                    double px = adjAt(ss->bars, entryIdx);
+                    int exitIdx = entryIdx + hold;
+                    if (px > 0.0 && exitIdx < ss->bars->count())
+                    {
+                        string exitDate = dateAt(ss->bars, exitIdx);
+                        int exitSpy = lowerBoundDate(spy, exitDate);
+                        if (exitSpy >= nSpy) exitSpy = nSpy - 1;
+                        double alloc = totalBefore / (double)slots;
+                        if (alloc > equity) alloc = equity;
+                        if (alloc > 0.0)
+                        {
+                            Position pos = default;
+                            pos.sym = e.sym;
+                            pos.entryIdx = entryIdx;
+                            pos.entryPrice = px;
+                            pos.notional = alloc * (1.0 - HALF_COST);
+                            pos.exitSpy = exitSpy;
+                            equity -= alloc;
+                            open.add(pos);
+                        }
+                    }
+                }
+                c++;
+            }
+        }
+
+        // 4. end-of-day equity.
+        invested = 0.0;
+        p = 0;
+        while (p < open.count())
+        {
+            Position pos = open.get(p);
+            SymSeries* ss = syms->get(pos.sym);
+            int mi = markIndex(ss->bars, today);
+            double px = adjAt(ss->bars, mi);
+            invested += pos.entryPrice > 0.0 ? pos.notional * px / pos.entryPrice : pos.notional;
+            p++;
+        }
+        double total = equity + invested;
+
+        if (equityOut->count() > 0)
+        {
+            double prev = equityOut->get(equityOut->count() - 1);
+            double r = prev > 0.0 ? total / prev - 1.0 : 0.0;
+            sumR += r;
+            sumR2 += r * r;
+            nR++;
+        }
+        equityOut->add(total);
+        datesOut->add(today.copy());
+
+        if (total > peak) peak = total;
+        double dd = peak > 0.0 ? total / peak - 1.0 : 0.0;
+        if (dd < worst) worst = dd;
+
+        d++;
+    }
+
+    // Liquidate anything still open at the end of the sample.
+    while (open.count() > 0)
+    {
+        Position pos = open.take(0);
+        SymSeries* ss = syms->get(pos.sym);
+        double px = adjAt(ss->bars, ss->bars->count() - 1);
+        double value = pos.entryPrice > 0.0 ? pos.notional * px / pos.entryPrice : pos.notional;
+        value = value * (1.0 - HALF_COST);
+        if (value > pos.notional) wins++;
+        perf.positions++;
+    }
+
+    double last = equityOut->count() > 0 ? equityOut->get(equityOut->count() - 1) : 1.0;
+    perf.totalReturn = last - 1.0;
+    double years = (double)nR / 252.0;
+    perf.cagr = years > 0.0 && last > 0.0 ? Math.pow(last, 1.0 / years) - 1.0 : 0.0;
+    double mean = nR > 0 ? sumR / (double)nR : 0.0;
+    double var = nR > 1 ? sumR2 / (double)nR - mean * mean : 0.0;
+    if (var < 0.0) var = 0.0;
+    perf.vol = Math.sqrt(var) * Math.sqrt(252.0);
+    perf.sharpe = perf.vol > 0.0 ? mean * 252.0 / perf.vol : 0.0;
+    perf.maxdd = worst;
+    perf.winRate = perf.positions > 0 ? (double)wins / (double)perf.positions : 0.0;
+    return perf;
+}
+
+// SPY buy-and-hold over the same calendar span, for the benchmark column.
+PerfStats spyBuyHold(list<Bar>* spy, int startDay, list<double>* equityOut)
+{
+    PerfStats perf = default;
+    int n = spy->count();
+    if (startDay < 0 || startDay >= n) return perf;
+    double base = adjAt(spy, startDay);
+    if (base <= 0.0) return perf;
+
+    double peak = 1.0;
+    double worst = 0.0;
+    double sumR = 0.0;
+    double sumR2 = 0.0;
+    int nR = 0;
+    int d = startDay;
+    while (d < n)
+    {
+        double v = adjAt(spy, d) / base;
+        if (equityOut->count() > 0)
+        {
+            double prev = equityOut->get(equityOut->count() - 1);
+            double r = prev > 0.0 ? v / prev - 1.0 : 0.0;
+            sumR += r;
+            sumR2 += r * r;
+            nR++;
+        }
+        equityOut->add(v);
+        if (v > peak) peak = v;
+        double dd = v / peak - 1.0;
+        if (dd < worst) worst = dd;
+        d++;
+    }
+    double last = equityOut->get(equityOut->count() - 1);
+    perf.totalReturn = last - 1.0;
+    double years = (double)nR / 252.0;
+    perf.cagr = years > 0.0 ? Math.pow(last, 1.0 / years) - 1.0 : 0.0;
+    double mean = nR > 0 ? sumR / (double)nR : 0.0;
+    double var = nR > 1 ? sumR2 / (double)nR - mean * mean : 0.0;
+    if (var < 0.0) var = 0.0;
+    perf.vol = Math.sqrt(var) * Math.sqrt(252.0);
+    perf.sharpe = perf.vol > 0.0 ? mean * 252.0 / perf.vol : 0.0;
+    perf.maxdd = worst;
+    return perf;
+}
+
+// ---------------------------------------------------------------------------
+// Report / CSV / chart output
+// ---------------------------------------------------------------------------
+
+move string windowName(int which)
+{
+    if (which == 0) return "pre (-5..-1)";
+    if (which == 1) return "announce (-1..+1)";
+    if (which == 2) return "drift (+1..+5)";
+    if (which == 3) return "drift (+1..+20)";
+    return "drift (+1..+60)";
+}
+
+void appendQuintileTable(stringbuilder* sb, list<Event>* events, int which)
+{
+    sb->append("| Quintile | N | Mean AR | Hit rate | t-stat |\n|---|---|---|---|---|\n");
+    int qi = 1;
+    while (qi <= 5)
+    {
+        WinStats w = statsFor(events, qi, which);
+        sb->append("| Q" + qi.toString());
+        sb->append(" | " + w.n.toString());
+        sb->append(" | " + fmtPct(w.mean, 2));
+        sb->append(" | " + fmtPct(w.hit, 1));
+        sb->append(" | " + fmtF(w.t, 2));
+        sb->append(" |\n");
+        qi++;
+    }
+    WinStats all = statsFor(events, 0, which);
+    sb->append("| all | " + all.n.toString() + " | " + fmtPct(all.mean, 2));
+    sb->append(" | " + fmtPct(all.hit, 1) + " | " + fmtF(all.t, 2) + " |\n");
+
+    WinStats q5 = statsFor(events, 5, which);
+    WinStats q1 = statsFor(events, 1, which);
+    sb->append("| **Q5 - Q1** | | **" + fmtPct(q5.mean - q1.mean, 2) + "** | | |\n\n");
+}
+
+void appendPerfRow(stringbuilder* sb, string label, PerfStats* p)
+{
+    sb->append("| " + label);
+    sb->append(" | " + fmtPct(p->totalReturn, 2));
+    sb->append(" | " + fmtPct(p->cagr, 2));
+    sb->append(" | " + fmtPct(p->vol, 2));
+    sb->append(" | " + fmtF(p->sharpe, 3));
+    sb->append(" | " + fmtPct(p->maxdd, 2));
+    sb->append(" | " + p->positions.toString());
+    sb->append(" | " + fmtPct(p->winRate, 1));
+    sb->append(" |\n");
+}
+
+void chartArByQuintile(list<Event>* events, string path)
+{
+    Plot* p = new Plot;
+    p->create(1000, 620, 0x1e1e1e);
+    list<string> labels;
+    list<double> vals;
+    int qi = 1;
+    while (qi <= 5)
+    {
+        WinStats w = statsFor(events, qi, 4);
+        labels.add("Q" + qi.toString());
+        vals.add(w.mean);
+        qi++;
+    }
+    drawBarChart(p, 0, 0, 1000, 620, "mean 60d abnormal return by SUE quintile",
+                 &labels, &vals, 0x81c784, 0xe57373);
+    p->saveBmp(path);
+    delete p;
+}
+
+void chartCumAr(list<Event>* events, list<double>* cars, string path)
+{
+    Plot* p = new Plot;
+    p->create(1100, 640, 0x1e1e1e);
+
+    list<double>* c1 = new list<double>;
+    list<double>* c3 = new list<double>;
+    list<double>* c5 = new list<double>;
+    meanCar(events, cars, 1, c1);
+    meanCar(events, cars, 3, c3);
+    meanCar(events, cars, 5, c5);
+
+    list<string> labels;
+    int k = 0;
+    while (k < CAR_LEN) { labels.add(k.toString()); k++; }
+
+    list<Series> ss;
+    Series a = Series(); a.name = "Q1"; a.y = c1; a.color = 0xe57373; ss.add(move a);
+    Series b = Series(); b.name = "Q3"; b.y = c3; b.color = 0xffb74d; ss.add(move b);
+    Series c = Series(); c.name = "Q5"; c.y = c5; c.color = 0x81c784; ss.add(move c);
+
+    drawLineChart(p, 0, 0, 1100, 640, "mean cumulative AR, event day 0 to +60", &labels, &ss, false);
+    p->saveBmp(path);
+    delete p;
+    delete c1;
+    delete c3;
+    delete c5;
+}
+
+void chartEquity(list<string>* dates, list<double>* stratEq, list<double>* spyEq,
+                 list<double>* ctrlEq, string path)
+{
+    Plot* p = new Plot;
+    p->create(1200, 700, 0x1e1e1e);
+    list<Series> ss;
+    Series a = Series(); a.name = "Q5 strategy"; a.y = stratEq; a.color = 0x81c784; ss.add(move a);
+    Series b = Series(); b.name = "SPY"; b.y = spyEq; b.color = 0x4fc3f7; ss.add(move b);
+    Series c = Series(); c.name = "Q1 control"; c.y = ctrlEq; c.color = 0xe57373; ss.add(move c);
+    drawLineChart(p, 0, 0, 1200, 700, "PEAD strategy vs SPY vs Q1 control", dates, &ss, false);
+    p->saveBmp(path);
+    delete p;
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic fixtures (used by --selftest)
+//
+// A deterministic xorshift generator drives everything so a passing selftest
+// stays passing.
+// ---------------------------------------------------------------------------
+
+class Rng
+{
+    // xorshift32 on a u64 state with u-suffixed 32-bit masks.
+    u64 s = 2463534242u;
+    double next()
+    {
+        s = s ^ ((s << 13) & 0xFFFFFFFFu);
+        s = s ^ (s >> 17);
+        s = s ^ ((s << 5) & 0xFFFFFFFFu);
+        return (double)s / 4294967296.0;
+    }
+    double gauss()
+    {
+        double sum = 0.0;
+        int i = 0;
+        while (i < 12) { sum += next(); i++; }
+        return sum - 6.0;
+    }
+};
+
+// Gregorian date from a day count since 1970-01-01 (Howard Hinnant's algorithm).
+move string dateFromEpochDay(i64 z)
+{
+    z += 719468;
+    i64 era = (z >= 0 ? z : z - 146096) / 146097;
+    i64 doe = z - era * 146097;
+    i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    i64 y = yoe + era * 400;
+    i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    i64 mp = (5 * doy + 2) / 153;
+    i64 dd = doy - (153 * mp + 2) / 5 + 1;
+    i64 mm = mp + (mp < 10 ? 3 : -9);
+    if (mm <= 2) y += 1;
+
+    stringbuilder sb;
+    sb.append(y);
+    sb.appendChar('-');
+    if (mm < 10) sb.appendChar('0');
+    sb.append(mm);
+    sb.appendChar('-');
+    if (dd < 10) sb.appendChar('0');
+    sb.append(dd);
+    return sb.toString();
+}
+
+// `n` weekday dates starting at 2015-01-02 (epoch day 16437, a Friday).
+void makeTradingDates(int n, list<string>* out)
+{
+    i64 z = 16437;
+    while (out->count() < n)
+    {
+        // (z + 4) % 7 is the ISO-free weekday with 0 = Sunday (1970-01-01 was a
+        // Thursday, which lands on 4).
+        i64 dow = (z + 4) % 7;
+        if (dow != 0 && dow != 6) out->add(dateFromEpochDay(z));
+        z++;
+    }
+}
+
+move string fixtureSymbol(int i)
+{
+    stringbuilder sb;
+    sb.append("TS");
+    if (i + 1 < 10) sb.appendChar('0');
+    sb.append(i + 1);
+    return sb.toString();
+}
+
+const int FIX_SYMS  = 15;
+const int FIX_DAYS  = 1600;
+const int FIX_Q     = 24;
+const int FIX_FIRST = 60;    // bar index of the first quarter end
+const int FIX_STEP  = 63;    // trading days between quarter ends
+const int FIX_LAG   = 20;    // trading days from quarter end to filing
+
+// Write data/earnings_test/: prices/ (SPY + TS01..TS15) and the earnings CSVs.
+// Returns the planted Q5-minus-Q1 60-day drift spread that the analysis should
+// recover.
+double genFixtures(string dir)
+{
+    string priceDir = dir + "/prices";
+    _ = Directory.createAll(dir);
+    _ = Directory.createAll(priceDir);
+
+    list<string> dates;
+    makeTradingDates(FIX_DAYS, &dates);
+
+    Rng* rng = new Rng;
+
+    // --- pass 1: EPS histories and their SUEs ------------------------------
+    // epsAll is a flat FIX_SYMS x FIX_Q matrix.
+    list<double> epsAll;
+    int s = 0;
+    while (s < FIX_SYMS)
+    {
+        double base = 0.8 + rng->next();
+        int q = 0;
+        while (q < FIX_Q)
+        {
+            double shock = (rng->next() - 0.5) * 0.30;
+            epsAll.add(base + 0.02 * (double)q + shock);
+            q++;
+        }
+        s++;
+    }
+
+    list<double> sues;       // parallel to (symIdx, qIdx)
+    list<int> sueSym;
+    list<int> sueQ;
+    s = 0;
+    while (s < FIX_SYMS)
+    {
+        list<double> eps;
+        int q = 0;
+        while (q < FIX_Q) { eps.add(epsAll.get(s * FIX_Q + q)); q++; }
+        q = 8;
+        while (q < FIX_Q)
+        {
+            double sue = 0.0;
+            double diff = 0.0;
+            if (sueFor(&eps, q, &sue, &diff))
+            {
+                sues.add(sue);
+                sueSym.add(s);
+                sueQ.add(q);
+            }
+            q++;
+        }
+        s++;
+    }
+
+    list<double> sorted;
+    int i = 0;
+    while (i < sues.count()) { sorted.add(sues.get(i)); i++; }
+    sorted.sort((double a, double b) => { return a < b; });
+    double b1 = percentileSorted(&sorted, 0.2);
+    double b2 = percentileSorted(&sorted, 0.4);
+    double b3 = percentileSorted(&sorted, 0.6);
+    double b4 = percentileSorted(&sorted, 0.8);
+
+    // Planted 60-day drift per quintile.
+    list<double> drift;
+    i = 0;
+    while (i < sues.count())
+    {
+        double v = sues.get(i);
+        double t = -0.05;
+        if (v >= b1) t = -0.025;
+        if (v >= b2) t = 0.0;
+        if (v >= b3) t = 0.025;
+        if (v >= b4) t = 0.05;
+        drift.add(t);
+        i++;
+    }
+
+    // --- SPY -----------------------------------------------------------------
+    stringbuilder spyCsv;
+    spyCsv.append("date,open,high,low,close,adj_close,volume\n");
+    double px = 200.0;
+    i = 0;
+    while (i < FIX_DAYS)
+    {
+        if (i > 0) px = px * (1.0 + 0.0003 + rng->gauss() * 0.004);
+        string v = fmtF(px, 4);
+        spyCsv.append(dates.get(i) + "," + v + "," + v + "," + v + "," + v + "," + v + ",1000000\n");
+        i++;
+    }
+    _ = File.writeAllText(priceDir + "/SPY.csv", spyCsv.toString());
+
+    // --- pass 2: prices with the planted drift, plus the earnings CSVs -------
+    s = 0;
+    while (s < FIX_SYMS)
+    {
+        // Per-day extra drift for this symbol.
+        list<double> extra;
+        i = 0;
+        while (i < FIX_DAYS) { extra.add(0.0); i++; }
+
+        int e = 0;
+        while (e < sues.count())
+        {
+            if (sueSym.get(e) == s)
+            {
+                int t0 = FIX_FIRST + sueQ.get(e) * FIX_STEP + FIX_LAG;
+                double perDay = drift.get(e) / 60.0;
+                int k = 1;
+                while (k <= 60)
+                {
+                    int at = t0 + k;
+                    if (at < FIX_DAYS) extra.set(at, extra.get(at) + perDay);
+                    k++;
+                }
+            }
+            e++;
+        }
+
+        stringbuilder csv;
+        csv.append("date,open,high,low,close,adj_close,volume\n");
+        double p = 50.0 + 5.0 * (double)s;
+        i = 0;
+        while (i < FIX_DAYS)
+        {
+            if (i > 0) p = p * (1.0 + 0.0003 + rng->gauss() * 0.005 + extra.get(i));
+            string v = fmtF(p, 4);
+            csv.append(dates.get(i) + "," + v + "," + v + "," + v + "," + v + "," + v + ",500000\n");
+            i++;
+        }
+        string sym = fixtureSymbol(s);
+        _ = File.writeAllText(priceDir + "/" + sym + ".csv", csv.toString());
+
+        stringbuilder ecsv;
+        ecsv.append("period_end,filed,fiscal_year,fiscal_period,eps\n");
+        int q = 0;
+        while (q < FIX_Q)
+        {
+            int pe = FIX_FIRST + q * FIX_STEP;
+            int fl = pe + FIX_LAG;
+            if (fl + 61 >= FIX_DAYS) break;
+            int fy = 2015 + q / 4;
+            string fp = "Q" + (q % 4 + 1).toString();
+            ecsv.append(dates.get(pe) + "," + dates.get(fl) + "," + fy.toString() + "," + fp + "," + fmtF(epsAll.get(s * FIX_Q + q), 4) + "\n");
+            q++;
+        }
+        _ = File.writeAllText(dir + "/" + sym + ".csv", ecsv.toString());
+        s++;
+    }
+
+    delete rng;
+
+    // Planted spread: Q5 (+5%) minus Q1 (-5%).
+    return 0.10;
+}
+
+// ---------------------------------------------------------------------------
+// Driver
+// ---------------------------------------------------------------------------
+
+int firstEntryDay(list<Event>* events)
+{
+    int best = -1;
+    int i = 0;
+    while (i < events->count())
+    {
+        int d = events->get(i).spyEntry;
+        if (best < 0 || d < best) best = d;
+        i++;
+    }
+    return best;
+}
+
+// Collect the symbols that have both an earnings CSV and a price CSV.
+void discoverSymbols(string earnDir, string priceDir, list<string>* out)
+{
+    list<string>* names = Directory.listFiles(earnDir);
+    int i = 0;
+    while (i < names->count())
+    {
+        string nm = names->get(i);
+        i++;
+        if (!nm.endsWith(".csv")) continue;
+        string sym = nm.substring(0, nm.length() - 4);
+        if (sym == "SPY" || sym.length() == 0) continue;
+        if (!File.exists(priceDir + "/" + sym + ".csv")) continue;
+        out->add(move sym);
+    }
+    delete names;
+    out->sort((string a, string b) => { return a < b; });
+}
+
+// Runs the whole pipeline.  `spreadOut` receives the Q5-minus-Q1 mean 60-day
+// abnormal return so that --selftest can assert on it.
+int runAnalysis(string earnDir, string priceDir, string outPrefix,
+                int hold, double topFrac, double minSue, int slots,
+                double* spreadOut, bool writeReport)
+{
+    string spyPath = priceDir + "/SPY.csv";
+    if (!File.exists(spyPath))
+    {
+        printf("pead: missing benchmark %s\n", spyPath.data());
+        return 1;
+    }
+    list<Bar>* spy = loadCsv(spyPath);
+    if (spy->count() < 100)
+    {
+        printf("pead: benchmark %s has too little history\n", spyPath.data());
+            return 1;
+    }
+
+    list<string> symbols;
+    discoverSymbols(earnDir, priceDir, &symbols);
+    if (symbols.count() == 0)
+    {
+        printf("pead: no <SYM>.csv in %s with a matching price file in %s\n",
+               earnDir.data(), priceDir.data());
+        return 1;
+    }
+
+    list<unique SymSeries*> syms;
+    list<Event> events;
+    list<double> cars;
+    int skipped = 0;
+
+    int i = 0;
+    while (i < symbols.count())
+    {
+        string sym = symbols.get(i);
+        i++;
+        SymSeries* s = new SymSeries;
+        s->sym = sym.copy();
+        bool ok = loadEarnings(s, earnDir + "/" + sym + ".csv");
+        if (ok)
+        {
+            s->bars = loadCsv(priceDir + "/" + sym + ".csv");
+            ok = s->bars->count() >= 100;
+        }
+        if (!ok) { skipped++; continue; }   // `s` is released at scope exit
+        int idx = syms.count();
+        buildEvents(idx, s, spy, &events, &cars);
+        syms.add(move s);
+    }
+
+    printf("pead: %d symbols, %d usable events (%d symbols skipped)\n",
+           syms.count(), events.count(), skipped);
+    if (events.count() < 25)
+    {
+        printf("pead: not enough events for a quintile study\n");
+        return 1;
+    }
+
+    assignQuintiles(&events);
+
+    WinStats q5w = statsFor(&events, 5, 4);
+    WinStats q1w = statsFor(&events, 1, 4);
+    *spreadOut = q5w.mean - q1w.mean;
+
+    // --- strategy backtests --------------------------------------------------
+    list<double> stratEq;
+    list<string> stratDates;
+    PerfStats strat = runStrategy(&events, &syms, spy, 1, hold, topFrac, minSue, slots,
+                                  &stratEq, &stratDates);
+
+    list<double> ctrlEq;
+    list<string> ctrlDates;
+    PerfStats ctrl = runStrategy(&events, &syms, spy, -1, hold, topFrac, minSue, slots,
+                                 &ctrlEq, &ctrlDates);
+
+    int start = firstEntryDay(&events);
+    list<double> benchEq;
+    PerfStats bench = spyBuyHold(spy, start, &benchEq);
+
+    printf("pead: Q5 60d AR %s  Q1 %s  spread %s\n",
+           fmtPct(q5w.mean, 2).data(), fmtPct(q1w.mean, 2).data(), fmtPct(*spreadOut, 2).data());
+    printf("pead: strategy CAGR %s sharpe %s maxdd %s (%d positions)   SPY CAGR %s sharpe %s\n",
+           fmtPct(strat.cagr, 2).data(), fmtF(strat.sharpe, 3).data(), fmtPct(strat.maxdd, 2).data(),
+           strat.positions, fmtPct(bench.cagr, 2).data(), fmtF(bench.sharpe, 3).data());
+
+    if (writeReport)
+    {
+        _ = Directory.createAll("results");
+
+        // --- events CSV ------------------------------------------------------
+        stringbuilder csv;
+        csv.append("symbol,period_end,filed,t0,eps,eps_yoy,sue,quintile,ar_pre,ar_ann,ar_5,ar_20,ar_60\n");
+        i = 0;
+        while (i < events.count())
+        {
+            Event e = events.get(i);
+            SymSeries* s = syms.get(e.sym);
+            csv.append(s->sym + ",");
+            csv.append(s->periodEnd.get(e.q) + ",");
+            csv.append(s->filed.get(e.q) + ",");
+            csv.append(dateAt(s->bars, e.t0) + ",");
+            csv.append(fmtF(e.eps, 4) + "," + fmtF(e.epsYoy, 4) + "," + fmtF(e.sue, 4) + ",");
+            csv.append(e.quintile.toString() + ",");
+            csv.append(fmtF(e.arPre, 6) + "," + fmtF(e.arAnn, 6) + "," + fmtF(e.ar5, 6) + ",");
+            csv.append(fmtF(e.ar20, 6) + "," + fmtF(e.ar60, 6) + "\n");
+            i++;
+        }
+        _ = File.writeAllText(outPrefix + "_events.csv", csv.toString());
+
+        // --- markdown report --------------------------------------------------
+        stringbuilder md;
+        md.append("# Post-earnings announcement drift\n\n");
+        int nEvents = events.count();
+        md.append("Universe: " + syms.count().toString() + " symbols with both an earnings history in `");
+        md.append(earnDir + "` and daily bars in `" + priceDir + "`.  ");
+        md.append(nEvents.toString() + " usable quarterly events.\n\n");
+
+        md.append("## Method\n\n");
+        md.append("* `SUE(q) = (eps[q] - eps[q-4]) / stdev(YoY diffs for q-1..q-8)` (at least four diffs required).\n");
+        md.append("* Event day `t0` is the first trading day on or after the SEC filing date.\n");
+        md.append("* Abnormal return `AR(a,b) = close[b]/close[a] - SPY close[b']/SPY close[a']` over the same calendar span.\n");
+        md.append("* Quintiles are formed from the pooled SUE distribution of the whole sample (the backtest instead uses an\n");
+        md.append("  expanding window so it never sees a future boundary).\n\n");
+
+        md.append("## Event study\n\n");
+        int w = 0;
+        while (w < 5)
+        {
+            md.append("### " + windowName(w) + "\n\n");
+            appendQuintileTable(&md, &events, w);
+            w++;
+        }
+
+        md.append("## Strategy backtest\n\n");
+        md.append("Long only, at most " + slots.toString() + " concurrent positions, each sized at 1/" + slots.toString());
+        md.append(" of equity at the moment it is opened.  Entry is the close of `t0+1`, exit is " + hold.toString());
+        md.append(" trading days later, 10 bps round-trip cost, idle cash earns nothing.\n");
+        md.append("The Q5 book takes events whose SUE clears the expanding-window top ");
+        md.append(fmtPct(topFrac, 0) + " of already-announced events (fallback `--min-sue " + fmtF(minSue, 2) + "`); ");
+        md.append("the Q1 control takes the mirror bottom " + fmtPct(topFrac, 0) + ".\n\n");
+        md.append("| Book | Total return | CAGR | Vol | Sharpe | Max DD | Positions | Win rate |\n");
+        md.append("|---|---|---|---|---|---|---|---|\n");
+        appendPerfRow(&md, "Q5 (top SUE)", &strat);
+        appendPerfRow(&md, "Q1 control", &ctrl);
+        appendPerfRow(&md, "SPY buy & hold", &bench);
+        md.append("\n");
+        if (stratDates.count() > 0)
+        {
+            md.append("Span: " + stratDates.get(0) + " to ");
+            int nDaysRun = stratDates.count();
+            md.append(stratDates.get(nDaysRun - 1) + " (" + nDaysRun.toString() + " trading days).\n\n");
+        }
+
+        md.append("## Caveats\n\n");
+        md.append("* The SEC **filing** date lags the press release by 0-5 days, so the announce-window return here is\n");
+        md.append("  partially contaminated: much of the real announcement move has already happened before `t0`.\n");
+        md.append("  Treat the announce column as descriptive, not tradable.\n");
+        md.append("* There is no analyst-consensus data in this pipeline, so SUE is **year-over-year** rather than\n");
+        md.append("  surprise-versus-consensus.  Seasonal EPS patterns are removed, but genuine expectations are not.\n");
+        md.append("* **Survivorship bias**: the universe is today's large caps, so companies that shrank or were delisted\n");
+        md.append("  are missing and the sample is tilted toward winners.\n");
+        md.append("* Positions are equal-weighted at 1/slots of equity, so the book is often only partly invested; the CAGR\n");
+        md.append("  is therefore not directly comparable to a fully invested SPY.\n");
+        md.append("* Fills at the closing price ignore the spread and any market impact beyond the flat 10 bps.\n\n");
+
+        md.append("## Charts\n\n");
+        md.append("* `" + outPrefix + "_ar_by_quintile.bmp` - mean 60-day AR per SUE quintile\n");
+        md.append("* `" + outPrefix + "_cum_ar.bmp` - mean cumulative AR, day 0..60, for Q1/Q3/Q5\n");
+        md.append("* `" + outPrefix + "_equity.bmp` - strategy vs SPY vs Q1 control\n");
+
+        _ = File.writeAllText(outPrefix + "_report.md", md.toString());
+
+        chartArByQuintile(&events, outPrefix + "_ar_by_quintile.bmp");
+        chartCumAr(&events, &cars, outPrefix + "_cum_ar.bmp");
+        chartEquity(&stratDates, &stratEq, &benchEq, &ctrlEq, outPrefix + "_equity.bmp");
+
+        printf("pead: wrote %s_events.csv, %s_report.md and 3 charts\n", outPrefix.data(), outPrefix.data());
+    }
+
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Selftest: synthetic data with a planted +5% / -5% 60-day drift on the top and
+// bottom SUE quintiles.  The recovered Q5-Q1 spread must exceed 5%.
+// ---------------------------------------------------------------------------
+
+int selftest()
+{
+    string dir = "data/earnings_test";
+    double planted = genFixtures(dir);
+    printf("pead selftest: generated fixtures in %s (planted Q5-Q1 spread %s)\n",
+           dir.data(), fmtPct(planted, 2).data());
+
+    double spread = 0.0;
+    _ = Directory.createAll("results");
+    int rc = runAnalysis(dir, dir + "/prices", "results/pead_selftest", 60, 0.2, 0.0, 10, &spread, true);
+    if (rc != 0)
+    {
+        printf("pead selftest: FAIL (analysis returned %d)\n", rc);
+        return 1;
+    }
+    printf("pead selftest: recovered Q5-Q1 60d spread = %s (need > 5.00%%)\n", fmtPct(spread, 2).data());
+    if (spread <= 0.05)
+    {
+        printf("pead selftest: FAIL\n");
+        return 1;
+    }
+    printf("pead selftest: PASS\n");
+    return 0;
+}
+
+void usage()
+{
+    printf("Usage: bin/pead [--hold 60] [--top 0.2] [--min-sue 0] [--slots 10]\n");
+    printf("                [--dir data/earnings] [--prices data] [--out results/pead]\n");
+    printf("       bin/pead --selftest\n");
+}
+
+extern int main(int argc, char** argv)
+{
+    int hold = 60;
+    double topFrac = 0.2;
+    double minSue = 0.0;
+    int slots = 10;
+    string earnDir = "data/earnings";
+    string priceDir = "data";
+    string outPrefix = "results/pead";
+    bool test = false;
+
+    int a = 1;
+    while (a < argc)
+    {
+        string arg = (string)argv[a];
+        if (arg == "--selftest") test = true;
+        else if (arg == "--hold" && a + 1 < argc) { hold = ((string)argv[a + 1]).toInt(); a++; }
+        else if (arg == "--top" && a + 1 < argc) { topFrac = ((string)argv[a + 1]).toDouble(); a++; }
+        else if (arg == "--min-sue" && a + 1 < argc) { minSue = ((string)argv[a + 1]).toDouble(); a++; }
+        else if (arg == "--slots" && a + 1 < argc) { slots = ((string)argv[a + 1]).toInt(); a++; }
+        else if (arg == "--dir" && a + 1 < argc) { earnDir = (string)argv[a + 1]; a++; }
+        else if (arg == "--prices" && a + 1 < argc) { priceDir = (string)argv[a + 1]; a++; }
+        else if (arg == "--out" && a + 1 < argc) { outPrefix = (string)argv[a + 1]; a++; }
+        else { usage(); return 2; }
+        a++;
+    }
+
+    if (test) return selftest();
+
+    if (hold < 1) hold = 1;
+    if (slots < 1) slots = 1;
+    if (topFrac <= 0.0 || topFrac >= 1.0) topFrac = 0.2;
+
+    double spread = 0.0;
+    return runAnalysis(earnDir, priceDir, outPrefix, hold, topFrac, minSue, slots, &spread, true);
+}

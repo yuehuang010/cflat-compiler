@@ -1,0 +1,156 @@
+// Command-line front end for the backtest engine.
+import "backtest_engine.cb";
+import "filesystem.cb";
+import "string.cb";
+
+string g_summaryPath = "results/summary.csv";
+
+string strategyParams(string strategy, int fast, int slow, int lookback, double threshold, int period, int donchian)
+{
+    if (strategy == "sma") return "fast=" + fast.toString() + ";slow=" + slow.toString();
+    if (strategy == "momentum") return "lookback=" + lookback.toString() + ";threshold=" + threshold.toString();
+    if (strategy == "meanrev") return "period=" + period.toString() + ";buy=30;sell=70";
+    if (strategy == "donchian") return "n=" + donchian.toString();
+    return "";
+}
+
+void writeResultCsv(string symbol, string strategy, list<Bar>* bars, BacktestResult r)
+{
+    string path = "results/" + symbol + "_" + strategy + ".csv";
+    stringbuilder out;
+    out.append("date,equity,position,drawdown\n");
+    int i = 0;
+    while (i < bars->count())
+    {
+        string date = bars->get(i).date;
+        out.append(date);
+        out.append(",");
+        out.append(r.equity[i].toString());
+        out.append(",");
+        out.append(r.position[i].toString());
+        out.append(",");
+        out.append(r.drawdown[i].toString());
+        out.append("\n");
+        i++;
+    }
+    File.writeAllText(path, out.toString());
+}
+
+void appendSummary(string symbol, string strategy, string params, BacktestResult r)
+{
+    string line = symbol + "," + strategy + "," + params + "," +
+        r.total_return.toString() + "," + r.cagr.toString() + "," +
+        r.vol.toString() + "," + r.sharpe.toString() + "," +
+        r.sortino.toString() + "," + r.max_dd.toString() + "," +
+        r.calmar.toString() + "," + r.trades.toString() + "," +
+        r.win_rate.toString() + "," + r.exposure.toString() + "\n";
+    File.appendAllText(g_summaryPath, line);
+}
+
+void printSummary(string symbol, string strategy, BacktestResult r)
+{
+    printf("%-5s %-10s total=%8.2f%% CAGR=%8.2f%% vol=%7.2f%% Sharpe=%7.3f Sortino=%7.3f maxDD=%8.2f%% trades=%4d win=%6.2f%% exposure=%6.2f%%\n",
+        symbol.data(), strategy.data(), r.total_return * 100.0, r.cagr * 100.0,
+        r.vol * 100.0, r.sharpe, r.sortino, r.max_dd * 100.0, r.trades,
+        r.win_rate * 100.0, r.exposure * 100.0);
+}
+
+void runOne(string symbol, string strategy, int fast, int slow, int lookback, double threshold, int period, int donchian, bool commissionGiven, double commissionBps, double slippageBps)
+{
+    string input = "data/" + symbol + ".csv";
+    list<Bar>* bars = loadCsv(input);
+    if (bars->count() == 0)
+    {
+        printf("No bars loaded from %s\n", input.data());
+        delete bars;
+        return;
+    }
+
+    IStrategy strat;
+    if (strategy == "buyhold") strat = new BuyAndHold();
+    else if (strategy == "sma") strat = new SmaCross(fast, slow);
+    else if (strategy == "momentum") strat = new Momentum(lookback, threshold);
+    else if (strategy == "meanrev") strat = new MeanReversion(period, 30.0, 70.0);
+    else if (strategy == "donchian") strat = new Donchian(donchian);
+    else
+    {
+        printf("Unknown strategy: %s\n", strategy.data());
+        delete bars;
+        return;
+    }
+
+    BacktestResult r = runBacktest(bars, strat, commissionBps, slippageBps);
+    writeResultCsv(symbol, strategy, bars, r);
+    appendSummary(symbol, strategy, strategyParams(strategy, fast, slow, lookback, threshold, period, donchian), r);
+    printSummary(symbol, strategy, r);
+    delete bars;
+}
+
+void usage()
+{
+    printf("Usage: bin/backtest --symbol SPY --strategy sma [--fast 20 --slow 100]\n");
+    printf("       bin/backtest --all\n");
+    printf("Strategies: buyhold, sma, momentum, meanrev, donchian\n");
+}
+
+extern int main(int argc, char** argv)
+{
+    string symbol = "SPY";
+    string strategy = "buyhold";
+    bool all = false;
+    int fast = 20;
+    int slow = 100;
+    int lookback = 60;
+    double threshold = 0.02;
+    int period = 14;
+    int donchian = 55;
+    double commissionBps = 1.0;
+    double slippageBps = 1.0;
+
+    int i = 1;
+    while (i < argc)
+    {
+        string a = (string)argv[i];
+        bool known = false;
+        if (a == "--all") { all = true; known = true; }
+        if (a == "--symbol" && i + 1 < argc) { i = i + 1; symbol = (string)argv[i]; known = true; }
+        if (a == "--strategy" && i + 1 < argc) { i = i + 1; strategy = (string)argv[i]; known = true; }
+        if (a == "--fast" && i + 1 < argc) { i = i + 1; fast = ((string)argv[i]).toInt(); known = true; }
+        if (a == "--slow" && i + 1 < argc) { i = i + 1; slow = ((string)argv[i]).toInt(); known = true; }
+        if (a == "--lookback" && i + 1 < argc) { i = i + 1; lookback = ((string)argv[i]).toInt(); known = true; }
+        if (a == "--threshold" && i + 1 < argc) { i = i + 1; threshold = ((string)argv[i]).toDouble(); known = true; }
+        if (a == "--period" && i + 1 < argc) { i = i + 1; period = ((string)argv[i]).toInt(); known = true; }
+        if (a == "--n" && i + 1 < argc) { i = i + 1; donchian = ((string)argv[i]).toInt(); known = true; }
+        if (a == "--commission" && i + 1 < argc) { i = i + 1; commissionBps = ((string)argv[i]).toDouble(); known = true; }
+        if (a == "--slippage" && i + 1 < argc) { i = i + 1; slippageBps = ((string)argv[i]).toDouble(); known = true; }
+        if (a == "--help" || a == "-h") { usage(); return 0; }
+        if (!known) { printf("Unknown argument: %s\n", a.data()); usage(); return 2; }
+        i++;
+    }
+    if (fast <= 0 || slow <= 0 || fast > slow || lookback <= 0 || period <= 0 || donchian <= 0)
+    {
+        printf("Periods must be positive and fast <= slow.\n");
+        return 2;
+    }
+
+    File.writeAllText(g_summaryPath, "symbol,strategy,params,total_return,cagr,vol,sharpe,sortino,max_dd,calmar,trades,win_rate,exposure\n");
+    printf("symbol strategy   total return      CAGR      vol  Sharpe Sortino    max DD trades    win exposure\n");
+    if (all)
+    {
+        string[4] symbols = {"SPY", "QQQ", "TLT", "GLD"};
+        string[5] strategies = {"buyhold", "sma", "momentum", "meanrev", "donchian"};
+        int si = 0;
+        while (si < 4)
+        {
+            int ti = 0;
+            while (ti < 5)
+            {
+                runOne(symbols[si], strategies[ti], fast, slow, lookback, threshold, period, donchian, true, commissionBps, slippageBps);
+                ti++;
+            }
+            si++;
+        }
+    }
+    else runOne(symbol, strategy, fast, slow, lookback, threshold, period, donchian, true, commissionBps, slippageBps);
+    return 0;
+}

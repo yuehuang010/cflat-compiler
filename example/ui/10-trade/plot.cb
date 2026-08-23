@@ -1,0 +1,1216 @@
+// plot.cb - small dependency-free software rasterizer used by both the BMP
+// exporter and the native canvas application.  Pixels are top-down BGRA32.
+import "list.cb";
+import "string.cb";
+import "math.cb";
+import "graphic/bitmap.cb";
+
+const u32 PLOT_GRID = 0x333333;
+const u32 PLOT_TEXT = 0xcccccc;
+
+class Plot
+{
+    int _w = 0;
+    int _h = 0;
+    u8* _pixels = nullptr;
+
+    void create(int w, int h, u32 bg)
+    {
+        if (_pixels != nullptr)
+        {
+            free((void*)_pixels);
+        }
+        _w = w < 1 ? 1 : w;
+        _h = h < 1 ? 1 : h;
+        _pixels = (u8*)malloc((i64)(_w * _h * 4));
+        fillRect(0, 0, _w, _h, bg);
+    }
+
+    int width()
+    {
+        return _w;
+    }
+
+    int height()
+    {
+        return _h;
+    }
+
+    u64 pixels()
+    {
+        return (u64)_pixels;
+    }
+
+    void _put(int x, int y, u32 rgb)
+    {
+        if (_pixels == nullptr || x < 0 || y < 0 || x >= _w || y >= _h)
+        {
+            return;
+        }
+        int at = (y * _w + x) * 4;
+        _pixels[at] = (u8)(rgb & 255u);
+        _pixels[at + 1] = (u8)((rgb >> 8) & 255u);
+        _pixels[at + 2] = (u8)((rgb >> 16) & 255u);
+        _pixels[at + 3] = 255;
+    }
+
+    void fillRect(int x, int y, int w, int h, u32 rgb)
+    {
+        if (w <= 0 || h <= 0 || _pixels == nullptr)
+        {
+            return;
+        }
+        int x1 = x < 0 ? 0 : x;
+        int y1 = y < 0 ? 0 : y;
+        int x2 = x + w;
+        if (x2 > _w)
+        {
+            x2 = _w;
+        }
+        int y2 = y + h;
+        if (y2 > _h)
+        {
+            y2 = _h;
+        }
+        int yy = y1;
+        while (yy < y2)
+        {
+            int xx = x1;
+            while (xx < x2)
+            {
+                _put(xx, yy, rgb);
+                xx++;
+            }
+            yy++;
+        }
+    }
+
+    void line(int x0, int y0, int x1, int y1, u32 rgb)
+    {
+        int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+        int sx = x0 < x1 ? 1 : -1;
+        int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+        int sy = y0 < y1 ? 1 : -1;
+        int err = dx + dy;
+        while (true)
+        {
+            _put(x0, y0, rgb);
+            if (x0 == x1 && y0 == y1)
+            {
+                break;
+            }
+            int e2 = 2 * err;
+            if (e2 >= dy)
+            {
+                err += dy;
+                x0 += sx;
+            }
+            if (e2 <= dx)
+            {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    void thickLine(int x0, int y0, int x1, int y1, u32 rgb, int thickness)
+    {
+        if (thickness <= 1)
+        {
+            line(x0, y0, x1, y1, rgb);
+            return;
+        }
+        int r = thickness / 2;
+        int yy = -r;
+        while (yy <= r)
+        {
+            int xx = -r;
+            while (xx <= r)
+            {
+                if (xx * xx + yy * yy <= r * r + 1)
+                {
+                    line(x0 + xx, y0 + yy, x1 + xx, y1 + yy, rgb);
+                }
+                xx++;
+            }
+            yy++;
+        }
+    }
+
+    // Seven-bit rows packed into five seven-bit columns.  Lowercase ASCII is
+    // intentionally rendered with the matching uppercase glyph: chart labels
+    // remain legible at the one-pixel font size while keeping the rasterizer
+    // compact and deterministic.
+    u64 _glyph(i8 ch)
+    {
+        if (ch >= 'a' && ch <= 'z')
+        {
+            ch = (i8)((int)ch - 32);
+        }
+        u64 a = 0;
+        u64 b = 0;
+        u64 c = 0;
+        u64 d = 0;
+        u64 e = 0;
+        if (ch == '0')
+        {
+            a = 0x3e;
+            b = 0x51;
+            c = 0x49;
+            d = 0x45;
+            e = 0x3e;
+        }
+        else if (ch == '1')
+        {
+            a = 0x00;
+            b = 0x42;
+            c = 0x7f;
+            d = 0x40;
+            e = 0x00;
+        }
+        else if (ch == '2')
+        {
+            a = 0x42;
+            b = 0x61;
+            c = 0x51;
+            d = 0x49;
+            e = 0x46;
+        }
+        else if (ch == '3')
+        {
+            a = 0x21;
+            b = 0x41;
+            c = 0x45;
+            d = 0x4b;
+            e = 0x31;
+        }
+        else if (ch == '4')
+        {
+            a = 0x18;
+            b = 0x14;
+            c = 0x12;
+            d = 0x7f;
+            e = 0x10;
+        }
+        else if (ch == '5')
+        {
+            a = 0x27;
+            b = 0x45;
+            c = 0x45;
+            d = 0x45;
+            e = 0x39;
+        }
+        else if (ch == '6')
+        {
+            a = 0x3c;
+            b = 0x4a;
+            c = 0x49;
+            d = 0x49;
+            e = 0x30;
+        }
+        else if (ch == '7')
+        {
+            a = 0x01;
+            b = 0x71;
+            c = 0x09;
+            d = 0x05;
+            e = 0x03;
+        }
+        else if (ch == '8')
+        {
+            a = 0x36;
+            b = 0x49;
+            c = 0x49;
+            d = 0x49;
+            e = 0x36;
+        }
+        else if (ch == '9')
+        {
+            a = 0x06;
+            b = 0x49;
+            c = 0x49;
+            d = 0x29;
+            e = 0x1e;
+        }
+        else if (ch == 'A')
+        {
+            a = 0x7e;
+            b = 9;
+            c = 9;
+            d = 9;
+            e = 0x7e;
+        }
+        else if (ch == 'B')
+        {
+            a = 0x7f;
+            b = 0x49;
+            c = 0x49;
+            d = 0x49;
+            e = 0x36;
+        }
+        else if (ch == 'C')
+        {
+            a = 0x3e;
+            b = 0x41;
+            c = 0x41;
+            d = 0x41;
+            e = 0x22;
+        }
+        else if (ch == 'D')
+        {
+            a = 0x7f;
+            b = 0x41;
+            c = 0x41;
+            d = 0x22;
+            e = 0x1c;
+        }
+        else if (ch == 'E')
+        {
+            a = 0x7f;
+            b = 0x49;
+            c = 0x49;
+            d = 0x49;
+            e = 0x41;
+        }
+        else if (ch == 'F')
+        {
+            a = 0x7f;
+            b = 9;
+            c = 9;
+            d = 9;
+            e = 1;
+        }
+        else if (ch == 'G')
+        {
+            a = 0x3e;
+            b = 0x41;
+            c = 0x49;
+            d = 0x49;
+            e = 0x7a;
+        }
+        else if (ch == 'H')
+        {
+            a = 0x7f;
+            b = 8;
+            c = 8;
+            d = 8;
+            e = 0x7f;
+        }
+        else if (ch == 'I')
+        {
+            a = 0x41;
+            b = 0x41;
+            c = 0x7f;
+            d = 0x41;
+            e = 0x41;
+        }
+        else if (ch == 'J')
+        {
+            a = 0x20;
+            b = 0x40;
+            c = 0x41;
+            d = 0x3f;
+            e = 1;
+        }
+        else if (ch == 'K')
+        {
+            a = 0x7f;
+            b = 8;
+            c = 0x14;
+            d = 0x22;
+            e = 0x41;
+        }
+        else if (ch == 'L')
+        {
+            a = 0x7f;
+            b = 0x40;
+            c = 0x40;
+            d = 0x40;
+            e = 0x40;
+        }
+        else if (ch == 'M')
+        {
+            a = 0x7f;
+            b = 2;
+            c = 4;
+            d = 2;
+            e = 0x7f;
+        }
+        else if (ch == 'N')
+        {
+            a = 0x7f;
+            b = 4;
+            c = 8;
+            d = 0x10;
+            e = 0x7f;
+        }
+        else if (ch == 'O')
+        {
+            a = 0x3e;
+            b = 0x41;
+            c = 0x41;
+            d = 0x41;
+            e = 0x3e;
+        }
+        else if (ch == 'P')
+        {
+            a = 0x7f;
+            b = 9;
+            c = 9;
+            d = 9;
+            e = 6;
+        }
+        else if (ch == 'Q')
+        {
+            a = 0x3e;
+            b = 0x41;
+            c = 0x51;
+            d = 0x21;
+            e = 0x5e;
+        }
+        else if (ch == 'R')
+        {
+            a = 0x7f;
+            b = 9;
+            c = 0x19;
+            d = 0x29;
+            e = 0x46;
+        }
+        else if (ch == 'S')
+        {
+            a = 0x46;
+            b = 0x49;
+            c = 0x49;
+            d = 0x49;
+            e = 0x31;
+        }
+        else if (ch == 'T')
+        {
+            a = 1;
+            b = 1;
+            c = 0x7f;
+            d = 1;
+            e = 1;
+        }
+        else if (ch == 'U')
+        {
+            a = 0x3f;
+            b = 0x40;
+            c = 0x40;
+            d = 0x40;
+            e = 0x3f;
+        }
+        else if (ch == 'V')
+        {
+            a = 7;
+            b = 0x18;
+            c = 0x60;
+            d = 0x18;
+            e = 7;
+        }
+        else if (ch == 'W')
+        {
+            a = 0x7f;
+            b = 0x20;
+            c = 0x18;
+            d = 0x20;
+            e = 0x7f;
+        }
+        else if (ch == 'X')
+        {
+            a = 0x63;
+            b = 0x14;
+            c = 8;
+            d = 0x14;
+            e = 0x63;
+        }
+        else if (ch == 'Y')
+        {
+            a = 3;
+            b = 4;
+            c = 0x78;
+            d = 4;
+            e = 3;
+        }
+        else if (ch == 'Z')
+        {
+            a = 0x61;
+            b = 0x51;
+            c = 0x49;
+            d = 0x45;
+            e = 0x43;
+        }
+        else if (ch == '-')
+        {
+            a = 8;
+            b = 8;
+            c = 8;
+            d = 8;
+            e = 8;
+        }
+        else if (ch == '_')
+        {
+            a = 0x40;
+            b = 0x40;
+            c = 0x40;
+            d = 0x40;
+            e = 0x40;
+        }
+        else if (ch == '.')
+        {
+            c = 0x60;
+        }
+        else if (ch == ':')
+        {
+            c = 0x24;
+        }
+        else if (ch == '/')
+        {
+            a = 1;
+            b = 2;
+            c = 4;
+            d = 8;
+            e = 0x10;
+        }
+        else if (ch == '%')
+        {
+            a = 0x11;
+            b = 8;
+            c = 4;
+            d = 2;
+            e = 0x11;
+        }
+        else if (ch == '+')
+        {
+            b = 8;
+            c = 0x1c;
+            d = 8;
+        }
+        else if (ch == '=')
+        {
+            b = 8;
+            c = 8;
+            d = 8;
+        }
+        else if (ch == '(')
+        {
+            a = 0x1c;
+            b = 0x22;
+            c = 0x41;
+        }
+        else if (ch == ')')
+        {
+            c = 0x41;
+            d = 0x22;
+            e = 0x1c;
+        }
+        else if (ch == ' ')
+        {
+            return 0;
+        }
+        else
+        {
+            a = 0x7f;
+            b = 0x41;
+            c = 0x41;
+            d = 0x41;
+            e = 0x7f;
+        }
+        return a | (b << 7) | (c << 14) | (d << 21) | (e << 28);
+    }
+
+    void _textOne(int x, int y, i8 ch, u32 rgb, int scale)
+    {
+        u64 g = _glyph(ch);
+        int col = 0;
+        while (col < 5)
+        {
+            int row = 0;
+            int bits = (int)((g >> (col * 7)) & 127u);
+            while (row < 7)
+            {
+                if ((bits & (1 << row)) != 0)
+                {
+                    fillRect(x + col * scale, y + row * scale, scale, scale, rgb);
+                }
+                row++;
+            }
+            col++;
+        }
+    }
+
+    void text2(int x, int y, string s, u32 rgb, int scale)
+    {
+        if (scale < 1)
+        {
+            scale = 1;
+        }
+        i8* d = s.data();
+        int i = 0;
+        while (i < s.length())
+        {
+            _textOne(x + i * 6 * scale, y, d[i], rgb, scale);
+            i++;
+        }
+    }
+
+    void text(int x, int y, string s, u32 rgb)
+    {
+        text2(x, y, s, rgb, 1);
+    }
+
+    bool saveBmp(string path)
+    {
+        if (_pixels == nullptr || _w <= 0 || _h <= 0)
+        {
+            return false;
+        }
+        Bitmap* b = new Bitmap;
+        b->create(_w, _h);
+        int y = 0;
+        while (y < _h)
+        {
+            int x = 0;
+            while (x < _w)
+            {
+                int at = (y * _w + x) * 4;
+                BitmapPixel px = BitmapPixel();
+                px.b = _pixels[at];
+                px.g = _pixels[at + 1];
+                px.r = _pixels[at + 2];
+                px.a = 255;
+                b->set(x, y, px);
+                x++;
+            }
+            y++;
+        }
+        bool ok = b->save(path);
+        delete b;
+        return ok;
+    }
+
+    ~Plot()
+    {
+        if (_pixels != nullptr)
+        {
+            free((void*)_pixels);
+        }
+    }
+};
+
+struct Series
+{
+    string name;
+    list<double>* y;
+    u32 color;
+};
+
+// This is also the table used by chart_export's pixel-level font selftest.
+u64 _plotExpectedGlyph(i8 ch)
+{
+    u64 a = 0;
+    u64 b = 0;
+    u64 c = 0;
+    u64 d = 0;
+    u64 e = 0;
+    if (ch == '0')
+    {
+        a = 0x3e;
+        b = 0x51;
+        c = 0x49;
+        d = 0x45;
+        e = 0x3e;
+    }
+    else if (ch == '1')
+    {
+        a = 0x00;
+        b = 0x42;
+        c = 0x7f;
+        d = 0x40;
+        e = 0x00;
+    }
+    else if (ch == '2')
+    {
+        a = 0x42;
+        b = 0x61;
+        c = 0x51;
+        d = 0x49;
+        e = 0x46;
+    }
+    else if (ch == '3')
+    {
+        a = 0x21;
+        b = 0x41;
+        c = 0x45;
+        d = 0x4b;
+        e = 0x31;
+    }
+    else if (ch == '4')
+    {
+        a = 0x18;
+        b = 0x14;
+        c = 0x12;
+        d = 0x7f;
+        e = 0x10;
+    }
+    else if (ch == '5')
+    {
+        a = 0x27;
+        b = 0x45;
+        c = 0x45;
+        d = 0x45;
+        e = 0x39;
+    }
+    else if (ch == '6')
+    {
+        a = 0x3c;
+        b = 0x4a;
+        c = 0x49;
+        d = 0x49;
+        e = 0x30;
+    }
+    else if (ch == '7')
+    {
+        a = 0x01;
+        b = 0x71;
+        c = 0x09;
+        d = 0x05;
+        e = 0x03;
+    }
+    else if (ch == '8')
+    {
+        a = 0x36;
+        b = 0x49;
+        c = 0x49;
+        d = 0x49;
+        e = 0x36;
+    }
+    else if (ch == '9')
+    {
+        a = 0x06;
+        b = 0x49;
+        c = 0x49;
+        d = 0x29;
+        e = 0x1e;
+    }
+    else if (ch == '-')
+    {
+        a = 0x08;
+        b = 0x08;
+        c = 0x08;
+        d = 0x08;
+        e = 0x08;
+    }
+    else if (ch == '.')
+    {
+        c = 0x60;
+    }
+    else if (ch == '%')
+    {
+        a = 0x11;
+        b = 0x08;
+        c = 0x04;
+        d = 0x02;
+        e = 0x11;
+    }
+    else if (ch == '(')
+    {
+        a = 0x1c;
+        b = 0x22;
+        c = 0x41;
+    }
+    else if (ch == ')')
+    {
+        c = 0x41;
+        d = 0x22;
+        e = 0x1c;
+    }
+    else if (ch == ':')
+    {
+        c = 0x24;
+    }
+    else if (ch == 'S')
+    {
+        a = 0x46;
+        b = 0x49;
+        c = 0x49;
+        d = 0x49;
+        e = 0x31;
+    }
+    return a | (b << 7) | (c << 14) | (d << 21) | (e << 28);
+}
+
+double _plotValue(list<double>* xs, int i, bool logY)
+{
+    double v = xs->get(i);
+    if (logY)
+    {
+        return v > 0.0 ? Math.log(v) : 0.0;
+    }
+    return v;
+}
+
+void _plotBounds(list<double>* values, bool logY, double* lo, double* hi)
+{
+    *lo = 0.0;
+    *hi = 1.0;
+    if (values == nullptr || values->count() == 0)
+    {
+        return;
+    }
+    *lo = _plotValue(values, 0, logY);
+    *hi = *lo;
+    int i = 1;
+    while (i < values->count())
+    {
+        double v = _plotValue(values, i, logY);
+        if (v < *lo)
+        {
+            *lo = v;
+        }
+        if (v > *hi)
+        {
+            *hi = v;
+        }
+        i++;
+    }
+    if (*lo == *hi)
+    {
+        *lo = *lo - 1.0;
+        *hi = *hi + 1.0;
+    }
+}
+
+int _plotX(int i, int n, int x, int w)
+{
+    return n <= 1 ? x : x + (int)((double)i * (double)(w - 1) / (double)(n - 1));
+}
+
+int _plotY(double v, double lo, double hi, int y, int h)
+{
+    return y + h - 1 - (int)((v - lo) * (double)(h - 1) / (hi - lo));
+}
+
+string _plotFmt(double v, int decimals)
+{
+    stringbuilder sb;
+    if (v != v || v > 1.0e15 || v < -1.0e15)
+    {
+        return "n/a";
+    }
+    if (v < 0.0)
+    {
+        sb.appendChar('-');
+        v = -v;
+    }
+    double scale = 1.0;
+    int i = 0;
+    while (i < decimals)
+    {
+        scale = scale * 10.0;
+        i++;
+    }
+    i64 integerScale = (i64)scale;
+    i64 scaled = (i64)(v * scale + 0.5);
+    sb.append(scaled / integerScale);
+    if (decimals > 0)
+    {
+        sb.appendChar('.');
+        i64 fractional = scaled % integerScale;
+        i64 place = integerScale / 10;
+        while (place > 0)
+        {
+            sb.appendChar((i8)(48 + (int)((fractional / place) % 10)));
+            place = place / 10;
+        }
+    }
+    return sb.toString();
+}
+
+int _plotTextWidth(string s)
+{
+    if (s.length() == 0)
+    {
+        return 0;
+    }
+    return s.length() * 6 - 1;
+}
+
+string _plotMonth(string s)
+{
+    return s.length() > 7 ? s.substring(0, 7) : s;
+}
+
+void _plotTextCentered(Plot* p, int center, int y, string s, u32 color, int left, int right)
+{
+    int tw = _plotTextWidth(s);
+    int tx = center - tw / 2;
+    if (tx < left)
+    {
+        tx = left;
+    }
+    if (tx + tw > right)
+    {
+        tx = right - tw;
+    }
+    p->text(tx, y, s, color);
+}
+
+void _plotXAxis(Plot* p, int px, int py, int pw, int ph, list<string>* labels)
+{
+    if (labels == nullptr || labels->count() == 0)
+    {
+        return;
+    }
+    int n = labels->count();
+    int count = n < 6 ? n : 6;
+    int i = 0;
+    while (i < count)
+    {
+        int index = count <= 1 ? 0 : (i * (n - 1)) / (count - 1);
+        string label = _plotMonth(labels->get(index));
+        int xx = _plotX(index, n, px, pw);
+        _plotTextCentered(p, xx, py + ph + 8, label, PLOT_TEXT, px, px + pw - 1);
+        i++;
+    }
+}
+
+void _plotYAxis(Plot* p, int axisX, int py, int ph, double lo, double hi, bool logY)
+{
+    // Pick decimals from the tick spacing so adjacent labels never collide (e.g. 0.01/0.01).
+    double step = logY ? (Math.exp(hi) - Math.exp(lo)) / 4.0 : (hi - lo) / 4.0;
+    if (step < 0.0) step = -step;
+    int decimals = 2;
+    double probe = 0.01;
+    while (decimals < 6 && step > 0.0 && step < probe) { decimals++; probe = probe / 10.0; }
+    int i = 0;
+    while (i < 5)
+    {
+        double fraction = (double)i / 4.0;
+        double plotted = lo + (hi - lo) * fraction;
+        double actual = logY ? Math.exp(plotted) : plotted;
+        string label = _plotFmt(actual, decimals);
+        int yy = py + ph - 1 - (int)(fraction * (double)(ph - 1));
+        int tw = _plotTextWidth(label);
+        int tx = axisX - 7 - tw;
+        p->text(tx, yy - 3, label, PLOT_TEXT);
+        i++;
+    }
+}
+
+void _plotFrame(Plot* p, int x, int y, int w, int h, string title)
+{
+    p->fillRect(x, y, w, h, 0x1e1e1e);
+    p->text(x + 8, y + 7, title, PLOT_TEXT);
+    p->line(x + 60, y + 25, x + 60, y + h - 28, PLOT_GRID);
+    p->line(x + 60, y + h - 28, x + w - 12, y + h - 28, PLOT_GRID);
+}
+
+void _plotLegend(Plot* p, int px, int py, int pw, int ph, list<Series>* series)
+{
+    if (series == nullptr)
+    {
+        return;
+    }
+    int lx = px + 4;
+    int row = 0;
+    int i = 0;
+    while (i < series->count())
+    {
+        Series s = series->get(i);
+        int tw = _plotTextWidth(s.name);
+        int itemWidth = 12 + tw + 8;
+        if (lx != px + 4 && lx + itemWidth > px + pw)
+        {
+            row++;
+            lx = px + 4;
+        }
+        if (row > 1 || py + 4 + row * 11 + 8 > py + ph)
+        {
+            break;
+        }
+        int ly = py + 4 + row * 11;
+        p->fillRect(lx, ly + 1, 8, 8, s.color);
+        p->text(lx + 12, ly, s.name, s.color);
+        lx += itemWidth;
+        i++;
+    }
+}
+
+void drawLineChart(Plot* p, int x, int y, int w, int h, string title, list<string>* xLabels, list<Series>* series, bool logY)
+{
+    if (p == nullptr || w < 70 || h < 55)
+    {
+        return;
+    }
+    _plotFrame(p, x, y, w, h, title);
+    int px = x + 60;
+    int py = y + 28;
+    int pw = w - 74;
+    int ph = h - 58;
+    if (pw < 2 || ph < 2)
+    {
+        return;
+    }
+    if (series == nullptr || series->count() == 0)
+    {
+        _plotXAxis(p, px, py, pw, ph, xLabels);
+        return;
+    }
+    double lo = 0.0;
+    double hi = 1.0;
+    bool first = true;
+    int si = 0;
+    while (si < series->count())
+    {
+        Series s = series->get(si);
+        if (s.y != nullptr && s.y->count() > 0)
+        {
+            double a = 0.0;
+            double b = 1.0;
+            _plotBounds(s.y, logY, &a, &b);
+            if (first || a < lo)
+            {
+                lo = a;
+            }
+            if (first || b > hi)
+            {
+                hi = b;
+            }
+            first = false;
+        }
+        si++;
+    }
+    if (lo == hi)
+    {
+        lo -= 1.0;
+        hi += 1.0;
+    }
+    int gy = 0;
+    while (gy < 5)
+    {
+        int yy = py + gy * (ph - 1) / 4;
+        p->line(px, yy, px + pw - 1, yy, PLOT_GRID);
+        gy++;
+    }
+    _plotYAxis(p, px, py, ph, lo, hi, logY);
+    si = 0;
+    while (si < series->count())
+    {
+        Series s = series->get(si);
+        if (s.y != nullptr && s.y->count() > 0)
+        {
+            int n = s.y->count();
+            int i = 1;
+            while (i < n)
+            {
+                p->line(
+                    _plotX(i - 1, n, px, pw),
+                    _plotY(_plotValue(s.y, i - 1, logY), lo, hi, py, ph),
+                    _plotX(i, n, px, pw),
+                    _plotY(_plotValue(s.y, i, logY), lo, hi, py, ph),
+                    s.color);
+                i++;
+            }
+        }
+        si++;
+    }
+    _plotLegend(p, px, py, pw, ph, series);
+    _plotXAxis(p, px, py, pw, ph, xLabels);
+}
+
+void drawAreaChart(Plot* p, int x, int y, int w, int h, string title, list<string>* xLabels, list<double>* values, u32 color)
+{
+    if (p == nullptr || values == nullptr)
+    {
+        return;
+    }
+    _plotFrame(p, x, y, w, h, title);
+    int px = x + 60;
+    int py = y + 28;
+    int pw = w - 74;
+    int ph = h - 58;
+    if (pw < 2 || ph < 2 || values->count() == 0)
+    {
+        _plotXAxis(p, px, py, pw, ph, xLabels);
+        return;
+    }
+    double lo = 0.0;
+    double hi = 0.0;
+    _plotBounds(values, false, &lo, &hi);
+    if (hi < 0.0)
+    {
+        hi = 0.0;
+    }
+    if (lo > 0.0)
+    {
+        lo = 0.0;
+    }
+    if (lo == hi)
+    {
+        lo = -1.0;
+        hi = 1.0;
+    }
+    int gy = 0;
+    while (gy < 5)
+    {
+        int yy = py + gy * (ph - 1) / 4;
+        p->line(px, yy, px + pw - 1, yy, PLOT_GRID);
+        gy++;
+    }
+    _plotYAxis(p, px, py, ph, lo, hi, false);
+    int zero = _plotY(0.0, lo, hi, py, ph);
+    p->line(px, zero, px + pw - 1, zero, PLOT_GRID);
+    int i = 0;
+    while (i < values->count())
+    {
+        int xx = _plotX(i, values->count(), px, pw);
+        int yy = _plotY(values->get(i), lo, hi, py, ph);
+        int top = yy < zero ? yy : zero;
+        int height = yy - zero < 0 ? zero - yy : yy - zero;
+        p->fillRect(xx, top, 2, height + 1, color);
+        i++;
+    }
+    _plotXAxis(p, px, py, pw, ph, xLabels);
+}
+
+void drawBarChart(Plot* p, int x, int y, int w, int h, string title, list<string>* labels, list<double>* values, u32 posColor, u32 negColor)
+{
+    if (p == nullptr || values == nullptr)
+    {
+        return;
+    }
+    _plotFrame(p, x, y, w, h, title);
+    int px = x + 60;
+    int py = y + 28;
+    int pw = w - 74;
+    int ph = h - 58;
+    if (pw < 2 || ph < 2 || values->count() == 0)
+    {
+        _plotXAxis(p, px, py, pw, ph, labels);
+        return;
+    }
+    double lo = 0.0;
+    double hi = 0.0;
+    _plotBounds(values, false, &lo, &hi);
+    if (lo > 0.0)
+    {
+        lo = 0.0;
+    }
+    if (hi < 0.0)
+    {
+        hi = 0.0;
+    }
+    if (lo == hi)
+    {
+        lo = -1.0;
+        hi = 1.0;
+    }
+    int gy = 0;
+    while (gy < 5)
+    {
+        int yy = py + gy * (ph - 1) / 4;
+        p->line(px, yy, px + pw - 1, yy, PLOT_GRID);
+        gy++;
+    }
+    _plotYAxis(p, px, py, ph, lo, hi, false);
+    int zero = _plotY(0.0, lo, hi, py, ph);
+    p->line(px, zero, px + pw - 1, zero, PLOT_GRID);
+    int n = values->count();
+    int i = 0;
+    while (i < n)
+    {
+        int xx = px + i * pw / n;
+        int bw = pw / n - 2;
+        if (bw < 1)
+        {
+            bw = 1;
+        }
+        int yy = _plotY(values->get(i), lo, hi, py, ph);
+        int top = yy < zero ? yy : zero;
+        int height = yy - zero < 0 ? zero - yy : yy - zero;
+        u32 barColor = values->get(i) >= 0.0 ? posColor : negColor;
+        p->fillRect(xx, top, bw, height + 1, barColor);
+        i++;
+    }
+    _plotXAxis(p, px, py, pw, ph, labels);
+}
+
+void drawHeatmap(Plot* p, int x, int y, int w, int h, string title, list<string>* rowLabels, list<string>* colLabels, list<double>* values, double vmin, double vmax)
+{
+    if (p == nullptr || values == nullptr || rowLabels == nullptr || colLabels == nullptr)
+    {
+        return;
+    }
+    _plotFrame(p, x, y, w, h, title);
+    int rows = rowLabels->count();
+    int cols = colLabels->count();
+    if (rows <= 0 || cols <= 0)
+    {
+        return;
+    }
+    int px = x + 68;
+    int py = y + 30;
+    int pw = w - 80;
+    int ph = h - 55;
+    int cw = pw / cols;
+    int ch = ph / rows;
+    if (cw < 1)
+    {
+        cw = 1;
+    }
+    if (ch < 1)
+    {
+        ch = 1;
+    }
+    int r = 0;
+    while (r < rows)
+    {
+        int c = 0;
+        while (c < cols)
+        {
+            int k = r * cols + c;
+            if (k >= values->count())
+            {
+                break;
+            }
+            double v = values->get(k);
+            double t = vmax == vmin ? 0.5 : (v - vmin) / (vmax - vmin);
+            if (t < 0.0)
+            {
+                t = 0.0;
+            }
+            if (t > 1.0)
+            {
+                t = 1.0;
+            }
+            int rr = t <= 0.5 ? (int)(255.0 * t * 2.0) : 255;
+            int bb = t >= 0.5 ? (int)(255.0 * (1.0 - t) * 2.0) : 255;
+            int gg = (int)(255.0 * (1.0 - Math.abs(t - 0.5) * 2.0));
+            u32 rgb = ((u32)rr << 16) | ((u32)gg << 8) | (u32)bb;
+            int cellX = px + c * cw;
+            int cellY = py + r * ch;
+            p->fillRect(cellX, cellY, cw - 1, ch - 1, rgb);
+            string cellText = _plotFmt(v, 2);
+            int textWidth = _plotTextWidth(cellText);
+            if (textWidth <= cw - 4 && ch >= 9)
+            {
+                p->text(cellX + cw - 2 - textWidth, cellY + (ch - 7) / 2, cellText, 0x1e1e1e);
+            }
+            c++;
+        }
+        r++;
+    }
+    int c = 0;
+    while (c < cols && c < 16)
+    {
+        p->text(px + c * cw, y + h - 17, colLabels->get(c), PLOT_TEXT);
+        c++;
+    }
+    r = 0;
+    while (r < rows && r < 16)
+    {
+        p->text(x + 3, py + r * ch + 2, rowLabels->get(r), PLOT_TEXT);
+        r++;
+    }
+}

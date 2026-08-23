@@ -1,0 +1,205 @@
+// Headless chart exporter.  It deliberately shares the Plot API with the live
+// native app, so every view has a deterministic BMP representation for CI.
+import "plot.cb";
+import "backtest_engine.cb";
+import "filesystem.cb";
+import "string.cb";
+import "list.cb";
+import "math.cb";
+
+u32 chartColor(int i)
+{ if(i==0)return 0x4fc3f7;if(i==1)return 0xffb74d;if(i==2)return 0x81c784;if(i==3)return 0xe57373;if(i==4)return 0xba68c8;return 0xfff176; }
+string chartStrategy(int i)
+{ if(i==0)return "buyhold";if(i==1)return "sma";if(i==2)return "momentum";if(i==3)return "meanrev";return "donchian"; }
+
+class Curve
+{
+    list<string> dates;
+    list<double> equity;
+    list<double> position;
+    list<double> drawdown;
+};
+
+Curve* readCurve(string path)
+{
+    Curve* c = new Curve;
+    File* f = new File;
+    if (!f->openRead(path)) { delete f; return c; }
+    string header = f->readLine();
+    while (!f->atEnd())
+    {
+        string line = f->readLine(); if (line.length() == 0) continue;
+        list<string> fields = line.split(","); if (fields.count() < 4) continue;
+        c->dates.add(fields.get(0)); c->equity.add(fields.get(1).toDouble());
+        c->position.add(fields.get(2).toDouble()); c->drawdown.add(fields.get(3).toDouble());
+    }
+    f->close(); delete f; return c;
+}
+
+int _digitsAfter(string s, string key)
+{
+    int at = s.indexOf(key); if (at < 0) return 0; at += key.length();
+    while (at < s.length() && (s.data()[at] < '0' || s.data()[at] > '9')) at++;
+    int out = 0;
+    while (at < s.length() && s.data()[at] >= '0' && s.data()[at] <= '9') { out = out * 10 + (int)s.data()[at] - 48; at++; }
+    return out;
+}
+
+string bestStrategy(string symbol)
+{
+    string best = "buyhold"; double bestSharpe = -1.0e30;
+    File* f = new File;
+    if (!f->openRead("results/summary.csv")) { delete f; return best; }
+    string header = f->readLine();
+    while (!f->atEnd())
+    {
+        string line=f->readLine(); if(line.length()==0)continue; list<string> q=line.split(","); if(q.count()<8||q.get(0)!=symbol)continue;
+        double sh=q.get(6).toDouble(); if(sh>bestSharpe){bestSharpe=sh;best=q.get(1).copy();}
+    }
+    f->close();delete f;return best;
+}
+
+void addSeries(list<Series>* out, Curve* c, string name, u32 color)
+{
+    Series s = Series(); s.name=name.copy(); s.y=&c->equity; s.color=color; out->add(move s);
+}
+
+void monthlyReturns(Curve* c, list<string>* labels, list<double>* values)
+{
+    if(c==nullptr||c->dates.count()==0)return;string month=c->dates.get(0).substring(0,7);double first=c->equity.get(0);double last=first;int i=0;
+    while(i<c->dates.count()){string m=c->dates.get(i).substring(0,7);if(m!=month){labels->add(month);values->add(last/first-1.0);month=m;first=c->equity.get(i);}last=c->equity.get(i);i++;}
+    labels->add(month);values->add(last/first-1.0);
+}
+
+void makeEquity(string symbol, list<Curve*>* curves)
+{
+    Plot* p=new Plot;p->create(1200,700,0x1e1e1e);list<Series> ss;int i=0;while(i<curves->count()){Curve* c=curves->get(i);if(c->equity.count()>0)addSeries(&ss,c,chartStrategy(i),chartColor(i));i++;}
+    list<string>* labels=curves->count()>0?&curves->get(0)->dates:nullptr;drawLineChart(p,0,0,1200,700,symbol+" equity (log scale)",labels,&ss,true);p->saveBmp("results/"+symbol+"_equity.bmp");delete p;
+}
+
+void makeDrawdown(string symbol, list<Curve*>* curves)
+{
+    Plot* p=new Plot;p->create(1200,700,0x1e1e1e);int i=0;while(i<curves->count()){Curve* c=curves->get(i);drawAreaChart(p,0,i*138,1200,136,chartStrategy(i)+" drawdown",&c->dates,&c->drawdown,chartColor(i));i++;}p->saveBmp("results/"+symbol+"_drawdown.bmp");delete p;
+}
+
+void makeMonthly(string symbol, string strategy, Curve* c)
+{
+    Plot* p=new Plot;p->create(1200,700,0x1e1e1e);list<string> labels;list<double> values;monthlyReturns(c,&labels,&values);drawBarChart(p,0,0,1200,700,strategy+" monthly returns",&labels,&values,0x81c784,0xe57373);p->saveBmp("results/"+symbol+"_monthly.bmp");delete p;
+}
+
+void makeSweep(string symbol)
+{
+    Plot* p=new Plot;p->create(1200,700,0x1e1e1e);list<string> rows;list<string> cols;list<double> vals;int fval=5;while(fval<=50){rows.add(fval.toString());fval+=5;}int sval=50;while(sval<=250){cols.add(sval.toString());sval+=25;}int i=0;while(i<rows.count()*cols.count()){vals.add(-2.0);i++;}
+    File* f=new File;if(f->openRead("results/sweep_"+symbol+".csv")){string h=f->readLine();while(!f->atEnd()){string line=f->readLine();list<string> q=line.split(",");if(q.count()>=8&&q.get(0)==symbol&&q.get(1)=="sma"){int fast=_digitsAfter(q.get(2),"fast=");int slow=_digitsAfter(q.get(2),"slow=");int ri=(fast-5)/5;int ci=(slow-50)/25;if(ri>=0&&ri<rows.count()&&ci>=0&&ci<cols.count())vals.set(ri*cols.count()+ci,q.get(6).toDouble());}}f->close();}delete f;
+    // Missing combos (fast >= slow) were seeded with -2.0: scale the ramp to the real data and paint them neutral (mid-ramp).
+    double lo=1e9;double hi=-1e9;int k=0;while(k<vals.count()){double v=vals.get(k);if(v>-1.5){if(v<lo)lo=v;if(v>hi)hi=v;}k++;}if(lo>hi){lo=0.0;hi=1.0;}k=0;while(k<vals.count()){if(vals.get(k)<=-1.5)vals.set(k,(lo+hi)*0.5);k++;}
+    drawHeatmap(p,0,0,1200,700,symbol+" SMA Sharpe sweep",&rows,&cols,&vals,lo,hi);p->saveBmp("results/"+symbol+"_sweep.bmp");delete p;
+}
+
+double corrPair(string a, string b)
+{
+    list<Bar>* x=loadCsv("data/"+a+".csv");list<Bar>* y=loadCsv("data/"+b+".csv");int n=x->count()<y->count()?x->count():y->count();if(n<3){delete x;delete y;return 0.0;}double mx=0.0;double my=0.0;int i=1;while(i<n){mx+=x->get(i).adj_close/x->get(i-1).adj_close-1.0;my+=y->get(i).adj_close/y->get(i-1).adj_close-1.0;i++;}int m=n-1;mx/=m;my/=m;double xx=0.0;double yy=0.0;double xy=0.0;i=1;while(i<n){double rx=x->get(i).adj_close/x->get(i-1).adj_close-1.0;double ry=y->get(i).adj_close/y->get(i-1).adj_close-1.0;xx+=(rx-mx)*(rx-mx);yy+=(ry-my)*(ry-my);xy+=(rx-mx)*(ry-my);i++;}delete x;delete y;if(xx==0.0||yy==0.0)return 0.0;return xy/Math.sqrt(xx*yy);
+}
+
+void makeCorrelation()
+{
+    Plot* p=new Plot;p->create(1200,700,0x1e1e1e);list<string> labels;labels.add("SPY");labels.add("QQQ");labels.add("TLT");labels.add("GLD");list<double> vals;int i=0;while(i<4){int j=0;while(j<4){vals.add(i==j?1.0:corrPair(labels.get(i),labels.get(j)));j++;}i++;}drawHeatmap(p,0,0,1200,700,"daily return correlation",&labels,&labels,&vals,-1.0,1.0);p->saveBmp("results/correlation.bmp");delete p;
+}
+
+u64 renderedGlyphMask(Plot* p, int x, int y)
+{
+    u8* pixels = (u8*)p->pixels();
+    u64 mask = 0;
+    int col = 0;
+    while (col < 5)
+    {
+        int row = 0;
+        while (row < 7)
+        {
+            int at = ((y + row) * p->width() + x + col) * 4;
+            if (pixels[at] == 255 && pixels[at + 1] == 255 && pixels[at + 2] == 255)
+            {
+                mask = mask | ((u64)1 << (col * 7 + row));
+            }
+            row++;
+        }
+        col++;
+    }
+    return mask;
+}
+
+bool checkRenderedGlyphs(Plot* p, string text, int x, int y)
+{
+    bool ok = true;
+    int i = 0;
+    while (i < text.length())
+    {
+        i8 ch = text.data()[i];
+        u64 actual = renderedGlyphMask(p, x + i * 6, y);
+        u64 expected = _plotExpectedGlyph(ch);
+        if (actual != expected)
+        {
+            printf("  glyph '%c' mask mismatch actual=%s expected=%s\n", ch, actual.toString(16).data(), expected.toString(16).data());
+            ok = false;
+        }
+        i++;
+    }
+    return ok;
+}
+
+int selftest()
+{
+    Plot* p = new Plot;
+    p->create(180, 80, 0x112233);
+    p->fillRect(120, 30, 10, 8, 0xff0000);
+    p->line(140, 40, 150, 50, 0x00ff00);
+    p->text(2, 2, "0123456789 -.%():", 0xffffff);
+    u8* px = (u8*)p->pixels();
+    int rect = (30 * 180 + 120) * 4;
+    int endpoint = (50 * 180 + 150) * 4;
+    bool ok = px[rect + 2] == 255 && px[rect + 1] == 0 && px[rect] == 0;
+    bool endpointOk = px[endpoint + 1] == 255;
+    bool glyphOk = checkRenderedGlyphs(p, "0123456789 -.%():", 2, 2);
+    bool distinctOk = p->_glyph('2') != p->_glyph('5')
+        && p->_glyph('5') != p->_glyph('S')
+        && p->_glyph('2') != p->_glyph('S');
+    if (!ok) printf("  rectangle pixel mismatch b=%d g=%d r=%d\n", px[rect], px[rect + 1], px[rect + 2]);
+    if (!endpointOk) printf("  line endpoint mismatch\n");
+    if (!distinctOk) printf("  digit masks are not distinct\n");
+    ok = ok && endpointOk && glyphOk && distinctOk;
+    bool ink = false;
+    int yy = 2;
+    while (yy < 9)
+    {
+        int xx = 2;
+        while (xx < 110)
+        {
+            int at = (yy * 180 + xx) * 4;
+            if (px[at] != 0x33 || px[at + 1] != 0x22 || px[at + 2] != 0x11)
+            {
+                ink = true;
+            }
+            xx++;
+        }
+        yy++;
+    }
+    ok = ok && ink;
+    if (!ok)
+    {
+        printf("chart_export selftest: FAIL\n");
+    }
+    else
+    {
+        printf("chart_export selftest: PASS\n");
+    }
+    delete p;
+    return ok ? 0 : 1;
+}
+
+void usage(){printf("Usage: bin/chart_export [--symbol SPY]\n       bin/chart_export --selftest\n");}
+
+extern int main(int argc, char** argv)
+{
+    string symbol="SPY";bool test=false;int i=1;while(i<argc){string a=(string)argv[i];if(a=="--selftest")test=true;else if(a=="--symbol"&&i+1<argc){i++;symbol=(string)argv[i];}else{usage();return 2;}i++;}if(test)return selftest();
+    list<Curve*> curves;int k=0;while(k<5){curves.add(readCurve("results/"+symbol+"_"+chartStrategy(k)+".csv"));k++;}makeEquity(symbol,&curves);makeDrawdown(symbol,&curves);string best=bestStrategy(symbol);int bi=0;while(bi<5&&chartStrategy(bi)!=best)bi++;if(bi>=5)bi=0;makeMonthly(symbol,best,curves.get(bi));makeSweep(symbol);makeCorrelation();printf("Exported charts for %s\n",symbol.data());return 0;
+}

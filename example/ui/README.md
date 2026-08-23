@@ -17,6 +17,7 @@ examples need no `-i` flag. The full reference is [`doc/UI.md`](../../doc/UI.md)
 | [07-testing](07-testing/) | Driving a UI app from an automated test |
 | [08-fedit](08-fedit/) | The flagship: a small native text editor |
 | [09-map](09-map/) | An interactive map on a canvas control, with a worker tile source |
+| [10-trade](10-trade/) | A native quant research toolkit with backtests, PEAD analysis, and charts |
 
 ## 01-elements
 
@@ -136,3 +137,32 @@ drawn control - a `CanvasView` - and for feeding it from a background thread.
 ```bash
 x64/Release/cflat.exe example/ui/09-map/map.cb -i example/ui -o out/map.exe
 ```
+
+## 10-trade
+
+A seven-binary quant research toolkit. It fetches Yahoo and SEC data, runs
+backtests and PEAD event studies, exports raster charts, and provides a native
+AppKit chart browser. `backtest_engine.cb` and `plot.cb` are shared libraries.
+
+The binaries are `fetch`, `backtest`, `analysis`, `chart_export`, `charts`,
+`edgar_fetch`, and `pead`. Build them from the repository root without an import
+directory:
+
+```bash
+for x in fetch backtest analysis chart_export charts edgar_fetch pead; do
+    x64/Release/cflat example/ui/10-trade/$x.cb -o out/trade_$x
+done
+```
+
+The deterministic self-test gates are:
+
+```bash
+out/trade_pead --selftest
+out/trade_chart_export --selftest
+out/trade_charts --selftest
+```
+
+The fetchers need network access and `/usr/bin/curl` on macOS. `backtest`,
+`analysis`, and the fetchers use runtime `data/` and `results/` directories;
+those data files live outside this repository. The three self-tests generate
+their own fixtures, so no market data is required to build or gate the example.

@@ -1,0 +1,186 @@
+// Download Yahoo Finance chart data and normalize it to the repository CSV contract.
+// Yahoo's response is a regular set of parallel JSON arrays.  This small scanner is
+// intentionally limited to those arrays, which avoids building a large JSON object tree
+// for a 10-year daily response.
+import "process.cb";
+import "filesystem.cb";
+import "string.cb";
+
+move list<double>* scanNumbers(string text, string key)
+{
+    list<double>* values = new list<double>;
+    int k = text.indexOf(key);
+    if (k < 0) return values;
+    int p = text.indexOf("[", k);
+    if (p < 0) return values;
+    if (p + 1 < text.length() && text.charAt(p + 1) == '{') p = text.indexOf("[", p + 1);
+    if (p < 0) return values;
+    p = p + 1;
+    while (p < text.length())
+    {
+        while (p < text.length() && (text.charAt(p) == ' ' || text.charAt(p) == '\n' || text.charAt(p) == '\r' || text.charAt(p) == '\t' || text.charAt(p) == ',')) p++;
+        if (p >= text.length() || text.charAt(p) == ']') break;
+        if (p + 4 <= text.length() && text.substring(p, 4) == "null")
+        {
+            values->add(0.0);
+            p = p + 4;
+            continue;
+        }
+        int q = p;
+        while (q < text.length() && text.charAt(q) != ',' && text.charAt(q) != ']') q++;
+        if (q > p) values->add(text.substring(p, q - p).toDouble());
+        p = q;
+    }
+    return values;
+}
+
+move list<i64>* scanIntegers(string text, string key)
+{
+    list<i64>* values = new list<i64>;
+    int k = text.indexOf(key);
+    if (k < 0) return values;
+    int p = text.indexOf("[", k);
+    if (p < 0) return values;
+    if (p + 1 < text.length() && text.charAt(p + 1) == '{') p = text.indexOf("[", p + 1);
+    if (p < 0) return values;
+    p = p + 1;
+    while (p < text.length())
+    {
+        while (p < text.length() && (text.charAt(p) == ' ' || text.charAt(p) == '\n' || text.charAt(p) == '\r' || text.charAt(p) == '\t' || text.charAt(p) == ',')) p++;
+        if (p >= text.length() || text.charAt(p) == ']') break;
+        if (p + 4 <= text.length() && text.substring(p, 4) == "null")
+        {
+            values->add(0);
+            p = p + 4;
+            continue;
+        }
+        int q = p;
+        while (q < text.length() && text.charAt(q) != ',' && text.charAt(q) != ']') q++;
+        if (q > p) values->add(text.substring(p, q - p).toLong());
+        p = q;
+    }
+    return values;
+}
+
+void appendTwo(stringbuilder* out, int value)
+{
+    if (value < 10) out->append("0");
+    out->append(value.toString());
+}
+
+string utcDate(i64 timestamp)
+{
+    i64 days = timestamp / 86400;
+    i64 z = days + 719468;
+    i64 era = (z >= 0 ? z : z - 146096) / 146097;
+    i64 doe = z - era * 146097;
+    i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    i64 year = yoe + era * 400;
+    i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    i64 mp = (5 * doy + 2) / 153;
+    i64 day = doy - (153 * mp + 2) / 5 + 1;
+    i64 month = mp + (mp < 10 ? 3 : -9);
+    year = year + (month <= 2 ? 1 : 0);
+    stringbuilder out;
+    out.append(year.toString());
+    out.append("-");
+    appendTwo(&out, (int)month);
+    out.append("-");
+    appendTwo(&out, (int)day);
+    return out.toString();
+}
+
+bool fetchSymbol(string symbol)
+{
+    stringbuilder response;
+    process p;
+    p.exe = "/usr/bin/curl";
+    p.onStdout = (char* buf, int len) => {
+        int i = 0;
+        while (i < len) { response.appendChar(buf[i]); i++; }
+    };
+    list<string> args;
+    args.add("-sS");
+    args.add("-A");
+    args.add("Mozilla/5.0");
+    args.add("https://query1.finance.yahoo.com/v8/finance/chart/" + symbol + "?interval=1d&range=10y");
+    p.run(&args);
+    p.WaitForExit();
+    if (p.exitCode != 0 || response.length() == 0)
+    {
+        printf("fetch %s failed (curl exit %d)\n", symbol.data(), p.exitCode);
+        return false;
+    }
+
+    string body = response.toString();
+    list<i64>* timestamps = scanIntegers(body, "\"timestamp\"");
+    list<double>* opens = scanNumbers(body, "\"open\"");
+    list<double>* highs = scanNumbers(body, "\"high\"");
+    list<double>* lows = scanNumbers(body, "\"low\"");
+    list<double>* closes = scanNumbers(body, "\"close\"");
+    list<double>* adj = scanNumbers(body, "\"adjclose\"");
+    list<double>* volumes = scanNumbers(body, "\"volume\"");
+    int count = timestamps->count();
+    if (opens->count() < count) count = opens->count();
+    if (highs->count() < count) count = highs->count();
+    if (lows->count() < count) count = lows->count();
+    if (closes->count() < count) count = closes->count();
+    if (adj->count() < count) count = adj->count();
+    if (volumes->count() < count) count = volumes->count();
+    if (count == 0)
+    {
+        printf("fetch %s returned no chart rows\n", symbol.data());
+        delete timestamps; delete opens; delete highs; delete lows; delete closes; delete adj; delete volumes;
+        return false;
+    }
+
+    stringbuilder csv;
+    csv.append("date,open,high,low,close,adj_close,volume\n");
+    int i = 0;
+    int written = 0;
+    while (i < count)
+    {
+        if (timestamps->get(i) > 0 && opens->get(i) > 0.0 && highs->get(i) > 0.0 && lows->get(i) > 0.0 && closes->get(i) > 0.0 && adj->get(i) > 0.0)
+        {
+            double openValue = opens->get(i);
+            double highValue = highs->get(i);
+            double lowValue = lows->get(i);
+            double closeValue = closes->get(i);
+            double adjValue = adj->get(i);
+            i64 volumeValue = (i64)volumes->get(i);
+            csv.append(utcDate(timestamps->get(i)));
+            csv.append(","); csv.append(openValue.toString());
+            csv.append(","); csv.append(highValue.toString());
+            csv.append(","); csv.append(lowValue.toString());
+            csv.append(","); csv.append(closeValue.toString());
+            csv.append(","); csv.append(adjValue.toString());
+            csv.append(","); csv.append(volumeValue.toString());
+            csv.append("\n");
+            written++;
+        }
+        i++;
+    }
+    string output = "data/" + symbol + ".csv";
+    bool ok = File.writeAllText(output, csv.toString());
+    printf("%s: wrote %d rows to %s\n", symbol.data(), written, output.data());
+    delete timestamps; delete opens; delete highs; delete lows; delete closes; delete adj; delete volumes;
+    return ok && written > 0;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc < 2)
+    {
+        printf("Usage: bin/fetch SYMBOL [SYMBOL ...]\n");
+        return 2;
+    }
+    int failures = 0;
+    int i = 1;
+    while (i < argc)
+    {
+        string symbol = ((string)argv[i]).toUpper();
+        if (!fetchSymbol(symbol)) failures++;
+        i++;
+    }
+    return failures == 0 ? 0 : 1;
+}

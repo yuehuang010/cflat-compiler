@@ -1,0 +1,760 @@
+// ---------------------------------------------------------------------------
+// analysis.cb  --  component C of the CFlat quant backtester.
+//
+// Given a symbol, this tool:
+//   1. runs a parameter sweep over the SMA-cross, momentum and Donchian grids,
+//   2. ranks every combination by Sharpe,
+//   3. performs a walk-forward check (fit on the first 60% of history, evaluate
+//      on the last 40%) so that in-sample overfitting becomes visible,
+//   4. renders a monthly-return table and a rolling 252-day Sharpe series for
+//      the best strategy found,
+//   5. builds a correlation matrix of daily returns across every symbol in data/.
+//
+// Output: results/analysis_<symbol>.md and results/sweep_<symbol>.csv.
+//
+// Usage: bin/analysis --symbol SPY [--commission 1.0] [--slippage 1.0]
+// ---------------------------------------------------------------------------
+
+import "list.cb";
+import "string.cb";
+import "filesystem.cb";
+import "math.cb";
+import "dictionary.cb";
+
+// The backtest engine (Bar, loadCsv, IStrategy, the strategy classes,
+// BacktestResult and runBacktest) lives in component B.
+import "backtest_engine.cb";
+
+// Format a fraction as a percentage string, e.g. 0.1234 -> "12.34%".
+move string fmtPct(double v, int dec)
+{
+    string body = fmtF(v * 100.0, dec);
+    return body + "%";
+}
+
+// ---------------------------------------------------------------------------
+// Sweep bookkeeping
+//
+// Deliberately holds only integers and doubles (no `string` fields) so the
+// rows can be sorted with list<T>.sort() without any ownership subtleties.
+// ---------------------------------------------------------------------------
+
+const int KIND_SMA      = 0;
+const int KIND_MOMENTUM = 1;
+const int KIND_DONCHIAN = 2;
+
+struct SweepRow
+{
+    int kind = 0;           // one of the KIND_* constants
+    int p1 = 0;             // sma: fast    momentum: lookback    donchian: n
+    int p2 = 0;             // sma: slow    momentum: threshold in bps
+    double total_return = 0.0;
+    double cagr = 0.0;
+    double vol = 0.0;
+    double sharpe = 0.0;
+    double sortino = 0.0;
+    double max_dd = 0.0;
+    double calmar = 0.0;
+    int trades = 0;
+    double win_rate = 0.0;
+    double exposure = 0.0;
+};
+
+move string kindName(int kind)
+{
+    if (kind == KIND_SMA) return "sma";
+    if (kind == KIND_MOMENTUM) return "momentum";
+    return "donchian";
+}
+
+// Human-readable parameter description for a grid point.
+move string kindParams(int kind, int p1, int p2)
+{
+    if (kind == KIND_SMA) return "fast=" + p1.toString() + " slow=" + p2.toString();
+    if (kind == KIND_MOMENTUM) return "lookback=" + p1.toString();
+    return "n=" + p1.toString();
+}
+
+// Build a heap-allocated strategy for a grid point.  The caller adopts the
+// returned interface value into a `unique IStrategy` local, which frees it.
+move IStrategy makeStrategy(int kind, int p1, int p2)
+{
+    if (kind == KIND_SMA) return new SmaCross(p1, p2);
+    if (kind == KIND_MOMENTUM) return new Momentum(p1, (double)p2 / 10000.0);
+    return new Donchian(p1);
+}
+
+// Copy the metric fields of a BacktestResult onto a sweep row.
+void fillRow(SweepRow* row, BacktestResult* r)
+{
+    row->total_return = r->total_return;
+    row->cagr = r->cagr;
+    row->vol = r->vol;
+    row->sharpe = r->sharpe;
+    row->sortino = r->sortino;
+    row->max_dd = r->max_dd;
+    row->calmar = r->calmar;
+    row->trades = r->trades;
+    row->win_rate = r->win_rate;
+    row->exposure = r->exposure;
+}
+
+// Run the whole parameter grid over `bars`, appending one row per combination.
+//
+// Grid (from SPEC.md):
+//   SMA cross : fast 5..50 step 5, slow 50..250 step 25, fast < slow
+//   Momentum  : lookback 20..250 step 10, threshold 0
+//   Donchian  : n 10..100 step 5
+void runGrid(list<Bar>* bars, list<SweepRow>* out, double commissionBps, double slippageBps)
+{
+    // --- SMA cross ---------------------------------------------------------
+    int fast = 5;
+    while (fast <= 50)
+    {
+        int slow = 50;
+        while (slow <= 250)
+        {
+            if (slow > fast)
+            {
+                SweepRow row = default;
+                row.kind = KIND_SMA;
+                row.p1 = fast;
+                row.p2 = slow;
+                unique IStrategy s = makeStrategy(KIND_SMA, fast, slow);
+                BacktestResult r = runBacktest(bars, s, commissionBps, slippageBps);
+                fillRow(&row, &r);
+                out->add(row);
+            }
+            slow = slow + 25;
+        }
+        fast = fast + 5;
+    }
+
+    // --- Momentum ----------------------------------------------------------
+    int lookback = 20;
+    while (lookback <= 250)
+    {
+        SweepRow row = default;
+        row.kind = KIND_MOMENTUM;
+        row.p1 = lookback;
+        row.p2 = 0;
+        unique IStrategy s = makeStrategy(KIND_MOMENTUM, lookback, 0);
+        BacktestResult r = runBacktest(bars, s, commissionBps, slippageBps);
+        fillRow(&row, &r);
+        out->add(row);
+        lookback = lookback + 10;
+    }
+
+    // --- Donchian ----------------------------------------------------------
+    int n = 10;
+    while (n <= 100)
+    {
+        SweepRow row = default;
+        row.kind = KIND_DONCHIAN;
+        row.p1 = n;
+        row.p2 = 0;
+        unique IStrategy s = makeStrategy(KIND_DONCHIAN, n, 0);
+        BacktestResult r = runBacktest(bars, s, commissionBps, slippageBps);
+        fillRow(&row, &r);
+        out->add(row);
+        n = n + 5;
+    }
+}
+
+// Index of the highest-Sharpe row of a given strategy family, or -1.
+int bestOfKind(list<SweepRow>* rows, int kind)
+{
+    int best = -1;
+    int i = 0;
+    while (i < rows->count())
+    {
+        SweepRow r = rows->get(i);
+        if (r.kind == kind)
+        {
+            if (best < 0 || r.sharpe > rows->get(best).sharpe) best = i;
+        }
+        i++;
+    }
+    return best;
+}
+
+
+// ---------------------------------------------------------------------------
+// Bar slicing (used by the walk-forward split)
+// ---------------------------------------------------------------------------
+
+// Copy bars [lo, toEx) into a fresh list.  Date strings are deep-copied so
+// the slice does not alias the parent list's buffers.
+move list<Bar>* sliceBars(list<Bar>* bars, int lo, int toEx)
+{
+    list<Bar>* out = new list<Bar>;
+    int i = lo;
+    while (i < toEx)
+    {
+        Bar src = bars->get(i);
+        Bar b = Bar();
+        b.date = src.date.copy();
+        b.open = src.open;
+        b.high = src.high;
+        b.low = src.low;
+        b.close = src.close;
+        b.adj_close = src.adj_close;
+        b.volume = src.volume;
+        out->add(move b);
+        i++;
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Return-series statistics
+// ---------------------------------------------------------------------------
+
+// Daily simple returns derived from an equity curve.
+void equityToReturns(list<double>* equity, list<double>* out)
+{
+    int i = 1;
+    while (i < equity->count())
+    {
+        double prev = equity->get(i - 1);
+        double cur = equity->get(i);
+        out->add(prev == 0.0 ? 0.0 : cur / prev - 1.0);
+        i++;
+    }
+}
+
+// Annualised Sharpe (rf = 0) over rets[lo, toEx).
+double sharpeOf(list<double>* rets, int lo, int toEx)
+{
+    int n = toEx - lo;
+    if (n < 2) return 0.0;
+    double sum = 0.0;
+    int i = lo;
+    while (i < toEx) { sum += rets->get(i); i++; }
+    double mean = sum / (double)n;
+    double sq = 0.0;
+    i = lo;
+    while (i < toEx)
+    {
+        double d = rets->get(i) - mean;
+        sq += d * d;
+        i++;
+    }
+    double sd = Math.sqrt(sq / (double)(n - 1));
+    if (sd <= 0.0) return 0.0;
+    return mean / sd * Math.sqrt(252.0);
+}
+
+// Pearson correlation over the leading min(count) elements of two series.
+double correlation(list<double>* a, list<double>* b)
+{
+    int n = a->count() < b->count() ? a->count() : b->count();
+    if (n < 2) return 0.0;
+    double sa = 0.0;
+    double sb = 0.0;
+    int i = 0;
+    while (i < n) { sa += a->get(i); sb += b->get(i); i++; }
+    double ma = sa / (double)n;
+    double mb = sb / (double)n;
+    double num = 0.0;
+    double da = 0.0;
+    double db = 0.0;
+    i = 0;
+    while (i < n)
+    {
+        double x = a->get(i) - ma;
+        double y = b->get(i) - mb;
+        num += x * y;
+        da += x * x;
+        db += y * y;
+        i++;
+    }
+    if (da <= 0.0 || db <= 0.0) return 0.0;
+    return num / (Math.sqrt(da) * Math.sqrt(db));
+}
+
+// ---------------------------------------------------------------------------
+// Report sections
+// ---------------------------------------------------------------------------
+
+// Append one markdown row describing a sweep result.
+void appendSweepRow(stringbuilder* sb, SweepRow r, int rank)
+{
+    sb->append("| " + rank.toString());
+    sb->append(" | " + kindName(r.kind));
+    sb->append(" | " + kindParams(r.kind, r.p1, r.p2));
+    sb->append(" | " + fmtF(r.sharpe, 3));
+    sb->append(" | " + fmtF(r.sortino, 3));
+    sb->append(" | " + fmtPct(r.cagr, 2));
+    sb->append(" | " + fmtPct(r.vol, 2));
+    sb->append(" | " + fmtPct(r.max_dd, 2));
+    sb->append(" | " + fmtF(r.calmar, 2));
+    sb->append(" | " + r.trades.toString());
+    sb->append(" | " + fmtPct(r.win_rate, 1));
+    sb->append(" | " + fmtPct(r.exposure, 1));
+    sb->append(" |\n");
+}
+
+// Monthly return table for a strategy's equity curve.
+// `dates` and `equity` are index-aligned (equity[i] is the close of bars[i]).
+void writeMonthlyTable(stringbuilder* sb, list<Bar>* bars, list<double>* equity)
+{
+    int n = equity->count();
+    if (n < 2 || bars->count() < n) return;
+
+    // Collect (YYYY-MM, return) pairs by walking month boundaries.
+    list<string> keys;
+    list<double> rets;
+
+    string curKey = bars->get(0).date.substring(0, 7);
+    double monthStart = equity->get(0);
+    int i = 1;
+    while (i < n)
+    {
+        string k = bars->get(i).date.substring(0, 7);
+        if (k != curKey)
+        {
+            double monthEnd = equity->get(i - 1);
+            keys.add(curKey.copy());
+            rets.add(monthStart == 0.0 ? 0.0 : monthEnd / monthStart - 1.0);
+            monthStart = monthEnd;
+            curKey = k.copy();
+        }
+        i++;
+    }
+    // Flush the trailing (possibly partial) month.
+    keys.add(curKey.copy());
+    rets.add(monthStart == 0.0 ? 0.0 : equity->get(n - 1) / monthStart - 1.0);
+
+    sb->append("| Year | Jan | Feb | Mar | Apr | May | Jun | Jul | Aug | Sep | Oct | Nov | Dec | Year |\n");
+    sb->append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+
+    int idx = 0;
+    while (idx < keys.count())
+    {
+        string year = keys.get(idx).substring(0, 4);
+
+        // Gather the twelve month cells for this year.
+        double[12] cells = default;
+        bool[12] present = default;
+        double yearGrowth = 1.0;
+        while (idx < keys.count() && keys.get(idx).substring(0, 4) == year)
+        {
+            int m = keys.get(idx).substring(5, 2).toInt() - 1;
+            if (m >= 0 && m < 12)
+            {
+                cells[m] = rets.get(idx);
+                present[m] = true;
+                yearGrowth = yearGrowth * (1.0 + rets.get(idx));
+            }
+            idx++;
+        }
+
+        sb->append("| " + year);
+        int m = 0;
+        while (m < 12)
+        {
+            if (present[m]) sb->append(" | " + fmtPct(cells[m], 2));
+            else sb->append(" | ");
+            m++;
+        }
+        sb->append(" | " + fmtPct(yearGrowth - 1.0, 2) + " |\n");
+    }
+}
+
+// Rolling 252-day Sharpe, sampled quarterly to keep the table readable.
+void writeRollingSharpe(stringbuilder* sb, list<Bar>* bars, list<double>* rets)
+{
+    int window = 252;
+    int n = rets->count();
+    if (n <= window)
+    {
+        sb->append("_Not enough history for a 252-day rolling window._\n");
+        return;
+    }
+
+    sb->append("| Window end | Rolling 252d Sharpe |\n|---|---|\n");
+
+    double best = 0.0;
+    double worst = 0.0;
+    double sum = 0.0;
+    int count = 0;
+    bool first = true;
+
+    int i = window;
+    while (i <= n)
+    {
+        double s = sharpeOf(rets, i - window, i);
+        sum += s;
+        count++;
+        if (first) { best = s; worst = s; first = false; }
+        else
+        {
+            if (s > best) best = s;
+            if (s < worst) worst = s;
+        }
+        // rets[i-1] corresponds to bars[i]; sample every ~63 trading days.
+        if ((n - i) % 63 == 0)
+        {
+            int barIdx = i < bars->count() ? i : bars->count() - 1;
+            sb->append("| " + bars->get(barIdx).date + " | " + fmtF(s, 3) + " |\n");
+        }
+        i++;
+    }
+
+    sb->append("\nMean rolling Sharpe **" + fmtF(count > 0 ? sum / (double)count : 0.0, 3) + "**");
+    sb->append(", best **" + fmtF(best, 3) + "**");
+    sb->append(", worst **" + fmtF(worst, 3) + "**.\n");
+}
+
+// ---------------------------------------------------------------------------
+// Correlation matrix across every CSV in data/
+// ---------------------------------------------------------------------------
+
+// Strip a directory prefix and the .csv suffix from a path.
+move string symbolFromPath(string path)
+{
+    int slash = -1;
+    int i = 0;
+    while (i < path.length())
+    {
+        i8 c = path.charAt(i);
+        if (c == '/' || c == '\\') slash = i;
+        i++;
+    }
+    string name = path.substring(slash + 1);
+    if (name.length() > 4 && name.substring(name.length() - 4, 4) == ".csv")
+        return name.substring(0, name.length() - 4);
+    return name.copy();
+}
+
+void writeCorrelationMatrix(stringbuilder* sb, string dataDir, string primary)
+{
+    list<string>* entries = Directory.listFiles(dataDir);
+    if (entries == nullptr)
+    {
+        sb->append("_No data directory found._\n");
+        return;
+    }
+
+    // Collect the symbols, primary first so it heads the matrix.
+    list<string> symbols;
+    list<string> paths;
+    int i = 0;
+    while (i < entries->count())
+    {
+        string e = entries->get(i);
+        string full = e.indexOf('/') >= 0 ? e.copy() : (dataDir + "/" + e);
+        string sym = symbolFromPath(full);
+        if (e.length() > 4 && e.substring(e.length() - 4, 4) == ".csv")
+        {
+            symbols.add(sym.copy());
+            paths.add(full.copy());
+        }
+        i++;
+    }
+    delete entries;
+
+    if (symbols.count() == 0)
+    {
+        sb->append("_No CSV files in " + dataDir + "._\n");
+        return;
+    }
+
+    // Daily adj_close returns keyed by date, per symbol.
+    list<unique dictionary<string, double>*> byDate;
+    i = 0;
+    while (i < paths.count())
+    {
+        dictionary<string, double>* d = new dictionary<string, double>;
+        list<Bar>* bars = loadCsv(paths.get(i));
+        int j = 1;
+        while (j < bars->count())
+        {
+            double prev = bars->get(j - 1).adj_close;
+            double cur = bars->get(j).adj_close;
+            if (prev > 0.0) d->set(bars->get(j).date, cur / prev - 1.0);
+            j++;
+        }
+        byDate.add(d);
+        i++;
+    }
+
+    // Align on the dates of the primary symbol (falling back to symbol 0).
+    int base = 0;
+    i = 0;
+    while (i < symbols.count())
+    {
+        if (symbols.get(i) == primary) base = i;
+        i++;
+    }
+
+    list<Bar>* baseBars = loadCsv(paths.get(base));
+    list<string> dates;
+    int j = 1;
+    while (j < baseBars->count())
+    {
+        string dt = baseBars->get(j).date;
+        bool everywhere = true;
+        int k = 0;
+        while (k < byDate.count())
+        {
+            if (!byDate.get(k)->contains(dt)) everywhere = false;
+            k++;
+        }
+        if (everywhere) dates.add(dt);
+        j++;
+    }
+
+    // Materialise aligned return vectors.
+    list<unique list<double>*> series;
+    i = 0;
+    while (i < symbols.count())
+    {
+        list<double>* v = new list<double>;
+        int d = 0;
+        while (d < dates.count())
+        {
+            v->add(byDate.get(i)->get(dates.get(d)));
+            d++;
+        }
+        series.add(v);
+        i++;
+    }
+
+    int nDates = dates.count();
+    sb->append("Aligned on " + nDates.toString() + " common trading days.\n\n");
+    sb->append("| |");
+    i = 0;
+    while (i < symbols.count()) { sb->append(" " + symbols.get(i) + " |"); i++; }
+    sb->append("\n|---|");
+    i = 0;
+    while (i < symbols.count()) { sb->append("---|"); i++; }
+    sb->append("\n");
+
+    int r = 0;
+    while (r < symbols.count())
+    {
+        sb->append("| **" + symbols.get(r) + "** |");
+        int c = 0;
+        while (c < symbols.count())
+        {
+            sb->append(" " + fmtF(correlation(series.get(r), series.get(c)), 3) + " |");
+            c++;
+        }
+        sb->append("\n");
+        r++;
+    }
+
+    // `series` and `byDate` hold `unique` elements, so their destructors free
+    // every dictionary/vector; `baseBars` is owned by this scope as well.
+}
+
+// ---------------------------------------------------------------------------
+// Walk-forward analysis
+// ---------------------------------------------------------------------------
+
+// Evaluate one family: pick the best parameters in-sample, then report the
+// out-of-sample Sharpe those parameters actually delivered.
+void appendWalkForwardRow(stringbuilder* sb, list<SweepRow>* isRows, int kind,
+                          list<Bar>* oos, double commissionBps, double slippageBps)
+{
+    int bi = bestOfKind(isRows, kind);
+    if (bi < 0) return;
+    SweepRow b = isRows->get(bi);
+
+    unique IStrategy s = makeStrategy(b.kind, b.p1, b.p2);
+    BacktestResult r = runBacktest(oos, s, commissionBps, slippageBps);
+
+    double decay = b.sharpe != 0.0 ? (r.sharpe - b.sharpe) : 0.0;
+
+    sb->append("| " + kindName(b.kind));
+    sb->append(" | " + kindParams(b.kind, b.p1, b.p2));
+    sb->append(" | " + fmtF(b.sharpe, 3));
+    sb->append(" | " + fmtF(r.sharpe, 3));
+    sb->append(" | " + fmtF(decay, 3));
+    sb->append(" | " + fmtPct(b.cagr, 2));
+    sb->append(" | " + fmtPct(r.cagr, 2));
+    sb->append(" |\n");
+}
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
+
+extern int main(int argc, char** argv)
+{
+    string symbol = "SPY";
+    double commissionBps = 1.0;
+    double slippageBps = 1.0;
+
+    int a = 1;
+    while (a < argc)
+    {
+        string arg = (string)argv[a];
+        if (arg == "--symbol" && a + 1 < argc) { symbol = (string)argv[a + 1]; a++; }
+        else if (arg == "--commission" && a + 1 < argc) { commissionBps = ((string)argv[a + 1]).toDouble(); a++; }
+        else if (arg == "--slippage" && a + 1 < argc) { slippageBps = ((string)argv[a + 1]).toDouble(); a++; }
+        a++;
+    }
+
+    string dataDir = "data";
+    string csvPath = dataDir + "/" + symbol + ".csv";
+    if (!File.exists(csvPath))
+    {
+        printf("analysis: no such data file: %s\n", csvPath.data());
+        return 1;
+    }
+
+    list<Bar>* bars = loadCsv(csvPath);
+    int n = bars->count();
+    if (n < 300)
+    {
+        printf("analysis: %s has only %d bars - not enough history.\n", symbol.data(), n);
+        return 1;
+    }
+    printf("analysis: loaded %d bars for %s (%s .. %s)\n",
+           n, symbol.data(), bars->get(0).date.data(), bars->get(n - 1).date.data());
+
+    // --- 1. full-history parameter sweep -----------------------------------
+    printf("analysis: running full-history parameter sweep...\n");
+    list<SweepRow> sweep;
+    runGrid(bars, &sweep, commissionBps, slippageBps);
+    sweep.sort((SweepRow x, SweepRow y) => { return x.sharpe > y.sharpe; });
+    printf("analysis: %d parameter combinations evaluated.\n", sweep.count());
+
+    // --- 2. walk-forward split ---------------------------------------------
+    int split = (int)((double)n * 0.6);
+    list<Bar>* inSample = sliceBars(bars, 0, split);
+    list<Bar>* outSample = sliceBars(bars, split, n);
+    printf("analysis: walk-forward split at %s (%d in-sample / %d out-of-sample bars)\n",
+           bars->get(split).date.data(), inSample->count(), outSample->count());
+
+    list<SweepRow> isSweep;
+    runGrid(inSample, &isSweep, commissionBps, slippageBps);
+
+    // --- 3. best overall strategy, for the equity-derived sections ----------
+    SweepRow best = sweep.get(0);
+    unique IStrategy bestStrat = makeStrategy(best.kind, best.p1, best.p2);
+    BacktestResult bestRes = runBacktest(bars, bestStrat, commissionBps, slippageBps);
+
+    list<double> bestRets;
+    equityToReturns(&bestRes.equity, &bestRets);
+
+    // Buy-and-hold benchmark over the same window.
+    BuyAndHold bh = BuyAndHold();
+    BacktestResult bhRes = runBacktest(bars, bh, commissionBps, slippageBps);
+
+    // --- 4. sweep CSV -------------------------------------------------------
+    stringbuilder csv;
+    csv.append("symbol,strategy,params,total_return,cagr,vol,sharpe,sortino,max_dd,calmar,trades,win_rate,exposure\n");
+    int i = 0;
+    while (i < sweep.count())
+    {
+        SweepRow r = sweep.get(i);
+        csv.append(symbol + "," + kindName(r.kind) + ",\"" + kindParams(r.kind, r.p1, r.p2) + "\",");
+        csv.append(fmtF(r.total_return, 6) + "," + fmtF(r.cagr, 6) + "," + fmtF(r.vol, 6) + ",");
+        csv.append(fmtF(r.sharpe, 6) + "," + fmtF(r.sortino, 6) + "," + fmtF(r.max_dd, 6) + ",");
+        csv.append(fmtF(r.calmar, 6) + "," + r.trades.toString() + ",");
+        csv.append(fmtF(r.win_rate, 6) + "," + fmtF(r.exposure, 6) + "\n");
+        i++;
+    }
+    string sweepPath = "results/sweep_" + symbol + ".csv";
+    _ = File.writeAllText(sweepPath, csv.toString());
+
+    // --- 5. markdown report -------------------------------------------------
+    stringbuilder md;
+    md.append("# Parameter sweep and walk-forward analysis: " + symbol + "\n\n");
+    md.append("Data: `" + csvPath + "` - " + n.toString() + " daily bars, ");
+    md.append(bars->get(0).date + " to " + bars->get(n - 1).date + ".\n\n");
+    md.append("Costs: commission " + fmtF(commissionBps, 1) + " bps, slippage " + fmtF(slippageBps, 1) + " bps per unit of turnover.\n\n");
+
+    md.append("## Benchmark: buy and hold\n\n");
+    md.append("| Metric | Value |\n|---|---|\n");
+    md.append("| Total return | " + fmtPct(bhRes.total_return, 2) + " |\n");
+    md.append("| CAGR | " + fmtPct(bhRes.cagr, 2) + " |\n");
+    md.append("| Annualised vol | " + fmtPct(bhRes.vol, 2) + " |\n");
+    md.append("| Sharpe | " + fmtF(bhRes.sharpe, 3) + " |\n");
+    md.append("| Sortino | " + fmtF(bhRes.sortino, 3) + " |\n");
+    md.append("| Max drawdown | " + fmtPct(bhRes.max_dd, 2) + " |\n");
+    md.append("| Calmar | " + fmtF(bhRes.calmar, 2) + " |\n\n");
+
+    md.append("## Parameter sweep - top 20 by Sharpe\n\n");
+    int nCombos = sweep.count();
+    md.append(nCombos.toString() + " combinations evaluated over the full history ");
+    md.append("(SMA fast 5..50/5 x slow 50..250/25, momentum lookback 20..250/10, Donchian n 10..100/5).\n\n");
+    md.append("| # | Strategy | Params | Sharpe | Sortino | CAGR | Vol | MaxDD | Calmar | Trades | Win rate | Exposure |\n");
+    md.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    i = 0;
+    while (i < sweep.count() && i < 20)
+    {
+        appendSweepRow(&md, sweep.get(i), i + 1);
+        i++;
+    }
+    md.append("\nFull ranking: `" + sweepPath + "`.\n\n");
+
+    md.append("## Best parameters per strategy family (full history)\n\n");
+    md.append("| # | Strategy | Params | Sharpe | Sortino | CAGR | Vol | MaxDD | Calmar | Trades | Win rate | Exposure |\n");
+    md.append("|---|---|---|---|---|---|---|---|---|---|---|---|\n");
+    int k = 0;
+    while (k < 3)
+    {
+        int bi = bestOfKind(&sweep, k);
+        if (bi >= 0) appendSweepRow(&md, sweep.get(bi), k + 1);
+        k++;
+    }
+    md.append("\n");
+
+    md.append("## Walk-forward check (60% in-sample / 40% out-of-sample)\n\n");
+    int nIs = inSample->count();
+    int nOos = outSample->count();
+    md.append("Parameters are chosen on the first " + nIs.toString() + " bars (");
+    md.append(bars->get(0).date + " to " + bars->get(split - 1).date + ") and then applied unchanged to the ");
+    md.append("remaining " + nOos.toString() + " bars (");
+    md.append(bars->get(split).date + " to " + bars->get(n - 1).date + ").\n");
+    md.append("A large negative Sharpe decay is the signature of an overfitted grid search.\n\n");
+    md.append("| Strategy | In-sample best params | IS Sharpe | OOS Sharpe | Sharpe decay | IS CAGR | OOS CAGR |\n");
+    md.append("|---|---|---|---|---|---|---|\n");
+    k = 0;
+    while (k < 3)
+    {
+        appendWalkForwardRow(&md, &isSweep, k, outSample, commissionBps, slippageBps);
+        k++;
+    }
+    md.append("\n");
+
+    md.append("## Best overall strategy: " + kindName(best.kind) + " (" + kindParams(best.kind, best.p1, best.p2) + ")\n\n");
+    md.append("| Metric | Value |\n|---|---|\n");
+    md.append("| Total return | " + fmtPct(bestRes.total_return, 2) + " |\n");
+    md.append("| CAGR | " + fmtPct(bestRes.cagr, 2) + " |\n");
+    md.append("| Annualised vol | " + fmtPct(bestRes.vol, 2) + " |\n");
+    md.append("| Sharpe | " + fmtF(bestRes.sharpe, 3) + " |\n");
+    md.append("| Sortino | " + fmtF(bestRes.sortino, 3) + " |\n");
+    md.append("| Max drawdown | " + fmtPct(bestRes.max_dd, 2) + " |\n");
+    md.append("| Calmar | " + fmtF(bestRes.calmar, 2) + " |\n");
+    md.append("| Trades | " + bestRes.trades.toString() + " |\n");
+    md.append("| Win rate | " + fmtPct(bestRes.win_rate, 1) + " |\n");
+    md.append("| Exposure | " + fmtPct(bestRes.exposure, 1) + " |\n\n");
+
+    md.append("### Monthly returns\n\n");
+    writeMonthlyTable(&md, bars, &bestRes.equity);
+    md.append("\n");
+
+    md.append("### Rolling 252-day Sharpe\n\n");
+    writeRollingSharpe(&md, bars, &bestRets);
+    md.append("\n");
+
+    md.append("## Correlation matrix of daily returns\n\n");
+    writeCorrelationMatrix(&md, dataDir, symbol);
+    md.append("\n");
+
+    string mdPath = "results/analysis_" + symbol + ".md";
+    _ = File.writeAllText(mdPath, md.toString());
+
+    printf("analysis: wrote %s and %s\n", mdPath.data(), sweepPath.data());
+    printf("analysis: best = %s %s  sharpe=%.3f cagr=%.2f%%\n",
+           kindName(best.kind).data(), kindParams(best.kind, best.p1, best.p2).data(),
+           best.sharpe, best.cagr * 100.0);
+
+    return 0;
+}

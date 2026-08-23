@@ -1,0 +1,1493 @@
+// charts.cb - component G: the live native macOS chart app for the CFlat quant
+// backtester.
+//
+//   bin/charts               -> real AppKit window (ComboBoxes, Checkbox, Button,
+//                               StatusBar, TabControl with 5 CanvasView tabs)
+//   bin/charts --selftest    -> headless ui_test.cb suite, exit 0 on success
+//   bin/charts --probe [s]   -> unattended LIVE run: opens the real window, walks
+//                               every tab, asserts each one actually rasterized
+//                               non-background pixels, then closes.  Exit 0 = ok.
+//
+// All chart rasterization goes through component P (src/plot.cb): ICanvas only
+// offers drawText/drawRect/drawImage, so every line/area/bar/heatmap is drawn by
+// the software rasterizer into a top-down BGRA32 Plot buffer which is uploaded
+// with canvasCreateImage() and blitted with ICanvas.drawImage() in POINTS.
+//
+// Build:
+//   tools/cflat-macos-arm64-v0.11.0/cflat src/charts.cb -o bin/charts
+import "ui_native/host.cb";
+import "ui_test.cb";
+import "plot.cb";
+import "filesystem.cb";
+import "thread.cb";
+import "time.cb";
+
+// ---------------------------------------------------------------------------
+// Theme + layout constants (dark theme from SPEC_CHARTS.md)
+// ---------------------------------------------------------------------------
+const u32 CH_BG   = (u32)0x1e1e1e;
+const u32 CH_GRID = (u32)0x333333;
+const u32 CH_INK  = (u32)0xcccccc;
+const u32 CH_WARN = (u32)0xe57373;
+
+const int CH_TAB_EQUITY   = 0;
+const int CH_TAB_DRAWDOWN = 1;
+const int CH_TAB_MONTHLY  = 2;
+const int CH_TAB_SWEEP    = 3;
+const int CH_TAB_CORR     = 4;
+const int CH_TAB_COUNT    = 5;
+
+const int CH_CANVAS_H  = 14;    // CanvasView height in layout cells (14 * 26 = 364pt)
+const int CH_CELL_W    = 8;     // Cocoa cell width  in points
+const int CH_CELL_H    = 26;    // Cocoa cell height in points
+
+u32 chPalette(int i)
+{
+    int k = i % 6;
+    if (k == 0) return (u32)0x4fc3f7;
+    if (k == 1) return (u32)0xffb74d;
+    if (k == 2) return (u32)0x81c784;
+    if (k == 3) return (u32)0xe57373;
+    if (k == 4) return (u32)0xba68c8;
+    return (u32)0xfff176;
+}
+
+string chStrategyId(int i)
+{
+    if (i == 0) return "buyhold";
+    if (i == 1) return "sma";
+    if (i == 2) return "momentum";
+    if (i == 3) return "meanrev";
+    return "donchian";
+}
+
+string chTabName(int t)
+{
+    if (t == CH_TAB_EQUITY)   return "equity";
+    if (t == CH_TAB_DRAWDOWN) return "drawdown";
+    if (t == CH_TAB_MONTHLY)  return "monthly";
+    if (t == CH_TAB_SWEEP)    return "sweep";
+    return "correlation";
+}
+
+// ---------------------------------------------------------------------------
+// Small formatting + CSV helpers (prefixed `ch` so they cannot collide with the
+// names plot.cb / chart_export.cb bring into the shared global scope).
+// ---------------------------------------------------------------------------
+move string chFmt(double v, int dec)
+{
+    stringbuilder sb;
+    if (v != v) return "n/a";
+    if (v > 1.0e15 || v < -1.0e15) return "n/a";
+    if (v < 0.0) { sb.appendChar('-'); v = -v; }
+    double scale = 1.0;
+    int k = 0;
+    while (k < dec) { scale = scale * 10.0; k++; }
+    i64 iscale = (i64)scale;
+    i64 scaled = (i64)(v * scale + 0.5);
+    sb.append(scaled / iscale);
+    if (dec > 0)
+    {
+        sb.appendChar('.');
+        i64 fp = scaled % iscale;
+        i64 p = iscale / 10;
+        while (p > 0) { sb.appendChar((i8)(48 + (int)((fp / p) % 10))); p = p / 10; }
+    }
+    return sb.toString();
+}
+
+int chTextW(int nchars, int scale) { return nchars * 6 * scale - scale; }
+
+move string chPct(double v, int dec) { return chFmt(v * 100.0, dec) + "%"; }
+
+// Read a whole text file into owned lines (blank lines dropped).
+move list<string> chReadLines(string path)
+{
+    list<string> out = default;
+    File* f = new File;
+    if (!f->openRead(path)) { delete f; return out; }
+    while (!f->atEnd())
+    {
+        string line = f->readLine();
+        if (line.length() == 0) continue;
+        out.add(move line);
+    }
+    f->close();
+    delete f;
+    return out;
+}
+
+// Strip surrounding double quotes from a CSV field.
+move string chUnquote(string s)
+{
+    int n = s.length();
+    if (n >= 2 && s.data()[0] == '"' && s.data()[n - 1] == '"') return s.substring(1, n - 2);
+    return s.copy();
+}
+
+// Pull an integer out of a "key=value" token list such as `fast=10 slow=100`.
+int chParamInt(string params, string key, int fallback)
+{
+    i32 at = params.indexOf(key + "=");
+    if (at < 0) return fallback;
+    int start = (int)at + key.length() + 1;
+    int n = params.length();
+    char* d = params.data();
+    int end = start;
+    while (end < n)
+    {
+        i8 c = d[end];
+        if (c < '0' || c > '9') break;
+        end++;
+    }
+    if (end == start) return fallback;
+    return (int)params.substring(start, end - start).toInt();
+}
+
+// ---------------------------------------------------------------------------
+// Model rows
+// ---------------------------------------------------------------------------
+class ChCurve
+{
+    string       name       = default;   // strategy id
+    list<string> dates      = default;
+    list<double> equity     = default;
+    list<double> drawdown   = default;
+    // Zoom/pan slice handed to plot.cb (Series.y is BORROWED, so these must be
+    // long-lived fields, not locals).
+    list<string> viewDates  = default;
+    list<double> viewEquity = default;
+    list<double> viewDd     = default;
+    u32          color      = (u32)0;
+    bool         ok         = false;
+
+};
+
+class ChSummary
+{
+    string symbol   = default;
+    string strategy = default;
+    string params   = default;
+    double totalReturn = 0.0;
+    double cagr        = 0.0;
+    double vol         = 0.0;
+    double sharpe      = 0.0;
+    double sortino     = 0.0;
+    double maxDd       = 0.0;
+    double calmar      = 0.0;
+    int    trades      = 0;
+    double winRate     = 0.0;
+    double exposure    = 0.0;
+};
+
+// ---------------------------------------------------------------------------
+// ChartsApp
+// ---------------------------------------------------------------------------
+class ChartsApp : IComponent
+{
+    IUiContext uiCtx = default;
+
+    list<string> symbols  = default;      // from data/*.csv
+    int  symIdx   = 0;
+    int  stratIdx = 0;                    // 0 = "all", 1..5 = one strategy
+    bool logY     = true;
+    int  tab      = 0;
+    bool loaded   = false;
+
+    list<unique ChCurve*>   curves  = default;   // 5 curves for the current symbol
+    list<unique ChSummary*> summary = default;   // results/summary.csv
+
+    // Sweep heatmap (SMA fast x slow Sharpe).
+    list<string> sweepRows = default;     // slow values
+    list<string> sweepCols = default;     // fast values
+    list<double> sweepVals = default;     // row-major
+    double sweepMin = 0.0;
+    double sweepMax = 1.0;
+
+    // Correlation heatmap.
+    list<string> corrLabels = default;
+    list<double> corrVals   = default;
+
+    // Monthly bars.
+    list<string> monthLabels = default;
+    list<double> monthVals   = default;
+    string       monthStrat  = default;
+
+    // Raster target + host image handle.
+    Plot* plot     = nullptr;
+    u64   img      = (u64)0;
+    u64   baseBuf  = (u64)0;             // untouched copy of the last full render
+    int   plotW    = 0;
+    int   plotH    = 0;
+    bool  dirty    = true;               // chart needs a full re-rasterize
+    bool  overlayOn = false;             // crosshair currently composited
+
+    // Equity zoom / pan (index range into the curve arrays).
+    int  viewStart = 0;
+    int  viewEnd   = 0;                  // exclusive; 0 = "whole history"
+    int  fullLen   = 0;
+
+    // Pointer state on the Equity canvas.
+    int    hoverIdx = 0 - 1;
+    double hoverX   = 0.0;
+    double hoverY   = 0.0;
+    bool   dragging = false;
+    double dragX    = 0.0;
+
+    // Paint diagnostics (the --probe oracle).
+    int   paintCount = 0;
+    int   paintMask  = 0;
+    int[5] tabPixels = default;
+
+    string lastExport = default;
+
+    ~ChartsApp()
+    {
+        if (this.img != (u64)0) { canvasReleaseImage(this.img); this.img = (u64)0; }
+        if (this.baseBuf != (u64)0) { free((void*)this.baseBuf); this.baseBuf = (u64)0; }
+        if (this.plot != nullptr) { delete this.plot; this.plot = nullptr; }
+    }
+
+    // -- data loading -------------------------------------------------------
+
+    void ensureLoaded()
+    {
+        if (this.loaded) return;
+        this.loaded = true;
+        this.discoverSymbols();
+        this.loadSummary();
+        this.loadSymbolData();
+    }
+
+    void discoverSymbols()
+    {
+        list<string>* files = Directory.listFiles("data");
+        if (files != nullptr)
+        {
+            int i = 0;
+            while (i < files.count())
+            {
+                string nm = files.get(i);
+                if (nm.endsWith(".csv"))
+                    this.symbols.add(nm.substring(0, nm.length() - 4));
+                i++;
+            }
+            delete files;
+        }
+        if (this.symbols.count() == 0) this.symbols.add("SPY");
+        // Deterministic order (insertion sort - at most a handful of symbols).
+        int a = 1;
+        while (a < this.symbols.count())
+        {
+            int b = a;
+            while (b > 0 && this.symbols.get(b).compare(this.symbols.get(b - 1)) < 0)
+            {
+                string tmp = this.symbols.get(b).copy();
+                this.symbols.set(b, this.symbols.get(b - 1).copy());
+                this.symbols.set(b - 1, move tmp);
+                b--;
+            }
+            a++;
+        }
+    }
+
+    void loadSummary()
+    {
+        list<string> lines = chReadLines("results/summary.csv");
+        int i = 1;   // skip header
+        while (i < lines.count())
+        {
+            list<string> f = lines.get(i).split(",");
+            if (f.count() >= 13)
+            {
+                ChSummary* r = new ChSummary();
+                r.symbol      = f.get(0).copy();
+                r.strategy    = f.get(1).copy();
+                r.params      = chUnquote(f.get(2));
+                r.totalReturn = f.get(3).toDouble();
+                r.cagr        = f.get(4).toDouble();
+                r.vol         = f.get(5).toDouble();
+                r.sharpe      = f.get(6).toDouble();
+                r.sortino     = f.get(7).toDouble();
+                r.maxDd       = f.get(8).toDouble();
+                r.calmar      = f.get(9).toDouble();
+                r.trades      = (int)f.get(10).toInt();
+                r.winRate     = f.get(11).toDouble();
+                r.exposure    = f.get(12).toDouble();
+                this.summary.add(r);
+            }
+            i++;
+        }
+    }
+
+    string symbol()
+    {
+        if (this.symIdx < 0 || this.symIdx >= this.symbols.count()) return "SPY";
+        return this.symbols.get(this.symIdx);
+    }
+
+    // (Re)load the 5 equity curves + the sweep/correlation/monthly derivatives
+    // for the current symbol.
+    void loadSymbolData()
+    {
+        this.curves.clear();
+        string sym = this.symbol();
+        int s = 0;
+        while (s < 5)
+        {
+            ChCurve* c = new ChCurve();
+            c.name  = chStrategyId(s);
+            c.color = chPalette(s);
+            list<string> lines = chReadLines("results/" + sym + "_" + chStrategyId(s) + ".csv");
+            int i = 1;
+            while (i < lines.count())
+            {
+                list<string> f = lines.get(i).split(",");
+                if (f.count() >= 4)
+                {
+                    c.dates.add(f.get(0).copy());
+                    c.equity.add(f.get(1).toDouble());
+                    c.drawdown.add(f.get(3).toDouble());
+                }
+                i++;
+            }
+            c.ok = c.equity.count() > 1;
+            this.curves.add(c);
+            s++;
+        }
+
+        this.fullLen = 0;
+        int k = 0;
+        while (k < this.curves.count())
+        {
+            if (this.curves.get(k).equity.count() > this.fullLen)
+                this.fullLen = this.curves.get(k).equity.count();
+            k++;
+        }
+        this.viewStart = 0;
+        this.viewEnd   = this.fullLen;
+
+        this.loadSweep(sym);
+        this.buildMonthly();
+        this.loadCorrelation();
+        this.dirty = true;
+    }
+
+    // results/sweep_<SYM>.csv -> SMA fast x slow Sharpe matrix.
+    void loadSweep(string sym)
+    {
+        this.sweepRows.clear();
+        this.sweepCols.clear();
+        this.sweepVals.clear();
+
+        list<string> lines = chReadLines("results/sweep_" + sym + ".csv");
+        list<int>    fastV = default;
+        list<int>    slowV = default;
+        list<double> shV   = default;
+        int i = 1;
+        while (i < lines.count())
+        {
+            list<string> f = lines.get(i).split(",");
+            if (f.count() >= 7 && f.get(1).contains("sma"))
+            {
+                string prm = chUnquote(f.get(2));
+                int fa = chParamInt(prm, "fast", 0 - 1);
+                int sl = chParamInt(prm, "slow", 0 - 1);
+                if (fa > 0 && sl > 0)
+                {
+                    fastV.add(fa);
+                    slowV.add(sl);
+                    shV.add(f.get(6).toDouble());
+                }
+            }
+            i++;
+        }
+        if (fastV.count() == 0) return;
+
+        // Unique, ascending axis values.
+        list<int> fa = default;
+        list<int> sl = default;
+        i = 0;
+        while (i < fastV.count()) { chAddUniqueSorted(&fa, fastV.get(i)); i++; }
+        i = 0;
+        while (i < slowV.count()) { chAddUniqueSorted(&sl, slowV.get(i)); i++; }
+
+        int cols = fa.count();
+        int rows = sl.count();
+        // Cap the grid so the labels stay legible in the canvas.
+        int cStep = (cols + 11) / 12;  if (cStep < 1) cStep = 1;
+        int rStep = (rows + 8) / 9;    if (rStep < 1) rStep = 1;
+
+        list<int> useF = default;
+        list<int> useS = default;
+        i = 0;
+        while (i < cols) { if ((i % cStep) == 0) useF.add(fa.get(i)); i++; }
+        i = 0;
+        while (i < rows) { if ((i % rStep) == 0) useS.add(sl.get(i)); i++; }
+
+        i = 0;
+        while (i < useF.count()) { int fv = useF.get(i); this.sweepCols.add(fv.toString()); i++; }
+        i = 0;
+        while (i < useS.count()) { int sv = useS.get(i); this.sweepRows.add(sv.toString()); i++; }
+
+        double lo =  1.0e300;
+        double hi = -1.0e300;
+        int r = 0;
+        while (r < useS.count())
+        {
+            int c = 0;
+            while (c < useF.count())
+            {
+                double v = 0.0;
+                bool found = false;
+                int j = 0;
+                while (j < shV.count())
+                {
+                    if (fastV.get(j) == useF.get(c) && slowV.get(j) == useS.get(r))
+                    { v = shV.get(j); found = true; break; }
+                    j++;
+                }
+                if (!found) v = 0.0;
+                if (v < lo) lo = v;
+                if (v > hi) hi = v;
+                this.sweepVals.add(v);
+                c++;
+            }
+            r++;
+        }
+        // Symmetric range so the diverging ramp centres on 0.
+        double mag = hi > (0.0 - lo) ? hi : (0.0 - lo);
+        if (mag < 1.0e-9) mag = 1.0;
+        this.sweepMin = 0.0 - mag;
+        this.sweepMax = mag;
+    }
+
+    // Monthly returns of the "best" strategy (the selected one, else the highest
+    // Sharpe for this symbol in results/summary.csv).
+    void buildMonthly()
+    {
+        this.monthLabels.clear();
+        this.monthVals.clear();
+        int pick = this.stratIdx - 1;
+        if (pick < 0) pick = this.bestStrategyIndex();
+        if (pick < 0 || pick >= this.curves.count()) return;
+        ChCurve* c = this.curves.get(pick);
+        this.monthStrat = c.name.copy();
+        if (!c.ok) return;
+
+        int n = c.equity.count();
+        int i = 1;
+        string curMonth = c.dates.get(0).substring(0, 7);
+        double monthStartEq = c.equity.get(0);
+        double lastEq = c.equity.get(0);
+        while (i < n)
+        {
+            string m = c.dates.get(i).substring(0, 7);
+            if (m.compare(curMonth) != 0)
+            {
+                double ret = monthStartEq > 0.0 ? (lastEq / monthStartEq - 1.0) : 0.0;
+                this.monthLabels.add(curMonth.copy());
+                this.monthVals.add(ret);
+                curMonth = move m;
+                monthStartEq = lastEq;
+            }
+            lastEq = c.equity.get(i);
+            i++;
+        }
+        double tail = monthStartEq > 0.0 ? (lastEq / monthStartEq - 1.0) : 0.0;
+        this.monthLabels.add(curMonth.copy());
+        this.monthVals.add(tail);
+    }
+
+    int bestStrategyIndex()
+    {
+        string sym = this.symbol();
+        int best = 0;
+        double bestSharpe = 0.0 - 1.0e300;
+        int i = 0;
+        while (i < this.summary.count())
+        {
+            ChSummary* r = this.summary.get(i);
+            if (r.symbol.compare(sym) == 0)
+            {
+                int si = 0;
+                while (si < 5)
+                {
+                    if (r.strategy.compare(chStrategyId(si)) == 0 && r.sharpe > bestSharpe)
+                    { bestSharpe = r.sharpe; best = si; }
+                    si++;
+                }
+            }
+            i++;
+        }
+        return best;
+    }
+
+    // Pearson correlation of daily adj_close returns across every data/*.csv.
+    void loadCorrelation()
+    {
+        this.corrLabels.clear();
+        this.corrVals.clear();
+        int m = this.symbols.count();
+        if (m < 1) return;
+
+        // date -> return, per symbol, plus the first symbol's date order.
+        list<string> baseDates = default;
+        list<unique dictionary<string, double>*> maps = default;
+
+        int s = 0;
+        while (s < m)
+        {
+            dictionary<string, double>* d = new dictionary<string, double>();
+            list<string> lines = chReadLines("data/" + this.symbols.get(s) + ".csv");
+            double prev = 0.0;
+            bool havePrev = false;
+            int i = 1;
+            while (i < lines.count())
+            {
+                list<string> f = lines.get(i).split(",");
+                if (f.count() >= 6)
+                {
+                    double ac = f.get(5).toDouble();
+                    if (ac > 0.0)
+                    {
+                        if (havePrev)
+                        {
+                            string dt = f.get(0);
+                            d.set(dt, ac / prev - 1.0);
+                            if (s == 0) baseDates.add(f.get(0).copy());
+                        }
+                        prev = ac;
+                        havePrev = true;
+                    }
+                }
+                i++;
+            }
+            maps.add(d);
+            this.corrLabels.add(this.symbols.get(s));
+            s++;
+        }
+
+        // Intersect on the first symbol's dates.
+        list<string> common = default;
+        int i2 = 0;
+        while (i2 < baseDates.count())
+        {
+            string dt = baseDates.get(i2);
+            bool all = true;
+            int k = 0;
+            while (k < m) { if (!maps.get(k).contains(dt)) { all = false; break; } k++; }
+            if (all) common.add(dt);
+            i2++;
+        }
+        int n = common.count();
+        if (n < 3)
+        {
+            // Degenerate: emit an identity matrix so the tab still renders.
+            int r = 0;
+            while (r < m) { int c = 0; while (c < m) { this.corrVals.add(r == c ? 1.0 : 0.0); c++; } r++; }
+            return;
+        }
+
+        list<double> means = default;
+        list<double> sds   = default;
+        s = 0;
+        while (s < m)
+        {
+            double sum = 0.0;
+            int i = 0;
+            while (i < n) { sum = sum + maps.get(s).get(common.get(i)); i++; }
+            double mu = sum / (double)n;
+            double ss = 0.0;
+            i = 0;
+            while (i < n) { double d2 = maps.get(s).get(common.get(i)) - mu; ss = ss + d2 * d2; i++; }
+            means.add(mu);
+            sds.add(Math.sqrt(ss / (double)n));
+            s++;
+        }
+
+        int r = 0;
+        while (r < m)
+        {
+            int c = 0;
+            while (c < m)
+            {
+                double cov = 0.0;
+                int i = 0;
+                while (i < n)
+                {
+                    string dt = common.get(i);
+                    cov = cov + (maps.get(r).get(dt) - means.get(r)) * (maps.get(c).get(dt) - means.get(c));
+                    i++;
+                }
+                cov = cov / (double)n;
+                double den = sds.get(r) * sds.get(c);
+                this.corrVals.add(den > 1.0e-15 ? cov / den : 0.0);
+                c++;
+            }
+            r++;
+        }
+    }
+
+    // -- rasterization ------------------------------------------------------
+
+    int canvasCells()
+    {
+        int w = hostWidth() - 4;
+        if (w < 44) w = 44;
+        if (w > 200) w = 200;
+        return w;
+    }
+
+    int canvasPxW() { return this.canvasCells() * CH_CELL_W; }
+    int canvasPxH() { return CH_CANVAS_H * CH_CELL_H; }
+
+    void ensurePlot()
+    {
+        int w = this.canvasPxW();
+        int h = this.canvasPxH();
+        if (this.plot == nullptr) this.plot = new Plot();
+        if (this.plotW != w || this.plotH != h)
+        {
+            this.plot.create(w, h, CH_BG);
+            this.plotW = w;
+            this.plotH = h;
+            if (this.baseBuf != (u64)0) { free((void*)this.baseBuf); this.baseBuf = (u64)0; }
+            this.baseBuf = (u64)malloc((i64)(w * h * 4));
+            this.dirty = true;
+        }
+    }
+
+    // Refresh each curve's zoom slice from [viewStart, viewEnd).
+    void rebuildViews()
+    {
+        int lo = this.viewStart;
+        int hi = this.viewEnd;
+        if (hi <= lo) hi = this.fullLen;
+        int i = 0;
+        while (i < this.curves.count())
+        {
+            ChCurve* c = this.curves.get(i);
+            c.viewDates.clear();
+            c.viewEquity.clear();
+            c.viewDd.clear();
+            int a = lo; if (a < 0) a = 0;
+            int b = hi; if (b > c.equity.count()) b = c.equity.count();
+            // Decimate so the polyline never draws more points than pixels.
+            int span = b - a;
+            int step = 1;
+            if (span > this.plotW && this.plotW > 0) step = span / this.plotW;
+            if (step < 1) step = 1;
+            int k = a;
+            while (k < b)
+            {
+                c.viewDates.add(c.dates.get(k));
+                c.viewEquity.add(c.equity.get(k));
+                c.viewDd.add(c.drawdown.get(k));
+                k = k + step;
+            }
+            i++;
+        }
+    }
+
+    bool curveSelected(int i)
+    {
+        if (this.stratIdx == 0) return this.curves.get(i).ok;
+        return (this.stratIdx - 1) == i && this.curves.get(i).ok;
+    }
+
+    // Full re-rasterization of the ACTIVE tab into this.plot.
+    void renderTab()
+    {
+        this.ensureLoaded();
+        this.ensurePlot();
+        this.rebuildViews();
+        Plot* p = this.plot;
+        p.fillRect(0, 0, this.plotW, this.plotH, CH_BG);
+
+        string sym = this.symbol();
+        if (this.tab == CH_TAB_EQUITY)        this.paintEquity(p, sym);
+        else if (this.tab == CH_TAB_DRAWDOWN) this.paintDrawdown(p, sym);
+        else if (this.tab == CH_TAB_MONTHLY)  this.paintMonthly(p, sym);
+        else if (this.tab == CH_TAB_SWEEP)    this.paintSweep(p, sym);
+        else                                  this.paintCorrelation(p);
+
+        // Snapshot the clean render for cheap crosshair compositing.
+        if (this.baseBuf != (u64)0)
+            memcpy((void*)this.baseBuf, (void*)p.pixels(), (i64)(this.plotW * this.plotH * 4));
+        this.dirty = false;
+        this.overlayOn = false;
+        this.tabPixels[this.tab] = this.countNonBg();
+    }
+
+    void paintEquity(Plot* p, string sym)
+    {
+        list<Series> ss = default;
+        int i = 0;
+        while (i < this.curves.count())
+        {
+            if (this.curveSelected(i))
+            {
+                ChCurve* c = this.curves.get(i);
+                Series s = default;
+                s.name  = c.name;
+                s.y     = &c.viewEquity;
+                s.color = c.color;
+                ss.add(s);
+            }
+            i++;
+        }
+        list<string>* xl = nullptr;
+        int first = this.firstSelected();
+        if (first >= 0) { ChCurve* fc = this.curves.get(first); xl = &fc.viewDates; }
+        string title = sym + " equity (growth of 1)" + (this.logY ? "  [log]" : "");
+        if (ss.count() == 0) { p.text2(20, 20, "no equity data for " + sym, CH_WARN, 2); return; }
+        drawLineChart(p, 0, 0, this.plotW, this.plotH, title, xl, &ss, this.logY);
+    }
+
+    int firstSelected()
+    {
+        int i = 0;
+        while (i < this.curves.count()) { if (this.curveSelected(i)) return i; i++; }
+        return 0 - 1;
+    }
+
+    void paintDrawdown(Plot* p, string sym)
+    {
+        list<int> sel = default;
+        int i = 0;
+        while (i < this.curves.count()) { if (this.curveSelected(i)) sel.add(i); i++; }
+        if (sel.count() == 0) { p.text2(20, 20, "no drawdown data for " + sym, CH_WARN, 2); return; }
+
+        if (sel.count() == 1)
+        {
+            ChCurve* c = this.curves.get(sel.get(0));
+            drawAreaChart(p, 0, 0, this.plotW, this.plotH,
+                          sym + " " + c.name + " drawdown", &c.viewDates, &c.viewDd, c.color);
+            return;
+        }
+        // Small multiples: 2 columns.
+        int cols = 2;
+        int rows = (sel.count() + cols - 1) / cols;
+        int cw = this.plotW / cols;
+        int chh = this.plotH / rows;
+        i = 0;
+        while (i < sel.count())
+        {
+            ChCurve* c = this.curves.get(sel.get(i));
+            int gx = (i % cols) * cw;
+            int gy = (i / cols) * chh;
+            drawAreaChart(p, gx, gy, cw, chh, sym + " " + c.name, &c.viewDates, &c.viewDd, c.color);
+            i++;
+        }
+    }
+
+    void paintMonthly(Plot* p, string sym)
+    {
+        if (this.monthVals.count() == 0) { p.text2(20, 20, "no monthly data", CH_WARN, 2); return; }
+        drawBarChart(p, 0, 0, this.plotW, this.plotH,
+                     sym + " monthly returns - " + this.monthStrat,
+                     &this.monthLabels, &this.monthVals, (u32)0x81c784, (u32)0xe57373);
+    }
+
+    void paintSweep(Plot* p, string sym)
+    {
+        if (this.sweepVals.count() == 0)
+        {
+            p.text2(20, 20, "no results/sweep_" + sym + ".csv", CH_WARN, 2);
+            p.text(20, 56, "run: bin/analysis --symbol " + sym, CH_INK);
+            return;
+        }
+        drawHeatmap(p, 0, 0, this.plotW, this.plotH,
+                    sym + " SMA sweep - Sharpe (rows=slow, cols=fast)",
+                    &this.sweepRows, &this.sweepCols, &this.sweepVals,
+                    this.sweepMin, this.sweepMax);
+    }
+
+    void paintCorrelation(Plot* p)
+    {
+        if (this.corrVals.count() == 0) { p.text2(20, 20, "no data/*.csv", CH_WARN, 2); return; }
+        drawHeatmap(p, 0, 0, this.plotW, this.plotH,
+                    "Daily return correlation",
+                    &this.corrLabels, &this.corrLabels, &this.corrVals, -1.0, 1.0);
+    }
+
+    // Count pixels that differ from the background - the paint oracle used by
+    // the self-test and --probe.
+    int countNonBg()
+    {
+        if (this.plot == nullptr || this.plot.pixels() == (u64)0) return 0;
+        u8* b = (u8*)this.plot.pixels();
+        int bgB = (int)(CH_BG & (u32)0xFF);
+        int bgG = (int)((CH_BG >> 8) & (u32)0xFF);
+        int bgR = (int)((CH_BG >> 16) & (u32)0xFF);
+        int n = this.plotW * this.plotH;
+        int hits = 0;
+        int i = 0;
+        while (i < n)
+        {
+            int o = i * 4;
+            if ((int)b[o] != bgB || (int)b[o + 1] != bgG || (int)b[o + 2] != bgR) hits++;
+            i = i + 3;      // sample every third pixel - plenty for a liveness oracle
+        }
+        return hits;
+    }
+
+    int minTabPixels()
+    {
+        int lo = this.tabPixels[0];
+        int i = 1;
+        while (i < CH_TAB_COUNT) { if (this.tabPixels[i] < lo) lo = this.tabPixels[i]; i++; }
+        return lo;
+    }
+
+    // -- crosshair overlay --------------------------------------------------
+
+    // Composite the crosshair + readout on top of the cached base render.
+    void applyOverlay()
+    {
+        if (this.baseBuf == (u64)0 || this.plot == nullptr) return;
+        memcpy((void*)this.plot.pixels(), (void*)this.baseBuf, (i64)(this.plotW * this.plotH * 4));
+        this.overlayOn = false;
+        if (this.tab != CH_TAB_EQUITY || this.hoverIdx < 0) return;
+
+        int first = this.firstSelected();
+        if (first < 0) return;
+        ChCurve* c = this.curves.get(first);
+        if (this.hoverIdx >= c.viewDates.count()) return;
+
+        int px = (int)this.hoverX;
+        int py = (int)this.hoverY;
+        if (px < 0) px = 0;
+        if (px >= this.plotW) px = this.plotW - 1;
+        this.plot.line(px, 0, px, this.plotH - 1, (u32)0x666666);
+        this.plot.line(0, py, this.plotW - 1, py, (u32)0x444444);
+
+        stringbuilder sb;
+        sb.append(c.viewDates.get(this.hoverIdx));
+        int i = 0;
+        while (i < this.curves.count())
+        {
+            if (this.curveSelected(i))
+            {
+                ChCurve* cc = this.curves.get(i);
+                if (this.hoverIdx < cc.viewEquity.count())
+                {
+                    sb.append("  ");
+                    sb.append(cc.name);
+                    sb.append("=");
+                    sb.append(chFmt(cc.viewEquity.get(this.hoverIdx), 3));
+                }
+            }
+            i++;
+        }
+        string readout = sb.toString();
+        int tw = chTextW(readout.length(), 1);
+        int bx = px + 8;
+        if (bx + tw + 8 > this.plotW) bx = px - tw - 12;
+        if (bx < 2) bx = 2;
+        int by = this.plotH - 20;
+        this.plot.fillRect(bx - 4, by - 4, tw + 8, 16, (u32)0x101010);
+        this.plot.text(bx, by, readout, (u32)0xffffff);
+        this.overlayOn = true;
+    }
+
+    // -- CanvasView paint ---------------------------------------------------
+
+    void paint(ICanvas cv)
+    {
+        this.paintCount++;
+        bool needUpload = false;
+        int wantW = this.canvasPxW();
+        int wantH = this.canvasPxH();
+        if (this.plot == nullptr || this.plotW != wantW || this.plotH != wantH) this.dirty = true;
+        if (this.dirty) { this.renderTab(); needUpload = true; }
+        if (this.tab == CH_TAB_EQUITY && (this.hoverIdx >= 0 || this.overlayOn))
+        {
+            this.applyOverlay();
+            needUpload = true;
+        }
+        if (this.img == (u64)0) needUpload = true;
+
+        if (needUpload)
+        {
+            if (this.img != (u64)0) { canvasReleaseImage(this.img); this.img = (u64)0; }
+            this.img = canvasCreateImage(this.plot.pixels(), this.plotW, this.plotH);
+        }
+        this.paintMask = this.paintMask | (1 << this.tab);
+        if (this.tabPixels[this.tab] == 0) this.tabPixels[this.tab] = this.countNonBg();
+        if (this.img != (u64)0)
+            cv.drawImage(this.img, 0.0, 0.0, (double)this.plotW, (double)this.plotH);
+    }
+
+    // -- input --------------------------------------------------------------
+
+    int hoverIndexFor(double px)
+    {
+        int first = this.firstSelected();
+        if (first < 0) return 0 - 1;
+        int n = this.curves.get(first).viewEquity.count();
+        if (n < 2) return 0 - 1;
+        // Mirrors plot.cb's plot rect (left 66, right 14 margins).
+        double px0 = 66.0;
+        double px1 = (double)this.plotW - 14.0;
+        if (px < px0 || px > px1) return 0 - 1;
+        double t = (px - px0) / (px1 - px0 - 1.0);
+        if (t < 0.0) t = 0.0;
+        if (t > 1.0) t = 1.0;
+        int idx = (int)(t * (double)(n - 1) + 0.5);
+        if (idx < 0) idx = 0;
+        if (idx >= n) idx = n - 1;
+        return idx;
+    }
+
+    void pointerMove(double px, double py, int buttons)
+    {
+        if (this.tab != CH_TAB_EQUITY) return;
+        if (this.dragging)
+        {
+            double dx = px - this.dragX;
+            this.dragX = px;
+            int span = this.viewEnd - this.viewStart;
+            if (span < 2) span = 2;
+            double px0 = 66.0;
+            double px1 = (double)this.plotW - 14.0;
+            double perPx = (double)span / (px1 - px0);
+            int shift = (int)(0.0 - dx * perPx);
+            this.panBy(shift);
+            return;
+        }
+        int idx = this.hoverIndexFor(px);
+        if (idx == this.hoverIdx && idx < 0) return;
+        this.hoverIdx = idx;
+        this.hoverX = px;
+        this.hoverY = py;
+        this.repaintNow();
+    }
+
+    void pointerDown(double px, double py, int buttons)
+    {
+        this.dragging = true;
+        this.dragX = px;
+    }
+
+    void pointerUp(double px, double py, int buttons) { this.dragging = false; }
+
+    void panBy(int bars)
+    {
+        if (bars == 0) return;
+        int span = this.viewEnd - this.viewStart;
+        int lo = this.viewStart + bars;
+        if (lo < 0) lo = 0;
+        if (lo + span > this.fullLen) lo = this.fullLen - span;
+        if (lo < 0) lo = 0;
+        if (lo == this.viewStart) return;
+        this.viewStart = lo;
+        this.viewEnd = lo + span;
+        this.dirty = true;
+        this.repaintNow();
+    }
+
+    // Wheel zooms the date range around the cursor.
+    void wheel(double px, double py, double dx, double dy, bool precise)
+    {
+        if (this.tab != CH_TAB_EQUITY) return;
+        if (precise && (dy < 0.5 && dy > -0.5))
+        {
+            // Trackpad horizontal swipe -> pan.
+            int span = this.viewEnd - this.viewStart;
+            this.panBy((int)(0.0 - dx * (double)span / 400.0));
+            return;
+        }
+        int idx = this.hoverIndexFor(px);
+        int span = this.viewEnd - this.viewStart;
+        if (span < 2) span = this.fullLen;
+        double anchorT = 0.5;
+        if (idx >= 0 && span > 1) anchorT = (double)idx / (double)(span - 1);
+        double factor = dy > 0.0 ? 0.8 : 1.25;
+        int newSpan = (int)((double)span * factor);
+        if (newSpan < 20) newSpan = 20;
+        if (newSpan > this.fullLen) newSpan = this.fullLen;
+        int anchorAbs = this.viewStart + (int)(anchorT * (double)span);
+        int lo = anchorAbs - (int)(anchorT * (double)newSpan);
+        if (lo < 0) lo = 0;
+        if (lo + newSpan > this.fullLen) lo = this.fullLen - newSpan;
+        if (lo < 0) lo = 0;
+        if (lo == this.viewStart && newSpan == span) return;
+        this.viewStart = lo;
+        this.viewEnd = lo + newSpan;
+        this.dirty = true;
+        this.repaintNow();
+    }
+
+    void repaintNow()
+    {
+        if (this.uiCtx != nullptr) this.uiCtx.requestRepaint();
+        pumpNative();
+    }
+
+    void gotoTab(int t)
+    {
+        if (t < 0 || t >= CH_TAB_COUNT) return;
+        this.tab = t;
+        this.hoverIdx = 0 - 1;
+        this.dirty = true;
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+        pumpNative();
+    }
+
+    void setSymbol(int i)
+    {
+        if (i < 0 || i >= this.symbols.count() || i == this.symIdx) return;
+        this.symIdx = i;
+        this.loadSymbolData();
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+    }
+
+    void setStrategy(int i)
+    {
+        if (i == this.stratIdx) return;
+        this.stratIdx = i;
+        this.buildMonthly();
+        this.dirty = true;
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+    }
+
+    void setLog(bool v)
+    {
+        this.logY = v;
+        this.dirty = true;
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+    }
+
+    bool exportBmp()
+    {
+        this.renderTab();
+        string path = "results/" + this.symbol() + "_" + chTabName(this.tab) + "_view.bmp";
+        bool ok = this.plot.saveBmp(path);
+        this.lastExport = ok ? path.copy() : ("FAILED " + path);
+        if (this.uiCtx != nullptr) this.uiCtx.invalidate();
+        return ok;
+    }
+
+    // -- status -------------------------------------------------------------
+
+    alias ChSummary* summaryRow()
+    {
+        string sym = this.symbol();
+        int want = this.stratIdx > 0 ? (this.stratIdx - 1) : this.bestStrategyIndex();
+        int i = 0;
+        while (i < this.summary.count())
+        {
+            ChSummary* r = this.summary.get(i);
+            if (r.symbol.compare(sym) == 0 && r.strategy.compare(chStrategyId(want)) == 0) return r;
+            i++;
+        }
+        return nullptr;
+    }
+
+    move string statusText()
+    {
+        ChSummary* r = this.summaryRow();
+        if (r == nullptr) return this.symbol() + " - no summary row (run bin/backtest --all)";
+        return this.symbol() + " " + r.strategy
+            + "  total=" + chPct(r.totalReturn, 1)
+            + "  CAGR=" + chPct(r.cagr, 2)
+            + "  Sharpe=" + chFmt(r.sharpe, 2)
+            + "  maxDD=" + chPct(r.maxDd, 1);
+    }
+
+    // -- render -------------------------------------------------------------
+
+    ICanvasView buildCanvas(int t)
+    {
+        ICanvasView cv = canvasView((ICanvas c) => { this.paint(c); });
+        cv.width  = this.canvasCells();
+        cv.height = CH_CANVAS_H;
+        cv.setKey("cv");
+        cv.tooltip = "chart canvas";
+        if (t == CH_TAB_EQUITY)
+        {
+            cv.setOnPointerDown((double px, double py, int bt) => { this.pointerDown(px, py, bt); });
+            cv.setOnPointerMove((double px, double py, int bt) => { this.pointerMove(px, py, bt); });
+            cv.setOnPointerUp((double px, double py, int bt) => { this.pointerUp(px, py, bt); });
+            cv.setOnWheel((double px, double py, double dx, double dy, bool pr) => {
+                this.wheel(px, py, dx, dy, pr);
+            });
+        }
+        return cv;
+    }
+
+    IElement render(IUiContext ctx)
+    {
+        this.uiCtx = ctx;
+        ctx.theme = darkTheme();
+        this.ensureLoaded();
+
+        IView root = column(makeStyle(1, hostWidth(), 0));
+        root.style.gap = 1;
+        root.setKey("root");
+
+        // -- toolbar ---------------------------------------------------------
+        IView tb = row(makeStyle(0, 0, 0));
+        tb.style.gap = 2;
+        tb.setKey("tb");
+
+        IComboBox symCb = comboBox(this.symIdx, (int i) => { this.setSymbol(i); });
+        symCb.setKey("sym");
+        symCb.width = 12;
+        symCb.tooltip = "symbol";
+        int i = 0;
+        while (i < this.symbols.count()) { symCb.addItem(this.symbols.get(i)); i++; }
+        tb.add(symCb);
+
+        IComboBox stCb = comboBox(this.stratIdx, (int i) => { this.setStrategy(i); });
+        stCb.setKey("strat");
+        stCb.width = 16;
+        stCb.tooltip = "strategy";
+        stCb.addItem("all");
+        i = 0;
+        while (i < 5) { stCb.addItem(chStrategyId(i)); i++; }
+        tb.add(stCb);
+
+        ICheckbox lg = checkbox("log scale", this.logY, (bool v) => { this.setLog(v); });
+        lg.setKey("log");
+        tb.add(lg);
+
+        IButton ex = button("Export BMP", () => { this.exportBmp(); });
+        ex.setKey("export");
+        tb.add(ex);
+        root.add(tb);
+
+        // -- tabs ------------------------------------------------------------
+        ITabControl tabs = tabControl(this.tab, (int t) => { this.gotoTab(t); });
+        tabs.setKey("tabs");
+        tabs.width  = this.canvasCells() + 2;
+        tabs.height = CH_CANVAS_H + 2;
+
+        int t = 0;
+        while (t < CH_TAB_COUNT)
+        {
+            ITabPane pane = tabPane(chTabName(t));
+            pane.setKey("p" + t.toString());
+            if (t == this.tab) pane.add(this.buildCanvas(t));
+            tabs.add(pane);
+            t++;
+        }
+        root.add(tabs);
+
+        // -- status bar ------------------------------------------------------
+        IStatusBar sb = statusBar(this.statusText());
+        sb.setKey("status");
+        sb.parts.add("tab: " + chTabName(this.tab));
+        sb.parts.add(this.lastExport.length() > 0 ? this.lastExport : "range: "
+            + (this.viewEnd - this.viewStart).toString() + "/" + this.fullLen.toString() + " bars");
+        root.add(sb);
+        return root;
+    }
+};
+
+// Insert `v` into an ascending list of unique ints.
+void chAddUniqueSorted(list<int>* xs, int v)
+{
+    int i = 0;
+    while (i < xs.count()) { if (xs.get(i) == v) return; i++; }
+    xs.add(v);
+    int j = xs.count() - 1;
+    while (j > 0 && xs.get(j - 1) > xs.get(j))
+    {
+        int a = xs.get(j - 1);
+        int b = xs.get(j);
+        xs.set(j - 1, b);
+        xs.set(j, a);
+        j--;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --probe : the LIVE run-loop oracle.  Opens the real window, walks every tab on
+// the UI thread letting AppKit drive drawRect unassisted, then reads the paint
+// diagnostics back and closes.  Exit 0 only if all 5 tabs painted real pixels.
+// ---------------------------------------------------------------------------
+int _chProbeMask   = 0;
+int _chProbeMin    = 0;
+int _chProbePaints = 0;
+
+class ChProbeWatch
+{
+    Thread th   = default;
+    void*  app  = nullptr;
+    int    secs = 0;
+};
+
+int _chProbeWatchdog(void* arg)
+{
+    ChProbeWatch* pw = (ChProbeWatch*)arg;
+    ChartsApp* app = (ChartsApp*)pw.app;
+    i64 slice = (i64)pw.secs * (i64)1000 / (i64)(CH_TAB_COUNT + 1);
+    if (slice < 120) slice = 120;
+
+    int i = 0;
+    while (i < CH_TAB_COUNT)
+    {
+        sleep(slice);
+        int target = i;
+        app.uiCtx.post(() => { app.gotoTab(target); });
+        i++;
+    }
+    sleep(slice);
+    app.uiCtx.post(() =>
+    {
+        _chProbeMask   = app.paintMask;
+        _chProbeMin    = app.minTabPixels();
+        _chProbePaints = app.paintCount;
+        nativeCloseWindow();
+    });
+    return 0;
+}
+
+int chartsLiveProbe(int secs)
+{
+    ChartsApp* app = new ChartsApp();   // runAppGuiNative owns + frees it on close
+    ChProbeWatch pw = default;
+    pw.app = (void*)app;
+    pw.secs = secs;
+    pw.th.start(_chProbeWatchdog, &pw);
+    runAppGuiNative(app, "CFlat Quant Charts (probe)");
+    pw.th.join();
+
+    int wantMask = (1 << CH_TAB_COUNT) - 1;
+    if (_chProbeMask == wantMask && _chProbeMin > 0)
+    {
+        printf("PROBE PASS: all %d tabs painted live (%d paints, min non-bg pixels %d)\n",
+               CH_TAB_COUNT, _chProbePaints, _chProbeMin);
+        return 0;
+    }
+    printf("PROBE FAIL: paintMask=0x%x (want 0x%x), minNonBg=%d, paints=%d\n",
+           _chProbeMask, wantMask, _chProbeMin, _chProbePaints);
+    return 1;
+}
+
+move string chartSelfDate(int i)
+{
+    int month0 = i / 10;
+    int year = 2020 + month0 / 12;
+    int month = month0 % 12 + 1;
+    int day = i % 10 + 1;
+    stringbuilder sb;
+    sb.append(year.toString());
+    sb.appendChar('-');
+    if (month < 10) sb.appendChar('0');
+    sb.append(month.toString());
+    sb.appendChar('-');
+    if (day < 10) sb.appendChar('0');
+    sb.append(day.toString());
+    return sb.toString();
+}
+
+void chartSelfTestFixtures()
+{
+    _ = Directory.createAll("data");
+    _ = Directory.createAll("results");
+
+    stringbuilder prices;
+    prices.append("date,open,high,low,close,adj_close,volume\n");
+    int i = 0;
+    while (i < 130)
+    {
+        string d = chartSelfDate(i);
+        double v = 100.0 + (double)i;
+        prices.append(d + "," + v.toString() + "," + v.toString() + "," + v.toString() + "," + v.toString() + "," + v.toString() + ",1000\n");
+        i++;
+    }
+    _ = File.writeAllText("data/SPY.csv", prices.toString());
+
+    stringbuilder summary;
+    summary.append("symbol,strategy,params,total_return,cagr,vol,sharpe,sortino,max_dd,calmar,trades,win_rate,exposure\n");
+    int s = 0;
+    while (s < 5)
+    {
+        summary.append("SPY," + chStrategyId(s) + ",params,0.1,0.1,0.1," + (1.0 + (double)s).toString() + ",1.0,-0.1,1.0,10,0.5,1.0\n");
+        s++;
+    }
+    _ = File.writeAllText("results/summary.csv", summary.toString());
+
+    s = 0;
+    while (s < 5)
+    {
+        stringbuilder curve;
+        curve.append("date,equity,position,drawdown\n");
+        i = 0;
+        while (i < 130)
+        {
+            double eq = 1.0 + (double)i * 0.002 + (double)s * 0.01;
+            double dd = 0.0 - (double)(i % 7) * 0.01;
+            curve.append(chartSelfDate(i) + "," + eq.toString() + ",1," + dd.toString() + "\n");
+            i++;
+        }
+        _ = File.writeAllText("results/SPY_" + chStrategyId(s) + ".csv", curve.toString());
+        s++;
+    }
+}
+
+void chartSelfTestCleanup()
+{
+    _ = File.remove("data/SPY.csv");
+    _ = File.remove("results/summary.csv");
+    _ = File.remove("results/SPY_buyhold.csv");
+    _ = File.remove("results/SPY_sma.csv");
+    _ = File.remove("results/SPY_momentum.csv");
+    _ = File.remove("results/SPY_meanrev.csv");
+    _ = File.remove("results/SPY_donchian.csv");
+    _ = File.remove("results/SPY_equity_view.bmp");
+}
+
+// ---------------------------------------------------------------------------
+// --selftest : headless ui_test.cb suite (no window shown).
+// ---------------------------------------------------------------------------
+int chartsSelfTest()
+{
+    chartSelfTestFixtures();
+    UiTestSuite s = uiTestSuite("charts");
+
+    s.test("data loads from results/ and data/", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+        t.expectTrue("symbols discovered from data/*.csv", a.symbols.count() >= 1);
+        t.expectTrue("5 strategy curves allocated", a.curves.count() == 5);
+        t.expectTrue("equity curve has bars", a.fullLen > 100);
+        t.expectTrue("summary.csv rows parsed", a.summary.count() >= 5);
+        t.expectTrue("monthly returns derived", a.monthVals.count() > 12);
+        t.expectTrue("correlation matrix is square",
+            a.corrVals.count() == a.corrLabels.count() * a.corrLabels.count());
+        t.expectTrue("sweep heatmap has cells",
+            a.sweepVals.count() == a.sweepRows.count() * a.sweepCols.count());
+    });
+
+    s.test("every tab rasterizes non-background pixels", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+        t.expectTrue("tab control has 5 panes", t.tabCount("root/tabs") == CH_TAB_COUNT);
+
+        int i = 0;
+        bool allPainted = true;
+        while (i < CH_TAB_COUNT)
+        {
+            t.tabSelect("root/tabs", i);
+            a.gotoTab(i);
+            a.renderTab();
+            int px = a.countNonBg();
+            if (px < 200) { allPainted = false; printf("    tab %d painted only %d px\n", i, px); }
+            i++;
+        }
+        t.expectTrue("all 5 tabs rendered content", allPainted);
+        t.expectInt("selected tab followed the driver", CH_TAB_COUNT - 1, t.tabSelected("root/tabs"));
+    });
+
+    s.test("combo boxes re-drive the model", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+
+        int nsym = a.symbols.count();
+        if (nsym > 1)
+        {
+            t.comboSelect("root/tb/sym", 1);
+            t.expectInt("symbol combo drove the model", 1, a.symIdx);
+            t.expectInt("symbol combo readback", 1, t.comboSelected("root/tb/sym"));
+            t.expectTrue("new symbol reloaded curves", a.fullLen > 100);
+        }
+        t.comboSelect("root/tb/strat", 2);
+        t.expectInt("strategy combo drove the model", 2, a.stratIdx);
+        t.expectTrue("single strategy selected for paint", a.firstSelected() == 1);
+        a.renderTab();
+        t.expectTrue("single-strategy equity still paints", a.countNonBg() > 200);
+    });
+
+    s.test("log-scale checkbox and export button", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+
+        bool before = a.logY;
+        t.click("root/tb/log");
+        t.expectBool("checkbox toggled the model", !before, a.logY);
+        t.expectBool("native checkbox state follows", !before, t.isChecked("root/tb/log"));
+        a.renderTab();
+        t.expectTrue("linear-scale equity paints", a.countNonBg() > 200);
+
+        t.click("root/tb/export");
+        t.expectTrue("export wrote a bmp path", a.lastExport.contains(".bmp")
+            && !a.lastExport.contains("FAILED"));
+    });
+
+    s.test("crosshair, wheel zoom and drag pan", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+        a.gotoTab(CH_TAB_EQUITY);
+        a.renderTab();
+
+        double mid = (double)a.plotW * 0.5;
+        a.pointerMove(mid, 100.0, 0);
+        t.expectTrue("hover resolves a bar index", a.hoverIdx >= 0);
+        a.applyOverlay();
+        t.expectTrue("crosshair overlay composited", a.overlayOn);
+        int withCross = a.countNonBg();
+        a.hoverIdx = 0 - 1;
+        a.applyOverlay();
+        t.expectTrue("overlay is removable (base render restored)",
+            !a.overlayOn && a.countNonBg() < withCross);
+
+        // Wheel zoom shrinks the visible range, drag pan shifts it.
+        int span0 = a.viewEnd - a.viewStart;
+        a.wheel(mid, 100.0, 0.0, 3.0, false);
+        int span1 = a.viewEnd - a.viewStart;
+        t.expectTrue("wheel zoom narrows the date range", span1 < span0);
+
+        int start1 = a.viewStart;
+        a.pointerDown(mid, 100.0, 1);
+        a.pointerMove(mid - 120.0, 100.0, 1);
+        a.pointerUp(mid - 120.0, 100.0, 0);
+        t.expectTrue("drag pans the date range", a.viewStart != start1 || start1 + span1 >= a.fullLen);
+        a.renderTab();
+        t.expectTrue("zoomed equity still paints", a.countNonBg() > 200);
+    });
+
+    s.test("status bar reports the selected series metrics", (IUiTest t) =>
+    {
+        t.launch(new ChartsApp(), 100, 34);
+        ChartsApp* a = activeApp() as ChartsApp;
+        t.requireTrue("app mounted", a != nullptr);
+        string st = a.statusText();
+        t.expectTrue("status names the symbol", st.contains(a.symbol()));
+        t.expectTrue("status carries Sharpe", st.contains("Sharpe="));
+        t.expectTrue("status carries max drawdown", st.contains("maxDD="));
+    });
+
+    int rc = s.run(0, nullptr);
+    chartSelfTestCleanup();
+    return rc;
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
+        return chartsSelfTest();
+
+    if (argc > 1 && strcmp(argv[1], "--probe") == 0)
+    {
+        int secs = (argc > 2) ? atoi(argv[2]) : 3;
+        if (secs < 1) secs = 1;
+        return chartsLiveProbe(secs);
+    }
+
+    return runAppGuiNative(new ChartsApp(), "CFlat Quant Charts");
+}
