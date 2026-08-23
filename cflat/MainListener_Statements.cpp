@@ -1868,6 +1868,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto nv = ParseAssignmentExpressionNamed(initAssign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(initAssign, nv);
                         ProcessPlusPlus();
+                        RegisterDiscardedOwningStructTemp(nv);
                         compiler->FlushOwnedTemps();
                     }
 
@@ -1905,7 +1906,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         auto nv = ParseAssignmentExpressionNamed(assign, ResultUse::Discard);
                         if (bareExpr) DiagnoseDiscardedOwningReturn(assign, nv);
                         ProcessPlusPlus();
+                        RegisterDiscardedOwningStructTemp(nv);
                     }
+                    // Flush HERE, not in the condition block: the increment block does not
+                    // dominate the condition, so a temp registered here would never be freed.
+                    compiler->FlushOwnedTemps();
 
                     compiler->CreateBlockBreak(blockCondition, false);
 

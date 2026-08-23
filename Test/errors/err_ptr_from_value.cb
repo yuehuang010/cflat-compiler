@@ -175,3 +175,31 @@ expect_error("cannot store a string literal") {
 expect_error("cannot store a string literal") {
     int litJoinAsDefaultParameter(Point* p = true ? "nn" : "mm") { return 0; }
 }
+
+expect_error("cannot store a string literal") {
+    void litMixedPointerArmTrue() {
+        Point point = default;
+        Point* p = true ? &point : "nn";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litMixedPointerArmFalse() {
+        Point point = default;
+        Point* p = false ? "nn" : &point;
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litMixedCoalesceArm() {
+        Point point = default;
+        Point* p = &point ?? "nn";
+    }
+}
+
+expect_error("cannot store a string literal") {
+    void litMixedCastArm() {
+        Point point = default;
+        Point* p = true ? &point : (Point*)"nn";
+    }
+}

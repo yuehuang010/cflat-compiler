@@ -4010,6 +4010,9 @@ public:
                           const LLVMBackend::OwnedTempMark& mark, bool& deepCopied,
                           llvm::BasicBlock* hoistTo);
 
+    llvm::Value* CloneTernaryClosureValue(
+        llvm::Value* value, antlr4::ParserRuleContext* ctx);
+
     /*
      * Lower `cond ? a : b` as a real branch, mirroring the '??' lowering directly below: the true
      * arm is emitted into its own block, the false arm into its own, and the two join through a PHI

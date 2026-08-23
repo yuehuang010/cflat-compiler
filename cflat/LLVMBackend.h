@@ -5212,11 +5212,9 @@ public:
     int JoinArmStringLiteralKind(const llvm::Value* value, int depth) const;
 
     /*
-     * Does a '?:' / '??' JOIN deliver a value proven to be a string LITERAL on every path? The
-     * arms are joined into one SSA value before any store site sees them, so the direct-constant
-     * test in IsStringLiteralIntoStructPointer cannot see them. EVERY arm must be proven (or
-     * neutral) and at least one proven: an ANY-arm quantifier would reject 'g ? &pt : "b"',
-     * which the merge base compiles and runs correctly on its pointer arm.
+     * Does a '?:' / '??' JOIN contain any arm proven to be a string LITERAL? The arms are joined
+     * into one SSA value before any store site sees them, so the direct-constant test cannot see
+     * them. An unknown arm does not erase the proof supplied by a literal arm.
      */
     bool JoinIsAllStringLiterals(const llvm::Value* value, int depth = 0) const;
     std::string DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,

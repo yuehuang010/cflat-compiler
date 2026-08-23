@@ -1373,7 +1373,6 @@ int LLVMBackend::JoinArmStringLiteralKind(const llvm::Value* value, int depth) c
 bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) const
 {
     if (value == nullptr || depth > kMaxJoinArmDepth) return false;
-    bool proven = false;
     // A '?:' joins through a PHI whose incoming values ARE the arms; a '??' joins through a
     // slot, so its arms survive only in the nullCoalesceJoins_ ledger.
     if (const auto* phi = llvm::dyn_cast<llvm::PHINode>(value))
@@ -1382,10 +1381,9 @@ bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) c
         for (unsigned i = 0; i < phi->getNumIncomingValues(); i++)
         {
             const int kind = JoinArmStringLiteralKind(phi->getIncomingValue(i), depth + 1);
-            if (kind < 0) return false;
-            if (kind > 0) proven = true;
+            if (kind > 0) return true;
         }
-        return proven;
+        return false;
     }
     if (const NullCoalesceJoin* join = FindNullCoalesceJoin(value))
     {
@@ -1393,10 +1391,9 @@ bool LLVMBackend::JoinIsAllStringLiterals(const llvm::Value* value, int depth) c
         for (const auto& arm : join->Arms)
         {
             const int kind = JoinArmStringLiteralKind(arm.Value, depth + 1);
-            if (kind < 0) return false;
-            if (kind > 0) proven = true;
+            if (kind > 0) return true;
         }
-        return proven;
+        return false;
     }
     return false;
 }

@@ -4359,6 +4359,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     ifacePtr = Compiler(ctx)->CreateAlloca(fatTy);
                                     Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
                                 }
+                                bool cleanupInlineOwnedReceiver = interfaceVar.Primary != nullptr
+                                    && interfaceVar.Storage == nullptr
+                                    && Compiler(ctx)->FindOwnedReturnEntry(interfaceVar.Primary) != nullptr;
 
                                 // Definitely-null dispatch: record the receiver only when it is a
                                 // NAMED local's own slot dispatched with a plain '.'. A '?.' chain
@@ -4385,6 +4388,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     extraArgs,
                                     ncSitePtr
                                 );
+                                if (cleanupInlineOwnedReceiver && ifacePtr != nullptr)
+                                {
+                                    Compiler(ctx)->SuppressCallerRelease(interfaceVar.Primary);
+                                    auto* receiver = Compiler(ctx)->CreateLoad(
+                                        Compiler(ctx)->GetFatPtrType(), ifacePtr);
+                                    Compiler(ctx)->DeleteInterfaceValue(
+                                        receiver, interfaceVar.TypeAndValue.TypeName, ifacePtr);
+                                }
                                 namedVar.Storage = nullptr;
                                 namedVar.BaseType = namedVar.Primary ? namedVar.Primary->getType() : nullptr;
                                 // Populate TypeAndValue from the interface method's return type and
@@ -7119,12 +7130,24 @@ llvm::Value* MainListener::ParseExpression(CFlatParser::ExpressionContext* ctx) 
 void MainListener::RegisterDiscardedOwningStructTemp(const LLVMBackend::NamedVariable& nv) {
         const std::string& typeName = nv.TypeAndValue.TypeName;
         if (nv.Primary == nullptr || nv.Storage != nullptr || nv.BaseType == nullptr) return;
-        if (typeName.empty() || typeName == "string" || typeName == "__closure_fat_ptr") return;
+        if (typeName.empty()) return;
+        auto* compiler = Compiler();
+        if (!compiler->IsProducedTempValue(nv.Primary)) return;
+        if (typeName == "string")
+        {
+            compiler->RegisterOwnedStringTemp(nv.Primary);
+            return;
+        }
+        if (typeName == "__closure_fat_ptr")
+        {
+            if (!compiler->IsOwnedClosureTemp(nv.Primary))
+                compiler->RegisterOwnedClosureTemp(nv.Primary);
+            return;
+        }
         // A POINTER rvalue is not a struct value: spilling it would destruct the pointer's own
         // bits as if they were the object. Owning pointers are handled by the owned-ptr temp list.
         if (nv.TypeAndValue.Pointer || nv.TypeAndValue.IsAlias || nv.FromOwningTempField) return;
 
-        auto* compiler = Compiler();
         if (!compiler->IsOwningValueType(typeName)) return;
 
         auto* tempAlloca = compiler->AllocaAtEntry(nv.BaseType, nullptr, "discardtemp");

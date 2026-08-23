@@ -4070,6 +4070,23 @@ void MainListener::FinishTernaryArm(LLVMBackend* compiler, llvm::Value*& value,
         compiler->FlushOwnedTempsSince(mark, deepCopied ? nullptr : value, hoistTo);
     }
 
+llvm::Value* MainListener::CloneTernaryClosureValue(
+        llvm::Value* value, antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (value == nullptr || value->getType() != compiler->GetClosureFatPtrType()) return value;
+
+        LLVMBackend::NamedVariable source;
+        source.Primary = value;
+        source.BaseType = compiler->GetClosureFatPtrType();
+        source.TypeAndValue.TypeName = "__closure_fat_ptr";
+        auto* cloned = compiler->CreateOverloadedFunctionCall("copy", { source });
+        if (cloned == nullptr) return value;
+        if (const auto* sources = compiler->FindBondedValue(value))
+            compiler->RegisterBondedValue(cloned, *sources);
+        compiler->RegisterOwnedClosureTemp(cloned);
+        return cloned;
+    }
+
 LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* ctx,
         const LLVMBackend::TypedValue& condTv,
@@ -4467,7 +4484,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
         compiler->PropagateFatInterfaceJoin(trueValue, falseValue, phi);
-        LLVMBackend::TypedValue result{ phi, joinUnsigned };
+        llvm::Value* resultValue = CloneTernaryClosureValue(phi, ctx);
+        LLVMBackend::TypedValue result{ resultValue, joinUnsigned };
         result.isAlias = trueAlias || falseAlias;
         result.storage = storageJoin;
         return result;
@@ -4755,6 +4773,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
                 compiler->PropagateBondedValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
+                selectValue = CloneTernaryClosureValue(selectValue, ctx);
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
                 return result;
@@ -6395,6 +6414,16 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
         std::string opName = "operator" + op;
         if (!compiler->GetFunction(opName)) return nullptr;
 
+        bool receiverConsumes = false;
+        if (auto it = compiler->functionTable.find(opName); it != compiler->functionTable.end())
+            for (const auto& candidate : it->second)
+                if (!candidate.Parameters.empty()
+                    && candidate.Parameters[0].TypeName == typeName
+                    && !candidate.Parameters[0].Pointer && candidate.Parameters[0].IsMove)
+                {
+                    receiverConsumes = true;
+                    break;
+                }
         // Determine whether to pass the operand by pointer or by value.
         bool usePointer = false;
         {
@@ -6414,6 +6443,20 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             }
         }
 
+        // Only the BY-POINTER receiver leaks: the by-value receiver is already registered by the
+        // call-argument lowering, and registering it here too would destruct the temp twice.
+        bool receiverArmsAlreadyRegistered = inCallArgument_ && llvm::isa<llvm::PHINode>(operand);
+        bool receiverTempAlreadyRegistered = receiverArmsAlreadyRegistered;
+        if (usePointer && !receiverConsumes && !receiverArmsAlreadyRegistered)
+        {
+            LLVMBackend::NamedVariable receiverNV;
+            receiverNV.Primary = operand;
+            receiverNV.BaseType = structTy;
+            receiverNV.TypeAndValue.TypeName = typeName;
+            compiler->RegisterBorrowedOwningStructTemp(receiverNV, true);
+            receiverTempAlreadyRegistered = true;
+        }
+
         if (usePointer)
         {
             auto* tempAlloca = compiler->CreateAlloca(structTy);
@@ -6423,6 +6466,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.TypeAndValue.TypeName = typeName;
             thisNV.TypeAndValue.Pointer  = true;
             thisNV.Primary = tempAlloca;
+            thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
             return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
         }
@@ -6433,6 +6477,7 @@ llvm::Value* MainListener::TryUnaryOperatorOverload(
             thisNV.TypeAndValue.Pointer  = false;
             thisNV.Primary  = operand;
             thisNV.BaseType = structTy;
+            thisNV.TernaryTempAlreadyRegistered = receiverTempAlreadyRegistered;
 
             return compiler->CreateOverloadedFunctionCall(opName, { thisNV });
         }

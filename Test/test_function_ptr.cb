@@ -2095,6 +2095,28 @@ bool testClosureFieldReadIntoLocal()
     return result;
 }
 
+// A ternary over two closure fields must copy the selected fat pointer before the holder dies.
+struct TernaryClosureHolder { Lambda<int()> f = default; };
+
+bool testTernaryClosureFieldJoin()
+{
+    bool result = true;
+    list<int> xs = default;
+    xs.add(1); xs.add(2); xs.add(3);
+    TernaryClosureHolder h = default;
+    TernaryClosureHolder k = default;
+    h.f = () => xs.count();
+    k.f = () => xs.count() + 1;
+
+    bool choose = true;
+    Lambda<int()> first = choose ? h.f : k.f;
+    result &= Test("ternary closure field true arm", first(), 3);
+    choose = false;
+    Lambda<int()> second = choose ? h.f : k.f;
+    result &= Test("ternary closure field false arm", second(), 4);
+    return result;
+}
+
 // A bonded reference capture may live in a stack holder whose lifetime is no longer than the source.
 struct BondedFieldBox { Lambda<int()> f = default; Lambda<int()> g = default; };
 struct BondedFieldOuter { BondedFieldBox box = default; };
@@ -4695,6 +4717,7 @@ extern int main(int argc, char** argv)
     // Brace-init of a closure field auto-clones the env, same as the `=` store
     total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
     total++; passed += testClosureFieldReadIntoLocal()   ? 1 : 0;
+    total++; passed += testTernaryClosureFieldJoin()     ? 1 : 0;
     total++; passed += testBondedClosureFieldLifetime()  ? 1 : 0;
     total++; passed += testBondedClosureFieldCallOnly() ? 1 : 0;
     total++; passed += testBondedClosureFieldInterfaceCallOnly() ? 1 : 0;
