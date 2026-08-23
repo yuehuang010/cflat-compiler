@@ -346,7 +346,9 @@ REM below (build with --heap-audit + run headless), so they are excluded from th
 REM fedit_jsx is fedit.cb authored in the <Tag/> sugar; both run the same state-assert
 REM self-test via --worker-fedit, so both are excluded from the plain sweep.
 REM map is driven by --worker-map; map_app/map_engine are its no-main library halves.
-set EXCLUDE=test_helper fedit fedit_jsx gallery gallery_app map map_app map_engine todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
+REM backtest_engine and plot are the no-main library halves of the 10-trade app (imported by
+REM backtest.cb / charts.cb).
+set EXCLUDE=test_helper backtest_engine plot fedit fedit_jsx gallery gallery_app map map_app map_engine todo_app todo_test http_parser http_response http_json http_server http_client router rest_server http_io cocoa_probe cocoa_native_settings hello_objc cocoa_window sysinfo_mac framework_link winui_app_demo winui_demo winui_gallery
 
 REM Discover the newest cached Win32-metadata package dir (the one holding Windows.Win32.winmd).
 REM dir /o-n lists newest-version-first by name. Empty if the nuget package is not installed

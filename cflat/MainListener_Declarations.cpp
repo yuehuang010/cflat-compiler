@@ -6202,6 +6202,13 @@ bool MainListener::RejectAliasStoreIntoField(
 
         if (rightNV.FromOwningTempField && rightNV.TypeAndValue.TypeName != "string")
         {
+            // A raw, non-owning pointer read out of the temp (a `void*` OS handle, a back-pointer)
+            // is not a buffer anyone frees, so copying it into a field can never dangle. Owning
+            // unique pointers took the IsUniqueTempFieldRead exit above and never reach here.
+            if (rightNV.TypeAndValue.Pointer
+                && !IsOwningUniquePointerField(rightNV.TypeAndValue)
+                && !IsOwningUniqueInterfaceField(rightNV.TypeAndValue))
+                return false;
             LogErrorContext(ctx, std::format(
                 "cannot store '{}.{}' taken from a temporary into a field; its buffer is owned "
                 "elsewhere and would be freed. Use '.copy()' for an independent owned copy.",

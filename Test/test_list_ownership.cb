@@ -646,6 +646,38 @@ int testAliasPointerElementBorrows()
     return passed;
 }
 
+// A RAW, non-owning pointer field read through an `alias T*` accessor and stored into
+// another field: nothing owns that pointee, so the borrow-persist gate must let it through
+// (it used to reject the OS-handle idiom `dest.handle = current().handle`).
+class RawHandle
+{
+    void* handle = nullptr;
+    int id = default;
+    ~RawHandle() { g_dtor = g_dtor + 1; }
+};
+struct RawHandleSink { void* handle = nullptr; int id = default; };
+alias RawHandle* borrowHandle(RawHandle* p) { return p; }
+
+int testAliasPointerRawFieldStore()
+{
+    int passed = 0;
+    g_dtor = 0;
+    int marker = 77;
+    RawHandle* h = new RawHandle();
+    h.handle = &marker;
+    h.id = 9;
+
+    RawHandleSink sink = default;
+    sink.handle = borrowHandle(h).handle;   // raw pointer out of an alias temp: legal
+    sink.id = borrowHandle(h).id;
+    passed += Test("alias temp raw pointer field copied", *(int*)sink.handle, 77);
+    passed += Test("alias temp scalar field copied", sink.id, 9);
+
+    delete h;
+    passed += Test("alias accessor freed nothing itself", g_dtor, 1);
+    return passed;
+}
+
 // --- unique pointer: OWNS ---------------------------------------------------------
 
 int testUniquePointerOwns()
@@ -1237,6 +1269,7 @@ extern int main()
     total += 5;  passed += testBarePointerBorrows();
     total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 7;  passed += testAliasPointerElementBorrows();
+    total += 3;  passed += testAliasPointerRawFieldStore();
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();
     total += 3;  passed += testUniquePointerSelfAssign();
