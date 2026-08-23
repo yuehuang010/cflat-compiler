@@ -3,7 +3,11 @@
 expect_error("missing ')' at '{'");
 int castNotReserved() { int q = (int)true; if (q { return 0; } return 1; }
 struct Buf { int a; };
-// Expectations here match parse diagnostics, so keep them locale-stable.
+expect_error("found ';' but expected");
+void strategyGenerated() { int y = ; }
+expect_error("found ';' but expected") {
+    void strategyBlock() { int y = ; }
+}
 expect_error("missing ';' at 'return'");
 void unnamedMoveParam(int, move Buf b) { int y = 1 return y; }
 expect_error("'class' is a reserved word in CFlat");

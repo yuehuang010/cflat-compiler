@@ -1,0 +1,7 @@
+// Error recovery can leave a malformed expect_error without its string literal. The
+// parse-stage expectation scan must skip it, not dereference a null literal and crash.
+// The truncated expect_error below consumes the rest of the file, so keep it last.
+expect_error("missing StringLiteral at ')'");
+expect_error();
+expect_error("found 'end of file' but expected StringLiteral");
+expect_error(

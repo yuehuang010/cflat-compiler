@@ -1904,16 +1904,78 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
         if (errorListener.hasErrors())
         {
-            std::vector<std::string> parserExpectedErrors;
-            if (auto* tu = computeUnit->translationUnit())
+            struct ParserExpectation
             {
-                for (auto* decl : tu->externalDeclaration())
-                {
-                    if (auto* expectDecl = decl->expectErrorDeclaration())
-                        parserExpectedErrors.push_back(
-                            DequoteStringLiteral(expectDecl->StringLiteral()->getText()));
-                }
-            }
+                std::string message;
+                int firstLine = 0;
+                int firstCol = 0;
+                int lastLine = 0;
+                int lastCol = 0;
+                bool hasRange = false;
+            };
+            std::vector<ParserExpectation> parserExpectedErrors;
+            auto isCompleteParserExpectation = [](CFlatParser::ExpectErrorDeclarationContext* expectDecl) {
+                if (expectDecl == nullptr) return false;
+                auto* literal = expectDecl->StringLiteral();
+                auto* literalToken = literal ? literal->getSymbol() : nullptr;
+                auto* stop = expectDecl->getStop();
+                if (literalToken == nullptr || literalToken->getTokenIndex() == INVALID_INDEX
+                    || stop == nullptr || stop->getType() == cflat::kTokenEOF)
+                    return false;
+                return stop->getText() == ";" || stop->getText() == "}";
+            };
+            std::function<void(antlr4::tree::ParseTree*)> collectParserExpectations =
+                [&](antlr4::tree::ParseTree* node) {
+                    auto* expectDecl = dynamic_cast<CFlatParser::ExpectErrorDeclarationContext*>(node);
+                    // Recovery can leave a missing literal or closing brace in the tree. Skip
+                    // incomplete expectations and let the parse diagnostics stand.
+                    if (isCompleteParserExpectation(expectDecl))
+                    {
+                        ParserExpectation expectation;
+                        expectation.message = DequoteStringLiteral(
+                            expectDecl->StringLiteral()->getText());
+                        const auto& declarations = expectDecl->externalDeclaration();
+                        if (!declarations.empty())
+                        {
+                            auto* first = declarations.front()->getStart();
+                            auto* last = expectDecl->getStop();
+                            if (first != nullptr && last != nullptr)
+                            {
+                                expectation.firstLine = first->getLine();
+                                expectation.firstCol = first->getCharPositionInLine();
+                                expectation.lastLine = last->getLine();
+                                expectation.lastCol = last->getCharPositionInLine();
+                                expectation.hasRange = true;
+                            }
+                        }
+                        parserExpectedErrors.push_back(std::move(expectation));
+                    }
+                    if (node == nullptr) return;
+                    for (auto* child : node->children)
+                        collectParserExpectations(child);
+                };
+            if (auto* tu = computeUnit->translationUnit())
+                collectParserExpectations(tu);
+            // Expectations match the English source message (like the listener stage) so they
+            // survive --locale; each diagnostic may be claimed by exactly one expectation.
+            auto diagnosticMatchText = [&](size_t diagnosticIndex) -> const std::string& {
+                const auto& diagnostic = errorListener.getDiagnostics()[diagnosticIndex];
+                return diagnostic.sourceMessage.empty() ? diagnostic.message : diagnostic.sourceMessage;
+            };
+            auto diagnosticIsInExpectationRange = [&](size_t diagnosticIndex,
+                                                       const ParserExpectation& expectation) {
+                if (!expectation.hasRange) return true;
+                const auto& diagnostic = errorListener.getDiagnostics()[diagnosticIndex];
+                if (diagnostic.line < expectation.firstLine || diagnostic.line > expectation.lastLine)
+                    return false;
+                if (diagnostic.line == expectation.firstLine
+                    && diagnostic.col < expectation.firstCol)
+                    return false;
+                if (diagnostic.line == expectation.lastLine
+                    && diagnostic.col > expectation.lastCol)
+                    return false;
+                return true;
+            };
             std::vector<int> diagnosticMatches(errorListener.getDiagnostics().size(), -1);
             auto matchExpectation = [&](auto&& self, size_t expectedIndex,
                                          std::vector<bool>& visited) -> bool
@@ -1922,8 +1984,11 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                      diagnosticIndex < errorListener.getDiagnostics().size(); ++diagnosticIndex)
                 {
                     if (visited[diagnosticIndex]) continue;
-                    const auto& diagnostic = errorListener.getDiagnostics()[diagnosticIndex];
-                    if (diagnostic.message.find(parserExpectedErrors[expectedIndex]) == std::string::npos)
+                    const auto& expectation = parserExpectedErrors[expectedIndex];
+                    if (!diagnosticIsInExpectationRange(diagnosticIndex, expectation))
+                        continue;
+                    if (diagnosticMatchText(diagnosticIndex).find(expectation.message)
+                        == std::string::npos)
                         continue;
                     visited[diagnosticIndex] = true;
                     if (diagnosticMatches[diagnosticIndex] == -1 ||
@@ -1966,9 +2031,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             for (auto* decl : tu->externalDeclaration())
             {
                 auto* ee = decl->expectErrorDeclaration();
-                if (ee && ee->externalDeclaration().empty())
+                auto* literal = ee ? ee->StringLiteral() : nullptr;
+                auto* literalToken = literal ? literal->getSymbol() : nullptr;
+                if (ee && ee->externalDeclaration().empty() && literalToken != nullptr
+                    && literalToken->getTokenIndex() != INVALID_INDEX)
                 {
-                    std::string raw = ee->StringLiteral()->getText();
+                    std::string raw = literal->getText();
                     fileScopeExpectedError_ = DequoteStringLiteral(raw);
                     expectedError = fileScopeExpectedError_;
                     expectedErrorScopeDepth = SIZE_MAX;

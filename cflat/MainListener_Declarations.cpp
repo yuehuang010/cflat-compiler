@@ -1780,10 +1780,20 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
         }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
-            // Bare-semicolon file-scope form (no inner declarations): armed before imports in
-            // LLVMBackend::Compile (so it can catch import-time diagnostics); the match and the
-            // did-not-occur check both happen there. Nothing to do during the walk.
-            if (!expectErrDecl->externalDeclaration().empty())
+            // Bare file-scope form is armed before imports in LLVMBackend::Compile. A namespace
+            // form is armed here because its members are processed under the namespace scope.
+            if (expectErrDecl->externalDeclaration().empty())
+            {
+                // A namespace has no function scope-exit handler, so remember its bare form
+                // and let ParseNamespaceDefinition report a missing error after its members.
+                if (!namespaceName.empty())
+                {
+                    std::string rawText = expectErrDecl->StringLiteral()->getText();
+                    compilerLLVM->expectedError = ProcessRawText(rawText);
+                    compilerLLVM->expectedErrorScopeDepth = compilerLLVM->stackNamedVariable.size();
+                }
+            }
+            else
             {
                 // Scoped block form at file scope: expect_error("msg") { functionDef / structDef / ... }
                 std::string rawText = expectErrDecl->StringLiteral()->getText();
@@ -2207,6 +2217,18 @@ void MainListener::ParseNamespaceDefinition(CFlatParser::NamespaceDefinitionCont
         LLVMBackend::NamespaceScope nsScope(compiler, namespaceName);
         for (auto* extDecl : ctx->externalDeclaration())
             ParseExternalDeclaration(extDecl, namespaceName);
+
+        // A bare namespace expectation has no enclosing function to check its scope exit.
+        if (!compilerLLVM->expectedError.empty()
+            && compilerLLVM->expectedErrorScopeDepth != SIZE_MAX)
+        {
+            std::cout << std::format("FAIL: expected error '{}' did not occur\n",
+                                      compilerLLVM->expectedError);
+            compilerLLVM->expectedError.clear();
+            if (compilerLLVM->diagnosticSink_)
+                throw CompilerAbortException{ "expected error did not occur", compilerLLVM->sourceFileName, 0, 0 };
+            compilerLLVM->FailCompilation("expected error did not occur");
+        }
     }
 
 void MainListener::enterExternalDeclaration(CFlatParser::ExternalDeclarationContext* ctx) {

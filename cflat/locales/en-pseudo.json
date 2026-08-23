@@ -397,6 +397,7 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
+    "endoffile": [],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"

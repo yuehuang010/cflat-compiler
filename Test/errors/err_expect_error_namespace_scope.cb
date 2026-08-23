@@ -1,0 +1,4 @@
+namespace Review3Expect {
+    expect_error("Undefined variable review3_namespace_missing");
+    int review3_namespace_function() { return review3_namespace_missing; }
+}

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "platform/GeneratedParser.h"
+#include "CFlatErrorListener.h"
 #include <DefaultErrorStrategy.h>
 #include <exception>
 #include <functional>
@@ -25,11 +25,18 @@ protected:
                              const antlr4::InputMismatchException& e) override
     {
         antlr4::Token* offendingToken = e.getOffendingToken();
-        std::string msg = localizeMessage_(
-            "mismatched input {} expecting {}",
-            {displayToken(offendingToken),
-             e.getExpectedTokens().toString(recognizer->getVocabulary())});
-        recognizer->notifyErrorListeners(offendingToken, msg, std::make_exception_ptr(e));
+        std::vector<std::string> localizedArguments{
+            displayToken(offendingToken, true),
+            e.getExpectedTokens().toString(recognizer->getVocabulary())};
+        std::vector<std::string> sourceArguments{
+            displayToken(offendingToken, false),
+            e.getExpectedTokens().toString(recognizer->getVocabulary())};
+        std::string msg = localizeMessage_("mismatched input {} expecting {}", localizedArguments);
+        std::string sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+            "found {} but expected {}", sourceArguments);
+        recognizer->notifyErrorListeners(
+            offendingToken, msg,
+            std::make_exception_ptr(ParseDiagnosticSourceMessage{std::move(sourceMessage)}));
     }
 
     void reportUnwantedToken(antlr4::Parser* recognizer) override
@@ -39,11 +46,18 @@ protected:
         beginErrorCondition(recognizer);
 
         antlr4::Token* token = recognizer->getCurrentToken();
-        std::string msg = localizeMessage_(
-            "extraneous input {} expecting {}",
-            {displayToken(token),
-             getExpectedTokens(recognizer).toString(recognizer->getVocabulary())});
-        recognizer->notifyErrorListeners(token, msg, nullptr);
+        std::vector<std::string> localizedArguments{
+            displayToken(token, true),
+            getExpectedTokens(recognizer).toString(recognizer->getVocabulary())};
+        std::vector<std::string> sourceArguments{
+            displayToken(token, false),
+            getExpectedTokens(recognizer).toString(recognizer->getVocabulary())};
+        std::string msg = localizeMessage_("extraneous input {} expecting {}", localizedArguments);
+        std::string sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+            "unexpected {} here; expected {}", sourceArguments);
+        recognizer->notifyErrorListeners(
+            token, msg,
+            std::make_exception_ptr(ParseDiagnosticSourceMessage{std::move(sourceMessage)}));
     }
 
     void reportMissingToken(antlr4::Parser* recognizer) override
@@ -53,11 +67,18 @@ protected:
         beginErrorCondition(recognizer);
 
         antlr4::Token* token = recognizer->getCurrentToken();
-        std::string msg = localizeMessage_(
-            "missing {} at {}",
-            {getExpectedTokens(recognizer).toString(recognizer->getVocabulary()),
-             displayToken(token)});
-        recognizer->notifyErrorListeners(token, msg, nullptr);
+        std::vector<std::string> localizedArguments{
+            getExpectedTokens(recognizer).toString(recognizer->getVocabulary()),
+            displayToken(token, true)};
+        std::vector<std::string> sourceArguments{
+            getExpectedTokens(recognizer).toString(recognizer->getVocabulary()),
+            displayToken(token, false)};
+        std::string msg = localizeMessage_("missing {} at {}", localizedArguments);
+        std::string sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+            "missing {} at {}", sourceArguments);
+        recognizer->notifyErrorListeners(
+            token, msg,
+            std::make_exception_ptr(ParseDiagnosticSourceMessage{std::move(sourceMessage)}));
     }
 
     void reportNoViableAlternative(antlr4::Parser* recognizer,
@@ -75,22 +96,32 @@ protected:
         else
             input = "<unknown input>";
 
-        std::string msg = localizeMessage_(
-            "no viable alternative at input {}", {escapeWSAndQuote(input)});
-        recognizer->notifyErrorListeners(e.getOffendingToken(), msg,
-                                         std::make_exception_ptr(e));
+        std::vector<std::string> arguments{escapeWSAndQuote(input)};
+        std::string msg = localizeMessage_("no viable alternative at input {}", arguments);
+        std::string sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+            "cannot understand the code at {}", arguments);
+        recognizer->notifyErrorListeners(
+            e.getOffendingToken(), msg,
+            std::make_exception_ptr(ParseDiagnosticSourceMessage{std::move(sourceMessage)}));
     }
 
 private:
     std::function<std::string(std::string, std::vector<std::string>)> localizeMessage_;
 
-    std::string displayToken(antlr4::Token* token)
+    std::string displayToken(antlr4::Token* token, bool localized)
     {
         std::string display = getTokenErrorDisplay(token);
         if (display == "'<EOF>'")
-            return "'" + localizeMessage_("end of file", {}) + "'";
+        {
+            std::string endOfFile = localized
+                ? localizeMessage_("end of file", {})
+                : DiagnosticLocalization::FormatSourceTemplate("end of file", {});
+            return "'" + endOfFile + "'";
+        }
         if (display == "<EOF>")
-            return localizeMessage_("end of file", {});
+            return localized
+                ? localizeMessage_("end of file", {})
+                : DiagnosticLocalization::FormatSourceTemplate("end of file", {});
         return display;
     }
 };

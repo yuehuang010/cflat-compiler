@@ -10,12 +10,18 @@
 #include <utility>
 #include <cctype>
 
+struct ParseDiagnosticSourceMessage
+{
+    std::string value;
+};
+
 struct ParseDiagnostic
 {
     std::string file;
     int line = 0;
     int col  = 0;
     std::string message;
+    std::string sourceMessage;
     std::string hint;
 };
 
@@ -53,16 +59,43 @@ public:
             : static_cast<int>(charPositionInLine);
         static constexpr std::string_view lexerPrefix = "token recognition error at: ";
         int sourceReservedCol = -1;
-        std::string reserved = reservedWordFromSource(line, charPositionInLine, sourceReservedCol);
+        std::string reservedSourceMessage;
+        std::string reserved = reservedWordFromSource(line, charPositionInLine, sourceReservedCol,
+                                                       reservedSourceMessage);
         if (sourceReservedCol >= 0)
             d.col = sourceReservedCol;
         if (msg.rfind(lexerPrefix, 0) == 0)
-            d.message = localizeMessage_("unexpected character: {}",
-                                         {msg.substr(lexerPrefix.size())});
+        {
+            std::vector<std::string> arguments{msg.substr(lexerPrefix.size())};
+            d.message = localizeMessage_("unexpected character: {}", arguments);
+            d.sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+                "found an unexpected character: {}", arguments);
+        }
         else if (!reserved.empty())
+        {
             d.message = reserved;
+            d.sourceMessage = reservedSourceMessage;
+        }
         else
+        {
             d.message = humanizeMessage(msg);
+            if (e)
+            {
+                try
+                {
+                    std::rethrow_exception(e);
+                }
+                catch (const ParseDiagnosticSourceMessage& source)
+                {
+                    d.sourceMessage = source.value;
+                }
+                catch (...)
+                {
+                }
+            }
+            if (d.sourceMessage.empty())
+                d.sourceMessage = d.message;
+        }
         d.hint    = reserved.empty() ? buildHint(recognizer, diagnosticToken, e, msg) : std::string();
         diagnostics_.push_back(std::move(d));
     }
@@ -92,7 +125,8 @@ private:
         return false;
     }
 
-    std::string reservedWordFromSource(size_t line, size_t col, int& wordCol) const
+    std::string reservedWordFromSource(size_t line, size_t col, int& wordCol,
+                                       std::string& sourceMessage) const
     {
         if (line == 0 || line > sourceLines_.size()) return {};
         const std::string& source = sourceLines_[line - 1];
@@ -144,8 +178,13 @@ private:
                 && gapIsDeclarationLike(previousEnd, begin))
             {
                 wordCol = static_cast<int>(begin);
-                return localizeMessage_("'{}' is a reserved word in CFlat and cannot be used as an identifier",
-                                        {word});
+                std::vector<std::string> arguments{word};
+                sourceMessage = DiagnosticLocalization::FormatSourceTemplate(
+                    "'{}' is a reserved word in CFlat and cannot be used as an identifier",
+                    arguments);
+                return localizeMessage_(
+                    "'{}' is a reserved word in CFlat and cannot be used as an identifier",
+                    arguments);
             }
             previousWord = word;
             previousEnd = i;
