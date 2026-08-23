@@ -2072,9 +2072,11 @@ bool LLVMBackend::TranslateMacroBody(const CFunctionMacroEntry& m, std::string& 
         size_t pos = 0;
         while ((pos = out.find('(', pos)) != std::string::npos)
         {
-            if (pos > 0)
+            size_t prevPos = pos;
+            while (prevPos > 0 && std::isspace((unsigned char)out[prevPos - 1])) --prevPos;
+            if (prevPos > 0)
             {
-                char prev = out[pos - 1];
+                char prev = out[prevPos - 1];
                 if (std::isalnum((unsigned char)prev) || prev == '_') { ++pos; continue; }
             }
             size_t inner = pos + 1;
@@ -2098,7 +2100,8 @@ bool LLVMBackend::TranslateMacroBody(const CFunctionMacroEntry& m, std::string& 
     }
 
 void LLVMBackend::RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>& funcMacros,
-                                 const std::string& fileForLsp)
+                                 const std::string& fileForLsp,
+                                 std::vector<CFunctionMacroEntry>* retryMacros)
 {
         if (funcMacros.empty()) return;
 
@@ -2120,6 +2123,8 @@ void LLVMBackend::RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>
             if (!TranslateMacroBody(m, translatedBody))
             {
                 ++rejected;
+                if (retryMacros != nullptr)
+                    retryMacros->push_back(m);
                 if (verbose) std::cout << std::format("[verbose]   reject macro {}: body uses unsupported tokens\n", m.name);
                 continue;
             }
@@ -2191,6 +2196,175 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RecordDependency(realPaths.back());
         }
         const std::string& fileForLsp = realPaths.front();
+
+        // Best-effort alias retry: a macro that still cannot be resolved is dropped, exactly as
+        // the first registration pass drops it. A real header carries many such macros.
+        bool aliasRetryFailed = false;
+        auto macroUsesObjectAlias = [](const auto& macro, const auto& aliases) {
+            std::unordered_set<std::string> params(macro.params.begin(), macro.params.end());
+            std::unordered_set<std::string> aliasNames;
+            for (const auto& alias : aliases)
+                if (!alias.name.empty() && !alias.aliasTarget.empty()) aliasNames.insert(alias.name);
+            size_t i = 0;
+            while (i < macro.body.size())
+            {
+                if (!std::isalpha((unsigned char)macro.body[i]) && macro.body[i] != '_')
+                {
+                    ++i;
+                    continue;
+                }
+                size_t start = i++;
+                while (i < macro.body.size()
+                       && (std::isalnum((unsigned char)macro.body[i]) || macro.body[i] == '_')) ++i;
+                std::string ident = macro.body.substr(start, i - start);
+                if (!params.count(ident) && aliasNames.count(ident)) return true;
+            }
+            return false;
+        };
+        auto rewriteObjectAliases = [&](CFunctionMacroEntry macro, const auto& aliases) {
+            std::unordered_map<std::string, std::string> aliasMap;
+            for (const auto& alias : aliases)
+                if (!alias.name.empty() && !alias.aliasTarget.empty())
+                    aliasMap.emplace(alias.name, alias.aliasTarget);
+            std::unordered_set<std::string> params(macro.params.begin(), macro.params.end());
+            auto resolve = [&](const std::string& name) {
+                std::string current = name;
+                std::unordered_set<std::string> seen;
+                for (int depth = 0; depth < 16; ++depth)
+                {
+                    auto it = aliasMap.find(current);
+                    if (it == aliasMap.end()) return current;
+                    if (!seen.insert(current).second) { aliasRetryFailed = true; return current; }
+                    current = it->second;
+                }
+                aliasRetryFailed = true;
+                return current;
+            };
+
+            std::string rewritten;
+            rewritten.reserve(macro.body.size());
+            size_t i = 0;
+            while (i < macro.body.size())
+            {
+                if (!std::isalpha((unsigned char)macro.body[i]) && macro.body[i] != '_')
+                {
+                    rewritten += macro.body[i++];
+                    continue;
+                }
+                size_t start = i++;
+                while (i < macro.body.size()
+                       && (std::isalnum((unsigned char)macro.body[i]) || macro.body[i] == '_')) ++i;
+                std::string ident = macro.body.substr(start, i - start);
+                if (!params.count(ident) && aliasMap.count(ident)) rewritten += resolve(ident);
+                else rewritten += ident;
+            }
+            macro.body = std::move(rewritten);
+            return macro;
+        };
+        auto expandFunctionMacroAliases = [&](CFunctionMacroEntry macro,
+                                               const auto& aliases, const auto& functionMacros) {
+            std::unordered_map<std::string, std::string> aliasMap;
+            for (const auto& alias : aliases)
+                if (!alias.name.empty() && !alias.aliasTarget.empty())
+                    aliasMap.emplace(alias.name, alias.aliasTarget);
+            std::unordered_map<std::string, const CFunctionMacroEntry*> functionMacroMap;
+            for (const auto& functionMacro : functionMacros)
+                functionMacroMap.emplace(functionMacro.name, &functionMacro);
+            std::unordered_set<std::string> params(macro.params.begin(), macro.params.end());
+
+            auto resolve = [&](const std::string& name) {
+                std::string current = name;
+                std::unordered_set<std::string> seen;
+                for (int depth = 0; depth < 16; ++depth)
+                {
+                    auto it = aliasMap.find(current);
+                    if (it == aliasMap.end()) return current;
+                    if (!seen.insert(current).second) { aliasRetryFailed = true; return current; }
+                    current = it->second;
+                }
+                aliasRetryFailed = true;
+                return current;
+            };
+            auto substitute = [](const CFunctionMacroEntry& functionMacro,
+                                 const std::vector<std::string>& arguments) {
+                std::unordered_map<std::string, std::string> replacements;
+                for (size_t i = 0; i < functionMacro.params.size(); ++i)
+                    replacements.emplace(functionMacro.params[i], arguments[i]);
+                std::string result;
+                size_t i = 0;
+                while (i < functionMacro.body.size())
+                {
+                    if (!std::isalpha((unsigned char)functionMacro.body[i])
+                        && functionMacro.body[i] != '_')
+                    {
+                        result += functionMacro.body[i++];
+                        continue;
+                    }
+                    size_t start = i++;
+                    while (i < functionMacro.body.size()
+                           && (std::isalnum((unsigned char)functionMacro.body[i])
+                               || functionMacro.body[i] == '_')) ++i;
+                    std::string ident = functionMacro.body.substr(start, i - start);
+                    auto replacement = replacements.find(ident);
+                    result += replacement == replacements.end() ? ident : replacement->second;
+                }
+                return result;
+            };
+
+            for (int pass = 0; pass < 16; ++pass)
+            {
+                bool expanded = false;
+                size_t i = 0;
+                while (i < macro.body.size())
+                {
+                    if (!std::isalpha((unsigned char)macro.body[i]) && macro.body[i] != '_')
+                    {
+                        ++i;
+                        continue;
+                    }
+                    size_t start = i++;
+                    while (i < macro.body.size()
+                           && (std::isalnum((unsigned char)macro.body[i]) || macro.body[i] == '_')) ++i;
+                    std::string ident = macro.body.substr(start, i - start);
+                    if (params.count(ident)) continue;
+                    size_t open = i;
+                    while (open < macro.body.size() && std::isspace((unsigned char)macro.body[open])) ++open;
+                    auto functionMacro = functionMacroMap.find(resolve(ident));
+                    if (aliasRetryFailed) return macro;
+                    if (open >= macro.body.size() || macro.body[open] != '(' || functionMacro == functionMacroMap.end())
+                        continue;
+
+                    size_t close = open + 1;
+                    int depth = 1;
+                    size_t argumentStart = close;
+                    std::vector<std::string> arguments;
+                    while (close < macro.body.size() && depth > 0)
+                    {
+                        if (macro.body[close] == '(') ++depth;
+                        else if (macro.body[close] == ')') --depth;
+                        if (depth == 1 && macro.body[close] == ',')
+                        {
+                            arguments.push_back(macro.body.substr(argumentStart, close - argumentStart));
+                            argumentStart = close + 1;
+                        }
+                        ++close;
+                    }
+                    if (depth != 0) { aliasRetryFailed = true; return macro; }
+                    if (close - 1 > argumentStart || !functionMacro->second->params.empty())
+                        arguments.push_back(macro.body.substr(argumentStart, close - 1 - argumentStart));
+                    if (arguments.size() != functionMacro->second->params.size())
+                        { aliasRetryFailed = true; return macro; }
+
+                    std::string replacement = substitute(*functionMacro->second, arguments);
+                    macro.body.replace(start, close - start, replacement);
+                    expanded = true;
+                    break;
+                }
+                if (!expanded) return macro;
+            }
+            aliasRetryFailed = true;
+            return macro;
+        };
 
         // Fold headers, include-dirs, and defines: same header under different roots/defines or
         // standalone vs. grouped must not share a stale cache entry.
@@ -2270,9 +2444,23 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
-            RegisterCFunctionMacros(hitFuncMacros, fileForLsp);
+            std::vector<CFunctionMacroEntry> retryMacros;
+            RegisterCFunctionMacros(hitFuncMacros, fileForLsp, &retryMacros);
             RegisterCGlobals(hitGlobals, fileForLsp);
             RegisterCMacroAliases(hitMacros, hitFuncMacros, fileForLsp);
+            std::vector<CFunctionMacroEntry> aliasRetries;
+            for (const auto& m : retryMacros)
+                if (macroUsesObjectAlias(m, hitMacros))
+                {
+                    aliasRetryFailed = false;
+                    CFunctionMacroEntry rewritten = rewriteObjectAliases(m, hitMacros);
+                    if (!aliasRetryFailed)
+                        rewritten = expandFunctionMacroAliases(rewritten, hitMacros, hitFuncMacros);
+                    std::string translated;
+                    if (!aliasRetryFailed && TranslateMacroBody(rewritten, translated))
+                        aliasRetries.push_back(std::move(rewritten));
+                }
+            RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
             return true;
         }
 
@@ -2302,9 +2490,23 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
                 RegisterCEnums(diskEntry.enums, fileForLsp);
                 RegisterCMacros(diskEntry.macros);
-                RegisterCFunctionMacros(diskEntry.funcMacros, fileForLsp);
+                std::vector<CFunctionMacroEntry> retryMacros;
+                RegisterCFunctionMacros(diskEntry.funcMacros, fileForLsp, &retryMacros);
                 RegisterCGlobals(diskEntry.globals, fileForLsp);
                 RegisterCMacroAliases(diskEntry.macros, diskEntry.funcMacros, fileForLsp);
+                std::vector<CFunctionMacroEntry> aliasRetries;
+                for (const auto& m : retryMacros)
+                    if (macroUsesObjectAlias(m, diskEntry.macros))
+                    {
+                        aliasRetryFailed = false;
+                        CFunctionMacroEntry rewritten = rewriteObjectAliases(m, diskEntry.macros);
+                        if (!aliasRetryFailed)
+                            rewritten = expandFunctionMacroAliases(rewritten, diskEntry.macros, diskEntry.funcMacros);
+                        std::string translated;
+                        if (!aliasRetryFailed && TranslateMacroBody(rewritten, translated))
+                            aliasRetries.push_back(std::move(rewritten));
+                    }
+                RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
                 return true;
             }
         }
@@ -2380,9 +2582,23 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             RegisterCSignatures(sigs, fileForLsp);
             RegisterCEnums(enums, fileForLsp);
             RegisterCMacros(macros);
-            RegisterCFunctionMacros(funcMacros, fileForLsp);
+            std::vector<CFunctionMacroEntry> retryMacros;
+            RegisterCFunctionMacros(funcMacros, fileForLsp, &retryMacros);
             RegisterCGlobals(globals, fileForLsp);
             RegisterCMacroAliases(macros, funcMacros, fileForLsp);
+            std::vector<CFunctionMacroEntry> aliasRetries;
+            for (const auto& m : retryMacros)
+                if (macroUsesObjectAlias(m, macros))
+                {
+                    aliasRetryFailed = false;
+                    CFunctionMacroEntry rewritten = rewriteObjectAliases(m, macros);
+                    if (!aliasRetryFailed)
+                        rewritten = expandFunctionMacroAliases(rewritten, macros, funcMacros);
+                    std::string translated;
+                    if (!aliasRetryFailed && TranslateMacroBody(rewritten, translated))
+                        aliasRetries.push_back(std::move(rewritten));
+                }
+            RegisterCFunctionMacros(aliasRetries, fileForLsp + "@alias-retry");
         }
         return true;
     }

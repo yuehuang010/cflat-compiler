@@ -34,38 +34,25 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     int _size     = 0;
     int _capacity = 0;
 
-    // `new T[n]` default-CONSTRUCTS every slot, so a T whose default construction acquires
-    // (e.g. a field initialized with `new`) hands back a buffer of live values - but every
-    // container store here assumes an EMPTY slot and drops no old value. Drain the fresh buffer
-    // once so the "slots outside [0,_size) are empty" invariant holds. Skipped for primitives
-    // and pointers (bare/`unique`/`alias`/interface), whose fresh slots are plain zeroed scalars.
-    void _drainFresh(T* buf, int n)
-    {
-        if const (!is_primitive(T) && !is_pointer(T))
-        {
-            int k = 0;
-            while (k < n)
-            {
-                _ = move buf[k];
-                k++;
-            }
-        }
-    }
-
     // Double the backing buffer, moving existing elements over. Moving (not copying) is
     // correct here because the old buffer is discarded immediately after.
     void _grow()
     {
         int newCap = _capacity == 0 ? 4 : _capacity * 2;
-        T* newData = new T[newCap];
-        _drainFresh(newData, newCap);
+        T* newData = nullptr;
+        if const (is_pointer(T)) newData = new T[newCap];
+        else newData = (T*)calloc((i64)newCap, (i64)sizeof(T));
         int i = 0;
         while (i < _size)
         {
             newData[i] = move _data[i];
             i++;
         }
-        if (_data != nullptr) delete[_] _data;
+        if (_data != nullptr)
+        {
+            if const (is_pointer(T)) delete[_] _data;
+            else free((void*)_data);
+        }
         _data = newData;
         _capacity = newCap;
     }
@@ -373,8 +360,8 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
     }
 
     // Frees `unique` elements; bare pointers and bare interface values are left to their
-    // real owner. Value elements are NOT released here - `delete[_size]` runs their
-    // destructors as it frees the buffer, so doing it above would destruct them twice.
+    // real owner. Value elements are NOT released here - live elements are released above and
+    // the raw backing buffer is freed below, so no per-element dtor pass is needed.
     // NOTE: this deliberately keeps the direct delete-site loop rather than the clear()-style
     // `_releaseAt` collapse. A self-referential `list<unique T*>` (T incomplete when the list
     // is monomorphized, e.g. TreeBox) needs the delete SITE's deferred destructor resolution;
@@ -390,6 +377,10 @@ class list<T> : IEnumerable<T>, IList<T>, ICopyable<list<T>>
             _releaseAt(i);
             i++;
         }
-        if (_data != nullptr) delete[_] _data;
+        if (_data != nullptr)
+        {
+            if const (is_pointer(T)) delete[_] _data;
+            else free((void*)_data);
+        }
     }
 };

@@ -569,6 +569,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
             LLVMBackend::NamedVariable namedVar;
             LLVMBackend::NamedVariable structVar;
             LLVMBackend::NamedVariable interfaceVar;
+            bool receiverWasFixedArray = false;
+            auto hasFixedArrayShape = [](const LLVMBackend::NamedVariable& value) {
+                return value.TypeAndValue.ConstArraySize > 0
+                    || (value.BaseType && llvm::isa<llvm::ArrayType>(value.BaseType));
+            };
             std::string primaryIdentifier;
             std::string callDisplayName;
             std::string namespaceContext;
@@ -697,6 +702,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 for (size_t i = 0; i + 2 < childIndex; ++i)
                     text += ctx->children[i]->getText();
                 return text;
+            };
+            auto isFixedArrayReceiver = [&]() {
+                bool result = receiverWasFixedArray
+                    || hasFixedArrayShape(structVar)
+                    || hasFixedArrayShape(namedVar)
+                    || hasFixedArrayShape(interfaceVar);
+                if (!result)
+                {
+                    std::string receiverText = ReceiverSourceText();
+                    auto original = Compiler(ctx)->GetScopedLocalOrArgument(receiverText);
+                    if (!hasFixedArrayShape(original))
+                        original = Compiler(ctx)->GetGlobalVariableNV(receiverText);
+                    result = hasFixedArrayShape(original);
+                }
+                return result;
             };
             // Captured at the member name so the call suffix below can still name the receiver.
             std::string nullIfaceRecvText;
@@ -1663,6 +1683,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             structVar = {};
                             interfaceVar = {};
                         }
+                        receiverWasFixedArray = hasFixedArrayShape(namedVar);
 
                         // [PFX-2-dangle] Disarm when the name resolved to a real value (a field, a
                         // namespace global, an enum member, ...); a confirmed method name stays armed.
@@ -2039,6 +2060,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             structVar = {};
                             interfaceVar = {};
                         }
+                        receiverWasFixedArray = hasFixedArrayShape(namedVar);
 
                         break;
                     }
@@ -2369,6 +2391,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         // A subscript result is an element (container slot): move-dataflow leaves
                         // index/deref lvalues untracked, so mark it so USE-recording skips it.
                         namedVar.IsElementAccess = true;
+                        receiverWasFixedArray = false;
                         // Positive provenance for the ownership arms: only an addressable element
                         // of a `T[]` view qualifies (a simd lane has no Storage).
                         namedVar.IsViewElement = baseWasArrayView && namedVar.Storage != nullptr;
@@ -4032,6 +4055,16 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
                         else if (interfaceVar.TypeAndValue.IsInterface)
                         {
+                            bool receiverIsFixedArray = isFixedArrayReceiver();
+                            bool receiverIsCharStringConversion = primaryIdentifier == "toString"
+                                && ((interfaceVar.TypeAndValue.TypeName == "char"
+                                     && interfaceVar.TypeAndValue.ConstArraySize > 0)
+                                    || (namedVar.TypeAndValue.TypeName == "char"
+                                        && namedVar.TypeAndValue.ConstArraySize > 0));
+                            if (receiverIsFixedArray && !receiverIsCharStringConversion)
+                                LogErrorContext(primaryCtx, std::format(
+                                    "no overload of '{}' matches the given arguments.", primaryIdentifier));
+
                             // [PFX-nc-iface] '?.': test the receiver BEFORE the argument list, so a
                             // null receiver skips the arguments. Both arms share this one guard.
                             llvm::Value* ncIfacePtr = nullptr;
@@ -4861,6 +4894,20 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             bool deferHresultChainArguments = hresultChainPending && winrtSlot != nullptr;
                             if (!deferHresultChainArguments)
                                 evaluateCallArguments();
+
+                            // A fixed array is not its element for extension-method lookup. The
+                            // char[N].toString() path above is the one intentional array UFCS case.
+                            bool receiverIsFixedArray = isFixedArrayReceiver();
+                            bool receiverIsCharStringConversion = functionName == "toString"
+                                && ((structVar.TypeAndValue.TypeName == "char"
+                                     && structVar.TypeAndValue.ConstArraySize > 0)
+                                    || (namedVar.TypeAndValue.TypeName == "char"
+                                        && namedVar.TypeAndValue.ConstArraySize > 0));
+                            if (receiverIsFixedArray && !receiverIsCharStringConversion)
+                            {
+                                LogErrorContext(primaryCtx, std::format(
+                                    "no overload of '{}' matches the given arguments.", functionName));
+                            }
 
                             // [PFX-7] call lowering, three ways: a [winrt] COM vtable dispatch
                             // (recv->lpVtbl->slot), a null-conditional `?.` guarded call, or the

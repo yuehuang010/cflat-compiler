@@ -61,6 +61,14 @@ int c_triple(int x);                  /* defined in cinterop.c */
 int c_quad(int x);                    /* defined in cinterop.c */
 #define CB_ALIAS_COUNTER c_global_counter  /* -> extern data (shares storage) */
 #define CB_ALIAS_MIN     CB_MIN       /* -> function-like macro template */
+#define CB_ALIAS_FUNC_TARGET c_triple  /* object alias used inside a function macro */
+#define CB_ALIAS_FUNC_CALL(x) CB_ALIAS_FUNC_TARGET(x)
+#define CB_ALIAS_FUNC_MID CB_MIN
+#define CB_ALIAS_FUNC_OUT CB_ALIAS_FUNC_MID
+#define CB_ALIAS_FUNC_CHAIN(x,y) CB_ALIAS_FUNC_OUT(x,y)
+#define CB_PARAM_TARGET c_global_counter
+#define CB_PARAM_CONST c_global_counter
+#define CB_PARAM_COLLISION(CB_PARAM_TARGET) CB_PARAM_TARGET + CB_PARAM_CONST
 #define CB_ALIAS_TRAIL   c_triple     /* trailing comment must not defeat the match */
 #define CB_ALIAS_UNKNOWN cb_no_such_name_anywhere  /* unknown: dropped, no error */
 #define CB_BASE_VAL      100

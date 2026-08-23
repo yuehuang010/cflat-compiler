@@ -4136,7 +4136,8 @@ private:
     bool TranslateMacroBody(const CFunctionMacroEntry& m, std::string& out) const;
 
     void RegisterCFunctionMacros(const std::vector<CFunctionMacroEntry>& funcMacros,
-                                 const std::string& fileForLsp);
+                                 const std::string& fileForLsp,
+                                 std::vector<CFunctionMacroEntry>* retryMacros = nullptr);
 
     void ReportOrphanHeader(const std::vector<std::string>& headerPaths, const std::string& clangErr);
 

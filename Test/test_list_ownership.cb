@@ -389,13 +389,10 @@ int testValueCopySemantics()
         passed += Test("list<Val> copy is independent", l[0].id, 1);
         passed += Test("list<Val> source intact", a.id, 42);
     }
-    // Six destructors for six live Val objects: the source local, the copy in slot 0, and the
-    // FOUR slots of the cap-4 backing buffer, which `new Val[4]` default-CONSTRUCTS. Only the
-    // first two ran before the container drain fix - the buffer's four were never destructed at
-    // all, which is a leak for any element type whose construction acquires. The ctor/dtor pair
-    // is the real assertion: 5 default constructions + 1 memberwise copy = 6 destructions.
-    passed += Test("list<Val> ctor count", g_ctor, 5);
-    passed += Test("list<Val> dtor count", g_dtor, 6);
+    // Raw value storage leaves unused capacity unconstructed. Only the source local and the
+    // copied live slot are constructed/destructed, while the backing allocation is freed raw.
+    passed += Test("list<Val> ctor count", g_ctor, 1);
+    passed += Test("list<Val> dtor count", g_dtor, 2);
     return passed;
 }
 

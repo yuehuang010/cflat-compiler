@@ -886,6 +886,40 @@ bool testLockScopeExitReleasesRepeatedly() {
 // channel<int> tests
 // ---------------------------------------------------------------------------
 
+int gValueBufferDtorCount = 0;
+struct ValueBufferDtor
+{
+    int value = 0;
+    ~ValueBufferDtor() { gValueBufferDtorCount++; }
+};
+
+bool testValueBufferTeardown()
+{
+    bool result = true;
+    gValueBufferDtorCount = 0;
+    {
+        channel<ValueBufferDtor> ch;
+        ch.init(4);
+        ValueBufferDtor value = default;
+        ch.send(value);
+        gValueBufferDtorCount = 0;
+        ch.destroy();
+    }
+    result &= Test("channel live value slot destructed", gValueBufferDtorCount, 2);
+
+    gValueBufferDtorCount = 0;
+    {
+        spsc_queue<ValueBufferDtor> q;
+        q.init(4);
+        ValueBufferDtor value = default;
+        q.push(value);
+        gValueBufferDtorCount = 0;
+        q.destroy();
+    }
+    result &= Test("spsc live value slot destructed", gValueBufferDtorCount, 2);
+    return result;
+}
+
 struct ChanCtx {
     void* ch    = nullptr;  // channel<int>*
     int   start = 0;
@@ -1894,6 +1928,7 @@ extern int main() {
     total++; passed += testEmbeddedAtomicCounterInitialized() ? 1 : 0;
 
     // Channel / spsc_queue tests
+    total++; passed += testValueBufferTeardown()      ? 1 : 0;
     total++; passed += testChannelBasicSendReceive()  ? 1 : 0;
     total++; passed += testChannelCount()             ? 1 : 0;
     total++; passed += testChannelTryReceive()        ? 1 : 0;

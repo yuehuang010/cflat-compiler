@@ -837,6 +837,10 @@ extern int main()
                                 nbeL[0].r.v * 10 + nbeL[1].r.v, 12);
     }
     total++; passed += Test("one destruction per braced element", nbeDtors, 2);
+    string[2] methodValues = { "A", "B" };
+    total++; passed += Test("fixed-array element method receiver", methodValues[0].length(), 1);
+    char[4] methodChars = { 'a', 'b', 'c', 0 };
+    total++; passed += Test("fixed-array char toString conversion", methodChars.toString().length(), 3);
     if (passed == total)
     {
         printf("ALL %d initializer-list tests passed.\n", total);

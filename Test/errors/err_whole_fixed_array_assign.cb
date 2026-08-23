@@ -3,8 +3,47 @@
 // module verification, while a string literal folded that cast into a ConstantExpr the
 // verifier does not check - which miscompiled to garbage, or crashed the compiler in
 // SelectionDAG on an indexed read. Element assignment (`b[i] = ...`) is unaffected.
+import "string.cb";
 expect_error("assignment to a whole fixed array 'int[3]' is not supported") {
     void f() { int[3] a = default; int[3] b = default; b = a; }
+}
+
+// A fixed-array receiver must not decay to its element type during method lookup.
+expect_error("no overload of 'length' matches the given arguments") {
+    void fixedArrayLocal() { string[3] names = { "A", "B", "C" }; names.length(); }
+}
+
+expect_error("no overload of 'length' matches the given arguments") {
+    void fixedArrayNested() { string[2][3] names = default; names.length(); }
+}
+
+expect_error("no overload of 'length' matches the given arguments") {
+    struct FixedArrayMethodField { int[2] values = default; int length() { return values.length(); } };
+    void fixedArrayField() { FixedArrayMethodField value = default; value.length(); }
+}
+
+namespace FixedArrayMethodNamespace {
+    struct Point { int length() { return 17; } };
+}
+expect_error("no overload of 'length' matches the given arguments") {
+    void fixedArrayNamespace() { FixedArrayMethodNamespace.Point[2] points = default; points.length(); }
+}
+
+// The element method must EXIST, or the reject is vacuous: 'length' is absent from
+// FixedArrayBox, so the leg would pass on the unfixed compiler too.
+class FixedArrayBox<T> { T value = default; int size() { return 1; } };
+expect_error("no overload of 'size' matches the given arguments") {
+    void fixedArrayGeneric() { FixedArrayBox<int>[2] boxes = default; boxes.size(); }
+}
+
+interface FixedArrayReceiverInterface { int area(); };
+class FixedArrayReceiverImpl : FixedArrayReceiverInterface { int area() { return 7; } };
+expect_error("no overload of 'area' matches the given arguments") {
+    void fixedArrayInterface() {
+        FixedArrayReceiverImpl impl = default;
+        FixedArrayReceiverInterface[2] items = { impl, impl };
+        items.area();
+    }
 }
 
 // A union's ARRAY ARM is still a whole fixed array, so the whole-array reject covers it.

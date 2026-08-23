@@ -81,20 +81,6 @@ class channel<T>
 
     // -- public API ------------------------------------------------------------
 
-    // `new T[n]` default-CONSTRUCTS every slot, so a T whose default construction acquires
-    // (e.g. a field initialized with `new`) hands back a buffer of live values that the ring's
-    // bitwise hand-off then overwrites without dropping. Drain the fresh buffer once so every
-    // slot starts EMPTY. Skipped for primitives and pointers, whose fresh slots are zeroed.
-    void _drainFresh(T* buf, i64 n) {
-        if const (!is_primitive(T) && !is_pointer(T)) {
-            i64 k = (i64)0;
-            while (k < n) {
-                _ = move buf[k];
-                k = k + (i64)1;
-            }
-        }
-    }
-
     // Allocate the ring and sequence array; rounds cap up to a power of two.
     void init(int cap) {
         // Round up to the next power of two so bitmasking is safe.
@@ -102,8 +88,8 @@ class channel<T>
         while (n < (i64)cap) { n = n * (i64)2; }
         _cap  = n;
         _mask = n - (i64)1;
-        _buf  = new T[_cap];
-        _drainFresh(_buf, _cap);
+        if const (is_pointer(T)) _buf = new T[_cap];
+        else _buf = (T*)calloc(_cap, (i64)sizeof(T));
         _seq  = (i64*)malloc(_cap * (i64)8);
         int i = 0;
         while (i < (int)_cap) { _seq[i] = (i64)i; i++; }
@@ -112,6 +98,9 @@ class channel<T>
         __atomic_i64_store(&_producers, (i64)0);
         __atomic_i64_store(&_closed, (i64)0);
     }
+
+    // Release one live value slot before the raw backing buffer is freed.
+    void _releaseAt(int index) { _ = move _buf[index]; }
 
     // -- producer-lifetime tracking (drives blocking receive(T*) termination) --
 
@@ -379,7 +368,24 @@ class channel<T>
 
     // Free the ring buffer and sequence array. Safe to call more than once.
     void destroy() {
-        if (_buf != nullptr) { delete[_] _buf; _buf = nullptr; }
+        if (_buf != nullptr)
+        {
+            if const (!is_pointer(T) && !is_primitive(T))
+            {
+                i64 tail = __atomic_i64_load(&_tail);
+                i64 head = __atomic_i64_load(&_head);
+                i64 i = (i64)0;
+                while (i < head - tail)
+                {
+                    _releaseAt((int)((tail + i) & _mask));
+                    i++;
+                }
+                free((void*)_buf);
+            }
+            else if const (is_pointer(T)) delete[_] _buf;
+            else free((void*)_buf);
+            _buf = nullptr;
+        }
         if (_seq != nullptr) { free((void*)_seq); _seq = nullptr; }
     }
 

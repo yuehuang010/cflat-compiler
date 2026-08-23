@@ -560,6 +560,9 @@ extern int main()
     if (CB_ALIAS_TRAIL(7) != 21)                 return 243;   // trailing comment after body
     if (CB_ALIAS_MIN(3, 7) != 3)                 return 244;   // alias -> function-like macro
     if (CB_ALIAS_MIN(9, 2) != 2)                 return 245;
+    if (CB_ALIAS_FUNC_CALL(7) != 21)             return 250;   // function macro body -> object alias
+    if (CB_ALIAS_FUNC_CHAIN(3, 8) != 3)          return 251;   // macro -> alias -> alias -> function macro
+    if (CB_PARAM_COLLISION(3) != 1008)           return 252;   // alias retry must preserve parameter name
 
     // Alias to extern data must share the TARGET's storage: a write through one name is
     // visible through the other (a freshly created global would read 0, not 4243/1005).

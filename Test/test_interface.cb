@@ -712,6 +712,16 @@ bool testChannelInterface()
     return a0 == 75 && a1 == 16;
 }
 
+bool testFixedArrayInterfaceElementCall()
+{
+    IShape[2] items = default;
+    Circle impl = default;
+    impl.r = 3;
+    items[0] = impl;
+    items[1] = impl;
+    return Test("fixed array interface indexed method", items[1].area(), 27) != 0;
+}
+
 // ── Test 15: delete through an interface fat pointer ─────────────────────────
 // 'delete <interfaceValue>' must virtually destruct the concrete object EXACTLY
 // once and free it once - for both a same-scope boxed local (which must transfer
@@ -4992,6 +5002,7 @@ extern int main()
     total++; passed += testListInterfaceForeach() ? 1 : 0;
     total++; passed += testListInterfaceSort()   ? 1 : 0;
     total++; passed += testChannelInterface()    ? 1 : 0;
+    total++; passed += testFixedArrayInterfaceElementCall() ? 1 : 0;
     total++; passed += testDeleteThroughInterface() ? 1 : 0;
     total++; passed += testMoveInterfaceParam()     ? 1 : 0;
     total++; passed += testMoveUniqueInterfaceLocal() ? 1 : 0;
