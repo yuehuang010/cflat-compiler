@@ -146,6 +146,10 @@ bool MainListener::AllowBondedClosureFieldStore(
             auto it = frame.namedVariable.find(holderName);
             if (it == frame.namedVariable.end()) continue;
             it->second.ContainsBondedClosure = true;
+            for (const auto& source : sources)
+                if (std::find(it->second.BondedSources.begin(), it->second.BondedSources.end(), source)
+                    == it->second.BondedSources.end())
+                    it->second.BondedSources.push_back(source);
             return true;
         }
         return false;
@@ -359,6 +363,12 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
             }
             if (result.Primary != nullptr && compilerLLVM->IsAliasValue(result.Primary))
                 result.TypeAndValue.IsAlias = true;
+            if (result.Primary != nullptr)
+                if (const auto* sources = compilerLLVM->FindBondedValue(result.Primary))
+                {
+                    result.IsBonded = true;
+                    result.BondedSources = *sources;
+                }
             // A '?:' / '??' result reaches here as a raw join with no type name; fill only the
             // type identity so flags already decided above (IsAlias) are not overwritten.
             if (result.Primary != nullptr && result.TypeAndValue.TypeName.empty()
@@ -2217,9 +2227,37 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                             LogErrorContext(ctx, std::format("bonded value cannot be assigned to '{}' - '{}' is in a wider scope than its bond source '{}'", namedVar.CallerName, namedVar.CallerName, source));
                     }
                 }
+                else if (llvm::isa<llvm::GlobalVariable>(destination))
+                    LogErrorContext(ctx,
+                        "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
                 compiler->lastCallIsBonded = false;
                 compiler->lastCallBondByAddress = false;
                 compiler->lastCallBondedSources.clear();
+            }
+
+            if (operatorText == "=" && namedVar.FieldName.empty()
+                && !namedVar.CallerName.empty() && namedVar.Storage != nullptr
+                && (llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                    || llvm::isa<llvm::GlobalVariable>(namedVar.Storage)))
+            {
+                for (auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+                {
+                    auto it = frame.namedVariable.find(namedVar.CallerName);
+                    if (it == frame.namedVariable.end() || it->second.Storage != namedVar.Storage)
+                        continue;
+                    if (rightNV.IsBonded)
+                    {
+                        it->second.IsBonded = true;
+                        it->second.BondByAddress = rightNV.BondByAddress;
+                        it->second.BondedSources = rightNV.BondedSources;
+                        it->second.BondDeclBlock = compiler->builder->GetInsertBlock();
+                        it->second.BondDeclFunction = it->second.BondDeclBlock != nullptr
+                            ? it->second.BondDeclBlock->getParent() : nullptr;
+                    }
+                    else
+                        compiler->ClearVariableBond(namedVar.CallerName);
+                    break;
+                }
             }
 
             // Interface upcast: struct* -> fat pointer when assigning to an interface variable.
@@ -4424,6 +4462,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
             compiler->ClearOwnedResultChannels();
         compiler->PropagateAliasValue(trueValue, falseValue, phi);
+        compiler->PropagateBondedValue(trueValue, falseValue, phi);
         if (trueAlias || falseAlias) compiler->RegisterAliasValue(phi);
         if (trueTempField || falseTempField) compiler->RegisterTempFieldValue(phi);
         compiler->PropagateUniqueFieldRead(trueValue, falseValue, phi);
@@ -4542,6 +4581,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 compiler->RegisterNullCoalesceJoin(
                     joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
                 compiler->PropagateAliasValue(lhs, rhs, joined);
+                compiler->PropagateBondedValue(lhs, rhs, joined);
                 compiler->RegisterJoinArmCastOccurrence(joined, 0, lhsOcc);
                 compiler->RegisterJoinArmCastOccurrence(joined, 1, rhsOcc);
                 compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
@@ -4713,6 +4753,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 if (compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue))
                     compiler->ClearOwnedResultChannels();
                 compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
+                compiler->PropagateBondedValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);
                 LLVMBackend::TypedValue result{ selectValue, joinUnsigned };
                 result.isAlias = compiler->IsAliasValue(selectValue);
@@ -7938,8 +7979,11 @@ bool MainListener::EmitOneFieldInit(
         {
             const auto& bondedSources = rightNV.IsBonded
                 ? rightNV.BondedSources : compiler->lastCallBondedSources;
+            // The holder is the BRACE DESTINATION (recovered from structPtr), never the
+            // source's own field path - passing rightNV re-marks the source holder instead.
+            LLVMBackend::NamedVariable braceDestination{};
             if (rightNV.ContainsBondedClosure
-                || !AllowBondedClosureFieldStore(compiler, rightNV, structPtr,
+                || !AllowBondedClosureFieldStore(compiler, braceDestination, structPtr,
                                                   bondedSources, errCtx))
                 LogErrorContext(errCtx,
                     "bonded value cannot be stored in a struct field or through a pointer - bond lifetime would be untrackable");
@@ -10912,6 +10956,9 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.OwnedElementBorrowFunction     = src.OwnedElementBorrowFunction;
         dst.BondDeclBlock                  = src.BondDeclBlock;
         dst.BondDeclFunction               = src.BondDeclFunction;
+        dst.IsBonded                        = src.IsBonded;
+        dst.BondByAddress                   = src.BondByAddress;
+        dst.BondedSources                   = src.BondedSources;
         dst.ContainsBondedClosure          = src.ContainsBondedClosure;
         dst.LambdaCaptureNames             = src.LambdaCaptureNames;
         dst.LambdaReferenceCaptureNames    = src.LambdaReferenceCaptureNames;
@@ -11277,6 +11324,9 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
+                result.IsBonded = argNV.IsBonded;
+                result.BondByAddress = argNV.BondByAddress;
+                result.BondedSources = argNV.BondedSources;
                 // CallerName is deliberately NOT carried: the source is already detached and
                 // zeroed, and keeping it re-marks the origin in the move tracker (false positives).
                 // Carry the owning flag so 'move s' directly as a 'move string' arg TRANSFERS the buffer;

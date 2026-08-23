@@ -5292,6 +5292,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->lastCallBondedSources.clear();
                         }
 
+                        // A closure field read carries its bond on the initializer value, not
+                        // through the call-result side channel used above.
+                        if (haveInitializerSourceNV && initializerSourceNV.IsBonded)
+                        {
+                            auto& nv = compiler->GetOrCreateStackVariable(name);
+                            nv.IsBonded = true;
+                            nv.BondByAddress = initializerSourceNV.BondByAddress;
+                            nv.BondedSources = initializerSourceNV.BondedSources;
+                            nv.BondDeclBlock = compiler->builder->GetInsertBlock();
+                            nv.BondDeclFunction = nv.BondDeclBlock != nullptr
+                                ? nv.BondDeclBlock->getParent() : nullptr;
+                        }
+
                         // Propagate borrow: if the RHS is a borrowed pointer (non-move param or
                         // a local that already aliases one, possibly via cast), this local also
                         // aliases the borrowed origin and must not be deleted. IsOwning/IsNewAllocated

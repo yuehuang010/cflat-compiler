@@ -214,6 +214,11 @@
       ".data()",
       "printf(\"%s\", s.data())"
     ],
+    "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": [
+      "IBondedClosureStore",
+      "put",
+      "f"
+    ],
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
       "cmp",
       "1",
@@ -507,6 +512,7 @@
     "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": "cannot pass '{0}' to the '{1}' parameter '{2}' of '{3}': a '{4}' is a {5} value, not a '{6}' - the callee would read the pair itself. Pass the buffer explicitly with '{7}'. An interpolated string literal is a '{8}': bind it first ({9}; {10}).",
     "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": "cannot pass '{0}' to the '{1}' parameter {2} through a function value: a '{3}' is a {4} value, not a '{5}'. Pass the buffer explicitly with '{6}'.",
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": "cannot pass '{0}' to the variadic '{1}' of '{2}': a variadic slot is untyped and a '{3}' is a {4} value, not a '{5}' - the length field would be read as the next argument. Pass the buffer explicitly with '{6}' (e.g. {7}).",
+    "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": "cannot pass bonded value to interface method '{0}.{1}' parameter '{2}' - bonded values cannot be transferred out of their source's scope",
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",

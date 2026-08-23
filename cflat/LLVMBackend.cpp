@@ -4204,6 +4204,7 @@ void LLVMBackend::ResetForReanalysis()
     uniqueFieldReadJoins_.clear();
     aliasValues_.clear();
     tempFieldValues_.clear();
+    bondedValues_.clear();
     // Keyed by llvm::Function*, which a rebuilt module invalidates.
     DropModuleEscapeMemo();
     poisonedFunctions.clear();

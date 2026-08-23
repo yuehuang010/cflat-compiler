@@ -2100,6 +2100,13 @@ struct BondedFieldBox { Lambda<int()> f = default; Lambda<int()> g = default; };
 struct BondedFieldOuter { BondedFieldBox box = default; };
 struct BondedVoidFieldBox { Lambda<void()> f = default; };
 
+// A callee that only INVOKES the closure keeps the bond inside the caller's frame, so passing
+// an extracted bonded field to it stays legal (the reject side is err_bond_lambda_escape.cb).
+int invokeBondedTwice(Lambda<int()> f) { return f() + f(); }
+
+interface IInvokeBonded { int run(Lambda<int()> f); };
+class InvokeBondedOnly : IInvokeBonded { int run(Lambda<int()> f) { return f(); } };
+
 bool testBondedClosureFieldLifetime()
 {
     bool result = true;
@@ -2109,6 +2116,13 @@ bool testBondedClosureFieldLifetime()
         BondedFieldBox h = default;
         h.f = () => { return c.value; };
         result &= Test("bonded field same scope", h.f(), 31);
+        Lambda<int()> copied = h.f;
+        result &= Test("bonded field local copy call", copied(), 31);
+        result &= Test("bonded field pointer call", (&h)->f(), 31);
+        result &= Test("bonded field into call-only callee", invokeBondedTwice(h.f), 62);
+        InvokeBondedOnly impl = default;
+        IInvokeBonded runner = impl;
+        result &= Test("bonded field into call-only interface", runner.run(h.f), 31);
     }
     {
         Counter c = default; c.value = 33;
@@ -2194,6 +2208,47 @@ bool testBondedClosureFieldLifetime()
     }
 
     return result;
+}
+
+int callBondedField(Lambda<int()> f) { return f(); }
+
+bool testBondedClosureFieldCallOnly()
+{
+    list<int> xs = default;
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count() + 46; };
+    return Test("bonded field call-only callee", callBondedField(h.f), 46) != 0;
+}
+
+interface IBondedClosureCallOnly { int invoke(Lambda<int()> f); };
+class BondedClosureCallOnly : IBondedClosureCallOnly {
+    int invoke(Lambda<int()> f) { return f(); }
+};
+
+bool testBondedClosureFieldInterfaceCallOnly()
+{
+    list<int> xs = default;
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count() + 49; };
+    BondedClosureCallOnly impl = default;
+    IBondedClosureCallOnly sink = impl;
+    return Test("bonded field interface call-only", sink.invoke(h.f), 49) != 0;
+}
+
+Lambda<int()> rebindBondedFieldCopy()
+{
+    list<int> xs = default;
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count() + 47; };
+    Lambda<int()> g = default;
+    g = h.f;
+    g = () => { return 48; };
+    return g;
+}
+
+bool testBondedClosureFieldRebind()
+{
+    return Test("bonded field copy rebind return", rebindBondedFieldCopy()(), 48) != 0;
 }
 
 int bondedParamListAccept(list<int> xs)
@@ -4641,6 +4696,9 @@ extern int main(int argc, char** argv)
     total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
     total++; passed += testClosureFieldReadIntoLocal()   ? 1 : 0;
     total++; passed += testBondedClosureFieldLifetime()  ? 1 : 0;
+    total++; passed += testBondedClosureFieldCallOnly() ? 1 : 0;
+    total++; passed += testBondedClosureFieldInterfaceCallOnly() ? 1 : 0;
+    total++; passed += testBondedClosureFieldRebind()   ? 1 : 0;
     total++; passed += testBondedClosureParameterSources() ? 1 : 0;
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind

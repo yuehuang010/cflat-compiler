@@ -1686,6 +1686,7 @@ public:
     std::vector<UniqueFieldReadJoin> uniqueFieldReadJoins_;
     std::vector<llvm::Value*> aliasValues_;
     std::vector<llvm::Value*> tempFieldValues_;
+    std::unordered_map<const llvm::Value*, std::vector<std::string>> bondedValues_;
 
     std::vector<NullCoalesceJoin> nullCoalesceJoins_;
 
@@ -1708,6 +1709,10 @@ public:
     bool IsTempFieldValue(const llvm::Value* value) const;
     void PropagateTempFieldValue(llvm::Value* trueValue, llvm::Value* falseValue,
                                  llvm::Value* joined);
+    void RegisterBondedValue(llvm::Value* value, const std::vector<std::string>& sources);
+    const std::vector<std::string>* FindBondedValue(const llvm::Value* value) const;
+    void PropagateBondedValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                              llvm::Value* joined);
 
     /*
      * The cast occurrence (see codeValueDataCasts_) each ARM of a join was evaluated under, keyed
@@ -3177,6 +3182,7 @@ private:
      * pointer the callee reads out of it (or parks into it) that outlives the call counts too.
      */
     bool ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth = 0);
+    bool ClosureParameterMayEscape(const llvm::Function* fn, unsigned argIndex);
 
     /*
      * The "does not retain PAST my call" half of the question above: same walk, but the callee's
@@ -3269,6 +3275,10 @@ private:
                                              const std::string& methodName, size_t arity,
                                              unsigned paramIndex, std::string& destKind,
                                              std::string& implDetail);
+
+    bool InterfaceCallMayRetainBondedArg(const std::string& ifaceName,
+                                         const std::string& methodName, size_t arity,
+                                         unsigned paramIndex);
 
     bool EveryImplementorMayReturnInterfaceArg(const std::string& ifaceName,
                                                const std::string& methodName, size_t arity,

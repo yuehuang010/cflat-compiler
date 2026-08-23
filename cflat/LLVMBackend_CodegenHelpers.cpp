@@ -69,6 +69,11 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         currentFunctionReturnsOwned = returnsOwned;
         currentFunctionReturnIsArrayView = returnIsArrayView;
         currentFunctionReturnTypeName = returnTypeName;
+        // The bond side channel is per-call: a value left set by a swallowed diagnostic (or by a
+        // deferred lambda body) must never answer the next function's return/assign checks.
+        lastCallIsBonded = false;
+        lastCallBondByAddress = false;
+        lastCallBondedSources.clear();
         // Reset the per-function alias-scope registry; scopes from a prior function must never leak.
         aliasDomain_ = nullptr;
         aliasScopes_.clear();

@@ -142,6 +142,101 @@ void escapeListIntoGlobal() {
     gEscapedListLambda = () => { xs.add(1); };
 }
 
+Lambda<void()> returnExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    return h.f;
+}
+
+Lambda<void()> returnExtractedBondedFieldParam(list<int> xs) {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    return h.f;
+}
+
+Lambda<void()> returnExtractedBondedFieldMoveParam(move list<int> xs) {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    return h.f;
+}
+
+Lambda<void()> returnAssignedExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    Lambda<void()> g = default;
+    g = h.f;
+    return g;
+}
+
+void escapeExtractedBondedFieldGlobal() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    gEscapedListLambda = h.f;
+}
+
+void escapeExtractedBondedFieldOut(ListHolder* out) {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    out->f = h.f;
+}
+
+void escapeExtractedBondedFieldList() {
+    expect_error("cannot pass bonded value to 'consuming' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    list<Lambda<void()>> out = default;
+    out.add(h.f);
+}
+
+void storeExtractedBondedField(Lambda<void()> f) { gEscapedListLambda = f; }
+
+void escapeExtractedBondedFieldToCallee() {
+    expect_error("cannot pass bonded value to 'consuming' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    storeExtractedBondedField(h.f);
+}
+
+struct NestedBondedFieldHolder { ListHolder inner = default; };
+
+Lambda<void()> returnNestedExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    NestedBondedFieldHolder h = default;
+    h.inner.f = () => { xs.add(1); };
+    return h.inner.f;
+}
+
+Lambda<void()> returnPointerExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.add(1); };
+    return (&h)->f;
+}
+
+Lambda<void()> returnTernaryExtractedBondedField(bool chooseFirst) {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    ListHolder k = default;
+    h.f = () => { xs.add(1); };
+    k.f = () => { xs.add(2); };
+    return chooseFirst ? h.f : k.f;
+}
+
 // A holder in an outer scope outlives a bonded source in an inner scope.
 void escapeOuterHolder() {
     expect_error("bonded value cannot be stored in a struct field or through a pointer");
@@ -277,6 +372,48 @@ void secondLambdaCapturesHolder() {
     takeClosure(() => { h.f(); });
 }
 
+void lambdaCapturesExtractedBondedClosure() {
+    expect_error("cannot capture 'g' in a lambda");
+    Counter c = default;
+    ListHolder h = default;
+    h.f = () => { c.value = 1; };
+    Lambda<void()> g = h.f;
+    takeClosure(() => { g(); });
+}
+
+struct MethodBondedHolder { Lambda<void()> f = default; Lambda<void()> get() { return this->f; } };
+
+Lambda<void()> returnMethodExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    MethodBondedHolder h = default;
+    h.f = () => { xs.count(); };
+    return h.get();
+}
+
+Lambda<void()> returnMovedExtractedBondedField() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.count(); };
+    return move h.f;
+}
+
+interface IBondedClosureStore { void put(Lambda<void()> f); };
+class BondedClosureStore : IBondedClosureStore {
+    void put(Lambda<void()> f) { gEscapedListLambda = f; }
+};
+
+void escapeExtractedBondedFieldThroughInterface() {
+    expect_error("cannot pass bonded value to interface method");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.count(); };
+    BondedClosureStore impl = default;
+    IBondedClosureStore sink = impl;
+    sink.put(h.f);
+}
+
 // The holder lives in the enclosing function; the inner lambda's own parameter dies first, so
 // storing a closure bonded to it into that captured holder must reject.
 struct InnerHolder { Lambda<int()> f = default; };
@@ -286,4 +423,39 @@ void rejectHolderCapturedByLambda() {
     Lambda<void(BondCounter)> inner = (BondCounter c) => {
         h.f = () => c.value;
     };
+}
+
+// A callee that hands its argument back keeps the bond on the RESULT, so the
+// caller's return escapes just as `return h.f;` does.
+Lambda<void()> passThroughBondedField(Lambda<void()> f) { return f; }
+
+Lambda<void()> returnBondedFieldThroughIdentityCall() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.count(); };
+    return passThroughBondedField(h.f);
+}
+
+Lambda<void()> returnBondedFieldWithRawCount(Lambda<void()> f, move int* p) { return f; }
+
+Lambda<void()> returnBondedFieldThroughRawCount() {
+    expect_error("returning bonded value whose source 'xs' is not a 'bond' parameter");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.count(); };
+    int* p = new int[1];
+    return returnBondedFieldWithRawCount(h.f, move p);
+}
+
+// Brace initialization must mark the DESTINATION holder, not the source's holder.
+struct BraceResultHolder { Lambda<void()> f = default; };
+
+BraceResultHolder returnBraceInitBondedField() {
+    expect_error("cannot return a holder containing a bonded closure");
+    list<int> xs = default;
+    ListHolder h = default;
+    h.f = () => { xs.count(); };
+    BraceResultHolder r = {f = h.f};
+    return r;
 }

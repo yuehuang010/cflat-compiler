@@ -2444,6 +2444,18 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             return nullptr;
         const InterfaceMethod* methodInfo = &(*ifaceMethods)[methodIdx];
 
+        for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
+        {
+            if (!callArgNVs[i].IsBonded) continue;
+            if (!methodInfo->Parameters[i].IsMove
+                && !InterfaceCallMayRetainBondedArg(ifaceName, methodName,
+                                                     methodInfo->Parameters.size(), (unsigned)i))
+                continue;
+            LogErrorMessage(
+                "cannot pass bonded value to interface method '{}.{}' parameter '{}' - bonded values cannot be transferred out of their source's scope",
+                { ifaceName, methodName, methodInfo->Parameters[i].VariableName });
+        }
+
         // Method indices start at 1 (slot 0 is type ID)
         auto fnPtrField = builder->CreateGEP(ptrTy, vtablePtr, builder->getInt32(methodIdx + 1));
         auto fnPtr = builder->CreateLoad(ptrTy, fnPtrField);

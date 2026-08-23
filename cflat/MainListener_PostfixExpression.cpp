@@ -880,6 +880,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // can detect that the parent pointer is a borrowed parameter.
                                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                                structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
+                                structVar.BondedSources = namedVar.BondedSources;
                             }
                         }
                         else if (!namedVar.TypeAndValue.Pointer
@@ -899,6 +901,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
                                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                                structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
+                                structVar.BondedSources = namedVar.BondedSources;
                             }
                         }
                         else if (nullConditionalPending
@@ -1397,6 +1401,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
+                                    if (namedVar.ContainsBondedClosure)
+                                        namedVar.BondedSources = structVar.BondedSources;
+                                    if (structVar.ContainsBondedClosure
+                                        && (fieldType.IsFunctionPointer
+                                            || Compiler(ctx)->GetEncodedClosureType(fieldType.TypeName) != nullptr))
+                                    {
+                                        namedVar.IsBonded = true;
+                                        namedVar.BondedSources = structVar.BondedSources;
+                                        if (namedVar.Primary != nullptr)
+                                            Compiler(ctx)->RegisterBondedValue(namedVar.Primary,
+                                                                                namedVar.BondedSources);
+                                    }
                                     namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
                                         || structVar.IsAliasBorrow
                                         || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
@@ -1499,6 +1515,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     namedVar.TypeAndValue.ParentVariableName = structVar.TypeAndValue.VariableName;
                                     namedVar.ContainsBondedClosure = structVar.ContainsBondedClosure
                                         && IsBondedClosureContainer(Compiler(ctx), fieldType);
+                                    if (namedVar.ContainsBondedClosure)
+                                        namedVar.BondedSources = structVar.BondedSources;
+                                    if (structVar.ContainsBondedClosure
+                                        && (fieldType.IsFunctionPointer
+                                            || Compiler(ctx)->GetEncodedClosureType(fieldType.TypeName) != nullptr))
+                                    {
+                                        namedVar.IsBonded = true;
+                                        namedVar.BondedSources = structVar.BondedSources;
+                                        if (namedVar.Primary != nullptr)
+                                            Compiler(ctx)->RegisterBondedValue(namedVar.Primary,
+                                                                                namedVar.BondedSources);
+                                    }
                                     namedVar.IsAliasBorrow = namedVar.IsAliasBorrow
                                         || structVar.IsAliasBorrow
                                         || (structVar.TypeAndValue.IsAlias && !structVar.TypeAndValue.Pointer);
@@ -5085,6 +5113,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(ctx)->lastCallReturnType;
                                 PrepareAliasCallResult(ctx, namedVar);
+                                if (namedVar.Primary != nullptr && structVar.ContainsBondedClosure
+                                    && (namedVar.TypeAndValue.IsFunctionPointer
+                                        || Compiler(ctx)->GetEncodedClosureType(
+                                            namedVar.TypeAndValue.TypeName) != nullptr))
+                                {
+                                    namedVar.IsBonded = true;
+                                    namedVar.BondedSources = structVar.BondedSources;
+                                    Compiler(ctx)->lastCallIsBonded = true;
+                                    Compiler(ctx)->lastCallBondedSources = structVar.BondedSources;
+                                    Compiler(ctx)->RegisterBondedValue(
+                                        namedVar.Primary, structVar.BondedSources);
+                                }
                                 structVar = {};
                                 interfaceVar = {};
                             }
@@ -5135,6 +5175,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (namedVar.Primary)
                                     namedVar.TypeAndValue = Compiler(primaryCtx)->lastCallReturnType;
                                 PrepareAliasCallResult(primaryCtx, namedVar);
+                                if (namedVar.Primary != nullptr && structVar.ContainsBondedClosure
+                                    && (namedVar.TypeAndValue.IsFunctionPointer
+                                        || Compiler(primaryCtx)->GetEncodedClosureType(
+                                            namedVar.TypeAndValue.TypeName) != nullptr))
+                                {
+                                    namedVar.IsBonded = true;
+                                    namedVar.BondedSources = structVar.BondedSources;
+                                    Compiler(primaryCtx)->lastCallIsBonded = true;
+                                    Compiler(primaryCtx)->lastCallBondedSources = structVar.BondedSources;
+                                    Compiler(primaryCtx)->RegisterBondedValue(
+                                        namedVar.Primary, structVar.BondedSources);
+                                }
                                 // A primitive result has no aggregate classifier: clear the previous
                                 // receiver, else `box.get().toString()` reuses `box` as the receiver.
                                 structVar = {};
@@ -6235,22 +6287,22 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         // The lambda borrows stack addresses that cannot outlive their source scope.
         for (const auto& cap : captures)
         {
+            // A copied closure extracted from a bonded holder still borrows the
+            // holder's captured frame and cannot be carried into another lambda.
+            for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
+            {
+                auto it = frame.namedVariable.find(cap.Name);
+                if (it == frame.namedVariable.end()) continue;
+                if (it->second.ContainsBondedClosure || it->second.IsBonded)
+                    LogErrorContext(ctx, std::format(
+                        "cannot capture '{}' in a lambda - it holds a bonded closure that would outlive its captured local",
+                        cap.Name));
+                break;
+            }
             if (cap.ByReference)
             {
                 result.IsBonded = true;
                 result.BondedSources.push_back(cap.Name);
-                // The captured holder already stores a bonded closure, so this lambda
-                // transitively borrows that frame and cannot be tracked from here.
-                for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
-                {
-                    auto it = frame.namedVariable.find(cap.Name);
-                    if (it == frame.namedVariable.end()) continue;
-                    if (it->second.ContainsBondedClosure)
-                        LogErrorContext(ctx, std::format(
-                            "cannot capture '{}' in a lambda - it holds a bonded closure that would outlive its captured local",
-                            cap.Name));
-                    break;
-                }
             }
         }
         if (result.IsBonded)

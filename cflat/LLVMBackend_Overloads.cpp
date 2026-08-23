@@ -1352,6 +1352,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });
+            if ((OwningSinkConsumesConcrete(candidate.Parameters[i])
+                    || candidate.Parameters[i].IsConsumeInferredSink)
+                && matched[i].IsBonded)
+                LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
+                    { candidate.Parameters[i].VariableName, "consuming" });
             // The element slot of a borrowing container is a legal `move` destination: the
             // container keeps the ONLY handle afterwards (manual-free idiom), so the generic
             // "move into a borrow parameter transfers nothing" diagnostic is wrong there.
@@ -1476,6 +1481,48 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 lastCallIsBonded = true;
                 lastCallBondedSources.push_back(matched[i].CallerName);
+            }
+        }
+
+        // A bonded argument the callee hands back keeps its bond: the result still borrows the
+        // caller's frame, so the escape checks must see the sources on the call result.
+        if (candidate.Function != nullptr && !candidate.Function->isVarArg())
+        {
+            size_t expandedParams = 0;
+            const bool useRecipeSlots = candidate.External && candidate.Recipe.hasLowering
+                && candidate.Recipe.paramSlots.size() == candidate.Parameters.size();
+            if (useRecipeSlots)
+            {
+                for (const auto& slot : candidate.Recipe.paramSlots)
+                    expandedParams += SlotLLVMParamCount(slot);
+            }
+            else
+            {
+                for (const auto& param : candidate.Parameters)
+                    expandedParams += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+            }
+            size_t trailingRawCount = (!candidate.External
+                && ReturnCarriesRawArrayCount(candidate.ReturnType)) ? 1u : 0u;
+            if (candidate.Function->arg_size() >= expandedParams + trailingRawCount)
+            {
+                unsigned llvmParamIndex = (unsigned)(candidate.Function->arg_size()
+                    - expandedParams - trailingRawCount);
+                for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+                {
+                    const unsigned slotCount = useRecipeSlots
+                        ? SlotLLVMParamCount(candidate.Recipe.paramSlots[i])
+                        : (ParameterCarriesRawArrayCount(candidate.Parameters[i]) ? 2u : 1u);
+                    if (matched[i].IsBonded && !matched[i].BondedSources.empty()
+                        && ParameterMayReachReturn(candidate.Function, llvmParamIndex))
+                    {
+                        lastCallIsBonded = true;
+                        for (const auto& source : matched[i].BondedSources)
+                            if (std::find(lastCallBondedSources.begin(), lastCallBondedSources.end(),
+                                          source) == lastCallBondedSources.end())
+                                lastCallBondedSources.push_back(source);
+                    }
+                    llvmParamIndex += slotCount;
+                }
             }
         }
 

@@ -168,7 +168,31 @@ void LLVMBackend::PropagateTempFieldValue(llvm::Value* trueValue, llvm::Value* f
 {
         if (joined != nullptr && (IsTempFieldValue(trueValue) || IsTempFieldValue(falseValue)))
             RegisterTempFieldValue(joined);
-    }
+}
+
+void LLVMBackend::RegisterBondedValue(llvm::Value* value, const std::vector<std::string>& sources)
+{
+        if (value == nullptr || sources.empty()) return;
+        auto& recorded = bondedValues_[value];
+        for (const auto& source : sources)
+            if (std::find(recorded.begin(), recorded.end(), source) == recorded.end())
+                recorded.push_back(source);
+}
+
+const std::vector<std::string>* LLVMBackend::FindBondedValue(const llvm::Value* value) const
+{
+        if (value == nullptr) return nullptr;
+        auto it = bondedValues_.find(value);
+        return it == bondedValues_.end() ? nullptr : &it->second;
+}
+
+void LLVMBackend::PropagateBondedValue(llvm::Value* trueValue, llvm::Value* falseValue,
+                                       llvm::Value* joined)
+{
+        if (joined == nullptr) return;
+        if (const auto* sources = FindBondedValue(trueValue)) RegisterBondedValue(joined, *sources);
+        if (const auto* sources = FindBondedValue(falseValue)) RegisterBondedValue(joined, *sources);
+}
 
 const LLVMBackend::NullCoalesceJoin* LLVMBackend::FindNullCoalesceJoin(const llvm::Value* value) const
 {
@@ -1684,6 +1708,84 @@ void LLVMBackend::PropagateFatInterfaceJoin(llvm::Value* trueValue, llvm::Value*
         RegisterFatInterfaceValueTypeName(joined, ifaceName);
     }
 
+bool LLVMBackend::ClosureParameterMayEscape(const llvm::Function* fn, unsigned argIndex)
+{
+        if (fn == nullptr || argIndex >= fn->arg_size() || !FunctionBodyIsComplete(fn)) return true;
+        const llvm::Argument* root = fn->getArg(argIndex);
+        if (root->getType() != GetClosureFatPtrType()) return true;
+
+        llvm::SmallPtrSet<const llvm::Value*, 32> aggregateSeen;
+        llvm::SmallPtrSet<const llvm::Value*, 32> environmentSeen;
+        std::vector<std::pair<const llvm::Value*, bool>> work{{root, false}};
+        while (!work.empty())
+        {
+            auto [value, isEnvironment] = work.back();
+            work.pop_back();
+            auto& seen = isEnvironment ? environmentSeen : aggregateSeen;
+            if (!seen.insert(value).second) continue;
+            for (const llvm::User* user : value->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(user);
+                if (inst == nullptr) return true;
+                if (const auto* store = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    if (store->getValueOperand() != value) continue;
+                    const llvm::Value* destination = llvm::getUnderlyingObject(
+                        store->getPointerOperand());
+                    if (!llvm::isa<llvm::AllocaInst>(destination)) return true;
+                    work.push_back({destination, isEnvironment});
+                    continue;
+                }
+                if (const auto* load = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    if (llvm::isa<llvm::AllocaInst>(value))
+                        work.push_back({load, isEnvironment});
+                    continue;
+                }
+                if (const auto* extract = llvm::dyn_cast<llvm::ExtractValueInst>(inst))
+                {
+                    if (extract->getAggregateOperand() != value || extract->getNumIndices() == 0)
+                        continue;
+                    if (extract->getIndices()[0] == 1)
+                        work.push_back({extract, true});
+                    continue;
+                }
+                if (const auto* insert = llvm::dyn_cast<llvm::InsertValueInst>(inst))
+                {
+                    if (insert->getInsertedValueOperand() == value)
+                        work.push_back({insert, false});
+                    continue;
+                }
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const llvm::Function* callee = call->getCalledFunction();
+                    if (callee != nullptr
+                        && callee->getName().starts_with("__closure_fat_ptr.copy"))
+                    {
+                        work.push_back({call, false});
+                        continue;
+                    }
+                    if (callee == nullptr && isEnvironment) continue;
+                    for (const llvm::Value* arg : call->args())
+                        if (arg == value) return true;
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst)
+                    || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst)
+                    || llvm::isa<llvm::PtrToIntInst>(inst)
+                    || llvm::isa<llvm::IntToPtrInst>(inst)
+                    || llvm::isa<llvm::BinaryOperator>(inst)
+                    || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    work.push_back({inst, isEnvironment});
+                }
+            }
+        }
+        return false;
+}
+
 bool LLVMBackend::ParameterRetainsArgument(const llvm::Function* fn, unsigned argIndex, int depth)
 {
         // A va_arg slot is a C boundary: it cannot retain caller ownership and has no body to walk.
@@ -2352,7 +2454,29 @@ bool LLVMBackend::EveryImplementorRetainsInterfaceArg(const std::string& ifaceNa
             : std::format("all {} implementors store it, e.g. '{}.{}' into {}",
                           impls.size(), firstImpl, methodName, firstKind);
         return true;
-    }
+}
+
+bool LLVMBackend::InterfaceCallMayRetainBondedArg(const std::string& ifaceName,
+        const std::string& methodName, size_t arity, unsigned paramIndex)
+{
+        std::vector<std::string> impls;
+        if (!EnumerateInterfaceImplementors(ifaceName, impls)) return true;
+        const InterfaceMethod* method = FindInterfaceMethod(ifaceName, methodName, arity);
+        if (method == nullptr || paramIndex >= method->Parameters.size()) return true;
+        for (const std::string& impl : impls)
+        {
+            llvm::Function* fn = LookupInterfaceMethodImpl(impl, *method);
+            if (fn == nullptr || !FunctionBodyIsComplete(fn)) return true;
+            if (fn->getArg(paramIndex + 1)->getType() == GetClosureFatPtrType())
+            {
+                bool escapes = ClosureParameterMayEscape(fn, paramIndex + 1);
+                if (escapes) return true;
+            }
+            else if (ParameterRetainsArgument(fn, paramIndex + 1))
+                return true;
+        }
+        return false;
+}
 
 bool LLVMBackend::EveryImplementorMayReturnInterfaceArg(const std::string& ifaceName,
         const std::string& methodName, size_t arity, unsigned paramIndex)
