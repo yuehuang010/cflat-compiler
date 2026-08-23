@@ -1233,6 +1233,28 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                     }
                 }();
             }
+
+            // Interface locals are represented as SSA fat values rather than load-backed
+            // slots. A returned local still transfers its box to the caller, so suppress
+            // the scope cleanup using the storage identity threaded by the return site.
+            if (returnedLocalStorage != nullptr
+                && value->getType() == GetFatPtrType())
+            {
+                for (auto& frame : stackNamedVariable)
+                {
+                    for (auto& [varName, nv] : frame.namedVariable)
+                    {
+                        if (nv.Storage == returnedLocalStorage
+                            && nv.TypeAndValue.IsFatInterfaceValue() && nv.IsOwning)
+                        {
+                            ownedPtrReturnVar = &nv;
+                            nv.IsOwning = false;
+                            break;
+                        }
+                    }
+                    if (ownedPtrReturnVar != nullptr) break;
+                }
+            }
         }
 
         // Returning a struct VALUE local whose full-destructor frees members (owned string

@@ -339,7 +339,7 @@ class MapView
     // supported, but the factory makes the paint callback explicit). Rewired every render;
     // reconcile keeps the native surface, the boxed paint closure captures `this`
     // which is stable for the app's lifetime.
-    ICanvasView build(IUiContext ctx)
+    move ICanvasView build(IUiContext ctx)
     {
         this.uiCtx = ctx;
         ICanvasView cv = canvasView((ICanvas c) => { this.paint(c); });
@@ -353,7 +353,7 @@ class MapView
             this.wheel(px, py, dx, dy, prec);
         });
         cv.setOnPinch((double px, double py, double sc) => { this.pinch(px, py, sc); });
-        return cv;
+        return move cv;
     }
 };
 

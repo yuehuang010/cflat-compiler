@@ -1409,12 +1409,58 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
+
         RegisterRawArrayCallResult(result, rawReturnCountSlot,
                                    candidate.ReturnType.AllocAlignValue);
 
         // Runs before ApplyMoveParamTransfer, whose UnregisterOwnedPtrTemp still has the
         // last word for a sink parameter.
         RegisterNonEscapingOwningPtrArgs(result);
+
+        // A bare interface element in the core list aliases the object; the caller's owning
+        // handle must be retired so removeAt()+delete remains the one release path. Keep this
+        // tied to the core list receiver - a user-defined `add` method is not an ownership API.
+        if (functionName == "add" && candidate.IsMethod && candidate.Parameters.size() >= 2
+            && candidate.Parameters[0].Pointer
+            && candidate.Parameters[0].TypeName.starts_with("list__")
+            && candidate.Parameters[1].IsFatInterfaceValue())
+        {
+            for (const auto& arg : matched)
+            {
+                if (!arg.TypeAndValue.IsFatInterfaceValue()
+                    || !arg.OwnsInterfaceBox || arg.CallerName.empty() || !arg.FieldName.empty())
+                    continue;
+                SetVariableOwning(arg.CallerName, false);
+                SetVariableOwnsInterfaceBox(arg.CallerName, false);
+            }
+        }
+
+        // An `adopt` parameter publishes an owned interface box into callee-managed storage.
+        // The source remains readable, but its local teardown ownership is retired.
+        for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
+        {
+            if (!candidate.Parameters[i].IsAdopt) continue;
+            const auto& arg = matched[i];
+            bool ownedMoveInterface = arg.TypeAndValue.IsFatInterfaceValue()
+                && arg.TypeAndValue.IsMove && arg.Storage == nullptr && arg.FieldName.empty();
+            bool ownedInterfaceLocal = arg.OwnsInterfaceBox
+                || arg.IsAdoptable
+                || (arg.TypeAndValue.IsFatInterfaceValue() && arg.IsOwning && arg.TypeAndValue.IsMove);
+            if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg
+                || (!ownedInterfaceLocal && !ownedMoveInterface)
+                || (!arg.CallerName.empty() && !arg.FieldName.empty()))
+                LogErrorMessage(
+                    "call to '{}': adopt parameter '{}' requires an owned interface local or "
+                    "a move-returning interface result; "
+                    "a unique local or borrowed interface cannot be adopted",
+                    { functionName, candidate.Parameters[i].VariableName });
+            if (!arg.CallerName.empty())
+            {
+                SetVariableOwning(arg.CallerName, false);
+                SetVariableOwnsInterfaceBox(arg.CallerName, false);
+            }
+        }
+
         // A callee that provably hands EXACTLY this owning argument back aliases it, so the
         // result carries the ownership and an owning destination can adopt it.
         AdoptLaunderedOwningTempResult(result);

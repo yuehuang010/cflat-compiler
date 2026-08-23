@@ -127,6 +127,41 @@ struct AssignmentIfaceBox
 interface IGuardBox { int tag(); };
 class GuardBoxImpl : IGuardBox { int tag() { return 42; } };
 
+interface IAdoptNode
+{
+    void destroyTree();
+};
+
+class AdoptNode : IAdoptNode
+{
+    void destroyTree() { }
+    ~AdoptNode() { dtorCount = dtorCount + 1; }
+};
+
+interface IAdoptTree
+{
+    void add(adopt IAdoptNode child);
+    void destroyTree();
+};
+
+class AdoptTree : IAdoptTree
+{
+    list<IAdoptNode> children = default;
+
+    void add(adopt IAdoptNode child) { children.add(child); }
+    void destroyTree()
+    {
+        for (IAdoptNode child in children)
+        {
+            child.destroyTree();
+            delete child;
+        }
+    }
+};
+
+move IAdoptNode makeAdoptNode() { return new AdoptNode(); }
+move IAdoptNode makeAdoptNodeAt(i64 v) { return new AdoptNode(); }
+
 // Returns false, but not as a compile-time-foldable literal: keeps the 'if' below a genuine
 // runtime branch (not eliminated) for the cross-block interface regression.
 int gGuardFlag = 0;
@@ -2406,6 +2441,7 @@ class SqMove : IShapeMove
 };
 
 move IShapeMove makeShapeMove() { return new SqMove(); }
+void consumeShapeMove(move IShapeMove s) { delete s; }
 
 int ciMoveCtorCount = 0;
 class CiMove : IShapeMove
@@ -3768,6 +3804,80 @@ int testUniqueInterfaceReassign()
         passed += Test("unique_iface_reassign_drops_old_at_assign", dtorCount, 1);
     }
     passed += Test("unique_iface_reassign_old_and_new_freed_once", dtorCount, 2);
+
+    // A plain interface local adopts a move-returning box and releases it at scope exit.
+    dtorCount = 0;
+    {
+        IShapeMove plain = makeShapeMove();
+        passed += Test("plain_iface_move_return_alive", dtorCount, 0);
+    }
+    passed += Test("plain_iface_move_return_freed_once", dtorCount, 1);
+
+    // Reassigning from a second move-returning call drops the old box immediately and adopts
+    // the new call result for scope-exit cleanup.
+    dtorCount = 0;
+    {
+        IShapeMove plain = makeShapeMove();
+        plain = makeShapeMove();
+        passed += Test("plain_iface_reassign_move_old_freed", dtorCount, 1);
+    }
+    passed += Test("plain_iface_reassign_move_both_freed_once", dtorCount, 2);
+
+    // The adopted local can be consumed by a move parameter; the caller has no exit-time dtor.
+    dtorCount = 0;
+    {
+        IShapeMove plain = makeShapeMove();
+        consumeShapeMove(plain);
+        passed += Test("plain_iface_move_param_consumed", dtorCount, 1);
+    }
+    passed += Test("plain_iface_move_param_no_caller_dtor", dtorCount, 1);
+
+    // Rebinding through a borrow, then adopting another move result, drops each owned box once.
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        IShapeMove plain = makeShapeMove();
+        IShapeMove borrowed = owner;
+        plain = borrowed;
+        passed += Test("plain_iface_chain_borrow_drops_old", dtorCount, 1);
+        plain = makeShapeMove();
+        passed += Test("plain_iface_chain_new_area", plain.area(), 0);
+    }
+    passed += Test("plain_iface_chain_freed_once_each", dtorCount, 3);
+
+    // Rebinding that owning plain local from a borrow releases the old box and clears the local's
+    // ownership, so only the real unique owner frees the borrowed replacement.
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        IShapeMove plain = makeShapeMove();
+        IShapeMove borrowed = owner;
+        plain = borrowed;
+        passed += Test("plain_iface_rebind_borrow_value", plain.area(), 0);
+    }
+    passed += Test("plain_iface_rebind_borrow_freed_once_each", dtorCount, 2);
+
+    // Reclaiming the concrete pointer with `as` retires the adoption, so the explicit delete is
+    // the single release path - and the source stays readable (nulling its data field faulted).
+    dtorCount = 0;
+    {
+        IShapeMove plain = makeShapeMove();
+        SqMove* reclaimed = plain as SqMove;
+        passed += Test("plain_iface_as_reclaim_nonnull", reclaimed != nullptr, true);
+        if (reclaimed != nullptr) delete reclaimed;
+        passed += Test("plain_iface_as_reclaim_freed_once", dtorCount, 1);
+    }
+    passed += Test("plain_iface_as_reclaim_no_second_free", dtorCount, 1);
+
+    // A `unique` local keeps its scope-exit release across an `as` probe, and the probed value
+    // is still usable afterwards.
+    dtorCount = 0;
+    {
+        unique IShapeMove owner = new SqMove();
+        passed += Test("unique_iface_as_probe_nonnull", (owner as SqMove) != nullptr, true);
+        passed += Test("unique_iface_as_probe_still_usable", owner.area(), 0);
+    }
+    passed += Test("unique_iface_as_probe_freed_once", dtorCount, 1);
 
     return passed;
 }
@@ -11201,6 +11311,36 @@ int testCastBorrowsOwningPointer()
     return passed;
 }
 
+int testAdoptInterfaceParam()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        IAdoptTree tree = new AdoptTree();
+        IAdoptNode child = makeAdoptNode();
+        tree.add(child);
+        passed += Test("adopt_child_stays_readable", child != nullptr, true);
+        tree.destroyTree();
+        passed += Test("adopt_tree_frees_child_once", dtorCount, 1);
+        delete tree;
+    }
+    // A '.' in the factory call's ARGUMENT text (dotted arg, or a lambda body touching
+    // 'this.x') must not disqualify adoption - only a dotted CALLEE head does.
+    dtorCount = 0;
+    {
+        IAdoptTree tree = new AdoptTree();
+        CastItem src;
+        src.a = 5;
+        IAdoptNode kid = makeAdoptNodeAt(src.a);
+        tree.add(kid);
+        passed += Test("adopt_dotted_arg_factory", kid != nullptr, true);
+        tree.destroyTree();
+        passed += Test("adopt_dotted_arg_freed_once", dtorCount, 1);
+        delete tree;
+    }
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -11460,7 +11600,7 @@ extern int main()
     total += 68;
 
     passed += testUniqueInterfaceReassign();
-    total += 8;
+    total += 25;
 
     passed += testUniqueInterfaceTernary();
     total += 184;
@@ -11564,6 +11704,9 @@ extern int main()
 
     passed += testCastBorrowsOwningPointer();
     total += 7;
+
+    passed += testAdoptInterfaceParam();
+    total += 4;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

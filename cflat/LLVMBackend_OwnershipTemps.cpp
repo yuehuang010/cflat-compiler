@@ -1042,6 +1042,19 @@ void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
         }
     }
 
+void LLVMBackend::SetVariableOwnsInterfaceBox(const std::string& varName, bool value)
+{
+        for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
+        {
+            auto it = frame.namedVariable.find(varName);
+            if (it != frame.namedVariable.end())
+            {
+                it->second.OwnsInterfaceBox = value;
+                return;
+            }
+        }
+    }
+
 bool LLVMBackend::IsVariableOwning(const std::string& name) const
 {
         if (name.empty()) return false;
@@ -1309,9 +1322,10 @@ void LLVMBackend::EmitCountedArrayDestruction(llvm::Value* ptrVal,
 bool LLVMBackend::IsOwningInterfaceValue(const NamedVariable& namedVar) const
 {
         return namedVar.IsOwning && namedVar.Storage != nullptr
-            && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
+            && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg
+                || namedVar.OwnsInterfaceBox)
             && namedVar.TypeAndValue.IsFatInterfaceValue();
-    }
+}
 
 void LLVMBackend::EmitOwningInterfaceCleanup(const NamedVariable& namedVar)
 {
@@ -1679,9 +1693,14 @@ bool LLVMBackend::PropagateTernaryOwnership(llvm::Value* trueValue, llvm::Value*
         if (mixedPtrJoin)
         {
             SuppressCallerRelease(joined);
-            // A struct join carries no runtime owned bit, so suppression must be recorded by VALUE
-            // identity: the receiver reads it to borrow instead of adopting.
-            if (owningStructJoin) RegisterNonOwningStructJoin(joined);
+            // A joined value carries no runtime owned bit, so suppression must be recorded by
+            // VALUE identity: a destination reads it to borrow instead of adopting. The same
+            // identity is used to reject a direct interface receiver, whose selected PHI arm
+            // cannot be proven safe to release after dispatch.
+            bool interfaceArmOwnershipDisagrees = IsInterfaceFatValue(joined)
+                && TernaryArmJoinsOwning(trueValue) != TernaryArmJoinsOwning(falseValue);
+            if (owningStructJoin || interfaceArmOwnershipDisagrees)
+                RegisterNonOwningStructJoin(joined);
             return true;
         }
         if (IsOwnedNewTemp(trueValue))
@@ -3455,7 +3474,7 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
         // TypeAndValue pointer bit was stripped by an lvalue walk. It borrows the pointee and
         // must never fall through to a value destructor.
         if (!namedVar.IsOwning && namedVar.BaseType != nullptr && namedVar.BaseType->isPointerTy()) return;
-        // A `unique` interface local owns a heap-boxed object: free it via the vtable dtor slot
+        // An owning interface local owns a heap-boxed object: free it via the vtable dtor slot
         // + operator delete (mirrors the owning-pointer path; data field nulled so a prior delete no-ops).
         if (IsOwningUniqueArray(namedVar))
         {

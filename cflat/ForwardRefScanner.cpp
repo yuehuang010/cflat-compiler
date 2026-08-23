@@ -40,11 +40,16 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             auto storageSpec = declSpec->storageClassSpecifier();
                 if (typeSpec != nullptr)
                 {
-                    // 'move', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
+                    // 'move', 'adopt', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
                     // in typeSpecifier context
                     if (typeSpec->getText() == "move")
                     {
                         declType.IsMove = true;
+                        continue;  // not a type; look for the actual type in next specifier
+                    }
+                    if (typeSpec->getText() == "adopt")
+                    {
+                        declType.IsAdopt = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
                     if (typeSpec->getText() == "alias")

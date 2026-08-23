@@ -1992,6 +1992,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if ((prevPrimary->expression() != nullptr || prevPrimary->elementExpression() != nullptr)
                                 && !lastParenExprType.TypeName.empty())
                                 namedVar.TypeAndValue = lastParenExprType;
+                            if (prevPrimary->elementExpression() != nullptr)
+                                AdoptWrapperProvenance(namedVar, lastParenExprNamed);
                             // A parenthesized lvalue keeps its storage so a STORE writes through to
                             // the object ('(*p) = 9'). Postfix '(*p)++' is still a no-op - see
                             // internal/issue/p2/paren-deref-increment-is-a-silent-no-op.md.
@@ -4237,6 +4239,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TernaryTempAlreadyRegistered = argNV.TernaryTempAlreadyRegistered;
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
+                                    argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
+                                    argVar.IsAdoptable = argNV.IsAdoptable;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
                                     argVar.AllocatedByRawNewArray = argNV.AllocatedByRawNewArray;
@@ -4249,6 +4253,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
+                                    argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
+                                    argVar.TypeAndValue.IsUniqueTypeArg = argNV.TypeAndValue.IsUniqueTypeArg;
                                     // Propagate the pointer SHAPE flags: without them a `T**` or a
                                     // `T[]` looks like a thin `T*` and gets boxed into an interface param.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
@@ -4351,6 +4358,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (Compiler(ctx)->HasInterfaceMethod(interfaceVar.TypeAndValue.TypeName, primaryIdentifier))
                             {
                                 // Interface method dispatch via vtable.
+                                if (interfaceVar.Primary != nullptr
+                                    && Compiler(ctx)->IsNonOwningStructJoin(interfaceVar.Primary))
+                                {
+                                    LogErrorContext(ctx, std::format(
+                                        "cannot call interface method '{}' on a mixed owning/borrowed "
+                                        "ternary join - rewrite it as an if/else and bind each arm separately",
+                                        primaryIdentifier));
+                                }
                                 // Ensure we have a {i8*,i8*}* pointer (alloca address).
                                 // If the interface value was produced inline (Primary set, no Storage),
                                 // spill it into a temp alloca first.
@@ -4830,6 +4845,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Propagate storage and ownership so move-param zeroing works at the call site.
                                     argVar.Storage = argNV.Storage;
                                     argVar.IsOwning = argNV.IsOwning;
+                                    argVar.OwnsInterfaceBox = argNV.OwnsInterfaceBox;
+                                    argVar.IsAdoptable = argNV.IsAdoptable;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
                                     // Explicit 'move' at the call site: drives move-overload selection
@@ -4839,6 +4856,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // without its alignment tag is rejected instead of mis-freed.
                                     argVar.AllocAlignment = argNV.AllocAlignment;
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
+                                    argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
+                                    argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
+                                    argVar.TypeAndValue.IsUniqueTypeArg = argNV.TypeAndValue.IsUniqueTypeArg;
                                     // Propagate the array-view flag so a `T[]` argument is still seen
                                     // as a view at the call site (otherwise the noalias gate would
                                     // false-reject a legitimate view passed to a `T[]` parameter).
@@ -6580,6 +6600,7 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
                 childNV.BaseType = childPtr->getType();
                 childNV.TypeAndValue.TypeName = childEl->Identifier()[0]->getText();
                 childNV.TypeAndValue.Pointer = true;
+                childNV.IsAdoptable = true;
             }
             else
             {
@@ -6602,6 +6623,7 @@ llvm::Value* MainListener::ParseElementExpression(CFlatParser::ElementExpression
         lastParenExprFieldName.clear();
         lastParenExprCallerName.clear();
         lastParenExprNamed = {};
+        lastParenExprNamed.IsAdoptable = true;
 
         // Launder ownership: the result is an unowned-by-tracker heap pointer the
         // caller manages (add to a parent or deleteTree), exactly like a factory such

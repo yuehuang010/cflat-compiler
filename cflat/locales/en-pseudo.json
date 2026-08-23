@@ -35,6 +35,16 @@
       "auto",
       "auto f<T>(T x)"
     ],
+    "calltoarg0arg1adoptp...rfacecannotbeadopted3c6285968c7bf0a5": [
+      "IAdoptErrorSink",
+      "add",
+      "child"
+    ],
+    "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
+      "IAdoptErrorSink",
+      "add",
+      "child"
+    ],
     "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": [
       "IFSlot",
       "g",
@@ -499,6 +509,8 @@
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",
+    "calltoarg0arg1adoptp...rfacecannotbeadopted3c6285968c7bf0a5": "call to '{0}.{1}': adopt parameter '{2}' requires an owning plain interface local; a unique local or borrowed interface cannot be adopted",
+    "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": "call to '{0}.{1}': adopt parameter '{2}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
     "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": "call to '{0}.{1}': cannot pass a pointer to by-value parameter '{2}' of type '{3}' - an address is not of type '{4}'. Dereference it with '{5}' at the call site, or declare the parameter as '{6}'.",
     "calltoarg0arg1cannot...retheparameterasarg6ee426562302ed0bf": "call to '{0}.{1}': cannot pass a '{2}' to by-value parameter '{3}' of type '{4}' - there is no implicit dereference. Write '{5}' at the call site to pass the pointee, or declare the parameter as '{6}'.",
     "calltoarg0arg1cannot...sitetopassthepointee20812a9d00c778b2": "call to '{0}.{1}': cannot pass a '{2}' to by-value parameter '{3}' of type '{4}' - there is no implicit dereference. Write '{5}' at the call site to pass the pointee.",

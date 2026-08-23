@@ -577,6 +577,7 @@ public:
         bool IsFatInterfaceValue() const { return IsInterface && !IsInterfacePointer && !IsArrayView; }
         bool IsNullable = false;
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
+        bool IsAdopt = false;    // parameter declared with 'adopt' - retires an owned interface box at the call site
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
         // This type came from a generic type argument qualified with `unique`. It records only
         // that provenance - it is set on ANY declaration whose type substitutes to `unique X*`
@@ -1042,6 +1043,8 @@ public:
         llvm::Value* Storage = nullptr;  // The container holding the value, used to load or store.
         llvm::Type* UnionFieldType = nullptr;  // When non-null: load/store this storage as this type (union field access).
         bool IsOwning = false;           // true for move parameters, new-allocated locals, and any owned pointer - freed on scope exit
+        bool OwnsInterfaceBox = false;   // true when a plain interface local adopted an owned box
+        bool IsAdoptable = false;        // compiler-generated node already owned by its parent tree
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
         uint64_t AllocAlignment = 0;     // per-allocation alignment from `new T[n] alignas(N)` (>16 = over-aligned); frees via __delete_aligned
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
@@ -2922,6 +2925,7 @@ private:
     // Set a named local's ownership flag (e.g. a `unique` interface local adopting a new owned
     // value on reassignment, so its scope-exit teardown frees the current pointee).
     void SetVariableOwning(const std::string& varName, bool value);
+    void SetVariableOwnsInterfaceBox(const std::string& varName, bool value);
     void SetVariableRawNewArray(const std::string& varName, bool value,
                                 llvm::Value* rawArrayLength = nullptr);
     // Record the per-site allocation alignment a reassignment delivered, so the free site picks

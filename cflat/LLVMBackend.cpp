@@ -6023,6 +6023,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (t.IsInterfacePointer)     o["ifp"] = true;
     if (t.IsNullable)             o["nl"]  = true;
     if (t.IsMove)                 o["mv"]  = true;
+    if (t.IsAdopt)                o["ad"]  = true;
     // 'alias' joins its ownership siblings here because VerifyInterfaceMethodContract reads it:
     // dropped on a warm cache, an interface's `alias` return would silently stop matching its
     // implementor's and the contract check would misfire.
@@ -6100,6 +6101,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("ifp"))t.IsInterfacePointer = *v;
     if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
     if (auto v = o.getBoolean("mv")) t.IsMove = *v;
+    if (auto v = o.getBoolean("ad")) t.IsAdopt = *v;
     if (auto v = o.getBoolean("al")) t.IsAlias = *v;
     if (auto v = o.getBoolean("unt")) t.IsUniqueTypeArg = *v;
     if (auto v = o.getBoolean("eou")) t.ElementOwningUnique = *v;

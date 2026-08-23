@@ -107,6 +107,18 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
 
+            if (paramType.IsAdopt)
+            {
+                if (!paramType.IsFatInterfaceValue())
+                    LogErrorContext(paramDecl, std::format(
+                        "parameter '{}' declared 'adopt' must be a plain interface value",
+                        paramType.VariableName));
+                if (paramType.IsMove || paramType.IsBond || paramType.IsAlias || paramType.IsUnique)
+                    LogErrorContext(paramDecl, std::format(
+                        "parameter '{}': 'adopt' cannot be combined with another ownership qualifier",
+                        paramType.VariableName));
+            }
+
             // Fires before the body is walked, so no decayed signature reaches codegen.
             if (std::string fixedArray = FixedArrayParamMessage(paramDecl, paramType); !fixedArray.empty())
                 LogErrorContext(paramDecl, fixedArray);

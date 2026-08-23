@@ -907,6 +907,7 @@ std::string LLVMBackend::InterfaceMethodTypeText(const TypeAndValue& tv, const s
 {
         std::string s;
         if (tv.IsMove)  s += "move ";
+        if (tv.IsAdopt) s += "adopt ";
         if (tv.IsAlias) s += "alias ";
         if (tv.IsBond)  s += "bond ";
         s += InterfaceFieldTypeText(tv);
@@ -977,6 +978,7 @@ bool LLVMBackend::InterfaceMethodContractConforms(const InterfaceMethod& method,
             bool cpMove = cp.IsMove || cp.IsUniqueTypeArg;
             bool ipMove = ip.IsMove || ip.IsUniqueTypeArg;
             if (cpMove != ipMove) return false;
+            if (cp.IsAdopt != ip.IsAdopt) return false;
             if (cp.IsBond != ip.IsBond) return false;
             if (cp.IsAlias != ip.IsAlias) return false;
         }
@@ -1024,6 +1026,15 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                         "parameter '{}' on interface '{}'.",
                         { implName, method.Name, pname, "move", ifaceName, "move", implName, "move",
                           implName, InterfaceMethodTypeText(cp, pname), ifaceName });
+            }
+            else if (cp.IsAdopt != ip.IsAdopt)
+            {
+                LogErrorMessage(
+                    "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
+                    "declares it '{}' - '{}' is part of the method's contract. Make the two "
+                    "declarations agree.",
+                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                      InterfaceMethodTypeText(ip), "adopt" });
             }
             // 'bond' and 'move' are mutually exclusive, so report only the more severe disagreement.
             else if (cp.IsBond != ip.IsBond)

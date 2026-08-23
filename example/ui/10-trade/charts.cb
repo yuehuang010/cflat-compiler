@@ -1099,7 +1099,7 @@ class ChartsApp : IComponent
 
     // -- render -------------------------------------------------------------
 
-    ICanvasView buildCanvas(int t)
+    move ICanvasView buildCanvas(int t)
     {
         ICanvasView cv = canvasView((ICanvas c) => { this.paint(c); });
         cv.width  = this.canvasCells();
@@ -1115,7 +1115,7 @@ class ChartsApp : IComponent
                 this.wheel(px, py, dx, dy, pr);
             });
         }
-        return cv;
+        return move cv;
     }
 
     IElement render(IUiContext ctx)

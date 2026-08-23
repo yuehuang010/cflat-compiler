@@ -2324,6 +2324,48 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && llvm::isa_and_nonnull<llvm::AllocaInst>(destination))
                 TagInterfaceBoxProvenance(namedVar.CallerName, right, &rightNV);
 
+            // A plain interface local adopts an owning result just like a value-struct local. Its
+            // ownership is not implied by `unique`; the IsOwning bit is the per-slot state. When a
+            // later assignment supplies a borrow, release the old box first and clear that bit so
+            // scope exit does not release the borrowed source. A concrete pointer upcast may have
+            // transferred ownership while boxing, so include that value-keyed fact as well.
+            bool destPlainInterfaceLocal = operatorText == "="
+                && namedVar.TypeAndValue.IsFatInterfaceValue()
+                && !namedVar.TypeAndValue.IsUnique
+                && namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                && llvm::isa_and_nonnull<llvm::AllocaInst>(destination)
+                && destination != rightNV.Storage;
+            if (destPlainInterfaceLocal)
+            {
+                if (namedVar.IsOwning)
+                    compiler->DropValue(namedVar);
+
+                const auto* boxedRecord = compiler->FindInterfaceBoxByFatValue(right);
+                bool boxedOwnershipTransferred = boxedRecord != nullptr
+                    && boxedRecord->OwnershipTransferred;
+                bool moveFromNamedInterface = rightNV.TypeAndValue.IsMove
+                    && rightNV.TypeAndValue.IsFatInterfaceValue()
+                    && TopLevelMoveExpression(assignCtx)
+                    && rightNV.Storage != nullptr && !rightNV.IsBorrowed;
+                bool sourceIsOwnedInterfaceResult =
+                    compiler->FindOwnedReturnEntry(rightNV.Primary) != nullptr
+                    || (srcIsOwnedForUniqueIface && TopLevelMoveExpression(assignCtx));
+                bool sourceTransfersInterfaceOwnership =
+                    sourceIsOwnedInterfaceResult
+                    && (rightNV.Storage == nullptr || moveFromNamedInterface
+                        || boxedOwnershipTransferred);
+                if (moveFromNamedInterface)
+                {
+                    compiler->builder->CreateStore(
+                        llvm::Constant::getNullValue(compiler->GetFatPtrType()), rightNV.Storage);
+                    if (!rightNV.CallerName.empty())
+                        compiler->MarkVariableMoved(rightNV.CallerName);
+                }
+                compiler->SetVariableOwning(namedVar.CallerName, sourceTransfersInterfaceOwnership);
+                compiler->SetVariableOwnsInterfaceBox(
+                    namedVar.CallerName, sourceTransfersInterfaceOwnership);
+            }
+
             // D5 (assignment leg): a `unique` interface local owns a heap-boxed object, and its
             // scope-exit teardown frees the fat-ptr data pointer. Reassigning it from a borrowed
             // value or a stack box would either create a second owner (leak / double-free) or point
@@ -3255,7 +3297,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && right->getType()->isStructTy()
                 && isDerefStorage()
                 && !namedVar.TypeAndValue.IsInterface
-                && !namedVar.TypeAndValue.Pointer
+                && (!namedVar.TypeAndValue.Pointer || NamedVarIsString(namedVar))
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
                 && !namedVar.TypeAndValue.IsArrayView
@@ -3312,6 +3354,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     if (srcIsNamedVar && !rightNV.CallerName.empty())
                         compiler->MarkVariableMoved(rightNV.CallerName);
                 }
+                if (NamedVarIsString(namedVar))
+                    TransferMoveStringOwnershipOnStore(rightNV, ctx);
                 return finishStore(assignResult);
             }
 
@@ -5782,6 +5826,14 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
 
         // In opaque pointer mode, dataPtr is already the right pointer type - no bitcast needed
         auto nullPtr = llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(dataPtr->getType()));
+        // Reclaiming the concrete pointer out of a local that ADOPTED its box retires that
+        // adoption, so an explicit `delete` on the result stays the single release path.
+        if (srcBinding != nullptr && srcBinding->OwnsInterfaceBox && !srcBinding->CallerName.empty()
+            && srcBinding->TypeAndValue.IsFatInterfaceValue() && !srcBinding->TypeAndValue.Pointer)
+        {
+            compiler->SetVariableOwning(srcBinding->CallerName, false);
+            compiler->SetVariableOwnsInterfaceBox(srcBinding->CallerName, false);
+        }
         return compiler->builder->CreateSelect(typeMatches, dataPtr, nullPtr);
     }
 
@@ -11131,6 +11183,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         // parameter was rejected as "borrowed" when only CallerName came across.
         dst.IsOwning         = src.IsOwning;
         dst.IsNewAllocated   = src.IsNewAllocated;
+        dst.IsAdoptable      = src.IsAdoptable;
         dst.IsOwningString   = src.IsOwningString;
         dst.IsOwningStruct   = src.IsOwningStruct;
         dst.AllocAlignment   = src.AllocAlignment;
@@ -11530,6 +11583,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 result.Storage      = nullptr;      // prevent re-load from zeroed storage
                 result.BaseType     = argNV.BaseType;
                 result.TypeAndValue = argNV.TypeAndValue;
+                result.TypeAndValue.IsMove = true;
                 result.IsBonded = argNV.IsBonded;
                 result.BondByAddress = argNV.BondByAddress;
                 result.BondedSources = argNV.BondedSources;

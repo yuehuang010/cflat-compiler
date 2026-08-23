@@ -394,11 +394,16 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // Set when the spec names a generic interface instantiation, whose interfaceTable
                 // entry is only built by the next ProcessPendingInstantiations.
                 bool genericSpecIsInterface = false;
-                // 'move', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
+                // 'move', 'adopt', 'alias', 'bond', 'unique' and 'manifest' are soft keywords parsed as Identifiers
                 // in typeSpecifier context
                 if (typeSpec->getText() == "move")
                 {
                     declType.IsMove = true;
+                    continue;  // not a type; look for the actual type in next specifier
+                }
+                if (typeSpec->getText() == "adopt")
+                {
+                    declType.IsAdopt = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
                 if (typeSpec->getText() == "alias")
@@ -4661,8 +4666,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // Declaration leg of the borrowed-box tag: `right` is the fat value this local
                     // is about to receive. See TagInterfaceBoxProvenance.
                     if (typeAndValue.IsFatInterfaceValue())
+                    {
+                        if (haveInterfaceSourceNV)
+                            compiler->GetOrCreateStackVariable(name).IsAdoptable =
+                                interfaceSourceNV.IsAdoptable;
                         TagInterfaceBoxProvenance(
                             name, right, haveInterfaceSourceNV ? &interfaceSourceNV : nullptr);
+                    }
 
                     if (bindAliasReference)
                     {
@@ -5155,13 +5165,26 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
 
                         // Same for a `move <interface>`-returning call: the fat-ptr local owns the
-                        // boxed heap object (released by an explicit `delete`; interface locals are
-                        // never auto-destructed). The flag MUST be consumed here, or it leaks into
-                        // the next declaration or return and misclassifies it as owned.
-                        if (!typeAndValue.Pointer && compiler->lastCallReturnsOwned
-                            && compiler->IsInterfaceType(typeAndValue.TypeName))
+                        // boxed heap object. Keep the existing ownership flag propagation for unique
+                        // locals and mark only a direct plain-local move result for auto cleanup.
+                        bool interfaceMoveResult = !typeAndValue.Pointer
+                            && compiler->lastCallReturnsOwned
+                            && compiler->IsInterfaceType(typeAndValue.TypeName);
+                        bool plainInterfaceMoveResult = interfaceMoveResult
+                            && !typeAndValue.IsUnique
+                            && !typeAndValue.IsUniqueTypeArg
+                            && compiler->lastCallReturnType.IsMove
+                            && !srcRhsExprText.empty()
+                            // The RHS must BE a call; lastCallReturnType.IsMove above already
+                            // proves it returned an owned box, so a dotted callee (this._card())
+                            // or a '.' in an argument/lambda body must not disqualify it.
+                            && srcRhsExprText.find('(') != std::string::npos
+                            && !InGenericInstantiation();
+                        if (interfaceMoveResult)
                         {
-                            compiler->GetOrCreateStackVariable(name).IsOwning = true;
+                            auto& local = compiler->GetOrCreateStackVariable(name);
+                            local.IsOwning = true;
+                            local.OwnsInterfaceBox = plainInterfaceMoveResult;
                             compiler->lastCallReturnsOwned = false;
                         }
 

@@ -2574,6 +2574,32 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
                                    methodInfo->ReturnType.AllocAlignValue);
 
+        // An `adopt` parameter publishes an owned interface box into callee-managed storage.
+        // The source remains readable, but its local teardown ownership is retired.
+        for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
+        {
+            if (!methodInfo->Parameters[i].IsAdopt) continue;
+            const auto& arg = callArgNVs[i];
+            bool ownedMoveInterface = arg.TypeAndValue.IsFatInterfaceValue()
+                && arg.TypeAndValue.IsMove && arg.Storage == nullptr && arg.FieldName.empty();
+            bool ownedInterfaceLocal = arg.OwnsInterfaceBox
+                || arg.IsAdoptable
+                || (arg.TypeAndValue.IsFatInterfaceValue() && arg.IsOwning && arg.TypeAndValue.IsMove);
+            if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg
+                || (!ownedInterfaceLocal && !ownedMoveInterface)
+                || (!arg.CallerName.empty() && !arg.FieldName.empty()))
+                LogErrorMessage(
+                    "call to '{}.{}': adopt parameter '{}' requires an owned interface local or "
+                    "a move-returning interface result; "
+                    "a unique local or borrowed interface cannot be adopted",
+                    { ifaceName, methodName, methodInfo->Parameters[i].VariableName });
+            if (!arg.CallerName.empty())
+            {
+                SetVariableOwning(arg.CallerName, false);
+                SetVariableOwnsInterfaceBox(arg.CallerName, false);
+            }
+        }
+
         // A `move` parameter on an INTERFACE method transfers ownership just as it does on a
         // direct call, so the caller's source must be nulled/marked-moved here too. Without this
         // the source keeps its owning flag and scope exit frees what the callee now owns.

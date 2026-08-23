@@ -807,15 +807,13 @@ int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICan
 //     detection, childList() exposes a container's children (nullptr for leaves).
 //
 // Factory ownership. A factory (`button(...)`) returns `move IButton`: the caller
-// owns the heap node. `add(IElement child)` is a BORROW param on purpose - it does not
-// transfer, it publishes: the parent's `children` list now names the node, and from that
-// point the TREE is its single owner. That is sound because an interface value carries no
-// ownership bit and an interface local is never auto-destructed, so a caller that boxed a
-// node and handed it to a parent has nothing left to free - and it can still configure the
-// node afterwards (`b.title = ...`), which a `move` param would forbid. A node never given
-// to a parent is the caller's to `delete` (the fat pointer's dtor slot). The tree is freed
-// exactly once, by destroyTree() + `delete c` per child (list<IElement> does not destruct
-// its elements).
+// owns the heap node. `add(adopt IElement child)` publishes the node: the parent's
+// `children` list now names it, and from that point the TREE is its single owner. The
+// `adopt` marker retires teardown ownership of the caller's plain interface local while
+// leaving the value readable for later configuration (`b.title = ...`). A `unique` local
+// or a borrowed interface cannot be passed to an adopt parameter. A node never given to a
+// parent is the caller's to `delete` (the fat pointer's dtor slot). The tree is freed exactly
+// once, by destroyTree() + `delete c` per child (list<IElement> does not destruct its elements).
 interface IElement
 {
     move string toJson();
@@ -872,7 +870,7 @@ interface IView : IElement
 {
     Style style;
     list<IElement> children;
-    void add(IElement child);
+    void add(adopt IElement child);
 };
 
 interface IText : ITooltipped
@@ -893,7 +891,7 @@ interface IButton : IDisableable
 interface IBox : IElement
 {
     Style style;
-    void  add(IElement child);
+    void  add(adopt IElement child);
 };
 
 interface ITextInput : IDisableable
@@ -940,7 +938,7 @@ interface IScrollView : IElement
 {
     Style style;
     int   contentH;
-    void  add(IElement child);
+    void  add(adopt IElement child);
 };
 
 interface IRadioButton : IDisableable
@@ -955,7 +953,7 @@ interface IRadioGroup : IElement
 {
     int   value;
     Style style;
-    void  add(IElement child);
+    void  add(adopt IElement child);
     void  addOption(string label);
     void  fireChange(int v);
 };
@@ -985,7 +983,7 @@ interface IListView : IDisableable
 interface ITabPane : IElement
 {
     string title;
-    void   add(IElement child);
+    void   add(adopt IElement child);
 };
 
 interface ITabControl : IDisableable
@@ -995,7 +993,7 @@ interface ITabControl : IDisableable
     int    width;
     int    height;
     string _title(int i);
-    void   add(IElement child);
+    void   add(adopt IElement child);
     void   fireSelectTab(int i);
 };
 
@@ -1020,7 +1018,7 @@ interface ISplitView : IElement
     // field must be on the interface for a caller holding an ISplitView to wire it up.
     Lambda<void(int)> onRatioChange;
     int   _ratioAt(int px, int py);
-    void  add(IElement child);
+    void  add(adopt IElement child);
     void  fireRatioChange(int r);
 };
 
@@ -1038,7 +1036,7 @@ interface IGroupBox : ITooltipped
 {
     string title;
     Style  style;
-    void   add(IElement child);
+    void   add(adopt IElement child);
 };
 
 interface ICanvasView : ITooltipped
@@ -1094,7 +1092,7 @@ class View : IView
     Rect bounds = default;
     string key = default;
 
-    void add(IElement child)
+    void add(adopt IElement child)
     {
         this.children.add(child);
     }
@@ -1755,7 +1753,7 @@ class Box : IBox
     Rect bounds = default;
     string key = default;
 
-    void add(IElement child)
+    void add(adopt IElement child)
     {
         this.children.add(child);
     }
@@ -2441,7 +2439,7 @@ class ScrollView : IScrollView
     Rect   bounds   = default;
     string key      = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     int _viewH()
     {
@@ -2760,7 +2758,7 @@ class RadioGroup : IRadioGroup
     Rect  bounds   = default;
     string key     = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     void fireChange(int v) { if (this.onChange != nullptr) { this.onChange(v); } }
 
@@ -3189,7 +3187,7 @@ class TabPane : ITabPane
     Rect bounds = default;
     string key = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     Size layout(LayoutConstraints c)
     {
@@ -3264,7 +3262,7 @@ class TabControl : ITabControl
     Rect bounds = default;
     string key = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     void fireSelectTab(int i) { if (this.onSelectTab != nullptr) { this.onSelectTab(i); } }
 
@@ -3497,7 +3495,7 @@ class SplitView : ISplitView
     Rect  dividerBounds = default;       // the draggable gutter (host hit-test target)
     string key     = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     void fireRatioChange(int r) { if (this.onRatioChange != nullptr) { this.onRatioChange(r); } }
 
@@ -3843,7 +3841,7 @@ class GroupBox : IGroupBox
     Rect   bounds = default;
     string key    = default;
 
-    void add(IElement child) { this.children.add(child); }
+    void add(adopt IElement child) { this.children.add(child); }
 
     Size layout(LayoutConstraints c)
     {

@@ -1186,6 +1186,12 @@ switch (shape)
   interface locals are not auto-destructed - the holder must `delete` it. Returning one from
   a non-`move` function is rejected (the caller could not see that it owns the object).
 
+An interface parameter may use the soft keyword `adopt` (`void add(adopt IElement child)`) to
+publish an owned box into callee-managed storage. The call must pass a plain interface local that
+currently owns its box, or a move-returning interface result; the compiler retires a local's
+teardown ownership while leaving the interface readable, so the callee's tree or container becomes
+the single owner. `unique` locals and borrowed interface locals are rejected at an `adopt` parameter.
+
 - **`interface*` (pointer-to-interface) is rejected.** You cannot take the address of an
   interface variable. Use a concrete pointer where an indirect reference is needed.
 

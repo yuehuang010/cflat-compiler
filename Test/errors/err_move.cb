@@ -253,6 +253,38 @@ expect_error("cannot initialize unique 'thinBorrowIntoUnique' from a borrowed va
     }
 }
 
+interface IAdoptErrorNode { void destroyTree(); };
+interface IAdoptErrorSink { void add(adopt IAdoptErrorNode child); };
+class AdoptErrorSink : IAdoptErrorSink
+{
+    void add(adopt IAdoptErrorNode child) { }
+};
+
+expect_error("adopt parameter 'child' requires an owned interface local or a move-returning interface result") {
+    void adoptUniqueSource(unique IAdoptErrorNode child, IAdoptErrorSink sink)
+    {
+        sink.add(child);
+    }
+}
+
+expect_error("adopt parameter 'child' requires an owned interface local or a move-returning interface result") {
+    void adoptBorrowedSource(IAdoptErrorNode child, IAdoptErrorSink sink)
+    {
+        sink.add(child);
+    }
+}
+
+// A plain interface receiver cannot safely release a mixed join: the selected PHI arm may be a
+// borrow owned by another local. Keep the plain-local mixed-join ruling, but diagnose this direct
+// receiver spelling instead of leaking the selected owning arm.
+expect_error("cannot call interface method 'get' on a mixed owning/borrowed ternary join") {
+    int mixedIfaceReceiver(bool c)
+    {
+        unique IUniqueThing owner = new UniqueIfaceThing();
+        return (c ? makeUniqueIface() : owner).get();
+    }
+}
+
 // Borrows an interface value; the call-argument spelling of the class -> interface upcast.
 int takesIface(IUniqueThing s) { return s.get(); }
 

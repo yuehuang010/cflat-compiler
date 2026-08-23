@@ -97,24 +97,24 @@ class GalleryApp : IComponent
     // Build one churn-pool element for `slot` (a fixed kind per slot). Its LOCAL key is
     // "s<slot>", so under the stress box its path is "root/stressbox/s<slot>". Kinds span
     // leaf, container, and data-control families to exercise reconcile across the set.
-    IElement _stressChild(int slot)
+    move IElement _stressChild(int slot)
     {
         string k = "s" + slot.toString();
-        if (slot == 0) { IButton b = button("b", () => {}); b.setKey(k); return b; }
-        if (slot == 1) { IText t = text("t"); t.setKey(k); return t; }
-        if (slot == 2) { ICheckbox c = checkbox("c", false, (bool v) => {}); c.setKey(k); return c; }
-        if (slot == 3) { ITextInput ti = textInput("", (string s) => {}); ti.width = 10; ti.setKey(k); return ti; }
-        if (slot == 4) { IProgressBar p = progressBar(50, 10); p.setKey(k); return p; }
-        if (slot == 5) { ISlider s = slider(50, 10, (int v) => {}); s.setKey(k); return s; }
+        if (slot == 0) { IButton b = button("b", () => {}); b.setKey(k); return move b; }
+        if (slot == 1) { IText t = text("t"); t.setKey(k); return move t; }
+        if (slot == 2) { ICheckbox c = checkbox("c", false, (bool v) => {}); c.setKey(k); return move c; }
+        if (slot == 3) { ITextInput ti = textInput("", (string s) => {}); ti.width = 10; ti.setKey(k); return move ti; }
+        if (slot == 4) { IProgressBar p = progressBar(50, 10); p.setKey(k); return move p; }
+        if (slot == 5) { ISlider s = slider(50, 10, (int v) => {}); s.setKey(k); return move s; }
         if (slot == 6)
         {
             IGroupBox g = groupBox("g", makeStyle(0, 10, 2)); g.setKey(k);
             IText gc = text("gc"); gc.setKey("gc"); g.add(gc);
-            return g;
+            return move g;
         }
         IComboBox cb = comboBox(0, (int i) => {}); cb.addItem("x"); cb.addItem("y");
         cb.width = 10; cb.setKey(k);
-        return cb;
+        return move cb;
     }
 
     // Human-readable label for a Combo Box font index (matches the item order added
