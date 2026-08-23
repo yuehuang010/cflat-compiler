@@ -2196,6 +2196,105 @@ bool testBondedClosureFieldLifetime()
     return result;
 }
 
+int bondedParamListAccept(list<int> xs)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count(); };
+    return h.f();
+}
+
+int bondedParamStringAccept(string s)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return s.length(); };
+    return h.f();
+}
+
+int bondedParamStringBuilderAccept(stringbuilder sb)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return sb.length(); };
+    return h.f();
+}
+
+int bondedParamStructAccept(Counter c)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return c.value; };
+    return h.f();
+}
+
+int bondedParamAliasAccept(alias list<int> xs)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count(); };
+    return h.f();
+}
+
+int bondedParamTwoAccept(list<int> xs, string s)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count() + s.length(); };
+    return h.f();
+}
+
+int bondedParamGenericAccept<T>(T xs)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count(); };
+    return h.f();
+}
+
+// An owning `move` parameter is destructed by the callee AFTER every local, so a holder
+// local still dies first.
+int bondedParamMoveAccept(move list<int> xs)
+{
+    BondedFieldBox h = default;
+    h.f = () => { return xs.count(); };
+    return h.f();
+}
+
+int bondedParamLambdaParamAccept()
+{
+    Lambda<int()> outer = () => {
+        Lambda<int(Counter)> inner = (Counter xs) => {
+            BondedFieldBox h = default;
+            h.f = () => { return xs.value; };
+            return h.f();
+        };
+        Counter xs = default;
+        xs.value = 1;
+        return inner(xs);
+    };
+    return outer();
+}
+
+bool testBondedClosureParameterSources()
+{
+    bool result = true;
+    list<int> xs = default;
+    xs.add(1);
+    result &= Test("bonded by-value list parameter", bondedParamListAccept(xs), 1);
+    result &= Test("bonded string parameter", bondedParamStringAccept("abc"), 3);
+
+    stringbuilder sb = default;
+    sb.appendChar('x');
+    result &= Test("bonded stringbuilder parameter", bondedParamStringBuilderAccept(sb), 1);
+
+    Counter c = default;
+    c.value = 7;
+    result &= Test("bonded user struct parameter", bondedParamStructAccept(c), 7);
+    result &= Test("bonded alias parameter", bondedParamAliasAccept(xs), 1);
+    result &= Test("bonded two parameters", bondedParamTwoAccept(xs, "xy"), 3);
+    result &= Test("bonded generic parameter", bondedParamGenericAccept<list<int>>(xs), 1);
+    result &= Test("bonded lambda parameter", bondedParamLambdaParamAccept(), 1);
+
+    list<int> moved = default;
+    moved.add(1);
+    result &= Test("bonded move parameter", bondedParamMoveAccept(move moved), 1);
+    return result;
+}
+
 // A nested (inner) lambda that references a local of the ENCLOSING FUNCTION reaches it
 // TRANSITIVELY through the outer lambda. The outer lambda must capture it too, so the inner
 // closure reads it out of the outer env (which dominates in the outer body) rather than the
@@ -4542,6 +4641,7 @@ extern int main(int argc, char** argv)
     total++; passed += testClosureBraceInitClonesEnv()   ? 1 : 0;
     total++; passed += testClosureFieldReadIntoLocal()   ? 1 : 0;
     total++; passed += testBondedClosureFieldLifetime()  ? 1 : 0;
+    total++; passed += testBondedClosureParameterSources() ? 1 : 0;
 
     // Function-pointer argument provenance / signature gating: legal spellings still bind
     total++; passed += testFuncPtrArgProvenanceAccepts()  ? 1 : 0;

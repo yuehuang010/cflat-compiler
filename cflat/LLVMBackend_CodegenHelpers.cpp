@@ -119,7 +119,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .Primary = nullptr,
                     .Storage = &arg,
                 };
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             // An `IFace[]` view arrives as a thin pointer to a run of fat structs, not as one
             // fat struct by value, so it must fall through to the pointer-parameter path below.
@@ -143,7 +143,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     // `unique <iface>` sink (uniqueAutoSink) is likewise owning at entry (8a).
                     .IsOwning = itr_nameArg->IsMove || uniqueAutoSink,
                 };
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             else if ((itr_nameArg->IsMove || uniqueAutoSink) && itr_nameArg->Pointer)
             {
@@ -169,7 +169,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     : static_cast<llvm::Value*>(builder->getInt64(-1)),
                     namedVar.RawArrayLengthStorage);
                 namedVar.AllocatedByRawNewArray = true;
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             else if (itr_nameArg->IsMove && itr_nameArg->TypeName == "string")
             {
@@ -184,7 +184,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .Storage = alloc,
                     .IsOwningString = true,
                 };
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             else if (itr_nameArg->IsMove && !itr_nameArg->Pointer)
             {
@@ -207,7 +207,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .Storage = alloc,
                     .IsOwningStruct = true,
                 };
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             else if (!itr_nameArg->Pointer && GetType(*itr_nameArg)->isStructTy())
             {
@@ -241,7 +241,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 if (OwningSinkConsumesConcrete(*itr_nameArg) && IsOwningValueType(itr_nameArg->TypeName)
                     && !IsCopyableType(itr_nameArg->TypeName))
                     namedVar.IsOwningStruct = true;
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             else
             {
@@ -263,7 +263,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     namedVar.IsBorrowed = true;
                     namedVar.BorrowedOrigin = itr_nameArg->VariableName;
                 }
-                stackState.functionArgument[itr_nameArg->VariableName] = namedVar;
+                RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             if (symbolSink_ && !itr_nameArg->VariableName.empty())
                 symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName);

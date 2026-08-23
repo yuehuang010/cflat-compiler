@@ -122,9 +122,17 @@ bool MainListener::AllowBondedClosureFieldStore(
                 for (const auto& frame : std::ranges::reverse_view(compiler->stackNamedVariable))
                 {
                     auto it = frame.namedVariable.find(source);
-                    if (it == frame.namedVariable.end()) continue;
-                    sourceNV = &it->second;
-                    break;
+                    if (it != frame.namedVariable.end())
+                    {
+                        sourceNV = &it->second;
+                        break;
+                    }
+                    auto argIt = frame.functionArgument.find(source);
+                    if (argIt != frame.functionArgument.end())
+                    {
+                        sourceNV = &argIt->second;
+                        break;
+                    }
                 }
                 if (holder->DeclSequence == 0 || sourceNV == nullptr
                     || sourceNV->DeclSequence == 0 || holder->DeclSequence <= sourceNV->DeclSequence)
@@ -10846,6 +10854,7 @@ void MainListener::AdoptWrapperProvenance(LLVMBackend::NamedVariable& dst,
         dst.FieldName        = src.FieldName;
         dst.FieldPathText    = src.FieldPathText;
         dst.FieldPathRoot    = src.FieldPathRoot;
+        dst.FieldPathThroughPointer = src.FieldPathThroughPointer;
         dst.RootIsBorrowedByValueParam = src.RootIsBorrowedByValueParam;
         dst.RootIsAliasBorrowLocal = src.RootIsAliasBorrowLocal;
         dst.PointsToBorrowedByValueParam = src.PointsToBorrowedByValueParam;

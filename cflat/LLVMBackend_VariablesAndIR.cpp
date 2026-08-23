@@ -342,6 +342,12 @@ LLVMBackend::NamedVariable& LLVMBackend::GetOrCreateStackVariable(const std::str
         return it->second;
     }
 
+void LLVMBackend::RegisterFunctionArgument(const std::string& name, NamedVariable namedVar)
+{
+        namedVar.DeclSequence = nextDeclSequence++;
+        stackNamedVariable.back().functionArgument[name] = std::move(namedVar);
+}
+
 void LLVMBackend::SetStackVariable(const std::string& name, NamedVariable namedVar)
 {
         auto& slot = GetOrCreateStackVariable(name);
@@ -497,7 +503,7 @@ void LLVMBackend::RegisterThisPointer(const TypeAndValue& tv, llvm::Value* stora
             .Primary = nullptr,
             .Storage = storage,
         };
-        stackNamedVariable.back().functionArgument[tv.VariableName] = namedVar;
+        RegisterFunctionArgument(tv.VariableName, namedVar);
 
         // Also register under "this" so `this->field` resolves correctly.
         // Primary=storage makes LoadNamedVariable return the pointer, not load through it.
@@ -509,8 +515,8 @@ void LLVMBackend::RegisterThisPointer(const TypeAndValue& tv, llvm::Value* stora
             .Primary = storage,
             .Storage = nullptr,
         };
-        stackNamedVariable.back().functionArgument["this"] = thisVar;
-    }
+        RegisterFunctionArgument("this", thisVar);
+}
 
 llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, llvm::Type* elemType,
                                           llvm::Type* loadType)

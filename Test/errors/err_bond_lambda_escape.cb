@@ -169,6 +169,15 @@ void escapePointerHolder() {
     p->f = () => { xs.add(1); };
 }
 
+// Parenthesized pointer field path: the wrapper must retain the pointer-crossing provenance.
+void escapeParenthesizedPointerHolder() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    list<int> xs = default;
+    ListHolder h = default;
+    ListHolder* p = &h;
+    (p->f) = () => { xs.add(1); };
+}
+
 struct OwnerBondedHolder { unique ListHolder* holder = nullptr; };
 
 void escapeUniqueHolderField() {
@@ -218,6 +227,14 @@ void escapeFixedArrayHolder() {
     arr[0].f = () => { xs.add(1); };
 }
 
+// The holder is declared before a later local source, so same-depth declaration order is unsafe.
+void rejectParameterWithLaterLocal(list<int> xs) {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    ListHolder h = default;
+    list<int> later = default;
+    h.f = () => { xs.count(); later.count(); };
+}
+
 void captureHolderContainingClosure() {
     expect_error("cannot capture 'h' in a lambda");
     list<int> xs = default;
@@ -258,4 +275,15 @@ void secondLambdaCapturesHolder() {
     CopyHolder h = default;
     h.f = () => { c.value = 1; };
     takeClosure(() => { h.f(); });
+}
+
+// The holder lives in the enclosing function; the inner lambda's own parameter dies first, so
+// storing a closure bonded to it into that captured holder must reject.
+struct InnerHolder { Lambda<int()> f = default; };
+void rejectHolderCapturedByLambda() {
+    expect_error("bonded value cannot be stored in a struct field or through a pointer");
+    InnerHolder h = default;
+    Lambda<void(BondCounter)> inner = (BondCounter c) => {
+        h.f = () => c.value;
+    };
 }

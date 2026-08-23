@@ -5549,6 +5549,9 @@ public:
     // Return a live local binding, assigning its declaration sequence on first insertion.
     NamedVariable& GetOrCreateStackVariable(const std::string& name);
 
+    // Register a function parameter before locals, so lifetime comparisons can order it.
+    void RegisterFunctionArgument(const std::string& name, NamedVariable namedVar);
+
     // Register a complete local binding while preserving its declaration sequence on overwrite.
     void SetStackVariable(const std::string& name, NamedVariable namedVar);
 
