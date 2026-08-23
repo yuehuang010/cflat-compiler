@@ -678,6 +678,36 @@ int testAliasPointerRawFieldStore()
     return passed;
 }
 
+// Storing into an owning `string` FIELD through a POINTER (`this.s = ...` inside a method,
+// or `o.s = ...` on a pointer parameter) takes the deref-lvalue store path. An owned string
+// TEMP there must MOVE: deep-copying it stranded the temp, which nothing ever freed.
+class StringHolder
+{
+    string s = default;
+    void setConcat(string a, string b) { this.s = a + b; }
+    void setParam(string k) { this.s = k; }
+};
+void setThroughPointer(StringHolder* h, string a) { h.s = a + "!"; }
+
+int testStringFieldStoreThroughPointer()
+{
+    int passed = 0;
+    {
+        StringHolder* h = new StringHolder();
+        h.setConcat("ab", "cd");                 // owned temp -> field, through `this`
+        passed += Test("concat temp into field through this", h.s.length(), 4);
+        h.setConcat("ef", "ghi");                // reassign drops the old buffer
+        passed += Test("field reassign length", h.s.length(), 5);
+        h.setParam("xyz");                       // borrowed by-value param -> one copy only
+        passed += Test("param copy into field", h.s.length(), 3);
+        setThroughPointer(h, "pq");              // pointer parameter, not `this`
+        passed += Test("concat temp via pointer param", h.s.length(), 3);
+        delete h;
+    }
+    // The suite-wide HeapAudit oracle at the end is what actually pins the leak.
+    return passed;
+}
+
 // --- unique pointer: OWNS ---------------------------------------------------------
 
 int testUniquePointerOwns()
@@ -1270,6 +1300,7 @@ extern int main()
     total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 7;  passed += testAliasPointerElementBorrows();
     total += 3;  passed += testAliasPointerRawFieldStore();
+    total += 4;  passed += testStringFieldStoreThroughPointer();
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();
     total += 3;  passed += testUniquePointerSelfAssign();

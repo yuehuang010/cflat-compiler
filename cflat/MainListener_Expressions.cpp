@@ -2702,7 +2702,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     && !argNV.TypeAndValue.IsMove
                     && !argNV.IsOwningString;
                 if (srcIsByValueStringParam)
+                {
                     right = compiler->EmitOwnedStringDeepCopy(right);
+                    rightStringImplicitCopied = true;
+                }
             }
 
             // Implied move of a `move`-temp's owning field (`dest = makeToken().text`): the temp OWNS it,
@@ -3104,20 +3107,34 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // (source stays live - no zero, no mark-moved); a non-copyable owner MOVES. Produce
                 // the value before destructing the old destination. `move` rides the same argument
                 // the alloca/global sibling passes, so a `move` source TRANSFERS for any owner.
-                AssignSourceKind kind;
-                llvm::Value* toStore = ClassifyOwningAssignSource(
-                    right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
-                if (kind == AssignSourceKind::Move
-                    && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
-                    return finishStore(right);
-                if (kind == AssignSourceKind::Move
-                    && RejectImplicitConsumeOfOutlivingOwner(
-                        compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
-                    return finishStore(right);
+                // A source that already hands us a SOLE-OWNED buffer - an owned call temp
+                // (`p.name = a + b`), or a value an earlier arm on this same store already
+                // deep-copied - transfers instead of copying: copying it again strands the
+                // original, which has no other owner and nothing ever frees (a leak).
+                // `string` only: an owning STRUCT temp is already destructed by the statement's
+                // owned-temp cleanup, so copy-then-drop is leak-free there and stays as it is.
+                const bool srcHandsOverOwnedBuffer = NamedVarIsString(namedVar)
+                    && (rightStringImplicitCopied
+                        || (rightNV.Storage == nullptr && compiler->IsProducedTempValue(right)));
+                AssignSourceKind kind = AssignSourceKind::Move;
+                llvm::Value* toStore = right;
+                if (!srcHandsOverOwnedBuffer)
+                {
+                    toStore = ClassifyOwningAssignSource(
+                        right, namedVar.TypeAndValue.TypeName, rightNV.TypeAndValue.IsMove, ctx, kind);
+                    if (kind == AssignSourceKind::Move
+                        && RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                        return finishStore(right);
+                    if (kind == AssignSourceKind::Move
+                        && RejectImplicitConsumeOfOutlivingOwner(
+                            compiler, rightNV, rightNV.TypeAndValue.IsMove, ctx))
+                        return finishStore(right);
+                }
                 if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 auto* assignResult = derefAssign(toStore, rhsUnsigned);
-                if (kind == AssignSourceKind::Move)
+                // A handed-over temp has no source slot to clear and no name to mark moved.
+                if (kind == AssignSourceKind::Move && !srcHandsOverOwnedBuffer)
                 {
                     // Zero the moved-out source (a named local or `*pa`) so its dtor frees nothing.
                     if (rightNV.Storage != nullptr)
