@@ -1586,7 +1586,7 @@ std::string LLVMBackend::FindFunctionSourceName(const llvm::Function* fn) const
         for (const auto& [name, overloads] : functionTable)
             for (const auto& sym : overloads)
                 if (sym.Function == fn)
-                    return name;
+                    return sym.SourceName.empty() ? name : sym.SourceName;
         return fn->getName().str();
     }
 

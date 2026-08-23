@@ -1428,6 +1428,7 @@ public:
     {
     public:
         std::string UniqueName;
+        std::string SourceName;
         llvm::Function* Function;
         TypeAndValue ReturnType;
         std::vector<TypeAndValue> Parameters;
@@ -1436,6 +1437,7 @@ public:
         bool ReturnsOwned = false; // true when the function returns an owned value (heap string or owned pointer) - caller must free
         bool ReturnsAlias = false; // true when the function returns an 'alias' reference - caller must not free the interior
         bool IsMethod = false;     // true when registered as a struct/class method (has implicit self pointer)
+        bool IsCInteropAlias = false;
         std::vector<std::string> RequiredLocks; // canonical lock-set that the caller must hold (from lock clause)
         AbiRecipe Recipe;          // populated for extern (cdecl) functions whose signature contains struct-by-value
     };
@@ -2702,6 +2704,15 @@ private:
         int line = 1;
         int col = 0;
     };
+    struct CTypeAliasEntry
+    {
+        std::string name;
+        std::string target;
+        std::string file;
+        int line = 1;
+        int col = 0;
+        bool isAnonymousRecord = false;
+    };
     struct CMacroNameCand
     {
         std::string name;
@@ -2726,8 +2737,12 @@ private:
         std::vector<CGlobalEntry> globals;
         // typedef-name -> tag aliases (MSG -> tagMSG). Cached so disk-cache hits replay them.
         std::vector<std::pair<std::string, std::string>> recordAliases;
+        std::vector<CTypeAliasEntry> typeAliases;
         std::vector<CHeaderDep> deps;
     };
+    // Unresolved object-like aliases are retried after later C imports. Unknown aliases stay
+    // here until the compile ends and are intentionally never diagnosed.
+    std::vector<CMacroEntry> pendingCInteropAliases_;
     static inline std::mutex cFileSigCacheMutex_;
     // Key: canonical .c path, or for bound headers "<canonical .h>|<include dirs>" so the
     // same header under different --c-include roots does not collide.
@@ -4080,9 +4095,16 @@ private:
     void CollectRecordTypedefAliases(const cflat_cinterop::ExtractResult& raw,
                                      std::vector<std::pair<std::string, std::string>>& out);
 
+    void CollectTypeAliases(const cflat_cinterop::ExtractResult& raw,
+                            std::vector<CTypeAliasEntry>& out);
+
     // Register record-typedef aliases (from CollectRecordTypedefAliases or a cache entry). Never
     // shadows a real type or an existing alias (first-writer-wins).
     void RegisterRecordAliases(const std::vector<std::pair<std::string, std::string>>& aliases);
+    void RegisterTypeAliasSymbol(const std::string& alias, const std::string& target,
+                                 const std::string& file, int line, int col,
+                                 bool isAnonymousRecord = false);
+    void RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases);
 
     // Keep the transitive closure of in-scope records over their by-value field deps, plus any
     // record referenced BY VALUE from an in-scope function signature or global variable (e.g.
@@ -4112,6 +4134,7 @@ private:
                              std::vector<CFunctionMacroEntry>& outFuncMacros,
                              std::vector<CGlobalEntry>& outGlobals,
                              std::vector<std::pair<std::string, std::string>>& outAliases,
+                             std::vector<CTypeAliasEntry>& outTypeAliases,
                              const std::vector<std::string>& extraDefines = {},
                              std::vector<std::string>* outIncludes = nullptr,
                              bool* outPrereqFailure = nullptr,
@@ -7295,6 +7318,9 @@ public:
 
     static nlohmann::json FuncMacroToJson(const CFunctionMacroEntry& m);
     static CFunctionMacroEntry FuncMacroFromJson(const SjVal& j);
+
+    static nlohmann::json TypeAliasToJson(const CTypeAliasEntry& a);
+    static CTypeAliasEntry TypeAliasFromJson(const SjVal& j);
 
     static bool CHeaderDepFresh(const CHeaderDep& dep);
 

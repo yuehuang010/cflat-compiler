@@ -1055,6 +1055,15 @@ static bool IsImplicitEntryMain(const std::string& functionName,
 
 void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
 {
+        if (external)
+        {
+            auto it = functionTable.find(functionName);
+            if (it != functionTable.end())
+                std::erase_if(it->second, [](const FunctionSymbol& sym) {
+                    return sym.IsCInteropAlias;
+                });
+        }
+
         // For extern C declarations, compute an ABI recipe so struct-by-value params/returns
         // are lowered (coerce-to-int / byval / sret) per the Win64 or Win32 MSVC ABI. If the
         // recipe has no lowering (scalar/pointer only) the existing GetFunctionType path is used.
@@ -1121,6 +1130,7 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,
+                .SourceName = functionName,
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),
@@ -1470,6 +1480,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             auto& symList = functionTable[functionName];
             FunctionSymbol funcSym = {
                 .UniqueName = mangledName,
+                .SourceName = functionName,
                 .Function = fn,
                 .ReturnType = returnType,
                 .Variadic = fn->isVarArg(),

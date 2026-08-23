@@ -39,6 +39,27 @@ void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const st
     symbols_[name] = std::move(def);
 }
 
+void LspSymbolIndex::RemoveFunctionAliases(const std::string& name)
+{
+    auto it = symbols_.find(name);
+    if (it == symbols_.end() || it->second.kind != SymbolKind::Function) return;
+    SymbolDef& def = it->second;
+    auto isAlias = [](const std::string& sig) { return sig.starts_with("#define "); };
+    if (isAlias(def.signatureMarkdown))
+    {
+        auto real = std::find_if(def.overloadSignatures.begin(), def.overloadSignatures.end(),
+                                 [&](const std::string& sig) { return !isAlias(sig); });
+        if (real == def.overloadSignatures.end())
+        {
+            symbols_.erase(it);
+            return;
+        }
+        def.signatureMarkdown = *real;
+        def.overloadSignatures.erase(real);
+    }
+    std::erase_if(def.overloadSignatures, isAlias);
+}
+
 void LspSymbolIndex::RegisterDefinition(const SymbolDef& def)
 {
     if (def.name.empty()) return;

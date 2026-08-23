@@ -73,6 +73,10 @@ namespace cflat_cinterop
     {
         std::string name;
         std::string underlying;
+        std::string file;
+        int line = 1;
+        int col = 0;
+        bool isAnonymousRecord = false;
     };
 
     // An object-like macro folded in-process. Exactly one of int/float/string is meaningful,

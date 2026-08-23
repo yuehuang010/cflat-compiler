@@ -809,6 +809,7 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
 
             if (auto* s = GetSymbolSink())
             {
+                s->RemoveFunctionAliases(e.name);
                 std::string sig = e.ret.TypeName + (e.ret.Pointer ? "*" : "") + " " + e.name + "(";
                 bool first = true;
                 for (const auto& p : e.params)
@@ -826,6 +827,9 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
                 s->Register(SymbolKind::Function, e.name, declFile, e.line, e.col < 0 ? 0 : e.col, sig);
             }
         }
+
+        // A previous import may have supplied an alias before this declaration arrived.
+        RegisterCMacroAliases({}, {}, fileForLsp);
 
         if (verbose)
             std::cout << std::format("[verbose]   registered {} C function(s) from {}\n", sigs.size(), fileForLsp);
@@ -1003,6 +1007,76 @@ void LLVMBackend::CollectRecordTypedefAliases(const cflat_cinterop::ExtractResul
             if (dataStructures.find(tag) == dataStructures.end()) continue;  // not a registered record
             out.emplace_back(t.name, tag + std::string(ptr, '*'));
         }
+    }
+
+void LLVMBackend::CollectTypeAliases(const cflat_cinterop::ExtractResult& raw,
+                                     std::vector<CTypeAliasEntry>& out)
+{
+        for (const auto& t : raw.typedefs)
+        {
+            if (t.name.empty() || t.underlying.empty()) continue;
+            if (t.name == t.underlying && !t.isAnonymousRecord) continue;
+            CTypeAliasEntry entry;
+            entry.name = t.name;
+            entry.target = t.underlying;
+            entry.file = t.file;
+            entry.line = t.line;
+            entry.col = t.col;
+            entry.isAnonymousRecord = t.isAnonymousRecord;
+            out.push_back(std::move(entry));
+        }
+    }
+
+void LLVMBackend::RegisterTypeAliasSymbol(const std::string& alias, const std::string& target,
+                                           const std::string& file, int line, int col,
+                                           bool isAnonymousRecord)
+{
+        auto* s = GetSymbolSink();
+        if (s == nullptr || alias.empty()) return;
+
+        std::string targetName = target;
+        while (!targetName.empty() && targetName.back() == '*') targetName.pop_back();
+        size_t first = targetName.find_first_not_of(" \t");
+        if (first != std::string::npos) targetName.erase(0, first);
+        if (targetName.starts_with("struct ")) targetName.erase(0, 7);
+        else if (targetName.starts_with("union ")) targetName.erase(0, 6);
+        else if (targetName.starts_with("enum ")) targetName.erase(0, 5);
+        size_t last = targetName.find_last_not_of(" \t");
+        if (last == std::string::npos) targetName.clear();
+        else targetName.resize(last + 1);
+        if (targetName == alias)
+        {
+            // Clang canonicalizes `typedef struct { ... } Alias` to the typedef name. There is
+            // no record tag to register, so surface the typedef itself as the struct symbol.
+            if (isAnonymousRecord && dataStructures.find(alias) == dataStructures.end())
+                s->Register(SymbolKind::Struct, alias, file, line, col, "struct " + alias);
+            return;
+        }
+
+        // RegisterRecordAliases already surfaced record typedefs with the CFlat-facing spelling
+        // (tagRVPT*, not "struct tagRVPT *"); first-writer-wins keeps that entry and its members.
+        if (const SymbolDef* prev = s->Lookup(alias))
+            if (prev->kind == SymbolKind::Struct
+                || (prev->kind == SymbolKind::TypeAlias && !prev->file.empty()))
+                return;
+
+        std::string targetFile = file;
+        int targetLine = line;
+        int targetCol = col;
+        if (const SymbolDef* td = s->Lookup(targetName))
+        {
+            targetFile = td->file;
+            targetLine = td->line;
+            targetCol = td->column;
+        }
+        s->Register(SymbolKind::TypeAlias, alias, targetFile, targetLine, targetCol,
+                    "typedef " + target + " " + alias);
+    }
+
+void LLVMBackend::RegisterTypeAliasSymbols(const std::vector<CTypeAliasEntry>& aliases)
+{
+        for (const auto& a : aliases)
+            RegisterTypeAliasSymbol(a.name, a.target, a.file, a.line, a.col, a.isAnonymousRecord);
     }
 
 void LLVMBackend::RegisterRecordAliases(const std::vector<std::pair<std::string, std::string>>& aliases)
@@ -1189,6 +1263,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
                              std::vector<CFunctionMacroEntry>& outFuncMacros,
                              std::vector<CGlobalEntry>& outGlobals,
                              std::vector<std::pair<std::string, std::string>>& outAliases,
+                             std::vector<CTypeAliasEntry>& outTypeAliases,
                              const std::vector<std::string>& extraDefines,
                              std::vector<std::string>* outIncludes,
                              bool* outPrereqFailure,
@@ -1296,6 +1371,7 @@ bool LLVMBackend::ExtractCHeaderClang(const std::vector<std::string>& headerPath
             // are registered, so the user can write MSG/RECT/WNDCLASSEXA, not tagMSG/...
             CollectRecordTypedefAliases(raw, outAliases);
             RegisterRecordAliases(outAliases);
+            CollectTypeAliases(raw, outTypeAliases);
         }
 
         {
@@ -1552,6 +1628,7 @@ void LLVMBackend::RegisterCGlobals(const std::vector<CGlobalEntry>& globals, con
                 s->Register(SymbolKind::Variable, e.name, fileForLsp, e.line, e.col < 0 ? 0 : e.col,
                             tv.TypeName + (tv.Pointer ? "*" : "") + " " + e.name);
         }
+        RegisterCMacroAliases({}, {}, fileForLsp);
         if (verbose)
             std::cout << std::format("[verbose]   registered {} C global(s) from {}\n", globals.size(), fileForLsp);
     }
@@ -1705,6 +1782,8 @@ void LLVMBackend::RegisterCRecords(const std::vector<CRecordEntry>& records, con
             SetTypeAnnotations(r.name, std::move(anns));
         }
 
+        RegisterCMacroAliases({}, {}, fileForLsp);
+
         if (verbose)
             std::cout << std::format("[verbose]   registered {} C record(s) from {}\n", ours.size(), fileForLsp);
     }
@@ -1806,10 +1885,17 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
                                         const std::vector<CFunctionMacroEntry>& funcMacros,
                                         const std::string& fileForLsp)
 {
+        std::vector<CMacroEntry> candidates = pendingCInteropAliases_;
+        candidates.insert(candidates.end(), macros.begin(), macros.end());
+
         std::unordered_map<std::string, std::string> aliasMap;
-        for (const CMacroEntry& m : macros)
+        for (const CMacroEntry& m : candidates)
             if (!m.name.empty() && !m.aliasTarget.empty()) aliasMap.emplace(m.name, m.aliasTarget);
-        if (aliasMap.empty()) return;
+        if (aliasMap.empty())
+        {
+            pendingCInteropAliases_.clear();
+            return;
+        }
 
         std::unordered_map<std::string, const CFunctionMacroEntry*> funcMacroByName;
         for (const CFunctionMacroEntry& f : funcMacros) funcMacroByName.emplace(f.name, &f);
@@ -1824,7 +1910,8 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
 
         size_t bound = 0;
         std::vector<CFunctionMacroEntry> macroTemplateAliases;
-        for (const CMacroEntry& m : macros)
+        std::vector<CMacroEntry> unresolved;
+        for (const CMacroEntry& m : candidates)
         {
             if (m.name.empty() || m.aliasTarget.empty()) continue;
             // A real declaration of the same name always wins over the alias spelling.
@@ -1843,7 +1930,12 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
             {
                 // Reuse the target's llvm::Function and its whole signature: the alias is a
                 // second lookup name for one linkage symbol, never a new external symbol.
-                for (const FunctionSymbol& sym : fn->second) functionTable[m.name].push_back(sym);
+                for (const FunctionSymbol& sym : fn->second)
+                {
+                    FunctionSymbol aliasSym = sym;
+                    aliasSym.IsCInteropAlias = true;
+                    functionTable[m.name].push_back(std::move(aliasSym));
+                }
                 if (auto* sink = GetSymbolSink())
                     sink->Register(SymbolKind::Function, m.name, m.file, m.line, m.col < 0 ? 0 : m.col,
                                    "#define " + m.name + " " + target);
@@ -1879,12 +1971,19 @@ void LLVMBackend::RegisterCMacroAliases(const std::vector<CMacroEntry>& macros,
                 if (ResolveTypeAlias(m.name) == m.name && !dataStructures.count(m.name))
                 {
                     RegisterTypeAlias(m.name, target);
+                    RegisterTypeAliasSymbol(m.name, target, m.file, m.line, m.col < 0 ? 0 : m.col);
                     ++bound;
                 }
             }
-            // Anything else (an unknown identifier) stays unimported, silently: a header is
-            // full of aliases for names CFlat has no business binding.
+            else
+            {
+                // Keep unresolved aliases for a later import. An unknown identifier still stays
+                // unimported, silently: a header is full of names CFlat has no business binding.
+                unresolved.push_back(m);
+            }
         }
+
+        pendingCInteropAliases_.swap(unresolved);
 
         if (!macroTemplateAliases.empty())
             RegisterCFunctionMacros(macroTemplateAliases, fileForLsp + "@aliases");
@@ -2412,6 +2511,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CFunctionMacroEntry> hitFuncMacros;
         std::vector<CGlobalEntry> hitGlobals;
         std::vector<std::pair<std::string, std::string>> hitAliases;
+        std::vector<CTypeAliasEntry> hitTypeAliases;
         bool hit = false;
         {
             std::lock_guard<std::mutex> lock(cFileSigCacheMutex_);
@@ -2425,6 +2525,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
+                    hitTypeAliases = entry.typeAliases;
                 }
                 else if (hashNow() == entry.hash)
                 {
@@ -2433,6 +2534,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                     hitSigs = entry.sigs; hitEnums = entry.enums; hitRecords = entry.records;
                     hitMacros = entry.macros; hitFuncMacros = entry.funcMacros; hitGlobals = entry.globals;
                     hitAliases = entry.recordAliases; hit = true;
+                    hitTypeAliases = entry.typeAliases;
                 }
             }
         }
@@ -2441,6 +2543,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             // Records before sigs so struct-by-value signatures resolve to the same types.
             RegisterCRecords(hitRecords, fileForLsp);
             RegisterRecordAliases(hitAliases);
+            RegisterTypeAliasSymbols(hitTypeAliases);
             RegisterCSignatures(hitSigs, fileForLsp);
             RegisterCEnums(hitEnums, fileForLsp);
             RegisterCMacros(hitMacros);
@@ -2487,6 +2590,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
                 llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
                 RegisterCRecords(diskEntry.records, fileForLsp);
                 RegisterRecordAliases(diskEntry.recordAliases);
+                RegisterTypeAliasSymbols(diskEntry.typeAliases);
                 RegisterCSignatures(diskEntry.sigs, fileForLsp);
                 RegisterCEnums(diskEntry.enums, fileForLsp);
                 RegisterCMacros(diskEntry.macros);
@@ -2518,6 +2622,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         std::vector<CFunctionMacroEntry> funcMacros;
         std::vector<CGlobalEntry> globals;
         std::vector<std::pair<std::string, std::string>> aliases;
+        std::vector<CTypeAliasEntry> typeAliases;
         // Deep mode: collect the transitive include set so the disk entry can validate it.
         bool wantDeps = diskCache && cHeaderCacheDeep_ && !cHeaderCacheDir.empty();
         std::vector<std::string> includes;
@@ -2528,7 +2633,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             bool prereqFailure = false;
             std::string prereqMsg;
             if (!ExtractCHeaderClang(realPaths, sigs, enums, records, macros, funcMacros, globals,
-                                     aliases, extraDefines, wantDeps ? &includes : nullptr,
+                                     aliases, typeAliases, extraDefines, wantDeps ? &includes : nullptr,
                                      &prereqFailure, &prereqMsg))
             {
                 if (prereqFailure)
@@ -2549,6 +2654,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
             entry.funcMacros = funcMacros;
             entry.globals = globals;
             entry.recordAliases = aliases;
+            entry.typeAliases = typeAliases;
             // Keep only real on-disk paths in the transitive dependency list (deep mode).
             // Non-existent deps would otherwise poison every later cache validation.
             if (wantDeps)
@@ -2580,6 +2686,7 @@ bool LLVMBackend::CompileCHeaderGroup(const std::vector<std::string>& headerPath
         {
             llvm::TimeTraceScope registerScope("CHeaderRegister", fileForLsp);
             RegisterCSignatures(sigs, fileForLsp);
+            RegisterTypeAliasSymbols(typeAliases);
             RegisterCEnums(enums, fileForLsp);
             RegisterCMacros(macros);
             std::vector<CFunctionMacroEntry> retryMacros;

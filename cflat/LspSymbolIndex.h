@@ -58,6 +58,7 @@ public:
                   int line, int col, const std::string& sig,
                   const std::vector<std::string>& members = {},
                   const std::string& docComment = {});
+    void RemoveFunctionAliases(const std::string& name);
     void RegisterDefinition(const SymbolDef& def);
     void RegisterFunctionRange(const std::string& name, const std::string& file,
                                int startLine, int endLine);

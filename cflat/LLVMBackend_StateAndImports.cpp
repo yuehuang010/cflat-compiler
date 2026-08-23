@@ -1278,6 +1278,24 @@ LLVMBackend::CFunctionMacroEntry LLVMBackend::FuncMacroFromJson(const SjVal& j)
         return m;
     }
 
+nlohmann::json LLVMBackend::TypeAliasToJson(const CTypeAliasEntry& a)
+{
+        return {{"n", a.name}, {"t", a.target}, {"f", a.file},
+                {"ln", a.line}, {"co", a.col}, {"ar", a.isAnonymousRecord}};
+    }
+
+LLVMBackend::CTypeAliasEntry LLVMBackend::TypeAliasFromJson(const SjVal& j)
+{
+        CTypeAliasEntry a;
+        a.name = j.value("n", std::string{});
+        a.target = j.value("t", std::string{});
+        a.file = j.value("f", std::string{});
+        a.line = j.value("ln", 1);
+        a.col = j.value("co", 0);
+        a.isAnonymousRecord = j.value("ar", false);
+        return a;
+    }
+
 bool LLVMBackend::CHeaderDepFresh(const CHeaderDep& dep)
 {
         std::error_code ec;
@@ -1338,7 +1356,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // (defined in a sibling out-of-scope header, named only by a function's params/return)
         // would still be missing.
         // v11 carries alias macros (`#define A B`); a v10 entry dropped every one of them.
-        if (version != 11) return false;
+        // v12 carries typedef aliases for the LSP symbol sink.
+        // v13 records anonymous-struct typedef identity in that alias cache.
+        if (version != 13) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -1366,6 +1386,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
             if (j.contains("recordAliases"))
                 for (const auto& a : j["recordAliases"])
                     entry.recordAliases.emplace_back(a.value("a", std::string{}), a.value("t", std::string{}));
+            if (j.contains("typeAliases"))
+                for (const auto& a : j["typeAliases"])
+                    entry.typeAliases.push_back(TypeAliasFromJson(a));
 
             // A deep (transitive) entry is only fresh if every recorded include is unchanged.
             // Shallow entries (no "deps") skip this and rely on the top-header check above.
@@ -1400,7 +1423,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 11;
+        j["version"] = 13;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 
@@ -1426,6 +1449,10 @@ void LLVMBackend::WriteCHeaderDiskCache(
         for (const auto& a : entry.recordAliases)
             recordAliases.push_back({{"a", a.first}, {"t", a.second}});
         j["recordAliases"] = recordAliases;
+        nlohmann::json typeAliases = nlohmann::json::array();
+        for (const auto& a : entry.typeAliases)
+            typeAliases.push_back(TypeAliasToJson(a));
+        j["typeAliases"] = typeAliases;
 
         // Deep mode only: the transitive include set for strict (transitive) validation.
         if (!entry.deps.empty())

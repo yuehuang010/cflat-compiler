@@ -29,6 +29,20 @@
 //                       SCK -> HANDLE -> void*) must auto-register; previously
 //                       skipped as "unsupported return/parameter type".
 
+import "library/c_alias_order_alias.h";
+import "library/c_alias_order_real.h";
+import "library/c_alias_reverse_real.h";
+import "library/c_alias_reverse_alias.h";
+import { "library/c_alias_group_alias.h", "library/c_alias_group_real.h" };
+import { "library/c_alias_group_real_first.h", "library/c_alias_group_real_first_alias.h" };
+import "library/c_alias_late_alias.h";
+import "library/c_alias_late_target.h";
+import "library/c_alias_late_chain_a.h";
+import "library/c_alias_late_chain_b.h";
+import "library/c_alias_late_chain_target.h";
+import { "library/c_alias_group_late_alias.h", "library/c_alias_group_late_target.h" };
+import "library/c_alias_late_diff.h";
+import "library/c_alias_late_diff_target.h";
 import "library/cinterop.c";
 import "library/struct_byval_util.c";
 import package "cinterop/mathlib.h" lib "cinterop/mathlib.lib" define "ML_EXTRA";
@@ -580,6 +594,27 @@ extern int main()
     // the ONLY call to c_alias_victim in the file, so no earlier leg can absorb the failure.
     if (CB_ALIAS_CONST != 100)                   return 248;
     if (c_alias_victim(5) != 50)                 return 249;
+
+    // Accept-set: these same-header and reverse-order values are identical PRE/POST. They keep
+    // existing replacement and reverse-order behavior alive; the late-target legs below are the
+    // discriminators for this follow-up.
+    if (CAA_GetObject(7) != 407)                 return 253;
+    if (CAA_GetReverse(7) != 507)                return 254;
+    if (CAA_GetGroup(7) != 807)                  return 255;
+    if (CAA_GetGroupRealFirst(7) != 1007)        return 256;
+
+    expect_error("'CAA_GetObject' is a function used as a value") {
+        int bad = CAA_GetObject;
+    }
+
+    // These aliases are declared before their targets in later separate imports. They are
+    // the discriminating late-target legs: PRE reports an undefined alias at each call.
+    if (CAA_LateAlias(7) != 1307)                return 257;
+    if (CAA_LateChainA(7) != 1407)              return 258;
+    // The grouped target order is an accept-set leg: both declarations arrive in one extraction.
+    if (CAA_GroupLateAlias(7) != 1507)           return 259;
+    // The later target uses a different parameter signature and must still be retried.
+    if (CAA_DiffAlias(7.5) != 1607)              return 260;
 
     return 0;
 }

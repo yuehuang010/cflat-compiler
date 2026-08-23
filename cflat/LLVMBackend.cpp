@@ -4060,6 +4060,7 @@ void LLVMBackend::ResetForReanalysis()
     returnedStructDtorSkipAlloca = nullptr;
 
     functionTable.clear();
+    pendingCInteropAliases_.clear();
     dataStructures.clear();
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
@@ -6834,6 +6835,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
             if (!key || !uniq) continue;
             FS sym;
             sym.UniqueName = uniq->str();
+            sym.SourceName = key->str();
             sym.Function   = module->getFunction(sym.UniqueName);
             if (!sym.Function) continue;
             sym.External = sym.Function->hasExternalLinkage();

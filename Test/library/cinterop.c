@@ -86,6 +86,18 @@ void cb_init_obj(CbObj* obj, int start)
 /* Targets for the alias-macro legs in c_macro_helpers.h (Section U of
    test_c_interop.cb). Kept trivial: the legs assert the alias reaches THIS body. */
 int c_triple(int x) { return x * 3; }
+int CAA_GetObjectW(int value) { return 700 + value; }
+int CAA_GetObject(int value) { return 400 + value; }
+int CAA_GetReverse(int value) { return 500 + value; }
+int CAA_GetReverseW(int value) { return 900 + value; }
+int CAA_GetGroupW(int value) { return 1100 + value; }
+int CAA_GetGroup(int value) { return 800 + value; }
+int CAA_GetGroupRealFirst(int value) { return 1000 + value; }
+int CAA_GetGroupRealFirstW(int value) { return 1200 + value; }
+int CAA_LateTarget(int value) { return 1300 + value; }
+int CAA_LateChainTarget(int value) { return 1400 + value; }
+int CAA_GroupLateTarget(int value) { return 1500 + value; }
+int CAA_DiffTarget(double value) { return 1600 + (int)value; }
 int c_quad(int x)   { return x * 4; }
 int c_alias_victim(int x) { return x * 10; }
 int c_negate(int x)       { return -x; }

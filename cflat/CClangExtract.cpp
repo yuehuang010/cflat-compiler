@@ -468,6 +468,13 @@ namespace cflat_cinterop
                 // which the mapper strips to int. Mirrors the old CollectCTypedefsLibclang.
                 RawTypedef t;
                 t.name = name;
+                LocOfRaw(td, t.file, t.line, t.col);
+                if (const RecordType* rt = u->getAs<RecordType>())
+                {
+                    const RecordDecl* rd = rt->getDecl();
+                    t.isAnonymousRecord = rd->isStruct() && !rd->getIdentifier()
+                                       && rd->getTypedefNameForAnonDecl() == td;
+                }
                 if (!canon.empty() && canon != name) t.underlying = canon;
                 else if (!sugared.empty())           t.underlying = sugared;
                 else                                  t.underlying = canon;

@@ -1,0 +1,1 @@
+#define CAA_LateChainB CAA_LateChainTarget
