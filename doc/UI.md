@@ -724,6 +724,12 @@ interface IUiContext
 
     void bindPost(u64 target, function<void(u64, u64)> hook);   // host wiring (not app code)
     void bindThreadId(u64 uiTid, function<u64()> tidFn);
+    void setContentSize(int width, int height); // request client size in layout cells
+    void setTopmost(bool topmost);              // keep this context's window above normal windows
+    bool systemPrefersDark();                   // current OS preference, not ctx.theme/hostDark()
+    u64 after(int milliseconds, Lambda<void()> work); // one-shot UI-thread callback; 0 is invalid
+    u64 every(int milliseconds, Lambda<void()> work);  // repeating UI-thread callback
+    void cancelTimer(u64 handle);               // cancellation is idempotent
     void post(Lambda<void()> work);   // v12: run `work` on the UI thread (thread-safe)
     void assertUiThread();            // v12: debug guard (warns off the UI thread)
 };
@@ -738,6 +744,17 @@ The host owns one `UiContext`, threads it into `render()` as an `IUiContext`, an
 call `ctx.invalidate()`. Boxing the host's instance into the interface BORROWS it - the fat
 pointer's data word IS that instance's address, nothing is copied and nothing is owned - so
 `activeCtx()` handed out at any time reaches the same state.
+
+**Window operations and timers.** `setContentSize` takes layout-cell dimensions and
+routes to the context's current window. `setTopmost` changes only that window's z-order.
+`systemPrefersDark` reads the OS preference independently from `hostDark()`, which remains
+the last framework theme applied to the window. On Windows this is the per-user
+`AppsUseLightTheme` preference (with a system-color fallback for unavailable settings or
+high-contrast mode); Cocoa reads `AppleInterfaceStyle`. `after` and `every` return an opaque handle;
+callbacks run on the UI thread, and `cancelTimer` releases the callback closure. Native
+hosts cancel every outstanding timer during window teardown. In headless/TUI contexts with
+no wall-clock host loop, timer scheduling returns 0 deterministically and does not start a
+worker thread; native headless hosts drive their timers through their normal message pump.
 
 **`ctx.post(work)` (v12) - thread marshaling.** Call from any thread to run `work`
 back on the UI thread. The closure is cloned into a heap box and the host marshals it

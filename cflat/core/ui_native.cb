@@ -664,6 +664,56 @@ void __uiRunPostBox(u64 boxPtr)
     delete b;
 }
 
+// A timer callback is boxed exactly like a posted callback, but a repeating timer
+// keeps its box until cancellation or host teardown.
+class TimerBox
+{
+    Lambda<void()> work = default;
+    bool repeating = false;
+    bool firing = false;
+    bool cancelled = false;
+};
+
+TimerBox* _boxTimer(Lambda<void()> work, bool repeating)
+{
+    TimerBox* box = new TimerBox();
+    box.work = work;
+    box.repeating = repeating;
+    return box;
+}
+
+void __uiRunTimerBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    TimerBox* box = (TimerBox*)boxPtr;
+    if (box.cancelled)
+    {
+        __uiFreeTimerBox(boxPtr);
+        return;
+    }
+    bool repeating = box.repeating;
+    box.firing = true;
+    box.work();
+    box.firing = false;
+    if (!repeating || box.cancelled) __uiFreeTimerBox(boxPtr);
+}
+
+void __uiFreeTimerBox(u64 boxPtr)
+{
+    if (boxPtr != 0u)
+    {
+        TimerBox* box = (TimerBox*)boxPtr;
+        if (box.firing)
+        {
+            // A callback may cancel itself or tear down its host. Keep the closure
+            // alive until the active invocation returns to __uiRunTimerBox.
+            box.cancelled = true;
+            return;
+        }
+        delete box;
+    }
+}
+
 // -- UiContext: the host-owned per-app runtime state ---------------------------
 // Replaces the former library globals. A handler calls ctx.invalidate() to mark
 // the UI dirty; the host drains it once per loop (consumeDirty) and re-renders
@@ -702,6 +752,12 @@ interface IUiContext
 
     void bindPost(u64 target, function<void(u64, u64)> hook);
     void bindThreadId(u64 uiTid, function<u64()> tidFn);
+    void setContentSize(int w, int h);
+    void setTopmost(bool topmost);
+    bool systemPrefersDark();
+    u64 after(int ms, Lambda<void()> work);
+    u64 every(int ms, Lambda<void()> work);
+    void cancelTimer(u64 handle);
     void post(Lambda<void()> work);
     void assertUiThread();
 };
@@ -733,6 +789,16 @@ class UiContext : IUiContext
     u64  uiThreadId  = 0u;                        // the UI thread's OS id (host-set)
     function<u64()> tidHook = default;            // returns the CURRENT thread id (host-set)
     bool hasTidHook  = false;
+    u64 windowTarget = 0u;
+    function<void(u64, int, int)> sizeHook = default;
+    function<void(u64, bool)> topmostHook = default;
+    function<bool(u64)> systemDarkHook = default;
+    function<u64(u64, int, bool, u64)> timerStartHook = default;
+    function<void(u64, u64)> timerCancelHook = default;
+    bool hasWindowOps = false;
+    int requestedWidth = 0;
+    int requestedHeight = 0;
+    bool requestedTopmost = false;
 
     void invalidate() { this.dirty = true; }
 
@@ -745,6 +811,63 @@ class UiContext : IUiContext
     void bindThreadId(u64 uiTid, function<u64()> tidFn)
     {
         this.uiThreadId = uiTid; this.tidHook = tidFn; this.hasTidHook = true;
+    }
+
+    void bindWindowOps(u64 target, function<void(u64, int, int)> sizeHook,
+                       function<void(u64, bool)> topmostHook,
+                       function<bool(u64)> systemDarkHook,
+                       function<u64(u64, int, bool, u64)> timerStartHook,
+                       function<void(u64, u64)> timerCancelHook)
+    {
+        this.windowTarget = target;
+        this.sizeHook = sizeHook;
+        this.topmostHook = topmostHook;
+        this.systemDarkHook = systemDarkHook;
+        this.timerStartHook = timerStartHook;
+        this.timerCancelHook = timerCancelHook;
+        this.hasWindowOps = true;
+    }
+
+    void setContentSize(int w, int h)
+    {
+        if (w < 1 || h < 1) return;
+        this.requestedWidth = w; this.requestedHeight = h;
+        if (this.hasWindowOps) this.sizeHook(this.windowTarget, w, h);
+    }
+
+    void setTopmost(bool topmost)
+    {
+        this.requestedTopmost = topmost;
+        if (this.hasWindowOps) this.topmostHook(this.windowTarget, topmost);
+    }
+
+    bool systemPrefersDark()
+    {
+        if (this.hasWindowOps) return this.systemDarkHook(this.windowTarget);
+        return false;
+    }
+
+    u64 _scheduleTimer(int ms, bool repeating, Lambda<void()> work)
+    {
+        if (ms < 1) ms = 1;
+        TimerBox* box = _boxTimer(work, repeating);
+        if (!this.hasWindowOps)
+        {
+            __uiFreeTimerBox((u64)box);
+            return 0u;
+        }
+        u64 handle = this.timerStartHook(this.windowTarget, ms, repeating, (u64)box);
+        if (handle == 0u) __uiFreeTimerBox((u64)box);
+        return handle;
+    }
+
+    u64 after(int ms, Lambda<void()> work) { return this._scheduleTimer(ms, false, work); }
+    u64 every(int ms, Lambda<void()> work) { return this._scheduleTimer(ms, true, work); }
+
+    void cancelTimer(u64 handle)
+    {
+        if (handle == 0u || !this.hasWindowOps) return;
+        this.timerCancelHook(this.windowTarget, handle);
     }
 
     // Run `work` on the UI thread. Safe to call from any thread: the closure is cloned

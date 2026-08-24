@@ -71,6 +71,10 @@ class GalleryApp : IComponent
     int    progress   = 60;      // ProgressBar value (0..100)
     int    sliderVal  = 40;      // Slider value (0..100)
     int    areaEdits  = 0;       // TextArea dirty-notify count
+    int    timerOnce  = 0;
+    int    timerTicks = 0;
+    bool   timerCallbackRan = false;
+    u64    timerSelfCancelHandle = 0u;
 
     // Image pixel buffer (owned by the component; freed in the destructor). Borrowed by
     // the Image element each render - the element never owns pixel memory.
@@ -974,6 +978,42 @@ int gallerySelfTest()
         t.expectTrue("card capped at 70 cols (View honors style.width)",
             nativeNodeBounds("root/content/cardbtn").w == 70
             && nativeNodeBounds("root/content/cardcombo").w == 70);
+
+        // 38. Context window operations and UI-thread timers use the active window's seam.
+        IUiContext timerCtx = activeCtx();
+        timerCtx.setContentSize(42, 24);
+        timerCtx.setTopmost(true);
+        timerCtx.setTopmost(false);
+        bool appliedBeforePref = hostDark();
+        bool pref = timerCtx.systemPrefersDark();
+        bool prefAgain = timerCtx.systemPrefersDark();
+        u64 onceHandle = timerCtx.after(20, () =>
+        {
+            if (g != nullptr) { g.timerOnce++; g.timerCallbackRan = true; }
+        });
+        u64 repeatHandle = timerCtx.every(10, () =>
+        {
+            if (g != nullptr)
+            {
+                g.timerTicks++; g.timerCallbackRan = true;
+                if (g.timerTicks == 1) activeCtx().cancelTimer(g.timerSelfCancelHandle);
+            }
+        });
+        if (g != nullptr) g.timerSelfCancelHandle = repeatHandle;
+        bool oneShot = t.waitUntil(() => g != nullptr && g.timerOnce == 1, 500);
+        int ticksBeforeCancel = g != nullptr ? g.timerTicks : 0;
+        timerCtx.cancelTimer(repeatHandle);
+        t.pump();
+        os.sleep_ms(30);
+        t.pump();
+        t.expectTrue("context size + system preference query",
+            hostWidth() == 42 && hostHeight() == 24 && hostDark() == appliedBeforePref
+            && pref == prefAgain);
+        t.expectTrue("one-shot and repeating UI timers",
+            onceHandle != 0u && repeatHandle != 0u && oneShot
+            && ticksBeforeCancel > 0 && g != nullptr && g.timerCallbackRan);
+        t.expectTrue("cancelled repeating timer stays stopped",
+            g != nullptr && g.timerTicks == ticksBeforeCancel);
     });
 
     return s.run(0, nullptr);

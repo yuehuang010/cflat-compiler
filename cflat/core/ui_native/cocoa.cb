@@ -147,6 +147,7 @@ bool _isScroll(void* ctrl)
 class CocoaHost : INativeHost
 {
     void* window      = nullptr;
+    bool  topmost     = false;
     void* contentView = nullptr;   // the flipped CfFlippedView
     void* target      = nullptr;   // this window's CfHostTarget (control + delegate + dataSource)
     bool  applying    = false;     // guard: swallow self-inflicted change notifications
@@ -159,6 +160,9 @@ class CocoaHost : INativeHost
     bool      ready = false;
     int       w     = 95;   // client size in cells (760pt / 8)
     int       h     = 21;   // 560pt / 26
+    list<u64> timerHandles = default;
+    list<u64> timerBoxes   = default;
+    list<u64> timerObjects = default;
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
 
@@ -1626,6 +1630,15 @@ class CocoaHost : INativeHost
     // does not re-enter windowWillClose: and recurse into destroyWindowStateAt.
     void dispose(bool sendClose)
     {
+        int ti0 = 0;
+        while (ti0 < this.timerHandles.count())
+        {
+            void* timer = u2h(this.timerObjects.get(ti0));
+            if (timer != nullptr) msg0(timer, "invalidate");
+            __uiFreeTimerBox(this.timerBoxes.get(ti0));
+            ti0++;
+        }
+        this.timerHandles.clear(); this.timerBoxes.clear(); this.timerObjects.clear();
         if (this.ready) { IElement t = this.tree; deleteTree(t); this.ready = false; }
         if (this.app != nullptr) { IComponent a = this.app; this.app = nullptr; delete a; }
         // Free the host-owned boxes (the destroyControl path does not run for a window
@@ -2107,6 +2120,96 @@ void _runPostBoxImp(void* self, void* cmd, void* num)
     // A posted closure is a UI-thread mutation like any native event handler: if it
     // called ctx.invalidate() it expects a repaint, so pump here (handlers do the same).
     pumpNative();
+}
+
+u64 _cocoaTimerSerial = 1u;
+
+void _cocoaSetContentSize(u64 target, int w, int h)
+{
+    if (!_setCurFromTarget(u2h(target))) return;
+    CocoaHost* wnd = curWin();
+    msgSize(wnd.window, "setContentSize:", (double)(w * BASE_X), (double)(h * BASE_Y));
+    wnd.w = w; wnd.h = h;
+    if (wnd.ready) buildNativeTree();
+}
+
+void _cocoaSetTopmost(u64 target, bool topmost)
+{
+    if (!_setCurFromTarget(u2h(target))) return;
+    CocoaHost* wnd = curWin();
+    // NSFloatingWindowLevel keeps utility windows above normal app windows.
+    msgInt(wnd.window, "setLevel:", topmost ? 3 : 0);
+    wnd.topmost = topmost;
+}
+
+bool _cocoaSystemPrefersDark(u64 target)
+{
+    if (!_setCurFromTarget(u2h(target))) return false;
+    void* defaults = msg0(cls("NSUserDefaults"), "standardUserDefaults");
+    void* style = msg1(defaults, "objectForKey:", nsStr((char*)"AppleInterfaceStyle"));
+    char* value = style != nullptr ? cStr(style) : nullptr;
+    return value != nullptr && strcmp(value, (char*)"Dark") == 0;
+}
+
+u64 _cocoaStartTimer(u64 target, int ms, bool repeating, u64 boxPtr)
+{
+    if (!_setCurFromTarget(u2h(target))) return 0u;
+    CocoaHost* wnd = curWin();
+    u64 handle = _cocoaTimerSerial++;
+    if (handle == 0u) handle = _cocoaTimerSerial++;
+    void* info = msgIntArg(cls("NSNumber"), "numberWithUnsignedLongLong:", (i64)handle);
+    function<void*(void*, void*, double, void*, void*, void*, i8)> f =
+        (function<void*(void*, void*, double, void*, void*, void*, i8)>)__objcMsgSendPtr;
+    void* timer = f(cls("NSTimer"), sel("scheduledTimerWithTimeInterval:target:selector:userInfo:repeats:"),
+                    (double)ms / 1000.0, wnd.target, sel("runTimer:"), info,
+                    repeating ? (i8)1 : (i8)0);
+    if (timer == nullptr) return 0u;
+    wnd.timerHandles.add(handle); wnd.timerBoxes.add(boxPtr); wnd.timerObjects.add((u64)timer);
+    return handle;
+}
+
+void _cocoaCancelTimer(u64 target, u64 handle)
+{
+    if (!_setCurFromTarget(u2h(target))) return;
+    CocoaHost* wnd = curWin();
+    int i = 0;
+    while (i < wnd.timerHandles.count())
+    {
+        if (wnd.timerHandles.get(i) == handle)
+        {
+            void* timer = u2h(wnd.timerObjects.get(i));
+            if (timer != nullptr) msg0(timer, "invalidate");
+            __uiFreeTimerBox(wnd.timerBoxes.get(i));
+            wnd.timerHandles.removeAt(i); wnd.timerBoxes.removeAt(i); wnd.timerObjects.removeAt(i);
+            return;
+        }
+        i++;
+    }
+}
+
+void _runTimerImp(void* self, void* cmd, void* timer)
+{
+    if (!_setCurFromTarget(self) || timer == nullptr) return;
+    CocoaHost* wnd = curWin();
+    void* info = msg0(timer, "userInfo");
+    u64 handle = info != nullptr ? (u64)msgGetI64(info, "unsignedLongLongValue") : 0u;
+    int i = 0;
+    while (i < wnd.timerHandles.count())
+    {
+        if (wnd.timerHandles.get(i) == handle)
+        {
+            u64 box = wnd.timerBoxes.get(i);
+            bool repeating = ((TimerBox*)box).repeating;
+            if (!repeating)
+            {
+                msg0(timer, "invalidate");
+                wnd.timerHandles.removeAt(i); wnd.timerBoxes.removeAt(i); wnd.timerObjects.removeAt(i);
+            }
+            __uiRunTimerBox(box);
+            return;
+        }
+        i++;
+    }
 }
 
 // -- Host-neutral accessors (mirror the Win32 host) ------------------------------
@@ -3414,6 +3517,7 @@ void registerHostClasses()
         function<void(void*, void*, void*)> trc = _onTreeClickImp;
         function<void(void*, void*, void*)> twe = _onTreeWillExpandImp;
         function<void(void*, void*, void*)> rpb = _runPostBoxImp;
+        function<void(void*, void*, void*)> rt = _runTimerImp;
         addMethod0(tg, "onListClick:", lc);
         addMethod0(tg, "onListDoubleClick:", ld);
         addMethod2(tg, "tableView:didClickTableColumn:", lh);
@@ -3422,6 +3526,7 @@ void registerHostClasses()
         addMethod0(tg, "onTreeClick:", trc);
         addMethod0(tg, "outlineViewItemWillExpand:", twe);
         addMethod0(tg, "runPostBox:", rpb);
+        addMethod0(tg, "runTimer:", rt);
         function<i64(void*, void*, void*)> nr = _numberOfRowsImp;
         function<void*(void*, void*, void*, void*, i64)> tov = _tableObjectValueImp;
         addMethodI64_1(tg, "numberOfRowsInTableView:", nr);
@@ -3520,6 +3625,8 @@ int createAppWindow(IComponent app, const char* title, bool show)
     // target's runPostBox: (performSelectorOnMainThread). Same opaque-u64 contract as Win32.
     curWin().ctx.bindPost((u64)curWin().target, _cocoaPostEnqueue);
     curWin().ctx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
+    curWin().ctx.bindWindowOps((u64)curWin().target, _cocoaSetContentSize, _cocoaSetTopmost,
+                               _cocoaSystemPrefersDark, _cocoaStartTimer, _cocoaCancelTimer);
 
     buildMenuBar();   // app-wide, built once
 

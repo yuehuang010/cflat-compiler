@@ -154,6 +154,52 @@ int win32HardeningSelfTest()
                     && _exists("root/content/cardstatus/status")));
     });
 
+    // Two real windows prove that an opaque context keeps routing to its owning HWND
+    // even after another window becomes active. Closing the second must not invalidate
+    // the first context or its timer registry.
+    s.test("multi-window context ownership", (IUiTest t) =>
+    {
+        t.launch(new GalleryApp(), 60, 60);
+        int before = hostWindowCount();
+        GalleryApp* first = activeApp() as GalleryApp;
+        IUiContext firstCtx = activeCtx();
+        void* firstHwnd = curWin().hwnd;
+        openAppWindow(new GalleryApp(), "uitest-second");
+        GalleryApp* second = activeApp() as GalleryApp;
+        IUiContext secondCtx = activeCtx();
+        firstCtx.setContentSize(41, 23);
+        firstCtx.setTopmost(true);
+        secondCtx.setContentSize(52, 26);
+        secondCtx.setTopmost(false);
+        u64 firstTimer = firstCtx.every(1, () => { if (first != nullptr) first.timerTicks++; });
+        u64 secondTimer = secondCtx.after(1, () => { if (second != nullptr) second.timerOnce++; });
+        os.sleep_ms(20);
+        t.pump();
+        bool firstTopmost = ((u32)GetWindowLongPtrA(firstHwnd, (int)GWL_EXSTYLE) & (u32)WS_EX_TOPMOST) != 0u;
+        t.expectTrue("two windows retain independent context targets",
+            before == 1 && hostWindowCount() == 2 && firstTimer != 0u && secondTimer != 0u
+            && first != nullptr && second != nullptr && first.timerTicks > 0 && second.timerOnce == 1);
+        secondCtx.setTopmost(false); // make the second the servicing window before close
+        nativeCloseWindow();
+        t.expectTrue("closing one window preserves the other context",
+            hostWindowCount() == 1 && hostWidth() == 41 && hostHeight() == 23 && firstTopmost);
+        int ticks = first != nullptr ? first.timerTicks : 0;
+        firstCtx.cancelTimer(firstTimer);
+        t.pump();
+        os.sleep_ms(10);
+        t.pump();
+        t.expectTrue("remaining window timer cancels independently",
+            first != nullptr && first.timerTicks == ticks);
+    });
+
+    s.test("timer teardown reentrancy", (IUiTest t) =>
+    {
+        t.launch(new GalleryApp(), 60, 60);
+        activeCtx().after(1, () => { nativeTeardownForTest(); });
+        bool torn = t.waitUntil(() => hostWindowCount() == 0, 500);
+        t.expectTrue("teardown from timer callback is complete", torn);
+    });
+
     // Accessibility Name: a text-bearing control's Name is its window text; a textless control
     // (ProgressBar) gets its Name from the tooltip mirrored in by applyTree.
     s.test("accessibility names", (IUiTest t) =>

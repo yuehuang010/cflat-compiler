@@ -122,6 +122,37 @@ using XamlMenuItemVector           = Windows.Foundation.Collections.IVector<Micr
 using XamlBindableVector           = Microsoft.UI.Xaml.Interop.IBindableVector;
 using XamlBindableIterable         = Microsoft.UI.Xaml.Interop.IBindableIterable;
 
+// DispatcherQueue timer ABI, kept private to this backend.
+struct DqVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface = nullptr;
+    function<u32(void*)> AddRef = nullptr;
+    function<u32(void*)> Release = nullptr;
+    function<i32(void*, u32*, void**)> GetIids = nullptr;
+    function<i32(void*, void**)> GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)> GetTrustLevel = nullptr;
+    function<i32(void*, void**)> CreateTimer = nullptr;
+};
+struct DqObject { DqVtbl* lpVtbl = nullptr; };
+
+struct DqTimerVtbl
+{
+    function<i32(void*, void*, void**)> QueryInterface = nullptr;
+    function<u32(void*)> AddRef = nullptr;
+    function<u32(void*)> Release = nullptr;
+    function<i32(void*, u32*, void**)> GetIids = nullptr;
+    function<i32(void*, void**)> GetRuntimeClassName = nullptr;
+    function<i32(void*, i32*)> GetTrustLevel = nullptr;
+    function<i32(void*, i64*)> get_Interval = nullptr;
+    function<i32(void*, i64)> put_Interval = nullptr;
+    function<i32(void*, i8*)> get_IsRunning = nullptr;
+    function<i32(void*)> Start = nullptr;
+    function<i32(void*)> Stop = nullptr;
+    function<i32(void*, void*, u64*)> add_Tick = nullptr;
+    function<i32(void*, u64)> remove_Tick = nullptr;
+};
+struct DqTimerObject { DqTimerVtbl* lpVtbl = nullptr; };
+
 extern stdcall i32  MddBootstrapInitialize2(u32 majorMinor, u16* versionTag, u64 minVersion, i32 options);
 extern stdcall void MddBootstrapShutdown();
 
@@ -294,7 +325,18 @@ const u32 WSWP_FRAMECHANGED = 0x0027u;   // NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
 
 function<i32(void*, u32, void*, u32)>             _wDwmSetAttr   = nullptr;
 function<i32(void*, void*, i32, i32, i32, i32, u32)> _wSetWindowPos = nullptr;
+function<u32(i32)> _wGetSysColor = nullptr;
+function<i32(void*, char*, u32, u32, void**)> _wRegOpenKeyExA = nullptr;
+function<i32(void*, char*, void*, u32*, void*, u32*)> _wRegQueryValueExA = nullptr;
+function<i32(void*)> _wRegCloseKey = nullptr;
+function<i32(u32, u32, void*, u32)> _wSystemParametersInfoA = nullptr;
 bool _wChromeBound = false;
+struct WHighContrast
+{
+    u32 cbSize = 0u;
+    u32 dwFlags = 0u;
+    void* scheme = nullptr;
+};
 
 void winuiBindChrome()
 {
@@ -305,7 +347,18 @@ void winuiBindChrome()
     if (d != nullptr)
         _wDwmSetAttr = (function<i32(void*, u32, void*, u32)>)GetProcAddress(d, "DwmSetWindowAttribute");
     if (u != nullptr)
+    {
         _wSetWindowPos = (function<i32(void*, void*, i32, i32, i32, i32, u32)>)GetProcAddress(u, "SetWindowPos");
+        _wGetSysColor = (function<u32(i32)>)GetProcAddress(u, "GetSysColor");
+        _wSystemParametersInfoA = (function<i32(u32, u32, void*, u32)>)GetProcAddress(u, "SystemParametersInfoA");
+    }
+    void* a = LoadLibraryA("advapi32.dll");
+    if (a != nullptr)
+    {
+        _wRegOpenKeyExA = (function<i32(void*, char*, u32, u32, void**)>)GetProcAddress(a, "RegOpenKeyExA");
+        _wRegQueryValueExA = (function<i32(void*, char*, void*, u32*, void*, u32*)>)GetProcAddress(a, "RegQueryValueExA");
+        _wRegCloseKey = (function<i32(void*)>)GetProcAddress(a, "RegCloseKey");
+    }
 }
 
 // Framework color (0xRRGGBB, 0 = default) -> COLORREF (0x00BBGGRR).
@@ -451,7 +504,6 @@ bool       _wReady  = false;
 bool       _wDark   = false;   // last applied theme was dark (drives hostDark())
 int        _wW      = 80;      // client size in CELLS (the layout unit); a live window
 int        _wH      = 40;      // overwrites both from its real size (see _winuiSyncWindowSize)
-
 // XAML plumbing captured during bring-up (all borrowed process-lived singletons).
 void* _gApp        = nullptr;   // XamlApplication* (base app; Exit ends the pump)
 void* _gDq         = nullptr;   // DispatcherQueue* for this thread
@@ -500,6 +552,7 @@ double winuiRasterScale()
 int hostWidth()  { return _wW; }
 int hostHeight() { return _wH; }
 bool hostDark()  { return _wDark; }
+int hostWindowCount() { return _wApp != nullptr && !_winuiPendingTeardown() ? 1 : 0; }
 
 alias IComponent activeApp() { return _wApp; }
 IUiContext      activeCtx() { return &_wCtx; }
@@ -1060,6 +1113,19 @@ class WinUI3Host : INativeHost
 {
     bool applying = false;   // guard: swallow self-inflicted Checked/Unchecked
     list<string> liveKeys = default;   // keys live this frame (drives the destroy diff)
+
+    // DispatcherQueue timer ownership belongs to this host instance. The public
+    // context only holds the host hook; no process-global timer registry is used.
+    list<u64> timerHandles = default;
+    list<u64> timerBoxes   = default;
+    list<u64> timerObjects = default;
+    list<u64> timerHandlers = default;
+    list<u64> timerTokens  = default;
+    u64 timerSerial = 1u;
+    bool headlessTimers = false;
+    bool timerDispatching = false;
+    bool teardownPending = false;
+    bool tornDown = false;
 
     // ListView: parallel control handle -> the bound item source (WItemSource* as u64). The
     // source IS the control's ItemsSource, so every list driver reads it back off the control.
@@ -2506,7 +2572,8 @@ string winuiParentPath(string key)
 // Re-render when the model is dirty: render -> reconcile -> layout -> apply.
 void pumpWinui()
 {
-    if (_wCtx.consumeDirty())
+    _winuiFireHeadlessTimers();
+    if (_wApp != nullptr && _wCtx.consumeDirty())
     {
         IElement wip = _wApp.render(&_wCtx);
         list<Patch> patches = default;
@@ -2830,6 +2897,202 @@ void _winuiPostEnqueue(u64 target, u64 boxPtr)
     ((DispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
 }
 u64 _winuiCurTid() { return (u64)GetCurrentThreadId(); }
+void _winuiFireTimer(u64 timerPtr);
+
+void _winuiReleaseTimerAt(int i)
+{
+    DqTimerObject* timer = (DqTimerObject*)_wHost.timerObjects.get(i);
+    if (timer != nullptr)
+    {
+        ((DqTimerVtbl*)timer.lpVtbl)->Stop((void*)timer);
+        ((DqTimerVtbl*)timer.lpVtbl)->remove_Tick((void*)timer, _wHost.timerTokens.get(i));
+        ((DqTimerVtbl*)timer.lpVtbl)->Release((void*)timer);
+    }
+    DqObject* handler = (DqObject*)_wHost.timerHandlers.get(i);
+    if (handler != nullptr) handler.lpVtbl->Release((void*)handler);
+}
+
+u64 _winuiStartTimer(u64 target, int ms, bool repeating, u64 boxPtr)
+{
+    u64 handle = _wHost.timerSerial++;
+    if (handle == 0u) handle = _wHost.timerSerial++;
+    if (_wHost.headlessTimers)
+    {
+        _wHost.timerHandles.add(handle); _wHost.timerBoxes.add(boxPtr); _wHost.timerObjects.add(0u);
+        _wHost.timerHandlers.add(0u); _wHost.timerTokens.add(0u);
+        return handle;
+    }
+    if (_gDq == nullptr) return 0u;
+    void* rawTimer = nullptr;
+    i32 hr = ((DqObject*)_gDq).lpVtbl->CreateTimer(_gDq, &rawTimer);
+    if (hr != 0 || rawTimer == nullptr) return 0u;
+    DqTimerObject* timer = (DqTimerObject*)rawTimer;
+    ((DqTimerVtbl*)timer.lpVtbl)->put_Interval(rawTimer, (i64)ms * 10000);
+    void* handler = winrtDelegate(
+        Windows.Foundation.TypedEventHandler<Microsoft.UI.Dispatching.DispatcherQueueTimer, object>,
+        (void* sender, void* args) => { _winuiFireTimer((u64)sender); });
+    u64 token = 0u;
+    i32 addHr = ((DqTimerVtbl*)timer.lpVtbl)->add_Tick(rawTimer, handler, &token);
+    if (addHr != 0)
+    {
+        ((DqTimerVtbl*)timer.lpVtbl)->Release(rawTimer);
+        ((DqObject*)handler).lpVtbl->Release(handler);
+        return 0u;
+    }
+    ((DqTimerVtbl*)timer.lpVtbl)->Start(rawTimer);
+    _wHost.timerHandles.add(handle); _wHost.timerBoxes.add(boxPtr); _wHost.timerObjects.add((u64)rawTimer);
+    _wHost.timerHandlers.add((u64)handler); _wHost.timerTokens.add(token);
+    return handle;
+}
+
+void _winuiFinishTeardown();
+bool _winuiPendingTeardown() { return _wHost.teardownPending; }
+
+void _winuiRunTimerBox(u64 box)
+{
+    _wHost.timerDispatching = true;
+    __uiRunTimerBox(box);
+    _wHost.timerDispatching = false;
+    if (_wHost.teardownPending && !_wHost.headlessTimers && _gDq != nullptr)
+    {
+        void* h = winrtDelegate(DispatcherHandler, () =>
+        {
+            if (_wHost.teardownPending)
+            {
+                _wHost.teardownPending = false;
+                _winuiFinishTeardown();
+            }
+        });
+        void* enqOut = nullptr;
+        ((DispatcherQueue*)_gDq)->lpVtbl->TryEnqueue(_gDq, h, &enqOut);
+    }
+}
+
+void _winuiFireHeadlessTimers()
+{
+    if (!_wHost.headlessTimers) return;
+    int i = 0;
+    while (i < _wHost.timerHandles.count())
+    {
+        u64 box = _wHost.timerBoxes.get(i);
+        bool repeating = ((TimerBox*)box).repeating;
+        u64 handle = _wHost.timerHandles.get(i);
+        if (!repeating)
+        {
+            _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
+            _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+        }
+        _winuiRunTimerBox(box);
+        if (repeating && i < _wHost.timerHandles.count() && _wHost.timerHandles.get(i) == handle) i++;
+    }
+}
+
+void _winuiCancelTimer(u64 target, u64 handle)
+{
+    int i = 0;
+    while (i < _wHost.timerHandles.count())
+    {
+        if (_wHost.timerHandles.get(i) == handle)
+        {
+            _winuiReleaseTimerAt(i);
+            __uiFreeTimerBox(_wHost.timerBoxes.get(i));
+            _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
+            _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+            return;
+        }
+        i++;
+    }
+}
+
+void _winuiFireTimer(u64 timerPtr)
+{
+    int i = 0;
+    while (i < _wHost.timerObjects.count())
+    {
+        if (_wHost.timerObjects.get(i) == timerPtr)
+        {
+            u64 box = _wHost.timerBoxes.get(i);
+            bool repeating = ((TimerBox*)box).repeating;
+            if (!repeating)
+            {
+                _winuiReleaseTimerAt(i);
+                _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
+                _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+            }
+            _winuiRunTimerBox(box);
+            return;
+        }
+        i++;
+    }
+}
+
+void _winuiSetContentSize(u64 target, int w, int h)
+{
+    winuiBindChrome();
+    void* hwnd = winuiHwnd();
+    if (hwnd != nullptr && _wSetWindowPos != nullptr)
+        _wSetWindowPos(hwnd, nullptr, 0, 0, w * (i32)BASE_X, h * (i32)BASE_Y, 0u);
+    _wW = w; _wH = h;
+    if (_wReady) buildWinuiTree();
+}
+
+void _winuiSetTopmost(u64 target, bool topmost)
+{
+    winuiBindChrome();
+    void* hwnd = winuiHwnd();
+    if (hwnd != nullptr && _wSetWindowPos != nullptr)
+    {
+        void* z = topmost ? (void*)((i64)(0 - 1)) : (void*)((i64)(0 - 2));
+        _wSetWindowPos(hwnd, z, 0, 0, 0, 0, 0x0010u);
+    }
+}
+
+bool _winuiSystemPrefersDark(u64 target)
+{
+    winuiBindChrome();
+    if (_wGetSysColor == nullptr) return false;
+    u32 c = _wGetSysColor(5);
+    int r = (int)(c & 0xFFu); int g = (int)((c >> 8) & 0xFFu); int b = (int)((c >> 16) & 0xFFu);
+    // AppsUseLightTheme is the Windows app-appearance preference. High-contrast
+    // mode deliberately falls back to the system color because it has no stable
+    // light/dark app preference. The result remains independent of hostDark().
+    bool highContrast = false;
+    if (_wSystemParametersInfoA != nullptr)
+    {
+        WHighContrast hc = default;
+        hc.cbSize = (u32)sizeof(hc);
+        highContrast = _wSystemParametersInfoA(0x0042u, hc.cbSize, &hc, 0u) != 0
+                    && (hc.dwFlags & 1u) != 0u;
+    }
+    if (!highContrast && _wRegOpenKeyExA != nullptr && _wRegQueryValueExA != nullptr && _wRegCloseKey != nullptr)
+    {
+        void* key = nullptr;
+        i32 rc = _wRegOpenKeyExA((void*)(i64)(0 - 2147483647),
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            0u, 0x20019u, &key);
+        if (rc == 0 && key != nullptr)
+        {
+            u32 type = 0u; u32 size = 4u; u32 useLight = 1u;
+            rc = _wRegQueryValueExA(key, "AppsUseLightTheme", nullptr, &type, &useLight, &size);
+            _wRegCloseKey(key);
+            if (rc == 0 && type == 4u && size >= 4u) return useLight == 0u;
+        }
+    }
+    return (r + g + b) < 384;
+}
+
+void _winuiCancelAllTimers()
+{
+    int i = 0;
+    while (i < _wHost.timerHandles.count())
+    {
+        _winuiReleaseTimerAt(i);
+        __uiFreeTimerBox(_wHost.timerBoxes.get(i));
+        i++;
+    }
+    _wHost.timerHandles.clear(); _wHost.timerBoxes.clear(); _wHost.timerObjects.clear();
+    _wHost.timerHandlers.clear(); _wHost.timerTokens.clear();
+}
 
 // -- Derived App outer: IInspectable + IXamlMetadataProvider (COM aggregation) -
 // A bare (null-outer) Application exposes no IXamlMetadataProvider, so XamlControlsResources' XBF
@@ -2932,6 +3195,8 @@ void* _makeOuter()
 // Stand up Application/Window/ICanvas + the thread DispatcherQueue (shared by live + headless init).
 void winuiInitFramework()
 {
+    _wHost.tornDown = false;
+    _wHost.teardownPending = false;
     // Activate the framework metadata provider first so the aggregated App can forward to it.
     Guid mpi = IID_IXamlMetadataProvider();
     activateInstance("Microsoft.UI.Xaml.XamlTypeInfo.XamlControlsXamlMetaDataProvider", &mpi, &_gMeta);
@@ -3061,6 +3326,8 @@ void winuiInitFramework()
     // Install the ctx.post marshaling hooks (worker-thread closures run on this UI thread).
     _wCtx.bindPost((u64)0, _winuiPostEnqueue);
     _wCtx.bindThreadId(_winuiCurTid(), _winuiCurTid);
+    _wCtx.bindWindowOps((u64)0, _winuiSetContentSize, _winuiSetTopmost,
+                        _winuiSystemPrefersDark, _winuiStartTimer, _winuiCancelTimer);
 }
 
 // Adopt the live window's client size as the layout extent (in CELLS) and relayout. This is the
@@ -3091,6 +3358,7 @@ void _winuiSyncWindowSize()
 // Live-app init: track the window size, build the tree, then hand control to the post-mount hook.
 void winuiOnInit(void* params)
 {
+    _wHost.headlessTimers = false;
     winuiInitFramework();
     if (_gRootFe != nullptr)
     {
@@ -3137,8 +3405,14 @@ void winuiForceLayout()
 // they miss the fault; waiting on Loaded lets the pump run real frames until layout has happened.
 void winuiHeadlessInit(void* params)
 {
+    _wHost.headlessTimers = true;
     winuiInitFramework();
     if (_wHasSelfBody) _wSelfRc = _wSelfBody();
+    if (_wHost.teardownPending)
+    {
+        winuiExit();
+        return;
+    }
     if (_gRootFe != nullptr)
     {
         void* h = winrtDelegate(XamlRoutedEventHandler,
@@ -3204,17 +3478,34 @@ int runWinuiHeadless()
     if (shr != 0 || appStat == nullptr) { printf("winui: XamlApplicationStatics 0x%08X\n", shr); MddBootstrapShutdown(); return 1; }
     void* cb = winrtDelegate(XamlAppInitCallback, (void* p) => { winuiHeadlessInit(p); });
     appStat->Start(cb);
+    if (_wHost.teardownPending)
+    {
+        _wHost.teardownPending = false;
+        _winuiFinishTeardown();
+    }
     MddBootstrapShutdown();
     return _wSelfRc;
 }
 
 // Fully release host state (headless self-tests). Heap-audit is off for WinUI, but keep clean.
-void nativeTeardownForTest()
+void _winuiFinishTeardown()
 {
+    if (_wHost.tornDown) return;
+    _wHost.tornDown = true;
+    _wHost.teardownPending = false;
+    _winuiCancelAllTimers();
     if (_wReady) { deleteTree(_wTree); _wReady = false; }
     _wHost.dispose();
     if (_wApp != nullptr) { IComponent a = _wApp; _wApp = nullptr; delete a; }
     if (_hasMenuHandler) { Lambda<void(int)> a = move _menuHandler; _hasMenuHandler = false; }
+}
+
+void nativeTeardownForTest()
+{
+    // XAML must not be torn down from inside a DispatcherQueue callback. Mark the
+    // request and let the timer runner finish the active closure first.
+    if (_wHost.timerDispatching) { _wHost.teardownPending = true; return; }
+    _winuiFinishTeardown();
 }
 
 // -- UIA drivers (kept for winui_demo's Automation-peer self-test) -------------
