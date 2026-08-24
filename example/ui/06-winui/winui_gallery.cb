@@ -6,9 +6,9 @@
 // seam + the whole native* driver surface run against, which is the last design-risk retirement
 // before the API can freeze.
 //
-// The self-test runs SYNCHRONOUSLY inside Application.Start's init callback (runWinuiHeadless
-// installs gallerySelfTest as the body): the XAML framework is up, so startHeadlessWindow mounts
-// the tree and every native* driver creates/drives/reads controls with plain COM calls, then Exits.
+// runWinuiHeadless installs gallerySelfTest as the body. The test starts after the root Loaded
+// event and an explicit layout pass, so native* drivers inspect attached controls and realized
+// templates before deterministic teardown and Exit.
 //
 // Build (needs -i to both winui/ and ui/ + gallery/; the winmds/bootstrapper come from NuGet):
 //   cflat winui_gallery.cb -i example/ui/06-winui -i example/ui -i example/ui/05-gallery -o winui_gallery.exe
@@ -22,9 +22,15 @@ extern int main(int argc, char** argv)
 {
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
     {
-        // Run the shared gallery self-test on the XAML UI thread, inside the pump.
+        // Run the shared gallery self-test on the XAML UI thread after the root is loaded.
         setSelfTestBody(() => { return gallerySelfTest(); });
-        return runWinuiHeadless();
+        int rc = runWinuiHeadless();
+        if (!nativeListVisualTeardownClean())
+        {
+            printf("FAIL: WinUI ListView visual resources survived teardown\n");
+            return 1;
+        }
+        return rc;
     }
 
     // Live window: render the gallery on real WinUI 3 controls.

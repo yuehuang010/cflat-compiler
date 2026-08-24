@@ -10,16 +10,17 @@
 // STRUCTURE: like the Win32 host, but single-window (multi-window is deferred, mirroring the
 // Cocoa decision - the gallery gate needs one window; fedit-on-WinUI is not gating). The
 // whole graph lives on the XAML UI thread inside Application.Start's callback (Start owns the
-// message pump). A live app idles the pump; the headless self-test runs SYNCHRONOUSLY inside the
-// init callback (the framework is up, controls create + drive + read back with plain COM calls -
-// no reposting needed) and then Exits.
+// message pump). A live app idles the pump; the headless self-test starts after the root Loaded
+// event and an explicit layout pass, so template/container checks inspect attached live controls,
+// then teardown runs before the application exits.
 //
 // DATA CONTROLS: the ListView/TreeView/TabView XAML controls carry REAL items. The ListView is
 // bound to a virtualized item source (WItemSource - a hand-written IBindableVector over the boxed
-// rowText callback, so 100k rows cost as many rowText calls as XAML realizes rows); the TabView
-// holds real TabViewItems; the TreeView holds real TreeViewNodes, materialized on expand. Every
-// native* driver reads its answer back OUT of the control (ItemsSource/TabItems/RootNodes/
-// SelectedIndex), so an empty control cannot pass a green driver assert.
+// rowText callback, so 100k rows cost as many rowText calls as XAML realizes rows). Realized
+// ListViewItem containers receive an Image plus per-column TextBlocks and the ListView Header owns
+// live column buttons. The TabView holds real TabViewItems; the TreeView holds real TreeViewNodes,
+// materialized on expand. Every native* driver reads its answer back OUT of the live control tree,
+// so an empty control cannot pass a green driver assert.
 //
 // This file has no main(); an app imports it, defines a IComponent, and calls runAppWinui() (live)
 // or the launcher runs runWinuiHeadless() with a self-test body. See winui_demo.cb / winui_gallery.cb.
@@ -60,8 +61,11 @@ using XamlContentControl           = Microsoft.UI.Xaml.Controls.IContentControl;
 using XamlControl                  = Microsoft.UI.Xaml.Controls.IControl;
 using XamlImage                    = Microsoft.UI.Xaml.Controls.IImage;
 using XamlItemsControl             = Microsoft.UI.Xaml.Controls.IItemsControl;
+using XamlItemContainerMapping     = Microsoft.UI.Xaml.Controls.IItemContainerMapping;
 using XamlListViewBase             = Microsoft.UI.Xaml.Controls.IListViewBase;
+using XamlContainerChangingArgs    = Microsoft.UI.Xaml.Controls.IContainerContentChangingEventArgs;
 using XamlPanel                    = Microsoft.UI.Xaml.Controls.IPanel;
+using XamlStackPanel               = Microsoft.UI.Xaml.Controls.IStackPanel;
 using XamlProgressBarFactory       = Microsoft.UI.Xaml.Controls.IProgressBarFactory;
 using XamlScrollViewer             = Microsoft.UI.Xaml.Controls.IScrollViewer;
 using XamlItemsStackPanel          = Microsoft.UI.Xaml.Controls.IItemsStackPanel;
@@ -567,6 +571,7 @@ void setPostMount(Lambda<void()> f) { _wPostMount = f; _wHasPostMount = true; }
 Lambda<int()>  _wSelfBody    = default;
 bool           _wHasSelfBody = false;
 int            _wSelfRc      = 0;
+bool           _wSelfRunning = false;
 void setSelfTestBody(Lambda<int()> f) { _wSelfBody = f; _wHasSelfBody = true; }
 
 // App-wide command dispatcher + per-key context menus (chrome; reused by nativeFireContextMenu).
@@ -698,12 +703,22 @@ void winuiLayoutChrome(bool barOn)
     ((XamlFrameworkElement*)_gScrollFe)->lpVtbl->put_Height(_gScrollFe, sh);
 }
 
-// QI helper: COM QueryInterface is symmetric, so any thin interface pointer reaches slot-0 QI.
+// The first three IUnknown slots are byte-identical for every COM/WinRT interface.
 void* wqi(void* obj, void* iid)
 {
     void* out = nullptr;
-    if (obj != nullptr) ((XamlButton*)obj)->lpVtbl->QueryInterface(obj, iid, (void**)&out);
+    if (obj != nullptr) ((IUnknown*)obj)->lpVtbl->QueryInterface(obj, iid, (void**)&out);
     return out;
+}
+
+void waddref(void* obj)
+{
+    if (obj != nullptr) ((IUnknown*)obj)->lpVtbl->AddRef(obj);
+}
+
+void wrelease(void* obj)
+{
+    if (obj != nullptr) ((IUnknown*)obj)->lpVtbl->Release(obj);
 }
 
 // Box a UTF-8 string as an IInspectable (WinRT content object) via PropertyValue.CreateString.
@@ -729,9 +744,12 @@ void* winuiSolidBrush(int color)
     void* insp = nullptr;
     RoActivateInstance(hstring("Microsoft.UI.Xaml.Media.SolidColorBrush"), &insp);
     void* scb = wqi(insp, iidof(XamlSolidColorBrush));
-    if (scb == nullptr) return nullptr;
+    if (scb == nullptr) { wrelease(insp); return nullptr; }
     ((XamlSolidColorBrush*)scb)->lpVtbl->put_Color(scb, winuiColorArg(color));
-    return wqi(insp, iidof(XamlBrush));
+    void* brush = wqi(insp, iidof(XamlBrush));
+    wrelease(scb);
+    wrelease(insp);
+    return brush;
 }
 
 // An items control paints the rows its panel realizes BEYOND the viewport (WinUI's ListView
@@ -764,9 +782,12 @@ void* winuiFillBrush(int color)
     void* insp = nullptr;
     RoActivateInstance(hstring("Microsoft.UI.Xaml.Media.SolidColorBrush"), &insp);
     void* scb = wqi(insp, iidof(XamlSolidColorBrush));
-    if (scb == nullptr) return nullptr;
+    if (scb == nullptr) { wrelease(insp); return nullptr; }
     ((XamlSolidColorBrush*)scb)->lpVtbl->put_Color(scb, (void*)(u64)0);   // A=0: transparent
-    return wqi(insp, iidof(XamlBrush));
+    void* brush = wqi(insp, iidof(XamlBrush));
+    wrelease(scb);
+    wrelease(insp);
+    return brush;
 }
 
 // Compose a control that has no ActivateInstance (E_NOTIMPL): factory->CreateInstance(null outer),
@@ -836,8 +857,8 @@ void* winuiBuildFlyout(u64 menuPtr)
 // called. IVector<object> has the exact same vtable shape as IBindableVector, so one vtable
 // answers both IIDs; the object also exposes IBindableIterable (IBindableVector requires it).
 //
-// The object is refcounted (XAML holds a ref for as long as the control is bound), is NOT on
-// the cflat heap, and owns the ListRowBox the seam handed it - freed on final release.
+// The object is refcounted (XAML holds a ref for as long as the control is bound) and owns the
+// callback boxes. The host owns native bitmap resources in its per-list visual state.
 struct WSrcVtbl
 {
     function<i32(void*, void*, void**)>    QueryInterface      = nullptr;
@@ -889,10 +910,9 @@ struct WItemSource
     u32            rc       = 0u;
     u64            box      = 0u;        // the boxed rowText callback (ListRowBox*), owned
     u64            iconBox  = 0u;        // boxed row icon callback, owned by this source
-    int            iconCacheCount = 0;
-    u64[8]         iconCacheIds = default;
-    u64[8]         iconCacheRevisions = default;
     u64            styleBox = 0u;        // boxed ListCellStyle callback, owned
+    u64            lastItem = 0u;        // most recent GetAt result, retained for IndexOf
+    u32            lastItemIndex = 0u;
     int            rowCount = 0;
     int            cols     = 1;
 };
@@ -902,6 +922,42 @@ struct WItemIterator
     u32          rc     = 0u;
     WItemSource* src    = nullptr;
     u32          idx    = 0u;
+};
+
+class WinuiListRowVisual
+{
+    u64 containerKey = 0u;
+    u64 container = 0u;
+    u64 root = 0u;
+    u64 image = 0u;
+    list<u64> cells = default;
+    list<int> colors = default;
+    list<bool> brushesApplied = default;
+    int row = 0 - 1;
+    string iconIdentity = default;
+    u64 iconRevision = 0u;
+    bool iconApplied = false;
+};
+
+class WinuiListVisualState
+{
+    u64 listHandle = 0u;
+    string key = default;
+    u64 header = 0u;
+    list<u64> headerButtons = default;
+    list<string> columnTitles = default;
+    list<int> columnWidths = default;
+    list<WinuiListRowVisual*> rows = default;
+    list<int> brushColors = default;
+    list<u64> brushes = default;
+    list<string> iconIds = default;
+    list<u64> iconRevisions = default;
+    list<u64> iconPixels = default;
+    list<int> iconWidths = default;
+    list<int> iconHeights = default;
+    list<u64> iconSources = default;
+    list<u64> seenContainerKeys = default;
+    int reuseCount = 0;
 };
 
 WSrcVtbl      _gSrcVtbl  = default;
@@ -919,23 +975,13 @@ bool _guidEqP(void* a, void* b)
     return true;
 }
 
-// The display string of one row: the row's columns joined (a ListView item is ONE object).
+// The boxed item supplies identity to the virtual collection. Realized container content is
+// replaced by the host's per-column visual tree; this string is never the visible row template.
 move string _wsRowText(WItemSource* s, int row)
 {
     if (s.box == 0u) return "";
     int n = s.cols > 0 ? s.cols : 1;
     string out = "";
-    if (s.iconBox != 0u)
-    {
-        ListRowIcon icon = __uiListRowIcon(s.iconBox, row);
-        if (icon.identity != nullptr && strlen((char*)icon.identity) > 0
-            && icon.pixels != 0u && icon.pxW > 0 && icon.pxH > 0)
-        {
-            string mark = strlen((char*)icon.identity) <= 8
-                ? "[" + (char*)icon.identity + "] " : "[icon] ";
-            out = mark;
-        }
-    }
     int c = 0;
     while (c < n)
     {
@@ -974,32 +1020,11 @@ u32 _wsRelease(void* self)
         if (s.box != 0u) { __uiFreeListRowBox(s.box); s.box = 0u; }
         if (s.iconBox != 0u) { __uiFreeListIconBox(s.iconBox); s.iconBox = 0u; }
         if (s.styleBox != 0u) { __uiFreeListStyleBox(s.styleBox); s.styleBox = 0u; }
+        wrelease((void*)s.lastItem);
+        s.lastItem = 0u;
         free((void*)s);
     }
     return left;
-}
-
-int _wsIconSlot(WItemSource* s, int row)
-{
-    if (s.iconBox == 0u) return -1;
-    ListRowIcon icon = __uiListRowIcon(s.iconBox, row);
-    if (icon.identity == nullptr || strlen((char*)icon.identity) == 0
-        || icon.pixels == 0u || icon.pxW <= 0 || icon.pxH <= 0) return -1;
-    int i = 0;
-    while (i < s.iconCacheCount)
-    {
-        if (strcmp((char*)s.iconCacheIds[i], (char*)icon.identity) == 0)
-        {
-            s.iconCacheRevisions[i] = icon.revision;
-            return i;
-        }
-        i++;
-    }
-    if (s.iconCacheCount >= 8) return -1;
-    s.iconCacheIds[s.iconCacheCount] = (u64)icon.identity;
-    s.iconCacheRevisions[s.iconCacheCount] = icon.revision;
-    s.iconCacheCount++;
-    return s.iconCacheCount - 1;
 }
 
 i32 _wsGetIids(void* self, u32* count, void** iids) { count[0] = 0u; iids[0] = nullptr; return 0; }
@@ -1011,6 +1036,10 @@ i32 _wsGetAt(void* self, u32 index, void** out)
     WItemSource* s = (WItemSource*)self;
     if ((int)index >= s.rowCount) { out[0] = nullptr; return (i32)0x8000000B; }   // E_BOUNDS
     out[0] = boxString(_wsRowText(s, (int)index));
+    wrelease((void*)s.lastItem);
+    s.lastItem = (u64)out[0];
+    s.lastItemIndex = index;
+    waddref(out[0]);
     return 0;
 }
 i32 _wsGetSize(void* self, u32* out)
@@ -1020,7 +1049,22 @@ i32 _wsGetSize(void* self, u32* out)
     return 0;
 }
 i32 _wsGetView(void* self, void** out) { out[0] = nullptr; return (i32)0x80004001; }   // E_NOTIMPL
-i32 _wsIndexOf(void* self, void* value, u32* index, u8* found) { index[0] = 0u; found[0] = 0; return 0; }
+i32 _wsIndexOf(void* self, void* value, u32* index, u8* found)
+{
+    // ScrollIntoView synchronously calls GetAt and then IndexOf for that boxed item. Retaining the
+    // latest item supports arbitrary row jumps without materializing stable objects for 100k rows.
+    WItemSource* s = (WItemSource*)self;
+    index[0] = 0u;
+    found[0] = 0;
+    if (value == nullptr || s.lastItem == 0u) return 0;
+    Guid iid = IID_IUnknown();
+    void* a = wqi(value, &iid);
+    void* b = wqi((void*)s.lastItem, &iid);
+    if (a != nullptr && a == b) { index[0] = s.lastItemIndex; found[0] = 1; }
+    wrelease(a);
+    wrelease(b);
+    return 0;
+}
 // The source is read-only (the app's rowCount + rowText ARE the collection).
 i32 _wsSetAt(void* self, u32 index, void* value)    { return (i32)0x80004001; }
 i32 _wsInsertAt(void* self, u32 index, void* value) { return (i32)0x80004001; }
@@ -1072,9 +1116,7 @@ i32 _wtGetTrust(void* self, i32* level) { level[0] = 0; return 0; }
 i32 _wtGetCurrent(void* self, void** out)
 {
     WItemIterator* it = (WItemIterator*)self;
-    if ((int)it.idx >= it.src.rowCount) { out[0] = nullptr; return (i32)0x8000000B; }
-    out[0] = boxString(_wsRowText(it.src, (int)it.idx));
-    return 0;
+    return _wsGetAt((void*)it.src, it.idx, out);
 }
 i32 _wtGetHasCurrent(void* self, u8* out)
 {
@@ -1123,6 +1165,8 @@ WItemSource* winuiNewItemSource()
     s.box = 0u;
     s.iconBox = 0u;
     s.styleBox = 0u;
+    s.lastItem = 0u;
+    s.lastItemIndex = 0u;
     s.rowCount = 0;
     s.cols = 1;
     return s;
@@ -1172,6 +1216,9 @@ class WinUI3Host : INativeHost
     // source IS the control's ItemsSource, so every list driver reads it back off the control.
     list<u64>    listH   = default;
     list<u64>    listSrc = default;
+    list<u64>    listVisualH = default;
+    list<WinuiListVisualState*> listVisuals = default;
+    bool         listVisualTeardownClean = true;
 
     // TreeView: the boxed node source (TreeBox*) per control, plus the association a REAL
     // TreeViewNode needs to map back to the app's integer nodeId (a node carries only Content).
@@ -1309,6 +1356,7 @@ class WinUI3Host : INativeHost
         if (ic == nullptr) return;
         ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, nullptr);
         ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, (void*)src);
+        wrelease(ic);
     }
     // The item source the CONTROL is bound to (nullptr if the control carries no items), matched
     // against the sources this host owns before it is dereferenced.
@@ -1318,9 +1366,11 @@ class WinUI3Host : INativeHost
         if (ic == nullptr) return nullptr;
         void* src = nullptr;
         ((XamlItemsControl*)ic)->lpVtbl->get_ItemsSource(ic, &src);
-        if (src == nullptr) return nullptr;
-        if (this._slot(&this.listSrc, (u64)src) < 0) return nullptr;
-        return (WItemSource*)src;
+        WItemSource* found = src != nullptr && this._slot(&this.listSrc, (u64)src) >= 0
+            ? (WItemSource*)src : nullptr;
+        wrelease(src);
+        wrelease(ic);
+        return found;
     }
     void _listDropSrc(u64 h)
     {
@@ -1331,7 +1381,446 @@ class WinUI3Host : INativeHost
         // Unbind first, so XAML drops its ref and the source (and its rowText box) really dies.
         void* ic = wqi((void*)h, iidof(XamlItemsControl));
         if (ic != nullptr) ((XamlItemsControl*)ic)->lpVtbl->put_ItemsSource(ic, nullptr);
+        wrelease(ic);
         if (src != 0u) _wsRelease((void*)src);
+    }
+
+    u64 _listObjectKey(void* obj)
+    {
+        if (obj == nullptr) return 0u;
+        Guid iid = IID_IUnknown();
+        void* identity = wqi(obj, &iid);
+        u64 key = (u64)identity;
+        wrelease(identity);
+        return key;
+    }
+
+    int _listVisualSlot(u64 h) { return this._slot(&this.listVisualH, h); }
+
+    alias WinuiListVisualState* _listVisualFor(u64 h)
+    {
+        int i = this._listVisualSlot(h);
+        if (i < 0) return nullptr;
+        return this.listVisuals.get(i);
+    }
+
+    u64 _listCreateElement(string cls)
+    {
+        void* insp = nullptr;
+        RoActivateInstance(hstring(cls), &insp);
+        return (u64)insp;
+    }
+
+    alias WinuiListVisualState* _listEnsureVisual(u64 h, string key)
+    {
+        WinuiListVisualState* have = this._listVisualFor(h);
+        if (have != nullptr) return have;
+        WinuiListVisualState* st = new WinuiListVisualState();
+        st.listHandle = h;
+        st.key = "" + key;
+        this.listVisualH.add(h);
+        this.listVisuals.add(move st);
+        this.listVisualTeardownClean = false;
+        return this.listVisuals.get(this.listVisuals.count() - 1);
+    }
+
+    void _listClearHeader(WinuiListVisualState* st)
+    {
+        if (st == nullptr) return;
+        void* lvb = wqi((void*)st.listHandle, iidof(XamlListViewBase));
+        if (lvb != nullptr)
+        {
+            ((XamlListViewBase*)lvb)->lpVtbl->put_Header(lvb, nullptr);
+            wrelease(lvb);
+        }
+        int i = 0;
+        while (i < st.headerButtons.count()) { wrelease((void*)st.headerButtons.get(i)); i++; }
+        st.headerButtons.clear();
+        st.columnTitles.clear();
+        st.columnWidths.clear();
+        wrelease((void*)st.header);
+        st.header = 0u;
+    }
+
+    void _listEnsureHeader(WinuiListVisualState* st)
+    {
+        if (st == nullptr || st.header != 0u) return;
+        st.header = this._listCreateElement("Microsoft.UI.Xaml.Controls.StackPanel");
+        void* sp = wqi((void*)st.header, iidof(XamlStackPanel));
+        if (sp != nullptr)
+        {
+            ((XamlStackPanel*)sp)->lpVtbl->put_Orientation(sp, 0);
+            wrelease(sp);
+        }
+        void* lvb = wqi((void*)st.listHandle, iidof(XamlListViewBase));
+        if (lvb != nullptr)
+        {
+            ((XamlListViewBase*)lvb)->lpVtbl->put_Header(lvb, (void*)st.header);
+            wrelease(lvb);
+        }
+    }
+
+    void _listAddColumn(u64 h, string title, int widthCells, int column)
+    {
+        WinuiListVisualState* st = this._listVisualFor(h);
+        if (st == nullptr || column != st.columnWidths.count()) return;
+        this._listEnsureHeader(st);
+        if (widthCells < 1) widthCells = 1;
+        st.columnTitles.add("" + title);
+        st.columnWidths.add(widthCells);
+        u64 button = this._listCreateElement("Microsoft.UI.Xaml.Controls.Button");
+        if (button == 0u) return;
+        void* cc = wqi((void*)button, iidof(XamlContentControl));
+        void* boxedTitle = boxString(title);
+        if (cc != nullptr) ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, boxedTitle);
+        wrelease(boxedTitle);
+        wrelease(cc);
+        void* fe = wqi((void*)button, iidof(XamlFrameworkElement));
+        if (fe != nullptr)
+        {
+            ((XamlFrameworkElement*)fe)->lpVtbl->put_Width(fe, (double)(widthCells * BASE_X));
+            wrelease(fe);
+        }
+        string routeKey = "" + st.key;
+        int routeColumn = column;
+        void* bb = wqi((void*)button, iidof(XamlButtonBase));
+        if (bb != nullptr)
+        {
+            void* handler = winrtDelegate(XamlRoutedEventHandler,
+                (void* s, void* a) => { routeWinuiListHeader(routeKey, routeColumn); });
+            u64 token = 0u;
+            ((XamlButtonBase*)bb)->lpVtbl->add_Click(bb, handler, &token);
+            wrelease(handler);
+            wrelease(bb);
+        }
+        void* panel = wqi((void*)st.header, iidof(XamlPanel));
+        void* elem = wqi((void*)button, iidof(XamlUIElement));
+        if (panel != nullptr && elem != nullptr)
+        {
+            void* children = nullptr;
+            ((XamlPanel*)panel)->lpVtbl->get_Children(panel, &children);
+            if (children != nullptr) ((XamlUIElementVector*)children)->lpVtbl->Append(children, elem);
+            wrelease(children);
+        }
+        wrelease(elem);
+        wrelease(panel);
+        st.headerButtons.add(button);
+    }
+
+    u64 _listBrush(WinuiListVisualState* st, int color)
+    {
+        int i = 0;
+        while (i < st.brushColors.count())
+        {
+            if (st.brushColors.get(i) == color) return st.brushes.get(i);
+            i++;
+        }
+        void* brush = winuiSolidBrush(color);
+        st.brushColors.add(color);
+        st.brushes.add((u64)brush);
+        return (u64)brush;
+    }
+
+    u64 _listNewBitmap(ListRowIcon icon)
+    {
+        XamlWriteableBitmapFactory* factory = nullptr;
+        activationFactory("Microsoft.UI.Xaml.Media.Imaging.WriteableBitmap",
+            iidof(XamlWriteableBitmapFactory), (void**)&factory);
+        if (factory == nullptr) return 0u;
+        void* raw = nullptr;
+        factory->lpVtbl->CreateInstanceWithDimensions(factory, icon.pxW, icon.pxH, &raw);
+        wrelease((void*)factory);
+        if (raw == nullptr) return 0u;
+        void* bitmap = wqi(raw, iidof(XamlWriteableBitmap));
+        void* buffer = nullptr;
+        if (bitmap != nullptr) ((XamlWriteableBitmap*)bitmap)->lpVtbl->get_PixelBuffer(bitmap, &buffer);
+        Guid accessIid = IID_IBufferByteAccess();
+        void* access = wqi(buffer, &accessIid);
+        if (access != nullptr)
+        {
+            u8* dst = nullptr;
+            ((IBufferByteAccess*)access)->lpVtbl->Buffer(access, &dst);
+            if (dst != nullptr)
+                memcpy((void*)dst, (void*)icon.pixels, (i64)(icon.pxW * icon.pxH * 4));
+        }
+        void* source = wqi(raw, iidof(XamlImageSource));
+        wrelease(access);
+        wrelease(buffer);
+        wrelease(bitmap);
+        wrelease(raw);
+        return (u64)source;
+    }
+
+    void _listClearIconCache(WinuiListVisualState* st)
+    {
+        if (st == nullptr) return;
+        int i = 0;
+        while (i < st.iconSources.count())
+        {
+            wrelease((void*)st.iconSources.get(i));
+            i++;
+        }
+        st.iconIds.clear();
+        st.iconRevisions.clear();
+        st.iconPixels.clear();
+        st.iconWidths.clear();
+        st.iconHeights.clear();
+        st.iconSources.clear();
+    }
+
+    int _listIconSlot(WinuiListVisualState* st, ListRowIcon icon)
+    {
+        if (st == nullptr || icon.identity == nullptr || strlen((char*)icon.identity) == 0
+            || icon.pixels == 0u || icon.pxW <= 0 || icon.pxH <= 0) return -1;
+        string identity = (string)icon.identity;
+        int i = 0;
+        while (i < st.iconIds.count())
+        {
+            if (st.iconIds.get(i) == identity) return i;
+            i++;
+        }
+        st.iconIds.add("" + identity);
+        st.iconRevisions.add(0u);
+        st.iconPixels.add(0u);
+        st.iconWidths.add(0);
+        st.iconHeights.add(0);
+        st.iconSources.add(0u);
+        return st.iconIds.count() - 1;
+    }
+
+    u64 _listIconSource(WinuiListVisualState* st, WItemSource* src, int row,
+                        ListRowIcon* outIcon)
+    {
+        if (src == nullptr || src.iconBox == 0u) return 0u;
+        ListRowIcon icon = __uiListRowIcon(src.iconBox, row);
+        outIcon[0] = icon;
+        int slot = this._listIconSlot(st, icon);
+        if (slot < 0) return 0u;
+        bool changed = st.iconSources.get(slot) == 0u
+            || st.iconRevisions.get(slot) != icon.revision
+            || st.iconPixels.get(slot) != icon.pixels
+            || st.iconWidths.get(slot) != icon.pxW
+            || st.iconHeights.get(slot) != icon.pxH;
+        if (changed)
+        {
+            u64 source = this._listNewBitmap(icon);
+            if (source == 0u) return 0u;
+            wrelease((void*)st.iconSources.get(slot));
+            st.iconSources.set(slot, source);
+            st.iconRevisions.set(slot, icon.revision);
+            st.iconPixels.set(slot, icon.pixels);
+            st.iconWidths.set(slot, icon.pxW);
+            st.iconHeights.set(slot, icon.pxH);
+        }
+        return st.iconSources.get(slot);
+    }
+
+    int _listRowSlot(WinuiListVisualState* st, u64 containerKey)
+    {
+        int i = 0;
+        while (i < st.rows.count())
+        {
+            if (st.rows.get(i).containerKey == containerKey) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    alias WinuiListRowVisual* _listCreateRow(WinuiListVisualState* st, void* container)
+    {
+        WinuiListRowVisual* row = new WinuiListRowVisual();
+        row.containerKey = this._listObjectKey(container);
+        bool seen = false;
+        int si = 0;
+        while (si < st.seenContainerKeys.count())
+        {
+            if (st.seenContainerKeys.get(si) == row.containerKey) { seen = true; break; }
+            si++;
+        }
+        if (seen) st.reuseCount++;
+        else st.seenContainerKeys.add(row.containerKey);
+        row.container = (u64)container;
+        waddref(container);
+        row.root = this._listCreateElement("Microsoft.UI.Xaml.Controls.StackPanel");
+        void* sp = wqi((void*)row.root, iidof(XamlStackPanel));
+        if (sp != nullptr)
+        {
+            ((XamlStackPanel*)sp)->lpVtbl->put_Orientation(sp, 0);
+            wrelease(sp);
+        }
+        row.image = this._listCreateElement("Microsoft.UI.Xaml.Controls.Image");
+        void* panel = wqi((void*)row.root, iidof(XamlPanel));
+        void* children = nullptr;
+        if (panel != nullptr) ((XamlPanel*)panel)->lpVtbl->get_Children(panel, &children);
+        void* imageElem = wqi((void*)row.image, iidof(XamlUIElement));
+        if (children != nullptr && imageElem != nullptr)
+            ((XamlUIElementVector*)children)->lpVtbl->Append(children, imageElem);
+        wrelease(imageElem);
+        int c = 0;
+        while (c < st.columnWidths.count())
+        {
+            u64 cell = this._listCreateElement("Microsoft.UI.Xaml.Controls.TextBlock");
+            row.cells.add(cell);
+            row.colors.add(0);
+            row.brushesApplied.add(false);
+            void* cellElem = wqi((void*)cell, iidof(XamlUIElement));
+            if (children != nullptr && cellElem != nullptr)
+                ((XamlUIElementVector*)children)->lpVtbl->Append(children, cellElem);
+            wrelease(cellElem);
+            c++;
+        }
+        wrelease(children);
+        wrelease(panel);
+        void* cc = wqi(container, iidof(XamlContentControl));
+        if (cc != nullptr)
+        {
+            ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, (void*)row.root);
+            wrelease(cc);
+        }
+        st.rows.add(move row);
+        return st.rows.get(st.rows.count() - 1);
+    }
+
+    void _listSyncRow(WinuiListVisualState* st, WinuiListRowVisual* visual,
+                      WItemSource* src, int row)
+    {
+        if (st == nullptr || visual == nullptr || src == nullptr || src.box == 0u) return;
+        if (visual.row >= 0 && visual.row != row) st.reuseCount++;
+        visual.row = row;
+        ListRowIcon icon = default;
+        u64 source = this._listIconSource(st, src, row, &icon);
+        void* image = wqi((void*)visual.image, iidof(XamlImage));
+        if (image != nullptr)
+        {
+            ((XamlImage*)image)->lpVtbl->put_Source(image, (void*)source);
+            wrelease(image);
+        }
+        void* imageElem = wqi((void*)visual.image, iidof(XamlUIElement));
+        if (imageElem != nullptr)
+        {
+            ((XamlUIElement*)imageElem)->lpVtbl->put_Visibility(imageElem, source != 0u ? 0 : 1);
+            wrelease(imageElem);
+        }
+        void* imageFe = wqi((void*)visual.image, iidof(XamlFrameworkElement));
+        if (imageFe != nullptr)
+        {
+            ((XamlFrameworkElement*)imageFe)->lpVtbl->put_Width(imageFe, source != 0u ? 24.0 : 0.0);
+            ((XamlFrameworkElement*)imageFe)->lpVtbl->put_Height(imageFe, source != 0u ? 24.0 : 0.0);
+            wrelease(imageFe);
+        }
+        visual.iconApplied = source != 0u;
+        visual.iconIdentity = source != 0u ? (string)icon.identity : "";
+        visual.iconRevision = source != 0u ? icon.revision : 0u;
+
+        int c = 0;
+        while (c < visual.cells.count())
+        {
+            u64 cell = visual.cells.get(c);
+            void* text = wqi((void*)cell, iidof(XamlTextBlock));
+            ListCellStyle style = __uiListCellStyle(src.styleBox, row, c);
+            int color = resolveListCellColor(style, _wCtx.theme, _wCtx.systemPrefersDark());
+            bool applyBrush = style.hasLiteral || style.hasRole;
+            if (text != nullptr)
+            {
+                ((XamlTextBlock*)text)->lpVtbl->put_Text(text, hstring(__uiListRowText(src.box, row, c)));
+                ((XamlTextBlock*)text)->lpVtbl->put_Foreground(text,
+                    applyBrush ? (void*)this._listBrush(st, color) : nullptr);
+                wrelease(text);
+            }
+            void* fe = wqi((void*)cell, iidof(XamlFrameworkElement));
+            if (fe != nullptr)
+            {
+                ((XamlFrameworkElement*)fe)->lpVtbl->put_Width(fe,
+                    (double)(st.columnWidths.get(c) * BASE_X));
+                wrelease(fe);
+            }
+            visual.colors.set(c, color);
+            visual.brushesApplied.set(c, applyBrush);
+            c++;
+        }
+    }
+
+    void _listDropRowAt(WinuiListVisualState* st, int at)
+    {
+        if (st == nullptr || at < 0 || at >= st.rows.count()) return;
+        WinuiListRowVisual* row = st.rows.get(at);
+        st.rows.removeAt(at);
+        if (row == nullptr) return;
+        void* cc = wqi((void*)row.container, iidof(XamlContentControl));
+        if (cc != nullptr)
+        {
+            ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, nullptr);
+            wrelease(cc);
+        }
+        int i = 0;
+        while (i < row.cells.count()) { wrelease((void*)row.cells.get(i)); i++; }
+        wrelease((void*)row.image);
+        wrelease((void*)row.root);
+        wrelease((void*)row.container);
+        delete row;
+    }
+
+    void _listContainerChanged(u64 h, void* args)
+    {
+        WinuiListVisualState* st = this._listVisualFor(h);
+        WItemSource* src = this._listLiveSrc(h);
+        void* ea = wqi(args, iidof(XamlContainerChangingArgs));
+        if (st == nullptr || src == nullptr || ea == nullptr) { wrelease(ea); return; }
+        void* container = nullptr;
+        ((XamlContainerChangingArgs*)ea)->lpVtbl->get_ItemContainer(ea, &container);
+        u8 recycle = 0;
+        ((XamlContainerChangingArgs*)ea)->lpVtbl->get_InRecycleQueue(ea, &recycle);
+        u64 key = this._listObjectKey(container);
+        int at = this._listRowSlot(st, key);
+        if (recycle != 0)
+        {
+            if (at >= 0) this._listDropRowAt(st, at);
+            wrelease(container);
+            wrelease(ea);
+            return;
+        }
+        i32 row = 0;
+        ((XamlContainerChangingArgs*)ea)->lpVtbl->get_ItemIndex(ea, &row);
+        WinuiListRowVisual* visual = at >= 0 ? st.rows.get(at) : this._listCreateRow(st, container);
+        this._listSyncRow(st, visual, src, (int)row);
+        ((XamlContainerChangingArgs*)ea)->lpVtbl->put_Handled(ea, true);
+        wrelease(container);
+        wrelease(ea);
+    }
+
+    void _listRefreshRows(u64 h)
+    {
+        WinuiListVisualState* st = this._listVisualFor(h);
+        WItemSource* src = this._listLiveSrc(h);
+        if (st == nullptr || src == nullptr) return;
+        int i = 0;
+        while (i < st.rows.count())
+        {
+            WinuiListRowVisual* row = st.rows.get(i);
+            if (row != nullptr && row.row >= 0 && row.row < src.rowCount)
+                this._listSyncRow(st, row, src, row.row);
+            i++;
+        }
+    }
+
+    void _listDropVisual(u64 h)
+    {
+        int at = this._listVisualSlot(h);
+        if (at < 0) return;
+        WinuiListVisualState* st = this.listVisuals.get(at);
+        if (st != nullptr)
+        {
+            while (st.rows.count() > 0) this._listDropRowAt(st, st.rows.count() - 1);
+            this._listClearHeader(st);
+            this._listClearIconCache(st);
+            int i = 0;
+            while (i < st.brushes.count()) { wrelease((void*)st.brushes.get(i)); i++; }
+            st.brushes.clear();
+            st.brushColors.clear();
+            delete st;
+        }
+        this.listVisualH.removeAt(at);
+        this.listVisuals.removeAt(at);
     }
 
     // -- TreeView: real TreeViewNodes ------------------------------------------
@@ -1786,6 +2275,7 @@ class WinUI3Host : INativeHost
         }
         else if (elemKind == ELEM_LIST)
         {
+            this._listEnsureVisual((u64)insp, key);
             void* sel = wqi(insp, iidof(XamlSelector));
             if (sel != nullptr)
             {
@@ -1800,6 +2290,18 @@ class WinUI3Host : INativeHost
                     (void* s, void* a) => { routeWinuiListActivate(key); });
                 u64 tok2 = 0;
                 ((XamlUIElement*)elem)->lpVtbl->add_DoubleTapped(elem, hd, &tok2);
+            }
+            void* listBase = wqi(insp, iidof(XamlListViewBase));
+            if (listBase != nullptr)
+            {
+                string routeKey = "" + key;
+                void* hc = winrtDelegate(
+                    Windows.Foundation.TypedEventHandler<Microsoft.UI.Xaml.Controls.ListViewBase, Microsoft.UI.Xaml.Controls.ContainerContentChangingEventArgs>,
+                    (void* s, void* a) => { routeWinuiListContainer(routeKey, a); });
+                u64 tok3 = 0u;
+                ((XamlListViewBase*)listBase)->lpVtbl->add_ContainerContentChanging(listBase, hc, &tok3);
+                wrelease(hc);
+                wrelease(listBase);
             }
         }
         else if (elemKind == ELEM_TABS)
@@ -1906,6 +2408,7 @@ class WinUI3Host : INativeHost
     {
         if (h == 0u) return;
         // Unbind + free anything this control owned (the item source owns its rowText box).
+        this._listDropVisual(h);
         this._listDropSrc(h);
         int ti = this._slot(&this.treeBoxH, h);
         if (ti >= 0)
@@ -2137,13 +2640,15 @@ class WinUI3Host : INativeHost
         {
             WItemSource* s = (WItemSource*)this._listMakeSrc(h);
             s.cols = 0;
+            WinuiListVisualState* st = this._listVisualFor(h);
+            this._listClearHeader(st);
+            this._listEnsureHeader(st);
         }
         else if (op == LISTOP_ADD_COLUMN)
         {
-            // A XAML ListView item is one object, so the columns become one joined row string
-            // (the header row itself has no equivalent; see doc/UI.md's parity matrix).
             WItemSource* s = (WItemSource*)this._listMakeSrc(h);
             if (arg1 + 1 > s.cols) s.cols = arg1 + 1;
+            this._listAddColumn(h, (string)text, arg0, arg1);
         }
         else if (op == LISTOP_SET_ROWCOUNT)
         {
@@ -2162,14 +2667,16 @@ class WinUI3Host : INativeHost
             WItemSource* s = (WItemSource*)this._listMakeSrc(h);
             if (s.iconBox != 0u && s.iconBox != payload) __uiFreeListIconBox(s.iconBox);
             s.iconBox = payload;
-            s.iconCacheCount = 0;
+            this._listClearIconCache(this._listVisualFor(h));
             this._listBind(h, (u64)s);
+            this._listRefreshRows(h);
         }
         else if (op == LISTOP_SET_CELLSTYLE_CB)
         {
             WItemSource* s = (WItemSource*)this._listMakeSrc(h);
             if (s.styleBox != 0u && s.styleBox != payload) __uiFreeListStyleBox(s.styleBox);
             s.styleBox = payload;
+            this._listRefreshRows(h);
         }
         else if (op == LISTOP_SET_SELECT_MODE)
         {
@@ -2392,9 +2899,8 @@ class WinUI3Host : INativeHost
         }
         else if (k == ELEM_LIST)
         {
-            // One-time ListView setup: the columns (they become the joined row string), the
-            // select mode, and the boxed rowText callback (it captures the component, so it
-            // reads live state) - the item source XAML pulls realized rows out of.
+            // One-time ListView setup: live header/cell columns, selection mode, and the boxed
+            // callbacks captured by the virtual source and queried as containers are realized.
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_RESET_COLUMNS, 0, 0, "", 0u);
             int ci = 0;
@@ -2548,7 +3054,13 @@ class WinUI3Host : INativeHost
     {
         // The item source owns its rowText box, and XAML still holds a ref while the control is
         // bound - so unbind first, then drop the host's ref (that is the final one).
+        while (this.listVisualH.count() > 0)
+        {
+            u64 h = this.listVisualH.get(0);
+            this._listDropVisual(h);
+        }
         while (this.listH.count() > 0) { u64 h = this.listH.get(0); this._listDropSrc(h); }
+        this.listVisualTeardownClean = this.listVisualH.count() == 0 && this.listVisuals.count() == 0;
         int i = 0;
         while (i < this.treeBoxV.count()) { u64 b = this.treeBoxV.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; }
         this.treeBoxH.clear(); this.treeBoxV.clear();
@@ -2707,6 +3219,24 @@ void routeWinuiListSelect(string key)
     if (lv == nullptr) return;
     int sel = _winuiListSel(_wCtx.nativeHandle(key));
     if (sel >= 0 && sel != lv.selectedIndex) { lv.fireSelect(sel); pumpWinui(); }
+}
+
+void routeWinuiListContainer(string key, void* args)
+{
+    u64 h = _wCtx.nativeHandle(key);
+    if (h != 0u) _wHost._listContainerChanged(h, args);
+}
+
+void routeWinuiListHeader(string key, int column)
+{
+    IElement e = winuiElem(key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv != nullptr && column >= 0 && column < lv.columns.count())
+    {
+        lv.fireHeaderClick(column);
+        pumpWinui();
+    }
 }
 
 void routeWinuiListActivate(string key)
@@ -3455,8 +3985,8 @@ void winuiForceLayout()
     if (_gRootElem != nullptr) ((XamlUIElement*)_gRootElem)->lpVtbl->UpdateLayout(_gRootElem);
 }
 
-// Headless init: framework only, then run the self-test body synchronously. Exit is DEFERRED
-// until the root canvas raises Loaded - which fires only after the mounted tree has entered the
+// Headless init: create the framework, then defer the self-test and exit until the root raises
+// Loaded - which fires only after the mounted tree has entered the
 // live window and each control has applied its ControlTemplate (a bad theme resource failfasts
 // 0xC000027B during that template application, before Loaded). A synchronous UpdateLayout or a
 // burst of same-frame dispatcher hops both return before the window's first real layout pass, so
@@ -3465,20 +3995,34 @@ void winuiHeadlessInit(void* params)
 {
     _wHost.headlessTimers = true;
     winuiInitFramework();
-    if (_wHasSelfBody) _wSelfRc = _wSelfBody();
-    if (_wHost.teardownPending)
-    {
-        winuiExit();
-        return;
-    }
     if (_gRootFe != nullptr)
     {
         void* h = winrtDelegate(XamlRoutedEventHandler,
-            (void* s, void* a) => { winuiForceLayout(); winuiExit(); });
+            (void* s, void* a) =>
+            {
+                if (_wHasSelfBody)
+                {
+                    _wSelfRunning = true;
+                    _wSelfRc = _wSelfBody();
+                    _wSelfRunning = false;
+                }
+                if (_wHost.teardownPending)
+                {
+                    _wHost.teardownPending = false;
+                    _winuiFinishTeardown();
+                }
+                winuiForceLayout();
+                winuiExit();
+            });
         u64 tok = 0;
         ((XamlFrameworkElement*)_gRootFe)->lpVtbl->add_Loaded(_gRootFe, h, &tok);
+        wrelease(h);
     }
-    else winuiExit();
+    else
+    {
+        if (_wHasSelfBody) _wSelfRc = _wSelfBody();
+        winuiExit();
+    }
 }
 
 // Exit the XAML pump (ends Application.Start).
@@ -3505,6 +4049,7 @@ void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 {
     _wApp = app; _wW = w; _wH = h;
     buildWinuiTree();
+    winuiForceLayout();
 }
 
 // Bring up the whole WinUI 3 app for `app` (live). Blocks in the XAML pump until winuiExit().
@@ -3562,30 +4107,39 @@ void nativeTeardownForTest()
 {
     // XAML must not be torn down from inside a DispatcherQueue callback. Mark the
     // request and let the timer runner finish the active closure first.
-    if (_wHost.timerDispatching) { _wHost.teardownPending = true; return; }
+    if (_wHost.timerDispatching || _wSelfRunning) { _wHost.teardownPending = true; return; }
     _winuiFinishTeardown();
 }
 
 // -- UIA drivers (kept for winui_demo's Automation-peer self-test) -------------
-bool winuiUiaInvoke(string key)
+bool _winuiUiaInvokeHandle(u64 h)
 {
-    u64 h = _wCtx.nativeHandle(key);
     if (h == 0u) return false;
     void* elem = wqi((void*)h, iidof(XamlUIElement));
     if (elem == nullptr) return false;
     XamlPeerStatics* ps = nullptr;
     activationFactory("Microsoft.UI.Xaml.Automation.Peers.FrameworkElementAutomationPeer",
         iidof(XamlPeerStatics), (void**)&ps);
-    if (ps == nullptr) return false;
+    if (ps == nullptr) { wrelease(elem); return false; }
     void* peer = nullptr;
     ps->lpVtbl->CreatePeerForElement(ps, elem, &peer);
-    if (peer == nullptr) return false;
+    if (peer == nullptr) { wrelease((void*)ps); wrelease(elem); return false; }
     void* pat = nullptr;
     ((XamlAutomationPeer*)peer)->lpVtbl->GetPattern(peer, 0, &pat);   // Invoke = 0
     void* inv = wqi(pat, iidof(XamlInvokeProvider));
-    if (inv == nullptr) return false;
-    ((XamlInvokeProvider*)inv)->lpVtbl->Invoke(inv);
-    return true;
+    bool invoked = inv != nullptr;
+    if (invoked) ((XamlInvokeProvider*)inv)->lpVtbl->Invoke(inv);
+    wrelease(inv);
+    wrelease(pat);
+    wrelease(peer);
+    wrelease((void*)ps);
+    wrelease(elem);
+    return invoked;
+}
+
+bool winuiUiaInvoke(string key)
+{
+    return _winuiUiaInvokeHandle(_wCtx.nativeHandle(key));
 }
 
 bool winuiUiaToggle(string key)
@@ -3773,8 +4327,7 @@ int nativeListRowCount(string keyPath)
     ((XamlBindableVector*)src)->lpVtbl->get_Size(src, &n);
     return (int)n;
 }
-// The cell the control would display at (row, col): the row string XAML pulls out of the bound
-// source is the COLUMNS JOINED, so the cell is read from the same source, one column at a time.
+// Read the same callback-backed cell that the realized TextBlock uses.
 string nativeListCellText(string keyPath, int row, int col)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
@@ -3786,33 +4339,197 @@ string nativeListCellText(string keyPath, int row, int col)
 int nativeListIconCacheCount(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
-    if (h == 0u) return 0;
-    WItemSource* src = _wHost._listLiveSrc(h);
-    return src != nullptr ? src.iconCacheCount : 0;
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    return st != nullptr ? st.iconIds.count() : 0;
 }
 int nativeListIconResolve(string keyPath, int row)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return -1;
     WItemSource* src = _wHost._listLiveSrc(h);
-    return src != nullptr ? _wsIconSlot(src, row) : -1;
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (src == nullptr || st == nullptr) return -1;
+    ListRowIcon icon = default;
+    u64 source = _wHost._listIconSource(st, src, row, &icon);
+    return source != 0u ? _wHost._listIconSlot(st, icon) : -1;
 }
 u64 nativeListIconRevision(string keyPath, int row)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return 0u;
-    WItemSource* src = _wHost._listLiveSrc(h);
-    if (src == nullptr) return 0u;
-    int slot = _wsIconSlot(src, row);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (st == nullptr) return 0u;
+    int slot = nativeListIconResolve(keyPath, row);
     if (slot < 0) return 0u;
-    return src.iconCacheRevisions[slot];
+    return st.iconRevisions.get(slot);
 }
 void nativeListIconResetForTest(string keyPath)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     if (h == 0u) return;
     WItemSource* src = _wHost._listLiveSrc(h);
-    if (src != nullptr) { if (src.iconBox != 0u) __uiFreeListIconBox(src.iconBox); src.iconBox = 0u; src.iconCacheCount = 0; }
+    if (src != nullptr)
+    {
+        if (src.iconBox != 0u) __uiFreeListIconBox(src.iconBox);
+        src.iconBox = 0u;
+        _wHost._listClearIconCache(_wHost._listVisualFor(h));
+        _wHost._listRefreshRows(h);
+    }
+}
+
+alias WinuiListRowVisual* _winuiListRealizedVisual(string keyPath, int row)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (st == nullptr) return nullptr;
+    int i = 0;
+    while (i < st.rows.count())
+    {
+        WinuiListRowVisual* visual = st.rows.get(i);
+        if (visual != nullptr && visual.row == row) return visual;
+        i++;
+    }
+    return nullptr;
+}
+
+bool nativeListVisualExpected() { return true; }
+
+int nativeListRealizeRow(string keyPath, int row)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WItemSource* src = _wHost._listLiveSrc(h);
+    if (h == 0u || src == nullptr || row < 0 || row >= src.rowCount) return -1;
+    void* itemsControl = wqi((void*)h, iidof(XamlItemsControl));
+    void* items = nullptr;
+    if (itemsControl != nullptr)
+        ((XamlItemsControl*)itemsControl)->lpVtbl->get_Items(itemsControl, &items);
+    void* vector = wqi(items, iidof(XamlObjectVector));
+    void* item = nullptr;
+    if (vector != nullptr) ((XamlObjectVector*)vector)->lpVtbl->GetAt(vector, (u32)row, &item);
+    void* listBase = wqi((void*)h, iidof(XamlListViewBase));
+    if (listBase != nullptr && item != nullptr)
+        ((XamlListViewBase*)listBase)->lpVtbl->ScrollIntoView(listBase, item);
+    winuiForceLayout();
+    void* mapping = wqi((void*)h, iidof(XamlItemContainerMapping));
+    void* container = nullptr;
+    if (mapping != nullptr)
+        ((XamlItemContainerMapping*)mapping)->lpVtbl->ContainerFromIndex(mapping, row, &container);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    bool attached = false;
+    if (container != nullptr && st != nullptr)
+    {
+        u64 key = _wHost._listObjectKey(container);
+        int at = _wHost._listRowSlot(st, key);
+        WinuiListRowVisual* realized = at >= 0 ? st.rows.get(at) : nullptr;
+        void* cc = wqi(container, iidof(XamlContentControl));
+        void* content = nullptr;
+        if (cc != nullptr) ((XamlContentControl*)cc)->lpVtbl->get_Content(cc, &content);
+        attached = realized != nullptr && realized.row == row
+            && _wHost._listObjectKey(content) == _wHost._listObjectKey((void*)realized.root);
+        wrelease(content);
+        wrelease(cc);
+    }
+    wrelease(container);
+    wrelease(mapping);
+    wrelease(listBase);
+    wrelease(item);
+    wrelease(vector);
+    wrelease(items);
+    wrelease(itemsControl);
+    return attached ? row : -1;
+}
+
+void nativeListReload(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WItemSource* src = _wHost._listLiveSrc(h);
+    if (h == 0u || src == nullptr) return;
+    _wHost._listBind(h, (u64)src);
+    winuiForceLayout();
+    _wHost._listRefreshRows(h);
+}
+
+bool nativeListHeaderAttached(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (st == nullptr || st.header == 0u || st.headerButtons.count() == 0) return false;
+    void* listBase = wqi((void*)h, iidof(XamlListViewBase));
+    void* header = nullptr;
+    if (listBase != nullptr) ((XamlListViewBase*)listBase)->lpVtbl->get_Header(listBase, &header);
+    bool attached = _wHost._listObjectKey(header) == _wHost._listObjectKey((void*)st.header);
+    wrelease(header);
+    wrelease(listBase);
+    return attached;
+}
+
+bool nativeListInvokeHeader(string keyPath, int column)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (st == nullptr || column < 0 || column >= st.headerButtons.count()) return false;
+    if (!nativeListHeaderAttached(keyPath)) return false;
+    return _winuiUiaInvokeHandle(st.headerButtons.get(column));
+}
+
+bool nativeListRealizedCellBrush(string keyPath, int row, int column)
+{
+    WinuiListRowVisual* visual = _winuiListRealizedVisual(keyPath, row);
+    if (visual == nullptr || column < 0 || column >= visual.cells.count()) return false;
+    void* text = wqi((void*)visual.cells.get(column), iidof(XamlTextBlock));
+    void* brush = nullptr;
+    if (text != nullptr) ((XamlTextBlock*)text)->lpVtbl->get_Foreground(text, &brush);
+    bool applied = brush != nullptr && visual.brushesApplied.get(column);
+    wrelease(brush);
+    wrelease(text);
+    return applied;
+}
+
+int nativeListRealizedCellColor(string keyPath, int row, int column)
+{
+    WinuiListRowVisual* visual = _winuiListRealizedVisual(keyPath, row);
+    if (visual == nullptr || column < 0 || column >= visual.colors.count()) return 0;
+    return visual.colors.get(column);
+}
+
+bool nativeListRealizedIcon(string keyPath, int row)
+{
+    WinuiListRowVisual* visual = _winuiListRealizedVisual(keyPath, row);
+    if (visual == nullptr || !visual.iconApplied) return false;
+    void* image = wqi((void*)visual.image, iidof(XamlImage));
+    void* source = nullptr;
+    if (image != nullptr) ((XamlImage*)image)->lpVtbl->get_Source(image, &source);
+    bool applied = source != nullptr;
+    wrelease(source);
+    wrelease(image);
+    return applied;
+}
+
+u64 nativeListRealizedIconRevision(string keyPath, int row)
+{
+    WinuiListRowVisual* visual = _winuiListRealizedVisual(keyPath, row);
+    return visual != nullptr && visual.iconApplied ? visual.iconRevision : 0u;
+}
+
+int nativeListVisualResourceCount(string keyPath)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    WinuiListVisualState* st = _wHost._listVisualFor(h);
+    if (st == nullptr) return 0;
+    int cached = st.iconIds.count();
+    return 1 + st.headerButtons.count() + st.rows.count() + st.brushes.count() + cached;
+}
+
+int nativeListContainerReuseCount(string keyPath)
+{
+    WinuiListVisualState* st = _wHost._listVisualFor(_wCtx.nativeHandle(keyPath));
+    return st != nullptr ? st.reuseCount : 0;
+}
+
+bool nativeListVisualTeardownClean()
+{
+    return _wHost.listVisualTeardownClean && _wHost.listVisualH.count() == 0
+        && _wHost.listVisuals.count() == 0;
 }
 void nativeListSelect(string keyPath, int row)
 {
@@ -3852,7 +4569,8 @@ int nativeListCellColor(string keyPath, int row, int col)
 {
     WItemSource* src = _wHost._listLiveSrc(_wCtx.nativeHandle(keyPath));
     if (src == nullptr) return 0;
-    return resolveListCellColor(__uiListCellStyle(src.styleBox, row, col), _wCtx.theme);
+    return resolveListCellColor(__uiListCellStyle(src.styleBox, row, col), _wCtx.theme,
+                                _wCtx.systemPrefersDark());
 }
 
 // -- Tab drivers (read back off the live TabView) -------------------------------

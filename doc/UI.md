@@ -215,9 +215,9 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   `listCellRole(LIST_ROLE_TEXT|MUTED|SUCCESS|WARNING|ERROR)`, or
   `listCellLiteral(color)`. Literal black is valid because presence is tagged; it is
   not inferred from integer zero. Semantic roles resolve through the current `Theme`.
-  Win32 and Cocoa apply the resolved role/literal to realized native cells. WinUI
-  currently resolves and retains the style for its deterministic driver, but its
-  one-string default item template does not yet paint a per-cell foreground.
+  Win32, Cocoa, and WinUI apply the resolved role/literal to realized native cells.
+  WinUI resolves semantic roles against the active theme and system appearance, and
+  applies literal black as an explicit opaque brush rather than treating zero as absent.
 
 All layout dimensions and column widths are shared integer cells, not DIPs. The
 public `colWidths` field is retained for source compatibility; `addColumn` uses
@@ -228,8 +228,8 @@ the clearer `widthCells` parameter name. Likewise, native `setFrame` and
 item source, so the `INativeHost` interface gained ONE op-coded call:
 `setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)`, with the
 `LISTOP_*` codes (RESET_COLUMNS / ADD_COLUMN / SET_ROWCOUNT / SET_ROWTEXT_CB /
-SET_SELECT_MODE / SET_SELECTION / INVALIDATE / SET_ROWICON_CB). The op set is the deliberate common
-denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ItemsView` (see the
+SET_SELECT_MODE / SET_SELECTION / INVALIDATE / SET_ROWICON_CB / SET_CELLSTYLE_CB). The op set is the deliberate common
+denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ListView` (see the
 design block above the method in `ui_native.cb`). The `rowText` callback rides as an
 opaque `u64` (a ui.cb `ListRowBox*`, invoked via `__uiListRowText`) so no `Lambda` type
 crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost (real `NSTableView`
@@ -239,17 +239,16 @@ see the parity matrix.
 
 `LISTOP_SET_CELLSTYLE_CB` carries the opaque `ListCellStyle` callback box. Hosts query
 only realized cells and release the box with the control; no native handle, brush, or
-image resource enters the public UI model. WinUI's current implementation is a
-resolution/readback seam until its item template can apply the color visibly.
+image resource enters the public UI model. WinUI applies a host-owned brush to each
+realized TextBlock and refreshes it when a recycled container is rebound.
 
 `LISTOP_SET_ROWICON_CB` carries the opaque `ListIconBox` callback. Win32 resolves
 realized icons into a host-owned small image list (`LVIF_IMAGE`); Cocoa resolves them
-on each reused `NSTextFieldCell` and sets its copied `NSImage`; WinUI's current stock
-virtualized item path uses a bounded identity marker (`[id]`) and retains only the
-portable descriptor, with no per-row native object. Missing icons use the text-only
-item. Replacing a callback or reloading a source drops the old box and cache before
-binding the new source; teardown releases all host resources. A future WinUI template
-can promote the cached pixels to an `Image` without changing this public contract.
+on each reused `NSTextFieldCell` and sets its copied `NSImage`; WinUI resolves each
+realized or reused row into a host-owned `WriteableBitmap` and displays it in the
+container's `Image`. Its per-list dynamic identity cache replaces a source in place
+when revision, dimensions, or pixels change and has no fixed identity ceiling. Missing
+or invalid icons leave the row Image hidden. Reload and teardown release all host resources.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a ICanvas fallback and a headless
 self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is
@@ -1129,7 +1128,7 @@ drivers read their answers back out of the control - an empty control cannot pas
 | ProgressBar  | Y msctls_progress32       | Y NSProgressIndicator     | Y ProgressBar (IRangeBase)          |
 | Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
 | ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
-| ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y ListView, virtualized ItemsSource |
+| ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
 | TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
 | TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView + TreeViewNodes (lazy)   |
 | SplitView    | layout container          | layout container          | layout container                    |
@@ -1150,12 +1149,6 @@ Deliberate WinUI 3 gaps in this release, all documented and non-silent:
   owned + freed, but never invoked on WinUI.
 - **GroupBox** renders as a header label rather than a titled frame (a look difference; the title
   text is what the self-test reads).
-- **ListView columns** collapse into ONE joined row string: a XAML ListView item is a single
-  object, so there is no column header row (the `rowText(row, col)` callback is still called
-  per column, and `nativeListCellText` reads a single cell back out of the bound source).
-- **ListView header and cell styling** are not yet native on WinUI: `nativeListHeaderClick`
-  and `nativeListCellColor` are deterministic host-neutral drivers/readbacks, not proof of a
-  user header click or visible XAML foreground. The active issue files track these two gaps.
 - **Multi-window** is single-window (mirrors the Cocoa decision); the gallery gate needs one window.
 - **tooltip** prop is not wired to `ToolTipService` yet (no self-test covers it on WinUI).
 

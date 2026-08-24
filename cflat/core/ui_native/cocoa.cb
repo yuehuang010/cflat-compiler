@@ -2920,6 +2920,18 @@ int nativeListCellColor(string keyPath, int row, int col)
     return resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)curWin()._tableOf(h)), row, col), curWin().ctx.theme);
 }
 
+bool nativeListVisualExpected() { return false; }
+bool nativeListHeaderAttached(string keyPath) { return false; }
+bool nativeListInvokeHeader(string keyPath, int column) { return false; }
+int nativeListRealizeRow(string keyPath, int row) { return -1; }
+void nativeListReload(string keyPath) {}
+bool nativeListRealizedCellBrush(string keyPath, int row, int column) { return false; }
+int nativeListRealizedCellColor(string keyPath, int row, int column) { return 0; }
+bool nativeListRealizedIcon(string keyPath, int row) { return false; }
+u64 nativeListRealizedIconRevision(string keyPath, int row) { return 0u; }
+int nativeListVisualResourceCount(string keyPath) { return 0; }
+int nativeListContainerReuseCount(string keyPath) { return 0; }
+
 // -- Host-neutral form/data test drivers (mirror the Win32 names) ---------------
 void nativeClickButton(string keyPath)
 {

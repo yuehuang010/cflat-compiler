@@ -97,6 +97,15 @@ class GalleryApp : IComponent
     ListRowIcon iconForRow(int r)
     {
         this.rowIconCalls = this.rowIconCalls + 1;
+        if (r == 60000) return listIconRevision("cache0", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60001) return listIconRevision("cache1", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60002) return listIconRevision("cache2", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60003) return listIconRevision("cache3", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60004) return listIconRevision("cache4", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60005) return listIconRevision("cache5", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60006) return listIconRevision("cache6", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60007) return listIconRevision("cache7", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+        if (r == 60008) return listIconRevision("cache8", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
         if (r % 3 == 2) return noListIcon();
         return r % 2 == 0
             ? listIconRevision("ok", this.imgPixels, this.imgW, this.imgH, this.iconRevision)
@@ -787,6 +796,20 @@ int gallerySelfTest()
             && warnSlot != okSlot && warnAgain == warnSlot
             && nativeListIconCacheCount("root/content/cardlist/list") == 2);
         u64 cachedBefore = nativeListIconRevision("root/content/cardlist/list", 50004);
+        bool winuiVisual = nativeListVisualExpected();
+        u64 realizedRevisionBefore = 0u;
+        if (winuiVisual)
+        {
+            t.expectTrue("WinUI ListView header is attached",
+                nativeListHeaderAttached("root/content/cardlist/list"));
+            t.expectInt("WinUI realizes a far ListView row", 50004,
+                nativeListRealizeRow("root/content/cardlist/list", 50004));
+            realizedRevisionBefore = nativeListRealizedIconRevision(
+                "root/content/cardlist/list", 50004);
+            t.expectTrue("WinUI realized row icon source",
+                nativeListRealizedIcon("root/content/cardlist/list", 50004)
+                && realizedRevisionBefore == 1u);
+        }
         u64 oldRevision = iconEven.revision;
         if (g != nullptr) g.mutateIconForTest();
         ListRowIcon replaced = g != nullptr ? g.iconForRow(50004) : noListIcon();
@@ -796,9 +819,41 @@ int gallerySelfTest()
         u64 cachedAfter = nativeListIconRevision("root/content/cardlist/list", 50004);
         t.expectTrue("row icon native revision replacement", okReplaced == okSlot
             && cachedBefore == 1u && cachedAfter == 2u && cachedAfter != cachedBefore);
+        if (winuiVisual)
+        {
+            nativeListReload("root/content/cardlist/list");
+            int replacedRow = nativeListRealizeRow("root/content/cardlist/list", 50004);
+            u64 realizedRevisionAfter = nativeListRealizedIconRevision(
+                "root/content/cardlist/list", 50004);
+            t.expectTrue("WinUI replaces a cached icon revision in place",
+                replacedRow == 50004 && nativeListRealizedIcon("root/content/cardlist/list", 50004)
+                && realizedRevisionBefore == 1u && realizedRevisionAfter == 2u);
+        }
         int invalidSlot = nativeListIconResolve("root/content/cardlist/list", 50000);
         t.expectTrue("row icon native omission", invalidSlot < 0
             && nativeListIconCacheCount("root/content/cardlist/list") == 2);
+        if (winuiVisual)
+        {
+            int missingRow = nativeListRealizeRow("root/content/cardlist/list", 50000);
+            int backAtTop = nativeListRealizeRow("root/content/cardlist/list", 0);
+            int resources = nativeListVisualResourceCount("root/content/cardlist/list");
+            t.expectTrue("WinUI omits invalid realized row icons",
+                missingRow == 50000 && !nativeListRealizedIcon("root/content/cardlist/list", 50000));
+            t.expectTrue("WinUI scrolls and reuses ListView containers",
+                backAtTop == 0 && nativeListContainerReuseCount("root/content/cardlist/list") > 0);
+            t.expectTrue("WinUI ListView resources stay viewport-bounded",
+                resources > 0 && resources < 64);
+            int distinctIcons = 0;
+            int iconProbeRow = 60000;
+            while (iconProbeRow <= 60008)
+            {
+                if (nativeListIconResolve("root/content/cardlist/list", iconProbeRow) >= 0)
+                    distinctIcons++;
+                iconProbeRow++;
+            }
+            t.expectTrue("WinUI icon cache has no fixed eight-identity ceiling",
+                distinctIcons == 9 && nativeListIconCacheCount("root/content/cardlist/list") == 11);
+        }
         nativeListIconResetForTest("root/content/cardlist/list");
         t.expectTrue("row icon teardown cache", nativeListIconCacheCount("root/content/cardlist/list") == 0
             && nativeListIconResolve("root/content/cardlist/list", 50004) < 0);
@@ -817,12 +872,25 @@ int gallerySelfTest()
 
         // Header input is distinct from row selection/activation, and style is virtual:
         // one row/cell can resolve a semantic role or explicit literal black on demand.
-        nativeListHeaderClick("root/content/cardlist/list", 1);
+        if (winuiVisual) nativeListInvokeHeader("root/content/cardlist/list", 1);
+        else nativeListHeaderClick("root/content/cardlist/list", 1);
         t.expectTrue("list header callback", g != nullptr && g.listHeader == 1 && g.listSel == 5);
         int listErrorColor = nativeListCellColor("root/content/cardlist/list", 50000, 1);
         t.expectTrue("list cell styles", galleryHasThemeListError(listErrorColor));
         t.expectTrue("list literal black is present", galleryHasBlack(
             nativeListCellColor("root/content/cardlist/list", 50000, 0)));
+        if (winuiVisual)
+        {
+            int styledRow = nativeListRealizeRow("root/content/cardlist/list", 50000);
+            t.expectTrue("WinUI applies semantic cell foreground",
+                styledRow == 50000
+                && nativeListRealizedCellBrush("root/content/cardlist/list", 50000, 1)
+                && nativeListRealizedCellColor("root/content/cardlist/list", 50000, 1) == listErrorColor);
+            t.expectTrue("WinUI applies literal black foreground",
+                nativeListRealizedCellBrush("root/content/cardlist/list", 50000, 0)
+                && galleryHasBlack(nativeListRealizedCellColor(
+                    "root/content/cardlist/list", 50000, 0)));
+        }
 
         // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
         t.expectTrue("tabs init",
