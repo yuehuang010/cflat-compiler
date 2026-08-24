@@ -504,9 +504,9 @@ bool nativeMappable(int kind)
 // The style.backgroundColor of a plain (non-mapped) container - a View from view/row/
 // column - or 0 for anything else. A non-zero value opts the container into a painted
 // backdrop panel behind its children (Box maps to a real control, so it is excluded).
-int _containerBg(IElement node)
+int _containerBg(IElement node, Theme theme, bool systemDark)
 {
-    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return v.style.backgroundColor; }
+    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return resolveColor(v.style.backgroundColor, theme, systemDark); }
     return 0;
 }
 
@@ -567,6 +567,7 @@ class Window : INativeHost
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
     u32   dpi     = 96u;             // monitor density (96 = 100%); drives cell->px
     bool  dark    = false;           // last applied theme was dark (titlebar/bg)
+    Theme appTheme = default;        // last theme, retained for tagged text overrides
     bool  themed  = false;           // the app set colors (a monochrome theme = native look)
     // The common controls (ListView/TreeView/TabControl/ProgressBar/scrollbar) currently carry
     // the DARK theming; ctlEverDark stays true once set. Until a dark theme is applied ONCE, a
@@ -887,18 +888,19 @@ class Window : INativeHost
     void _setTextAppearance(u64 h, IText t)
     {
         void* f = this.fontFor(t.font);
-        u32 ink = t.color != 0 ? this.colorRef(t.color)
+        int explicitColor = resolveColor(t.color, this.appTheme, this.dark);
+        u32 ink = colorIsSet(t.color) ? this.colorRef(explicitColor)
             : (t.font == 3 ? this.captionInk() : this.themeText);
         int i = 0;
         while (i < this.textHandles.count())
         {
             if (this.textHandles.get(i) == h)
             {
-                if (this.textFonts.get(i) == t.font && this.textColors.get(i) == t.color
+                if (this.textFonts.get(i) == t.font && this.textColors.get(i) == explicitColor
                     && this.textInks.get(i) == ink) return;
                 if (f != nullptr) SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)f, (i64)1);
                 this.textFonts.set(i, t.font);
-                this.textColors.set(i, t.color);
+                this.textColors.set(i, explicitColor);
                 this.textInks.set(i, ink);
                 InvalidateRect(u2h(h), nullptr, 1);
                 return;
@@ -908,7 +910,7 @@ class Window : INativeHost
         if (f != nullptr) SendMessageA(u2h(h), (u32)WM_SETFONT, (u64)f, (i64)1);
         this.textHandles.add(h);
         this.textFonts.add(t.font);
-        this.textColors.add(t.color);
+        this.textColors.add(explicitColor);
         this.textInks.add(ink);
     }
 
@@ -2162,12 +2164,12 @@ class Window : INativeHost
                 fw.add(b.w * this.dipX()); fh.add(fhpx);
             }
         }
-        else if (_containerBg(node) != 0)
+        else if (_containerBg(node, ctx.theme, ctx.systemPrefersDark()) != 0)
         {
             // A plain container with a fill gets a painted backdrop panel (keyed by the
             // container's OWN path) behind its children; it recurses into children below
             // like any container, and rides the same create/reuse/destroy/position pass.
-            int bg = _containerBg(node);
+            int bg = _containerBg(node, ctx.theme, ctx.systemPrefersDark());
             u64 h = ctx.nativeHandle(path);
             if (h == 0u)
             {
@@ -2769,9 +2771,12 @@ class Window : INativeHost
     // change (setText/setBoolProp), and a CanvasView is invalidated by update().
     void applyTheme(IUiContext ctx)
     {
-        int panel = pickColor(ctx.theme.panelBg, 0);
-        int text  = pickColor(ctx.theme.textColor, 0);
-        bool isDark = themeIsDark(&ctx.theme);
+        this.appTheme = ctx.theme;
+        int panel = pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BG), ctx.theme,
+                              ctx.systemPrefersDark());
+        int text  = pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme,
+                              ctx.systemPrefersDark());
+        bool isDark = themeIsDark(&ctx.theme, ctx.systemPrefersDark());
         bool changed = false;
 
         if (isDark != this.dark || this.bgBrush == nullptr)
@@ -2805,12 +2810,16 @@ class Window : INativeHost
         this.themeText = fg;
         // The data controls (ListView/TreeView) get their own body slot so a row does not melt
         // into the card behind it; the ProgressBar takes the trough/accent pair.
-        int field  = pickColor(ctx.theme.inputBg, panel);
-        int fieldT = pickColor(ctx.theme.inputText, text);
+        int field  = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_BG), ctx.theme,
+                               ctx.systemPrefersDark());
+        int fieldT = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_TEXT), ctx.theme,
+                               ctx.systemPrefersDark());
         this.themeField     = field  != 0 ? this.colorRef(field)  : bg;
         this.themeFieldText = fieldT != 0 ? this.colorRef(fieldT) : fg;
-        this.themeTrack  = this.colorRef(pickColor(ctx.theme.track, panel));
-        this.themeAccent = this.colorRef(pickColor(ctx.theme.accent, text));
+        this.themeTrack  = this.colorRef(pickColor(colorUnset(), colorRole(THEME_ROLE_TRACK),
+                                                   ctx.theme, ctx.systemPrefersDark()));
+        this.themeAccent = this.colorRef(pickColor(colorUnset(), colorRole(THEME_ROLE_ACCENT),
+                                                   ctx.theme, ctx.systemPrefersDark()));
 
         // Only on a real theme change: the common controls that ignore WM_CTLCOLOR* are
         // re-themed here, never per pump - that churn would flicker. RDW_ALLCHILDREN is required
@@ -3831,9 +3840,9 @@ void hostDrainPosted()
 
 // A Theme is "dark" when its panel background is darker than mid-gray. A default
 // (monochrome, all-zero) theme is treated as light.
-bool themeIsDark(Theme* t)
+bool themeIsDark(Theme* t, bool systemDark)
 {
-    int c = t.panelBg;
+    int c = resolveColor(resolveThemeRole(*t, THEME_ROLE_PANEL_BG, systemDark), *t, systemDark);
     if (c == 0) return false;
     int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
     return (r + g + b) < 384;
@@ -4313,7 +4322,8 @@ int nativeContainerBg(string keyPath)
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) return 0;
     IView v = e as IView;
-    if (v != nullptr) return v.style.backgroundColor;
+    if (v != nullptr) return resolveColor(v.style.backgroundColor, wnd.ctx.theme,
+                                           wnd.ctx.systemPrefersDark());
     return 0;
 }
 

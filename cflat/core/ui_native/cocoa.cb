@@ -109,9 +109,9 @@ bool nativeMappable(int kind)
 // The style.backgroundColor of a plain (non-mapped) container - a View from
 // view/row/column - or 0 for anything else. A non-zero value opts the container into
 // a painted backdrop panel (Box already maps to a native NSBox, so it is excluded).
-int _containerBg(IElement node)
+int _containerBg(IElement node, Theme theme, bool systemDark)
 {
-    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return v.style.backgroundColor; }
+    if (node.kind() == ELEM_VIEW) { IView v = node as IView; return resolveColor(v.style.backgroundColor, theme, systemDark); }
     return 0;
 }
 
@@ -1073,8 +1073,9 @@ class CocoaHost : INativeHost
         void* ctrl = u2h(h);
         void* f = this._fontFor(t.font);
         if (f != nullptr) msg1(ctrl, "setFont:", f);
-        if (t.color != 0)
-            msg1(ctrl, "setTextColor:", this.colorFor(t.color));
+        if (colorIsSet(t.color))
+            msg1(ctrl, "setTextColor:", this.colorFor(resolveColor(t.color, this.ctx.theme,
+                                                                    this.ctx.systemPrefersDark())));
         else if (t.font == FONT_CAPTION)
             msg1(ctrl, "setTextColor:", msg0(cls("NSColor"), "secondaryLabelColor"));
         else
@@ -1113,7 +1114,9 @@ class CocoaHost : INativeHost
         void* col = this.colorFor(bg);
         void* cg = col != nullptr ? msg0(col, "CGColor") : nullptr;
         msg1(layer, "setBackgroundColor:", cg);
-        int pb = this.ctx.theme.panelBorder;
+        int pb = resolveColor(resolveThemeRole(this.ctx.theme, THEME_ROLE_PANEL_BORDER,
+                                               this.ctx.systemPrefersDark()), this.ctx.theme,
+                              this.ctx.systemPrefersDark());
         if (pb != 0)
         {
             void* bc = this.colorFor(pb);
@@ -1450,12 +1453,12 @@ class CocoaHost : INativeHost
             // Parent-relative frame: absolute cell frame minus the enclosing scroll origin.
             fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
         }
-        else if (_containerBg(node) != 0)
+        else if (_containerBg(node, ctx.theme, ctx.systemPrefersDark()) != 0)
         {
             // A plain container with a fill gets a painted backdrop panel (keyed by the
             // container's path) behind its children; it recurses into children below like
             // any container, and rides the same create/reuse/destroy/reposition reconcile.
-            int bg = _containerBg(node);
+            int bg = _containerBg(node, ctx.theme, ctx.systemPrefersDark());
             u64 h = ctx.nativeHandle(path);
             if (h != 0u && parentView != 0u && msg0(u2h(h), "superview") != u2h(parentView))
             {
@@ -1731,7 +1734,7 @@ class CocoaHost : INativeHost
     // monochrome-default behavior.
     void applyTheme(IUiContext ctx)
     {
-        bool isDark = themeIsDark(&ctx.theme);
+        bool isDark = themeIsDark(&ctx.theme, ctx.systemPrefersDark());
         this.dark = isDark;
         if (this.window != nullptr)
         {
@@ -1859,9 +1862,9 @@ void destroyWindowStateAt(int idx, bool sendClose)
 
 // A Theme is "dark" when its panel background is darker than mid-gray. A default
 // (monochrome, all-zero) theme is treated as light.
-bool themeIsDark(Theme* t)
+bool themeIsDark(Theme* t, bool systemDark)
 {
-    int c = t.panelBg;
+    int c = resolveColor(resolveThemeRole(*t, THEME_ROLE_PANEL_BG, systemDark), *t, systemDark);
     if (c == 0) return false;
     int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
     return (r + g + b) < 384;
@@ -2716,7 +2719,8 @@ int nativeContainerBg(string keyPath)
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return 0;
     IView v = e as IView;
-    if (v != nullptr) return v.style.backgroundColor;
+    if (v != nullptr) return resolveColor(v.style.backgroundColor, wnd.ctx.theme,
+                                           wnd.ctx.systemPrefersDark());
     return 0;
 }
 

@@ -30,7 +30,7 @@ int hostWidth()  { return _gTermW; }
 int hostHeight() { return _gTermH; }
 
 // Convert a framework color to a Win32 COLORREF (0x00BBGGRR). The masks drop the
-// rgb() marker bit; COLOR_DEFAULT (0) maps to black, matching the monochrome host.
+// rgb() marker bit; an unresolved 0 maps to black, matching the monochrome host.
 u32 colorRef(int color)
 {
     int r = (color >> 16) & 0xFF;

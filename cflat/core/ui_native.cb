@@ -31,22 +31,53 @@ int WRAP_WRAP = 1;   // children that would overflow availW start a new line
 
 // Shared layout/style props. Plain value struct carried by host elements. Field
 // names track React Native (flexDirection); a typed struct, not an open bag.
-// COLOR_DEFAULT (0) means "no explicit color": the ICanvas falls back to its
-// monochrome default (black ink / black border / no fill), so a tree that sets no
-// colors renders exactly as it did before colors existed. 0 is deliberately the
-// sentinel because a default/zero-initialized struct field is then automatically
-// "unset" - the framework never depends on a -1 field initializer surviving (a
-// nested `Struct f = default;` field is zero-filled in CFlat, not initializer-run).
-//
-// Build explicit colors with rgb(): it packs 0xRRGGBB AND sets a high marker bit so
-// even pure black (rgb(0,0,0)) is non-zero and distinct from "unset". colorRef() in
-// the GDI host masks the marker off.
-int COLOR_DEFAULT = 0;
-int COLOR_SET_BIT = 0x1000000;   // marks an explicit color; masked off at draw time
+// Color is tagged so literal black (including numeric zero) is distinct from an
+// unset field. Hosts receive a marked integer only after resolution.
+int COLOR_UNSET = 0;
+int COLOR_LITERAL = 1;
+int COLOR_ROLE = 2;
+int COLOR_SET_BIT = 0x1000000;
+
+struct Color
+{
+    int kind = 0;       // COLOR_UNSET, COLOR_LITERAL, or COLOR_ROLE
+    int value = 0;      // raw 0xRRGGBB for literals, semantic role for roles
+};
+
+Color COLOR_DEFAULT = default; // compatibility alias for an unset Color
+
+Color colorUnset() { return default; }
+
+Color colorLiteral(int value)
+{
+    Color c = default;
+    c.kind = COLOR_LITERAL;
+    c.value = value & 0xFFFFFF;
+    return c;
+}
+
+Color colorRole(int role)
+{
+    Color c = default;
+    c.kind = COLOR_ROLE;
+    c.value = role;
+    return c;
+}
+
+bool colorIsSet(Color c) { return c.kind != COLOR_UNSET; }
+bool colorIsLiteral(Color c) { return c.kind == COLOR_LITERAL; }
+
+int colorRaw(Color c) { return c.value; }
+int colorPacked(Color c) { return colorIsSet(c) ? markColor(c.value) : 0; }
 
 int rgb(int r, int g, int b)
 {
     return COLOR_SET_BIT | ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF);
+}
+
+int markColor(int value)
+{
+    return rgb((value >> 16) & 0xFF, (value >> 8) & 0xFF, value & 0xFF);
 }
 
 int clampByte(int v)
@@ -85,8 +116,8 @@ struct Style
     int width = 0;
     int height = 0;
     int flexDirection = 0;          // DIR_COLUMN | DIR_ROW
-    int color = 0;                  // foreground (text / border); 0 = default
-    int backgroundColor = 0;        // fill; 0 = no fill
+    Color color = default;           // foreground (text / border)
+    Color backgroundColor = default; // fill
     int gap = 0;                    // cells of space between stacked children
     int flex = 0;                   // main-axis weight; 0 = intrinsic size (unset)
     int flexWrap = 0;               // WRAP_NONE | WRAP_WRAP (DIR_ROW only)
@@ -113,7 +144,7 @@ Style flexStyle(int flex)
 bool styleIsEmpty(Style s)
 {
     return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0
-        && s.color == 0 && s.backgroundColor == 0 && s.gap == 0 && s.flex == 0
+        && !colorIsSet(s.color) && !colorIsSet(s.backgroundColor) && s.gap == 0 && s.flex == 0
         && s.flexWrap == 0;
 }
 
@@ -121,7 +152,9 @@ bool styleEquals(Style a, Style b)
 {
     return a.padding == b.padding && a.width == b.width
         && a.height == b.height && a.flexDirection == b.flexDirection
-        && a.color == b.color && a.backgroundColor == b.backgroundColor
+        && a.color.kind == b.color.kind && a.color.value == b.color.value
+        && a.backgroundColor.kind == b.backgroundColor.kind
+        && a.backgroundColor.value == b.backgroundColor.value
         && a.gap == b.gap && a.flex == b.flex && a.flexWrap == b.flexWrap;
 }
 
@@ -131,8 +164,8 @@ string styleToJson(Style s)
          + ",\"width\":" + s.width.toString()
          + ",\"height\":" + s.height.toString()
          + ",\"flexDirection\":" + s.flexDirection.toString()
-         + ",\"color\":" + s.color.toString()
-         + ",\"backgroundColor\":" + s.backgroundColor.toString()
+         + ",\"color\":" + colorRaw(s.color).toString()
+         + ",\"backgroundColor\":" + colorRaw(s.backgroundColor).toString()
          + ",\"gap\":" + s.gap.toString()
          + ",\"flex\":" + s.flex.toString()
          + ",\"flexWrap\":" + s.flexWrap.toString() + "}";
@@ -327,7 +360,7 @@ void drawBorder(Surface* s, Rect b)
 // pushClip/popClip bound subsequent drawing to a rectangle (in cells). A
 // ScrollView pushes its viewport so off-viewport children are clipped; calls
 // nest (each push intersects with the active clip) and must be balanced.
-// color is 0xRRGGBB, or COLOR_DEFAULT (-1) for the backend's monochrome default.
+// color is a resolved marked 0xRRGGBB value, or 0 for the backend default.
 // A backend with no color (the TUI char grid) ignores it.
 interface ICanvas
 {
@@ -501,33 +534,140 @@ Event mouseUp(int x, int y)
     return e;
 }
 
-// -- Theme: the app's styling preference (per-widget default colors) ----------
-// A widget that sets no explicit color falls back to the theme slot for its role,
-// so styling is declared once on the context instead of on every node. A
-// default-constructed Theme is MONOCHROME (every slot COLOR_DEFAULT): a host that
-// sets no theme renders exactly as the pre-color framework did, which keeps the
-// GDI self-test and the TUI hosts byte-identical. An app opts into styling by
-// assigning ctx.theme = lightTheme() (or its own Theme) in render().
+// -- Theme: semantic roles and appearance palettes ---------------------------
+// A Theme stores independent light and dark role tables. AUTO follows the host
+// system preference; LIGHT and DARK force one table. Literal colors bypass these
+// tables, including literal black (numeric zero).
+int THEME_AUTO = 0;
+int THEME_LIGHT = 1;
+int THEME_DARK = 2;
+
+int THEME_ROLE_TEXT = 1;
+int THEME_ROLE_PANEL_BG = 2;
+int THEME_ROLE_PANEL_BORDER = 3;
+int THEME_ROLE_BUTTON_BG = 4;
+int THEME_ROLE_BUTTON_TEXT = 5;
+int THEME_ROLE_INPUT_BG = 6;
+int THEME_ROLE_INPUT_TEXT = 7;
+int THEME_ROLE_FOCUS_RING = 8;
+int THEME_ROLE_TRACK = 9;
+int THEME_ROLE_ACCENT = 10;
+int THEME_ROLE_LIST_TEXT = 11;
+int THEME_ROLE_LIST_MUTED = 12;
+int THEME_ROLE_LIST_SUCCESS = 13;
+int THEME_ROLE_LIST_WARNING = 14;
+int THEME_ROLE_LIST_ERROR = 15;
+
+struct ThemePalette
+{
+    Color textColor = default;
+    Color panelBg = default;
+    Color panelBorder = default;
+    Color buttonBg = default;
+    Color buttonText = default;
+    Color inputBg = default;
+    Color inputText = default;
+    Color focusRing = default;
+    Color track = default;
+    Color accent = default;
+    Color listText = default;
+    Color listMuted = default;
+    Color listSuccess = default;
+    Color listWarning = default;
+    Color listError = default;
+};
+
 struct Theme
 {
-    int textColor   = 0;   // Text ink
-    int panelBg     = 0;   // Box fill
-    int panelBorder = 0;   // Box border
-    int buttonBg    = 0;   // Button fill
-    int buttonText  = 0;   // Button label ink
-    int inputBg     = 0;   // TextInput fill
-    int inputText   = 0;   // TextInput ink
-    int focusRing   = 0;   // border drawn around the focused widget
-    int track       = 0;   // ProgressBar / Slider trough
-    int accent      = 0;   // ProgressBar / Slider filled portion + thumb
-    // Semantic ListView cell roles. These are appearance colors, independent of
-    // the OS light/dark scheme, and are resolved by ListCellStyle.
-    int listText     = 0;
-    int listMuted    = 0;
-    int listSuccess  = 0;
-    int listWarning  = 0;
-    int listError    = 0;
+    int appearance = 0; // THEME_AUTO, THEME_LIGHT, or THEME_DARK
+    ThemePalette light = default;
+    ThemePalette dark = default;
+    // Direct role fields remain ergonomic lvalues for app code. When set, they
+    // override the selected palette; unset fields use the light/dark tables.
+    Color textColor = default;
+    Color panelBg = default;
+    Color panelBorder = default;
+    Color buttonBg = default;
+    Color buttonText = default;
+    Color inputBg = default;
+    Color inputText = default;
+    Color focusRing = default;
+    Color track = default;
+    Color accent = default;
+    Color listText = default;
+    Color listMuted = default;
+    Color listSuccess = default;
+    Color listWarning = default;
+    Color listError = default;
 };
+
+Color themeRole(ThemePalette p, int role)
+{
+    if (role == THEME_ROLE_PANEL_BG) return p.panelBg;
+    if (role == THEME_ROLE_PANEL_BORDER) return p.panelBorder;
+    if (role == THEME_ROLE_BUTTON_BG) return p.buttonBg;
+    if (role == THEME_ROLE_BUTTON_TEXT) return p.buttonText;
+    if (role == THEME_ROLE_INPUT_BG) return p.inputBg;
+    if (role == THEME_ROLE_INPUT_TEXT) return p.inputText;
+    if (role == THEME_ROLE_FOCUS_RING) return p.focusRing;
+    if (role == THEME_ROLE_TRACK) return p.track;
+    if (role == THEME_ROLE_ACCENT) return p.accent;
+    if (role == THEME_ROLE_LIST_TEXT) return p.listText;
+    if (role == THEME_ROLE_LIST_MUTED) return p.listMuted;
+    if (role == THEME_ROLE_LIST_SUCCESS) return p.listSuccess;
+    if (role == THEME_ROLE_LIST_WARNING) return p.listWarning;
+    if (role == THEME_ROLE_LIST_ERROR) return p.listError;
+    return p.textColor;
+}
+
+Color resolveThemeRole(Theme t, int role, bool systemDark)
+{
+    bool useDark = t.appearance == THEME_DARK
+        || (t.appearance == THEME_AUTO && systemDark);
+    Color direct = default;
+    if (role == THEME_ROLE_PANEL_BG) direct = t.panelBg;
+    else if (role == THEME_ROLE_PANEL_BORDER) direct = t.panelBorder;
+    else if (role == THEME_ROLE_BUTTON_BG) direct = t.buttonBg;
+    else if (role == THEME_ROLE_BUTTON_TEXT) direct = t.buttonText;
+    else if (role == THEME_ROLE_INPUT_BG) direct = t.inputBg;
+    else if (role == THEME_ROLE_INPUT_TEXT) direct = t.inputText;
+    else if (role == THEME_ROLE_FOCUS_RING) direct = t.focusRing;
+    else if (role == THEME_ROLE_TRACK) direct = t.track;
+    else if (role == THEME_ROLE_ACCENT) direct = t.accent;
+    else if (role == THEME_ROLE_LIST_TEXT) direct = t.listText;
+    else if (role == THEME_ROLE_LIST_MUTED) direct = t.listMuted;
+    else if (role == THEME_ROLE_LIST_SUCCESS) direct = t.listSuccess;
+    else if (role == THEME_ROLE_LIST_WARNING) direct = t.listWarning;
+    else if (role == THEME_ROLE_LIST_ERROR) direct = t.listError;
+    else direct = t.textColor;
+    if (colorIsSet(direct)) return direct;
+    return themeRole(useDark ? t.dark : t.light, role);
+}
+
+int resolveColor(Color c, Theme t, bool systemDark)
+{
+    if (c.kind == COLOR_LITERAL) return markColor(c.value);
+    if (c.kind == COLOR_ROLE) return resolveColor(resolveThemeRole(t, c.value, systemDark), t, systemDark);
+    return 0;
+}
+
+int pickColor(Color nodeColor, Color themeColor, Theme t, bool systemDark)
+{
+    if (colorIsSet(nodeColor)) return resolveColor(nodeColor, t, systemDark);
+    return resolveColor(themeColor, t, systemDark);
+}
+
+int pickColor(Color nodeColor, Color themeColor)
+{
+    if (colorIsSet(nodeColor)) return resolveColor(nodeColor, default, false);
+    return resolveColor(themeColor, default, false);
+}
+
+int pickColor(Color nodeColor, int themeColor)
+{
+    if (colorIsSet(nodeColor)) return resolveColor(nodeColor, default, false);
+    return themeColor;
+}
 
 // A tagged, virtualization-safe ListView cell appearance. A callback can return
 // one value for every column in a row to express row-level styling without copying
@@ -601,51 +741,49 @@ ListCellStyle listCellLiteral(int color)
     return s;
 }
 
-int resolveListCellColor(ListCellStyle style, Theme theme)
+int resolveListCellColor(ListCellStyle style, Theme theme, bool systemDark)
 {
     if (style.hasLiteral)
-    {
-        // Normalize both raw 0xRRGGBB and existing rgb() values to the marked
-        // representation used by ICanvas, retaining explicit literal black.
-        return rgb((style.literal >> 16) & 0xFF, (style.literal >> 8) & 0xFF,
-                   style.literal & 0xFF);
-    }
-    if (!style.hasRole) return theme.listText;
-    if (style.role == LIST_ROLE_MUTED) return theme.listMuted;
-    if (style.role == LIST_ROLE_SUCCESS) return theme.listSuccess;
-    if (style.role == LIST_ROLE_WARNING) return theme.listWarning;
-    if (style.role == LIST_ROLE_ERROR) return theme.listError;
-    return theme.listText;
+        return markColor(style.literal);
+    if (!style.hasRole) return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_TEXT, systemDark), theme, systemDark);
+    if (style.role == LIST_ROLE_MUTED) return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_MUTED, systemDark), theme, systemDark);
+    if (style.role == LIST_ROLE_SUCCESS) return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_SUCCESS, systemDark), theme, systemDark);
+    if (style.role == LIST_ROLE_WARNING) return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_WARNING, systemDark), theme, systemDark);
+    if (style.role == LIST_ROLE_ERROR) return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_ERROR, systemDark), theme, systemDark);
+    return resolveColor(resolveThemeRole(theme, THEME_ROLE_LIST_TEXT, systemDark), theme, systemDark);
 }
 
-// Resolve a color: an explicit per-node color (anything but COLOR_DEFAULT/0) wins;
-// otherwise fall back to the theme slot (itself 0 in the monochrome theme, which
-// the ICanvas renders as its default ink).
-int pickColor(int nodeColor, int themeColor)
+int resolveListCellColor(ListCellStyle style, Theme theme)
 {
-    if (nodeColor != 0) return nodeColor;
-    return themeColor;
+    return resolveListCellColor(style, theme, false);
 }
 
 // A light theme: slate-on-near-white with a blue primary button.
 Theme lightTheme()
 {
     Theme t = default;
-    t.textColor   = rgb(28, 32, 38);
-    t.panelBg     = rgb(245, 247, 250);
-    t.panelBorder = rgb(170, 178, 190);
-    t.buttonBg    = rgb(52, 120, 247);
-    t.buttonText  = rgb(255, 255, 255);
-    t.inputBg     = rgb(255, 255, 255);
-    t.inputText   = rgb(20, 20, 20);
-    t.focusRing   = rgb(52, 120, 247);
-    t.track       = rgb(210, 214, 220);
-    t.accent      = rgb(52, 120, 247);
-    t.listText    = t.textColor;
-    t.listMuted   = rgb(110, 118, 130);
-    t.listSuccess = rgb(20, 125, 70);
-    t.listWarning = rgb(170, 105, 0);
-    t.listError   = rgb(190, 45, 45);
+    t.appearance = THEME_LIGHT;
+    t.light.textColor   = colorLiteral(0x1C2026);
+    t.light.panelBg     = colorLiteral(0xF5F7FA);
+    t.light.panelBorder = colorLiteral(0xAAB2BE);
+    t.light.buttonBg    = colorLiteral(0x3478F7);
+    t.light.buttonText  = colorLiteral(0xFFFFFF);
+    t.light.inputBg     = colorLiteral(0xFFFFFF);
+    t.light.inputText   = colorLiteral(0x141414);
+    t.light.focusRing   = colorLiteral(0x3478F7);
+    t.light.track       = colorLiteral(0xD2D6DC);
+    t.light.accent      = colorLiteral(0x3478F7);
+    t.light.listText    = t.light.textColor;
+    t.light.listMuted   = colorLiteral(0x6E7682);
+    t.light.listSuccess = colorLiteral(0x147D46);
+    t.light.listWarning = colorLiteral(0xAA6900);
+    t.light.listError   = colorLiteral(0xBE2D2D);
+    t.textColor = t.light.textColor; t.panelBg = t.light.panelBg; t.panelBorder = t.light.panelBorder;
+    t.buttonBg = t.light.buttonBg; t.buttonText = t.light.buttonText;
+    t.inputBg = t.light.inputBg; t.inputText = t.light.inputText; t.focusRing = t.light.focusRing;
+    t.track = t.light.track; t.accent = t.light.accent; t.listText = t.light.listText;
+    t.listMuted = t.light.listMuted; t.listSuccess = t.light.listSuccess;
+    t.listWarning = t.light.listWarning; t.listError = t.light.listError;
     return t;
 }
 
@@ -653,21 +791,41 @@ Theme lightTheme()
 Theme darkTheme()
 {
     Theme t = default;
-    t.textColor   = rgb(225, 228, 233);
-    t.panelBg     = rgb(34, 38, 46);
-    t.panelBorder = rgb(80, 88, 100);
-    t.buttonBg    = rgb(88, 150, 255);
-    t.buttonText  = rgb(12, 16, 22);
-    t.inputBg     = rgb(52, 58, 68);
-    t.inputText   = rgb(235, 238, 242);
-    t.focusRing   = rgb(120, 170, 255);
-    t.track       = rgb(60, 66, 76);
-    t.accent      = rgb(88, 150, 255);
-    t.listText    = t.textColor;
-    t.listMuted   = rgb(160, 168, 180);
-    t.listSuccess = rgb(100, 210, 145);
-    t.listWarning = rgb(245, 190, 80);
-    t.listError   = rgb(255, 120, 120);
+    t.appearance = THEME_DARK;
+    t.dark.textColor   = colorLiteral(0xE1E4E9);
+    t.dark.panelBg     = colorLiteral(0x22262E);
+    t.dark.panelBorder = colorLiteral(0x505864);
+    t.dark.buttonBg    = colorLiteral(0x5896FF);
+    t.dark.buttonText  = colorLiteral(0x0C1016);
+    t.dark.inputBg     = colorLiteral(0x343A44);
+    t.dark.inputText   = colorLiteral(0xEBEEF2);
+    t.dark.focusRing   = colorLiteral(0x78AAFF);
+    t.dark.track       = colorLiteral(0x3C424C);
+    t.dark.accent      = colorLiteral(0x5896FF);
+    t.dark.listText    = t.dark.textColor;
+    t.dark.listMuted   = colorLiteral(0xA0A8B4);
+    t.dark.listSuccess = colorLiteral(0x64D291);
+    t.dark.listWarning = colorLiteral(0xF5BE50);
+    t.dark.listError   = colorLiteral(0xFF7878);
+    t.textColor = t.dark.textColor; t.panelBg = t.dark.panelBg; t.panelBorder = t.dark.panelBorder;
+    t.buttonBg = t.dark.buttonBg; t.buttonText = t.dark.buttonText;
+    t.inputBg = t.dark.inputBg; t.inputText = t.dark.inputText; t.focusRing = t.dark.focusRing;
+    t.track = t.dark.track; t.accent = t.dark.accent; t.listText = t.dark.listText;
+    t.listMuted = t.dark.listMuted; t.listSuccess = t.dark.listSuccess;
+    t.listWarning = t.dark.listWarning; t.listError = t.dark.listError;
+    return t;
+}
+
+// An AUTO theme with both semantic tables populated. Direct role overrides stay unset,
+// so the host system preference can select either table.
+Theme systemTheme()
+{
+    Theme light = lightTheme();
+    Theme dark = darkTheme();
+    Theme t = default;
+    t.appearance = THEME_AUTO;
+    t.light = light.light;
+    t.dark = dark.dark;
     return t;
 }
 
@@ -1109,15 +1267,15 @@ interface IView : IElement
 interface IText : ITooltipped
 {
     string text;
-    int    color;
+    Color  color;
     int    font;      // FONT_* id; a native-host display hint (0 = default UI font)
 };
 
 interface IButton : IDisableable
 {
     string title;
-    int    color;
-    int    backgroundColor;
+    Color  color;
+    Color  backgroundColor;
     void   fireClick();
 };
 
@@ -1131,8 +1289,8 @@ interface ITextInput : IDisableable
     string value;
     string placeholder;
     int    width;
-    int    color;
-    int    backgroundColor;
+    Color  color;
+    Color  backgroundColor;
     void   fireChangeText(string s);
 };
 
@@ -1140,7 +1298,7 @@ interface ICheckbox : IDisableable
 {
     string label;
     bool   checked;
-    int    color;
+    Color  color;
     void   fireToggle();
 };
 
@@ -1148,7 +1306,7 @@ interface IProgressBar : ITooltipped
 {
     int value;
     int width;
-    int color;
+    Color color;
 };
 
 interface ISlider : IDisableable
@@ -1163,8 +1321,8 @@ interface ITextArea : IDisableable
     string value;
     int    width;
     int    height;
-    int    color;
-    int    backgroundColor;
+    Color  color;
+    Color  backgroundColor;
     void   fireChange();
 };
 
@@ -1751,8 +1909,9 @@ class View : IView
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        if (this.style.backgroundColor != 0)
-            cv.drawRect(this.bounds, true, this.style.backgroundColor);
+        int bg = resolveColor(this.style.backgroundColor, ctx.theme, ctx.systemPrefersDark());
+        if (colorIsSet(this.style.backgroundColor))
+            cv.drawRect(this.bounds, true, bg);
         for (IElement c in this.children)
             c.paint(cv, ctx);
     }
@@ -1824,7 +1983,7 @@ class Text : IText
 {
     Style style = default;
     string text = default;
-    int    color = 0;           // rgb(); 0 = default ink
+    Color  color = default;     // explicit literal or semantic role
     int    font = 0;            // FONT_UI (0) default; FONT_TITLE / FONT_CAPTION on native hosts
     string tooltip = default;   // native hover tooltip; "" = none. Use a literal.
     Rect bounds = default;
@@ -1862,7 +2021,7 @@ class Text : IText
     void paint(ICanvas cv, IUiContext ctx)
     {
         cv.drawText(this.bounds.x, this.bounds.y, this.text.data(),
-                    pickColor(this.color, ctx.theme.textColor));
+                    pickColor(this.color, colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark()));
     }
 
     bool dispatch(Event e, IUiContext ctx) { return false; }
@@ -1880,7 +2039,8 @@ class Text : IText
         // color is compared too: the native hosts now paint a Text's ink from it, so a
         // color-only change must produce a patch or the new ink never reaches the host.
         return o != nullptr && this.text == o.text && this.font == o.font
-            && this.color == o.color && styleEquals(this.style, o.style);
+            && this.color.kind == o.color.kind && this.color.value == o.color.value
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -1897,8 +2057,8 @@ class Button : IButton
     Style style = default;
     string title = default;
     Lambda<void()> onPress = default;
-    int    color = 0;               // label ink; 0 = default
-    int    backgroundColor = 0;     // button fill; 0 = no fill
+    Color  color = default;         // label ink
+    Color  backgroundColor = default; // button fill
     bool   disabled = false;        // dimmed + ignores input
     string tooltip = default;       // native hover tooltip; "" = none
     Rect bounds = default;
@@ -1934,26 +2094,27 @@ class Button : IButton
         // Disabled: a flat dimmed fill + gray label, no hover/press/focus affordance.
         if (this.disabled)
         {
-            int dbg = dimColor(pickColor(this.backgroundColor, ctx.theme.buttonBg));
+            int dbg = dimColor(pickColor(this.backgroundColor, colorRole(THEME_ROLE_BUTTON_BG), ctx.theme, ctx.systemPrefersDark()));
             if (dbg != 0)
                 cv.drawRect(this.bounds, true, dbg);
             string dl = "[ " + this.title + " ]";
             cv.drawText(this.bounds.x, this.bounds.y, dl.data(),
-                        dimColor(pickColor(this.color, ctx.theme.buttonText)));
+                        dimColor(pickColor(this.color, colorRole(THEME_ROLE_BUTTON_TEXT), ctx.theme, ctx.systemPrefersDark())));
             return;
         }
         // Pressed darkens the fill, hover lightens it (shade() leaves an unset
         // monochrome button untouched). Pressed wins over hover.
-        int bg = pickColor(this.backgroundColor, ctx.theme.buttonBg);
+        int bg = pickColor(this.backgroundColor, colorRole(THEME_ROLE_BUTTON_BG), ctx.theme, ctx.systemPrefersDark());
         if (ctx.hasPress(this.key))      bg = shade(bg, -40);
         else if (ctx.hasHover(this.key)) bg = shade(bg, 28);
         if (bg != 0)
             cv.drawRect(this.bounds, true, bg);
-        if (ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
-            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+        int focus = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_FOCUS_RING, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (ctx.hasFocus(this.key) && focus != 0)
+            cv.drawRect(this.bounds, false, focus);
         string rendered = "[ " + this.title + " ]";
         cv.drawText(this.bounds.x, this.bounds.y, rendered.data(),
-                    pickColor(this.color, ctx.theme.buttonText));
+                    pickColor(this.color, colorRole(THEME_ROLE_BUTTON_TEXT), ctx.theme, ctx.systemPrefersDark()));
     }
 
     bool dispatch(Event e, IUiContext ctx)
@@ -2068,10 +2229,10 @@ class Box : IBox
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int bg = pickColor(this.style.backgroundColor, ctx.theme.panelBg);
+        int bg = pickColor(this.style.backgroundColor, colorRole(THEME_ROLE_PANEL_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0)
             cv.drawRect(this.bounds, true, bg);
-        cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
+        cv.drawRect(this.bounds, false, pickColor(this.style.color, colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
         for (IElement c in this.children)
             c.paint(cv, ctx);
     }
@@ -2146,8 +2307,8 @@ class TextInput : ITextInput
     string placeholder = default;
     Lambda<void(string)> onChangeText = default;
     int    width  = 0;          // 0 -> sized to content
-    int    color = 0;               // text ink; 0 = default
-    int    backgroundColor = 0;     // field fill; 0 = no fill
+    Color  color = default;         // text ink
+    Color  backgroundColor = default; // field fill
     bool   disabled = false;        // dimmed + ignores input
     string tooltip = default;       // native hover tooltip; "" = none
     Rect   bounds = default;
@@ -2180,13 +2341,14 @@ class TextInput : ITextInput
     {
         // Show the value, or the placeholder when empty; a focused field shows a
         // trailing '_' caret in the next cell.
-        int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
+        int bg = pickColor(this.backgroundColor, colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) bg = dimColor(bg);
         if (bg != 0)
             cv.drawRect(this.bounds, true, bg);
-        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
-            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
-        int ink = pickColor(this.color, ctx.theme.inputText);
+        int focus = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_FOCUS_RING, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (!this.disabled && ctx.hasFocus(this.key) && focus != 0)
+            cv.drawRect(this.bounds, false, focus);
+        int ink = pickColor(this.color, colorRole(THEME_ROLE_INPUT_TEXT), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) ink = dimColor(ink);
         bool empty = this.value.length() == 0;
         string shown = empty ? this.placeholder : this.value;
@@ -2270,7 +2432,7 @@ class Checkbox : ICheckbox
     bool   checked  = false;
     bool   disabled = false;
     Lambda<void(bool)> onChange = default;
-    int    color = 0;            // label ink; 0 = default
+    Color  color = default;      // label ink
     string tooltip = default;    // native hover tooltip; "" = none
     Rect   bounds = default;
     string key   = default;
@@ -2299,11 +2461,12 @@ class Checkbox : ICheckbox
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int ink = pickColor(this.color, ctx.theme.textColor);
+        int ink = pickColor(this.color, colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) ink = dimColor(ink);
-        else if (ctx.hasHover(this.key) && ctx.theme.focusRing != 0) ink = ctx.theme.focusRing;
-        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
-            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+        int focus = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_FOCUS_RING, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (ctx.hasHover(this.key) && focus != 0) ink = focus;
+        if (!this.disabled && ctx.hasFocus(this.key) && focus != 0)
+            cv.drawRect(this.bounds, false, focus);
         string mark = this.checked ? "[x] " : "[ ] ";
         string shown = mark + this.label;
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
@@ -2363,7 +2526,7 @@ class ProgressBar : IProgressBar
     Style style = default;
     int    value = 0;          // 0..100
     int    width = 20;         // cells
-    int    color = 0;          // fill override; 0 = theme accent
+    Color  color = default;    // fill override; unset = theme accent
     string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
     string key = default;
@@ -2390,8 +2553,8 @@ class ProgressBar : IProgressBar
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int track = ctx.theme.track;
-        int fill  = pickColor(this.color, ctx.theme.accent);
+        int track = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TRACK, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        int fill  = pickColor(this.color, colorRole(THEME_ROLE_ACCENT), ctx.theme, ctx.systemPrefersDark());
         if (track != 0) cv.drawRect(this.bounds, true, track);
         cv.drawRect(this.bounds, false, track);   // outline (0 -> default black border)
         int fw = this._clampPct(this.value) * this.bounds.w / 100;
@@ -2471,8 +2634,8 @@ class Slider : ISlider
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int track = ctx.theme.track;
-        int fill  = ctx.theme.accent;
+        int track = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TRACK, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        int fill  = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_ACCENT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) { track = dimColor(track); fill = dimColor(fill); }
         if (track != 0) cv.drawRect(this.bounds, true, track);
         cv.drawRect(this.bounds, false, track);
@@ -2484,8 +2647,9 @@ class Slider : ISlider
         if (tx >= this.bounds.x + this.bounds.w) tx = this.bounds.x + this.bounds.w - 1;
         Rect th = default; th.x = tx; th.y = this.bounds.y; th.w = 1; th.h = 1;
         cv.drawRect(th, true, fill);
-        if (!this.disabled && ctx.hasFocus(this.key) && ctx.theme.focusRing != 0)
-            cv.drawRect(this.bounds, false, ctx.theme.focusRing);
+        int focus = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_FOCUS_RING, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (!this.disabled && ctx.hasFocus(this.key) && focus != 0)
+            cv.drawRect(this.bounds, false, focus);
     }
 
     bool dispatch(Event e, IUiContext ctx)
@@ -2555,8 +2719,8 @@ class TextArea : ITextArea
     Lambda<void()> onChange = default;   // dirty notify (no payload)
     int    width  = 40;
     int    height = 10;
-    int    color = 0;
-    int    backgroundColor = 0;
+    Color  color = default;
+    Color  backgroundColor = default;
     bool   disabled = false;
     string tooltip = default;  // native hover tooltip; "" = none
     Rect   bounds = default;
@@ -2585,10 +2749,10 @@ class TextArea : ITextArea
     // clipped to the region. Native hosts ignore this (the EDIT paints itself).
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int bg = pickColor(this.backgroundColor, ctx.theme.inputBg);
+        int bg = pickColor(this.backgroundColor, colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
-        cv.drawRect(this.bounds, false, pickColor(this.color, ctx.theme.panelBorder));
-        int ink = pickColor(this.color, ctx.theme.inputText);
+        cv.drawRect(this.bounds, false, pickColor(this.color, colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
+        int ink = pickColor(this.color, colorRole(THEME_ROLE_INPUT_TEXT), ctx.theme, ctx.systemPrefersDark());
         int row = 0; int start = 0; int n = (int)this.value.length();
         int i = 0;
         while (i <= n && row < this.bounds.h - 1)
@@ -2701,7 +2865,7 @@ class StatusBar : IStatusBar
             i++;
         }
         cv.drawText(this.bounds.x, this.bounds.y, line.data(),
-                    pickColor(0, ctx.theme.textColor));
+                    pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark()));
     }
 
     bool dispatch(Event e, IUiContext ctx) { return false; }
@@ -2804,8 +2968,9 @@ class ScrollView : IScrollView
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        if (this.style.backgroundColor != 0)
-            cv.drawRect(this.bounds, true, this.style.backgroundColor);
+        int bg = resolveColor(this.style.backgroundColor, ctx.theme, ctx.systemPrefersDark());
+        if (colorIsSet(this.style.backgroundColor))
+            cv.drawRect(this.bounds, true, bg);
         cv.pushClip(this.bounds);
         for (IElement c in this.children)
             c.paint(cv, ctx);
@@ -3040,7 +3205,7 @@ class RadioButton : IRadioButton
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int ink = pickColor(0, ctx.theme.textColor);
+        int ink = pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) ink = dimColor(ink);
         string mark = this.checked ? "(o) " : "( ) ";
         string shown = mark + this.label;
@@ -3264,9 +3429,9 @@ class ComboBox : IComboBox
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int ink = pickColor(0, ctx.theme.inputText);
+        int ink = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_TEXT), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) ink = dimColor(ink);
-        int bg = pickColor(0, ctx.theme.inputBg);
+        int bg = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
         string shown = "[" + this._selectedText() + " v]";
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
@@ -3388,10 +3553,10 @@ class ListView : IListView
     // here too - the callback is asked for at most bounds.h-1 rows regardless of count).
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int bg = pickColor(0, ctx.theme.inputBg);
+        int bg = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
-        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
-        int ink = pickColor(0, ctx.theme.listText);
+        cv.drawRect(this.bounds, false, pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
+        int ink = pickColor(colorUnset(), colorRole(THEME_ROLE_LIST_TEXT), ctx.theme, ctx.systemPrefersDark());
         string hdr = "";
         int c = 0;
         while (c < this.columns.count())
@@ -3455,7 +3620,8 @@ class ListView : IListView
                 {
                     string text = this.rowText != nullptr ? this.rowText(r, cc) : "";
                     ListCellStyle cs = this.cellStyle(r, cc);
-                    cv.drawText(x, this.bounds.y + 1 + r, text.data(), resolveListCellColor(cs, ctx.theme));
+                    cv.drawText(x, this.bounds.y + 1 + r, text.data(),
+                                resolveListCellColor(cs, ctx.theme, ctx.systemPrefersDark()));
                     x = x + (int)text.length();
                     if (cc + 1 < ncol) { cv.drawText(x, this.bounds.y + 1 + r, " | ", ink); x = x + 3; }
                     cc++;
@@ -3775,10 +3941,10 @@ class TabControl : ITabControl
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int bg = pickColor(0, ctx.theme.panelBg);
+        int bg = pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
-        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
-        int ink = pickColor(0, ctx.theme.textColor);
+        cv.drawRect(this.bounds, false, pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
+        int ink = pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark());
         string hdr = "";
         int i = 0;
         while (i < this.children.count())
@@ -3903,10 +4069,10 @@ class TreeView : ITreeView
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        int bg = pickColor(0, ctx.theme.inputBg);
+        int bg = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
-        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
-        int ink = pickColor(0, ctx.theme.textColor);
+        cv.drawRect(this.bounds, false, pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
+        int ink = pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark());
         int n = this.childCount != nullptr ? this.childCount(TREE_ROOT) : 0;
         int visible = this.bounds.h - 1;
         int r = 0;
@@ -4047,7 +4213,7 @@ class SplitView : ISplitView
     void paint(ICanvas cv, IUiContext ctx)
     {
         for (IElement c in this.children) c.paint(cv, ctx);
-        cv.drawRect(this.dividerBounds, true, pickColor(this.style.color, ctx.theme.panelBorder));
+        cv.drawRect(this.dividerBounds, true, pickColor(this.style.color, colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
     }
 
     bool dispatch(Event e, IUiContext ctx)
@@ -4282,10 +4448,10 @@ class Image : IImage
     // ICanvas fallback: a bordered box with the alt text (a char grid has no bitmap).
     void paint(ICanvas cv, IUiContext ctx)
     {
-        cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
+        cv.drawRect(this.bounds, false, pickColor(colorUnset(), colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
         string t = this.altText.length() > 0 ? this.altText : "[img]";
         cv.drawText(this.bounds.x + 1, this.bounds.y + this.bounds.h / 2, t.data(),
-                    pickColor(0, ctx.theme.textColor));
+                    pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark()));
     }
 
     bool dispatch(Event e, IUiContext ctx) { return false; }
@@ -4371,9 +4537,9 @@ class GroupBox : IGroupBox
 
     void paint(ICanvas cv, IUiContext ctx)
     {
-        cv.drawRect(this.bounds, false, pickColor(this.style.color, ctx.theme.panelBorder));
+        cv.drawRect(this.bounds, false, pickColor(this.style.color, colorRole(THEME_ROLE_PANEL_BORDER), ctx.theme, ctx.systemPrefersDark()));
         cv.drawText(this.bounds.x + 2, this.bounds.y, this.title.data(),
-                    pickColor(0, ctx.theme.textColor));
+                    pickColor(colorUnset(), colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark()));
         for (IElement c in this.children) c.paint(cv, ctx);
     }
 

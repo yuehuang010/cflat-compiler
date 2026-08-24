@@ -12,6 +12,16 @@
 import "ui_native.cb";
 import "ui_test.cb";
 
+bool galleryHasBlack(int value) { return value == 16777216; }
+bool galleryHasThemeListError(int value)
+{
+    return value == 0x1BE2D2D || value == 0x1FF7878;
+}
+int galleryThemePanelColor(Theme t)
+{
+    return resolveColor(resolveThemeRole(t, THEME_ROLE_PANEL_BG, false), t, false);
+}
+
 const int GALLERY_ROWS = 100000;
 
 // Context-menu command ids (routed through the app menu handler, like the menu bar).
@@ -168,7 +178,7 @@ class GalleryApp : IComponent
         // full-bleed a wide window; height stays content-driven.
         IView card = column(makeStyle(1, 70, 0));
         card.style.gap = 1;
-        card.style.backgroundColor = ctx.theme.panelBg;
+        card.style.backgroundColor = colorRole(THEME_ROLE_PANEL_BG);
         card.setKey(key);
 
         IView header = column(makeStyle(0, 0, 0));
@@ -638,6 +648,22 @@ int gallerySelfTest()
         t.launch(new GalleryApp(), 60, 60);
         GalleryApp* g = activeApp() as GalleryApp;
 
+        // AUTO chooses the semantic table from the supplied system preference;
+        // forced appearance wins, and a direct literal override wins over roles.
+        Theme autoTheme = systemTheme();
+        Color panelRole = colorRole(THEME_ROLE_PANEL_BG);
+        int autoLight = resolveColor(resolveThemeRole(autoTheme, panelRole.value, false), autoTheme, false);
+        int autoDark = resolveColor(resolveThemeRole(autoTheme, panelRole.value, true), autoTheme, true);
+        autoTheme.appearance = THEME_LIGHT;
+        int forcedLight = resolveColor(resolveThemeRole(autoTheme, panelRole.value, true), autoTheme, true);
+        autoTheme.appearance = THEME_DARK;
+        int forcedDark = resolveColor(resolveThemeRole(autoTheme, panelRole.value, false), autoTheme, false);
+        autoTheme.panelBg = colorLiteral(0);
+        int directBlack = resolveColor(resolveThemeRole(autoTheme, panelRole.value, true), autoTheme, true);
+        t.expectTrue("theme AUTO semantic matrix",
+            autoLight != autoDark && autoLight == forcedLight && autoDark == forcedDark
+            && directBlack == COLOR_SET_BIT);
+
         // Factory return is interface-typed: every app-settable ListView property
         // must remain writable and the fire wrapper must reach the assigned closure.
         IListView configured = listView(2, (int r, int c) => { return "x"; });
@@ -660,37 +686,40 @@ int gallerySelfTest()
 
         ITextInput configuredInput = textInput("", (string s) =>
         { if (g != nullptr) g.interfaceTextChanged++; });
-        configuredInput.width = 17; configuredInput.color = rgb(1, 2, 3);
-        configuredInput.backgroundColor = rgb(4, 5, 6);
+        configuredInput.width = 17; configuredInput.color = colorLiteral(rgb(1, 2, 3));
+        configuredInput.backgroundColor = colorLiteral(rgb(4, 5, 6));
         Size inputSize = configuredInput.layout(lc); configuredInput.fireChangeText("typed");
         t.expectTrue("factory ITextInput properties", inputSize.w == 17
-            && configuredInput.color == rgb(1, 2, 3)
-            && configuredInput.backgroundColor == rgb(4, 5, 6)
+            && colorIsLiteral(configuredInput.color) && colorPacked(configuredInput.color) == rgb(1, 2, 3)
+            && colorIsLiteral(configuredInput.backgroundColor) && colorPacked(configuredInput.backgroundColor) == rgb(4, 5, 6)
             && g != nullptr && g.interfaceTextChanged == 1);
         delete configuredInput;
 
         ICheckbox configuredCheck = checkbox("probe", false, (bool v) =>
         { if (g != nullptr) g.interfaceCheckboxChanged = v; });
-        configuredCheck.color = rgb(7, 8, 9); configuredCheck.fireToggle();
-        t.expectTrue("factory ICheckbox properties", configuredCheck.color == rgb(7, 8, 9)
+        configuredCheck.color = colorLiteral(rgb(7, 8, 9)); configuredCheck.fireToggle();
+        t.expectTrue("factory ICheckbox properties", colorIsLiteral(configuredCheck.color)
+            && colorPacked(configuredCheck.color) == rgb(7, 8, 9)
             && g != nullptr && g.interfaceCheckboxChanged);
         delete configuredCheck;
 
         IProgressBar configuredProgress = progressBar(25, 19);
-        configuredProgress.color = rgb(10, 11, 12);
+        configuredProgress.color = colorLiteral(rgb(10, 11, 12));
         Size progressSize = configuredProgress.layout(lc);
         t.expectTrue("factory IProgressBar properties", progressSize.w == 19
-            && configuredProgress.color == rgb(10, 11, 12));
+            && colorIsLiteral(configuredProgress.color)
+            && colorPacked(configuredProgress.color) == rgb(10, 11, 12));
         delete configuredProgress;
 
         ITextArea configuredArea = textArea("", () =>
         { if (g != nullptr) g.interfaceAreaChanged++; });
         configuredArea.width = 21; configuredArea.height = 6;
-        configuredArea.color = rgb(13, 14, 15); configuredArea.backgroundColor = rgb(16, 17, 18);
+        configuredArea.color = colorLiteral(rgb(13, 14, 15)); configuredArea.backgroundColor = colorLiteral(rgb(16, 17, 18));
         Size areaSize = configuredArea.layout(lc); configuredArea.fireChange();
         t.expectTrue("factory ITextArea properties", areaSize.w == 21 && areaSize.h == 6
-            && configuredArea.color == rgb(13, 14, 15)
-            && configuredArea.backgroundColor == rgb(16, 17, 18)
+            && colorIsLiteral(configuredArea.color) && colorPacked(configuredArea.color) == rgb(13, 14, 15)
+            && colorIsLiteral(configuredArea.backgroundColor)
+            && colorPacked(configuredArea.backgroundColor) == rgb(16, 17, 18)
             && g != nullptr && g.interfaceAreaChanged == 1);
         delete configuredArea;
 
@@ -791,10 +820,9 @@ int gallerySelfTest()
         nativeListHeaderClick("root/content/cardlist/list", 1);
         t.expectTrue("list header callback", g != nullptr && g.listHeader == 1 && g.listSel == 5);
         int listErrorColor = nativeListCellColor("root/content/cardlist/list", 50000, 1);
-        t.expectTrue("list cell styles", listErrorColor == darkTheme().listError
-            || listErrorColor == lightTheme().listError);
-        t.expectTrue("list literal black is present", nativeListCellColor("root/content/cardlist/list", 50000, 0)
-            == rgb(0, 0, 0));
+        t.expectTrue("list cell styles", galleryHasThemeListError(listErrorColor));
+        t.expectTrue("list literal black is present", galleryHasBlack(
+            nativeListCellColor("root/content/cardlist/list", 50000, 0)));
 
         // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
         t.expectTrue("tabs init",
@@ -894,7 +922,7 @@ int gallerySelfTest()
         // 24b. Card backdrop follows the theme flip: the committed View's fill re-colors to
         //      the dark panel. The reconcile bug kept the stale light fill (unreadable card).
         t.expectTrue("card backdrop re-colors on theme flip",
-            nativeContainerBg("root/content/cardbtn") == darkTheme().panelBg);
+            nativeContainerBg("root/content/cardbtn") == galleryThemePanelColor(darkTheme()));
 
         // 25. Accent buttons (P10): dark-mode push button carries a stored accent AND the
         //     NM_CUSTOMDRAW path renders it - driving the custom draw fills the button rect

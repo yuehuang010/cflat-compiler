@@ -473,16 +473,17 @@ struct Style
     int width = 0;
     int height = 0;
     int flexDirection = 0;       // DIR_COLUMN (0) | DIR_ROW (1)
-    int color = 0;               // foreground (text / border); COLOR_DEFAULT (0) = default ink
-    int backgroundColor = 0;     // fill; COLOR_DEFAULT (0) = no fill
+    Color color = default;       // foreground (text / border)
+    Color backgroundColor = default; // fill
     int gap = 0;                 // cells of space inserted between stacked children
     int flex = 0;                // main-axis weight in a DIR_ROW/DIR_COLUMN parent; 0 = intrinsic
     int flexWrap = 0;            // WRAP_NONE (0) | WRAP_WRAP (1); DIR_ROW only
 };
 Style makeStyle(int padding, int width, int height);   // flexDirection column, colors default
 Style flexStyle(int flex);                             // a Style carrying only a flex weight
-int   rgb(int r, int g, int b);                        // build an explicit color
-int   COLOR_DEFAULT;                                   // 0: backend monochrome default
+Color colorLiteral(int value);                        // explicit color, including 0
+Color colorUnset();                                    // no explicit color
+int   rgb(int r, int g, int b);                        // integer packing helper
 ```
 
 Every element uses its typed `style.flex` as its main-axis flex weight. In a
@@ -494,13 +495,11 @@ existing direct widget `width`/`height` field remains the compatibility fallback
 Intrinsic sizing is preserved when flex is zero and on an unbounded scroll axis.
 The same rules feed native `nodeBounds()` and canvas/TUI/headless painting.
 
-ALWAYS build colors with `rgb(r, g, b)` - never a raw `0xRRGGBB` literal. `rgb()`
-sets a marker bit so an explicit color is non-zero (even `rgb(0,0,0)`), and
-`COLOR_DEFAULT` is `0` ("no explicit color"): a tree that sets no color renders
-exactly as before colors existed. 0-as-sentinel is deliberate so a default/zeroed
-field is automatically "unset" - the framework does not rely on a `-1` initializer
-surviving (a nested `Struct f = default;` field is zero-filled in CFlat). The GDI
-host masks the marker off when converting to a `COLORREF`.
+Use `colorLiteral(value)` for explicit colors, including `colorLiteral(0)` for
+literal black. `colorUnset()` is the only unset value; the tagged `Color` value
+keeps numeric zero distinct from absence. `rgb(r, g, b)` remains a convenient
+integer packing helper, so `colorLiteral(rgb(r, g, b))` is also valid. Hosts mark
+resolved literals before drawing and mask that marker at the native API boundary.
 
 `color`/`backgroundColor` live on `Style` (read by `View`/`Box`/`ScrollView`) and
 as direct fields on the color-bearing leaves: `Text.color`, `Button.color` +
@@ -534,15 +533,19 @@ that specify no color of their own inherit it. An explicit per-node color still 
 
 ```
 struct Theme {
-    int textColor; int panelBg; int panelBorder;
-    int buttonBg;  int buttonText;
-    int inputBg;   int inputText;
-    int focusRing;
-    int track;     int accent;             // all COLOR_DEFAULT (0) in a default Theme
+    int appearance;                         // THEME_AUTO, THEME_LIGHT, THEME_DARK
+    ThemePalette light; ThemePalette dark;  // semantic role tables
+    Color textColor; Color panelBg; Color panelBorder;
+    Color buttonBg; Color buttonText;
+    Color inputBg; Color inputText; Color focusRing;
+    Color track; Color accent;
 };
 Theme lightTheme();   // slate-on-near-white, blue primary button
 Theme darkTheme();    // light-on-charcoal, brighter blue button
-int   pickColor(int nodeColor, int themeColor);   // node color wins, else theme slot
+Theme systemTheme();  // AUTO: both tables, selected from systemPrefersDark()
+Color colorLiteral(int value);                    // explicit literal, including 0
+Color colorRole(int role);                        // semantic role reference
+int   pickColor(Color nodeColor, Color themeColor, Theme theme, bool systemDark);
 int   shade(int color, int delta);                // lighten/darken (hover/pressed)
 ```
 
@@ -559,11 +562,13 @@ IElement render(IUiContext ctx) {
 `theme` is an interface FIELD, so both the whole-struct write above and a nested read
 (`ctx.theme.buttonBg`) go straight to the host's one live `UiContext` - no copy.
 
-A default-constructed `Theme` is monochrome (every slot `0`), so a host that sets no
-theme renders exactly as the pre-color framework did - this is what keeps the GDI
-self-test and the TUI hosts byte-identical. `Box`/`Text`/`Button`/`TextInput`
-resolve each color as `pickColor(nodeColor, themeSlot)`; `View`/`ScrollView` fill
-only when given an explicit `style.backgroundColor`.
+A default-constructed `Theme` is monochrome (every role is unset), so a host that
+sets no theme renders exactly as the pre-color framework did. `AUTO` follows the
+host system preference; `LIGHT` and `DARK` select one semantic table. Direct role
+fields remain ergonomic overrides, while `Style` and widget colors use `Color` and
+must be assigned with `colorLiteral`, `colorRole`, or `colorUnset`. `Box`/`Text`/
+`Button`/`TextInput` resolve each color through the selected role table; `View`/
+`ScrollView` fill only when given an explicit `style.backgroundColor`.
 
 On the **Cocoa** host a plain `View` container (from `view`/`row`/`column`) with a
 non-zero `style.backgroundColor` is painted as a rounded (8pt) layer-backed backdrop
@@ -825,7 +830,7 @@ directly, so the same tree renders to any backend.
 interface ICanvas
 {
     void clear();
-    void drawText(int col, int row, const char* s, int color);  // color via rgb(), 0 = default
+    void drawText(int col, int row, const char* s, int color);  // resolved marked color
     void drawRect(Rect r, bool filled, int color);              // filled=false: border; true: fill
     void drawImage(u64 img, double dx, double dy, double dw, double dh);  // POINTS; canvas image handle
     void pushClip(Rect r);
@@ -840,7 +845,7 @@ The native hosts blit; the TUI char grid draws a documented no-op.
   binds one for a paint call. The grid has no color, so it ignores the `color` arg.
 - **Win32:** `GdiCanvas` (in `core/ui_canvas/win32.cb`) maps a cell to `CELL_W`x`CELL_H`
   pixels and draws with `DrawTextA`/`FrameRect`/`FillRect`. It honors `color`
-  (`0`/COLOR_DEFAULT keeps the original black ink / black border path) and the host selects a
+  (`0` keeps the original black ink / black border path) and the host selects a
   crisp monospace font (`createUiFont()`, Consolas) into the DC before painting.
   Layout stays cell-based, so the font is monospace to keep text aligned to box
   borders and the caret; proportional/pixel layout remains deferred.

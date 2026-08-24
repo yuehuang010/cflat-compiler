@@ -576,9 +576,9 @@ void setMenuHandler(Lambda<void(int)> h) { _menuHandler = h; _hasMenuHandler = t
 void routeMenu(int cmd) { if (_hasMenuHandler) _menuHandler(cmd); pumpWinui(); }
 
 // A Theme is "dark" when its panel background is darker than mid-gray (default/monochrome = light).
-bool winuiThemeIsDark(Theme* t)
+bool winuiThemeIsDark(Theme* t, bool systemDark)
 {
-    int c = t.panelBg;
+    int c = resolveColor(resolveThemeRole(*t, THEME_ROLE_PANEL_BG, systemDark), *t, systemDark);
     if (c == 0) return false;
     int r = (c >> 16) & 0xFF; int g = (c >> 8) & 0xFF; int b = c & 0xFF;
     return (r + g + b) < 384;
@@ -595,9 +595,9 @@ int winuiScaleRgb(int c, int pct)
 
 // The page background behind the cards: the panel fill nudged darker, so a Box still reads as a
 // card ON a page instead of dissolving into it. Monochrome theme -> the XAML page defaults.
-int winuiPageBg(Theme* t, bool dark)
+int winuiPageBg(Theme* t, bool dark, bool systemDark)
 {
-    int c = t.panelBg;
+    int c = resolveColor(resolveThemeRole(*t, THEME_ROLE_PANEL_BG, systemDark), *t, systemDark);
     if (c == 0) return dark ? rgb(32, 32, 32) : rgb(243, 243, 243);
     return winuiScaleRgb(c, dark ? 62 : 94);
 }
@@ -646,10 +646,10 @@ void winuiApplyTitleBarTheme(bool dark)
 // light cflat theme (near-white panel fills) drew XAML's dark-theme WHITE text on white cards.
 // RequestedTheme on the root FrameworkElement re-themes the whole tree, so "Toggle theme" flips
 // XAML's own default brushes live; the page Background is re-synced from the theme alongside it.
-void winuiApplyRootTheme(Theme* t)
+void winuiApplyRootTheme(Theme* t, bool systemDark)
 {
     if (_gRootFe == nullptr) return;
-    bool dark = winuiThemeIsDark(t);
+    bool dark = winuiThemeIsDark(t, systemDark);
     if (!_wXamlThemeSet || dark != _wXamlDark)
     {
         if (dark) ((XamlFrameworkElement*)_gRootFe)->lpVtbl->put_RequestedTheme(_gRootFe, ElementTheme_Dark);
@@ -658,7 +658,7 @@ void winuiApplyRootTheme(Theme* t)
         _wXamlDark = dark;
         _wXamlThemeSet = true;
     }
-    int bg = winuiPageBg(t, dark);
+    int bg = winuiPageBg(t, dark, systemDark);
     if (_gRootPanel != nullptr && bg != _wPageBg)
     {
         void* br = winuiSolidBrush(bg);
@@ -670,7 +670,7 @@ void winuiApplyRootTheme(Theme* t)
     }
     // The status strip is a bar, so it carries the PANEL fill (not the page fill) - the same
     // read the Win32 host's themed status bar has.
-    int sb = t.panelBg;
+    int sb = resolveColor(resolveThemeRole(*t, THEME_ROLE_PANEL_BG, systemDark), *t, systemDark);
     if (_gStatusPanel != nullptr && sb != 0 && sb != _wStatusBg)
     {
         void* sbr = winuiSolidBrush(sb);
@@ -1142,12 +1142,12 @@ bool winuiMappable(int kind)
 // The style.backgroundColor of a plain (non-mapped) container - a View from view/row/column - or 0
 // for anything else. A non-zero value opts the container into a painted backdrop panel (Box is
 // excluded: it already maps to a native Border). Mirrors the Cocoa host's _containerBg.
-int winuiContainerBg(IElement node)
+int winuiContainerBg(IElement node, Theme theme, bool systemDark)
 {
     if (node.kind() != ELEM_VIEW) return 0;
     IView v = node as IView;
     if (v == nullptr) return 0;
-    return v.style.backgroundColor;
+    return resolveColor(v.style.backgroundColor, theme, systemDark);
 }
 
 class WinUI3Host : INativeHost
@@ -1239,14 +1239,16 @@ class WinUI3Host : INativeHost
         if (tb == nullptr) return;
         double size = 14.0;
         u32 weight = 400u;
-        int ink = this.appTheme().textColor;
+        Theme* theme = this.appTheme();
+        int ink = resolveColor(resolveThemeRole(*theme, THEME_ROLE_TEXT, _wDark),
+                                *theme, _wDark);
         if (t.font == 2) { size = 18.2; weight = 700u; }
         else if (t.font == 3)
         {
             size = 12.0;
             ink = ink != 0 ? shade(ink, 96) : rgb(120, 120, 120);
         }
-        if (t.color != 0) ink = t.color;
+        if (colorIsSet(t.color)) ink = resolveColor(t.color, *theme, _wDark);
         ((XamlTextBlock*)tb)->lpVtbl->put_FontSize(tb, size);
         ((XamlTextBlock*)tb)->lpVtbl->put_FontWeight(tb, weight);
 
@@ -1614,7 +1616,7 @@ class WinUI3Host : INativeHost
     // Rasterize the canvas's boxed onPaint closure into its WriteableBitmap. This is the WinUI
     // equivalent of the Win32 host's InvalidateRect: _syncProps calls it on every pump. `s` is the
     // rasterization scale the pxW x pxH surface was sized at (device px per DIP).
-    void _paintCanvas(u64 h, int pxW, int pxH, double s)
+    void _paintCanvas(u64 h, int pxW, int pxH, double s, Theme theme, bool systemDark)
     {
         if (h == 0u || pxW <= 0 || pxH <= 0) return;
         if (!winuiGdiReady()) return;
@@ -1650,7 +1652,8 @@ class WinUI3Host : INativeHost
         // Fill the theme background first, so custom drawing sits on the app palette. The
         // brush is cached and only recreated when the theme/background color changes.
         WGdiRect rc = default; rc.right = pxW; rc.bottom = pxH;
-        int bgColor = this.appTheme().panelBg;
+        int bgColor = resolveColor(resolveThemeRole(theme, THEME_ROLE_PANEL_BG, systemDark),
+                                   theme, systemDark);
         int fillColor = bgColor != 0 ? bgColor : 0xFFFFFF;
         if (this.canvasBr.get(i) == 0u || this.canvasBrColor.get(i) != fillColor)
         {
@@ -1887,12 +1890,13 @@ class WinUI3Host : INativeHost
 
     // Re-sync a backdrop's fill (and the theme panel border) to the container's current color.
     // Called on every reconcile, so a theme flip re-colors the card.
-    void _syncBackdrop(u64 h, int bg)
+    void _syncBackdrop(u64 h, int bg, Theme theme, bool systemDark)
     {
         void* sh = wqi((void*)h, iidof(XamlShape));
         if (sh == nullptr) return;
         ((XamlShape*)sh)->lpVtbl->put_Fill(sh, winuiSolidBrush(bg));
-        int pb = this.appTheme().panelBorder;
+        int pb = resolveColor(resolveThemeRole(theme, THEME_ROLE_PANEL_BORDER, systemDark),
+                              theme, systemDark);
         if (pb == 0) return;
         ((XamlShape*)sh)->lpVtbl->put_Stroke(sh, winuiSolidBrush(pb));
         ((XamlShape*)sh)->lpVtbl->put_StrokeThickness(sh, 1.0);
@@ -2243,8 +2247,8 @@ class WinUI3Host : INativeHost
     void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
-        _wDark = winuiThemeIsDark(&ctx.theme);
-        winuiApplyRootTheme(&ctx.theme);
+        _wDark = winuiThemeIsDark(&ctx.theme, ctx.systemPrefersDark());
+        winuiApplyRootTheme(&ctx.theme, ctx.systemPrefersDark());
         list<string> newKeys = default;
         this._applyNode(tree, keySegment(tree, 0), ctx, &newKeys, 0u);
 
@@ -2317,7 +2321,7 @@ class WinUI3Host : INativeHost
             this.setFrame(h, b);
             keys.add("" + path);
         }
-        else if (winuiContainerBg(node) != 0)
+        else if (winuiContainerBg(node, ctx.theme, ctx.systemPrefersDark()) != 0)
         {
             // A plain container with a fill gets a backdrop panel keyed by the CONTAINER's own path
             // (painted behind its children); it rides the same create/reuse/destroy/reposition
@@ -2328,7 +2332,8 @@ class WinUI3Host : INativeHost
                 h = this._createBackdrop();
                 ctx.setNativeHandle(path, h);
             }
-            this._syncBackdrop(h, winuiContainerBg(node));
+            this._syncBackdrop(h, winuiContainerBg(node, ctx.theme, ctx.systemPrefersDark()),
+                               ctx.theme, ctx.systemPrefersDark());
             this.setFrame(h, node.nodeBounds());
             keys.add("" + path);
         }
@@ -2509,8 +2514,10 @@ class WinUI3Host : INativeHost
             // would never reach its ContextFlyout. Fill it (its own color, or transparent).
             IBox bx = node as IBox;
             void* bd = wqi((void*)h, iidof(XamlBorder));
+            Theme* theme = this.appTheme();
             if (bd != nullptr)
-                ((XamlBorder*)bd)->lpVtbl->put_Background(bd, winuiFillBrush(bx.style.backgroundColor));
+                ((XamlBorder*)bd)->lpVtbl->put_Background(bd, winuiFillBrush(
+                    resolveColor(bx.style.backgroundColor, *theme, _wDark)));
         }
         else if (k == ELEM_IMAGE)
         {
@@ -2528,7 +2535,8 @@ class WinUI3Host : INativeHost
             double s = winuiRasterScale();
             int pxW = (int)(b.w * BASE_X * s); if (pxW < 1) pxW = 1;
             int pxH = (int)(b.h * BASE_Y * s); if (pxH < 1) pxH = 1;
-            this._paintCanvas(h, pxW, pxH, s);
+            Theme* theme = this.appTheme();
+            this._paintCanvas(h, pxW, pxH, s, *theme, _wDark);
         }
     }
 
@@ -3958,7 +3966,8 @@ int nativeContainerBg(string keyPath)
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return 0;
     IView v = e as IView;
-    if (v != nullptr) return v.style.backgroundColor;
+    if (v != nullptr) return resolveColor(v.style.backgroundColor, _wCtx.theme,
+                                           _wCtx.systemPrefersDark());
     return 0;
 }
 
