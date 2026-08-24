@@ -6604,6 +6604,21 @@ public:
     // Drop a function's null-state log without analyzing it (an aborted body has a partial CFG).
     void DiscardNullDerefEvents(llvm::Function* F);
 
+    /*
+     * A scoped `expect_error` block abandons only its own body, not the whole function, so the
+     * per-function pending logs must rewind to exactly what was recorded before the block. The
+     * events inside it were already answered by the swallowed diagnostic; leaving them queued
+     * makes the end-of-module sweep report the same error a second time, unexpected.
+     */
+    struct PendingAnalysisMark
+    {
+        size_t nullEvents = 0;
+        size_t returnDangleChecks = 0;
+        size_t nullIfaceDispatch = 0;
+    };
+    PendingAnalysisMark MarkPendingAnalyses(llvm::Function* F) const;
+    void RewindPendingAnalyses(llvm::Function* F, const PendingAnalysisMark& mark);
+
     // Solve the MAY-null fixpoint for ONE function as soon as its body is fully lowered, so the
     // resulting error still lands inside an enclosing scoped expect_error block. Reports the
     // earliest dereference of a maybe-null explicitly-moved local (LogError).

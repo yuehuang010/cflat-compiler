@@ -4980,6 +4980,41 @@ bool testNamespacedInterfaceAliasLookups()
     return Test("namespaced_interface_alias_lookups", InterfaceChecks.run(), 17) != 0;
 }
 
+// A plain interface local initialized from another interface local that ADOPTED its box
+// must take the box over, not become a second owner: the source is released, the `move`
+// param sink frees it once, and scope exit must not free it again (regression: double free).
+interface IAdoptElement { int area(); };
+interface IAdoptBox     { int area(); };
+
+class AdoptSquare : IAdoptElement, IAdoptBox
+{
+    int n = default;
+    int area() { return this.n; }
+};
+
+int adoptSinkCount = 0;
+
+move IAdoptBox makeAdoptBox(int n)
+{
+    IAdoptBox b = new AdoptSquare{ n = n };
+    return move b;
+}
+
+void adoptSink(move IAdoptElement root)
+{
+    adoptSinkCount = adoptSinkCount + root.area();
+    delete root;
+}
+
+bool testInterfaceLocalAdoptsBoxOnce()
+{
+    adoptSinkCount = 0;
+    IAdoptBox rootBox = makeAdoptBox(5);
+    IAdoptElement tree = rootBox;
+    adoptSink(tree);
+    return Test("interface_local_adopts_box_once", adoptSinkCount, 5) != 0;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -5086,6 +5121,8 @@ extern int main()
     total++; passed += testGiNsCollideQualified()                        ? 1 : 0;
     total++; passed += testGiNsTaInterfaceTypeArg()                      ? 1 : 0;
     total++; passed += testGiNsBodyKeepsCallerTypeArg()                  ? 1 : 0;
+
+    total++; passed += testInterfaceLocalAdoptsBoxOnce()               ? 1 : 0;
 
     printf("Interface/is/as tests: %d/%d passed.\n", passed, total);
     return passed == total ? 0 : 1;

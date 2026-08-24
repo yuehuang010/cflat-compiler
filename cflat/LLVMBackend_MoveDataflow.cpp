@@ -109,6 +109,35 @@ void LLVMBackend::DiscardNullDerefEvents(llvm::Function* F)
         if (F) nullEventLog_.erase(F);
     }
 
+// Sizes of the three per-function pending logs, so an abandoned region can rewind to them.
+LLVMBackend::PendingAnalysisMark LLVMBackend::MarkPendingAnalyses(llvm::Function* F) const
+{
+        PendingAnalysisMark mark;
+        if (F == nullptr) return mark;
+        auto nullIt = nullEventLog_.find(F);
+        if (nullIt != nullEventLog_.end()) mark.nullEvents = nullIt->second.size();
+        auto dangleIt = pendingReturnDangleChecks_.find(F);
+        if (dangleIt != pendingReturnDangleChecks_.end()) mark.returnDangleChecks = dangleIt->second.size();
+        auto ifaceIt = pendingNullIfaceDispatch_.find(F);
+        if (ifaceIt != pendingNullIfaceDispatch_.end()) mark.nullIfaceDispatch = ifaceIt->second.size();
+        return mark;
+    }
+
+void LLVMBackend::RewindPendingAnalyses(llvm::Function* F, const PendingAnalysisMark& mark)
+{
+        if (F == nullptr) return;
+        // Only ever shrinks: a log that somehow got smaller is left alone rather than grown.
+        auto rewind = [](auto& table, llvm::Function* fn, size_t keep) {
+            auto it = table.find(fn);
+            if (it == table.end()) return;
+            if (it->second.size() > keep) it->second.resize(keep);
+            if (it->second.empty()) table.erase(it);
+        };
+        rewind(nullEventLog_, F, mark.nullEvents);
+        rewind(pendingReturnDangleChecks_, F, mark.returnDangleChecks);
+        rewind(pendingNullIfaceDispatch_, F, mark.nullIfaceDispatch);
+    }
+
 void LLVMBackend::RunNullDerefDataflow(llvm::Function* F)
 {
         if (!F) return;

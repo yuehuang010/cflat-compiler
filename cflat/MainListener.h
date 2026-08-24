@@ -2409,6 +2409,7 @@ private:
     // reopens a live block and hides the ret terminator. Set only by the return handler (not
     // break/continue - see straightLineJumped_); loops/switch restore it (they fall through).
     bool straightLineReturned_ = false;
+    llvm::BasicBlock* expectErrorRecoveryBlock_ = nullptr;
 
     // Set by the break/continue handlers. Like a return, a break/continue branch does NOT reach
     // the if's resume block, so its moves must not leak onto the fall-through path. Unlike a

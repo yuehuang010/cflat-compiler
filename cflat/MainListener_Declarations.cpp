@@ -2540,7 +2540,9 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             // as a missing return. It is also left without a terminator, so close it
             // with 'unreachable' below for module validity.
             bool blockUnreachable = compiler->IsCurrentBlockUnreachable();
-
+            auto* currentBlock = compilerLLVM->builder->GetInsertBlock();
+            if (!blockUnreachable && currentBlock == expectErrorRecoveryBlock_ && currentBlock->empty())
+                blockUnreachable = true;
             if (returnType.TypeName != "void" && !compiler->IsBlockTerminated() && !blockUnreachable)
                 LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
 
@@ -4667,9 +4669,31 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     // is about to receive. See TagInterfaceBoxProvenance.
                     if (typeAndValue.IsFatInterfaceValue())
                     {
+                        // Initializing from an interface local that ADOPTED its box transfers the
+                        // box, so exactly one of the two destructs it (mirrors 'string b = a').
+                        bool adoptsSourceBox = haveInterfaceSourceNV
+                            && interfaceSourceNV.OwnsInterfaceBox
+                            && !interfaceSourceNV.CallerName.empty()
+                            && interfaceSourceNV.FieldName.empty()
+                            && !typeAndValue.Pointer
+                            && !typeAndValue.IsUnique
+                            && !typeAndValue.IsUniqueTypeArg
+                            && !typeAndValue.IsAlias;
+                        if (adoptsSourceBox)
+                        {
+                            compiler->SetVariableOwning(interfaceSourceNV.CallerName, false);
+                            compiler->SetVariableOwnsInterfaceBox(interfaceSourceNV.CallerName, false);
+                        }
                         if (haveInterfaceSourceNV)
-                            compiler->GetOrCreateStackVariable(name).IsAdoptable =
-                                interfaceSourceNV.IsAdoptable;
+                        {
+                            auto& destNV = compiler->GetOrCreateStackVariable(name);
+                            destNV.IsAdoptable = interfaceSourceNV.IsAdoptable;
+                            if (adoptsSourceBox)
+                            {
+                                destNV.IsOwning = true;
+                                destNV.OwnsInterfaceBox = true;
+                            }
+                        }
                         TagInterfaceBoxProvenance(
                             name, right, haveInterfaceSourceNV ? &interfaceSourceNV : nullptr);
                     }

@@ -1333,11 +1333,6 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
             useRecipe = recipe.hasLowering;
-            for (const AbiSlot& slot : recipe.paramSlots)
-            {
-                if (slot.kind != AbiSlot::Direct)
-                    LogErrorMessage("extern definition '{}' has a by-value parameter that requires C ABI lowering; declare it without a body and implement it in C", { functionName });
-            }
         }
         llvm::FunctionType* functionType = useRecipe
             ? BuildExternFunctionType(returnType, arguments, varargs, recipe)

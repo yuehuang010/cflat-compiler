@@ -83,6 +83,7 @@ void MainListener::ParseBlockItemList(CFlatParser::BlockItemListContext* ctx) {
             auto destructuring = blockItem->destructuringDeclaration();
 
             auto* compiler = Compiler(blockItem);
+            expectErrorRecoveryBlock_ = nullptr;
 
             // Dead code after a return/break/continue (typically one nested in a compound
             // block or an `if const` arm, which inline into this block): the insert block is
@@ -2667,6 +2668,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // Scoped block form: expect_error("msg") { ... } - error must occur inside the braces.
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
+                auto* entryBB = compilerLLVM->builder->GetInsertBlock();
+                bool entryWasUnterminated = entryBB != nullptr && entryBB->getTerminator() == nullptr;
+                // Rewind point for the per-function pending logs (see PendingAnalysisMark).
+                auto* markedFn = entryBB != nullptr ? entryBB->getParent() : nullptr;
+                auto pendingMark = compilerLLVM->MarkPendingAnalyses(markedFn);
                 compiler->InitializeBlock(nullptr, true);
                 bool errorReceived = false;
                 try
@@ -2683,28 +2689,40 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // Pop any extra nested frames without destructors (error path).
                     while (compilerLLVM->stackNamedVariable.size() > savedDepth)
                         compilerLLVM->stackNamedVariable.pop_back();
-                    // Terminate the current block and create a new one so the outer
-                    // function's subsequent statements have a valid insertion point.
+                    // The swallowed diagnostic already answered everything this block queued;
+                    // leaving it queued makes the end-of-module sweep report it a second time.
+                    compilerLLVM->RewindPendingAnalyses(markedFn, pendingMark);
+                    // Terminate abandoned blocks and reconnect the live path to recovery.
                     if (auto* bb = compilerLLVM->builder->GetInsertBlock())
                     {
+                        auto* function = bb->getParent();
+                        auto* resume = llvm::BasicBlock::Create(
+                            *compilerLLVM->context, "after_expect_error", function);
                         if (!compiler->IsBlockTerminated())
                             compilerLLVM->builder->CreateUnreachable();
                         // A throwing diagnostic can unwind through a guarded expression whose
                         // sibling arm is not the current insert block (for example `?.`). The
                         // expectation harness continues compilation, so close every abandoned
                         // block in this function before creating its recovery continuation.
-                        auto* function = bb->getParent();
                         for (auto& abandoned : *function)
                         {
+                            if (&abandoned == resume)
+                                continue;
                             if (abandoned.getTerminator() == nullptr)
                             {
                                 compilerLLVM->builder->SetInsertPoint(&abandoned);
                                 compilerLLVM->builder->CreateUnreachable();
                             }
                         }
-                        auto* resume = llvm::BasicBlock::Create(
-                            *compilerLLVM->context, "after_expect_error", function);
+                        if (entryWasUnterminated && entryBB->getParent() == function)
+                        {
+                            if (auto* terminator = entryBB->getTerminator())
+                                terminator->eraseFromParent();
+                            compilerLLVM->builder->SetInsertPoint(entryBB);
+                            compilerLLVM->builder->CreateBr(resume);
+                        }
                         compilerLLVM->builder->SetInsertPoint(resume);
+                        expectErrorRecoveryBlock_ = resume;
                     }
                     compilerLLVM->RestoreFileScopeExpectedError();
                 }

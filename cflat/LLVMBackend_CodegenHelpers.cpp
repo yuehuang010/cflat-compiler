@@ -100,13 +100,51 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
         if (abiRecipe != nullptr && abiRecipe->retSlot.kind == AbiSlot::SRetReturn
             && llvmArgIt != fn->arg_end())
             ++llvmArgIt;
+        size_t abiParamIndex = 0;
         for (; itr_nameArg != arguments.end() && llvmArgIt != fn->arg_end(); ++itr_nameArg)
         {
-            auto& arg = *llvmArgIt++;
+            auto* incomingArg = &*llvmArgIt++;
+            incomingArg->setName(itr_nameArg->VariableName);
+
+            const AbiSlot* abiSlot = nullptr;
+            llvm::Argument* secondAbiArg = nullptr;
+            if (abiRecipe != nullptr && abiParamIndex < abiRecipe->paramSlots.size())
+            {
+                abiSlot = &abiRecipe->paramSlots[abiParamIndex++];
+                if (abiSlot->kind == AbiSlot::CoercePair && llvmArgIt != fn->arg_end())
+                    secondAbiArg = &*llvmArgIt++;
+            }
+
+            // ABI-lowered struct parameters arrive as pointers, integer/SSE values, or a pair
+            // of eightbytes. Rebuild the natural struct value before the normal parameter
+            // binding code stores it in the function's local slot.
+            llvm::Value* argValue = incomingArg;
+            if (abiSlot != nullptr && abiSlot->kind != AbiSlot::Direct)
+            {
+                if (abiSlot->kind == AbiSlot::ByVal)
+                    argValue = builder->CreateLoad(abiSlot->structTy, incomingArg);
+                else
+                {
+                    auto* slot = AllocaAtEntry(abiSlot->structTy, nullptr,
+                        itr_nameArg->VariableName + ".abi");
+                    if (abiSlot->kind == AbiSlot::CoerceToInt)
+                    {
+                        StoreCoerceAt(slot, incomingArg, 0);
+                        argValue = builder->CreateLoad(abiSlot->structTy, slot);
+                    }
+                    else if (abiSlot->kind == AbiSlot::CoercePair && secondAbiArg != nullptr)
+                    {
+                        StoreCoerceAt(slot, incomingArg, 0);
+                        StoreCoerceAt(slot, secondAbiArg, 8);
+                        argValue = builder->CreateLoad(abiSlot->structTy, slot);
+                    }
+                }
+            }
+
             llvm::Argument* rawArrayCountArg = nullptr;
-            if (ParameterCarriesRawArrayCount(*itr_nameArg) && llvmArgIt != fn->arg_end())
+            if (abiRecipe == nullptr && ParameterCarriesRawArrayCount(*itr_nameArg)
+                && llvmArgIt != fn->arg_end())
                 rawArrayCountArg = &*llvmArgIt++;
-            arg.setName(itr_nameArg->VariableName);
             if (rawArrayCountArg != nullptr)
                 rawArrayCountArg->setName(itr_nameArg->VariableName + ".raw_array_count");
 
@@ -126,7 +164,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = GetType(*itr_nameArg),
                     .Primary = nullptr,
-                    .Storage = &arg,
+                    .Storage = argValue,
                 };
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
@@ -141,7 +179,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 RecordInterfaceMaterialization(itr_nameArg->TypeName, "the type of a parameter");
                 auto fatTy = GetFatPtrType();
                 auto tmp = builder->CreateAlloca(fatTy, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, tmp);
+                builder->CreateStore(argValue, tmp);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = fatTy,
@@ -159,7 +197,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 // move parameter: alloca a slot so we can null it out on scope exit
                 auto* ptrTy = GetType(*itr_nameArg, nullptr, true);
                 auto* alloc = builder->CreateAlloca(ptrTy, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, alloc);
+                builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = ptrTy,
@@ -185,7 +223,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 // move string parameter: alloca a slot so the destructor can free the buffer on scope exit
                 auto* strTy = GetType(*itr_nameArg, nullptr, false);
                 auto* alloc = builder->CreateAlloca(strTy, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, alloc);
+                builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = strTy,
@@ -208,7 +246,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 auto* slotTy = unsizedShell ? (llvm::Type*)builder->getInt8Ty() : structTy;
                 auto* alloc = builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
                 if (!unsizedShell)
-                    builder->CreateStore(&arg, alloc);
+                    builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = structTy,
@@ -228,7 +266,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 auto* slotTy = unsizedShell ? (llvm::Type*)builder->getInt8Ty() : structTy;
                 auto* alloc = builder->CreateAlloca(slotTy, nullptr, itr_nameArg->VariableName);
                 if (!unsizedShell)
-                    builder->CreateStore(&arg, alloc);
+                    builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar{
                     .TypeAndValue = *itr_nameArg,
                     .BaseType = structTy,
@@ -258,7 +296,7 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 // are writable (CreateStore targets) just like local variables.
                 auto* ty = GetType(*itr_nameArg, nullptr, itr_nameArg->Pointer);
                 auto* alloc = builder->CreateAlloca(ty, nullptr, itr_nameArg->VariableName);
-                builder->CreateStore(&arg, alloc);
+                builder->CreateStore(argValue, alloc);
                 NamedVariable namedVar
                 {
                     .TypeAndValue = *itr_nameArg,
