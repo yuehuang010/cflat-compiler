@@ -294,6 +294,13 @@ bool addMethod2(void* klass, char* selName, function<void(void*, void*, void*, v
     return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@@") != (i8)0;
 }
 
+// -(void)sel:(id)table cell:(id)cell column:(id)column row:(NSInteger)row.
+bool addMethodVoidIdIdIdI64(void* klass, char* selName,
+                            function<void(void*, void*, void*, void*, void*, i64)> imp)
+{
+    return __classAddMethod(klass, sel(selName), (void*)imp, "v@:@@@q") != (i8)0;
+}
+
 // [obj selector:(NSInteger)v] returning NSInteger - e.g. numberOfItems reads with
 // msgGetI64; this is for selectItemAtIndex: style calls that also return an integer.
 void* msgIntArg(void* obj, char* selName, i64 v)

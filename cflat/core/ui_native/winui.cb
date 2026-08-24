@@ -835,6 +835,7 @@ struct WItemSource
     WIterableVtbl* lpVtbl2  = nullptr;   // IBindableIterable / IIterable<object> (self = &lpVtbl2)
     u32            rc       = 0u;
     u64            box      = 0u;        // the boxed rowText callback (ListRowBox*), owned
+    u64            styleBox = 0u;        // boxed ListCellStyle callback, owned
     int            rowCount = 0;
     int            cols     = 1;
 };
@@ -903,6 +904,7 @@ u32 _wsRelease(void* self)
     if (left == 0u)
     {
         if (s.box != 0u) { __uiFreeListRowBox(s.box); s.box = 0u; }
+        if (s.styleBox != 0u) { __uiFreeListStyleBox(s.styleBox); s.styleBox = 0u; }
         free((void*)s);
     }
     return left;
@@ -1026,6 +1028,7 @@ WItemSource* winuiNewItemSource()
     s.lpVtbl2 = &_gIterableVtbl;
     s.rc = 1u;
     s.box = 0u;
+    s.styleBox = 0u;
     s.rowCount = 0;
     s.cols = 1;
     return s;
@@ -2043,6 +2046,12 @@ class WinUI3Host : INativeHost
             s.box = payload;
             this._listBind(h, (u64)s);
         }
+        else if (op == LISTOP_SET_CELLSTYLE_CB)
+        {
+            WItemSource* s = (WItemSource*)this._listMakeSrc(h);
+            if (s.styleBox != 0u && s.styleBox != payload) __uiFreeListStyleBox(s.styleBox);
+            s.styleBox = payload;
+        }
         else if (op == LISTOP_SET_SELECT_MODE)
         {
             void* lvb = wqi((void*)h, iidof(XamlListViewBase));
@@ -2278,6 +2287,7 @@ class WinUI3Host : INativeHost
             }
             this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
             this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+            this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
         }
         else if (k == ELEM_TREE)
         {
@@ -2365,6 +2375,7 @@ class WinUI3Host : INativeHost
         {
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
             winuiZeroItemsCache(h);
@@ -3447,6 +3458,21 @@ void nativeListActivate(string keyPath, int row)
     if (row >= 0) nativeListSelect(keyPath, row);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { IListView lv = e as IListView; if (lv != nullptr) { lv.fireActivate(row); pumpWinui(); } }
+}
+
+void nativeListHeaderClick(string keyPath, int col)
+{
+    IElement e = winuiElem(keyPath);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv != nullptr && col >= 0 && col < lv.columns.count()) { lv.fireHeaderClick(col); pumpWinui(); }
+}
+
+int nativeListCellColor(string keyPath, int row, int col)
+{
+    WItemSource* src = _wHost._listLiveSrc(_wCtx.nativeHandle(keyPath));
+    if (src == nullptr) return 0;
+    return resolveListCellColor(__uiListCellStyle(src.styleBox, row, col), _wCtx.theme);
 }
 
 // -- Tab drivers (read back off the live TabView) -------------------------------

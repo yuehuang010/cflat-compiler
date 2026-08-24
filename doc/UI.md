@@ -161,7 +161,7 @@ same fields.
 | `RadioGroup` | `ELEM_RADIOGROUP` | controlled single-choice group (container) | `int value` (selected index), `onChange`, `RadioButton` children |
 | `RadioButton` | `ELEM_RADIO` | one option inside a `RadioGroup` | `string label`, `int index`, `bool checked` |
 | `ComboBox` | `ELEM_COMBO` | controlled dropdown | `list<string> items`, `int selectedIndex`, `onChange` |
-| `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `int selectedIndex`, `onSelect`, `onActivate` |
+| `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `cellStyle(row,col)`, `int selectedIndex`, `width`, `height`, `onSelect`, `onActivate`, `onHeaderClick` |
 | `TabControl` | `ELEM_TABS` | keyed tab panes, lazy inactive tabs | `int selectedTab`, `onSelectTab`, `TabPane` children |
 | `TabPane` | `ELEM_TABPANE` | one titled pane inside a `TabControl` (container) | `string title`, `children` |
 | `TreeView` | `ELEM_TREE` | expand-on-demand tree | `childCount(nid)`, `childId(nid,i)`, `label(nid)`, `int selectedNode`, `onSelect`, `onExpand` |
@@ -200,9 +200,18 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   `rowCount` can be 100k+ and only the visible cells are ever queried (Win32
   `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthCells)`;
   controlled `selectedIndex`; `onSelect(row)` on a selection change, `onActivate(row)`
-  on double-click / Enter. Driver helpers: `nativeListSelect(keyPath, row)`,
+  on double-click / Enter, and `onHeaderClick(column)` for a zero-based header click.
+  Factory-returned `IListView` exposes `width`, `height`, and all three callbacks, so
+  interface-typed values remain fully configurable. Driver helpers: `nativeListSelect(keyPath, row)`,
   `nativeListSelectedRow(keyPath)`, `nativeListCellText(keyPath, row, col)`,
-  `nativeListRowCount(keyPath)`.
+  `nativeListRowCount(keyPath)`, and `nativeListHeaderClick(keyPath, column)`.
+  Optional `cellStyle(row, col)` returns a tagged `ListCellStyle`: `listCellInherit()`,
+  `listCellRole(LIST_ROLE_TEXT|MUTED|SUCCESS|WARNING|ERROR)`, or
+  `listCellLiteral(color)`. Literal black is valid because presence is tagged; it is
+  not inferred from integer zero. Semantic roles resolve through the current `Theme`.
+  Win32 and Cocoa apply the resolved role/literal to realized native cells. WinUI
+  currently resolves and retains the style for its deterministic driver, but its
+  one-string default item template does not yet paint a per-cell foreground.
 
 All layout dimensions and column widths are shared integer cells, not DIPs. The
 public `colWidths` field is retained for source compatibility; `addColumn` uses
@@ -221,6 +230,11 @@ crosses the seam - the same constraint `ctx.post` obeys. The CocoaHost (real `NS
 dataSource) and WinUI3Host (real `ListView` bound to a hand-written `IBindableVector` over the
 same `rowText` box, so XAML pulls only the rows it realizes) both implement `setListOp` fully;
 see the parity matrix.
+
+`LISTOP_SET_CELLSTYLE_CB` carries the opaque `ListCellStyle` callback box. Hosts query
+only realized cells and release the box with the control; no native handle, brush, or
+image resource enters the public UI model. WinUI's current implementation is a
+resolution/readback seam until its item template can apply the color visibly.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a ICanvas fallback and a headless
 self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is
@@ -1102,6 +1116,9 @@ Deliberate WinUI 3 gaps in this release, all documented and non-silent:
 - **ListView columns** collapse into ONE joined row string: a XAML ListView item is a single
   object, so there is no column header row (the `rowText(row, col)` callback is still called
   per column, and `nativeListCellText` reads a single cell back out of the bound source).
+- **ListView header and cell styling** are not yet native on WinUI: `nativeListHeaderClick`
+  and `nativeListCellColor` are deterministic host-neutral drivers/readbacks, not proof of a
+  user header click or visible XAML foreground. The active issue files track these two gaps.
 - **Multi-window** is single-window (mirrors the Cocoa decision); the gallery gate needs one window.
 - **tooltip** prop is not wired to `ToolTipService` yet (no self-test covers it on WinUI).
 

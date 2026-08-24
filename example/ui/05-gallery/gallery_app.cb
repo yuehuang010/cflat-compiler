@@ -48,6 +48,13 @@ class GalleryApp : IComponent
     int fontIdx       = 0;    // ComboBox selection
     int listSel       = -1;   // ListView selected row (controlled)
     int listActivated = -1;   // last double-clicked / Entered row
+    int listHeader     = -1;   // last clicked zero-based column header
+    int factoryProbe   = -1;   // interface factory callback self-test value
+    int factoryActivate = -1;  // interface ListView activate callback self-test value
+    int factoryHeader  = -1;   // interface ListView header callback self-test value
+    int interfaceTextChanged = 0;
+    bool interfaceCheckboxChanged = false;
+    int interfaceAreaChanged = 0;
     int rowTextCalls  = 0;    // rowText callback invocations (virtualization oracle)
     int tab           = 0;    // TabControl selection (P9)
     int treeSel       = 0 - 1; // selected tree node id (P9)
@@ -352,6 +359,12 @@ class GalleryApp : IComponent
             i64 sq = (i64)r * (i64)r;
             return sq.toString();
         };
+        lv.cellStyle = (int r, int c) => {
+            if (r == 50000 && c == 1) return listCellRole(LIST_ROLE_ERROR);
+            if (r == 50000 && c == 0) return listCellLiteral(0);
+            return listCellInherit();
+        };
+        lv.onHeaderClick = (int c) => { this.listHeader = c; ctx.invalidate(); };
         cardList.add(lv);
         content.add(cardList);
 
@@ -603,6 +616,76 @@ int gallerySelfTest()
         t.launch(new GalleryApp(), 60, 60);
         GalleryApp* g = activeApp() as GalleryApp;
 
+        // Factory return is interface-typed: every app-settable ListView property
+        // must remain writable and the fire wrapper must reach the assigned closure.
+        IListView configured = listView(2, (int r, int c) => { return "x"; });
+        configured.width = 18; configured.height = 4;
+        configured.onSelect = (int r) => { if (g != nullptr) g.factoryProbe = r; };
+        configured.onActivate = (int r) => { if (g != nullptr) g.factoryActivate = r; };
+        configured.onHeaderClick = (int c) => { if (g != nullptr) g.factoryHeader = c; };
+        configured.cellStyle = (int r, int c) => listCellRole(LIST_ROLE_WARNING);
+        LayoutConstraints lc = default; lc.availW = 100; lc.availH = 100;
+        Size configuredSize = configured.layout(lc);
+        configured.fireSelect(1);
+        configured.fireActivate(2);
+        configured.fireHeaderClick(1);
+        ListCellStyle configuredStyle = configured.cellStyle(0, 0);
+        t.expectTrue("factory IListView properties",
+            configuredSize.w == 18 && configuredSize.h == 4 && g != nullptr && g.factoryProbe == 1
+            && g.factoryActivate == 2 && g.factoryHeader == 1
+            && configuredStyle.hasRole && configuredStyle.role == LIST_ROLE_WARNING);
+        delete configured;
+
+        ITextInput configuredInput = textInput("", (string s) =>
+        { if (g != nullptr) g.interfaceTextChanged++; });
+        configuredInput.width = 17; configuredInput.color = rgb(1, 2, 3);
+        configuredInput.backgroundColor = rgb(4, 5, 6);
+        Size inputSize = configuredInput.layout(lc); configuredInput.fireChangeText("typed");
+        t.expectTrue("factory ITextInput properties", inputSize.w == 17
+            && configuredInput.color == rgb(1, 2, 3)
+            && configuredInput.backgroundColor == rgb(4, 5, 6)
+            && g != nullptr && g.interfaceTextChanged == 1);
+        delete configuredInput;
+
+        ICheckbox configuredCheck = checkbox("probe", false, (bool v) =>
+        { if (g != nullptr) g.interfaceCheckboxChanged = v; });
+        configuredCheck.color = rgb(7, 8, 9); configuredCheck.fireToggle();
+        t.expectTrue("factory ICheckbox properties", configuredCheck.color == rgb(7, 8, 9)
+            && g != nullptr && g.interfaceCheckboxChanged);
+        delete configuredCheck;
+
+        IProgressBar configuredProgress = progressBar(25, 19);
+        configuredProgress.color = rgb(10, 11, 12);
+        Size progressSize = configuredProgress.layout(lc);
+        t.expectTrue("factory IProgressBar properties", progressSize.w == 19
+            && configuredProgress.color == rgb(10, 11, 12));
+        delete configuredProgress;
+
+        ITextArea configuredArea = textArea("", () =>
+        { if (g != nullptr) g.interfaceAreaChanged++; });
+        configuredArea.width = 21; configuredArea.height = 6;
+        configuredArea.color = rgb(13, 14, 15); configuredArea.backgroundColor = rgb(16, 17, 18);
+        Size areaSize = configuredArea.layout(lc); configuredArea.fireChange();
+        t.expectTrue("factory ITextArea properties", areaSize.w == 21 && areaSize.h == 6
+            && configuredArea.color == rgb(13, 14, 15)
+            && configuredArea.backgroundColor == rgb(16, 17, 18)
+            && g != nullptr && g.interfaceAreaChanged == 1);
+        delete configuredArea;
+
+        ITreeView configuredTree = treeView((int i) => 0, (int p, int i) => 0,
+            (int i) => "probe");
+        configuredTree.width = 23; configuredTree.height = 7;
+        Size treeSize = configuredTree.layout(lc);
+        t.expectTrue("factory ITreeView properties", treeSize.w == 23 && treeSize.h == 7);
+        delete configuredTree;
+
+        IImage configuredImage = image(0u, 1, 1);
+        configuredImage.width = 11; configuredImage.height = 5; configuredImage.altText = "probe";
+        Size imageSize = configuredImage.layout(lc);
+        t.expectTrue("factory IImage properties", imageSize.w == 11 && imageSize.h == 5
+            && configuredImage.altText == "probe");
+        delete configuredImage;
+
         // 1. Every P8 control became a real control.
         t.expectTrue("controls created",
             _exists("root/content/cardradio/rg/r0") && _exists("root/content/cardradio/rg/r1")
@@ -649,6 +732,16 @@ int gallerySelfTest()
         t.expectTrue("list activation",
             g != nullptr && g.listActivated == 5
             && _statusIs("root/content/cardstatus/status", "Size: Large  Font: Segoe UI  Row: 5  Opened: 5"));
+
+        // Header input is distinct from row selection/activation, and style is virtual:
+        // one row/cell can resolve a semantic role or explicit literal black on demand.
+        nativeListHeaderClick("root/content/cardlist/list", 1);
+        t.expectTrue("list header callback", g != nullptr && g.listHeader == 1 && g.listSel == 5);
+        int listErrorColor = nativeListCellColor("root/content/cardlist/list", 50000, 1);
+        t.expectTrue("list cell styles", listErrorColor == darkTheme().listError
+            || listErrorColor == lightTheme().listError);
+        t.expectTrue("list literal black is present", nativeListCellColor("root/content/cardlist/list", 50000, 0)
+            == rgb(0, 0, 0));
 
         // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
         t.expectTrue("tabs init",

@@ -520,7 +520,68 @@ struct Theme
     int focusRing   = 0;   // border drawn around the focused widget
     int track       = 0;   // ProgressBar / Slider trough
     int accent      = 0;   // ProgressBar / Slider filled portion + thumb
+    // Semantic ListView cell roles. These are appearance colors, independent of
+    // the OS light/dark scheme, and are resolved by ListCellStyle.
+    int listText     = 0;
+    int listMuted    = 0;
+    int listSuccess  = 0;
+    int listWarning  = 0;
+    int listError    = 0;
 };
+
+// A tagged, virtualization-safe ListView cell appearance. A callback can return
+// one value for every column in a row to express row-level styling without copying
+// rows into host state. `literal` is explicit, so numeric color 0 is valid.
+struct ListCellStyle
+{
+    bool hasRole = false;
+    int  role = 0;
+    bool hasLiteral = false;
+    int  literal = 0;
+};
+
+int LIST_ROLE_TEXT    = 1;
+int LIST_ROLE_MUTED   = 2;
+int LIST_ROLE_SUCCESS = 3;
+int LIST_ROLE_WARNING = 4;
+int LIST_ROLE_ERROR   = 5;
+
+ListCellStyle listCellInherit()
+{
+    ListCellStyle s = default;
+    return s;
+}
+
+ListCellStyle listCellRole(int role)
+{
+    ListCellStyle s = default;
+    s.hasRole = true; s.role = role;
+    return s;
+}
+
+ListCellStyle listCellLiteral(int color)
+{
+    ListCellStyle s = default;
+    s.hasLiteral = true; s.literal = color;
+    return s;
+}
+
+int resolveListCellColor(ListCellStyle style, Theme theme)
+{
+    if (style.hasLiteral)
+    {
+        // Normalize both raw 0xRRGGBB and existing rgb() values to the marked
+        // representation used by ICanvas, retaining explicit literal black.
+        return rgb((style.literal >> 16) & 0xFF, (style.literal >> 8) & 0xFF,
+                   style.literal & 0xFF);
+    }
+    if (!style.hasRole) return theme.listText;
+    if (style.role == LIST_ROLE_MUTED) return theme.listMuted;
+    if (style.role == LIST_ROLE_SUCCESS) return theme.listSuccess;
+    if (style.role == LIST_ROLE_WARNING) return theme.listWarning;
+    if (style.role == LIST_ROLE_ERROR) return theme.listError;
+    return theme.listText;
+}
 
 // Resolve a color: an explicit per-node color (anything but COLOR_DEFAULT/0) wins;
 // otherwise fall back to the theme slot (itself 0 in the monochrome theme, which
@@ -545,6 +606,11 @@ Theme lightTheme()
     t.focusRing   = rgb(52, 120, 247);
     t.track       = rgb(210, 214, 220);
     t.accent      = rgb(52, 120, 247);
+    t.listText    = t.textColor;
+    t.listMuted   = rgb(110, 118, 130);
+    t.listSuccess = rgb(20, 125, 70);
+    t.listWarning = rgb(170, 105, 0);
+    t.listError   = rgb(190, 45, 45);
     return t;
 }
 
@@ -562,6 +628,11 @@ Theme darkTheme()
     t.focusRing   = rgb(120, 170, 255);
     t.track       = rgb(60, 66, 76);
     t.accent      = rgb(88, 150, 255);
+    t.listText    = t.textColor;
+    t.listMuted   = rgb(160, 168, 180);
+    t.listSuccess = rgb(100, 210, 145);
+    t.listWarning = rgb(245, 190, 80);
+    t.listError   = rgb(255, 120, 120);
     return t;
 }
 
@@ -902,6 +973,8 @@ interface ITextInput : IDisableable
     string value;
     string placeholder;
     int    width;
+    int    color;
+    int    backgroundColor;
     void   fireChangeText(string s);
 };
 
@@ -909,6 +982,7 @@ interface ICheckbox : IDisableable
 {
     string label;
     bool   checked;
+    int    color;
     void   fireToggle();
 };
 
@@ -916,6 +990,7 @@ interface IProgressBar : ITooltipped
 {
     int value;
     int width;
+    int color;
 };
 
 interface ISlider : IDisableable
@@ -928,6 +1003,10 @@ interface ISlider : IDisableable
 interface ITextArea : IDisableable
 {
     string value;
+    int    width;
+    int    height;
+    int    color;
+    int    backgroundColor;
     void   fireChange();
 };
 
@@ -976,9 +1055,16 @@ interface IListView : IDisableable
     int  selectedIndex;
     bool multiSelect;
     Lambda<string(int,int)> rowText;   // read as a value: boxed across the host seam
+    Lambda<ListCellStyle(int,int)> cellStyle; // optional virtual cell appearance source
+    int  width;
+    int  height;
+    Lambda<void(int)> onSelect;
+    Lambda<void(int)> onActivate;
+    Lambda<void(int)> onHeaderClick;
     void addColumn(string title, int widthCells);
     void fireSelect(int row);
     void fireActivate(int row);
+    void fireHeaderClick(int col);
 };
 
 interface ITabPane : IElement
@@ -1005,6 +1091,8 @@ interface ITreeView : IDisableable
     Lambda<int(int,int)> childId;
     Lambda<string(int)>  label;
     int  selectedNode;
+    int  width;
+    int  height;
     void fireSelect(int nodeId);
     void fireExpand(int nodeId);
 };
@@ -1030,6 +1118,7 @@ interface IImage : ITooltipped
     int    width;
     int    height;
     string source;
+    string altText;
 };
 
 interface IGroupBox : ITooltipped
@@ -3089,10 +3178,12 @@ class ListView : IListView
     list<int>    colWidths = default;    // per-column width in layout cells
     int   rowCount = 0;
     Lambda<string(int,int)> rowText = default;   // (row, col) -> cell text
+    Lambda<ListCellStyle(int,int)> cellStyle = default; // (row, col) -> tagged appearance
     int   selectedIndex = -1;            // controlled single selection (-1 = none)
     bool  multiSelect = false;
     Lambda<void(int)> onSelect   = default;      // selection changed to row
     Lambda<void(int)> onActivate = default;      // double-click / Enter on row
+    Lambda<void(int)> onHeaderClick = default;   // zero-based column header click
     int   width  = 40;
     int   height = 10;
     bool  disabled = false;
@@ -3108,6 +3199,7 @@ class ListView : IListView
 
     void fireSelect(int row)   { if (this.onSelect != nullptr) { this.onSelect(row); } }
     void fireActivate(int row) { if (this.onActivate != nullptr) { this.onActivate(row); } }
+    void fireHeaderClick(int col) { if (this.onHeaderClick != nullptr) { this.onHeaderClick(col); } }
 
     move string toJson()
     {
@@ -3139,7 +3231,7 @@ class ListView : IListView
         int bg = pickColor(0, ctx.theme.inputBg);
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
         cv.drawRect(this.bounds, false, pickColor(0, ctx.theme.panelBorder));
-        int ink = pickColor(0, ctx.theme.textColor);
+        int ink = pickColor(0, ctx.theme.listText);
         string hdr = "";
         int c = 0;
         while (c < this.columns.count())
@@ -3154,16 +3246,36 @@ class ListView : IListView
         int r = 0;
         while (r < visible && r < this.rowCount)
         {
-            string line = "";
-            int cc = 0;
-            while (cc < ncol)
+            // Keep the legacy joined rendering for the default style. Styled rows
+            // draw each cell separately so colors remain virtualized and precise.
+            if (this.cellStyle == nullptr)
             {
-                if (cc > 0) line = line + " | ";
-                if (this.rowText != nullptr) line = line + this.rowText(r, cc);
-                cc++;
+                string line = "";
+                int cc = 0;
+                while (cc < ncol)
+                {
+                    if (cc > 0) line = line + " | ";
+                    if (this.rowText != nullptr) line = line + this.rowText(r, cc);
+                    cc++;
+                }
+                if (r == this.selectedIndex) line = ">" + line;
+                cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
             }
-            if (r == this.selectedIndex) line = ">" + line;
-            cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
+            else
+            {
+                int x = this.bounds.x + 1;
+                if (r == this.selectedIndex) { cv.drawText(x, this.bounds.y + 1 + r, ">", ink); x++; }
+                int cc = 0;
+                while (cc < ncol)
+                {
+                    string text = this.rowText != nullptr ? this.rowText(r, cc) : "";
+                    ListCellStyle cs = this.cellStyle(r, cc);
+                    cv.drawText(x, this.bounds.y + 1 + r, text.data(), resolveListCellColor(cs, ctx.theme));
+                    x = x + (int)text.length();
+                    if (cc + 1 < ncol) { cv.drawText(x, this.bounds.y + 1 + r, " | ", ink); x = x + 3; }
+                    cc++;
+                }
+            }
             r++;
         }
     }
@@ -3174,8 +3286,19 @@ class ListView : IListView
         if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
         {
             ctx.focus(this.key);
+            if (e.y == this.bounds.y)
+            {
+                int col = 0; int x = this.bounds.x + 1;
+                while (col < this.columns.count())
+                {
+                    int width = col < this.colWidths.count() ? this.colWidths.get(col) : 12;
+                    if (e.x >= x && e.x < x + width) { this.fireHeaderClick(col); return true; }
+                    x = x + width + 3; col++;
+                }
+                return true;
+            }
             int r = e.y - (this.bounds.y + 1);
-            if (r >= 0 && r < this.rowCount) this.onSelect(r);
+            if (r >= 0 && r < this.rowCount) this.fireSelect(r);
             return true;
         }
         if (e.kind == EV_KEY && ctx.hasFocus(this.key))
@@ -3249,6 +3372,8 @@ move IListView listView(int rowCount, Lambda<string(int,int)> rowText)
 // when the control is destroyed. Mirrors the PostBox pattern above.
 class ListRowBox { Lambda<string(int,int)> cb = default; };
 
+class ListStyleBox { Lambda<ListCellStyle(int,int)> cb = default; };
+
 // Heap-box a rowText closure. Returns a TYPED pointer so escape analysis keeps the
 // cloned closure alive past this call; the caller casts to u64 at its own site.
 ListRowBox* _boxListRow(Lambda<string(int,int)> cb)
@@ -3273,6 +3398,28 @@ void __uiFreeListRowBox(u64 boxPtr)
 {
     if (boxPtr == 0u) return;
     ListRowBox* b = (ListRowBox*)boxPtr;
+    delete b;
+}
+
+ListStyleBox* _boxListStyle(Lambda<ListCellStyle(int,int)> cb)
+{
+    ListStyleBox* b = new ListStyleBox();
+    b.cb = cb;
+    return b;
+}
+
+ListCellStyle __uiListCellStyle(u64 boxPtr, int row, int col)
+{
+    if (boxPtr == 0u) return listCellInherit();
+    ListStyleBox* b = (ListStyleBox*)boxPtr;
+    if (b.cb == nullptr) return listCellInherit();
+    return b.cb(row, col);
+}
+
+void __uiFreeListStyleBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    ListStyleBox* b = (ListStyleBox*)boxPtr;
     delete b;
 }
 
@@ -4574,6 +4721,7 @@ int LISTOP_SET_ROWTEXT_CB = 4;   // payload = boxed rowText callback (ListRowBox
 int LISTOP_SET_SELECT_MODE = 5;  // arg0 = 0 single-select, 1 multi-select
 int LISTOP_SET_SELECTION  = 6;   // arg0 = row to select (-1 clears selection)
 int LISTOP_INVALIDATE     = 7;   // redraw / reload the visible (virtual) rows
+int LISTOP_SET_CELLSTYLE_CB = 8; // payload = boxed ListCellStyle callback
 
 // -- Tab + tree ops on the SAME setListOp seam ---------------------------------
 // TabControl and TreeView reuse setListOp rather than adding new interface methods

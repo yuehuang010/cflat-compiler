@@ -168,6 +168,8 @@ class CocoaHost : INativeHost
     // Win32 LVS_OWNERDATA does, but the boxed rowText is still the single item source).
     list<u64>    listBoxHandles = default;
     list<u64>    listBoxPtrs    = default;
+    list<u64>    listStyleHandles = default;
+    list<u64>    listStylePtrs    = default;
     list<u64>    listSelHandles = default;   // parallel handle -> selected row
     list<int>    listSelRows    = default;
     list<u64>    accHandles = default;       // parallel handle -> stored accent bg
@@ -414,6 +416,7 @@ class CocoaHost : INativeHost
     {
         if (h == 0u) return;
         this._freeListBox(h);    // no-op unless h is a list with a boxed rowText
+        this._freeListStyle(h);
         this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
         this._storeAccent(h, 0); // drop any stored accent for this handle
@@ -628,6 +631,50 @@ class CocoaHost : INativeHost
                 if (old != 0u) __uiFreeListRowBox(old);
                 this.listBoxHandles.removeAt(i); this.listBoxPtrs.removeAt(i);
                 return;
+            }
+            i++;
+        }
+    }
+
+    u64 _listStyleForTable(u64 tablePtr)
+    {
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == tablePtr) return this.listStylePtrs.get(i);
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setListStyle(u64 h, u64 box)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listStylePtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListStyleBox(old);
+                this.listStylePtrs.set(i, box); return;
+            }
+            i++;
+        }
+        this.listStyleHandles.add((u64)table); this.listStylePtrs.add(box);
+    }
+
+    void _freeListStyle(u64 h)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listStylePtrs.get(i);
+                if (old != 0u) __uiFreeListStyleBox(old);
+                this.listStyleHandles.removeAt(i); this.listStylePtrs.removeAt(i); return;
             }
             i++;
         }
@@ -1039,6 +1086,10 @@ class CocoaHost : INativeHost
         {
             this._setListBox(h, payload);
         }
+        else if (op == LISTOP_SET_CELLSTYLE_CB)
+        {
+            this._setListStyle(h, payload);
+        }
         else if (op == LISTOP_SET_SELECT_MODE)
         {
             void* table = this._tableOf(h);
@@ -1229,6 +1280,7 @@ class CocoaHost : INativeHost
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
                     this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                    this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
                 }
                 else if (node.kind() == ELEM_TREE)
                 {
@@ -1451,6 +1503,7 @@ class CocoaHost : INativeHost
             // is pulled on demand via the boxed rowText (the table's dataSource).
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
         }
@@ -1579,10 +1632,12 @@ class CocoaHost : INativeHost
         // closing wholesale). The parallel lists + ctx.nativeByKey are value fields freed
         // automatically when `delete owned` runs this window's destructor.
         { int i = 0; while (i < this.listBoxPtrs.count()) { u64 b = this.listBoxPtrs.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; } }
+        { int i = 0; while (i < this.listStylePtrs.count()) { u64 b = this.listStylePtrs.get(i); if (b != 0u) __uiFreeListStyleBox(b); i++; } }
         { int i = 0; while (i < this.treeBoxPtrs.count()) { u64 b = this.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
         { int i = 0; while (i < this.canvasBoxes.count()) { u64 b = this.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
         { int i = 0; while (i < this.ctxMenus.count()) { u64 b = this.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
         this.listBoxHandles.clear(); this.listBoxPtrs.clear();
+        this.listStyleHandles.clear(); this.listStylePtrs.clear();
         this.treeBoxHandles.clear(); this.treeBoxPtrs.clear();
         this.canvasHandles.clear();  this.canvasBoxes.clear();
         this.ctxKeys.clear();        this.ctxMenus.clear();
@@ -1913,6 +1968,37 @@ void _onListDoubleClickImp(void* self, void* cmd, void* table)
     if (lv == nullptr) return;
     int sel = (int)msgGetI64(table, "selectedRow");
     if (sel >= 0) { lv.fireActivate(sel); pumpNative(); }
+}
+
+void _onListHeaderClickImp(void* self, void* cmd, void* table, void* column)
+{
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready || curWin().applying) return;
+    string key = curWin().keyForHandle((u64)msg0(table, "enclosingScrollView"));
+    if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv == nullptr) return;
+    i64 ci = msgGetI64Arg(msg0(table, "tableColumns"), "indexOfObject:", column);
+    if (ci >= (i64)0) { lv.fireHeaderClick((int)ci); pumpNative(); }
+}
+
+void _onListWillDisplayCellImp(void* self, void* cmd, void* table, void* cell,
+                               void* column, i64 row)
+{
+    if (!_setCurFromTarget(self)) return;
+    u64 scroll = (u64)msg0(table, "enclosingScrollView");
+    string key = curWin().keyForHandle(scroll);
+    if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv == nullptr) return;
+    i64 ci = msgGetI64Arg(msg0(table, "tableColumns"), "indexOfObject:", column);
+    if (ci < (i64)0) ci = 0;
+    int color = resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)table), (int)row, (int)ci), curWin().ctx.theme);
+    msg1(cell, "setTextColor:", curWin().colorFor(color));
 }
 
 // The segmented tab strip changed -> onSelectTab.
@@ -2534,6 +2620,21 @@ void nativeListActivate(string keyPath, int row)
     IListView lv = e as IListView;
     if (lv == nullptr) return;
     if (row >= 0) { lv.fireActivate(row); pumpNative(); }
+}
+
+void nativeListHeaderClick(string keyPath, int col)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv != nullptr && col >= 0 && col < lv.columns.count()) { lv.fireHeaderClick(col); pumpNative(); }
+}
+
+int nativeListCellColor(string keyPath, int row, int col)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)curWin()._tableOf(h)), row, col), curWin().ctx.theme);
 }
 
 // -- Host-neutral form/data test drivers (mirror the Win32 names) ---------------
@@ -3307,12 +3408,16 @@ void registerHostClasses()
         // Data-control target/action + dataSource methods.
         function<void(void*, void*, void*)> lc = _onListClickImp;
         function<void(void*, void*, void*)> ld = _onListDoubleClickImp;
+        function<void(void*, void*, void*, void*)> lh = _onListHeaderClickImp;
+        function<void(void*, void*, void*, void*, void*, i64)> lw = _onListWillDisplayCellImp;
         function<void(void*, void*, void*)> tsg = _onTabSegmentImp;
         function<void(void*, void*, void*)> trc = _onTreeClickImp;
         function<void(void*, void*, void*)> twe = _onTreeWillExpandImp;
         function<void(void*, void*, void*)> rpb = _runPostBoxImp;
         addMethod0(tg, "onListClick:", lc);
         addMethod0(tg, "onListDoubleClick:", ld);
+        addMethod2(tg, "tableView:didClickTableColumn:", lh);
+        addMethodVoidIdIdIdI64(tg, "tableView:willDisplayCell:forTableColumn:row:", lw);
         addMethod0(tg, "onTabSegment:", tsg);
         addMethod0(tg, "onTreeClick:", trc);
         addMethod0(tg, "outlineViewItemWillExpand:", twe);

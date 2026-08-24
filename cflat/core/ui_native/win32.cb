@@ -148,6 +148,7 @@ const int LVIS_FOCUSED  = 0x0001;
 const int LVIS_SELECTED = 0x0002;
 const int LVNI_SELECTED = 0x0002;
 const int LVN_ITEMCHANGED = -101;   // LVN_FIRST-1
+const int LVN_COLUMNCLICK = -108;   // LVN_FIRST-8
 const int LVN_GETDISPINFOA = -150;  // LVN_FIRST-50
 const int LVN_KEYDOWN     = -155;   // LVN_FIRST-55
 const int NM_DBLCLK       = -3;     // NM_FIRST-3
@@ -309,6 +310,7 @@ const int CDDS_ITEMPREPAINT  = 0x00010001;   // CDDS_ITEM | CDDS_PREPAINT
 const int CDRF_DODEFAULT     = 0x00000000;
 const int CDRF_NOTIFYPOSTPAINT = 0x00000010;
 const int CDRF_NOTIFYITEMDRAW = 0x00000020;
+const int CDRF_NEWFONT        = 0x00000002;
 const int CDRF_SKIPDEFAULT   = 0x00000004;
 const int CDIS_SELECTED      = 0x00000001;
 const int CDIS_FOCUS         = 0x00000010;
@@ -563,6 +565,8 @@ class Window : INativeHost
     // seam, so the callback rides as an opaque u64 (see setListOp / __uiListRowText).
     list<u64>    listBoxHandles = default;
     list<u64>    listBoxPtrs    = default;
+    list<u64>    listStyleHandles = default;
+    list<u64>    listStylePtrs    = default;
     // TreeView node-source boxes: parallel HWND -> TreeBox* (as u64), like the list
     // boxes. Freed on destroyControl + dispose (a Lambda cannot cross the seam).
     list<u64>    treeBoxHandles = default;
@@ -774,6 +778,7 @@ class Window : INativeHost
     {
         if (h == 0u) return;
         this._freeListBox(h);   // no-op unless h is a ListView with a boxed callback
+        this._freeListStyle(h);
         this._freeTreeBox(h);   // no-op unless h is a TreeView with a boxed node source
         this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
         this._freeCanvasBox(h); // no-op unless h is a CanvasView with a boxed painter
@@ -1390,6 +1395,48 @@ class Window : INativeHost
         }
     }
 
+    u64 _listStyleFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == h) return this.listStylePtrs.get(i);
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setListStyle(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == h)
+            {
+                u64 old = this.listStylePtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListStyleBox(old);
+                this.listStylePtrs.set(i, box); return;
+            }
+            i++;
+        }
+        this.listStyleHandles.add(h); this.listStylePtrs.add(box);
+    }
+
+    void _freeListStyle(u64 h)
+    {
+        int i = 0;
+        while (i < this.listStyleHandles.count())
+        {
+            if (this.listStyleHandles.get(i) == h)
+            {
+                u64 old = this.listStylePtrs.get(i);
+                if (old != 0u) __uiFreeListStyleBox(old);
+                this.listStyleHandles.removeAt(i); this.listStylePtrs.removeAt(i); return;
+            }
+            i++;
+        }
+    }
+
     // -- TreeView node-source box bookkeeping (mirrors the ListView boxes) ------
     u64 _treeBoxFor(u64 h)
     {
@@ -1539,6 +1586,10 @@ class Window : INativeHost
             this._setListBox(h, payload);
             SendMessageA(ctrl, (u32)LVM_SETEXTENDEDLISTVIEWSTYLE,
                          (u64)LVS_EX_FULLROWSELECT, (i64)LVS_EX_FULLROWSELECT);
+        }
+        else if (op == LISTOP_SET_CELLSTYLE_CB)
+        {
+            this._setListStyle(h, payload);
         }
         else if (op == LISTOP_SET_SELECT_MODE)
         {
@@ -1799,6 +1850,7 @@ class Window : INativeHost
                     // Inline _boxListRow call-result cast to u64: no named owning local,
                     // so nothing auto-frees the box the host now owns (mirrors ctx.post).
                     this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                    this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
                 }
                 else if (node.kind() == ELEM_RADIO)
                 {
@@ -2371,6 +2423,7 @@ class Window : INativeHost
             // text is pulled on demand via the boxed rowText callback (LVN_GETDISPINFO).
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setListOp(h, LISTOP_INVALIDATE, 0, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
@@ -2567,6 +2620,15 @@ class Window : INativeHost
         }
         this.listBoxHandles.clear();
         this.listBoxPtrs.clear();
+        int si = 0;
+        while (si < this.listStylePtrs.count())
+        {
+            u64 b = this.listStylePtrs.get(si);
+            if (b != 0u) __uiFreeListStyleBox(b);
+            si++;
+        }
+        this.listStyleHandles.clear();
+        this.listStylePtrs.clear();
         // Free any TreeView node-source boxes still live.
         int ti = 0;
         while (ti < this.treeBoxPtrs.count())
@@ -3548,6 +3610,20 @@ void routeListActivate(void* hFrom)
     if (sel >= 0) { lv.fireActivate(sel); pumpNative(); }
 }
 
+void routeListHeader(void* hFrom, i64 lParam)
+{
+    Window* wnd = curWin();
+    string key = wnd.keyForHandle((u64)hFrom);
+    if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv == nullptr) return;
+    // NMLISTVIEW.iSubItem is immediately after NMHDR + iItem.
+    i32* sub = (i32*)((char*)u2h((u64)lParam) + 28);
+    if (sub[0] >= 0) { lv.fireHeaderClick(sub[0]); pumpNative(); }
+}
+
 // Dispatch a WM_NOTIFY from a child control. Returns true if we consumed it.
 bool routeNotify(i64 lParam)
 {
@@ -3557,6 +3633,7 @@ bool routeNotify(i64 lParam)
     void* hFrom = nh.hwndFrom;
     if (code == LVN_GETDISPINFOA) { fillListDispInfo(lParam); return true; }
     if (code == LVN_ITEMCHANGED)  { routeListSelect(hFrom); return true; }
+    if (code == LVN_COLUMNCLICK) { routeListHeader(hFrom, lParam); return true; }
     if (code == NM_DBLCLK)        { routeListActivate(hFrom); return true; }
     if (code == LVN_KEYDOWN)
     {
@@ -4353,6 +4430,46 @@ bool tryCustomDrawTrackbar(Window* wnd, i64 lParam, i64* result)
     return true;
 }
 
+// ListView virtual-cell ink. The callback is queried only for the row/subitem
+// the common control is painting; no rows or native resources are retained.
+bool tryCustomDrawList(Window* wnd, i64 lParam, i64* result)
+{
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    if (nh == nullptr) return false;
+    char[32] cn;
+    GetClassNameA(nh.hwndFrom, cn, 32);
+    if (strcmp(cn, "SysListView32") != 0) return false;
+    char* p = (char*)u2h((u64)lParam);
+    u32* stagePtr = (u32*)(p + 24);
+    u32 stage = stagePtr[0];
+    if (stage == (u32)CDDS_PREPAINT)
+    {
+        result[0] = (i64)CDRF_NOTIFYITEMDRAW;
+        return true;
+    }
+    if (stage != (u32)CDDS_ITEMPREPAINT && stage != (u32)(CDDS_ITEMPREPAINT | 0x00030000u))
+        return false;
+    if (stage == (u32)CDDS_ITEMPREPAINT)
+    {
+        result[0] = (i64)CDRF_NOTIFYITEMDRAW;
+        return true;
+    }
+    i64* rowPtr = (i64*)(p + 56);
+    i64 row = rowPtr[0];
+    int col = 0;
+    if (stage == (u32)(CDDS_ITEMPREPAINT | 0x00030000u))
+    {
+        i32* subPtr = (i32*)(p + 80);
+        col = subPtr[0];
+    }
+    u64 box = wnd._listStyleFor((u64)nh.hwndFrom);
+    int color = resolveListCellColor(__uiListCellStyle(box, (int)row, col), wnd.ctx.theme);
+    u32* textPtr = (u32*)(p + 72);
+    textPtr[0] = wnd.colorRef(color);
+    result[0] = (i64)CDRF_NEWFONT;
+    return true;
+}
+
 // Headless verification of the accent-button DRAW. NM_CUSTOMDRAW cannot be captured
 // by PrintWindow (it re-renders controls default), so this drives the custom-draw path into
 // a memory DC with a synthetic NMCUSTOMDRAW and returns the filled pixel as a COLORREF. The
@@ -4486,6 +4603,21 @@ void nativeListActivate(string keyPath, int row)
     if (h == 0u) return;
     if (row >= 0) nativeListSelect(keyPath, row);
     routeListActivate(u2h(h));
+}
+
+void nativeListHeaderClick(string keyPath, int col)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    if (e == nullptr) return;
+    IListView lv = e as IListView;
+    if (lv != nullptr && col >= 0 && col < lv.columns.count()) { lv.fireHeaderClick(col); pumpNative(); }
+}
+
+int nativeListCellColor(string keyPath, int row, int col)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleFor(h), row, col), curWin().ctx.theme);
 }
 
 // The progress bar position (PBM_GETPOS); -1 if no control.
@@ -4750,6 +4882,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             i64 cdr = (i64)CDRF_DODEFAULT;
             if (tryCustomDrawButton(wnd, lParam, &cdr)) return cdr;
             if (tryCustomDrawTrackbar(wnd, lParam, &cdr)) return cdr;
+            if (tryCustomDrawList(wnd, lParam, &cdr)) return cdr;
         }
         if (wnd.ready && routeNotify(lParam)) return (i64)0;
         return DefWindowProcA(hwnd, msg, wParam, lParam);
