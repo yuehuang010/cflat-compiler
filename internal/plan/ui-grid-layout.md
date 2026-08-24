@@ -2,9 +2,12 @@
 
 Status:
 - Flex weights + flexWrap: SHIPPED (2026-07-12; d08998a + follow-ons). Record below.
-- Grid (track layout) + GridView (virtualized item grid): PROPOSED 2026-08-24,
-  maintainer-directed. Awaiting ratification of the API surface (section
-  "Acceptance") before any implementation.
+- Grid (track layout) + GridView (virtualized item grid): IMPLEMENTED 2026-08-24
+  (ratified same day, all four acceptance points), uncommitted. Grid adopted in
+  fedit (both authoring variants; splitH/fixed-size arithmetic removed, app is
+  resize-driven) and the gallery (Grid form card + GridView 10k-cell card).
+  buildci.bat green over the full set. Deferred as planned: cell span (1b),
+  cell recycling (2b), Cocoa/WinUI wheel routing.
 
 ## Part 1 (shipped): flex weights + flexWrap
 

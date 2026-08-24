@@ -43,6 +43,7 @@ manifest ManifestDoc uiNativeManifest = { assembly = {
 extern stdcall void InitCommonControls();
 extern stdcall i32 InitCommonControlsEx(void* p);
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
+extern stdcall i32 DrawMenuBar(void* hwnd);
 extern stdcall void* ImageList_Create(i32 cx, i32 cy, u32 flags, i32 initial, i32 grow);
 extern stdcall i32 ImageList_Destroy(void* himl);
 extern stdcall i32 ImageList_Add(void* himl, void* image, void* mask);
@@ -419,11 +420,17 @@ void* u2h(u64 u) { return (void*)u; }
 // a crash). SetWindowTheme itself is documented; only its theme-name string is not.
 const int UXORD_ALLOW_DARK_MODE_FOR_WINDOW = 133;
 const int UXORD_SET_PREFERRED_APP_MODE     = 135;
+const int UXORD_FLUSH_MENU_THEMES          = 136;
 const int UX_APPMODE_DEFAULT   = 0;
 const int UX_APPMODE_ALLOW_DARK = 1;
+// Force modes follow the APP theme regardless of the system setting - needed so an
+// app-local dark toggle re-themes menus/popups (menus have no per-window theme API).
+const int UX_APPMODE_FORCE_DARK  = 2;
+const int UX_APPMODE_FORCE_LIGHT = 3;
 
 function<i32(void*, i32)> _uxAllowDarkForWindow = nullptr;
 function<i32(i32)>        _uxSetPreferredAppMode = nullptr;
+function<void()>          _uxFlushMenuThemes = nullptr;
 bool _uxBound = false;
 
 // Bind uxtheme's dark-mode ordinals once. Absent ordinals leave the pointers null.
@@ -437,6 +444,8 @@ void _bindUxTheme()
         GetProcAddress(ux, (const char*)(i64)UXORD_ALLOW_DARK_MODE_FOR_WINDOW);
     _uxSetPreferredAppMode = (function<i32(i32)>)
         GetProcAddress(ux, (const char*)(i64)UXORD_SET_PREFERRED_APP_MODE);
+    _uxFlushMenuThemes = (function<void()>)
+        GetProcAddress(ux, (const char*)(i64)UXORD_FLUSH_MENU_THEMES);
 }
 
 // A NUL-terminated UTF-16 copy of an ASCII string, for the LPCWSTR-only SetWindowTheme.
@@ -481,10 +490,13 @@ void _ctlThemeReset(void* hwnd) { SetWindowTheme(hwnd, nullptr, nullptr); }
 void _applyDarkNonClient(void* hwnd, bool dark)
 {
     _bindUxTheme();
+    // Force (not Allow) so popup menus track the APP theme even on a light system.
     if (_uxSetPreferredAppMode != nullptr)
-        _uxSetPreferredAppMode(dark ? UX_APPMODE_ALLOW_DARK : UX_APPMODE_DEFAULT);
+        _uxSetPreferredAppMode(dark ? UX_APPMODE_FORCE_DARK : UX_APPMODE_FORCE_LIGHT);
     _allowDark(hwnd, dark);
     _ctlTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer");
+    if (_uxFlushMenuThemes != nullptr) _uxFlushMenuThemes();
+    DrawMenuBar(hwnd);
     // The scrollbar lives in the frame, so only a FRAME redraw picks the new theme up.
     RedrawWindow(hwnd, nullptr, nullptr, (u32)(RDW_INVALIDATE | RDW_FRAME | RDW_NOCHILDREN));
 }
@@ -507,6 +519,7 @@ bool nativeMappable(int kind)
 int _containerBg(IElement node, Theme theme, bool systemDark)
 {
     if (node.kind() == ELEM_VIEW) { IView v = node as IView; return resolveColor(v.style.backgroundColor, theme, systemDark); }
+    if (node.kind() == ELEM_GRID) { IGrid g = node as IGrid; return resolveColor(g.style.backgroundColor, theme, systemDark); }
     return 0;
 }
 
@@ -517,6 +530,16 @@ int _containerBg(IElement node, Theme theme, bool systemDark)
 bool _containerControl(int kind)
 {
     return kind == ELEM_GROUPBOX || kind == ELEM_TABS || kind == ELEM_BOX;
+}
+
+// Fill-style controls stretch into the sub-cell remainder at the layout edge (see
+// _edgeWpx/_edgeHpx); fixed-height chrome (buttons, fields, combos, sliders...)
+// keeps its exact cell frame.
+bool _fillKind(int kind)
+{
+    return kind == ELEM_TEXTAREA || kind == ELEM_LIST || kind == ELEM_TREE
+        || kind == ELEM_TABS || kind == ELEM_CANVAS || kind == ELEM_GRIDVIEW
+        || kind == ELEM_GROUPBOX || kind == ELEM_BOX;
 }
 
 // HWND_BOTTOM / HWND_TOP: the ends of the sibling z-order (cast macros the header binding
@@ -668,6 +691,9 @@ class Window : INativeHost
     // derived from it minus the scrollbar column, so showing the bar narrows the content.
     int          clientPxW       = 0;
     int          clientPxH       = 0;
+    // The last layout row fill controls may stretch from (set per applyTree pass):
+    // the row above the status strip when the tree docks one, else the bottom row.
+    int          fillBottomCells = 0;
 
     IComponent app   = default;       // the mounted component (this window owns it)
     IElement   tree  = default;       // the committed IElement tree
@@ -1146,6 +1172,12 @@ class Window : INativeHost
         if (this.content == nullptr) return;
         int vw = this.w * this.dipX();
         int vh = this.h * this.dipY();
+        // Cover the sub-cell remainder at the client edges, so fill controls stretched
+        // into it (_edgeWpx/_edgeHpx) are not clipped by the pane. The status bar sits
+        // above the pane in z and clips it out of its band, so full height is safe.
+        int cw = this.clientPxW - this._scrollColPx();
+        if (cw > vw) vw = cw;
+        if (this.clientPxH > vh) vh = this.clientPxH;
         int ph = this.scrollContentPx > vh ? this.scrollContentPx : vh;
         if (ph > PANE_MAX_H)
         {
@@ -1186,6 +1218,45 @@ class Window : INativeHost
         if (nw < 1) nw = 1;
         if (nh < 1) nh = 1;
         this.w = nw; this.h = nh;
+    }
+
+    // Cell frames quantize the client size, leaving up to one cell of dead band at the
+    // right/bottom edges (and above the self-docked status strip, whose px height is not
+    // a cell multiple). Fill controls whose frame ends on the layout's last column/row
+    // absorb that remainder so the content meets the true client edge.
+    int _edgeWpx(Rect b)
+    {
+        int w = b.w * this.dipX();
+        if (b.x + b.w != this.w) return w;
+        int edge = this.clientPxW - this._scrollColPx() - b.x * this.dipX();
+        return edge > w ? edge : w;
+    }
+
+    int _edgeHpx(Rect b)
+    {
+        int h = b.h * this.dipY();
+        if (b.y + b.h != this.fillBottomCells) return h;
+        int reserve = this._statusPx();
+        // First pass: the status control does not exist yet - reserve its cell row.
+        if (reserve == 0 && this.fillBottomCells < this.h) reserve = this.dipY();
+        int edge = this.clientPxH - reserve - b.y * this.dipY();
+        return edge > h ? edge : h;
+    }
+
+    // True if any node in the committed tree is a status bar (it docks to the frame
+    // bottom, so the layout's last row belongs to it, not to the content).
+    bool _treeHasStatusBar(IElement n)
+    {
+        if (n.kind() == ELEM_STATUSBAR) return true;
+        list<IElement>* kids = n.childList();
+        if (kids == nullptr) return false;
+        int i = 0;
+        while (i < kids.count())
+        {
+            if (this._treeHasStatusBar(kids.get(i))) return true;
+            i++;
+        }
+        return false;
     }
 
     // Park the scrollbar control in the right column of the viewport, above the status bar.
@@ -1979,6 +2050,7 @@ class Window : INativeHost
         this.applying = true;
         this.bdFrame.clear();
         this.ctFrame.clear();
+        this.fillBottomCells = this._treeHasStatusBar(tree) ? this.h - 1 : this.h;
 
         list<string> newKeys    = default;
         list<u64>    newHandles = default;
@@ -2194,12 +2266,14 @@ class Window : INativeHost
             }
             else
             {
-                int fhpx = b.h * this.dipY();
+                bool fill = _fillKind(node.kind());
+                int fwpx = fill ? this._edgeWpx(b) : b.w * this.dipX();
+                int fhpx = fill ? this._edgeHpx(b) : b.h * this.dipY();
                 // A dropdown-list combo's height param sizes the dropped list; add rows
                 // so the list is usable (the collapsed field height is fixed by the OS).
                 if (node.kind() == ELEM_COMBO) fhpx = fhpx + 8 * this.dipY();
                 fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
-                fw.add(b.w * this.dipX()); fh.add(fhpx);
+                fw.add(fwpx); fh.add(fhpx);
             }
         }
         else if (_containerBg(node, ctx.theme, ctx.systemPrefersDark()) != 0)
@@ -2220,8 +2294,9 @@ class Window : INativeHost
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
+            // A backdrop always absorbs the edge remainder - it is pure background.
             fx.add(b.x * this.dipX()); fy.add(b.y * this.dipY());
-            fw.add(b.w * this.dipX()); fh.add(b.h * this.dipY());
+            fw.add(this._edgeWpx(b)); fh.add(this._edgeHpx(b));
         }
 
         // A TabControl walks ONLY its active pane into native controls (lazy inactive
@@ -2236,6 +2311,27 @@ class Window : INativeHost
                 IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
+            }
+            return;
+        }
+
+        if (node.kind() == ELEM_GRIDVIEW)
+        {
+            IGridView gv = node as IGridView;
+            Rect gb = node.nodeBounds();
+            int i = 0;
+            while (i < gv.realizedCount())
+            {
+                IElement cell = gv.getRealized(i);
+                Rect cb = cell.nodeBounds();
+                Rect visible = intersectRect(gb, cb);
+                // Overscan keeps native controls bounded, at the cost of edge churn.
+                if (visible.w > 0 && visible.h > 0)
+                {
+                    string cp = joinKeyPath(path, keySegment(cell, i));
+                    this._applyNode(cell, cp, ctx, keys, handles, fx, fy, fw, fh);
+                }
+                i++;
             }
             return;
         }
@@ -2391,8 +2487,12 @@ class Window : INativeHost
         else if (strcmp(cn, "msctls_progress32") == 0) this._themeProgress(h);
         else if (strcmp(cn, "BUTTON") == 0 || strcmp(cn, "Button") == 0)
         {
-            i64 style = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE);
-            if ((style & (i64)BS_GROUPBOX) != 0) this._themeGroupBox(h);
+            // The button TYPE is the low style nibble compared whole - BS_GROUPBOX
+            // (0x7) overlaps checkbox (0x3) and radio (0x9) bitwise.
+            i64 bs = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE) & (i64)0xF;
+            if (bs == (i64)BS_GROUPBOX) this._themeGroupBox(h);
+            else if (bs == (i64)BS_AUTOCHECKBOX || bs == (i64)BS_AUTORADIOBUTTON)
+                this._themeCheckGlyph(h);
             else this._themeBasicControl(h, "DarkMode_CFD");
         }
         else if (strcmp(cn, "COMBOBOX") == 0 || strcmp(cn, "ComboBox") == 0)
@@ -2467,6 +2567,17 @@ class Window : INativeHost
         if (dk) _ctlThemeNone(ctrl); else _ctlThemeReset(ctrl);
         SendMessageA(ctrl, (u32)PBM_SETBKCOLOR, 0u, (i64)(u64)(dk ? this.themeTrack : CLR_DEFAULT));
         SendMessageA(ctrl, (u32)PBM_SETBARCOLOR, 0u, (i64)(u64)(dk ? this.themeAccent : CLR_DEFAULT));
+        InvalidateRect(ctrl, nullptr, 1);
+    }
+
+    // Checkbox/radio: tryCustomDrawCheckbox paints them when themed, so keep the
+    // STANDARD v6 theme - a classic (theme-less) BUTTON never sends NM_CUSTOMDRAW,
+    // and the DarkMode themes have no check-glyph parts.
+    void _themeCheckGlyph(u64 h)
+    {
+        void* ctrl = u2h(h);
+        _allowDark(ctrl, this.ctlDark);
+        _ctlThemeReset(ctrl);
         InvalidateRect(ctrl, nullptr, 1);
     }
 
@@ -3122,6 +3233,53 @@ class Window : INativeHost
         if (cmd > 0) routeMenu(cmd);
         return true;
     }
+
+// Find the GridView under a content-space point. GridView pools are leaves to this walk.
+IGridView _gridAtPoint(IElement node, int x, int y)
+{
+    if (node.kind() == ELEM_GRIDVIEW)
+    {
+        if (node.nodeBounds().contains(x, y)) return node as IGridView;
+        return nullptr;
+    }
+    list<IElement>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = kids.count() - 1;
+        while (i >= 0)
+        {
+            IGridView hit = _gridAtPoint(kids.get(i), x, y);
+            if (hit != nullptr) return hit;
+            i--;
+        }
+    }
+    return nullptr;
+}
+
+bool _routeGridWheel(int sx, int sy, double lines, bool horizontal)
+{
+    if (horizontal || !hasCurWin()) return false;
+    Window* wnd = curWin();
+    if (!wnd.ready || wnd.content == nullptr) return false;
+    POINT pt = default;
+    pt.x = sx; pt.y = sy;
+    ScreenToClient(wnd.content, &pt);
+    int dx = wnd.dipX(); int dy = wnd.dipY();
+    if (dx < 1) dx = 1; if (dy < 1) dy = 1;
+    IGridView gv = _gridAtPoint(wnd.tree, pt.x / dx, pt.y / dy);
+    if (gv == nullptr) return false;
+    // Scroll chaining: a grid already at its edge in the wheel direction does not
+    // consume the event - it falls through to the outer page scroll.
+    int max = gv.maxScrollY();
+    int delta = (int)(lines * 3.0);
+    if (delta >= 0 && gv.scrollY <= 0) return false;
+    if (delta <= 0 && gv.scrollY >= max) return false;
+    gv.scrollY = gv.scrollY - delta;
+    if (gv.scrollY < 0) gv.scrollY = 0;
+    if (gv.scrollY > max) gv.scrollY = max;
+    wnd.requestLayout();
+    return true;
+}
 
     // Hit-test a pixel against every SplitView divider in the tree; returns the split's
     // key path (widened to a grabbable band) or "". Drives WM_LBUTTONDOWN drag capture.
@@ -3881,11 +4039,28 @@ void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 // Drain any pending posted UI-thread calls (WM_APP_CALL) + other queued messages.
 // The headless self-tests call this after a worker thread posts, since there is no
 // running message loop to dispatch the marshaled closure.
+// Win32 delivers wheel messages to the FOCUSED window; modern apps (and the Cocoa
+// host) scroll whatever is under the POINTER. Retarget a wheel message to the
+// window under the cursor (same thread only), so a focused ListView/EDIT does not
+// trap the page scroll, and hovering a scrollable scrolls it without a click.
+void _retargetWheel(MSG* msg)
+{
+    if (msg.message != (u32)WM_MOUSEWHEEL && msg.message != (u32)WM_MOUSEHWHEEL) return;
+    POINT pt = default;
+    pt.x = _loWordSigned(msg.lParam);   // wheel lParam carries SCREEN coordinates
+    pt.y = _hiWordSigned(msg.lParam);
+    void* under = WindowFromPoint(pt);
+    if (under == nullptr || under == msg.hwnd) return;
+    if (GetWindowThreadProcessId(under, nullptr) != GetCurrentThreadId()) return;
+    msg.hwnd = under;
+}
+
 void hostDrainPosted()
 {
     MSG msg = default;
     while (PeekMessageA(&msg, nullptr, 0u, 0u, (u32)PM_REMOVE) != 0)
     {
+        _retargetWheel(&msg);
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
@@ -4377,6 +4552,9 @@ int nativeContainerBg(string keyPath)
     if (e == nullptr) return 0;
     IView v = e as IView;
     if (v != nullptr) return resolveColor(v.style.backgroundColor, wnd.ctx.theme,
+                                           wnd.ctx.systemPrefersDark());
+    IGrid g = e as IGrid;
+    if (g != nullptr) return resolveColor(g.style.backgroundColor, wnd.ctx.theme,
                                            wnd.ctx.systemPrefersDark());
     return 0;
 }
@@ -4902,11 +5080,111 @@ bool tryCustomDrawButton(Window* wnd, i64 lParam, i64* result)
     return true;
 }
 
-// Dark trackbar custom draw: the themed thumb remains native, while the theme has no dark
-// channel/tick parts. dwItemSpec is the TBCD_* part id at offset 56 in NMCUSTOMDRAW.
+// Themed checkbox / radio custom draw: the stock 13px glyph reads tiny against the
+// cell-sized UI font, so a THEMED app gets a glyph drawn at cell scale in theme
+// colors. An unthemed (monochrome) app keeps the stock native look, per the
+// stock-until-themed rule above.
+bool tryCustomDrawCheckbox(Window* wnd, i64 lParam, i64* result)
+{
+    NMHDR* nh = (NMHDR*)u2h((u64)lParam);
+    char[32] cn;
+    GetClassNameA(nh.hwndFrom, cn, 32);
+    if (!wnd.themed) return false;
+    if (strcmp(cn, "BUTTON") != 0 && strcmp(cn, "Button") != 0) return false;
+    i64 st = GetWindowLongPtrA(nh.hwndFrom, (int)GWL_STYLE);
+    bool isCheck = (st & (i64)0xF) == (i64)BS_AUTOCHECKBOX;
+    bool isRadio = (st & (i64)0xF) == (i64)BS_AUTORADIOBUTTON;
+    if (!isCheck && !isRadio) return false;
+    char* p = (char*)u2h((u64)lParam);
+    u32* stagePtr = (u32*)(p + 24);
+    if (stagePtr[0] != (u32)CDDS_PREPAINT) { result[0] = (i64)CDRF_DODEFAULT; return true; }
+    void** hdcPtr = (void**)(p + 32);
+    void* hdc = hdcPtr[0];
+    i32* rcPtr = (i32*)(p + 40);
+    u32* statePtr = (u32*)(p + 64);
+    u32 state = statePtr[0];
+    RECT rc = default;
+    rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+
+    bool checked = (int)SendMessageA(nh.hwndFrom, (u32)BM_GETCHECK, 0u, (i64)0) == 1;
+    FillRect(hdc, &rc, wnd._brushFor(wnd.themeBg));
+
+    int side = wnd.dipY() * 2 / 3;
+    if (side < 13) side = 13;
+    RECT bx = default;
+    bx.left = rc.left; bx.top = (rc.top + rc.bottom - side) / 2;
+    bx.right = bx.left + side; bx.bottom = bx.top + side;
+
+    u32 fill = wnd.themeAccent;
+    if ((state & (u32)CDIS_SELECTED) != 0u) fill = shadeRef(fill, 0 - 40);
+    else if ((state & (u32)CDIS_HOT) != 0u) fill = shadeRef(fill, 28);
+    u32 line = shadeRef(wnd.themeBg, wnd.dark ? 90 : 0 - 90);
+    if ((state & (u32)CDIS_HOT) != 0u) line = wnd.themeAccent;
+
+    if (isCheck && checked)
+    {
+        FillRect(hdc, &bx, wnd._brushFor(fill));
+        int pw = side / 7; if (pw < 2) pw = 2;
+        void* pen = CreatePen((int)PS_SOLID, pw, 0xFFFFFFu);
+        void* oldPen = SelectObject(hdc, pen);
+        MoveToEx(hdc, bx.left + side * 22 / 100, bx.top + side * 52 / 100, nullptr);
+        LineTo(hdc, bx.left + side * 42 / 100, bx.top + side * 72 / 100);
+        LineTo(hdc, bx.left + side * 78 / 100, bx.top + side * 28 / 100);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+    else if (isCheck)
+    {
+        void* fr = CreateSolidBrush(line);
+        FrameRect(hdc, &bx, fr);
+        RECT inner = default;
+        inner.left = bx.left + 1; inner.top = bx.top + 1;
+        inner.right = bx.right - 1; inner.bottom = bx.bottom - 1;
+        FrameRect(hdc, &inner, fr);   // a 2px border reads at cell scale
+        DeleteObject(fr);
+    }
+    else
+    {
+        void* pen = CreatePen((int)PS_SOLID, 2, checked ? fill : line);
+        void* oldPen = SelectObject(hdc, pen);
+        void* oldBr = SelectObject(hdc, GetStockObject((int)NULL_BRUSH));
+        Ellipse(hdc, bx.left, bx.top, bx.right, bx.bottom);
+        if (checked)
+        {
+            int inset = side * 30 / 100;
+            void* dot = CreateSolidBrush(fill);
+            void* oldDot = SelectObject(hdc, dot);
+            Ellipse(hdc, bx.left + inset, bx.top + inset, bx.right - inset, bx.bottom - inset);
+            SelectObject(hdc, oldDot);
+            DeleteObject(dot);
+        }
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPen);
+        DeleteObject(pen);
+    }
+
+    if ((state & (u32)CDIS_FOCUS) != 0u)
+        FrameRect(hdc, &rc, wnd._brushFor(shadeRef(wnd.themeAccent, 60)));
+
+    char[256] label; GetWindowTextA(nh.hwndFrom, label, 256);
+    RECT tr = default;
+    tr.left = bx.right + side / 2; tr.top = rc.top;
+    tr.right = rc.right; tr.bottom = rc.bottom;
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, wnd.themeText);
+    DrawTextA(hdc, label, -1, &tr,
+              (u32)(DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX));
+    result[0] = (i64)CDRF_SKIPDEFAULT;
+    return true;
+}
+
+// Trackbar custom draw. Dark: the theme has no dark channel/tick parts, paint them
+// with the track color. Themed (light or dark): the stock OS-blue thumb clashes with
+// the app palette, paint it in the theme accent with hover/drag shades like a button.
+// dwItemSpec is the TBCD_* part id at offset 56 in NMCUSTOMDRAW.
 bool tryCustomDrawTrackbar(Window* wnd, i64 lParam, i64* result)
 {
-    if (!wnd.ctlDark) return false;
+    if (!wnd.ctlDark && !wnd.themed) return false;
     char* p = (char*)u2h((u64)lParam);
     u32* stagePtr = (u32*)(p + 24);
     NMHDR* nh = (NMHDR*)u2h((u64)lParam);
@@ -4920,17 +5198,28 @@ bool tryCustomDrawTrackbar(Window* wnd, i64 lParam, i64* result)
     }
     if (stagePtr[0] != (u32)CDDS_ITEMPREPAINT) return false;
     i64* itemPtr = (i64*)(p + 56);
-    if (itemPtr[0] != (i64)TBCD_CHANNEL && itemPtr[0] != (i64)TBCD_TICS)
-    {
-        result[0] = (i64)CDRF_DODEFAULT;
-        return true;
-    }
     void** hdcPtr = (void**)(p + 32);
     i32* rcPtr = (i32*)(p + 40);
     RECT rc = default;
     rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
-    FillRect(hdcPtr[0], &rc, wnd._brushFor(wnd.themeTrack));
-    result[0] = (i64)CDRF_SKIPDEFAULT;
+    if (itemPtr[0] == (i64)TBCD_THUMB && wnd.themed)
+    {
+        u32* statePtr = (u32*)(p + 64);
+        u32 state = statePtr[0];
+        u32 fill = wnd.themeAccent;
+        if ((state & (u32)CDIS_SELECTED) != 0u) fill = shadeRef(fill, 0 - 40);
+        else if ((state & (u32)CDIS_HOT) != 0u) fill = shadeRef(fill, 28);
+        FillRect(hdcPtr[0], &rc, wnd._brushFor(fill));
+        result[0] = (i64)CDRF_SKIPDEFAULT;
+        return true;
+    }
+    if ((itemPtr[0] == (i64)TBCD_CHANNEL || itemPtr[0] == (i64)TBCD_TICS) && wnd.ctlDark)
+    {
+        FillRect(hdcPtr[0], &rc, wnd._brushFor(wnd.themeTrack));
+        result[0] = (i64)CDRF_SKIPDEFAULT;
+        return true;
+    }
+    result[0] = (i64)CDRF_DODEFAULT;
     return true;
 }
 
@@ -5330,6 +5619,9 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     {
         double lines = (double)_hiWordSigned((i64)wParam) / 120.0;
         bool ctrl = (wParam & (u64)MK_CONTROL) != 0u;
+        if (wnd._routeGridWheel(_loWordSigned(lParam), _hiWordSigned(lParam), lines,
+                              msg == WM_MOUSEHWHEEL))
+            return (i64)0;
         if (_routeCanvasWheel(_loWordSigned(lParam), _hiWordSigned(lParam), lines,
                               msg == WM_MOUSEHWHEEL, ctrl))
             return (i64)0;
@@ -5418,6 +5710,7 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         if (wnd.ready && nh != nullptr && (int)nh.code == NM_CUSTOMDRAW)
         {
             i64 cdr = (i64)CDRF_DODEFAULT;
+            if (tryCustomDrawCheckbox(wnd, lParam, &cdr)) return cdr;
             if (tryCustomDrawButton(wnd, lParam, &cdr)) return cdr;
             if (tryCustomDrawTrackbar(wnd, lParam, &cdr)) return cdr;
             if (tryCustomDrawList(wnd, lParam, &cdr)) return cdr;
@@ -5762,6 +6055,7 @@ int runAppGuiNative(IComponent app, const char* title)
     MSG msg = default;
     while (GetMessageA(&msg, nullptr, 0u, 0u) > 0)
     {
+        _retargetWheel(&msg);
         void* activeHwnd = GetActiveWindow();
         if (activeHwnd == nullptr && _windows.count() > 0) activeHwnd = _windows.get(0).hwnd;
         if (activeHwnd != nullptr && _accelTable != nullptr && TranslateAcceleratorA(activeHwnd, _accelTable, &msg) != 0)

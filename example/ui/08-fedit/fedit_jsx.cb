@@ -121,7 +121,7 @@ class Editor : IComponent
     list<int>    tabDirty   = default;   // per tab: 0/1
     int    activeTab = 0;
     int    treeSel   = 0 - 1;     // selected tree node id
-    int    splitRatio = 22;       // sidebar width percentage
+    int    sideW = 24;            // sidebar width in cells; constant across window resizes
     bool   _ctxReg   = false;     // one-time tree context-menu registration
 
     int tabCount() { return this.tabPaths.count(); }
@@ -205,7 +205,7 @@ class Editor : IComponent
     // saves the outgoing buffer and loads the incoming one.
     move ITabControl buildTabs(IUiContext ctx)
     {
-        ITabControl tabs = <TabControl key="tabs" width={100} height={3}
+        ITabControl tabs = <TabControl key="tabs"
                                        selectedTab={this.activeTab}
                                        onSelectTab={(int i) => { this.switchTab(i, ctx); }} />;
         int ti = 0;
@@ -234,17 +234,17 @@ class Editor : IComponent
             this._ctxReg = true;
         }
 
-        int splitH = hostHeight() - (this.findOpen ? 4 : 3); if (splitH < 4) splitH = 4;
 
         // Toolbar buttons carry explicit keys: sugar children are keyed positionally
         // otherwise, exactly as with the construction form.
-        IBox root = <Box key="root" style={makeStyle(0, hostWidth(), hostHeight())}>
+        IGrid root = <Grid key="root" cols={1}>
                       <View key="tb" style={toolbarStyle()}>
                         <Button key="new"  title="New"  onPress={() => { this.onCommand(CMD_NEW,  ctx); }} />
                         <Button key="open" title="Open" onPress={() => { this.onCommand(CMD_OPEN, ctx); }} />
                         <Button key="save" title="Save" onPress={() => { this.onCommand(CMD_SAVE, ctx); }} />
                       </View>
-                    </Box>;
+                    </Grid>;
+        root.style.backgroundColor = colorRole(THEME_ROLE_PANEL_BG);
 
         // Optional find bar (Edit > Find). Controlled TextInput.
         if (this.findOpen)
@@ -255,16 +255,13 @@ class Editor : IComponent
                                  onChangeText={(string v) => { this.findText = "" + v; ctx.invalidate(); }} />);
         }
 
-        // Split: file-tree sidebar | (tab strip + editor). The panes are plain column
-        // Views (not native-mapped); their leaf controls carry the native handles. The
-        // shared editor is an uncontrolled native EDIT whose key is stable across renders
+        // Split: file-tree sidebar | (tab strip + editor). The panes are one-column grids
+        // whose leaves carry the native handles.
+        // The shared editor is an uncontrolled native EDIT whose key is stable across renders
         // and tab switches, so its buffer is reused; content flows via nativeSetControlText
         // (tab switch / file open), never pushed by render.
-        root.add(<SplitView key="split" ratio={this.splitRatio} vertical={true}
-                            style={makeStyle(0, hostWidth(), splitH)}
-                            onRatioChange={(int r) => { this.splitRatio = r; ctx.invalidate(); }}>
-                   <View key="side" style={makeStyle(0, 0, 0)}>
-                     <TreeView key="tree" width={100} height={splitH - 1}
+        IGrid side = <Grid key="side" cols={1}>
+                     <TreeView key="tree"
                                selectedNode={this.treeSel}
                                childCount={(int nid) => { return fsChildCount(nid); }}
                                childId={(int nid, int i) => { return fsChildId(nid, i); }}
@@ -272,13 +269,26 @@ class Editor : IComponent
                                onSelect={(int nid) => { this.onTreeSelect(nid, ctx); }}
                                onExpand={(int nid) => { }}
                                tooltip="Project files - click a file to open it in a tab" />
-                   </View>
-                   <View key="main" style={makeStyle(0, 0, 0)}>
+                   </Grid>;
+        side.rowStar(0, 1);
+        side.colStar(0, 1);
+        IGrid main = <Grid key="main" cols={1}>
                      {this.buildTabs(ctx)}
-                     <TextArea key="editor" value="" width={100} height={splitH - 4}
+                     <TextArea key="editor" value=""
                                onChange={() => { this.markDirty(ctx); }}
                                tooltip="Editor - type your text here" />
-                   </View>
+                   </Grid>;
+        main.rowFixed(0, 1);
+        main.rowStar(1, 1);
+        main.colStar(0, 1);
+        // The sidebar keeps an absolute width (firstSize): a window resize moves only
+        // the editor. A divider drag reports a ratio; convert it back to cells.
+        root.add(<SplitView key="split" ratio={50} firstSize={this.sideW} vertical={true}
+                            onRatioChange={(int r) => {
+                                this.sideW = ((hostWidth() - 1) * r + 50) / 100; ctx.invalidate();
+                            }}>
+                   {side}
+                   {main}
                  </SplitView>);
 
         // Bottom status bar: file pane (name + dirty marker) + a theme pane. StatusBar is a
@@ -292,6 +302,9 @@ class Editor : IComponent
             + "   |   tab " + tabNo.toString() + "/" + tabN.toString());
         sb.addPart(this.isDark ? "dark" : "light");
         root.add(sb);
+        int splitRow = this.findOpen ? 2 : 1;
+        root.rowStar(splitRow, 1);
+        root.colStar(0, 1);
         return root;
     }
 
@@ -569,7 +582,7 @@ int feditSelfTest()
         Rect splitB = nativeNodeBounds("root/split");
         nativeSplitterDrag("root/split", splitB.x + splitB.w * 60 / 100, splitB.y);
         Rect edAfter = nativeNodeBounds(EDITOR_KEY);
-        t.expectTrue("split drag", e.splitRatio != 22 && edAfter.x != edBefore.x);
+        t.expectTrue("split drag", e.sideW != 24 && edAfter.x != edBefore.x);
 
         // 12. Context-menu command routes: firing "New Tab" adds a tab via the handler.
         int tabsBefore2 = e.tabCount();
@@ -591,6 +604,34 @@ int feditSelfTest()
         bool queuedNotRun = _postRan == 0;
         hostDrainPosted();
         t.expectTrue("post round-trip", queuedNotRun && _postRan == 1 && _postRanTid == mainTid);
+
+        // 15. Grid rows and exact cells leave no dead strip around the panes.
+        Rect splitGrid = nativeNodeBounds("root/split");
+        Rect sideGrid = nativeNodeBounds("root/split/side");
+        Rect mainGrid = nativeNodeBounds("root/split/main");
+        Rect treeGrid = nativeNodeBounds(TREE_KEY);
+        Rect editorGrid = nativeNodeBounds(EDITOR_KEY);
+        Rect statusGrid = nativeNodeBounds("root/status");
+        t.expectTrue("grid editor reaches status",
+            editorGrid.y + editorGrid.h == statusGrid.y);
+        t.expectTrue("grid tree reaches split bottom",
+            treeGrid.y + treeGrid.h == splitGrid.y + splitGrid.h);
+        t.expectTrue("grid editor fills main width", editorGrid.w == mainGrid.w);
+        t.expectTrue("grid tree fills side width", treeGrid.w == sideGrid.w);
+
+        // 19. The star rows remain attached to the live window size.
+        list<UiSize> sizes = default;
+        sizes.add(uiSize(96, 40));
+        sizes.add(uiSize(64, 24));
+        sizes.add(uiSize(80, 34));
+        t.expectTrue("grid resize keeps editor on status",
+            resizeStorm("root", sizes, () => {
+                Rect ed = nativeNodeBounds(EDITOR_KEY);
+                Rect status = nativeNodeBounds("root/status");
+                // The current window is the test-13 second editor (default sideW 24):
+                // its sidebar holds that width; only the editor absorbs the resize.
+                return ed.y + ed.h == status.y && nativeNodeBounds(TREE_KEY).w == 24;
+            }));
     });
 
     return s.run(0, nullptr);

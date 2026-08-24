@@ -67,6 +67,10 @@ class GalleryApp : IComponent
     int interfaceAreaChanged = 0;
     int rowTextCalls  = 0;    // rowText callback invocations (virtualization oracle)
     int rowIconCalls  = 0;    // rowIcon callback invocations (identity/reuse oracle)
+    int gridViewCalls = 0;  // makeCell calls; the bounded-pool oracle
+    int gridCount = 10000; // model size used by the GridView card
+    int gridScroll = 0;     // self-test controlled scroll offset
+    int gridSelected = -1;  // forces the leaf replacement used by the self-test
     u64 iconRevision  = 1u;    // explicit content revision for same-identity replacement
     int tab           = 0;    // TabControl selection (P9)
     int treeSel       = 0 - 1; // selected tree node id (P9)
@@ -74,6 +78,23 @@ class GalleryApp : IComponent
     int splitRatio    = 30;   // SplitView first-pane percentage (P9)
     int ctxFired      = 0;    // last context-menu command routed (P9)
     bool _ctxReg      = false; // one-time context-menu registration guard
+
+    move IElement _galleryGrid()
+    {
+        GridView* gv = new GridView();
+        gv.cellW = 12; gv.cellH = 3; gv.count = this.gridCount;
+        gv.makeCell = (int i) => {
+            this.gridViewCalls = this.gridViewCalls + 1;
+            IBox cell = box(makeStyle(0, 12, 3));
+            cell.add(text("item " + i.toString()));
+            return move cell;
+        };
+        gv.setKey("gv");
+        gv.width = 60; gv.height = 12;
+        gv.scrollY = this.gridScroll;
+        gv.selectedIndex = this.gridSelected;
+        return gv;
+    }
 
     // P10 form-widget state (all controlled).
     bool   dark       = false;   // theme toggle (light/dark)
@@ -309,6 +330,24 @@ class GalleryApp : IComponent
         cardInput.add(inputRow);
         content.add(cardInput);
 
+        // -- Grid form ---------------------------------------------------------------------
+        // Track layout keeps the label column aligned across all rows while the field
+        // column absorbs the remaining card width.
+        IView cardGrid = this._card(ctx, "cardgrid", "Grid",
+                "track layout: auto label column + star field column");
+        IGrid formGrid = grid(2);
+        formGrid.setKey("grid");
+        formGrid.style.gap = 1;
+        formGrid.colStar(1, 1);
+        IText nameLabel = text("Name"); nameLabel.setKey("namelabel"); formGrid.add(nameLabel);
+        ITextInput nameInput = textInput("", (string s) => {}); nameInput.setKey("name"); formGrid.add(nameInput);
+        IText emailLabel = text("Email address"); emailLabel.setKey("emaillabel"); formGrid.add(emailLabel);
+        ITextInput emailInput = textInput("", (string s) => {}); emailInput.setKey("email"); formGrid.add(emailInput);
+        IText noteLabel = text("Note"); noteLabel.setKey("notelabel"); formGrid.add(noteLabel);
+        ITextInput noteInput = textInput("", (string s) => {}); noteInput.setKey("note"); formGrid.add(noteInput);
+        cardGrid.add(formGrid);
+        content.add(cardGrid);
+
         // -- Checkbox ----------------------------------------------------------------------
         IView cardCheck = this._card(ctx, "cardcheck", "Checkbox",
                 "Toggles a boolean; controlled through onChange.");
@@ -408,6 +447,12 @@ class GalleryApp : IComponent
         lv.onHeaderClick = (int c) => { this.listHeader = c; ctx.invalidate(); };
         cardList.add(lv);
         content.add(cardList);
+
+        // -- GridView -------------------------------------------------------------------------
+        IView cardGridView = this._card(ctx, "cardgridview", "GridView",
+                "Virtualized item grid - 10000 cells, bounded pool.");
+        cardGridView.add(this._galleryGrid());
+        content.add(cardGridView);
 
         // -- Tab Control ---------------------------------------------------------------------
         // TabControl authored in sugar (P9): keyed panes, only the active one maps to
@@ -780,6 +825,24 @@ int gallerySelfTest()
         // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
         int calls = g != nullptr ? g.rowTextCalls : 999999;
         t.expectTrue("rowText small", calls > 0 && calls < 100);
+
+        // GridView realization is bounded and keyed by item index.
+        t.expectTrue("GridView bounded pool",
+            g != nullptr && g.gridCount == 10000 && g.gridViewCalls > 0
+            && g.gridViewCalls < 100);
+        t.expectTrue("GridView initial native realization",
+            _exists("root/content/cardgridview/gv/item-0")
+            && !_exists("root/content/cardgridview/gv/item-9999"));
+        if (g != nullptr)
+        {
+            g.gridSelected = 1;
+            g.gridScroll = 150;
+            activeCtx().invalidate();
+            t.pump();
+        }
+        t.expectTrue("GridView evicts and realizes on scroll",
+            !_exists("root/content/cardgridview/gv/item-0")
+            && _exists("root/content/cardgridview/gv/item-250"));
 
         // Row icons use only a stable identity plus borrowed BGRA data. The same
         // callback is safe for virtualization/reuse, while empty identity is omission.
@@ -1159,6 +1222,25 @@ int gallerySelfTest()
             && ticksBeforeCancel > 0 && g != nullptr && g.timerCallbackRan);
         t.expectTrue("cancelled repeating timer stays stopped",
             g != nullptr && g.timerTicks == ticksBeforeCancel);
+
+        // 39. Grid labels share one auto-sized column across all rows and all inputs exist.
+        Rect gridB = nativeNodeBounds("root/content/cardgrid/grid");
+        Rect nameLabelB = nativeNodeBounds("root/content/cardgrid/grid/namelabel");
+        Rect emailLabelB = nativeNodeBounds("root/content/cardgrid/grid/emaillabel");
+        Rect nameB = nativeNodeBounds("root/content/cardgrid/grid/name");
+        Rect emailB = nativeNodeBounds("root/content/cardgrid/grid/email");
+        Rect noteB = nativeNodeBounds("root/content/cardgrid/grid/note");
+        t.expectTrue("grid labels align inputs",
+            _exists("root/content/cardgrid/grid/name")
+            && _exists("root/content/cardgrid/grid/email")
+            && _exists("root/content/cardgrid/grid/note")
+            && nameLabelB.w == 13 && emailLabelB.w == 13
+            && nameB.x == emailB.x && emailB.x == noteB.x
+            && nameB.x == gridB.x + 14);
+
+        // 40. The star field column absorbs the remaining card width.
+        t.expectTrue("grid star fields stretch",
+            nameB.w > 20 && emailB.w > 20 && noteB.w > 20);
     });
 
     return s.run(0, nullptr);

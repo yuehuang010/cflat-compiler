@@ -410,6 +410,113 @@ bool testFlexLeafExplicitDimension()
     return ok;
 }
 
+bool testGridAutoTrack()
+{
+    IGrid g = grid(2, makeStyle(1, 40, 0));
+    g.style.gap = 1;
+    IText a = text("abcde"); g.add(a);
+    ITextInput b = textInput("", (string s) => {}); g.add(b);
+    IText c = text("abcdefghi"); g.add(c);
+    ITextInput d = textInput("", (string s) => {}); g.add(d);
+    IElement root = g;
+    layoutRoot(root, 0, 0, 80);
+    Rect rb = b.nodeBounds(); Rect rd = d.nodeBounds();
+    bool ok = rb.x == rd.x && rb.x == 1 + 9 + 1;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridFixedStarGap()
+{
+    IGrid g = grid(3, makeStyle(0, 40, 0));
+    g.style.gap = 1;
+    g.colFixed(0, 10); g.colStar(1, 1); g.colStar(2, 2);
+    IBox a = box(makeStyle(0, 0, 0)); g.add(a);
+    IBox b = box(makeStyle(0, 0, 0)); g.add(b);
+    IBox c = box(makeStyle(0, 0, 0)); g.add(c);
+    IElement root = g;
+    layoutRoot(root, 0, 0, 40);
+    Rect ra = a.nodeBounds(); Rect rb = b.nodeBounds(); Rect rc = c.nodeBounds();
+    bool ok = ra.w == 10 && rb.w == 10 && rc.w == 18
+        && ra.x == 0 && rb.x == 11 && rc.x == 22;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridTrailingPartialRow()
+{
+    IGrid g = grid(2, makeStyle(1, 0, 0));
+    g.style.gap = 1;
+    IText a = text("a"); g.add(a);
+    IText b = text("b"); g.add(b);
+    IText c = text("c"); g.add(c);
+    IText d = text("d"); g.add(d);
+    IText e = text("e"); g.add(e);
+    IElement root = g;
+    Size sz = layoutRoot(root, 0, 0, 20);
+    Rect re = e.nodeBounds();
+    bool ok = re.x == 1 && re.y == 5 && sz.h == 7;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridStarRow()
+{
+    IGrid g = grid(1);
+    g.rowFixed(0, 2); g.rowStar(1, 1); g.rowStar(2, 1);
+    IBox a = box(makeStyle(0, 0, 0)); g.add(a);
+    IBox b = box(makeStyle(0, 0, 0)); g.add(b);
+    IBox c = box(makeStyle(0, 0, 0)); g.add(c);
+    IElement root = g;
+    Size bounded = layoutRootBounded(root, 0, 0, 20, 20);
+    Rect ba = a.nodeBounds(); Rect bb = b.nodeBounds(); Rect bc = c.nodeBounds();
+    bool boundedOk = bounded.h == 20 && ba.h == 2 && bb.y == 2 && bb.h == 9
+        && bc.y == 11 && bc.h == 9;
+    Size unbounded = layoutRoot(root, 0, 0, 20);
+    Rect ua = a.nodeBounds(); Rect ub = b.nodeBounds(); Rect uc = c.nodeBounds();
+    bool unboundedOk = unbounded.h == 4 && ua.h == 2 && ub.y == 2 && ub.h == 1
+        && uc.y == 3 && uc.h == 1;
+    deleteTree(root);
+    return boundedOk && unboundedOk;
+}
+
+bool testGridExplicitChildWins()
+{
+    IGrid g = grid(1, makeStyle(0, 20, 0));
+    g.colStar(0, 1);
+    IBox child = box(makeStyle(0, 7, 0)); g.add(child);
+    IElement root = g;
+    layoutRoot(root, 0, 0, 20);
+    bool ok = child.nodeBounds().w == 7;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridAdoptProps()
+{
+    IGrid committed = grid(2);
+    committed.colFixed(0, 4);
+    IText c0 = text("first"); committed.add(c0);
+    IText c1 = text("second"); committed.add(c1);
+    IText c2 = text("third"); committed.add(c2);
+
+    IGrid wip = grid(3);
+    wip.colFixed(0, 7);
+    IText w0 = text("first"); wip.add(w0);
+    IText w1 = text("second"); wip.add(w1);
+    IText w2 = text("third"); wip.add(w2);
+
+    IElement root = committed;
+    IElement next = wip;
+    list<Patch> p = default;
+    root = reconcile(root, next, &p);
+    layoutRoot(root, 0, 0, 30);
+    Rect r0 = c0.nodeBounds(); Rect r2 = c2.nodeBounds();
+    bool ok = r0.w == 7 && r2.y == 0 && r2.x > r0.x;
+    deleteTree(root);
+    return ok;
+}
+
 // Every built-in implementor shares IElement.style. A row allocation is the
 // compact gate: each leaf must consume the exact 32-cell main-axis share.
 bool checkFlexRoot(IElement root)
@@ -430,6 +537,12 @@ bool testAllFlexImplementors()
     bool ok = true;
     {
         IElement e = view(makeStyle(0, 0, 0)); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = grid(1); e.style.flex = 1; e.style.height = 4;
         IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
         IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
         ok = checkFlexRoot(root) && ok; deleteTree(root);
@@ -909,9 +1022,123 @@ bool testViewWidthHonored()
     return ok;
 }
 
+
+// -- GridView virtualization ---------------------------------------------------
+
+struct GridTestProbe { int calls = 0; };
+
+move IElement gridTestCell(int item)
+{
+    IBox b = box(makeStyle(0, 10, 2));
+    b.add(text("cell " + item.toString()));
+    return move b;
+}
+
+bool testGridViewVisibleRange()
+{
+    IGridView gv = gridView(10, 2, 100, (int i) => gridTestCell(i));
+    gv.width = 34; gv.height = 10;
+    IElement root = gv;
+    layoutRoot(root, 0, 0, 34);
+    bool ok = gv.realizedCount() == 24 && gv.realizedCount() < 100;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridViewScrollOneRow()
+{
+    GridTestProbe probe;
+    GridTestProbe* p = &probe;
+    IGridView gv = gridView(10, 2, 100, (int i) => {
+        p->calls++;
+        return gridTestCell(i);
+    });
+    gv.width = 34; gv.height = 10;
+    gv.scrollY = (GRIDVIEW_OVERSCAN_ROWS + 1) * gv.cellH;
+    IElement root = gv;
+    layoutRoot(root, 0, 0, 34);
+    int beforeCalls = probe.calls;
+    int beforeRealized = gv.realizedCount();
+    gv.scrollY = gv.scrollY + gv.cellH;
+    layoutRoot(root, 0, 0, 34);
+    bool ok = probe.calls == beforeCalls + 3
+        && gv.realizedCount() == beforeRealized;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridViewEviction()
+{
+    IGridView gv = gridView(10, 2, 100, (int i) => gridTestCell(i));
+    gv.width = 34; gv.height = 10;
+    IElement root = gv;
+    layoutRoot(root, 0, 0, 34);
+    gv.scrollY = 50 * gv.cellH;
+    layoutRoot(root, 0, 0, 34);
+    bool oldGone = true;
+    int i = 0;
+    while (i < gv.realizedCount())
+    {
+        if (gv.realizedItem(i) < 69) oldGone = false;
+        i++;
+    }
+    deleteTree(root);
+    return oldGone;
+}
+
+bool testGridViewSelectKeys()
+{
+    UiContext ctx = default;
+    IGridView gv = gridView(10, 2, 100, (int i) => gridTestCell(i));
+    gv.width = 34; gv.height = 10; gv.selectedIndex = 0;
+    gv.setKey("grid");
+    IElement root = gv;
+    layoutRoot(root, 0, 0, 34);
+    ctx.focus("grid");
+    int i = 0;
+    while (i < 6) { root.dispatch(keyPress(KEY_DOWN), &ctx); i++; }
+    bool ok = gv.selectedIndex == 18 && gv.scrollY > 0 && ctx.consumeRepaint();
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridViewClampEmpty()
+{
+    IGridView gv = gridView(10, 2, 0, (int i) => gridTestCell(i));
+    gv.width = 34; gv.height = 10; gv.scrollY = 50;
+    IElement root = gv;
+    Size s = layoutRoot(root, 0, 0, 34);
+    bool ok = s.w == 34 && s.h == 10 && gv.realizedCount() == 0 && gv.scrollY == 0;
+    deleteTree(root);
+    return ok;
+}
+
+bool testGridViewLeafReconcile()
+{
+    IGridView committed = gridView(10, 2, 6, (int i) => gridTestCell(i));
+    IGridView wip = gridView(10, 2, 9, (int i) => gridTestCell(i));
+    IElement root = committed;
+    IElement next = wip;
+    layoutRoot(root, 0, 0, 34);
+    list<Patch> patches = default;
+    root = reconcile(root, next, &patches);
+    IGridView after = root as IGridView;
+    layoutRoot(root, 0, 0, 34);
+    bool ok = countOp(&patches, PATCH_UPDATE) == 1 && after != nullptr
+        && after.count == 9 && after.realizedCount() > 0;
+    deleteTree(root);
+    return ok;
+}
+
 int selfTest()
 {
     int pass = 0; int total = 0;
+    total++; if (testGridViewVisibleRange()) pass++; else printf("  FAIL: GridView visible range\n");
+    total++; if (testGridViewScrollOneRow()) pass++; else printf("  FAIL: GridView one-row scroll\n");
+    total++; if (testGridViewEviction()) pass++; else printf("  FAIL: GridView eviction\n");
+    total++; if (testGridViewSelectKeys()) pass++; else printf("  FAIL: GridView selection keys\n");
+    total++; if (testGridViewClampEmpty()) pass++; else printf("  FAIL: GridView empty clamp\n");
+    total++; if (testGridViewLeafReconcile()) pass++; else printf("  FAIL: GridView leaf reconcile\n");
     total++; if (testCounterReconcile())   pass++; else printf("  FAIL: counter reconcile + minimal repaint\n");
     total++; if (testKeyedReorder())       pass++; else printf("  FAIL: keyed reorder\n");
     total++; if (testComponentReconcile()) pass++; else printf("  FAIL: component reconcile\n");
@@ -929,6 +1156,12 @@ int selfTest()
     total++; if (testFlexLeafRow())        pass++; else printf("  FAIL: leaf flex row\n");
     total++; if (testFlexLeafColumnList()) pass++; else printf("  FAIL: leaf flex column list\n");
     total++; if (testFlexLeafExplicitDimension()) pass++; else printf("  FAIL: leaf explicit dimension precedence\n");
+    total++; if (testGridAutoTrack())       pass++; else printf("  FAIL: grid auto track\n");
+    total++; if (testGridFixedStarGap())    pass++; else printf("  FAIL: grid fixed/star/gap\n");
+    total++; if (testGridTrailingPartialRow()) pass++; else printf("  FAIL: grid trailing partial row\n");
+    total++; if (testGridStarRow())         pass++; else printf("  FAIL: grid star row bounded/unbounded\n");
+    total++; if (testGridExplicitChildWins()) pass++; else printf("  FAIL: grid explicit child size\n");
+    total++; if (testGridAdoptProps())      pass++; else printf("  FAIL: grid reconcile adoption\n");
     total++; if (testAllFlexImplementors()) pass++; else printf("  FAIL: all flex implementors\n");
     total++; if (testFlexWrapFixedCells())     pass++; else printf("  FAIL: flexWrap fixed cells\n");
     total++; if (testFlexWrapLineHeight())     pass++; else printf("  FAIL: flexWrap line height\n");

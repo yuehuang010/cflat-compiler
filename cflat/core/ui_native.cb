@@ -25,6 +25,11 @@ import "math.cb";
 int DIR_COLUMN = 0;   // stack children top-to-bottom (default)
 int DIR_ROW    = 1;   // place children left-to-right
 
+// Grid track sizing kinds (see doc/UI.md "Grid (track layout)").
+int TRACK_AUTO  = 0;   // max intrinsic size across the track's cells (default)
+int TRACK_FIXED = 1;   // explicit size in cells
+int TRACK_STAR  = 2;   // weight over the remainder (flex distribution per axis)
+
 // Flex wrap mode (DIR_ROW only; see doc/UI.md "Flex weights" / flexWrap).
 int WRAP_NONE = 0;   // single line, the default (unchanged behavior)
 int WRAP_WRAP = 1;   // children that would overflow availW start a new line
@@ -1192,6 +1197,8 @@ int ELEM_SPLIT      = 20;   // split view: two weighted panes + divider; contain
 int ELEM_IMAGE      = 21;   // bitmap image; BGRA32 pixels pushed via setImageData
 int ELEM_GROUPBOX   = 22;   // titled group frame; container, native-mapped
 int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICanvas
+int ELEM_GRID       = 24;   // track-layout container; pure layout, not native-mapped
+int ELEM_GRIDVIEW   = 25;   // virtualized item grid; cells realized on demand
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -1270,6 +1277,21 @@ interface IView : IElement
 {
     list<IElement> children;
     void add(adopt IElement child);
+};
+
+interface IGrid : IElement
+{
+    list<IElement> children;
+    int cols;
+    list<int> colKinds;
+    list<int> colVals;
+    list<int> rowKinds;
+    list<int> rowVals;
+    void add(adopt IElement child);
+    void colFixed(int col, int widthCells);
+    void colStar(int col, int weight);
+    void rowFixed(int row, int heightCells);
+    void rowStar(int row, int weight);
 };
 
 interface IText : ITooltipped
@@ -1392,6 +1414,26 @@ interface IListView : IDisableable
     void fireHeaderClick(int col);
 };
 
+interface IGridView : IDisableable
+{
+    int  cellW;
+    int  cellH;
+    int  count;
+    Lambda<IElement(int)> makeCell;
+    int  selectedIndex;
+    int  scrollY;
+    Lambda<void(int)> onSelect;
+    Lambda<void(int)> onActivate;
+    int  width;
+    int  height;
+    void fireSelect(int item);
+    void fireActivate(int item);
+    int  realizedCount();
+    IElement getRealized(int i);
+    int  realizedItem(int i);
+    int  maxScrollY();
+};
+
 interface ITabPane : IElement
 {
     string title;
@@ -1425,6 +1467,9 @@ interface ITreeView : IDisableable
 interface ISplitView : IElement
 {
     int   ratio;
+    // Absolute first-pane size in cells; 0 (default) keeps the ratio mode. Wins
+    // over ratio and holds across window resizes (layout re-reads it each pass).
+    int   firstSize;
     bool  vertical;
     Rect  dividerBounds;
     // Settable prop, not a factory arg: splitView(ratio, vertical) cannot take it, so the
@@ -1979,6 +2024,351 @@ class View : IView
     {
         IView o = other as IView;
         return o != nullptr && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- Grid: a pure track-layout container -------------------------------------
+class Grid : IGrid
+{
+    Style style = default;
+    list<IElement> children = default;
+    list<int> colKinds = default;
+    list<int> colVals = default;
+    list<int> rowKinds = default;
+    list<int> rowVals = default;
+    int cols = 1;
+    Rect bounds = default;
+    string key = default;
+
+    void add(adopt IElement child) { this.children.add(child); }
+
+    void _setTrack(list<int>* kinds, list<int>* vals, int i, int kind, int val)
+    {
+        if (i < 0) return;
+        while (kinds->count() <= i)
+        {
+            kinds->add(TRACK_AUTO);
+            vals->add(0);
+        }
+        kinds->set(i, kind);
+        vals->set(i, val);
+    }
+
+    void colFixed(int col, int widthCells) { this._setTrack(&this.colKinds, &this.colVals, col, TRACK_FIXED, widthCells); }
+    void colStar(int col, int weight) { this._setTrack(&this.colKinds, &this.colVals, col, TRACK_STAR, weight); }
+    void rowFixed(int row, int heightCells) { this._setTrack(&this.rowKinds, &this.rowVals, row, TRACK_FIXED, heightCells); }
+    void rowStar(int row, int weight) { this._setTrack(&this.rowKinds, &this.rowVals, row, TRACK_STAR, weight); }
+
+    int _trackKind(list<int>* kinds, int i)
+    {
+        if (i < kinds->count()) return kinds->get(i);
+        return TRACK_AUTO;
+    }
+
+    int _trackVal(list<int>* vals, int i)
+    {
+        if (i < vals->count()) return vals->get(i);
+        return 0;
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int pad = this.style.padding;
+        int gap = this.style.gap;
+        if (this.style.width > 0) c.availW = this.style.width;
+        int innerW = c.availW - 2 * pad;
+        int n = this.children.count();
+        int nc = this.cols;
+        if (nc < 1) nc = 1;
+        int nr = (n + nc - 1) / nc;
+        Size sz = default;
+        if (nr == 0)
+        {
+            sz.w = c.availW;
+            sz.h = 2 * pad;
+            Rect emptyBounds = default;
+            emptyBounds.x = c.x; emptyBounds.y = c.y;
+            emptyBounds.w = sz.w; emptyBounds.h = sz.h;
+            this.bounds = emptyBounds;
+            return sz;
+        }
+
+        // Probe every child once to measure the intrinsic width of its column.
+        list<int> childW;
+        int i = 0;
+        while (i < n)
+        {
+            LayoutConstraints cc = default;
+            cc.x = c.x + pad; cc.y = c.y + pad;
+            cc.availW = innerW; cc.availH = c.availH - 2 * pad;
+            Size cs = this.children.get(i).layout(cc);
+            childW.add(cs.w);
+            i++;
+        }
+
+        list<int> colW;
+        int col = 0;
+        int nonStarW = 0;
+        int starSumW = 0;
+        while (col < nc)
+        {
+            int kind = this._trackKind(&this.colKinds, col);
+            int val = this._trackVal(&this.colVals, col);
+            int width = 0;
+            if (kind == TRACK_FIXED) width = val;
+            else if (kind == TRACK_AUTO)
+            {
+                int child = col;
+                while (child < n)
+                {
+                    if (childW.get(child) > width) width = childW.get(child);
+                    child = child + nc;
+                }
+            }
+            else starSumW = starSumW + val;
+            colW.add(width);
+            if (kind != TRACK_STAR) nonStarW = nonStarW + width;
+            col++;
+        }
+        int gapSumW = 0;
+        if (nc > 1) gapSumW = gap * (nc - 1);
+        int leftoverW = innerW - nonStarW - gapSumW;
+        if (leftoverW < 0) leftoverW = 0;
+        if (starSumW > 0)
+        {
+            list<int> shares;
+            int allocated = 0;
+            col = 0;
+            while (col < nc)
+            {
+                if (this._trackKind(&this.colKinds, col) == TRACK_STAR)
+                {
+                    int share = leftoverW * this._trackVal(&this.colVals, col) / starSumW;
+                    shares.add(share);
+                    allocated = allocated + share;
+                }
+                col++;
+            }
+            int remainder = leftoverW - allocated;
+            int ri = 0;
+            while (remainder > 0 && ri < shares.count())
+            {
+                shares.set(ri, shares.get(ri) + 1);
+                remainder--;
+                ri++;
+            }
+            int si = 0;
+            col = 0;
+            while (col < nc)
+            {
+                if (this._trackKind(&this.colKinds, col) == TRACK_STAR)
+                {
+                    colW.set(col, shares.get(si));
+                    si++;
+                }
+                col++;
+            }
+        }
+
+        // Probe again at each child's final column width to measure row heights.
+        list<int> childH;
+        i = 0;
+        while (i < n)
+        {
+            col = i % nc;
+            LayoutConstraints cc = default;
+            cc.x = c.x + pad; cc.y = c.y + pad;
+            cc.availW = colW.get(col); cc.exactW = true;
+            cc.availH = c.availH - 2 * pad;
+            Size cs = this.children.get(i).layout(cc);
+            childH.add(cs.h);
+            i++;
+        }
+
+        list<int> rowH;
+        int row = 0;
+        int nonStarH = 0;
+        int starSumH = 0;
+        while (row < nr)
+        {
+            int kind = this._trackKind(&this.rowKinds, row);
+            int val = this._trackVal(&this.rowVals, row);
+            int height = 0;
+            if (kind == TRACK_FIXED) height = val;
+            else if (kind == TRACK_AUTO || c.availH >= LAYOUT_UNBOUNDED)
+            {
+                // Under unbounded height, a star row falls back to auto.
+                int child = row * nc;
+                while (child < n && child < (row + 1) * nc)
+                {
+                    if (childH.get(child) > height) height = childH.get(child);
+                    child++;
+                }
+            }
+            else starSumH = starSumH + val;
+            rowH.add(height);
+            if (kind != TRACK_STAR || c.availH >= LAYOUT_UNBOUNDED) nonStarH = nonStarH + height;
+            row++;
+        }
+        int gapSumH = 0;
+        if (nr > 1) gapSumH = gap * (nr - 1);
+        if (c.availH < LAYOUT_UNBOUNDED && starSumH > 0)
+        {
+            int innerH = c.availH - 2 * pad;
+            int leftoverH = innerH - nonStarH - gapSumH;
+            if (leftoverH < 0) leftoverH = 0;
+            list<int> shares;
+            int allocated = 0;
+            row = 0;
+            while (row < nr)
+            {
+                if (this._trackKind(&this.rowKinds, row) == TRACK_STAR)
+                {
+                    int share = leftoverH * this._trackVal(&this.rowVals, row) / starSumH;
+                    shares.add(share);
+                    allocated = allocated + share;
+                }
+                row++;
+            }
+            int remainder = leftoverH - allocated;
+            int ri = 0;
+            while (remainder > 0 && ri < shares.count())
+            {
+                shares.set(ri, shares.get(ri) + 1);
+                remainder--;
+                ri++;
+            }
+            int si = 0;
+            row = 0;
+            while (row < nr)
+            {
+                if (this._trackKind(&this.rowKinds, row) == TRACK_STAR)
+                {
+                    rowH.set(row, shares.get(si));
+                    si++;
+                }
+                row++;
+            }
+        }
+
+        // Prefix sums keep placement linear even when the grid has many cells.
+        list<int> colPrefix;
+        int cursor = 0;
+        col = 0;
+        while (col < nc)
+        {
+            colPrefix.add(cursor);
+            cursor = cursor + colW.get(col) + gap;
+            col++;
+        }
+        list<int> rowPrefix;
+        cursor = 0;
+        row = 0;
+        while (row < nr)
+        {
+            rowPrefix.add(cursor);
+            cursor = cursor + rowH.get(row) + gap;
+            row++;
+        }
+        i = 0;
+        while (i < n)
+        {
+            col = i % nc;
+            row = i / nc;
+            LayoutConstraints cc = default;
+            cc.x = c.x + pad + colPrefix.get(col);
+            cc.y = c.y + pad + rowPrefix.get(row);
+            cc.availW = colW.get(col); cc.exactW = true;
+            cc.availH = rowH.get(row); cc.exactH = true;
+            // The cell box is exact on both axes so containers fill the cell;
+            // explicit child style.width/height still wins inside its layout.
+            this.children.get(i).layout(cc);
+            i++;
+        }
+
+        int totalH = 0;
+        row = 0;
+        while (row < nr) { totalH = totalH + rowH.get(row); row++; }
+        sz.w = c.availW;
+        sz.h = 2 * pad + totalH + gapSumH;
+        Rect b = default;
+        b.x = c.x; b.y = c.y; b.w = sz.w; b.h = sz.h;
+        this.bounds = b;
+        return sz;
+    }
+
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        if (colorIsSet(this.style.backgroundColor))
+            cv.drawRect(this.bounds, true, resolveColor(this.style.backgroundColor, ctx.theme, ctx.systemPrefersDark()));
+        for (IElement c in this.children) c.paint(cv, ctx);
+    }
+
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        for (IElement c in this.children)
+        {
+            if (c.dispatch(e, ctx)) return true;
+        }
+        return false;
+    }
+
+    move string toJson()
+    {
+        string out = "{\"type\":\"Grid\",\"cols\":" + this.cols.toString() + ",\"children\":[";
+        int i = 0;
+        for (IElement c in this.children)
+        {
+            if (i > 0) out = out + ",";
+            out = out + c.toJson();
+            i++;
+        }
+        return out + "]}";
+    }
+
+    bool _tracksEqual(list<int>* a, list<int>* b)
+    {
+        if (a->count() != b->count()) return false;
+        int i = 0;
+        while (i < a->count())
+        {
+            if (a->get(i) != b->get(i)) return false;
+            i++;
+        }
+        return true;
+    }
+
+    void destroyTree()
+    {
+        for (IElement c in this.children)
+        {
+            c.destroyTree();
+            delete c;
+        }
+        this.children.clear();
+    }
+
+    int kind() { return ELEM_GRID; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys)
+    {
+        for (IElement c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(IElement other)
+    {
+        IGrid o = other as IGrid;
+        return o != nullptr && this.cols == o.cols
+            && this._tracksEqual(&this.colKinds, &o.colKinds)
+            && this._tracksEqual(&this.colVals, &o.colVals)
+            && this._tracksEqual(&this.rowKinds, &o.rowKinds)
+            && this._tracksEqual(&this.rowVals, &o.rowVals)
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
@@ -3122,6 +3512,23 @@ move IView column(Style style)
     return v;
 }
 
+move IGrid grid(int cols)
+{
+    Grid* g = new Grid();
+    g.cols = cols;
+    if (g.cols < 1) g.cols = 1;
+    return g;
+}
+
+move IGrid grid(int cols, Style style)
+{
+    Grid* g = new Grid();
+    g.cols = cols;
+    if (g.cols < 1) g.cols = 1;
+    g.style = style;
+    return g;
+}
+
 // Plain string params: assigning an alias/param to an owning-string field
 // deep-copies, so the field keeps its own buffer after the arg is freed.
 move IText text(string s)
@@ -3716,6 +4123,346 @@ class ListView : IListView
     Rect nodeBounds() { return this.bounds; }
 };
 
+// -- GridView: a virtualized item grid ------------------------------------------
+int GRIDVIEW_OVERSCAN_ROWS = 2;
+
+class GridView : IGridView
+{
+    Style style = default;
+    int cellW = 1;
+    int cellH = 1;
+    int count = 0;
+    Lambda<IElement(int)> makeCell = default;
+    int selectedIndex = -1;
+    int scrollY = 0;
+    Lambda<void(int)> onSelect = default;
+    Lambda<void(int)> onActivate = default;
+    int width = 40;
+    int height = 10;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+    int colsFit = 1;
+    list<int> poolItems = default;
+    list<IElement> poolCells = default;
+
+    void fireSelect(int item) { if (this.onSelect != nullptr) this.onSelect(item); }
+    void fireActivate(int item) { if (this.onActivate != nullptr) this.onActivate(item); }
+    int realizedCount() { return this.poolCells.count(); }
+    IElement getRealized(int i)
+    {
+        if (i < 0 || i >= this.poolCells.count()) return nullptr;
+        return this.poolCells.get(i);
+    }
+    int realizedItem(int i)
+    {
+        if (i < 0 || i >= this.poolItems.count()) return -1;
+        return this.poolItems.get(i);
+    }
+
+    int _poolIndex(int item)
+    {
+        int i = 0;
+        while (i < this.poolItems.count())
+        {
+            if (this.poolItems.get(i) == item) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    void _insertRealizedAt(int pos, int item, move IElement cell)
+    {
+        this.poolItems.insert(pos, item);
+        this.poolCells.insert(pos, cell);
+    }
+
+    // The scroll limit for the committed bounds. Hosts use it to chain a wheel
+    // event to the outer page when the grid is already at its edge.
+    int maxScrollY()
+    {
+        return this._maxScroll(this.bounds.w, this.bounds.h);
+    }
+
+    int _maxScroll(int w, int h)
+    {
+        int gap = this.style.gap;
+        int cw = this.cellW; if (cw < 1) cw = 1;
+        int ch = this.cellH; if (ch < 1) ch = 1;
+        int cols = (w + gap) / (cw + gap);
+        if (cols < 1) cols = 1;
+        int rows = (this.count + cols - 1) / cols;
+        int content = rows * ch;
+        if (rows > 0) content = content + (rows - 1) * gap;
+        int max = content - h;
+        if (max < 0) max = 0;
+        return max;
+    }
+
+    void _syncPool(int firstRow, int lastRow, int cols)
+    {
+        int firstItem = firstRow * cols;
+        int lastItem = (lastRow + 1) * cols - 1;
+        if (firstRow > lastRow) { firstItem = 0; lastItem = -1; }
+        int i = 0;
+        while (i < this.poolItems.count())
+        {
+            int item = this.poolItems.get(i);
+            if (item < firstItem || item > lastItem || item >= this.count)
+            {
+                IElement cell = this.poolCells.get(i);
+                this.poolItems.removeAt(i);
+                this.poolCells.removeAt(i);
+                if (cell != nullptr) { cell.destroyTree(); delete cell; }
+            }
+            else i++;
+        }
+
+        int item = firstItem;
+        while (item <= lastItem && item < this.count)
+        {
+            int idx = this._poolIndex(item);
+            if (idx < 0 && this.makeCell != nullptr)
+            {
+                int pos = 0;
+                while (pos < this.poolItems.count() && this.poolItems.get(pos) < item) pos++;
+                IElement cell = this.makeCell(item);
+                if (cell != nullptr)
+                {
+                    cell.setKey("item-" + item.toString());
+                    this._insertRealizedAt(pos, item, move cell);
+                }
+            }
+            item++;
+        }
+    }
+
+    move string toJson()
+    {
+        return "{\"type\":\"GridView\",\"count\":" + this.count.toString()
+             + ",\"scrollY\":" + this.scrollY.toString()
+             + ",\"selectedIndex\":" + this.selectedIndex.toString()
+             + ",\"realized\":" + this.realizedCount().toString() + "}";
+    }
+
+    Size layout(LayoutConstraints c)
+    {
+        int w = this.width;
+        if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
+        int h = this.height;
+        if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
+
+        int gap = this.style.gap;
+        int cw = this.cellW; if (cw < 1) cw = 1;
+        int ch = this.cellH; if (ch < 1) ch = 1;
+        int cols = (w + gap) / (cw + gap);
+        if (cols < 1) cols = 1;
+        this.colsFit = cols;
+        int totalRows = (this.count + cols - 1) / cols;
+        int contentH = totalRows * ch;
+        if (totalRows > 0) contentH = contentH + (totalRows - 1) * gap;
+        int maxScroll = contentH - h;
+        if (maxScroll < 0) maxScroll = 0;
+        if (this.scrollY < 0) this.scrollY = 0;
+        if (this.scrollY > maxScroll) this.scrollY = maxScroll;
+
+        int stride = ch + gap;
+        if (stride < 1) stride = 1;
+        int firstRow = this.scrollY / stride - GRIDVIEW_OVERSCAN_ROWS;
+        if (firstRow < 0) firstRow = 0;
+        int lastRow = (this.scrollY + h) / stride + GRIDVIEW_OVERSCAN_ROWS;
+        if (lastRow > totalRows - 1) lastRow = totalRows - 1;
+        this._syncPool(firstRow, lastRow, cols);
+
+        int bx = c.x + this.style.padding;
+        int by = c.y + this.style.padding;
+        int i = 0;
+        while (i < this.poolCells.count())
+        {
+            int item = this.poolItems.get(i);
+            int r = item / cols;
+            int col = item % cols;
+            LayoutConstraints cc = default;
+            cc.x = bx + col * (cw + gap);
+            cc.y = by + r * (ch + gap) - this.scrollY;
+            cc.availW = cw; cc.exactW = true;
+            cc.availH = ch; cc.exactH = true;
+            this.poolCells.get(i).layout(cc);
+            i++;
+        }
+
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        this.bounds = b;
+        Size s = default; s.w = w; s.h = h;
+        return s;
+    }
+
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        if (colorIsSet(this.style.backgroundColor))
+            cv.drawRect(this.bounds, true, resolveColor(this.style.backgroundColor, ctx.theme, ctx.systemPrefersDark()));
+        cv.pushClip(this.bounds);
+        int i = 0;
+        while (i < this.poolCells.count())
+        {
+            this.poolCells.get(i).paint(cv, ctx);
+            i++;
+        }
+        if (this.selectedIndex >= 0)
+        {
+            int p = this._poolIndex(this.selectedIndex);
+            if (p >= 0)
+            {
+                int accent = pickColor(colorUnset(), colorRole(THEME_ROLE_ACCENT),
+                                       ctx.theme, ctx.systemPrefersDark());
+                cv.drawRect(this.poolCells.get(p).nodeBounds(), false, accent);
+            }
+        }
+        cv.popClip();
+    }
+
+    int _itemAt(int x, int y)
+    {
+        int gap = this.style.gap;
+        int cw = this.cellW; if (cw < 1) cw = 1;
+        int ch = this.cellH; if (ch < 1) ch = 1;
+        int strideX = cw + gap; if (strideX < 1) strideX = 1;
+        int strideY = ch + gap; if (strideY < 1) strideY = 1;
+        int rx = x - (this.bounds.x + this.style.padding);
+        int ry = y - (this.bounds.y + this.style.padding) + this.scrollY;
+        if (rx < 0 || ry < 0) return -1;
+        if (rx % strideX >= cw || ry % strideY >= ch) return -1;
+        int col = rx / strideX;
+        int row = ry / strideY;
+        if (col < 0 || col >= this.colsFit) return -1;
+        int item = row * this.colsFit + col;
+        if (item < 0 || item >= this.count) return -1;
+        return item;
+    }
+
+    void _scrollSelection()
+    {
+        if (this.selectedIndex < 0 || this.selectedIndex >= this.count) return;
+        int gap = this.style.gap;
+        int ch = this.cellH; if (ch < 1) ch = 1;
+        int stride = ch + gap; if (stride < 1) stride = 1;
+        int row = this.selectedIndex / this.colsFit;
+        int top = row * stride;
+        int bottom = top + ch;
+        if (top < this.scrollY) this.scrollY = top;
+        if (bottom > this.scrollY + this.bounds.h) this.scrollY = bottom - this.bounds.h;
+        int max = this._maxScroll(this.bounds.w, this.bounds.h);
+        if (this.scrollY < 0) this.scrollY = 0;
+        if (this.scrollY > max) this.scrollY = max;
+    }
+
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN)
+        {
+            if (!this.bounds.contains(e.x, e.y)) return false;
+            int i = 0;
+            while (i < this.poolCells.count())
+            {
+                if (this.poolCells.get(i).dispatch(e, ctx)) return true;
+                i++;
+            }
+            int item = this._itemAt(e.x, e.y);
+            if (item >= 0)
+            {
+                bool changed = this.selectedIndex != item;
+                this.selectedIndex = item;
+                if (changed) this.fireSelect(item);
+            }
+            ctx.focus(this.key);
+            ctx.requestRepaint();
+            return true;
+        }
+        if (e.kind == EV_MOUSE_MOVE || e.kind == EV_MOUSE_UP)
+        {
+            if (!this.bounds.contains(e.x, e.y)) return false;
+            int i = 0;
+            while (i < this.poolCells.count())
+            {
+                if (this.poolCells.get(i).dispatch(e, ctx)) return true;
+                i++;
+            }
+            return false;
+        }
+        if (e.kind == EV_KEY)
+        {
+            int i = 0;
+            while (i < this.poolCells.count())
+            {
+                if (this.poolCells.get(i).dispatch(e, ctx)) return true;
+                i++;
+            }
+            if (!ctx.hasFocus(this.key)) return false;
+            if (this.count <= 0) return false;
+            int oldSelection = this.selectedIndex;
+            int oldScroll = this.scrollY;
+            int next = oldSelection < 0 ? 0 : oldSelection;
+            if (e.key == KEY_UP) next = next - this.colsFit;
+            else if (e.key == KEY_DOWN) next = next + this.colsFit;
+            else if (e.key == KEY_LEFT) next = next - 1;
+            else if (e.key == KEY_RIGHT) next = next + 1;
+            else if (e.key == KEY_ENTER)
+            {
+                if (this.selectedIndex >= 0) this.fireActivate(this.selectedIndex);
+                return this.selectedIndex >= 0;
+            }
+            else return false;
+            if (next < 0) next = 0;
+            if (next >= this.count) next = this.count - 1;
+            this.selectedIndex = next;
+            this._scrollSelection();
+            bool changed = next != oldSelection;
+            bool scrolled = this.scrollY != oldScroll;
+            if (changed) this.fireSelect(next);
+            if (changed || scrolled) { ctx.requestRepaint(); return true; }
+            return false;
+        }
+        return false;
+    }
+
+    void destroyTree()
+    {
+        while (this.poolCells.count() > 0)
+        {
+            IElement cell = this.poolCells.get(0);
+            this.poolItems.removeAt(0);
+            this.poolCells.removeAt(0);
+            if (cell != nullptr) { cell.destroyTree(); delete cell; }
+        }
+        this.poolItems.clear();
+    }
+
+    int kind() { return ELEM_GRIDVIEW; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+    }
+    bool propsEqual(IElement other)
+    {
+        IGridView o = other as IGridView;
+        return o != nullptr && this.cellW == o.cellW && this.cellH == o.cellH
+            && this.count == o.count && this.selectedIndex == o.selectedIndex
+            && this.width == o.width && this.height == o.height
+            && this.disabled == o.disabled && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
 // -- IElement factories (thin field-setters; sugar-ready fields elsewhere) -------
 // A controlled radio group; append options with addOption(), which wires index/key
 // and seeds checked from `value`.
@@ -3743,6 +4490,16 @@ move IListView listView(int rowCount, Lambda<string(int,int)> rowText)
     lv.rowCount = rowCount;
     lv.rowText = rowText;
     return lv;
+}
+
+move IGridView gridView(int cellW, int cellH, int count, Lambda<IElement(int)> makeCell)
+{
+    GridView* gv = new GridView();
+    gv.cellW = cellW < 1 ? 1 : cellW;
+    gv.cellH = cellH < 1 ? 1 : cellH;
+    gv.count = count < 0 ? 0 : count;
+    gv.makeCell = makeCell;
+    return gv;
 }
 
 // -- ListView rowText callback boxing (the setListOp seam carries an opaque u64) -
@@ -4171,6 +4928,7 @@ class SplitView : ISplitView
 {
     list<IElement> children = default;   // exactly two panes
     int   ratio    = 50;                 // first pane's percentage of the split axis (5..95)
+    int   firstSize = 0;                 // absolute first-pane cells; 0 = ratio mode
     bool  vertical = true;               // true = side-by-side, false = stacked
     Lambda<void(int)> onRatioChange = default;
     Style style    = default;
@@ -4183,6 +4941,18 @@ class SplitView : ISplitView
     void fireRatioChange(int r) { if (this.onRatioChange != nullptr) { this.onRatioChange(r); } }
 
     int _clampRatio(int v) { if (v < 5) return 5; if (v > 95) return 95; return v; }
+
+    // In absolute mode the first pane holds firstSize cells regardless of the
+    // axis length; clamped so the second pane keeps at least one cell.
+    int _applyFirstSize(int ratioCells, int axis)
+    {
+        if (this.firstSize <= 0) return ratioCells;
+        int f = this.firstSize;
+        int max = axis - SPLIT_DIVIDER - 1;
+        if (f > max) f = max;
+        if (f < 1) f = 1;
+        return f;
+    }
 
     Size layout(LayoutConstraints c)
     {
@@ -4198,7 +4968,9 @@ class SplitView : ISplitView
         int rt = this._clampRatio(this.ratio);
         if (this.vertical)
         {
-            int firstW = (w - SPLIT_DIVIDER) * rt / 100;
+            // Round-nearest so ratio -> cells -> ratio round-trips with _ratioAt.
+            int firstW = ((w - SPLIT_DIVIDER) * rt + 50) / 100;
+            firstW = this._applyFirstSize(firstW, w);
             if (this.children.count() > 0)
             {
                 LayoutConstraints cc = default;
@@ -4219,7 +4991,8 @@ class SplitView : ISplitView
         }
         else
         {
-            int firstH = (h - SPLIT_DIVIDER) * rt / 100;
+            int firstH = ((h - SPLIT_DIVIDER) * rt + 50) / 100;
+            firstH = this._applyFirstSize(firstH, h);
             if (this.children.count() > 0)
             {
                 LayoutConstraints cc = default;
@@ -4243,15 +5016,19 @@ class SplitView : ISplitView
     }
 
     // Map a pointer position along the split axis to a ratio (clamped 5..95).
+    // Inverse of layout's firstW/firstH mapping: same denominator (axis minus
+    // divider) and round-nearest, so the divider lands under the cursor.
     int _ratioAt(int px, int py)
     {
         if (this.vertical)
         {
-            if (this.bounds.w <= 1) return this.ratio;
-            return this._clampRatio((px - this.bounds.x) * 100 / this.bounds.w);
+            int den = this.bounds.w - SPLIT_DIVIDER;
+            if (den <= 0) return this.ratio;
+            return this._clampRatio(((px - this.bounds.x) * 100 + den / 2) / den);
         }
-        if (this.bounds.h <= 1) return this.ratio;
-        return this._clampRatio((py - this.bounds.y) * 100 / this.bounds.h);
+        int den = this.bounds.h - SPLIT_DIVIDER;
+        if (den <= 0) return this.ratio;
+        return this._clampRatio(((py - this.bounds.y) * 100 + den / 2) / den);
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -4301,8 +5078,8 @@ class SplitView : ISplitView
     bool propsEqual(IElement other)
     {
         ISplitView o = other as ISplitView;
-        return o != nullptr && this.ratio == o.ratio && this.vertical == o.vertical
-            && styleEquals(this.style, o.style);
+        return o != nullptr && this.ratio == o.ratio && this.firstSize == o.firstSize
+            && this.vertical == o.vertical && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
@@ -4326,7 +5103,10 @@ void adoptContainerProps(IElement committed, IElement wip)
     {
         ISplitView a = committed as ISplitView;
         ISplitView b = wip as ISplitView;
-        if (a != nullptr && b != nullptr) { a.ratio = b.ratio; a.vertical = b.vertical; }
+        if (a != nullptr && b != nullptr)
+        {
+            a.ratio = b.ratio; a.firstSize = b.firstSize; a.vertical = b.vertical;
+        }
     }
     else if (k == ELEM_VIEW)
     {
@@ -4336,6 +5116,20 @@ void adoptContainerProps(IElement committed, IElement wip)
         IView a = committed as IView;
         IView b = wip as IView;
         if (a != nullptr && b != nullptr) a.style = b.style;
+    }
+    else if (k == ELEM_GRID)
+    {
+        IGrid a = committed as IGrid;
+        IGrid b = wip as IGrid;
+        if (a != nullptr && b != nullptr)
+        {
+            a.style = b.style;
+            a.cols = b.cols;
+            a.colKinds.clear(); for (int v in b.colKinds) a.colKinds.add(v);
+            a.colVals.clear(); for (int v in b.colVals) a.colVals.add(v);
+            a.rowKinds.clear(); for (int v in b.rowKinds) a.rowKinds.add(v);
+            a.rowVals.clear(); for (int v in b.rowVals) a.rowVals.add(v);
+        }
     }
 }
 

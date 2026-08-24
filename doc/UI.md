@@ -149,6 +149,7 @@ same fields.
 | Node | Kind | Role | Key props |
 |------|------|------|-----------|
 | `View` | `ELEM_VIEW` | flex container | `Style style`, `list<IElement> children` |
+| `Grid` | `ELEM_GRID` | track-layout container (auto \| fixed \| star columns/rows, row-major fill) | `cols`, `colFixed`, `colStar`, `rowFixed`, `rowStar`, `gap` |
 | `Text` | `ELEM_TEXT` | text leaf | `string text` |
 | `Button` | `ELEM_BUTTON` | pressable leaf | `string title`, `Lambda<void()> onPress`, `bool disabled` |
 | `Box` | `ELEM_BOX` | bordered sized container | `Style style`, `children` |
@@ -162,10 +163,11 @@ same fields.
 | `RadioButton` | `ELEM_RADIO` | one option inside a `RadioGroup` | `string label`, `int index`, `bool checked` |
 | `ComboBox` | `ELEM_COMBO` | controlled dropdown | `list<string> items`, `int selectedIndex`, `onChange` |
 | `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `cellStyle(row,col)`, `int selectedIndex`, `width`, `height`, `onSelect`, `onActivate`, `onHeaderClick` |
+| `GridView` | `ELEM_GRIDVIEW` | virtualized item grid | `cellW`, `cellH`, `count`, `makeCell`, `selectedIndex` |
 | `TabControl` | `ELEM_TABS` | keyed tab panes, lazy inactive tabs | `int selectedTab`, `onSelectTab`, `TabPane` children |
 | `TabPane` | `ELEM_TABPANE` | one titled pane inside a `TabControl` (container) | `string title`, `children` |
 | `TreeView` | `ELEM_TREE` | expand-on-demand tree | `childCount(nid)`, `childId(nid,i)`, `label(nid)`, `int selectedNode`, `onSelect`, `onExpand` |
-| `SplitView` | `ELEM_SPLIT` | two weighted panes + draggable divider (container) | `int ratio`, `bool vertical`, `onRatioChange`, two pane children |
+| `SplitView` | `ELEM_SPLIT` | two weighted panes + draggable divider (container) | `int ratio`, `int firstSize`, `bool vertical`, `onRatioChange`, two pane children |
 | `Image` | `ELEM_IMAGE` | bitmap leaf (BGRA32 via `setImageData`) | `u64 pixels` (borrowed top-down BGRA32), `int pxW/pxH`, `int width/height`, `string source` (.bmp), `string altText` |
 | `GroupBox` | `ELEM_GROUPBOX` | titled group frame (container) | `string title`, `Style style`, `children` |
 | `CanvasView` | `ELEM_CANVAS` | app-painted escape hatch | `Lambda<void(ICanvas)> onPaint`, `int width/height` |
@@ -228,6 +230,23 @@ public `colWidths` field is retained for source compatibility; `addColumn` uses
 the clearer `widthCells` parameter name. Likewise, native `setFrame` and
 `measureText` use cell-based parameter names while preserving the same values.
 
+### GridView (virtualized item grid)
+
+`GridView` is a leaf to reconciliation and a container to the hosts. Its `makeCell`
+callback is an owning `Lambda<IElement(int)>`: it receives an item index and returns
+that item's element. The callback is called only for the visible rows plus two overscan
+rows above and below, so a count of 10000 does not create 10000 elements. Columns are
+derived as `max(1, (width + gap) / (cellW + gap))`; `cellW` and `cellH` are uniform
+cell dimensions.
+
+GridView owns `scrollY` and scrolls itself. Arrow-key navigation runs through the
+`dispatch(Event)` seam, so it is live on the canvas/TUI hosts (native hosts do not
+synthesize `EV_KEY`); Win32 routes the mouse wheel to the GridView in cell-row steps,
+and cell selection by mouse works everywhere. Cocoa and WinUI wheel routing is
+deferred. GridView cells are not part of the Tab ring. Nesting a
+GridView inside a `ScrollView` is unsupported. Its `toJson()` output reports count,
+scrollY, selectedIndex, and realized count, never cell contents.
+
 **`setListOp` seam (v13).** Property setters cannot express a data control's columns +
 item source, so the `INativeHost` interface gained ONE op-coded call:
 `setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)`, with the
@@ -276,6 +295,8 @@ the flagship that composes all of them:
   `nativeTreeExpandItem`/`nativeTreeSelectItem`/`nativeTreeItemNodeId`.
 - **`SplitView`** - two panes split by `int ratio` (the first pane's percentage of the
   split axis) with a 1-cell divider gutter; `bool vertical` picks side-by-side vs stacked.
+  `int firstSize` (cells, 0 = off) switches to an absolute first pane that holds its
+  size across window resizes - the IDE-sidebar idiom; drags still report a ratio.
   A layout container (not a native control): the layout engine learns the weighted
   two-pane constraint. Dragging the divider fires `onRatioChange(newRatio)` (Win32 hit-
   tests the gutter in the parent `WndProc` with `SetCapture`; `nativeSplitterDrag(keyPath,
@@ -675,6 +696,29 @@ the container's height is the sum of line heights plus `gap` between lines
 (and between the last line and the two paddings). `flexWrap` is a `DIR_ROW`-
 only feature in this phase; a `DIR_COLUMN` `View` ignores the flag and keeps
 its normal single-line stacking.
+
+For cross-row alignment of heterogeneous children, use `Grid` (track layout)
+instead of trying to make a wrapped flex row share column widths.
+
+### Grid (track layout)
+
+`Grid` arranges children row-major into a declared number of columns. Each
+column and row is `auto`, `fixed`, or `star`. Auto takes the maximum
+intrinsic size of the cells in that track, fixed takes the value supplied by
+`colFixed` or `rowFixed`, and star divides the remaining space by integer
+weight with the same left-to-right/top-to-bottom remainder handout as flex.
+Trailing partial rows are legal.
+
+Star rows distribute space only when height is bounded. Under
+`LAYOUT_UNBOUNDED`, a star row falls back to its intrinsic auto height, just
+like column flex on an unbounded scroll axis. A cell span is deferred.
+
+Sizing precedence is explicit child `style.width`/`style.height`, then the
+exact cell box supplied by the grid, then the track size. The grid itself is a
+pure layout container; it is not a native host control.
+
+The `08-fedit` example is the reference migration for a window shell: one-column
+grids use auto rows for chrome and a star row for the panes.
 
 ## Input: the `dispatch(Event)` seam and focus
 
@@ -1137,9 +1181,11 @@ drivers read their answers back out of the control - an empty control cannot pas
 | Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
 | ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
 | ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
+| GridView     | cell realization (wheel)  | cell realization (keyboard) | cell realization (keyboard) |
 | TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
 | TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView + TreeViewNodes (lazy)   |
 | SplitView    | layout container          | layout container          | layout container                    |
+| Grid         | layout container          | layout container          | layout container                    |
 | StatusBar    | Y msctls_statusbar32      | Y NSTextField strip       | Y TextBlock strip                   |
 | GroupBox     | Y BS_GROUPBOX frame       | Y titled NSBox            | header label (look difference)      |
 | Image        | Y HBITMAP DIB             | Y NSImageView             | Y WriteableBitmap (BGRA upload)     |
@@ -1210,7 +1256,7 @@ Handlers follow one principled convention (React-Native-derived), frozen for rel
 | `onPress` | `Button` | pressed/activated |
 | `onChange` | `Checkbox`, `Slider`, `RadioGroup`, `ComboBox`, `TextArea` | the controlled scalar VALUE changed |
 | `onChangeText` | `TextInput` | the text value changed (RN's `TextInput.onChangeText` name) |
-| `onSelect` / `onActivate` | `ListView`, `TreeView` | selection changed / row double-click-or-Enter |
+| `onSelect` / `onActivate` | `ListView`, `GridView`, `TreeView` | selection changed / row double-click-or-Enter |
 | `onSelectTab` | `TabControl` | the active tab changed |
 | `onExpand` | `TreeView` | a node expanded (children materialized) |
 | `onRatioChange` | `SplitView` | the divider was dragged |

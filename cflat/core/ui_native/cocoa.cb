@@ -112,6 +112,7 @@ bool nativeMappable(int kind)
 int _containerBg(IElement node, Theme theme, bool systemDark)
 {
     if (node.kind() == ELEM_VIEW) { IView v = node as IView; return resolveColor(v.style.backgroundColor, theme, systemDark); }
+    if (node.kind() == ELEM_GRID) { IGrid g = node as IGrid; return resolveColor(g.style.backgroundColor, theme, systemDark); }
     return 0;
 }
 
@@ -1526,6 +1527,27 @@ class CocoaHost : INativeHost
             double vpH = (double)(sb.h * BASE_Y);
             if (docH < vpH) docH = vpH;   // never shorter than the viewport
             msgRect(docv, "setFrame:", 0.0, 0.0, docW, docH);
+            return;
+        }
+
+        if (node.kind() == ELEM_GRIDVIEW)
+        {
+            IGridView gv = node as IGridView;
+            Rect gb = node.nodeBounds();
+            int i = 0;
+            while (i < gv.realizedCount())
+            {
+                IElement cell = gv.getRealized(i);
+                Rect cb = cell.nodeBounds();
+                Rect visible = intersectRect(gb, cb);
+                // Overscan keeps native controls bounded, at the cost of edge churn.
+                if (visible.w > 0 && visible.h > 0)
+                {
+                    string cp = joinKeyPath(path, keySegment(cell, i));
+                    this._applyNode(cell, cp, ctx, keys, handles, fx, fy, fw, fh, parentView, offX, offY);
+                }
+                i++;
+            }
             return;
         }
 

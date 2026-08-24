@@ -73,7 +73,9 @@ Every element in one app, and the chapter that proves host-neutrality.
 
 - `gallery_app.cb` - the `GalleryApp` component and its headless self-test. It imports
   only the element model and has no `main()`; the host free functions it calls are
-  supplied by whichever launcher imports it.
+  supplied by whichever launcher imports it. The gallery includes a Grid form card
+  showing an auto-sized label column and a star-sized field column. It also includes a
+  GridView card demonstrating a bounded pool for 10000 virtualized cells.
 - `gallery.cb` - the Win32/Cocoa launcher, plus the screenshot path.
 
 The WinUI launcher for this same component lives in chapter 06.
@@ -113,7 +115,8 @@ controls, a real menu bar and accelerators, real shell file dialogs, and a real
 multiline editor - no browser engine.
 
 - `fedit.cb` - a small IDE shell: file-tree sidebar, multi-tab documents, a draggable
-  splitter, a context menu, and a toolbar.
+  splitter, a context menu, and a toolbar, with a Grid-based layout driven by window
+  size instead of hand-computed heights.
 - `fedit_jsx.cb` - the same app with `render()` authored in the `<Tag/>` sugar. Chapter
   01 proves the sugar desugars to an identical tree; this proves it at app scale, by
   passing the same self-test against the same key paths.
