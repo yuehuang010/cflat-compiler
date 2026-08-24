@@ -23,15 +23,23 @@ Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` re
 
 ## Agent Delegation: Cost vs Intelligence
 
-The default worker agent is Luna with high effort. Implementation work should be delegated to Luna; the main session plans, coordinates, and reviews the results.
+Before delegating, first decide whether delegation is proportionate. Account for the cost of
+briefing, coordination, waiting, and review. Keep small, direct tasks in the main session when
+delegation would cost as much as or more than doing the work locally.
+
+The default worker agent is Luna with high effort. Substantial implementation work should be
+delegated to Luna when that division is proportionate; the main session plans, coordinates, and
+reviews the results. Here, "implementation" means source-code changes (including related source
+tests and build logic). Documentation, issue files, plans, and specifications are not
+implementation and should be handled in the main session by default.
 
 Subagents must not create or invoke subagents. If the task is unsuitable for Luna, it should report that to the main session instead of delegating further.
 
 Guidelines:
 
-- Default flow: the main session writes the plan and acceptance criteria, delegates implementation to Luna with high effort, then verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on macOS/Linux).
+- Default flow for proportionate implementation work: the main session writes the plan and acceptance criteria, delegates implementation to Luna with high effort, then verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on macOS/Linux).
 - Give implementation agents a self-contained prompt: exact files, the plan, constraints from this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and how to verify.
-- Use read-only exploration for broad codebase searches instead of burning main-session context.
+- Use read-only exploration for broad codebase searches when the search is large enough to justify the delegation overhead.
 - Independent sub-tasks should be spawned in parallel when they touch disjoint files.
 
 ## Token Efficiency
