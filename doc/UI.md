@@ -88,19 +88,22 @@ it implements this interface AND exposes the construction shape described later.
 ```cflat
 interface IElement
 {
+    Style style;                            // shared RN-shaped layout/style fields
     move string toJson();                   // serialize self + subtree
     void destroyTree();                     // free owning descendants (not self)
     Size layout(LayoutConstraints c);       // place self, return consumed size
     void paint(ICanvas c, IUiContext ctx);  // draw self + subtree (focus-aware) via ICanvas
     bool dispatch(Event e, IUiContext ctx); // route one input event; true if consumed
     int  kind();                            // ELEM_* tag for the reconciler
-    int  flexWeight();                      // main-axis flex weight; 0 = intrinsic (leaves)
+    int  flexWeight();                      // style.flex; 0 = intrinsic
     bool propsEqual(IElement other);        // structured props compare (same kind)
     list<IElement>* childList();            // children for containers, nullptr for leaves
     string keyOf();                         // "" if unkeyed; drives keyed reconciliation
     void setKey(string k);
     void collectFocusables(list<string>* keys); // append focusable keys (Tab ring)
-    Rect nodeBounds();                      // absolute frame stamped by the last layout
+    Rect nodeBounds();                      // absolute frame stamped by the last layout (cells)
+    int styleWidth();                       // Style.width for generic layout code
+    int styleHeight();                      // Style.height for generic layout code
 };
 ```
 
@@ -133,7 +136,8 @@ IElement
 
 A derived interface converts IMPLICITLY to any ancestor (assignment, call argument,
 `list<IElement>.add`, return), so `view.add(button(...))` needs no cast. `ComponentElement`
-(what `mount` returns) has no interface of its own: `IElement` is its whole contract.
+(what `mount` returns) has no interface of its own: `IElement` is its whole contract,
+including the shared `style` field.
 
 Each widget interface carries the props a caller reaches plus its `fire*` verbs (e.g.
 `IButton { string title; int color; int backgroundColor; void fireClick(); }`). Use LSP
@@ -194,11 +198,16 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 - **`ListView`** - a **virtualized** report-mode list. The item source is a callback,
   `Lambda<string(int,int)> rowText` (row, col -> cell text), NOT a copied list, so
   `rowCount` can be 100k+ and only the visible cells are ever queried (Win32
-  `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthDip)`;
+  `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthCells)`;
   controlled `selectedIndex`; `onSelect(row)` on a selection change, `onActivate(row)`
   on double-click / Enter. Driver helpers: `nativeListSelect(keyPath, row)`,
   `nativeListSelectedRow(keyPath)`, `nativeListCellText(keyPath, row, col)`,
   `nativeListRowCount(keyPath)`.
+
+All layout dimensions and column widths are shared integer cells, not DIPs. The
+public `colWidths` field is retained for source compatibility; `addColumn` uses
+the clearer `widthCells` parameter name. Likewise, native `setFrame` and
+`measureText` use cell-based parameter names while preserving the same values.
 
 **`setListOp` seam (v13).** Property setters cannot express a data control's columns +
 item source, so the `INativeHost` interface gained ONE op-coded call:
@@ -234,11 +243,11 @@ the flagship that composes all of them:
   Driver helpers: `nativeTreeRootItem`/`nativeTreeChildItem`/`nativeTreeItemCount`/
   `nativeTreeExpandItem`/`nativeTreeSelectItem`/`nativeTreeItemNodeId`.
 - **`SplitView`** - two panes split by `int ratio` (the first pane's percentage of the
-  split axis) with a 1-DIP divider gutter; `bool vertical` picks side-by-side vs stacked.
+  split axis) with a 1-cell divider gutter; `bool vertical` picks side-by-side vs stacked.
   A layout container (not a native control): the layout engine learns the weighted
   two-pane constraint. Dragging the divider fires `onRatioChange(newRatio)` (Win32 hit-
   tests the gutter in the parent `WndProc` with `SetCapture`; `nativeSplitterDrag(keyPath,
-  dipX, dipY)` drives it headlessly). ICanvas draws the two panes and the divider line.
+  cellX, cellY)` drives it headlessly). ICanvas draws the two panes and the divider line.
 - **`ContextMenu`** - a per-element right-click menu reusing the P3 declarative menu model
   (`addItem(label, cmd)` / `addSeparator()`). The app builds one (the `<ContextMenu/>`
   sugar works) and registers it by key path with `nativeSetContextMenu(keyPath, (u64)m)`;
@@ -358,7 +367,7 @@ move ITextArea    textArea(string value, Lambda<void()> onChange);
 move IStatusBar   statusBar(string mainText);   // add more panes with .addPart(s)
 move IRadioGroup  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
 move IComboBox    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
-move IListView    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthDip)
+move IListView    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthCells)
 move ITabControl  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .add(tabPane(title))
 move ITabPane     tabPane(string title);
 move ITreeView    treeView(Lambda<int(int)> childCount, Lambda<int(int,int)> childId, Lambda<string(int)> label);
@@ -424,7 +433,8 @@ destructor); the Win32 `GdiCanvas` uses `SaveDC` + `IntersectClipRect` / `Restor
 
 ## Style (React-Native field names)
 
-`Style` is a TYPED struct, not an open dynamic bag - the one deliberate deviation
+`Style style` is inherited by every widget interface and is directly available on
+the generic `IElement` returned by `mount`. `Style` is a TYPED struct, not an open dynamic bag - the one deliberate deviation
 from RN, which takes arbitrary string keys. Fields track RN names:
 
 ```
@@ -445,6 +455,15 @@ Style flexStyle(int flex);                             // a Style carrying only 
 int   rgb(int r, int g, int b);                        // build an explicit color
 int   COLOR_DEFAULT;                                   // 0: backend monochrome default
 ```
+
+Every element uses its typed `style.flex` as its main-axis flex weight. In a
+row, a bounded share sets the element's cell width; in a bounded column, it
+sets the cell height. The element consumes that exact share, so padding, gaps,
+and the left-to-right remainder handout sum without overlap. `style.width` or
+`style.height` wins over flex on that axis. When a Style dimension is zero, an
+existing direct widget `width`/`height` field remains the compatibility fallback.
+Intrinsic sizing is preserved when flex is zero and on an unbounded scroll axis.
+The same rules feed native `nodeBounds()` and canvas/TUI/headless painting.
 
 ALWAYS build colors with `rgb(r, g, b)` - never a raw `0xRRGGBB` literal. `rgb()`
 sets a marker bit so an explicit color is non-zero (even `rgb(0,0,0)`), and
@@ -900,12 +919,12 @@ interface INativeHost
 {
     u64  createControl(int elemKind, u64 parentHandle, string key);
     void destroyControl(u64 h);
-    void setFrame(u64 h, Rect frameDip);
+    void setFrame(u64 h, Rect frameCells);
     void setText(u64 h, const char* s);
     void setBoolProp(u64 h, int prop, bool v);      // PROP_CHECKED/ENABLED/VISIBLE
     void setIntProp(u64 h, int prop, int v);        // PROP_VALUE/MAX/CARET/SCROLLY
     void setAccent(u64 h, int fgColor, int bgColor);// 0 = native default
-    Size measureText(const char* s, int fontId, int wrapWidthDip);  // FONT_UI/MONO/TITLE/CAPTION
+    Size measureText(const char* s, int fontId, int wrapWidthCells);  // FONT_UI/MONO/TITLE/CAPTION
     void requestLayout();
     void setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload); // v13: LISTOP_* item-data batch
     // (v14 reuses setListOp for the tab + tree ops: LISTOP_TAB_* / LISTOP_TREE_*)
@@ -925,11 +944,13 @@ the native->`Event` translation.
   touches it; ICanvas hosts leave it empty and inert. The handles are non-owning
   integers, so tearing the map down destroys no windows - the host destroys
   controls explicitly.
-- **DIP units.** Layout math in `ui.cb` is unit-blind integer arithmetic. A
-  ICanvas/TUI host reads those integers as cells (1 DIP == 1 cell, so the TUI stays
-  byte-identical); a `INativeHost` reads them as DIPs and scales DIP->physical px at
-  the host boundary using the monitor DPI. `measureText` replaces the
-  1-cell-per-char assumption for native text.
+- **Cell units.** Layout math in `ui.cb` is integer cell arithmetic. A
+  ICanvas/TUI/headless host reads those integers directly as cells. Native hosts
+  convert cells at the boundary: Win32 uses the DPI-scaled `BASE_X=8` and
+  `BASE_Y=26` cell bases, Cocoa uses 8 x 26 points per cell, and WinUI uses its
+  8 x 34 XAML-DIP cell bases followed by its render scale. These host conversions
+  are not a change to the shared numerical layout model. `measureText` accepts a
+  cell wrap width and returns a cell size.
 
 ### Win32 native host: editor features (v10)
 
@@ -947,7 +968,7 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   `openAppWindow(new App(), title)`. These accessors are mirrored on the Cocoa host
   (single-window there in this release; multi-window parity is planned).
 
-- **Modern look:** per-monitor-v2 DPI awareness with DIP->px scaling and
+- **Modern look:** per-monitor-v2 DPI awareness with cell->px scaling and
   `WM_DPICHANGED` relayout; Segoe UI Variable font; immersive dark-mode titlebar +
   themed control/window colors driven by the app `Theme` (`WM_CTLCOLOR*` +
   `WM_ERASEBKGND`). The menu bar and stock scrollbars stay light in dark mode
@@ -989,7 +1010,7 @@ Each helper routes through the same element-model handler the OS would fire on r
 re-renders; readbacks query native control state (on every host, including the data controls -
 a driver reads the control's own items/selection, so an empty control cannot answer).
 
-- **Window / app:** `startHeadlessWindow(new App(), title, w, h)` (hidden window at DIP
+- **Window / app:** `startHeadlessWindow(new App(), title, w, h)` (hidden window at cell
   size, tree built), `activeApp()` / `activeCtx()`, `hostDark()`, `hostWindowCount()`,
   `nativeTeardownForTest()` (leak-gate cleanup).
 - **Buttons / state:** `nativeClickButton(keyPath)` (Button/Checkbox/RadioButton - mirrors
@@ -1003,7 +1024,7 @@ a driver reads the control's own items/selection, so an empty control cannot ans
   `nativeListSelect(keyPath, row)`, `nativeListSelectedRow`, `nativeListActivate(keyPath, row)`.
 - **Tabs / tree / split:** `nativeTabSelected`/`nativeTabCount`/`nativeTabSelect`,
   `nativeTreeRootItem`/`nativeTreeChildItem`/`nativeTreeItemCount`/`nativeTreeExpandItem`/
-  `nativeTreeSelectItem`/`nativeTreeItemNodeId`, `nativeSplitterDrag(keyPath, dipX, dipY)`,
+  `nativeTreeSelectItem`/`nativeTreeItemNodeId`, `nativeSplitterDrag(keyPath, cellX, cellY)`,
   `nativeNodeBounds(keyPath)`.
 - **Chrome / visuals:** `nativeSetContextMenu(keyPath, menuPtr)`,
   `nativeFireContextMenu(keyPath, itemIndex)`, `nativeImageHasBitmap(keyPath)`.
@@ -1209,7 +1230,7 @@ exact signatures):
 
 | Group | Methods |
 |-------|---------|
-| Launch | `launch(new App(), wDip, hDip)`, `pump()` (re-render + drain posted work) |
+| Launch | `launch(new App(), wCells, hCells)`, `pump()` (re-render + drain posted work) |
 | Actions | `click`, `type`, `setText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
 | Readers | `controlText`, `isChecked`, `isEnabled`/`isDisabled`, `comboSelected`, `listRowCount`, `listSelectedRow`, `listCellText`, `progressValue`, `statusText`, `bounds`, `accessibleName`, `focusedKey`, `tabCount`/`tabSelected`, `tooltipCount`, `exists(key)`, `hostIsDark()` |
 | Asserts | `expectTrue`/`expectFalse`, `expectBool`, `expectInt`, `expectStr`, `expectText(name, key, want)`, `requireTrue(name, cond)` |

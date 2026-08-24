@@ -339,9 +339,9 @@ struct BmiHeader
     u32 biClrImportant = 0u;
 };
 
-// Per-DIP base pixels at 96 dpi (100%). Layout math in ui.cb is unit-blind
-// integers; a native host reads them as DIPs and scales by the monitor dpi:
-// physical px = dip * BASE * dpi / 96. One layout column ~8px, one row ~26px so
+// Per-cell base pixels at 96 dpi (100%). Layout math in ui.cb uses shared cells;
+// the native host converts them to physical pixels using monitor DPI:
+// physical px = cell * BASE * dpi / 96. One layout column ~8px, one row ~26px so
 // native controls get sensible heights.
 const int BASE_X = 8;
 const int BASE_Y = 26;
@@ -535,7 +535,7 @@ class Window : INativeHost
     void* fontCaption = nullptr;
     void* tooltip = nullptr;         // lazily-created tooltips_class32 for this window
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
-    u32   dpi     = 96u;             // window dpi (96 = 100%); drives DIP->px
+    u32   dpi     = 96u;             // monitor density (96 = 100%); drives cell->px
     bool  dark    = false;           // last applied theme was dark (titlebar/bg)
     bool  themed  = false;           // the app set colors (a monochrome theme = native look)
     // The common controls (ListView/TreeView/TabControl/ProgressBar/scrollbar) currently carry
@@ -616,7 +616,7 @@ class Window : INativeHost
     int          scrollContentPx = 0;
     bool         sbShown         = false;
     bool         paneClamped     = false;   // the content overflowed PANE_MAX_H (reported once)
-    // The frame's client size in PHYSICAL px (WM_SIZE). The layout size (w/h, in DIPs) is
+    // The frame's client size in PHYSICAL px (WM_SIZE). The layout size (w/h, in cells) is
     // derived from it minus the scrollbar column, so showing the bar narrows the content.
     int          clientPxW       = 0;
     int          clientPxH       = 0;
@@ -625,10 +625,10 @@ class Window : INativeHost
     IElement   tree  = default;       // the committed IElement tree
     UiContext ctx   = default;       // per-window runtime state
     bool      ready = false;
-    int       w     = 80;            // client size in DIP units (layout width)
-    int       h     = 30;            // client size in DIP units (layout height)
+    int       w     = 80;            // client size in cells (layout width)
+    int       h     = 30;            // client size in cells (layout height)
 
-    // Physical pixels per layout DIP on each axis at the current dpi.
+    // Physical pixels per layout cell on each axis at the current dpi.
     int dipX() { return BASE_X * (int)this.dpi / 96; }
     int dipY() { return BASE_Y * (int)this.dpi / 96; }
 
@@ -787,10 +787,10 @@ class Window : INativeHost
     // Batched elsewhere (applyTree uses DeferWindowPos); this immediate form is the
     // INativeHost contract for a one-off reposition. A status bar self-docks, so it is
     // repositioned by a WM_SIZE tickle rather than an absolute frame.
-    void setFrame(u64 h, Rect frameDip)
+    void setFrame(u64 h, Rect frameCells)
     {
-        MoveWindow(u2h(h), frameDip.x * this.dipX(), frameDip.y * this.dipY(),
-                   frameDip.w * this.dipX(), frameDip.h * this.dipY(), 1);
+        MoveWindow(u2h(h), frameCells.x * this.dipX(), frameCells.y * this.dipY(),
+                   frameCells.w * this.dipX(), frameCells.h * this.dipY(), 1);
     }
 
     // Only push text when it actually differs, so an EDIT does not reset its caret
@@ -1122,7 +1122,7 @@ class Window : INativeHost
         return r.bottom - r.top;
     }
 
-    // Derive the LAYOUT size (DIPs) from the client size, minus the scrollbar column. The old
+    // Derive the LAYOUT size (cells) from the client size, minus the scrollbar column. The old
     // non-client bar shrank the client area itself and got this for free.
     void _syncSizeDip()
     {
@@ -1592,8 +1592,8 @@ class Window : INativeHost
         }
     }
 
-    // Text metrics in DIPs. Selects the UI font into a screen DC and measures.
-    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    // Text metrics in cells. Selects the UI font into a screen DC and measures.
+    Size measureText(const char* s, int fontId, int wrapWidthCells)
     {
         Size sz = default;
         void* dc = GetDC(this.hwnd);
@@ -1790,9 +1790,9 @@ class Window : INativeHost
                     int ci = 0;
                     while (ci < lv.columns.count())
                     {
-                        int wdip = 12;
-                        if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
-                        this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                        int wCells = 12;
+                        if (ci < lv.colWidths.count()) wCells = lv.colWidths.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(), 0u);
                         ci++;
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
@@ -2759,7 +2759,7 @@ class Window : INativeHost
             Rect d = sv.dividerBounds;
             int x0 = d.x * this.dipX(); int y0 = d.y * this.dipY();
             int x1 = x0 + d.w * this.dipX(); int y1 = y0 + d.h * this.dipY();
-            if (x1 - x0 < 6) { x0 = x0 - 3; x1 = x1 + 3; }   // widen a 1-DIP gutter
+            if (x1 - x0 < 6) { x0 = x0 - 3; x1 = x1 + 3; }   // widen a 1-cell gutter
             if (y1 - y0 < 6) { y0 = y0 - 3; y1 = y1 + 3; }
             if (px >= x0 && px < x1 && py >= y0 && py < y1) return "" + path;
         }
@@ -3767,19 +3767,19 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
     if (cmd > 0) routeMenu(cmd);
 }
 
-// Drive a splitter to a DIP position along its axis (headless drag). Fires onRatioChange.
-void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+// Drive a splitter to a cell position along its axis (headless drag). Fires onRatioChange.
+void nativeSplitterDrag(string keyPath, int cellX, int cellY)
 {
     Window* wnd = curWin();
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), keyPath);
     if (e == nullptr) return;
     ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(cellX, cellY));
     pumpNative();
 }
 
-// The absolute frame (DIP) of the node at keyPath, or a zero rect (layout assertions).
+// The absolute cell frame of the node at keyPath, or a zero rect (layout assertions).
 Rect nativeNodeBounds(string keyPath)
 {
     Window* wnd = curWin();
@@ -4629,12 +4629,12 @@ string nativeFocusNext() { return curWin().keyForHandle(nativeFocusNextH()); }
 string nativeFocusedKey() { return curWin().keyForHandle(_testFocusH); }
 u64    nativeFocusedHandle() { return _testFocusH; }
 
-// Drive a live client-area resize (WM_SIZE) to w x h DIPs, so the host relayouts + reconciles.
-void nativeResizeClient(int wDip, int hDip)
+// Drive a live client-area resize (WM_SIZE) to w x h cells, so the host relayouts + reconciles.
+void nativeResizeClient(int wCells, int hCells)
 {
     Window* wnd = curWin();
-    int px = wDip * wnd.dipX();
-    int py = hDip * wnd.dipY();
+    int px = wCells * wnd.dipX();
+    int py = hCells * wnd.dipY();
     i64 lp = (i64)(((py & 0xFFFF) << 16) | (px & 0xFFFF));
     SendMessageA(wnd.hwnd, (u32)WM_SIZE, 0u, lp);
 }

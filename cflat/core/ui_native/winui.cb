@@ -329,9 +329,9 @@ void* winuiColorArg(int color)
     return (void*)(u64)(0xFFu | (r << 8) | (g << 16) | (b << 24));
 }
 
-// The layout cell, in XAML DIPs - the same cell model the Win32/Cocoa hosts use (their BASE_X/
-// BASE_Y). The framework's layout unit is a CELL; setFrame/measureText convert at the edges.
-// DIPs are already dpi-independent, so unlike Win32 there is no dpi factor anywhere here.
+// The layout cell is converted to XAML DIPs at the host edge; it is the same
+// shared cell model as Win32/Cocoa (their BASE_X/BASE_Y).
+// XAML DIPs are already dpi-independent, so unlike Win32 there is no extra DPI factor here.
 // BASE_Y is taller than the Win32 host's 26: a XAML control is chunkier than its GDI equivalent
 // (a default Button is 32 DIPs), so a 1-cell control row would clip its own text at 26.
 const int BASE_X = 8;
@@ -2271,9 +2271,9 @@ class WinUI3Host : INativeHost
             int ci = 0;
             while (ci < lv.columns.count())
             {
-                int wdip = 12;
-                if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
-                this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                int wCells = 12;
+                if (ci < lv.colWidths.count()) wCells = lv.colWidths.get(ci);
+                this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(), 0u);
                 ci++;
             }
             this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
@@ -2638,7 +2638,7 @@ void routeWinuiTreeExpand(string key, void* args)
 
 // -- Canvas input routing (parity with the Win32/Cocoa hosts) -------------------
 // The CanvasView handlers take POINTS relative to the canvas origin. XAML reports the pointer
-// position in DIPs relative to the element, and this host maps one cell to one DIP (see
+// position in XAML DIPs relative to the element, and this host maps layout cells through
 // WinuiGdiCanvas), so the position passes through unscaled. Handlers resolve the LIVE element
 // per event (like routeWinuiClick); a canvas with no handler installed is a no-op - the has*
 // flag is always checked first, since reading an unset Lambda faults.
@@ -3537,13 +3537,13 @@ int nativeTreeItemNodeId(string keyPath, u64 hItem)
 }
 
 // -- Splitter / bounds ---------------------------------------------------------
-void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+void nativeSplitterDrag(string keyPath, int cellX, int cellY)
 {
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
     ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(cellX, cellY));
     pumpWinui();
 }
 Rect nativeNodeBounds(string keyPath)

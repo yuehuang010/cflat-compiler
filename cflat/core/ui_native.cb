@@ -182,6 +182,10 @@ struct LayoutConstraints
     int y = 0;
     int availW = 0;
     int availH = 0;
+    // An exact axis is a flex allocation from the parent, not an intrinsic
+    // measurement hint. Leaves must consume this share on that axis.
+    bool exactW = false;
+    bool exactH = false;
 };
 
 struct Size
@@ -816,15 +820,14 @@ int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICan
 // once, by destroyTree() + `delete c` per child (list<IElement> does not destruct its elements).
 interface IElement
 {
+    Style style;
     move string toJson();
     void destroyTree();
     Size layout(LayoutConstraints c);
     void paint(ICanvas c, IUiContext ctx);
     bool dispatch(Event e, IUiContext ctx);
     int  kind();
-    // Main-axis flex weight for a View-row/column distribution pass; 0 = not
-    // flexible (intrinsic size). Only View carries a real Style; every other
-    // IElement implementor returns 0 (leaves are never flex children).
+    // Main-axis flex weight for a View-row/column distribution pass; 0 = intrinsic.
     int  flexWeight();
     bool propsEqual(IElement other);   // other is guaranteed same kind() by reconcile
     list<IElement>* childList();
@@ -833,9 +836,11 @@ interface IElement
     // Append the keys of focusable descendants (Button/TextInput) in tree order,
     // so Tab/Shift-Tab can build a focus ring. Leaves that cannot focus no-op.
     void collectFocusables(list<string>* keys);
-    // The absolute frame stamped by the last layout pass (in DIP/cell units). A
+    // The absolute frame stamped by the last layout pass (in shared cell units). A
     // INativeHost reads this to position the node's OS control (v9).
     Rect nodeBounds();
+    int styleWidth();
+    int styleHeight();
 };
 
 // -- Per-widget interfaces ------------------------------------------------------
@@ -868,7 +873,6 @@ interface IDisableable : ITooltipped
 
 interface IView : IElement
 {
-    Style style;
     list<IElement> children;
     void add(adopt IElement child);
 };
@@ -890,7 +894,6 @@ interface IButton : IDisableable
 
 interface IBox : IElement
 {
-    Style style;
     void  add(adopt IElement child);
 };
 
@@ -936,7 +939,6 @@ interface IStatusBar : IElement
 
 interface IScrollView : IElement
 {
-    Style style;
     int   contentH;
     void  add(adopt IElement child);
 };
@@ -952,7 +954,6 @@ interface IRadioButton : IDisableable
 interface IRadioGroup : IElement
 {
     int   value;
-    Style style;
     void  add(adopt IElement child);
     void  addOption(string label);
     void  fireChange(int v);
@@ -975,7 +976,7 @@ interface IListView : IDisableable
     int  selectedIndex;
     bool multiSelect;
     Lambda<string(int,int)> rowText;   // read as a value: boxed across the host seam
-    void addColumn(string title, int widthDip);
+    void addColumn(string title, int widthCells);
     void fireSelect(int row);
     void fireActivate(int row);
 };
@@ -1012,7 +1013,6 @@ interface ISplitView : IElement
 {
     int   ratio;
     bool  vertical;
-    Style style;
     Rect  dividerBounds;
     // Settable prop, not a factory arg: splitView(ratio, vertical) cannot take it, so the
     // field must be on the interface for a caller holding an ISplitView to wire it up.
@@ -1035,7 +1035,6 @@ interface IImage : ITooltipped
 interface IGroupBox : ITooltipped
 {
     string title;
-    Style  style;
     void   add(adopt IElement child);
 };
 
@@ -1103,15 +1102,13 @@ class View : IView
     bool isRowFlexChild(IElement child)
     {
         if (child.flexWeight() <= 0) return false;
-        IView v = child as IView;
-        return v == nullptr || v.style.width <= 0;
+        return child.styleWidth() <= 0;
     }
 
     bool isColumnFlexChild(IElement child)
     {
         if (child.flexWeight() <= 0) return false;
-        IView v = child as IView;
-        return v == nullptr || v.style.height <= 0;
+        return child.styleHeight() <= 0;
     }
 
     // One layout pass; flexDirection picks the strategy. Column stacks children
@@ -1251,6 +1248,7 @@ class View : IView
                         int share = shares[si];
                         si++;
                         cc.availW = share;
+                        cc.exactW = true;
                         Size cs = child.layout(cc);
                         if (cs.h > lineH) lineH = cs.h;
                         cx = cx + share;
@@ -1349,6 +1347,7 @@ class View : IView
                         int share = shares[si];
                         si++;
                         cc.availW = share;
+                        cc.exactW = true;
                         Size cs = child.layout(cc);
                         if (cs.h > maxH) maxH = cs.h;
                         cx = cx + share;
@@ -1376,6 +1375,7 @@ class View : IView
                     LayoutConstraints cc = default;
                     cc.x = cx; cc.y = c.y + pad;
                     cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+                    if (c.exactW && this.children.count() == 1) cc.exactW = true;
                     Size cs = child.layout(cc);
                     cx = cx + cs.w;
                     if (cs.h > maxH) maxH = cs.h;
@@ -1458,6 +1458,7 @@ class View : IView
                         int share = shares[si];
                         si++;
                         cc.availH = share;
+                        cc.exactH = true;
                         child.layout(cc);
                         cy = cy + share;
                     }
@@ -1482,6 +1483,7 @@ class View : IView
                     LayoutConstraints cc = default;
                     cc.x = c.x + pad; cc.y = cy;
                     cc.availW = c.availW - 2 * pad; cc.availH = c.availH - 2 * pad;
+                    if (c.exactH && this.children.count() == 1) cc.exactH = true;
                     Size cs = child.layout(cc);
                     cy = cy + cs.h;
                     i++;
@@ -1491,6 +1493,8 @@ class View : IView
             }
         }
 
+        if (c.exactW && this.style.width == 0) sz.w = c.availW;
+        if (c.exactH && this.style.height == 0) sz.h = c.availH;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = sz.w; b.h = sz.h;
         this.bounds = b;
@@ -1548,6 +1552,8 @@ class View : IView
 
     int kind() { return ELEM_VIEW; }
     int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -1568,6 +1574,7 @@ class View : IView
 // -- Text: a leaf displaying a string -----------------------------------------
 class Text : IText
 {
+    Style style = default;
     string text = default;
     int    color = 0;           // rgb(); 0 = default ink
     int    font = 0;            // FONT_UI (0) default; FONT_TITLE / FONT_CAPTION on native hosts
@@ -1593,9 +1600,12 @@ class Text : IText
         // FONT_TITLE == 2 (bold, ~1.3x wider on native hosts; literal since the
         // FONT_* consts are declared later in the file) reserves a wider cell.
         b.w = this.font == 2 ? (len * 13 + 9) / 10 : len;
-        b.h = 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        if (c.exactW) b.w = c.availW;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = b.w; s.h = 1;
+        Size s = default; s.w = b.w; s.h = b.h;
         return s;
     }
 
@@ -1612,7 +1622,9 @@ class Text : IText
     void destroyTree() { }
 
     int kind() { return ELEM_TEXT; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys) { }
     bool propsEqual(IElement other)
     {
@@ -1620,7 +1632,7 @@ class Text : IText
         // color is compared too: the native hosts now paint a Text's ink from it, so a
         // color-only change must produce a patch or the new ink never reaches the host.
         return o != nullptr && this.text == o.text && this.font == o.font
-            && this.color == o.color;
+            && this.color == o.color && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -1634,6 +1646,7 @@ class Text : IText
 // half of the focus seam).
 class Button : IButton
 {
+    Style style = default;
     string title = default;
     Lambda<void()> onPress = default;
     int    color = 0;               // label ink; 0 = default
@@ -1658,9 +1671,13 @@ class Button : IButton
     Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = (int)this.title.length() + 4; b.h = 1;
+        b.x = c.x; b.y = c.y; b.w = (int)this.title.length() + 4;
+        if (this.style.width > 0) b.w = this.style.width;
+        if (c.exactW) b.w = c.availW;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = b.w; s.h = 1;
+        Size s = default; s.w = b.w; s.h = b.h;
         return s;
     }
 
@@ -1725,7 +1742,9 @@ class Button : IButton
     void destroyTree() { }
 
     int kind() { return ELEM_BUTTON; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -1733,7 +1752,8 @@ class Button : IButton
     bool propsEqual(IElement other)
     {
         IButton o = other as IButton;
-        return o != nullptr && this.title == o.title && this.disabled == o.disabled;
+        return o != nullptr && this.title == o.title && this.disabled == o.disabled
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -1764,6 +1784,8 @@ class Box : IBox
         if (this.style.width > 0) w = this.style.width;
         int h = 1;
         if (this.style.height > 0) h = this.style.height;
+        if (c.exactW) w = c.availW;
+        if (c.exactH) h = c.availH;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
@@ -1843,7 +1865,9 @@ class Box : IBox
     }
 
     int kind() { return ELEM_BOX; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -1869,6 +1893,7 @@ class Box : IBox
 // that string stabilization unblocked.
 class TextInput : ITextInput
 {
+    Style style = default;
     string value       = default;
     string placeholder = default;
     Lambda<void(string)> onChangeText = default;
@@ -1891,11 +1916,15 @@ class TextInput : ITextInput
     {
         int w = this.width;
         if (w <= 0) w = (int)this.value.length() + 1;   // +1 for the caret cell
+        if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
         if (w < 3) w = 3;
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        b.x = c.x; b.y = c.y; b.w = w;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = w; s.h = 1;
+        Size s = default; s.w = w; s.h = b.h;
         return s;
     }
 
@@ -1961,7 +1990,9 @@ class TextInput : ITextInput
     void destroyTree() { }
 
     int kind() { return ELEM_TEXTINPUT; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -1969,7 +2000,8 @@ class TextInput : ITextInput
     bool propsEqual(IElement other)
     {
         ITextInput o = other as ITextInput;
-        return o != nullptr && this.value == o.value && this.disabled == o.disabled;
+        return o != nullptr && this.value == o.value && this.disabled == o.disabled
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -1985,6 +2017,7 @@ class TextInput : ITextInput
 // disabled dims and ignores input - all via the same UiContext state as Button.
 class Checkbox : ICheckbox
 {
+    Style style = default;
     string label    = default;
     bool   checked  = false;
     bool   disabled = false;
@@ -2006,9 +2039,13 @@ class Checkbox : ICheckbox
     Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4; b.h = 1;  // "[x] " + label
+        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4;
+        if (this.style.width > 0) b.w = this.style.width;
+        if (c.exactW) b.w = c.availW;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = b.w; s.h = 1;
+        Size s = default; s.w = b.w; s.h = b.h;
         return s;
     }
 
@@ -2051,7 +2088,9 @@ class Checkbox : ICheckbox
     void destroyTree() { }
 
     int kind() { return ELEM_CHECKBOX; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -2060,7 +2099,7 @@ class Checkbox : ICheckbox
     {
         ICheckbox o = other as ICheckbox;
         return o != nullptr && this.checked == o.checked && this.label == o.label
-            && this.disabled == o.disabled;
+            && this.disabled == o.disabled && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2073,6 +2112,7 @@ class Checkbox : ICheckbox
 // in cells. Purely presentational - it takes no input and no focus.
 class ProgressBar : IProgressBar
 {
+    Style style = default;
     int    value = 0;          // 0..100
     int    width = 20;         // cells
     int    color = 0;          // fill override; 0 = theme accent
@@ -2089,10 +2129,14 @@ class ProgressBar : IProgressBar
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width; if (w < 2) w = 2;
-        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        int w = this.width; if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w < 2 && !c.exactW) w = 2;
+        int h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) h = c.availH;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
-        Size s = default; s.w = w; s.h = 1;
+        Size s = default; s.w = w; s.h = b.h;
         return s;
     }
 
@@ -2113,12 +2157,15 @@ class ProgressBar : IProgressBar
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_PROGRESS; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys) { }
     bool propsEqual(IElement other)
     {
         IProgressBar o = other as IProgressBar;
-        return o != nullptr && this.value == o.value && this.width == o.width;
+        return o != nullptr && this.value == o.value && this.width == o.width
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2132,6 +2179,7 @@ class ProgressBar : IProgressBar
 // Controlled: fires onChange(newValue); the parent owns the value.
 class Slider : ISlider
 {
+    Style style = default;
     int    value = 0;          // 0..100
     int    width = 20;         // cells
     bool   disabled = false;
@@ -2162,10 +2210,14 @@ class Slider : ISlider
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width; if (w < 3) w = 3;
-        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        int w = this.width; if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w < 3 && !c.exactW) w = 3;
+        int h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) h = c.availH;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
-        Size s = default; s.w = w; s.h = 1;
+        Size s = default; s.w = w; s.h = b.h;
         return s;
     }
 
@@ -2222,7 +2274,9 @@ class Slider : ISlider
 
     void destroyTree() { }
     int kind() { return ELEM_SLIDER; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -2230,7 +2284,8 @@ class Slider : ISlider
     bool propsEqual(IElement other)
     {
         ISlider o = other as ISlider;
-        return o != nullptr && this.value == o.value && this.disabled == o.disabled;
+        return o != nullptr && this.value == o.value && this.disabled == o.disabled
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2247,6 +2302,7 @@ class Slider : ISlider
 // host falls back to painting `value` line by line (read-only preview).
 class TextArea : ITextArea
 {
+    Style style = default;
     string value    = default;   // pushed content (setText); not per-keystroke state
     Lambda<void()> onChange = default;   // dirty notify (no payload)
     int    width  = 40;
@@ -2264,9 +2320,13 @@ class TextArea : ITextArea
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
-        if (w < 4) w = 4;
-        int h = this.height; if (h < 2) h = 2;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
+        if (w < 4 && !c.exactW) w = 4;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 2 && !c.exactH) h = 2;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
@@ -2309,7 +2369,9 @@ class TextArea : ITextArea
 
     void destroyTree() { }
     int kind() { return ELEM_TEXTAREA; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -2320,7 +2382,8 @@ class TextArea : ITextArea
     bool propsEqual(IElement other)
     {
         ITextArea o = other as ITextArea;
-        return o != nullptr && this.disabled == o.disabled;
+        return o != nullptr && this.disabled == o.disabled
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2344,6 +2407,7 @@ move ITextArea textArea(string value, Lambda<void()> onChange)
 // falls back to one row of " | "-joined parts.
 class StatusBar : IStatusBar
 {
+    Style style = default;
     list<string> parts = default;   // text per pane; parts[0] is the main pane
     Rect   bounds = default;
     string key    = default;
@@ -2367,9 +2431,13 @@ class StatusBar : IStatusBar
     Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = c.availW; b.h = 1;
+        b.x = c.x; b.y = c.y;
+        b.w = this.style.width > 0 ? this.style.width : c.availW;
+        if (c.exactW) b.w = c.availW;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = b.w; s.h = 1;
+        Size s = default; s.w = b.w; s.h = b.h;
         return s;
     }
 
@@ -2391,7 +2459,9 @@ class StatusBar : IStatusBar
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_STATUSBAR; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys) { }
     bool propsEqual(IElement other)
     {
@@ -2404,7 +2474,7 @@ class StatusBar : IStatusBar
             if (this.parts.get(i) != o.parts.get(i)) return false;
             i++;
         }
-        return true;
+        return styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2565,7 +2635,9 @@ class ScrollView : IScrollView
     }
 
     int kind() { return ELEM_SCROLL; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (this.key.length() > 0) keys.add("" + this.key);
@@ -2688,6 +2760,7 @@ move IScrollView scrollView(Style style)
 // BS_AUTORADIOBUTTON on Win32 (WS_GROUP on the first radio of the group).
 class RadioButton : IRadioButton
 {
+    Style style = default;
     string label      = default;
     int    index      = 0;          // position within the group (drives selection)
     bool   checked    = false;      // controlled: index == group.value
@@ -2707,9 +2780,13 @@ class RadioButton : IRadioButton
     Size layout(LayoutConstraints c)
     {
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4; b.h = 1;  // "(o) " + label
+        b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4;
+        if (this.style.width > 0) b.w = this.style.width;
+        if (c.exactW) b.w = c.availW;
+        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) b.h = c.availH;
         this.bounds = b;
-        Size s = default; s.w = b.w; s.h = 1;
+        Size s = default; s.w = b.w; s.h = b.h;
         return s;
     }
 
@@ -2725,7 +2802,9 @@ class RadioButton : IRadioButton
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_RADIO; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -2734,7 +2813,7 @@ class RadioButton : IRadioButton
     {
         IRadioButton o = other as IRadioButton;
         return o != nullptr && this.checked == o.checked && this.label == o.label
-            && this.disabled == o.disabled;
+            && this.disabled == o.disabled && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2799,8 +2878,13 @@ class RadioGroup : IRadioGroup
             cy = cy + cs.h;
             i++;
         }
+        int bw = this.style.width > 0 ? this.style.width : c.availW;
+        if (c.exactW) bw = c.availW;
+        int bh = (cy - c.y) + pad;
+        if (this.style.height > 0) bh = this.style.height;
+        if (c.exactH) bh = c.availH;
         Rect b = default;
-        b.x = c.x; b.y = c.y; b.w = c.availW; b.h = (cy - c.y) + pad;
+        b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
         this.bounds = b;
         Size sz = default; sz.w = b.w; sz.h = b.h;
         return sz;
@@ -2853,7 +2937,9 @@ class RadioGroup : IRadioGroup
     }
 
     int kind() { return ELEM_RADIOGROUP; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -2875,6 +2961,7 @@ class RadioGroup : IRadioGroup
 // onChange(index). ICanvas fallback shows "[selected v]" and cycles on click.
 class ComboBox : IComboBox
 {
+    Style style = default;
     list<string> items = default;
     int   selectedIndex = 0;
     Lambda<void(int)> onChange = default;
@@ -2916,10 +3003,14 @@ class ComboBox : IComboBox
             }
             w = mx + 4;   // room for the dropdown arrow
         }
-        if (w < 6) w = 6;
-        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = 1;
+        if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w < 6 && !c.exactW) w = 6;
+        int h = this.style.height > 0 ? this.style.height : 1;
+        if (c.exactH) h = c.availH;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
-        Size s = default; s.w = w; s.h = 1;
+        Size s = default; s.w = w; s.h = b.h;
         return s;
     }
 
@@ -2955,7 +3046,9 @@ class ComboBox : IComboBox
 
     void destroyTree() { }
     int kind() { return ELEM_COMBO; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -2972,7 +3065,7 @@ class ComboBox : IComboBox
             if (this.items.get(i) != o.items.get(i)) return false;
             i++;
         }
-        return true;
+        return styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -2991,8 +3084,9 @@ class ComboBox : IComboBox
 // committed node is reused across renders (no per-frame re-box needed).
 class ListView : IListView
 {
+    Style style = default;
     list<string> columns   = default;   // header titles
-    list<int>    colWidths = default;    // per-column width in DIPs (parallel to columns)
+    list<int>    colWidths = default;    // per-column width in layout cells
     int   rowCount = 0;
     Lambda<string(int,int)> rowText = default;   // (row, col) -> cell text
     int   selectedIndex = -1;            // controlled single selection (-1 = none)
@@ -3006,10 +3100,10 @@ class ListView : IListView
     Rect  bounds = default;
     string key = default;
 
-    void addColumn(string title, int widthDip)
+    void addColumn(string title, int widthCells)
     {
         this.columns.add("" + title);
-        this.colWidths.add(widthDip);
+        this.colWidths.add(widthCells);
     }
 
     void fireSelect(int row)   { if (this.onSelect != nullptr) { this.onSelect(row); } }
@@ -3025,9 +3119,13 @@ class ListView : IListView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
-        if (w < 6) w = 6;
-        int h = this.height; if (h < 3) h = 3;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
+        if (w < 6 && !c.exactW) w = 6;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
@@ -3091,7 +3189,9 @@ class ListView : IListView
 
     void destroyTree() { }
     int kind() { return ELEM_LIST; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -3102,7 +3202,8 @@ class ListView : IListView
         if (o == nullptr) return false;
         return this.rowCount == o.rowCount && this.selectedIndex == o.selectedIndex
             && this.multiSelect == o.multiSelect && this.disabled == o.disabled
-            && this.columns.count() == o.columns.count();
+            && this.columns.count() == o.columns.count()
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3182,6 +3283,7 @@ void __uiFreeListRowBox(u64 boxPtr)
 // materializes an inactive pane's controls.
 class TabPane : ITabPane
 {
+    Style style = default;
     string title = default;
     list<IElement> children = default;
     Rect bounds = default;
@@ -3199,7 +3301,12 @@ class TabPane : ITabPane
             Size cs = child.layout(cc);
             cy = cy + cs.h;
         }
-        Rect b = default; b.x = c.x; b.y = c.y; b.w = c.availW; b.h = cy - c.y;
+        int bw = this.style.width > 0 ? this.style.width : c.availW;
+        if (c.exactW) bw = c.availW;
+        int bh = cy - c.y;
+        if (this.style.height > 0) bh = this.style.height;
+        if (c.exactH) bh = c.availH;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -3229,7 +3336,9 @@ class TabPane : ITabPane
     }
 
     int kind() { return ELEM_TABPANE; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -3237,7 +3346,7 @@ class TabPane : ITabPane
     bool propsEqual(IElement other)
     {
         ITabPane o = other as ITabPane;
-        return o != nullptr && this.title == o.title;
+        return o != nullptr && this.title == o.title && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
@@ -3252,6 +3361,7 @@ class TabPane : ITabPane
 // Controlled: `selectedTab` flows down, a header click fires onSelectTab(index).
 class TabControl : ITabControl
 {
+    Style style = default;
     list<IElement> children = default;   // TabPane*
     int selectedTab = 0;                 // controlled active pane index
     Lambda<void(int)> onSelectTab = default;
@@ -3277,9 +3387,13 @@ class TabControl : ITabControl
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
-        if (w < 6) w = 6;
-        int h = this.height; if (h < 3) h = 3;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
+        if (w < 6 && !c.exactW) w = 6;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         int hdr = 2;   // the tab header strip reserves two rows
@@ -3362,7 +3476,9 @@ class TabControl : ITabControl
     }
 
     int kind() { return ELEM_TABS; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (this.selectedTab >= 0 && this.selectedTab < this.children.count())
@@ -3372,7 +3488,8 @@ class TabControl : ITabControl
     {
         ITabControl o = other as ITabControl;
         return o != nullptr && this.selectedTab == o.selectedTab
-            && this.children.count() == o.children.count();
+            && this.children.count() == o.children.count()
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return &this.children; }
     string keyOf() { return "" + this.key; }
@@ -3391,6 +3508,7 @@ const int TREE_ROOT = -1;   // virtual root nodeId; its children are the top-lev
 
 class TreeView : ITreeView
 {
+    Style style = default;
     Lambda<int(int)>     childCount = default;   // nodeId -> number of children
     Lambda<int(int,int)> childId    = default;   // (nodeId, i) -> child nodeId
     Lambda<string(int)>  label      = default;   // nodeId -> display text
@@ -3414,9 +3532,13 @@ class TreeView : ITreeView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
-        if (w < 4) w = 4;
-        int h = this.height; if (h < 3) h = 3;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
+        if (w < 4 && !c.exactW) w = 4;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
@@ -3459,7 +3581,9 @@ class TreeView : ITreeView
 
     void destroyTree() { }
     int kind() { return ELEM_TREE; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
@@ -3467,7 +3591,8 @@ class TreeView : ITreeView
     bool propsEqual(IElement other)
     {
         ITreeView o = other as ITreeView;
-        return o != nullptr && this.selectedNode == o.selectedNode && this.disabled == o.disabled;
+        return o != nullptr && this.selectedNode == o.selectedNode && this.disabled == o.disabled
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3478,11 +3603,11 @@ class TreeView : ITreeView
 // -- SplitView: two weighted panes + a draggable divider ------------------------
 // A pure layout container (not itself a native control): it splits the available
 // space between exactly two child panes by `ratio` (the first pane's percentage
-// along the split axis), reserving a 1-DIP divider gutter between them. `vertical`
+// along the split axis), reserving a 1-cell divider gutter between them. `vertical`
 // true = side-by-side (a vertical divider), false = stacked. Dragging the divider
 // fires onRatioChange(newRatio) - the app owns the ratio (controlled), the host hit-
 // tests the gutter. The ICanvas fallback draws the two panes and the divider line.
-const int SPLIT_DIVIDER = 1;   // DIP thickness of the divider gutter
+const int SPLIT_DIVIDER = 1;   // cell thickness of the divider gutter
 
 class SplitView : ISplitView
 {
@@ -3600,7 +3725,9 @@ class SplitView : ISplitView
     }
 
     int kind() { return ELEM_SPLIT; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -3764,11 +3891,12 @@ move IView toolbar()
 // with the `altText` centered.
 class Image : IImage
 {
+    Style style = default;
     u64    pixels  = 0u;         // borrowed top-down BGRA32 buffer (app-owned); 0 = none
     int    pxW     = 0;          // source pixel width
     int    pxH     = 0;          // source pixel height
-    int    width   = 8;          // layout width (DIP)
-    int    height  = 4;          // layout height (DIP)
+    int    width   = 8;          // layout width (cells)
+    int    height  = 4;          // layout height (cells)
     string source  = default;    // optional .bmp file path (host-decoded); use a literal
     string altText = default;    // placeholder / accessibility text; use a literal
     string tooltip = default;    // native hover tooltip; "" = none
@@ -3783,8 +3911,12 @@ class Image : IImage
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w < 1) w = 1;
-        int h = this.height; if (h < 1) h = 1;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w < 1 && !c.exactW) w = 1;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
@@ -3803,13 +3935,16 @@ class Image : IImage
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_IMAGE; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys) { }
     bool propsEqual(IElement other)
     {
         IImage o = other as IImage;
         return o != nullptr && this.pixels == o.pixels && this.pxW == o.pxW
-            && this.pxH == o.pxH && this.width == o.width && this.height == o.height;
+            && this.pxH == o.pxH && this.width == o.width && this.height == o.height
+            && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3849,6 +3984,8 @@ class GroupBox : IGroupBox
         if (this.style.width > 0) w = this.style.width;
         int h = 2;
         if (this.style.height > 0) h = this.style.height;
+        if (c.exactW) w = c.availW;
+        if (c.exactH) h = c.availH;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
 
@@ -3906,7 +4043,9 @@ class GroupBox : IGroupBox
     }
 
     int kind() { return ELEM_GROUPBOX; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.children) c.collectFocusables(keys);
@@ -3954,6 +4093,7 @@ move IGroupBox groupBox(string title, Style style)
 // OS input; the TUI/ICanvas host exposes the same handlers through its test drivers.
 class CanvasView : ICanvasView
 {
+    Style style = default;
     Lambda<void(ICanvas)> onPaint = default;
     Lambda<void(double, double, int)> onPointerDown = default;
     Lambda<void(double, double, int)> onPointerMove = default;
@@ -3965,8 +4105,8 @@ class CanvasView : ICanvasView
     bool hasPointerUp   = false;
     bool hasWheel       = false;
     bool hasPinch       = false;
-    int    width   = 20;         // layout width (DIP)
-    int    height  = 8;          // layout height (DIP)
+    int    width   = 20;         // layout width (cells)
+    int    height  = 8;          // layout height (cells)
     string tooltip = default;
     Rect   bounds = default;
     string key    = default;
@@ -3983,9 +4123,13 @@ class CanvasView : ICanvasView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (w > c.availW && c.availW > 0) w = c.availW;
-        if (w < 1) w = 1;
-        int h = this.height; if (h < 1) h = 1;
+        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        if (c.exactW) w = c.availW;
+        if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
+        if (w < 1 && !c.exactW) w = 1;
+        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        if (c.exactH) h = c.availH;
+        if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
@@ -3998,9 +4142,11 @@ class CanvasView : ICanvasView
     bool dispatch(Event e, IUiContext ctx) { return false; }
     void destroyTree() { }
     int kind() { return ELEM_CANVAS; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys) { }
-    bool propsEqual(IElement other) { ICanvasView o = other as ICanvasView; return o != nullptr; }
+    bool propsEqual(IElement other) { ICanvasView o = other as ICanvasView; return o != nullptr && styleEquals(this.style, o.style); }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
     void setKey(string k) { this.key = k; }
@@ -4283,6 +4429,7 @@ interface IComponent
 // style of its own; layout/paint/dispatch delegate to the inner subtree.
 class ComponentElement : IElement
 {
+    Style style = default;
     list<IElement> inner = default;   // exactly one child: the component's render()
     Rect bounds = default;
     string key = default;
@@ -4296,11 +4443,15 @@ class ComponentElement : IElement
             LayoutConstraints cc = default;
             cc.x = c.x; cc.y = cy;
             cc.availW = c.availW; cc.availH = c.availH;
+            cc.exactW = c.exactW; cc.exactH = c.exactH;
             Size cs = child.layout(cc);
             cy = cy + cs.h;
             total.h = total.h + cs.h;
         }
-        total.w = c.availW;
+        total.w = this.style.width > 0 ? this.style.width : c.availW;
+        if (c.exactW) total.w = c.availW;
+        if (this.style.height > 0) total.h = this.style.height;
+        if (c.exactH) total.h = c.availH;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = total.w; b.h = total.h;
@@ -4343,7 +4494,9 @@ class ComponentElement : IElement
     }
 
     int kind() { return ELEM_COMPONENT; }
-    int flexWeight() { return 0; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
     void collectFocusables(list<string>* keys)
     {
         for (IElement c in this.inner) c.collectFocusables(keys);
@@ -4384,7 +4537,7 @@ int PROP_VISIBLE = 3;   // control is shown
 int PROP_VALUE   = 1;   // ProgressBar/Slider position (0..100)
 int PROP_MAX     = 2;   // range maximum (default 100)
 int PROP_CARET   = 3;   // text caret index
-int PROP_SCROLLY = 4;   // vertical scroll offset (DIPs)
+int PROP_SCROLLY = 4;   // vertical scroll offset (cells)
 
 // Font ids for measureText and Text.font; a host maps these to a concrete
 // typeface + size. Only native hosts honor them; the canvas/TUI hosts render a
@@ -4415,7 +4568,7 @@ int FONT_CAPTION = 3;   // smaller, secondary label color (descriptions / captio
 // a cell's text) are host free functions, not interface methods, since they return
 // values; see nativeListSelectedRow / nativeListCellText in the Win32 host.
 int LISTOP_RESET_COLUMNS  = 1;   // remove every column (start a fresh header set)
-int LISTOP_ADD_COLUMN     = 2;   // arg0 = width in DIPs, text = header title
+int LISTOP_ADD_COLUMN     = 2;   // arg0 = width in cells, text = header title
 int LISTOP_SET_ROWCOUNT   = 3;   // arg0 = number of (virtual) rows
 int LISTOP_SET_ROWTEXT_CB = 4;   // payload = boxed rowText callback (ListRowBox* as u64)
 int LISTOP_SET_SELECT_MODE = 5;  // arg0 = 0 single-select, 1 multi-select
@@ -4451,16 +4604,16 @@ interface INativeHost
     void destroyControl(u64 h);
 
     // Geometry + content, all property-style so they map to XAML setters later.
-    void setFrame(u64 h, Rect frameDip);
+    void setFrame(u64 h, Rect frameCells);
     void setText(u64 h, const char* s);
     void setBoolProp(u64 h, int prop, bool v);
     void setIntProp(u64 h, int prop, int v);
     void setAccent(u64 h, int fgColor, int bgColor);   // 0 = native default
 
     // Text metrics for layout (replaces the 1-cell-per-char assumption). Returns
-    // the size in DIPs the string needs in font `fontId`, wrapped to
-    // `wrapWidthDip` (0 = single line, unbounded).
-    Size measureText(const char* s, int fontId, int wrapWidthDip);
+    // the size in cells the string needs in font `fontId`, wrapped to
+    // `wrapWidthCells` (0 = single line, unbounded).
+    Size measureText(const char* s, int fontId, int wrapWidthCells);
 
     // Ask the host to relayout the tree and reposition controls (e.g. after a
     // content change that alters intrinsic sizes).

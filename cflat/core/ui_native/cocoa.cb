@@ -11,7 +11,7 @@
 //
 // It drives AppKit through the objc_msgSend bridge in cocoa.cb, which links AppKit +
 // Foundation via `import framework` (no SDK, no Xcode). Coordinates use a FLIPPED content view so every
-// frame is top-left like Win32; DIP->points is x*BASE_X, y*BASE_Y with NO DPI
+// frame is top-left like Win32; cells->points is x*BASE_X, y*BASE_Y with NO DPI
 // scaling (Cocoa points are already density-independent, so the Win32 WM_DPICHANGED
 // machinery is dropped here).
 //
@@ -22,8 +22,8 @@
 import "ui_native.cb";
 import "cocoa.cb";
 
-// Per-DIP base points. Layout math in ui.cb is unit-blind integers; a native host
-// reads them as DIPs. One layout column ~8pt, one row ~26pt so native controls get
+// Per-cell base points. Layout math in ui.cb uses shared cells; the native host
+// converts them to points. One layout column ~8pt, one row ~26pt so controls get
 // sensible heights. Unlike Win32, there is no DPI multiplier (Cocoa points scale).
 const int BASE_X = 8;
 const int BASE_Y = 26;
@@ -157,7 +157,7 @@ class CocoaHost : INativeHost
     IElement   tree  = default;
     UiContext ctx   = default;
     bool      ready = false;
-    int       w     = 95;   // client size in DIP units (760pt / 8)
+    int       w     = 95;   // client size in cells (760pt / 8)
     int       h     = 21;   // 560pt / 26
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
@@ -422,14 +422,14 @@ class CocoaHost : INativeHost
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
     }
 
-    // Position + size in points (flipped view, so no y-flip). DIP -> points by
-    // BASE_X / BASE_Y; the resize path feeds the client size back in DIPs.
-    void setFrame(u64 h, Rect frameDip)
+    // Position + size in points (flipped view, so no y-flip). Cells -> points by
+    // BASE_X / BASE_Y; the resize path feeds the client size back in cells.
+    void setFrame(u64 h, Rect frameCells)
     {
         void* ctrl = u2h(h);
         msgRect(ctrl, "setFrame:",
-                (double)(frameDip.x * BASE_X), (double)(frameDip.y * BASE_Y),
-                (double)(frameDip.w * BASE_X), (double)(frameDip.h * BASE_Y));
+                (double)(frameCells.x * BASE_X), (double)(frameCells.y * BASE_Y),
+                (double)(frameCells.w * BASE_X), (double)(frameCells.h * BASE_Y));
     }
 
     // Only push text when it actually differs, so an NSTextField does not reset its
@@ -511,7 +511,7 @@ class CocoaHost : INativeHost
 
     // Route a value/max set to the right control by class (keeps the seam
     // property-based: the host, not ui.cb, knows progress vs slider). Both take
-    // doubles; the DIP int value is promoted.
+    // doubles; the cell int value is promoted.
     void setIntProp(u64 h, int prop, int v)
     {
         void* ctrl = u2h(h);
@@ -1101,9 +1101,9 @@ class CocoaHost : INativeHost
         msg1(ctrl, "setImage:", img);
     }
 
-    // Text metrics in DIPs. A length-based estimate is enough: the layout pass in
+    // Text metrics in cells. A length-based estimate is enough: the layout pass in
     // ui.cb never calls measureText today (the winui host uses the same stub).
-    Size measureText(const char* s, int fontId, int wrapWidthDip)
+    Size measureText(const char* s, int fontId, int wrapWidthCells)
     {
         Size sz = default;
         int n = (int)strlen((char*)s) + 1;
@@ -1124,7 +1124,7 @@ class CocoaHost : INativeHost
 
     // Reconcile the IElement tree to native controls: ensure a control per mappable
     // node (create on first sight, reuse by key path), sync its props, collect its
-    // DIP frame, position everything, then destroy controls that left the tree.
+    // Cell frame, position everything, then destroy controls that left the tree.
     void applyTree(IElement tree, IUiContext ctx)
     {
         this.applying = true;
@@ -1182,9 +1182,9 @@ class CocoaHost : INativeHost
     }
 
     // Recursive worker: `path` is this node's key path. Mappable nodes get a control
-    // + synced props + a collected DIP frame; every node recurses into its children
+    // + synced props + a collected cell frame; every node recurses into its children
     // (containers contribute only geometry). `parentView` is the NSView new controls
-    // parent to (a ScrollView's document view inside one); (offX, offY) is the DIP
+    // parent to (a ScrollView's document view inside one); (offX, offY) is the cell
     // origin subtracted to make frames parent-relative inside a scroll container.
     void _applyNode(IElement node, string path, IUiContext ctx,
                     list<string>* keys, list<u64>* handles,
@@ -1222,9 +1222,9 @@ class CocoaHost : INativeHost
                     int ci = 0;
                     while (ci < lv.columns.count())
                     {
-                        int wdip = 12;
-                        if (ci < lv.colWidths.count()) wdip = lv.colWidths.get(ci);
-                        this.setListOp(h, LISTOP_ADD_COLUMN, wdip, ci, lv.columns.get(ci).data(), 0u);
+                        int wCells = 12;
+                        if (ci < lv.colWidths.count()) wCells = lv.colWidths.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(), 0u);
                         ci++;
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
@@ -1274,7 +1274,7 @@ class CocoaHost : INativeHost
             }
             keys.add("" + path);
             handles.add(h);
-            // Parent-relative frame: absolute DIP minus the enclosing scroll origin.
+            // Parent-relative frame: absolute cell frame minus the enclosing scroll origin.
             fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
         }
         else if (_containerBg(node) != 0)
@@ -2034,7 +2034,7 @@ int hostWidth()  { return curWin().w; }
 int hostHeight() { return curWin().h; }
 int hostWindowCount() { return _windows.count(); }
 
-// Create a hidden window bound to `app` at DIP size w x h and build its tree (mirror
+// Create a hidden window bound to `app` at cell size w x h and build its tree (mirror
 // of the Win32 startHeadlessWindow; the headless self-tests use it).
 void startHeadlessWindow(IComponent app, const char* title, int w, int h)
 {
@@ -2373,16 +2373,16 @@ void nativeFireContextMenu(string keyPath, int itemIndex)
     if (cmd > 0) routeMenu(cmd);
 }
 
-// Drive a splitter to a DIP position along its axis (headless drag). Fires onRatioChange
+// Drive a splitter to a cell position along its axis (headless drag). Fires onRatioChange
 // (the SplitView is a layout container, like Win32 - the divider is a parent-tracked gap,
 // not an NSSplitView, so the layout model stays single-source).
-void nativeSplitterDrag(string keyPath, int dipX, int dipY)
+void nativeSplitterDrag(string keyPath, int cellX, int cellY)
 {
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return;
     ISplitView sv = e as ISplitView;
     if (sv == nullptr) return;
-    sv.fireRatioChange(sv._ratioAt(dipX, dipY));
+    sv.fireRatioChange(sv._ratioAt(cellX, cellY));
     pumpNative();
 }
 
@@ -2680,15 +2680,15 @@ u32 nativeTestCustomDrawFill(string keyPath) { return nativeAccentBg(keyPath); }
 // Same contract as the Win32 bodies (win32.cb): a live client resize, the accessible
 // Name of a control, and the logical Tab ring (focus first / next / read back).
 
-// Drive a live client-area resize to w x h DIPs, so the host relayouts + reconciles.
+// Drive a live client-area resize to w x h cells, so the host relayouts + reconciles.
 // Cocoa peer of the Win32 WM_SIZE synthesis: set the window's content size and run the
-// same relayout path windowDidResize: takes (buildNativeTree at the new DIP size).
-void nativeResizeClient(int wDip, int hDip)
+// same relayout path windowDidResize: takes (buildNativeTree at the new cell size).
+void nativeResizeClient(int wCells, int hCells)
 {
     if (!hasCurWin()) return;
     CocoaHost* wnd = curWin();
-    int w = wDip < 1 ? 1 : wDip;
-    int h = hDip < 1 ? 1 : hDip;
+    int w = wCells < 1 ? 1 : wCells;
+    int h = hCells < 1 ? 1 : hCells;
     if (wnd.window != nullptr)
         msgSize(wnd.window, "setContentSize:", (double)(w * BASE_X), (double)(h * BASE_Y));
     wnd.w = w; wnd.h = h;

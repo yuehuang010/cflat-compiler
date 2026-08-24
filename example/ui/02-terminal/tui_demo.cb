@@ -76,6 +76,11 @@ int diffRows(Surface* a, Surface* b, int h)
 
 move IText ktext(string k, string s) { IText t = text(s); t.setKey(k); return t; }
 
+move IRadioButton testRadioButton()
+{
+    RadioButton* raw = new RadioButton(); raw.label = "x"; return raw;
+}
+
 // Scan the grid region for the first cell that consumes a mouse-down. Returns
 // true and leaves the handler's side effects applied.
 bool clickScan(IElement tree, IUiContext ctx, int w, int h)
@@ -352,6 +357,220 @@ bool testFlexColumn()
     deleteTree(tu);
 
     return bounded && unbounded;
+}
+
+// Leaf elements read the same Style flex contract as View. The text leaf takes
+// the row share, while a fixed sibling keeps its intrinsic width.
+bool testFlexLeafRow()
+{
+    IView r = row(makeStyle(0, 0, 0));
+    IText leaf = text("x"); leaf.style = flexStyle(1); r.add(leaf);
+    IBox fixed = box(makeStyle(0, 10, 1)); r.add(fixed);
+    IElement t = r;
+    layoutRoot(t, 0, 0, 40);
+    Rect rl = leaf.nodeBounds(); Rect rf = fixed.nodeBounds();
+    bool ok = leaf.flexWeight() == 1 && rl.x == 0 && rl.w == 30
+        && rf.x == 30 && rf.w == 10;
+    deleteTree(t);
+    return ok;
+}
+
+// A native leaf in a wrapper transfers the bounded column share to the leaf;
+// the fixed status bar remains below it without overlap or drift.
+bool testFlexLeafColumnList()
+{
+    IView root = column(makeStyle(0, 0, 0));
+    IListView list = listView(20, (int r, int c) => "x");
+    list.style = flexStyle(1);
+    root.add(list);
+    IStatusBar status = statusBar("ready"); root.add(status);
+    IElement t = root;
+    LayoutConstraints c = default; c.availW = 40; c.availH = 20;
+    t.layout(c);
+    Rect rl = list.nodeBounds(); Rect rs = status.nodeBounds();
+    bool ok = list.flexWeight() == 1 && rl.x == 0 && rl.y == 0
+        && rl.w == 40 && rl.h == 19 && rs.y == 19 && rs.h == 1;
+    deleteTree(t);
+    return ok;
+}
+
+// An explicit Style dimension wins over a flex weight; the legacy direct width
+// remains available when Style.width is unset.
+bool testFlexLeafExplicitDimension()
+{
+    IView r = row(makeStyle(0, 0, 0));
+    IListView fixed = listView(5, (int r, int c) => "x");
+    fixed.style = flexStyle(1); fixed.style.width = 12; fixed.style.height = 4;
+    r.add(fixed);
+    IBox tail = box(makeStyle(0, 8, 1)); r.add(tail);
+    IElement t = r; layoutRoot(t, 0, 0, 40);
+    Rect rf = fixed.nodeBounds(); Rect rt = tail.nodeBounds();
+    bool ok = rf.w == 12 && rf.h == 4 && rt.x == 12 && rt.w == 8;
+    deleteTree(t);
+    return ok;
+}
+
+// Every built-in implementor shares IElement.style. A row allocation is the
+// compact gate: each leaf must consume the exact 32-cell main-axis share.
+bool checkFlexRoot(IElement root)
+{
+    LayoutConstraints c = default; c.availW = 40; c.availH = 12;
+    root.layout(c);
+    list<IElement>* children = root.childList();
+    IElement child = (*children)[0]; IElement tail = (*children)[1];
+    Rect b = child.nodeBounds(); Rect t = tail.nodeBounds();
+    bool ok = child.flexWeight() == 1 && b.x == 0 && b.y == 0
+        && b.w == 32 && t.x == 32 && t.w == 8;
+    child = nullptr; tail = nullptr;
+    return ok;
+}
+
+bool testAllFlexImplementors()
+{
+    bool ok = true;
+    {
+        IElement e = view(makeStyle(0, 0, 0)); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = text("x"); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = button("x", () => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = box(makeStyle(0, 0, 0)); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = textInput("", (string s) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = checkbox("x", false, (bool v) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = progressBar(0, 8); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = slider(0, 8, (int v) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = textArea("", () => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = statusBar("x"); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = scrollView(makeStyle(0, 0, 0)); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = radioGroup(0, (int v) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok;
+        deleteTree(root);
+    }
+    {
+        IElement e = testRadioButton(); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = comboBox(0, (int v) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = listView(1, (int r, int c) => "x"); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = tabPane("x"); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = tabControl(0, (int v) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = treeView((int n) => 0, (int n, int i) => 0, (int n) => "x");
+        e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = splitView(50, false); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = image(0u, 1, 1); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = groupBox("x", makeStyle(0, 0, 0)); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    {
+        IElement e = canvasView((ICanvas c) => {}); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    UiContext ctx = default;
+    Counter component;
+    {
+        IElement e = mount(component, "all", &ctx); e.style.flex = 1; e.style.height = 4;
+        IView r = view(makeStyle(0, 0, 0)); r.style.flexDirection = DIR_ROW; r.add(e);
+        IBox t = box(makeStyle(0, 8, 1)); r.add(t); IElement root = r;
+        ok = checkFlexRoot(root) && ok; deleteTree(root);
+    }
+    return ok;
 }
 
 // -- Flex layout (Phase 2: flexWrap) -------------------------------------------
@@ -707,6 +926,10 @@ int selfTest()
     total++; if (testFlexGapPadding())     pass++; else printf("  FAIL: flex gap + padding\n");
     total++; if (testFlexNoFlexUnchanged())pass++; else printf("  FAIL: no-flex tree unchanged\n");
     total++; if (testFlexColumn())         pass++; else printf("  FAIL: column flex bounded/unbounded\n");
+    total++; if (testFlexLeafRow())        pass++; else printf("  FAIL: leaf flex row\n");
+    total++; if (testFlexLeafColumnList()) pass++; else printf("  FAIL: leaf flex column list\n");
+    total++; if (testFlexLeafExplicitDimension()) pass++; else printf("  FAIL: leaf explicit dimension precedence\n");
+    total++; if (testAllFlexImplementors()) pass++; else printf("  FAIL: all flex implementors\n");
     total++; if (testFlexWrapFixedCells())     pass++; else printf("  FAIL: flexWrap fixed cells\n");
     total++; if (testFlexWrapLineHeight())     pass++; else printf("  FAIL: flexWrap line height\n");
     total++; if (testFlexWrapOversizedChild()) pass++; else printf("  FAIL: flexWrap oversized child\n");
