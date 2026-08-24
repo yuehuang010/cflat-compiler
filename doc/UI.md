@@ -201,6 +201,12 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthCells)`;
   controlled `selectedIndex`; `onSelect(row)` on a selection change, `onActivate(row)`
   on double-click / Enter, and `onHeaderClick(column)` for a zero-based header click.
+  Optional `rowIcon(row)` returns a `ListRowIcon`: a stable borrowed identity plus
+  borrowed top-down BGRA32 pixels (the same data convention as `Image`) and an explicit
+  `revision` token. Empty identity or invalid pixels omits the icon. Hosts cache by
+  identity, replace when revision/dimensions/pixels change, resolve it again for every realized/reused row, and release the
+  callback/cache when the list is destroyed. No HWND, HBITMAP, NSImage, XAML object, or
+  other native handle enters this API.
   Factory-returned `IListView` exposes `width`, `height`, and all three callbacks, so
   interface-typed values remain fully configurable. Driver helpers: `nativeListSelect(keyPath, row)`,
   `nativeListSelectedRow(keyPath)`, `nativeListCellText(keyPath, row, col)`,
@@ -222,7 +228,7 @@ the clearer `widthCells` parameter name. Likewise, native `setFrame` and
 item source, so the `INativeHost` interface gained ONE op-coded call:
 `setListOp(u64 h, int op, int arg0, int arg1, const char* text, u64 payload)`, with the
 `LISTOP_*` codes (RESET_COLUMNS / ADD_COLUMN / SET_ROWCOUNT / SET_ROWTEXT_CB /
-SET_SELECT_MODE / SET_SELECTION / INVALIDATE). The op set is the deliberate common
+SET_SELECT_MODE / SET_SELECTION / INVALIDATE / SET_ROWICON_CB). The op set is the deliberate common
 denominator of Win32 `ListView`, macOS `NSTableView`, and WinUI `ItemsView` (see the
 design block above the method in `ui_native.cb`). The `rowText` callback rides as an
 opaque `u64` (a ui.cb `ListRowBox*`, invoked via `__uiListRowText`) so no `Lambda` type
@@ -235,6 +241,15 @@ see the parity matrix.
 only realized cells and release the box with the control; no native handle, brush, or
 image resource enters the public UI model. WinUI's current implementation is a
 resolution/readback seam until its item template can apply the color visibly.
+
+`LISTOP_SET_ROWICON_CB` carries the opaque `ListIconBox` callback. Win32 resolves
+realized icons into a host-owned small image list (`LVIF_IMAGE`); Cocoa resolves them
+on each reused `NSTextFieldCell` and sets its copied `NSImage`; WinUI's current stock
+virtualized item path uses a bounded identity marker (`[id]`) and retains only the
+portable descriptor, with no per-row native object. Missing icons use the text-only
+item. Replacing a callback or reloading a source drops the old box and cache before
+binding the new source; teardown releases all host resources. A future WinUI template
+can promote the cached pixels to an `Image` without changing this public contract.
 
 **Navigation chrome (v14).** Tier-2 controls, each with a ICanvas fallback and a headless
 self-test in `example/ui/05-gallery/gallery.cb`; `example/ui/08-fedit/fedit.cb` (fedit v2) is

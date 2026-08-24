@@ -43,6 +43,11 @@ manifest ManifestDoc uiNativeManifest = { assembly = {
 extern stdcall void InitCommonControls();
 extern stdcall i32 InitCommonControlsEx(void* p);
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
+extern stdcall void* ImageList_Create(i32 cx, i32 cy, u32 flags, i32 initial, i32 grow);
+extern stdcall i32 ImageList_Destroy(void* himl);
+extern stdcall i32 ImageList_Add(void* himl, void* image, void* mask);
+extern stdcall i32 ImageList_Replace(void* himl, i32 index, void* image, void* mask);
+extern stdcall i32 IsWindowVisible(void* hwnd);
 struct _InitCommonControlsExArgs
 {
     u32 cbSize = 0u;
@@ -145,6 +150,7 @@ const int LVM_SETITEMSTATE            = 0x102B;   // LVM_FIRST+43
 const int LVM_GETITEMTEXTA            = 0x102D;   // LVM_FIRST+45
 const int LVM_GETNEXTITEM             = 0x100C;   // LVM_FIRST+12
 const int LVM_SETEXTENDEDLISTVIEWSTYLE = 0x1036;  // LVM_FIRST+54
+const int LVM_SETIMAGELIST           = 0x1003;   // LVM_FIRST+3
 const int LVM_GETITEMCOUNT            = 0x1004;   // LVM_FIRST+4
 // Dark-mode colors + the header (a SEPARATE control that needs its own theme).
 const int LVM_SETBKCOLOR     = 0x1001;   // LVM_FIRST+1
@@ -161,6 +167,10 @@ const int LVCF_WIDTH   = 0x0002;
 const int LVCF_TEXT    = 0x0004;
 const int LVCF_SUBITEM = 0x0008;
 const int LVIF_TEXT    = 0x0001;
+const int LVIF_IMAGE   = 0x0002;
+const int LVSIL_SMALL  = 1;
+const int ILC_COLOR32  = 0x0020;
+const int ILC_MASK     = 0x0001;
 const int LVIS_FOCUSED  = 0x0001;
 const int LVIS_SELECTED = 0x0002;
 const int LVNI_SELECTED = 0x0002;
@@ -583,6 +593,19 @@ class Window : INativeHost
     // seam, so the callback rides as an opaque u64 (see setListOp / __uiListRowText).
     list<u64>    listBoxHandles = default;
     list<u64>    listBoxPtrs    = default;
+    list<u64>    listIconHandles = default;
+    list<u64>    listIconPtrs    = default;
+    // One host-owned small image list and identity cache per ListView.
+    list<u64>    listIconListH   = default;
+    list<u64>    listIconListPtrs = default;
+    list<u64>    listIconCacheH  = default;
+    list<u64>    listIconCachePtrs = default;
+    list<string> listIconCacheIds = default;
+    list<u64>    listIconCachePixels = default;
+    list<u64>    listIconCacheRevisions = default;
+    list<int>    listIconCacheW = default;
+    list<int>    listIconCacheH2 = default;
+    list<int>    listIconCacheIndices = default;
     list<u64>    listStyleHandles = default;
     list<u64>    listStylePtrs    = default;
     // TreeView node-source boxes: parallel HWND -> TreeBox* (as u64), like the list
@@ -798,6 +821,8 @@ class Window : INativeHost
     {
         if (h == 0u) return;
         this._freeListBox(h);   // no-op unless h is a ListView with a boxed callback
+        this._freeListIconBox(h);
+        this._dropListIconCache(h);
         this._freeListStyle(h);
         this._freeTreeBox(h);   // no-op unless h is a TreeView with a boxed node source
         this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
@@ -1415,6 +1440,196 @@ class Window : INativeHost
         }
     }
 
+    u64 _listIconBoxFor(u64 h)
+    {
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == h) return this.listIconPtrs.get(i);
+            i++;
+        }
+        return 0u;
+    }
+
+    void _setListIconBox(u64 h, u64 box)
+    {
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == h)
+            {
+                u64 old = this.listIconPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListIconBox(old);
+                this.listIconPtrs.set(i, box); return;
+            }
+            i++;
+        }
+        this.listIconHandles.add(h); this.listIconPtrs.add(box);
+    }
+
+    void _freeListIconBox(u64 h)
+    {
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == h)
+            {
+                u64 old = this.listIconPtrs.get(i);
+                if (old != 0u) __uiFreeListIconBox(old);
+                this.listIconHandles.removeAt(i); this.listIconPtrs.removeAt(i); return;
+            }
+            i++;
+        }
+    }
+
+    int _iconListSlot(u64 h)
+    {
+        int i = 0;
+        while (i < this.listIconListH.count())
+        {
+            if (this.listIconListH.get(i) == h) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    int _iconCacheSlot(u64 h, string id)
+    {
+        int i = 0;
+        while (i < this.listIconCacheH.count())
+        {
+            if (this.listIconCacheH.get(i) == h && this.listIconCacheIds.get(i) == id) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    void _dropListIconCache(u64 h)
+    {
+        int i = this._iconListSlot(h);
+        if (i < 0) return;
+        void* himl = u2h(this.listIconListPtrs.get(i));
+        if (himl != nullptr) ImageList_Destroy(himl);
+        this.listIconListH.removeAt(i); this.listIconListPtrs.removeAt(i);
+        int j = this.listIconCacheH.count() - 1;
+        while (j >= 0)
+        {
+            if (this.listIconCacheH.get(j) == h)
+            {
+                this.listIconCacheH.removeAt(j); this._listIconCacheCacheRemove(j);
+            }
+            j--;
+        }
+    }
+
+    void _listIconCacheCacheRemove(int i)
+    {
+        this.listIconCachePtrs.removeAt(i); this.listIconCacheIds.removeAt(i);
+        this.listIconCachePixels.removeAt(i); this.listIconCacheRevisions.removeAt(i);
+        this.listIconCacheW.removeAt(i); this.listIconCacheH2.removeAt(i);
+        this.listIconCacheIndices.removeAt(i);
+    }
+
+    // Resolve one portable row icon into the host cache. Headless controls keep
+    // metadata only; visible controls materialize copied pixels in an image list.
+    int _listIconIndex(void* ctrl, int row)
+    {
+        u64 h = (u64)ctrl;
+        u64 box = this._listIconBoxFor(h);
+        if (box == 0u) return -1;
+        ListRowIcon icon = __uiListRowIcon(box, row);
+        if (icon.identity == nullptr || strlen((char*)icon.identity) == 0
+            || icon.pixels == 0u || icon.pxW <= 0 || icon.pxH <= 0) return -1;
+        string id = "" + (char*)icon.identity;
+        bool materialize = IsWindowVisible(this.hwnd) != 0;
+        int li = this._iconListSlot(h);
+        if (li < 0)
+        {
+            void* himl = materialize
+                ? ImageList_Create(16, 16, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4) : nullptr;
+            if (materialize && himl == nullptr) return -1;
+            this.listIconListH.add(h); this.listIconListPtrs.add((u64)himl);
+            li = this.listIconListH.count() - 1;
+            if (materialize)
+                SendMessageA(ctrl, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)himl);
+        }
+        int ci = this._iconCacheSlot(h, id);
+        if (ci < 0)
+        {
+            if (!materialize)
+            {
+                int idx = this.listIconCacheH.count();
+                this.listIconCacheH.add(h); this.listIconCachePtrs.add(0u);
+                this.listIconCacheIds.add(id); this.listIconCachePixels.add(icon.pixels);
+                this.listIconCacheRevisions.add(icon.revision); this.listIconCacheW.add(icon.pxW);
+                this.listIconCacheH2.add(icon.pxH); this.listIconCacheIndices.add(idx);
+                return idx;
+            }
+            void* dc = GetDC(this.hwnd);
+            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+            void* bits = nullptr;
+            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+            ReleaseDC(this.hwnd, dc);
+            if (bmp == nullptr || bits == nullptr) return -1;
+            int cw = icon.pxW < 16 ? icon.pxW : 16;
+            int ch = icon.pxH < 16 ? icon.pxH : 16;
+            int y = 0;
+            while (y < ch)
+            {
+                memcpy((void*)((char*)bits + y * 16 * 4),
+                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
+                y++;
+            }
+            int idx = ImageList_Add(u2h(this.listIconListPtrs.get(li)), bmp, nullptr);
+            DeleteObject(bmp);
+            if (idx < 0) return -1;
+            this.listIconCacheH.add(h); this.listIconCachePtrs.add(this.listIconListPtrs.get(li));
+            this.listIconCacheIds.add(id); this.listIconCachePixels.add(icon.pixels);
+            this.listIconCacheRevisions.add(icon.revision); this.listIconCacheW.add(icon.pxW);
+            this.listIconCacheH2.add(icon.pxH); this.listIconCacheIndices.add(idx);
+            ci = this.listIconCacheH.count() - 1;
+        }
+        else if (this.listIconCachePixels.get(ci) != icon.pixels
+                 || this.listIconCacheRevisions.get(ci) != icon.revision
+                 || this.listIconCacheW.get(ci) != icon.pxW
+                 || this.listIconCacheH2.get(ci) != icon.pxH)
+        {
+            if (!materialize)
+            {
+                this.listIconCachePixels.set(ci, icon.pixels);
+                this.listIconCacheRevisions.set(ci, icon.revision);
+                this.listIconCacheW.set(ci, icon.pxW); this.listIconCacheH2.set(ci, icon.pxH);
+                return this.listIconCacheIndices.get(ci);
+            }
+            // Same identity with new pixels is a replacement, not a new row-owned
+            // object. ImageList_Replace copies the bitmap before the temporary dies.
+            void* dc = GetDC(this.hwnd);
+            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+            void* bits = nullptr;
+            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+            ReleaseDC(this.hwnd, dc);
+            if (bmp == nullptr || bits == nullptr) return this.listIconCacheIndices.get(ci);
+            int cw = icon.pxW < 16 ? icon.pxW : 16;
+            int ch = icon.pxH < 16 ? icon.pxH : 16;
+            int y = 0;
+            while (y < ch)
+            {
+                memcpy((void*)((char*)bits + y * 16 * 4),
+                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
+                y++;
+            }
+            ImageList_Replace(u2h(this.listIconListPtrs.get(li)),
+                              this.listIconCacheIndices.get(ci), bmp, nullptr);
+            DeleteObject(bmp);
+            this.listIconCachePixels.set(ci, icon.pixels);
+            this.listIconCacheRevisions.set(ci, icon.revision);
+            this.listIconCacheW.set(ci, icon.pxW); this.listIconCacheH2.set(ci, icon.pxH);
+        }
+        return this.listIconCacheIndices.get(ci);
+    }
+
     u64 _listStyleFor(u64 h)
     {
         int i = 0;
@@ -1606,6 +1821,10 @@ class Window : INativeHost
             this._setListBox(h, payload);
             SendMessageA(ctrl, (u32)LVM_SETEXTENDEDLISTVIEWSTYLE,
                          (u64)LVS_EX_FULLROWSELECT, (i64)LVS_EX_FULLROWSELECT);
+        }
+        else if (op == LISTOP_SET_ROWICON_CB)
+        {
+            this._setListIconBox(h, payload);
         }
         else if (op == LISTOP_SET_CELLSTYLE_CB)
         {
@@ -1870,6 +2089,7 @@ class Window : INativeHost
                     // Inline _boxListRow call-result cast to u64: no named owning local,
                     // so nothing auto-frees the box the host now owns (mirrors ctx.post).
                     this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                    this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
                     this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
                 }
                 else if (node.kind() == ELEM_RADIO)
@@ -2648,6 +2868,25 @@ class Window : INativeHost
         }
         this.listBoxHandles.clear();
         this.listBoxPtrs.clear();
+        int li = this.listIconHandles.count() - 1;
+        while (li >= 0)
+        {
+            u64 b = this.listIconPtrs.get(li);
+            if (b != 0u) __uiFreeListIconBox(b);
+            li--;
+        }
+        int lc = this.listIconListPtrs.count() - 1;
+        while (lc >= 0)
+        {
+            void* himl = u2h(this.listIconListPtrs.get(lc));
+            if (himl != nullptr) ImageList_Destroy(himl);
+            lc--;
+        }
+        this.listIconHandles.clear(); this.listIconPtrs.clear();
+        this.listIconListH.clear(); this.listIconListPtrs.clear();
+        this.listIconCacheH.clear(); this.listIconCachePtrs.clear(); this.listIconCacheIds.clear();
+        this.listIconCachePixels.clear(); this.listIconCacheRevisions.clear(); this.listIconCacheW.clear();
+        this.listIconCacheH2.clear(); this.listIconCacheIndices.clear();
         int si = 0;
         while (si < this.listStylePtrs.count())
         {
@@ -3716,15 +3955,21 @@ void fillListDispInfo(i64 lParam)
     NMHDR* nh = (NMHDR*)u2h((u64)lParam);
     void* hFrom = nh.hwndFrom;
     LVItemA* item = (LVItemA*)((char*)u2h((u64)lParam) + 24);   // LVITEM at NMHDR+24
-    if ((item.mask & (u32)LVIF_TEXT) == 0u) return;
-    if (item.pszText == nullptr || item.cchTextMax <= 0) return;
-    u64 box = wnd._listBoxFor((u64)hFrom);
-    if (box == 0u) { item.pszText[0] = '\0'; return; }
-    string cell = __uiListRowText(box, item.iItem, item.iSubItem);
-    int max = item.cchTextMax - 1;
-    int i = 0; int len = (int)cell.length();
-    while (i < len && i < max) { item.pszText[i] = cell.data()[i]; i++; }
-    item.pszText[i] = '\0';
+    if ((item.mask & (u32)LVIF_IMAGE) != 0u)
+    {
+        int idx = wnd._listIconIndex(hFrom, item.iItem);
+        item.iImage = idx;
+    }
+    if ((item.mask & (u32)LVIF_TEXT) != 0u && item.pszText != nullptr && item.cchTextMax > 0)
+    {
+        u64 box = wnd._listBoxFor((u64)hFrom);
+        if (box == 0u) { item.pszText[0] = '\0'; return; }
+        string cell = __uiListRowText(box, item.iItem, item.iSubItem);
+        int max = item.cchTextMax - 1;
+        int i = 0; int len = (int)cell.length();
+        while (i < len && i < max) { item.pszText[i] = cell.data()[i]; i++; }
+        item.pszText[i] = '\0';
+    }
 }
 
 // The currently selected row of the ListView at `from`, or -1.
@@ -3914,6 +4159,49 @@ string nativeListCellText(string keyPath, int row, int col)
     it.cchTextMax = 512;
     SendMessageA(u2h(h), (u32)LVM_GETITEMTEXTA, (u64)row, (i64)&it);
     return "" + buf;   // owned copy (buf is a stack buffer)
+}
+
+int nativeListIconCacheCount(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    int n = 0;
+    int i = 0;
+    while (i < curWin().listIconCacheH.count())
+    {
+        if (curWin().listIconCacheH.get(i) == h) n++;
+        i++;
+    }
+    return n;
+}
+
+int nativeListIconResolve(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return -1;
+    return curWin()._listIconIndex(u2h(h), row);
+}
+
+u64 nativeListIconRevision(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    int idx = curWin()._listIconIndex(u2h(h), row);
+    if (idx < 0) return 0u;
+    u64 box = curWin()._listIconBoxFor(h);
+    if (box == 0u) return 0u;
+    ListRowIcon icon = __uiListRowIcon(box, row);
+    if (icon.identity == nullptr) return 0u;
+    int ci = curWin()._iconCacheSlot(h, "" + (char*)icon.identity);
+    return ci >= 0 ? curWin().listIconCacheRevisions.get(ci) : 0u;
+}
+
+void nativeListIconResetForTest(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    curWin()._freeListIconBox(h);
+    curWin()._dropListIconCache(h);
 }
 
 int nativeListRowCount(string keyPath)

@@ -540,6 +540,41 @@ struct ListCellStyle
     int  literal = 0;
 };
 
+// A portable ListView row icon description. `identity` is a stable application
+// key (for example "warning"), not a toolkit handle. `pixels` points at borrowed
+// top-down BGRA32 data using the same convention as IImage; the host copies it
+// into its own cache. Empty identity or invalid dimensions means "no icon".
+struct ListRowIcon
+{
+    const char* identity = nullptr;
+    u64    pixels = 0u;
+    int    pxW = 0;
+    int    pxH = 0;
+    u64    revision = 0u;
+};
+
+ListRowIcon listIconRevision(const char* identity, u64 pixels, int pxW, int pxH, u64 revision)
+{
+    ListRowIcon i = default;
+    i.identity = identity;
+    i.pixels = pixels;
+    i.pxW = pxW;
+    i.pxH = pxH;
+    i.revision = revision;
+    return i;
+}
+
+ListRowIcon listIcon(const char* identity, u64 pixels, int pxW, int pxH)
+{
+    return listIconRevision(identity, pixels, pxW, pxH, 0u);
+}
+
+ListRowIcon noListIcon()
+{
+    ListRowIcon i = default;
+    return i;
+}
+
 int LIST_ROLE_TEXT    = 1;
 int LIST_ROLE_MUTED   = 2;
 int LIST_ROLE_SUCCESS = 3;
@@ -1178,6 +1213,7 @@ interface IListView : IDisableable
     int  selectedIndex;
     bool multiSelect;
     Lambda<string(int,int)> rowText;   // read as a value: boxed across the host seam
+    Lambda<ListRowIcon(int)> rowIcon;   // stable portable identity + borrowed pixels
     Lambda<ListCellStyle(int,int)> cellStyle; // optional virtual cell appearance source
     int  width;
     int  height;
@@ -3301,6 +3337,7 @@ class ListView : IListView
     list<int>    colWidths = default;    // per-column width in layout cells
     int   rowCount = 0;
     Lambda<string(int,int)> rowText = default;   // (row, col) -> cell text
+    Lambda<ListRowIcon(int)> rowIcon = default;   // row -> portable icon description
     Lambda<ListCellStyle(int,int)> cellStyle = default; // (row, col) -> tagged appearance
     int   selectedIndex = -1;            // controlled single selection (-1 = none)
     bool  multiSelect = false;
@@ -3381,12 +3418,37 @@ class ListView : IListView
                     if (this.rowText != nullptr) line = line + this.rowText(r, cc);
                     cc++;
                 }
+                if (this.rowIcon != nullptr)
+                {
+                    ListRowIcon icon = this.rowIcon(r);
+                    if (icon.identity != nullptr && strlen((char*)icon.identity) > 0
+                        && icon.pixels != 0u && icon.pxW > 0 && icon.pxH > 0)
+                    {
+                        string mark = strlen((char*)icon.identity) <= 8
+                            ? "[" + (char*)icon.identity + "] " : "[icon] ";
+                        line = mark + line;
+                    }
+                }
                 if (r == this.selectedIndex) line = ">" + line;
                 cv.drawText(this.bounds.x + 1, this.bounds.y + 1 + r, line.data(), ink);
             }
             else
             {
                 int x = this.bounds.x + 1;
+                if (this.rowIcon != nullptr)
+                {
+                    ListRowIcon icon = this.rowIcon(r);
+                    if (icon.identity != nullptr && strlen((char*)icon.identity) > 0
+                        && icon.pixels != 0u && icon.pxW > 0 && icon.pxH > 0)
+                    {
+                        // Canvas/headless hosts have no native image handle. Keep a
+                        // bounded identity marker and omit bitmap pixels deterministically.
+                        string mark = strlen((char*)icon.identity) <= 8
+                            ? "[" + (char*)icon.identity + "] " : "[icon] ";
+                        cv.drawText(x, this.bounds.y + 1 + r, mark.data(), ink);
+                        x = x + (int)mark.length();
+                    }
+                }
                 if (r == this.selectedIndex) { cv.drawText(x, this.bounds.y + 1 + r, ">", ink); x++; }
                 int cc = 0;
                 while (cc < ncol)
@@ -3477,7 +3539,7 @@ move IComboBox comboBox(int selectedIndex, Lambda<void(int)> onChange)
     return c;
 }
 
-// A virtualized list; add columns with addColumn() and set `rowText`/`rowCount`.
+// A virtualized list; add columns with addColumn() and set `rowText`/`rowIcon`/`rowCount`.
 move IListView listView(int rowCount, Lambda<string(int,int)> rowText)
 {
     ListView* lv = new ListView();
@@ -3495,6 +3557,8 @@ move IListView listView(int rowCount, Lambda<string(int,int)> rowText)
 // when the control is destroyed. Mirrors the PostBox pattern above.
 class ListRowBox { Lambda<string(int,int)> cb = default; };
 
+class ListIconBox { Lambda<ListRowIcon(int)> cb = default; };
+
 class ListStyleBox { Lambda<ListCellStyle(int,int)> cb = default; };
 
 // Heap-box a rowText closure. Returns a TYPED pointer so escape analysis keeps the
@@ -3504,6 +3568,28 @@ ListRowBox* _boxListRow(Lambda<string(int,int)> cb)
     ListRowBox* b = new ListRowBox();
     b.cb = cb;   // clone-in (lambdas are clone-by-default)
     return b;
+}
+
+ListIconBox* _boxListIcon(Lambda<ListRowIcon(int)> cb)
+{
+    ListIconBox* b = new ListIconBox();
+    b.cb = cb;
+    return b;
+}
+
+ListRowIcon __uiListRowIcon(u64 boxPtr, int row)
+{
+    if (boxPtr == 0u) return noListIcon();
+    ListIconBox* b = (ListIconBox*)boxPtr;
+    if (b.cb == nullptr) return noListIcon();
+    return b.cb(row);
+}
+
+void __uiFreeListIconBox(u64 boxPtr)
+{
+    if (boxPtr == 0u) return;
+    ListIconBox* b = (ListIconBox*)boxPtr;
+    delete b;
 }
 
 // Invoke a boxed rowText callback (called by the host from its cell-data handler).
@@ -4845,6 +4931,7 @@ int LISTOP_SET_SELECT_MODE = 5;  // arg0 = 0 single-select, 1 multi-select
 int LISTOP_SET_SELECTION  = 6;   // arg0 = row to select (-1 clears selection)
 int LISTOP_INVALIDATE     = 7;   // redraw / reload the visible (virtual) rows
 int LISTOP_SET_CELLSTYLE_CB = 8; // payload = boxed ListCellStyle callback
+int LISTOP_SET_ROWICON_CB  = 9; // payload = boxed ListRowIcon callback
 
 // -- Tab + tree ops on the SAME setListOp seam ---------------------------------
 // TabControl and TreeView reuse setListOp rather than adding new interface methods

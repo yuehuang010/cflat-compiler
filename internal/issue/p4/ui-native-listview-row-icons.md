@@ -1,6 +1,13 @@
-# Native ListView has no row-icon support
+# WinUI native ListView row icons still need a visual item template
 
-Imported issue #17 (icon half) from winmempress's `COMPILER-ISSUES.md`.
+Status (2026-08-24): the portable row-icon callback and visible Win32/Cocoa paths
+are implemented. WinUI currently has a bounded `[identity]` marker and host-owned
+identity/pixel cache, but its stock virtualized item template does not yet paint the
+cached bitmap. Keep this issue active for the WinUI template promotion; do not treat
+the marker as native bitmap acceptance.
+
+Imported issue #17 (icon half) from winmempress's `COMPILER-ISSUES.md`. The original
+whole-surface gap is closed for the portable API, Win32, Cocoa, and canvas fallback.
 Triage: p4. Per-row/cell colors from that report are tracked separately in
 `internal/issue/p3/ui-native-listview-per-cell-color.md`.
 
@@ -40,3 +47,7 @@ explicit for controls that outlive a render pass.
 - Add a host-neutral/headless exercise for icon identity and teardown, plus native host
   checks where available. Confirm that scrolling/reloading does not leak image resources
   or retain obsolete row callbacks.
+
+Residual: WinUI needs a realized item template (`Image` + text) bound to the existing
+portable icon cache. The public contract and callback/resource lifetime rules are fixed;
+only the WinUI visual template remains.

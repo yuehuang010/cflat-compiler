@@ -172,6 +172,15 @@ class CocoaHost : INativeHost
     // Win32 LVS_OWNERDATA does, but the boxed rowText is still the single item source).
     list<u64>    listBoxHandles = default;
     list<u64>    listBoxPtrs    = default;
+    list<u64>    listIconHandles = default;
+    list<u64>    listIconPtrs    = default;
+    list<u64>    listIconCacheH = default;
+    list<string> listIconCacheIds = default;
+    list<u64>    listIconCachePixels = default;
+    list<u64>    listIconCacheImgs = default;
+    list<u64>    listIconCacheRevisions = default;
+    list<int>    listIconCacheW = default;
+    list<int>    listIconCacheH2 = default;
     list<u64>    listStyleHandles = default;
     list<u64>    listStylePtrs    = default;
     list<u64>    listSelHandles = default;   // parallel handle -> selected row
@@ -420,6 +429,7 @@ class CocoaHost : INativeHost
     {
         if (h == 0u) return;
         this._freeListBox(h);    // no-op unless h is a list with a boxed rowText
+        this._freeListIconState(h);
         this._freeListStyle(h);
         this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
@@ -637,6 +647,108 @@ class CocoaHost : INativeHost
                 return;
             }
             i++;
+        }
+    }
+
+    void _setListIconBox(u64 h, u64 box)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listIconPtrs.get(i);
+                if (old != 0u && old != box) __uiFreeListIconBox(old);
+                this.listIconPtrs.set(i, box); return;
+            }
+            i++;
+        }
+        this.listIconHandles.add((u64)table); this.listIconPtrs.add(box);
+    }
+
+    u64 _listIconBoxForTable(u64 tablePtr)
+    {
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == tablePtr) return this.listIconPtrs.get(i);
+            i++;
+        }
+        return 0u;
+    }
+
+    int _listIconCacheSlot(u64 tablePtr, string id)
+    {
+        int i = 0;
+        while (i < this.listIconCacheH.count())
+        {
+            if (this.listIconCacheH.get(i) == tablePtr && this.listIconCacheIds.get(i) == id) return i;
+            i++;
+        }
+        return -1;
+    }
+
+    void* _listIconImage(u64 tablePtr, int row)
+    {
+        u64 box = this._listIconBoxForTable(tablePtr);
+        if (box == 0u) return nullptr;
+        ListRowIcon icon = __uiListRowIcon(box, row);
+        if (icon.identity == nullptr || strlen((char*)icon.identity) == 0
+            || icon.pixels == 0u || icon.pxW <= 0 || icon.pxH <= 0) return nullptr;
+        string id = "" + (char*)icon.identity;
+        int i = this._listIconCacheSlot(tablePtr, id);
+        if (i >= 0 && this.listIconCachePixels.get(i) == icon.pixels
+            && this.listIconCacheRevisions.get(i) == icon.revision
+            && this.listIconCacheW.get(i) == icon.pxW && this.listIconCacheH2.get(i) == icon.pxH)
+            return u2h(this.listIconCacheImgs.get(i));
+        void* rep = nsBitmapRep((void*)icon.pixels, (i64)icon.pxW, (i64)icon.pxH,
+                                (i64)8, (i64)4, (i8)1, (i8)0,
+                                nsStr("NSDeviceRGBColorSpace"), (i64)(icon.pxW * 4), (i64)32);
+        if (rep == nullptr) return nullptr;
+        void* img = msg0(msg0(cls("NSImage"), "alloc"), "init");
+        msg1(img, "addRepresentation:", rep);
+        if (i >= 0)
+        {
+            void* old = u2h(this.listIconCacheImgs.get(i));
+            if (old != nullptr) msg0(old, "release");
+            this.listIconCachePixels.set(i, icon.pixels); this.listIconCacheImgs.set(i, (u64)img);
+            this.listIconCacheRevisions.set(i, icon.revision);
+            this.listIconCacheW.set(i, icon.pxW); this.listIconCacheH2.set(i, icon.pxH);
+        }
+        else
+        {
+            this.listIconCacheH.add(tablePtr); this.listIconCacheIds.add(id);
+            this.listIconCachePixels.add(icon.pixels); this.listIconCacheImgs.add((u64)img);
+            this.listIconCacheRevisions.add(icon.revision);
+            this.listIconCacheW.add(icon.pxW); this.listIconCacheH2.add(icon.pxH);
+        }
+        return img;
+    }
+
+    void _freeListIconState(u64 h)
+    {
+        void* table = this._tableOf(h);
+        int i = 0;
+        while (i < this.listIconHandles.count())
+        {
+            if (this.listIconHandles.get(i) == (u64)table)
+            {
+                u64 old = this.listIconPtrs.get(i); if (old != 0u) __uiFreeListIconBox(old);
+                this.listIconHandles.removeAt(i); this.listIconPtrs.removeAt(i); break;
+            }
+            i++;
+        }
+        i = this.listIconCacheH.count() - 1;
+        while (i >= 0)
+        {
+            if (this.listIconCacheH.get(i) == (u64)table)
+            {
+                void* img = u2h(this.listIconCacheImgs.get(i)); if (img != nullptr) msg0(img, "release");
+                this.listIconCacheH.removeAt(i); this.listIconCacheIds.removeAt(i);
+                this.listIconCachePixels.removeAt(i); this.listIconCacheImgs.removeAt(i);
+            }
+            i--;
         }
     }
 
@@ -1090,6 +1202,10 @@ class CocoaHost : INativeHost
         {
             this._setListBox(h, payload);
         }
+        else if (op == LISTOP_SET_ROWICON_CB)
+        {
+            this._setListIconBox(h, payload);
+        }
         else if (op == LISTOP_SET_CELLSTYLE_CB)
         {
             this._setListStyle(h, payload);
@@ -1284,6 +1400,7 @@ class CocoaHost : INativeHost
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
                     this.setListOp(h, LISTOP_SET_ROWTEXT_CB, 0, 0, "", (u64)_boxListRow(lv.rowText));
+                    this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
                     this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
                 }
                 else if (node.kind() == ELEM_TREE)
@@ -1645,11 +1762,17 @@ class CocoaHost : INativeHost
         // closing wholesale). The parallel lists + ctx.nativeByKey are value fields freed
         // automatically when `delete owned` runs this window's destructor.
         { int i = 0; while (i < this.listBoxPtrs.count()) { u64 b = this.listBoxPtrs.get(i); if (b != 0u) __uiFreeListRowBox(b); i++; } }
+        { int i = 0; while (i < this.listIconPtrs.count()) { u64 b = this.listIconPtrs.get(i); if (b != 0u) __uiFreeListIconBox(b); i++; } }
+        { int i = 0; while (i < this.listIconCacheImgs.count()) { u64 img = this.listIconCacheImgs.get(i); if (img != 0u) msg0(u2h(img), "release"); i++; } }
         { int i = 0; while (i < this.listStylePtrs.count()) { u64 b = this.listStylePtrs.get(i); if (b != 0u) __uiFreeListStyleBox(b); i++; } }
         { int i = 0; while (i < this.treeBoxPtrs.count()) { u64 b = this.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
         { int i = 0; while (i < this.canvasBoxes.count()) { u64 b = this.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
         { int i = 0; while (i < this.ctxMenus.count()) { u64 b = this.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
         this.listBoxHandles.clear(); this.listBoxPtrs.clear();
+        this.listIconHandles.clear(); this.listIconPtrs.clear();
+        this.listIconCacheH.clear(); this.listIconCacheIds.clear();
+        this.listIconCachePixels.clear(); this.listIconCacheImgs.clear();
+        this.listIconCacheRevisions.clear(); this.listIconCacheW.clear(); this.listIconCacheH2.clear();
         this.listStyleHandles.clear(); this.listStylePtrs.clear();
         this.treeBoxHandles.clear(); this.treeBoxPtrs.clear();
         this.canvasHandles.clear();  this.canvasBoxes.clear();
@@ -2012,6 +2135,10 @@ void _onListWillDisplayCellImp(void* self, void* cmd, void* table, void* cell,
     if (ci < (i64)0) ci = 0;
     int color = resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)table), (int)row, (int)ci), curWin().ctx.theme);
     msg1(cell, "setTextColor:", curWin().colorFor(color));
+    // AppKit reuses cell instances while scrolling. Resolve the portable icon on
+    // every realization and clear non-first columns so stale images cannot stick.
+    void* icon = ci == (i64)0 ? curWin()._listIconImage((u64)table, (int)row) : nullptr;
+    msg1(cell, "setImage:", icon);
 }
 
 // The segmented tab strip changed -> onSelectTab.
@@ -2689,6 +2816,55 @@ string nativeListCellText(string keyPath, int row, int col)
     u64 box = curWin()._listBoxForTable((u64)table);
     if (box == 0u) return "";
     return __uiListRowText(box, row, col);
+}
+
+int nativeListIconCacheCount(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0;
+    void* table = curWin()._tableOf(h);
+    int n = 0; int i = 0;
+    while (i < curWin().listIconCacheH.count())
+    {
+        if (curWin().listIconCacheH.get(i) == (u64)table) n++;
+        i++;
+    }
+    return n;
+}
+
+int nativeListIconResolve(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return -1;
+    void* table = curWin()._tableOf(h);
+    void* img = curWin()._listIconImage((u64)table, row);
+    if (img == nullptr) return -1;
+    ListRowIcon icon = __uiListRowIcon(curWin()._listIconBoxForTable((u64)table), row);
+    if (icon.identity == nullptr) return -1;
+    string id = "" + (char*)icon.identity;
+    return curWin()._listIconCacheSlot((u64)table, id);
+}
+
+u64 nativeListIconRevision(string keyPath, int row)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return 0u;
+    void* table = curWin()._tableOf(h);
+    void* img = curWin()._listIconImage((u64)table, row);
+    if (img == nullptr) return 0u;
+    u64 box = curWin()._listIconBoxForTable((u64)table);
+    if (box == 0u) return 0u;
+    ListRowIcon icon = __uiListRowIcon(box, row);
+    if (icon.identity == nullptr) return 0u;
+    int i = curWin()._listIconCacheSlot((u64)table, "" + (char*)icon.identity);
+    return i >= 0 ? curWin().listIconCacheRevisions.get(i) : 0u;
+}
+
+void nativeListIconResetForTest(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath);
+    if (h == 0u) return;
+    curWin()._freeListIconState(h);
 }
 
 void nativeListSelect(string keyPath, int row)

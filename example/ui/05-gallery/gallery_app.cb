@@ -56,6 +56,8 @@ class GalleryApp : IComponent
     bool interfaceCheckboxChanged = false;
     int interfaceAreaChanged = 0;
     int rowTextCalls  = 0;    // rowText callback invocations (virtualization oracle)
+    int rowIconCalls  = 0;    // rowIcon callback invocations (identity/reuse oracle)
+    u64 iconRevision  = 1u;    // explicit content revision for same-identity replacement
     int tab           = 0;    // TabControl selection (P9)
     int treeSel       = 0 - 1; // selected tree node id (P9)
     int treeExpands   = 0;    // onExpand invocations (P9)
@@ -81,6 +83,21 @@ class GalleryApp : IComponent
     u64 imgPixels = 0u;
     int imgW = 0;
     int imgH = 0;
+
+    ListRowIcon iconForRow(int r)
+    {
+        this.rowIconCalls = this.rowIconCalls + 1;
+        if (r % 3 == 2) return noListIcon();
+        return r % 2 == 0
+            ? listIconRevision("ok", this.imgPixels, this.imgW, this.imgH, this.iconRevision)
+            : listIconRevision("warn", this.imgPixels, this.imgW, this.imgH, this.iconRevision);
+    }
+
+    void mutateIconForTest()
+    {
+        if (this.imgPixels != 0u) ((char*)this.imgPixels)[0] = (char)(((char*)this.imgPixels)[0] + 1);
+        this.iconRevision = 2u;
+    }
 
     // P13 reconcile stress-soak state. When `stress` is on, render() emits a churn box
     // whose active pool slots (a fixed kind per slot) and order are driven by a seeded LCG,
@@ -363,6 +380,7 @@ class GalleryApp : IComponent
             i64 sq = (i64)r * (i64)r;
             return sq.toString();
         };
+        lv.rowIcon = (int r) => { return this.iconForRow(r); };
         lv.cellStyle = (int r, int c) => {
             if (r == 50000 && c == 1) return listCellRole(LIST_ROLE_ERROR);
             if (r == 50000 && c == 0) return listCellLiteral(0);
@@ -724,6 +742,37 @@ int gallerySelfTest()
         // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
         int calls = g != nullptr ? g.rowTextCalls : 999999;
         t.expectTrue("rowText small", calls > 0 && calls < 100);
+
+        // Row icons use only a stable identity plus borrowed BGRA data. The same
+        // callback is safe for virtualization/reuse, while empty identity is omission.
+        ListRowIcon iconMissing = g != nullptr ? g.iconForRow(50000) : noListIcon();
+        ListRowIcon iconOdd = g != nullptr ? g.iconForRow(50005) : noListIcon();
+        ListRowIcon iconEven = g != nullptr ? g.iconForRow(50004) : noListIcon();
+        t.expectTrue("row icon identity and missing", iconEven.identity != nullptr
+            && iconOdd.identity != nullptr && strcmp((char*)iconEven.identity, "ok") == 0
+            && strcmp((char*)iconOdd.identity, "warn") == 0 && iconMissing.identity == nullptr);
+        int warnSlot = nativeListIconResolve("root/content/cardlist/list", 50005);
+        int okSlot = nativeListIconResolve("root/content/cardlist/list", 50004);
+        int warnAgain = nativeListIconResolve("root/content/cardlist/list", 50005);
+        t.expectTrue("row icon native cache identities", warnSlot >= 0 && okSlot >= 0
+            && warnSlot != okSlot && warnAgain == warnSlot
+            && nativeListIconCacheCount("root/content/cardlist/list") == 2);
+        u64 cachedBefore = nativeListIconRevision("root/content/cardlist/list", 50004);
+        u64 oldRevision = iconEven.revision;
+        if (g != nullptr) g.mutateIconForTest();
+        ListRowIcon replaced = g != nullptr ? g.iconForRow(50004) : noListIcon();
+        t.expectTrue("row icon in-place revision", replaced.revision != oldRevision
+            && replaced.pixels == iconEven.pixels);
+        int okReplaced = nativeListIconResolve("root/content/cardlist/list", 50004);
+        u64 cachedAfter = nativeListIconRevision("root/content/cardlist/list", 50004);
+        t.expectTrue("row icon native revision replacement", okReplaced == okSlot
+            && cachedBefore == 1u && cachedAfter == 2u && cachedAfter != cachedBefore);
+        int invalidSlot = nativeListIconResolve("root/content/cardlist/list", 50000);
+        t.expectTrue("row icon native omission", invalidSlot < 0
+            && nativeListIconCacheCount("root/content/cardlist/list") == 2);
+        nativeListIconResetForTest("root/content/cardlist/list");
+        t.expectTrue("row icon teardown cache", nativeListIconCacheCount("root/content/cardlist/list") == 0
+            && nativeListIconResolve("root/content/cardlist/list", 50004) < 0);
 
         // 7. Selection round-trip: select row 5 as the OS would.
         nativeListSelect("root/content/cardlist/list", 5);
