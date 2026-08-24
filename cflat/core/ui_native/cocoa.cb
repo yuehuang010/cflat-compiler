@@ -747,6 +747,7 @@ class CocoaHost : INativeHost
                 void* img = u2h(this.listIconCacheImgs.get(i)); if (img != nullptr) msg0(img, "release");
                 this.listIconCacheH.removeAt(i); this.listIconCacheIds.removeAt(i);
                 this.listIconCachePixels.removeAt(i); this.listIconCacheImgs.removeAt(i);
+                this.listIconCacheRevisions.removeAt(i); this.listIconCacheW.removeAt(i); this.listIconCacheH2.removeAt(i);
             }
             i--;
         }
@@ -1627,6 +1628,7 @@ class CocoaHost : INativeHost
             // is pulled on demand via the boxed rowText (the table's dataSource).
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
             this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
@@ -1671,8 +1673,8 @@ class CocoaHost : INativeHost
     // Win32 host feeds NM_CUSTOMDRAW is applied here through bezelColor (look policy).
     void _syncButtonAccent(u64 h, IButton b)
     {
-        int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
-        int afg = pickColor(b.color, this.ctx.theme.buttonText);
+        int abg = pickColor(b.backgroundColor, colorRole(THEME_ROLE_BUTTON_BG), this.ctx.theme, this.ctx.systemPrefersDark());
+        int afg = pickColor(b.color, colorRole(THEME_ROLE_BUTTON_TEXT), this.ctx.theme, this.ctx.systemPrefersDark());
         this.setAccent(h, afg, abg);
     }
 
@@ -2136,7 +2138,7 @@ void _onListWillDisplayCellImp(void* self, void* cmd, void* table, void* cell,
     if (lv == nullptr) return;
     i64 ci = msgGetI64Arg(msg0(table, "tableColumns"), "indexOfObject:", column);
     if (ci < (i64)0) ci = 0;
-    int color = resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)table), (int)row, (int)ci), curWin().ctx.theme);
+    int color = resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)table), (int)row, (int)ci), curWin().ctx.theme, curWin().ctx.systemPrefersDark());
     msg1(cell, "setTextColor:", curWin().colorFor(color));
     // AppKit reuses cell instances while scrolling. Resolve the portable icon on
     // every realization and clear non-first columns so stale images cannot stick.
@@ -2719,8 +2721,8 @@ int nativeContainerBg(string keyPath)
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
     if (e == nullptr) return 0;
     IView v = e as IView;
-    if (v != nullptr) return resolveColor(v.style.backgroundColor, wnd.ctx.theme,
-                                           wnd.ctx.systemPrefersDark());
+    if (v != nullptr) return resolveColor(v.style.backgroundColor, curWin().ctx.theme,
+                                           curWin().ctx.systemPrefersDark());
     return 0;
 }
 
@@ -2917,10 +2919,11 @@ int nativeListCellColor(string keyPath, int row, int col)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0;
-    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)curWin()._tableOf(h)), row, col), curWin().ctx.theme);
+    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)curWin()._tableOf(h)), row, col), curWin().ctx.theme, curWin().ctx.systemPrefersDark());
 }
 
 bool nativeListVisualExpected() { return false; }
+bool nativeListVisualTeardownClean() { return true; }
 bool nativeListHeaderAttached(string keyPath) { return false; }
 bool nativeListInvokeHeader(string keyPath, int column) { return false; }
 int nativeListRealizeRow(string keyPath, int row) { return -1; }

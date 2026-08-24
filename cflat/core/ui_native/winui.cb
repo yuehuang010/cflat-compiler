@@ -329,6 +329,8 @@ const u32 WSWP_FRAMECHANGED = 0x0027u;   // NOSIZE|NOMOVE|NOZORDER|FRAMECHANGED
 
 function<i32(void*, u32, void*, u32)>             _wDwmSetAttr   = nullptr;
 function<i32(void*, void*, i32, i32, i32, i32, u32)> _wSetWindowPos = nullptr;
+function<i64(void*, i32)> _wGetWindowLongPtr = nullptr;
+function<i32(void*, u32, i32, u32)> _wAdjustWindowRectEx = nullptr;
 function<u32(i32)> _wGetSysColor = nullptr;
 function<i32(void*, char*, u32, u32, void**)> _wRegOpenKeyExA = nullptr;
 function<i32(void*, char*, void*, u32*, void*, u32*)> _wRegQueryValueExA = nullptr;
@@ -353,6 +355,8 @@ void winuiBindChrome()
     if (u != nullptr)
     {
         _wSetWindowPos = (function<i32(void*, void*, i32, i32, i32, i32, u32)>)GetProcAddress(u, "SetWindowPos");
+        _wGetWindowLongPtr = (function<i64(void*, i32)>)GetProcAddress(u, "GetWindowLongPtrA");
+        _wAdjustWindowRectEx = (function<i32(void*, u32, i32, u32)>)GetProcAddress(u, "AdjustWindowRectEx");
         _wGetSysColor = (function<u32(i32)>)GetProcAddress(u, "GetSysColor");
         _wSystemParametersInfoA = (function<i32(u32, u32, void*, u32)>)GetProcAddress(u, "SystemParametersInfoA");
     }
@@ -1197,6 +1201,7 @@ int winuiContainerBg(IElement node, Theme theme, bool systemDark)
 class WinUI3Host : INativeHost
 {
     bool applying = false;   // guard: swallow self-inflicted Checked/Unchecked
+    bool topmost = false;
     list<string> liveKeys = default;   // keys live this frame (drives the destroy diff)
 
     // DispatcherQueue timer ownership belongs to this host instance. The public
@@ -1206,9 +1211,13 @@ class WinUI3Host : INativeHost
     list<u64> timerObjects = default;
     list<u64> timerHandlers = default;
     list<u64> timerTokens  = default;
+    list<u64> timerDue     = default;
+    list<u64> timerIntervals = default;
     u64 timerSerial = 1u;
     bool headlessTimers = false;
     bool timerDispatching = false;
+    bool systemDarkCacheValid = false;
+    bool systemDarkCached = false;
     bool teardownPending = false;
     bool tornDown = false;
 
@@ -2940,8 +2949,8 @@ class WinUI3Host : INativeHost
             IButton b = node as IButton;
             this.setText(h, b.title.data());
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
-            int abg = pickColor(b.backgroundColor, this.appTheme().buttonBg);
-            int afg = pickColor(b.color, this.appTheme().buttonText);
+            int abg = pickColor(b.backgroundColor, colorRole(THEME_ROLE_BUTTON_BG), _wCtx.theme, _wCtx.systemPrefersDark());
+            int afg = pickColor(b.color, colorRole(THEME_ROLE_BUTTON_TEXT), _wCtx.theme, _wCtx.systemPrefersDark());
             this.setAccent(h, afg, abg);
         }
         else if (k == ELEM_TEXT)
@@ -3002,6 +3011,7 @@ class WinUI3Host : INativeHost
         {
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
             this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
@@ -3142,6 +3152,7 @@ string winuiParentPath(string key)
 // Re-render when the model is dirty: render -> reconcile -> layout -> apply.
 void pumpWinui()
 {
+    _wHost.systemDarkCacheValid = false;
     _winuiFireHeadlessTimers();
     if (_wApp != nullptr && _wCtx.consumeDirty())
     {
@@ -3476,6 +3487,24 @@ void buildWinuiTree()
 
 // -- ctx.post marshaling hooks (installed into the window's ctx) ---------------
 extern stdcall u32 GetCurrentThreadId();
+function<u64()> _wGetTickCount64 = nullptr;
+bool _wTickCountBound = false;
+
+void winuiBindTickCount()
+{
+    if (_wTickCountBound) return;
+    _wTickCountBound = true;
+    void* k = LoadLibraryA("kernel32.dll");
+    if (k != nullptr)
+        _wGetTickCount64 = (function<u64()>)GetProcAddress(k, "GetTickCount64");
+}
+
+u64 winuiTickCount()
+{
+    winuiBindTickCount();
+    if (_wGetTickCount64 == nullptr) return 0u;
+    return _wGetTickCount64();
+}
 void _winuiPostEnqueue(u64 target, u64 boxPtr)
 {
     // Enqueue a run-the-box tick onto the DispatcherQueue (target unused - one UI thread).
@@ -3506,8 +3535,11 @@ u64 _winuiStartTimer(u64 target, int ms, bool repeating, u64 boxPtr)
     if (handle == 0u) handle = _wHost.timerSerial++;
     if (_wHost.headlessTimers)
     {
+        int delay = ms; if (delay < 0) delay = 0;
         _wHost.timerHandles.add(handle); _wHost.timerBoxes.add(boxPtr); _wHost.timerObjects.add(0u);
         _wHost.timerHandlers.add(0u); _wHost.timerTokens.add(0u);
+        _wHost.timerDue.add(winuiTickCount() + (u64)delay);
+        _wHost.timerIntervals.add((u64)delay);
         return handle;
     }
     if (_gDq == nullptr) return 0u;
@@ -3530,6 +3562,7 @@ u64 _winuiStartTimer(u64 target, int ms, bool repeating, u64 boxPtr)
     ((DqTimerVtbl*)timer.lpVtbl)->Start(rawTimer);
     _wHost.timerHandles.add(handle); _wHost.timerBoxes.add(boxPtr); _wHost.timerObjects.add((u64)rawTimer);
     _wHost.timerHandlers.add((u64)handler); _wHost.timerTokens.add(token);
+    _wHost.timerDue.add(0u); _wHost.timerIntervals.add(0u);
     return handle;
 }
 
@@ -3559,9 +3592,11 @@ void _winuiRunTimerBox(u64 box)
 void _winuiFireHeadlessTimers()
 {
     if (!_wHost.headlessTimers) return;
+    u64 now = winuiTickCount();
     int i = 0;
     while (i < _wHost.timerHandles.count())
     {
+        if (_wHost.timerDue.get(i) > now) { i++; continue; }
         u64 box = _wHost.timerBoxes.get(i);
         bool repeating = ((TimerBox*)box).repeating;
         u64 handle = _wHost.timerHandles.get(i);
@@ -3569,6 +3604,11 @@ void _winuiFireHeadlessTimers()
         {
             _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
             _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+            _wHost.timerDue.removeAt(i); _wHost.timerIntervals.removeAt(i);
+        }
+        else
+        {
+            _wHost.timerDue.set(i, _wHost.timerDue.get(i) + _wHost.timerIntervals.get(i));
         }
         _winuiRunTimerBox(box);
         if (repeating && i < _wHost.timerHandles.count() && _wHost.timerHandles.get(i) == handle) i++;
@@ -3586,6 +3626,7 @@ void _winuiCancelTimer(u64 target, u64 handle)
             __uiFreeTimerBox(_wHost.timerBoxes.get(i));
             _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
             _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+            _wHost.timerDue.removeAt(i); _wHost.timerIntervals.removeAt(i);
             return;
         }
         i++;
@@ -3606,6 +3647,7 @@ void _winuiFireTimer(u64 timerPtr)
                 _winuiReleaseTimerAt(i);
                 _wHost.timerHandles.removeAt(i); _wHost.timerBoxes.removeAt(i); _wHost.timerObjects.removeAt(i);
                 _wHost.timerHandlers.removeAt(i); _wHost.timerTokens.removeAt(i);
+                _wHost.timerDue.removeAt(i); _wHost.timerIntervals.removeAt(i);
             }
             _winuiRunTimerBox(box);
             return;
@@ -3618,8 +3660,19 @@ void _winuiSetContentSize(u64 target, int w, int h)
 {
     winuiBindChrome();
     void* hwnd = winuiHwnd();
+    int outerW = w * (i32)BASE_X; int outerH = h * (i32)BASE_Y;
     if (hwnd != nullptr && _wSetWindowPos != nullptr)
-        _wSetWindowPos(hwnd, nullptr, 0, 0, w * (i32)BASE_X, h * (i32)BASE_Y, 0u);
+    {
+        if (_wGetWindowLongPtr != nullptr && _wAdjustWindowRectEx != nullptr)
+        {
+            WGdiRect rc = default; rc.left = 0; rc.top = 0; rc.right = outerW; rc.bottom = outerH;
+            i64 style = _wGetWindowLongPtr(hwnd, (i32)(0 - 16));
+            i64 ex = _wGetWindowLongPtr(hwnd, (i32)(0 - 20));
+            _wAdjustWindowRectEx(&rc, (u32)style, 1, (u32)ex);
+            outerW = rc.right - rc.left; outerH = rc.bottom - rc.top;
+        }
+        _wSetWindowPos(hwnd, nullptr, 0, 0, outerW, outerH, 0u);
+    }
     _wW = w; _wH = h;
     if (_wReady) buildWinuiTree();
 }
@@ -3633,12 +3686,19 @@ void _winuiSetTopmost(u64 target, bool topmost)
         void* z = topmost ? (void*)((i64)(0 - 1)) : (void*)((i64)(0 - 2));
         _wSetWindowPos(hwnd, z, 0, 0, 0, 0, 0x0010u);
     }
+    _wHost.topmost = topmost;
 }
 
 bool _winuiSystemPrefersDark(u64 target)
 {
+    if (_wHost.systemDarkCacheValid) return _wHost.systemDarkCached;
     winuiBindChrome();
-    if (_wGetSysColor == nullptr) return false;
+    if (_wGetSysColor == nullptr)
+    {
+        _wHost.systemDarkCached = false;
+        _wHost.systemDarkCacheValid = true;
+        return false;
+    }
     u32 c = _wGetSysColor(5);
     int r = (int)(c & 0xFFu); int g = (int)((c >> 8) & 0xFFu); int b = (int)((c >> 16) & 0xFFu);
     // AppsUseLightTheme is the Windows app-appearance preference. High-contrast
@@ -3652,6 +3712,7 @@ bool _winuiSystemPrefersDark(u64 target)
         highContrast = _wSystemParametersInfoA(0x0042u, hc.cbSize, &hc, 0u) != 0
                     && (hc.dwFlags & 1u) != 0u;
     }
+    bool result = (r + g + b) < 384;
     if (!highContrast && _wRegOpenKeyExA != nullptr && _wRegQueryValueExA != nullptr && _wRegCloseKey != nullptr)
     {
         void* key = nullptr;
@@ -3663,12 +3724,13 @@ bool _winuiSystemPrefersDark(u64 target)
             u32 type = 0u; u32 size = 4u; u32 useLight = 1u;
             rc = _wRegQueryValueExA(key, "AppsUseLightTheme", nullptr, &type, &useLight, &size);
             _wRegCloseKey(key);
-            if (rc == 0 && type == 4u && size >= 4u) return useLight == 0u;
+            if (rc == 0 && type == 4u && size >= 4u) result = useLight == 0u;
         }
     }
-    return (r + g + b) < 384;
+    _wHost.systemDarkCached = result;
+    _wHost.systemDarkCacheValid = true;
+    return result;
 }
-
 void _winuiCancelAllTimers()
 {
     int i = 0;
@@ -3680,6 +3742,7 @@ void _winuiCancelAllTimers()
     }
     _wHost.timerHandles.clear(); _wHost.timerBoxes.clear(); _wHost.timerObjects.clear();
     _wHost.timerHandlers.clear(); _wHost.timerTokens.clear();
+    _wHost.timerDue.clear(); _wHost.timerIntervals.clear();
 }
 
 // -- Derived App outer: IInspectable + IXamlMetadataProvider (COM aggregation) -

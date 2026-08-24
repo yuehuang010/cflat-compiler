@@ -203,7 +203,11 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   on double-click / Enter, and `onHeaderClick(column)` for a zero-based header click.
   Optional `rowIcon(row)` returns a `ListRowIcon`: a stable borrowed identity plus
   borrowed top-down BGRA32 pixels (the same data convention as `Image`) and an explicit
-  `revision` token. Empty identity or invalid pixels omits the icon. Hosts cache by
+  `revision` token. Empty identity or invalid pixels omits the icon. Constructors:
+  `ListRowIcon listIcon(const char* identity, u64 pixels, int pxW, int pxH);`
+  `ListRowIcon listIconRevision(const char* identity, u64 pixels, int pxW, int pxH, u64 revision);`
+  `ListRowIcon noListIcon();`
+  Hosts cache by
   identity, replace when revision/dimensions/pixels change, resolve it again for every realized/reused row, and release the
   callback/cache when the list is destroyed. No HWND, HBITMAP, NSImage, XAML object, or
   other native handle enters this API.
@@ -538,6 +542,7 @@ struct Theme {
     Color buttonBg; Color buttonText;
     Color inputBg; Color inputText; Color focusRing;
     Color track; Color accent;
+    Color listText; Color listMuted; Color listSuccess; Color listWarning; Color listError;
 };
 Theme lightTheme();   // slate-on-near-white, blue primary button
 Theme darkTheme();    // light-on-charcoal, brighter blue button
@@ -546,6 +551,9 @@ Color colorLiteral(int value);                    // explicit literal, including
 Color colorRole(int role);                        // semantic role reference
 int   pickColor(Color nodeColor, Color themeColor, Theme theme, bool systemDark);
 int   shade(int color, int delta);                // lighten/darken (hover/pressed)
+THEME_ROLE_TEXT, THEME_ROLE_PANEL_BG, THEME_ROLE_PANEL_BORDER, THEME_ROLE_BUTTON_BG, THEME_ROLE_BUTTON_TEXT;
+THEME_ROLE_INPUT_BG, THEME_ROLE_INPUT_TEXT, THEME_ROLE_FOCUS_RING, THEME_ROLE_TRACK, THEME_ROLE_ACCENT;
+THEME_ROLE_LIST_TEXT, THEME_ROLE_LIST_MUTED, THEME_ROLE_LIST_SUCCESS, THEME_ROLE_LIST_WARNING, THEME_ROLE_LIST_ERROR;
 ```
 
 The theme lives on `UiContext` (`ctx.theme`), the host-owned per-app state. An app
@@ -773,7 +781,7 @@ high-contrast mode); Cocoa reads `AppleInterfaceStyle`. `after` and `every` retu
 callbacks run on the UI thread, and `cancelTimer` releases the callback closure. Native
 hosts cancel every outstanding timer during window teardown. In headless/TUI contexts with
 no wall-clock host loop, timer scheduling returns 0 deterministically and does not start a
-worker thread; native headless hosts drive their timers through their normal message pump.
+worker thread. All native hosts fire timers through their normal message pumps and honor the requested delay.
 
 **`ctx.post(work)` (v12) - thread marshaling.** Call from any thread to run `work`
 back on the UI thread. The closure is cloned into a heap box and the host marshals it

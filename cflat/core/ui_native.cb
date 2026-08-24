@@ -165,7 +165,9 @@ string styleToJson(Style s)
          + ",\"height\":" + s.height.toString()
          + ",\"flexDirection\":" + s.flexDirection.toString()
          + ",\"color\":" + colorRaw(s.color).toString()
+         + (s.color.kind != COLOR_UNSET ? ",\"colorKind\":" + s.color.kind.toString() : "")
          + ",\"backgroundColor\":" + colorRaw(s.backgroundColor).toString()
+         + (s.backgroundColor.kind != COLOR_UNSET ? ",\"backgroundColorKind\":" + s.backgroundColor.kind.toString() : "")
          + ",\"gap\":" + s.gap.toString()
          + ",\"flex\":" + s.flex.toString()
          + ",\"flexWrap\":" + s.flexWrap.toString() + "}";
@@ -646,8 +648,14 @@ Color resolveThemeRole(Theme t, int role, bool systemDark)
 
 int resolveColor(Color c, Theme t, bool systemDark)
 {
+    int hops = 0;
+    while (c.kind == COLOR_ROLE)
+    {
+        if (hops >= 8) return 0;
+        c = resolveThemeRole(t, c.value, systemDark);
+        hops++;
+    }
     if (c.kind == COLOR_LITERAL) return markColor(c.value);
-    if (c.kind == COLOR_ROLE) return resolveColor(resolveThemeRole(t, c.value, systemDark), t, systemDark);
     return 0;
 }
 
@@ -863,7 +871,7 @@ class TimerBox
 {
     Lambda<void()> work = default;
     bool repeating = false;
-    bool firing = false;
+    int firing = 0;
     bool cancelled = false;
 };
 
@@ -885,10 +893,10 @@ void __uiRunTimerBox(u64 boxPtr)
         return;
     }
     bool repeating = box.repeating;
-    box.firing = true;
+    box.firing++;
     box.work();
-    box.firing = false;
-    if (!repeating || box.cancelled) __uiFreeTimerBox(boxPtr);
+    box.firing--;
+    if ((!repeating || box.cancelled) && box.firing == 0) __uiFreeTimerBox(boxPtr);
 }
 
 void __uiFreeTimerBox(u64 boxPtr)
@@ -896,7 +904,7 @@ void __uiFreeTimerBox(u64 boxPtr)
     if (boxPtr != 0u)
     {
         TimerBox* box = (TimerBox*)boxPtr;
-        if (box.firing)
+        if (box.firing > 0)
         {
             // A callback may cancel itself or tear down its host. Keep the closure
             // alive until the active invocation returns to __uiRunTimerBox.
@@ -2007,10 +2015,11 @@ class Text : IText
         // FONT_TITLE == 2 (bold, ~1.3x wider on native hosts; literal since the
         // FONT_* consts are declared later in the file) reserves a wider cell.
         b.w = this.font == 2 ? (len * 13 + 9) / 10 : len;
-        if (this.style.width > 0) b.w = this.style.width;
         if (c.exactW) b.w = c.availW;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -2080,10 +2089,11 @@ class Button : IButton
     {
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = (int)this.title.length() + 4;
-        if (this.style.width > 0) b.w = this.style.width;
         if (c.exactW) b.w = c.availW;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -2190,11 +2200,11 @@ class Box : IBox
     Size layout(LayoutConstraints c)
     {
         int w = c.availW;
+        if (c.exactW) w = c.availW;
         if (this.style.width > 0) w = this.style.width;
         int h = 1;
-        if (this.style.height > 0) h = this.style.height;
-        if (c.exactW) w = c.availW;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
@@ -2325,13 +2335,14 @@ class TextInput : ITextInput
     {
         int w = this.width;
         if (w <= 0) w = (int)this.value.length() + 1;   // +1 for the caret cell
-        if (this.style.width > 0) w = this.style.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w < 3) w = 3;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
         return s;
@@ -2450,10 +2461,11 @@ class Checkbox : ICheckbox
     {
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4;
-        if (this.style.width > 0) b.w = this.style.width;
         if (c.exactW) b.w = c.availW;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -2464,7 +2476,7 @@ class Checkbox : ICheckbox
         int ink = pickColor(this.color, colorRole(THEME_ROLE_TEXT), ctx.theme, ctx.systemPrefersDark());
         if (this.disabled) ink = dimColor(ink);
         int focus = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_FOCUS_RING, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
-        if (ctx.hasHover(this.key) && focus != 0) ink = focus;
+        if (!this.disabled && ctx.hasHover(this.key) && focus != 0) ink = focus;
         if (!this.disabled && ctx.hasFocus(this.key) && focus != 0)
             cv.drawRect(this.bounds, false, focus);
         string mark = this.checked ? "[x] " : "[ ] ";
@@ -2540,11 +2552,13 @@ class ProgressBar : IProgressBar
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width; if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w < 2 && !c.exactW) w = 2;
-        int h = this.style.height > 0 ? this.style.height : 1;
+        int h = 1;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
@@ -2621,11 +2635,13 @@ class Slider : ISlider
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width; if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w < 3 && !c.exactW) w = 3;
-        int h = this.style.height > 0 ? this.style.height : 1;
+        int h = 1;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
@@ -2732,12 +2748,14 @@ class TextArea : ITextArea
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
         if (w < 4 && !c.exactW) w = 4;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 2 && !c.exactH) h = 2;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -2844,10 +2862,12 @@ class StatusBar : IStatusBar
     {
         Rect b = default;
         b.x = c.x; b.y = c.y;
-        b.w = this.style.width > 0 ? this.style.width : c.availW;
+        b.w = c.availW;
         if (c.exactW) b.w = c.availW;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -2939,12 +2959,15 @@ class ScrollView : IScrollView
     Size layout(LayoutConstraints c)
     {
         int w = c.availW;
+        if (c.exactW) w = c.availW;
         if (this.style.width > 0) w = this.style.width;
         int h = this._viewH();
         // No explicit height + a bounded height available (native host): fill the
         // viewport. Under LAYOUT_UNBOUNDED (TUI/canvas) _viewH()'s fallback stands.
         if (this.style.height == 0 && c.availH < LAYOUT_UNBOUNDED)
             h = c.availH;
+        if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
@@ -2957,6 +2980,9 @@ class ScrollView : IScrollView
             LayoutConstraints cc = default;
             cc.x = c.x; cc.y = cy;
             cc.availW = w; cc.availH = LAYOUT_UNBOUNDED;
+            // Only the width axis propagates: scroll content is deliberately
+            // unbounded vertically, so an exact height must stop at the viewport.
+            if (c.exactW && this.children.count() == 1) cc.exactW = true;
             Size cs = child.layout(cc);
             cy = cy + cs.h;
         }
@@ -3194,10 +3220,11 @@ class RadioButton : IRadioButton
     {
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = (int)this.label.length() + 4;
-        if (this.style.width > 0) b.w = this.style.width;
         if (c.exactW) b.w = c.availW;
-        b.h = this.style.height > 0 ? this.style.height : 1;
+        if (this.style.width > 0) b.w = this.style.width;
+        b.h = 1;
         if (c.exactH) b.h = c.availH;
+        if (this.style.height > 0) b.h = this.style.height;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
         return s;
@@ -3291,11 +3318,12 @@ class RadioGroup : IRadioGroup
             cy = cy + cs.h;
             i++;
         }
-        int bw = this.style.width > 0 ? this.style.width : c.availW;
+        int bw = c.availW;
         if (c.exactW) bw = c.availW;
+        if (this.style.width > 0) bw = this.style.width;
         int bh = (cy - c.y) + pad;
-        if (this.style.height > 0) bh = this.style.height;
         if (c.exactH) bh = c.availH;
+        if (this.style.height > 0) bh = this.style.height;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
         this.bounds = b;
@@ -3416,11 +3444,12 @@ class ComboBox : IComboBox
             }
             w = mx + 4;   // room for the dropdown arrow
         }
-        if (this.style.width > 0) w = this.style.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w < 6 && !c.exactW) w = 6;
-        int h = this.style.height > 0 ? this.style.height : 1;
+        int h = 1;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
@@ -3536,12 +3565,14 @@ class ListView : IListView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
         if (w < 6 && !c.exactW) w = 6;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -3642,7 +3673,7 @@ class ListView : IListView
                 int col = 0; int x = this.bounds.x + 1;
                 while (col < this.columns.count())
                 {
-                    int width = col < this.colWidths.count() ? this.colWidths.get(col) : 12;
+                    int width = (int)this.columns.get(col).length();
                     if (e.x >= x && e.x < x + width) { this.fireHeaderClick(col); return true; }
                     x = x + width + 3; col++;
                 }
@@ -3823,11 +3854,12 @@ class TabPane : ITabPane
             Size cs = child.layout(cc);
             cy = cy + cs.h;
         }
-        int bw = this.style.width > 0 ? this.style.width : c.availW;
+        int bw = c.availW;
         if (c.exactW) bw = c.availW;
+        if (this.style.width > 0) bw = this.style.width;
         int bh = cy - c.y;
-        if (this.style.height > 0) bh = this.style.height;
         if (c.exactH) bh = c.availH;
+        if (this.style.height > 0) bh = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
@@ -3909,12 +3941,14 @@ class TabControl : ITabControl
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
         if (w < 6 && !c.exactW) w = 6;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -4054,12 +4088,14 @@ class TreeView : ITreeView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
         if (w < 4 && !c.exactW) w = 4;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -4150,9 +4186,13 @@ class SplitView : ISplitView
 
     Size layout(LayoutConstraints c)
     {
-        int w = c.availW; if (this.style.width > 0) w = this.style.width;
-        int h = this.style.height > 0 ? this.style.height : c.availH;
+        int w = c.availW;
+        if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
+        int h = c.availH;
         if (h >= LAYOUT_UNBOUNDED) h = 1;
+        if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
         int rt = this._clampRatio(this.ratio);
@@ -4163,6 +4203,7 @@ class SplitView : ISplitView
             {
                 LayoutConstraints cc = default;
                 cc.x = c.x; cc.y = c.y; cc.availW = firstW; cc.availH = h;
+                cc.exactW = c.exactW; cc.exactH = c.exactH;
                 this.children.get(0).layout(cc);
             }
             Rect d = default; d.x = c.x + firstW; d.y = c.y; d.w = SPLIT_DIVIDER; d.h = h;
@@ -4172,6 +4213,7 @@ class SplitView : ISplitView
                 LayoutConstraints cc = default;
                 cc.x = c.x + firstW + SPLIT_DIVIDER; cc.y = c.y;
                 cc.availW = w - firstW - SPLIT_DIVIDER; cc.availH = h;
+                cc.exactW = c.exactW; cc.exactH = c.exactH;
                 this.children.get(1).layout(cc);
             }
         }
@@ -4182,6 +4224,7 @@ class SplitView : ISplitView
             {
                 LayoutConstraints cc = default;
                 cc.x = c.x; cc.y = c.y; cc.availW = w; cc.availH = firstH;
+                cc.exactW = c.exactW; cc.exactH = c.exactH;
                 this.children.get(0).layout(cc);
             }
             Rect d = default; d.x = c.x; d.y = c.y + firstH; d.w = w; d.h = SPLIT_DIVIDER;
@@ -4191,6 +4234,7 @@ class SplitView : ISplitView
                 LayoutConstraints cc = default;
                 cc.x = c.x; cc.y = c.y + firstH + SPLIT_DIVIDER;
                 cc.availW = w; cc.availH = h - firstH - SPLIT_DIVIDER;
+                cc.exactW = c.exactW; cc.exactH = c.exactH;
                 this.children.get(1).layout(cc);
             }
         }
@@ -4433,11 +4477,13 @@ class Image : IImage
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w < 1 && !c.exactW) w = 1;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -4503,11 +4549,11 @@ class GroupBox : IGroupBox
     Size layout(LayoutConstraints c)
     {
         int w = c.availW;
+        if (c.exactW) w = c.availW;
         if (this.style.width > 0) w = this.style.width;
         int h = 2;
-        if (this.style.height > 0) h = this.style.height;
-        if (c.exactW) w = c.availW;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
 
@@ -4645,12 +4691,14 @@ class CanvasView : ICanvasView
 
     Size layout(LayoutConstraints c)
     {
-        int w = this.width;  if (this.style.width > 0) w = this.style.width;
+        int w = this.width;
         if (c.exactW) w = c.availW;
+        if (this.style.width > 0) w = this.style.width;
         if (w > c.availW && c.availW > 0 && !c.exactW) w = c.availW;
         if (w < 1 && !c.exactW) w = 1;
-        int h = this.height; if (this.style.height > 0) h = this.style.height;
+        int h = this.height;
         if (c.exactH) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
         if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
         this.bounds = b;
@@ -4970,10 +5018,11 @@ class ComponentElement : IElement
             cy = cy + cs.h;
             total.h = total.h + cs.h;
         }
-        total.w = this.style.width > 0 ? this.style.width : c.availW;
+        total.w = c.availW;
         if (c.exactW) total.w = c.availW;
-        if (this.style.height > 0) total.h = this.style.height;
+        if (this.style.width > 0) total.w = this.style.width;
         if (c.exactH) total.h = c.availH;
+        if (this.style.height > 0) total.h = this.style.height;
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = total.w; b.h = total.h;

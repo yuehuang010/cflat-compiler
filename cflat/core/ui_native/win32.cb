@@ -567,6 +567,8 @@ class Window : INativeHost
     bool  applying = false;          // guard: swallow self-inflicted EN_CHANGE
     u32   dpi     = 96u;             // monitor density (96 = 100%); drives cell->px
     bool  dark    = false;           // last applied theme was dark (titlebar/bg)
+    bool  systemDarkCached = false;
+    bool  systemDarkCacheValid = false;
     Theme appTheme = default;        // last theme, retained for tagged text overrides
     bool  themed  = false;           // the app set colors (a monochrome theme = native look)
     // The common controls (ListView/TreeView/TabControl/ProgressBar/scrollbar) currently carry
@@ -1555,7 +1557,43 @@ class Window : INativeHost
             if (materialize)
                 SendMessageA(ctrl, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)himl);
         }
+        if (li >= 0 && materialize && this.listIconListPtrs.get(li) == 0u)
+        {
+            void* himl = ImageList_Create(16, 16, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4);
+            if (himl == nullptr) return -1;
+            this.listIconListPtrs.set(li, (u64)himl);
+            SendMessageA(ctrl, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)himl);
+        }
         int ci = this._iconCacheSlot(h, id);
+        // A zero image-list ptr marks a metadata-only (hidden-window) entry; its
+        // logical slot in listIconCacheIndices stays valid for headless probes.
+        if (ci >= 0 && materialize && this.listIconCachePtrs.get(ci) == 0u)
+        {
+            void* dc = GetDC(this.hwnd);
+            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
+            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+            void* bits = nullptr;
+            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+            ReleaseDC(this.hwnd, dc);
+            if (bmp == nullptr || bits == nullptr) return -1;
+            int cw = icon.pxW < 16 ? icon.pxW : 16;
+            int ch = icon.pxH < 16 ? icon.pxH : 16;
+            int y = 0;
+            while (y < ch)
+            {
+                memcpy((void*)((char*)bits + y * 16 * 4),
+                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
+                y++;
+            }
+            int idx = ImageList_Add(u2h(this.listIconListPtrs.get(li)), bmp, nullptr);
+            DeleteObject(bmp);
+            if (idx < 0) return -1;
+            this.listIconCachePtrs.set(ci, this.listIconListPtrs.get(li));
+            this.listIconCacheIndices.set(ci, idx);
+            this.listIconCachePixels.set(ci, icon.pixels);
+            this.listIconCacheRevisions.set(ci, icon.revision);
+            this.listIconCacheW.set(ci, icon.pxW); this.listIconCacheH2.set(ci, icon.pxH);
+        }
         if (ci < 0)
         {
             if (!materialize)
@@ -2597,8 +2635,8 @@ class Window : INativeHost
             this.setBoolProp(h, PROP_ENABLED, !b.disabled);
             // Accent-fill via NM_CUSTOMDRAW: a themed button gets its accent colors;
             // a monochrome theme (buttonBg 0) forgets the accent -> native look.
-            int abg = pickColor(b.backgroundColor, this.ctx.theme.buttonBg);
-            int afg = pickColor(b.color, this.ctx.theme.buttonText);
+            int abg = pickColor(b.backgroundColor, colorRole(THEME_ROLE_BUTTON_BG), this.ctx.theme, this.ctx.systemPrefersDark());
+            int afg = pickColor(b.color, colorRole(THEME_ROLE_BUTTON_TEXT), this.ctx.theme, this.ctx.systemPrefersDark());
             this.setAccent(h, afg, abg);
         }
         else if (k == ELEM_TEXT)
@@ -2665,6 +2703,7 @@ class Window : INativeHost
             // text is pulled on demand via the boxed rowText callback (LVN_GETDISPINFO).
             IListView lv = node as IListView;
             this.setListOp(h, LISTOP_SET_ROWCOUNT, lv.rowCount, 0, "", 0u);
+            this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
             this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
             this.setListOp(h, LISTOP_INVALIDATE, 0, 0, "", 0u);
@@ -2816,10 +2855,12 @@ class Window : INativeHost
                                ctx.systemPrefersDark());
         this.themeField     = field  != 0 ? this.colorRef(field)  : bg;
         this.themeFieldText = fieldT != 0 ? this.colorRef(fieldT) : fg;
-        this.themeTrack  = this.colorRef(pickColor(colorUnset(), colorRole(THEME_ROLE_TRACK),
-                                                   ctx.theme, ctx.systemPrefersDark()));
-        this.themeAccent = this.colorRef(pickColor(colorUnset(), colorRole(THEME_ROLE_ACCENT),
-                                                   ctx.theme, ctx.systemPrefersDark()));
+        int track = pickColor(colorUnset(), colorRole(THEME_ROLE_TRACK), ctx.theme, ctx.systemPrefersDark());
+        if (track == 0) track = panel;
+        this.themeTrack = this.colorRef(track);
+        int accent = pickColor(colorUnset(), colorRole(THEME_ROLE_ACCENT), ctx.theme, ctx.systemPrefersDark());
+        if (accent == 0) accent = text;
+        this.themeAccent = this.colorRef(accent);
 
         // Only on a real theme change: the common controls that ignore WM_CTLCOLOR* are
         // re-themed here, never per pump - that churn would flicker. RDW_ALLCHILDREN is required
@@ -3703,6 +3744,8 @@ void _win32SetContentSize(u64 target, int w, int h)
 {
     int wi = _win32WindowForTarget(target);
     if (wi < 0) return;
+    // Window ops deliberately re-point the servicing window at their target
+    // (gallery multi-window teardown relies on it); timer helpers do not.
     _cur = wi;
     Window* wnd = curWin();
     int px = w * wnd.dipX(); int py = h * wnd.dipY();
@@ -3732,6 +3775,8 @@ bool _win32SystemPrefersDark(u64 target)
 {
     int wi = _win32WindowForTarget(target);
     if (wi < 0) return false;
+    Window* wnd = _windows.get(wi);
+    if (wnd.systemDarkCacheValid) return wnd.systemDarkCached;
 
     // AppsUseLightTheme is the Windows app-appearance preference, independent of
     // the framework Theme applied by hostDark(). High-contrast mode has no stable
@@ -3742,6 +3787,7 @@ bool _win32SystemPrefersDark(u64 target)
                      && (hc.dwFlags & _HCF_HIGHCONTRASTON) != 0u;
     u32 c = (u32)GetSysColor((int)COLOR_WINDOW);
     int r = (int)(c & 0xFFu); int g = (int)((c >> 8) & 0xFFu); int b = (int)((c >> 16) & 0xFFu);
+    bool result = (r + g + b) < 384;
     if (!highContrast)
     {
         void* key = nullptr;
@@ -3753,25 +3799,29 @@ bool _win32SystemPrefersDark(u64 target)
             u32 type = 0u; u32 size = (u32)sizeof(u32); u32 useLight = 1u;
             rc = RegQueryValueExA(key, "AppsUseLightTheme", nullptr, &type, &useLight, &size);
             RegCloseKey(key);
-            if (rc == 0 && type == _REG_DWORD && size >= (u32)sizeof(u32)) return useLight == 0u;
+            if (rc == 0 && type == _REG_DWORD && size >= (u32)sizeof(u32)) result = useLight == 0u;
         }
     }
-    return (r + g + b) < 384;
+    wnd.systemDarkCached = result;
+    wnd.systemDarkCacheValid = true;
+    return result;
 }
-
 u64 _win32StartTimer(u64 target, int ms, bool repeating, u64 boxPtr)
 {
     int wi = _win32WindowForTarget(target);
     if (wi < 0) return 0u;
+    int previous = _cur;
     _cur = wi;
     Window* wnd = curWin();
     u64 id = _win32TimerSerial++;
     if (id == 0u) id = _win32TimerSerial++;
     if (SetTimer(wnd.hwnd, id, (u32)ms, nullptr) == 0u)
     {
+        _cur = previous;
         return 0u;
     }
     wnd.timerIds.add(id); wnd.timerBoxes.add(boxPtr);
+    _cur = previous;
     return id;
 }
 
@@ -3779,6 +3829,7 @@ void _win32CancelTimer(u64 target, u64 handle)
 {
     int wi = _win32WindowForTarget(target);
     if (wi < 0) return;
+    int previous = _cur;
     _cur = wi;
     Window* wnd = curWin();
     int i = 0;
@@ -3789,10 +3840,12 @@ void _win32CancelTimer(u64 target, u64 handle)
             KillTimer(wnd.hwnd, handle);
             __uiFreeTimerBox(wnd.timerBoxes.get(i));
             wnd.timerIds.removeAt(i); wnd.timerBoxes.removeAt(i);
+            _cur = previous;
             return;
         }
         i++;
     }
+    _cur = previous;
 }
 
 void _win32FireTimer(Window* wnd, u64 id)
@@ -3893,6 +3946,7 @@ u64 _win32CurTid() { return (u64)GetCurrentThreadId(); }
 void pumpNative()
 {
     if (!hasCurWin()) return;
+    curWin().systemDarkCacheValid = false;
     Window* wnd = curWin();
     if (wnd.ctx.consumeDirty())
     {
@@ -4889,6 +4943,12 @@ bool tryCustomDrawList(Window* wnd, i64 lParam, i64* result)
     char[32] cn;
     GetClassNameA(nh.hwndFrom, cn, 32);
     if (strcmp(cn, "SysListView32") != 0) return false;
+    u64 box = wnd._listStyleFor((u64)nh.hwndFrom);
+    if (box == 0u)
+    {
+        result[0] = (i64)CDRF_DODEFAULT;
+        return true;
+    }
     char* p = (char*)u2h((u64)lParam);
     u32* stagePtr = (u32*)(p + 24);
     u32 stage = stagePtr[0];
@@ -4909,13 +4969,16 @@ bool tryCustomDrawList(Window* wnd, i64 lParam, i64* result)
     int col = 0;
     if (stage == (u32)(CDDS_ITEMPREPAINT | 0x00030000u))
     {
-        i32* subPtr = (i32*)(p + 80);
+        i32* subPtr = (i32*)(p + 88);
         col = subPtr[0];
     }
-    u64 box = wnd._listStyleFor((u64)nh.hwndFrom);
-    int color = resolveListCellColor(__uiListCellStyle(box, (int)row, col), wnd.ctx.theme);
-    u32* textPtr = (u32*)(p + 72);
-    textPtr[0] = wnd.colorRef(color);
+
+    int color = resolveListCellColor(__uiListCellStyle(box, (int)row, col), wnd.ctx.theme, wnd.ctx.systemPrefersDark());
+    if (color != 0)
+    {
+        u32* textPtr = (u32*)(p + 80);
+        textPtr[0] = wnd.colorRef(color);
+    }
     result[0] = (i64)CDRF_NEWFONT;
     return true;
 }
@@ -5067,10 +5130,11 @@ int nativeListCellColor(string keyPath, int row, int col)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
     if (h == 0u) return 0;
-    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleFor(h), row, col), curWin().ctx.theme);
+    return resolveListCellColor(__uiListCellStyle(curWin()._listStyleFor(h), row, col), curWin().ctx.theme, curWin().ctx.systemPrefersDark());
 }
 
 bool nativeListVisualExpected() { return false; }
+bool nativeListVisualTeardownClean() { return true; }
 bool nativeListHeaderAttached(string keyPath) { return false; }
 bool nativeListInvokeHeader(string keyPath, int column) { return false; }
 int nativeListRealizeRow(string keyPath, int row) { return -1; }
@@ -5309,6 +5373,12 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     {
         if (wnd._drawStatusItem((u64)lParam)) return (i64)1;
         if (wnd._drawTabItem((u64)lParam)) return (i64)1;
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_SETTINGCHANGE)
+    {
+        wnd.systemDarkCacheValid = false;
         return DefWindowProcA(hwnd, msg, wParam, lParam);
     }
 

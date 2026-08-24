@@ -75,6 +75,7 @@ int nativeListSelectedRow(string keyPath);
 string nativeListCellText(string keyPath, int row, int col);
 int nativeListCellColor(string keyPath, int row, int col);
 bool nativeListVisualExpected();
+bool nativeListVisualTeardownClean();
 bool nativeListHeaderAttached(string keyPath);
 bool nativeListInvokeHeader(string keyPath, int column);
 int nativeListRealizeRow(string keyPath, int row);
