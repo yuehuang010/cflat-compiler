@@ -53,6 +53,9 @@ void nativeListActivate(string keyPath, int row);
 void nativeListHeaderClick(string keyPath, int col);
 void nativeTabSelect(string keyPath, int idx);
 void nativeSliderSet(string keyPath, int v);
+void nativeSpinnerSet(string keyPath, int v);
+void nativeLinkClick(string keyPath);
+void nativeToolbarClick(string keyPath, int cmd);
 void nativeSplitterDrag(string keyPath, int dipX, int dipY);
 // CanvasView input drivers (M1). Coordinates/deltas are POINTS relative to the canvas
 // origin. phase: 0 down, 1 move, 2 up. Defined by the native backend (cocoa); a no-op on
@@ -64,6 +67,10 @@ void nativeCanvasPinch(string keyPath, double x, double y, double scale);
 void nativeFireContextMenu(string keyPath, int itemIndex);
 void nativeTestFireMenu(int cmd);
 void nativeResizeClient(int wDip, int hDip);
+
+// Scripted modal answers for headless tests. Each call supplies the next result.
+void uiTestScriptMessageBox(int answer);
+void uiTestScriptFolder(string path);
 
 // Reader drivers (read live control + model state; the oracle, no pixels).
 string nativeControlText(string keyPath);
@@ -154,6 +161,9 @@ interface IUiTest
     void listActivate(string key, int row);
     void tabSelect(string key, int i);
     void sliderSet(string key, int v);
+    void spinnerSet(string key, int v);
+    void linkClick(string key);
+    void toolbarClick(string key, int cmd);
     void splitterDrag(string key, int dx, int dy);
     void fireContextMenu(string key, int i);
     void fireMenu(int cmd);
@@ -237,6 +247,9 @@ class UiTest : IUiTest
     void listActivate(string key, int row)  { if (this.aborted) return; nativeListActivate(key, row); }
     void tabSelect(string key, int i)       { if (this.aborted) return; nativeTabSelect(key, i); }
     void sliderSet(string key, int v)       { if (this.aborted) return; nativeSliderSet(key, v); }
+    void spinnerSet(string key, int v)      { if (this.aborted) return; nativeSpinnerSet(key, v); }
+    void linkClick(string key)              { if (this.aborted) return; nativeLinkClick(key); }
+    void toolbarClick(string key, int cmd)  { if (this.aborted) return; nativeToolbarClick(key, cmd); }
     void splitterDrag(string key, int dx, int dy) { if (this.aborted) return; nativeSplitterDrag(key, dx, dy); }
     void fireContextMenu(string key, int i) { if (this.aborted) return; nativeFireContextMenu(key, i); }
     void fireMenu(int cmd)                  { if (this.aborted) return; nativeTestFireMenu(cmd); }

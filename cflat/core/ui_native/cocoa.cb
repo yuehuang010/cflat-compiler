@@ -99,6 +99,7 @@ bool nativeMappable(int kind)
 {
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -182,6 +183,8 @@ class CocoaHost : INativeHost
     list<u64> timerObjects = default;
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
+    list<u64>    spinnerHandles = default;
+    list<u64>    toolbarHandles = default;
     double edgeWPt = 0.0;
     double edgeHPt = 0.0;
     double contentWPt = 0.0;
@@ -246,7 +249,8 @@ class CocoaHost : INativeHost
     // INativeHost: create a control of `elemKind` under the flipped content view.
     // `key` is the node's key path (kept by the caller in the shadow map). Returns
     // the control (NSView*) as a u64; a TextArea returns its enclosing scroll view.
-    u64 createControl(int elemKind, u64 parentHandle, string key)
+    u64 createControl(int elemKind, u64 parentHandle, string key,
+                      bool password, bool indeterminate)
     {
         void* ctrl = nullptr;
         if (elemKind == ELEM_BUTTON)
@@ -265,7 +269,10 @@ class CocoaHost : INativeHost
         }
         else if (elemKind == ELEM_TEXTINPUT)
         {
-            ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            if (password)
+                ctrl = msgRect(msg0(cls("NSSecureTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            else
+                ctrl = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msg1(ctrl, "setDelegate:", this.target);
         }
         else if (elemKind == ELEM_TEXT)
@@ -285,7 +292,8 @@ class CocoaHost : INativeHost
         {
             ctrl = msgRect(msg0(cls("NSProgressIndicator"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msgInt(ctrl, "setStyle:", 0);                 // NSProgressIndicatorStyleBar
-            msgBool(ctrl, "setIndeterminate:", false);
+            msgBool(ctrl, "setIndeterminate:", indeterminate);
+            if (indeterminate) msg1(ctrl, "startAnimation:", nullptr);
             msgSetDouble(ctrl, "setMinValue:", 0.0);
         }
         else if (elemKind == ELEM_SLIDER)
@@ -294,6 +302,27 @@ class CocoaHost : INativeHost
             msgBool(ctrl, "setContinuous:", true);
             msg1(ctrl, "setTarget:", this.target);
             msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_SPINNER)
+        {
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            void* field = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 80.0, 26.0);
+            msgBool(field, "setEditable:", true); msgBool(field, "setSelectable:", true);
+            msg1(field, "setDelegate:", this.target);
+            void* stepper = msgRect(msg0(cls("NSStepper"), "alloc"), "initWithFrame:", 80.0, 0.0, 24.0, 26.0);
+            msg1(stepper, "setTarget:", this.target); msg1(stepper, "setAction:", sel("onAction:"));
+            msg1(ctrl, "addSubview:", field); msg1(ctrl, "addSubview:", stepper);
+            msg0(field, "release"); msg0(stepper, "release"); this.spinnerHandles.add((u64)ctrl);
+        }
+        else if (elemKind == ELEM_LINK)
+        {
+            ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 26.0);
+            msgBool(ctrl, "setBordered:", false); msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_TOOLBAR)
+        {
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 26.0);
+            this.toolbarHandles.add((u64)ctrl);
         }
         else if (elemKind == ELEM_TEXTAREA)
         {
@@ -474,6 +503,7 @@ class CocoaHost : INativeHost
         this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
         this._storeAccent(h, 0); // drop any stored accent for this handle
+        this._dropComposite(&this.spinnerHandles, h); this._dropComposite(&this.toolbarHandles, h);
         void* ctrl = u2h(h);
         msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
@@ -495,6 +525,78 @@ class CocoaHost : INativeHost
                 (double)(frameCells.x * BASE_X), (double)(frameCells.y * BASE_Y),
                 (double)(frameCells.w * BASE_X) + this.applyExtraW,
                 (double)(frameCells.h * BASE_Y) + this.applyExtraH);
+        if (this._hasComposite(&this.spinnerHandles, (u64)ctrl)) this._layoutSpinner(ctrl,
+            (double)(frameCells.w * BASE_X) + this.applyExtraW,
+            (double)(frameCells.h * BASE_Y) + this.applyExtraH);
+    }
+
+    bool _hasComposite(list<u64>* xs, u64 h)
+    {
+        int i = 0; while (i < xs.count()) { if (xs.get(i) == h) return true; i++; } return false;
+    }
+    void _dropComposite(list<u64>* xs, u64 h)
+    {
+        int i = 0; while (i < xs.count()) { if (xs.get(i) == h) { xs.removeAt(i); return; } i++; }
+    }
+
+    void _layoutSpinner(void* ctrl, double w, double h)
+    {
+        void* kids = msg0(ctrl, "subviews"); if (kids == nullptr) return;
+        void* field = msgInt(kids, "objectAtIndex:", 0); void* stepper = msgInt(kids, "objectAtIndex:", 1);
+        double sw = 24.0; msgRect(field, "setFrame:", 0.0, 0.0, w - sw, h); msgRect(stepper, "setFrame:", w - sw, 0.0, sw, h);
+    }
+
+    void _setLinkTitle(void* ctrl, string text)
+    {
+        void* attrs = msg0(msg0(cls("NSMutableDictionary"), "alloc"), "init");
+        void* underline = msgIntArg(cls("NSNumber"), "numberWithInteger:", 1);
+        msg2(attrs, "setObject:forKey:", underline, nsStr("NSUnderline"));
+        msg2(attrs, "setObject:forKey:", nsColor(0.0, 0.42, 0.85, 1.0), _nsForegroundColorKey());
+        void* a = msg2(msg0(cls("NSMutableAttributedString"), "alloc"), "initWithString:attributes:", nsStr(text.data()), attrs);
+        msg1(ctrl, "setAttributedTitle:", a); msg0(a, "release"); msg0(attrs, "release");
+    }
+
+    void _layoutToolbar(void* ctrl, IToolBar t)
+    {
+        void* kids = msg0(ctrl, "subviews"); if (kids == nullptr) return;
+        RectD r = ((function<RectD(void*, void*)>)__objcMsgSendPtr)(ctrl, sel("frame"));
+        double x = 0.0; int i = 0;
+        while (i < t.labels.count())
+        {
+            void* child = msgInt(kids, "objectAtIndex:", i); string label = t.labels.get(i);
+            double cw = label == "" ? 8.0 : (double)((int)label.length() + 4) * BASE_X;
+            msgRect(child, "setFrame:", x, 0.0, cw, r.h); x = x + cw + (double)BASE_X; i++;
+        }
+    }
+
+    void _syncToolbar(u64 h, IToolBar t)
+    {
+        void* ctrl = u2h(h); void* old = msg0(ctrl, "subviews");
+        while (old != nullptr && msgGetI64(old, "count") > 0)
+        {
+            void* child = msgInt(old, "objectAtIndex:", 0); msg0(child, "removeFromSuperview");
+            old = msg0(ctrl, "subviews");
+        }
+        int i = 0;
+        while (i < t.labels.count())
+        {
+            string label = t.labels.get(i); void* child = nullptr;
+            if (label == "")
+            {
+                child = msgRect(msg0(cls("NSBox"), "alloc"), "initWithFrame:", 0.0, 0.0, 8.0, 26.0);
+                msgInt(child, "setBoxType:", 2);
+            }
+            else
+            {
+                child = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 40.0, 26.0);
+                msgInt(child, "setBezelStyle:", 2); msg1(child, "setTarget:", this.target); msg1(child, "setAction:", sel("onAction:"));
+                msgInt(child, "setTag:", (i64)t.cmds.get(i)); this._setLinkTitle(child, label);
+                msgBool(child, "setEnabled:", t.enabled.get(i));
+                if (t.tips.get(i) != "") msg1(child, "setToolTip:", nsStr(t.tips.get(i).data()));
+            }
+            msg1(ctrl, "addSubview:", child); msg0(child, "release"); i++;
+        }
+        this._layoutToolbar(ctrl, t);
     }
 
     // Only push text when it actually differs, so an NSTextField does not reset its
@@ -571,6 +673,12 @@ class CocoaHost : INativeHost
         else if (prop == PROP_VISIBLE)
         {
             msgBool(ctrl, "setHidden:", !v);
+        }
+        else if (prop == PROP_INDETERMINATE)
+        {
+            msgBool(ctrl, "setIndeterminate:", v);
+            if (v) msg1(ctrl, "startAnimation:", nullptr);
+            else msg1(ctrl, "stopAnimation:", nullptr);
         }
     }
 
@@ -1594,7 +1702,19 @@ class CocoaHost : INativeHost
             }
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), parentView, path);
+                bool password = false;
+                bool indeterminate = false;
+                if (node.kind() == ELEM_TEXTINPUT)
+                {
+                    ITextInput ti = node as ITextInput;
+                    password = ti.password;
+                }
+                else if (node.kind() == ELEM_PROGRESS)
+                {
+                    IProgressBar p = node as IProgressBar;
+                    indeterminate = p.indeterminate;
+                }
+                h = this.createControl(node.kind(), parentView, path, password, indeterminate);
                 ctx.setNativeHandle(path, h);
                 // One-time seed of a TextArea's buffer (uncontrolled after; the
                 // native view owns the text, further pushes are explicit).
@@ -1822,6 +1942,7 @@ class CocoaHost : INativeHost
         {
             ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
+            msg1(u2h(h), "setPlaceholderString:", nsStr(ti.placeholder.data()));
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
@@ -1836,6 +1957,7 @@ class CocoaHost : INativeHost
             IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
+            this.setBoolProp(h, PROP_INDETERMINATE, p.indeterminate);
         }
         else if (k == ELEM_SLIDER)
         {
@@ -1843,6 +1965,26 @@ class CocoaHost : INativeHost
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_SPINNER)
+        {
+            ISpinner s = node as ISpinner; void* kids = msg0(u2h(h), "subviews");
+            if (kids != nullptr)
+            {
+                void* field = msgInt(kids, "objectAtIndex:", 0); void* stepper = msgInt(kids, "objectAtIndex:", 1);
+                msg1(field, "setStringValue:", nsStr(s.value.toString().data()));
+                msgSetDouble(stepper, "setMinValue:", (double)s.minValue); msgSetDouble(stepper, "setMaxValue:", (double)s.maxValue);
+                msgSetDouble(stepper, "setIncrement:", (double)(s.step < 1 ? 1 : s.step)); msgSetDouble(stepper, "setDoubleValue:", (double)s.value);
+                msgBool(field, "setEnabled:", !s.disabled); msgBool(stepper, "setEnabled:", !s.disabled);
+            }
+        }
+        else if (k == ELEM_LINK)
+        {
+            ILink l = node as ILink; this._setLinkTitle(u2h(h), l.text); this.setBoolProp(h, PROP_ENABLED, !l.disabled);
+        }
+        else if (k == ELEM_TOOLBAR)
+        {
+            IToolBar t = node as IToolBar; this._syncToolbar(h, t);
         }
         else if (k == ELEM_TEXTAREA)
         {
@@ -2341,24 +2483,37 @@ IGridView _cocoaGridAtPoint(IElement node, int x, int y)
 
 void _flippedScrollWheelImp(void* self, void* cmd, void* event)
 {
-    if (!_setCurFromView(self) || !curWin().ready) return;
-    PointD p = _canvasPointFor(curWin().contentView, event);
-    double dx = msgGetDouble(event, "scrollingDeltaX");
-    double dy = msgGetDouble(event, "scrollingDeltaY");
-    double adx = dx < 0.0 ? 0.0 - dx : dx;
-    double ady = dy < 0.0 ? 0.0 - dy : dy;
-    if (ady == 0.0 || adx > ady) return;
-    IGridView gv = _cocoaGridAtPoint(curWin().tree, (int)(p.x / BASE_X), (int)(p.y / BASE_Y));
-    if (gv == nullptr) return;
-    int delta = (int)(dy * 3.0);
-    if (delta == 0) return;
-    int max = gv.maxScrollY();
-    if (delta >= 0 && gv.scrollY <= 0) return;
-    if (delta <= 0 && gv.scrollY >= max) return;
-    gv.scrollY = gv.scrollY - delta;
-    if (gv.scrollY < 0) gv.scrollY = 0;
-    if (gv.scrollY > max) gv.scrollY = max;
-    curWin().requestLayout();
+    if (_setCurFromView(self) && curWin().ready)
+    {
+        PointD p = _canvasPointFor(curWin().contentView, event);
+        double dx = msgGetDouble(event, "scrollingDeltaX");
+        double dy = msgGetDouble(event, "scrollingDeltaY");
+        double adx = dx < 0.0 ? 0.0 - dx : dx;
+        double ady = dy < 0.0 ? 0.0 - dy : dy;
+        if (ady > 0.0 && adx <= ady)
+        {
+            IGridView gv = _cocoaGridAtPoint(curWin().tree, (int)(p.x / BASE_X), (int)(p.y / BASE_Y));
+            if (gv != nullptr)
+            {
+                int delta = (int)(dy * 3.0);
+                int max = gv.maxScrollY();
+                // Consume only when the grid can still move; at a boundary the
+                // event falls through so an enclosing scroll view keeps scrolling.
+                bool canMove = delta > 0 ? gv.scrollY > 0 : (delta < 0 && gv.scrollY < max);
+                if (canMove)
+                {
+                    gv.scrollY = gv.scrollY - delta;
+                    if (gv.scrollY < 0) gv.scrollY = 0;
+                    if (gv.scrollY > max) gv.scrollY = max;
+                    curWin().requestLayout();
+                    return;
+                }
+            }
+        }
+    }
+    // Not consumed by a GridView: forward to the next responder (the clip view),
+    // so a plain NSScrollView documentView still wheel-scrolls normally.
+    msg1(msg0(self, "nextResponder"), "scrollWheel:", event);
 }
 
 // magnifyWithEvent: -magnification is the incremental zoom delta; report scale = 1.0 + it.
@@ -2786,6 +2941,17 @@ void pumpNative()
     }
 }
 
+string _keyForView(void* view)
+{
+    void* v = view; int guard = 0;
+    while (v != nullptr && guard < 16)
+    {
+        string key = curWin().keyForHandle((u64)v); if (key.length() > 0) return key;
+        v = msg0(v, "superview"); guard++;
+    }
+    return "";
+}
+
 // -- Native event routing (target/action + delegate -> element handler) --------
 void routeClick(void* ctrl)
 {
@@ -2797,6 +2963,8 @@ void routeClick(void* ctrl)
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+    ILink l = e as ILink;
+    if (l != nullptr) { l.fireClick(); pumpNative(); return; }
     // A radio routes to its enclosing RadioGroup (one key-path segment up), which owns
     // the controlled value + onChange (mirror of the Win32 host).
     IRadioButton rb = e as IRadioButton;
@@ -2810,6 +2978,25 @@ void routeClick(void* ctrl)
             if (g != nullptr) { g.fireChange(rb.index); pumpNative(); }
         }
     }
+}
+
+void routeSpinner(void* ctrl)
+{
+    string key = _keyForView(ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    ISpinner s = e as ISpinner; if (s == nullptr) return;
+    char* raw = cStr(msg0(ctrl, "stringValue"));
+    int v = msgBool1(ctrl, "isKindOfClass:", cls("NSStepper")) != (i8)0
+        ? (int)msgGetDouble(ctrl, "doubleValue") : (raw != nullptr ? ((string)raw).toInt() : 0);
+    s.fireSet(v); pumpNative();
+}
+
+void routeToolbar(void* button)
+{
+    string key = _keyForView(button); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    IToolBar t = e as IToolBar; if (t == nullptr) return;
+    t.fireCommand((int)msgGetI64(button, "tag")); pumpNative();
 }
 
 // Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
@@ -2864,10 +3051,15 @@ void routeTreeSelectItem(void* outline, void* item)
 
 void routeEdit(void* ctrl)
 {
-    string key = curWin().keyForHandle((u64)ctrl);
+    string key = _keyForView(ctrl);
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
+    ISpinner sp = e as ISpinner;
+    if (sp != nullptr)
+    {
+        char* c = cStr(msg0(ctrl, "stringValue")); sp.fireSet(c != nullptr ? ((string)c).toInt() : 0); pumpNative(); return;
+    }
     ITextInput ti = e as ITextInput;
     if (ti != nullptr)
     {
@@ -3403,6 +3595,24 @@ void nativeSliderSet(string keyPath, int v)
     routeSlider(u2h(h));
 }
 
+void nativeSpinnerSet(string keyPath, int v)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    void* kids = msg0(u2h(h), "subviews"); if (kids == nullptr) return;
+    void* stepper = msgInt(kids, "objectAtIndex:", 1); msgSetDouble(stepper, "setDoubleValue:", (double)v); routeSpinner(stepper);
+}
+
+void nativeLinkClick(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return; routeClick(u2h(h));
+}
+
+void nativeToolbarClick(string keyPath, int cmd)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath); if (e == nullptr) return;
+    IToolBar t = e as IToolBar; if (t != nullptr) { t.fireCommand(cmd); pumpNative(); }
+}
+
 bool nativeImageHasBitmap(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -3645,6 +3855,12 @@ void _onActionImp(void* self, void* cmd, void* sender)
 {
     if (!_setCurFromTarget(self)) return;
     if (!curWin().ready) return;
+    if (msgBool1(sender, "isKindOfClass:", cls("NSStepper")) != (i8)0) { routeSpinner(sender); return; }
+    if (_keyForView(sender).length() > 0 && _keyForView(sender) != curWin().keyForHandle((u64)sender))
+    {
+        IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), _keyForView(sender));
+        if (e != nullptr && (e as IToolBar) != nullptr) { routeToolbar(sender); return; }
+    }
     if (msgBool1(sender, "isKindOfClass:", cls("NSSlider")) != (i8)0) { routeSlider(sender); return; }
     routeClick(sender);
 }
@@ -3911,6 +4127,12 @@ void routeMenu(int id)
 }
 
 // -- File dialogs + alerts ----------------------------------------------------
+list<int> _uiTestMessageBoxAnswers = default;
+list<string> _uiTestFolderAnswers = default;
+
+void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
+void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
+
 string nativeOpenFile()
 {
     void* panel = msg0(cls("NSOpenPanel"), "openPanel");
@@ -3928,6 +4150,52 @@ string nativeOpenFile()
 string nativeSaveFile()
 {
     void* panel = msg0(cls("NSSavePanel"), "savePanel");
+    i64 r = msgGetI64(panel, "runModal");
+    if (r != (i64)1) return "";
+    void* url = msg0(panel, "URL");
+    if (url == nullptr) return "";
+    char* c = cStr(msg0(url, "path"));
+    return c != nullptr ? "" + c : "";
+}
+
+int nativeMessageBox(string title, string text, int kind)
+{
+    if (_uiTestMessageBoxAnswers.count() > 0)
+    {
+        int answer = _uiTestMessageBoxAnswers.get(0);
+        _uiTestMessageBoxAnswers.removeAt(0);
+        return answer;
+    }
+    void* alert = msg0(msg0(cls("NSAlert"), "alloc"), "init");
+    msg1(alert, "setMessageText:", nsStr(title.data()));
+    msg1(alert, "setInformativeText:", nsStr(text.data()));
+    if (kind == MSGBOX_YESNO)
+    {
+        msg1(alert, "addButtonWithTitle:", nsStr("Yes"));
+        msg1(alert, "addButtonWithTitle:", nsStr("No"));
+    }
+    else
+    {
+        msg1(alert, "addButtonWithTitle:", nsStr("OK"));
+        if (kind == MSGBOX_OKCANCEL) msg1(alert, "addButtonWithTitle:", nsStr("Cancel"));
+    }
+    i64 r = msgGetI64(alert, "runModal");
+    msg0(alert, "release");
+    return r == (i64)1000 ? 1 : 0;
+}
+
+string nativeSelectFolder()
+{
+    if (_uiTestFolderAnswers.count() > 0)
+    {
+        string path = "" + _uiTestFolderAnswers.get(0);
+        _uiTestFolderAnswers.removeAt(0);
+        return path;
+    }
+    void* panel = msg0(cls("NSOpenPanel"), "openPanel");
+    msgBool(panel, "setCanChooseDirectories:", true);
+    msgBool(panel, "setCanChooseFiles:", false);
+    msgBool(panel, "setAllowsMultipleSelection:", false);
     i64 r = msgGetI64(panel, "runModal");
     if (r != (i64)1) return "";
     void* url = msg0(panel, "URL");

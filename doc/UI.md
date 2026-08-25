@@ -128,10 +128,10 @@ One interface per element class, and two shared parents hoisted out of them, so 
 IElement
   +- ITooltipped  { string tooltip; }
   |    +- IDisableable { bool disabled; }
-  |    |    +- IButton, ITextInput, ICheckbox, ISlider, ITextArea,
+  |    |    +- IButton, ITextInput, ICheckbox, ISlider, ISpinner, ILink, ITextArea,
   |    |       IRadioButton, IComboBox, IListView, ITabControl, ITreeView
   |    +- IText, IProgressBar, IImage, IGroupBox, ICanvasView
-  +- IView, IBox, IStatusBar, IScrollView, IRadioGroup, ITabPane, ISplitView
+  +- IToolBar, IView, IBox, IStatusBar, IScrollView, IRadioGroup, ITabPane, ISplitView
 ```
 
 A derived interface converts IMPLICITLY to any ancestor (assignment, call argument,
@@ -153,10 +153,15 @@ same fields.
 | `Text` | `ELEM_TEXT` | text leaf | `string text` |
 | `Button` | `ELEM_BUTTON` | pressable leaf | `string title`, `Lambda<void()> onPress`, `bool disabled` |
 | `Box` | `ELEM_BOX` | bordered sized container | `Style style`, `children` |
-| `TextInput` | `ELEM_TEXTINPUT` | controlled text field | `string value`, `Lambda<void(string)> onChangeText`, `int width`, `bool disabled` |
+| `TextInput` | `ELEM_TEXTINPUT` | controlled text field | `string value`, `string placeholder`, `bool password`, `Lambda<void(string)> onChangeText`, `int width`, `bool disabled` |
 | `Checkbox` | `ELEM_CHECKBOX` | controlled on/off toggle | `string label`, `bool checked`, `Lambda<void(bool)> onChange`, `bool disabled` |
-| `ProgressBar` | `ELEM_PROGRESS` | presentational fill bar | `int value` (0..100), `int width` |
+| `ProgressBar` | `ELEM_PROGRESS` | presentational fill bar | `int value` (0..100), `bool indeterminate`, `int width` |
 | `Slider` | `ELEM_SLIDER` | controlled value via click/drag/arrows | `int value` (0..100), `int width`, `Lambda<void(int)> onChange`, `bool disabled` |
+| `Spinner` | `ELEM_SPINNER` | bounded numeric up-down | `value`, `minValue`, `maxValue`, `step`, `onChange`, `disabled` |
+| `Link` | `ELEM_LINK` | hyperlink-style pressable label | `string text`, `onClick`, `disabled` |
+| `ToolBar` | `ELEM_TOOLBAR` | horizontal text commands and separators | `labels`, `cmds`, `tips`, `enabled`, `onCommand` |
+
+`ToolBar` v1 is text-only; icon items are a documented follow-up.
 | `TextArea` | `ELEM_TEXTAREA` | multiline text region (editor) | `string value` (push), `Lambda<void()> onChange` (dirty notify), `int width/height` |
 | `StatusBar` | `ELEM_STATUSBAR` | bottom strip of text panes (app shell) | `list<string> parts` (pane text) |
 | `RadioGroup` | `ELEM_RADIOGROUP` | controlled single-choice group (container) | `int value` (selected index), `onChange`, `RadioButton` children |
@@ -175,7 +180,7 @@ same fields.
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
 **`tooltip` prop (v12):** every mappable element (`Text`/`Button`/`Box`/`TextInput`/
-`Checkbox`/`ProgressBar`/`Slider`/`TextArea`/`RadioButton`/`ComboBox`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
+`Checkbox`/`ProgressBar`/`Slider`/`Spinner`/`Link`/`ToolBar`/`TextArea`/`RadioButton`/`ComboBox`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
 A native host attaches it to the OS control (Win32 `tooltips_class32`, Cocoa `setToolTip:`);
 ICanvas hosts ignore it. Use a string literal (a bare `string` field does not auto-free).
 
@@ -426,6 +431,9 @@ move ITextInput   textInput(string value, Lambda<void(string)> onChangeText);
 move ICheckbox    checkbox(string label, bool checked, Lambda<void(bool)> onChange);
 move IProgressBar progressBar(int value, int width);
 move ISlider      slider(int value, int width, Lambda<void(int)> onChange);
+move ISpinner     spinner(int value, int minValue, int maxValue, Lambda<void(int)> onChange);
+move ILink        link(string text, Lambda<void()> onClick);
+move IToolBar     toolbar(Lambda<void(int)> onCommand);
 move ITextArea    textArea(string value, Lambda<void()> onChange);
 move IStatusBar   statusBar(string mainText);   // add more panes with .addPart(s)
 move IRadioGroup  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
@@ -469,6 +477,12 @@ makes it ignore input and drop out of the Tab focus ring.
   the component updates state + `invalidate()`, so the next render flows the new
   value back. A focused field inserts printable keys, deletes on `KEY_BACKSPACE`,
   and paints a trailing `_` caret. The per-keystroke buffer is an owning `string`.
+  `placeholder` is shown while `value` is empty. `password` uses a secure Cocoa
+  field and an `ES_PASSWORD` Win32 edit style, and is creation-time on those hosts;
+  changing it requires replacing the node/control. WinUI currently remains a TextBox
+  until generated PasswordBox bindings are added.
+- **ProgressBar.indeterminate** maps to Cocoa's spinning indicator, Win32 marquee
+  mode, and WinUI `IsIndeterminate`; it can be toggled live.
 - **ScrollView** lays its children in a tall virtual column shifted by `scrollY`
   and paints them clipped to its viewport via `pushClip`/`popClip`. A focused
   ScrollView scrolls on Up/Down. Scrolling changes layout but not the tree, so it
@@ -1115,6 +1129,15 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   accelerators like `"Ctrl+S"` / `"F3"`).
 - **Dialogs:** `nativeOpenFile()` / `nativeSaveFile()` (shell file dialogs),
   `nativeConfirm(title, text)` (Yes/No/Cancel -> 1/0/-1), `nativeInfo(title, text)`.
+
+### Dialogs
+
+Native hosts expose `nativeMessageBox(title, text, kind)` and `nativeSelectFolder()`.
+`kind` is `MSGBOX_OK`, `MSGBOX_OKCANCEL`, or `MSGBOX_YESNO`; the message box returns
+1 for OK/Yes and 0 for Cancel/No. Folder selection returns a path or `""` when cancelled.
+Cocoa and Win32 implement both; WinUI does not. Headless tests script the next answers
+without opening a dialog with `uiTestScriptMessageBox(answer)` and
+`uiTestScriptFolder(path)`.
 - **Windowing:** `setCloseQuery(Lambda<bool()>)` vetoes window close (dirty-save
   prompt); `showSecondaryWindow(title, message)` opens a read-only second top-level
   window; `openAppWindow(new App(), title)` opens a full second app window (v12);
@@ -1206,7 +1229,11 @@ drivers read their answers back out of the control - an empty control cannot pas
 | Checkbox     | Y BUTTON checkbox         | Y NSButton                | Y CheckBox                          |
 | RadioGroup   | Y BS_AUTORADIOBUTTON      | Y NSButton radio          | Y RadioButton (controlled via model)|
 | ProgressBar  | Y msctls_progress32       | Y NSProgressIndicator     | Y ProgressBar (IRangeBase)          |
+| dialogs      | Y                         | Y                         | N                                   |
 | Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
+| Spinner      | Y EDIT + msctls_updown32 | Y NSTextField + NSStepper | Y NumberBox                         |
+| Link         | Y SysLink                | Y NSButton                | Y HyperlinkButton (driver-only event) |
+| ToolBar      | Y ToolbarWindow32        | Y flat NSView buttons     | Y StackPanel buttons (driver-only event) |
 | ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
 | ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
 | GridView     | cell realization (wheel)  | cell realization (wheel)  | cell realization (keyboard) |
@@ -1282,7 +1309,9 @@ Handlers follow one principled convention (React-Native-derived), frozen for rel
 | Handler | On which nodes | Fires when |
 |---------|----------------|------------|
 | `onPress` | `Button` | pressed/activated |
-| `onChange` | `Checkbox`, `Slider`, `RadioGroup`, `ComboBox`, `TextArea` | the controlled scalar VALUE changed |
+| `onChange` | `Checkbox`, `Slider`, `Spinner`, `RadioGroup`, `ComboBox`, `TextArea` | the controlled scalar VALUE changed |
+| `onClick` | `Link` | the link label was activated |
+| `onCommand` | `ToolBar` | a toolbar button command was activated |
 | `onChangeText` | `TextInput` | the text value changed (RN's `TextInput.onChangeText` name) |
 | `onSelect` / `onActivate` | `ListView`, `GridView`, `TreeView` | selection changed / row double-click-or-Enter |
 | `onSelectTab` | `TabControl` | the active tab changed |
@@ -1360,7 +1389,7 @@ exact signatures):
 | Group | Methods |
 |-------|---------|
 | Launch | `launch(new App(), wCells, hCells)`, `pump()` (re-render + drain posted work) |
-| Actions | `click`, `type`, `setText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
+| Actions | `click`, `type`, `setText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `spinnerSet`, `linkClick`, `toolbarClick`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
 | Readers | `controlText`, `isChecked`, `isEnabled`/`isDisabled`, `comboSelected`, `listRowCount`, `listSelectedRow`, `listCellText`, `progressValue`, `statusText`, `bounds`, `accessibleName`, `focusedKey`, `tabCount`/`tabSelected`, `tooltipCount`, `exists(key)`, `hostIsDark()` |
 | Asserts | `expectTrue`/`expectFalse`, `expectBool`, `expectInt`, `expectStr`, `expectText(name, key, want)`, `requireTrue(name, cond)` |
 | Wait | `waitUntil(pred, timeoutMs)` - see the rule below |

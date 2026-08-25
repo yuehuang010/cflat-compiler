@@ -1266,6 +1266,9 @@ int ELEM_GROUPBOX   = 22;   // titled group frame; container, native-mapped
 int ELEM_CANVAS     = 23;   // app-painted canvas child; paint callback via ICanvas
 int ELEM_GRID       = 24;   // track-layout container; pure layout, not native-mapped
 int ELEM_GRIDVIEW   = 25;   // virtualized item grid; cells realized on demand
+int ELEM_SPINNER    = 26;   // numeric up-down control
+int ELEM_LINK       = 27;   // hyperlink-style pressable label
+int ELEM_TOOLBAR    = 28;   // text buttons and separators
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -1385,6 +1388,7 @@ interface ITextInput : IDisableable
 {
     string value;
     string placeholder;
+    bool   password;
     int    width;
     Color  color;
     Color  backgroundColor;
@@ -1402,6 +1406,7 @@ interface ICheckbox : IDisableable
 interface IProgressBar : ITooltipped
 {
     int value;
+    bool indeterminate;
     int width;
     Color color;
 };
@@ -1411,6 +1416,32 @@ interface ISlider : IDisableable
     int  value;
     int  width;
     void fireSet(int v);
+};
+
+interface ISpinner : IDisableable
+{
+    int value;
+    int minValue;
+    int maxValue;
+    int step;
+    void fireSet(int v);
+};
+
+interface ILink : IDisableable
+{
+    string text;
+    void fireClick();
+};
+
+interface IToolBar : ITooltipped
+{
+    list<string> labels;
+    list<int> cmds;
+    list<string> tips;
+    list<bool> enabled;
+    void addButton(string label, int cmd);
+    void addSeparator();
+    void fireCommand(int cmd);
 };
 
 interface ITextArea : IDisableable
@@ -2787,6 +2818,7 @@ class TextInput : ITextInput
     Style style = default;
     string value       = default;
     string placeholder = default;
+    bool password = false;
     Lambda<void(string)> onChangeText = default;
     int    width  = 0;          // 0 -> sized to content
     Color  color = default;         // text ink
@@ -2800,7 +2832,10 @@ class TextInput : ITextInput
 
     move string toJson()
     {
-        return "{\"type\":\"TextInput\",\"value\":\"" + this.value + "\"}";
+        string out = "{\"type\":\"TextInput\",\"value\":\"" + this.value + "\"";
+        if (this.placeholder != "") out = out + ",\"placeholder\":\"" + this.placeholder + "\"";
+        if (this.password) out = out + ",\"password\":true";
+        return out + "}";
     }
 
     Size layout(LayoutConstraints c)
@@ -2894,7 +2929,8 @@ class TextInput : ITextInput
     bool propsEqual(IElement other)
     {
         ITextInput o = other as ITextInput;
-        return o != nullptr && this.value == o.value && this.disabled == o.disabled
+        return o != nullptr && this.value == o.value && this.placeholder == o.placeholder
+            && this.password == o.password && this.disabled == o.disabled
             && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
@@ -3011,6 +3047,7 @@ class ProgressBar : IProgressBar
 {
     Style style = default;
     int    value = 0;          // 0..100
+    bool   indeterminate = false;
     int    width = 20;         // cells
     Color  color = default;    // fill override; unset = theme accent
     string tooltip = default;  // native hover tooltip; "" = none
@@ -3021,7 +3058,9 @@ class ProgressBar : IProgressBar
 
     move string toJson()
     {
-        return "{\"type\":\"ProgressBar\",\"value\":" + this.value.toString() + "}";
+        string out = "{\"type\":\"ProgressBar\",\"value\":" + this.value.toString();
+        if (this.indeterminate) out = out + ",\"indeterminate\":true";
+        return out + "}";
     }
 
     Size layout(LayoutConstraints c)
@@ -3064,7 +3103,8 @@ class ProgressBar : IProgressBar
     bool propsEqual(IElement other)
     {
         IProgressBar o = other as IProgressBar;
-        return o != nullptr && this.value == o.value && this.width == o.width
+        return o != nullptr && this.value == o.value && this.indeterminate == o.indeterminate
+            && this.width == o.width
             && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
@@ -3190,6 +3230,180 @@ class Slider : ISlider
         ISlider o = other as ISlider;
         return o != nullptr && this.value == o.value && this.disabled == o.disabled
             && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- Spinner: a bounded integer value with a stepper and editable value field.
+class Spinner : ISpinner
+{
+    Style style = default;
+    int value = 0;
+    int minValue = 0;
+    int maxValue = 100;
+    int step = 1;
+    bool disabled = false;
+    Lambda<void(int)> onChange = default;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireSet(int v)
+    {
+        int lo = this.minValue; int hi = this.maxValue;
+        if (hi < lo) { int t = lo; lo = hi; hi = t; }
+        if (v < lo) v = lo; if (v > hi) v = hi;
+        int st = this.step; if (st < 1) st = 1;
+        if (v >= lo) v = lo + ((v - lo) / st) * st;
+        if (v < lo) v = lo; if (v > hi) v = hi;
+        if (this.onChange != nullptr) this.onChange(v);
+    }
+    move string toJson() { return "{\"type\":\"Spinner\",\"value\":" + this.value.toString() + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = 12; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        cv.drawText(this.bounds.x, this.bounds.y, this.value.toString().data(), ink);
+        if (this.bounds.w > 3) cv.drawText(this.bounds.x + this.bounds.w - 3, this.bounds.y, "^v", ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (this.disabled) return false;
+        if (e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); this.fireSet(this.value + this.step); return true; }
+        if (e.kind == EV_KEY && ctx.hasFocus(this.key))
+        {
+            if (e.key == KEY_UP) { this.fireSet(this.value + this.step); return true; }
+            if (e.key == KEY_DOWN) { this.fireSet(this.value - this.step); return true; }
+        }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_SPINNER; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        ISpinner o = other as ISpinner;
+        return o != nullptr && this.value == o.value && this.minValue == o.minValue
+            && this.maxValue == o.maxValue && this.step == o.step && this.disabled == o.disabled
+            && this.tooltip == o.tooltip
+            && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+class Link : ILink
+{
+    Style style = default;
+    string text = default;
+    bool disabled = false;
+    Lambda<void()> onClick = default;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireClick() { if (!this.disabled && this.onClick != nullptr) this.onClick(); }
+    move string toJson() { return "{\"type\":\"Link\",\"text\":\"" + this.text + "\"}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = (int)this.text.length() + 1; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_ACCENT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink); cv.drawText(this.bounds.x, this.bounds.y, this.text.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (e.kind == EV_MOUSE_DOWN && !this.disabled && this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); this.fireClick(); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_LINK; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        ILink o = other as ILink;
+        return o != nullptr && this.text == o.text && this.disabled == o.disabled && this.tooltip == o.tooltip
+            && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+class ToolBar : IToolBar
+{
+    Style style = default;
+    list<string> labels = default;
+    list<int> cmds = default;
+    list<string> tips = default;
+    list<bool> enabled = default;
+    Lambda<void(int)> onCommand = default;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void addButton(string label, int cmd) { this.labels.add("" + label); this.cmds.add(cmd); this.tips.add(""); this.enabled.add(true); }
+    void addSeparator() { this.labels.add(""); this.cmds.add(0); this.tips.add(""); this.enabled.add(true); }
+    void fireCommand(int cmd) { if (this.onCommand != nullptr) this.onCommand(cmd); }
+    move string toJson() { return "{\"type\":\"ToolBar\",\"items\":" + this.labels.count().toString() + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = 0; int i = 0; while (i < this.labels.count()) { w = w + (this.labels.get(i) == "" ? 1 : (int)this.labels.get(i).length() + 4); i++; }
+        if (w < 1) w = 1; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        int x = this.bounds.x; int i = 0;
+        while (i < this.labels.count()) { string s = this.labels.get(i); if (s == "") s = "|"; else s = "[" + s + "]"; cv.drawText(x, this.bounds.y, s.data(), ink); x = x + (int)s.length() + 1; i++; }
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (e.kind != EV_MOUSE_DOWN || !this.bounds.contains(e.x, e.y)) return false;
+        int x = this.bounds.x; int i = 0;
+        while (i < this.labels.count()) { string s = this.labels.get(i); int w = s == "" ? 1 : (int)s.length() + 4; if (e.x < x + w) { if (s != "" && this.enabled.get(i)) this.fireCommand(this.cmds.get(i)); return true; } x = x + w + 1; i++; }
+        return true;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_TOOLBAR; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(IElement other)
+    {
+        IToolBar o = other as IToolBar;
+        if (o == nullptr || !styleEquals(this.style, o.style) || this.tooltip != o.tooltip) return false;
+        if (this.labels.count() != o.labels.count()) return false;
+        int i = 0; while (i < this.labels.count()) { if (this.labels.get(i) != o.labels.get(i) || this.cmds.get(i) != o.cmds.get(i) || this.tips.get(i) != o.tips.get(i) || this.enabled.get(i) != o.enabled.get(i)) return false; i++; }
+        return true;
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -3678,6 +3892,23 @@ move ISlider slider(int value, int width, Lambda<void(int)> onChange)
     s.width = width;
     s.onChange = onChange;
     return s;
+}
+
+move ISpinner spinner(int value, int minValue, int maxValue, Lambda<void(int)> onChange)
+{
+    Spinner* s = new Spinner();
+    s.value = value; s.minValue = minValue; s.maxValue = maxValue; s.onChange = onChange;
+    return s;
+}
+
+move ILink link(string text, Lambda<void()> onClick)
+{
+    Link* l = new Link(); l.text = text; l.onClick = onClick; return l;
+}
+
+move IToolBar toolbar(Lambda<void(int)> onCommand)
+{
+    ToolBar* t = new ToolBar(); t.onCommand = onCommand; return t;
 }
 
 move IScrollView scrollView(Style style)
@@ -6012,6 +6243,12 @@ move IElement mount(IComponent c, string key, IUiContext ctx)
 int PROP_CHECKED = 1;   // Checkbox/radio checked state
 int PROP_ENABLED = 2;   // control is interactive (vs disabled/dimmed)
 int PROP_VISIBLE = 3;   // control is shown
+int PROP_INDETERMINATE = 4; // ProgressBar marquee/spinning state
+
+// Dialog button kinds. nativeMessageBox returns 1 for the first button and 0 otherwise.
+int MSGBOX_OK = 0;
+int MSGBOX_OKCANCEL = 1;
+int MSGBOX_YESNO = 2;
 
 // Integer control properties (setIntProp).
 int PROP_VALUE   = 1;   // ProgressBar/Slider position (0..100)
@@ -6082,7 +6319,8 @@ interface INativeHost
     // Create a control of the given ELEM_* kind under `parentHandle` (0 = the
     // window's client area). `key` is the node's stable key path, for the host's
     // own reverse map (handle -> key) used to route events. Returns the handle.
-    u64  createControl(int elemKind, u64 parentHandle, string key);
+    u64  createControl(int elemKind, u64 parentHandle, string key,
+                       bool password, bool indeterminate);
     void destroyControl(u64 h);
 
     // Geometry + content, all property-style so they map to XAML setters later.

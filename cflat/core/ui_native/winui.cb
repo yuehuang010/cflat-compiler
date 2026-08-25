@@ -78,6 +78,8 @@ using XamlTabViewItem              = Microsoft.UI.Xaml.Controls.ITabViewItem;
 using XamlTabViewItemFactory       = Microsoft.UI.Xaml.Controls.ITabViewItemFactory;
 using XamlTextBlock                = Microsoft.UI.Xaml.Controls.ITextBlock;
 using XamlTextBox                  = Microsoft.UI.Xaml.Controls.ITextBox;
+using XamlNumberBox                = Microsoft.UI.Xaml.Controls.INumberBox;
+using XamlProgressBar              = Microsoft.UI.Xaml.Controls.IProgressBar;
 using XamlTreeView                 = Microsoft.UI.Xaml.Controls.ITreeView;
 using XamlTreeView2                = Microsoft.UI.Xaml.Controls.ITreeView2;
 using XamlTreeView3                = Microsoft.UI.Xaml.Controls.ITreeView3;
@@ -1181,6 +1183,7 @@ bool winuiMappable(int kind)
 {
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -2207,7 +2210,8 @@ class WinUI3Host : INativeHost
     }
 
     // -- INativeHost: create a XAML control for elemKind ------------------------
-    u64 createControl(int elemKind, u64 parentHandle, string key)
+    u64 createControl(int elemKind, u64 parentHandle, string key,
+                      bool password, bool indeterminate)
     {
         void* insp = nullptr;
         if (elemKind == ELEM_PROGRESS)
@@ -2222,9 +2226,16 @@ class WinUI3Host : INativeHost
             if (elemKind == ELEM_BUTTON)         cls = "Microsoft.UI.Xaml.Controls.Button";
             else if (elemKind == ELEM_CHECKBOX)  cls = "Microsoft.UI.Xaml.Controls.CheckBox";
             else if (elemKind == ELEM_RADIO)     cls = "Microsoft.UI.Xaml.Controls.RadioButton";
-            else if (elemKind == ELEM_TEXTINPUT) cls = "Microsoft.UI.Xaml.Controls.TextBox";
+            else if (elemKind == ELEM_TEXTINPUT)
+            {
+                // TODO: use PasswordBox when the generated PasswordBox bindings are added.
+                cls = "Microsoft.UI.Xaml.Controls.TextBox";
+            }
             else if (elemKind == ELEM_TEXTAREA)  cls = "Microsoft.UI.Xaml.Controls.TextBox";
             else if (elemKind == ELEM_SLIDER)    cls = "Microsoft.UI.Xaml.Controls.Slider";
+            else if (elemKind == ELEM_SPINNER)   cls = "Microsoft.UI.Xaml.Controls.NumberBox";
+            else if (elemKind == ELEM_LINK)      cls = "Microsoft.UI.Xaml.Controls.HyperlinkButton";
+            else if (elemKind == ELEM_TOOLBAR)   cls = "Microsoft.UI.Xaml.Controls.StackPanel";
             else if (elemKind == ELEM_COMBO)     cls = "Microsoft.UI.Xaml.Controls.ComboBox";
             else if (elemKind == ELEM_LIST)      cls = "Microsoft.UI.Xaml.Controls.ListView";
             else if (elemKind == ELEM_IMAGE)     cls = "Microsoft.UI.Xaml.Controls.Image";
@@ -2495,6 +2506,29 @@ class WinUI3Host : INativeHost
         if (cc != nullptr) ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, boxString((string)s));
     }
 
+    void _syncToolbar(u64 h, IToolBar t)
+    {
+        void* panel = wqi((void*)h, iidof(XamlPanel)); if (panel == nullptr) return;
+        void* children = nullptr; ((XamlPanel*)panel)->lpVtbl->get_Children(panel, &children);
+        if (children != nullptr) ((XamlUIElementVector*)children)->lpVtbl->Clear(children);
+        int i = 0;
+        while (i < t.labels.count())
+        {
+            string label = t.labels.get(i); string cls = label == "" ? "Microsoft.UI.Xaml.Controls.TextBlock" : "Microsoft.UI.Xaml.Controls.Button";
+            void* raw = nullptr; RoActivateInstance(hstring(cls), &raw);
+            if (raw != nullptr && label != "")
+            {
+                void* cc = wqi(raw, iidof(XamlContentControl)); if (cc != nullptr) { ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, boxString(label)); wrelease(cc); }
+                void* ctl = wqi(raw, iidof(XamlControl)); if (ctl != nullptr) { ((XamlControl*)ctl)->lpVtbl->put_IsEnabled(ctl, t.enabled.get(i)); wrelease(ctl); }
+            }
+            else if (raw != nullptr) setText((u64)raw, "|");
+            void* elem = raw != nullptr ? wqi(raw, iidof(XamlUIElement)) : nullptr;
+            if (children != nullptr && elem != nullptr) ((XamlUIElementVector*)children)->lpVtbl->Append(children, elem);
+            wrelease(elem); wrelease(raw); i++;
+        }
+        wrelease(children); wrelease(panel);
+    }
+
     void setBoolProp(u64 h, int prop, bool v)
     {
         if (prop == PROP_CHECKED)
@@ -2511,6 +2545,11 @@ class WinUI3Host : INativeHost
         {
             void* elem = wqi((void*)h, iidof(XamlUIElement));
             if (elem != nullptr) ((XamlUIElement*)elem)->lpVtbl->put_Visibility(elem, v ? 0 : 1);
+        }
+        else if (prop == PROP_INDETERMINATE)
+        {
+            void* pb = wqi((void*)h, iidof(XamlProgressBar));
+            if (pb != nullptr) ((XamlProgressBar*)pb)->lpVtbl->put_IsIndeterminate(pb, v);
         }
     }
 
@@ -2836,7 +2875,19 @@ class WinUI3Host : INativeHost
             u64 h = ctx.nativeHandle(path);
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), 0u, path);
+                bool password = false;
+                bool indeterminate = false;
+                if (node.kind() == ELEM_TEXTINPUT)
+                {
+                    ITextInput ti = node as ITextInput;
+                    password = ti.password;
+                }
+                else if (node.kind() == ELEM_PROGRESS)
+                {
+                    IProgressBar p = node as IProgressBar;
+                    indeterminate = p.indeterminate;
+                }
+                h = this.createControl(node.kind(), 0u, path, password, indeterminate);
                 ctx.setNativeHandle(path, h);
                 this._firstMount(node, h);
             }
@@ -2993,6 +3044,8 @@ class WinUI3Host : INativeHost
         {
             ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
+            void* tx = wqi((void*)h, iidof(XamlTextBox));
+            if (tx != nullptr) ((XamlTextBox*)tx)->lpVtbl->put_PlaceholderText(tx, hstring(ti.placeholder));
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
@@ -3007,6 +3060,7 @@ class WinUI3Host : INativeHost
             IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
+            this.setBoolProp(h, PROP_INDETERMINATE, p.indeterminate);
         }
         else if (k == ELEM_SLIDER)
         {
@@ -3014,6 +3068,29 @@ class WinUI3Host : INativeHost
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_SPINNER)
+        {
+            ISpinner s = node as ISpinner; void* nb = wqi((void*)h, iidof(XamlNumberBox));
+            if (nb != nullptr)
+            {
+                ((XamlNumberBox*)nb)->lpVtbl->put_Minimum(nb, (double)s.minValue);
+                ((XamlNumberBox*)nb)->lpVtbl->put_Maximum(nb, (double)s.maxValue);
+                ((XamlNumberBox*)nb)->lpVtbl->put_Value(nb, (double)s.value);
+                ((XamlNumberBox*)nb)->lpVtbl->put_SpinButtonPlacementMode(nb, 2);
+                wrelease(nb);
+            }
+            // TODO: NumberBox live ValueChanged wiring is not installed yet; the driver fires the model.
+            this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_LINK)
+        {
+            ILink l = node as ILink; this.setText(h, l.text.data()); this.setBoolProp(h, PROP_ENABLED, !l.disabled);
+            // TODO: HyperlinkButton live Click wiring is not installed yet; the driver fires the model.
+        }
+        else if (k == ELEM_TOOLBAR)
+        {
+            IToolBar t = node as IToolBar; this._syncToolbar(h, t);
         }
         else if (k == ELEM_TEXTAREA) { ITextArea ta = node as ITextArea; this.setBoolProp(h, PROP_ENABLED, !ta.disabled); }
         else if (k == ELEM_STATUSBAR)
@@ -4802,6 +4879,27 @@ void nativeSliderSet(string keyPath, int v)
     if (rb != nullptr) ((XamlRangeBase*)rb)->lpVtbl->put_Value(rb, (double)v);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { ISlider s = e as ISlider; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
+}
+void nativeSpinnerSet(string keyPath, int v)
+{
+    u64 h = _wCtx.nativeHandle(keyPath);
+    if (h != 0u)
+    {
+        void* nb = wqi((void*)h, iidof(XamlNumberBox));
+        if (nb != nullptr) { ((XamlNumberBox*)nb)->lpVtbl->put_Value(nb, (double)v); wrelease(nb); }
+    }
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { ISpinner s = e as ISpinner; if (s != nullptr) { s.fireSet(v); pumpWinui(); } }
+}
+void nativeLinkClick(string keyPath)
+{
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { ILink l = e as ILink; if (l != nullptr) { l.fireClick(); pumpWinui(); } }
+}
+void nativeToolbarClick(string keyPath, int cmd)
+{
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { IToolBar t = e as IToolBar; if (t != nullptr) { t.fireCommand(cmd); pumpWinui(); } }
 }
 bool nativeImageHasBitmap(string keyPath)
 {

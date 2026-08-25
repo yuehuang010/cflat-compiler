@@ -72,6 +72,7 @@ class GalleryApp : IComponent
     int gridScroll = 0;     // self-test controlled scroll offset
     int gridSelected = -1;  // forces the leaf replacement used by the self-test
     u64 iconRevision  = 1u;    // explicit content revision for same-identity replacement
+    int page          = 0;    // gallery page selection
     int tab           = 0;    // TabControl selection (P9)
     int treeSel       = 0 - 1; // selected tree node id (P9)
     int treeExpands   = 0;    // onExpand invocations (P9)
@@ -100,9 +101,15 @@ class GalleryApp : IComponent
     bool   dark       = false;   // theme toggle (light/dark)
     int    btnClicks  = 0;       // push-button press count
     string inputText  = default; // TextInput value
+    string passwordText = default;
     bool   checked    = false;   // Checkbox value
     int    progress   = 60;      // ProgressBar value (0..100)
     int    sliderVal  = 40;      // Slider value (0..100)
+    int    spinnerVal = 25;      // Spinner value (0..100, step 5)
+    int    linkClicks = 0;       // Link press count
+    int    toolbarCmd = 0;       // Last toolbar command
+    int    dialogAnswer = -1;    // Last message-box answer
+    string folderPath = default; // Last selected folder
     int    areaEdits  = 0;       // TextArea dirty-notify count
     int    timerOnce  = 0;
     int    timerTicks = 0;
@@ -227,91 +234,84 @@ class GalleryApp : IComponent
         return card;
     }
 
-    IElement render(IUiContext ctx)
+    move IView _pageBody()
     {
-        ctx.theme = this.dark ? darkTheme() : lightTheme();
+        IView body = column(makeStyle(1, 0, 0));
+        body.style.gap = 1;
+        body.setKey("page");
+        return move body;
+    }
 
-        // Lazily build the image pixels once (freed in the destructor). Sized to the
-        // Image element's displayed cell size (width={12} height={4} -> ~96x104pt on
-        // Cocoa; 96x48 is a reasonable buffer, not a 12x6 postage stamp).
-        if (this.imgPixels == 0u) { this.imgW = 96; this.imgH = 48; this.imgPixels = makeGradientPixels(96, 48); }
+    move IView _pageBasics(IUiContext ctx)
+    {
+        IView body = this._pageBody();
 
-        // Register the tree's context menu once (keyed by control path; idempotent).
-        if (!this._ctxReg)
-        {
-            nativeSetContextMenu("root/content/cardcontext/ctxbox", (u64)buildCtxMenu());
-            this._ctxReg = true;
-        }
-
-        // The whole gallery is one native ScrollView (fills the window: style.height 0)
-        // holding a single column of cards, one per control, so the reference stays a
-        // scrollable page regardless of how tall the full control set renders.
-        IScrollView root = scrollView(makeStyle(0, hostWidth(), 0));
-        root.setKey("root");
-
-        // Page margins: ~3-column inset on every side of the card column.
-        IView content = column(makeStyle(3, 0, 0));
-        content.style.gap = 1;
-        content.setKey("content");
-        root.add(content);
-
-        IText title = text("Widget Gallery");
-        title.setKey("title");
-        title.font = FONT_TITLE;
-        content.add(title);
-
-        // -- Buttons -------------------------------------------------------------------
-        // The two buttons sit side by side in a row, not stacked.
         IView cardBtn = this._card(ctx, "cardbtn", "Buttons",
                 "Fires onPress; supports accent style and disabled state.");
         IView btnRow = row(makeStyle(0, 0, 0));
         btnRow.style.gap = 1;
         btnRow.setKey("btnrow");
         IButton btn = <Button key="btn" title="Click me"
-                onPress={() => { this.btnClicks = this.btnClicks + 1; ctx.invalidate(); }}/>;
+                onPress={() => { this.btnClicks = this.btnClicks + 1; ctx.invalidate(); }}/>
+        ;
         btnRow.add(btn);
         IButton themeBtn = <Button key="themebtn" title="Toggle theme"
-                onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>;
+                onPress={() => { this.dark = !this.dark; ctx.invalidate(); }}/>
+        ;
         btnRow.add(themeBtn);
         cardBtn.add(btnRow);
-        content.add(cardBtn);
+        body.add(cardBtn);
 
-        // -- Image ---------------------------------------------------------------------
-        // An Image fed a procedural BGRA32 buffer through the setImageData seam.
-        IView cardImg = this._card(ctx, "cardimg", "Image",
-                "Displays a bitmap uploaded through the setImageData seam; no asset file needed.");
-        IImage img = <Image key="img" width={12} height={4} altText="gradient"/>;
-        img.pixels = this.imgPixels; img.pxW = this.imgW; img.pxH = this.imgH;
-        cardImg.add(img);
-        content.add(cardImg);
+        IView cardText = this._card(ctx, "cardtext", "Text / Labels",
+                "Text elements provide titles, captions, and form labels.");
+        IView labels = column(makeStyle(0, 0, 0));
+        labels.setKey("labels");
+        labels.style.gap = 0;
+        labels.add(<Text key="headline" text="A headline label"/>);
+        labels.add(<Text key="caption" text="A secondary caption label"/>);
+        cardText.add(labels);
+        body.add(cardText);
 
-        // -- ICanvas --------------------------------------------------------------------
-        // A CanvasView escape hatch: the app draws with the same ICanvas API the framework
-        // paints through (here, a tiny bar chart + a label) into a native child surface.
-        IView cardCanvas = this._card(ctx, "cardcanvas", "ICanvas",
-                "Escape hatch: draw directly with the ICanvas API into a native child surface.");
-        ICanvasView canvas = <CanvasView key="canvas" width={24} height={6}/>;
-        canvas.onPaint = (ICanvas c) => {
-            int barCount = 5;
-            int i = 0;
-            while (i < barCount)
-            {
-                Rect bar = default;
-                bar.x = 1 + i * 4; bar.w = 3;
-                bar.h = 1 + i; bar.y = 5 - bar.h;
-                c.drawRect(bar, true, rgb(60 + i * 30, 120, 220));
-                i++;
-            }
-            c.drawText(1, 5, "canvas", rgb(40, 40, 40));
-        };
-        cardCanvas.add(canvas);
-        content.add(cardCanvas);
+        IView cardCheck = this._card(ctx, "cardcheck", "Checkbox",
+                "Toggles a boolean; controlled through onChange.");
+        ICheckbox chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
+                onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>
+        ;
+        cardCheck.add(chk);
+        body.add(cardCheck);
 
-        // -- Text Input ------------------------------------------------------------------
-        // Controlled TextInput, form-row style: [label fixed 12][field flex 1]. The label's
-        // width is fixed so every form row below shares the same field start x - the flex
-        // View wrapper (not the TextInput itself, which stays content-sized) is what stretches
-        // with the window, per the "cursor advances by the flex share" contract in doc/UI.md.
+        IView cardRadio = this._card(ctx, "cardradio", "Radio Group",
+                "Mutually exclusive selection; controlled through onChange.");
+        IRadioGroup rg = <RadioGroup key="rg" value={this.pick}
+                onChange={(int i) => { this.pick = i; ctx.invalidate(); }}>
+            <RadioButton key="r0" label="Small"  index={0} checked={this.pick == 0}/>
+            <RadioButton key="r1" label="Medium" index={1} checked={this.pick == 1}/>
+            <RadioButton key="r2" label="Large"  index={2} checked={this.pick == 2}/>
+        </RadioGroup>;
+        cardRadio.add(rg);
+        body.add(cardRadio);
+
+        IView cardLink = this._card(ctx, "cardlink", "Link",
+                "Clickable text link with a disabled link below it.");
+        ILink demoLink = <Link key="link" text="Increment counter"
+                onClick={() => { this.linkClicks = this.linkClicks + 1; ctx.invalidate(); }}/>
+        ;
+        cardLink.add(demoLink);
+        ILink disabledLink = <Link key="disabled" text="Disabled link" disabled={true}
+                onClick={() => {}}/>
+        ;
+        cardLink.add(disabledLink);
+        IText linkCount = text("Clicks: " + this.linkClicks.toString());
+        linkCount.setKey("count");
+        cardLink.add(linkCount);
+        body.add(cardLink);
+        return move body;
+    }
+
+    move IView _pageInput(IUiContext ctx)
+    {
+        IView body = this._pageBody();
+
         IView cardInput = this._card(ctx, "cardinput", "Text Input",
                 "Single-line editable field; controlled through onChangeText.");
         IView inputRow = row(makeStyle(0, 0, 0));
@@ -324,83 +324,40 @@ class GalleryApp : IComponent
         inputField.setKey("inputfield");
         ITextInput input = <TextInput key="input" value={this.inputText} width={24}
                 placeholder="type here"
-                onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>;
+                onChangeText={(string s) => { this.inputText = s; ctx.invalidate(); }}/>
+        ;
         inputField.add(input);
         inputRow.add(inputField);
         cardInput.add(inputRow);
-        content.add(cardInput);
 
-        // -- Grid form ---------------------------------------------------------------------
-        // Track layout keeps the label column aligned across all rows while the field
-        // column absorbs the remaining card width.
-        IView cardGrid = this._card(ctx, "cardgrid", "Grid",
-                "track layout: auto label column + star field column");
-        IGrid formGrid = grid(2);
-        formGrid.setKey("grid");
-        formGrid.style.gap = 1;
-        formGrid.colStar(1, 1);
-        IText nameLabel = text("Name"); nameLabel.setKey("namelabel"); formGrid.add(nameLabel);
-        ITextInput nameInput = textInput("", (string s) => {}); nameInput.setKey("name"); formGrid.add(nameInput);
-        IText emailLabel = text("Email address"); emailLabel.setKey("emaillabel"); formGrid.add(emailLabel);
-        ITextInput emailInput = textInput("", (string s) => {}); emailInput.setKey("email"); formGrid.add(emailInput);
-        IText noteLabel = text("Note"); noteLabel.setKey("notelabel"); formGrid.add(noteLabel);
-        ITextInput noteInput = textInput("", (string s) => {}); noteInput.setKey("note"); formGrid.add(noteInput);
-        cardGrid.add(formGrid);
-        content.add(cardGrid);
+        IView passwordRow = row(makeStyle(0, 0, 0));
+        passwordRow.setKey("passwordrow");
+        IView passwordLabel = view(makeStyle(0, 12, 0));
+        passwordLabel.setKey("passwordlabel");
+        passwordLabel.add(text("Password:"));
+        passwordRow.add(passwordLabel);
+        IView passwordField = view(flexStyle(1));
+        passwordField.setKey("passwordfield");
+        ITextInput password = <TextInput key="password" value={this.passwordText} width={24}
+                placeholder="enter secret" password={true}
+                onChangeText={(string s) => { this.passwordText = s; ctx.invalidate(); }}/>
+        ;
+        passwordField.add(password);
+        passwordRow.add(passwordField);
+        cardInput.add(passwordRow);
+        IText passwordMirror = text("Password mirror: " + this.passwordText);
+        passwordMirror.setKey("passwordmirror");
+        cardInput.add(passwordMirror);
+        body.add(cardInput);
 
-        // -- Checkbox ----------------------------------------------------------------------
-        IView cardCheck = this._card(ctx, "cardcheck", "Checkbox",
-                "Toggles a boolean; controlled through onChange.");
-        ICheckbox chk = <Checkbox key="check" label="Enable feature" checked={this.checked}
-                onChange={(bool v) => { this.checked = v; ctx.invalidate(); }}/>;
-        cardCheck.add(chk);
-        content.add(cardCheck);
+        IView cardArea = this._card(ctx, "cardarea", "Text Area",
+                "Multiline editable text block; reports a dirty-notify count on change.");
+        ITextArea area = <TextArea key="area" value="" width={40} height={4}
+                onChange={() => { this.areaEdits = this.areaEdits + 1; }}/>
+        ;
+        cardArea.add(area);
+        body.add(cardArea);
 
-        // -- Progress Bar --------------------------------------------------------------------
-        IView cardProg = this._card(ctx, "cardprog", "Progress Bar",
-                "Presentational value indicator (0..100).");
-        IProgressBar prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
-        prog.tooltip = "download progress";   // also the control's accessible Name (P13 a11y)
-        cardProg.add(prog);
-        content.add(cardProg);
-
-        // -- Slider ----------------------------------------------------------------------
-        IView cardSlider = this._card(ctx, "cardslider", "Slider",
-                "Draggable numeric control; controlled through onChange.");
-        ISlider sld = <Slider key="slider" value={this.sliderVal} width={24}
-                onChange={(int v) => { this.sliderVal = v; ctx.invalidate(); }}/>;
-        cardSlider.add(sld);
-        content.add(cardSlider);
-
-        // -- Group Box ---------------------------------------------------------------------
-        // A GroupBox framing a couple of labels (classic-forms grouping).
-        IView cardGrp = this._card(ctx, "cardgrp", "Group Box",
-                "Frames related controls under a titled border.");
-        IGroupBox grp = <GroupBox key="grp" title="Options"/>;
-        grp.style.width = 30; grp.style.height = 4;
-        grp.add(<Text key="gt0" text="grouped item A"/>);
-        grp.add(<Text key="gt1" text="grouped item B"/>);
-        cardGrp.add(grp);
-        content.add(cardGrp);
-
-        // -- Radio Group ---------------------------------------------------------------------
-        // RadioGroup authored in sugar (controlled: each radio's checked flows down).
-        IView cardRadio = this._card(ctx, "cardradio", "Radio Group",
-                "Mutually exclusive selection; controlled through onChange.");
-        IRadioGroup rg = <RadioGroup key="rg" value={this.pick}
-                onChange={(int i) => { this.pick = i; ctx.invalidate(); }}>
-            <RadioButton key="r0" label="Small"  index={0} checked={this.pick == 0}/>
-            <RadioButton key="r1" label="Medium" index={1} checked={this.pick == 1}/>
-            <RadioButton key="r2" label="Large"  index={2} checked={this.pick == 2}/>
-        </RadioGroup>;
-        cardRadio.add(rg);
-        content.add(cardRadio);
-
-        // -- Combo Box ---------------------------------------------------------------------
-        // ComboBox authored in sugar; items added imperatively (a list-valued field is
-        // not set through a sugar attribute - the container-copy-into-field rule). Same
-        // [label fixed 12][field flex 1] form-row idiom as the TextInput above, so the
-        // two fields' flex-View slots align in a column (asserted below).
         IView cardCombo = this._card(ctx, "cardcombo", "Combo Box",
                 "Dropdown single-selection list; controlled through onChange.");
         IView comboRow = row(makeStyle(0, 0, 0));
@@ -412,26 +369,64 @@ class GalleryApp : IComponent
         IView comboField = view(flexStyle(1));
         comboField.setKey("combofield");
         IComboBox cb = <ComboBox key="combo" selectedIndex={this.fontIdx} width={20}
-                onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>;
-        cb.addItem("Consolas");
-        cb.addItem("Cascadia Code");
-        cb.addItem("Segoe UI");
-        cb.addItem("Courier New");
+                onChange={(int i) => { this.fontIdx = i; ctx.invalidate(); }}/>
+        ;
+        cb.addItem("Consolas"); cb.addItem("Cascadia Code");
+        cb.addItem("Segoe UI"); cb.addItem("Courier New");
         comboField.add(cb);
         comboRow.add(comboField);
         cardCombo.add(comboRow);
-        content.add(cardCombo);
+        body.add(cardCombo);
 
-        // -- List View ---------------------------------------------------------------------
-        // Virtualized ListView authored in sugar; columns + rowText set imperatively.
+        IView cardSlider = this._card(ctx, "cardslider", "Slider",
+                "Draggable numeric control; controlled through onChange.");
+        ISlider sld = <Slider key="slider" value={this.sliderVal} width={24}
+                onChange={(int v) => { this.sliderVal = v; ctx.invalidate(); }}/>
+        ;
+        cardSlider.add(sld);
+        body.add(cardSlider);
+
+        IView cardSpinner = this._card(ctx, "cardspinner", "Spinner",
+                "Bounded numeric stepper; demonstrates min, max, and step.");
+        ISpinner spin = spinner(this.spinnerVal, 0, 100, (int v) => {
+            this.spinnerVal = v; ctx.invalidate();
+        });
+        spin.setKey("spinner");
+        spin.step = 5;
+        cardSpinner.add(spin);
+        IText spinnerMirror = text("Value: " + this.spinnerVal.toString());
+        spinnerMirror.setKey("value");
+        cardSpinner.add(spinnerMirror);
+        body.add(cardSpinner);
+
+        IView cardProg = this._card(ctx, "cardprog", "Progress Bar",
+                "Presentational value indicator (0..100).");
+        IProgressBar prog = <ProgressBar key="prog" value={this.progress} width={24}/>;
+        prog.tooltip = "download progress";
+        IProgressBar busyProg = <ProgressBar key="indeterminate" value={0} width={24}
+                indeterminate={true}/>;
+        IView progressRow = row(makeStyle(0, 0, 0));
+        progressRow.setKey("progressrow");
+        progressRow.style.gap = 1;
+        progressRow.add(prog);
+        progressRow.add(busyProg);
+        cardProg.add(progressRow);
+        body.add(cardProg);
+        return move body;
+    }
+
+    move IView _pageData(IUiContext ctx)
+    {
+        IView body = this._pageBody();
+
         IView cardList = this._card(ctx, "cardlist", "List View",
                 "Virtualized multi-column list; handles 100k rows with few rowText calls.");
         IListView lv = <ListView key="list" rowCount={GALLERY_ROWS}
                 selectedIndex={this.listSel} width={40} height={6}
                 onSelect={(int r) => { this.listSel = r; ctx.invalidate(); }}
-                onActivate={(int r) => { this.listActivated = r; ctx.invalidate(); }}/>;
-        lv.addColumn("Index", 12);
-        lv.addColumn("Square", 18);
+                onActivate={(int r) => { this.listActivated = r; ctx.invalidate(); }}/>
+        ;
+        lv.addColumn("Index", 12); lv.addColumn("Square", 18);
         lv.rowText = (int r, int c) => {
             this.rowTextCalls = this.rowTextCalls + 1;
             if (c == 0) return "row " + r.toString();
@@ -446,38 +441,22 @@ class GalleryApp : IComponent
         };
         lv.onHeaderClick = (int c) => { this.listHeader = c; ctx.invalidate(); };
         cardList.add(lv);
-        content.add(cardList);
+        body.add(cardList);
 
-        // -- GridView -------------------------------------------------------------------------
         IView cardGridView = this._card(ctx, "cardgridview", "GridView",
                 "Virtualized item grid - 10000 cells, bounded pool.");
         cardGridView.add(this._galleryGrid());
-        content.add(cardGridView);
+        body.add(cardGridView);
 
-        // -- Tab Control ---------------------------------------------------------------------
-        // TabControl authored in sugar (P9): keyed panes, only the active one maps to
-        // native. Switching tabs is controlled through onSelectTab.
-        IView cardTabs = this._card(ctx, "cardtabs", "Tab Control",
-                "Switches between keyed panes; only the active pane maps to native.");
-        ITabControl tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
-                onSelectTab={(int i) => { this.tab = i; ctx.invalidate(); }}>
-            <TabPane key="p0" title="Alpha"><Text key="t0" text="Alpha pane content"/></TabPane>
-            <TabPane key="p1" title="Beta"><Text key="t1" text="Beta pane content"/></TabPane>
-        </TabControl>;
-        cardTabs.add(tabs);
-        content.add(cardTabs);
-
-        // -- Tree View ---------------------------------------------------------------------
-        // TreeView authored in sugar (P9): expand-on-demand node source. onSelect/onExpand
-        // are attributes; the child/label callbacks are assigned imperatively (like rowText).
         IView cardTree = this._card(ctx, "cardtree", "Tree View",
                 "Lazy-expanding hierarchical list; children are fetched on demand.");
         ITreeView tree = <TreeView key="tree" width={24} height={6} selectedNode={this.treeSel}
                 onSelect={(int nid) => { this.treeSel = nid; ctx.invalidate(); }}
-                onExpand={(int nid) => { this.treeExpands = this.treeExpands + 1; }}/>;
+                onExpand={(int nid) => { this.treeExpands = this.treeExpands + 1; }}/>
+        ;
         tree.childCount = (int nid) => {
-            if (nid == TREE_ROOT) return 2;   // src (folder) + notes.txt
-            if (nid == 1) return 2;           // main.cb + ui.cb
+            if (nid == TREE_ROOT) return 2;
+            if (nid == 1) return 2;
             return 0;
         };
         tree.childId = (int nid, int i) => {
@@ -493,10 +472,34 @@ class GalleryApp : IComponent
             return "?";
         };
         cardTree.add(tree);
-        content.add(cardTree);
+        body.add(cardTree);
+        return move body;
+    }
 
-        // -- Split View ---------------------------------------------------------------------
-        // SplitView authored in sugar (P9): two weighted panes + a draggable divider.
+    move IView _pageLayout(IUiContext ctx)
+    {
+        IView body = this._pageBody();
+
+        IView cardGrid = this._card(ctx, "cardgrid", "Grid",
+                "track layout: auto label column + star field column");
+        IGrid formGrid = grid(2);
+        formGrid.setKey("grid"); formGrid.style.gap = 1; formGrid.colStar(1, 1);
+        IText nameLabel = text("Name"); nameLabel.setKey("namelabel"); formGrid.add(nameLabel);
+        ITextInput nameInput = textInput("", (string s) => {}); nameInput.setKey("name"); formGrid.add(nameInput);
+        IText emailLabel = text("Email address"); emailLabel.setKey("emaillabel"); formGrid.add(emailLabel);
+        ITextInput emailInput = textInput("", (string s) => {}); emailInput.setKey("email"); formGrid.add(emailInput);
+        IText noteLabel = text("Note"); noteLabel.setKey("notelabel"); formGrid.add(noteLabel);
+        ITextInput noteInput = textInput("", (string s) => {}); noteInput.setKey("note"); formGrid.add(noteInput);
+        cardGrid.add(formGrid); body.add(cardGrid);
+
+        IView cardGrp = this._card(ctx, "cardgrp", "Group Box",
+                "Frames related controls under a titled border.");
+        IGroupBox grp = <GroupBox key="grp" title="Options"/>;
+        grp.style.width = 30; grp.style.height = 4;
+        grp.add(<Text key="gt0" text="grouped item A"/>);
+        grp.add(<Text key="gt1" text="grouped item B"/>);
+        cardGrp.add(grp); body.add(cardGrp);
+
         IView cardSplit = this._card(ctx, "cardsplit", "Split View",
                 "Two resizable panes divided by a draggable splitter.");
         ISplitView split = <SplitView key="split" ratio={this.splitRatio} vertical={true}
@@ -505,109 +508,134 @@ class GalleryApp : IComponent
             <Box key="rp" style={makeStyle(0, 0, 3)}><Text key="rpt" text="right"/></Box>
         </SplitView>;
         split.style.width = 40; split.style.height = 3;
-        cardSplit.add(split);
-        content.add(cardSplit);
+        cardSplit.add(split); body.add(cardSplit);
 
-        // -- Text Area ---------------------------------------------------------------------
-        // A multiline TextArea (uncontrolled-with-sync).
-        IView cardArea = this._card(ctx, "cardarea", "Text Area",
-                "Multiline editable text block; reports a dirty-notify count on change.");
-        ITextArea area = <TextArea key="area" value="" width={40} height={4}
-                onChange={() => { this.areaEdits = this.areaEdits + 1; }}/>;
-        cardArea.add(area);
-        content.add(cardArea);
-
-        // -- Context Menu ---------------------------------------------------------------------
-        // A right-clickable panel routed through the app menu handler.
-        IView cardContext = this._card(ctx, "cardcontext", "Context Menu",
-                "Right-click panel routes commands through the app menu handler.");
-        IBox ctxbox = box(makeStyle(0, 40, 2));
-        ctxbox.setKey("ctxbox");
-        ctxbox.add(text("right-click me (context menu)"));
-        cardContext.add(ctxbox);
-        content.add(cardContext);
-
-        // -- Flex Layout ---------------------------------------------------------------------
-        // An explicit demo of the flex-weight idiom (doc/UI.md's "Flex weights" section) so
-        // the gallery stays a one-stop reference for it. Two shapes:
-        // (a) another [label fixed][field flex 1] row, reusing the form idiom above so all
-        //     three field rows share the same aligned start x/width; and
-        // (b) a weighted flex-2:flex-1 pair of boxes inside a fixed-width (61) container, so
-        //     the 39/19 split (leftover 58 + 1 gap cell, remainder handed to the higher-weight
-        //     child) is deterministic and independent of the host window size.
         IView cardFlex = this._card(ctx, "cardflex", "Flex Layout",
                 "Flex-weight idiom: an aligned form-row field and a 2:1 weighted split.");
-        IView flexRow = row(makeStyle(0, 0, 0));
-        flexRow.setKey("flexrow");
-        IView flexLabel = view(makeStyle(0, 12, 0));
-        flexLabel.setKey("flexlabel");
-        flexLabel.add(text("Name:"));
-        flexRow.add(flexLabel);
-        IView flexField = view(flexStyle(1));
-        flexField.setKey("flexfield");
-        ITextInput flexInput = textInput("", (string s) => {});
-        flexInput.setKey("flexinput");
-        flexField.add(flexInput);
-        flexRow.add(flexField);
-        cardFlex.add(flexRow);
+        IView flexRow = row(makeStyle(0, 0, 0)); flexRow.setKey("flexrow");
+        IView flexLabel = view(makeStyle(0, 12, 0)); flexLabel.setKey("flexlabel");
+        flexLabel.add(text("Name:")); flexRow.add(flexLabel);
+        IView flexField = view(flexStyle(1)); flexField.setKey("flexfield");
+        ITextInput flexInput = textInput("", (string s) => {}); flexInput.setKey("flexinput");
+        flexField.add(flexInput); flexRow.add(flexField); cardFlex.add(flexRow);
+        IBox flexDemo = box(makeStyle(0, 61, 3)); flexDemo.setKey("flexdemo");
+        IView flexPair = row(makeStyle(0, 0, 0)); flexPair.style.gap = 1; flexPair.setKey("flexpair");
+        IView flexTwo = view(flexStyle(2)); flexTwo.setKey("flextwo"); flexTwo.add(box(makeStyle(0, 0, 1)));
+        IView flexOne = view(flexStyle(1)); flexOne.setKey("flexone"); flexOne.add(box(makeStyle(0, 0, 1)));
+        flexPair.add(flexTwo); flexPair.add(flexOne); flexDemo.add(flexPair); cardFlex.add(flexDemo);
+        body.add(cardFlex);
+        return move body;
+    }
 
-        IBox flexDemo = box(makeStyle(0, 61, 3));
-        flexDemo.setKey("flexdemo");
-        IView flexPair = row(makeStyle(0, 0, 0));
-        flexPair.style.gap = 1;
-        flexPair.setKey("flexpair");
-        IView flexTwo = view(flexStyle(2));
-        flexTwo.setKey("flextwo");
-        flexTwo.add(box(makeStyle(0, 0, 1)));
-        IView flexOne = view(flexStyle(1));
-        flexOne.setKey("flexone");
-        flexOne.add(box(makeStyle(0, 0, 1)));
-        flexPair.add(flexTwo);
-        flexPair.add(flexOne);
-        flexDemo.add(flexPair);
-        cardFlex.add(flexDemo);
-        content.add(cardFlex);
+    move IView _pageMedia(IUiContext ctx)
+    {
+        IView body = this._pageBody();
+        IView cardImg = this._card(ctx, "cardimg", "Image",
+                "Displays a bitmap uploaded through the setImageData seam; no asset file needed.");
+        IImage img = <Image key="img" width={12} height={4} altText="gradient"/>;
+        img.pixels = this.imgPixels; img.pxW = this.imgW; img.pxH = this.imgH;
+        cardImg.add(img); body.add(cardImg);
+        IView cardCanvas = this._card(ctx, "cardcanvas", "ICanvas",
+                "Escape hatch: draw directly with the ICanvas API into a native child surface.");
+        ICanvasView canvas = <CanvasView key="canvas" width={24} height={6}/>;
+        canvas.onPaint = (ICanvas c) => {
+            int barCount = 5; int i = 0;
+            while (i < barCount)
+            {
+                Rect bar = default;
+                bar.x = 1 + i * 4; bar.w = 3; bar.h = 1 + i; bar.y = 5 - bar.h;
+                c.drawRect(bar, true, rgb(60 + i * 30, 120, 220)); i++;
+            }
+            c.drawText(1, 5, "canvas", rgb(40, 40, 40));
+        };
+        cardCanvas.add(canvas); body.add(cardCanvas);
+        return move body;
+    }
 
-        // -- Status Bar ---------------------------------------------------------------------
-        // Status lines (existing P8/P9 asserts) + a bottom StatusBar strip.
+    move IView _pageChrome(IUiContext ctx)
+    {
+        IView body = this._pageBody();
+        IView cardTabs = this._card(ctx, "cardtabs", "Tab Control",
+                "Switches between keyed panes; only the active pane maps to native.");
+        ITabControl tabs = <TabControl key="tabs" selectedTab={this.tab} width={40} height={5}
+                onSelectTab={(int i) => { this.tab = i; ctx.invalidate(); }}>
+            <TabPane key="p0" title="Alpha"><Text key="t0" text="Alpha pane content"/></TabPane>
+            <TabPane key="p1" title="Beta"><Text key="t1" text="Beta pane content"/></TabPane>
+        </TabControl>;
+        cardTabs.add(tabs); body.add(cardTabs);
+        IView cardContext = this._card(ctx, "cardcontext", "Context Menu",
+                "Right-click panel routes commands through the app menu handler.");
+        IBox ctxbox = box(makeStyle(0, 40, 2)); ctxbox.setKey("ctxbox");
+        ctxbox.add(text("right-click me (context menu)")); cardContext.add(ctxbox); body.add(cardContext);
         IView cardStatus = this._card(ctx, "cardstatus", "Status Bar",
-                "Presentational strip plus the running app-wide status text.");
+                "Status text reflects the current gallery selections and commands.");
         string rowTxt = this.listSel < 0 ? "none" : this.listSel.toString();
         string openTxt = this.listActivated < 0 ? "none" : this.listActivated.toString();
         IText status = text("Size: " + this._sizeName() + "  Font: " + this._fontName(this.fontIdx)
             + "  Row: " + rowTxt + "  Opened: " + openTxt);
-        status.setKey("status");
-        cardStatus.add(status);
-
+        status.setKey("status"); cardStatus.add(status);
         string tabTxt = this.tab == 0 ? "Alpha" : "Beta";
         string nodeTxt = this.treeSel < 0 ? "none" : this.treeSel.toString();
         string ctxTxt = this.ctxFired == 0 ? "none" : this.ctxFired.toString();
         IText status2 = text("Tab: " + tabTxt + "  Node: " + nodeTxt
             + "  Split: " + this.splitRatio.toString() + "%  Ctx: " + ctxTxt);
-        status2.setKey("status2");
-        cardStatus.add(status2);
+        status2.setKey("status2"); cardStatus.add(status2); body.add(cardStatus);
 
-        IStatusBar sbar = <StatusBar key="sbar"/>;
-        sbar.parts.add("Ready");
-        sbar.parts.add("clicks=" + this.btnClicks.toString());
-        cardStatus.add(sbar);
-        content.add(cardStatus);
+        IView cardToolbar = this._card(ctx, "cardtoolbar", "ToolBar",
+                "Commands, separator, tips, and a disabled item.");
+        IToolBar tb = toolbar((int cmd) => { this.toolbarCmd = cmd; ctx.invalidate(); });
+        tb.setKey("toolbar");
+        tb.addButton("New", 101);
+        tb.addButton("Open", 102);
+        tb.addSeparator();
+        tb.addButton("Disabled", 103);
+        tb.tips.set(0, "Create a document");
+        tb.tips.set(1, "Open a document");
+        tb.enabled.set(3, false);
+        cardToolbar.add(tb);
+        string command = this.toolbarCmd == 0 ? "none" : this.toolbarCmd.toString();
+        IText toolbarStatus = text("Command: " + command);
+        toolbarStatus.setKey("status");
+        cardToolbar.add(toolbarStatus);
+        body.add(cardToolbar);
 
-        // -- Reconcile Stress (self-test only) ------------------------------------------
-        // P13 reconcile stress-soak: the churn box only renders once the self-test turns
-        // `stress` on, so live users never see the pool. The card itself (retitled to make
-        // clear it is test scaffolding) stays present so the stress-step button below
-        // remains reachable before stress mode is armed. The active pool slots and their
-        // order come from the seeded LCG state, so each step is a deterministic
-        // create/destroy/reorder the keyed reconciler must track.
+        IView cardDialogs = this._card(ctx, "carddialogs", "Dialogs",
+                "Message boxes and native folder selection with headless scripting.");
+        IView dialogButtons = row(makeStyle(0, 0, 0));
+        dialogButtons.setKey("buttons");
+        dialogButtons.style.gap = 1;
+        IButton messageButton = button("Message box...", () => {
+            this.dialogAnswer = nativeMessageBox("Gallery", "Continue?", MSGBOX_YESNO);
+            ctx.invalidate();
+        });
+        messageButton.setKey("message");
+        dialogButtons.add(messageButton);
+        IButton folderButton = button("Pick folder...", () => {
+            this.folderPath = nativeSelectFolder(); ctx.invalidate();
+        });
+        folderButton.setKey("folder");
+        dialogButtons.add(folderButton);
+        cardDialogs.add(dialogButtons);
+        string answer = this.dialogAnswer < 0 ? "none" : (this.dialogAnswer == 1 ? "yes" : "no");
+        IText answerText = text("Answer: " + answer);
+        answerText.setKey("answer");
+        cardDialogs.add(answerText);
+        IText folderText = text("Folder: " + this.folderPath);
+        folderText.setKey("path");
+        cardDialogs.add(folderText);
+        body.add(cardDialogs);
+        return move body;
+    }
+
+    move IView _pageStress(IUiContext ctx)
+    {
+        IView body = this._pageBody();
         IView cardStress = this._card(ctx, "cardstress", "Stress (self-test)",
                 "Seeded churn pool exercising keyed create/destroy/reorder (P13 hardening).");
         if (this.stress)
         {
-            IBox sbox = box(makeStyle(0, 40, 10));
-            sbox.setKey("stressbox");
-            int n = 8;
-            int step = 0;
+            IBox sbox = box(makeStyle(0, 40, 60)); sbox.setKey("stressbox");
+            int n = 8; int step = 0;
             while (step < n)
             {
                 int slot = (step + this.stressOrder) % n;
@@ -616,24 +644,63 @@ class GalleryApp : IComponent
             }
             cardStress.add(sbox);
         }
-
-        // The stress-step button (always present) advances the LCG one step per click. The
-        // self-test drives it host-neutrally via nativeClickButton, then asserts the native
-        // control census matches this.stressMask after each reconcile.
         IButton stressBtn = button("stress-step", () => {
             this.stress = true;
             u32 s = (u32)this.stressSeed * 1103515245u + 12345u;
-            this.stressSeed = (int)s;
-            this.stressMask = (int)((s >> 8) & 0xFFu);
-            this.stressOrder = (int)((s >> 20) & 0x7u);
-            ctx.invalidate();
+            this.stressSeed = (int)s; this.stressMask = (int)((s >> 8) & 0xFFu);
+            this.stressOrder = (int)((s >> 20) & 0x7u); ctx.invalidate();
         });
-        stressBtn.setKey("stressbtn");
-        cardStress.add(stressBtn);
-        content.add(cardStress);
+        stressBtn.setKey("stressbtn"); cardStress.add(stressBtn); body.add(cardStress);
+        return move body;
+    }
 
+    IElement _newRender(IUiContext ctx)
+    {
+        ctx.theme = this.dark ? darkTheme() : lightTheme();
+        if (this.imgPixels == 0u) { this.imgW = 96; this.imgH = 48; this.imgPixels = makeGradientPixels(96, 48); }
+        // Root is a plain column: each page scrolls itself, and a root ScrollView
+        // would put the docked StatusBar into document coords (clipping its text).
+        IView root = column(makeStyle(0, hostWidth(), hostHeight())); root.setKey("root");
+        IView content = column(makeStyle(1, 0, 0)); content.style.gap = 0; content.setKey("content"); root.add(content);
+        IText title = text("Widget Gallery"); title.setKey("title"); title.font = FONT_TITLE; content.add(title);
+        ITabControl pages = <TabControl key="pages" selectedTab={this.page} width={hostWidth()}
+                height={hostHeight() - 3}
+                onSelectTab={(int i) => { this.page = i; ctx.invalidate(); }}/>
+        ;
+        ITabPane basics = tabPane("Basics"); basics.setKey("basics");
+        IScrollView basicsScroll = scrollView(makeStyle(0, 0, 0)); basicsScroll.setKey("scroll");
+        basicsScroll.add(this._pageBasics(ctx)); basics.add(basicsScroll); pages.add(basics);
+        ITabPane input = tabPane("Input"); input.setKey("input");
+        IScrollView inputScroll = scrollView(makeStyle(0, 0, 0)); inputScroll.setKey("scroll");
+        inputScroll.add(this._pageInput(ctx)); input.add(inputScroll); pages.add(input);
+        ITabPane data = tabPane("Data"); data.setKey("data");
+        IScrollView dataScroll = scrollView(makeStyle(0, 0, 0)); dataScroll.setKey("scroll");
+        dataScroll.add(this._pageData(ctx)); data.add(dataScroll); pages.add(data);
+        ITabPane layout = tabPane("Layout"); layout.setKey("layout");
+        IScrollView layoutScroll = scrollView(makeStyle(0, 0, 0)); layoutScroll.setKey("scroll");
+        layoutScroll.add(this._pageLayout(ctx)); layout.add(layoutScroll); pages.add(layout);
+        ITabPane media = tabPane("Media"); media.setKey("media");
+        IScrollView mediaScroll = scrollView(makeStyle(0, 0, 0)); mediaScroll.setKey("scroll");
+        mediaScroll.add(this._pageMedia(ctx)); media.add(mediaScroll); pages.add(media);
+        ITabPane chrome = tabPane("Chrome"); chrome.setKey("chrome");
+        IScrollView chromeScroll = scrollView(makeStyle(0, 0, 0)); chromeScroll.setKey("scroll");
+        chromeScroll.add(this._pageChrome(ctx)); chrome.add(chromeScroll); pages.add(chrome);
+        ITabPane stress = tabPane("Stress"); stress.setKey("stress");
+        IScrollView stressScroll = scrollView(makeStyle(0, 0, 0)); stressScroll.setKey("scroll");
+        stressScroll.add(this._pageStress(ctx)); stress.add(stressScroll); pages.add(stress);
+        content.add(pages);
+        IStatusBar sbar = <StatusBar key="sbar"/>;
+        sbar.parts.add("Ready"); sbar.parts.add("clicks=" + this.btnClicks.toString()); content.add(sbar);
+        if (!this._ctxReg && this.page == 5)
+        {
+            nativeSetContextMenu("root/content/pages/chrome/scroll/page/cardcontext/ctxbox", (u64)buildCtxMenu());
+            this._ctxReg = true;
+        }
         return root;
     }
+
+    IElement render(IUiContext ctx) { return this._newRender(ctx); }
+
 };
 
 // A context menu built with the <ContextMenu/> sugar (P9); returned as an owned pointer
@@ -701,6 +768,27 @@ int gallerySelfTest()
     {
         t.launch(new GalleryApp(), 60, 60);
         GalleryApp* g = activeApp() as GalleryApp;
+        string basics = "root/content/pages/basics/scroll/page/";
+        string input = "root/content/pages/input/scroll/page/";
+        string data = "root/content/pages/data/scroll/page/";
+        string layout = "root/content/pages/layout/scroll/page/";
+        string media = "root/content/pages/media/scroll/page/";
+        string chrome = "root/content/pages/chrome/scroll/page/";
+        string stress = "root/content/pages/stress/scroll/page/";
+        string appStatus = "root/content/sbar";
+        string listKey = data + "cardlist/list";
+        string gridViewKey = data + "cardgridview/gv";
+        string passwordKey = input + "cardinput/passwordrow/passwordfield/password";
+        string spinnerKey = input + "cardspinner/spinner";
+        string linkKey = basics + "cardlink/link";
+        string disabledLinkKey = basics + "cardlink/disabled";
+        string toolbarKey = chrome + "cardtoolbar/toolbar";
+        string messageKey = chrome + "carddialogs/buttons/message";
+        string folderKey = chrome + "carddialogs/buttons/folder";
+        string answerKey = chrome + "carddialogs/answer";
+        string folderPathKey = chrome + "carddialogs/path";
+        string tabsKey = chrome + "cardtabs/tabs";
+        string statusKey = chrome + "cardstatus/";
 
         // AUTO chooses the semantic table from the supplied system preference;
         // forced appearance wins, and a direct literal override wins over roles.
@@ -793,35 +881,53 @@ int gallerySelfTest()
             && configuredImage.altText == "probe");
         delete configuredImage;
 
-        // 1. Every P8 control became a real control.
-        t.expectTrue("controls created",
-            _exists("root/content/cardradio/rg/r0") && _exists("root/content/cardradio/rg/r1")
-            && _exists("root/content/cardradio/rg/r2")
-            && _exists("root/content/cardcombo/comborow/combofield/combo") && _exists("root/content/cardlist/list")
-            && _exists("root/content/cardstatus/status") && _exists("root/content/cardstatus/status2"));
+        // 1. Every P8 control became a real control. Inactive panes are lazy, so visit
+        // each page before reading its controls and retain one combined assertion.
+        nativeTabSelect("root/content/pages", 0);
+        bool createdBasics = _exists(basics + "cardradio/rg/r0") && _exists(basics + "cardradio/rg/r1")
+            && _exists(basics + "cardradio/rg/r2");
+        nativeTabSelect("root/content/pages", 1);
+        bool createdInput = _exists(input + "cardcombo/comborow/combofield/combo");
+        nativeTabSelect("root/content/pages", 2);
+        bool createdData = _exists(data + "cardlist/list");
+        nativeTabSelect("root/content/pages", 5);
+        bool createdChrome = _exists(chrome + "cardstatus/status") && _exists(chrome + "cardstatus/status2");
+        t.expectTrue("controls created", createdBasics && createdInput && createdData && createdChrome);
 
         // 2. Initial state: r1 checked (pick=1), combo at 0, 100k rows, status echoes model.
-        t.expectTrue("initial state",
-            nativeIsChecked("root/content/cardradio/rg/r1") && !nativeIsChecked("root/content/cardradio/rg/r0")
-            && !nativeIsChecked("root/content/cardradio/rg/r2")
-            && nativeComboSelected("root/content/cardcombo/comborow/combofield/combo") == 0
-            && nativeListRowCount("root/content/cardlist/list") == GALLERY_ROWS
-            && _statusIs("root/content/cardstatus/status", "Size: Medium  Font: Consolas  Row: none  Opened: none"));
+        nativeTabSelect("root/content/pages", 0);
+        bool initialRadio = nativeIsChecked(basics + "cardradio/rg/r1")
+            && !nativeIsChecked(basics + "cardradio/rg/r0") && !nativeIsChecked(basics + "cardradio/rg/r2");
+        nativeTabSelect("root/content/pages", 1);
+        bool initialCombo = nativeComboSelected(input + "cardcombo/comborow/combofield/combo") == 0;
+        nativeTabSelect("root/content/pages", 2);
+        bool initialList = nativeListRowCount(data + "cardlist/list") == GALLERY_ROWS;
+        nativeTabSelect("root/content/pages", 5);
+        bool initialStatus = _statusIs(chrome + "cardstatus/status",
+            "Size: Medium  Font: Consolas  Row: none  Opened: none");
+        t.expectTrue("initial state", initialRadio && initialCombo && initialList && initialStatus);
 
         // 3. Click radio "Large".
-        nativeClickButton("root/content/cardradio/rg/r2");
+        nativeTabSelect("root/content/pages", 0);
+        nativeClickButton(basics + "cardradio/rg/r2");
+        bool radioSelected = nativeIsChecked(basics + "cardradio/rg/r2")
+            && !nativeIsChecked(basics + "cardradio/rg/r1");
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("radio selection",
-            nativeIsChecked("root/content/cardradio/rg/r2") && !nativeIsChecked("root/content/cardradio/rg/r1")
-            && _statusIs("root/content/cardstatus/status", "Size: Large  Font: Consolas  Row: none  Opened: none"));
+            radioSelected
+            && _statusIs(chrome + "cardstatus/status", "Size: Large  Font: Consolas  Row: none  Opened: none"));
 
         // 4. Change the combo to index 2 (routes CBN_SELCHANGE).
-        nativeComboSelect("root/content/cardcombo/comborow/combofield/combo", 2);
+        nativeTabSelect("root/content/pages", 1);
+        nativeComboSelect(input + "cardcombo/comborow/combofield/combo", 2);
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("combo change routed",
-            _statusIs("root/content/cardstatus/status", "Size: Large  Font: Segoe UI  Row: none  Opened: none"));
+            _statusIs(chrome + "cardstatus/status", "Size: Large  Font: Segoe UI  Row: none  Opened: none"));
 
         // 5. Virtualization + rowText wiring: query two cells of row 50000.
-        string cell0 = nativeListCellText("root/content/cardlist/list", 50000, 0);
-        string cell1 = nativeListCellText("root/content/cardlist/list", 50000, 1);
+        nativeTabSelect("root/content/pages", 2);
+        string cell0 = nativeListCellText(listKey, 50000, 0);
+        string cell1 = nativeListCellText(listKey, 50000, 1);
         t.expectTrue("cell text", cell0 == "row 50000" && cell1 == "2500000000");
 
         // 6. Virtualization oracle: rowText fired only a handful of times for 100k rows.
@@ -833,8 +939,8 @@ int gallerySelfTest()
             g != nullptr && g.gridCount == 10000 && g.gridViewCalls > 0
             && g.gridViewCalls < 100);
         t.expectTrue("GridView initial native realization",
-            _exists("root/content/cardgridview/gv/item-0")
-            && !_exists("root/content/cardgridview/gv/item-9999"));
+            _exists(gridViewKey + "/item-0")
+            && !_exists(gridViewKey + "/item-9999"));
         if (g != nullptr)
         {
             g.gridSelected = 1;
@@ -843,8 +949,8 @@ int gallerySelfTest()
             t.pump();
         }
         t.expectTrue("GridView evicts and realizes on scroll",
-            !_exists("root/content/cardgridview/gv/item-0")
-            && _exists("root/content/cardgridview/gv/item-250"));
+            !_exists(gridViewKey + "/item-0")
+            && _exists(gridViewKey + "/item-250"));
 
         // Row icons use only a stable identity plus borrowed BGRA data. The same
         // callback is safe for virtualization/reuse, while empty identity is omission.
@@ -854,25 +960,25 @@ int gallerySelfTest()
         t.expectTrue("row icon identity and missing", iconEven.identity != nullptr
             && iconOdd.identity != nullptr && strcmp((char*)iconEven.identity, "ok") == 0
             && strcmp((char*)iconOdd.identity, "warn") == 0 && iconMissing.identity == nullptr);
-        int warnSlot = nativeListIconResolve("root/content/cardlist/list", 50005);
-        int okSlot = nativeListIconResolve("root/content/cardlist/list", 50004);
-        int warnAgain = nativeListIconResolve("root/content/cardlist/list", 50005);
+        int warnSlot = nativeListIconResolve(listKey, 50005);
+        int okSlot = nativeListIconResolve(listKey, 50004);
+        int warnAgain = nativeListIconResolve(listKey, 50005);
         t.expectTrue("row icon native cache identities", warnSlot >= 0 && okSlot >= 0
             && warnSlot != okSlot && warnAgain == warnSlot
-            && nativeListIconCacheCount("root/content/cardlist/list") == 2);
-        u64 cachedBefore = nativeListIconRevision("root/content/cardlist/list", 50004);
+            && nativeListIconCacheCount(listKey) == 2);
+        u64 cachedBefore = nativeListIconRevision(listKey, 50004);
         bool winuiVisual = nativeListVisualExpected();
         u64 realizedRevisionBefore = 0u;
         if (winuiVisual)
         {
             t.expectTrue("WinUI ListView header is attached",
-                nativeListHeaderAttached("root/content/cardlist/list"));
+                nativeListHeaderAttached(listKey));
             t.expectInt("WinUI realizes a far ListView row", 50004,
-                nativeListRealizeRow("root/content/cardlist/list", 50004));
+                nativeListRealizeRow(listKey, 50004));
             realizedRevisionBefore = nativeListRealizedIconRevision(
-                "root/content/cardlist/list", 50004);
+                listKey, 50004);
             t.expectTrue("WinUI realized row icon source",
-                nativeListRealizedIcon("root/content/cardlist/list", 50004)
+                nativeListRealizedIcon(listKey, 50004)
                 && realizedRevisionBefore == 1u);
         }
         u64 oldRevision = iconEven.revision;
@@ -880,204 +986,277 @@ int gallerySelfTest()
         ListRowIcon replaced = g != nullptr ? g.iconForRow(50004) : noListIcon();
         t.expectTrue("row icon in-place revision", replaced.revision != oldRevision
             && replaced.pixels == iconEven.pixels);
-        int okReplaced = nativeListIconResolve("root/content/cardlist/list", 50004);
-        u64 cachedAfter = nativeListIconRevision("root/content/cardlist/list", 50004);
+        int okReplaced = nativeListIconResolve(listKey, 50004);
+        u64 cachedAfter = nativeListIconRevision(listKey, 50004);
         t.expectTrue("row icon native revision replacement", okReplaced == okSlot
             && cachedBefore == 1u && cachedAfter == 2u && cachedAfter != cachedBefore);
         if (winuiVisual)
         {
-            nativeListReload("root/content/cardlist/list");
-            int replacedRow = nativeListRealizeRow("root/content/cardlist/list", 50004);
+            nativeListReload(listKey);
+            int replacedRow = nativeListRealizeRow(listKey, 50004);
             u64 realizedRevisionAfter = nativeListRealizedIconRevision(
-                "root/content/cardlist/list", 50004);
+                listKey, 50004);
             t.expectTrue("WinUI replaces a cached icon revision in place",
-                replacedRow == 50004 && nativeListRealizedIcon("root/content/cardlist/list", 50004)
+                replacedRow == 50004 && nativeListRealizedIcon(listKey, 50004)
                 && realizedRevisionBefore == 1u && realizedRevisionAfter == 2u);
         }
-        int invalidSlot = nativeListIconResolve("root/content/cardlist/list", 50000);
+        int invalidSlot = nativeListIconResolve(listKey, 50000);
         t.expectTrue("row icon native omission", invalidSlot < 0
-            && nativeListIconCacheCount("root/content/cardlist/list") == 2);
+            && nativeListIconCacheCount(listKey) == 2);
         if (winuiVisual)
         {
-            int missingRow = nativeListRealizeRow("root/content/cardlist/list", 50000);
-            int backAtTop = nativeListRealizeRow("root/content/cardlist/list", 0);
-            int resources = nativeListVisualResourceCount("root/content/cardlist/list");
+            int missingRow = nativeListRealizeRow(listKey, 50000);
+            int backAtTop = nativeListRealizeRow(listKey, 0);
+            int resources = nativeListVisualResourceCount(listKey);
             t.expectTrue("WinUI omits invalid realized row icons",
-                missingRow == 50000 && !nativeListRealizedIcon("root/content/cardlist/list", 50000));
+                missingRow == 50000 && !nativeListRealizedIcon(listKey, 50000));
             t.expectTrue("WinUI scrolls and reuses ListView containers",
-                backAtTop == 0 && nativeListContainerReuseCount("root/content/cardlist/list") > 0);
+                backAtTop == 0 && nativeListContainerReuseCount(listKey) > 0);
             t.expectTrue("WinUI ListView resources stay viewport-bounded",
                 resources > 0 && resources < 64);
             int distinctIcons = 0;
             int iconProbeRow = 60000;
             while (iconProbeRow <= 60008)
             {
-                if (nativeListIconResolve("root/content/cardlist/list", iconProbeRow) >= 0)
+                if (nativeListIconResolve(listKey, iconProbeRow) >= 0)
                     distinctIcons++;
                 iconProbeRow++;
             }
             t.expectTrue("WinUI icon cache has no fixed eight-identity ceiling",
-                distinctIcons == 9 && nativeListIconCacheCount("root/content/cardlist/list") == 11);
+                distinctIcons == 9 && nativeListIconCacheCount(listKey) == 11);
         }
-        nativeListIconResetForTest("root/content/cardlist/list");
-        t.expectTrue("row icon teardown cache", nativeListIconCacheCount("root/content/cardlist/list") == 0
-            && nativeListIconResolve("root/content/cardlist/list", 50004) < 0);
+        nativeListIconResetForTest(listKey);
+        t.expectTrue("row icon teardown cache", nativeListIconCacheCount(listKey) == 0
+            && nativeListIconResolve(listKey, 50004) < 0);
 
         // 7. Selection round-trip: select row 5 as the OS would.
-        nativeListSelect("root/content/cardlist/list", 5);
+        nativeListSelect(listKey, 5);
+        bool listSelected = nativeListSelectedRow(listKey) == 5 && g != nullptr && g.listSel == 5;
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("list selection round-trip",
-            nativeListSelectedRow("root/content/cardlist/list") == 5 && g != nullptr && g.listSel == 5
-            && _statusIs("root/content/cardstatus/status", "Size: Large  Font: Segoe UI  Row: 5  Opened: none"));
+            listSelected
+            && _statusIs(chrome + "cardstatus/status", "Size: Large  Font: Segoe UI  Row: 5  Opened: none"));
 
         // 8. Activation: Enter on the list (row 5 still selected).
-        nativeListActivate("root/content/cardlist/list", 5);
+        nativeTabSelect("root/content/pages", 2);
+        nativeListActivate(listKey, 5);
+        bool listActivated = g != nullptr && g.listActivated == 5;
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("list activation",
-            g != nullptr && g.listActivated == 5
-            && _statusIs("root/content/cardstatus/status", "Size: Large  Font: Segoe UI  Row: 5  Opened: 5"));
+            listActivated
+            && _statusIs(chrome + "cardstatus/status", "Size: Large  Font: Segoe UI  Row: 5  Opened: 5"));
 
         // Header input is distinct from row selection/activation, and style is virtual:
         // one row/cell can resolve a semantic role or explicit literal black on demand.
-        if (winuiVisual) nativeListInvokeHeader("root/content/cardlist/list", 1);
-        else nativeListHeaderClick("root/content/cardlist/list", 1);
+        nativeTabSelect("root/content/pages", 2);
+        t.pump();
+        if (winuiVisual) nativeListInvokeHeader(listKey, 1);
+        else nativeListHeaderClick(listKey, 1);
         t.expectTrue("list header callback", g != nullptr && g.listHeader == 1 && g.listSel == 5);
-        int listErrorColor = nativeListCellColor("root/content/cardlist/list", 50000, 1);
+        int listErrorColor = nativeListCellColor(listKey, 50000, 1);
         t.expectTrue("list cell styles", galleryHasThemeListError(listErrorColor));
         t.expectTrue("list literal black is present", galleryHasBlack(
-            nativeListCellColor("root/content/cardlist/list", 50000, 0)));
+            nativeListCellColor(listKey, 50000, 0)));
         if (winuiVisual)
         {
-            int styledRow = nativeListRealizeRow("root/content/cardlist/list", 50000);
+            int styledRow = nativeListRealizeRow(listKey, 50000);
             t.expectTrue("WinUI applies semantic cell foreground",
                 styledRow == 50000
-                && nativeListRealizedCellBrush("root/content/cardlist/list", 50000, 1)
-                && nativeListRealizedCellColor("root/content/cardlist/list", 50000, 1) == listErrorColor);
+                && nativeListRealizedCellBrush(listKey, 50000, 1)
+                && nativeListRealizedCellColor(listKey, 50000, 1) == listErrorColor);
             t.expectTrue("WinUI applies literal black foreground",
-                nativeListRealizedCellBrush("root/content/cardlist/list", 50000, 0)
-                && galleryHasBlack(nativeListRealizedCellColor(
-                    "root/content/cardlist/list", 50000, 0)));
+                nativeListRealizedCellBrush(listKey, 50000, 0)
+                && galleryHasBlack(nativeListRealizedCellColor(listKey, 50000, 0)));
         }
 
         // 9. TabControl (P9): two tabs, initial selection 0, the active pane's Text is live.
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("tabs init",
-            _exists("root/content/cardtabs/tabs") && nativeTabCount("root/content/cardtabs/tabs") == 2
-            && nativeTabSelected("root/content/cardtabs/tabs") == 0
-            && _exists("root/content/cardtabs/tabs/p0/t0") && !_exists("root/content/cardtabs/tabs/p1/t1"));
+            _exists(tabsKey) && nativeTabCount(tabsKey) == 2
+            && nativeTabSelected(tabsKey) == 0
+            && _exists(tabsKey + "/p0/t0") && !_exists(tabsKey + "/p1/t1"));
 
         // 10. Tab switch: select tab 1; model follows, pane p1 becomes live, p0 destroyed.
-        nativeTabSelect("root/content/cardtabs/tabs", 1);
+        nativeTabSelect(tabsKey, 1);
         t.expectTrue("tab switch",
-            g != nullptr && g.tab == 1 && nativeTabSelected("root/content/cardtabs/tabs") == 1
-            && _exists("root/content/cardtabs/tabs/p1/t1") && !_exists("root/content/cardtabs/tabs/p0/t0")
-            && _statusHas("root/content/cardstatus/status2", "Tab: Beta"));
+            g != nullptr && g.tab == 1 && nativeTabSelected(tabsKey) == 1
+            && _exists(tabsKey + "/p1/t1") && !_exists(tabsKey + "/p0/t0")
+            && _statusHas(statusKey + "status2", "Tab: Beta"));
 
         // 10b. Tab layout: the active pane's content lays out BELOW the strip row (the
         //      TabControl node's own y), so the pane never overlaps the tab segments.
-        Rect tabsB = nativeNodeBounds("root/content/cardtabs/tabs");
-        Rect paneTxtB = nativeNodeBounds("root/content/cardtabs/tabs/p1/t1");
+        Rect tabsB = nativeNodeBounds(tabsKey);
+        Rect paneTxtB = nativeNodeBounds(tabsKey + "/p1/t1");
         t.expectTrue("tab pane content sits below the strip",
             tabsB.h > 0 && paneTxtB.y > tabsB.y);
 
         // 11. TreeView (P9): two top-level nodes; expanding "src" lazily makes 2 children (2->4).
-        int cntBefore = nativeTreeItemCount("root/content/cardtree/tree");
-        u64 srcItem = nativeTreeRootItem("root/content/cardtree/tree");
+        nativeTabSelect("root/content/pages", 2);
+        string treeKey = data + "cardtree/tree";
+        int cntBefore = nativeTreeItemCount(treeKey);
+        u64 srcItem = nativeTreeRootItem(treeKey);
         int beforeExpands = g != nullptr ? g.treeExpands : 0;
-        nativeTreeExpandItem("root/content/cardtree/tree", srcItem);
-        int cntAfter = nativeTreeItemCount("root/content/cardtree/tree");
+        nativeTreeExpandItem(treeKey, srcItem);
+        int cntAfter = nativeTreeItemCount(treeKey);
         t.expectTrue("tree expand",
-            _exists("root/content/cardtree/tree") && cntBefore == 2 && cntAfter == 4
+            _exists(treeKey) && cntBefore == 2 && cntAfter == 4
             && g != nullptr && g.treeExpands > beforeExpands);
 
         // 12. Tree select: select the first child of "src" (main.cb, node 10) -> onSelect.
-        u64 child0 = nativeTreeChildItem("root/content/cardtree/tree", srcItem);
-        int childNid = nativeTreeItemNodeId("root/content/cardtree/tree", child0);
-        nativeTreeSelectItem("root/content/cardtree/tree", child0);
+        u64 child0 = nativeTreeChildItem(treeKey, srcItem);
+        int childNid = nativeTreeItemNodeId(treeKey, child0);
+        nativeTreeSelectItem(treeKey, child0);
+        bool treeSelected = g != nullptr && g.treeSel == 10 && childNid == 10;
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("tree select",
-            g != nullptr && g.treeSel == 10 && childNid == 10 && _statusHas("root/content/cardstatus/status2", "Node: 10"));
+            treeSelected && _statusHas(statusKey + "status2", "Node: 10"));
 
         // 13. SplitView (P9): dragging the divider changes the ratio + the left pane's width.
-        Rect sbBefore = nativeNodeBounds("root/content/cardsplit/split/lp");
-        Rect splitB = nativeNodeBounds("root/content/cardsplit/split");
-        nativeSplitterDrag("root/content/cardsplit/split", splitB.x + 30, splitB.y);   // ratio ~= 75
-        Rect sbAfter = nativeNodeBounds("root/content/cardsplit/split/lp");
+        nativeTabSelect("root/content/pages", 3);
+        string splitKey = layout + "cardsplit/split";
+        Rect sbBefore = nativeNodeBounds(splitKey + "/lp");
+        Rect splitB = nativeNodeBounds(splitKey);
+        nativeSplitterDrag(splitKey, splitB.x + 30, splitB.y);
+        Rect sbAfter = nativeNodeBounds(splitKey + "/lp");
+        bool splitDragged = g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w;
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("split drag",
-            g != nullptr && g.splitRatio != 30 && sbAfter.w != sbBefore.w
-            && _statusHas("root/content/cardstatus/status2", "Split: "));
+            splitDragged && _statusHas(statusKey + "status2", "Split: "));
 
         // 14. ContextMenu (P9): firing item 0 routes CMD_CTX_A through the app menu handler.
-        nativeFireContextMenu("root/content/cardcontext/ctxbox", 0);
+        nativeFireContextMenu(chrome + "cardcontext/ctxbox", 0);
         t.expectTrue("context menu route",
-            g != nullptr && g.ctxFired == CMD_CTX_A && _statusHas("root/content/cardstatus/status2", "Ctx: 201"));
+            g != nullptr && g.ctxFired == CMD_CTX_A && _statusHas(statusKey + "status2", "Ctx: 201"));
 
         // 15. All the P10 controls were created.
+        nativeTabSelect("root/content/pages", 0);
+        bool p10Basics = _exists(basics + "cardbtn/btnrow/btn") && _exists(basics + "cardcheck/check");
+        nativeTabSelect("root/content/pages", 1);
+        bool p10Input = _exists(input + "cardinput/inputrow/inputfield/input")
+            && _exists(input + "cardprog/progressrow/prog") && _exists(input + "cardslider/slider")
+            && _exists(input + "cardarea/area");
+        nativeTabSelect("root/content/pages", 3);
+        bool p10Layout = _exists(layout + "cardgrp/grp");
+        nativeTabSelect("root/content/pages", 4);
+        bool p10Media = _exists(media + "cardimg/img") && _exists(media + "cardcanvas/canvas");
+        nativeTabSelect("root/content/pages", 5);
         t.expectTrue("P10 controls created",
-            _exists("root/content/cardbtn/btnrow/btn") && _exists("root/content/cardinput/inputrow/inputfield/input")
-            && _exists("root/content/cardcheck/check")
-            && _exists("root/content/cardprog/prog") && _exists("root/content/cardslider/slider")
-            && _exists("root/content/cardgrp/grp") && _exists("root/content/cardimg/img")
-            && _exists("root/content/cardcanvas/canvas") && _exists("root/content/cardarea/area")
-            && _exists("root/content/cardstatus/sbar"));
+            p10Basics && p10Input && p10Layout && p10Media && _exists(appStatus));
+
+        nativeTabSelect("root/content/pages", 1);
+        t.expectTrue("password and indeterminate controls created",
+            _exists(passwordKey) && _exists(input + "cardprog/progressrow/indeterminate"));
+        t.expectTrue("spinner control created", _exists(spinnerKey));
+        nativeTabSelect("root/content/pages", 0);
+        t.expectTrue("link controls created", _exists(linkKey)
+            && _exists(disabledLinkKey) && !nativeIsEnabled(disabledLinkKey));
+        nativeTabSelect("root/content/pages", 5);
+        t.expectTrue("toolbar and dialog controls created", _exists(toolbarKey)
+            && _exists(messageKey) && _exists(folderKey));
 
         // 16. Button click routes onPress.
-        nativeClickButton("root/content/cardbtn/btnrow/btn");
+        nativeTabSelect("root/content/pages", 0);
+        nativeClickButton(basics + "cardbtn/btnrow/btn");
         t.expectTrue("button click", g != nullptr && g.btnClicks == 1);
 
         // 17. TextInput: type text (routes EN_CHANGE) -> controlled onChangeText updates model.
-        nativeTypeText("root/content/cardinput/inputrow/inputfield/input", "hello");
+        nativeTabSelect("root/content/pages", 1);
+        nativeTypeText(input + "cardinput/inputrow/inputfield/input", "hello");
         t.expectTrue("text input route",
             g != nullptr && g.inputText == "hello"
-            && _statusIs("root/content/cardinput/inputrow/inputfield/input", "hello"));
+            && _statusIs(input + "cardinput/inputrow/inputfield/input", "hello"));
+
+        t.type(passwordKey, "secret");
+        t.expectTrue("password field mirrors text",
+            g != nullptr && g.passwordText == "secret"
+            && _statusIs(input + "cardinput/passwordmirror", "Password mirror: secret"));
+
+        t.spinnerSet(spinnerKey, 35);
+        bool spinnerRoundTrip = g != nullptr && g.spinnerVal == 35
+            && _statusIs(input + "cardspinner/value", "Value: 35");
+        t.spinnerSet(spinnerKey, 999);
+        t.expectTrue("spinner round-trip and clamp", spinnerRoundTrip
+            && g != nullptr && g.spinnerVal == 100
+            && _statusIs(input + "cardspinner/value", "Value: 100"));
+
+        nativeTabSelect("root/content/pages", 0);
+        t.linkClick(linkKey);
+        t.expectTrue("link click counter", g != nullptr && g.linkClicks == 1
+            && _statusIs(basics + "cardlink/count", "Clicks: 1"));
+
+        nativeTabSelect("root/content/pages", 5);
+        t.toolbarClick(toolbarKey, 102);
+        t.expectTrue("toolbar command readout", g != nullptr && g.toolbarCmd == 102
+            && _statusIs(chrome + "cardtoolbar/status", "Command: 102"));
+
+        uiTestScriptMessageBox(1);
+        t.click(messageKey);
+        t.expectTrue("message box scripted answer",
+            g != nullptr && g.dialogAnswer == 1 && _statusIs(answerKey, "Answer: yes"));
+        uiTestScriptFolder("gallery-folder");
+        t.click(folderKey);
+        t.expectTrue("folder dialog scripted path",
+            g != nullptr && g.folderPath == "gallery-folder"
+            && _statusIs(folderPathKey, "Folder: gallery-folder"));
 
         // 18. Checkbox: click -> controlled onChange flips the model.
-        nativeClickButton("root/content/cardcheck/check");
+        nativeTabSelect("root/content/pages", 0);
+        nativeClickButton(basics + "cardcheck/check");
         t.expectTrue("checkbox toggle", g != nullptr && g.checked);
 
         // 19. ProgressBar reflects the model value.
-        t.expectTrue("progress value", nativeProgressValue("root/content/cardprog/prog") == 60);
+        nativeTabSelect("root/content/pages", 1);
+        t.expectTrue("progress value", nativeProgressValue(input + "cardprog/progressrow/prog") == 60);
 
         // 20. Slider: drag to a new position -> controlled onChange.
-        nativeSliderSet("root/content/cardslider/slider", 80);
+        nativeSliderSet(input + "cardslider/slider", 80);
         t.expectTrue("slider", g != nullptr && g.sliderVal == 80);
 
         // 21. GroupBox carries its title.
-        t.expectTrue("groupbox title", _statusIs("root/content/cardgrp/grp", "Options"));
+        nativeTabSelect("root/content/pages", 3);
+        t.expectTrue("groupbox title", _statusIs(layout + "cardgrp/grp", "Options"));
 
         // 22. Image: the setImageData seam uploaded a bitmap.
-        t.expectTrue("image has bitmap", nativeImageHasBitmap("root/content/cardimg/img"));
+        nativeTabSelect("root/content/pages", 4);
+        t.expectTrue("image has bitmap", nativeImageHasBitmap(media + "cardimg/img"));
 
         // 23. StatusBar strip carries the main pane text.
-        string sbarTxt = nativeStatusText("root/content/cardstatus/sbar");
+        string sbarTxt = nativeStatusText(appStatus);
         t.expectTrue("statusbar text", strstr(sbarTxt.data(), "Ready") != nullptr);
 
         // 24. Theme toggle: clicking flips dark mode and re-themes the window.
-        nativeClickButton("root/content/cardbtn/btnrow/themebtn");
+        nativeTabSelect("root/content/pages", 0);
+        nativeClickButton(basics + "cardbtn/btnrow/themebtn");
         t.expectTrue("theme toggle", g != nullptr && g.dark && hostDark());
 
         // 24b. Card backdrop follows the theme flip: the committed View's fill re-colors to
         //      the dark panel. The reconcile bug kept the stale light fill (unreadable card).
         t.expectTrue("card backdrop re-colors on theme flip",
-            nativeContainerBg("root/content/cardbtn") == galleryThemePanelColor(darkTheme()));
+            nativeContainerBg(basics + "cardbtn") == galleryThemePanelColor(darkTheme()));
 
         // 25. Accent buttons (P10): dark-mode push button carries a stored accent AND the
         //     NM_CUSTOMDRAW path renders it - driving the custom draw fills the button rect
         //     with exactly the stored accent (PrintWindow cannot capture this; live-only).
-        u32 abg = nativeAccentBg("root/content/cardbtn/btnrow/btn");
+        u32 abg = nativeAccentBg(basics + "cardbtn/btnrow/btn");
         bool stored = abg != 0u;
-        u32 drawn = nativeTestCustomDrawFill("root/content/cardbtn/btnrow/btn");
+        u32 drawn = nativeTestCustomDrawFill(basics + "cardbtn/btnrow/btn");
         t.expectTrue("accent", stored && drawn == abg);
 
         // 26. Theme-flip storm (via themeStorm kit): flip light/dark K times; the host titlebar
         //     theme must stay in lockstep with the model after every reconcile.
         t.expectTrue("theme-flip storm keeps host in lockstep",
-            themeStorm(26, "root/content/cardbtn/btnrow/themebtn", () => g != nullptr && g.dark));
+            themeStorm(26, basics + "cardbtn/btnrow/themebtn", () => g != nullptr && g.dark));
 
         // 27. Reconcile stress-soak (via reconcileStress kit): a seeded LCG drives create/
         //     destroy/reorder across the churn pool for 48 steps; after each step the native
         //     census must match the mask-decoded key set and any persisting key keeps its
         //     handle. mutate = click the stress-step button; expectedKeys = decode stressMask.
         g.stressSeed = 305419896;   // fixed seed (0x12345678); fully deterministic
+        nativeTabSelect("root/content/pages", 6);
+        string stressKey = stress + "cardstress";
         t.expectTrue("reconcile census + identity held across 48 steps",
             reconcileStress(48,
-                () => { nativeClickButton("root/content/cardstress/stressbtn"); },
+                () => { nativeClickButton(stressKey + "/stressbtn"); },
                 () =>
                 {
                     // Collect the keys the churn mask says should be live this step.
@@ -1086,7 +1265,7 @@ int gallerySelfTest()
                     while (slot < 8)
                     {
                         if (((g.stressMask >> slot) & 1) != 0)
-                            keys.add("root/content/cardstress/stressbox/s" + slot.toString());
+                            keys.add(stressKey + "/stressbox/s" + slot.toString());
                         slot++;
                     }
                     return keys;
@@ -1098,9 +1277,11 @@ int gallerySelfTest()
         //     With the card now width-capped at 70 (padding 1*2=2 -> inner 68) and the row
         //     padding/gap 0, each field flexes to 68 - 12(label) = 56 cols; the assert checks
         //     the three fields are identical rather than hardcoding 56, so it stays host-robust.
-        Rect inputFieldB = nativeNodeBounds("root/content/cardinput/inputrow/inputfield");
-        Rect comboFieldB = nativeNodeBounds("root/content/cardcombo/comborow/combofield");
-        Rect flexFieldB  = nativeNodeBounds("root/content/cardflex/flexrow/flexfield");
+        nativeTabSelect("root/content/pages", 1);
+        Rect inputFieldB = nativeNodeBounds(input + "cardinput/inputrow/inputfield");
+        Rect comboFieldB = nativeNodeBounds(input + "cardcombo/comborow/combofield");
+        nativeTabSelect("root/content/pages", 3);
+        Rect flexFieldB  = nativeNodeBounds(layout + "cardflex/flexrow/flexfield");
         t.expectTrue("flex form-row fields align",
             inputFieldB.w > 0 && comboFieldB.w > 0 && flexFieldB.w > 0
             && inputFieldB.x == comboFieldB.x && inputFieldB.w == comboFieldB.w
@@ -1110,18 +1291,18 @@ int gallerySelfTest()
         //     regardless of host window size. leftover = 61 - 2*inset(1) - gap(1) = 58; the
         //     2:1 shares floor to 38/19 (allocated 57) and the 1-cell remainder goes to the
         //     higher-weight child left to right, giving an exact 39/19 split.
-        Rect flexTwoB = nativeNodeBounds("root/content/cardflex/flexdemo/flexpair/flextwo");
-        Rect flexOneB = nativeNodeBounds("root/content/cardflex/flexdemo/flexpair/flexone");
+        Rect flexTwoB = nativeNodeBounds(layout + "cardflex/flexdemo/flexpair/flextwo");
+        Rect flexOneB = nativeNodeBounds(layout + "cardflex/flexdemo/flexpair/flexone");
         t.expectTrue("flex 2:1 weighted split with exact remainder handling",
             flexTwoB.w == 39 && flexOneB.w == 19
             && flexOneB.x == flexTwoB.x + flexTwoB.w + 1);
 
         // 30. Flex layout card: every control in the new section exists / lays out with
         //     positive bounds (the label, the flex field's TextInput, and the demo container).
-        Rect flexDemoB = nativeNodeBounds("root/content/cardflex/flexdemo");
+        Rect flexDemoB = nativeNodeBounds(layout + "cardflex/flexdemo");
         t.expectTrue("flex section controls laid out",
-            _exists("root/content/cardflex/flexrow/flexfield/flexinput")
-            && nativeNodeBounds("root/content/cardflex/flexrow/flexlabel").w > 0
+            _exists(layout + "cardflex/flexrow/flexfield/flexinput")
+            && nativeNodeBounds(layout + "cardflex/flexrow/flexlabel").w > 0
             && flexFieldB.x > 0 && flexFieldB.w > 0
             && flexDemoB.w > 0 && flexDemoB.h > 0
             && flexTwoB.w > 0 && flexOneB.w > 0);
@@ -1152,68 +1333,91 @@ int gallerySelfTest()
         t.expectTrue("max clamps cap explicit dimensions",
             maxTextB.w == 3 && maxTextB.h == 2);
         delete maxText;
-        // 31. The root ScrollView exists and its own bounds fill the whole window viewport
-        //     (the framework-computed viewport rect, independent of native scroll clipping).
-        // _exists() checks for a native HANDLE, and ScrollView (ELEM_SCROLL) is only
-        // in nativeMappable() on Cocoa (see internal/issue/ui-native-scrollview-win32-winui.md) -
-        // so it cannot gate this assertion host-neutrally. A missing tree node already
-        // yields an all-zero Rect from nativeNodeBounds, which cannot equal the (non-zero)
-        // host size below, so the bounds comparison alone proves the root exists.
+        // 31. The root container exists, sits at the origin, and covers the whole window
+        //     viewport (per-page ScrollViews live inside the tabs). Height may exceed the
+        // host by the clipped bottom-padding row: the tab strip is sized so its bottom
+        // edge meets the docked StatusBar, which pushes the column's own bottom pad off
+        // screen. A missing node yields an all-zero Rect, which the width check rejects.
         Rect scrollB = nativeNodeBounds("root");
-        t.expectTrue("root scrollview fills the window viewport",
-            scrollB.w == hostWidth() && scrollB.h == hostHeight());
+        t.expectTrue("root container covers the window viewport",
+            scrollB.x == 0 && scrollB.y == 0
+            && scrollB.w == hostWidth() && scrollB.h >= hostHeight());
 
-        // 32. Overflow proof: a card far down the column (Reconcile Stress, the last card)
-        //     lays out below the viewport's bottom edge, so scrolling is required to reach it -
-        //     the whole point of wrapping the gallery in a ScrollView.
-        Rect stressCardB = nativeNodeBounds("root/content/cardstress");
+        // 32. Overflow proof: the Stress page keeps its late card below its page viewport.
+        nativeTabSelect("root/content/pages", 6);
+        Rect stressPageB = nativeNodeBounds("root/content/pages/stress/scroll");
+        Rect stressCardB = nativeNodeBounds(stress + "cardstress");
         t.expectTrue("a late card overflows the viewport (scrolling is required)",
-            stressCardB.h > 0 && stressCardB.y + stressCardB.h > scrollB.y + scrollB.h);
+            stressCardB.h > 0 && stressCardB.y + stressCardB.h > stressPageB.y + stressPageB.h);
 
         // 33. Every card's title Text exists, under the "header" sub-column added in the
         //     Phase C card restructure (one card per demoed control, all listed here).
+        nativeTabSelect("root/content/pages", 0);
+        bool titlesBasics = _exists(basics + "cardbtn/header/title") && _exists(basics + "cardtext/header/title")
+            && _exists(basics + "cardcheck/header/title") && _exists(basics + "cardradio/header/title");
+        nativeTabSelect("root/content/pages", 1);
+        bool titlesInput = _exists(input + "cardinput/header/title") && _exists(input + "cardprog/header/title")
+            && _exists(input + "cardslider/header/title") && _exists(input + "cardcombo/header/title")
+            && _exists(input + "cardarea/header/title");
+        nativeTabSelect("root/content/pages", 2);
+        bool titlesData = _exists(data + "cardlist/header/title") && _exists(data + "cardgridview/header/title")
+            && _exists(data + "cardtree/header/title");
+        nativeTabSelect("root/content/pages", 3);
+        bool titlesLayout = _exists(layout + "cardgrid/header/title") && _exists(layout + "cardgrp/header/title")
+            && _exists(layout + "cardsplit/header/title") && _exists(layout + "cardflex/header/title");
+        nativeTabSelect("root/content/pages", 4);
+        bool titlesMedia = _exists(media + "cardimg/header/title") && _exists(media + "cardcanvas/header/title");
+        nativeTabSelect("root/content/pages", 5);
+        bool titlesChrome = _exists(chrome + "cardtabs/header/title") && _exists(chrome + "cardcontext/header/title")
+            && _exists(chrome + "cardstatus/header/title");
+        nativeTabSelect("root/content/pages", 6);
+        bool titlesStress = _exists(stress + "cardstress/header/title");
         t.expectTrue("every card title exists",
-            _exists("root/content/cardbtn/header/title") && _exists("root/content/cardimg/header/title")
-            && _exists("root/content/cardcanvas/header/title") && _exists("root/content/cardinput/header/title")
-            && _exists("root/content/cardcheck/header/title") && _exists("root/content/cardprog/header/title")
-            && _exists("root/content/cardslider/header/title") && _exists("root/content/cardgrp/header/title")
-            && _exists("root/content/cardradio/header/title") && _exists("root/content/cardcombo/header/title")
-            && _exists("root/content/cardlist/header/title") && _exists("root/content/cardtabs/header/title")
-            && _exists("root/content/cardtree/header/title") && _exists("root/content/cardsplit/header/title")
-            && _exists("root/content/cardarea/header/title") && _exists("root/content/cardcontext/header/title")
-            && _exists("root/content/cardflex/header/title") && _exists("root/content/cardstatus/header/title")
-            && _exists("root/content/cardstress/header/title"));
+            titlesBasics && titlesInput && titlesData && titlesLayout && titlesMedia && titlesChrome && titlesStress);
 
         // 34. Every card's caption desc Text exists too (paired one-line description under
         //     the title, gap 0 - Phase C typography restructure).
-        t.expectTrue("every card desc exists",
-            _exists("root/content/cardbtn/header/desc") && _exists("root/content/cardimg/header/desc")
-            && _exists("root/content/cardstatus/header/desc") && _exists("root/content/cardstress/header/desc"));
+        nativeTabSelect("root/content/pages", 0);
+        bool descBtn = _exists(basics + "cardbtn/header/desc");
+        nativeTabSelect("root/content/pages", 4);
+        bool descMedia = _exists(media + "cardimg/header/desc");
+        nativeTabSelect("root/content/pages", 5);
+        bool descChrome = _exists(chrome + "cardstatus/header/desc");
+        nativeTabSelect("root/content/pages", 6);
+        bool descStress = _exists(stress + "cardstress/header/desc");
+        t.expectTrue("every card desc exists", descBtn && descMedia && descChrome && descStress);
 
         // 35. A card's own path has a live native handle: Phase A's container-backdrop
         //     painting is keyed by the container's own path, so this doubles as the
         //     backdrop-existence oracle (host-neutral: it is the same nativeHandle check
         //     _exists always uses, just pointed at a card container instead of a leaf).
-        t.expectTrue("card backdrop handle exists",
-            _exists("root/content/cardbtn") && _exists("root/content/cardstatus"));
+        nativeTabSelect("root/content/pages", 0);
+        bool btnBackdrop = _exists(basics + "cardbtn");
+        nativeTabSelect("root/content/pages", 5);
+        bool statusBackdrop = _exists(chrome + "cardstatus");
+        t.expectTrue("card backdrop handle exists", btnBackdrop && statusBackdrop);
 
         // 36. Regression (the original bug): a form-row label's Text renders IN its
         //     row, not one row below it. The label wrapper is a plain View (padding
         //     0) now instead of a Box - a Box inset its child by 1+padding, pushing
         //     "Font:" a full row below the combo row. The Text child is unkeyed, so
         //     it resolves at the synthesized positional segment "#0".
-        Rect comboRowB   = nativeNodeBounds("root/content/cardcombo/comborow");
-        Rect comboLabelB = nativeNodeBounds("root/content/cardcombo/comborow/combolabel");
-        Rect comboLabelTxtB = nativeNodeBounds("root/content/cardcombo/comborow/combolabel/#0");
+        nativeTabSelect("root/content/pages", 1);
+        Rect comboRowB   = nativeNodeBounds(input + "cardcombo/comborow");
+        Rect comboLabelB = nativeNodeBounds(input + "cardcombo/comborow/combolabel");
+        Rect comboLabelTxtB = nativeNodeBounds(input + "cardcombo/comborow/combolabel/#0");
         t.expectTrue("form label text renders in-row (no Box border inset)",
             comboLabelB.y == comboRowB.y && comboLabelTxtB.y == comboLabelB.y
             && comboLabelB.h == 1);
 
         // 37. Cards cap at ~70 cols: View honors style.width (makeStyle(1, 70, 0)),
         //     so a card reports w = 70 regardless of the 60-col host window.
+        nativeTabSelect("root/content/pages", 0);
+        Rect btnCardB = nativeNodeBounds(basics + "cardbtn");
+        nativeTabSelect("root/content/pages", 1);
+        Rect comboCardB = nativeNodeBounds(input + "cardcombo");
         t.expectTrue("card capped at 70 cols (View honors style.width)",
-            nativeNodeBounds("root/content/cardbtn").w == 70
-            && nativeNodeBounds("root/content/cardcombo").w == 70);
+            btnCardB.w == 70 && comboCardB.w == 70);
 
         // 38. Context window operations and UI-thread timers use the active window's seam.
         IUiContext timerCtx = activeCtx();
@@ -1267,16 +1471,17 @@ int gallerySelfTest()
             g != nullptr && g.timerTicks == ticksBeforeCancel);
 
         // 39. Grid labels share one auto-sized column across all rows and all inputs exist.
-        Rect gridB = nativeNodeBounds("root/content/cardgrid/grid");
-        Rect nameLabelB = nativeNodeBounds("root/content/cardgrid/grid/namelabel");
-        Rect emailLabelB = nativeNodeBounds("root/content/cardgrid/grid/emaillabel");
-        Rect nameB = nativeNodeBounds("root/content/cardgrid/grid/name");
-        Rect emailB = nativeNodeBounds("root/content/cardgrid/grid/email");
-        Rect noteB = nativeNodeBounds("root/content/cardgrid/grid/note");
+        nativeTabSelect("root/content/pages", 3);
+        Rect gridB = nativeNodeBounds(layout + "cardgrid/grid");
+        Rect nameLabelB = nativeNodeBounds(layout + "cardgrid/grid/namelabel");
+        Rect emailLabelB = nativeNodeBounds(layout + "cardgrid/grid/emaillabel");
+        Rect nameB = nativeNodeBounds(layout + "cardgrid/grid/name");
+        Rect emailB = nativeNodeBounds(layout + "cardgrid/grid/email");
+        Rect noteB = nativeNodeBounds(layout + "cardgrid/grid/note");
         t.expectTrue("grid labels align inputs",
-            _exists("root/content/cardgrid/grid/name")
-            && _exists("root/content/cardgrid/grid/email")
-            && _exists("root/content/cardgrid/grid/note")
+            _exists(layout + "cardgrid/grid/name")
+            && _exists(layout + "cardgrid/grid/email")
+            && _exists(layout + "cardgrid/grid/note")
             && nameLabelB.w == 13 && emailLabelB.w == 13
             && nameB.x == emailB.x && emailB.x == noteB.x
             && nameB.x == gridB.x + 14);

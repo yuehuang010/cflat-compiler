@@ -21,10 +21,11 @@
 //
 // This file has no main(); an app imports it and calls runAppGuiNative().
 import "windows.h" lib { "user32.lib", "gdi32.lib", "comctl32.lib", "dwmapi.lib", "comdlg32.lib",
-                         "uxtheme.lib", "advapi32.lib" } cache;
+                         "uxtheme.lib", "advapi32.lib", "shell32.lib", "ole32.lib" } cache;
 import "ui_native.cb";
 import "manifest.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
+import "wstring.cb";
 
 manifest ManifestDoc uiNativeManifest = { assembly = {
     dependency = { { dependentAssembly = { assemblyIdentity = {
@@ -65,6 +66,21 @@ extern stdcall i32 RegQueryValueExA(void* hKey, const char* valueName, void* res
                                     u32* type, void* data, u32* dataSize);
 extern stdcall i32 RegCloseKey(void* hKey);
 extern stdcall i32 SystemParametersInfoA(u32 action, u32 param, void* data, u32 flags);
+extern stdcall void* SHBrowseForFolderW(void* info);
+extern stdcall i32 SHGetPathFromIDListW(void* pidl, u16* path);
+extern stdcall void CoTaskMemFree(void* p);
+
+struct _BrowseInfoW
+{
+    void* hwndOwner = nullptr;
+    u16* pidlRoot = nullptr;
+    u16* pszDisplayName = nullptr;
+    u16* lpszTitle = nullptr;
+    u32 ulFlags = 0u;
+    void* lpfn = nullptr;
+    i64 lParam = 0;
+    i32 iImage = 0;
+};
 
 const u32 _REG_DWORD = 4u;
 const u32 _KEY_READ = 0x20019u;
@@ -81,10 +97,38 @@ struct _HighContrast
 const int PBM_SETRANGE32 = 1030;   // WM_USER+6
 const int PBM_SETPOS     = 1026;   // WM_USER+2
 const int PBM_GETPOS     = 1032;   // WM_USER+8
+const int PBM_SETMARQUEE = 1034;   // WM_USER+10
+const int PBS_MARQUEE    = 0x08;
 const int TBM_GETPOS     = 1024;   // WM_USER+0
 const int TBM_SETPOS     = 1029;   // WM_USER+5
 const int TBM_SETRANGE   = 1030;   // WM_USER+6
+const int UDM_SETBUDDY   = 105;    // WM_USER+1
+const int UDM_SETRANGE32 = 111;    // WM_USER+31
+const int UDM_SETPOS32   = 113;    // WM_USER+33
+const int UDM_GETPOS32   = 114;    // WM_USER+34
+const int UDN_DELTAPOS   = -722;   // UDN_FIRST-1
+const int TB_BUTTONSTRUCTSIZE = 1054; // WM_USER+30
+const int TB_ADDBUTTONSA = 1028;      // WM_USER+4
+const int TB_DELETEBUTTON = 1046;     // WM_USER+22
+const int TBSTYLE_FLAT = 0x0800;
+const int TBSTYLE_LIST = 0x1000;
+const int CCS_NORESIZE = 1;
+const int I_IMAGENONE = -2;
+const int BTNS_SEP = 1;
+const int BTNS_SHOWTEXT = 0x40;
+const int TBSTATE_ENABLED = 4;
 const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+struct TBBUTTONA
+{
+    i32 iBitmap = 0;
+    i32 idCommand = 0;
+    u8 fsState = 0;
+    u8 fsStyle = 0;
+    u16 reserved = 0;
+    u64 dwData = 0u;
+    char* iString = nullptr;
+};
 
 // Status bar (msctls_statusbar32) messages.
 const int SB_SETTEXTA   = 1025;   // WM_USER+1
@@ -202,6 +246,7 @@ const int LVN_COLUMNCLICK = -108;   // LVN_FIRST-8
 const int LVN_GETDISPINFOA = -150;  // LVN_FIRST-50
 const int LVN_KEYDOWN     = -155;   // LVN_FIRST-55
 const int NM_DBLCLK       = -3;     // NM_FIRST-3
+const int NM_CLICK        = -2;     // NM_FIRST-2
 
 // LVCOLUMNA (ANSI, natural 8-byte pointer alignment). pszText/iSubItem drive an
 // LVM_INSERTCOLUMNA; _pad aligns pszText to offset 16.
@@ -529,6 +574,7 @@ bool nativeMappable(int kind)
 {
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
+        || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -630,6 +676,8 @@ class Window : INativeHost
     void* bgBrush   = nullptr;       // cached solid brush of themeBg
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
+    list<u64>    spinnerHandles = default;
+    list<u64>    spinnerUpdowns = default;
     // Text-only font/ink overrides. The font handles are cached per window; these parallel
     // arrays let WM_CTLCOLORSTATIC apply FONT_CAPTION or an explicit Text.color per control.
     list<u64>    textHandles = default;
@@ -748,7 +796,8 @@ class Window : INativeHost
     // contents are FLAT SIBLINGS, so without it the container repaints over content that was
     // never invalidated and erases it. Only a scroll's thin exposed band repaints, so any such
     // overpaint is permanent damage. Clipping + the z sink in applyTree are what prevent it.
-    u64 createControl(int elemKind, u64 parentHandle, string key)
+    u64 createControl(int elemKind, u64 parentHandle, string key,
+                      bool password, bool indeterminate)
     {
         void* parent = u2h(parentHandle);
         string cls = "STATIC";
@@ -767,6 +816,7 @@ class Window : INativeHost
         {
             cls = "EDIT";
             style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL);
+            if (password) style = style | (u32)0x20;
         }
         else if (elemKind == ELEM_TEXTAREA)
         {
@@ -788,11 +838,33 @@ class Window : INativeHost
         {
             cls = "msctls_progress32";
             style = (u32)(WS_CHILD | WS_VISIBLE);
+            if (indeterminate) style = style | (u32)PBS_MARQUEE;
         }
         else if (elemKind == ELEM_SLIDER)
         {
             cls = "msctls_trackbar32";
             style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        }
+        else if (elemKind == ELEM_SPINNER)
+        {
+            void* edit = CreateWindowExA(0u, "EDIT", "", (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL | 0x2000),
+                0, 0, 80, 20, parent, nullptr, _hInst, nullptr);
+            void* up = CreateWindowExA(0u, "msctls_updown32", "", (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | 0x0002 | 0x0004 | 0x0020),
+                0, 0, 20, 20, parent, nullptr, _hInst, nullptr);
+            SendMessageA(up, (u32)UDM_SETBUDDY, (u64)edit, (i64)0);
+            this.spinnerHandles.add((u64)edit); this.spinnerUpdowns.add((u64)up);
+            if (this.font != nullptr) SendMessageA(edit, (u32)WM_SETFONT, (u64)this.font, (i64)1);
+            return (u64)edit;
+        }
+        else if (elemKind == ELEM_LINK)
+        {
+            cls = "SysLink";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        }
+        else if (elemKind == ELEM_TOOLBAR)
+        {
+            cls = "ToolbarWindow32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | TBSTYLE_FLAT | TBSTYLE_LIST | CCS_NORESIZE);
         }
         else if (elemKind == ELEM_STATUSBAR)
         {
@@ -855,6 +927,7 @@ class Window : INativeHost
 
         void* h = CreateWindowExA(0u, cls.data(), "", style | (u32)WS_CLIPSIBLINGS,
                                   0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+        if (elemKind == ELEM_TOOLBAR) SendMessageA(h, (u32)TB_BUTTONSTRUCTSIZE, (u64)sizeof(TBBUTTONA), (i64)0);
         // A GroupBox (BS_GROUPBOX) and a Box (SS_ETCHEDFRAME) paint their frame and nothing else,
         // leaving the interior to a parent background that a WS_CLIPCHILDREN pane cannot supply.
         // Subclass them so they erase their own interior (see ContainerCtlProc). A TabControl
@@ -886,6 +959,16 @@ class Window : INativeHost
         this._forgetAccent(h);
         this._freeBackdrop(h);  // no-op unless h is a container backdrop
         this._freeStatusBar(h); // no-op unless h is a status bar with cached pane text
+        int si = 0;
+        while (si < this.spinnerHandles.count())
+        {
+            if (this.spinnerHandles.get(si) == h)
+            {
+                DestroyWindow(u2h(this.spinnerUpdowns.get(si)));
+                this.spinnerHandles.removeAt(si); this.spinnerUpdowns.removeAt(si); break;
+            }
+            si++;
+        }
         DestroyWindow(u2h(h));
     }
 
@@ -896,6 +979,18 @@ class Window : INativeHost
     {
         MoveWindow(u2h(h), frameCells.x * this.dipX(), frameCells.y * this.dipY(),
                    frameCells.w * this.dipX(), frameCells.h * this.dipY(), 1);
+        int i = 0;
+        while (i < this.spinnerHandles.count())
+        {
+            if (this.spinnerHandles.get(i) == h)
+            {
+                int w = frameCells.w * this.dipX(); int hh = frameCells.h * this.dipY(); int sw = 20 * this.dipX();
+                MoveWindow(u2h(h), frameCells.x * this.dipX(), frameCells.y * this.dipY(), w - sw, hh, 1);
+                MoveWindow(u2h(this.spinnerUpdowns.get(i)), frameCells.x * this.dipX() + w - sw, frameCells.y * this.dipY(), sw, hh, 1);
+                break;
+            }
+            i++;
+        }
     }
 
     // Only push text when it actually differs, so an EDIT does not reset its caret
@@ -906,6 +1001,20 @@ class Window : INativeHost
         GetWindowTextA(u2h(h), cur, 512);
         if (strcmp(cur, (char*)s) == 0) return;
         SetWindowTextA(u2h(h), (char*)s);
+    }
+
+    void _syncToolbar(u64 h, IToolBar t)
+    {
+        int i = 0; while (i < t.labels.count()) { SendMessageA(u2h(h), (u32)(TB_DELETEBUTTON), 0u, (i64)0); i++; }
+        i = 0;
+        while (i < t.labels.count())
+        {
+            TBBUTTONA b = default; string label = t.labels.get(i);
+            b.iBitmap = I_IMAGENONE; b.idCommand = t.cmds.get(i); b.iString = label.data();
+            if (label == "") { b.fsStyle = (u8)BTNS_SEP; b.fsState = 0; }
+            else { b.fsStyle = (u8)BTNS_SHOWTEXT; b.fsState = t.enabled.get(i) ? (u8)TBSTATE_ENABLED : (u8)0; }
+            SendMessageA(u2h(h), (u32)TB_ADDBUTTONSA, 1u, (i64)&b); i++;
+        }
     }
 
     void* fontFor(int fontId)
@@ -1015,6 +1124,18 @@ class Window : INativeHost
             EnableWindow(u2h(h), v ? 1 : 0);
         else if (prop == PROP_VISIBLE)
             ShowWindow(u2h(h), v ? (int)SW_SHOW : SW_HIDE);
+        else if (prop == PROP_INDETERMINATE)
+        {
+            i64 style = GetWindowLongPtrA(u2h(h), (int)GWL_STYLE);
+            bool hasMarquee = (style & (i64)PBS_MARQUEE) != 0;
+            if (hasMarquee != v)
+            {
+                if (v) style = style | (i64)PBS_MARQUEE;
+                else style = style & ~((i64)PBS_MARQUEE);
+                SetWindowLongPtrA(u2h(h), (int)GWL_STYLE, style);
+            }
+            SendMessageA(u2h(h), (u32)PBM_SETMARQUEE, v ? 1u : 0u, (i64)0);
+        }
     }
 
     // Route a value/max set to the right control message by its class (keeps the
@@ -2198,7 +2319,20 @@ class Window : INativeHost
             u64 h = ctx.nativeHandle(path);
             if (h == 0u)
             {
-                h = this.createControl(node.kind(), (u64)this.parentFor(node.kind()), path);
+                bool password = false;
+                bool indeterminate = false;
+                if (node.kind() == ELEM_TEXTINPUT)
+                {
+                    ITextInput ti = node as ITextInput;
+                    password = ti.password;
+                }
+                else if (node.kind() == ELEM_PROGRESS)
+                {
+                    IProgressBar p = node as IProgressBar;
+                    indeterminate = p.indeterminate;
+                }
+                h = this.createControl(node.kind(), (u64)this.parentFor(node.kind()), path,
+                                       password, indeterminate);
                 ctx.setNativeHandle(path, h);
                 // The new control landed at the BOTTOM of the sibling z-order, i.e. under the
                 // backdrops and containers it must paint above. Re-sink them after this pass.
@@ -2907,6 +3041,8 @@ class Window : INativeHost
         {
             ITextInput ti = node as ITextInput;
             this.setText(h, ti.value.data());
+            wstring placeholder = ti.placeholder.toWString();
+            SendMessageW(u2h(h), (u32)0x1501, 1u, (i64)placeholder.data());
             this.setBoolProp(h, PROP_ENABLED, !ti.disabled);
         }
         else if (k == ELEM_CHECKBOX)
@@ -2921,6 +3057,7 @@ class Window : INativeHost
             IProgressBar p = node as IProgressBar;
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, p.value);
+            this.setBoolProp(h, PROP_INDETERMINATE, p.indeterminate);
         }
         else if (k == ELEM_SLIDER)
         {
@@ -2928,6 +3065,26 @@ class Window : INativeHost
             this.setIntProp(h, PROP_MAX, 100);
             this.setIntProp(h, PROP_VALUE, s.value);
             this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+        }
+        else if (k == ELEM_SPINNER)
+        {
+            ISpinner s = node as ISpinner; int i = 0;
+            while (i < this.spinnerHandles.count() && this.spinnerHandles.get(i) != h) i++;
+            if (i < this.spinnerHandles.count())
+            {
+                SendMessageA(u2h(this.spinnerUpdowns.get(i)), (u32)UDM_SETRANGE32, (u64)s.minValue, (i64)s.maxValue);
+                SendMessageA(u2h(this.spinnerUpdowns.get(i)), (u32)UDM_SETPOS32, 0u, (i64)s.value);
+            }
+            this.setText(h, s.value.toString().data()); this.setBoolProp(h, PROP_ENABLED, !s.disabled);
+            if (i < this.spinnerHandles.count()) EnableWindow(u2h(this.spinnerUpdowns.get(i)), !s.disabled);
+        }
+        else if (k == ELEM_LINK)
+        {
+            ILink l = node as ILink; this.setText(h, ("<a>" + l.text + "</a>").data()); this.setBoolProp(h, PROP_ENABLED, !l.disabled);
+        }
+        else if (k == ELEM_TOOLBAR)
+        {
+            IToolBar t = node as IToolBar; this._syncToolbar(h, t);
         }
         else if (k == ELEM_TEXTAREA)
         {
@@ -4318,6 +4475,8 @@ void routeClick(void* ctrl)
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+    ILink l = e as ILink;
+    if (l != nullptr) { l.fireClick(); pumpNative(); return; }
     // A radio button routes to its enclosing RadioGroup (one key-path segment up),
     // which owns the controlled `value` + onChange.
     IRadioButton rb = e as IRadioButton;
@@ -4438,6 +4597,23 @@ bool routeNotify(i64 lParam)
     if (nh == nullptr) return false;
     int code = (int)nh.code;
     void* hFrom = nh.hwndFrom;
+    if (code == NM_CLICK)
+    {
+        Window* wnd = curWin(); string key = wnd.keyForHandle((u64)hFrom);
+        IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); ILink l = e as ILink;
+        if (l != nullptr) { l.fireClick(); pumpNative(); return true; }
+    }
+    if (code == UDN_DELTAPOS)
+    {
+        Window* wnd = curWin(); int i = 0;
+        while (i < wnd.spinnerUpdowns.count() && u2h(wnd.spinnerUpdowns.get(i)) != hFrom) i++;
+        if (i < wnd.spinnerUpdowns.count())
+        {
+            string key = wnd.keyForHandle(wnd.spinnerHandles.get(i));
+            IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); ISpinner s = e as ISpinner;
+            if (s != nullptr) { i32* p = (i32*)((char*)u2h((u64)lParam) + 24); s.fireSet(p[0] + p[1]); pumpNative(); return true; }
+        }
+    }
     if (code == LVN_GETDISPINFOA) { fillListDispInfo(lParam); return true; }
     if (code == LVN_ITEMCHANGED)  { routeListSelect(hFrom); return true; }
     if (code == LVN_COLUMNCLICK) { routeListHeader(hFrom, lParam); return true; }
@@ -4628,6 +4804,11 @@ void routeEdit(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
+    ISpinner sp = e as ISpinner;
+    if (sp != nullptr)
+    {
+        char[64] buf; GetWindowTextA(ctrl, buf, 64); sp.fireSet(((string)buf).toInt()); pumpNative(); return;
+    }
     ITextInput ti = e as ITextInput;
     if (ti != nullptr)
     {
@@ -4810,6 +4991,26 @@ void routeSlider(void* ctrl)
     int pos = (int)SendMessageA(ctrl, (u32)TBM_GETPOS, 0u, (i64)0);
     s.fireSet(pos);
     pumpNative();
+}
+
+void routeSpinner(void* ctrl)
+{
+    Window* wnd = curWin(); void* buddy = ctrl; int i = 0;
+    while (i < wnd.spinnerUpdowns.count() && u2h(wnd.spinnerUpdowns.get(i)) != ctrl) i++;
+    if (i < wnd.spinnerUpdowns.count()) buddy = u2h(wnd.spinnerHandles.get(i));
+    string key = wnd.keyForHandle((u64)buddy); if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); if (e == nullptr) return;
+    ISpinner s = e as ISpinner; if (s == nullptr) return;
+    int v = (int)GetWindowLongPtrA(ctrl, (int)GWLP_USERDATA);
+    if (i < wnd.spinnerUpdowns.count()) v = (int)SendMessageA(ctrl, (u32)UDM_GETPOS32, 0u, (i64)0);
+    s.fireSet(v); pumpNative();
+}
+
+void routeToolbar(void* ctrl, int cmd)
+{
+    Window* wnd = curWin(); string key = wnd.keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); if (e == nullptr) return;
+    IToolBar t = e as IToolBar; if (t != nullptr) { t.fireCommand(cmd); pumpNative(); }
 }
 
 // Mirror OS focus into ctx.focusKey (the framework's keyed focus becomes a mirror
@@ -5013,6 +5214,58 @@ string nativeSaveFile()
     ofn.Flags = (u32)((int)OFN_PATHMUSTEXIST | (int)OFN_OVERWRITEPROMPT);
     if (GetSaveFileNameA(&ofn) == 0) return "";
     return "" + path;   // owned copy (path is a stack buffer)
+}
+
+// Scripted modal answers are host-owned so ui_test.cb stays platform-neutral.
+list<int> _uiTestMessageBoxAnswers = default;
+list<string> _uiTestFolderAnswers = default;
+
+void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
+void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
+
+int nativeMessageBox(string title, string text, int kind)
+{
+    if (_uiTestMessageBoxAnswers.count() > 0)
+    {
+        int answer = _uiTestMessageBoxAnswers.get(0);
+        _uiTestMessageBoxAnswers.removeAt(0);
+        return answer;
+    }
+    wstring wt = text.toWString();
+    wstring wtitle = title.toWString();
+    u32 flags = (u32)MB_OK;
+    if (kind == MSGBOX_OKCANCEL) flags = (u32)MB_OKCANCEL;
+    else if (kind == MSGBOX_YESNO) flags = (u32)MB_YESNO;
+    int r = (int)MessageBoxW(curWin().hwnd, wt.data(), wtitle.data(), flags);
+    return r == (int)IDOK || r == (int)IDYES ? 1 : 0;
+}
+
+string nativeSelectFolder()
+{
+    if (_uiTestFolderAnswers.count() > 0)
+    {
+        string path = "" + _uiTestFolderAnswers.get(0);
+        _uiTestFolderAnswers.removeAt(0);
+        return path;
+    }
+    u16[128] title = default;
+    _wideAscii("Select folder", title, 128);
+    u16[520] display = default;
+    _BrowseInfoW bi = default;
+    bi.hwndOwner = curWin().hwnd;
+    bi.pszDisplayName = display;
+    bi.lpszTitle = title;
+    bi.ulFlags = (u32)(0x0001 | 0x0040); // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+    void* pidl = SHBrowseForFolderW(&bi);
+    if (pidl == nullptr) return "";
+    u16[520] path = default;
+    bool ok = SHGetPathFromIDListW(pidl, path) != 0;
+    CoTaskMemFree(pidl);
+    if (!ok) return "";
+    int n = 0;
+    while (n < 519 && path[n] != (u16)0) n++;
+    wstring w = wstring.fromUtf16(path, n);
+    return w.toString();
 }
 
 // Modal confirm with Yes/No/Cancel. Returns 1 = Yes, 0 = No, -1 = Cancel.
@@ -5624,6 +5877,25 @@ void nativeSliderSet(string keyPath, int v)
     routeSlider(u2h(h));
 }
 
+void nativeSpinnerSet(string keyPath, int v)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    int i = 0; while (i < curWin().spinnerHandles.count() && curWin().spinnerHandles.get(i) != h) i++;
+    if (i >= curWin().spinnerHandles.count()) return;
+    void* up = u2h(curWin().spinnerUpdowns.get(i)); bool prev = curWin().applying; curWin().applying = true;
+    SendMessageA(up, (u32)UDM_SETPOS32, 0u, (i64)v); curWin().applying = prev; routeSpinner(up);
+}
+
+void nativeLinkClick(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return; routeClick(u2h(h));
+}
+
+void nativeToolbarClick(string keyPath, int cmd)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return; routeToolbar(u2h(h), cmd);
+}
+
 // True if the Image control at keyPath has an uploaded bitmap (setImageData ran).
 bool nativeImageHasBitmap(string keyPath)
 {
@@ -5992,7 +6264,12 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         }
         else if (wnd.ready)
         {
-            if (code == BN_CLICKED)                          routeClick(ctrl);
+            if (code == 0 && wnd.keyForHandle((u64)ctrl).length() > 0)
+            {
+                IElement te = findByKey(wnd.tree, keySegment(wnd.tree, 0), wnd.keyForHandle((u64)ctrl));
+                IToolBar tb = te as IToolBar; if (tb != nullptr) routeToolbar(ctrl, (int)(wParam & (u64)0xFFFF));
+            }
+            else if (code == BN_CLICKED)                     routeClick(ctrl);
             else if (code == EN_CHANGE && !wnd.applying)     routeEdit(ctrl);
             else if (code == CBN_SELCHANGE && !wnd.applying) routeCombo(ctrl);
             else if (code == BN_SETFOCUS || code == EN_SETFOCUS) mirrorFocus(ctrl);
@@ -6249,7 +6526,7 @@ void ensureWindowClass()
     SetProcessDpiAwarenessContext((void*)(i64)(-4));
     _InitCommonControlsExArgs icc = default;
     icc.cbSize = (u32)sizeof(_InitCommonControlsExArgs);
-    icc.dwICC = 0x000000FFu | 0x00004000u;
+    icc.dwICC = 0x000000FFu | 0x00004000u | 0x00008000u;
     if (InitCommonControlsEx(&icc) == 0) InitCommonControls();
     _hInst = GetModuleHandleA(nullptr);
 
