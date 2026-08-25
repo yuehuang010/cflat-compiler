@@ -6,6 +6,17 @@ question this answers: measured against the standard toolkits (Win32 common cont
 WinUI 3), which commonly used controls does ui-native still lack, and in what order should they
 be added?
 
+## Status update 2026-08-25 (Windows): all tiers VERIFIED on Windows - gates green
+
+Windows-side verification is DONE (commit 203c373). The macOS-authored win32.cb needed
+real fixes (windows.h-duplicate consts, wrong UDM_*/EM_*EVENTMASK message values, richtext
+missing from nativeMappable); winui.cb needed layout forcing for tab select/row realization
+plus creation fallbacks and the scripted dialog seams; rich text is gated by a new
+nativeRichTextExpected() capability seam (stays winui-N). Hardening tests moved to the
+tabbed key layout. Green: buildci.bat (Debug+Release), win32 gallery 89/89 + harden 5/5,
+winui gallery 97/97, test_lsp 232/0. Still open: secondary windows / modal sheets, and the
+winui-N rows (popover, rich text, webview).
+
 ## Status update 2026-08-24: Tier 1 LANDED (macOS-verified; Windows verification pending)
 
 All Tier-1 rows below are implemented, with the search box delivered as the `placeholder`
