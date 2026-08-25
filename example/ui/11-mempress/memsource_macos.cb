@@ -1,70 +1,616 @@
-// macOS MemSource - a placeholder collector.
+// macOS MemSource - a libSystem/libproc collector for the mempress example.
 //
-// Selected by `memsource.cb` on macOS. It fabricates a stable set of rows so the
-// window, its sorting, its selection and its refresh cadence can be built and
-// exercised on a Mac; it reads nothing from the OS.
-//
-// Replacing it is the whole macOS port: fill `capture()` from the real APIs
-// (`host_statistics64` / `HOST_VM_INFO64` for the system totals, `proc_listpids`
-// + `proc_pid_rusage` per process for the per-app figures) and implement
-// `endTask` over `kill(2)`. Nothing outside this file needs to change - the
-// window and the pressure model are already platform-neutral.
+// Process memory is resident size (the public PROC_PIDTASKINFO surface); app
+// bundles are grouped by their .app root and all other processes share a row.
 
 import "appsample.cb";
+import "dictionary.cb";
 import "list.cb";
 import "string.cb";
 
+// sys/sysctl.h, mach/mach_host.h, mach/vm_statistics.h and libproc.h.
+extern i32 sysctlbyname(const char* name, void* oldp, u64* oldlenp,
+                        void* newp, u64 newlen);
+extern u32 mach_host_self();
+extern i32 host_page_size(u32 host, u64* pageSize);
+extern i32 host_statistics64(u32 host, i32 flavor, void* info, u32* count);
+extern i32 proc_listpids(u32 type, u32 typeinfo, void* buffer, i32 buffersize);
+extern i32 proc_pidinfo(i32 pid, i32 flavor, u64 arg, void* buffer, i32 buffersize);
+extern i32 proc_pidpath(i32 pid, void* buffer, u32 buffersize);
+extern i32 proc_name(i32 pid, void* buffer, u32 buffersize);
+extern i32 kill(i32 pid, i32 sig);
+extern i32* __error();
 
+int PROC_ALL_PIDS = 1;
+int PROC_PIDTASKINFO = 4;
+int HOST_VM_INFO64 = 4;
+int HOST_VM_INFO64_COUNT = 40;
+int ESRCH = 3;
+int SIGTERM = 15;
 
-bool memSourceCanEndTask() { return false; }
+// Layouts copied from Apple's mach/vm_statistics.h and sys/proc_info.h.
+struct VmStatistics64
+{
+    u32 free_count = 0;
+    u32 active_count = 0;
+    u32 inactive_count = 0;
+    u32 wire_count = 0;
+    u64 zero_fill_count = 0;
+    u64 reactivations = 0;
+    u64 pageins = 0;
+    u64 pageouts = 0;
+    u64 faults = 0;
+    u64 cow_faults = 0;
+    u64 lookups = 0;
+    u64 hits = 0;
+    u64 purges = 0;
+    u32 purgeable_count = 0;
+    u32 speculative_count = 0;
+    u64 decompressions = 0;
+    u64 compressions = 0;
+    u64 swapins = 0;
+    u64 swapouts = 0;
+    u32 compressor_page_count = 0;
+    u32 throttled_count = 0;
+    u32 external_page_count = 0;
+    u32 internal_page_count = 0;
+    u64 total_uncompressed_pages_in_compressor = 0;
+    u64 swapped_count = 0;
+};
+
+struct XswUsage
+{
+    u64 total = 0;
+    u64 available = 0;
+    u64 used = 0;
+    u32 pageSize = 0;
+    u8 encrypted = 0;
+};
+
+struct ProcTaskInfo
+{
+    u64 virtual_size = 0;
+    u64 resident_size = 0;
+    u64 total_user = 0;
+    u64 total_system = 0;
+    u64 threads_user = 0;
+    u64 threads_system = 0;
+    i32 policy = 0;
+    i32 faults = 0;
+    i32 pageins = 0;
+    i32 cow_faults = 0;
+    i32 messages_sent = 0;
+    i32 messages_received = 0;
+    i32 syscalls_mach = 0;
+    i32 syscalls_unix = 0;
+    i32 csw = 0;
+    i32 threadnum = 0;
+    i32 numrunning = 0;
+    i32 priority = 0;
+};
+
+i32 _findAppMarker(char* path)
+{
+    i32 i = 0;
+    while (path[i] != '\0')
+    {
+        if (path[i] == '.' && path[i + 1] == 'a' && path[i + 2] == 'p'
+            && path[i + 3] == 'p' && path[i + 4] == '/') return i;
+        i = i + 1;
+    }
+    return -1;
+}
+
+i32 _lastSlashBefore(char* path, i32 end)
+{
+    i32 slash = -1;
+    i32 i = 0;
+    while (i < end)
+    {
+        if (path[i] == '/') slash = i;
+        i = i + 1;
+    }
+    return slash;
+}
+
+i32 _ratioScore(u64 used, u64 total)
+{
+    if (total == 0u) return 0;
+    u64 value = used * (u64)100 / total;
+    if (value > 100u) value = 100u;
+    return (i32)value;
+}
+
+i32 _bandForScore(i32 value)
+{
+    if (value >= 75) return PressureBand.Critical;
+    if (value >= 50) return PressureBand.High;
+    if (value >= 25) return PressureBand.Moderate;
+    return PressureBand.Low;
+}
+
+void _setSystemPressure(AppSample* sample, u64 total, u64 available)
+{
+    u64 used = total > available ? total - available : 0u;
+    i32 value = _ratioScore(used, total);
+    i32 level = 0;
+    u64 levelLen = (u64)sizeof(level);
+    bool haveLevel = sysctlbyname("kern.memorystatus_vm_pressure_level", &level,
+                                  &levelLen, nullptr, 0u) == 0;
+    if (!haveLevel)
+    {
+        sample->pressure.value = value;
+        sample->pressure.band = _bandForScore(value);
+        return;
+    }
+
+    if (level == 4)
+    {
+        sample->pressure.band = PressureBand.Critical;
+        if (value < 75) value = 75;
+    }
+    else if (level == 2)
+    {
+        sample->pressure.band = PressureBand.High;
+        if (value < 50) value = 50;
+        if (value > 74) value = 74;
+    }
+    else
+    {
+        sample->pressure.band = PressureBand.Low;
+        if (value > 24) value = 24;
+    }
+    sample->pressure.value = value;
+}
 
 class MemSource
 {
-    i32 _tick = 0;
-
-    void _addApp(list<AppEntry>* apps, char* name, u64 megabytes, i32 pressure, i32 band)
+    void _addProcess(list<AppEntry>* apps, dictionary<string, i32>* indexes,
+                     char* path, char* name, i32 marker, i32 pid, ProcTaskInfo* ti,
+                     u64 physicalTotal)
     {
-        AppEntry app = default;
-        app.key = "" + name;
-        app.displayName = "" + name;
-        app.workingSet = megabytes * (u64)1048576;
-        app.commit = app.workingSet;
-        app.pressure.value = pressure;
-        app.pressure.band = band;
-        apps->add(app);
+        string key = default;
+        string display = default;
+        if (marker >= 0)
+        {
+            key = substring((string)path, 0, marker + 4);
+            i32 slash = _lastSlashBefore(path, marker);
+            if (slash >= 0) display = substring((string)path, slash + 1, marker - slash - 1);
+            else display = substring((string)path, 0, marker);
+        }
+        else
+        {
+            key = (string)kBackgroundAppKey;
+            display = (string)kBackgroundAppKey;
+        }
+
+        i32 appIndex = -1;
+        if (indexes->contains(key)) appIndex = indexes->get(key);
+        else
+        {
+            AppEntry app = default;
+            app.key = key.copy();
+            app.displayName = display.copy();
+            if (marker >= 0) app.exePath = ((string)path).copy();
+            apps->add(app);
+            appIndex = apps->count() - 1;
+            indexes->set(key, appIndex);
+        }
+
+        AppEntry* app = &apps->get(appIndex);
+        app->workingSet = app->workingSet + ti->resident_size;
+        app->commit = app->commit + ti->resident_size;
+        if (ti->faults > 0) app->hardFaults = app->hardFaults + (u64)ti->faults;
+        app->processIds.add((u32)pid);
+        i32 score = _ratioScore(app->workingSet, physicalTotal);
+        app->pressure.value = score;
+        app->pressure.band = _bandForScore(score);
+    }
+
+    void _collectSystem(AppSample* sample)
+    {
+        i64 physical = 0;
+        u64 physicalLen = (u64)sizeof(physical);
+        if (sysctlbyname("hw.memsize", &physical, &physicalLen, nullptr, 0u) != 0)
+            physical = 0;
+
+        u64 pageSize = 4096u;
+        host_page_size(mach_host_self(), &pageSize);
+        VmStatistics64 vm = default;
+        u32 count = (u32)HOST_VM_INFO64_COUNT;
+        u64 availablePages = 0u;
+        if (host_statistics64(mach_host_self(), HOST_VM_INFO64, &vm, &count) == 0)
+        {
+            availablePages = (u64)vm.free_count + (u64)vm.inactive_count
+                + (u64)vm.purgeable_count;
+            sample->system.hardFaults = vm.faults;
+        }
+
+        u64 available = availablePages * pageSize;
+        if ((u64)physical > 0u && available > (u64)physical) available = (u64)physical;
+        sample->system.physicalTotal = (u64)physical;
+        sample->system.physicalAvailable = available;
+        XswUsage swap = default;
+        u64 swapLen = (u64)sizeof(swap);
+        if (sysctlbyname("vm.swapusage", &swap, &swapLen, nullptr, 0u) != 0)
+            swap = default;
+        sample->system.commitLimit = (u64)physical + swap.total;
+        sample->system.commitTotal = (u64)physical - available + swap.used;
+        _setSystemPressure(sample, (u64)physical, available);
+    }
+
+    void _collectApps(AppSample* sample)
+    {
+        dictionary<string, i32> indexes = default;
+        i32 bytes = proc_listpids((u32)PROC_ALL_PIDS, 0u, nullptr, 0);
+        if (bytes <= 0) return;
+        i32 capacity = bytes + 1024 * (i32)sizeof(i32);
+        i32* pids = (i32*)malloc((i64)capacity);
+        if (pids == nullptr) return;
+        i32 returned = proc_listpids((u32)PROC_ALL_PIDS, 0u, pids, capacity);
+        i32 count = returned / (i32)sizeof(i32);
+        i32 i = 0;
+        while (i < count)
+        {
+            i32 pid = pids[i];
+            if (pid > 0)
+            {
+                ProcTaskInfo ti = default;
+                if (proc_pidinfo(pid, PROC_PIDTASKINFO, 0u, &ti, (i32)sizeof(ti))
+                    == (i32)sizeof(ti))
+                {
+                    char[4096] path = default;
+                    char[256] name = default;
+                    i32 pathResult = proc_pidpath(pid, path, (u32)sizeof(path));
+                    proc_name(pid, name, (u32)sizeof(name));
+                    i32 marker = pathResult > 0 ? _findAppMarker(path) : -1;
+                    this._addProcess(&sample->apps, &indexes, path, name, marker, pid,
+                                     &ti, sample->system.physicalTotal);
+                }
+            }
+            i = i + 1;
+        }
+        free((void*)pids);
     }
 
     move AppSample capture()
     {
-        // A cheap LCG so successive captures differ and the refresh is visible.
-        this._tick = (this._tick * 1103515245 + 12345) & 0x3FFFFFFF;
-        u64 drift = (u64)(this._tick % 64);
-
         AppSample sample = default;
-        this._addApp(&sample.apps, "Safari",        1420u + drift, 34, PressureBand.Moderate);
-        this._addApp(&sample.apps, "Xcode",          980u + drift, 22, PressureBand.Moderate);
-        this._addApp(&sample.apps, "Terminal",       120u + drift,  4, PressureBand.Low);
-        this._addApp(&sample.apps, "Finder",          96u + drift,  2, PressureBand.Low);
-        this._addApp(&sample.apps, "Music",           74u + drift,  1, PressureBand.Low);
-        this._addApp(&sample.apps, "Notes",           48u + drift,  0, PressureBand.Low);
-        this._addApp(&sample.apps, kBackgroundAppKey, 610u + drift,  9, PressureBand.Low);
-
-        sample.system.physicalTotal     = (u64)16 * (u64)1073741824;
-        sample.system.physicalAvailable = (u64)7 * (u64)1073741824 + drift * (u64)1048576;
-        sample.system.commitLimit       = sample.system.physicalTotal;
-        sample.system.commitTotal       = sample.system.physicalTotal - sample.system.physicalAvailable;
-        sample.pressure.value = 28;
-        sample.pressure.band  = PressureBand.Moderate;
+        this._collectSystem(&sample);
+        this._collectApps(&sample);
         return move sample;
     }
-
 };
+
+// True when the UI may send SIGTERM to the pids in an app row.
+bool memSourceCanEndTask() { return true; }
+
+i32 memSourceEndTask(list<u32>* processIds)
+{
+    if (processIds == nullptr) return 1;
+    i32 result = 0;
+    i32 i = 0;
+    i32* errnoPtr = nullptr;
+    while (i < processIds->count())
+    {
+        if (kill((i32)processIds->get(i), (i32)SIGTERM) != 0)
+        {
+            errnoPtr = __error();
+            if (*errnoPtr != ESRCH) result = 1;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+extern void* dlsym(void* handle, const char* name);
+
+void* _macIconMsgSend = nullptr;
+function<void*(char*)> _macIconGetClass = default;
+function<void*(char*)> _macIconRegisterName = default;
+
+bool _macIconInit()
+{
+    if (_macIconMsgSend != nullptr && _macIconGetClass != nullptr
+        && _macIconRegisterName != nullptr) return true;
+    void* rtld = (void*)(i64)(-2);
+    _macIconMsgSend = dlsym(rtld, "objc_msgSend");
+    _macIconGetClass = (function<void*(char*)>)dlsym(rtld, "objc_getClass");
+    _macIconRegisterName = (function<void*(char*)>)dlsym(rtld, "sel_registerName");
+    return _macIconMsgSend != nullptr && _macIconGetClass != nullptr
+        && _macIconRegisterName != nullptr;
+}
+
+void* _macIconClass(char* name) { return _macIconGetClass(name); }
+void* _macIconSel(char* name) { return _macIconRegisterName(name); }
+
+void* _macIconMsg0(void* object, char* selector)
+{
+    function<void*(void*, void*)> f = (function<void*(void*, void*)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector));
+}
+
+void* _macIconMsg1(void* object, char* selector, void* arg)
+{
+    function<void*(void*, void*, void*)> f =
+        (function<void*(void*, void*, void*)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector), arg);
+}
+
+i64 _macIconI64(void* object, char* selector)
+{
+    function<i64(void*, void*)> f = (function<i64(void*, void*)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector));
+}
+
+void* _macIconObjArg(void* object, char* selector, i64 arg)
+{
+    function<void*(void*, void*, i64)> f =
+        (function<void*(void*, void*, i64)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector), arg);
+}
+
+i8 _macIconBool1(void* object, char* selector, void* arg)
+{
+    function<i8(void*, void*, void*)> f =
+        (function<i8(void*, void*, void*)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector), arg);
+}
+
+i8 _macIconBool0(void* object, char* selector)
+{
+    function<i8(void*, void*)> f = (function<i8(void*, void*)>)_macIconMsgSend;
+    return f(object, _macIconSel(selector));
+}
+
+void* _macIconNSString(char* text)
+{
+    return _macIconMsg1(_macIconClass("NSString"),
+                        "stringWithUTF8String:", (void*)text);
+}
+
+class AppIconBuffer
+{
+    string key = default;
+    u8* pixels = nullptr;
+    i32 pxW = 0;
+    i32 pxH = 0;
+
+    ~AppIconBuffer()
+    {
+        if (this.pixels != nullptr) free((void*)this.pixels);
+    }
+};
+
+dictionary<string, unique AppIconBuffer*> _appIconCache = default;
+
+// CGRect decomposes to 4 doubles on arm64, so CGContextDrawImage takes scalars.
+import framework "CoreGraphics";
+extern void* CGColorSpaceCreateDeviceRGB();
+extern void CGColorSpaceRelease(void* space);
+extern void* CGBitmapContextCreate(void* data, u64 w, u64 h, u64 bitsPerComponent,
+                                   u64 bytesPerRow, void* space, u32 bitmapInfo);
+extern void CGContextRelease(void* c);
+extern void CGContextDrawImage(void* c, double x, double y, double w, double h, void* image);
+
+struct IconRectD
+{
+    double x = 0.0;
+    double y = 0.0;
+    double w = 0.0;
+    double h = 0.0;
+};
+
+// Rasterize the NSImage at 32x32 into a malloc'd premultiplied BGRA buffer the
+// caller owns; nullptr when CoreGraphics cannot produce a CGImage for it.
+u8* _macIconDraw32(void* icon)
+{
+    IconRectD rect = default;
+    rect.w = 32.0;
+    rect.h = 32.0;
+    function<void*(void*, void*, void*, void*, void*)> proposed =
+        (function<void*(void*, void*, void*, void*, void*)>)_macIconMsgSend;
+    void* cg = proposed(icon, _macIconSel("CGImageForProposedRect:context:hints:"),
+                        &rect, nullptr, nullptr);
+    if (cg == nullptr) return nullptr;
+
+    u8* pixels = (u8*)malloc(32 * 32 * 4);
+    if (pixels == nullptr) return nullptr;
+    memset((void*)pixels, 0, 32 * 32 * 4);
+    void* space = CGColorSpaceCreateDeviceRGB();
+    // kCGImageAlphaPremultipliedLast | default byte order: memory is R,G,B,A.
+    void* ctx = CGBitmapContextCreate((void*)pixels, 32u, 32u, 8u, 128u, space, 1u);
+    if (ctx == nullptr)
+    {
+        CGColorSpaceRelease(space);
+        free((void*)pixels);
+        return nullptr;
+    }
+    CGContextDrawImage(ctx, 0.0, 0.0, 32.0, 32.0, cg);
+    CGContextRelease(ctx);
+    CGColorSpaceRelease(space);
+
+    i64 i = 0;
+    while (i < 32 * 32 * 4)
+    {
+        u8 r = pixels[i];
+        pixels[i] = pixels[i + 2];
+        pixels[i + 2] = r;
+        i = i + 4;
+    }
+    return pixels;
+}
+
+// Sample layouts a TIFF page decodes to: 8-bit RGBA, 16-bit-integer RGBA, or
+// (modern .icns pages) 16-bit half-float RGBA. 0 = not directly readable.
+int ICONREP_NONE = 0;
+int ICONREP_U8   = 1;
+int ICONREP_U16  = 2;
+int ICONREP_F16  = 3;
+
+int _macIconRepLayout(void* rep, void* bitmapClass)
+{
+    if (rep == nullptr) return ICONREP_NONE;
+    if (_macIconBool1(rep, "isKindOfClass:", bitmapClass) == (i8)0) return ICONREP_NONE;
+    if (_macIconBool0(rep, "isPlanar") != (i8)0) return ICONREP_NONE;
+    if (_macIconI64(rep, "samplesPerPixel") != (i64)4) return ICONREP_NONE;
+    i64 bpp = _macIconI64(rep, "bitsPerPixel");
+    i64 fmt = _macIconI64(rep, "bitmapFormat");
+    if ((fmt & (i64)1) != (i64)0) return ICONREP_NONE;   // alpha-first: not seen; skip
+    if (bpp == (i64)32) return (fmt & (i64)4) == (i64)0 ? ICONREP_U8 : ICONREP_NONE;
+    if (bpp != (i64)64) return ICONREP_NONE;
+    return (fmt & (i64)4) != (i64)0 ? ICONREP_F16 : ICONREP_U16;
+}
+
+i64 _macIconRepPixelBytes(int layout) { return layout == ICONREP_U8 ? (i64)4 : (i64)8; }
+
+// IEEE half in [0,1] -> 0..255; negatives, subnormals -> 0; >= 1.0 -> 255.
+u32 _macIconHalfToByte(u32 h)
+{
+    if ((h & 0x8000u) != 0u) return 0u;
+    u32 e = (h >> 10) & 0x1Fu;
+    u32 m = h & 0x3FFu;
+    if (e == 0u) return 0u;
+    if (h >= 0x3C00u) return 255u;
+    u32 v = ((1024u + m) * 255u) >> (10u + 15u - e);
+    return v > 255u ? 255u : v;
+}
+
+u32 _macIconSampleByte(u8* px, int layout, i64 sample)
+{
+    if (layout == ICONREP_U8) return (u32)px[sample];
+    u32 lo = (u32)px[sample * 2];
+    u32 hi = (u32)px[sample * 2 + 1];
+    if (layout == ICONREP_U16) return hi;                // little-endian high byte
+    return _macIconHalfToByte((hi << 8) | lo);
+}
+
+AppIconBuffer* _readMacAppIcon(string bundlePath)
+{
+    AppIconBuffer* result = new AppIconBuffer();
+    result->key = bundlePath.copy();
+
+    if (!_macIconInit()) return result;
+    void* workspaceClass = _macIconClass("NSWorkspace");
+    void* bitmapClass = _macIconClass("NSBitmapImageRep");
+    if (workspaceClass == nullptr || bitmapClass == nullptr) return result;
+
+    void* workspace = _macIconMsg0(workspaceClass, "sharedWorkspace");
+    void* icon = workspace != nullptr ? _macIconMsg1(workspace, "iconForFile:",
+                                                       _macIconNSString(bundlePath.data())) : nullptr;
+    if (icon == nullptr) return result;
+
+    // Fast path: rasterize at 32px through a CGBitmapContext. CoreGraphics picks
+    // the right icon page and converts any sample format; the TIFF fallback below
+    // serializes every page (~74 MB for a modern icon) and stalls the UI thread.
+    u8* drawn = _macIconDraw32(icon);
+    if (drawn != nullptr)
+    {
+        result->pixels = drawn;
+        result->pxW = 32;
+        result->pxH = 32;
+        return result;
+    }
+
+    void* representations = _macIconMsg0(icon, "representations");
+    if (representations == nullptr) return result;
+
+    // Scan the icon's own representations first; if none is a readable bitmap
+    // (modern macOS exposes NSISIconImageRep there), fall back to the TIFF pages.
+    // Prefer the smallest page that still covers a retina row icon (>= 32px).
+    void* selected = nullptr;
+    int layout = ICONREP_NONE;
+    i64 width = 0;
+    i64 height = 0;
+    i64 stride = 0;
+    int pass = 0;
+    while (pass < 2 && selected == nullptr)
+    {
+        void* reps = representations;
+        if (pass == 1)
+        {
+            void* tiff = _macIconMsg0(icon, "TIFFRepresentation");
+            reps = tiff != nullptr ? _macIconMsg1(bitmapClass, "imageRepsWithData:", tiff) : nullptr;
+        }
+        i64 count = reps != nullptr ? _macIconI64(reps, "count") : (i64)0;
+        i64 i = 0;
+        while (i < count)
+        {
+            void* rep = _macIconObjArg(reps, "objectAtIndex:", i);
+            int repLayout = _macIconRepLayout(rep, bitmapClass);
+            if (repLayout != ICONREP_NONE)
+            {
+                i64 w = _macIconI64(rep, "pixelsWide");
+                i64 h = _macIconI64(rep, "pixelsHigh");
+                i64 s = _macIconI64(rep, "bytesPerRow");
+                if (w > 0 && h > 0 && s >= w * _macIconRepPixelBytes(repLayout)
+                    && (selected == nullptr || (w >= 32 && (width < 32 || w < width))))
+                {
+                    selected = rep;
+                    layout = repLayout;
+                    width = w;
+                    height = h;
+                    stride = s;
+                }
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    if (selected == nullptr) return result;
+    u8* source = (u8*)_macIconMsg0(selected, "bitmapData");
+    if (source == nullptr || width > 0x7FFFFFFF || height > 0x7FFFFFFF) return result;
+
+    // Cache at most 32px (2x a 16pt row icon): a 1024px TIFF page would otherwise
+    // cost 4 MB per cached app - unbecoming of a memory pressure monitor.
+    i64 outW = width;
+    i64 outH = height;
+    if (width > 64)
+    {
+        outW = 32;
+        outH = height * 32 / width;
+        if (outH < 1) outH = 1;
+    }
+    i64 size = outW * outH * 4;
+    u8* pixels = (u8*)malloc(size);
+    if (pixels == nullptr) return result;
+    i64 pixelBytes = _macIconRepPixelBytes(layout);
+    i64 y = 0;
+    while (y < outH)
+    {
+        u8* src = source + (y * height / outH) * stride;
+        u8* dst = pixels + y * outW * 4;
+        i64 x = 0;
+        while (x < outW)
+        {
+            // Rep samples are premultiplied RGBA (u8, u16, or half float). The
+            // Cocoa host's NSBitmapImageRep bridge consumes top-down BGRA32.
+            u8* px = src + (x * width / outW) * pixelBytes;
+            dst[x * 4 + 0] = (u8)_macIconSampleByte(px, layout, 2);
+            dst[x * 4 + 1] = (u8)_macIconSampleByte(px, layout, 1);
+            dst[x * 4 + 2] = (u8)_macIconSampleByte(px, layout, 0);
+            dst[x * 4 + 3] = (u8)_macIconSampleByte(px, layout, 3);
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    result->pixels = pixels;
+    result->pxW = (i32)outW;
+    result->pxH = (i32)outH;
+    return result;
+}
 
 ListRowIcon memSourceAppIcon(AppEntry* app)
 {
-    return noListIcon();
-}
+    if (app == nullptr || app->exePath.isEmpty() || app->key.isEmpty()) return noListIcon();
+    if (!_macIconInit() || _macIconClass("NSWorkspace") == nullptr) return noListIcon();
 
-// The real macOS implementation is kill(2) over the group's pids; until then
-// `memSourceCanEndTask()` is false and the UI never reaches this.
-i32 memSourceEndTask(list<u32>* processIds) { return 0; }
+    string cacheKey = app->key.copy();
+    if (!_appIconCache.contains(cacheKey))
+        _appIconCache.set(cacheKey, _readMacAppIcon(cacheKey));
+
+    AppIconBuffer* cached = _appIconCache.get(cacheKey);
+    if (cached == nullptr || cached->pixels == nullptr || cached->pxW <= 0 || cached->pxH <= 0)
+        return noListIcon();
+    return listIcon(cached->key.data(), (u64)cached->pixels, cached->pxW, cached->pxH);
+}

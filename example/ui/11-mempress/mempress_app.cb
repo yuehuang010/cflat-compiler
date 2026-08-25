@@ -230,7 +230,6 @@ class MonitorApp : IComponent
         if (!this._started)
         {
             this._started = true;
-            this._dark = ctx.systemPrefersDark();
             ctx.setContentSize(70, 14);
             this._refreshTimer = ctx.every(kRefreshIntervalMs, () =>
             {
@@ -238,6 +237,9 @@ class MonitorApp : IComponent
             });
             this._kickCapture();
         }
+        // Re-read per render: the hosts rebuild on an OS appearance change, so
+        // the window follows a live light/dark switch instead of the launch value.
+        this._dark = ctx.systemPrefersDark();
         ctx.theme = this._dark ? darkTheme() : lightTheme();
 
         i32 margin = 1;

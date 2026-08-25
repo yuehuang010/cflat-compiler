@@ -2947,3 +2947,31 @@ handed to an `extern f(int, ...)`, and it must not start to. Varargs are an opaq
 like a raw pointer; the caller is responsible. Reviewer-found "bonded closure through varargs
 escapes" (after d730964) was filed as a p3 and withdrawn on this ruling - do not re-file it, and
 do not add a fail-closed check for the variadic tail.
+
+## Cocoa cell-based NSTableView: verify on a real display, not just the headless host (2026-08-24)
+
+From the mempress macOS port. Three AppKit behaviors that the ui_test headless host does NOT
+reproduce - a fix that passes the driver suite can still be visibly broken in the real GUI:
+
+- **Big Sur's "automatic" table style resolves only when the view reaches a display.** In the
+  headless host `intercellSpacing` read back as the 3pt we pinned; on screen the style re-tiled
+  to the inset look with ~17pt spacing and pushed columns past the clip view. Pin
+  `setStyle: NSTableViewStylePlain` (guarded by respondsToSelector:) AND compact spacing; then
+  measure the tiled width and absorb any residual excess in the last column. Formula-based
+  spacing math kept missing (tile overhead was neither gap*(n-1) nor gap*n) - measure, correct,
+  re-measure.
+- **`NSCell setImage:` on a text cell CONVERTS it to an image-type cell and the text vanishes.**
+  This was latent in the row-icon path until the first cocoa app supplied real icons. Cell-based
+  tables show icon + text only via an attributed-string NSTextAttachment in the column-0
+  objectValue.
+- **`reloadData` on every render kills scrolling.** The 1 Hz app refresh re-entered
+  LISTOP_SET_ROWCOUNT -> unconditional reloadData, stuttering in-flight scroll gestures.
+  Reload only on a count CHANGE; same-count refreshes use setNeedsDisplay:, which re-queries
+  the dataSource for visible cells anyway.
+- **`TIFFRepresentation` of a modern .icns NSImage serializes every page (~74 MB) and takes
+  seconds.** Never do it on the UI thread per cache miss. Rasterize through a 32px
+  CGBitmapContext (`CGImageForProposedRect:` picks the page; CG converts the half-float
+  samples modern icon pages decode to).
+- **NSTextAlignment uses the UNIFIED TextKit numbering on modern macOS: center=1, right=2.**
+  The legacy AppKit values (right=1, center=2) render swapped. A right-aligned header with a
+  sort chevron LOOKS centered - screenshot a chevron-free column before trusting the mapping.

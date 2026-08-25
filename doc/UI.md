@@ -252,8 +252,8 @@ cell dimensions.
 GridView owns `scrollY` and scrolls itself. Arrow-key navigation runs through the
 `dispatch(Event)` seam, so it is live on the canvas/TUI hosts (native hosts do not
 synthesize `EV_KEY`); Win32 routes the mouse wheel to the GridView in cell-row steps,
-and cell selection by mouse works everywhere. Cocoa and WinUI wheel routing is
-deferred. GridView cells are not part of the Tab ring. Nesting a
+and cell selection by mouse works everywhere. Cocoa routes the wheel the same way
+through the content view's `scrollWheel:`; WinUI wheel routing is deferred. GridView cells are not part of the Tab ring. Nesting a
 GridView inside a `ScrollView` is unsupported. Its `toJson()` output reports count,
 scrollY, selectedIndex, and realized count, never cell contents.
 
@@ -842,9 +842,10 @@ pointer's data word IS that instance's address, nothing is copied and nothing is
 **Window operations and timers.** `setContentSize` takes layout-cell dimensions and
 routes to the context's current window. `setTopmost` changes only that window's z-order.
 `requestedWidth()` and `requestedHeight()` return the current live client size in layout
-cells on Win32, or the last requested size when the host has no live query. If the native
-window is not available, they also return the recorded request. `requestedTopmost()` uses
-the live window state on Win32 and the recorded request on hosts without a live query.
+cells on Win32 and Cocoa, or the last requested size when the host has no live query. If
+the native window is not available, they also return the recorded request.
+`requestedTopmost()` uses the live window state on Win32 and Cocoa and the recorded
+request on hosts without a live query.
 `systemPrefersDark` reads the OS preference independently from `hostDark()`, which remains
 the last framework theme applied to the window. On Windows this is the per-user
 `AppsUseLightTheme` preference (with a system-color fallback for unavailable settings or
@@ -1208,7 +1209,7 @@ drivers read their answers back out of the control - an empty control cannot pas
 | Slider       | Y msctls_trackbar32       | Y NSSlider                | Y Slider (IRangeBase)               |
 | ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
 | ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
-| GridView     | cell realization (wheel)  | cell realization (keyboard) | cell realization (keyboard) |
+| GridView     | cell realization (wheel)  | cell realization (wheel)  | cell realization (keyboard) |
 | TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
 | TreeView     | Y WC_TREEVIEW             | Y NSOutlineView           | Y TreeView + TreeViewNodes (lazy)   |
 | SplitView    | layout container          | layout container          | layout container                    |

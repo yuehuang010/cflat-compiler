@@ -116,6 +116,13 @@ int _containerBg(IElement node, Theme theme, bool systemDark)
     return 0;
 }
 
+bool _fillKind(int kind)
+{
+    return kind == ELEM_TEXTAREA || kind == ELEM_LIST || kind == ELEM_TREE
+        || kind == ELEM_TABS || kind == ELEM_CANVAS || kind == ELEM_GRIDVIEW
+        || kind == ELEM_GROUPBOX || kind == ELEM_BOX;
+}
+
 // The concrete tooltip text a mappable node carries ("" = none), read through
 // ITooltipped (mirror of the Win32 host); one downcast answers for all 15 classes.
 string tooltipOf(IElement node)
@@ -138,6 +145,15 @@ void* _nsStrSafe(string s)
 bool _isScroll(void* ctrl)
 {
     return msgBool1(ctrl, "isKindOfClass:", cls("NSScrollView")) != (i8)0;
+}
+
+// Unified (TextKit) NSTextAlignment numbering: center=1, right=2 - macOS adopted
+// the UIKit values; the legacy AppKit right=1/center=2 render swapped.
+int _cocoaTextAlignment(int align)
+{
+    if (align == COL_ALIGN_RIGHT) return 2;
+    if (align == COL_ALIGN_CENTER) return 1;
+    return 0;
 }
 
 // -- CocoaHost: the INativeHost implementation ---------------------------------
@@ -166,6 +182,13 @@ class CocoaHost : INativeHost
     list<u64> timerObjects = default;
     list<string> liveKeys    = default;   // keys with a live control this frame
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
+    double edgeWPt = 0.0;
+    double edgeHPt = 0.0;
+    double contentWPt = 0.0;
+    double contentHPt = 0.0;
+    double applyExtraW = 0.0;
+    double applyExtraH = 0.0;
+    int fillBottomCells = 0;
 
     // -- Data/visual-control bookkeeping (mirror of the Win32 host lists) -----------
     // ListView rowText boxes: parallel table-view handle -> ListRowBox* (as u64), plus
@@ -190,6 +213,13 @@ class CocoaHost : INativeHost
     list<u32>    accBgs     = default;       // (reported by nativeAccentBg)
     list<u64>    listRowCounts  = default;   // parallel handle -> virtual row count
     list<int>    listRowCountV  = default;
+    // Lists whose column widths must be re-synced AFTER the frame pass: the
+    // last-column stretch reads the scroll view's contentSize, live only then.
+    list<u64>       _pendingColSyncH  = default;
+    list<IListView> _pendingColSyncLv = default;
+    list<u64>    listSortHandles = default;
+    list<int>    listSortColumns = default;
+    list<int>    listSortAscending = default;
     // TreeView node-source boxes: parallel outline-view handle -> TreeBox* (as u64).
     list<u64>    treeBoxHandles = default;
     list<u64>    treeBoxPtrs    = default;
@@ -340,6 +370,14 @@ class CocoaHost : INativeHost
             // than centers in the extra space. Pin a compact row height so single-line
             // text reads vertically centered.
             msgSetDouble(table, "setRowHeight:", 19.0);
+            // Big Sur's "automatic" style resolves to the inset style once the view
+            // reaches a display, re-tiling with ~17pt intercellSpacing and pushing
+            // columns past the clip view. Pin the plain style + compact spacing.
+            if (msgBool1(table, "respondsToSelector:", sel("setStyle:")) != (i8)0)
+                msgInt(table, "setStyle:", 4);        // NSTableViewStylePlain
+            function<void(void*, void*, double, double)> spacing =
+                (function<void(void*, void*, double, double)>)__objcMsgSendPtr;
+            spacing(table, sel("setIntercellSpacing:"), 3.0, 2.0);
             msg1(table, "setDataSource:", this.target);
             msg1(table, "setDelegate:", this.target);
             msg1(table, "setTarget:", this.target);
@@ -432,6 +470,7 @@ class CocoaHost : INativeHost
         this._freeListBox(h);    // no-op unless h is a list with a boxed rowText
         this._freeListIconState(h);
         this._freeListStyle(h);
+        this._freeListSort(h);
         this._freeTreeBox(h);    // no-op unless h is a tree with a boxed node source
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
         this._storeAccent(h, 0); // drop any stored accent for this handle
@@ -445,9 +484,17 @@ class CocoaHost : INativeHost
     void setFrame(u64 h, Rect frameCells)
     {
         void* ctrl = u2h(h);
+        if (frameCells.w < 0)
+        {
+            double statusH = (double)(frameCells.h * BASE_Y);
+            msgRect(ctrl, "setFrame:", 0.0, this.contentHPt - statusH,
+                    this.contentWPt, statusH);
+            return;
+        }
         msgRect(ctrl, "setFrame:",
                 (double)(frameCells.x * BASE_X), (double)(frameCells.y * BASE_Y),
-                (double)(frameCells.w * BASE_X), (double)(frameCells.h * BASE_Y));
+                (double)(frameCells.w * BASE_X) + this.applyExtraW,
+                (double)(frameCells.h * BASE_Y) + this.applyExtraH);
     }
 
     // Only push text when it actually differs, so an NSTextField does not reset its
@@ -1194,14 +1241,25 @@ class CocoaHost : INativeHost
         {
             void* table = this._tableOf(h);
             void* col = msg1(msg0(cls("NSTableColumn"), "alloc"), "initWithIdentifier:", nsStr((char*)text));
-            msg1(msg0(col, "headerCell"), "setStringValue:", nsStr((char*)text));
+            void* header = msg0(col, "headerCell");
+            msg1(header, "setStringValue:", nsStr((char*)text));
+            msgInt(header, "setAlignment:", (i64)_cocoaTextAlignment((int)(i64)payload));
+            // Also stamp the column's dataCell prototype: the willDisplay copy alone
+            // is not reliably honored for cell-based data cells.
+            msgInt(msg0(col, "dataCell"), "setAlignment:", (i64)_cocoaTextAlignment((int)(i64)payload));
             msgSetDouble(col, "setWidth:", (double)(arg0 * BASE_X));
             msg1(table, "addTableColumn:", col);
         }
         else if (op == LISTOP_SET_ROWCOUNT)
         {
+            // reloadData only on a count change - it re-tiles the whole table and
+            // stutters an in-flight scroll. Same-count refreshes just redisplay,
+            // which re-queries the dataSource for the visible cells.
+            void* table = this._tableOf(h);
+            int prev = this._listRowsForTable((u64)table);
             this._setListRows(h, arg0);
-            msg0(this._tableOf(h), "reloadData");
+            if (prev != arg0) msg0(table, "reloadData");
+            else msgBool(table, "setNeedsDisplay:", true);
         }
         else if (op == LISTOP_SET_ROWTEXT_CB)
         {
@@ -1261,6 +1319,122 @@ class CocoaHost : INativeHost
         }
     }
 
+    void _syncListColumns(u64 h, IListView lv)
+    {
+        int n = lv.columns.count();
+        if (n <= 0) return;
+        void* table = this._tableOf(h);
+        // The columns must fill the clip view exactly: measure the scroll view's
+        // contentSize (excludes bezel + scroller) and subtract the intercell gaps.
+        function<PointD(void*, void*)> fs = (function<PointD(void*, void*)>)__objcMsgSendPtr;
+        double viewport = fs(u2h(h), sel("contentSize")).x;
+        double gap = fs(table, sel("intercellSpacing")).x;
+        // Before the first setFrame the scroll view still has its 10pt creation
+        // frame; approximate from the layout bounds until a real frame exists.
+        if (viewport < 16.0) viewport = (double)(lv.nodeBounds().w * BASE_X) - 2.0;
+        // NSTableView tiles to sum(colWidths) + intercellSpacing.width * n.
+        viewport = viewport - gap * (double)n;
+        if (viewport < 1.0) viewport = 1.0;
+
+        double others = 0.0;
+        int i = 0;
+        while (i < n - 1)
+        {
+            int cells = 12;
+            if (i < lv.colWidths.count()) cells = lv.colWidths.get(i);
+            others = others + (double)(cells * BASE_X);
+            i++;
+        }
+        int lastCells = 12;
+        if (n - 1 < lv.colWidths.count()) lastCells = lv.colWidths.get(n - 1);
+        double lastWidth = viewport - others;
+        double minLast = (double)(lastCells * BASE_X);
+        if (lastWidth < minLast) lastWidth = minLast;
+
+        i = 0;
+        while (i < n)
+        {
+            void* col = msgIntArg(msg0(table, "tableColumns"), "objectAtIndex:", (i64)i);
+            double want = i == n - 1 ? lastWidth : (double)(
+                (i < lv.colWidths.count() ? lv.colWidths.get(i) : 12) * BASE_X);
+            if (msgGetDouble(col, "width") != want) msgSetDouble(col, "setWidth:", want);
+            i++;
+        }
+
+        // The tiled document width includes per-column padding beyond the declared
+        // gap (style-dependent). Measure the actual excess and absorb it in the
+        // last column so nothing scrolls or clips horizontally.
+        function<RectD(void*, void*)> fr = (function<RectD(void*, void*)>)__objcMsgSendPtr;
+        double clipW = fs(u2h(h), sel("contentSize")).x;
+        double excess = fr(table, sel("frame")).w - clipW;
+        if (clipW >= 16.0 && excess > 0.5 && lastWidth - excess >= 24.0)
+        {
+            void* last = msgIntArg(msg0(table, "tableColumns"), "objectAtIndex:", (i64)(n - 1));
+            msgSetDouble(last, "setWidth:", lastWidth - excess);
+        }
+    }
+
+    void _syncListSort(u64 h, IListView lv)
+    {
+        void* table = this._tableOf(h);
+        int column = lv.sortColumn;
+        if (column < 0 || column >= lv.columns.count()) column = -1;
+        int asc = lv.sortAscending ? 1 : 0;
+        int slot = -1;
+        int i = 0;
+        while (i < this.listSortHandles.count())
+        {
+            if (this.listSortHandles.get(i) == (u64)table) { slot = i; break; }
+            i++;
+        }
+        if (slot >= 0 && this.listSortColumns.get(slot) == column
+            && this.listSortAscending.get(slot) == asc) return;
+
+        void* image = nullptr;
+        if (column >= 0)
+        {
+            image = msg1(cls("NSImage"), "imageNamed:",
+                         nsStr(asc != 0 ? "NSAscendingSortIndicator" : "NSDescendingSortIndicator"));
+        }
+        void* cols = msg0(table, "tableColumns");
+        i = 0;
+        while (i < lv.columns.count())
+        {
+            void* col = msgIntArg(cols, "objectAtIndex:", (i64)i);
+            msg2(table, "setIndicatorImage:inTableColumn:", i == column ? image : nullptr, col);
+            i++;
+        }
+        void* highlighted = column >= 0 ? msgIntArg(cols, "objectAtIndex:", (i64)column) : nullptr;
+        msg1(table, "setHighlightedTableColumn:", highlighted);
+        if (slot < 0)
+        {
+            this.listSortHandles.add((u64)table);
+            this.listSortColumns.add(column);
+            this.listSortAscending.add(asc);
+        }
+        else
+        {
+            this.listSortColumns.set(slot, column);
+            this.listSortAscending.set(slot, asc);
+        }
+    }
+
+    void _freeListSort(u64 h)
+    {
+        void* table = this._tableOf(h);
+        int i = this.listSortHandles.count() - 1;
+        while (i >= 0)
+        {
+            if (this.listSortHandles.get(i) == (u64)table)
+            {
+                this.listSortHandles.removeAt(i);
+                this.listSortColumns.removeAt(i);
+                this.listSortAscending.removeAt(i);
+            }
+            i--;
+        }
+    }
+
     // Upload a top-down BGRA32 buffer to an NSImageView as an NSImage. Builds an
     // NSBitmapImageRep (it copies the bytes), wraps it in an NSImage, and sets it.
     void setImageData(u64 h, u64 pixels, int w, int h2, int stride)
@@ -1305,13 +1479,26 @@ class CocoaHost : INativeHost
     {
         this.applying = true;
 
+        function<RectD(void*, void*)> ff = (function<RectD(void*, void*)>)__objcMsgSendPtr;
+        RectD cvFrame = ff(this.contentView, sel("frame"));
+        this.contentWPt = cvFrame.w;
+        this.contentHPt = cvFrame.h;
+        this.edgeWPt = cvFrame.w - (double)(this.w * BASE_X);
+        this.edgeHPt = cvFrame.h - (double)(this.h * BASE_Y);
+        if (this.edgeWPt < 0.0) this.edgeWPt = 0.0;
+        if (this.edgeHPt < 0.0) this.edgeHPt = 0.0;
+        if (this.edgeWPt > (double)(BASE_X - 1)) this.edgeWPt = (double)(BASE_X - 1);
+        if (this.edgeHPt > (double)(BASE_Y - 1)) this.edgeHPt = (double)(BASE_Y - 1);
+        this.fillBottomCells = this._treeHasStatusBar(tree) ? this.h - 1 : this.h;
+
         list<string> newKeys    = default;
         list<u64>    newHandles = default;
         list<int> fx = default; list<int> fy = default;
         list<int> fw = default; list<int> fh = default;
+        list<double> extraW = default; list<double> extraH = default;
 
         this._applyNode(tree, keySegment(tree, 0), ctx,
-                        &newKeys, &newHandles, &fx, &fy, &fw, &fh,
+                        &newKeys, &newHandles, &fx, &fy, &fw, &fh, &extraW, &extraH,
                         (u64)this.contentView, 0, 0);
 
         // Destroy controls whose key path is no longer in the tree.
@@ -1338,9 +1525,21 @@ class CocoaHost : INativeHost
             int rw = fw.get(j); int rh = fh.get(j);
             Rect r = default;
             r.x = rx; r.y = ry; r.w = rw; r.h = rh;
+            this.applyExtraW = extraW.get(j);
+            this.applyExtraH = extraH.get(j);
             this.setFrame(newHandles.get(j), r);
             j++;
         }
+
+        // Column widths depend on the frames just applied (contentSize is live now).
+        int q = 0;
+        while (q < this._pendingColSyncH.count())
+        {
+            this._syncListColumns(this._pendingColSyncH.get(q), this._pendingColSyncLv.get(q));
+            q++;
+        }
+        this._pendingColSyncH.clear();
+        this._pendingColSyncLv.clear();
 
         // Replace the live sets with COPIES (clear + add, not a move-assign, which
         // repeated per frame corrupted the heap on Win32 - avoid container move-into-field).
@@ -1357,6 +1556,20 @@ class CocoaHost : INativeHost
         this.applying = false;
     }
 
+    bool _treeHasStatusBar(IElement n)
+    {
+        if (n.kind() == ELEM_STATUSBAR) return true;
+        list<IElement>* kids = n.childList();
+        if (kids == nullptr) return false;
+        int i = 0;
+        while (i < kids.count())
+        {
+            if (this._treeHasStatusBar(kids.get(i))) return true;
+            i++;
+        }
+        return false;
+    }
+
     // Recursive worker: `path` is this node's key path. Mappable nodes get a control
     // + synced props + a collected cell frame; every node recurses into its children
     // (containers contribute only geometry). `parentView` is the NSView new controls
@@ -1365,6 +1578,7 @@ class CocoaHost : INativeHost
     void _applyNode(IElement node, string path, IUiContext ctx,
                     list<string>* keys, list<u64>* handles,
                     list<int>* fx, list<int>* fy, list<int>* fw, list<int>* fh,
+                    list<double>* extraW, list<double>* extraH,
                     u64 parentView, int offX, int offY)
     {
         if (nativeMappable(node.kind()))
@@ -1400,7 +1614,10 @@ class CocoaHost : INativeHost
                     {
                         int wCells = 12;
                         if (ci < lv.colWidths.count()) wCells = lv.colWidths.get(ci);
-                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(), 0u);
+                        int colAlign = 0;
+                        if (ci < lv.colAligns.count()) colAlign = lv.colAligns.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(),
+                                       (u64)(i64)colAlign);
                         ci++;
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
@@ -1452,8 +1669,20 @@ class CocoaHost : INativeHost
             }
             keys.add("" + path);
             handles.add(h);
-            // Parent-relative frame: absolute cell frame minus the enclosing scroll origin.
-            fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
+            if (node.kind() == ELEM_STATUSBAR)
+            {
+                fx.add(0); fy.add(0); fw.add(-1); fh.add(b.h);
+                extraW.add(0.0); extraH.add(0.0);
+            }
+            else
+            {
+                bool fill = _fillKind(node.kind());
+                double ew = fill && b.x + b.w == this.w ? this.edgeWPt : 0.0;
+                double eh = fill && b.y + b.h == this.fillBottomCells ? this.edgeHPt : 0.0;
+                // Parent-relative frame: absolute cell frame minus the enclosing scroll origin.
+                fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
+                extraW.add(ew); extraH.add(eh);
+            }
         }
         else if (_containerBg(node, ctx.theme, ctx.systemPrefersDark()) != 0)
         {
@@ -1477,7 +1706,11 @@ class CocoaHost : INativeHost
             Rect b = node.nodeBounds();
             keys.add("" + path);
             handles.add(h);
+            double ew = b.x + b.w == this.w ? this.edgeWPt : 0.0;
+            bool reachesBottom = b.y + b.h == this.h || b.y + b.h == this.fillBottomCells;
+            double eh = reachesBottom ? this.edgeHPt : 0.0;
             fx.add(b.x - offX); fy.add(b.y - offY); fw.add(b.w); fh.add(b.h);
+            extraW.add(ew); extraH.add(eh);
         }
 
         // A TabControl walks ONLY its active pane into native controls (lazy inactive
@@ -1492,7 +1725,7 @@ class CocoaHost : INativeHost
                 IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh,
-                                parentView, offX, offY);
+                                extraW, extraH, parentView, offX, offY);
             }
             return;
         }
@@ -1514,7 +1747,7 @@ class CocoaHost : INativeHost
                     IElement c = skids.get(i);
                     string cp = joinKeyPath(path, keySegment(c, i));
                     this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
-                                    (u64)docv, sb.x, sb.y);
+                                    extraW, extraH, (u64)docv, sb.x, sb.y);
                     i++;
                 }
             }
@@ -1544,7 +1777,8 @@ class CocoaHost : INativeHost
                 if (visible.w > 0 && visible.h > 0)
                 {
                     string cp = joinKeyPath(path, keySegment(cell, i));
-                    this._applyNode(cell, cp, ctx, keys, handles, fx, fy, fw, fh, parentView, offX, offY);
+                    this._applyNode(cell, cp, ctx, keys, handles, fx, fy, fw, fh,
+                                    extraW, extraH, parentView, offX, offY);
                 }
                 i++;
             }
@@ -1560,7 +1794,7 @@ class CocoaHost : INativeHost
                 IElement c = kids.get(i);
                 string cp = joinKeyPath(path, keySegment(c, i));
                 this._applyNode(c, cp, ctx, keys, handles, fx, fy, fw, fh,
-                                parentView, offX, offY);
+                                extraW, extraH, parentView, offX, offY);
                 i++;
             }
         }
@@ -1653,6 +1887,9 @@ class CocoaHost : INativeHost
             this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
             this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
+            this._pendingColSyncH.add(h);
+            this._pendingColSyncLv.add(lv);
+            this._syncListSort(h, lv);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
         }
         else if (k == ELEM_TABS)
@@ -1811,7 +2048,13 @@ class CocoaHost : INativeHost
             msg0(this.window, "release");                 // setReleasedWhenClosed: was false
             this.window = nullptr;
         }
-        if (this.target != nullptr) { msg0(this.target, "release"); this.target = nullptr; }
+        if (this.target != nullptr)
+        {
+            void* center = msg0(cls("NSDistributedNotificationCenter"), "defaultCenter");
+            msg1(center, "removeObserver:", this.target);
+            msg0(this.target, "release");
+            this.target = nullptr;
+        }
         if (this.fontUI != nullptr)      { msg0(this.fontUI, "release");      this.fontUI = nullptr; }
         if (this.fontTitle != nullptr)   { msg0(this.fontTitle, "release");   this.fontTitle = nullptr; }
         if (this.fontCaption != nullptr) { msg0(this.fontCaption, "release"); this.fontCaption = nullptr; }
@@ -2075,6 +2318,49 @@ void _canvasScrollWheelImp(void* self, void* cmd, void* event)
     cv.onWheel(p.x, p.y, dx, dy, precise);
 }
 
+IGridView _cocoaGridAtPoint(IElement node, int x, int y)
+{
+    if (node.kind() == ELEM_GRIDVIEW)
+    {
+        if (node.nodeBounds().contains(x, y)) return node as IGridView;
+        return nullptr;
+    }
+    list<IElement>* kids = node.childList();
+    if (kids != nullptr)
+    {
+        int i = kids.count() - 1;
+        while (i >= 0)
+        {
+            IGridView hit = _cocoaGridAtPoint(kids.get(i), x, y);
+            if (hit != nullptr) return hit;
+            i--;
+        }
+    }
+    return nullptr;
+}
+
+void _flippedScrollWheelImp(void* self, void* cmd, void* event)
+{
+    if (!_setCurFromView(self) || !curWin().ready) return;
+    PointD p = _canvasPointFor(curWin().contentView, event);
+    double dx = msgGetDouble(event, "scrollingDeltaX");
+    double dy = msgGetDouble(event, "scrollingDeltaY");
+    double adx = dx < 0.0 ? 0.0 - dx : dx;
+    double ady = dy < 0.0 ? 0.0 - dy : dy;
+    if (ady == 0.0 || adx > ady) return;
+    IGridView gv = _cocoaGridAtPoint(curWin().tree, (int)(p.x / BASE_X), (int)(p.y / BASE_Y));
+    if (gv == nullptr) return;
+    int delta = (int)(dy * 3.0);
+    if (delta == 0) return;
+    int max = gv.maxScrollY();
+    if (delta >= 0 && gv.scrollY <= 0) return;
+    if (delta <= 0 && gv.scrollY >= max) return;
+    gv.scrollY = gv.scrollY - delta;
+    if (gv.scrollY < 0) gv.scrollY = 0;
+    if (gv.scrollY > max) gv.scrollY = max;
+    curWin().requestLayout();
+}
+
 // magnifyWithEvent: -magnification is the incremental zoom delta; report scale = 1.0 + it.
 void _canvasMagnifyImp(void* self, void* cmd, void* event)
 {
@@ -2101,7 +2387,26 @@ void* _tableObjectValueImp(void* self, void* cmd, void* table, void* column, i64
     i64 ci = msgGetI64Arg(cols, "indexOfObject:", column);
     if (ci < (i64)0) ci = (i64)0;
     string cell = __uiListRowText(box, (int)row, (int)ci);
-    return nsStr(cell.data());
+    if (ci != (i64)0) return nsStr(cell.data());
+
+    // First column carries the portable row icon. A cell-based NSTextFieldCell
+    // cannot show image + text (setImage: converts it to an image-type cell and
+    // drops the text), so inline the icon as an attributed-string attachment.
+    void* icon = curWin()._listIconImage((u64)table, (int)row);
+    if (icon == nullptr) return nsStr(cell.data());
+    void* att = msg0(msg0(cls("NSTextAttachment"), "alloc"), "init");
+    msg1(att, "setImage:", icon);
+    msgRect(att, "setBounds:", 0.0, -3.0, 16.0, 16.0);
+    void* head = msg1(cls("NSAttributedString"), "attributedStringWithAttachment:", att);
+    void* text = msg0(cls("NSMutableAttributedString"), "alloc");
+    string label = " " + cell;
+    text = msg1(text, "initWithString:", nsStr(label.data()));
+    void* out = msg1(msg0(cls("NSMutableAttributedString"), "alloc"),
+                     "initWithAttributedString:", head);
+    msg1(out, "appendAttributedString:", text);
+    msg0(att, "release");
+    msg0(text, "release");
+    return msg0(out, "autorelease");
 }
 
 // A table row clicked (single) / double-clicked -> onSelect / onActivate.
@@ -2160,12 +2465,14 @@ void _onListWillDisplayCellImp(void* self, void* cmd, void* table, void* cell,
     if (lv == nullptr) return;
     i64 ci = msgGetI64Arg(msg0(table, "tableColumns"), "indexOfObject:", column);
     if (ci < (i64)0) ci = 0;
+    int align = 0;
+    if (ci < lv.colAligns.count()) align = lv.colAligns.get((int)ci);
+    msgInt(cell, "setAlignment:", (i64)_cocoaTextAlignment(align));
     int color = resolveListCellColor(__uiListCellStyle(curWin()._listStyleForTable((u64)table), (int)row, (int)ci), curWin().ctx.theme, curWin().ctx.systemPrefersDark());
     msg1(cell, "setTextColor:", curWin().colorFor(color));
-    // AppKit reuses cell instances while scrolling. Resolve the portable icon on
-    // every realization and clear non-first columns so stale images cannot stick.
-    void* icon = ci == (i64)0 ? curWin()._listIconImage((u64)table, (int)row) : nullptr;
-    msg1(cell, "setImage:", icon);
+    // Row icons ride the column-0 objectValue as attributed-string attachments
+    // (see _tableObjectValueImp); never setImage: here - it converts the text
+    // cell to an image-type cell and the row label disappears.
 }
 
 // The segmented tab strip changed -> onSelectTab.
@@ -2287,6 +2594,15 @@ void _cocoaSetContentSize(u64 target, int w, int h)
     if (wnd.ready) buildNativeTree();
 }
 
+Size _cocoaLiveContentSize(u64 target)
+{
+    Size result = default;
+    if (!_setCurFromTarget(u2h(target))) return result;
+    result.w = curWin().w;
+    result.h = curWin().h;
+    return result;
+}
+
 void _cocoaSetTopmost(u64 target, bool topmost)
 {
     if (!_setCurFromTarget(u2h(target))) return;
@@ -2294,6 +2610,14 @@ void _cocoaSetTopmost(u64 target, bool topmost)
     // NSFloatingWindowLevel keeps utility windows above normal app windows.
     msgInt(wnd.window, "setLevel:", topmost ? 3 : 0);
     wnd.topmost = topmost;
+}
+
+bool _cocoaLiveTopmost(u64 target)
+{
+    if (!_setCurFromTarget(u2h(target))) return false;
+    CocoaHost* wnd = curWin();
+    if (wnd.topmost) return true;
+    return wnd.window != nullptr && msgGetI64(wnd.window, "level") != (i64)0;
 }
 
 bool _cocoaSystemPrefersDark(u64 target)
@@ -3376,6 +3700,13 @@ void _windowResizeImp(void* self, void* cmd, void* note)
     buildNativeTree();
 }
 
+void _cocoaThemeChangedImp(void* self, void* cmd, void* note)
+{
+    if (!_setCurFromTarget(self)) return;
+    if (!curWin().ready || curWin().applying) return;
+    buildNativeTree();
+}
+
 // windowShouldClose: the app's close guard vetoes (dirty-save prompt) before close.
 i8 _windowShouldCloseImp(void* self, void* cmd, void* sender)
 {
@@ -3704,6 +4035,8 @@ void registerHostClasses()
     {
         function<i8(void*, void*)> impF = _isFlippedImp;
         addMethodBool0(fv, "isFlipped", impF);
+        function<void(void*, void*, void*)> sw = _flippedScrollWheelImp;
+        addMethod0(fv, "scrollWheel:", sw);
         finishClass(fv);
     }
 
@@ -3717,6 +4050,7 @@ void registerHostClasses()
         function<void(void*, void*, void*)> wr = _windowResizeImp;
         function<void(void*, void*, void*)> ww = _windowWillCloseImp;
         function<i8(void*, void*, void*)>   wc = _windowShouldCloseImp;
+        function<void(void*, void*, void*)> th = _cocoaThemeChangedImp;
         addMethod0(tg, "onAction:", a);
         addMethod0(tg, "onMenu:", m);
         addMethod0(tg, "controlTextDidChange:", ct);
@@ -3724,6 +4058,7 @@ void registerHostClasses()
         addMethod0(tg, "windowDidResize:", wr);
         addMethod0(tg, "windowWillClose:", ww);
         addMethodBool(tg, "windowShouldClose:", wc);
+        addMethod0(tg, "onThemeChanged:", th);
 
         // Data-control target/action + dataSource methods.
         function<void(void*, void*, void*)> lc = _onListClickImp;
@@ -3838,13 +4173,19 @@ int createAppWindow(IComponent app, const char* title, bool show)
     curWin().target = msg0(msg0(cls("CfHostTarget"), "alloc"), "init");
     msg1(win, "setDelegate:", curWin().target);
 
+    void* center = msg0(cls("NSDistributedNotificationCenter"), "defaultCenter");
+    function<void*(void*, void*, void*, void*, void*, void*)> observe =
+        (function<void*(void*, void*, void*, void*, void*, void*)>)__objcMsgSendPtr;
+    observe(center, sel("addObserver:selector:name:object:"), curWin().target,
+            sel("onThemeChanged:"), nsStr("AppleInterfaceThemeChangedNotification"), nullptr);
+
     // ctx.post() marshaling: run a boxed closure on the main thread via THIS window's
     // target's runPostBox: (performSelectorOnMainThread). Same opaque-u64 contract as Win32.
     curWin().ctx.bindPost((u64)curWin().target, _cocoaPostEnqueue);
     curWin().ctx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
     curWin().ctx.bindWindowOps((u64)curWin().target, _cocoaSetContentSize, _cocoaSetTopmost,
                                _cocoaSystemPrefersDark, _cocoaStartTimer, _cocoaCancelTimer,
-                               false, _uiNoLiveWindowSize, _uiNoLiveWindowTopmost);
+                               true, _cocoaLiveContentSize, _cocoaLiveTopmost);
 
     buildMenuBar();   // app-wide, built once
 
