@@ -154,6 +154,15 @@ _WIN_ONLY_FILES = {
 _WIN_ONLY_PATHS = {
     "cflat/core/ui_native/win32.cb",
     "cflat/core/ui_canvas/win32.cb",
+    # example/ui/11-mempress: the Win32 collector, its memcore backend and the
+    # ListView front-end all bind windows.h. The portable halves (memsource.cb,
+    # memsource_macos.cb, mempress_app.cb, memcore/appmodel.cb) still sweep.
+    "example/ui/11-mempress/memsource_win32.cb",
+    "example/ui/11-mempress/mempress_gui.cb",
+    "example/ui/11-mempress/memcore/winapi.cb",
+    "example/ui/11-mempress/memcore/grouper.cb",
+    "example/ui/11-mempress/memcore/pressure.cb",
+    "example/ui/11-mempress/memcore/snapshot.cb",
 }
 
 
