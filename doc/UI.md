@@ -166,7 +166,12 @@ same fields.
 | `StatusBar` | `ELEM_STATUSBAR` | bottom strip of text panes (app shell) | `list<string> parts` (pane text) |
 | `RadioGroup` | `ELEM_RADIOGROUP` | controlled single-choice group (container) | `int value` (selected index), `onChange`, `RadioButton` children |
 | `RadioButton` | `ELEM_RADIO` | one option inside a `RadioGroup` | `string label`, `int index`, `bool checked` |
-| `ComboBox` | `ELEM_COMBO` | controlled dropdown | `list<string> items`, `int selectedIndex`, `onChange` |
+| `ComboBox` | `ELEM_COMBO` | controlled dropdown or editable combo | `list<string> items`, `int selectedIndex`, `onChange`, `bool editable`, `string text`, `onEdit` |
+| `ToggleSwitch` | `ELEM_TOGGLE` | controlled on/off switch | `bool on`, `string label`, `onToggle`, `disabled` |
+| `SegmentedControl` | `ELEM_SEGMENTED` | controlled single-choice strip | `list<string> labels`, `int selected`, `onSelect`, `disabled` |
+| `DatePicker` | `ELEM_DATEPICKER` | controlled year/month/day picker | `year`, `month` (1-12), `day` (1-31), `onChangeDate`, `disabled` |
+| `Expander` | `ELEM_EXPANDER` | disclosure header with lazy children | `title`, `expanded`, `onToggle`, `children`, `disabled` |
+| `ColorWell` | `ELEM_COLORWELL` | native color swatch and picker | `Color value`, `onChangeColor`, `disabled` |
 | `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `cellStyle(row,col)`, `int selectedIndex`, `width`, `height`, `onSelect`, `onActivate`, `onHeaderClick` |
 | `GridView` | `ELEM_GRIDVIEW` | virtualized item grid | `cellW`, `cellH`, `count`, `makeCell`, `selectedIndex` |
 | `TabControl` | `ELEM_TABS` | keyed tab panes, lazy inactive tabs | `int selectedTab`, `onSelectTab`, `TabPane` children |
@@ -180,7 +185,7 @@ same fields.
 | `ComponentElement` | `ELEM_COMPONENT` | wraps a mounted component subtree | single inner child |
 
 **`tooltip` prop (v12):** every mappable element (`Text`/`Button`/`Box`/`TextInput`/
-`Checkbox`/`ProgressBar`/`Slider`/`Spinner`/`Link`/`ToolBar`/`TextArea`/`RadioButton`/`ComboBox`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
+`Checkbox`/`ProgressBar`/`Slider`/`Spinner`/`Link`/`ToolBar`/`TextArea`/`RadioButton`/`ComboBox`/`ToggleSwitch`/`SegmentedControl`/`DatePicker`/`Expander`/`ColorWell`/`ListView`/`TabControl`/`TreeView`) carries a `string tooltip` field ("" = none).
 A native host attaches it to the OS control (Win32 `tooltips_class32`, Cocoa `setToolTip:`);
 ICanvas hosts ignore it. Use a string literal (a bare `string` field does not auto-free).
 
@@ -201,7 +206,26 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   first); a click routes to the group's `onChange`. ICanvas draws `(o)`/`( )` rows.
 - **`ComboBox`** - a controlled dropdown (`CBS_DROPDOWNLIST`). `int selectedIndex` +
   `list<string> items` (add with `addItem`) + `onChange(index)`. ICanvas draws
-  `[selected v]`.
+  `[selected v]`. Set `editable=true` for a text-entry combo; `text` is the edit value and
+  `onEdit(string)` fires for free typing while item picks still use `onChange(index)`. This
+  is a creation-time choice, like `TextInput.password`; changing it on a live node does not
+  re-class the native control.
+- **`ToggleSwitch`** - a controlled `on` value with `onToggle(bool)` and an optional label.
+  Win32 uses a native checkbox fallback (`BS_AUTOCHECKBOX`); Cocoa uses `NSSwitch` plus a
+  trailing label; WinUI uses `ToggleSwitch`.
+- **`SegmentedControl`** - a controlled `selected` index. Create it with `segmented(onSelect)`
+  and append labels with `addSegment(label)`. Win32 uses a row of push-like radio buttons;
+  WinUI uses a `StackPanel` of `ToggleButton`s.
+- **`DatePicker`** - a controlled calendar date. Create it with `datePicker(year, month, day,
+  onChangeDate)`. Month is 1-12 and day is 1-31. Cocoa uses `NSDatePicker`; Win32 uses
+  `SysDateTimePick32`.
+- **`Expander`** - a disclosure section. Create it with `expander(title, expanded, onToggle)`
+  and add children with `.add(...)`. Its header is always native; children are walked into
+  native controls only while expanded, so collapsing removes their native handles and
+  reflow uses one header row.
+- **`ColorWell`** - a controlled `Color` swatch. Create it with `colorWell(value,
+  onChangeColor)`. Cocoa opens the native `NSColorPanel`; Win32 opens `ChooseColorW` and
+  shows the selected `#RRGGBB` value on the button.
 - **`ListView`** - a **virtualized** report-mode list. The item source is a callback,
   `Lambda<string(int,int)> rowText` (row, col -> cell text), NOT a copied list, so
   `rowCount` can be 100k+ and only the visible cells are ever queried (Win32
@@ -438,6 +462,11 @@ move ITextArea    textArea(string value, Lambda<void()> onChange);
 move IStatusBar   statusBar(string mainText);   // add more panes with .addPart(s)
 move IRadioGroup  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
 move IComboBox    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
+move IToggleSwitch toggleSwitch(string label, bool on, Lambda<void(bool)> onToggle);
+move ISegmented    segmented(Lambda<void(int)> onSelect);                  // add labels with .addSegment(s)
+move IDatePicker   datePicker(int year, int month, int day, Lambda<void(int,int,int)> onChangeDate);
+move IExpander     expander(string title, bool expanded, Lambda<void(bool)> onToggle); // add children
+move IColorWell    colorWell(Color value, Lambda<void(Color)> onChangeColor);
 move IListView    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthCells)
 move ITabControl  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .add(tabPane(title))
 move ITabPane     tabPane(string title);
@@ -1137,7 +1166,9 @@ Native hosts expose `nativeMessageBox(title, text, kind)` and `nativeSelectFolde
 1 for OK/Yes and 0 for Cancel/No. Folder selection returns a path or `""` when cancelled.
 Cocoa and Win32 implement both; WinUI does not. Headless tests script the next answers
 without opening a dialog with `uiTestScriptMessageBox(answer)` and
-`uiTestScriptFolder(path)`.
+`uiTestScriptFolder(path)`. Color picks can be scripted with
+`uiTestScriptColor(r, g, b)` on Cocoa and Win32; `nativeColorSet` is the portable direct
+driver. The color well opens the native panel/dialog on user activation.
 - **Windowing:** `setCloseQuery(Lambda<bool()>)` vetoes window close (dirty-save
   prompt); `showSecondaryWindow(title, message)` opens a read-only second top-level
   window; `openAppWindow(new App(), title)` opens a full second app window (v12);
@@ -1166,10 +1197,16 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 - **Window / app:** `startHeadlessWindow(new App(), title, w, h)` (hidden window at cell
   size, tree built), `activeApp()` / `activeCtx()`, `hostDark()`, `hostWindowCount()`,
   `nativeTeardownForTest()` (leak-gate cleanup).
-- **Buttons / state:** `nativeClickButton(keyPath)` (Button/Checkbox/RadioButton - mirrors
+- **Buttons / state:** `nativeClickButton(keyPath)` (Button/Checkbox/RadioButton/ToggleSwitch - mirrors
   the OS auto-toggle then routes), `nativeIsChecked(keyPath)`, `nativeIsEnabled(keyPath)`
   (Win32 `IsWindowEnabled`; Cocoa `NSControl.isEnabled`; WinUI element-model read).
-- **Combo:** `nativeComboSelected(keyPath)`, `nativeComboSelect(keyPath, idx)`.
+- **Combo:** `nativeComboSelected(keyPath)`, `nativeComboSelect(keyPath, idx)`,
+  `nativeComboTypeText(keyPath, text)`.
+- **Toggle / segmented:** `nativeToggleSet(keyPath, on)`,
+  `nativeSegmentedSelect(keyPath, index)`.
+- **Date / disclosure / color:** `nativeDateSet(keyPath, y, m, d)`,
+  `nativeExpanderToggle(keyPath)`, `nativeColorSet(keyPath, r, g, b)`;
+  `nativeControlClass(keyPath)` is useful for native-class assertions.
 - **Text:** `nativeTypeText(keyPath, s)` (types + routes the change),
   `nativeControlText(keyPath)`, `nativeSetControlText(keyPath, s)`, `nativeStatusText(keyPath)`.
 - **Range:** `nativeProgressValue(keyPath)`, `nativeSliderSet(keyPath, v)`.
@@ -1234,7 +1271,12 @@ drivers read their answers back out of the control - an empty control cannot pas
 | Spinner      | Y EDIT + msctls_updown32 | Y NSTextField + NSStepper | Y NumberBox                         |
 | Link         | Y SysLink                | Y NSButton                | Y HyperlinkButton (driver-only event) |
 | ToolBar      | Y ToolbarWindow32        | Y flat NSView buttons     | Y StackPanel buttons (driver-only event) |
-| ComboBox     | Y COMBOBOX                | Y NSPopUpButton           | Y ComboBox (live items + selection) |
+| ComboBox     | Y COMBOBOX (DROPDOWN when editable) | Y NSPopUpButton / NSComboBox | Y ComboBox (live items + selection/text) |
+| ToggleSwitch | Y checkbox fallback       | Y NSSwitch + label         | Y ToggleSwitch                       |
+| Segmented    | Y push-like radio row     | Y NSSegmentedControl       | Y StackPanel ToggleButtons           |
+| DatePicker   | Y SysDateTimePick32       | Y NSDatePicker              | N (DateTimeOffset routing TODO)       |
+| Expander     | Y BS_PUSHLIKE checkbox    | Y NSButton disclosure       | N (content routing TODO)              |
+| ColorWell    | Y ChooseColorW button     | Y NSColorWell + NSColorPanel | N (native color dialog TODO)        |
 | ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
 | GridView     | cell realization (wheel)  | cell realization (wheel)  | cell realization (keyboard) |
 | TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
@@ -1310,6 +1352,9 @@ Handlers follow one principled convention (React-Native-derived), frozen for rel
 |---------|----------------|------------|
 | `onPress` | `Button` | pressed/activated |
 | `onChange` | `Checkbox`, `Slider`, `Spinner`, `RadioGroup`, `ComboBox`, `TextArea` | the controlled scalar VALUE changed |
+| `onToggle` | `ToggleSwitch` | the controlled on/off value changed |
+| `onEdit` | editable `ComboBox` | free text changed without changing selected item |
+| `onSelect` | `SegmentedControl` | the selected segment changed |
 | `onClick` | `Link` | the link label was activated |
 | `onCommand` | `ToolBar` | a toolbar button command was activated |
 | `onChangeText` | `TextInput` | the text value changed (RN's `TextInput.onChangeText` name) |

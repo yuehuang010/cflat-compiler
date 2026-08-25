@@ -111,6 +111,15 @@ class GalleryApp : IComponent
     int    dialogAnswer = -1;    // Last message-box answer
     string folderPath = default; // Last selected folder
     int    areaEdits  = 0;       // TextArea dirty-notify count
+    string editableComboText = default;
+    bool   toggleOn = false;
+    int    segmentSel = 0;
+    int    dateYear = 2025;
+    int    dateMonth = 1;
+    int    dateDay = 15;
+    Color  colorValue = colorLiteral(rgb(32, 96, 160));
+    string colorHex = "#2060A0";
+    bool   expanderOpen = true;
     int    timerOnce  = 0;
     int    timerTicks = 0;
     bool   timerCallbackRan = false;
@@ -200,6 +209,20 @@ class GalleryApp : IComponent
         if (idx == 1) return "Cascadia Code";
         if (idx == 2) return "Segoe UI";
         return "Courier New";
+    }
+
+    string _colorHex(Color c)
+    {
+        int raw = colorRaw(c);
+        char* hex = "0123456789ABCDEF";
+        char[8] out = default;
+        out[0] = '#';
+        out[1] = hex[(raw >> 20) & 0xF]; out[2] = hex[(raw >> 16) & 0xF];
+        out[3] = hex[(raw >> 12) & 0xF]; out[4] = hex[(raw >> 8) & 0xF];
+        out[5] = hex[(raw >> 4) & 0xF]; out[6] = hex[raw & 0xF];
+        out[7] = (char)0;
+        string borrowed = (string)&out[0];
+        return borrowed.copy();
     }
 
     // Build one reference card: a themed container with a "header" sub-column (title
@@ -378,6 +401,71 @@ class GalleryApp : IComponent
         cardCombo.add(comboRow);
         body.add(cardCombo);
 
+        IView cardEditable = this._card(ctx, "cardeditable", "Editable Combo Box",
+                "Text-entry combo; onEdit mirrors free-form text while items remain available.");
+        IComboBox editable = <ComboBox key="editable" selectedIndex={0} width={24}
+                editable={true} text={this.editableComboText}
+                onEdit={(string s) => { this.editableComboText = s; ctx.invalidate(); }}/>
+        ;
+        editable.addItem("Custom"); editable.addItem("Preset");
+        cardEditable.add(editable);
+        IText editableMirror = text("Edited: " + this.editableComboText);
+        editableMirror.setKey("editmirror");
+        cardEditable.add(editableMirror);
+        body.add(cardEditable);
+
+        IView cardToggle = this._card(ctx, "cardtoggle", "Toggle Switch",
+                "Boolean switch with a state label driven by onToggle.");
+        IToggleSwitch toggle = toggleSwitch("Enable sync", this.toggleOn, (bool v) => {
+            this.toggleOn = v; ctx.invalidate();
+        });
+        toggle.setKey("toggle");
+        cardToggle.add(toggle);
+        IText toggleState = text("State: " + (this.toggleOn ? "on" : "off"));
+        toggleState.setKey("state");
+        cardToggle.add(toggleState);
+        body.add(cardToggle);
+
+        IView cardSegmented = this._card(ctx, "cardsegmented", "Segmented Control",
+                "Single selection across compact labeled segments.");
+        ISegmented segments = segmented((int i) => {
+            this.segmentSel = i; ctx.invalidate();
+        });
+        segments.setKey("segments");
+        segments.selected = this.segmentSel;
+        segments.addSegment("One"); segments.addSegment("Two"); segments.addSegment("Three");
+        cardSegmented.add(segments);
+        IText segmentState = text("Selected: " + this.segmentSel.toString());
+        segmentState.setKey("selected");
+        cardSegmented.add(segmentState);
+        body.add(cardSegmented);
+
+        IView cardDate = this._card(ctx, "carddate", "Date Picker",
+                "Calendar date control with a controlled date label.");
+        IDatePicker date = datePicker(this.dateYear, this.dateMonth, this.dateDay,
+            (int y, int m, int d) => {
+                this.dateYear = y; this.dateMonth = m; this.dateDay = d; ctx.invalidate();
+            });
+        date.setKey("date");
+        cardDate.add(date);
+        IText dateState = text("Date: " + this.dateYear.toString() + "-"
+            + this.dateMonth.toString() + "-" + this.dateDay.toString());
+        dateState.setKey("value");
+        cardDate.add(dateState);
+        body.add(cardDate);
+
+        IView cardColor = this._card(ctx, "cardcolor", "Color Well",
+                "Native color chooser with a controlled hexadecimal readout.");
+        IColorWell color = colorWell(this.colorValue, (Color c) => {
+            this.colorValue = c; this.colorHex = this._colorHex(c); ctx.invalidate();
+        });
+        color.setKey("color");
+        cardColor.add(color);
+        IText colorState = text("Hex: " + this.colorHex);
+        colorState.setKey("hex");
+        cardColor.add(colorState);
+        body.add(cardColor);
+
         IView cardSlider = this._card(ctx, "cardslider", "Slider",
                 "Draggable numeric control; controlled through onChange.");
         ISlider sld = <Slider key="slider" value={this.sliderVal} width={24}
@@ -523,6 +611,21 @@ class GalleryApp : IComponent
         IView flexTwo = view(flexStyle(2)); flexTwo.setKey("flextwo"); flexTwo.add(box(makeStyle(0, 0, 1)));
         IView flexOne = view(flexStyle(1)); flexOne.setKey("flexone"); flexOne.add(box(makeStyle(0, 0, 1)));
         flexPair.add(flexTwo); flexPair.add(flexOne); flexDemo.add(flexPair); cardFlex.add(flexDemo);
+
+        IView cardExpander = this._card(ctx, "cardexpander", "Expander",
+                "Collapse and expand controls to reflow the cards below.");
+        IExpander advanced = expander("Advanced options", this.expanderOpen, (bool v) => {
+            this.expanderOpen = v; ctx.invalidate();
+        });
+        advanced.setKey("expander");
+        ITextInput expanderInput = textInput("", (string s) => {});
+        expanderInput.setKey("childinput");
+        advanced.add(expanderInput);
+        ICheckbox expanderCheck = checkbox("Use compact spacing", false, (bool v) => {});
+        expanderCheck.setKey("childcheck");
+        advanced.add(expanderCheck);
+        cardExpander.add(advanced);
+        body.add(cardExpander);
         body.add(cardFlex);
         return move body;
     }
@@ -780,6 +883,13 @@ int gallerySelfTest()
         string gridViewKey = data + "cardgridview/gv";
         string passwordKey = input + "cardinput/passwordrow/passwordfield/password";
         string spinnerKey = input + "cardspinner/spinner";
+        string editableKey = input + "cardeditable/editable";
+        string toggleKey = input + "cardtoggle/toggle";
+        string segmentedKey = input + "cardsegmented/segments";
+        string dateKey = input + "carddate/date";
+        string colorKey = input + "cardcolor/color";
+        string expanderKey = layout + "cardexpander/expander";
+        string expanderChildKey = expanderKey + "/childinput";
         string linkKey = basics + "cardlink/link";
         string disabledLinkKey = basics + "cardlink/disabled";
         string toolbarKey = chrome + "cardtoolbar/toolbar";
@@ -1134,9 +1244,11 @@ int gallerySelfTest()
         nativeTabSelect("root/content/pages", 1);
         bool p10Input = _exists(input + "cardinput/inputrow/inputfield/input")
             && _exists(input + "cardprog/progressrow/prog") && _exists(input + "cardslider/slider")
-            && _exists(input + "cardarea/area");
+            && _exists(input + "cardarea/area") && _exists(editableKey)
+            && _exists(toggleKey) && _exists(segmentedKey) && _exists(dateKey)
+            && _exists(colorKey);
         nativeTabSelect("root/content/pages", 3);
-        bool p10Layout = _exists(layout + "cardgrp/grp");
+        bool p10Layout = _exists(layout + "cardgrp/grp") && _exists(expanderKey);
         nativeTabSelect("root/content/pages", 4);
         bool p10Media = _exists(media + "cardimg/img") && _exists(media + "cardcanvas/canvas");
         nativeTabSelect("root/content/pages", 5);
@@ -1178,6 +1290,42 @@ int gallerySelfTest()
         t.expectTrue("spinner round-trip and clamp", spinnerRoundTrip
             && g != nullptr && g.spinnerVal == 100
             && _statusIs(input + "cardspinner/value", "Value: 100"));
+
+        t.comboTypeText(editableKey, "typed combo");
+        t.expectTrue("editable combo onEdit mirror",
+            g != nullptr && g.editableComboText == "typed combo"
+            && _statusIs(input + "cardeditable/editmirror", "Edited: typed combo"));
+
+        t.toggleSet(toggleKey, true);
+        t.expectTrue("toggle switch state label",
+            g != nullptr && g.toggleOn && _statusIs(input + "cardtoggle/state", "State: on"));
+
+        t.segmentedSelect(segmentedKey, 2);
+        t.expectTrue("segmented selection label",
+            g != nullptr && g.segmentSel == 2
+            && _statusIs(input + "cardsegmented/selected", "Selected: 2"));
+
+        t.dateSet(dateKey, 2026, 8, 9);
+        t.expectTrue("date picker label",
+            g != nullptr && g.dateYear == 2026 && g.dateMonth == 8 && g.dateDay == 9
+            && _statusIs(input + "carddate/value", "Date: 2026-8-9"));
+
+        t.colorSet(colorKey, 12, 34, 56);
+        t.expectTrue("color well hex label",
+            g != nullptr && g.colorHex == "#0C2238"
+            && _statusIs(input + "cardcolor/hex", "Hex: #0C2238"));
+
+        nativeTabSelect("root/content/pages", 3);
+        Rect expanderExpanded = nativeNodeBounds(expanderKey);
+        bool expanderChildExpanded = _exists(expanderChildKey);
+        t.expanderToggle(expanderKey);
+        Rect expanderCollapsed = nativeNodeBounds(expanderKey);
+        bool expanderChildCollapsed = !_exists(expanderChildKey);
+        t.expanderToggle(expanderKey);
+        bool expanderChildReexpanded = _exists(expanderChildKey);
+        t.expectTrue("expander collapse reflows cards",
+            expanderChildExpanded && expanderChildCollapsed && expanderChildReexpanded
+            && expanderCollapsed.h < expanderExpanded.h);
 
         nativeTabSelect("root/content/pages", 0);
         t.linkClick(linkKey);
@@ -1358,13 +1506,16 @@ int gallerySelfTest()
         nativeTabSelect("root/content/pages", 1);
         bool titlesInput = _exists(input + "cardinput/header/title") && _exists(input + "cardprog/header/title")
             && _exists(input + "cardslider/header/title") && _exists(input + "cardcombo/header/title")
-            && _exists(input + "cardarea/header/title");
+            && _exists(input + "cardarea/header/title") && _exists(input + "cardeditable/header/title")
+            && _exists(input + "cardtoggle/header/title") && _exists(input + "cardsegmented/header/title")
+            && _exists(input + "carddate/header/title") && _exists(input + "cardcolor/header/title");
         nativeTabSelect("root/content/pages", 2);
         bool titlesData = _exists(data + "cardlist/header/title") && _exists(data + "cardgridview/header/title")
             && _exists(data + "cardtree/header/title");
         nativeTabSelect("root/content/pages", 3);
         bool titlesLayout = _exists(layout + "cardgrid/header/title") && _exists(layout + "cardgrp/header/title")
-            && _exists(layout + "cardsplit/header/title") && _exists(layout + "cardflex/header/title");
+            && _exists(layout + "cardsplit/header/title") && _exists(layout + "cardflex/header/title")
+            && _exists(layout + "cardexpander/header/title");
         nativeTabSelect("root/content/pages", 4);
         bool titlesMedia = _exists(media + "cardimg/header/title") && _exists(media + "cardcanvas/header/title");
         nativeTabSelect("root/content/pages", 5);

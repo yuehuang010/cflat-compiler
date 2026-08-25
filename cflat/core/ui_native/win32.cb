@@ -43,6 +43,7 @@ manifest ManifestDoc uiNativeManifest = { assembly = {
 // DwmSetWindowAttribute (dwmapi.h) drives the immersive dark-mode titlebar.
 extern stdcall void InitCommonControls();
 extern stdcall i32 InitCommonControlsEx(void* p);
+extern stdcall i32 ChooseColorW(void* p);
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
 extern stdcall i32 DrawMenuBar(void* hwnd);
 extern stdcall void* ImageList_Create(i32 cx, i32 cy, u32 flags, i32 initial, i32 grow);
@@ -54,6 +55,18 @@ struct _InitCommonControlsExArgs
 {
     u32 cbSize = 0u;
     u32 dwICC = 0u;
+};
+struct _ChooseColorWArgs
+{
+    u32 lStructSize = 0u;
+    void* hwndOwner = nullptr;
+    void* hInstance = nullptr;
+    u32 rgbResult = 0u;
+    u32* lpCustColors = nullptr;
+    u32 Flags = 0u;
+    void* lpfnHook = nullptr;
+    i64 lCustData = 0;
+    u16* lpTemplateName = nullptr;
 };
 // PrintWindow + GetDIBits back the offscreen screenshot path; not surfaced by the binding.
 extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
@@ -107,6 +120,12 @@ const int UDM_SETRANGE32 = 111;    // WM_USER+31
 const int UDM_SETPOS32   = 113;    // WM_USER+33
 const int UDM_GETPOS32   = 114;    // WM_USER+34
 const int UDN_DELTAPOS   = -722;   // UDN_FIRST-1
+const int DTM_GETSYSTEMTIME = 0x1001;
+const int DTM_SETSYSTEMTIME = 0x1002;
+const int DTN_DATETIMECHANGE = -759;
+const u32 ICC_DATE_CLASSES = 0x00000100u;
+const u32 CC_RGBINIT = 0x00000001u;
+const u32 CC_FULLOPEN = 0x00000002u;
 const int TB_BUTTONSTRUCTSIZE = 1054; // WM_USER+30
 const int TB_ADDBUTTONSA = 1028;      // WM_USER+4
 const int TB_DELETEBUTTON = 1046;     // WM_USER+22
@@ -575,10 +594,19 @@ bool nativeMappable(int kind)
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
+        || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
+        || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
+}
+
+string winColorText(int raw)
+{
+    u8[16] buf = default;
+    sprintf((char*)&buf[0], "#%06X", raw & 0xFFFFFF);
+    return "" + (char*)&buf[0];
 }
 
 // The style.backgroundColor of a plain (non-mapped) container - a View from view/row/
@@ -678,6 +706,9 @@ class Window : INativeHost
     list<u64>    liveHandles = default;   // parallel handles (HWND as u64)
     list<u64>    spinnerHandles = default;
     list<u64>    spinnerUpdowns = default;
+    list<u64>    segmentParents = default;
+    list<u64>    segmentChildren = default;
+    list<int>    segmentIndices = default;
     // Text-only font/ink overrides. The font handles are cached per window; these parallel
     // arrays let WM_CTLCOLORSTATIC apply FONT_CAPTION or an explicit Text.color per control.
     list<u64>    textHandles = default;
@@ -797,7 +828,7 @@ class Window : INativeHost
     // never invalidated and erases it. Only a scroll's thin exposed band repaints, so any such
     // overpaint is permanent damage. Clipping + the z sink in applyTree are what prevent it.
     u64 createControl(int elemKind, u64 parentHandle, string key,
-                      bool password, bool indeterminate)
+                      bool password, bool indeterminate, bool comboEditable)
     {
         void* parent = u2h(parentHandle);
         string cls = "STATIC";
@@ -881,7 +912,32 @@ class Window : INativeHost
         else if (elemKind == ELEM_COMBO)
         {
             cls = "COMBOBOX";
-            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL);
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | (comboEditable ? CBS_DROPDOWN : CBS_DROPDOWNLIST) | WS_VSCROLL);
+        }
+        else if (elemKind == ELEM_TOGGLE)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX);
+        }
+        else if (elemKind == ELEM_SEGMENTED)
+        {
+            cls = "STATIC";
+            style = (u32)(WS_CHILD | WS_VISIBLE);
+        }
+        else if (elemKind == ELEM_DATEPICKER)
+        {
+            cls = "SysDateTimePick32";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP);
+        }
+        else if (elemKind == ELEM_EXPANDER)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX | BS_PUSHLIKE);
+        }
+        else if (elemKind == ELEM_COLORWELL)
+        {
+            cls = "BUTTON";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON);
         }
         else if (elemKind == ELEM_LIST)
         {
@@ -948,6 +1004,17 @@ class Window : INativeHost
     void destroyControl(u64 h)
     {
         if (h == 0u) return;
+        int si2 = 0;
+        while (si2 < this.segmentParents.count())
+        {
+            if (this.segmentParents.get(si2) == h)
+            {
+                DestroyWindow(u2h(this.segmentChildren.get(si2)));
+                this.segmentParents.removeAt(si2); this.segmentChildren.removeAt(si2); this.segmentIndices.removeAt(si2);
+                continue;
+            }
+            si2++;
+        }
         this._freeListBox(h);   // no-op unless h is a ListView with a boxed callback
         this._freeListIconBox(h);
         this._dropListIconCache(h);
@@ -990,6 +1057,25 @@ class Window : INativeHost
                 break;
             }
             i++;
+        }
+        int si = 0; int count = 0;
+        while (si < this.segmentParents.count())
+        {
+            if (this.segmentParents.get(si) == h) count++;
+            si++;
+        }
+        if (count > 0)
+        {
+            int w = frameCells.w * this.dipX(); int each = w / count; si = 0; int j = 0;
+            while (si < this.segmentParents.count())
+            {
+                if (this.segmentParents.get(si) == h)
+                {
+                    int cw = j == count - 1 ? w - each * j : each;
+                    MoveWindow(u2h(this.segmentChildren.get(si)), each * j, 0, cw, frameCells.h * this.dipY(), 1); j++;
+                }
+                si++;
+            }
         }
     }
 
@@ -2331,8 +2417,10 @@ class Window : INativeHost
                     IProgressBar p = node as IProgressBar;
                     indeterminate = p.indeterminate;
                 }
+                bool comboEditable = false;
+                if (node.kind() == ELEM_COMBO) { IComboBox cb = node as IComboBox; comboEditable = cb.editable; }
                 h = this.createControl(node.kind(), (u64)this.parentFor(node.kind()), path,
-                                       password, indeterminate);
+                                       password, indeterminate, comboEditable);
                 ctx.setNativeHandle(path, h);
                 // The new control landed at the BOTTOM of the sibling z-order, i.e. under the
                 // backdrops and containers it must paint above. Re-sink them after this pass.
@@ -2477,6 +2565,23 @@ class Window : INativeHost
                 IElement pane = panes.get(sel);
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh);
+            }
+            return;
+        }
+        if (node.kind() == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            if (!ex.expanded) return;
+            list<IElement>* kids = node.childList();
+            if (kids != nullptr)
+            {
+                int i = 0;
+                while (i < kids.count())
+                {
+                    IElement c = kids.get(i);
+                    this._applyNode(c, joinKeyPath(path, keySegment(c, i)), ctx, keys, fx, fy, fw, fh);
+                    i++;
+                }
             }
             return;
         }
@@ -3112,6 +3217,36 @@ class Window : INativeHost
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
+        else if (k == ELEM_TOGGLE)
+        {
+            IToggleSwitch ts = node as IToggleSwitch;
+            this.setText(h, ts.label.data()); this.setBoolProp(h, PROP_CHECKED, ts.on);
+            this.setBoolProp(h, PROP_ENABLED, !ts.disabled);
+        }
+        else if (k == ELEM_SEGMENTED)
+        {
+            this._syncSegmented(h, node as ISegmented);
+        }
+        else if (k == ELEM_DATEPICKER)
+        {
+            IDatePicker dp = node as IDatePicker;
+            u8[16] raw = default; u16* st = (u16*)&raw[0];
+            st[0] = (u16)dp.year; st[1] = (u16)dp.month; st[3] = (u16)dp.day;
+            SendMessageA(u2h(h), (u32)DTM_SETSYSTEMTIME, 0u, (i64)&raw[0]);
+            this.setBoolProp(h, PROP_ENABLED, !dp.disabled);
+        }
+        else if (k == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            string title = (ex.expanded ? "v " : "> ") + ex.title;
+            this.setText(h, title.data()); this.setBoolProp(h, PROP_CHECKED, ex.expanded);
+            this.setBoolProp(h, PROP_ENABLED, !ex.disabled);
+        }
+        else if (k == ELEM_COLORWELL)
+        {
+            IColorWell cw = node as IColorWell;
+            this.setText(h, winColorText(colorRaw(cw.value)).data()); this.setBoolProp(h, PROP_ENABLED, !cw.disabled);
+        }
         else if (k == ELEM_LIST)
         {
             // Virtualized: push row count + controlled selection, then repaint. Cell
@@ -3192,6 +3327,44 @@ class Window : INativeHost
         int cur = (int)SendMessageA(ctrl, (u32)CB_GETCURSEL, 0u, (i64)0);
         if (cur != cb.selectedIndex)
             SendMessageA(ctrl, (u32)CB_SETCURSEL, (u64)cb.selectedIndex, (i64)0);
+        if (cb.editable) this.setText(h, cb.text.data());
+    }
+
+    void _syncSegmented(u64 h, ISegmented sg)
+    {
+        int have = 0; int i = 0;
+        while (i < this.segmentParents.count()) { if (this.segmentParents.get(i) == h) have++; i++; }
+        if (have != sg.labels.count())
+        {
+            i = 0;
+            while (i < this.segmentParents.count())
+            {
+                if (this.segmentParents.get(i) == h) { DestroyWindow(u2h(this.segmentChildren.get(i))); this.segmentParents.removeAt(i); this.segmentChildren.removeAt(i); this.segmentIndices.removeAt(i); continue; }
+                i++;
+            }
+            i = 0;
+            while (i < sg.labels.count())
+            {
+                void* child = CreateWindowExA(0u, "BUTTON", sg.labels.get(i).data(),
+                    (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHLIKE | BS_AUTORADIOBUTTON),
+                    0, 0, 10, 20, u2h(h), nullptr, _hInst, nullptr);
+                this.segmentParents.add(h); this.segmentChildren.add((u64)child); this.segmentIndices.add(i);
+                if (this.font != nullptr) SendMessageA(child, (u32)WM_SETFONT, (u64)this.font, (i64)1);
+                i++;
+            }
+        }
+        i = 0;
+        while (i < this.segmentParents.count())
+        {
+            if (this.segmentParents.get(i) == h)
+            {
+                void* child = u2h(this.segmentChildren.get(i));
+                SetWindowTextA(child, sg.labels.get(this.segmentIndices.get(i)).data());
+                SendMessageA(child, (u32)BM_SETCHECK, this.segmentIndices.get(i) == sg.selected ? 1u : 0u, (i64)0);
+                EnableWindow(child, !sg.disabled);
+            }
+            i++;
+        }
     }
 
     // The key path bound to a control HWND this frame, or "" if none (linear scan
@@ -4475,6 +4648,8 @@ void routeClick(void* ctrl)
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpNative(); return; }
+    IToggleSwitch ts = e as IToggleSwitch;
+    if (ts != nullptr) { ts.fireToggle(); pumpNative(); return; }
     ILink l = e as ILink;
     if (l != nullptr) { l.fireClick(); pumpNative(); return; }
     // A radio button routes to its enclosing RadioGroup (one key-path segment up),
@@ -4490,6 +4665,10 @@ void routeClick(void* ctrl)
             if (g != nullptr) { g.fireChange(rb.index); pumpNative(); }
         }
     }
+    IExpander ex = e as IExpander;
+    if (ex != nullptr) { ex.fireToggle(); curWin().ctx.invalidate(); pumpNative(); return; }
+    IColorWell cw = e as IColorWell;
+    if (cw != nullptr) { routeColorWell(ctrl); return; }
 }
 
 // Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
@@ -4513,6 +4692,49 @@ void routeCombo(void* ctrl)
     if (cb == nullptr) return;
     int sel = (int)SendMessageA(ctrl, (u32)CB_GETCURSEL, 0u, (i64)0);
     if (sel >= 0) { cb.fireChange(sel); pumpNative(); }
+}
+
+void routeDatePicker(void* ctrl)
+{
+    Window* wnd = curWin(); string key = wnd.keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); if (e == nullptr) return;
+    IDatePicker dp = e as IDatePicker; if (dp == nullptr) return;
+    u8[16] raw = default;
+    SendMessageA(ctrl, (u32)DTM_GETSYSTEMTIME, 0u, (i64)&raw[0]);
+    u16* st = (u16*)&raw[0]; dp.fireChangeDate((int)st[0], (int)st[1], (int)st[3]); pumpNative();
+}
+
+void routeColorWell(void* ctrl)
+{
+    Window* wnd = curWin(); string key = wnd.keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); if (e == nullptr) return;
+    IColorWell cw = e as IColorWell; if (cw == nullptr) return;
+    u32 raw = 0u;
+    if (_uiTestColorValues.count() > 0)
+    {
+        raw = (u32)_uiTestColorValues.get(0); _uiTestColorValues.removeAt(0);
+    }
+    else
+    {
+        u32[16] custom = default; _ChooseColorWArgs cc = default;
+        cc.lStructSize = (u32)sizeof(_ChooseColorWArgs); cc.hwndOwner = wnd.hwnd;
+        cc.rgbResult = (u32)colorRaw((cw.value)); cc.lpCustColors = &custom[0]; cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+        if (ChooseColorW(&cc) == 0) return;
+        raw = cc.rgbResult;
+    }
+    int r = (int)(raw & 0xFF); int g = (int)((raw >> 8) & 0xFF); int b = (int)((raw >> 16) & 0xFF);
+    cw.fireChangeColor(colorLiteral((r << 16) | (g << 8) | b)); pumpNative();
+}
+
+void routeSegmentedButton(void* ctrl)
+{
+    Window* wnd = curWin(); void* parent = GetParent(ctrl);
+    string key = wnd.keyForHandle((u64)parent); if (key.length() == 0) return;
+    IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key); if (e == nullptr) return;
+    ISegmented sg = e as ISegmented; if (sg == nullptr) return;
+    int i = 0;
+    while (i < wnd.segmentChildren.count() && u2h(wnd.segmentChildren.get(i)) != ctrl) i++;
+    if (i < wnd.segmentChildren.count()) { int index = wnd.segmentIndices.get(i); if (index != sg.selected) { sg.fireSelect(index); pumpNative(); } }
 }
 
 // -- ListView notifications (WM_NOTIFY) ---------------------------------------
@@ -4614,6 +4836,7 @@ bool routeNotify(i64 lParam)
             if (s != nullptr) { i32* p = (i32*)((char*)u2h((u64)lParam) + 24); s.fireSet(p[0] + p[1]); pumpNative(); return true; }
         }
     }
+    if (code == DTN_DATETIMECHANGE) { routeDatePicker(hFrom); return true; }
     if (code == LVN_GETDISPINFOA) { fillListDispInfo(lParam); return true; }
     if (code == LVN_ITEMCHANGED)  { routeListSelect(hFrom); return true; }
     if (code == LVN_COLUMNCLICK) { routeListHeader(hFrom, lParam); return true; }
@@ -4804,6 +5027,11 @@ void routeEdit(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
+    IComboBox cb = e as IComboBox;
+    if (cb != nullptr && cb.editable)
+    {
+        char[512] buf; GetWindowTextA(ctrl, buf, 512); cb.fireEdit((string)buf); pumpNative(); return;
+    }
     ISpinner sp = e as ISpinner;
     if (sp != nullptr)
     {
@@ -5218,9 +5446,11 @@ string nativeSaveFile()
 
 // Scripted modal answers are host-owned so ui_test.cb stays platform-neutral.
 list<int> _uiTestMessageBoxAnswers = default;
+list<int> _uiTestColorValues = default;
 list<string> _uiTestFolderAnswers = default;
 
 void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
+void uiTestScriptColor(int r, int g, int b) { _uiTestColorValues.add((r << 16) | (g << 8) | b); }
 void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
 
 int nativeMessageBox(string title, string text, int kind)
@@ -5773,6 +6003,11 @@ void nativeClickButton(string keyPath)
         int cur = (int)SendMessageA(ctrl, (u32)BM_GETCHECK, 0u, (i64)0);
         SendMessageA(ctrl, (u32)BM_SETCHECK, cur == 0 ? 1u : 0u, (i64)0);
     }
+    else if (e != nullptr && e.kind() == ELEM_TOGGLE)
+    {
+        int cur = (int)SendMessageA(ctrl, (u32)BM_GETCHECK, 0u, (i64)0);
+        SendMessageA(ctrl, (u32)BM_SETCHECK, cur == 0 ? 1u : 0u, (i64)0);
+    }
     else if (e != nullptr && e.kind() == ELEM_RADIO)
     {
         SendMessageA(ctrl, (u32)BM_SETCHECK, 1u, (i64)0);
@@ -5812,6 +6047,63 @@ void nativeComboSelect(string keyPath, int idx)
     if (h == 0u) return;
     SendMessageA(u2h(h), (u32)CB_SETCURSEL, (u64)idx, (i64)0);
     routeCombo(u2h(h));
+}
+
+void nativeComboTypeText(string keyPath, string text)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    SetWindowTextA(u2h(h), text.data()); routeEdit(u2h(h));
+}
+
+void nativeToggleSet(string keyPath, bool on)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IToggleSwitch ts = e as IToggleSwitch; if (ts == nullptr || ts.on == on) return;
+    SendMessageA(u2h(h), (u32)BM_SETCHECK, on ? 1u : 0u, (i64)0); routeClick(u2h(h));
+}
+
+void nativeDateSet(string keyPath, int y, int m, int d)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    u8[16] raw = default; u16* st = (u16*)&raw[0]; st[0] = (u16)y; st[1] = (u16)m; st[3] = (u16)d;
+    SendMessageA(u2h(h), (u32)DTM_SETSYSTEMTIME, 0u, (i64)&raw[0]); routeDatePicker(u2h(h));
+}
+
+void nativeExpanderToggle(string keyPath)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath); if (e == nullptr) return;
+    IExpander ex = e as IExpander; if (ex != nullptr) { ex.fireToggle(); curWin().ctx.invalidate(); pumpNative(); }
+}
+
+void nativeColorSet(string keyPath, int r, int g, int b)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    SetWindowTextA(u2h(h), winColorText((r << 16) | (g << 8) | b).data());
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath); if (e == nullptr) return;
+    IColorWell cw = e as IColorWell; if (cw != nullptr) { cw.fireChangeColor(colorLiteral((r << 16) | (g << 8) | b)); pumpNative(); }
+}
+
+string nativeControlClass(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return "";
+    u8[64] buf = default; int n = GetClassNameA(u2h(h), (char*)&buf[0], 64);
+    if (n <= 0) return ""; return "" + (char*)&buf[0];
+}
+
+void nativeSegmentedSelect(string keyPath, int index)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    int i = 0;
+    while (i < curWin().segmentParents.count())
+    {
+        if (curWin().segmentParents.get(i) == h && curWin().segmentIndices.get(i) == index)
+        {
+            SendMessageA(u2h(curWin().segmentChildren.get(i)), (u32)BM_SETCHECK, 1u, (i64)0);
+            routeSegmentedButton(u2h(curWin().segmentChildren.get(i))); return;
+        }
+        i++;
+    }
 }
 
 // Type `s` into a text input and route EN_CHANGE (controlled: onChangeText fires).
@@ -6269,7 +6561,11 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
                 IElement te = findByKey(wnd.tree, keySegment(wnd.tree, 0), wnd.keyForHandle((u64)ctrl));
                 IToolBar tb = te as IToolBar; if (tb != nullptr) routeToolbar(ctrl, (int)(wParam & (u64)0xFFFF));
             }
-            else if (code == BN_CLICKED)                     routeClick(ctrl);
+            else if (code == BN_CLICKED)
+            {
+                int si = 0; while (si < wnd.segmentChildren.count() && u2h(wnd.segmentChildren.get(si)) != ctrl) si++;
+                if (si < wnd.segmentChildren.count()) routeSegmentedButton(ctrl); else routeClick(ctrl);
+            }
             else if (code == EN_CHANGE && !wnd.applying)     routeEdit(ctrl);
             else if (code == CBN_SELCHANGE && !wnd.applying) routeCombo(ctrl);
             else if (code == BN_SETFOCUS || code == EN_SETFOCUS) mirrorFocus(ctrl);
@@ -6526,7 +6822,7 @@ void ensureWindowClass()
     SetProcessDpiAwarenessContext((void*)(i64)(-4));
     _InitCommonControlsExArgs icc = default;
     icc.cbSize = (u32)sizeof(_InitCommonControlsExArgs);
-    icc.dwICC = 0x000000FFu | 0x00004000u | 0x00008000u;
+    icc.dwICC = 0x000000FFu | ICC_DATE_CLASSES | 0x00004000u | 0x00008000u;
     if (InitCommonControlsEx(&icc) == 0) InitCommonControls();
     _hInst = GetModuleHandleA(nullptr);
 

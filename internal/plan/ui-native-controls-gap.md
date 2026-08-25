@@ -36,6 +36,38 @@ verification (test.bat + example.bat + gallery selftest) is the remaining step b
 Tier 1 is fully closed. WinUI keeps its pre-existing pattern of driver-only event wiring,
 and password there stays TextBox with a TODO until PasswordBox property routing exists.
 
+## Status update 2026-08-25: Tier 2 LANDED except secondary windows (macOS-verified)
+
+Everything in the Tier-2 table below except secondary windows is implemented. Shipped:
+
+- ComboBox `editable` bool (creation-time class switch like TextInput.password; adds
+  `text` + `onEdit` fired on free typing; cocoa NSComboBox vs NSPopUpButton, win32
+  CBS_DROPDOWN, winui IsEditable). Driver: comboTypeText.
+- ELEM_TOGGLE=29 `toggleSwitch(label, on, onToggle)` - cocoa NSSwitch, win32 checkbox
+  fallback (ruling: no owner-draw), winui ToggleSwitch. Driver: toggleSet.
+- ELEM_SEGMENTED=30 `segmented(onSelect)` + addSegment(label) - cocoa NSSegmentedControl,
+  win32 pushlike-radio row, winui ToggleButton StackPanel. Driver: segmentedSelect.
+- ELEM_DATEPICKER=31 `datePicker(y, m, d, onChangeDate)` (month/day 1-based) - cocoa
+  NSDatePicker, win32 SysDateTimePick32 (+ICC_DATE_CLASSES), winui parity N (DateTimeOffset
+  routing missing). Driver: dateSet.
+- ELEM_EXPANDER=32 `expander(title, expanded, onToggle)` CONTAINER - header maps native,
+  children walked only when expanded (TabControl lazy-pane pattern); cocoa disclosure
+  button, win32 pushlike-checkbox header, winui parity N. Driver: expanderToggle.
+- ELEM_COLORWELL=33 `colorWell(value, onChangeColor)` - cocoa NSColorWell/NSColorPanel,
+  win32 button + ChooseColorW showing #RRGGBB, winui parity N. Driver: colorSet.
+- Gallery: cards for all six on Input/Layout pages; selftest 84/84, one case.
+
+Bug found and fixed during this batch (worth remembering): `adoptContainerProps` for the
+Expander shallow-assigned `title`/`tooltip` strings from the wip node, which reconcile
+frees immediately - the committed node's strings dangled and double-freed at teardown
+(malloc abort AFTER the suite printed PASS; only the exit code caught it). CFlat string
+field adoption across an ownership boundary must copy (`"" + s`). Check agent-reported
+suite results against the process exit code.
+
+Remaining Tier 2: secondary windows / modal sheets - architecture item, needs its own plan
+(declarative model, event routing, and ui_test driver are all single-window today).
+Windows-side verification of all Tier-2 win32/winui code is pending, same as Tier 1.
+
 ## Current coverage (baseline as of e95aa98)
 
 25 ELEM kinds in `cflat/core/ui_native.cb`: View, Text (label), Button, Box, TextInput,

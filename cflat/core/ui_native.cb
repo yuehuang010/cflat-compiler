@@ -1269,6 +1269,11 @@ int ELEM_GRIDVIEW   = 25;   // virtualized item grid; cells realized on demand
 int ELEM_SPINNER    = 26;   // numeric up-down control
 int ELEM_LINK       = 27;   // hyperlink-style pressable label
 int ELEM_TOOLBAR    = 28;   // text buttons and separators
+int ELEM_TOGGLE     = 29;   // on/off switch
+int ELEM_SEGMENTED  = 30;   // single-selection segmented control
+int ELEM_DATEPICKER = 31;   // controlled year/month/day picker
+int ELEM_EXPANDER   = 32;   // disclosure header + lazy children
+int ELEM_COLORWELL  = 33;   // native color well/dialog
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -1487,8 +1492,54 @@ interface IComboBox : IDisableable
     list<string> items;
     int  selectedIndex;
     int  width;
+    bool editable;
+    string text;
+    Lambda<void(string)> onEdit;
     void addItem(string s);
     void fireChange(int v);
+    void fireEdit(string s);
+};
+
+interface IToggleSwitch : IDisableable
+{
+    bool on;
+    Lambda<void(bool)> onToggle;
+    string label;
+    void fireToggle();
+};
+
+interface ISegmented : IDisableable
+{
+    list<string> labels;
+    int selected;
+    void addSegment(string label);
+    void fireSelect(int index);
+};
+
+interface IDatePicker : IDisableable
+{
+    int year;
+    int month;
+    int day;
+    Lambda<void(int,int,int)> onChangeDate;
+    void fireChangeDate(int year, int month, int day);
+};
+
+interface IExpander : IDisableable
+{
+    string title;
+    bool expanded;
+    Lambda<void(bool)> onToggle;
+    list<IElement> children;
+    void add(adopt IElement child);
+    void fireToggle();
+};
+
+interface IColorWell : IDisableable
+{
+    Color value;
+    Lambda<void(Color)> onChangeColor;
+    void fireChangeColor(Color value);
 };
 
 // Column text alignment for ListView columns (hosts map to the native column format).
@@ -4136,6 +4187,9 @@ class ComboBox : IComboBox
     int   selectedIndex = 0;
     Lambda<void(int)> onChange = default;
     int   width    = 0;             // 0 -> sized to the widest item
+    bool  editable = false;
+    string text    = default;
+    Lambda<void(string)> onEdit = default;
     bool  disabled = false;
     string tooltip = default;
     Rect  bounds = default;
@@ -4144,6 +4198,7 @@ class ComboBox : IComboBox
     void addItem(string s) { this.items.add("" + s); }
 
     void fireChange(int v) { if (this.onChange != nullptr) { this.onChange(v); } }
+    void fireEdit(string s) { if (this.onEdit != nullptr) { this.onEdit(s); } }
 
     string _selectedText()
     {
@@ -4154,8 +4209,10 @@ class ComboBox : IComboBox
     move string toJson()
     {
         int n = this.items.count();
-        return "{\"type\":\"ComboBox\",\"selectedIndex\":" + this.selectedIndex.toString()
-             + ",\"count\":" + n.toString() + "}";
+        string out = "{\"type\":\"ComboBox\",\"selectedIndex\":" + this.selectedIndex.toString()
+             + ",\"count\":" + n.toString();
+        if (this.editable) out = out + ",\"editable\":true";
+        return out + "}";
     }
 
     Size layout(LayoutConstraints c)
@@ -4193,6 +4250,7 @@ class ComboBox : IComboBox
         int bg = pickColor(colorUnset(), colorRole(THEME_ROLE_INPUT_BG), ctx.theme, ctx.systemPrefersDark());
         if (bg != 0) cv.drawRect(this.bounds, true, bg);
         string shown = "[" + this._selectedText() + " v]";
+        if (this.editable) shown = this.text;
         cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
     }
 
@@ -4203,15 +4261,15 @@ class ComboBox : IComboBox
         {
             ctx.focus(this.key);
             int n = this.items.count();
-            if (n > 0) this.onChange((this.selectedIndex + 1) % n);
+            if (n > 0) this.fireChange((this.selectedIndex + 1) % n);
             return true;
         }
         if (e.kind == EV_KEY && ctx.hasFocus(this.key))
         {
             int n = this.items.count();
             if (n == 0) return false;
-            if (e.key == KEY_DOWN) { this.onChange((this.selectedIndex + 1) % n); return true; }
-            if (e.key == KEY_UP)   { this.onChange((this.selectedIndex - 1 + n) % n); return true; }
+            if (e.key == KEY_DOWN) { this.fireChange((this.selectedIndex + 1) % n); return true; }
+            if (e.key == KEY_UP)   { this.fireChange((this.selectedIndex - 1 + n) % n); return true; }
         }
         return false;
     }
@@ -4229,7 +4287,9 @@ class ComboBox : IComboBox
     {
         IComboBox o = other as IComboBox;
         if (o == nullptr) return false;
-        if (this.selectedIndex != o.selectedIndex || this.disabled != o.disabled) return false;
+        if (this.selectedIndex != o.selectedIndex || this.disabled != o.disabled
+            || this.editable != o.editable || this.text != o.text || this.width != o.width
+            || this.tooltip != o.tooltip) return false;
         if (this.items.count() != o.items.count()) return false;
         int i = 0;
         while (i < this.items.count())
@@ -4238,6 +4298,313 @@ class ComboBox : IComboBox
             i++;
         }
         return styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- ToggleSwitch: a controlled on/off switch ---------------------------------
+class ToggleSwitch : IToggleSwitch
+{
+    Style style = default;
+    bool on = false;
+    Lambda<void(bool)> onToggle = default;
+    string label = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireToggle() { if (!this.disabled && this.onToggle != nullptr) this.onToggle(!this.on); }
+    move string toJson()
+    {
+        string flag = this.on ? "true" : "false";
+        string out = "{\"type\":\"ToggleSwitch\",\"on\":" + flag;
+        if (this.label != "") out = out + ",\"label\":\"" + this.label + "\"";
+        return out + "}";
+    }
+    Size layout(LayoutConstraints c)
+    {
+        int w = (int)this.label.length() + 6; if (w < 6) w = 6;
+        if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        string s = "[ ] "; if (this.on) s = "[x] "; s = s + this.label;
+        cv.drawText(this.bounds.x, this.bounds.y, s.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (!this.disabled && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); this.fireToggle(); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_TOGGLE; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        IToggleSwitch o = other as IToggleSwitch;
+        return o != nullptr && this.on == o.on && this.label == o.label && this.disabled == o.disabled
+            && this.tooltip == o.tooltip && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- SegmentedControl: a controlled single-selection strip --------------------
+class SegmentedControl : ISegmented
+{
+    Style style = default;
+    list<string> labels = default;
+    int selected = 0;
+    Lambda<void(int)> onSelect = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void addSegment(string label) { this.labels.add("" + label); }
+    void fireSelect(int index) { if (!this.disabled && this.onSelect != nullptr) this.onSelect(index); }
+    move string toJson() { return "{\"type\":\"SegmentedControl\",\"count\":" + this.labels.count().toString() + ",\"selected\":" + this.selected.toString() + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = 0; int i = 0; while (i < this.labels.count()) { w = w + (int)this.labels.get(i).length() + 2; i++; }
+        if (w < 3) w = 3; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        int x = this.bounds.x; int i = 0;
+        while (i < this.labels.count()) { string s = "[" + this.labels.get(i) + "]"; cv.drawText(x, this.bounds.y, s.data(), ink); x = x + (int)s.length() + 1; i++; }
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (this.disabled || e.kind != EV_MOUSE_DOWN || !this.bounds.contains(e.x, e.y)) return false;
+        int x = this.bounds.x; int i = 0;
+        while (i < this.labels.count()) { int w = (int)this.labels.get(i).length() + 2; if (e.x < x + w) { ctx.focus(this.key); this.fireSelect(i); return true; } x = x + w + 1; i++; }
+        return true;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_SEGMENTED; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        ISegmented o = other as ISegmented;
+        if (o == nullptr || this.selected != o.selected || this.disabled != o.disabled || this.tooltip != o.tooltip
+            || this.labels.count() != o.labels.count() || !styleEquals(this.style, o.style)) return false;
+        int i = 0; while (i < this.labels.count()) { if (this.labels.get(i) != o.labels.get(i)) return false; i++; }
+        return true;
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- DatePicker: a controlled calendar date -----------------------------------
+class DatePicker : IDatePicker
+{
+    Style style = default;
+    int year = 2000;
+    int month = 1;
+    int day = 1;
+    Lambda<void(int,int,int)> onChangeDate = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireChangeDate(int y, int m, int d)
+    {
+        if (!this.disabled && this.onChangeDate != nullptr) this.onChangeDate(y, m, d);
+    }
+    move string toJson()
+    {
+        return "{\"type\":\"DatePicker\",\"year\":" + this.year.toString()
+             + ",\"month\":" + this.month.toString() + ",\"day\":" + this.day.toString() + "}";
+    }
+    Size layout(LayoutConstraints c)
+    {
+        int w = 12; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        string shown = this.year.toString() + "-" + this.month.toString() + "-" + this.day.toString();
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (!this.disabled && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        { ctx.focus(this.key); this.fireChangeDate(this.year, this.month, this.day); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_DATEPICKER; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        IDatePicker o = other as IDatePicker;
+        return o != nullptr && this.year == o.year && this.month == o.month && this.day == o.day
+            && this.disabled == o.disabled && this.tooltip == o.tooltip && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- Expander: a disclosure header with lazy native children ------------------
+class Expander : IExpander
+{
+    Style style = default;
+    string title = default;
+    bool expanded = false;
+    Lambda<void(bool)> onToggle = default;
+    list<IElement> children = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void add(adopt IElement child) { this.children.add(child); }
+    void fireToggle() { if (!this.disabled && this.onToggle != nullptr) this.onToggle(!this.expanded); }
+    move string toJson()
+    {
+        string flag = this.expanded ? "true" : "false";
+        string out = "{\"type\":\"Expander\",\"expanded\":" + flag + ",\"children\":[";
+        int i = 0; for (IElement c in this.children) { if (i > 0) out = out + ","; out = out + c.toJson(); i++; }
+        return out + "]}";
+    }
+    Size layout(LayoutConstraints c)
+    {
+        int pad = this.style.padding; int cy = c.y + 1 + pad; int maxW = 0;
+        if (this.expanded)
+        {
+            int i = 0;
+            while (i < this.children.count())
+            {
+                if (i > 0) cy = cy + this.style.gap;
+                LayoutConstraints cc = default; cc.x = c.x + pad; cc.y = cy;
+                cc.availW = c.availW - 2 * pad; cc.availH = c.availH;
+                Size cs = this.children.get(i).layout(cc); cy = cy + cs.h; if (cs.w > maxW) maxW = cs.w; i++;
+            }
+            cy = cy + pad;
+        }
+        int w = c.exactW ? c.availW : (maxW + 2 * pad); if (w < 8) w = 8;
+        if (this.style.width > 0) w = this.style.width;
+        int h = this.expanded ? cy - c.y : 1; if (c.exactH && this.expanded) h = c.availH;
+        if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        string shown = this.expanded ? "v " : "> "; shown = shown + this.title;
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+        if (this.expanded) for (IElement c in this.children) c.paint(cv, ctx);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (!this.disabled && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y)
+            && e.y == this.bounds.y) { ctx.focus(this.key); this.fireToggle(); return true; }
+        if (this.expanded) for (IElement c in this.children) if (c.dispatch(e, ctx)) return true;
+        return false;
+    }
+    void destroyTree() { for (IElement c in this.children) { c.destroyTree(); delete c; } this.children.clear(); }
+    int kind() { return ELEM_EXPANDER; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys)
+    {
+        if (!this.disabled && this.key.length() > 0) keys.add("" + this.key);
+        if (this.expanded) for (IElement c in this.children) c.collectFocusables(keys);
+    }
+    bool propsEqual(IElement other)
+    {
+        IExpander o = other as IExpander;
+        return o != nullptr && this.title == o.title && this.expanded == o.expanded
+            && this.disabled == o.disabled && this.tooltip == o.tooltip && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return &this.children; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- ColorWell: a controlled native color chooser -----------------------------
+class ColorWell : IColorWell
+{
+    Style style = default;
+    Color value = default;
+    Lambda<void(Color)> onChangeColor = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireChangeColor(Color c) { if (!this.disabled && this.onChangeColor != nullptr) this.onChangeColor(c); }
+    move string toJson() { return "{\"type\":\"ColorWell\",\"value\":" + colorRaw(this.value).toString() + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = 10; if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 1; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        if (this.disabled) ink = dimColor(ink);
+        string shown = colorRaw(this.value).toString();
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (!this.disabled && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        { ctx.focus(this.key); this.fireChangeColor(this.value); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_COLORWELL; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        IColorWell o = other as IColorWell;
+        return o != nullptr && this.value.kind == o.value.kind && this.value.value == o.value.value
+            && this.disabled == o.disabled && this.tooltip == o.tooltip && styleEquals(this.style, o.style);
     }
     list<IElement>* childList() { return nullptr; }
     string keyOf() { return "" + this.key; }
@@ -4816,6 +5183,41 @@ move IComboBox comboBox(int selectedIndex, Lambda<void(int)> onChange)
     c.selectedIndex = selectedIndex;
     c.onChange = onChange;
     return c;
+}
+
+move IToggleSwitch toggleSwitch(string label, bool on, Lambda<void(bool)> onToggle)
+{
+    ToggleSwitch* t = new ToggleSwitch();
+    t.label = label; t.on = on; t.onToggle = onToggle;
+    return t;
+}
+
+move ISegmented segmented(Lambda<void(int)> onSelect)
+{
+    SegmentedControl* s = new SegmentedControl();
+    s.onSelect = onSelect;
+    return s;
+}
+
+move IDatePicker datePicker(int year, int month, int day, Lambda<void(int,int,int)> onChangeDate)
+{
+    DatePicker* d = new DatePicker();
+    d.year = year; d.month = month; d.day = day; d.onChangeDate = onChangeDate;
+    return d;
+}
+
+move IExpander expander(string title, bool expanded, Lambda<void(bool)> onToggle)
+{
+    Expander* e = new Expander();
+    e.title = title; e.expanded = expanded; e.onToggle = onToggle;
+    return e;
+}
+
+move IColorWell colorWell(Color value, Lambda<void(Color)> onChangeColor)
+{
+    ColorWell* w = new ColorWell();
+    w.value = value; w.onChangeColor = onChangeColor;
+    return w;
 }
 
 // A virtualized list; add columns with addColumn() and set `rowText`/`rowIcon`/`rowCount`.
@@ -5447,6 +5849,18 @@ void adoptContainerProps(IElement committed, IElement wip)
         if (a != nullptr && b != nullptr)
         {
             a.ratio = b.ratio; a.firstSize = b.firstSize; a.vertical = b.vertical;
+        }
+    }
+    else if (k == ELEM_EXPANDER)
+    {
+        IExpander a = committed as IExpander;
+        IExpander b = wip as IExpander;
+        if (a != nullptr && b != nullptr)
+        {
+            // Strings must be copied ("" +): the wip node is freed right after
+            // adoption, so a shallow alias would dangle and double-free at teardown.
+            a.style = b.style; a.title = "" + b.title; a.expanded = b.expanded;
+            a.disabled = b.disabled; a.tooltip = "" + b.tooltip;
         }
     }
     else if (k == ELEM_VIEW)
@@ -6320,7 +6734,7 @@ interface INativeHost
     // window's client area). `key` is the node's stable key path, for the host's
     // own reverse map (handle -> key) used to route events. Returns the handle.
     u64  createControl(int elemKind, u64 parentHandle, string key,
-                       bool password, bool indeterminate);
+                       bool password, bool indeterminate, bool comboEditable);
     void destroyControl(u64 h);
 
     // Geometry + content, all property-style so they map to XAML setters later.

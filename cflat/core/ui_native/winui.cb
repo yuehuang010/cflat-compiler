@@ -79,6 +79,8 @@ using XamlTabViewItemFactory       = Microsoft.UI.Xaml.Controls.ITabViewItemFact
 using XamlTextBlock                = Microsoft.UI.Xaml.Controls.ITextBlock;
 using XamlTextBox                  = Microsoft.UI.Xaml.Controls.ITextBox;
 using XamlNumberBox                = Microsoft.UI.Xaml.Controls.INumberBox;
+using XamlComboBox                 = Microsoft.UI.Xaml.Controls.IComboBox;
+using XamlToggleSwitch              = Microsoft.UI.Xaml.Controls.IToggleSwitch;
 using XamlProgressBar              = Microsoft.UI.Xaml.Controls.IProgressBar;
 using XamlTreeView                 = Microsoft.UI.Xaml.Controls.ITreeView;
 using XamlTreeView2                = Microsoft.UI.Xaml.Controls.ITreeView2;
@@ -1184,11 +1186,16 @@ bool winuiMappable(int kind)
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
+        || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
 }
+
+// Tier-2 batch B: DatePicker DateTimeOffset routing and ColorWell have no stable
+// property seam in the current generated projection; Expander content ownership is
+// likewise not wired here. They remain parity-N while the shared model stays usable.
 
 // The style.backgroundColor of a plain (non-mapped) container - a View from view/row/column - or 0
 // for anything else. A non-zero value opts the container into a painted backdrop panel (Box is
@@ -2211,7 +2218,7 @@ class WinUI3Host : INativeHost
 
     // -- INativeHost: create a XAML control for elemKind ------------------------
     u64 createControl(int elemKind, u64 parentHandle, string key,
-                      bool password, bool indeterminate)
+                      bool password, bool indeterminate, bool comboEditable)
     {
         void* insp = nullptr;
         if (elemKind == ELEM_PROGRESS)
@@ -2237,6 +2244,8 @@ class WinUI3Host : INativeHost
             else if (elemKind == ELEM_LINK)      cls = "Microsoft.UI.Xaml.Controls.HyperlinkButton";
             else if (elemKind == ELEM_TOOLBAR)   cls = "Microsoft.UI.Xaml.Controls.StackPanel";
             else if (elemKind == ELEM_COMBO)     cls = "Microsoft.UI.Xaml.Controls.ComboBox";
+            else if (elemKind == ELEM_TOGGLE)    cls = "Microsoft.UI.Xaml.Controls.ToggleSwitch";
+            else if (elemKind == ELEM_SEGMENTED) cls = "Microsoft.UI.Xaml.Controls.StackPanel";
             else if (elemKind == ELEM_LIST)      cls = "Microsoft.UI.Xaml.Controls.ListView";
             else if (elemKind == ELEM_IMAGE)     cls = "Microsoft.UI.Xaml.Controls.Image";
             // GroupBox is a headered label approximation (Border+header is a deliberate look
@@ -2639,6 +2648,13 @@ class WinUI3Host : INativeHost
     // Populate a combo's items only when the item set changed, then set the controlled selection.
     void _syncCombo(u64 h, IComboBox cb)
     {
+        void* combo = wqi((void*)h, iidof(XamlComboBox));
+        if (combo != nullptr)
+        {
+            ((XamlComboBox*)combo)->lpVtbl->put_IsEditable(combo, cb.editable);
+            if (cb.editable) ((XamlComboBox*)combo)->lpVtbl->put_Text(combo, hstring(cb.text));
+            wrelease(combo);
+        }
         void* ic = wqi((void*)h, iidof(XamlItemsControl));
         if (ic == nullptr) return;
         void* items = nullptr;
@@ -2662,6 +2678,33 @@ class WinUI3Host : INativeHost
         }
         void* sel = wqi((void*)h, iidof(XamlSelector));
         if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, cb.selectedIndex);
+    }
+
+    void _syncSegmented(u64 h, ISegmented sg)
+    {
+        void* panel = wqi((void*)h, iidof(XamlPanel)); if (panel == nullptr) return;
+        void* children = nullptr; ((XamlPanel*)panel)->lpVtbl->get_Children(panel, &children);
+        if (children == nullptr) { wrelease(panel); return; }
+        ((XamlUIElementVector*)children)->lpVtbl->Clear(children);
+        int i = 0;
+        while (i < sg.labels.count())
+        {
+            void* raw = nullptr; RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.ToggleButton"), &raw);
+            if (raw != nullptr)
+            {
+                void* tb = wqi(raw, iidof(XamlToggleButton));
+                if (tb != nullptr) { ((XamlToggleButton*)tb)->lpVtbl->put_IsChecked(tb, boxBool(i == sg.selected)); wrelease(tb); }
+                void* cc = wqi(raw, iidof(XamlContentControl));
+                if (cc != nullptr) { ((XamlContentControl*)cc)->lpVtbl->put_Content(cc, boxString(sg.labels.get(i))); wrelease(cc); }
+                void* ctl = wqi(raw, iidof(XamlControl));
+                if (ctl != nullptr) { ((XamlControl*)ctl)->lpVtbl->put_IsEnabled(ctl, !sg.disabled); wrelease(ctl); }
+                void* elem = wqi(raw, iidof(XamlUIElement));
+                if (elem != nullptr) { ((XamlUIElementVector*)children)->lpVtbl->Append(children, elem); wrelease(elem); }
+                wrelease(raw);
+            }
+            i++;
+        }
+        wrelease(children); wrelease(panel);
     }
 
     // Rebuild a TabView's items when its pane count changes, then set the controlled selection.
@@ -2887,7 +2930,9 @@ class WinUI3Host : INativeHost
                     IProgressBar p = node as IProgressBar;
                     indeterminate = p.indeterminate;
                 }
-                h = this.createControl(node.kind(), 0u, path, password, indeterminate);
+                bool comboEditable = false;
+                if (node.kind() == ELEM_COMBO) { IComboBox cb = node as IComboBox; comboEditable = cb.editable; }
+                h = this.createControl(node.kind(), 0u, path, password, indeterminate, comboEditable);
                 ctx.setNativeHandle(path, h);
                 this._firstMount(node, h);
             }
@@ -2927,6 +2972,11 @@ class WinUI3Host : INativeHost
                 this._applyNode(pane, cp, ctx, keys, menu);
             }
             return;
+        }
+        if (node.kind() == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            if (!ex.expanded) return;
         }
 
         if (node.kind() == ELEM_GRIDVIEW)
@@ -3114,6 +3164,18 @@ class WinUI3Host : INativeHost
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
+        else if (k == ELEM_TOGGLE)
+        {
+            IToggleSwitch ts = node as IToggleSwitch;
+            void* sw = wqi((void*)h, iidof(XamlToggleSwitch));
+            if (sw != nullptr) { ((XamlToggleSwitch*)sw)->lpVtbl->put_IsOn(sw, ts.on); wrelease(sw); }
+            // TODO: bind ToggleSwitch.Header when the generated HeaderedContentControl projection is available.
+            this.setText(h, ts.label.data()); this.setBoolProp(h, PROP_ENABLED, !ts.disabled);
+        }
+        else if (k == ELEM_SEGMENTED)
+        {
+            this._syncSegmented(h, node as ISegmented);
+        }
         else if (k == ELEM_LIST)
         {
             IListView lv = node as IListView;
@@ -3283,6 +3345,8 @@ void routeWinuiClick(string key)
     if (b != nullptr) { b.fireClick(); pumpWinui(); return; }
     ICheckbox c = e as ICheckbox;
     if (c != nullptr) { c.fireToggle(); pumpWinui(); return; }
+    IToggleSwitch ts = e as IToggleSwitch;
+    if (ts != nullptr) { ts.fireToggle(); pumpWinui(); return; }
     IRadioButton rb = e as IRadioButton;
     if (rb != nullptr)
     {
@@ -4406,6 +4470,7 @@ bool nativeIsChecked(string keyPath)
     if (e == nullptr) return false;
     if (e.kind() == ELEM_CHECKBOX) { ICheckbox c = e as ICheckbox; return c.checked; }
     if (e.kind() == ELEM_RADIO)    { IRadioButton rb = e as IRadioButton; return rb.checked; }
+    if (e.kind() == ELEM_TOGGLE)   { IToggleSwitch ts = e as IToggleSwitch; return ts.on; }
     return false;
 }
 
@@ -4474,6 +4539,51 @@ void nativeComboSelect(string keyPath, int idx)
     if (sel != nullptr) ((XamlSelector*)sel)->lpVtbl->put_SelectedIndex(sel, idx);
     IElement e = winuiElem(keyPath);
     if (e != nullptr) { IComboBox cb = e as IComboBox; if (cb != nullptr) { cb.fireChange(idx); pumpWinui(); } }
+}
+
+void nativeComboTypeText(string keyPath, string text)
+{
+    u64 h = _wCtx.nativeHandle(keyPath); if (h == 0u) return;
+    void* combo = wqi((void*)h, iidof(XamlComboBox));
+    if (combo != nullptr) { ((XamlComboBox*)combo)->lpVtbl->put_Text(combo, hstring(text)); wrelease(combo); }
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { IComboBox cb = e as IComboBox; if (cb != nullptr) { cb.fireEdit(text); pumpWinui(); } }
+}
+
+void nativeToggleSet(string keyPath, bool on)
+{
+    u64 h = _wCtx.nativeHandle(keyPath); if (h == 0u) return;
+    void* sw = wqi((void*)h, iidof(XamlToggleSwitch));
+    if (sw != nullptr) { ((XamlToggleSwitch*)sw)->lpVtbl->put_IsOn(sw, on); wrelease(sw); }
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { IToggleSwitch ts = e as IToggleSwitch; if (ts != nullptr && ts.on != on) { ts.fireToggle(); pumpWinui(); } }
+}
+
+void nativeDateSet(string keyPath, int y, int m, int d)
+{
+    IElement e = winuiElem(keyPath); if (e == nullptr) return;
+    IDatePicker dp = e as IDatePicker; if (dp != nullptr) { dp.fireChangeDate(y, m, d); pumpWinui(); }
+}
+
+void nativeExpanderToggle(string keyPath)
+{
+    IElement e = winuiElem(keyPath); if (e == nullptr) return;
+    IExpander ex = e as IExpander; if (ex != nullptr) { ex.fireToggle(); activeCtx().invalidate(); pumpWinui(); }
+}
+
+void nativeColorSet(string keyPath, int r, int g, int b)
+{
+    IElement e = winuiElem(keyPath); if (e == nullptr) return;
+    IColorWell cw = e as IColorWell; if (cw != nullptr) { cw.fireChangeColor(colorLiteral((r << 16) | (g << 8) | b)); pumpWinui(); }
+}
+
+string nativeControlClass(string keyPath) { return ""; }
+void uiTestScriptColor(int r, int g, int b) { }
+
+void nativeSegmentedSelect(string keyPath, int index)
+{
+    IElement e = winuiElem(keyPath);
+    if (e != nullptr) { ISegmented sg = e as ISegmented; if (sg != nullptr) { sg.fireSelect(index); pumpWinui(); } }
 }
 
 // Type `s` into a text input (live) and route onChangeText (controlled).

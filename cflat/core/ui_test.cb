@@ -48,6 +48,13 @@ void nativeClickButton(string keyPath);
 void nativeTypeText(string keyPath, string s);
 void nativeSetControlText(string keyPath, string s);
 void nativeComboSelect(string keyPath, int idx);
+void nativeComboTypeText(string keyPath, string text);
+void nativeToggleSet(string keyPath, bool on);
+void nativeDateSet(string keyPath, int y, int m, int d);
+void nativeExpanderToggle(string keyPath);
+void nativeColorSet(string keyPath, int r, int g, int b);
+string nativeControlClass(string keyPath);
+void nativeSegmentedSelect(string keyPath, int index);
 void nativeListSelect(string keyPath, int row);
 void nativeListActivate(string keyPath, int row);
 void nativeListHeaderClick(string keyPath, int col);
@@ -71,6 +78,7 @@ void nativeResizeClient(int wDip, int hDip);
 // Scripted modal answers for headless tests. Each call supplies the next result.
 void uiTestScriptMessageBox(int answer);
 void uiTestScriptFolder(string path);
+void uiTestScriptColor(int r, int g, int b);
 
 // Reader drivers (read live control + model state; the oracle, no pixels).
 string nativeControlText(string keyPath);
@@ -157,6 +165,12 @@ interface IUiTest
     void type(string key, string s);
     void setText(string key, string s);
     void comboSelect(string key, int i);
+    void comboTypeText(string key, string text);
+    void toggleSet(string key, bool on);
+    void segmentedSelect(string key, int index);
+    void dateSet(string key, int y, int m, int d);
+    void expanderToggle(string key);
+    void colorSet(string key, int r, int g, int b);
     void listSelect(string key, int row);
     void listActivate(string key, int row);
     void tabSelect(string key, int i);
@@ -243,6 +257,12 @@ class UiTest : IUiTest
     void type(string key, string s)         { if (this.aborted) return; nativeTypeText(key, s); }
     void setText(string key, string s)      { if (this.aborted) return; nativeSetControlText(key, s); }
     void comboSelect(string key, int i)     { if (this.aborted) return; nativeComboSelect(key, i); }
+    void comboTypeText(string key, string text) { if (this.aborted) return; nativeComboTypeText(key, text); }
+    void toggleSet(string key, bool on)      { if (this.aborted) return; nativeToggleSet(key, on); }
+    void dateSet(string key, int y, int m, int d) { if (this.aborted) return; nativeDateSet(key, y, m, d); }
+    void expanderToggle(string key)           { if (this.aborted) return; nativeExpanderToggle(key); }
+    void colorSet(string key, int r, int g, int b) { if (this.aborted) return; nativeColorSet(key, r, g, b); }
+    void segmentedSelect(string key, int index) { if (this.aborted) return; nativeSegmentedSelect(key, index); }
     void listSelect(string key, int row)    { if (this.aborted) return; nativeListSelect(key, row); }
     void listActivate(string key, int row)  { if (this.aborted) return; nativeListActivate(key, row); }
     void tabSelect(string key, int i)       { if (this.aborted) return; nativeTabSelect(key, i); }

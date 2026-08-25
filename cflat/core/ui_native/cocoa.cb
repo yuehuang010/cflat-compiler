@@ -77,6 +77,7 @@ list<string>          _menuItemLabel  = default;   // per item: label
 list<int>             _menuItemCmd    = default;   // per item: app command id (0 = separator)
 list<string>          _menuAccel      = default;   // per item: accel text (e.g. "Ctrl+S")
 Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
+list<int>             _uiTestColorValues = default;
 
 // Optional close guard: the app returns true to allow the window to close, false to
 // veto. Default (unset) always allows.
@@ -100,6 +101,8 @@ bool nativeMappable(int kind)
     return kind == ELEM_BUTTON || kind == ELEM_TEXT || kind == ELEM_TEXTINPUT
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
+        || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
+        || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -185,6 +188,7 @@ class CocoaHost : INativeHost
     list<u64>    liveHandles = default;   // parallel handles (NSView* as u64)
     list<u64>    spinnerHandles = default;
     list<u64>    toolbarHandles = default;
+    list<u64>    toggleHandles = default;
     double edgeWPt = 0.0;
     double edgeHPt = 0.0;
     double contentWPt = 0.0;
@@ -250,7 +254,7 @@ class CocoaHost : INativeHost
     // `key` is the node's key path (kept by the caller in the shadow map). Returns
     // the control (NSView*) as a u64; a TextArea returns its enclosing scroll view.
     u64 createControl(int elemKind, u64 parentHandle, string key,
-                      bool password, bool indeterminate)
+                      bool password, bool indeterminate, bool comboEditable)
     {
         void* ctrl = nullptr;
         if (elemKind == ELEM_BUTTON)
@@ -377,12 +381,49 @@ class CocoaHost : INativeHost
         }
         else if (elemKind == ELEM_COMBO)
         {
-            // NSPopUpButton (pull-down NO = a select-one popup). Items are populated in
-            // _syncCombo; selection routes onChange through onAction:.
-            ctrl = msgRect(msg0(cls("NSPopUpButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
-            msgBool(ctrl, "setPullsDown:", false);
+            if (comboEditable)
+                ctrl = msgRect(msg0(cls("NSComboBox"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            else
+                ctrl = msgRect(msg0(cls("NSPopUpButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            if (!comboEditable) msgBool(ctrl, "setPullsDown:", false);
             msg1(ctrl, "setTarget:", this.target);
             msg1(ctrl, "setAction:", sel("onAction:"));
+            if (comboEditable) msg1(ctrl, "setDelegate:", this.target);
+        }
+        else if (elemKind == ELEM_TOGGLE)
+        {
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            void* sw = msgRect(msg0(cls("NSSwitch"), "alloc"), "initWithFrame:", 0.0, 0.0, 38.0, 24.0);
+            void* label = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 42.0, 0.0, 80.0, 24.0);
+            msgBool(label, "setBezeled:", false); msgBool(label, "setDrawsBackground:", false);
+            msgBool(label, "setEditable:", false); msgBool(label, "setSelectable:", false);
+            msg1(sw, "setTarget:", this.target); msg1(sw, "setAction:", sel("onAction:"));
+            msg1(ctrl, "addSubview:", sw); msg1(ctrl, "addSubview:", label);
+            msg0(sw, "release"); msg0(label, "release");
+            this.toggleHandles.add((u64)ctrl);
+        }
+        else if (elemKind == ELEM_SEGMENTED)
+        {
+            ctrl = msgRect(msg0(cls("NSSegmentedControl"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setTrackingMode:", 0);
+            msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_DATEPICKER)
+        {
+            ctrl = msgRect(msg0(cls("NSDatePicker"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setDatePickerStyle:", 0); msgInt(ctrl, "setDatePickerElements:", 0x00E0);
+            msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_EXPANDER)
+        {
+            ctrl = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgInt(ctrl, "setButtonType:", 1); msgInt(ctrl, "setBezelStyle:", 5);
+            msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_COLORWELL)
+        {
+            ctrl = msgRect(msg0(cls("NSColorWell"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
         }
         else if (elemKind == ELEM_LIST)
         {
@@ -504,6 +545,7 @@ class CocoaHost : INativeHost
         this._freeCanvasBox(h);  // no-op unless h is a canvas with a boxed painter
         this._storeAccent(h, 0); // drop any stored accent for this handle
         this._dropComposite(&this.spinnerHandles, h); this._dropComposite(&this.toolbarHandles, h);
+        this._dropComposite(&this.toggleHandles, h);
         void* ctrl = u2h(h);
         msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
@@ -528,6 +570,9 @@ class CocoaHost : INativeHost
         if (this._hasComposite(&this.spinnerHandles, (u64)ctrl)) this._layoutSpinner(ctrl,
             (double)(frameCells.w * BASE_X) + this.applyExtraW,
             (double)(frameCells.h * BASE_Y) + this.applyExtraH);
+        if (this._hasComposite(&this.toggleHandles, (u64)ctrl)) this._layoutToggle(ctrl,
+            (double)(frameCells.w * BASE_X) + this.applyExtraW,
+            (double)(frameCells.h * BASE_Y) + this.applyExtraH);
     }
 
     bool _hasComposite(list<u64>* xs, u64 h)
@@ -544,6 +589,13 @@ class CocoaHost : INativeHost
         void* kids = msg0(ctrl, "subviews"); if (kids == nullptr) return;
         void* field = msgInt(kids, "objectAtIndex:", 0); void* stepper = msgInt(kids, "objectAtIndex:", 1);
         double sw = 24.0; msgRect(field, "setFrame:", 0.0, 0.0, w - sw, h); msgRect(stepper, "setFrame:", w - sw, 0.0, sw, h);
+    }
+
+    void _layoutToggle(void* ctrl, double w, double h)
+    {
+        void* kids = msg0(ctrl, "subviews"); if (kids == nullptr || msgGetI64(kids, "count") < 2) return;
+        void* sw = msgInt(kids, "objectAtIndex:", 0); void* label = msgInt(kids, "objectAtIndex:", 1);
+        double swW = 38.0; msgRect(sw, "setFrame:", 0.0, 0.0, swW, h); msgRect(label, "setFrame:", swW + 4.0, 0.0, w - swW - 4.0, h);
     }
 
     void _setLinkTitle(void* ctrl, string text)
@@ -1714,7 +1766,9 @@ class CocoaHost : INativeHost
                     IProgressBar p = node as IProgressBar;
                     indeterminate = p.indeterminate;
                 }
-                h = this.createControl(node.kind(), parentView, path, password, indeterminate);
+                bool comboEditable = false;
+                if (node.kind() == ELEM_COMBO) { IComboBox cb = node as IComboBox; comboEditable = cb.editable; }
+                h = this.createControl(node.kind(), parentView, path, password, indeterminate, comboEditable);
                 ctx.setNativeHandle(path, h);
                 // One-time seed of a TextArea's buffer (uncontrolled after; the
                 // native view owns the text, further pushes are explicit).
@@ -1846,6 +1900,24 @@ class CocoaHost : INativeHost
                 string cp = joinKeyPath(path, keySegment(pane, sel));
                 this._applyNode(pane, cp, ctx, keys, handles, fx, fy, fw, fh,
                                 extraW, extraH, parentView, offX, offY);
+            }
+            return;
+        }
+        if (node.kind() == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            if (!ex.expanded) return;
+            list<IElement>* kids = node.childList();
+            if (kids != nullptr)
+            {
+                int i = 0;
+                while (i < kids.count())
+                {
+                    IElement c = kids.get(i);
+                    this._applyNode(c, joinKeyPath(path, keySegment(c, i)), ctx, keys, handles,
+                                    fx, fy, fw, fh, extraW, extraH, parentView, offX, offY);
+                    i++;
+                }
             }
             return;
         }
@@ -2020,6 +2092,56 @@ class CocoaHost : INativeHost
             this._syncCombo(h, cb);
             this.setBoolProp(h, PROP_ENABLED, !cb.disabled);
         }
+        else if (k == ELEM_TOGGLE)
+        {
+            IToggleSwitch ts = node as IToggleSwitch;
+            void* kids = msg0(u2h(h), "subviews");
+            if (kids != nullptr)
+            {
+                void* sw = msgInt(kids, "objectAtIndex:", 0); void* label = msgInt(kids, "objectAtIndex:", 1);
+                msgInt(sw, "setState:", ts.on ? 1 : 0); msg1(label, "setStringValue:", nsStr(ts.label.data()));
+                msgBool(sw, "setEnabled:", !ts.disabled); msgBool(label, "setEnabled:", !ts.disabled);
+            }
+        }
+        else if (k == ELEM_SEGMENTED)
+        {
+            ISegmented sg = node as ISegmented; void* ctrl = u2h(h);
+            int have = (int)msgGetI64(ctrl, "segmentCount");
+            if (have != sg.labels.count())
+            {
+                msgInt(ctrl, "setSegmentCount:", (i64)sg.labels.count());
+                function<void*(void*, void*, void*, i64)> f = (function<void*(void*, void*, void*, i64)>)__objcMsgSendPtr;
+                int i = 0; while (i < sg.labels.count()) { f(ctrl, sel("setLabel:forSegment:"), nsStr(sg.labels.get(i).data()), (i64)i); i++; }
+            }
+            msgInt(ctrl, "setSelectedSegment:", (i64)sg.selected); msgBool(ctrl, "setEnabled:", !sg.disabled);
+        }
+        else if (k == ELEM_DATEPICKER)
+        {
+            IDatePicker dp = node as IDatePicker;
+            void* comps = msg0(msg0(cls("NSDateComponents"), "alloc"), "init");
+            msgInt(comps, "setYear:", (i64)dp.year); msgInt(comps, "setMonth:", (i64)dp.month); msgInt(comps, "setDay:", (i64)dp.day);
+            void* cal = msg0(cls("NSCalendar"), "currentCalendar");
+            msg1(u2h(h), "setDateValue:", msg1(cal, "dateFromComponents:", comps));
+            msgBool(u2h(h), "setEnabled:", !dp.disabled);
+        }
+        else if (k == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            string prefix = ex.expanded ? "v " : "> ";
+            string title = prefix + ex.title;
+            msg1(u2h(h), "setTitle:", nsStr(title.data()));
+            msgInt(u2h(h), "setState:", ex.expanded ? 1 : 0); msgBool(u2h(h), "setEnabled:", !ex.disabled);
+        }
+        else if (k == ELEM_COLORWELL)
+        {
+            IColorWell cw = node as IColorWell;
+            int raw = colorRaw(cw.value);
+            if (msgBool1(u2h(h), "isHiddenOrHasHiddenAncestor", nullptr) == (i8)0)
+                msg1(u2h(h), "setColor:", nsColor((double)((raw >> 16) & 0xFF) / 255.0,
+                                                     (double)((raw >> 8) & 0xFF) / 255.0,
+                                                     (double)(raw & 0xFF) / 255.0, 1.0));
+            msgBool(u2h(h), "setEnabled:", !cw.disabled);
+        }
         else if (k == ELEM_LIST)
         {
             // Virtualized: push row count + controlled selection, then reload. Cell text
@@ -2084,6 +2206,7 @@ class CocoaHost : INativeHost
     void _syncCombo(u64 h, IComboBox cb)
     {
         void* ctrl = u2h(h);
+        bool editable = msgBool1(ctrl, "isKindOfClass:", cls("NSComboBox")) != (i8)0;
         int have = (int)msgGetI64(ctrl, "numberOfItems");
         if (have != cb.items.count())
         {
@@ -2091,12 +2214,14 @@ class CocoaHost : INativeHost
             int i = 0;
             while (i < cb.items.count())
             {
-                msg1(ctrl, "addItemWithTitle:", nsStr(cb.items.get(i).data()));
+                if (editable) msg1(ctrl, "addItemWithObjectValue:", nsStr(cb.items.get(i).data()));
+                else msg1(ctrl, "addItemWithTitle:", nsStr(cb.items.get(i).data()));
                 i++;
             }
         }
         int cur = (int)msgGetI64(ctrl, "indexOfSelectedItem");
         if (cur != cb.selectedIndex) msgInt(ctrl, "selectItemAtIndex:", (i64)cb.selectedIndex);
+        if (editable) msg1(ctrl, "setStringValue:", nsStr(cb.text.data()));
     }
 
     // Rebuild the segmented tab strip on a pane-count change, then set the selection.
@@ -2999,6 +3124,69 @@ void routeToolbar(void* button)
     t.fireCommand((int)msgGetI64(button, "tag")); pumpNative();
 }
 
+void routeToggle(void* sw)
+{
+    string key = _keyForView(sw); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    IToggleSwitch t = e as IToggleSwitch; if (t == nullptr) return;
+    t.fireToggle(); pumpNative();
+}
+
+void routeSegmented(void* ctrl)
+{
+    string key = curWin().keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    ISegmented s = e as ISegmented; if (s == nullptr) return;
+    int index = (int)msgGetI64(ctrl, "selectedSegment");
+    if (index >= 0 && index != s.selected) { s.fireSelect(index); pumpNative(); }
+}
+
+void routeExpander(void* ctrl)
+{
+    if (curWin().applying) return;
+    string key = curWin().keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    IExpander ex = e as IExpander; if (ex == nullptr) return;
+    ex.fireToggle(); curWin().ctx.invalidate(); pumpNative();
+}
+
+void routeDatePicker(void* ctrl)
+{
+    if (curWin().applying) return;
+    string key = curWin().keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    IDatePicker dp = e as IDatePicker; if (dp == nullptr) return;
+    void* cal = msg0(cls("NSCalendar"), "currentCalendar");
+    void* date = msg0(ctrl, "dateValue");
+    function<void*(void*, void*, i64, void*)> f = (function<void*(void*, void*, i64, void*)>)__objcMsgSendPtr;
+    void* comps = f(cal, sel("components:fromDate:"), (i64)28, date);
+    dp.fireChangeDate((int)msgGetI64(comps, "year"), (int)msgGetI64(comps, "month"), (int)msgGetI64(comps, "day"));
+    pumpNative();
+}
+
+void routeColorWell(void* ctrl)
+{
+    if (curWin().applying) return;
+    string key = curWin().keyForHandle((u64)ctrl); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key); if (e == nullptr) return;
+    IColorWell cw = e as IColorWell; if (cw == nullptr) return;
+    int raw = 0;
+    if (_uiTestColorValues.count() > 0)
+    {
+        raw = _uiTestColorValues.get(0); _uiTestColorValues.removeAt(0);
+    }
+    else
+    {
+        void* color = msg0(ctrl, "color");
+        color = msg1(color, "colorUsingColorSpace:", msg0(cls("NSColorSpace"), "sRGBColorSpace"));
+        int r = (int)(msgGetDouble(color, "redComponent") * 255.0 + 0.5);
+        int g = (int)(msgGetDouble(color, "greenComponent") * 255.0 + 0.5);
+        int b = (int)(msgGetDouble(color, "blueComponent") * 255.0 + 0.5);
+        raw = (r << 16) | (g << 8) | b;
+    }
+    cw.fireChangeColor(colorLiteral(raw)); pumpNative();
+}
+
 // Strip the last "/segment" from a key path ("root/rg/r1" -> "root/rg"); "" if none.
 string _parentPath(string key)
 {
@@ -3055,6 +3243,11 @@ void routeEdit(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
+    IComboBox cb = e as IComboBox;
+    if (cb != nullptr && cb.editable)
+    {
+        char* c = cStr(msg0(ctrl, "stringValue")); cb.fireEdit(c != nullptr ? (string)c : ""); pumpNative(); return;
+    }
     ISpinner sp = e as ISpinner;
     if (sp != nullptr)
     {
@@ -3563,6 +3756,57 @@ int nativeComboSelected(string keyPath)
     return (int)msgGetI64(u2h(h), "indexOfSelectedItem");
 }
 
+void nativeComboTypeText(string keyPath, string text)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    msg1(u2h(h), "setStringValue:", nsStr(text.data())); routeEdit(u2h(h));
+}
+
+void nativeToggleSet(string keyPath, bool on)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath); if (e == nullptr) return;
+    IToggleSwitch t = e as IToggleSwitch; if (t == nullptr) return;
+    if (t.on == on) return;
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    void* kids = msg0(u2h(h), "subviews"); if (kids == nullptr) return;
+    void* sw = msgInt(kids, "objectAtIndex:", 0); msgInt(sw, "setState:", on ? 1 : 0); routeToggle(sw);
+}
+
+void nativeDateSet(string keyPath, int y, int m, int d)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    void* comps = msg0(msg0(cls("NSDateComponents"), "alloc"), "init");
+    msgInt(comps, "setYear:", (i64)y); msgInt(comps, "setMonth:", (i64)m); msgInt(comps, "setDay:", (i64)d);
+    void* cal = msg0(cls("NSCalendar"), "currentCalendar");
+    msg1(u2h(h), "setDateValue:", msg1(cal, "dateFromComponents:", comps)); routeDatePicker(u2h(h));
+}
+
+void nativeExpanderToggle(string keyPath)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath); if (e == nullptr) return;
+    IExpander ex = e as IExpander; if (ex != nullptr) { ex.fireToggle(); curWin().ctx.invalidate(); pumpNative(); }
+}
+
+void nativeColorSet(string keyPath, int r, int g, int b)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    _uiTestColorValues.add((r << 16) | (g << 8) | b);
+    // Headless NSColorWell setColor: trips AppKit workspace notifications.
+    routeColorWell(u2h(h));
+}
+
+string nativeControlClass(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return "";
+    char* c = cStr(msg0(u2h(h), "className")); return c != nullptr ? "" + c : "";
+}
+
+void nativeSegmentedSelect(string keyPath, int index)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    msgInt(u2h(h), "setSelectedSegment:", (i64)index); routeSegmented(u2h(h));
+}
+
 void nativeComboSelect(string keyPath, int idx)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -3862,6 +4106,16 @@ void _onActionImp(void* self, void* cmd, void* sender)
         if (e != nullptr && (e as IToolBar) != nullptr) { routeToolbar(sender); return; }
     }
     if (msgBool1(sender, "isKindOfClass:", cls("NSSlider")) != (i8)0) { routeSlider(sender); return; }
+    if (msgBool1(sender, "isKindOfClass:", cls("NSSwitch")) != (i8)0) { routeToggle(sender); return; }
+    if (msgBool1(sender, "isKindOfClass:", cls("NSSegmentedControl")) != (i8)0) { routeSegmented(sender); return; }
+    if (msgBool1(sender, "isKindOfClass:", cls("NSDatePicker")) != (i8)0) { routeDatePicker(sender); return; }
+    if (msgBool1(sender, "isKindOfClass:", cls("NSColorWell")) != (i8)0) { routeColorWell(sender); return; }
+    if (msgBool1(sender, "isKindOfClass:", cls("NSButton")) != (i8)0)
+    {
+        string key = curWin().keyForHandle((u64)sender);
+        IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+        if (e != nullptr && (e as IExpander) != nullptr) { routeExpander(sender); return; }
+    }
     routeClick(sender);
 }
 
@@ -4131,6 +4385,7 @@ list<int> _uiTestMessageBoxAnswers = default;
 list<string> _uiTestFolderAnswers = default;
 
 void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
+void uiTestScriptColor(int r, int g, int b) { _uiTestColorValues.add((r << 16) | (g << 8) | b); }
 void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
 
 string nativeOpenFile()
