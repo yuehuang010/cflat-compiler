@@ -163,6 +163,8 @@ same fields.
 
 `ToolBar` v1 is text-only; icon items are a documented follow-up.
 | `TextArea` | `ELEM_TEXTAREA` | multiline text region (editor) | `string value` (push), `Lambda<void()> onChange` (dirty notify), `int width/height` |
+| `RichText` | `ELEM_RICHTEXT` | controlled attributed run list | `editable`, `addRun(text, flags, colorRgb)`, `onChangeText` |
+| `WebView` | `ELEM_WEBVIEW` | Cocoa web content surface | `url`, `html`, `onNavigate` |
 | `StatusBar` | `ELEM_STATUSBAR` | bottom strip of text panes (app shell) | `list<string> parts` (pane text) |
 | `RadioGroup` | `ELEM_RADIOGROUP` | controlled single-choice group (container) | `int value` (selected index), `onChange`, `RadioButton` children |
 | `RadioButton` | `ELEM_RADIO` | one option inside a `RadioGroup` | `string label`, `int index`, `bool checked` |
@@ -172,6 +174,8 @@ same fields.
 | `DatePicker` | `ELEM_DATEPICKER` | controlled year/month/day picker | `year`, `month` (1-12), `day` (1-31), `onChangeDate`, `disabled` |
 | `Expander` | `ELEM_EXPANDER` | disclosure header with lazy children | `title`, `expanded`, `onToggle`, `children`, `disabled` |
 | `ColorWell` | `ELEM_COLORWELL` | native color swatch and picker | `Color value`, `onChangeColor`, `disabled` |
+| `InfoBar` | `ELEM_INFOBAR` | severity-tinted message banner | `severity`, `title`, `message`, `closable`, `onClose` |
+| `Popover` | `ELEM_POPOVER` | controlled floating text and command buttons | `anchorKey`, `open`, `title`, `body`, `labels`, `cmds`, `onCommand`, `onClose` |
 | `ListView` | `ELEM_LIST` | virtualized report-mode list | `columns`, `int rowCount`, `rowText(row,col)`, `cellStyle(row,col)`, `int selectedIndex`, `width`, `height`, `onSelect`, `onActivate`, `onHeaderClick` |
 | `GridView` | `ELEM_GRIDVIEW` | virtualized item grid | `cellW`, `cellH`, `count`, `makeCell`, `selectedIndex` |
 | `TabControl` | `ELEM_TABS` | keyed tab panes, lazy inactive tabs | `int selectedTab`, `onSelectTab`, `TabPane` children |
@@ -459,6 +463,8 @@ move ISpinner     spinner(int value, int minValue, int maxValue, Lambda<void(int
 move ILink        link(string text, Lambda<void()> onClick);
 move IToolBar     toolbar(Lambda<void(int)> onCommand);
 move ITextArea    textArea(string value, Lambda<void()> onChange);
+move IRichText    richText(bool editable, Lambda<void(string)> onChangeText);
+move IWebView     webView(string url);   // set html for local content; html wins over url
 move IStatusBar   statusBar(string mainText);   // add more panes with .addPart(s)
 move IRadioGroup  radioGroup(int value, Lambda<void(int)> onChange);  // add options with .addOption(label)
 move IComboBox    comboBox(int selectedIndex, Lambda<void(int)> onChange);  // add items with .addItem(s)
@@ -467,6 +473,8 @@ move ISegmented    segmented(Lambda<void(int)> onSelect);                  // ad
 move IDatePicker   datePicker(int year, int month, int day, Lambda<void(int,int,int)> onChangeDate);
 move IExpander     expander(string title, bool expanded, Lambda<void(bool)> onToggle); // add children
 move IColorWell    colorWell(Color value, Lambda<void(Color)> onChangeColor);
+move IInfoBar      infoBar(int severity, string title, string message, Lambda<void()> onClose);
+move IPopover      popover(string anchorKey, bool open, Lambda<void()> onClose); // addButton(label, cmd)
 move IListView    listView(int rowCount, Lambda<string(int,int)> rowText); // add columns with .addColumn(title, widthCells)
 move ITabControl  tabControl(int selectedTab, Lambda<void(int)> onSelectTab); // add panes with .add(tabPane(title))
 move ITabPane     tabPane(string title);
@@ -1152,6 +1160,12 @@ documented-API only (no uxtheme ordinals). An app imports this host and calls
   `value` is pushed only at creation; `onChange` is a dirty NOTIFICATION. Pull/push
   the text with the host helpers `nativeControlText(keyPath)` /
   `nativeSetControlText(keyPath, s)`.
+- **`RichText`** is a controlled run list, not markup. `RICH_BOLD`, `RICH_ITALIC`, and
+  `RICH_UNDERLINE` select run traits; `colorRgb == -1` uses the theme text color. In an
+  editable instance, `onChangeText` receives plain text only. v1 does not round-trip
+  formatting from user edits - the app owns how its run list evolves.
+- **`WebView`** loads `html` when it is non-empty, otherwise `url`; `onNavigate` fires after
+  a committed navigation. Tests must use local HTML and must not load remote pages.
 - **Menu bar + accelerators:** `menuReset()`, `menuAddTop(title)`,
   `menuAddItem(top, label, accel, cmdId)`, `menuAddSeparator(top)` build the menu;
   `setMenuHandler(Lambda<void(int)>)` receives command ids (menu clicks AND
@@ -1168,7 +1182,9 @@ Cocoa and Win32 implement both; WinUI does not. Headless tests script the next a
 without opening a dialog with `uiTestScriptMessageBox(answer)` and
 `uiTestScriptFolder(path)`. Color picks can be scripted with
 `uiTestScriptColor(r, g, b)` on Cocoa and Win32; `nativeColorSet` is the portable direct
-driver. The color well opens the native panel/dialog on user activation.
+driver. The color well opens the native panel/dialog on user activation. Font selection uses
+`nativeChooseFont(FontChoice* out)` and can be scripted with `uiTestScriptFont(family, size)`
+on Cocoa and Win32; WinUI has no font dialog in this release.
 - **Windowing:** `setCloseQuery(Lambda<bool()>)` vetoes window close (dirty-save
   prompt); `showSecondaryWindow(title, message)` opens a read-only second top-level
   window; `openAppWindow(new App(), title)` opens a full second app window (v12);
@@ -1207,6 +1223,10 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 - **Date / disclosure / color:** `nativeDateSet(keyPath, y, m, d)`,
   `nativeExpanderToggle(keyPath)`, `nativeColorSet(keyPath, r, g, b)`;
   `nativeControlClass(keyPath)` is useful for native-class assertions.
+- **InfoBar / popover:** `nativeInfoBarClose(keyPath)` and
+  `nativePopoverCommand(keyPath, cmd)` (also available as `UiTest.infoBarClose()` /
+  `UiTest.popoverCommand()`). A popover has no inline layout size; its handle is nonzero only
+  while `open` is true.
 - **Text:** `nativeTypeText(keyPath, s)` (types + routes the change),
   `nativeControlText(keyPath)`, `nativeSetControlText(keyPath, s)`, `nativeStatusText(keyPath)`.
 - **Range:** `nativeProgressValue(keyPath)`, `nativeSliderSet(keyPath, v)`.
@@ -1248,7 +1268,7 @@ a driver reads the control's own items/selection, so an empty control cannot ans
   the gallery launcher is `example/ui/06-winui/winui_gallery.cb`. Its self-tests run WITHOUT
   `--heap-audit` (the WinAppSDK runtime keeps process-lived singletons and its own heaps).
 
-### IElement x host parity matrix (v17)
+### IElement x host parity matrix (v18)
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
 compile-checked and runtime-verified on this arm64 Mac by `bash example_mac.sh Release`;
@@ -1263,6 +1283,8 @@ drivers read their answers back out of the control - an empty control cannot pas
 | Text.font    | default font              | Y FONT_UI/TITLE/CAPTION   | default font                        |
 | TextInput    | Y EDIT                    | Y NSTextField             | Y TextBox                           |
 | TextArea     | Y EDIT multiline          | Y NSTextView              | Y TextBox (uncontrolled-with-sync)  |
+| RichText     | Y RICHEDIT50W             | Y NSScrollView + NSTextView | N (RichEditBox needs ITextDocument routing) |
+| WebView      | N - needs WebView2 runtime ruling | Y WKWebView          | N - needs WebView2 runtime ruling   |
 | Checkbox     | Y BUTTON checkbox         | Y NSButton                | Y CheckBox                          |
 | RadioGroup   | Y BS_AUTORADIOBUTTON      | Y NSButton radio          | Y RadioButton (controlled via model)|
 | ProgressBar  | Y msctls_progress32       | Y NSProgressIndicator     | Y ProgressBar (IRangeBase)          |
@@ -1277,6 +1299,8 @@ drivers read their answers back out of the control - an empty control cannot pas
 | DatePicker   | Y SysDateTimePick32       | Y NSDatePicker              | N (DateTimeOffset routing TODO)       |
 | Expander     | Y BS_PUSHLIKE checkbox    | Y NSButton disclosure       | N (content routing TODO)              |
 | ColorWell    | Y ChooseColorW button     | Y NSColorWell + NSColorPanel | N (native color dialog TODO)        |
+| InfoBar      | Y composite STATIC band   | Y composite NSView banner    | Y InfoBar (properties TODO)        |
+| Popover      | Y owned WS_POPUP (minimal) | Y NSPopover                  | N (Flyout content routing TODO)    |
 | ListView     | Y virtualized OWNERDATA   | Y NSTableView dataSource  | Y virtualized ListView + realized row visuals |
 | GridView     | cell realization (wheel)  | cell realization (wheel)  | cell realization (keyboard) |
 | TabControl   | Y WC_TABCONTROL           | Y NSSegmentedControl      | Y TabView + TabViewItems            |
@@ -1380,6 +1404,7 @@ purely cosmetic gain).
 | `ListView` / `TreeView` / `TabControl` | CONTROLLED selection | `selectedIndex`/`selectedNode`/`selectedTab` is owned by the component |
 | `SplitView` | CONTROLLED ratio | `ratio` owned by the component; `onRatioChange` pushes drags up |
 | `TextArea` | UNCONTROLLED-with-sync | native buffer is the source of truth; `value` is a push, `onChange` a dirty notify (documented large-buffer exception) |
+| `RichText` | CONTROLLED runs / plain-text edit event | runs are the source of truth; editable hosts report plain text through `onChangeText` |
 | `ProgressBar` | presentational | no input; `value` is display-only |
 
 ## Testing your app
@@ -1434,8 +1459,8 @@ exact signatures):
 | Group | Methods |
 |-------|---------|
 | Launch | `launch(new App(), wCells, hCells)`, `pump()` (re-render + drain posted work) |
-| Actions | `click`, `type`, `setText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `spinnerSet`, `linkClick`, `toolbarClick`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
-| Readers | `controlText`, `isChecked`, `isEnabled`/`isDisabled`, `comboSelected`, `listRowCount`, `listSelectedRow`, `listCellText`, `progressValue`, `statusText`, `bounds`, `accessibleName`, `focusedKey`, `tabCount`/`tabSelected`, `tooltipCount`, `exists(key)`, `hostIsDark()` |
+| Actions | `click`, `type`, `setText`, `richTextTypeText`, `comboSelect`, `listSelect`, `listActivate`, `tabSelect`, `sliderSet`, `spinnerSet`, `linkClick`, `toolbarClick`, `splitterDrag`, `fireContextMenu`, `fireMenu`, `resize`, `focusFirst`/`focusNext` (all key-path addressed) |
+| Readers | `controlText`, `richTextPlain`, `webViewUrl`, `isChecked`, `isEnabled`/`isDisabled`, `comboSelected`, `listRowCount`, `listSelectedRow`, `listCellText`, `progressValue`, `statusText`, `bounds`, `accessibleName`, `focusedKey`, `tabCount`/`tabSelected`, `tooltipCount`, `exists(key)`, `hostIsDark()` |
 | Asserts | `expectTrue`/`expectFalse`, `expectBool`, `expectInt`, `expectStr`, `expectText(name, key, want)`, `requireTrue(name, cond)` |
 | Wait | `waitUntil(pred, timeoutMs)` - see the rule below |
 | Suite | `uiTestSuite(name)`, `s.test(name, body)`, `s.run(argc, argv)` |

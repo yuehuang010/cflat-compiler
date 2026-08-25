@@ -36,6 +36,37 @@ verification (test.bat + example.bat + gallery selftest) is the remaining step b
 Tier 1 is fully closed. WinUI keeps its pre-existing pattern of driver-only event wiring,
 and password there stays TextBox with a TODO until PasswordBox property routing exists.
 
+## Status update 2026-08-25 (later): Tier 3 LANDED (macOS-verified; scope rulings inline)
+
+All Tier-3 rows are implemented, with these scope decisions (made when the maintainer said
+"finish tier 3"; revisit any of them if wrong):
+
+- ELEM_INFOBAR=34 `infoBar(severity, title, message, onClose)` with INFOBAR_INFO/SUCCESS/
+  WARNING/ERROR - composite banner on cocoa (tinted layer + labels + close) and win32
+  (severity-prefix fallback, no owner-draw); winui uses native InfoBar. Driver infoBarClose.
+- ELEM_POPOVER=35 `popover(anchorKey, open, onClose)` + addButton(label, cmd)/onCommand -
+  TEXT+BUTTONS v1, controlled by app state, anchored by key. Cocoa NSPopover (delegate
+  close -> onClose), win32 owned WS_POPUP (minimal focus-dismiss), winui N. Driver
+  popoverCommand; nativeHandle(key) non-zero only while open.
+- Font dialog: `bool nativeChooseFont(FontChoice* out)` (family + point size, false =
+  cancel) - win32 ChooseFontW, cocoa modal NSAlert with font-family combo accessory (the
+  NSFontPanel non-modal machinery deliberately avoided); headless uiTestScriptFont.
+- ELEM_RICHTEXT=36 `richText(editable, onChangeText)` + addRun(text, flags, colorRgb),
+  RICH_BOLD/ITALIC/UNDERLINE - RUN-BASED v1: runs are the controlled source, user edits
+  fire onChangeText with PLAIN text only (no formatting round-trip; documented). Cocoa
+  NSTextView attributed storage, win32 RichEdit (Msftedit.dll, CHARFORMAT2W), winui N.
+  Drivers richTextTypeText / richTextPlain.
+- ELEM_WEBVIEW=37 `webView(url)` with `html` override + onNavigate - COCOA-ONLY v1
+  (WKWebView via runtime dlopen of WebKit; direct framework link clashed with the SDK-free
+  linker). win32/winui stay N pending a maintainer ruling on taking the WebView2 runtime
+  dependency. Driver webViewUrl; tests use inline html only, never remote pages.
+- Gallery: cards on Chrome (InfoBar, Popover, font dialog), Input (RichText), Media
+  (WebView, `if const (__MACOS__)`-gated); selftest 90/90, one case, exit 0.
+
+NOT built from the Tier-3 list: nothing - all five rows landed. Still open overall:
+secondary windows / modal sheets (needs its own architecture plan) and Windows-side
+verification of every tier's win32/winui code (test.bat + example.bat + gallery selftest).
+
 ## Status update 2026-08-25: Tier 2 LANDED except secondary windows (macOS-verified)
 
 Everything in the Tier-2 table below except secondary windows is implemented. Shipped:

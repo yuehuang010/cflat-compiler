@@ -110,6 +110,12 @@ class GalleryApp : IComponent
     int    toolbarCmd = 0;       // Last toolbar command
     int    dialogAnswer = -1;    // Last message-box answer
     string folderPath = default; // Last selected folder
+    string chosenFontFamily = "none";
+    int    chosenFontSize = 0;
+    bool   infoErrorClosed = false;
+    bool   popoverOpen = false;
+    int    popoverCmd = -1;
+    string richTextMirror = "none";
     int    areaEdits  = 0;       // TextArea dirty-notify count
     string editableComboText = default;
     bool   toggleOn = false;
@@ -380,6 +386,24 @@ class GalleryApp : IComponent
         ;
         cardArea.add(area);
         body.add(cardArea);
+
+        IView cardRich = this._card(ctx, "cardrich", "Rich Text",
+                "Attributed runs plus an editable rich-text field with a change mirror.");
+        IRichText richDisplay = richText(false, (string s) => {});
+        richDisplay.setKey("display"); richDisplay.style.width = 42; richDisplay.style.height = 3;
+        richDisplay.addRun("Bold ", RICH_BOLD, rgb(32, 96, 160));
+        richDisplay.addRun("italic ", RICH_ITALIC, rgb(160, 64, 32));
+        richDisplay.addRun("underlined", RICH_UNDERLINE, rgb(32, 140, 72));
+        cardRich.add(richDisplay);
+        IRichText richEditor = richText(true, (string s) => {
+            this.richTextMirror = s; ctx.invalidate();
+        });
+        richEditor.setKey("editor"); richEditor.style.width = 42; richEditor.style.height = 3;
+        richEditor.addRun("Edit this text", 0, rgb(40, 40, 40));
+        cardRich.add(richEditor);
+        IText richMirror = text("Mirror: " + this.richTextMirror);
+        richMirror.setKey("mirror"); cardRich.add(richMirror);
+        body.add(cardRich);
 
         IView cardCombo = this._card(ctx, "cardcombo", "Combo Box",
                 "Dropdown single-selection list; controlled through onChange.");
@@ -652,6 +676,15 @@ class GalleryApp : IComponent
             c.drawText(1, 5, "canvas", rgb(40, 40, 40));
         };
         cardCanvas.add(canvas); body.add(cardCanvas);
+        if const (__MACOS__)
+        {
+            IView cardWeb = this._card(ctx, "cardweb", "WebView",
+                    "Cocoa web content surface loaded from inline HTML.");
+            IWebView web = webView("about:blank");
+            web.setKey("web"); web.style.width = 42; web.style.height = 8;
+            web.html = "<h1>CFlat</h1><p>WebView</p>";
+            cardWeb.add(web); body.add(cardWeb);
+        }
         return move body;
     }
 
@@ -702,6 +735,45 @@ class GalleryApp : IComponent
         cardToolbar.add(toolbarStatus);
         body.add(cardToolbar);
 
+        IView cardInfo = this._card(ctx, "cardinfobar", "InfoBar",
+                "Severity-tinted messages; the error bar can be dismissed.");
+        IInfoBar info = infoBar(INFOBAR_INFO, "Info", "Informational message", nullptr);
+        info.setKey("info"); cardInfo.add(info);
+        IInfoBar success = infoBar(INFOBAR_SUCCESS, "Success", "Operation completed", nullptr);
+        success.setKey("success"); cardInfo.add(success);
+        IInfoBar warning = infoBar(INFOBAR_WARNING, "Warning", "Check this setting", nullptr);
+        warning.setKey("warning"); cardInfo.add(warning);
+        if (!this.infoErrorClosed)
+        {
+            IInfoBar error = infoBar(INFOBAR_ERROR, "Error", "Something needs attention", () => {
+                this.infoErrorClosed = true; ctx.invalidate();
+            });
+            error.setKey("error"); cardInfo.add(error);
+        }
+        IText errorState = text("Error bar: " + (this.infoErrorClosed ? "dismissed" : "shown"));
+        errorState.setKey("state"); cardInfo.add(errorState); body.add(cardInfo);
+
+        IView cardPopover = this._card(ctx, "cardpopover", "Popover",
+                "A floating command surface anchored to its opening button.");
+        IButton popOpen = button("Open popover", () => {
+            this.popoverOpen = true; ctx.invalidate();
+        });
+        popOpen.setKey("open"); cardPopover.add(popOpen);
+        string popAnchor = "root/content/pages/chrome/scroll/page/cardpopover/open";
+        IPopover pop = popover(popAnchor, this.popoverOpen, () => {
+            this.popoverOpen = false; ctx.invalidate();
+        });
+        pop.setKey("popover");
+        pop.title = "Popover commands"; pop.body = "Choose an action";
+        pop.onCommand = (int cmd) => {
+            this.popoverCmd = cmd; this.popoverOpen = false; ctx.invalidate();
+        };
+        pop.addButton("Action A", 1); pop.addButton("Action B", 2);
+        cardPopover.add(pop);
+        string popReadout = this.popoverCmd < 0 ? "Command: none" : "Command: " + this.popoverCmd.toString();
+        IText popState = text(popReadout); popState.setKey("readout"); cardPopover.add(popState);
+        body.add(cardPopover);
+
         IView cardDialogs = this._card(ctx, "carddialogs", "Dialogs",
                 "Message boxes and native folder selection with headless scripting.");
         IView dialogButtons = row(makeStyle(0, 0, 0));
@@ -718,6 +790,15 @@ class GalleryApp : IComponent
         });
         folderButton.setKey("folder");
         dialogButtons.add(folderButton);
+        IButton fontButton = button("Choose font...", () => {
+            FontChoice choice = default;
+            if (nativeChooseFont(&choice))
+            {
+                this.chosenFontFamily = choice.family; this.chosenFontSize = choice.size;
+            }
+            ctx.invalidate();
+        });
+        fontButton.setKey("font"); dialogButtons.add(fontButton);
         cardDialogs.add(dialogButtons);
         string answer = this.dialogAnswer < 0 ? "none" : (this.dialogAnswer == 1 ? "yes" : "no");
         IText answerText = text("Answer: " + answer);
@@ -726,6 +807,9 @@ class GalleryApp : IComponent
         IText folderText = text("Folder: " + this.folderPath);
         folderText.setKey("path");
         cardDialogs.add(folderText);
+        string fontText = this.chosenFontFamily == "none" ? "Font: none"
+            : "Font: " + this.chosenFontFamily + " " + this.chosenFontSize.toString();
+        IText fontReadout = text(fontText); fontReadout.setKey("fontreadout"); cardDialogs.add(fontReadout);
         body.add(cardDialogs);
         return move body;
     }
@@ -737,7 +821,7 @@ class GalleryApp : IComponent
                 "Seeded churn pool exercising keyed create/destroy/reorder (P13 hardening).");
         if (this.stress)
         {
-            IBox sbox = box(makeStyle(0, 40, 60)); sbox.setKey("stressbox");
+            IBox sbox = box(makeStyle(0, 40, 12)); sbox.setKey("stressbox");
             int n = 8; int step = 0;
             while (step < n)
             {
@@ -895,8 +979,19 @@ int gallerySelfTest()
         string toolbarKey = chrome + "cardtoolbar/toolbar";
         string messageKey = chrome + "carddialogs/buttons/message";
         string folderKey = chrome + "carddialogs/buttons/folder";
+        string fontKey = chrome + "carddialogs/buttons/font";
         string answerKey = chrome + "carddialogs/answer";
         string folderPathKey = chrome + "carddialogs/path";
+        string fontReadoutKey = chrome + "carddialogs/fontreadout";
+        string infoErrorKey = chrome + "cardinfobar/error";
+        string infoStateKey = chrome + "cardinfobar/state";
+        string popOpenKey = chrome + "cardpopover/open";
+        string popKey = chrome + "cardpopover/popover";
+        string popReadoutKey = chrome + "cardpopover/readout";
+        string richDisplayKey = input + "cardrich/display";
+        string richEditorKey = input + "cardrich/editor";
+        string richMirrorKey = input + "cardrich/mirror";
+        string webKey = media + "cardweb/web";
         string tabsKey = chrome + "cardtabs/tabs";
         string statusKey = chrome + "cardstatus/";
 
@@ -1264,7 +1359,10 @@ int gallerySelfTest()
             && _exists(disabledLinkKey) && !nativeIsEnabled(disabledLinkKey));
         nativeTabSelect("root/content/pages", 5);
         t.expectTrue("toolbar and dialog controls created", _exists(toolbarKey)
-            && _exists(messageKey) && _exists(folderKey));
+            && _exists(messageKey) && _exists(folderKey) && _exists(fontKey)
+            && _exists(chrome + "cardinfobar/info") && _exists(chrome + "cardinfobar/success")
+            && _exists(chrome + "cardinfobar/warning") && _exists(infoErrorKey)
+            && _exists(popOpenKey));
 
         // 16. Button click routes onPress.
         nativeTabSelect("root/content/pages", 0);
@@ -1346,6 +1444,39 @@ int gallerySelfTest()
         t.expectTrue("folder dialog scripted path",
             g != nullptr && g.folderPath == "gallery-folder"
             && _statusIs(folderPathKey, "Folder: gallery-folder"));
+
+        uiTestScriptFont("Menlo", 15);
+        t.click(fontKey);
+        t.expectTrue("font dialog scripted choice",
+            g != nullptr && g.chosenFontFamily == "Menlo" && g.chosenFontSize == 15
+            && _statusIs(fontReadoutKey, "Font: Menlo 15"));
+
+        t.infoBarClose(infoErrorKey);
+        t.expectTrue("info bar close callback",
+            g != nullptr && g.infoErrorClosed && !_exists(infoErrorKey)
+            && _statusIs(infoStateKey, "Error bar: dismissed"));
+
+        t.click(popOpenKey);
+        u64 popHandle = activeCtx().nativeHandle(popKey);
+        t.popoverCommand(popKey, 2);
+        t.expectTrue("popover command and close",
+            popHandle != 0u && g != nullptr && g.popoverCmd == 2
+            && activeCtx().nativeHandle(popKey) == 0u
+            && _statusIs(popReadoutKey, "Command: 2"));
+
+        nativeTabSelect("root/content/pages", 1);
+        t.expectTrue("rich text plain runs",
+            t.richTextPlain(richDisplayKey) == "Bold italic underlined");
+        t.richTextTypeText(richEditorKey, "typed rich text");
+        t.expectTrue("rich text edit mirror",
+            g != nullptr && g.richTextMirror == "typed rich text"
+            && _statusIs(richMirrorKey, "Mirror: typed rich text"));
+
+        if const (__MACOS__)
+        {
+            nativeTabSelect("root/content/pages", 4);
+            t.expectTrue("webview handle exists", _exists(webKey));
+        }
 
         // 18. Checkbox: click -> controlled onChange flips the model.
         nativeTabSelect("root/content/pages", 0);
@@ -1491,12 +1622,13 @@ int gallerySelfTest()
             scrollB.x == 0 && scrollB.y == 0
             && scrollB.w == hostWidth() && scrollB.h >= hostHeight());
 
-        // 32. Overflow proof: the Stress page keeps its late card below its page viewport.
-        nativeTabSelect("root/content/pages", 6);
-        Rect stressPageB = nativeNodeBounds("root/content/pages/stress/scroll");
-        Rect stressCardB = nativeNodeBounds(stress + "cardstress");
+        // 32. Overflow proof: the Input page's 12 cards naturally push its last card
+        //     below the page viewport, so per-page scrolling is genuinely exercised.
+        nativeTabSelect("root/content/pages", 1);
+        Rect inputPageB = nativeNodeBounds("root/content/pages/input/scroll");
+        Rect lateCardB = nativeNodeBounds(input + "cardprog");
         t.expectTrue("a late card overflows the viewport (scrolling is required)",
-            stressCardB.h > 0 && stressCardB.y + stressCardB.h > stressPageB.y + stressPageB.h);
+            lateCardB.h > 0 && lateCardB.y + lateCardB.h > inputPageB.y + inputPageB.h);
 
         // 33. Every card's title Text exists, under the "header" sub-column added in the
         //     Phase C card restructure (one card per demoed control, all listed here).
@@ -1508,7 +1640,8 @@ int gallerySelfTest()
             && _exists(input + "cardslider/header/title") && _exists(input + "cardcombo/header/title")
             && _exists(input + "cardarea/header/title") && _exists(input + "cardeditable/header/title")
             && _exists(input + "cardtoggle/header/title") && _exists(input + "cardsegmented/header/title")
-            && _exists(input + "carddate/header/title") && _exists(input + "cardcolor/header/title");
+            && _exists(input + "carddate/header/title") && _exists(input + "cardcolor/header/title")
+            && _exists(input + "cardrich/header/title");
         nativeTabSelect("root/content/pages", 2);
         bool titlesData = _exists(data + "cardlist/header/title") && _exists(data + "cardgridview/header/title")
             && _exists(data + "cardtree/header/title");
@@ -1518,9 +1651,11 @@ int gallerySelfTest()
             && _exists(layout + "cardexpander/header/title");
         nativeTabSelect("root/content/pages", 4);
         bool titlesMedia = _exists(media + "cardimg/header/title") && _exists(media + "cardcanvas/header/title");
+        if const (__MACOS__) titlesMedia = titlesMedia && _exists(media + "cardweb/header/title");
         nativeTabSelect("root/content/pages", 5);
         bool titlesChrome = _exists(chrome + "cardtabs/header/title") && _exists(chrome + "cardcontext/header/title")
-            && _exists(chrome + "cardstatus/header/title");
+            && _exists(chrome + "cardstatus/header/title") && _exists(chrome + "cardinfobar/header/title")
+            && _exists(chrome + "cardpopover/header/title");
         nativeTabSelect("root/content/pages", 6);
         bool titlesStress = _exists(stress + "cardstress/header/title");
         t.expectTrue("every card title exists",

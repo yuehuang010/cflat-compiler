@@ -1274,6 +1274,19 @@ int ELEM_SEGMENTED  = 30;   // single-selection segmented control
 int ELEM_DATEPICKER = 31;   // controlled year/month/day picker
 int ELEM_EXPANDER   = 32;   // disclosure header + lazy children
 int ELEM_COLORWELL  = 33;   // native color well/dialog
+int ELEM_INFOBAR    = 34;   // severity-tinted information banner
+int ELEM_POPOVER    = 35;   // controlled floating text + command buttons
+int ELEM_RICHTEXT   = 36;   // controlled attributed run list
+int ELEM_WEBVIEW    = 37;   // Cocoa WKWebView; URL/HTML navigation surface
+
+const int RICH_BOLD = 1;
+const int RICH_ITALIC = 2;
+const int RICH_UNDERLINE = 4;
+
+const int INFOBAR_INFO = 0;
+const int INFOBAR_SUCCESS = 1;
+const int INFOBAR_WARNING = 2;
+const int INFOBAR_ERROR = 3;
 
 // The node interface. Typed host structs implement these so the tree can be
 // walked uniformly (serialize, layout, paint, dispatch, reconcile, teardown)
@@ -1459,6 +1472,25 @@ interface ITextArea : IDisableable
     void   fireChange();
 };
 
+interface IRichText : IDisableable
+{
+    bool editable;
+    Lambda<void(string)> onChangeText;
+    list<string> runTexts;
+    list<int> runFlags;
+    list<int> runColors;
+    void addRun(string text, int flags, int colorRgb);
+    void fireChangeText(string s);
+};
+
+interface IWebView : ITooltipped
+{
+    string url;
+    string html;
+    Lambda<void(string)> onNavigate;
+    void fireNavigate(string url);
+};
+
 interface IStatusBar : IElement
 {
     list<string> parts;
@@ -1540,6 +1572,31 @@ interface IColorWell : IDisableable
     Color value;
     Lambda<void(Color)> onChangeColor;
     void fireChangeColor(Color value);
+};
+
+interface IInfoBar : ITooltipped
+{
+    int severity;
+    string title;
+    string message;
+    bool closable;
+    Lambda<void()> onClose;
+    void fireClose();
+};
+
+interface IPopover : IElement
+{
+    string anchorKey;
+    bool open;
+    string title;
+    string body;
+    list<string> labels;
+    list<int> cmds;
+    Lambda<void(int)> onCommand;
+    Lambda<void()> onClose;
+    void addButton(string label, int cmd);
+    void fireCommand(int cmd);
+    void fireClose();
 };
 
 // Column text alignment for ListView columns (hosts map to the native column format).
@@ -3462,6 +3519,123 @@ class ToolBar : IToolBar
     Rect nodeBounds() { return this.bounds; }
 };
 
+// -- RichText: controlled attributed runs -------------------------------------
+// The run lists are the source of truth. Editable hosts report plain text only;
+// the app decides how the runs change after an edit.
+class RichText : IRichText
+{
+    Style style = default;
+    bool editable = false;
+    Lambda<void(string)> onChangeText = default;
+    list<string> runTexts = default;
+    list<int> runFlags = default;
+    list<int> runColors = default;
+    bool disabled = false;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void addRun(string text, int flags, int colorRgb)
+    {
+        this.runTexts.add("" + text); this.runFlags.add(flags); this.runColors.add(colorRgb);
+    }
+    void fireChangeText(string s) { if (this.onChangeText != nullptr) this.onChangeText("" + s); }
+    string plainText()
+    {
+        string out = ""; int i = 0;
+        while (i < this.runTexts.count()) { out = out + this.runTexts.get(i); i++; }
+        return out;
+    }
+    move string toJson() { return "{\"type\":\"RichText\",\"runs\":" + this.runTexts.count().toString() + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = (int)this.plainText().length() + 2; if (w < 8) w = 8;
+        if (c.exactW) w = c.availW; if (this.style.width > 0) w = this.style.width;
+        int h = 3; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        cv.drawText(this.bounds.x, this.bounds.y, this.plainText().data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (!this.disabled && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y)) { ctx.focus(this.key); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_RICHTEXT; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (!this.disabled && this.editable && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        IRichText o = other as IRichText;
+        if (o == nullptr || this.editable != o.editable || this.disabled != o.disabled || this.tooltip != o.tooltip
+            || !styleEquals(this.style, o.style) || this.runTexts.count() != o.runTexts.count()) return false;
+        int i = 0;
+        while (i < this.runTexts.count())
+        {
+            if (this.runTexts.get(i) != o.runTexts.get(i) || this.runFlags.get(i) != o.runFlags.get(i)
+                || this.runColors.get(i) != o.runColors.get(i)) return false;
+            i++;
+        }
+        return true;
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- WebView: a Cocoa navigation surface with a host-neutral placeholder -------
+class WebView : IWebView
+{
+    Style style = default;
+    string url = default;
+    string html = default;
+    Lambda<void(string)> onNavigate = default;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireNavigate(string s) { if (this.onNavigate != nullptr) this.onNavigate("" + s); }
+    move string toJson() { return "{\"type\":\"WebView\"}"; }
+    Size layout(LayoutConstraints c)
+    {
+        int w = c.exactW ? c.availW : 40; if (this.style.width > 0) w = this.style.width;
+        int h = c.exactH ? c.availH : 12; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        string shown = this.html.length() > 0 ? this.html : this.url;
+        cv.drawText(this.bounds.x, this.bounds.y, shown.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_WEBVIEW; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(IElement other)
+    {
+        IWebView o = other as IWebView;
+        return o != nullptr && this.url == o.url && this.html == o.html && this.tooltip == o.tooltip
+            && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
 // -- TextArea: a multiline, scrollable text region (the editor's core widget) --
 // Deliberately NOT controlled per keystroke (round-tripping a large buffer per key
 // is the Electron-class mistake): the NATIVE control's buffer is the source of
@@ -3570,6 +3744,16 @@ move ITextArea textArea(string value, Lambda<void()> onChange)
     t.value = value;
     t.onChange = onChange;
     return t;
+}
+
+move IRichText richText(bool editable, Lambda<void(string)> onChangeText)
+{
+    RichText* r = new RichText(); r.editable = editable; r.onChangeText = onChangeText; return r;
+}
+
+move IWebView webView(string url)
+{
+    WebView* w = new WebView(); w.url = "" + url; return w;
 }
 
 // -- StatusBar: a bottom strip of text parts (msctls_statusbar32 on Win32) -----
@@ -4612,6 +4796,115 @@ class ColorWell : IColorWell
     Rect nodeBounds() { return this.bounds; }
 };
 
+// -- InfoBar: a severity-tinted message banner -------------------------------
+class InfoBar : IInfoBar
+{
+    Style style = default;
+    int severity = INFOBAR_INFO;
+    string title = default;
+    string message = default;
+    bool closable = true;
+    Lambda<void()> onClose = default;
+    string tooltip = default;
+    Rect bounds = default;
+    string key = default;
+
+    void fireClose() { if (this.closable && this.onClose != nullptr) this.onClose(); }
+    move string toJson()
+    {
+        return "{\"type\":\"InfoBar\",\"severity\":" + this.severity.toString()
+             + ",\"title\":\"" + this.title + "\",\"message\":\"" + this.message + "\"}";
+    }
+    Size layout(LayoutConstraints c)
+    {
+        int w = c.exactW ? c.availW : (int)this.title.length() + (int)this.message.length() + 8;
+        if (w < 12) w = 12; if (this.style.width > 0) w = this.style.width;
+        int h = 2; if (c.exactH) h = c.availH; if (this.style.height > 0) h = this.style.height;
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h; this.bounds = clampBounds(b, this.style);
+        Size s = default; s.w = this.bounds.w; s.h = this.bounds.h; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx)
+    {
+        int ink = resolveColor(resolveThemeRole(ctx.theme, THEME_ROLE_TEXT, ctx.systemPrefersDark()), ctx.theme, ctx.systemPrefersDark());
+        string prefix = "[i]";
+        if (this.severity == INFOBAR_SUCCESS) prefix = "[ok]";
+        else if (this.severity == INFOBAR_WARNING) prefix = "[!]";
+        else if (this.severity == INFOBAR_ERROR) prefix = "[x]";
+        string line = prefix + " " + this.title + ": " + this.message;
+        if (this.closable && this.onClose != nullptr) line = line + "  x";
+        cv.drawText(this.bounds.x, this.bounds.y, line.data(), ink);
+    }
+    bool dispatch(Event e, IUiContext ctx)
+    {
+        if (this.closable && this.onClose != nullptr && e.kind == EV_MOUSE_DOWN && this.bounds.contains(e.x, e.y))
+        { ctx.focus(this.key); this.fireClose(); return true; }
+        return false;
+    }
+    void destroyTree() { }
+    int kind() { return ELEM_INFOBAR; }
+    int flexWeight() { return this.style.flex; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { if (this.closable && this.onClose != nullptr && this.key.length() > 0) keys.add("" + this.key); }
+    bool propsEqual(IElement other)
+    {
+        IInfoBar o = other as IInfoBar;
+        return o != nullptr && this.severity == o.severity && this.title == o.title && this.message == o.message
+            && this.closable == o.closable && this.tooltip == o.tooltip && styleEquals(this.style, o.style);
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
+// -- Popover: a zero-size controlled floating command surface -----------------
+class Popover : IPopover
+{
+    Style style = default;
+    string anchorKey = default;
+    bool open = false;
+    string title = default;
+    string body = default;
+    list<string> labels = default;
+    list<int> cmds = default;
+    Lambda<void(int)> onCommand = default;
+    Lambda<void()> onClose = default;
+    Rect bounds = default;
+    string key = default;
+
+    void addButton(string label, int cmd) { this.labels.add("" + label); this.cmds.add(cmd); }
+    void fireCommand(int cmd) { if (this.onCommand != nullptr) this.onCommand(cmd); }
+    void fireClose() { if (this.onClose != nullptr) this.onClose(); }
+    move string toJson() { return "{\"type\":\"Popover\",\"open\":" + (this.open ? "true" : "false") + "}"; }
+    Size layout(LayoutConstraints c)
+    {
+        Rect b = default; b.x = c.x; b.y = c.y; b.w = 0; b.h = 0; this.bounds = b;
+        Size s = default; return s;
+    }
+    void paint(ICanvas cv, IUiContext ctx) { }
+    bool dispatch(Event e, IUiContext ctx) { return false; }
+    void destroyTree() { }
+    int kind() { return ELEM_POPOVER; }
+    int flexWeight() { return 0; }
+    int styleWidth() { return this.style.width; }
+    int styleHeight() { return this.style.height; }
+    void collectFocusables(list<string>* keys) { }
+    bool propsEqual(IElement other)
+    {
+        IPopover o = other as IPopover;
+        if (o == nullptr || this.anchorKey != o.anchorKey || this.open != o.open || this.title != o.title
+            || this.body != o.body || !styleEquals(this.style, o.style) || this.labels.count() != o.labels.count()) return false;
+        int i = 0;
+        while (i < this.labels.count()) { if (this.labels.get(i) != o.labels.get(i) || this.cmds.get(i) != o.cmds.get(i)) return false; i++; }
+        return true;
+    }
+    list<IElement>* childList() { return nullptr; }
+    string keyOf() { return "" + this.key; }
+    void setKey(string k) { this.key = k; }
+    Rect nodeBounds() { return this.bounds; }
+};
+
 // -- ListView: a virtualized report-mode list -----------------------------------
 // The item SOURCE is a callback, not a copied list: `rowText(row, col)` supplies a
 // cell on demand, so `rowCount` can be 100k+ and only the visible rows are ever
@@ -5218,6 +5511,21 @@ move IColorWell colorWell(Color value, Lambda<void(Color)> onChangeColor)
     ColorWell* w = new ColorWell();
     w.value = value; w.onChangeColor = onChangeColor;
     return w;
+}
+
+move IInfoBar infoBar(int severity, string title, string message, Lambda<void()> onClose)
+{
+    InfoBar* b = new InfoBar();
+    b.severity = severity; b.title = title; b.message = message; b.onClose = onClose;
+    b.closable = onClose != nullptr;
+    return b;
+}
+
+move IPopover popover(string anchorKey, bool open, Lambda<void()> onClose)
+{
+    Popover* p = new Popover();
+    p.anchorKey = anchorKey; p.open = open; p.onClose = onClose;
+    return p;
 }
 
 // A virtualized list; add columns with addColumn() and set `rowText`/`rowIcon`/`rowCount`.
@@ -6663,6 +6971,14 @@ int PROP_INDETERMINATE = 4; // ProgressBar marquee/spinning state
 int MSGBOX_OK = 0;
 int MSGBOX_OKCANCEL = 1;
 int MSGBOX_YESNO = 2;
+
+struct FontChoice
+{
+    string family = default;
+    int size = 0;
+};
+
+bool nativeChooseFont(FontChoice* out);
 
 // Integer control properties (setIntProp).
 int PROP_VALUE   = 1;   // ProgressBar/Slider position (0..100)

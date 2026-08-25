@@ -64,6 +64,11 @@ void nativeSpinnerSet(string keyPath, int v);
 void nativeLinkClick(string keyPath);
 void nativeToolbarClick(string keyPath, int cmd);
 void nativeSplitterDrag(string keyPath, int dipX, int dipY);
+void nativeInfoBarClose(string keyPath);
+void nativePopoverCommand(string keyPath, int cmd);
+void nativeRichTextTypeText(string keyPath, string text);
+string nativeRichTextPlain(string keyPath);
+string nativeWebViewUrl(string keyPath);
 // CanvasView input drivers (M1). Coordinates/deltas are POINTS relative to the canvas
 // origin. phase: 0 down, 1 move, 2 up. Defined by the native backend (cocoa); a no-op on
 // the Win32 hosts for now (canvas-input parity gap). The TUI/Canvas host defines its own
@@ -79,6 +84,7 @@ void nativeResizeClient(int wDip, int hDip);
 void uiTestScriptMessageBox(int answer);
 void uiTestScriptFolder(string path);
 void uiTestScriptColor(int r, int g, int b);
+void uiTestScriptFont(string family, int size);
 
 // Reader drivers (read live control + model state; the oracle, no pixels).
 string nativeControlText(string keyPath);
@@ -178,6 +184,9 @@ interface IUiTest
     void spinnerSet(string key, int v);
     void linkClick(string key);
     void toolbarClick(string key, int cmd);
+    void infoBarClose(string key);
+    void popoverCommand(string key, int cmd);
+    void richTextTypeText(string key, string text);
     void splitterDrag(string key, int dx, int dy);
     void fireContextMenu(string key, int i);
     void fireMenu(int cmd);
@@ -187,6 +196,8 @@ interface IUiTest
 
     // Readers.
     string controlText(string key);
+    string richTextPlain(string key);
+    string webViewUrl(string key);
     bool isChecked(string key);
     bool isEnabled(string key);
     bool isDisabled(string key);
@@ -270,6 +281,9 @@ class UiTest : IUiTest
     void spinnerSet(string key, int v)      { if (this.aborted) return; nativeSpinnerSet(key, v); }
     void linkClick(string key)              { if (this.aborted) return; nativeLinkClick(key); }
     void toolbarClick(string key, int cmd)  { if (this.aborted) return; nativeToolbarClick(key, cmd); }
+    void infoBarClose(string key)           { if (this.aborted) return; nativeInfoBarClose(key); }
+    void popoverCommand(string key, int cmd) { if (this.aborted) return; nativePopoverCommand(key, cmd); }
+    void richTextTypeText(string key, string text) { if (this.aborted) return; nativeRichTextTypeText(key, text); }
     void splitterDrag(string key, int dx, int dy) { if (this.aborted) return; nativeSplitterDrag(key, dx, dy); }
     void fireContextMenu(string key, int i) { if (this.aborted) return; nativeFireContextMenu(key, i); }
     void fireMenu(int cmd)                  { if (this.aborted) return; nativeTestFireMenu(cmd); }
@@ -279,6 +293,8 @@ class UiTest : IUiTest
 
     // -- Readers (return live state for the caller to assert on) ---------------
     string controlText(string key)          { return nativeControlText(key); }
+    string richTextPlain(string key)        { return nativeRichTextPlain(key); }
+    string webViewUrl(string key)           { return nativeWebViewUrl(key); }
     bool isChecked(string key)              { return nativeIsChecked(key); }
     bool isEnabled(string key)              { return nativeIsEnabled(key); }
     bool isDisabled(string key)             { return !nativeIsEnabled(key); }

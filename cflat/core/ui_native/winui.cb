@@ -1187,6 +1187,7 @@ bool winuiMappable(int kind)
         || kind == ELEM_CHECKBOX || kind == ELEM_PROGRESS || kind == ELEM_SLIDER
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
+        || kind == ELEM_INFOBAR || kind == ELEM_POPOVER
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -1196,6 +1197,8 @@ bool winuiMappable(int kind)
 // Tier-2 batch B: DatePicker DateTimeOffset routing and ColorWell have no stable
 // property seam in the current generated projection; Expander content ownership is
 // likewise not wired here. They remain parity-N while the shared model stays usable.
+// Tier-3 batch B: RichText needs RichEditBox ITextDocument routing; WebView needs a
+// WebView2 runtime dependency ruling. Both remain parity-N until those choices land.
 
 // The style.backgroundColor of a plain (non-mapped) container - a View from view/row/column - or 0
 // for anything else. A non-zero value opts the container into a painted backdrop panel (Box is
@@ -2255,6 +2258,8 @@ class WinUI3Host : INativeHost
             else if (elemKind == ELEM_BOX)       cls = "Microsoft.UI.Xaml.Controls.Border";
             else if (elemKind == ELEM_CANVAS)    cls = "Microsoft.UI.Xaml.Controls.Image";
             else if (elemKind == ELEM_STATUSBAR) cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            else if (elemKind == ELEM_INFOBAR)   cls = "Microsoft.UI.Xaml.Controls.InfoBar";
+            else if (elemKind == ELEM_POPOVER)   cls = "Microsoft.UI.Xaml.Controls.TextBlock";
             RoActivateInstance(hstring(cls), &insp);
         }
         if (insp == nullptr) return 0u;
@@ -2916,6 +2921,15 @@ class WinUI3Host : INativeHost
         if (winuiMappable(node.kind()))
         {
             u64 h = ctx.nativeHandle(path);
+            if (node.kind() == ELEM_POPOVER)
+            {
+                IPopover pp = node as IPopover;
+                if (pp == nullptr || !pp.open)
+                {
+                    if (h != 0u) { this.destroyControl(h); ctx.removeNativeHandle(path); }
+                    return;
+                }
+            }
             if (h == 0u)
             {
                 bool password = false;
@@ -3175,6 +3189,22 @@ class WinUI3Host : INativeHost
         else if (k == ELEM_SEGMENTED)
         {
             this._syncSegmented(h, node as ISegmented);
+        }
+        else if (k == ELEM_INFOBAR)
+        {
+            IInfoBar ib = node as IInfoBar;
+            string prefix = "[i]"; if (ib.severity == INFOBAR_SUCCESS) prefix = "[ok]";
+            else if (ib.severity == INFOBAR_WARNING) prefix = "[!]"; else if (ib.severity == INFOBAR_ERROR) prefix = "[x]";
+            this.setText(h, (prefix + " " + ib.title + ": " + ib.message).data());
+            // TODO: bind InfoBar.Severity, IsOpen, and CloseRequested when the projection is available.
+        }
+        else if (k == ELEM_POPOVER)
+        {
+            IPopover pp = node as IPopover;
+            string shown = pp.title + "\n" + pp.body;
+            int i = 0; while (i < pp.labels.count()) { shown = shown + "\n[" + pp.labels.get(i) + "]"; i++; }
+            this.setText(h, shown.data());
+            // TODO: route the floating Flyout content once its generated projection is available.
         }
         else if (k == ELEM_LIST)
         {
@@ -4577,8 +4607,26 @@ void nativeColorSet(string keyPath, int r, int g, int b)
     IColorWell cw = e as IColorWell; if (cw != nullptr) { cw.fireChangeColor(colorLiteral((r << 16) | (g << 8) | b)); pumpWinui(); }
 }
 
+void nativeInfoBarClose(string keyPath)
+{
+    IElement e = winuiElem(keyPath); if (e == nullptr) return;
+    IInfoBar b = e as IInfoBar; if (b != nullptr) { b.fireClose(); pumpWinui(); }
+}
+
+void nativePopoverCommand(string keyPath, int cmd)
+{
+    IElement e = winuiElem(keyPath); if (e == nullptr) return;
+    IPopover p = e as IPopover; if (p != nullptr) { p.fireCommand(cmd); pumpWinui(); }
+}
+
+void nativeRichTextTypeText(string keyPath, string text) { }
+string nativeRichTextPlain(string keyPath) { return ""; }
+string nativeWebViewUrl(string keyPath) { return ""; }
+
 string nativeControlClass(string keyPath) { return ""; }
 void uiTestScriptColor(int r, int g, int b) { }
+void uiTestScriptFont(string family, int size) { }
+bool nativeChooseFont(FontChoice* out) { return false; }
 
 void nativeSegmentedSelect(string keyPath, int index)
 {

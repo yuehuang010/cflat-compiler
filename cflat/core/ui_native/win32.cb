@@ -44,6 +44,7 @@ manifest ManifestDoc uiNativeManifest = { assembly = {
 extern stdcall void InitCommonControls();
 extern stdcall i32 InitCommonControlsEx(void* p);
 extern stdcall i32 ChooseColorW(void* p);
+extern stdcall i32 ChooseFontW(void* p);
 extern stdcall i32 DwmSetWindowAttribute(void* hwnd, u32 attr, void* pv, u32 cb);
 extern stdcall i32 DrawMenuBar(void* hwnd);
 extern stdcall void* ImageList_Create(i32 cx, i32 cy, u32 flags, i32 initial, i32 grow);
@@ -67,6 +68,20 @@ struct _ChooseColorWArgs
     void* lpfnHook = nullptr;
     i64 lCustData = 0;
     u16* lpTemplateName = nullptr;
+};
+struct _ChooseFontWArgs
+{
+    u32 lStructSize = 0u;
+    void* hwndOwner = nullptr;
+    void* hDC = nullptr;
+    void* lpLogFont = nullptr;
+    i32 iPointSize = 0;
+    u32 Flags = 0u;
+    u32 rgbColors = 0u;
+    i64 lCustData = 0;
+    void* lpfnHook = nullptr;
+    u16* lpTemplateName = nullptr;
+    void* hInstance = nullptr;
 };
 // PrintWindow + GetDIBits back the offscreen screenshot path; not surfaced by the binding.
 extern stdcall i32 PrintWindow(void* hwnd, void* hdc, u32 flags);
@@ -123,6 +138,19 @@ const int UDN_DELTAPOS   = -722;   // UDN_FIRST-1
 const int DTM_GETSYSTEMTIME = 0x1001;
 const int DTM_SETSYSTEMTIME = 0x1002;
 const int DTN_DATETIMECHANGE = -759;
+const int EM_SETSEL = 0x00B1;
+const int EM_REPLACESEL = 0x00C2;
+const int EM_SETEVENTMASK = 0x0446;
+const int EM_SETCHARFORMAT = 0x0444;
+const int EM_GETEVENTMASK = 0x043D;
+const int SCF_SELECTION = 0x0001;
+const u32 ENM_CHANGE = 0x00000001u;
+const u32 CFM_BOLD = 0x00000001u;
+const u32 CFM_ITALIC = 0x00000002u;
+const u32 CFM_UNDERLINE = 0x00000004u;
+const u32 CFM_COLOR = 0x40000000u;
+bool _richEditLoaded = false;
+void _ensureRichEdit() { if (!_richEditLoaded) { LoadLibraryA("Msftedit.dll"); _richEditLoaded = true; } }
 const u32 ICC_DATE_CLASSES = 0x00000100u;
 const u32 CC_RGBINIT = 0x00000001u;
 const u32 CC_FULLOPEN = 0x00000002u;
@@ -596,6 +624,7 @@ bool nativeMappable(int kind)
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
         || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL
+        || kind == ELEM_INFOBAR || kind == ELEM_POPOVER
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -635,7 +664,7 @@ bool _fillKind(int kind)
 {
     return kind == ELEM_TEXTAREA || kind == ELEM_LIST || kind == ELEM_TREE
         || kind == ELEM_TABS || kind == ELEM_CANVAS || kind == ELEM_GRIDVIEW
-        || kind == ELEM_GROUPBOX || kind == ELEM_BOX;
+        || kind == ELEM_GROUPBOX || kind == ELEM_BOX || kind == ELEM_RICHTEXT;
 }
 
 // HWND_BOTTOM / HWND_TOP: the ends of the sibling z-order (cast macros the header binding
@@ -709,6 +738,14 @@ class Window : INativeHost
     list<u64>    segmentParents = default;
     list<u64>    segmentChildren = default;
     list<int>    segmentIndices = default;
+    list<u64>    infoBarHandles = default;
+    list<u64>    richLastHandles = default;
+    list<string> richLastSigs = default;
+    list<u64>    infoTitleHandles = default;
+    list<u64>    infoBodyHandles = default;
+    list<u64>    infoCloseHandles = default;
+    list<u64>    popoverHandles = default;
+    list<u64>    popoverButtonOwners = default;
     // Text-only font/ink overrides. The font handles are cached per window; these parallel
     // arrays let WM_CTLCOLORSTATIC apply FONT_CAPTION or an explicit Text.color per control.
     list<u64>    textHandles = default;
@@ -855,6 +892,13 @@ class Window : INativeHost
             style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL
                           | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN);
         }
+        else if (elemKind == ELEM_RICHTEXT)
+        {
+            _ensureRichEdit();
+            cls = "RICHEDIT50W";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | WS_VSCROLL
+                          | ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN);
+        }
         else if (elemKind == ELEM_TEXT)
         {
             cls = "STATIC";
@@ -939,6 +983,17 @@ class Window : INativeHost
             cls = "BUTTON";
             style = (u32)(WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON);
         }
+        else if (elemKind == ELEM_INFOBAR)
+        {
+            cls = "STATIC";
+            style = (u32)(WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS);
+        }
+        else if (elemKind == ELEM_POPOVER)
+        {
+            cls = "STATIC";
+            style = (u32)(WS_POPUP | WS_BORDER | WS_VISIBLE | WS_CLIPSIBLINGS);
+            parent = nullptr;
+        }
         else if (elemKind == ELEM_LIST)
         {
             cls = "SysListView32";
@@ -983,7 +1038,14 @@ class Window : INativeHost
 
         void* h = CreateWindowExA(0u, cls.data(), "", style | (u32)WS_CLIPSIBLINGS,
                                   0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+        if (elemKind == ELEM_RICHTEXT)
+        {
+            u64 mask = (u64)SendMessageW(h, (u32)EM_GETEVENTMASK, 0u, (i64)0);
+            SendMessageW(h, (u32)EM_SETEVENTMASK, 0u, (i64)(mask | (u64)ENM_CHANGE));
+        }
         if (elemKind == ELEM_TOOLBAR) SendMessageA(h, (u32)TB_BUTTONSTRUCTSIZE, (u64)sizeof(TBBUTTONA), (i64)0);
+        if (elemKind == ELEM_INFOBAR) this.infoBarHandles.add((u64)h);
+        if (elemKind == ELEM_POPOVER) this.popoverHandles.add((u64)h);
         // A GroupBox (BS_GROUPBOX) and a Box (SS_ETCHEDFRAME) paint their frame and nothing else,
         // leaving the interior to a parent background that a WS_CLIPCHILDREN pane cannot supply.
         // Subclass them so they erase their own interior (see ContainerCtlProc). A TabControl
@@ -1022,10 +1084,25 @@ class Window : INativeHost
         this._freeTreeBox(h);   // no-op unless h is a TreeView with a boxed node source
         this._freeImage(h);     // no-op unless h is an Image with an HBITMAP
         this._freeCanvasBox(h); // no-op unless h is a CanvasView with a boxed painter
+        this._dropRichState(h);
         this._forgetText(h);
         this._forgetAccent(h);
         this._freeBackdrop(h);  // no-op unless h is a container backdrop
         this._freeStatusBar(h); // no-op unless h is a status bar with cached pane text
+        int ix = 0; while (ix < this.infoBarHandles.count())
+        {
+            if (this.infoBarHandles.get(ix) == h)
+            {
+                this.infoBarHandles.removeAt(ix);
+                if (ix < this.infoTitleHandles.count()) this.infoTitleHandles.removeAt(ix);
+                if (ix < this.infoBodyHandles.count()) this.infoBodyHandles.removeAt(ix);
+                if (ix < this.infoCloseHandles.count()) this.infoCloseHandles.removeAt(ix);
+                break;
+            }
+            ix++;
+        }
+        ix = 0; while (ix < this.popoverHandles.count()) { if (this.popoverHandles.get(ix) == h) { this.popoverHandles.removeAt(ix); break; } ix++; }
+        ix = 0; while (ix < this.popoverButtonOwners.count()) { if (this.popoverButtonOwners.get(ix) == h) { this.popoverButtonOwners.removeAt(ix); break; } ix++; }
         int si = 0;
         while (si < this.spinnerHandles.count())
         {
@@ -1044,6 +1121,12 @@ class Window : INativeHost
     // repositioned by a WM_SIZE tickle rather than an absolute frame.
     void setFrame(u64 h, Rect frameCells)
     {
+        int pi = 0;
+        while (pi < this.popoverHandles.count())
+        {
+            if (this.popoverHandles.get(pi) == h) return;
+            pi++;
+        }
         MoveWindow(u2h(h), frameCells.x * this.dipX(), frameCells.y * this.dipY(),
                    frameCells.w * this.dipX(), frameCells.h * this.dipY(), 1);
         int i = 0;
@@ -1077,6 +1160,14 @@ class Window : INativeHost
                 si++;
             }
         }
+        int ib = 0; while (ib < this.infoBarHandles.count() && this.infoBarHandles.get(ib) != h) ib++;
+        if (ib < this.infoBarHandles.count())
+        {
+            int pxw = frameCells.w * this.dipX(); int pxh = frameCells.h * this.dipY();
+            MoveWindow(u2h(this.infoTitleHandles.get(ib)), 8 * this.dipX(), 2 * this.dipY(), pxw - 48 * this.dipX(), this.dipY(), 1);
+            MoveWindow(u2h(this.infoBodyHandles.get(ib)), 8 * this.dipX(), this.dipY(), pxw - 48 * this.dipX(), pxh - this.dipY(), 1);
+            if (this.infoCloseHandles.get(ib) != 0u) MoveWindow(u2h(this.infoCloseHandles.get(ib)), pxw - 36 * this.dipX(), 0, 32 * this.dipX(), pxh, 1);
+        }
     }
 
     // Only push text when it actually differs, so an EDIT does not reset its caret
@@ -1087,6 +1178,65 @@ class Window : INativeHost
         GetWindowTextA(u2h(h), cur, 512);
         if (strcmp(cur, (char*)s) == 0) return;
         SetWindowTextA(u2h(h), (char*)s);
+    }
+
+    void _dropRichState(u64 h)
+    {
+        int i = 0;
+        while (i < this.richLastHandles.count())
+        {
+            if (this.richLastHandles.get(i) == h) { this.richLastHandles.removeAt(i); this.richLastSigs.removeAt(i); return; }
+            i++;
+        }
+    }
+
+    string _richSig(IRichText r)
+    {
+        string s = r.runTexts.count().toString() + ":"; int i = 0;
+        while (i < r.runTexts.count())
+        {
+            s = s + r.runTexts.get(i).length().toString() + ":" + r.runTexts.get(i)
+                + ":" + r.runFlags.get(i).toString() + ":" + r.runColors.get(i).toString() + ";";
+            i++;
+        }
+        return s;
+    }
+
+    void _syncRichText(u64 h, IRichText r)
+    {
+        string sig = this._richSig(r); int i = 0;
+        while (i < this.richLastHandles.count())
+        {
+            if (this.richLastHandles.get(i) == h && this.richLastSigs.get(i) == sig)
+            {
+                EnableWindow(u2h(h), !r.disabled); return;
+            }
+            i++;
+        }
+        bool prev = this.applying; this.applying = true;
+        wstring empty = toWString(""); SetWindowTextW(u2h(h), empty.data());
+        int j = 0;
+        while (j < r.runTexts.count())
+        {
+            int start = (int)GetWindowTextLengthW(u2h(h));
+            wstring wide = toWString(r.runTexts.get(j));
+            SendMessageW(u2h(h), (u32)EM_SETSEL, (u64)start, (i64)start);
+            SendMessageW(u2h(h), (u32)EM_REPLACESEL, 1u, (i64)wide.data());
+            int end = (int)GetWindowTextLengthW(u2h(h));
+            SendMessageW(u2h(h), (u32)EM_SETSEL, (u64)start, (i64)end);
+            u8[116] raw = default; u32* p = (u32*)&raw[0];
+            u32 mask = 0u; int flags = r.runFlags.get(j);
+            if ((flags & RICH_BOLD) != 0) mask = mask | CFM_BOLD;
+            if ((flags & RICH_ITALIC) != 0) mask = mask | CFM_ITALIC;
+            if ((flags & RICH_UNDERLINE) != 0) mask = mask | CFM_UNDERLINE;
+            int color = r.runColors.get(j); if (color != -1) mask = mask | CFM_COLOR;
+            p[0] = 116u; p[1] = mask; p[2] = (u32)flags & 7u;
+            if (color != -1) p[5] = (u32)(((color >> 16) & 255) | (color & 0xFF00) | ((color & 255) << 16));
+            SendMessageW(u2h(h), (u32)EM_SETCHARFORMAT, (u64)SCF_SELECTION, (i64)&raw[0]); j++;
+        }
+        this.applying = prev; EnableWindow(u2h(h), !r.disabled);
+        i = 0; while (i < this.richLastHandles.count()) { if (this.richLastHandles.get(i) == h) { this.richLastSigs.set(i, "" + sig); return; } i++; }
+        this.richLastHandles.add(h); this.richLastSigs.add("" + sig);
     }
 
     void _syncToolbar(u64 h, IToolBar t)
@@ -2403,6 +2553,15 @@ class Window : INativeHost
         if (nativeMappable(node.kind()))
         {
             u64 h = ctx.nativeHandle(path);
+            if (node.kind() == ELEM_POPOVER)
+            {
+                IPopover pp = node as IPopover;
+                if (pp == nullptr || !pp.open)
+                {
+                    if (h != 0u) { this.destroyControl(h); ctx.removeNativeHandle(path); }
+                    return;
+                }
+            }
             if (h == 0u)
             {
                 bool password = false;
@@ -3122,6 +3281,31 @@ class Window : INativeHost
         }
     }
 
+    int _infoBarSlot(u64 h)
+    {
+        int i = 0; while (i < this.infoBarHandles.count()) { if (this.infoBarHandles.get(i) == h) return i; i++; }
+        return -1;
+    }
+
+    void _syncInfoBar(u64 h, IInfoBar b)
+    {
+        int slot = this._infoBarSlot(h); if (slot < 0) return;
+        while (this.infoTitleHandles.count() <= slot)
+        {
+            void* parent = u2h(h);
+            void* title = CreateWindowExA(0u, "STATIC", "", (u32)(WS_CHILD | WS_VISIBLE | SS_LEFT), 0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+            void* body = CreateWindowExA(0u, "STATIC", "", (u32)(WS_CHILD | WS_VISIBLE | SS_LEFT), 0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+            void* close = nullptr;
+            if (b.closable && b.onClose != nullptr)
+                close = CreateWindowExA(0u, "BUTTON", "x", (u32)(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON), 0, 0, 10, 10, parent, nullptr, _hInst, nullptr);
+            this.infoTitleHandles.add((u64)title); this.infoBodyHandles.add((u64)body); this.infoCloseHandles.add((u64)close);
+            if (this.fontTitle != nullptr) SendMessageA(title, (u32)WM_SETFONT, (u64)this.fontTitle, (i64)1);
+        }
+        this.setText((u64)this.infoTitleHandles.get(slot), b.title.data());
+        this.setText((u64)this.infoBodyHandles.get(slot), b.message.data());
+        if (this.infoCloseHandles.get(slot) != 0u) ShowWindow(u2h(this.infoCloseHandles.get(slot)), b.closable && b.onClose != nullptr ? SW_SHOW : SW_HIDE);
+    }
+
     void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
@@ -3199,6 +3383,10 @@ class Window : INativeHost
             ITextArea ta = node as ITextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
+        else if (k == ELEM_RICHTEXT)
+        {
+            this._syncRichText(h, node as IRichText);
+        }
         else if (k == ELEM_STATUSBAR)
         {
             IStatusBar sb = node as IStatusBar;
@@ -3246,6 +3434,38 @@ class Window : INativeHost
         {
             IColorWell cw = node as IColorWell;
             this.setText(h, winColorText(colorRaw(cw.value)).data()); this.setBoolProp(h, PROP_ENABLED, !cw.disabled);
+        }
+        else if (k == ELEM_INFOBAR)
+        {
+            IInfoBar ib = node as IInfoBar;
+            string prefix = "[i]"; if (ib.severity == INFOBAR_SUCCESS) prefix = "[ok]";
+            else if (ib.severity == INFOBAR_WARNING) prefix = "[!]"; else if (ib.severity == INFOBAR_ERROR) prefix = "[x]";
+            string shown = prefix + " " + ib.title + ": " + ib.message + (ib.closable && ib.onClose != nullptr ? "  x" : "");
+            this.setText(h, shown.data()); this._syncInfoBar(h, ib);
+        }
+        else if (k == ELEM_POPOVER)
+        {
+            IPopover pp = node as IPopover;
+            string shown = pp.title + "\n" + pp.body;
+            int i = 0; while (i < pp.labels.count()) { shown = shown + "\n[" + pp.labels.get(i) + "]"; i++; }
+            this.setText(h, shown.data());
+            bool have = false; i = 0; while (i < this.popoverButtonOwners.count()) { if (this.popoverButtonOwners.get(i) == h) have = true; i++; }
+            if (!have)
+            {
+                this.popoverButtonOwners.add(h); i = 0;
+                while (i < pp.labels.count())
+                {
+                    CreateWindowExA(0u, "BUTTON", pp.labels.get(i).data(), (u32)(WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON),
+                                    8 + i * 82, 60, 76, 28, u2h(h), (void*)(i64)pp.cmds.get(i), _hInst, nullptr); i++;
+                }
+            }
+            u64 anchor = this.ctx.nativeHandle(pp.anchorKey);
+            if (anchor != 0u)
+            {
+                RECT ar = default; GetWindowRect(u2h(anchor), &ar);
+                SetWindowPos(u2h(h), nullptr, ar.left, ar.bottom, 260 * this.dipX() / BASE_X, 5 * this.dipY(),
+                             (u32)(SWP_NOACTIVATE | SWP_SHOWWINDOW));
+            }
         }
         else if (k == ELEM_LIST)
         {
@@ -4644,6 +4864,10 @@ void routeClick(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(wnd.tree, keySegment(wnd.tree, 0), key);
     if (e == nullptr) return;
+    IInfoBar ib = e as IInfoBar;
+    if (ib != nullptr) { ib.fireClose(); pumpNative(); return; }
+    IPopover pp = e as IPopover;
+    if (pp != nullptr) { pp.fireCommand((int)GetWindowLongPtrA(ctrl, (int)GWLP_ID)); pumpNative(); return; }
     IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     ICheckbox c = e as ICheckbox;
@@ -5047,6 +5271,13 @@ void routeEdit(void* ctrl)
         pumpNative();
         return;
     }
+    IRichText rt = e as IRichText;
+    if (rt != nullptr)
+    {
+        int n = (int)GetWindowTextLengthW(ctrl); u16* buf = new u16[n + 1];
+        GetWindowTextW(ctrl, buf, n + 1); wstring wide = wstring.fromUtf16(buf, n); delete[] buf;
+        move string text = wide.toString(); rt.fireChangeText(text); pumpNative(); return;
+    }
     // A TextArea is uncontrolled: EN_CHANGE is just a dirty NOTIFICATION; do not
     // read/push the (potentially large) buffer here.
     ITextArea ta = e as ITextArea;
@@ -5056,6 +5287,22 @@ void routeEdit(void* ctrl)
         pumpNative();
     }
 }
+
+string nativeRichTextPlain(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return "";
+    int n = (int)GetWindowTextLengthW(u2h(h)); u16* buf = new u16[n + 1]; GetWindowTextW(u2h(h), buf, n + 1);
+    wstring wide = wstring.fromUtf16(buf, n); delete[] buf; return wide.toString();
+}
+
+void nativeRichTextTypeText(string keyPath, string text)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    bool prev = curWin().applying; curWin().applying = true; wstring wide = toWString(text);
+    SetWindowTextW(u2h(h), wide.data()); curWin().applying = prev; routeEdit(u2h(h));
+}
+
+string nativeWebViewUrl(string keyPath) { return ""; }
 
 // Read the current text of the control at `keyPath` on the active window (owned
 // string). Used to PULL a TextArea's buffer on save. Returns "" if no such control.
@@ -5448,10 +5695,13 @@ string nativeSaveFile()
 list<int> _uiTestMessageBoxAnswers = default;
 list<int> _uiTestColorValues = default;
 list<string> _uiTestFolderAnswers = default;
+list<string> _uiTestFontFamilies = default;
+list<int> _uiTestFontSizes = default;
 
 void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
 void uiTestScriptColor(int r, int g, int b) { _uiTestColorValues.add((r << 16) | (g << 8) | b); }
 void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
+void uiTestScriptFont(string family, int size) { _uiTestFontFamilies.add("" + family); _uiTestFontSizes.add(size); }
 
 int nativeMessageBox(string title, string text, int kind)
 {
@@ -5468,6 +5718,28 @@ int nativeMessageBox(string title, string text, int kind)
     else if (kind == MSGBOX_YESNO) flags = (u32)MB_YESNO;
     int r = (int)MessageBoxW(curWin().hwnd, wt.data(), wtitle.data(), flags);
     return r == (int)IDOK || r == (int)IDYES ? 1 : 0;
+}
+
+bool nativeChooseFont(FontChoice* out)
+{
+    if (_uiTestFontFamilies.count() > 0)
+    {
+        out.family = "" + _uiTestFontFamilies.get(0); out.size = _uiTestFontSizes.get(0);
+        _uiTestFontFamilies.removeAt(0); _uiTestFontSizes.removeAt(0); return true;
+    }
+    u8[92] raw = default;
+    i32* height = (i32*)&raw[0]; height[0] = -16;
+    u16* face = (u16*)&raw[28]; face[0] = (u16)'S'; face[1] = (u16)'e'; face[2] = (u16)'g'; face[3] = (u16)'o'; face[4] = (u16)'e'; face[5] = (u16)0;
+    _ChooseFontWArgs cf = default; cf.lStructSize = (u32)sizeof(_ChooseFontWArgs); cf.hwndOwner = curWin().hwnd;
+    cf.lpLogFont = &raw[0]; cf.Flags = 0x00000001u | 0x00000040u;
+    if (ChooseFontW(&cf) == 0) return false;
+    int n = 0; while (n < 31 && face[n] != (u16)0) n++;
+    wstring family = wstring.fromUtf16(face, n);
+    out.family = family.toString();
+    void* dc = GetDC(curWin().hwnd); int dpi = GetDeviceCaps(dc, 90); ReleaseDC(curWin().hwnd, dc);
+    if (dpi < 1) dpi = 96;
+    int pt = (int)((0 - height[0]) * 72 / dpi); if (pt < 1) pt = 1; out.size = pt;
+    return true;
 }
 
 string nativeSelectFolder()
@@ -5991,6 +6263,18 @@ u32 nativeTestCustomDrawFill(string keyPath)
 
 // Click a Button / Checkbox / RadioButton by key: mirror the OS auto-toggle for the two
 // state controls, then route the click so the model fires + the tree re-renders.
+void nativeInfoBarClose(string keyPath)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IInfoBar b = e as IInfoBar; if (b != nullptr) { b.fireClose(); pumpNative(); }
+}
+
+void nativePopoverCommand(string keyPath, int cmd)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IPopover p = e as IPopover; if (p != nullptr) { p.fireCommand(cmd); pumpNative(); }
+}
+
 void nativeClickButton(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -6564,7 +6848,25 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
             else if (code == BN_CLICKED)
             {
                 int si = 0; while (si < wnd.segmentChildren.count() && u2h(wnd.segmentChildren.get(si)) != ctrl) si++;
-                if (si < wnd.segmentChildren.count()) routeSegmentedButton(ctrl); else routeClick(ctrl);
+                if (si < wnd.segmentChildren.count()) routeSegmentedButton(ctrl);
+                else
+                {
+                    void* owner = GetParent(ctrl);
+                    string ownerKey = owner != nullptr ? wnd.keyForHandle((u64)owner) : "";
+                    if (ownerKey.length() > 0)
+                    {
+                        IElement oe = findByKey(wnd.tree, keySegment(wnd.tree, 0), ownerKey);
+                        IInfoBar ib = oe as IInfoBar;
+                        if (ib != nullptr) { ib.fireClose(); pumpNative(); }
+                        else
+                        {
+                            IPopover pp = oe as IPopover;
+                            if (pp != nullptr) { pp.fireCommand((int)(wParam & (u64)0xFFFF)); pumpNative(); }
+                            else routeClick(ctrl);
+                        }
+                    }
+                    else routeClick(ctrl);
+                }
             }
             else if (code == EN_CHANGE && !wnd.applying)     routeEdit(ctrl);
             else if (code == CBN_SELCHANGE && !wnd.applying) routeCombo(ctrl);

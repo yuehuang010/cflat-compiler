@@ -22,6 +22,13 @@
 import "ui_native.cb";
 import "cocoa.cb";
 
+extern void* dlopen(const char* path, int mode);
+bool _webKitLoaded = false;
+void _ensureWebKit()
+{
+    if (!_webKitLoaded) { dlopen("/System/Library/Frameworks/WebKit.framework/WebKit", 2); _webKitLoaded = true; }
+}
+
 // Per-cell base points. Layout math in ui.cb uses shared cells; the native host
 // converts them to points. One layout column ~8pt, one row ~26pt so controls get
 // sensible heights. Unlike Win32, there is no DPI multiplier (Cocoa points scale).
@@ -78,6 +85,8 @@ list<int>             _menuItemCmd    = default;   // per item: app command id (
 list<string>          _menuAccel      = default;   // per item: accel text (e.g. "Ctrl+S")
 Lambda<void(int)>     _menuHandler    = default;   // app's command dispatcher
 list<int>             _uiTestColorValues = default;
+list<string>          _uiTestFontFamilies = default;
+list<int>             _uiTestFontSizes = default;
 
 // Optional close guard: the app returns true to allow the window to close, false to
 // veto. Default (unset) always allows.
@@ -103,6 +112,8 @@ bool nativeMappable(int kind)
         || kind == ELEM_SPINNER || kind == ELEM_LINK || kind == ELEM_TOOLBAR
         || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
         || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL
+        || kind == ELEM_INFOBAR || kind == ELEM_POPOVER
+        || kind == ELEM_RICHTEXT || kind == ELEM_WEBVIEW
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
@@ -124,7 +135,8 @@ bool _fillKind(int kind)
 {
     return kind == ELEM_TEXTAREA || kind == ELEM_LIST || kind == ELEM_TREE
         || kind == ELEM_TABS || kind == ELEM_CANVAS || kind == ELEM_GRIDVIEW
-        || kind == ELEM_GROUPBOX || kind == ELEM_BOX;
+        || kind == ELEM_GROUPBOX || kind == ELEM_BOX || kind == ELEM_RICHTEXT
+        || kind == ELEM_WEBVIEW;
 }
 
 // The concrete tooltip text a mappable node carries ("" = none), read through
@@ -189,6 +201,14 @@ class CocoaHost : INativeHost
     list<u64>    spinnerHandles = default;
     list<u64>    toolbarHandles = default;
     list<u64>    toggleHandles = default;
+    list<u64>    infoBarHandles = default;
+    list<u64>    popoverHandles = default;
+    list<u64>    popoverObjects = default;
+    list<string> popoverKeys = default;
+    list<u64>    richLastHandles = default;
+    list<string> richLastSigs = default;
+    list<u64>    webViewLastHandles = default;
+    list<string> webViewLastSources = default;
     double edgeWPt = 0.0;
     double edgeHPt = 0.0;
     double contentWPt = 0.0;
@@ -360,6 +380,28 @@ class CocoaHost : INativeHost
             msg1(scroll, "setDocumentView:", tv);
             ctrl = scroll;
         }
+        else if (elemKind == ELEM_RICHTEXT)
+        {
+            // The scroll view is the handle; its documentView is the rich editor.
+            void* scroll = msgRect(msg0(cls("NSScrollView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(scroll, "setHasVerticalScroller:", true); msgInt(scroll, "setBorderType:", 2);
+            void* tv = msgRect(msg0(cls("NSTextView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msgBool(tv, "setEditable:", false); msgBool(tv, "setSelectable:", true); msgBool(tv, "setRichText:", true);
+            double big = 10000000.0;
+            msgSize(tv, "setMinSize:", 0.0, 0.0); msgSize(tv, "setMaxSize:", big, big);
+            msgBool(tv, "setVerticallyResizable:", true); msgBool(tv, "setHorizontallyResizable:", false);
+            msgInt(tv, "setAutoresizingMask:", 2);
+            void* tc = msg0(tv, "textContainer");
+            if (tc != nullptr) { msgBool(tc, "setWidthTracksTextView:", true); msgSize(tc, "setContainerSize:", big, big); }
+            msg1(tv, "setDelegate:", this.target); msg1(scroll, "setDocumentView:", tv); ctrl = scroll;
+        }
+        else if (elemKind == ELEM_WEBVIEW)
+        {
+            _ensureWebKit();
+            ctrl = msgRect(msg0(cls("WKWebView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
+            msg1(ctrl, "setNavigationDelegate:", this.target);
+            this.webViewLastHandles.add((u64)ctrl); this.webViewLastSources.add("");
+        }
         else if (elemKind == ELEM_STATUSBAR)
         {
             // A read-only text strip stands in for the status bar; macOS has no
@@ -424,6 +466,16 @@ class CocoaHost : INativeHost
         {
             ctrl = msgRect(msg0(cls("NSColorWell"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 10.0);
             msg1(ctrl, "setTarget:", this.target); msg1(ctrl, "setAction:", sel("onAction:"));
+        }
+        else if (elemKind == ELEM_INFOBAR)
+        {
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 10.0, 52.0);
+            msgBool(ctrl, "setWantsLayer:", true); this.infoBarHandles.add((u64)ctrl);
+        }
+        else if (elemKind == ELEM_POPOVER)
+        {
+            ctrl = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 260.0, 120.0);
+            this.popoverHandles.add((u64)ctrl);
         }
         else if (elemKind == ELEM_LIST)
         {
@@ -529,7 +581,7 @@ class CocoaHost : INativeHost
         // inside one), falling back to the window's content view.
         void* parent = u2h(parentHandle);
         if (parent == nullptr) parent = this.contentView;
-        if (parent != nullptr && ctrl != nullptr)
+        if (parent != nullptr && ctrl != nullptr && elemKind != ELEM_POPOVER)
             msg1(parent, "addSubview:", ctrl);
         return (u64)ctrl;
     }
@@ -546,7 +598,14 @@ class CocoaHost : INativeHost
         this._storeAccent(h, 0); // drop any stored accent for this handle
         this._dropComposite(&this.spinnerHandles, h); this._dropComposite(&this.toolbarHandles, h);
         this._dropComposite(&this.toggleHandles, h);
+        this._dropRichState(h); this._dropWebState(h);
+        int ib = 0; while (ib < this.infoBarHandles.count()) { if (this.infoBarHandles.get(ib) == h) { this.infoBarHandles.removeAt(ib); break; } ib++; }
+        this._freePopover(h);
         void* ctrl = u2h(h);
+        if (msgBool1(ctrl, "isKindOfClass:", cls("WKWebView")) != (i8)0)
+        {
+            msg0(ctrl, "stopLoading"); msg1(ctrl, "setNavigationDelegate:", nullptr);
+        }
         msg0(ctrl, "removeFromSuperview");   // drops the superview's retain
         msg0(ctrl, "release");               // drops our alloc/init retain -> dealloc
     }
@@ -556,6 +615,7 @@ class CocoaHost : INativeHost
     void setFrame(u64 h, Rect frameCells)
     {
         void* ctrl = u2h(h);
+        if (this._hasComposite(&this.popoverHandles, (u64)ctrl)) return;
         if (frameCells.w < 0)
         {
             double statusH = (double)(frameCells.h * BASE_Y);
@@ -573,6 +633,9 @@ class CocoaHost : INativeHost
         if (this._hasComposite(&this.toggleHandles, (u64)ctrl)) this._layoutToggle(ctrl,
             (double)(frameCells.w * BASE_X) + this.applyExtraW,
             (double)(frameCells.h * BASE_Y) + this.applyExtraH);
+        if (this._hasComposite(&this.infoBarHandles, (u64)ctrl)) this._layoutInfoBar(ctrl,
+            (double)(frameCells.w * BASE_X) + this.applyExtraW,
+            (double)(frameCells.h * BASE_Y) + this.applyExtraH);
     }
 
     bool _hasComposite(list<u64>* xs, u64 h)
@@ -582,6 +645,92 @@ class CocoaHost : INativeHost
     void _dropComposite(list<u64>* xs, u64 h)
     {
         int i = 0; while (i < xs.count()) { if (xs.get(i) == h) { xs.removeAt(i); return; } i++; }
+    }
+
+    void _dropRichState(u64 h)
+    {
+        int i = 0;
+        while (i < this.richLastHandles.count())
+        {
+            if (this.richLastHandles.get(i) == h) { this.richLastHandles.removeAt(i); this.richLastSigs.removeAt(i); return; }
+            i++;
+        }
+    }
+
+    void _dropWebState(u64 h)
+    {
+        int i = 0;
+        while (i < this.webViewLastHandles.count())
+        {
+            if (this.webViewLastHandles.get(i) == h) { this.webViewLastHandles.removeAt(i); this.webViewLastSources.removeAt(i); return; }
+            i++;
+        }
+    }
+
+    string _richSig(IRichText r)
+    {
+        string s = r.runTexts.count().toString() + ":"; int i = 0;
+        while (i < r.runTexts.count())
+        {
+            s = s + r.runTexts.get(i).length().toString() + ":" + r.runTexts.get(i)
+                + ":" + r.runFlags.get(i).toString() + ":" + r.runColors.get(i).toString() + ";";
+            i++;
+        }
+        return s;
+    }
+
+    void _syncRichText(u64 h, IRichText r)
+    {
+        string sig = this._richSig(r); int found = -1; int i = 0;
+        while (i < this.richLastHandles.count()) { if (this.richLastHandles.get(i) == h) { found = i; break; } i++; }
+        if (found >= 0 && this.richLastSigs.get(found) == sig) return;
+        void* tv = msg0(u2h(h), "documentView");
+        void* astr = msg2(msg0(cls("NSMutableAttributedString"), "alloc"), "initWithString:attributes:", nsStr(""), nullptr);
+        void* fm = msg0(cls("NSFontManager"), "sharedFontManager");
+        int j = 0;
+        while (j < r.runTexts.count())
+        {
+            void* attrs = msg0(msg0(cls("NSMutableDictionary"), "alloc"), "init");
+            void* font = this._fontFor(FONT_UI);
+            int flags = r.runFlags.get(j);
+            if ((flags & RICH_BOLD) != 0 || (flags & RICH_ITALIC) != 0)
+            {
+                function<void*(void*, void*, void*, i64)> convert =
+                    (function<void*(void*, void*, void*, i64)>)__objcMsgSendPtr;
+                if ((flags & RICH_BOLD) != 0) font = convert(fm, sel("convertFont:toHaveTrait:"), font, (i64)2);
+                if ((flags & RICH_ITALIC) != 0) font = convert(fm, sel("convertFont:toHaveTrait:"), font, (i64)1);
+            }
+            msg2(attrs, "setObject:forKey:", font, nsStr("NSFont"));
+            if ((flags & RICH_UNDERLINE) != 0) msg2(attrs, "setObject:forKey:", msgIntArg(cls("NSNumber"), "numberWithInteger:", 1), nsStr("NSUnderline"));
+            int raw = r.runColors.get(j);
+            void* ink = raw == -1 ? msg0(cls("NSColor"), "textColor")
+                : nsColor((double)((raw >> 16) & 255) / 255.0, (double)((raw >> 8) & 255) / 255.0,
+                          (double)(raw & 255) / 255.0, 1.0);
+            msg2(attrs, "setObject:forKey:", ink, _nsForegroundColorKey());
+            void* piece = msg2(msg0(cls("NSAttributedString"), "alloc"), "initWithString:attributes:",
+                               _nsStrSafe(r.runTexts.get(j)), attrs);
+            msg1(astr, "appendAttributedString:", piece); msg0(piece, "release"); msg0(attrs, "release"); j++;
+        }
+        msg1(msg0(tv, "textStorage"), "setAttributedString:", astr); msg0(astr, "release");
+        if (found >= 0) this.richLastSigs.set(found, "" + sig);
+        else { this.richLastHandles.add(h); this.richLastSigs.add("" + sig); }
+    }
+
+    void _syncWebView(u64 h, IWebView wv)
+    {
+        string source = wv.html.length() > 0 ? "html:" + wv.html : "url:" + wv.url;
+        int i = 0; while (i < this.webViewLastHandles.count() && this.webViewLastHandles.get(i) != h) i++;
+        if (i < this.webViewLastHandles.count() && this.webViewLastSources.get(i) == source) return;
+        void* view = u2h(h);
+        if (wv.html.length() > 0) msg2(view, "loadHTMLString:baseURL:", _nsStrSafe(wv.html), nullptr);
+        else
+        {
+            void* url = msg1(cls("NSURL"), "URLWithString:", _nsStrSafe(wv.url));
+            void* req = msg1(msg0(cls("NSURLRequest"), "alloc"), "initWithURL:", url);
+            msg1(view, "loadRequest:", req); msg0(req, "release");
+        }
+        if (i < this.webViewLastHandles.count()) this.webViewLastSources.set(i, "" + source);
+        else { this.webViewLastHandles.add(h); this.webViewLastSources.add("" + source); }
     }
 
     void _layoutSpinner(void* ctrl, double w, double h)
@@ -596,6 +745,107 @@ class CocoaHost : INativeHost
         void* kids = msg0(ctrl, "subviews"); if (kids == nullptr || msgGetI64(kids, "count") < 2) return;
         void* sw = msgInt(kids, "objectAtIndex:", 0); void* label = msgInt(kids, "objectAtIndex:", 1);
         double swW = 38.0; msgRect(sw, "setFrame:", 0.0, 0.0, swW, h); msgRect(label, "setFrame:", swW + 4.0, 0.0, w - swW - 4.0, h);
+    }
+
+    void _layoutInfoBar(void* ctrl, double w, double h)
+    {
+        void* kids = msg0(ctrl, "subviews"); if (kids == nullptr) return;
+        int n = (int)msgGetI64(kids, "count"); if (n < 2) return;
+        void* title = msgInt(kids, "objectAtIndex:", 0); void* body = msgInt(kids, "objectAtIndex:", 1);
+        msgRect(title, "setFrame:", 8.0, 3.0, w - 52.0, 22.0);
+        msgRect(body, "setFrame:", 8.0, 25.0, w - 52.0, h - 28.0);
+        if (n > 2) msgRect(msgInt(kids, "objectAtIndex:", 2), "setFrame:", w - 38.0, 8.0, 30.0, 28.0);
+    }
+
+    void _syncInfoBar(u64 h, IInfoBar b)
+    {
+        void* ctrl = u2h(h); void* old = msg0(ctrl, "subviews");
+        while (old != nullptr && msgGetI64(old, "count") > 0)
+        {
+            void* child = msgInt(old, "objectAtIndex:", 0); msg0(child, "removeFromSuperview"); old = msg0(ctrl, "subviews");
+        }
+        int raw = 0x4A90E2;
+        if (b.severity == INFOBAR_SUCCESS) raw = 0x38A169;
+        else if (b.severity == INFOBAR_WARNING) raw = 0xD69E2E;
+        else if (b.severity == INFOBAR_ERROR) raw = 0xD64545;
+        void* layer = msg0(ctrl, "layer");
+        if (layer != nullptr)
+        {
+            void* col = nsColor((double)((raw >> 16) & 255) / 255.0, (double)((raw >> 8) & 255) / 255.0,
+                                (double)(raw & 255) / 255.0, 0.16);
+            msg1(layer, "setBackgroundColor:", msg0(col, "CGColor"));
+        }
+        void* title = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 8.0, 3.0, 180.0, 22.0);
+        msgBool(title, "setBezeled:", false); msgBool(title, "setDrawsBackground:", false);
+        msgBool(title, "setEditable:", false); msgBool(title, "setSelectable:", false);
+        msg1(title, "setStringValue:", nsStr(b.title.data())); msg1(title, "setFont:", this._fontFor(FONT_TITLE));
+        void* body = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 8.0, 25.0, 180.0, 24.0);
+        msgBool(body, "setBezeled:", false); msgBool(body, "setDrawsBackground:", false);
+        msgBool(body, "setEditable:", false); msgBool(body, "setSelectable:", false);
+        msg1(body, "setStringValue:", nsStr(b.message.data()));
+        msg1(ctrl, "addSubview:", title); msg1(ctrl, "addSubview:", body); msg0(title, "release"); msg0(body, "release");
+        if (b.closable && b.onClose != nullptr)
+        {
+            void* close = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 220.0, 8.0, 30.0, 28.0);
+            msgInt(close, "setBezelStyle:", 2); msg1(close, "setTitle:", nsStr("x"));
+            msg1(close, "setTarget:", this.target); msg1(close, "setAction:", sel("onAction:"));
+            msg1(ctrl, "addSubview:", close); msg0(close, "release");
+        }
+    }
+
+    int _popoverSlot(u64 h)
+    {
+        int i = 0; while (i < this.popoverHandles.count()) { if (this.popoverHandles.get(i) == h) return i; i++; }
+        return -1;
+    }
+
+    void _syncPopover(u64 h, IPopover p)
+    {
+        int slot = this._popoverSlot(h); if (slot < 0) return;
+        void* view = u2h(h); void* pop = slot < this.popoverObjects.count() ? u2h(this.popoverObjects.get(slot)) : nullptr;
+        if (pop == nullptr)
+        {
+            pop = msg0(msg0(cls("NSPopover"), "alloc"), "init");
+            void* vc = msg0(msg0(cls("NSViewController"), "alloc"), "init");
+            msg1(vc, "setView:", view); msg1(pop, "setContentViewController:", vc); msg0(vc, "release");
+            msg1(pop, "setDelegate:", this.target); msgInt(pop, "setBehavior:", 1);
+            while (this.popoverObjects.count() < this.popoverHandles.count()) this.popoverObjects.add(0u);
+            while (this.popoverKeys.count() < this.popoverHandles.count()) this.popoverKeys.add("");
+            this.popoverObjects.set(slot, (u64)pop);
+        }
+        if (slot >= this.popoverKeys.count()) this.popoverKeys.add("" + p.keyOf());
+        else this.popoverKeys.set(slot, "" + p.keyOf());
+        void* old = msg0(view, "subviews");
+        while (old != nullptr && msgGetI64(old, "count") > 0) { msg0(msgInt(old, "objectAtIndex:", 0), "removeFromSuperview"); old = msg0(view, "subviews"); }
+        void* title = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 12.0, 10.0, 236.0, 24.0);
+        msgBool(title, "setBezeled:", false); msgBool(title, "setDrawsBackground:", false); msgBool(title, "setEditable:", false); msg1(title, "setStringValue:", nsStr(p.title.data()));
+        void* body = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 12.0, 38.0, 236.0, 24.0);
+        msgBool(body, "setBezeled:", false); msgBool(body, "setDrawsBackground:", false); msgBool(body, "setEditable:", false); msg1(body, "setStringValue:", nsStr(p.body.data()));
+        msg1(view, "addSubview:", title); msg1(view, "addSubview:", body); msg0(title, "release"); msg0(body, "release");
+        int i = 0; while (i < p.labels.count())
+        {
+            void* button = msgRect(msg0(cls("NSButton"), "alloc"), "initWithFrame:", 12.0 + (double)(i * 82), 70.0, 76.0, 28.0);
+            msgInt(button, "setBezelStyle:", 2); msg1(button, "setTitle:", nsStr(p.labels.get(i).data()));
+            msg1(button, "setTarget:", this.target); msg1(button, "setAction:", sel("onAction:")); msgInt(button, "setTag:", (i64)p.cmds.get(i));
+            msg1(view, "addSubview:", button); msg0(button, "release"); i++;
+        }
+        void* anchor = u2h(this.ctx.nativeHandle(p.anchorKey));
+        if (!p.open) { if (pop != nullptr) msg0(pop, "close"); return; }
+        if (anchor != nullptr)
+        {
+            RectD ar = ((function<RectD(void*, void*)>)__objcMsgSendPtr)(anchor, sel("frame"));
+            function<void*(void*, void*, double, double, double, double, void*, i64)> show =
+                (function<void*(void*, void*, double, double, double, double, void*, i64)>)__objcMsgSendPtr;
+            show(pop, sel("showRelativeToRect:ofView:preferredEdge:"), 0.0, 0.0, ar.w, ar.h, anchor, (i64)1);
+        }
+    }
+
+    void _freePopover(u64 h)
+    {
+        int slot = this._popoverSlot(h); if (slot < 0) return;
+        if (slot < this.popoverObjects.count() && this.popoverObjects.get(slot) != 0u) msg0(u2h(this.popoverObjects.get(slot)), "close");
+        if (slot < this.popoverObjects.count() && this.popoverObjects.get(slot) != 0u) msg0(u2h(this.popoverObjects.get(slot)), "release");
+        this.popoverHandles.removeAt(slot); if (slot < this.popoverObjects.count()) this.popoverObjects.removeAt(slot); if (slot < this.popoverKeys.count()) this.popoverKeys.removeAt(slot);
     }
 
     void _setLinkTitle(void* ctrl, string text)
@@ -1744,6 +1994,15 @@ class CocoaHost : INativeHost
         if (nativeMappable(node.kind()))
         {
             u64 h = ctx.nativeHandle(path);
+            if (node.kind() == ELEM_POPOVER)
+            {
+                IPopover pp = node as IPopover;
+                if (pp == nullptr || !pp.open)
+                {
+                    if (h != 0u) { this.destroyControl(h); ctx.removeNativeHandle(path); }
+                    return;
+                }
+            }
             // Reparent edge: a control whose key path moved across a scroll boundary
             // now has the wrong superview - drop it so it is recreated under parentView.
             if (h != 0u && parentView != 0u && msg0(u2h(h), "superview") != u2h(parentView))
@@ -2066,6 +2325,15 @@ class CocoaHost : INativeHost
             ITextArea ta = node as ITextArea;
             this.setBoolProp(h, PROP_ENABLED, !ta.disabled);
         }
+        else if (k == ELEM_RICHTEXT)
+        {
+            IRichText rt = node as IRichText;
+            this._syncRichText(h, rt); this.setBoolProp(h, PROP_ENABLED, !rt.disabled);
+        }
+        else if (k == ELEM_WEBVIEW)
+        {
+            this._syncWebView(h, node as IWebView);
+        }
         else if (k == ELEM_STATUSBAR)
         {
             IStatusBar sb = node as IStatusBar;
@@ -2141,6 +2409,14 @@ class CocoaHost : INativeHost
                                                      (double)((raw >> 8) & 0xFF) / 255.0,
                                                      (double)(raw & 0xFF) / 255.0, 1.0));
             msgBool(u2h(h), "setEnabled:", !cw.disabled);
+        }
+        else if (k == ELEM_INFOBAR)
+        {
+            this._syncInfoBar(h, node as IInfoBar);
+        }
+        else if (k == ELEM_POPOVER)
+        {
+            this._syncPopover(h, node as IPopover);
         }
         else if (k == ELEM_LIST)
         {
@@ -2287,6 +2563,17 @@ class CocoaHost : INativeHost
             ti0++;
         }
         this.timerHandles.clear(); this.timerBoxes.clear(); this.timerObjects.clear();
+        int wi = 0;
+        while (wi < this.liveHandles.count())
+        {
+            void* ctrl = u2h(this.liveHandles.get(wi));
+            if (msgBool1(ctrl, "isKindOfClass:", cls("WKWebView")) != (i8)0)
+            {
+                msg0(ctrl, "stopLoading"); msg1(ctrl, "setNavigationDelegate:", nullptr);
+                msg0(ctrl, "removeFromSuperview"); msg0(ctrl, "release");
+            }
+            wi++;
+        }
         if (this.ready) { IElement t = this.tree; deleteTree(t); this.ready = false; }
         if (this.app != nullptr) { IComponent a = this.app; this.app = nullptr; delete a; }
         // Free the host-owned boxes (the destroyControl path does not run for a window
@@ -2299,6 +2586,7 @@ class CocoaHost : INativeHost
         { int i = 0; while (i < this.treeBoxPtrs.count()) { u64 b = this.treeBoxPtrs.get(i); if (b != 0u) __uiFreeTreeBox(b); i++; } }
         { int i = 0; while (i < this.canvasBoxes.count()) { u64 b = this.canvasBoxes.get(i); if (b != 0u) __uiFreeCanvasBox(b); i++; } }
         { int i = 0; while (i < this.ctxMenus.count()) { u64 b = this.ctxMenus.get(i); if (b != 0u) __uiFreeContextMenu(b); i++; } }
+        { int i = 0; while (i < this.popoverObjects.count()) { u64 p = this.popoverObjects.get(i); if (p != 0u) { msg0(u2h(p), "close"); msg0(u2h(p), "release"); } i++; } }
         this.listBoxHandles.clear(); this.listBoxPtrs.clear();
         this.listIconHandles.clear(); this.listIconPtrs.clear();
         this.listIconCacheH.clear(); this.listIconCacheIds.clear();
@@ -2308,6 +2596,7 @@ class CocoaHost : INativeHost
         this.treeBoxHandles.clear(); this.treeBoxPtrs.clear();
         this.canvasHandles.clear();  this.canvasBoxes.clear();
         this.ctxKeys.clear();        this.ctxMenus.clear();
+        this.popoverHandles.clear(); this.popoverObjects.clear(); this.popoverKeys.clear();
         if (this.window != nullptr)
         {
             msg1(this.window, "setDelegate:", nullptr);   // do not re-enter windowWillClose:
@@ -3084,6 +3373,10 @@ void routeClick(void* ctrl)
     if (key.length() == 0) return;
     IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
     if (e == nullptr) return;
+    IInfoBar ib = e as IInfoBar;
+    if (ib != nullptr) { ib.fireClose(); pumpNative(); return; }
+    IPopover pp = e as IPopover;
+    if (pp != nullptr) { pp.fireCommand((int)msgGetI64(ctrl, "tag")); pumpNative(); return; }
     IButton b = e as IButton;
     if (b != nullptr) { b.fireClick(); pumpNative(); return; }
     ICheckbox c = e as ICheckbox;
@@ -3262,6 +3555,13 @@ void routeEdit(void* ctrl)
         pumpNative();
         return;
     }
+    IRichText rt = e as IRichText;
+    if (rt != nullptr)
+    {
+        void* tv = _isScroll(ctrl) ? msg0(ctrl, "documentView") : ctrl;
+        char* c = cStr(msg0(tv, "string"));
+        rt.fireChangeText(c != nullptr ? "" + c : ""); pumpNative(); return;
+    }
     // A TextArea is uncontrolled: textDidChange is just a dirty NOTIFICATION; do
     // not read / push the (potentially large) buffer here.
     ITextArea ta = e as ITextArea;
@@ -3313,6 +3613,29 @@ string nativeControlText(string keyPath)
     string s = c != nullptr ? "" + c : "";
     poolPop(pool);
     return s;
+}
+
+string nativeRichTextPlain(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return "";
+    void* tv = msg0(u2h(h), "documentView");
+    void* pool = poolPush(); char* c = cStr(msg0(tv, "string")); string s = c != nullptr ? "" + c : "";
+    poolPop(pool); return s;
+}
+
+void nativeRichTextTypeText(string keyPath, string text)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return;
+    void* tv = msg0(u2h(h), "documentView"); bool prev = curWin().applying; curWin().applying = true;
+    msg1(tv, "setString:", _nsStrSafe(text)); curWin().applying = prev; routeEdit(u2h(h));
+}
+
+string nativeWebViewUrl(string keyPath)
+{
+    u64 h = curWin().ctx.nativeHandle(keyPath); if (h == 0u) return "";
+    void* pool = poolPush(); void* url = msg0(u2h(h), "URL");
+    char* c = url != nullptr ? cStr(msg0(url, "absoluteString")) : nullptr;
+    string s = c != nullptr ? "" + c : ""; poolPop(pool); return s;
 }
 
 // Read a status bar pane's text (mirror of the Win32 nativeStatusText). The macOS
@@ -3667,6 +3990,18 @@ int nativeListVisualResourceCount(string keyPath) { return 0; }
 int nativeListContainerReuseCount(string keyPath) { return 0; }
 
 // -- Host-neutral form/data test drivers (mirror the Win32 names) ---------------
+void nativeInfoBarClose(string keyPath)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IInfoBar b = e as IInfoBar; if (b != nullptr) { b.fireClose(); pumpNative(); }
+}
+
+void nativePopoverCommand(string keyPath, int cmd)
+{
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), keyPath);
+    IPopover p = e as IPopover; if (p != nullptr) { p.fireCommand(cmd); pumpNative(); }
+}
+
 void nativeClickButton(string keyPath)
 {
     u64 h = curWin().ctx.nativeHandle(keyPath);
@@ -4119,6 +4454,23 @@ void _onActionImp(void* self, void* cmd, void* sender)
     routeClick(sender);
 }
 
+void _onPopoverCloseImp(void* self, void* cmd, void* popover)
+{
+    if (!_setCurFromTarget(self)) return;
+    int i = 0;
+    while (i < curWin().popoverObjects.count())
+    {
+        if (curWin().popoverObjects.get(i) == (u64)popover && i < curWin().popoverKeys.count())
+        {
+            IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), curWin().popoverKeys.get(i));
+            IPopover p = e as IPopover;
+            if (p != nullptr && p.open && !curWin().applying) { p.fireClose(); pumpNative(); }
+            return;
+        }
+        i++;
+    }
+}
+
 // A menu item fired: its command id rides on the tag. There is no view, so resolve the
 // servicing window from the app's key window; if none is key (headless test), leave _cur
 // as-is so nativeTestFireMenu still routes to the current window.
@@ -4150,6 +4502,19 @@ void _textDidChangeImp(void* self, void* cmd, void* note)
     void* scroll = msg0(tv, "enclosingScrollView");
     if (scroll == nullptr) scroll = tv;
     routeEdit(scroll);
+}
+
+// WKWebView navigation callback; only committed navigations are reported.
+void _webViewCommitImp(void* self, void* cmd, void* webView, void* navigation)
+{
+    if (!_setCurFromTarget(self) || !curWin().ready || curWin().applying) return;
+    string key = curWin().keyForHandle((u64)webView); if (key.length() == 0) return;
+    IElement e = findByKey(curWin().tree, keySegment(curWin().tree, 0), key);
+    IWebView wv = e as IWebView; if (wv == nullptr) return;
+    void* pool = poolPush(); void* url = msg0(webView, "URL");
+    char* c = url != nullptr ? cStr(msg0(url, "absoluteString")) : nullptr;
+    string s = c != nullptr ? "" + c : ""; poolPop(pool);
+    wv.fireNavigate(s); pumpNative();
 }
 
 // windowDidResize: read the content view's size (struct return) and
@@ -4387,6 +4752,7 @@ list<string> _uiTestFolderAnswers = default;
 void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
 void uiTestScriptColor(int r, int g, int b) { _uiTestColorValues.add((r << 16) | (g << 8) | b); }
 void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
+void uiTestScriptFont(string family, int size) { _uiTestFontFamilies.add("" + family); _uiTestFontSizes.add(size); }
 
 string nativeOpenFile()
 {
@@ -4437,6 +4803,33 @@ int nativeMessageBox(string title, string text, int kind)
     i64 r = msgGetI64(alert, "runModal");
     msg0(alert, "release");
     return r == (i64)1000 ? 1 : 0;
+}
+
+bool nativeChooseFont(FontChoice* out)
+{
+    if (_uiTestFontFamilies.count() > 0)
+    {
+        out.family = "" + _uiTestFontFamilies.get(0); out.size = _uiTestFontSizes.get(0);
+        _uiTestFontFamilies.removeAt(0); _uiTestFontSizes.removeAt(0); return true;
+    }
+    void* alert = msg0(msg0(cls("NSAlert"), "alloc"), "init");
+    msg1(alert, "setMessageText:", nsStr("Choose Font"));
+    void* accessory = msgRect(msg0(cls("NSView"), "alloc"), "initWithFrame:", 0.0, 0.0, 280.0, 58.0);
+    void* combo = msgRect(msg0(cls("NSComboBox"), "alloc"), "initWithFrame:", 0.0, 30.0, 280.0, 24.0);
+    void* families = msg0(msg0(cls("NSFontManager"), "sharedFontManager"), "availableFontFamilies");
+    int i = 0; while (families != nullptr && i < (int)msgGetI64(families, "count"))
+    { msg1(combo, "addItemWithObjectValue:", msgInt(families, "objectAtIndex:", i)); i++; }
+    msg1(combo, "setStringValue:", nsStr("System"));
+    void* size = msgRect(msg0(cls("NSTextField"), "alloc"), "initWithFrame:", 0.0, 0.0, 80.0, 24.0);
+    msg1(size, "setStringValue:", nsStr("12")); msg1(accessory, "addSubview:", combo); msg1(accessory, "addSubview:", size);
+    msg0(combo, "release"); msg0(size, "release");
+    msg1(alert, "setAccessoryView:", accessory); msg0(accessory, "release");
+    msg1(alert, "addButtonWithTitle:", nsStr("OK")); msg1(alert, "addButtonWithTitle:", nsStr("Cancel"));
+    i64 r = msgGetI64(alert, "runModal");
+    if (r != (i64)1000) { msg0(alert, "release"); return false; }
+    char* fam = cStr(msg0(combo, "stringValue")); char* sz = cStr(msg0(size, "stringValue"));
+    out.family = fam != nullptr ? "" + fam : "System"; out.size = sz != nullptr ? ((string)sz).toInt() : 12;
+    msg0(alert, "release"); return true;
 }
 
 string nativeSelectFolder()
@@ -4567,17 +4960,21 @@ void registerHostClasses()
     if (tg != nullptr)
     {
         function<void(void*, void*, void*)> a  = _onActionImp;
+        function<void(void*, void*, void*)> pc = _onPopoverCloseImp;
         function<void(void*, void*, void*)> m  = _onMenuImp;
         function<void(void*, void*, void*)> ct = _controlTextChangedImp;
         function<void(void*, void*, void*)> td = _textDidChangeImp;
+        function<void(void*, void*, void*, void*)> wvCommit = _webViewCommitImp;
         function<void(void*, void*, void*)> wr = _windowResizeImp;
         function<void(void*, void*, void*)> ww = _windowWillCloseImp;
         function<i8(void*, void*, void*)>   wc = _windowShouldCloseImp;
         function<void(void*, void*, void*)> th = _cocoaThemeChangedImp;
         addMethod0(tg, "onAction:", a);
+        addMethod0(tg, "popoverDidClose:", pc);
         addMethod0(tg, "onMenu:", m);
         addMethod0(tg, "controlTextDidChange:", ct);
         addMethod0(tg, "textDidChange:", td);
+        addMethod2(tg, "webView:didCommitNavigation:", wvCommit);
         addMethod0(tg, "windowDidResize:", wr);
         addMethod0(tg, "windowWillClose:", ww);
         addMethodBool(tg, "windowShouldClose:", wc);
