@@ -5,6 +5,7 @@
 
 import "appsample.cb";
 import "dictionary.cb";
+import "ui_native.cb";
 import "wstring.cb";
 import { "windows.h", "shellapi.h" } lib "shell32.lib" cache;
 extern stdcall i32 SHDefExtractIconW(u16* pszIconFile, i32 iIndex, u32 uFlags, void** phiconLarge, void** phiconSmall, u32 nIconSize);
@@ -27,6 +28,23 @@ class AppIconBuffer
 };
 
 dictionary<string, unique AppIconBuffer*> _appIconCache = default;
+
+// Local BITMAPINFOHEADER for CreateDIBSection, so this file does not lean on the
+// win32 host's internal BmiHeader (it must analyze standalone for the LSP sweep).
+struct MemBmiHeader
+{
+    u32 biSize        = 40u;
+    i32 biWidth       = 0;
+    i32 biHeight      = 0;
+    u16 biPlanes      = 1;
+    u16 biBitCount    = 32;
+    u32 biCompression = 0u;
+    u32 biSizeImage   = 0u;
+    i32 biXPelsPerM   = 0;
+    i32 biYPelsPerM   = 0;
+    u32 biClrUsed     = 0u;
+    u32 biClrImportant = 0u;
+};
 
 ListRowIcon memSourceAppIcon(AppEntry* app)
 {
@@ -61,7 +79,7 @@ ListRowIcon memSourceAppIcon(AppEntry* app)
         if (icon != nullptr)
         {
             created.side = side;
-            BmiHeader bi = default;
+            MemBmiHeader bi = default;
             bi.biSize = 40u;
             bi.biWidth = side;
             bi.biHeight = 0 - side;

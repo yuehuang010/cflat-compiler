@@ -1465,12 +1465,15 @@ int gallerySelfTest()
             && _statusIs(popReadoutKey, "Command: 2"));
 
         nativeTabSelect("root/content/pages", 1);
-        t.expectTrue("rich text plain runs",
-            t.richTextPlain(richDisplayKey) == "Bold italic underlined");
-        t.richTextTypeText(richEditorKey, "typed rich text");
-        t.expectTrue("rich text edit mirror",
-            g != nullptr && g.richTextMirror == "typed rich text"
-            && _statusIs(richMirrorKey, "Mirror: typed rich text"));
+        if (nativeRichTextExpected())
+        {
+            t.expectTrue("rich text plain runs",
+                t.richTextPlain(richDisplayKey) == "Bold italic underlined");
+            t.richTextTypeText(richEditorKey, "typed rich text");
+            t.expectTrue("rich text edit mirror",
+                g != nullptr && g.richTextMirror == "typed rich text"
+                && _statusIs(richMirrorKey, "Mirror: typed rich text"));
+        }
 
         if const (__MACOS__)
         {

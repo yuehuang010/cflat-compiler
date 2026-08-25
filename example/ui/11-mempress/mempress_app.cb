@@ -13,6 +13,12 @@ import "mutex.cb";
 import "string.cb";
 import "thread.cb";
 
+// Host seams (the win32/cocoa backends define them); declared so this file
+// analyzes standalone in the LSP bulk sweep.
+int nativeConfirm(string title, string text);
+int hostWidth();
+int hostHeight();
+
 i32 kRefreshIntervalMs = 2000;
 i32 kCollapsedAppCount = 6;
 

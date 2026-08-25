@@ -3977,6 +3977,7 @@ int nativeListCellColor(string keyPath, int row, int col)
 }
 
 bool nativeListVisualExpected() { return false; }
+bool nativeRichTextExpected() { return true; }
 bool nativeListVisualTeardownClean() { return true; }
 bool nativeListHeaderAttached(string keyPath) { return false; }
 bool nativeListInvokeHeader(string keyPath, int column) { return false; }

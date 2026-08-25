@@ -1191,7 +1191,8 @@ bool winuiMappable(int kind)
         || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
-        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
+        || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS
+        || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL;
 }
 
 // Tier-2 batch B: DatePicker DateTimeOffset routing and ColorWell have no stable
@@ -2260,7 +2261,12 @@ class WinUI3Host : INativeHost
             else if (elemKind == ELEM_STATUSBAR) cls = "Microsoft.UI.Xaml.Controls.TextBlock";
             else if (elemKind == ELEM_INFOBAR)   cls = "Microsoft.UI.Xaml.Controls.InfoBar";
             else if (elemKind == ELEM_POPOVER)   cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            else if (elemKind == ELEM_DATEPICKER) cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            else if (elemKind == ELEM_EXPANDER)   cls = "Microsoft.UI.Xaml.Controls.TextBlock";
+            else if (elemKind == ELEM_COLORWELL)  cls = "Microsoft.UI.Xaml.Controls.Button";
             RoActivateInstance(hstring(cls), &insp);
+            if (insp == nullptr && (elemKind == ELEM_SPINNER || elemKind == ELEM_INFOBAR))
+                RoActivateInstance(hstring("Microsoft.UI.Xaml.Controls.TextBlock"), &insp);
         }
         if (insp == nullptr) return 0u;
 
@@ -3195,8 +3201,29 @@ class WinUI3Host : INativeHost
             IInfoBar ib = node as IInfoBar;
             string prefix = "[i]"; if (ib.severity == INFOBAR_SUCCESS) prefix = "[ok]";
             else if (ib.severity == INFOBAR_WARNING) prefix = "[!]"; else if (ib.severity == INFOBAR_ERROR) prefix = "[x]";
-            this.setText(h, (prefix + " " + ib.title + ": " + ib.message).data());
+            string infoText = prefix + " " + ib.title + ": " + ib.message;
+            this.setText(h, infoText.data());
             // TODO: bind InfoBar.Severity, IsOpen, and CloseRequested when the projection is available.
+        }
+        else if (k == ELEM_DATEPICKER)
+        {
+            IDatePicker dp = node as IDatePicker;
+            string dateText = dp.year.toString() + "-" + dp.month.toString() + "-" + dp.day.toString();
+            this.setText(h, dateText.data());
+        }
+        else if (k == ELEM_EXPANDER)
+        {
+            IExpander ex = node as IExpander;
+            string expanderText = ex.expanded ? "v " : "> ";
+            expanderText = expanderText + ex.title;
+            this.setText(h, expanderText.data());
+            this.setBoolProp(h, PROP_ENABLED, !ex.disabled);
+        }
+        else if (k == ELEM_COLORWELL)
+        {
+            IColorWell cw = node as IColorWell;
+            this.setText(h, "Color".data());
+            this.setBoolProp(h, PROP_ENABLED, !cw.disabled);
         }
         else if (k == ELEM_POPOVER)
         {
@@ -4624,9 +4651,50 @@ string nativeRichTextPlain(string keyPath) { return ""; }
 string nativeWebViewUrl(string keyPath) { return ""; }
 
 string nativeControlClass(string keyPath) { return ""; }
+
+// Scripted modal answers (ui_test.cb): headless runs script every dialog up front, so the
+// unscripted fallbacks answer "canceled" instead of opening real UI on the XAML thread.
+list<int> _uiTestMessageBoxAnswers = default;
+list<string> _uiTestFolderAnswers = default;
+list<string> _uiTestFontFamilies = default;
+list<int> _uiTestFontSizes = default;
+
+void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
 void uiTestScriptColor(int r, int g, int b) { }
-void uiTestScriptFont(string family, int size) { }
-bool nativeChooseFont(FontChoice* out) { return false; }
+void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
+void uiTestScriptFont(string family, int size) { _uiTestFontFamilies.add("" + family); _uiTestFontSizes.add(size); }
+
+int nativeMessageBox(string title, string text, int kind)
+{
+    if (_uiTestMessageBoxAnswers.count() > 0)
+    {
+        int answer = _uiTestMessageBoxAnswers.get(0);
+        _uiTestMessageBoxAnswers.removeAt(0);
+        return answer;
+    }
+    return 0;
+}
+
+bool nativeChooseFont(FontChoice* out)
+{
+    if (_uiTestFontFamilies.count() > 0)
+    {
+        out.family = "" + _uiTestFontFamilies.get(0); out.size = _uiTestFontSizes.get(0);
+        _uiTestFontFamilies.removeAt(0); _uiTestFontSizes.removeAt(0); return true;
+    }
+    return false;
+}
+
+string nativeSelectFolder()
+{
+    if (_uiTestFolderAnswers.count() > 0)
+    {
+        string path = "" + _uiTestFolderAnswers.get(0);
+        _uiTestFolderAnswers.removeAt(0);
+        return path;
+    }
+    return "";
+}
 
 void nativeSegmentedSelect(string keyPath, int index)
 {
@@ -4722,12 +4790,14 @@ alias WinuiListRowVisual* _winuiListRealizedVisual(string keyPath, int row)
 }
 
 bool nativeListVisualExpected() { return true; }
+bool nativeRichTextExpected() { return false; }
 
 int nativeListRealizeRow(string keyPath, int row)
 {
     u64 h = _wCtx.nativeHandle(keyPath);
     WItemSource* src = _wHost._listLiveSrc(h);
     if (h == 0u || src == nullptr || row < 0 || row >= src.rowCount) return -1;
+    winuiForceLayout();
     void* itemsControl = wqi((void*)h, iidof(XamlItemsControl));
     void* items = nullptr;
     if (itemsControl != nullptr)
@@ -4938,7 +5008,7 @@ void nativeTabSelect(string keyPath, int idx)
     IElement e = winuiElem(keyPath);
     if (e == nullptr) return;
     ITabControl tc = e as ITabControl;
-    if (tc != nullptr) { tc.fireSelectTab(idx); pumpWinui(); }
+    if (tc != nullptr) { tc.fireSelectTab(idx); pumpWinui(); winuiForceLayout(); }
 }
 
 // -- Tree drivers (the item handle IS the live TreeViewNode) --------------------

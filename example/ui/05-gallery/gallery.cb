@@ -123,6 +123,9 @@ int win32HardeningSelfTest()
     s.test("tab ring + focus readback", (IUiTest t) =>
     {
         t.launch(new GalleryApp(), 60, 60);
+        // The Basics page only carries ~5 tab stops since the tabbed split; the Input
+        // page is the control-dense one, so walk the ring there.
+        nativeTabSelect("root/content/pages", 1);
         u64 firstH = nativeFocusFirstH();
         int stepCount = 0; bool closed = false;
         while (stepCount < 200)
@@ -150,8 +153,9 @@ int win32HardeningSelfTest()
         sizes.add(uiSize(60, 60));     // restore
         t.expectTrue("resize storm keeps layout sane",
             resizeStorm("root", sizes,
-                () => _exists("root/content/cardlist/list") && _exists("root/content/cardtree/tree")
-                    && _exists("root/content/cardstatus/status")));
+                () => _exists("root/content/pages")
+                    && _exists("root/content/pages/basics/scroll/page/cardbtn/btnrow/btn")
+                    && _exists("root/content/pages/basics/scroll/page/cardradio/rg/r0")));
     });
 
     // Two real windows prove that an opaque context keeps routing to its owning HWND
@@ -206,8 +210,10 @@ int win32HardeningSelfTest()
     {
         t.launch(new GalleryApp(), 60, 60);
         // The button sits inside the card's "btnrow" wrapper - its key path includes it.
-        string btnName = t.accessibleName("root/content/cardbtn/btnrow/btn");
-        string progName = t.accessibleName("root/content/cardprog/prog");
+        string btnName = t.accessibleName("root/content/pages/basics/scroll/page/cardbtn/btnrow/btn");
+        // The progress bar lives on the Input page; select it so the control is realized.
+        nativeTabSelect("root/content/pages", 1);
+        string progName = t.accessibleName("root/content/pages/input/scroll/page/cardprog/progressrow/prog");
         t.expectTrue("a11y names",
             strcmp(btnName.data(), "Click me") == 0 && strcmp(progName.data(), "download progress") == 0);
     });

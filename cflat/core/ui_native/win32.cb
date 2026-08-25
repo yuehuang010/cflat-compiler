@@ -130,19 +130,18 @@ const int PBS_MARQUEE    = 0x08;
 const int TBM_GETPOS     = 1024;   // WM_USER+0
 const int TBM_SETPOS     = 1029;   // WM_USER+5
 const int TBM_SETRANGE   = 1030;   // WM_USER+6
-const int UDM_SETBUDDY   = 105;    // WM_USER+1
-const int UDM_SETRANGE32 = 111;    // WM_USER+31
-const int UDM_SETPOS32   = 113;    // WM_USER+33
-const int UDM_GETPOS32   = 114;    // WM_USER+34
+const int UDM_SETBUDDY   = 1129;   // WM_USER+105
+const int UDM_SETRANGE32 = 1135;   // WM_USER+111
+const int UDM_SETPOS32   = 1137;   // WM_USER+113
+const int UDM_GETPOS32   = 1138;   // WM_USER+114
 const int UDN_DELTAPOS   = -722;   // UDN_FIRST-1
 const int DTM_GETSYSTEMTIME = 0x1001;
 const int DTM_SETSYSTEMTIME = 0x1002;
 const int DTN_DATETIMECHANGE = -759;
-const int EM_SETSEL = 0x00B1;
-const int EM_REPLACESEL = 0x00C2;
-const int EM_SETEVENTMASK = 0x0446;
-const int EM_SETCHARFORMAT = 0x0444;
-const int EM_GETEVENTMASK = 0x043D;
+// EM_SETSEL / EM_REPLACESEL come from the windows.h import above.
+const int EM_SETEVENTMASK = 0x0445;  // WM_USER+69
+const int EM_SETCHARFORMAT = 0x0444; // WM_USER+68
+const int EM_GETEVENTMASK = 0x043B;  // WM_USER+59
 const int SCF_SELECTION = 0x0001;
 const u32 ENM_CHANGE = 0x00000001u;
 const u32 CFM_BOLD = 0x00000001u;
@@ -152,8 +151,7 @@ const u32 CFM_COLOR = 0x40000000u;
 bool _richEditLoaded = false;
 void _ensureRichEdit() { if (!_richEditLoaded) { LoadLibraryA("Msftedit.dll"); _richEditLoaded = true; } }
 const u32 ICC_DATE_CLASSES = 0x00000100u;
-const u32 CC_RGBINIT = 0x00000001u;
-const u32 CC_FULLOPEN = 0x00000002u;
+// CC_RGBINIT / CC_FULLOPEN come from the windows.h import above.
 const int TB_BUTTONSTRUCTSIZE = 1054; // WM_USER+30
 const int TB_ADDBUTTONSA = 1028;      // WM_USER+4
 const int TB_DELETEBUTTON = 1046;     // WM_USER+22
@@ -165,6 +163,14 @@ const int BTNS_SEP = 1;
 const int BTNS_SHOWTEXT = 0x40;
 const int TBSTATE_ENABLED = 4;
 const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+// Scripted modal answers are host-owned so ui_test.cb stays platform-neutral.
+// Declared up here because they are consumed before the uiTestScript* helpers.
+list<int> _uiTestMessageBoxAnswers = default;
+list<int> _uiTestColorValues = default;
+list<string> _uiTestFolderAnswers = default;
+list<string> _uiTestFontFamilies = default;
+list<int> _uiTestFontSizes = default;
 
 struct TBBUTTONA
 {
@@ -625,7 +631,8 @@ bool nativeMappable(int kind)
         || kind == ELEM_TOGGLE || kind == ELEM_SEGMENTED
         || kind == ELEM_DATEPICKER || kind == ELEM_EXPANDER || kind == ELEM_COLORWELL
         || kind == ELEM_INFOBAR || kind == ELEM_POPOVER
-        || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_STATUSBAR
+        || kind == ELEM_BOX || kind == ELEM_TEXTAREA || kind == ELEM_RICHTEXT
+        || kind == ELEM_STATUSBAR
         || kind == ELEM_RADIO || kind == ELEM_COMBO || kind == ELEM_LIST
         || kind == ELEM_TABS || kind == ELEM_TREE
         || kind == ELEM_IMAGE || kind == ELEM_GROUPBOX || kind == ELEM_CANVAS;
@@ -2738,7 +2745,7 @@ class Window : INativeHost
                 while (i < kids.count())
                 {
                     IElement c = kids.get(i);
-                    this._applyNode(c, joinKeyPath(path, keySegment(c, i)), ctx, keys, fx, fy, fw, fh);
+                    this._applyNode(c, joinKeyPath(path, keySegment(c, i)), ctx, keys, handles, fx, fy, fw, fh);
                     i++;
                 }
             }
@@ -3369,7 +3376,8 @@ class Window : INativeHost
         }
         else if (k == ELEM_LINK)
         {
-            ILink l = node as ILink; this.setText(h, ("<a>" + l.text + "</a>").data()); this.setBoolProp(h, PROP_ENABLED, !l.disabled);
+            ILink l = node as ILink; string linkText = "<a>" + l.text + "</a>";
+            this.setText(h, linkText.data()); this.setBoolProp(h, PROP_ENABLED, !l.disabled);
         }
         else if (k == ELEM_TOOLBAR)
         {
@@ -3426,7 +3434,8 @@ class Window : INativeHost
         else if (k == ELEM_EXPANDER)
         {
             IExpander ex = node as IExpander;
-            string title = (ex.expanded ? "v " : "> ") + ex.title;
+            string title = ex.expanded ? "v " : "> ";
+            title = title + ex.title;
             this.setText(h, title.data()); this.setBoolProp(h, PROP_CHECKED, ex.expanded);
             this.setBoolProp(h, PROP_ENABLED, !ex.disabled);
         }
@@ -4941,8 +4950,8 @@ void routeColorWell(void* ctrl)
     else
     {
         u32[16] custom = default; _ChooseColorWArgs cc = default;
-        cc.lStructSize = (u32)sizeof(_ChooseColorWArgs); cc.hwndOwner = wnd.hwnd;
-        cc.rgbResult = (u32)colorRaw((cw.value)); cc.lpCustColors = &custom[0]; cc.Flags = CC_RGBINIT | CC_FULLOPEN;
+        cc.lStructSize = (u32)sizeof(_ChooseColorWArgs); cc.hwndOwner = curWin().hwnd;
+        cc.rgbResult = (u32)colorRaw(cw.value); cc.lpCustColors = &custom[0]; cc.Flags = CC_RGBINIT | CC_FULLOPEN;
         if (ChooseColorW(&cc) == 0) return;
         raw = cc.rgbResult;
     }
@@ -5691,13 +5700,6 @@ string nativeSaveFile()
     return "" + path;   // owned copy (path is a stack buffer)
 }
 
-// Scripted modal answers are host-owned so ui_test.cb stays platform-neutral.
-list<int> _uiTestMessageBoxAnswers = default;
-list<int> _uiTestColorValues = default;
-list<string> _uiTestFolderAnswers = default;
-list<string> _uiTestFontFamilies = default;
-list<int> _uiTestFontSizes = default;
-
 void uiTestScriptMessageBox(int answer) { _uiTestMessageBoxAnswers.add(answer); }
 void uiTestScriptColor(int r, int g, int b) { _uiTestColorValues.add((r << 16) | (g << 8) | b); }
 void uiTestScriptFolder(string path) { _uiTestFolderAnswers.add("" + path); }
@@ -6424,6 +6426,7 @@ int nativeListCellColor(string keyPath, int row, int col)
 }
 
 bool nativeListVisualExpected() { return false; }
+bool nativeRichTextExpected() { return true; }
 bool nativeListVisualTeardownClean() { return true; }
 bool nativeListHeaderAttached(string keyPath) { return false; }
 bool nativeListInvokeHeader(string keyPath, int column) { return false; }

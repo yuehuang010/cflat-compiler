@@ -7,6 +7,7 @@ import "appsample.cb";
 import "dictionary.cb";
 import "list.cb";
 import "string.cb";
+import "ui_native.cb";
 
 // sys/sysctl.h, mach/mach_host.h, mach/vm_statistics.h and libproc.h.
 extern i32 sysctlbyname(const char* name, void* oldp, u64* oldlenp,
