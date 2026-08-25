@@ -3843,7 +3843,8 @@ int createAppWindow(IComponent app, const char* title, bool show)
     curWin().ctx.bindPost((u64)curWin().target, _cocoaPostEnqueue);
     curWin().ctx.bindThreadId(_cocoaCurTid(), _cocoaCurTid);
     curWin().ctx.bindWindowOps((u64)curWin().target, _cocoaSetContentSize, _cocoaSetTopmost,
-                               _cocoaSystemPrefersDark, _cocoaStartTimer, _cocoaCancelTimer);
+                               _cocoaSystemPrefersDark, _cocoaStartTimer, _cocoaCancelTimer,
+                               false, _uiNoLiveWindowSize, _uiNoLiveWindowTopmost);
 
     buildMenuBar();   // app-wide, built once
 

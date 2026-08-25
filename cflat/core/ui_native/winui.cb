@@ -4008,7 +4008,8 @@ void winuiInitFramework()
     _wCtx.bindPost((u64)0, _winuiPostEnqueue);
     _wCtx.bindThreadId(_winuiCurTid(), _winuiCurTid);
     _wCtx.bindWindowOps((u64)0, _winuiSetContentSize, _winuiSetTopmost,
-                        _winuiSystemPrefersDark, _winuiStartTimer, _winuiCancelTimer);
+                        _winuiSystemPrefersDark, _winuiStartTimer, _winuiCancelTimer,
+                        false, _uiNoLiveWindowSize, _uiNoLiveWindowTopmost);
 }
 
 // Adopt the live window's client size as the layout extent (in CELLS) and relayout. This is the

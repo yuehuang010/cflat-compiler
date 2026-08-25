@@ -496,6 +496,10 @@ struct Style
     int padding = 0;
     int width = 0;
     int height = 0;
+    int minWidth = 0;              // minimum width in cells; 0 = unset
+    int maxWidth = 0;              // maximum width in cells; 0 = unset
+    int minHeight = 0;             // minimum height in cells; 0 = unset
+    int maxHeight = 0;             // maximum height in cells; 0 = unset
     int flexDirection = 0;       // DIR_COLUMN (0) | DIR_ROW (1)
     Color color = default;       // foreground (text / border)
     Color backgroundColor = default; // fill
@@ -518,6 +522,12 @@ and the left-to-right remainder handout sum without overlap. `style.width` or
 existing direct widget `width`/`height` field remains the compatibility fallback.
 Intrinsic sizing is preserved when flex is zero and on an unbounded scroll axis.
 The same rules feed native `nodeBounds()` and canvas/TUI/headless painting.
+
+`style.minWidth` / `style.maxWidth` and `style.minHeight` / `style.maxHeight` are
+per-axis bounds in cells; 0 means unset. They are applied after intrinsic sizing,
+explicit dimensions, exact-axis assignments, and flex distribution, so clamps win
+over both flex and explicit sizes. When both sides are set but inverted, the minimum
+is applied first and the maximum second, so the maximum wins as in CSS.
 
 Use `colorLiteral(value)` for explicit colors, including `colorLiteral(0)` for
 literal black. `colorUnset()` is the only unset value; the tagged `Color` value
@@ -797,6 +807,9 @@ interface IUiContext
     void bindThreadId(u64 uiTid, function<u64()> tidFn);
     void setContentSize(int width, int height); // request client size in layout cells
     void setTopmost(bool topmost);              // keep this context's window above normal windows
+    int requestedWidth();                        // current/requested client width in layout cells
+    int requestedHeight();                       // current/requested client height in layout cells
+    bool requestedTopmost();                     // current/requested window z-order state
     bool systemPrefersDark();                   // current OS preference, not ctx.theme/hostDark()
     u64 after(int milliseconds, Lambda<void()> work); // one-shot UI-thread callback; 0 is invalid
     u64 every(int milliseconds, Lambda<void()> work);  // repeating UI-thread callback
@@ -818,6 +831,10 @@ pointer's data word IS that instance's address, nothing is copied and nothing is
 
 **Window operations and timers.** `setContentSize` takes layout-cell dimensions and
 routes to the context's current window. `setTopmost` changes only that window's z-order.
+`requestedWidth()` and `requestedHeight()` return the current live client size in layout
+cells on Win32, or the last requested size when the host has no live query. If the native
+window is not available, they also return the recorded request. `requestedTopmost()` uses
+the live window state on Win32 and the recorded request on hosts without a live query.
 `systemPrefersDark` reads the OS preference independently from `hostDark()`, which remains
 the last framework theme applied to the window. On Windows this is the per-user
 `AppsUseLightTheme` preference (with a system-color fallback for unavailable settings or

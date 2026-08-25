@@ -141,6 +141,18 @@ const int TTS_ALWAYSTIP      = 0x0001;
 // Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
 const int WM_APP_CALL = 0x8001;
 
+// Undocumented UAH menu owner-draw messages and their raw structure fields.
+const int WM_UAHDRAWMENU     = 0x0091;
+const int WM_UAHDRAWMENUITEM = 0x0092;
+const u32 _UAH_OBJID_MENU    = 0xFFFFFFFDu;
+const u32 _UAH_MIIM_STRING   = 0x0040u;
+const u32 _UAH_DT_HIDEPREFIX = 0x00100000u;
+const u32 _UAH_ODS_HOTLIGHT  = 0x0040u;
+const u32 _UAH_ODS_SELECTED  = 0x0001u;
+const u32 _UAH_ODS_GRAYED    = 0x0002u;
+const u32 _UAH_ODS_DISABLED  = 0x0004u;
+const u32 _UAH_ODS_NOACCEL   = 0x0100u;
+
 // -- ListView (WC_LISTVIEW) messages / styles / notify codes -------------------
 // The commctrl LV* constants are not surfaced by the windows.h binding (CB_* and
 // NMHDR are), so they are declared by hand. LVM_FIRST = 0x1000, LVN_FIRST = -100.
@@ -2988,6 +3000,7 @@ class Window : INativeHost
         {
             this._refreshTextInks();
             this._applyStatusTheme();
+            DrawMenuBar(this.hwnd);
             RedrawWindow(this.hwnd, nullptr, nullptr,
                          (u32)(RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN));
         }
@@ -3896,6 +3909,28 @@ u64 _win32TimerSerial = 1u;
 int _win32WindowForTarget(u64 target)
 {
     return findWindowIdx(u2h(target));
+}
+
+Size _win32LiveContentSize(u64 target)
+{
+    Size result = default;
+    int wi = _win32WindowForTarget(target);
+    if (wi < 0) return result;
+    _cur = wi;
+    Window* wnd = curWin();
+    if (wnd.clientPxW <= 0 || wnd.clientPxH <= 0) return result;
+    result.w = wnd.w; result.h = wnd.h;
+    return result;
+}
+
+bool _win32LiveTopmost(u64 target)
+{
+    int wi = _win32WindowForTarget(target);
+    if (wi < 0) return false;
+    _cur = wi;
+    Window* wnd = curWin();
+    i64 ex = GetWindowLongPtrA(wnd.hwnd, (int)GWL_EXSTYLE);
+    return (ex & (i64)WS_EX_TOPMOST) != 0;
 }
 
 void _win32SetContentSize(u64 target, int w, int h)
@@ -5588,6 +5623,105 @@ void nativeResizeClient(int wCells, int hCells)
 
 // LRESULT CALLBACK shared by all windows. Resolves the servicing window by scanning
 // the (small) registry for its HWND and sets `_cur` so app handlers reach it.
+// Read MENUBARINFO into raw x64 storage and map rcBar from screen to window space.
+bool _menuBarRect(void* hwnd, RECT* out)
+{
+    char[48] raw = default;
+    char* p = (char*)raw;
+    u32* cbPtr = (u32*)p;
+    cbPtr[0] = 48u;   // sizeof(MENUBARINFO) on x64: 4 + RECT + pad + HMENU + HWND + flags
+    if (GetMenuBarInfo(hwnd, _UAH_OBJID_MENU, 0u, (void*)p) == 0) return false;
+
+    RECT wr = default;
+    GetWindowRect(hwnd, &wr);
+    i32* rcPtr = (i32*)(p + 4);
+    out.left = rcPtr[0] - wr.left;
+    out.top = rcPtr[1] - wr.top;
+    out.right = rcPtr[2] - wr.left;
+    out.bottom = rcPtr[3] - wr.top;
+    return true;
+}
+
+// Paint the UAH menu bar background for a themed window.
+i64 _drawUahMenu(Window* wnd, void* hwnd, i64 lParam)
+{
+    char* p = (char*)u2h((u64)lParam);
+    void** hdcPtr = (void**)(p + 8);
+    void* hdc = hdcPtr[0];
+    if (hdc == nullptr || GetMenu(hwnd) == nullptr) return (i64)0;
+
+    RECT rc = default;
+    if (!_menuBarRect(hwnd, &rc)) return (i64)0;
+    FillRect(hdc, &rc, wnd._brushFor(wnd.themeBg));
+    return (i64)0;
+}
+
+// Paint one UAH top-level menu item from the raw DRAWITEMSTRUCT/UAHMENUITEM data.
+i64 _drawUahMenuItem(Window* wnd, void* hwnd, i64 lParam)
+{
+    char* p = (char*)u2h((u64)lParam);
+    void** hdcPtr = (void**)(p + 32);
+    void* hdc = hdcPtr[0];
+    i32* rcPtr = (i32*)(p + 40);
+    u32* statePtr = (u32*)(p + 16);
+    void** menuPtr = (void**)(p + 64);
+    i32* posPtr = (i32*)(p + 88);
+    if (hdc == nullptr || menuPtr[0] == nullptr) return (i64)0;
+
+    RECT rc = default;
+    rc.left = rcPtr[0]; rc.top = rcPtr[1]; rc.right = rcPtr[2]; rc.bottom = rcPtr[3];
+    u32 state = statePtr[0];
+    u32 fill = wnd.themeBg;
+    if ((state & _UAH_ODS_SELECTED) != 0u)
+        fill = shadeRef(wnd.themeBg, wnd.dark ? 40 : 0 - 24);
+    else if ((state & _UAH_ODS_HOTLIGHT) != 0u)
+        fill = shadeRef(wnd.themeBg, wnd.dark ? 26 : 0 - 14);
+    FillRect(hdc, &rc, wnd._brushFor(fill));
+
+    char[256] label = default;
+    char[80] mii = default;
+    char* miiPtr = (char*)mii;
+    u32* miiHead = (u32*)miiPtr;
+    miiHead[0] = 80u;
+    miiHead[1] = _UAH_MIIM_STRING;
+    void** textPtr = (void**)(miiPtr + 56);   // MENUITEMINFOA.dwTypeData (x64)
+    textPtr[0] = (void*)label;
+    u32* cchPtr = (u32*)(miiPtr + 64);        // MENUITEMINFOA.cch (x64)
+    cchPtr[0] = 256u;
+    if (GetMenuItemInfoA(menuPtr[0], (u32)posPtr[0], 1, (void*)miiPtr) == 0)
+        return (i64)0;
+
+    u32 ink = wnd.themeText;
+    if ((state & (_UAH_ODS_GRAYED | _UAH_ODS_DISABLED)) != 0u)
+        ink = shadeRef(wnd.themeText, wnd.dark ? 0 - 90 : 96);
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, ink);
+    u32 drawFlags = (u32)(DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    if ((state & _UAH_ODS_NOACCEL) != 0u) drawFlags = drawFlags | _UAH_DT_HIDEPREFIX;
+    DrawTextA(hdc, label, -1, &rc, drawFlags);
+    return (i64)0;
+}
+
+// Let the system paint non-client chrome, then replace the menu underline for themed windows.
+i64 _paintThemedMenuUnderline(Window* wnd, void* hwnd, u32 msg, u64 wParam, i64 lParam)
+{
+    i64 result = DefWindowProcA(hwnd, msg, wParam, lParam);
+    if (GetMenu(hwnd) == nullptr) return result;
+
+    RECT bar = default;
+    if (!_menuBarRect(hwnd, &bar)) return result;
+    void* dc = GetWindowDC(hwnd);
+    if (dc == nullptr) return result;
+
+    RECT line = default;
+    line.left = bar.left;
+    line.top = bar.bottom;
+    line.right = bar.right;
+    line.bottom = line.top + 1;
+    FillRect(dc, &line, wnd._brushFor(wnd.themeBg));
+    ReleaseDC(hwnd, dc);
+    return result;
+}
 stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
 {
     int wi = findWindowIdx(hwnd);
@@ -5658,6 +5792,13 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
         }
         return (i64)0;
     }
+
+    if (msg == WM_UAHDRAWMENU && wnd.themed && lParam != (i64)0)
+        return _drawUahMenu(wnd, hwnd, lParam);
+    if (msg == WM_UAHDRAWMENUITEM && wnd.themed && lParam != (i64)0)
+        return _drawUahMenuItem(wnd, hwnd, lParam);
+    if ((msg == WM_NCPAINT || msg == WM_NCACTIVATE) && wnd.themed)
+        return _paintThemedMenuUnderline(wnd, hwnd, msg, wParam, lParam);
 
     // An owner-drawn status bar pane / tab item: the control hands its drawing to the parent,
     // which is how a common control (it ignores WM_CTLCOLOR*) gets the theme's colors.
@@ -6021,7 +6162,8 @@ int createAppWindow(IComponent app, const char* title, bool show)
     wnd.ctx.bindPost((u64)hwnd, _win32PostEnqueue);
     wnd.ctx.bindThreadId(_win32CurTid(), _win32CurTid);
     wnd.ctx.bindWindowOps((u64)hwnd, _win32SetContentSize, _win32SetTopmost,
-                          _win32SystemPrefersDark, _win32StartTimer, _win32CancelTimer);
+                          _win32SystemPrefersDark, _win32StartTimer, _win32CancelTimer,
+                          true, _win32LiveContentSize, _win32LiveTopmost);
 
     buildMenuBar(hwnd);
     if (show)

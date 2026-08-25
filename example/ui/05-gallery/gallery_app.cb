@@ -1124,6 +1124,32 @@ int gallerySelfTest()
             && flexDemoB.w > 0 && flexDemoB.h > 0
             && flexTwoB.w > 0 && flexOneB.w > 0);
 
+        // 30b. Per-axis clamps survive an exact zero flex share and cap an explicit size.
+        IView clampRow = row(makeStyle(0, 4, 0));
+        IText clampLabel = text("fixed");
+        clampLabel.style.width = 12;
+        IButton clampButton = button("keep", () => { });
+        clampButton.style.flex = 1;
+        clampButton.style.minWidth = 3;
+        clampButton.style.minHeight = 2;
+        clampRow.add(clampLabel);
+        clampRow.add(clampButton);
+        LayoutConstraints clampC = default;
+        clampC.availW = 4; clampC.availH = 4;
+        clampRow.layout(clampC);
+        Rect clampedButtonB = clampButton.nodeBounds();
+        t.expectTrue("min clamps keep a zero-share flex control alive",
+            clampedButtonB.w == 3 && clampedButtonB.h == 2);
+        deleteTree(clampRow);
+
+        IText maxText = text("wide");
+        maxText.style.width = 8; maxText.style.height = 5;
+        maxText.style.maxWidth = 3; maxText.style.maxHeight = 2;
+        maxText.layout(clampC);
+        Rect maxTextB = maxText.nodeBounds();
+        t.expectTrue("max clamps cap explicit dimensions",
+            maxTextB.w == 3 && maxTextB.h == 2);
+        delete maxText;
         // 31. The root ScrollView exists and its own bounds fill the whole window viewport
         //     (the framework-computed viewport rect, independent of native scroll clipping).
         // _exists() checks for a native HANDLE, and ScrollView (ELEM_SCROLL) is only
@@ -1189,8 +1215,23 @@ int gallerySelfTest()
 
         // 38. Context window operations and UI-thread timers use the active window's seam.
         IUiContext timerCtx = activeCtx();
+        UiContext headlessState = default;
+        IUiContext headlessCtx = &headlessState;
+        headlessCtx.setContentSize(17, 9);
+        headlessCtx.setTopmost(true);
+        t.expectTrue("headless context window state accessors",
+            headlessCtx.requestedWidth() == 17 && headlessCtx.requestedHeight() == 9
+            && headlessCtx.requestedTopmost());
         timerCtx.setContentSize(42, 24);
         timerCtx.setTopmost(true);
+        nativeResizeClient(37, 21);
+        bool liveSize = timerCtx.requestedWidth() == hostWidth()
+            && timerCtx.requestedHeight() == hostHeight();
+        bool requestedSize = timerCtx.requestedWidth() == 42
+            && timerCtx.requestedHeight() == 24;
+        t.expectTrue("live context window state accessors",
+            (liveSize || requestedSize) && timerCtx.requestedTopmost());
+        timerCtx.setContentSize(42, 24);
         timerCtx.setTopmost(false);
         bool appliedBeforePref = hostDark();
         bool pref = timerCtx.systemPrefersDark();

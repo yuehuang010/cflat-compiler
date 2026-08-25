@@ -120,6 +120,10 @@ struct Style
     int padding = 0;
     int width = 0;
     int height = 0;
+    int minWidth = 0;              // minimum width in cells; 0 = unset
+    int maxWidth = 0;              // maximum width in cells; 0 = unset
+    int minHeight = 0;             // minimum height in cells; 0 = unset
+    int maxHeight = 0;             // maximum height in cells; 0 = unset
     int flexDirection = 0;          // DIR_COLUMN | DIR_ROW
     Color color = default;           // foreground (text / border)
     Color backgroundColor = default; // fill
@@ -148,7 +152,9 @@ Style flexStyle(int flex)
 
 bool styleIsEmpty(Style s)
 {
-    return s.padding == 0 && s.width == 0 && s.height == 0 && s.flexDirection == 0
+    return s.padding == 0 && s.width == 0 && s.height == 0
+        && s.minWidth == 0 && s.maxWidth == 0 && s.minHeight == 0 && s.maxHeight == 0
+        && s.flexDirection == 0
         && !colorIsSet(s.color) && !colorIsSet(s.backgroundColor) && s.gap == 0 && s.flex == 0
         && s.flexWrap == 0;
 }
@@ -157,6 +163,8 @@ bool styleEquals(Style a, Style b)
 {
     return a.padding == b.padding && a.width == b.width
         && a.height == b.height && a.flexDirection == b.flexDirection
+        && a.minWidth == b.minWidth && a.maxWidth == b.maxWidth
+        && a.minHeight == b.minHeight && a.maxHeight == b.maxHeight
         && a.color.kind == b.color.kind && a.color.value == b.color.value
         && a.backgroundColor.kind == b.backgroundColor.kind
         && a.backgroundColor.value == b.backgroundColor.value
@@ -168,6 +176,10 @@ string styleToJson(Style s)
     return "{\"padding\":" + s.padding.toString()
          + ",\"width\":" + s.width.toString()
          + ",\"height\":" + s.height.toString()
+         + (s.minWidth != 0 ? ",\"minWidth\":" + s.minWidth.toString() : "")
+         + (s.maxWidth != 0 ? ",\"maxWidth\":" + s.maxWidth.toString() : "")
+         + (s.minHeight != 0 ? ",\"minHeight\":" + s.minHeight.toString() : "")
+         + (s.maxHeight != 0 ? ",\"maxHeight\":" + s.maxHeight.toString() : "")
          + ",\"flexDirection\":" + s.flexDirection.toString()
          + ",\"color\":" + colorRaw(s.color).toString()
          + (s.color.kind != COLOR_UNSET ? ",\"colorKind\":" + s.color.kind.toString() : "")
@@ -193,6 +205,15 @@ struct Rect
     }
 };
 
+// Clamp the final layout bounds. Apply min first, then max when inverted.
+Rect clampBounds(Rect b, Style style)
+{
+    if (style.minWidth > 0 && b.w < style.minWidth) b.w = style.minWidth;
+    if (style.maxWidth > 0 && b.w > style.maxWidth) b.w = style.maxWidth;
+    if (style.minHeight > 0 && b.h < style.minHeight) b.h = style.minHeight;
+    if (style.maxHeight > 0 && b.h > style.maxHeight) b.h = style.maxHeight;
+    return b;
+}
 // Intersection of two rects (empty - zero w/h - if they do not overlap). Drives
 // the ICanvas clip stack so a ScrollView only paints inside its viewport.
 Rect intersectRect(Rect a, Rect b)
@@ -960,6 +981,9 @@ interface IUiContext
     void bindThreadId(u64 uiTid, function<u64()> tidFn);
     void setContentSize(int w, int h);
     void setTopmost(bool topmost);
+    int requestedWidth();
+    int requestedHeight();
+    bool requestedTopmost();
     bool systemPrefersDark();
     u64 after(int ms, Lambda<void()> work);
     u64 every(int ms, Lambda<void()> work);
@@ -967,6 +991,14 @@ interface IUiContext
     void post(Lambda<void()> work);
     void assertUiThread();
 };
+
+Size _uiNoLiveWindowSize(u64 target)
+{
+    Size result = default;
+    return result;
+}
+
+bool _uiNoLiveWindowTopmost(u64 target) { return false; }
 
 class UiContext : IUiContext
 {
@@ -1001,10 +1033,13 @@ class UiContext : IUiContext
     function<bool(u64)> systemDarkHook = default;
     function<u64(u64, int, bool, u64)> timerStartHook = default;
     function<void(u64, u64)> timerCancelHook = default;
+    function<Size(u64)> liveSizeHook = default;
+    function<bool(u64)> liveTopmostHook = default;
     bool hasWindowOps = false;
-    int requestedWidth = 0;
-    int requestedHeight = 0;
-    bool requestedTopmost = false;
+    bool hasLiveWindowQueries = false;
+    int requestedWidthValue = 0;
+    int requestedHeightValue = 0;
+    bool requestedTopmostValue = false;
 
     void invalidate() { this.dirty = true; }
 
@@ -1023,7 +1058,10 @@ class UiContext : IUiContext
                        function<void(u64, bool)> topmostHook,
                        function<bool(u64)> systemDarkHook,
                        function<u64(u64, int, bool, u64)> timerStartHook,
-                       function<void(u64, u64)> timerCancelHook)
+                       function<void(u64, u64)> timerCancelHook,
+                       bool hasLiveWindowQueries,
+                       function<Size(u64)> liveSizeHook,
+                       function<bool(u64)> liveTopmostHook)
     {
         this.windowTarget = target;
         this.sizeHook = sizeHook;
@@ -1031,20 +1069,49 @@ class UiContext : IUiContext
         this.systemDarkHook = systemDarkHook;
         this.timerStartHook = timerStartHook;
         this.timerCancelHook = timerCancelHook;
+        this.hasLiveWindowQueries = hasLiveWindowQueries;
+        this.liveSizeHook = liveSizeHook;
+        this.liveTopmostHook = liveTopmostHook;
         this.hasWindowOps = true;
     }
 
     void setContentSize(int w, int h)
     {
         if (w < 1 || h < 1) return;
-        this.requestedWidth = w; this.requestedHeight = h;
+        this.requestedWidthValue = w; this.requestedHeightValue = h;
         if (this.hasWindowOps) this.sizeHook(this.windowTarget, w, h);
     }
 
     void setTopmost(bool topmost)
     {
-        this.requestedTopmost = topmost;
+        this.requestedTopmostValue = topmost;
         if (this.hasWindowOps) this.topmostHook(this.windowTarget, topmost);
+    }
+
+    int requestedWidth()
+    {
+        if (this.hasLiveWindowQueries)
+        {
+            Size live = this.liveSizeHook(this.windowTarget);
+            if (live.w > 0 && live.h > 0) return live.w;
+        }
+        return this.requestedWidthValue;
+    }
+
+    int requestedHeight()
+    {
+        if (this.hasLiveWindowQueries)
+        {
+            Size live = this.liveSizeHook(this.windowTarget);
+            if (live.w > 0 && live.h > 0) return live.h;
+        }
+        return this.requestedHeightValue;
+    }
+
+    bool requestedTopmost()
+    {
+        if (this.hasLiveWindowQueries) return this.liveTopmostHook(this.windowTarget);
+        return this.requestedTopmostValue;
     }
 
     bool systemPrefersDark()
@@ -1956,8 +2023,9 @@ class View : IView
         if (c.exactH && this.style.height == 0) sz.h = c.availH;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = sz.w; b.h = sz.h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
-        return sz;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2093,8 +2161,9 @@ class Grid : IGrid
             Rect emptyBounds = default;
             emptyBounds.x = c.x; emptyBounds.y = c.y;
             emptyBounds.w = sz.w; emptyBounds.h = sz.h;
+            emptyBounds = clampBounds(emptyBounds, this.style);
             this.bounds = emptyBounds;
-            return sz;
+            sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
         }
 
         // Probe every child once to measure the intrinsic width of its column.
@@ -2297,8 +2366,9 @@ class Grid : IGrid
         sz.h = 2 * pad + totalH + gapSumH;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = sz.w; b.h = sz.h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
-        return sz;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2410,9 +2480,10 @@ class Text : IText
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // The canvas/TUI backends draw a single fixed cell font, so this.font is a
@@ -2484,9 +2555,10 @@ class Button : IButton
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2598,8 +2670,6 @@ class Box : IBox
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
-        this.bounds = b;
-
         int inset = 1 + this.style.padding;
         int cy = c.y + inset;
         int gi = 0;
@@ -2620,11 +2690,14 @@ class Box : IBox
         if (gi > 0)
         {
             int needH = (cy - c.y) + inset;
-            if (needH > h) { h = needH; this.bounds.h = h; }
+            if (needH > h) { h = needH; b.h = h; }
         }
 
-        Size sz = default; sz.w = w; sz.h = h;
-        return sz;
+        b.h = h;
+        b = clampBounds(b, this.style);
+        this.bounds = b;
+        Size sz = default; sz.w = b.w; sz.h = b.h;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2733,9 +2806,10 @@ class TextInput : ITextInput
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2856,9 +2930,10 @@ class Checkbox : ICheckbox
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -2950,9 +3025,10 @@ class ProgressBar : IProgressBar
         if (c.exactH) h = c.availH;
         if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3033,9 +3109,10 @@ class Slider : ISlider
         if (c.exactH) h = c.availH;
         if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3148,9 +3225,10 @@ class TextArea : ITextArea
         if (this.style.height > 0) h = this.style.height;
         if (h < 2 && !c.exactH) h = 2;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // ICanvas fallback: draw the pushed text, one grid row per '\n'-delimited line,
@@ -3258,9 +3336,10 @@ class StatusBar : IStatusBar
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // ICanvas fallback: the panes joined by " | " on the strip's row.
@@ -3361,8 +3440,6 @@ class ScrollView : IScrollView
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = w; b.h = h;
-        this.bounds = b;
-
         int top = c.y - this.scrollY;
         int cy = top;
         for (IElement child in this.children)
@@ -3378,8 +3455,11 @@ class ScrollView : IScrollView
         }
         this.contentH = cy - top;
 
-        Size sz = default; sz.w = w; sz.h = h;
-        return sz;
+        b.h = h;
+        b = clampBounds(b, this.style);
+        this.bounds = b;
+        Size sz = default; sz.w = b.w; sz.h = b.h;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3632,9 +3712,10 @@ class RadioButton : IRadioButton
         b.h = 1;
         if (c.exactH) b.h = c.availH;
         if (this.style.height > 0) b.h = this.style.height;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3733,9 +3814,10 @@ class RadioGroup : IRadioGroup
         if (this.style.height > 0) bh = this.style.height;
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size sz = default; sz.w = b.w; sz.h = b.h;
-        return sz;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3858,9 +3940,10 @@ class ComboBox : IComboBox
         if (c.exactH) h = c.availH;
         if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -3982,9 +4065,10 @@ class ListView : IListView
         if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // ICanvas fallback: header row + only the rows that fit (virtualization is visible
@@ -4295,9 +4379,10 @@ class GridView : IGridView
         }
 
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -4618,9 +4703,10 @@ class TabPane : ITabPane
         if (c.exactH) bh = c.availH;
         if (this.style.height > 0) bh = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = bw; b.h = bh;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = b.w; s.h = b.h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx) { for (IElement c in this.children) c.paint(cv, ctx); }
@@ -4708,7 +4794,6 @@ class TabControl : ITabControl
         if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
-        this.bounds = b;
         int hdr = 2;   // the tab header strip reserves two rows
         int i = 0;
         for (IElement child in this.children)
@@ -4726,8 +4811,11 @@ class TabControl : ITabControl
             child.layout(cc);
             i++;
         }
-        Size s = default; s.w = w; s.h = h;
-        return s;
+        b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = b.h;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -4855,9 +4943,10 @@ class TreeView : ITreeView
         if (this.style.height > 0) h = this.style.height;
         if (h < 3 && !c.exactH) h = 3;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -4964,7 +5053,6 @@ class SplitView : ISplitView
         if (c.exactH) h = c.availH;
         if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
-        this.bounds = b;
         int rt = this._clampRatio(this.ratio);
         if (this.vertical)
         {
@@ -5011,8 +5099,11 @@ class SplitView : ISplitView
                 this.children.get(1).layout(cc);
             }
         }
-        Size s = default; s.w = w; s.h = h;
-        return s;
+        b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
+        this.bounds = b;
+        Size s = default; s.w = b.w; s.h = b.h;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // Map a pointer position along the split axis to a ratio (clamped 5..95).
@@ -5280,9 +5371,10 @@ class Image : IImage
         if (this.style.height > 0) h = this.style.height;
         if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // ICanvas fallback: a bordered box with the alt text (a char grid has no bitmap).
@@ -5349,8 +5441,6 @@ class GroupBox : IGroupBox
         if (c.exactH) h = c.availH;
         if (this.style.height > 0) h = this.style.height;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
-        this.bounds = b;
-
         int inset = 1 + this.style.padding;
         int cy = c.y + inset;   // one row down for the caption + frame
         int gi = 0;
@@ -5369,10 +5459,13 @@ class GroupBox : IGroupBox
         if (gi > 0)
         {
             int needH = (cy - c.y) + inset;
-            if (needH > h) { h = needH; this.bounds.h = h; }
+            if (needH > h) { h = needH; b.h = h; }
         }
-        Size sz = default; sz.w = w; sz.h = h;
-        return sz;
+        b.h = h;
+        b = clampBounds(b, this.style);
+        this.bounds = b;
+        Size sz = default; sz.w = b.w; sz.h = b.h;
+        sz.w = this.bounds.w; sz.h = this.bounds.h; return sz;
     }
 
     void paint(ICanvas cv, IUiContext ctx)
@@ -5495,9 +5588,10 @@ class CanvasView : ICanvasView
         if (this.style.height > 0) h = this.style.height;
         if (h < 1 && !c.exactH) h = 1;
         Rect b = default; b.x = c.x; b.y = c.y; b.w = w; b.h = h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
         Size s = default; s.w = w; s.h = h;
-        return s;
+        s.w = this.bounds.w; s.h = this.bounds.h; return s;
     }
 
     // ICanvas fallback: the host IS a ICanvas, so delegate straight to the app's painter.
@@ -5820,7 +5914,9 @@ class ComponentElement : IElement
 
         Rect b = default;
         b.x = c.x; b.y = c.y; b.w = total.w; b.h = total.h;
+        b = clampBounds(b, this.style);
         this.bounds = b;
+        total.w = b.w; total.h = b.h;
         return total;
     }
 
