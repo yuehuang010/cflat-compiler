@@ -1,0 +1,1028 @@
+// mempressmonitor - Win32 ListView front-end over memcore.
+//
+// The C++ original drives an IDD_MAIN dialog template from a compiled .rc.
+// cflat embeds an application manifest (see `manifest` below) but has no
+// resource compiler for dialog templates, icons or VERSIONINFO, so the window
+// and its three controls are created directly here; behaviour is the same, and
+// the exe carries the stock application icon rather than app.ico.
+
+import { "windows.h", "commctrl.h", "uxtheme.h", "dwmapi.h", "shellapi.h", "shlobj.h" }
+    lib { "user32.lib", "gdi32.lib", "comctl32.lib", "uxtheme.lib", "dwmapi.lib",
+          "shell32.lib", "ole32.lib", "advapi32.lib" } cache;
+
+import "manifest.cb";
+import "appicon.cb";
+import "memcore/grouper.cb";
+import "memcore/pressure.cb";
+import "memcore/snapshot.cb";
+import "format.cb";
+import "dictionary.cb";
+import "list.cb";
+import "mutex.cb";
+import "string.cb";
+import "thread.cb";
+import "wstring.cb";
+
+// Embedded application manifest, matching src/gui/app.manifest: comctl32 v6 so
+// the ListView header and buttons are themed, and PerMonitorV2 DPI awareness.
+manifest ManifestDoc appManifest = { assembly = {
+    dependency = { { dependentAssembly = { assemblyIdentity = {
+        type = "win32", name = Manifest.commonControlsName,
+        version = Manifest.commonControlsVersion, processorArchitecture = "*",
+        publicKeyToken = Manifest.commonControlsToken, language = "*"
+    } } } },
+    application = { settings2016 = { dpiAwareness = DpiAwareness.PerMonitorV2 } }
+} };
+
+u32 kRefreshTimer   = 1;
+u32 kRefreshMessage = 0x8001;      // WM_APP + 1
+i32 kEndTaskId      = 1001;
+i32 kPinTopmostId   = 1002;
+i32 kExpandId       = 1003;
+i32 kAppListId      = 1004;
+
+// ---------------------------------------------------------------------------
+// Window state. The C++ version hangs this off the dialog's DWLP_USER slot; a
+// stdcall WndProc cannot capture, and with one window per process there is
+// nothing to distinguish, so it lives at file scope here instead. (Threading it
+// through GWLP_USERDATA is supported - see the EnumWindows context in
+// grouper.cb - and would be the way to run two of these windows at once.)
+// ---------------------------------------------------------------------------
+
+void* _window   = nullptr;
+void* _listView = nullptr;
+void* _endTask  = nullptr;
+void* _pinTopmost = nullptr;
+void* _expand   = nullptr;
+
+void* _stopEvent    = nullptr;
+void* _refreshEvent = nullptr;
+Thread _worker = default;
+bool _workerRunning = false;
+
+// Worker -> UI handoff. The worker fills these under _resultLock and posts
+// kRefreshMessage; the UI thread moves them out on the message.
+mutex _resultLock = default;
+list<AppEntry> _pendingApps = default;
+PressureScore _pendingPressure = default;
+bool _pendingReady = false;
+
+// Rows currently shown, in display order.
+list<AppEntry> _allApps = default;
+list<AppEntry> _apps = default;
+
+// Last rendered cell text per row, so a refresh only touches what changed
+// (the C++ version does the same to keep the ListView flicker-free).
+list<string> _renderedName = default;
+list<string> _renderedMemory = default;
+list<string> _renderedPressure = default;
+list<i32> _renderedImage = default;
+
+bool _dark = false;
+void* _backgroundBrush = nullptr;
+bool _ownsBackgroundBrush = false;
+i32 _sortColumn = 1;
+bool _sortAscending = false;
+bool _showAll = false;
+
+void* _controlFont = nullptr;
+void* _iconBig = nullptr;
+void* _iconSmall = nullptr;
+
+void* _imageList = nullptr;
+i32 _smallIconHeight = 0;
+i32 _fallbackImage = -1;
+dictionary<string, i32> _iconCache = default;
+
+// ---------------------------------------------------------------------------
+// Small Win32 helpers
+// ---------------------------------------------------------------------------
+
+i64 _send(void* window, u32 message, u64 wParam, i64 lParam)
+{
+    return SendMessageW(window, message, wParam, lParam);
+}
+
+i32 _scaleForDpi(i32 value, u32 dpi)
+{
+    return MulDiv(value, (i32)dpi, 96);
+}
+
+void _setControlText(void* control, string text)
+{
+    wstring wide = toWString(text);
+    SetWindowTextW(control, wide.data());
+}
+
+i32 _compareNames(string a, string b)
+{
+    return a.toLower().compare(b.toLower());
+}
+
+// ---------------------------------------------------------------------------
+// Theme
+// ---------------------------------------------------------------------------
+
+bool _isDarkTheme()
+{
+    void* key = nullptr;
+    wstring path = toWString("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize");
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path.data(), (u32)0, (u32)KEY_READ, &key) != ERROR_SUCCESS)
+        return false;
+    u32 value = 1;
+    u32 size = (u32)4;
+    u32 type = 0;
+    wstring name = toWString("AppsUseLightTheme");
+    i32 result = RegQueryValueExW(key, name.data(), nullptr, &type, (u8*)&value, &size);
+    RegCloseKey(key);
+    return result == ERROR_SUCCESS && type == (u32)REG_DWORD && value == (u32)0;
+}
+
+void _applyTitleBarTheme(void* window, bool dark)
+{
+    i32 enabled = dark ? 1 : 0;
+    // DWMWA_USE_IMMERSIVE_DARK_MODE, with the pre-20H1 attribute id as fallback.
+    if (DwmSetWindowAttribute(window, (u32)20, &enabled, (u32)4) != S_OK)
+        DwmSetWindowAttribute(window, (u32)19, &enabled, (u32)4);
+}
+
+void _setTheme(void* control, string theme)
+{
+    wstring wide = toWString(theme);
+    SetWindowTheme(control, wide.data(), nullptr);
+}
+
+u32 _rgb(u32 red, u32 green, u32 blue)
+{
+    return red | (green << 8) | (blue << 16);
+}
+
+void _applyTheme()
+{
+    _dark = _isDarkTheme();
+    if (_ownsBackgroundBrush && _backgroundBrush != nullptr) DeleteObject(_backgroundBrush);
+    _backgroundBrush = _dark ? CreateSolidBrush(_rgb((u32)32, (u32)32, (u32)32))
+                             : GetSysColorBrush((i32)COLOR_WINDOW);
+    _ownsBackgroundBrush = _dark;
+
+    _applyTitleBarTheme(_window, _dark);
+    string buttonTheme = _dark ? "DarkMode_Explorer" : "Explorer";
+    _setTheme(_endTask, buttonTheme);
+    _setTheme(_pinTopmost, buttonTheme);
+    _setTheme(_expand, buttonTheme);
+
+    u32 background = _dark ? _rgb((u32)32, (u32)32, (u32)32) : GetSysColor((i32)COLOR_WINDOW);
+    u32 text = _dark ? _rgb((u32)245, (u32)245, (u32)245) : GetSysColor((i32)COLOR_WINDOWTEXT);
+    _send(_listView, (u32)LVM_SETBKCOLOR, (u64)0, (i64)background);
+    _send(_listView, (u32)LVM_SETTEXTBKCOLOR, (u64)0, (i64)background);
+    _send(_listView, (u32)LVM_SETTEXTCOLOR, (u64)0, (i64)text);
+    _setTheme(_listView, buttonTheme);
+    void* header = (void*)_send(_listView, (u32)LVM_GETHEADER, (u64)0, (i64)0);
+    if (header != nullptr) _setTheme(header, _dark ? "DarkMode_ItemsView" : "ItemsView");
+    InvalidateRect(_listView, nullptr, 1);
+    InvalidateRect(_window, nullptr, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+
+// IDD_MAIN declares `FONT 9, "Segoe UI"` and the dialog manager pushes it onto
+// every control. Nothing does that for a plain window, so the font is built here
+// and set explicitly - otherwise the controls fall back to the 8pt system font.
+void _applyControlFont(u32 dpi)
+{
+    void* previous = _controlFont;
+    wstring face = toWString("Segoe UI");
+    _controlFont = CreateFontW(-MulDiv(9, (i32)dpi, 72), 0, 0, 0, (i32)FW_NORMAL, (u32)0, (u32)0,
+                               (u32)0, (u32)DEFAULT_CHARSET, (u32)OUT_DEFAULT_PRECIS,
+                               (u32)CLIP_DEFAULT_PRECIS, (u32)CLEARTYPE_QUALITY,
+                               (u32)DEFAULT_PITCH | (u32)FF_DONTCARE, face.data());
+    if (_controlFont == nullptr) { _controlFont = previous; return; }
+
+    _send(_listView, (u32)WM_SETFONT, (u64)_controlFont, (i64)1);
+    _send(_pinTopmost, (u32)WM_SETFONT, (u64)_controlFont, (i64)1);
+    _send(_expand, (u32)WM_SETFONT, (u64)_controlFont, (i64)1);
+    _send(_endTask, (u32)WM_SETFONT, (u64)_controlFont, (i64)1);
+    if (previous != nullptr) DeleteObject(previous);
+}
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
+
+// The .ico bytes are compiled in (cflat emits no RT_GROUP_ICON), so the icon
+// directory is walked here and the best-matching image turned into an HICON.
+void* _loadAppIcon(i32 wanted)
+{
+    if (kAppIconLength < 6) return nullptr;
+    i32 count = (i32)kAppIconData[4] | ((i32)kAppIconData[5] << 8);
+    i32 best = -1;
+    i32 bestDelta = 0;
+    i32 i = 0;
+    while (i < count)
+    {
+        i32 entry = 6 + i * 16;
+        if (entry + 16 > kAppIconLength) return nullptr;
+        i32 width = (i32)kAppIconData[entry];
+        if (width == 0) width = 256;
+        i32 delta = width >= wanted ? width - wanted : (wanted - width) * 2;
+        if (best < 0 || delta < bestDelta) { best = entry; bestDelta = delta; }
+        i = i + 1;
+    }
+    if (best < 0) return nullptr;
+
+    i32 size = (i32)kAppIconData[best + 8] | ((i32)kAppIconData[best + 9] << 8)
+             | ((i32)kAppIconData[best + 10] << 16) | ((i32)kAppIconData[best + 11] << 24);
+    i32 offset = (i32)kAppIconData[best + 12] | ((i32)kAppIconData[best + 13] << 8)
+               | ((i32)kAppIconData[best + 14] << 16) | ((i32)kAppIconData[best + 15] << 24);
+    if (offset < 0 || size <= 0 || offset + size > kAppIconLength) return nullptr;
+
+    // 0x00030000 is the icon resource version CreateIconFromResourceEx expects.
+    return CreateIconFromResourceEx(&kAppIconData[offset], (u32)size, 1, (u32)0x00030000,
+                                    wanted, wanted, (u32)LR_DEFAULTCOLOR);
+}
+
+void _applyWindowIcons(u32 dpi)
+{
+    void* previousBig = _iconBig;
+    void* previousSmall = _iconSmall;
+    _iconBig = _loadAppIcon(GetSystemMetricsForDpi((i32)SM_CXICON, dpi));
+    _iconSmall = _loadAppIcon(GetSystemMetricsForDpi((i32)SM_CXSMICON, dpi));
+    if (_iconBig != nullptr) _send(_window, (u32)WM_SETICON, (u64)ICON_BIG, (i64)_iconBig);
+    if (_iconSmall != nullptr) _send(_window, (u32)WM_SETICON, (u64)ICON_SMALL, (i64)_iconSmall);
+    if (previousBig != nullptr) DestroyIcon(previousBig);
+    if (previousSmall != nullptr) DestroyIcon(previousSmall);
+}
+
+void _destroyImageList()
+{
+    if (_imageList == nullptr) return;
+    void* previous = (void*)_send(_listView, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)0);
+    ImageList_Destroy(previous != nullptr ? previous : _imageList);
+    _imageList = nullptr;
+}
+
+void _createImageList(u32 dpi)
+{
+    _destroyImageList();
+    _iconCache.clear();
+    _fallbackImage = -1;
+
+    i32 cx = GetSystemMetricsForDpi((i32)SM_CXSMICON, dpi);
+    i32 cy = GetSystemMetricsForDpi((i32)SM_CYSMICON, dpi);
+    _smallIconHeight = cy;
+    _imageList = ImageList_Create(cx, cy, (u32)ILC_COLOR32 | (u32)ILC_MASK, 16, 16);
+    if (_imageList == nullptr) return;
+    _send(_listView, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)_imageList);
+
+    SHSTOCKICONINFO stockIcon = default;
+    stockIcon.cbSize = (u32)sizeof(SHSTOCKICONINFO);
+    if (SHGetStockIconInfo((i32)SIID_APPLICATION, (u32)SHGSI_ICON | (u32)SHGSI_SMALLICON,
+                           &stockIcon) == S_OK
+        && stockIcon.hIcon != nullptr)
+    {
+        _fallbackImage = ImageList_ReplaceIcon(_imageList, -1, stockIcon.hIcon);
+        DestroyIcon(stockIcon.hIcon);
+    }
+}
+
+i32 _imageForApp(string exePath)
+{
+    string cacheKey = exePath.toLower();
+    if (_iconCache.contains(cacheKey)) return _iconCache.get(cacheKey);
+
+    i32 image = _fallbackImage;
+    if (!exePath.isEmpty() && _imageList != nullptr)
+    {
+        wstring widePath = toWString(exePath);
+        void* icon = nullptr;
+        // LOWORD is the large-icon size, HIWORD the small one.
+        if (SHDefExtractIconW(widePath.data(), 0, (u32)0, nullptr, &icon,
+                              (u32)((u32)_smallIconHeight << 16)) == S_OK
+            && icon != nullptr)
+        {
+            i32 added = ImageList_ReplaceIcon(_imageList, -1, icon);
+            DestroyIcon(icon);
+            if (added >= 0) image = added;
+        }
+        else if (icon != nullptr)
+        {
+            DestroyIcon(icon);
+        }
+    }
+    _iconCache.set(cacheKey, image);
+    return image;
+}
+
+// ---------------------------------------------------------------------------
+// ListView plumbing
+// ---------------------------------------------------------------------------
+
+void _addColumn(i32 index, string title, i32 width, i32 format)
+{
+    wstring wideTitle = toWString(title);
+    LVCOLUMNW column = default;
+    column.mask = (u32)LVCF_TEXT | (u32)LVCF_WIDTH | (u32)LVCF_FMT;
+    column.pszText = wideTitle.data();
+    column.cx = width;
+    column.fmt = format;
+    _send(_listView, (u32)LVM_INSERTCOLUMNW, (u64)index, (i64)&column);
+}
+
+void _addColumns()
+{
+    u32 dpi = GetDpiForWindow(_listView);
+    _addColumn(0, "App", _scaleForDpi(360, dpi), (i32)LVCFMT_LEFT);
+    _addColumn(1, "Memory", _scaleForDpi(110, dpi), (i32)LVCFMT_CENTER);
+    _addColumn(2, "Pressure", _scaleForDpi(110, dpi), (i32)LVCFMT_CENTER);
+}
+
+i32 _columnWidth(i32 column)
+{
+    return (i32)_send(_listView, (u32)LVM_GETCOLUMNWIDTH, (u64)column, (i64)0);
+}
+
+i32 _itemCount()
+{
+    return (i32)_send(_listView, (u32)LVM_GETITEMCOUNT, (u64)0, (i64)0);
+}
+
+i32 _selectedItem()
+{
+    return (i32)_send(_listView, (u32)LVM_GETNEXTITEM, (u64)0xFFFFFFFFFFFFFFFF, (i64)LVNI_SELECTED);
+}
+
+void _setItemState(i32 index, u32 state, u32 mask)
+{
+    LVITEMW item = default;
+    item.state = state;
+    item.stateMask = mask;
+    _send(_listView, (u32)LVM_SETITEMSTATE, (u64)index, (i64)&item);
+}
+
+void _setItemText(i32 index, i32 column, string text)
+{
+    wstring wide = toWString(text);
+    LVITEMW item = default;
+    item.iSubItem = column;
+    item.pszText = wide.data();
+    _send(_listView, (u32)LVM_SETITEMTEXTW, (u64)index, (i64)&item);
+}
+
+void _setItemImage(i32 index, i32 image)
+{
+    LVITEMW item = default;
+    item.mask = (u32)LVIF_IMAGE;
+    item.iItem = index;
+    item.iImage = image;
+    _send(_listView, (u32)LVM_SETITEMW, (u64)0, (i64)&item);
+}
+
+void _insertItem(i32 index, string text, i32 image)
+{
+    wstring wide = toWString(text);
+    LVITEMW item = default;
+    item.mask = (u32)LVIF_TEXT | (u32)LVIF_PARAM | (u32)LVIF_IMAGE;
+    item.iItem = index;
+    item.lParam = (i64)index;
+    item.iImage = image;
+    item.pszText = wide.data();
+    _send(_listView, (u32)LVM_INSERTITEMW, (u64)0, (i64)&item);
+}
+
+void _updateSortArrows()
+{
+    void* header = (void*)_send(_listView, (u32)LVM_GETHEADER, (u64)0, (i64)0);
+    if (header == nullptr) return;
+    i32 column = 0;
+    while (column < 3)
+    {
+        HDITEMW item = default;
+        item.mask = (u32)HDI_FORMAT;
+        if (_send(header, (u32)HDM_GETITEMW, (u64)column, (i64)&item) != 0)
+        {
+            item.fmt = item.fmt & ~((i32)HDF_SORTUP | (i32)HDF_SORTDOWN);
+            if (column == _sortColumn)
+                item.fmt = item.fmt | (_sortAscending ? (i32)HDF_SORTUP : (i32)HDF_SORTDOWN);
+            _send(header, (u32)HDM_SETITEMW, (u64)column, (i64)&item);
+        }
+        column = column + 1;
+    }
+}
+
+void _updateEndTaskState()
+{
+    i32 selected = _selectedItem();
+    bool enabled = selected >= 0 && selected < _apps.count()
+                   && _apps.get(selected).key != kBackgroundAppKey;
+    EnableWindow(_endTask, enabled ? 1 : 0);
+}
+
+void _updateExpandButton()
+{
+    _setControlText(_expand, _showAll ? "Show top 6" : "Show all");
+}
+
+void _layoutControls()
+{
+    RECT client = default;
+    GetClientRect(_window, &client);
+    u32 dpi = GetDpiForWindow(_window);
+    i32 margin = _scaleForDpi(8, dpi);
+    i32 gap = _scaleForDpi(8, dpi);
+    i32 buttonWidth = _scaleForDpi(90, dpi);
+    i32 buttonHeight = _scaleForDpi(26, dpi);
+    i32 pinWidth = _scaleForDpi(130, dpi);
+    i32 buttonTop = client.bottom - margin - buttonHeight;
+
+    MoveWindow(_endTask, client.right - margin - buttonWidth, buttonTop,
+               buttonWidth, buttonHeight, 1);
+    MoveWindow(_pinTopmost, margin, buttonTop, pinWidth, buttonHeight, 1);
+    MoveWindow(_expand, margin + pinWidth + gap, buttonTop, buttonWidth, buttonHeight, 1);
+    MoveWindow(_listView, margin, margin, client.right - margin * 2,
+               buttonTop - gap - margin, 1);
+
+    RECT listClient = default;
+    GetClientRect(_listView, &listClient);
+    i32 fixedColumns = _columnWidth(1) + _columnWidth(2);
+    i32 nameWidth = listClient.right - fixedColumns;
+    i32 minimum = _scaleForDpi(120, dpi);
+    if (nameWidth < minimum) nameWidth = minimum;
+    _send(_listView, (u32)LVM_SETCOLUMNWIDTH, (u64)0, (i64)nameWidth);
+}
+
+// Replaces the visible rows, touching only the cells whose text actually changed.
+void _updateList(move list<AppEntry> apps)
+{
+    string selectedKey = default;
+    i32 oldSelected = _selectedItem();
+    if (oldSelected >= 0 && oldSelected < _apps.count())
+        selectedKey = _apps.get(oldSelected).key.copy();
+    if (oldSelected >= 0) _setItemState(oldSelected, (u32)0, (u32)LVIS_SELECTED | (u32)LVIS_FOCUSED);
+
+    _apps = move apps;
+    i32 oldCount = _itemCount();
+    i32 newCount = _apps.count();
+
+    list<string> names;
+    list<string> memories;
+    list<string> pressures;
+    list<i32> images;
+
+    i32 shared = oldCount < newCount ? oldCount : newCount;
+    i32 index = 0;
+    while (index < shared)
+    {
+        string name = _apps.get(index).displayName.copy();
+        string memory = formatMegabytes(_apps.get(index).workingSet);
+        string pressure = _apps.get(index).pressure.value.toString() + "%";
+        i32 image = _imageForApp(_apps.get(index).exePath);
+        bool isNew = index >= _renderedName.count();
+
+        LVITEMW item = default;
+        item.mask = (u32)LVIF_PARAM;
+        item.iItem = index;
+        item.lParam = (i64)index;
+        _send(_listView, (u32)LVM_SETITEMW, (u64)0, (i64)&item);
+
+        if (isNew || _renderedImage.get(index) != image) _setItemImage(index, image);
+        if (isNew || _renderedName.get(index) != name) _setItemText(index, 0, name);
+        if (isNew || _renderedMemory.get(index) != memory) _setItemText(index, 1, memory);
+        if (isNew || _renderedPressure.get(index) != pressure) _setItemText(index, 2, pressure);
+
+        names.add(move name);
+        memories.add(move memory);
+        pressures.add(move pressure);
+        images.add(image);
+        index = index + 1;
+    }
+
+    index = oldCount;
+    while (index < newCount)
+    {
+        string name = _apps.get(index).displayName.copy();
+        string memory = formatMegabytes(_apps.get(index).workingSet);
+        string pressure = _apps.get(index).pressure.value.toString() + "%";
+        i32 image = _imageForApp(_apps.get(index).exePath);
+        _insertItem(index, name, image);
+        _setItemText(index, 1, memory);
+        _setItemText(index, 2, pressure);
+        names.add(move name);
+        memories.add(move memory);
+        pressures.add(move pressure);
+        images.add(image);
+        index = index + 1;
+    }
+
+    index = oldCount - 1;
+    while (index >= newCount)
+    {
+        _send(_listView, (u32)LVM_DELETEITEM, (u64)index, (i64)0);
+        index = index - 1;
+    }
+
+    _renderedName = move names;
+    _renderedMemory = move memories;
+    _renderedPressure = move pressures;
+    _renderedImage = move images;
+
+    if (!selectedKey.isEmpty())
+    {
+        i32 i = 0;
+        while (i < _apps.count())
+        {
+            if (_apps.get(i).key == selectedKey)
+            {
+                _setItemState(i, (u32)LVIS_SELECTED | (u32)LVIS_FOCUSED,
+                              (u32)LVIS_SELECTED | (u32)LVIS_FOCUSED);
+                i = _apps.count();
+            }
+            else i = i + 1;
+        }
+    }
+    _updateEndTaskState();
+}
+
+// Top six real apps plus the catch-all OS row, unless the user expanded the list.
+move list<AppEntry> _visibleApps()
+{
+    list<AppEntry> visible;
+    i32 i = 0;
+    if (_showAll)
+    {
+        while (i < _allApps.count()) { visible.add(_allApps.get(i).copy()); i = i + 1; }
+        return move visible;
+    }
+    i32 shown = 0;
+    while (i < _allApps.count() && shown < 6)
+    {
+        if (_allApps.get(i).key != kBackgroundAppKey)
+        {
+            visible.add(_allApps.get(i).copy());
+            shown = shown + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < _allApps.count())
+    {
+        if (_allApps.get(i).key == kBackgroundAppKey)
+        {
+            visible.add(_allApps.get(i).copy());
+            i = _allApps.count();
+        }
+        else i = i + 1;
+    }
+    return move visible;
+}
+
+void _refreshVisibleList()
+{
+    _updateList(_visibleApps());
+}
+
+i32 _compareApps(AppEntry left, AppEntry right, i32 column)
+{
+    if (column == 1)
+    {
+        if (left.workingSet < right.workingSet) return -1;
+        return left.workingSet > right.workingSet ? 1 : 0;
+    }
+    if (column == 2) return left.pressure.value - right.pressure.value;
+    return _compareNames(left.displayName, right.displayName);
+}
+
+bool _sortOrder(AppEntry left, AppEntry right)
+{
+    bool leftBackground = left.key == kBackgroundAppKey;
+    bool rightBackground = right.key == kBackgroundAppKey;
+    if (leftBackground != rightBackground) return rightBackground;
+    i32 order = _compareApps(left, right, _sortColumn);
+    if (order != 0) return _sortAscending ? order < 0 : order > 0;
+    return _compareNames(left.displayName, right.displayName) < 0;
+}
+
+void _rebuildList(move list<AppEntry> apps)
+{
+    apps.sort(_sortOrder);
+    _allApps = move apps;
+    _refreshVisibleList();
+}
+
+// ---------------------------------------------------------------------------
+// Capture worker
+// ---------------------------------------------------------------------------
+
+i32 _captureOnWorker(void* context)
+{
+    MemPressEngine engine = default;
+    Snapshot snapshot = default;
+    while (true)
+    {
+        void*[2] events = {_stopEvent, _refreshEvent};
+        u32 result = WaitForMultipleObjects((u32)2, &events[0], 0, (u32)0xFFFFFFFF);
+        if (result != (u32)WAIT_OBJECT_0 + (u32)1) return 0;
+        ResetEvent(_refreshEvent);
+
+        string error = captureSnapshot(&snapshot);
+        if (error.isEmpty())
+        {
+            list<AppEntry> apps = engine.update(&snapshot, groupProcesses(&snapshot));
+            PressureScore pressure = engine.systemPressure();
+            _resultLock.acquire();
+            _pendingApps = move apps;
+            _pendingPressure = pressure;
+            _pendingReady = true;
+            _resultLock.release();
+        }
+        else
+        {
+            wstring message = toWString("MemPressMonitor capture failed: " + error + "\n");
+            OutputDebugStringW(message.data());
+        }
+        if (WaitForSingleObject(_stopEvent, (u32)0) == (u32)WAIT_OBJECT_0) return 0;
+        PostMessageW(_window, kRefreshMessage, (u64)0, (i64)0);
+    }
+    return 0;
+}
+
+bool _startWorker()
+{
+    _stopEvent = CreateEventW(nullptr, 1, 0, nullptr);
+    _refreshEvent = CreateEventW(nullptr, 1, 0, nullptr);
+    if (_stopEvent == nullptr || _refreshEvent == nullptr) return false;
+    if (!_worker.start(_captureOnWorker, nullptr, 0)) return false;
+    _workerRunning = true;
+    SetEvent(_refreshEvent);
+    return true;
+}
+
+void _stopWorker()
+{
+    KillTimer(_window, (u64)kRefreshTimer);
+    if (_stopEvent != nullptr) SetEvent(_stopEvent);
+    if (_workerRunning) _ = _worker.join();
+    _workerRunning = false;
+    if (_stopEvent != nullptr) CloseHandle(_stopEvent);
+    if (_refreshEvent != nullptr) CloseHandle(_refreshEvent);
+    _stopEvent = nullptr;
+    _refreshEvent = nullptr;
+}
+
+void _requestRefresh()
+{
+    if (_refreshEvent != nullptr) SetEvent(_refreshEvent);
+}
+
+void _endSelectedTask()
+{
+    i32 selected = _selectedItem();
+    if (selected < 0 || selected >= _apps.count()) return;
+    if (_apps.get(selected).key == kBackgroundAppKey) return;
+
+    string message = "End " + _apps.get(selected).displayName + "? This will terminate "
+                   + _apps.get(selected).processIds.count().toString() + " process(es).";
+    wstring wideMessage = toWString(message);
+    wstring title = toWString("MemPressMonitor");
+    if (MessageBoxW(_window, wideMessage.data(), title.data(),
+                    (u32)MB_YESNO | (u32)MB_ICONWARNING | (u32)MB_DEFBUTTON2) != IDYES)
+        return;
+
+    i32 i = 0;
+    while (i < _apps.get(selected).processIds.count())
+    {
+        void* process = OpenProcess((u32)PROCESS_TERMINATE, 0,
+                                    _apps.get(selected).processIds.get(i));
+        if (process != nullptr)
+        {
+            TerminateProcess(process, (u32)1);
+            CloseHandle(process);
+        }
+        i = i + 1;
+    }
+    _requestRefresh();
+}
+
+// ---------------------------------------------------------------------------
+// Custom draw
+// ---------------------------------------------------------------------------
+
+u32 _pressureColor(i32 band, bool dark)
+{
+    if (band == PressureBand.High)
+        return dark ? _rgb((u32)255, (u32)165, (u32)70) : _rgb((u32)200, (u32)100, (u32)0);
+    if (band == PressureBand.Critical)
+        return dark ? _rgb((u32)255, (u32)115, (u32)115) : _rgb((u32)175, (u32)0, (u32)0);
+    return dark ? _rgb((u32)110, (u32)220, (u32)125) : _rgb((u32)0, (u32)120, (u32)0);
+}
+
+// The ListView draws a 2px separator under each header divider; paint it out so
+// the rows read as one surface, exactly as the C++ version does.
+void _paintOverColumnSeparators(NMLVCUSTOMDRAW* draw)
+{
+    void* list = draw->nmcd.hdr.hwndFrom;
+    void* header = (void*)_send(list, (u32)LVM_GETHEADER, (u64)0, (i64)0);
+    RECT client = default;
+    GetClientRect(list, &client);
+    RECT headerRect = default;
+    GetWindowRect(header, &headerRect);
+    i32 top = headerRect.bottom - headerRect.top;
+
+    void* brush = CreateSolidBrush((u32)_send(list, (u32)LVM_GETBKCOLOR, (u64)0, (i64)0));
+    i32 column = 0;
+    while (column < 3)
+    {
+        RECT item = default;
+        if (_send(header, (u32)HDM_GETITEMRECT, (u64)column, (i64)&item) != 0)
+        {
+            RECT line = default;
+            line.left = item.right - 2;
+            line.top = top;
+            line.right = item.right + 2;
+            line.bottom = client.bottom;
+            FillRect(draw->nmcd.hdc, &line, brush);
+        }
+        column = column + 1;
+    }
+    DeleteObject(brush);
+}
+
+i64 _handleCustomDraw(i64 parameter)
+{
+    NMLVCUSTOMDRAW* draw = (NMLVCUSTOMDRAW*)parameter;
+    u32 stage = draw->nmcd.dwDrawStage;
+    if (stage == (u32)CDDS_PREPAINT) return (i64)CDRF_NOTIFYITEMDRAW | (i64)CDRF_NOTIFYPOSTPAINT;
+    if (stage == (u32)CDDS_POSTPAINT)
+    {
+        _paintOverColumnSeparators(draw);
+        return (i64)CDRF_DODEFAULT;
+    }
+    if (stage == (u32)CDDS_ITEMPREPAINT) return (i64)CDRF_NOTIFYSUBITEMDRAW;
+    if (stage == ((u32)CDDS_ITEMPREPAINT | (u32)CDDS_SUBITEM))
+    {
+        i32 item = (i32)draw->nmcd.dwItemSpec;
+        if (draw->iSubItem == 2 && item >= 0 && item < _apps.count())
+            draw->clrText = _pressureColor(_apps.get(item).pressure.band, _dark);
+        return (i64)CDRF_DODEFAULT;
+    }
+    return (i64)CDRF_DODEFAULT;
+}
+
+// The header does not honour a dark ListView text colour, so its NM_CUSTOMDRAW
+// is intercepted on the way up through the ListView.
+stdcall i64 _listSubclassProc(void* window, u32 message, u64 wParam, i64 lParam,
+                              u64 subclassId, u64 referenceData)
+{
+    if (message == (u32)WM_NOTIFY && _dark)
+    {
+        NMHDR* notification = (NMHDR*)lParam;
+        void* header = (void*)_send(window, (u32)LVM_GETHEADER, (u64)0, (i64)0);
+        if (notification->code == (u32)NM_CUSTOMDRAW && notification->hwndFrom == header)
+        {
+            NMCUSTOMDRAW* draw = (NMCUSTOMDRAW*)lParam;
+            if (draw->dwDrawStage == (u32)CDDS_PREPAINT) return (i64)CDRF_NOTIFYITEMDRAW;
+            if (draw->dwDrawStage == (u32)CDDS_ITEMPREPAINT)
+            {
+                SetTextColor(draw->hdc, _rgb((u32)245, (u32)245, (u32)245));
+                return (i64)CDRF_DODEFAULT;
+            }
+        }
+    }
+    return DefSubclassProc(window, message, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// Window procedure
+// ---------------------------------------------------------------------------
+
+i64 _onNotify(i64 lParam)
+{
+    NMHDR* header = (NMHDR*)lParam;
+    if (header->idFrom != (u64)kAppListId) return 0;
+    if (header->code == (u32)NM_CUSTOMDRAW) return _handleCustomDraw(lParam);
+    if (header->code == (u32)LVN_ITEMCHANGED) _updateEndTaskState();
+    if (header->code == (u32)LVN_COLUMNCLICK)
+    {
+        NMLISTVIEW* view = (NMLISTVIEW*)lParam;
+        i32 column = view->iSubItem;
+        if (column == _sortColumn)
+        {
+            _sortAscending = !_sortAscending;
+        }
+        else
+        {
+            _sortColumn = column;
+            _sortAscending = column == 0;
+        }
+        _updateSortArrows();
+        list<AppEntry> apps;
+        i32 i = 0;
+        while (i < _allApps.count()) { apps.add(_allApps.get(i).copy()); i = i + 1; }
+        _rebuildList(move apps);
+    }
+    return 0;
+}
+
+stdcall i64 _wndProc(void* window, u32 message, u64 wParam, i64 lParam)
+{
+    if (message == (u32)WM_SIZE) { _layoutControls(); return 0; }
+    if (message == (u32)WM_GETMINMAXINFO)
+    {
+        MINMAXINFO* info = (MINMAXINFO*)lParam;
+        u32 dpi = GetDpiForWindow(window);
+        info->ptMinTrackSize.x = _scaleForDpi(420, dpi);
+        info->ptMinTrackSize.y = _scaleForDpi(300, dpi);
+        return 0;
+    }
+    if (message == (u32)WM_DPICHANGED)
+    {
+        RECT* suggested = (RECT*)lParam;
+        SetWindowPos(window, nullptr, suggested->left, suggested->top,
+                     suggested->right - suggested->left, suggested->bottom - suggested->top,
+                     (u32)SWP_NOZORDER | (u32)SWP_NOACTIVATE);
+        u32 newDpi = (u32)(wParam >> 16);
+        _createImageList(newDpi);
+        _applyControlFont(newDpi);
+        _applyWindowIcons(newDpi);
+        _renderedName.clear();
+        _renderedMemory.clear();
+        _renderedPressure.clear();
+        _renderedImage.clear();
+        _refreshVisibleList();
+        _layoutControls();
+        return 0;
+    }
+    if (message == (u32)WM_TIMER)
+    {
+        if (wParam == (u64)kRefreshTimer) _requestRefresh();
+        return 0;
+    }
+    if (message == kRefreshMessage)
+    {
+        _resultLock.acquire();
+        bool ready = _pendingReady;
+        list<AppEntry> apps = move _pendingApps;
+        _pendingReady = false;
+        _resultLock.release();
+        if (ready) _rebuildList(move apps);
+        return 0;
+    }
+    if (message == (u32)WM_NOTIFY) return _onNotify(lParam);
+    if (message == (u32)WM_ERASEBKGND)
+    {
+        // A plain window has no dialog manager, so the dark client background is
+        // painted here rather than answered through WM_CTLCOLORDLG.
+        RECT client = default;
+        GetClientRect(window, &client);
+        FillRect((void*)wParam, &client, _backgroundBrush);
+        return 1;
+    }
+    if (message == (u32)WM_COMMAND)
+    {
+        i32 control = (i32)(wParam & (u64)0xFFFF);
+        u32 code = (u32)(wParam >> 16);
+        if (control == kEndTaskId && code == (u32)BN_CLICKED) { _endSelectedTask(); return 0; }
+        if (control == kExpandId && code == (u32)BN_CLICKED)
+        {
+            _showAll = !_showAll;
+            _updateExpandButton();
+            _refreshVisibleList();
+            return 0;
+        }
+        if (control == kPinTopmostId && code == (u32)BN_CLICKED)
+        {
+            bool pinned = _send(_pinTopmost, (u32)BM_GETCHECK, (u64)0, (i64)0) == (i64)BST_CHECKED;
+            SetWindowPos(window, pinned ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+                         (u32)SWP_NOMOVE | (u32)SWP_NOSIZE);
+            return 0;
+        }
+    }
+    if (message == (u32)WM_SETTINGCHANGE)
+    {
+        if (lParam != (i64)0)
+        {
+            wstring changed = wstring.fromUtf16((u16*)lParam, 18);
+            if (changed.toString() == "ImmersiveColorSet") _applyTheme();
+        }
+        return 0;
+    }
+    if (message == (u32)WM_CTLCOLORDLG || message == (u32)WM_CTLCOLORSTATIC
+        || message == (u32)WM_CTLCOLORBTN)
+    {
+        void* dc = (void*)wParam;
+        SetBkMode(dc, (i32)TRANSPARENT);
+        SetTextColor(dc, _dark ? _rgb((u32)245, (u32)245, (u32)245)
+                               : GetSysColor((i32)COLOR_WINDOWTEXT));
+        SetBkColor(dc, _dark ? _rgb((u32)32, (u32)32, (u32)32) : GetSysColor((i32)COLOR_WINDOW));
+        return (i64)_backgroundBrush;
+    }
+    if (message == (u32)WM_CLOSE) { DestroyWindow(window); return 0; }
+    if (message == (u32)WM_DESTROY)
+    {
+        RemoveWindowSubclass(_listView, _listSubclassProc, (u64)1);
+        _stopWorker();
+        if (_ownsBackgroundBrush && _backgroundBrush != nullptr) DeleteObject(_backgroundBrush);
+        _destroyImageList();
+        if (_controlFont != nullptr) DeleteObject(_controlFont);
+        if (_iconBig != nullptr) DestroyIcon(_iconBig);
+        if (_iconSmall != nullptr) DestroyIcon(_iconSmall);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+void* _createControl(string className, string text, i32 style, i32 id, void* instance)
+{
+    wstring wideClass = toWString(className);
+    wstring wideText = toWString(text);
+    return CreateWindowExW((u32)0, wideClass.data(), wideText.data(),
+                           (u32)WS_CHILD | (u32)WS_VISIBLE | (u32)style,
+                           0, 0, 10, 10, _window, (void*)(i64)id, instance, nullptr);
+}
+
+extern int main()
+{
+    // No embedded manifest is possible without a resource compiler, so DPI
+    // awareness is set programmatically instead.
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    INITCOMMONCONTROLSEX controls = default;
+    controls.dwSize = (u32)sizeof(INITCOMMONCONTROLSEX);
+    controls.dwICC = (u32)ICC_LISTVIEW_CLASSES;
+    InitCommonControlsEx(&controls);
+
+    void* instance = GetModuleHandleW(nullptr);
+    wstring className = toWString("MemPressMonitorWindow");
+    wstring title = toWString("MemPressMonitor");
+
+    WNDCLASSEXW windowClass = default;
+    windowClass.cbSize = (u32)sizeof(WNDCLASSEXW);
+    windowClass.lpfnWndProc = (void*)_wndProc;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, (u16*)(i64)IDC_ARROW);
+    windowClass.hIcon = LoadIconW(nullptr, (u16*)(i64)IDI_APPLICATION);
+    windowClass.hbrBackground = GetSysColorBrush((i32)COLOR_WINDOW);
+    windowClass.lpszClassName = className.data();
+    if (RegisterClassExW(&windowClass) == (u16)0) return 1;
+
+    // IDD_MAIN is 260x155 dialog units in 9pt Segoe UI, which is 455x291 pixels
+    // at 96 dpi. Reproduce that client size and let the frame grow around it.
+    u32 startDpi = GetDpiForSystem();
+    RECT frame = default;
+    frame.right = MulDiv(455, (i32)startDpi, 96);
+    frame.bottom = MulDiv(291, (i32)startDpi, 96);
+    AdjustWindowRectExForDpi(&frame, (u32)WS_OVERLAPPEDWINDOW, 0, (u32)0, startDpi);
+
+    _window = CreateWindowExW((u32)0, className.data(), title.data(), (u32)WS_OVERLAPPEDWINDOW,
+                              (i32)CW_USEDEFAULT, (i32)CW_USEDEFAULT,
+                              frame.right - frame.left, frame.bottom - frame.top,
+                              nullptr, nullptr, instance, nullptr);
+    if (_window == nullptr) return 1;
+
+    _listView = _createControl("SysListView32", "",
+                               (i32)LVS_REPORT | (i32)LVS_SINGLESEL | (i32)LVS_SHOWSELALWAYS,
+                               kAppListId, instance);
+    _pinTopmost = _createControl("Button", "Always on top", (i32)BS_AUTOCHECKBOX,
+                                 kPinTopmostId, instance);
+    _expand = _createControl("Button", "Show all", (i32)BS_PUSHBUTTON, kExpandId, instance);
+    _endTask = _createControl("Button", "End Task", (i32)BS_PUSHBUTTON, kEndTaskId, instance);
+
+    u32 dpi = GetDpiForWindow(_window);
+    _applyControlFont(dpi);
+    _applyWindowIcons(dpi);
+    _createImageList(dpi);
+    _send(_listView, (u32)LVM_SETEXTENDEDLISTVIEWSTYLE, (u64)0,
+          (i64)((u32)LVS_EX_FULLROWSELECT | (u32)LVS_EX_DOUBLEBUFFER));
+    _addColumns();
+    SetWindowSubclass(_listView, _listSubclassProc, (u64)1, (u64)0);
+    _updateSortArrows();
+    _applyTheme();
+    _layoutControls();
+    _updateExpandButton();
+    EnableWindow(_endTask, 0);
+
+    if (!_startWorker())
+    {
+        wstring message = toWString("Unable to start the memory capture worker.");
+        MessageBoxW(_window, message.data(), title.data(), (u32)MB_OK | (u32)MB_ICONERROR);
+        return 1;
+    }
+    SetTimer(_window, (u64)kRefreshTimer, (u32)2000, nullptr);
+
+    ShowWindow(_window, (i32)SW_SHOW);
+    UpdateWindow(_window);
+
+    MSG message = default;
+    while (GetMessageW(&message, nullptr, (u32)0, (u32)0) > 0)
+    {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    return (int)message.wParam;
+}

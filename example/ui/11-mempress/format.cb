@@ -1,0 +1,21 @@
+// Memory sizes are always rendered in whole MB (no KB/GB units), per product
+// decision: one unit everywhere so values stay directly comparable.
+
+import "string.cb";
+
+move string formatMegabytes(u64 bytes)
+{
+    string digits = (bytes / (u64)1048576).toString();
+    stringbuilder grouped = default;
+    i32 len = digits.length();
+    i32 i = 0;
+    while (i < len)
+    {
+        if (i > 0 && ((len - i) % 3) == 0)
+            grouped.appendChar(',');
+        grouped.appendChar(digits.charAt(i));
+        i = i + 1;
+    }
+    grouped.appendCStr(" MB");
+    return grouped.toString();
+}

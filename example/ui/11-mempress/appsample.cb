@@ -1,0 +1,20 @@
+// One capture's worth of data, handed from a MemSource to the UI.
+//
+// This is the whole contract between the platform-specific collector and the
+// host-neutral window, so `mempress_app.cb` compiles on any platform a
+// `MemSource` exists for.
+
+import "memcore/appmodel.cb";
+import "list.cb";
+import "string.cb";
+
+struct AppSample
+{
+    list<AppEntry> apps     = default;
+    PressureScore  pressure = default;
+    SystemStats    system   = default;
+
+    // Empty on success; a human-readable reason otherwise. The UI keeps the
+    // previous snapshot visible rather than failing the refresh.
+    string error = default;
+};

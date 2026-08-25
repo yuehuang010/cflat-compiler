@@ -1,0 +1,71 @@
+// Data model shared by the collector, the grouper, the pressure engine and the
+// front-ends. memcore fills these structs; front-ends render them.
+
+import "list.cb";
+import "string.cb";
+
+char* kBackgroundAppKey = "background";
+
+enum PressureBand : i32 { Low = 0, Moderate = 1, High = 2, Critical = 3 };
+
+struct PressureScore
+{
+    i32 value = 0;
+    i32 band  = PressureBand.Low;
+};
+
+struct ProcessInfo
+{
+    u32 processId          = 0;
+    u32 parentProcessId    = 0;
+    u32 sessionId          = 0;
+    u64 createTime         = 0;
+    u64 workingSet         = 0;
+    u64 workingSetShared   = 0;
+    u64 commit             = 0;
+    u64 gpuShared          = 0;
+    u64 hardFaults         = 0;
+    string imageName        = default;
+    string exePath          = default;
+    string packageFamilyName = default;
+};
+
+struct SystemStats
+{
+    u64 commitTotal        = 0;
+    u64 commitLimit        = 0;
+    u64 physicalTotal      = 0;
+    u64 physicalAvailable  = 0;
+    u64 hardFaults         = 0;
+    u64 kernelPagedPool    = 0;
+    u64 kernelNonpagedPool = 0;
+};
+
+struct Snapshot
+{
+    list<ProcessInfo> processes = default;
+    SystemStats system          = default;
+    u64 capturedAtQpc           = 0;
+};
+
+struct AppEntry
+{
+    string key               = default;
+    string displayName       = default;
+    string exePath           = default;
+    string packageFamilyName = default;
+    u64 workingSet  = 0;
+    u64 commit      = 0;
+    u64 gpuShared   = 0;
+    u64 hardFaults  = 0;
+    list<u32> processIds = default;
+    PressureScore pressure = default;
+};
+
+char* pressureBandName(i32 band)
+{
+    if (band == PressureBand.Critical) return "Critical";
+    if (band == PressureBand.High)     return "High";
+    if (band == PressureBand.Moderate) return "Moderate";
+    return "Low";
+}

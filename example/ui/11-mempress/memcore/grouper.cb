@@ -1,0 +1,278 @@
+// Collapses the raw process list into the app rows the UI shows: one row per
+// visible top-level window tree or MSIX package, plus a single "Background & OS"
+// row for everything with no user-facing window.
+
+import "appmodel.cb";
+import "winapi.cb";
+import "dictionary.cb";
+import "hashset.cb";
+import "list.cb";
+import "string.cb";
+import "wstring.cb";
+
+// Pids owning a visible, unowned top-level window. A stdcall callback cannot
+// capture, so the set travels into _collectWindow as the address of this struct
+// through the EnumWindows LPARAM; nothing about the walk is global state.
+struct VisibleWindows
+{
+    hashset<u32> processIds = default;
+};
+
+stdcall i32 _collectWindow(void* window, i64 parameter)
+{
+    VisibleWindows* visible = (VisibleWindows*)parameter;
+    if (IsWindowVisible(window) != 0 && GetWindow(window, (u32)GW_OWNER) == nullptr)
+    {
+        u32 processId = 0;
+        GetWindowThreadProcessId(window, &processId);
+        if (processId != (u32)0) visible->processIds.add(processId);
+    }
+    return 1;
+}
+
+move string _baseName(string path)
+{
+    i32 slash = path.lastIndexOf('\\');
+    i32 forward = path.lastIndexOf('/');
+    if (forward > slash) slash = forward;
+    return slash < 0 ? path.copy() : path.substring(slash + 1);
+}
+
+// Four lowercase hex digits, zero-padded - the language/code-page halves of a
+// version resource's translation id.
+move string _hex4(u32 value)
+{
+    string digits = ((i64)value).toString(16);
+    stringbuilder padded = default;
+    i32 i = digits.length();
+    while (i < 4) { padded.appendChar('0'); i = i + 1; }
+    padded.append(digits);
+    return padded.toString();
+}
+
+// FileDescription from the exe's version resource, falling back to `fallback`.
+move string _description(string path, string fallback)
+{
+    if (path.isEmpty()) return fallback.isEmpty() ? "Unknown" : fallback.copy();
+
+    wstring widePath = toWString(path);
+    u32 ignored = 0;
+    u32 size = GetFileVersionInfoSizeW(widePath.data(), &ignored);
+    if (size == (u32)0) return fallback.isEmpty() ? _baseName(path) : fallback.copy();
+
+    u8* data = new u8[(i32)size];
+    if (GetFileVersionInfoW(widePath.data(), (u32)0, size, data) == 0)
+    {
+        delete[] data;
+        return fallback.isEmpty() ? _baseName(path) : fallback.copy();
+    }
+
+    string block = "\\StringFileInfo\\040904b0\\FileDescription";
+    u16* translation = nullptr;
+    u32 translationSize = 0;
+    wstring translationKey = toWString("\\VarFileInfo\\Translation");
+    if (VerQueryValueW(data, translationKey.data(), (void**)&translation, &translationSize) != 0
+        && translationSize >= (u32)4)
+    {
+        block = "\\StringFileInfo\\" + _hex4((u32)translation[0]) + _hex4((u32)translation[1])
+              + "\\FileDescription";
+    }
+
+    string result = default;
+    u16* value = nullptr;
+    u32 valueSize = 0;
+    wstring blockKey = toWString(block);
+    if (VerQueryValueW(data, blockKey.data(), (void**)&value, &valueSize) != 0
+        && value != nullptr && valueSize > (u32)1 && value[0] != (u16)0)
+        result = wstring.fromUtf16(value, (i32)valueSize - 1).toString();
+    delete[] data;
+
+    if (!result.isEmpty()) return move result;
+    return fallback.isEmpty() ? _baseName(path) : fallback.copy();
+}
+
+move string _pathOf(ProcessInfo* process)
+{
+    return process->exePath.isEmpty() ? process->imageName.copy() : process->exePath.copy();
+}
+
+// Folds one process into an app row.
+void _addProcess(list<AppEntry>* apps, i32 appIndex, ProcessInfo* process)
+{
+    AppEntry* app = &(*apps)[appIndex];
+    app->workingSet = app->workingSet + process->workingSet;
+    app->commit     = app->commit + process->commit;
+    app->gpuShared  = app->gpuShared + process->gpuShared;
+    app->hardFaults = app->hardFaults + process->hardFaults;
+    app->processIds.add(process->processId);
+    if (app->exePath.isEmpty()) app->exePath = _pathOf(process);
+    if (app->displayName.isEmpty())
+    {
+        string path = _pathOf(process);
+        app->displayName = _description(path, _baseName(path));
+    }
+}
+
+// Index of the "Background & OS" row, creating it on first use.
+i32 _backgroundIndex(list<AppEntry>* apps, dictionary<string, i32>* groupIndexes)
+{
+    string key = kBackgroundAppKey;
+    if (groupIndexes->contains(key)) return groupIndexes->get(key);
+    AppEntry app = default;
+    app.key = key.copy();
+    app.displayName = "Background & OS";
+    apps->add(move app);
+    i32 index = apps->count() - 1;
+    groupIndexes->set(key, index);
+    return index;
+}
+
+// Nearest ancestor that owns a visible top-level window. `start` is known not to
+// own one, so only its parents can be anchors. Returns processes.count() for none.
+i32 _nearestVisibleAncestor(Snapshot* snapshot, dictionary<u32, i32>* indexes,
+                            VisibleWindows* visible, i32 start)
+{
+    i32 none = snapshot->processes.count();
+    hashset<u32> visited = default;
+    i32 current = start;
+    visited.add(snapshot->processes.get(current).processId);
+    while (true)
+    {
+        u32 parentId = snapshot->processes.get(current).parentProcessId;
+        u64 createTime = snapshot->processes.get(current).createTime;
+        if (parentId == (u32)0) return none;
+        if (!indexes->contains(parentId)) return none;
+        i32 parent = indexes->get(parentId);
+        u64 parentCreateTime = snapshot->processes.get(parent).createTime;
+        // A recycled pid whose "parent" started later is not really the parent.
+        if (createTime != (u64)0 && parentCreateTime != (u64)0 && parentCreateTime > createTime)
+            return none;
+        current = parent;
+        u32 currentId = snapshot->processes.get(current).processId;
+        if (visible->processIds.contains(currentId)) return current;
+        if (!visited.add(currentId)) return none;
+    }
+    return none;
+}
+
+move list<AppEntry> groupProcesses(Snapshot* snapshot)
+{
+    VisibleWindows visible = default;
+    EnumWindows(_collectWindow, (i64)&visible);
+
+    dictionary<string, i32> groupIndexes = default;
+    list<AppEntry> apps;
+
+    i32 processCount = snapshot->processes.count();
+    dictionary<u32, i32> indexes = default;
+    i32 i = 0;
+    while (i < processCount)
+    {
+        u32 processId = snapshot->processes.get(i).processId;
+        if (!indexes.contains(processId)) indexes.set(processId, i);
+        i = i + 1;
+    }
+
+    // Processes running the same exe map the same images, so their shared
+    // working sets overlap almost entirely. Charging each app the largest shared
+    // set per distinct exe (instead of the sum, which double-counts, or nothing,
+    // which hides framework DLLs entirely) gives a ballpark of the app's real
+    // footprint. System DLLs get counted once per app; accepted as rounding error.
+    dictionary<string, u64> sharedByAppExe = default;
+
+    i = 0;
+    while (i < processCount)
+    {
+        ProcessInfo* process = &snapshot->processes[i];
+        string key = default;
+        i32 anchorIndex = processCount;
+        if (!process->packageFamilyName.isEmpty())
+        {
+            key = "package:" + process->packageFamilyName.toLower();
+        }
+        else
+        {
+            anchorIndex = visible.processIds.contains(process->processId)
+                ? i : _nearestVisibleAncestor(snapshot, &indexes, &visible, i);
+            if (anchorIndex != processCount)
+            {
+                ProcessInfo* anchor = &snapshot->processes[anchorIndex];
+                if (!anchor->packageFamilyName.isEmpty())
+                {
+                    // Unpackaged child of a packaged app (e.g. a CLI spawned by
+                    // an MSIX desktop app): adopt the package's row instead of
+                    // opening a desktop row for the same tree.
+                    key = "package:" + anchor->packageFamilyName.toLower();
+                }
+                else
+                {
+                    string path = _pathOf(anchor);
+                    if (!path.isEmpty()) key = "desktop:" + path.toLower();
+                }
+            }
+        }
+
+        i32 appIndex = 0;
+        if (key.isEmpty())
+        {
+            appIndex = _backgroundIndex(&apps, &groupIndexes);
+        }
+        else if (groupIndexes.contains(key))
+        {
+            appIndex = groupIndexes.get(key);
+        }
+        else
+        {
+            // Name the group after its anchor, not the process encountered
+            // first; enumeration order is arbitrary.
+            ProcessInfo* identity = anchorIndex != processCount
+                ? &snapshot->processes[anchorIndex]
+                : &snapshot->processes[i];
+            AppEntry app = default;
+            app.key = key.copy();
+            app.packageFamilyName = identity->packageFamilyName.copy();
+            app.exePath = _pathOf(identity);
+            app.displayName = _description(app.exePath, _baseName(app.exePath));
+            apps.add(move app);
+            appIndex = apps.count() - 1;
+            groupIndexes.set(key, appIndex);
+        }
+
+        _addProcess(&apps, appIndex, process);
+        if (process->workingSetShared != (u64)0)
+        {
+            string sharedKey = appIndex.toString() + "|" + _pathOf(process).toLower();
+            u64 largest = process->workingSetShared;
+            if (sharedByAppExe.contains(sharedKey))
+            {
+                u64 previous = sharedByAppExe.get(sharedKey);
+                if (previous > largest) largest = previous;
+            }
+            sharedByAppExe.set(sharedKey, largest);
+        }
+        i = i + 1;
+    }
+
+    list<string> sharedKeys = sharedByAppExe.keys();
+    i = 0;
+    while (i < sharedKeys.count())
+    {
+        string sharedKey = sharedKeys.get(i).copy();
+        i32 bar = sharedKey.indexOf('|');
+        i32 appIndex = sharedKey.substring(0, bar).toInt();
+        AppEntry* app = &apps[appIndex];
+        app->workingSet = app->workingSet + sharedByAppExe.get(sharedKey);
+        i = i + 1;
+    }
+
+    // Kernel pool memory belongs to no process, so it would otherwise be
+    // invisible in the app list (e.g. a driver leaking non-paged pool). Charge it
+    // to the OS row. Per-process pool quotas must never be surfaced as columns,
+    // or these bytes would be counted twice.
+    i32 osIndex = _backgroundIndex(&apps, &groupIndexes);
+    u64 pool = snapshot->system.kernelPagedPool + snapshot->system.kernelNonpagedPool;
+    AppEntry* osRow = &apps[osIndex];
+    osRow->workingSet = osRow->workingSet + pool;
+    osRow->commit = osRow->commit + pool;
+    return move apps;
+}

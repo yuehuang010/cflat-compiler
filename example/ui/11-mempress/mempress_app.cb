@@ -1,0 +1,334 @@
+// MemPressMonitor window built on ui_native.
+//
+// The example keeps the collector behind memsource.cb while the window uses the
+// portable context, timer, ListView, styling, icon, and flex-layout APIs. The
+// same component drives native controls on Windows and the headless test host.
+
+import "ui_native.cb";
+import "appsample.cb";
+import "memsource.cb";
+import "format.cb";
+import "list.cb";
+import "mutex.cb";
+import "string.cb";
+import "thread.cb";
+
+i32 kRefreshIntervalMs = 2000;
+i32 kCollapsedAppCount = 6;
+
+i32 kSortName     = 0;
+i32 kSortMemory   = 1;
+i32 kSortPressure = 2;
+
+mutex     _resultLock       = default;
+AppSample _pendingSample    = default;
+bool      _pendingReady     = false;
+bool      _captureInFlight  = false;
+
+IUiContext _uiContext = default;
+MonitorApp* _appInstance = nullptr;
+
+class MonitorApp : IComponent
+{
+    list<AppEntry> _all     = default;
+    list<AppEntry> _visible = default;
+    PressureScore  _pressure = default;
+    SystemStats    _system   = default;
+    string         _error    = default;
+
+    i32  _sortColumn    = kSortMemory;
+    bool _sortAscending = false;
+    bool _showAll       = false;
+    i32  _selected      = -1;
+    bool _topmost       = false;
+    bool _dark          = false;
+
+    bool   _started      = false;
+    u64    _refreshTimer = 0u;
+    Thread _worker       = default;
+
+    ~MonitorApp()
+    {
+        if (this._refreshTimer != 0u)
+            _uiContext.cancelTimer(this._refreshTimer);
+        _appInstance = nullptr;
+        this._worker.join();
+    }
+
+    i32 _compare(AppEntry left, AppEntry right, i32 column)
+    {
+        if (column == kSortMemory)
+        {
+            if (left.workingSet < right.workingSet) return -1;
+            return left.workingSet > right.workingSet ? 1 : 0;
+        }
+        if (column == kSortPressure) return left.pressure.value - right.pressure.value;
+        return left.displayName.toLower().compare(right.displayName.toLower());
+    }
+
+    void _sort(list<AppEntry>* apps)
+    {
+        apps->sort((AppEntry left, AppEntry right) =>
+        {
+            bool leftBackground  = left.key == kBackgroundAppKey;
+            bool rightBackground = right.key == kBackgroundAppKey;
+            if (leftBackground != rightBackground) return rightBackground;
+            i32 order = this._compare(left, right, this._sortColumn);
+            if (order != 0) return this._sortAscending ? order < 0 : order > 0;
+            return this._compare(left, right, kSortName) < 0;
+        });
+    }
+
+    void _rebuildVisible()
+    {
+        string selectedKey = default;
+        if (this._selected >= 0 && this._selected < this._visible.count())
+            selectedKey = this._visible.get(this._selected).key.copy();
+
+        list<AppEntry> visible;
+        i32 shown = 0;
+        i32 i = 0;
+        while (i < this._all.count())
+        {
+            bool background = this._all.get(i).key == kBackgroundAppKey;
+            if (!background && (this._showAll || shown < kCollapsedAppCount))
+            {
+                visible.add(this._all.get(i).copy());
+                shown = shown + 1;
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while (i < this._all.count())
+        {
+            if (this._all.get(i).key == kBackgroundAppKey)
+            {
+                visible.add(this._all.get(i).copy());
+                i = this._all.count();
+            }
+            else i = i + 1;
+        }
+        this._visible = move visible;
+
+        this._selected = -1;
+        if (!selectedKey.isEmpty())
+        {
+            i = 0;
+            while (i < this._visible.count())
+            {
+                if (this._visible.get(i).key == selectedKey)
+                {
+                    this._selected = i;
+                    i = this._visible.count();
+                }
+                else i = i + 1;
+            }
+        }
+    }
+
+    void applySample(move AppSample sample)
+    {
+        this._error = move sample.error;
+        if (this._error.isEmpty())
+        {
+            this._all = move sample.apps;
+            this._pressure = sample.pressure;
+            this._system = sample.system;
+            this._sort(&this._all);
+        }
+        this._rebuildVisible();
+    }
+
+    bool _canEndSelected()
+    {
+        if (!memSourceCanEndTask()) return false;
+        if (this._selected < 0 || this._selected >= this._visible.count()) return false;
+        return this._visible.get(this._selected).key != kBackgroundAppKey;
+    }
+
+    void _endSelected(IUiContext ctx)
+    {
+        if (!this._canEndSelected()) return;
+        AppEntry app = this._visible.get(this._selected).copy();
+        string message = "End " + app.displayName + "? This will terminate "
+                       + app.processIds.count().toString() + " process(es).";
+        if (nativeConfirm("MemPressMonitor", message) != 1) return;
+
+        _ = memSourceEndTask(&app.processIds);
+        ctx.invalidate();
+    }
+
+    void _onHeaderClick(i32 column, IUiContext ctx)
+    {
+        if (column == this._sortColumn)
+            this._sortAscending = !this._sortAscending;
+        else
+        {
+            this._sortColumn = column;
+            this._sortAscending = column == kSortName;
+        }
+        this._sort(&this._all);
+        this._rebuildVisible();
+        ctx.invalidate();
+    }
+
+    ListCellStyle _cellStyle(i32 row, i32 column)
+    {
+        if (row < 0 || row >= this._visible.count() || column != kSortPressure)
+            return default;
+
+        i32 band = this._visible.get(row).pressure.band;
+        if (band == PressureBand.Low)      return listCellLiteral(0x4CAF50);
+        if (band == PressureBand.Moderate) return listCellLiteral(0xFFC107);
+        if (band == PressureBand.High)     return listCellLiteral(0xFF9800);
+        return listCellLiteral(0xF44336);
+    }
+
+    ListRowIcon _rowIcon(i32 row)
+    {
+        if (row < 0 || row >= this._visible.count())
+            return noListIcon();
+        // Rows without an extractable exe icon (Background & OS included) get the
+        // collector's fallback icon, like the C++ original.
+        return memSourceAppIcon(&this._visible[row]);
+    }
+
+    move string _cellText(i32 row, i32 column)
+    {
+        if (row < 0 || row >= this._visible.count()) return "" + "";
+        if (column == kSortMemory) return formatMegabytes(this._visible.get(row).workingSet);
+        if (column == kSortPressure) return this._visible.get(row).pressure.value.toString() + "%";
+        return this._visible.get(row).displayName.copy();
+    }
+
+    void _kickCapture()
+    {
+        if (!this._worker.try_join(0)) return;
+
+        _resultLock.acquire();
+        if (_captureInFlight)
+        {
+            _resultLock.release();
+            return;
+        }
+        _captureInFlight = true;
+        _resultLock.release();
+
+        if (!this._worker.start(_captureOnce, nullptr, 0))
+        {
+            _resultLock.acquire();
+            _captureInFlight = false;
+            _resultLock.release();
+        }
+    }
+
+    IElement render(IUiContext ctx)
+    {
+        _uiContext = ctx;
+        _appInstance = this;
+
+        if (!this._started)
+        {
+            this._started = true;
+            this._dark = ctx.systemPrefersDark();
+            ctx.setContentSize(70, 14);
+            this._refreshTimer = ctx.every(kRefreshIntervalMs, () =>
+            {
+                if (_appInstance != nullptr) _appInstance._kickCapture();
+            });
+            this._kickCapture();
+        }
+        ctx.theme = this._dark ? darkTheme() : lightTheme();
+
+        i32 margin = 1;
+        i32 gap = 1;
+        i32 memoryWidth = 13;
+        i32 pressureWidth = 13;
+        i32 nameWidth = hostWidth() - margin * 2 - memoryWidth - pressureWidth - 2;
+        if (nameWidth < 14) nameWidth = 14;
+
+        IView root = view(makeStyle(margin, hostWidth(), hostHeight()));
+        root.style.gap = gap;
+        root.setKey("root");
+
+        IListView apps = <ListView key="apps" rowCount={this._visible.count()}
+                selectedIndex={this._selected}
+                onSelect={(int row) => { this._selected = row; ctx.invalidate(); }}
+                onActivate={(int row) => { this._selected = row; this._endSelected(ctx); }}
+                onHeaderClick={(int column) => { this._onHeaderClick(column, ctx); }}/>;
+        apps.style.flex = 1;
+        apps.width = hostWidth() - margin * 2;
+        apps.sortColumn = this._sortColumn;
+        apps.sortAscending = this._sortAscending;
+        apps.addColumn("App", nameWidth);
+        apps.addColumnAligned("Memory", memoryWidth, COL_ALIGN_CENTER);
+        apps.addColumnAligned("Pressure", pressureWidth, COL_ALIGN_CENTER);
+        apps.rowText = (int row, int column) => { return this._cellText(row, column); };
+        apps.cellStyle = (int row, int column) => { return this._cellStyle(row, column); };
+        apps.rowIcon = (int row) => { return this._rowIcon(row); };
+        root.add(apps);
+
+        IView bar = toolbar();
+        bar.setKey("bar");
+
+        ICheckbox pin = checkbox("Always on top", this._topmost, (bool on) =>
+        {
+            this._topmost = on;
+            ctx.setTopmost(on);
+            ctx.invalidate();
+        });
+        pin.setKey("pin");
+        bar.add(pin);
+
+        IView spacer = view(flexStyle(1));
+        bar.add(spacer);
+
+        IButton expand = button(this._showAll ? "Show top 6" : "Show all", () =>
+        {
+            this._showAll = !this._showAll;
+            this._rebuildVisible();
+            ctx.invalidate();
+        });
+        expand.setKey("expand");
+        bar.add(expand);
+
+        IButton endTask = button("End Task", () => { this._endSelected(ctx); });
+        endTask.setKey("end");
+        endTask.disabled = !this._canEndSelected();
+        bar.add(endTask);
+
+        root.add(bar);
+        return root;
+    }
+};
+
+void _drainSample()
+{
+    _resultLock.acquire();
+    bool ready = _pendingReady;
+    AppSample sample = move _pendingSample;
+    _pendingReady = false;
+    _resultLock.release();
+    if (!ready || _appInstance == nullptr) return;
+
+    _appInstance.applySample(move sample);
+    _uiContext.invalidate();
+}
+
+int _captureOnce(void* argument)
+{
+    MemSource source = default;
+    AppSample sample = source.capture();
+
+    _resultLock.acquire();
+    _pendingSample = move sample;
+    _pendingReady = true;
+    _resultLock.release();
+
+    _uiContext.post(() => { _drainSample(); });
+
+    _resultLock.acquire();
+    _captureInFlight = false;
+    _resultLock.release();
+    return 0;
+}

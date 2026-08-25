@@ -109,8 +109,12 @@ const int ODT_TAB = 101;
 // NM_CUSTOMDRAW walks. HDM_FIRST = 0x1200.
 const int HDM_GETITEMCOUNT = 0x1200;   // HDM_FIRST+0
 const int HDM_GETITEMA     = 0x1203;   // HDM_FIRST+3
+const int HDM_SETITEMA     = 0x1204;   // HDM_FIRST+4
 const int HDM_GETITEMRECT  = 0x1207;   // HDM_FIRST+7
 const int HDI_TEXT         = 0x0002;
+const int HDI_FORMAT       = 0x0004;
+const int HDF_SORTDOWN     = 0x0200;
+const int HDF_SORTUP       = 0x0400;
 
 // HDITEMA (ANSI, 64-bit): pszText@8, cchTextMax@24. Only the text fields are read.
 struct HDItemA
@@ -140,6 +144,9 @@ const int TTS_ALWAYSTIP      = 0x0001;
 
 // Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
 const int WM_APP_CALL = 0x8001;
+// Posted on show: re-open each dark ListView's theme once the window is visible. A theme
+// applied to a HIDDEN list latches a variant that paints column rules over the body (Win11).
+const int WM_APP_RETHEME = 0x8002;
 
 // Undocumented UAH menu owner-draw messages and their raw structure fields.
 const int WM_UAHDRAWMENU     = 0x0091;
@@ -157,6 +164,8 @@ const u32 _UAH_ODS_NOACCEL   = 0x0100u;
 // The commctrl LV* constants are not surfaced by the windows.h binding (CB_* and
 // NMHDR are), so they are declared by hand. LVM_FIRST = 0x1000, LVN_FIRST = -100.
 const int LVM_DELETECOLUMN            = 0x101C;   // LVM_FIRST+28
+const int LVM_GETCOLUMNWIDTH          = 0x101D;   // LVM_FIRST+29
+const int LVM_SETCOLUMNWIDTH          = 0x101E;   // LVM_FIRST+30
 const int LVM_INSERTCOLUMNA           = 0x101B;   // LVM_FIRST+27
 const int LVM_SETITEMCOUNT            = 0x102F;   // LVM_FIRST+47
 const int LVM_SETITEMSTATE            = 0x102B;   // LVM_FIRST+43
@@ -175,6 +184,7 @@ const int LVS_SINGLESEL    = 0x0004;
 const int LVS_SHOWSELALWAYS = 0x0008;
 const int LVS_OWNERDATA    = 0x1000;
 const int LVS_EX_FULLROWSELECT = 0x0020;
+const int LVS_EX_DOUBLEBUFFER  = 0x10000;
 const int LVCF_FMT     = 0x0001;
 const int LVCF_WIDTH   = 0x0002;
 const int LVCF_TEXT    = 0x0004;
@@ -646,6 +656,10 @@ class Window : INativeHost
     list<int>    listIconCacheIndices = default;
     list<u64>    listStyleHandles = default;
     list<u64>    listStylePtrs    = default;
+    // Last-applied declared column widths per ListView ("40,13,13,"): declared widths
+    // are re-pushed only when this changes, so user column drags survive refresh syncs.
+    list<u64>    listColWH    = default;
+    list<string> listColWSpec = default;
     // TreeView node-source boxes: parallel HWND -> TreeBox* (as u64), like the list
     // boxes. Freed on destroyControl + dispose (a Lambda cannot cross the seam).
     list<u64>    treeBoxHandles = default;
@@ -1593,6 +1607,15 @@ class Window : INativeHost
 
     void _dropListIconCache(u64 h)
     {
+        int w = this.listColWH.count() - 1;
+        while (w >= 0)
+        {
+            if (this.listColWH.get(w) == h)
+            {
+                this.listColWH.removeAt(w); this.listColWSpec.removeAt(w);
+            }
+            w--;
+        }
         int i = this._iconListSlot(h);
         if (i < 0) return;
         void* himl = u2h(this.listIconListPtrs.get(i));
@@ -1617,6 +1640,39 @@ class Window : INativeHost
         this.listIconCacheIndices.removeAt(i);
     }
 
+    // Build a side x side top-down BGRA DIB from a row icon's (validated) pixels,
+    // nearest-sampled to the image-list size - an exact row copy when sizes match.
+    // Caller owns the returned bitmap; null on failure.
+    void* _listIconDib(ListRowIcon icon, int side)
+    {
+        void* dc = GetDC(this.hwnd);
+        BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = side; bi.biHeight = 0 - side;
+        bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
+        void* bits = nullptr;
+        void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
+        ReleaseDC(this.hwnd, dc);
+        if (bmp == nullptr || bits == nullptr)
+        {
+            if (bmp != nullptr) DeleteObject(bmp);
+            return nullptr;
+        }
+        u32* dst = (u32*)bits;
+        u32* src = (u32*)u2h(icon.pixels);
+        int y = 0;
+        while (y < side)
+        {
+            int sy = y * icon.pxH / side;
+            int x = 0;
+            while (x < side)
+            {
+                dst[y * side + x] = src[sy * icon.pxW + x * icon.pxW / side];
+                x++;
+            }
+            y++;
+        }
+        return bmp;
+    }
+
     // Resolve one portable row icon into the host cache. Headless controls keep
     // metadata only; visible controls materialize copied pixels in an image list.
     int _listIconIndex(void* ctrl, int row)
@@ -1629,11 +1685,12 @@ class Window : INativeHost
             || icon.pixels == 0u || icon.pxW <= 0 || icon.pxH <= 0) return -1;
         string id = "" + (char*)icon.identity;
         bool materialize = IsWindowVisible(this.hwnd) != 0;
+        int side = 16 * (int)this.dpi / 96;   // the image list lives at monitor density
         int li = this._iconListSlot(h);
         if (li < 0)
         {
             void* himl = materialize
-                ? ImageList_Create(16, 16, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4) : nullptr;
+                ? ImageList_Create(side, side, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4) : nullptr;
             if (materialize && himl == nullptr) return -1;
             this.listIconListH.add(h); this.listIconListPtrs.add((u64)himl);
             li = this.listIconListH.count() - 1;
@@ -1642,7 +1699,7 @@ class Window : INativeHost
         }
         if (li >= 0 && materialize && this.listIconListPtrs.get(li) == 0u)
         {
-            void* himl = ImageList_Create(16, 16, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4);
+            void* himl = ImageList_Create(side, side, (u32)(ILC_COLOR32 | ILC_MASK), 16, 4);
             if (himl == nullptr) return -1;
             this.listIconListPtrs.set(li, (u64)himl);
             SendMessageA(ctrl, (u32)LVM_SETIMAGELIST, (u64)LVSIL_SMALL, (i64)himl);
@@ -1652,22 +1709,8 @@ class Window : INativeHost
         // logical slot in listIconCacheIndices stays valid for headless probes.
         if (ci >= 0 && materialize && this.listIconCachePtrs.get(ci) == 0u)
         {
-            void* dc = GetDC(this.hwnd);
-            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
-            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
-            void* bits = nullptr;
-            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
-            ReleaseDC(this.hwnd, dc);
-            if (bmp == nullptr || bits == nullptr) return -1;
-            int cw = icon.pxW < 16 ? icon.pxW : 16;
-            int ch = icon.pxH < 16 ? icon.pxH : 16;
-            int y = 0;
-            while (y < ch)
-            {
-                memcpy((void*)((char*)bits + y * 16 * 4),
-                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
-                y++;
-            }
+            void* bmp = this._listIconDib(icon, side);
+            if (bmp == nullptr) return -1;
             int idx = ImageList_Add(u2h(this.listIconListPtrs.get(li)), bmp, nullptr);
             DeleteObject(bmp);
             if (idx < 0) return -1;
@@ -1688,22 +1731,8 @@ class Window : INativeHost
                 this.listIconCacheH2.add(icon.pxH); this.listIconCacheIndices.add(idx);
                 return idx;
             }
-            void* dc = GetDC(this.hwnd);
-            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
-            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
-            void* bits = nullptr;
-            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
-            ReleaseDC(this.hwnd, dc);
-            if (bmp == nullptr || bits == nullptr) return -1;
-            int cw = icon.pxW < 16 ? icon.pxW : 16;
-            int ch = icon.pxH < 16 ? icon.pxH : 16;
-            int y = 0;
-            while (y < ch)
-            {
-                memcpy((void*)((char*)bits + y * 16 * 4),
-                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
-                y++;
-            }
+            void* bmp = this._listIconDib(icon, side);
+            if (bmp == nullptr) return -1;
             int idx = ImageList_Add(u2h(this.listIconListPtrs.get(li)), bmp, nullptr);
             DeleteObject(bmp);
             if (idx < 0) return -1;
@@ -1727,22 +1756,8 @@ class Window : INativeHost
             }
             // Same identity with new pixels is a replacement, not a new row-owned
             // object. ImageList_Replace copies the bitmap before the temporary dies.
-            void* dc = GetDC(this.hwnd);
-            BmiHeader bi = default; bi.biSize = 40u; bi.biWidth = 16; bi.biHeight = -16;
-            bi.biPlanes = 1; bi.biBitCount = 32; bi.biCompression = 0u;
-            void* bits = nullptr;
-            void* bmp = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS, &bits, nullptr, 0u);
-            ReleaseDC(this.hwnd, dc);
-            if (bmp == nullptr || bits == nullptr) return this.listIconCacheIndices.get(ci);
-            int cw = icon.pxW < 16 ? icon.pxW : 16;
-            int ch = icon.pxH < 16 ? icon.pxH : 16;
-            int y = 0;
-            while (y < ch)
-            {
-                memcpy((void*)((char*)bits + y * 16 * 4),
-                       (void*)((char*)u2h(icon.pixels) + y * icon.pxW * 4), (i64)(cw * 4));
-                y++;
-            }
+            void* bmp = this._listIconDib(icon, side);
+            if (bmp == nullptr) return this.listIconCacheIndices.get(ci);
             ImageList_Replace(u2h(this.listIconListPtrs.get(li)),
                               this.listIconCacheIndices.get(ci), bmp, nullptr);
             DeleteObject(bmp);
@@ -1930,6 +1945,7 @@ class Window : INativeHost
         {
             LVColumnA col = default;
             col.mask = (u32)(LVCF_FMT | LVCF_WIDTH | LVCF_TEXT | LVCF_SUBITEM);
+            col.fmt = (i32)(i64)payload;   // COL_ALIGN_* == LVCFMT_LEFT/RIGHT/CENTER
             col.cx = arg0 * this.dipX();
             col.pszText = (char*)text;
             col.iSubItem = arg1;
@@ -1943,7 +1959,8 @@ class Window : INativeHost
         {
             this._setListBox(h, payload);
             SendMessageA(ctrl, (u32)LVM_SETEXTENDEDLISTVIEWSTYLE,
-                         (u64)LVS_EX_FULLROWSELECT, (i64)LVS_EX_FULLROWSELECT);
+                         (u64)(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER),
+                         (i64)(LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER));
         }
         else if (op == LISTOP_SET_ROWICON_CB)
         {
@@ -2206,7 +2223,10 @@ class Window : INativeHost
                     {
                         int wCells = 12;
                         if (ci < lv.colWidths.count()) wCells = lv.colWidths.get(ci);
-                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(), 0u);
+                        int colAlign = 0;
+                        if (ci < lv.colAligns.count()) colAlign = lv.colAligns.get(ci);
+                        this.setListOp(h, LISTOP_ADD_COLUMN, wCells, ci, lv.columns.get(ci).data(),
+                                       (u64)(i64)colAlign);
                         ci++;
                     }
                     this.setListOp(h, LISTOP_SET_SELECT_MODE, lv.multiSelect ? 1 : 0, 0, "", 0u);
@@ -2513,7 +2533,7 @@ class Window : INativeHost
             this._themeBasicControl(h, "DarkMode_Explorer");
     }
 
-    // ListView: the body takes DarkMode_Explorer (dark scrollbars + hot track) plus explicit
+    // ListView: the body takes DarkMode_ItemsView (dark scrollbars, no column rules) plus explicit
     // row colors; the HEADER is a separate control with its own theme (ItemsView, which the
     // dark app mode renders dark).
     void _themeListView(u64 h)
@@ -2522,7 +2542,9 @@ class Window : INativeHost
         void* hdr = (void*)SendMessageA(ctrl, (u32)LVM_GETHEADER, 0u, (i64)0);
         bool dk = this.ctlDark;
         _allowDark(ctrl, dk);
-        if (dk) _ctlTheme(ctrl, "DarkMode_Explorer"); else _ctlThemeReset(ctrl);
+        // ItemsView, not Explorer: on Win11 the DarkMode_Explorer part paints alpha-blended
+        // full-height column rules over an LVS_OWNERDATA report body; ItemsView does not.
+        if (dk) _ctlTheme(ctrl, "DarkMode_ItemsView"); else _ctlThemeReset(ctrl);
         if (hdr != nullptr)
         {
             _allowDark(hdr, dk);
@@ -2668,6 +2690,14 @@ class Window : INativeHost
         edge.left = rc.right - 1; edge.top = rc.top; edge.right = rc.right; edge.bottom = rc.bottom;
         FillRect(hdc, &edge, this._brushFor(shadeRef(this.themeBg, 40)));
 
+        // Item format up front: the low justify bits align the label, and the
+        // HDF_SORT* bits pick the arrow below.
+        u8[72] fraw = default;
+        u32* fmask = (u32*)&fraw[0];
+        i32* ffmt = (i32*)&fraw[28];
+        fmask[0] = (u32)HDI_FORMAT;
+        SendMessageA(nh.hwndFrom, (u32)HDM_GETITEMA, (u64)specPtr[0], (i64)&fraw[0]);
+
         char[128] label;
         label[0] = (char)0;
         HDItemA hi = default;
@@ -2676,10 +2706,36 @@ class Window : INativeHost
         hi.cchTextMax = 128;
         SendMessageA(nh.hwndFrom, (u32)HDM_GETITEMA, (u64)(i64)specPtr[0], (i64)&hi);
         rc.left = rc.left + 6;
+        rc.right = rc.right - 6;
+        i32 justify = ffmt[0] & (i32)3;   // HDF_LEFT 0 / HDF_RIGHT 1 / HDF_CENTER 2
+        u32 dtAlign = (u32)DT_LEFT;
+        if (justify == 1) dtAlign = (u32)DT_RIGHT;
+        else if (justify == 2) dtAlign = (u32)DT_CENTER;
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, this.themeText);
         DrawTextA(hdc, label, -1, &rc,
-                  (u32)(DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS));
+                  dtAlign | (u32)(DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS));
+
+        // The stock header paints HDF_SORTUP/SORTDOWN itself, but SKIPDEFAULT owns the whole
+        // item - so the sort arrow (a small triangle at the top center) is drawn here too.
+        if ((ffmt[0] & (i32)(HDF_SORTUP | HDF_SORTDOWN)) != 0)
+        {
+            void* arrow = this._brushFor(shadeRef(this.themeText, 0 - 60));
+            bool up = (ffmt[0] & (i32)HDF_SORTUP) != 0;
+            int rows = (rcPtr[3] - rcPtr[1]) / 7;
+            if (rows < 3) rows = 3;
+            int cx = (rcPtr[0] + rcPtr[2]) / 2;
+            int i = 0;
+            while (i < rows)
+            {
+                int span = up ? i : rows - 1 - i;
+                RECT seg = default;
+                seg.top = rcPtr[1] + 2 + i; seg.bottom = seg.top + 1;
+                seg.left = cx - 1 - span; seg.right = cx + 1 + span;
+                FillRect(hdc, &seg, arrow);
+                i++;
+            }
+        }
         result[0] = (i64)CDRF_SKIPDEFAULT;
         return true;
     }
@@ -2748,6 +2804,85 @@ class Window : INativeHost
 
     // Push a node's current props onto its control (one interface downcast per kind -
     // the same structured access the reconciler uses in propsEqual).
+    // The declared cell width is a MINIMUM for the final column, which stretches to
+    // the client edge so no dead strip trails the list (and shrinks back to its
+    // declared width when the window narrows). Declared widths for the OTHER columns
+    // are re-pushed whenever the app changes them (e.g. recomputed from the window
+    // size on resize) but left alone otherwise, so user column drags survive.
+    void _syncListColumns(u64 h, IListView lv)
+    {
+        int n = lv.columns.count();
+        if (n <= 0) return;
+        void* ctrl = u2h(h);
+
+        string wspec = "";
+        int wi = 0;
+        while (wi < lv.colWidths.count())
+        {
+            wspec = wspec + lv.colWidths.get(wi).toString() + ",";
+            wi++;
+        }
+        int slot = -1;
+        wi = 0;
+        while (wi < this.listColWH.count())
+        {
+            if (this.listColWH.get(wi) == h) { slot = wi; wi = this.listColWH.count(); }
+            else wi++;
+        }
+        if (slot < 0 || this.listColWSpec.get(slot) != wspec)
+        {
+            wi = 0;
+            while (wi < n - 1)
+            {
+                int wCells = 12;
+                if (wi < lv.colWidths.count()) wCells = lv.colWidths.get(wi);
+                SendMessageA(ctrl, (u32)LVM_SETCOLUMNWIDTH, (u64)wi, (i64)(wCells * this.dipX()));
+                wi++;
+            }
+            if (slot < 0) { this.listColWH.add(h); this.listColWSpec.add(wspec.copy()); }
+            else this.listColWSpec.set(slot, wspec.copy());
+        }
+
+        RECT rc = default;
+        GetClientRect(ctrl, &rc);
+        if (rc.right <= rc.left) return;
+        int others = 0;
+        int i = 0;
+        while (i < n - 1)
+        {
+            others = others + (int)SendMessageA(ctrl, (u32)LVM_GETCOLUMNWIDTH, (u64)i, (i64)0);
+            i++;
+        }
+        int spec = 12;
+        if (n - 1 < lv.colWidths.count()) spec = lv.colWidths.get(n - 1);
+        int target = (rc.right - rc.left) - others;
+        int minPx = spec * this.dipX();
+        if (target < minPx) target = minPx;
+        if ((int)SendMessageA(ctrl, (u32)LVM_GETCOLUMNWIDTH, (u64)(i64)(n - 1), (i64)0) != target)
+            SendMessageA(ctrl, (u32)LVM_SETCOLUMNWIDTH, (u64)(i64)(n - 1), (i64)target);
+    }
+
+    void _syncListSort(u64 h, IListView lv)
+    {
+        void* header = (void*)SendMessageA(u2h(h), (u32)LVM_GETHEADER, 0u, (i64)0);
+        if (header == nullptr) return;
+
+        int i = 0;
+        while (i < lv.columns.count())
+        {
+            u8[72] raw = default;
+            u32* mask = (u32*)&raw[0];
+            i32* fmt = (i32*)&raw[28];
+            mask[0] = (u32)HDI_FORMAT;
+            SendMessageA(header, (u32)HDM_GETITEMA, (u64)i, (i64)&raw[0]);
+            fmt[0] = fmt[0] & ~((i32)(HDF_SORTUP | HDF_SORTDOWN));
+            if (i == lv.sortColumn)
+                fmt[0] = fmt[0] | (lv.sortAscending ? (i32)HDF_SORTUP : (i32)HDF_SORTDOWN);
+            SendMessageA(header, (u32)HDM_SETITEMA, (u64)i, (i64)&raw[0]);
+            i++;
+        }
+    }
+
     void _syncProps(IElement node, u64 h)
     {
         int k = node.kind();
@@ -2829,6 +2964,8 @@ class Window : INativeHost
             this.setListOp(h, LISTOP_SET_ROWICON_CB, 0, 0, "", (u64)_boxListIcon(lv.rowIcon));
             this.setListOp(h, LISTOP_SET_CELLSTYLE_CB, 0, 0, "", (u64)_boxListStyle(lv.cellStyle));
             this.setListOp(h, LISTOP_SET_SELECTION, lv.selectedIndex, 0, "", 0u);
+            this._syncListColumns(h, lv);
+            this._syncListSort(h, lv);
             this.setListOp(h, LISTOP_INVALIDATE, 0, 0, "", 0u);
             this.setBoolProp(h, PROP_ENABLED, !lv.disabled);
         }
@@ -5813,6 +5950,26 @@ stdcall i64 NativeWndProc(void* hwnd, u32 msg, u64 wParam, i64 lParam)
     {
         wnd.systemDarkCacheValid = false;
         return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_SHOWWINDOW && wParam != 0u)
+    {
+        PostMessageA(hwnd, (u32)WM_APP_RETHEME, 0u, (i64)0);
+        return DefWindowProcA(hwnd, msg, wParam, lParam);
+    }
+
+    if (msg == WM_APP_RETHEME)
+    {
+        if (wnd.ctlDark)
+        {
+            int li = 0;
+            while (li < wnd.listBoxHandles.count())
+            {
+                wnd._themeListView(wnd.listBoxHandles.get(li));
+                li++;
+            }
+        }
+        return (i64)0;
     }
 
     if (msg == WM_SIZE)

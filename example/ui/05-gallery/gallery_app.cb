@@ -722,6 +722,7 @@ int gallerySelfTest()
         // must remain writable and the fire wrapper must reach the assigned closure.
         IListView configured = listView(2, (int r, int c) => { return "x"; });
         configured.width = 18; configured.height = 4;
+        configured.sortColumn = 1; configured.sortAscending = true;
         configured.onSelect = (int r) => { if (g != nullptr) g.factoryProbe = r; };
         configured.onActivate = (int r) => { if (g != nullptr) g.factoryActivate = r; };
         configured.onHeaderClick = (int c) => { if (g != nullptr) g.factoryHeader = c; };
@@ -735,7 +736,8 @@ int gallerySelfTest()
         t.expectTrue("factory IListView properties",
             configuredSize.w == 18 && configuredSize.h == 4 && g != nullptr && g.factoryProbe == 1
             && g.factoryActivate == 2 && g.factoryHeader == 1
-            && configuredStyle.hasRole && configuredStyle.role == LIST_ROLE_WARNING);
+            && configuredStyle.hasRole && configuredStyle.role == LIST_ROLE_WARNING
+            && configured.sortColumn == 1 && configured.sortAscending);
         delete configured;
 
         ITextInput configuredInput = textInput("", (string s) =>

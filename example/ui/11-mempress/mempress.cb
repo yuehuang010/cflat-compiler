@@ -1,0 +1,85 @@
+// mempress.cb - the ui_native launcher and headless self-test for MemPressMonitor.
+//
+// The window itself is in mempress_app.cb and the collector is selected by
+// memsource.cb. The same source runs the native application and its UI test.
+
+import "ui_native/host.cb";
+import "ui_test.cb";
+import "mempress_app.cb";
+
+int monitorSelfTest()
+{
+    UiTestSuite suite = uiTestSuite("mempressmonitor-ui");
+
+    suite.test("window builds its controls", (IUiTest t) =>
+    {
+        t.launch(new MonitorApp(), 70, 15);
+        t.requireTrue("controls created",
+            t.exists("root/apps") && t.exists("root/bar/pin")
+            && t.exists("root/bar/expand") && t.exists("root/bar/end")
+            && !t.exists("root/bar/sort") && !t.exists("root/status"));
+        t.expectTrue("end task starts disabled", t.isDisabled("root/bar/end"));
+    });
+
+    suite.test("a capture fills the list", (IUiTest t) =>
+    {
+        t.launch(new MonitorApp(), 70, 15);
+        bool ready = t.waitUntil(() => t.listRowCount("root/apps") > 0,
+                                 kRefreshIntervalMs + 3000);
+        t.expectTrue("rows arrived", ready && t.listRowCount("root/apps") > 0);
+        if (!ready) return;
+        t.expectTrue("memory cell rendered",
+            t.listCellText("root/apps", 0, kSortMemory).contains("MB"));
+    });
+
+    suite.test("show all expands past the collapsed count", (IUiTest t) =>
+    {
+        t.launch(new MonitorApp(), 70, 15);
+        bool ready = t.waitUntil(() => t.listRowCount("root/apps") > 0,
+                                 kRefreshIntervalMs + 3000);
+        if (!ready) return;
+
+        int collapsed = t.listRowCount("root/apps");
+        t.expectTrue("collapsed to the top apps plus the OS row",
+            collapsed <= kCollapsedAppCount + 1);
+        t.click("root/bar/expand");
+        t.expectTrue("expanded shows more rows",
+            t.listRowCount("root/apps") > collapsed);
+    });
+
+    suite.test("selecting a row enables End Task", (IUiTest t) =>
+    {
+        t.launch(new MonitorApp(), 70, 15);
+        bool ready = t.waitUntil(() => t.listRowCount("root/apps") > 0,
+                                 kRefreshIntervalMs + 3000);
+        if (!ready) return;
+
+        t.listSelect("root/apps", 0);
+        t.expectTrue("end task follows selection",
+            t.isEnabled("root/bar/end") == memSourceCanEndTask());
+    });
+
+    suite.test("header clicks update sort state", (IUiTest t) =>
+    {
+        t.launch(new MonitorApp(), 70, 15);
+        bool ready = t.waitUntil(() => t.listRowCount("root/apps") > 0,
+                                 kRefreshIntervalMs + 3000);
+        if (!ready) return;
+
+        MonitorApp* app = activeApp() as MonitorApp;
+        nativeListHeaderClick("root/apps", kSortMemory);
+        t.expectTrue("memory header toggles ascending",
+            app != nullptr && app._sortColumn == kSortMemory && app._sortAscending);
+        nativeListHeaderClick("root/apps", kSortName);
+        t.expectTrue("app header starts ascending",
+            app != nullptr && app._sortColumn == kSortName && app._sortAscending);
+    });
+
+    return suite.run(0, nullptr);
+}
+
+extern int main(int argc, char** argv)
+{
+    if (argc > 1 && strcmp(argv[1], "--selftest") == 0) return monitorSelfTest();
+    return runAppGuiNative(new MonitorApp(), "MemPressMonitor");
+}

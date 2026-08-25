@@ -1,0 +1,263 @@
+// Process and system-wide memory collection.
+
+import "appmodel.cb";
+import "winapi.cb";
+import "dictionary.cb";
+import "list.cb";
+import "string.cb";
+import "wstring.cb";
+
+// The GPU counter query is kept open across captures: PDH reports a delta-free
+// instantaneous value, but reopening the query on every refresh costs far more
+// than holding one handle for the life of the process.
+void* _gpuQuery   = nullptr;
+void* _gpuCounter = nullptr;
+
+void _closeGpuQuery()
+{
+    if (_gpuQuery != nullptr) PdhCloseQuery(_gpuQuery);
+    _gpuQuery = nullptr;
+    _gpuCounter = nullptr;
+}
+
+bool _openGpuQuery()
+{
+    if (PdhOpenQueryW(nullptr, (u64)0, &_gpuQuery) != ERROR_SUCCESS) return false;
+    wstring path = toWString("\\GPU Process Memory(pid_*)\\Shared Usage");
+    if (PdhAddEnglishCounterW(_gpuQuery, path.data(), (u64)0, &_gpuCounter) == ERROR_SUCCESS)
+        return true;
+    _closeGpuQuery();
+    return false;
+}
+
+// Instance names look like "pid_1234_luid_0x...". Returns false for anything else.
+bool _parseGpuPid(u16* name, u32* processId)
+{
+    if (name == nullptr) return false;
+    // "pid_"
+    if (name[0] != (u16)112 || name[1] != (u16)105 || name[2] != (u16)100 || name[3] != (u16)95)
+        return false;
+    i32 i = 4;
+    if (name[i] < (u16)48 || name[i] > (u16)57) return false;
+    u64 value = 0;
+    while (name[i] >= (u16)48 && name[i] <= (u16)57)
+    {
+        u64 digit = (u64)(name[i] - (u16)48);
+        if (value > ((u64)4294967295 - digit) / (u64)10) return false;
+        value = value * (u64)10 + digit;
+        i = i + 1;
+    }
+    // trailing '_'
+    if (name[i] != (u16)95) return false;
+    *processId = (u32)value;
+    return true;
+}
+
+// GPU shared-memory bytes per process id. PDH reports the whole machine in one
+// query, so it is sampled once before the process walk and looked up per process.
+move dictionary<u32, u64> _collectGpuShared()
+{
+    dictionary<u32, u64> sharedByProcess;
+    if (_gpuQuery == nullptr && !_openGpuQuery()) return move sharedByProcess;
+    if (PdhCollectQueryData(_gpuQuery) != ERROR_SUCCESS)
+    {
+        _closeGpuQuery();
+        return move sharedByProcess;
+    }
+
+    u32 bufferSize = 0;
+    u32 itemCount  = 0;
+    u32 status = PdhGetFormattedCounterArrayW(_gpuCounter, (u32)PDH_FMT_LARGE,
+                                              &bufferSize, &itemCount, nullptr);
+    if (status == (u32)PDH_CSTATUS_NO_INSTANCE) return move sharedByProcess;
+    if (status != (u32)PDH_MORE_DATA || bufferSize == 0)
+    {
+        _closeGpuQuery();
+        return move sharedByProcess;
+    }
+
+    u8* buffer = new u8[(i32)bufferSize];
+    status = PdhGetFormattedCounterArrayW(_gpuCounter, (u32)PDH_FMT_LARGE,
+                                          &bufferSize, &itemCount, buffer);
+    if (status != ERROR_SUCCESS)
+    {
+        delete[] buffer;
+        _closeGpuQuery();
+        return move sharedByProcess;
+    }
+    PDH_FMT_COUNTERVALUE_ITEM_W* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)buffer;
+
+    u32 i = 0;
+    while (i < itemCount)
+    {
+        u32 processId = 0;
+        if (_parseGpuPid(items[i].szName, &processId) && items[i].FmtValue.largeValue > 0)
+        {
+            u64 total = (u64)items[i].FmtValue.largeValue;
+            if (sharedByProcess.contains(processId)) total = total + sharedByProcess.get(processId);
+            sharedByProcess.set(processId, total);
+        }
+        i = i + 1;
+    }
+    delete[] buffer;
+    return move sharedByProcess;
+}
+
+// Exe path and MSIX package identity, both of which need a process handle.
+void _queryDetails(ProcessInfo* process)
+{
+    if (process->processId == 0) return;
+    void* handle = OpenProcess((u32)PROCESS_QUERY_LIMITED_INFORMATION, 0, process->processId);
+    if (handle == nullptr) return;
+
+    u16* path = new u16[32768];
+    u32 length = (u32)32768;
+    if (QueryFullProcessImageNameW(handle, (u32)0, path, &length) != 0)
+        process->exePath = wstring.fromUtf16(path, (i32)length).toString();
+    delete[] path;
+
+    u32 packageLength = 0;
+    if (GetPackageFamilyName(handle, &packageLength, nullptr) == ERROR_INSUFFICIENT_BUFFER
+        && packageLength != 0)
+    {
+        u16* packageBuffer = new u16[(i32)packageLength];
+        if (GetPackageFamilyName(handle, &packageLength, packageBuffer) == ERROR_SUCCESS)
+        {
+            i32 units = (i32)packageLength;
+            if (units > 0 && packageBuffer[units - 1] == (u16)0) units = units - 1;
+            process->packageFamilyName = wstring.fromUtf16(packageBuffer, units).toString();
+        }
+        delete[] packageBuffer;
+    }
+    CloseHandle(handle);
+}
+
+// Grows the buffer until NtQuerySystemInformation stops reporting a length
+// mismatch. Returns an empty string on success, else the failure text.
+move string _readProcessBuffer(u8** buffer, u32* size)
+{
+    i32 maximum = 64 * 1024 * 1024;
+    i32 capacity = 1024 * 1024;
+    u8* current = new u8[capacity];
+    while (true)
+    {
+        u32 returned = 0;
+        i32 status = NtQuerySystemInformation((u32)kSystemProcessInformation, current,
+                                              (u32)capacity, &returned);
+        if (status >= 0)
+        {
+            *buffer = current;
+            *size = (u32)capacity;
+            return "";
+        }
+        if (status != kLengthMismatch || capacity >= maximum)
+        {
+            delete[] current;
+            return "NtQuerySystemInformation failed with status 0x" + ((i64)(u32)status).toString(16);
+        }
+        i32 next = (i32)returned > capacity ? (i32)returned : capacity * 2;
+        if (next > maximum) next = maximum;
+        delete[] current;
+        capacity = next;
+        current = new u8[capacity];
+    }
+    return "";
+}
+
+void _readPerformance(SystemStats* stats)
+{
+    PERFORMANCE_INFORMATION info = default;
+    info.cb = (u32)sizeof(PERFORMANCE_INFORMATION);
+    if (GetPerformanceInfo(&info, info.cb) != 0)
+    {
+        u64 pageSize = (u64)info.PageSize;
+        stats->commitTotal        = (u64)info.CommitTotal * pageSize;
+        stats->commitLimit        = (u64)info.CommitLimit * pageSize;
+        stats->physicalTotal      = (u64)info.PhysicalTotal * pageSize;
+        stats->physicalAvailable  = (u64)info.PhysicalAvailable * pageSize;
+        stats->kernelPagedPool    = (u64)info.KernelPaged * pageSize;
+        stats->kernelNonpagedPool = (u64)info.KernelNonpaged * pageSize;
+    }
+    else
+    {
+        MEMORYSTATUSEX memory = default;
+        memory.dwLength = (u32)sizeof(MEMORYSTATUSEX);
+        if (GlobalMemoryStatusEx(&memory) != 0)
+        {
+            stats->physicalTotal     = memory.ullTotalPhys;
+            stats->physicalAvailable = memory.ullAvailPhys;
+        }
+    }
+}
+
+// Fills `snapshot`. Returns an empty string on success, else the failure text.
+move string captureSnapshot(Snapshot* snapshot)
+{
+    snapshot->processes.clear();
+    snapshot->system = default;
+
+    i64 timestamp = 0;
+    QueryPerformanceCounter(&timestamp);
+    snapshot->capturedAtQpc = (u64)timestamp;
+
+    dictionary<u32, u64> gpuShared = _collectGpuShared();
+
+    u8* buffer = nullptr;
+    u32 size = 0;
+    string error = _readProcessBuffer(&buffer, &size);
+    if (!error.isEmpty()) return move error;
+
+    u8* current = buffer;
+    u8* end = buffer + (i32)size;
+    while (true)
+    {
+        if (current + (i32)sizeof(ProcessRecord) > end)
+        {
+            delete[] buffer;
+            return "NtQuerySystemInformation returned a truncated process record.";
+        }
+        ProcessRecord* record = (ProcessRecord*)current;
+        ProcessInfo process = default;
+        process.processId       = (u32)record->processId;
+        process.parentProcessId = (u32)record->parentProcessId;
+        process.sessionId       = record->sessionId;
+        process.createTime      = (u64)record->createTime;
+
+        u64 fullWorkingSet = record->workingSetSize;
+        if (record->workingSetPrivateSize > 0)
+        {
+            process.workingSet = (u64)record->workingSetPrivateSize;
+            process.workingSetShared = fullWorkingSet > process.workingSet
+                ? fullWorkingSet - process.workingSet : (u64)0;
+        }
+        else
+        {
+            // Private size unavailable: workingSet already holds the full set,
+            // so no shared portion may be added on top of it.
+            process.workingSet = fullWorkingSet;
+        }
+        process.commit     = record->pagefileUsage;
+        process.hardFaults = (u64)record->hardFaultCount;
+        if (gpuShared.contains(process.processId))
+            process.gpuShared = gpuShared.get(process.processId);
+        process.imageName  = wstring.fromUtf16(record->imageNameBuffer,
+                                               (i32)(record->imageNameLength / (u16)2)).toString();
+        _queryDetails(&process);
+        if (process.exePath.isEmpty()) process.exePath = process.imageName.copy();
+        snapshot->system.hardFaults = snapshot->system.hardFaults + process.hardFaults;
+        snapshot->processes.add(process);
+
+        if (record->nextEntryOffset == 0) break;
+        if ((i64)record->nextEntryOffset > (i64)(end - current)
+            || current + (i32)record->nextEntryOffset >= end)
+        {
+            delete[] buffer;
+            return "NtQuerySystemInformation returned an invalid process offset.";
+        }
+        current = current + (i32)record->nextEntryOffset;
+    }
+    delete[] buffer;
+
+    _readPerformance(&snapshot->system);
+    return "";
+}

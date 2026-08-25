@@ -1,0 +1,70 @@
+// macOS MemSource - a placeholder collector.
+//
+// Selected by `memsource.cb` on macOS. It fabricates a stable set of rows so the
+// window, its sorting, its selection and its refresh cadence can be built and
+// exercised on a Mac; it reads nothing from the OS.
+//
+// Replacing it is the whole macOS port: fill `capture()` from the real APIs
+// (`host_statistics64` / `HOST_VM_INFO64` for the system totals, `proc_listpids`
+// + `proc_pid_rusage` per process for the per-app figures) and implement
+// `endTask` over `kill(2)`. Nothing outside this file needs to change - the
+// window and the pressure model are already platform-neutral.
+
+import "appsample.cb";
+import "list.cb";
+import "string.cb";
+
+
+
+bool memSourceCanEndTask() { return false; }
+
+class MemSource
+{
+    i32 _tick = 0;
+
+    void _addApp(list<AppEntry>* apps, char* name, u64 megabytes, i32 pressure, i32 band)
+    {
+        AppEntry app = default;
+        app.key = "" + name;
+        app.displayName = "" + name;
+        app.workingSet = megabytes * (u64)1048576;
+        app.commit = app.workingSet;
+        app.pressure.value = pressure;
+        app.pressure.band = band;
+        apps->add(app);
+    }
+
+    move AppSample capture()
+    {
+        // A cheap LCG so successive captures differ and the refresh is visible.
+        this._tick = (this._tick * 1103515245 + 12345) & 0x3FFFFFFF;
+        u64 drift = (u64)(this._tick % 64);
+
+        AppSample sample = default;
+        this._addApp(&sample.apps, "Safari",        1420u + drift, 34, PressureBand.Moderate);
+        this._addApp(&sample.apps, "Xcode",          980u + drift, 22, PressureBand.Moderate);
+        this._addApp(&sample.apps, "Terminal",       120u + drift,  4, PressureBand.Low);
+        this._addApp(&sample.apps, "Finder",          96u + drift,  2, PressureBand.Low);
+        this._addApp(&sample.apps, "Music",           74u + drift,  1, PressureBand.Low);
+        this._addApp(&sample.apps, "Notes",           48u + drift,  0, PressureBand.Low);
+        this._addApp(&sample.apps, kBackgroundAppKey, 610u + drift,  9, PressureBand.Low);
+
+        sample.system.physicalTotal     = (u64)16 * (u64)1073741824;
+        sample.system.physicalAvailable = (u64)7 * (u64)1073741824 + drift * (u64)1048576;
+        sample.system.commitLimit       = sample.system.physicalTotal;
+        sample.system.commitTotal       = sample.system.physicalTotal - sample.system.physicalAvailable;
+        sample.pressure.value = 28;
+        sample.pressure.band  = PressureBand.Moderate;
+        return move sample;
+    }
+
+};
+
+ListRowIcon memSourceAppIcon(AppEntry* app)
+{
+    return noListIcon();
+}
+
+// The real macOS implementation is kill(2) over the group's pids; until then
+// `memSourceCanEndTask()` is false and the UI never reaches this.
+i32 memSourceEndTask(list<u32>* processIds) { return 0; }

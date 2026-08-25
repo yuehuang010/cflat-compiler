@@ -200,9 +200,17 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
 - **`ListView`** - a **virtualized** report-mode list. The item source is a callback,
   `Lambda<string(int,int)> rowText` (row, col -> cell text), NOT a copied list, so
   `rowCount` can be 100k+ and only the visible cells are ever queried (Win32
-  `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthCells)`;
+  `LVS_OWNERDATA` + `LVN_GETDISPINFO`). Columns via `addColumn(title, widthCells)`, or
+  `addColumnAligned(title, widthCells, align)` with `COL_ALIGN_LEFT` / `COL_ALIGN_CENTER` /
+  `COL_ALIGN_RIGHT` for the cell and header text (the first column is always left-aligned
+  on Win32);
   controlled `selectedIndex`; `onSelect(row)` on a selection change, `onActivate(row)`
   on double-click / Enter, and `onHeaderClick(column)` for a zero-based header click.
+  `sortColumn` is the zero-based column with a sort indicator (-1 means no indicator),
+  and `sortAscending` selects the chevron direction. These fields are visual state only;
+  the application owns the actual row ordering. The declared width of the LAST column
+  is a minimum: it stretches to the list's client edge so no dead strip trails the
+  final column, and shrinks back to its declared width when the list narrows.
   Optional `rowIcon(row)` returns a `ListRowIcon`: a stable borrowed identity plus
   borrowed top-down BGRA32 pixels (the same data convention as `Image`) and an explicit
   `revision` token. Empty identity or invalid pixels omits the icon. Constructors:
@@ -211,7 +219,9 @@ fallback and a headless self-test in `example/ui/05-gallery/gallery.cb`:
   `ListRowIcon noListIcon();`
   Hosts cache by
   identity, replace when revision/dimensions/pixels change, resolve it again for every realized/reused row, and release the
-  callback/cache when the list is destroyed. No HWND, HBITMAP, NSImage, XAML object, or
+  callback/cache when the list is destroyed. The icon slot is 16 DIP; the host scales
+  the provided pixels to the monitor density, so supply them at the largest natural
+  size available (e.g. extract at `16 * dpi / 96`) for a crisp result. No HWND, HBITMAP, NSImage, XAML object, or
   other native handle enters this API.
   Factory-returned `IListView` exposes `width`, `height`, and all three callbacks, so
   interface-typed values remain fully configurable. Driver helpers: `nativeListSelect(keyPath, row)`,

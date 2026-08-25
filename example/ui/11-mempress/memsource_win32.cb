@@ -1,0 +1,142 @@
+// Windows MemSource - the real collector, driving the existing memcore.
+//
+// Selected by `memsource.cb` on Windows. The macOS counterpart is
+// `memsource_macos.cb`; both expose the same `MemSource` surface.
+
+import "appsample.cb";
+import "dictionary.cb";
+import "wstring.cb";
+import { "windows.h", "shellapi.h" } lib "shell32.lib" cache;
+extern stdcall i32 SHDefExtractIconW(u16* pszIconFile, i32 iIndex, u32 uFlags, void** phiconLarge, void** phiconSmall, u32 nIconSize);
+import "memcore/grouper.cb";
+import "memcore/pressure.cb";
+import "memcore/snapshot.cb";
+import "list.cb";
+import "string.cb";
+
+class AppIconBuffer
+{
+    void* bitmap = nullptr;
+    u8* pixels = nullptr;
+    i32 side = 0;
+
+    ~AppIconBuffer()
+    {
+        if (this.bitmap != nullptr) DeleteObject(this.bitmap);
+    }
+};
+
+dictionary<string, unique AppIconBuffer*> _appIconCache = default;
+
+ListRowIcon memSourceAppIcon(AppEntry* app)
+{
+    if (app == nullptr) return noListIcon();
+
+    // Extract at the monitor density (16 DIP scaled), so the host's image list
+    // gets a full-resolution bitmap instead of upscaling a 96-dpi one.
+    i32 side = (i32)(16u * GetDpiForSystem() / 96u);
+    if (side < 16) side = 16;
+
+    bool generic = app->exePath.isEmpty();
+    string cacheKey = generic ? "*fallback" + "" : app->exePath.copy();
+    if (!_appIconCache.contains(cacheKey))
+    {
+        AppIconBuffer* created = new AppIconBuffer();
+        void* icon = nullptr;
+        if (!generic)
+        {
+            wstring path = toWString(app->exePath);
+            if (SHDefExtractIconW(path.data(), 0, 0, &icon, nullptr, (u32)side) != 0)
+                icon = nullptr;
+        }
+        if (icon == nullptr)
+        {
+            // Same fallback as the C++ original: the shell's stock application icon.
+            SHSTOCKICONINFO stock = default;
+            stock.cbSize = (u32)sizeof(SHSTOCKICONINFO);
+            if (SHGetStockIconInfo((i32)SIID_APPLICATION,
+                                   (u32)SHGSI_ICON | (u32)SHGSI_SMALLICON, &stock) == S_OK)
+                icon = stock.hIcon;
+        }
+        if (icon != nullptr)
+        {
+            created.side = side;
+            BmiHeader bi = default;
+            bi.biSize = 40u;
+            bi.biWidth = side;
+            bi.biHeight = 0 - side;
+            bi.biPlanes = 1;
+            bi.biBitCount = 32;
+            bi.biCompression = 0u;
+
+            void* dc = GetDC(nullptr);
+            void* mem = CreateCompatibleDC(dc);
+            void* bits = nullptr;
+            created.bitmap = CreateDIBSection(dc, &bi, (u32)DIB_RGB_COLORS,
+                                              &bits, nullptr, 0u);
+            ReleaseDC(nullptr, dc);
+            if (mem != nullptr && created.bitmap != nullptr && bits != nullptr)
+            {
+                void* previous = SelectObject(mem, created.bitmap);
+                DrawIconEx(mem, 0, 0, icon, side, side, 0, nullptr, (u32)DI_NORMAL);
+                GdiFlush();
+                SelectObject(mem, previous);
+                created.pixels = (u8*)bits;
+            }
+            if (mem != nullptr) DeleteDC(mem);
+            DestroyIcon(icon);
+        }
+        _appIconCache.set(cacheKey, created);
+    }
+
+    AppIconBuffer* cached = _appIconCache.get(cacheKey);
+    if (cached == nullptr || cached->pixels == nullptr)
+        return noListIcon();
+    return listIcon(generic ? "*fallback" : app->key.data(),
+                    (u64)cached->pixels, cached->side, cached->side);
+}
+
+
+
+// True when `endTask` can actually terminate processes on this platform.
+bool memSourceCanEndTask() { return true; }
+
+class MemSource
+{
+    MemPressEngine _engine   = default;
+    Snapshot       _snapshot = default;
+
+    // Runs on the capture worker thread, never on the UI thread.
+    move AppSample capture()
+    {
+        AppSample sample = default;
+        sample.error = captureSnapshot(&this._snapshot);
+        if (!sample.error.isEmpty()) return move sample;
+
+        sample.apps = this._engine.update(&this._snapshot, groupProcesses(&this._snapshot));
+        sample.pressure = this._engine.systemPressure();
+        sample.system = this._snapshot.system;
+        return move sample;
+    }
+
+};
+
+// Terminates every process in an app group; returns how many were closed. A free
+// function rather than a MemSource method: ending a task carries no collector
+// state, and the UI thread calls it while the worker owns the MemSource.
+i32 memSourceEndTask(list<u32>* processIds)
+{
+    i32 closed = 0;
+    i32 i = 0;
+    while (i < processIds->count())
+    {
+        void* process = OpenProcess((u32)PROCESS_TERMINATE, 0, processIds->get(i));
+        if (process != nullptr)
+        {
+            if (TerminateProcess(process, (u32)1) != 0) closed = closed + 1;
+            CloseHandle(process);
+        }
+        i = i + 1;
+    }
+    return closed;
+}

@@ -1,0 +1,186 @@
+// Heuristic memory-pressure scoring. Hard-fault rate is the primary signal;
+// memory load only matters once the machine is close to its commit limit.
+
+import "appmodel.cb";
+import "winapi.cb";
+import "dictionary.cb";
+import "list.cb";
+import "math.cb";
+import "string.cb";
+
+double kMeasurableFaultsPerSec       = 10.0;
+double kNoticeableFaultsPerSec       = 100.0;
+u32    kSustainedIntervals           = 3;
+double kSystemNoticeableFaultsPerSec = 500.0;
+double kCriticalMemoryLoad           = 0.90;
+double kLatentMemoryLoad             = 0.80;
+
+double _clamp01to100(double value)
+{
+    return Math.clamp(value, 0.0, 100.0);
+}
+
+double _loadScore(double ratio, double criticalRatio)
+{
+    return criticalRatio > 0.0 ? _clamp01to100(ratio / criticalRatio * 100.0) : 0.0;
+}
+
+i32 _band(double value)
+{
+    if (value >= 75.0) return PressureBand.Critical;
+    if (value >= 50.0) return PressureBand.High;
+    if (value >= 25.0) return PressureBand.Moderate;
+    return PressureBand.Low;
+}
+
+double _linearScore(double value, double inputLow, double inputHigh,
+                    double scoreLow, double scoreHigh)
+{
+    if (inputHigh <= inputLow) return scoreLow;
+    double fraction = Math.clamp((value - inputLow) / (inputHigh - inputLow), 0.0, 1.0);
+    return scoreLow + fraction * (scoreHigh - scoreLow);
+}
+
+PressureScore _scoreInBand(double value, i32 band)
+{
+    double low = band == PressureBand.Low ? 0.0
+        : band == PressureBand.Moderate ? 25.0
+        : band == PressureBand.High ? 50.0 : 75.0;
+    double high = band == PressureBand.Low ? 24.0
+        : band == PressureBand.Moderate ? 49.0
+        : band == PressureBand.High ? 74.0 : 100.0;
+    PressureScore result = default;
+    result.value = (i32)Math.round(Math.clamp(value, low, high));
+    result.band = band;
+    return result;
+}
+
+double _seconds(u64 newer, u64 older)
+{
+    if (newer <= older || older == 0) return 0.0;
+    i64 frequency = 0;
+    QueryPerformanceFrequency(&frequency);
+    return frequency > 0 ? (double)(newer - older) / (double)frequency : 0.0;
+}
+
+double _faultRate(u64 current, u64 previous, double elapsed)
+{
+    if (elapsed <= 0.0 || current < previous) return 0.0;
+    return (double)(current - previous) / elapsed;
+}
+
+PressureScore _appScore(double rate, double workingSet, double commit, double memoryLoad,
+                        u32 noticeableIntervals)
+{
+    bool latentTrim = commit > 0.0 && workingSet / commit < 0.5 && memoryLoad >= kLatentMemoryLoad;
+    i32 band = PressureBand.Low;
+    double score = 0.0;
+    if (rate >= kNoticeableFaultsPerSec)
+    {
+        if (noticeableIntervals >= kSustainedIntervals)
+        {
+            band = PressureBand.Critical;
+            score = _linearScore(rate, kNoticeableFaultsPerSec,
+                                 10.0 * kNoticeableFaultsPerSec, 75.0, 100.0);
+        }
+        else
+        {
+            band = PressureBand.High;
+            score = _linearScore(rate, kNoticeableFaultsPerSec,
+                                 10.0 * kNoticeableFaultsPerSec, 50.0, 74.0);
+        }
+    }
+    else if (rate >= kMeasurableFaultsPerSec)
+    {
+        band = PressureBand.Moderate;
+        score = _linearScore(rate, kMeasurableFaultsPerSec, kNoticeableFaultsPerSec, 25.0, 49.0);
+    }
+    else if (latentTrim)
+    {
+        band = PressureBand.Moderate;
+        score = 25.0 + (1.0 - Math.clamp(workingSet / commit, 0.0, 1.0)) * 24.0;
+    }
+    else
+    {
+        score = _linearScore(rate, 0.0, kMeasurableFaultsPerSec, 0.0, 24.0);
+    }
+    return _scoreInBand(score, band);
+}
+
+// Per-app fault history from the previous capture.
+struct AppHistory
+{
+    u64 capturedAtQpc      = 0;
+    u64 hardFaults         = 0;
+    u32 noticeableIntervals = 0;
+};
+
+class MemPressEngine
+{
+    dictionary<string, AppHistory> _appHistory = default;
+    u64 _previousCapturedAtQpc = 0;
+    u64 _previousHardFaults    = 0;
+    u32 _systemNoticeableIntervals = 0;
+    PressureScore _systemPressure = default;
+
+    PressureScore systemPressure() { return _systemPressure; }
+
+    // Scores `apps` in place against `snapshot` and folds this capture into the
+    // rate history. The returned list carries the scored entries.
+    move list<AppEntry> update(Snapshot* snapshot, move list<AppEntry> apps)
+    {
+        double elapsed = _seconds(snapshot->capturedAtQpc, _previousCapturedAtQpc);
+        double systemFaultRate = _faultRate(snapshot->system.hardFaults, _previousHardFaults, elapsed);
+        if (systemFaultRate >= kSystemNoticeableFaultsPerSec)
+            _systemNoticeableIntervals = _systemNoticeableIntervals + (u32)1;
+        else
+            _systemNoticeableIntervals = 0;
+
+        double commitRatio = snapshot->system.commitLimit != (u64)0
+            ? (double)snapshot->system.commitTotal / (double)snapshot->system.commitLimit : 0.0;
+        double physicalRatio = snapshot->system.physicalTotal != (u64)0
+            ? 1.0 - (double)snapshot->system.physicalAvailable / (double)snapshot->system.physicalTotal
+            : 0.0;
+        double memoryLoad = Math.max(commitRatio, physicalRatio);
+        double loadScore = _loadScore(memoryLoad, kCriticalMemoryLoad);
+        double faultScore = _loadScore(systemFaultRate, 10.0 * kSystemNoticeableFaultsPerSec);
+        double rawScore = 0.5 * loadScore + 0.5 * faultScore;
+
+        i32 systemBand = _band(rawScore);
+        if (systemFaultRate >= kSystemNoticeableFaultsPerSec
+            && (systemBand == PressureBand.Low || systemBand == PressureBand.Moderate))
+            systemBand = PressureBand.High;
+        if (systemBand == PressureBand.Critical && _systemNoticeableIntervals < kSustainedIntervals)
+            systemBand = PressureBand.High;
+        _systemPressure = _scoreInBand(rawScore, systemBand);
+
+        list<AppEntry> scored;
+        while (apps.count() > 0)
+        {
+            AppEntry app = apps.take(0);
+            bool hasOld = _appHistory.contains(app.key);
+            AppHistory old = hasOld ? _appHistory.get(app.key) : default;
+            double appElapsed = hasOld ? _seconds(snapshot->capturedAtQpc, old.capturedAtQpc) : 0.0;
+            double appFaultRate = hasOld ? _faultRate(app.hardFaults, old.hardFaults, appElapsed) : 0.0;
+            u32 noticeableIntervals = hasOld ? old.noticeableIntervals : (u32)0;
+            if (appFaultRate >= kNoticeableFaultsPerSec)
+                noticeableIntervals = noticeableIntervals + (u32)1;
+            else
+                noticeableIntervals = 0;
+
+            app.pressure = _appScore(appFaultRate, (double)app.workingSet, (double)app.commit,
+                                     memoryLoad, noticeableIntervals);
+
+            AppHistory fresh = default;
+            fresh.capturedAtQpc = snapshot->capturedAtQpc;
+            fresh.hardFaults = app.hardFaults;
+            fresh.noticeableIntervals = noticeableIntervals;
+            _appHistory.set(app.key, fresh);
+            scored.add(app);
+        }
+
+        _previousCapturedAtQpc = snapshot->capturedAtQpc;
+        _previousHardFaults = snapshot->system.hardFaults;
+        return move scored;
+    }
+};

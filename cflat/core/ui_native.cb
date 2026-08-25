@@ -1460,12 +1460,20 @@ interface IComboBox : IDisableable
     void fireChange(int v);
 };
 
+// Column text alignment for ListView columns (hosts map to the native column format).
+const int COL_ALIGN_LEFT   = 0;
+const int COL_ALIGN_RIGHT  = 1;
+const int COL_ALIGN_CENTER = 2;
+
 interface IListView : IDisableable
 {
     list<string> columns;
     list<int>    colWidths;
+    list<int>    colAligns;
     int  rowCount;
     int  selectedIndex;
+    int  sortColumn;
+    bool sortAscending;
     bool multiSelect;
     Lambda<string(int,int)> rowText;   // read as a value: boxed across the host seam
     Lambda<ListRowIcon(int)> rowIcon;   // stable portable identity + borrowed pixels
@@ -1476,6 +1484,7 @@ interface IListView : IDisableable
     Lambda<void(int)> onActivate;
     Lambda<void(int)> onHeaderClick;
     void addColumn(string title, int widthCells);
+    void addColumnAligned(string title, int widthCells, int align);
     void fireSelect(int row);
     void fireActivate(int row);
     void fireHeaderClick(int col);
@@ -4019,11 +4028,14 @@ class ListView : IListView
     Style style = default;
     list<string> columns   = default;   // header titles
     list<int>    colWidths = default;    // per-column width in layout cells
+    list<int>    colAligns = default;    // per-column COL_ALIGN_* text alignment
     int   rowCount = 0;
     Lambda<string(int,int)> rowText = default;   // (row, col) -> cell text
     Lambda<ListRowIcon(int)> rowIcon = default;   // row -> portable icon description
     Lambda<ListCellStyle(int,int)> cellStyle = default; // (row, col) -> tagged appearance
     int   selectedIndex = -1;            // controlled single selection (-1 = none)
+    int sortColumn = 0 - 1;            // sorted header column; -1 = no indicator
+    bool sortAscending = false;        // direction for the sorted header column
     bool  multiSelect = false;
     Lambda<void(int)> onSelect   = default;      // selection changed to row
     Lambda<void(int)> onActivate = default;      // double-click / Enter on row
@@ -4037,8 +4049,14 @@ class ListView : IListView
 
     void addColumn(string title, int widthCells)
     {
+        this.addColumnAligned(title, widthCells, COL_ALIGN_LEFT);
+    }
+
+    void addColumnAligned(string title, int widthCells, int align)
+    {
         this.columns.add("" + title);
         this.colWidths.add(widthCells);
+        this.colAligns.add(align);
     }
 
     void fireSelect(int row)   { if (this.onSelect != nullptr) { this.onSelect(row); } }
@@ -4197,6 +4215,7 @@ class ListView : IListView
         IListView o = other as IListView;
         if (o == nullptr) return false;
         return this.rowCount == o.rowCount && this.selectedIndex == o.selectedIndex
+            && this.sortColumn == o.sortColumn && this.sortAscending == o.sortAscending
             && this.multiSelect == o.multiSelect && this.disabled == o.disabled
             && this.columns.count() == o.columns.count()
             && styleEquals(this.style, o.style);

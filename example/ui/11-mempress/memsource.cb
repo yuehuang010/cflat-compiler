@@ -1,0 +1,10 @@
+// Platform seam for the app data the window renders.
+//
+// The same shape as `core/ui_native/host.cb`: a file-scope compile-time switch
+// picks the backend. Both backends expose the collector, end-task capability, and app-icon helper, so `mempress_app.cb` names no platform at all.
+
+if const (__MACOS__) {
+    import "memsource_macos.cb";
+} else {
+    import "memsource_win32.cb";
+}

@@ -1,0 +1,64 @@
+// Single Win32 binding point for memcore. Every module imports this file rather
+// than binding the SDK headers again, so the header extraction runs once and the
+// import libraries are named in exactly one place.
+//
+// windows.h must lead the group: psapi.h / pdh.h / appmodel.h all use HANDLE and
+// DWORD without including the header that defines them.
+
+import { "windows.h", "psapi.h", "pdh.h", "pdhmsg.h", "appmodel.h", "winver.h" }
+    lib { "psapi.lib", "pdh.lib", "version.lib", "user32.lib", "advapi32.lib" } cache;
+
+// NtQuerySystemInformation is documented in winternl.h but its
+// SYSTEM_PROCESS_INFORMATION layout is deliberately abridged there, so the record
+// is transcribed by hand below and the entry point is declared directly.
+extern stdcall i32 NtQuerySystemInformation(u32 infoClass, void* buffer, u32 length, u32* returned);
+
+// SystemProcessInformation.
+i32 kSystemProcessInformation = 5;
+// STATUS_INFO_LENGTH_MISMATCH.
+i32 kLengthMismatch = (i32)0xC0000004;
+
+// SYSTEM_PROCESS_INFORMATION, x64. Padding is spelled out so the 256-byte C
+// layout is reproduced exactly; a static check in captureSnapshot guards it.
+struct ProcessRecord
+{
+    u32 nextEntryOffset          = 0;
+    u32 numberOfThreads          = 0;
+    i64 workingSetPrivateSize    = 0;
+    u32 hardFaultCount           = 0;
+    u32 threadsHighWatermark     = 0;
+    u64 cycleTime                = 0;
+    i64 createTime               = 0;
+    i64 userTime                 = 0;
+    i64 kernelTime               = 0;
+    u16  imageNameLength         = 0;
+    u16  imageNameMaximumLength  = 0;
+    u32  imageNamePadding        = 0;
+    u16* imageNameBuffer         = nullptr;
+    i32 basePriority             = 0;
+    i32 basePriorityPadding      = 0;
+    u64 processId                = 0;
+    u64 parentProcessId          = 0;
+    u32 handleCount              = 0;
+    u32 sessionId                = 0;
+    u64 uniqueProcessKey         = 0;
+    u64 peakVirtualSize          = 0;
+    u64 virtualSize              = 0;
+    u32 pageFaultCount           = 0;
+    u32 pageFaultCountPadding    = 0;
+    u64 peakWorkingSetSize       = 0;
+    u64 workingSetSize           = 0;
+    u64 quotaPeakPagedPoolUsage  = 0;
+    u64 quotaPagedPoolUsage      = 0;
+    u64 quotaPeakNonPagedPool    = 0;
+    u64 quotaNonPagedPoolUsage   = 0;
+    u64 pagefileUsage            = 0;
+    u64 peakPagefileUsage        = 0;
+    u64 privatePageCount         = 0;
+    i64 readOperationCount       = 0;
+    i64 writeOperationCount      = 0;
+    i64 otherOperationCount      = 0;
+    i64 readTransferCount        = 0;
+    i64 writeTransferCount       = 0;
+    i64 otherTransferCount       = 0;
+};
