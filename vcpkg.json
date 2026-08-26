@@ -3,14 +3,6 @@
   "version": "1.0",
   "dependencies": [
     "antlr4",
-    {
-      "name": "llvm",
-      "features": [
-        "target-aarch64",
-        "enable-rtti",
-        "lld"
-      ]
-    },
     "nlohmann-json",
     "simdjson"
   ]

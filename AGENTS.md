@@ -119,7 +119,7 @@ Current skills:
 
 ## Building
 
-The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies the dependencies (ANTLR4, LLVM); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
+The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/plan/llvm-version-migration.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
 
 **Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
 

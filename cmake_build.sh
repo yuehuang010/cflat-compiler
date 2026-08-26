@@ -37,10 +37,23 @@ if [ "$(uname -s)" = "Darwin" ]; then
     main_root="$(dirname "$common_git")"
     VCPKG_ROOT="$main_root/vcpkg"
   fi
+  # Distinguish "the clone is there but not bootstrapped" from "there is no clone
+  # at all" - a fresh checkout hits the second, and telling it to run a script
+  # inside a directory that does not exist is a dead end.
   if [ ! -x "$VCPKG_ROOT/vcpkg" ]; then
-    echo "ERROR: no bootstrapped vcpkg at \"$VCPKG_ROOT\"." >&2
-    echo "Set VCPKG_ROOT, or bootstrap the main checkout's clone:" >&2
-    echo "  \"$VCPKG_ROOT/bootstrap-vcpkg.sh\"" >&2
+    echo "ERROR: no usable vcpkg at \"$VCPKG_ROOT\"." >&2
+    echo "vcpkg supplies antlr4, nlohmann-json and simdjson (LLVM is a separate" >&2
+    echo "source build - see internal/plan/llvm-version-migration.md)." >&2
+    if [ -d "$VCPKG_ROOT" ]; then
+      echo "The clone exists but is not bootstrapped. Run:" >&2
+      echo "  \"$VCPKG_ROOT/bootstrap-vcpkg.sh\"" >&2
+    else
+      echo "There is no clone there. Either point VCPKG_ROOT at an existing one:" >&2
+      echo "  VCPKG_ROOT=/path/to/vcpkg $0 ${1:-release}" >&2
+      echo "or create it:" >&2
+      echo "  git clone https://github.com/microsoft/vcpkg \"$VCPKG_ROOT\"" >&2
+      echo "  \"$VCPKG_ROOT/bootstrap-vcpkg.sh\"" >&2
+    fi
     exit 1
   fi
   export VCPKG_ROOT
@@ -51,7 +64,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   installed="${CFLAT_VCPKG_INSTALLED:-$HOME/.cflat-compiler-deps/vcpkg_installed}"
   if [ ! -d "$installed/arm64-osx" ]; then
     echo "ERROR: shared dependency tree not found at \"$installed\"." >&2
-    echo "Populate it once (restores LLVM from the binary cache, no source build):" >&2
+    echo "Populate it once (small now that LLVM is not a vcpkg dependency):" >&2
     echo "  \"$VCPKG_ROOT/vcpkg\" install --triplet=arm64-osx \\" >&2
     echo "      --x-manifest-root=\"$script_dir\" --x-install-root=\"$installed\"" >&2
     exit 1

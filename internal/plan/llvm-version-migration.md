@@ -229,3 +229,50 @@ over 64, renaming functions to "refresh" intrinsic classification) plus
 All of it was reverted; only the shim header and the three root-cause fixes above
 were kept, and those alone reach 719/0. Anything that mutates IR inside
 `VerifyModule` should be treated as a review defect on sight.
+
+### Phase 2 hardening - static, source-built LLVM 22.1.8 (2026-08-26)
+
+macOS no longer depends on Homebrew at all. `llvmorg-22.1.8` was built from
+source with the recipe in `llvm-from-source-build.md` and installed to
+`~/.cflat-compiler-deps/llvm-22.1.8`; the `macos-arm64` preset points
+`LLVM_DIR` / `Clang_DIR` / `CFLAT_LLD_BIN_DIR` there. Result: `./test.sh Release`
+= **719 passed, 0 failed, 8 skipped**, and `otool -L x64/Release/cflat` shows no
+LLVM or clang dynamic dependency - fully static LLVM linkage, which is what the
+vcpkg build gave us and the Homebrew build did not.
+
+Measured on an 18-core / 48 GB Apple Silicon box:
+
+| | |
+|---|---|
+| Shallow clone (`--depth 1 --branch llvmorg-22.1.8`) | 2.6 GB |
+| Build (4473 ninja targets, `-j18`, `LLVM_PARALLEL_LINK_JOBS=4`) | under 20 min, 3.2 GB build dir |
+| Install tree | 2.5 GB, 168 static archives, cmake packages for llvm + clang + lld |
+
+Deltas from the recipe as written, all confirmed on this build:
+
+- **Drop `LLVM_ENABLE_TERMINFO`** - removed upstream; passing it only produces an
+  unused-variable warning.
+- **`CLANG_LINK_CLANG_DYLIB=OFF` and `LLVM_BUILD_LLVM_C_DYLIB=OFF` do not
+  suppress the convenience dylibs.** `libclang.dylib`, `libclang-cpp.dylib`,
+  `libLTO.dylib` and `libRemarks.dylib` are still emitted. They are simply
+  unused - cflat links the static archives and has no dynamic dependency on
+  them - so this is cosmetic, not a correctness issue.
+- **`lld` is in-tree**, so `bin/` holds `ld64.lld`, `lld-link` and `clang-cl`
+  together and `CFLAT_LLD_BIN_DIR` is only pointing at the same directory as
+  `LLVM_TOOLS_BINARY_DIR`. The Homebrew keg split is the reason that hint exists
+  at all; a source build does not need it.
+- **`ccache` bought nothing here** (0/3574 hits on a cold build, as expected) and
+  is only worth having for a later re-bump or a config change. Its default 5 GB
+  ceiling is too small for LLVM; raise it before relying on it.
+
+**The predicted X86 link failure happened exactly as written in gotcha #2.**
+Going static moves macOS off the `TARGET LLVM` dylib branch onto
+`llvm_map_components_to_libnames`, and the first link failed with undefined
+`LLVMInitializeX86AsmPrinter` / `Target` / `TargetInfo` / `TargetMC`, because
+`native` resolves to AArch64 on this host while the code calls
+`InitializeAllTargets()`. `CMakeLists.txt` now lists
+`X86CodeGen X86AsmParser X86Disassembler X86Desc X86Info` alongside the
+`AArch64*` libs. The duplicate-library link warning that follows is benign.
+
+Windows can now follow the same path with `-DLLVM_USE_CRT_RELEASE=MT`, which is
+its only route - no RTTI-enabled prebuilt exists for it.

@@ -9,7 +9,9 @@
 # VCPKG_MANIFEST_INSTALL=OFF - so configuring never triggers a vcpkg install,
 # and every git worktree shares the one 26 GB tree. Populate it once with
 # vcpkg-build.bat (Windows); cmake_build.sh prints the `vcpkg install` line for
-# macOS. Linux uses apt LLVM, no vcpkg at all.
+# macOS. vcpkg supplies antlr4 / nlohmann-json / simdjson only - LLVM comes from
+# a source build (see internal/plan/llvm-version-migration.md), since vcpkg's
+# llvm port is stuck at 18.1.6. Linux uses apt LLVM and no vcpkg at all.
 #
 # Output layout so test.bat works unchanged:
 #   x64/<Config>/cflat.exe + x64/<Config>/core/** + lld-link/clang-cl/*.dll.
@@ -64,8 +66,8 @@ else()
   message(FATAL_ERROR "antlr4-runtime found but neither antlr4_static nor antlr4_shared target exists")
 endif()
 
-# LLVM lib selection. On Windows (vcpkg static build) link the individual
-# static component archives. On Debian/Ubuntu, clang's libs are built against
+# LLVM lib selection. Against a static LLVM (a source build, on any platform)
+# link the individual component archives. On Debian/Ubuntu, clang's libs are built against
 # the shared libLLVM dylib; also linking the static LLVM archives would
 # register LLVM's CommandLine options twice ("registered more than once").
 # Prefer the single shared LLVM dylib target there. 'native'/'nativecodegen'
@@ -87,7 +89,10 @@ else()
     # Use the exact (case-sensitive) lib suffixes: llvm_map_components_to_libnames
     # prepends 'LLVM' verbatim, so 'aarch64' would wrongly yield 'LLVMaarch64'.
     AArch64CodeGen AArch64AsmParser AArch64Disassembler
-    AArch64Desc AArch64Info AArch64Utils)
+    AArch64Desc AArch64Info AArch64Utils
+    # Same reasoning for X86: on an AArch64 host 'native' resolves to AArch64, so a
+    # static LLVM built with X86;AArch64 leaves LLVMInitializeX86* unresolved.
+    X86CodeGen X86AsmParser X86Disassembler X86Desc X86Info)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -310,9 +315,9 @@ endif()
 #      orc::ObjectLinkingLayer::Plugin in LLVMBackend - so the derived typeinfo we
 #      emit references the base's typeinfo symbol.
 # Reason 2 is what makes LLVM/Clang's own build matter: a no-RTTI LLVM never emits
-# those base typeinfos, so the link fails. LLVM_ENABLE_RTTI=ON is required (Linux
-# apt LLVM has it; on vcpkg it comes from the "enable-rtti" feature on the llvm
-# dependency in vcpkg.json, which the llvm portfile maps to LLVM_ENABLE_RTTI).
+# those base typeinfos, so the link fails. LLVM_ENABLE_RTTI=ON is required, which
+# is why the llvm.org release tarballs cannot be used (they are built -fno-rtti):
+# apt LLVM has it, Homebrew has it, and a source build must pass it explicitly.
 # find_package(LLVM) above sets LLVM_ENABLE_RTTI from LLVMConfig.cmake.
 if(NOT MSVC AND DEFINED LLVM_ENABLE_RTTI AND NOT LLVM_ENABLE_RTTI)
   message(WARNING "LLVM was built without RTTI (LLVM_ENABLE_RTTI=OFF); linking cflat "

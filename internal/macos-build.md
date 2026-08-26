@@ -28,18 +28,24 @@ Fallbacks preserve robustness:
 compiler-rt builtins resolve via libSystem's reexported `libcompiler_rt.dylib`, plus
 `libclang_rt.osx.a` when a clang toolchain is present.
 
-## Why `vcpkg.json` lists `llvm` with `target-aarch64` + `enable-rtti` + `lld`
+## Why the LLVM build must have RTTI, AArch64 and lld
 
 RTTI is required: ANTLR's C++ runtime uses `dynamic_cast`, and a no-RTTI LLVM leaves
-clang/llvm base-class typeinfo undefined at link. `lld` supplies the bundled
-`ld64.lld`.
+clang/llvm base-class typeinfo undefined at link - which is why the llvm.org release
+tarballs are unusable, they are built `-fno-rtti`. `lld` supplies the bundled
+`ld64.lld`. These used to be the `enable-rtti` / `target-aarch64` / `lld` features on
+vcpkg's `llvm`; LLVM is no longer a vcpkg dependency (its port is stuck at 18.1.6),
+so they are now `-DLLVM_ENABLE_RTTI=ON`, `-DLLVM_TARGETS_TO_BUILD="X86;AArch64"` and
+`-DLLVM_ENABLE_PROJECTS="clang;lld"` on the source build. See
+[plan/llvm-version-migration.md](plan/llvm-version-migration.md).
 
 ## One-time Mac toolchain
 
 `brew install cmake ninja openjdk antlr pkg-config coreutils` (openjdk keg-only at
 `/opt/homebrew/opt/openjdk/bin`; `gtimeout` from coreutils is what `test.sh` uses),
-then bootstrap vcpkg and `vcpkg install --triplet=arm64-osx`. Build with Homebrew
-tools + `openjdk` on PATH.
+then bootstrap vcpkg and `vcpkg install --triplet=arm64-osx` (antlr4, nlohmann-json
+and simdjson only - LLVM is a separate source build). Build with Homebrew tools +
+`openjdk` on PATH.
 
 `cmake_build.sh` is the Mac/Linux counterpart to `cmake_build.bat` (`debug` |
 `release`, picks the preset from `uname`). The raw `cmake --preset
