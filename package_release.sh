@@ -67,6 +67,22 @@ while IFS= read -r -d '' tool; do
     fi
 done < <(find "$RELEASE_DIR" -maxdepth 1 -type f -perm -u+x -print0)
 
+# Strip the STAGED copies only - strip rewrites in place, and x64/Release must
+# keep its symbols so a local crash dump stays readable. -x drops local symbols
+# but keeps the globals, so CompilerManager backtraces still name functions.
+# strip re-signs on its way out: these carry an adhoc linker signature, which
+# asserts no identity, so cctools regenerates it rather than leaving it stale.
+# No codesign pass needed - arm64 SIGKILLs an image with stale hashes, and
+# strip does not leave one behind.
+strip_before=0
+strip_after=0
+while IFS= read -r -d '' bin; do
+    strip_before=$((strip_before + $(stat -f%z "$bin")))
+    strip -x "$bin"
+    strip_after=$((strip_after + $(stat -f%z "$bin")))
+done < <(find "$PUBLISH_DIR" -maxdepth 1 -type f -perm -u+x -print0)
+echo "Stripped staged binaries: $((strip_before / 1000000)) MB -> $((strip_after / 1000000)) MB"
+
 if [ ! -d "$RELEASE_DIR/core" ]; then
     echo "ERROR: core/ not found at $RELEASE_DIR - run a Release build first." >&2
     exit 1
