@@ -11809,7 +11809,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             std::vector<llvm::Value*> ops;
             for (int k = 0; k < intrin->Arity; k++)
                 ops.push_back(requireSimdArg(ctx, argValue(k), k, vecTy, method));
-            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), intrin->Id, {vecTy});
+            auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), intrin->Id, {vecTy});
             result.Primary = compiler->builder->CreateCall(fn, ops, "simdmath");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
@@ -11825,8 +11825,8 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             llvm::Value* x  = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
             llvm::Value* lo = requireSimdArg(ctx, argValue(1), 1, vecTy, method);
             llvm::Value* hi = requireSimdArg(ctx, argValue(2), 2, vecTy, method);
-            auto* maxFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::maxnum, {vecTy});
-            auto* minFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::minnum, {vecTy});
+            auto* maxFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::maxnum, {vecTy});
+            auto* minFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::minnum, {vecTy});
             llvm::Value* lower = compiler->builder->CreateCall(maxFn, {x, lo}, "simdclamplo");
             result.Primary = compiler->builder->CreateCall(minFn, {lower, hi}, "simdclamp");
             result.BaseType = vecTy;
@@ -11845,7 +11845,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             llvm::Value* x = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
             auto* one  = llvm::ConstantFP::get(vecTy, 1.0);
             auto* zero = llvm::ConstantFP::get(vecTy, 0.0);
-            auto* csFn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::copysign, {vecTy});
+            auto* csFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::copysign, {vecTy});
             llvm::Value* magOne = compiler->builder->CreateCall(csFn, {one, x}, "simdsignmag");
             llvm::Value* isZero = compiler->builder->CreateFCmpOEQ(x, zero, "simdsigniszero");
             result.Primary = compiler->builder->CreateSelect(isZero, zero, magOne, "simdsign");
@@ -11894,7 +11894,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             {
                 if (isFloat)
                 {
-                    auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_fadd, {vecTy});
+                    auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::vector_reduce_fadd, {vecTy});
                     auto* start = llvm::ConstantFP::get(elemTy, 0.0);
                     auto* call = compiler->builder->CreateCall(fn, {start, v}, "simdreduceadd");
                     call->setHasAllowReassoc(true);
@@ -11902,7 +11902,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                 }
                 else
                 {
-                    auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_add, {vecTy});
+                    auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::vector_reduce_add, {vecTy});
                     reduced = compiler->builder->CreateCall(fn, {v}, "simdreduceadd");
                 }
             }
@@ -11914,7 +11914,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                     : isUnsigned
                         ? (isMin ? llvm::Intrinsic::vector_reduce_umin : llvm::Intrinsic::vector_reduce_umax)
                         : (isMin ? llvm::Intrinsic::vector_reduce_smin : llvm::Intrinsic::vector_reduce_smax);
-                auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), rid, {vecTy});
+                auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), rid, {vecTy});
                 reduced = compiler->builder->CreateCall(fn, {v}, "simdreduce");
             }
             result.Primary = reduced;
@@ -11969,10 +11969,9 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             }
             llvm::Value* passthru = requireSimdArg(ctx, argValue(3), 3, vecTy, method);
             llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
-            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_load,
-                {vecTy, compiler->builder->getPtrTy()});
-            result.Primary = compiler->builder->CreateCall(
-                fn, {elemPtr, compiler->builder->getInt32((uint32_t)al.value()), mask, passthru}, "simdloadmasked");
+            result.Primary = cflat_llvm_compat::CreateMaskedLoad(*compiler->builder,
+                compiler->module.get(), vecTy, compiler->builder->getPtrTy(), elemPtr, mask,
+                passthru, (uint32_t)al.value(), "simdloadmasked");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
@@ -11997,9 +11996,9 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                 return result;
             }
             llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
-            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_store,
-                {vecTy, compiler->builder->getPtrTy()});
-            compiler->builder->CreateCall(fn, {vecVal, elemPtr, compiler->builder->getInt32((uint32_t)al.value()), mask});
+            cflat_llvm_compat::CreateMaskedStore(*compiler->builder, compiler->module.get(),
+                vecTy, compiler->builder->getPtrTy(), vecVal, elemPtr, mask,
+                (uint32_t)al.value());
             // store returns nothing
         }
         else if (method == "load_gather")
@@ -12027,9 +12026,9 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
             llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
             llvm::Value* passthru = llvm::PoisonValue::get(vecTy);
-            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_gather, {vecTy, ptrVecTy});
-            result.Primary = compiler->builder->CreateCall(
-                fn, {ptrVec, compiler->builder->getInt32((uint32_t)al.value()), allTrue, passthru}, "simdgather");
+            result.Primary = cflat_llvm_compat::CreateMaskedGather(*compiler->builder,
+                compiler->module.get(), vecTy, ptrVecTy, ptrVec, allTrue, passthru,
+                (uint32_t)al.value(), "simdgather");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
@@ -12058,8 +12057,8 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             auto* ptrVecTy = llvm::FixedVectorType::get(compiler->builder->getPtrTy(), vecTy->getNumElements());
             auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
             llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
-            auto* fn = llvm::Intrinsic::getDeclaration(compiler->module.get(), llvm::Intrinsic::masked_scatter, {vecTy, ptrVecTy});
-            compiler->builder->CreateCall(fn, {vecVal, ptrVec, compiler->builder->getInt32((uint32_t)al.value()), allTrue});
+            cflat_llvm_compat::CreateMaskedScatter(*compiler->builder, compiler->module.get(),
+                vecTy, ptrVecTy, vecVal, ptrVec, allTrue, (uint32_t)al.value());
             // store returns nothing
         }
         else

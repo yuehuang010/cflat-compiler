@@ -77,6 +77,7 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/TargetParser/Host.h>
 #pragma warning(pop)
+#include "LLVMCompat.h"
 #include "platform/GeneratedParser.h" // antlr runtime + generated parser/lexer/listener + kTokenEOF
 #include <fstream>
 #include "ArgParser.h"
@@ -316,7 +317,7 @@ namespace cflat_jit
         {
             llvm::jitlink::Symbol* handler = nullptr;
             for (auto* S : G.external_symbols())
-                if (S->hasName() && S->getName() == "__C_specific_handler") { handler = S; break; }
+                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__C_specific_handler") { handler = S; break; }
             if (!handler)
                 return llvm::Error::success(); // no SEH personality in this graph
 
@@ -352,7 +353,7 @@ namespace cflat_jit
         static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
         {
             for (auto* S : G.defined_symbols())
-                if (S->hasName() && S->getName() == "__ImageBase")
+                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
                     return llvm::Error::success(); // graph already supplies one
             llvm::jitlink::Block* lowest = LowestBlock(G);
             if (!lowest)

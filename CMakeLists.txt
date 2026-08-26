@@ -402,8 +402,18 @@ elseif(APPLE)
   # ld64.lld is a symlink into the multi-call lld binary; copy dereferences it
   # into a standalone file, and lld still selects the Mach-O driver from
   # argv[0] == "ld64.lld".
+  # The helper also repairs the rpath when the provider ships a shared libLLVM
+  # (Homebrew); it is a plain copy for a statically linked ld64.lld (vcpkg).
+  # ld64.lld does not always live in LLVM_TOOLS_BINARY_DIR: Homebrew ships lld
+  # in its own keg from llvm@19 on (CFLAT_LLD_BIN_DIR points the build at it),
+  # while vcpkg and a source build keep it beside the other LLVM tools.
+  find_program(CFLAT_LD64_LLD NAMES ld64.lld
+    HINTS "${CFLAT_LLD_BIN_DIR}" "${LLVM_TOOLS_BINARY_DIR}"
+    NO_DEFAULT_PATH REQUIRED)
+  message(STATUS "Mach-O linker: ${CFLAT_LD64_LLD}")
   add_custom_command(TARGET cflat POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${LLVM_TOOLS_BINARY_DIR}/ld64.lld" "$<TARGET_FILE_DIR:cflat>"
+    COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/cmake/deploy_macho_linker.sh"
+            "${CFLAT_LD64_LLD}" "$<TARGET_FILE_DIR:cflat>"
+            "${LLVM_LIBRARY_DIR}"
     COMMENT "Deploying ld64.lld (Mach-O linker) next to cflat")
 endif()

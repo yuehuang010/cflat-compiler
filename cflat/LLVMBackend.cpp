@@ -1397,7 +1397,7 @@ bool LLVMBackend::WriteIsolatedManifest(const std::string& manifestPath, const s
     manifest["format_version"] = 1;
     manifest["compiler_build_id"] = CFLAT_VERSION_STRING;
     manifest["llvm_major"] = LLVM_VERSION_MAJOR;
-    std::string targetTriple = module->getTargetTriple();
+    std::string targetTriple = cflat_llvm_compat::GetModuleTripleStr(*module);
     if (targetTriple.empty())
         targetTriple = targetMacOS_ ? "arm64-apple-macosx11.0.0"
             : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc"
@@ -3361,7 +3361,8 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
     // instcombine, whose fortify-folding would otherwise rewrite our __vsnprintf_chk /
     // __vfprintf_chk libc calls back into cflat's own vsnprintf/vfprintf and recurse
     // forever on ELF. Register before registerFunctionAnalyses so it wins.
-    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(llvm::Triple(module->getTargetTriple()));
+    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(
+        llvm::Triple(cflat_llvm_compat::GetModuleTripleStr(*module)));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
@@ -3587,7 +3588,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         // triple / ELF-shaped defaults it already worked with).
         if (targetMacOS_)
         {
-            module->setTargetTriple("arm64-apple-macosx11.0.0");
+            cflat_llvm_compat::SetModuleTriple(*module, "arm64-apple-macosx11.0.0");
 
             // Apple's asan runtime self-verifies interception at startup by
             // dlsym-ing "puts" and checking it resolves into the asan dylib.
@@ -3717,7 +3718,8 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     // recurse forever. Marking the colliding names unavailable keeps the chk calls
     // intact so they reach libc. Register this TLI before registerFunctionAnalyses so
     // it wins over the default (registerPass is a no-op once an analysis exists).
-    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(llvm::Triple(module->getTargetTriple()));
+    llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(
+        llvm::Triple(cflat_llvm_compat::GetModuleTripleStr(*module)));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
@@ -4140,6 +4142,14 @@ void LLVMBackend::ResetForReanalysis()
     // Same: both borrow-provenance ledgers are keyed by Functions/CallInsts of the old module.
     uniqueFieldBorrowReturns_.clear();
     uniqueFieldBorrowResults_.clear();
+    globalAssignBorrowOrigin_.clear();
+    rawArrayResults_.clear();
+    mayReachReturnInProgress_.clear();
+    joinAddressInProgress_.clear();
+    pendingReturnDangleChecks_.clear();
+    pendingNullIfaceDispatch_.clear();
+    pendingNullIfaceGlobal_.clear();
+    DropModuleEscapeMemo();
 
     module.reset();
     builder.reset();
@@ -4176,6 +4186,8 @@ void LLVMBackend::ResetForReanalysis()
     returnedStructDtorSkipAlloca = nullptr;
 
     functionTable.clear();
+    annotationRegistry.clear();
+    synthesizedReflectFunctions.clear();
     pendingCInteropAliases_.clear();
     cAbiFunctionThunkCache_.clear();
     dataStructures.clear();
@@ -4368,7 +4380,11 @@ void LLVMBackend::ResetForReanalysis()
     // on the next Analyze() call.
     importedFiles.clear();
     importStack.clear();
+    importAliasMembers.clear();
     importedParseStates.clear();
+    syntheticParseStates_.clear();
+    pendingMacroSources_.clear();
+    pipeStreamCounter = 0;
     heapAuditCanonicalPath_.clear();
 
     // Generic-template state must also be cleared so prior-analysis ANTLR contexts
@@ -6366,7 +6382,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         ? "e-m:o-i64:64-i128:128-n32:64-S128"
         : PlatformDataLayout(platformValue);
     module->setDataLayout(llvm::DataLayout(dl));
-    module->setTargetTriple(targetMacOS_ ? "arm64-apple-macosx"
+    cflat_llvm_compat::SetModuleTriple(*module, targetMacOS_ ? "arm64-apple-macosx"
                             : (platformValue == 32) ? "i686-pc-windows-msvc"
                                                     : "x86_64-pc-windows-msvc");
     RegisterBuiltinString();

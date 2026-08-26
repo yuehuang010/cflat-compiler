@@ -1,5 +1,9 @@
 # Building LLVM from source (statically linkable, find_package-consumable)
 
+> Migration sequencing (phase 1 = leave vcpkg at 18, phase 2 = move to 22)
+> lives in [`llvm-version-migration.md`](llvm-version-migration.md). This file is
+> the build recipe it references.
+
 ## Objective
 
 Learn to build LLVM/Clang/LLD from source so cflat can consume it as a set of

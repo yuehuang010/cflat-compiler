@@ -179,8 +179,14 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         // Closure type args (gap a) encode to a symbol-safe name; a `unique`-qualified
                         // arg routes through ResolveForwardTypeArg so its canonical "unique T*" text
                         // (D10) matches the queueing path; others keep the raw getText() spelling.
+                        // A NESTED generic arg must mangle the same way the main pass mangles it
+                        // ("Inner__int"), or the shell is registered under the raw "Inner<int>"
+                        // spelling and stays opaque.
+                        std::string nestedBase;
+                        bool nestedGeneric = entry->typeSpecifier() != nullptr
+                            && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
                         if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                            || TypeArgHasUnique(entry))
+                            || TypeArgHasUnique(entry) || nestedGeneric)
                             typeArgs.push_back(ResolveForwardTypeArg(entry));
                         else
                             typeArgs.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
@@ -1565,8 +1571,11 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             {
                 // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
                 // name matches the authoritative ParseUsingDeclaration; others keep raw getText().
+                std::string nestedBase;
+                bool nestedGeneric = entry->typeSpecifier() != nullptr
+                    && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
                 if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
-                    || TypeArgHasUnique(entry))
+                    || TypeArgHasUnique(entry) || nestedGeneric)
                     mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
                 else
                     mangledName += "__" + MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, entry->getText()));

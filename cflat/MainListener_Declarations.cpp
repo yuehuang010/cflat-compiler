@@ -1807,6 +1807,9 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 std::unordered_set<std::string> typesBefore;
                 for (const auto& [name, _] : compilerLLVM->dataStructures)
                     typesBefore.insert(name);
+                std::unordered_set<std::string> globalsBefore;
+                for (const auto& global : compilerLLVM->module->globals())
+                    globalsBefore.insert(global.getName().str());
 
                 bool errorReceived = false;
                 try
@@ -1826,6 +1829,23 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                             it = compilerLLVM->dataStructures.erase(it);
                         else
                             ++it;
+                    }
+                    // A global whose type is the shell just rolled back keeps an unsized
+                    // initializer, which the LLVM verifier rejects. Roll those back too - the
+                    // failed declaration never produced a usable global.
+                    std::vector<llvm::GlobalVariable*> unsizedGlobals;
+                    for (auto& global : compilerLLVM->module->globals())
+                        if (!globalsBefore.count(global.getName().str())
+                            && !global.getValueType()->isSized())
+                            unsizedGlobals.push_back(&global);
+                    for (auto* global : unsizedGlobals)
+                    {
+                        const std::string name = global->getName().str();
+                        global->replaceAllUsesWith(llvm::PoisonValue::get(global->getType()));
+                        global->eraseFromParent();
+                        compilerLLVM->globalNamedVariable.erase(name);
+                        compilerLLVM->globalVariableTypes.erase(name);
+                        compilerLLVM->globalDeclSite.erase(name);
                     }
                     // The rest of the block never ran, so its `if const` arms were never decided.
                     ForgetIfConstGuardedImpls(compilerLLVM, expectErrDecl);

@@ -11,6 +11,10 @@
 //      then value-fold parse) with prepass + one parse.
 #include "CClangExtract.h"
 
+#define CFLAT_LLVM_COMPAT_CLANG
+#include "LLVMCompat.h"
+#undef CFLAT_LLVM_COMPAT_CLANG
+
 #include "clang/AST/ASTConsumer.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Attr.h"
@@ -314,7 +318,7 @@ namespace cflat_cinterop
                         {
                             RawField rf;
                             rf.isBitfield = true;
-                            rf.bitWidth = f->getBitWidthValue(ctx);
+                            rf.bitWidth = cflat_llvm_compat::GetBitWidthValue(*f, ctx);
                             rf.ctype = CanonicalSpelling(ctx, f->getType());
                             rec.fields.push_back(std::move(rf));
                             continue;
@@ -401,7 +405,7 @@ namespace cflat_cinterop
                     if (f->isBitField())
                     {
                         rf.isBitfield = true;
-                        rf.bitWidth = f->getBitWidthValue(ctx);
+                        rf.bitWidth = cflat_llvm_compat::GetBitWidthValue(*f, ctx);
                     }
                     rec.fields.push_back(std::move(rf));
                 }
@@ -717,18 +721,17 @@ namespace cflat_cinterop
             for (const auto& a : req.args) cargs.push_back(a.c_str());
             cargs.push_back(inputName.c_str());
 
-            llvm::IntrusiveRefCntPtr<DiagnosticOptions> diagOpts(new DiagnosticOptions());
             llvm::IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-            llvm::IntrusiveRefCntPtr<DiagnosticsEngine> diags(
-                new DiagnosticsEngine(diagIDs, diagOpts, new IgnoringDiagConsumer(), /*own*/ true));
+            cflat_llvm_compat::ClangDiagnosticsState<DiagnosticsEngine,
+                                                      llvm::IntrusiveRefCntPtr<DiagnosticIDs>,
+                                                      DiagnosticOptions>
+                diagState(diagIDs, new IgnoringDiagConsumer());
 
             std::shared_ptr<CompilerInvocation> invocation;
             {
                 llvm::TimeTraceScope invScope("CreateInvocation", inputName);
-                CreateInvocationOptions civOpts;
-                civOpts.Diags = diags;
-                civOpts.RecoverOnError = true;
-                std::unique_ptr<CompilerInvocation> invocationUP = createInvocation(cargs, civOpts);
+                std::unique_ptr<CompilerInvocation> invocationUP =
+                    cflat_llvm_compat::CreateClangInvocation(cargs, diagState.engine);
                 if (!invocationUP) { err = "createInvocation failed"; return false; }
                 // Header binds only need declarations. Skipping function bodies avoids parsing
                 // inline definitions in system headers (e.g. an `&`-taking __inline in math.h
@@ -739,23 +742,22 @@ namespace cflat_cinterop
                 invocation.reset(invocationUP.release());
             }
 
-            CompilerInstance ci;
-            ci.setInvocation(invocation);
+            auto ci = cflat_llvm_compat::CreateClangCompilerInstance(invocation);
             // Own the consumer via the engine, but keep a raw pointer so the prereq tally can be
             // read back after the parse (the engine, hence the consumer, outlives this scope).
             PrereqDiagConsumer* prereqConsumer = new PrereqDiagConsumer();
-            ci.createDiagnostics(prereqConsumer, /*own*/ true);
+            ci->createDiagnostics(prereqConsumer, /*own*/ true);
 
             if (!source.empty())
             {
                 std::unique_ptr<llvm::MemoryBuffer> buf =
                     llvm::MemoryBuffer::getMemBufferCopy(source, req.mainFileName);
-                ci.getPreprocessorOpts().addRemappedFile(req.mainFileName, buf.release());
+                ci->getPreprocessorOpts().addRemappedFile(req.mainFileName, buf.release());
             }
 
             {
                 llvm::TimeTraceScope execScope("ExecuteFrontend", inputName);
-                if (!ci.ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
+                if (!ci->ExecuteAction(action)) { err = "ExecuteAction failed"; return false; }
             }
             if (outPrereqErrors) *outPrereqErrors = prereqConsumer->prereqErrors;
             if (outFirstPrereqError) *outFirstPrereqError = prereqConsumer->firstPrereqError;
