@@ -369,24 +369,39 @@ if [ "$RUN_MODE" -eq 0 ]; then
 defines_name="cli_defines"
 defines_log="$RES/$defines_name.log"
 defines_off_log="$RES/$defines_name.off.log"
+defines_ir="$RES/$defines_name.ll"
 defines_t0=$(now_ms)
 if ! $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
-    -DCLI_DEF_ON=0 -DCLI_DEF_ON -D CLI_DEF_LEVEL=6 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly \
+    -DCLI_DEF_ON=0 -DCLI_DEF_ON -D CLI_DEF_LEVEL=6 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 \
     --run --nologo >"$defines_log" 2>&1; then
   write_result "$defines_name" "FAIL: -D fixture did not compile or run" "$defines_t0"
 elif ! grep -Fq "mode=on level=7 tag=nightly" "$defines_log"; then
   write_result "$defines_name" "FAIL: -D value or later-wins ordering is wrong" "$defines_t0"
 elif ! grep -Fq "value sum=21 scaled=14" "$defines_log"; then
   write_result "$defines_name" "FAIL: -D constant did not fold as a value" "$defines_t0"
-elif ! grep -Fq "generic cap=7 count=2 pick=10" "$defines_log"; then
+elif ! grep -Fq "generic cap=8 alias=8 count=2 pick=10" "$defines_log"; then
   write_result "$defines_name" "FAIL: -D constant did not reach generic code" "$defines_t0"
+elif ! grep -Fq "value member=80 function=8 negative=-1 nested=8" "$defines_log"; then
+  write_result "$defines_name" "FAIL: generic value parameter specialization is wrong" "$defines_t0"
+elif ! grep -Fq "value bare=4 constarg=16" "$defines_log"; then
+  write_result "$defines_name" "FAIL: a bare -D define or const global did not fold as a value argument" "$defines_t0"
+elif ! grep -Fq "simd define=3 const=4" "$defines_log"; then
+  write_result "$defines_name" "FAIL: -D or const global did not reach simd lane count" "$defines_t0"
 elif ! $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
-    -DCLI_DEF_ON=0 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly --run --nologo \
+    -DCLI_DEF_ON=0 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 --run --nologo \
     >"$defines_off_log" 2>&1; then
   write_result "$defines_name" "FAIL: -D fixture did not run with the off define set" "$defines_t0"
 elif ! grep -Fq "mode=off level=7 tag=nightly" "$defines_off_log" \
-    || ! grep -Fq "generic cap=7 count=2 pick=20" "$defines_off_log"; then
+  || ! grep -Fq "generic cap=8 alias=8 count=2 pick=20" "$defines_off_log"; then
   write_result "$defines_name" "FAIL: flipping a -D did not reselect the if const arm" "$defines_t0"
+elif ! $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+    -DCLI_DEF_ON=1 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 \
+    --out-lli "$defines_ir" --nologo >>"$defines_log" 2>&1; then
+  write_result "$defines_name" "FAIL: value-parameter IR probe did not compile" "$defines_t0"
+elif [ "$(grep -c '^%Buf__i32__8 = type' "$defines_ir")" -ne 1 ]; then
+  write_result "$defines_name" "FAIL: equivalent folded values did not share one generic instantiation" "$defines_t0"
+elif ! grep -Fq "simd define=3 const=4" "$defines_off_log"; then
+  write_result "$defines_name" "FAIL: -D or const global did not reach simd lane count" "$defines_t0"
 elif $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
     -D__MACOS__=0 --check >>"$defines_log" 2>&1; then
   write_result "$defines_name" "FAIL: -D redefined a builtin macro" "$defines_t0"

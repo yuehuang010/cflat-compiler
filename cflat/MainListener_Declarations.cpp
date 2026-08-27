@@ -8,8 +8,9 @@ LLVMBackend* MainListener::Compiler(antlr4::ParserRuleContext* ctx) {
 
 
 bool MainListener::InGenericInstantiation() const {
-        return !activeTypeSubstitutions.empty() || !activePackSubstitutions.empty();
-    }
+        return !activeTypeSubstitutions.empty() || !activeValueSubstitutions.empty()
+            || !activePackSubstitutions.empty();
+}
 
 void MainListener::RecordLoopExitMovedState() {
         if (loopBreakMovedStates_.empty()) return;
@@ -26,6 +27,17 @@ void MainListener::ApplyVectorizeFpTier(LLVMBackend* compiler, VectorizeFpTier t
     }
 
 std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryContext* entry) {
+        if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
+        {
+            auto folded = FoldCompileTimeInt(Compiler(entry), entry->shiftExpression());
+            if (!folded)
+            {
+                LogErrorContext(entry, std::format("value argument '{}' does not fold to an integer",
+                    entry->getText()));
+                return "0";
+            }
+            return std::to_string(*folded);
+        }
         auto* typeSpec = entry->typeSpecifier();
         // `unique` ownership qualifier (D10): a leading Identifier == "unique". Any other leading
         // Identifier is an unknown qualifier.
@@ -116,6 +128,21 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 hasPointer = pointerDepth > 0;
                 isUnique = isUnique || substUnique;
                 isAlias = isAlias || substAlias;
+            }
+            else if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
+                     && entry->Identifier() == nullptr && typeSpec != nullptr
+                     && typeSpec->genericIdentifier() != nullptr
+                     && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+            {
+                auto valueIt = activeValueSubstitutions.find(resolved);
+                if (valueIt != activeValueSubstitutions.end())
+                    return valueIt->second;
+                std::string base = Compiler(entry)->ResolveTypeArgBaseName(resolved);
+                if (Compiler(entry)->IsTypeArgTypeKey(base)
+                    || Compiler(entry)->IsKnownTypeName(base))
+                    resolved = base;
+                else if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
+                    return std::to_string(*folded);
             }
             // A function-type alias (using IntFn = Lambda<int(int)>) used as a generic arg resolves
             // to the SAME encoded closure type as the direct spelling (canonicalization / gap a).
@@ -585,7 +612,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         elemType = substIt->second;
                     uint64_t lanes = 0;
                     std::string err;
-                    if (!TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err))
+                    if (!TryParseSimdLaneCount(Compiler(), sd->assignmentExpression(), lanes, err))
                         LogErrorContext(sd, err);
                     declType.TypeName = elemType;
                     declType.IsSimd = true;
@@ -643,7 +670,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // to avoid treating unresolved type parameters (e.g. "T") as concrete types.
                     // Top-level explicit uses (e.g. hashset<int> in user code) are handled by
                     // ForwardRefScanner::ScanGenericTypeUses and ScanAndQueueGenericTypeUses.
-                    if (!activeTypeSubstitutions.empty() && !instantiatedGenerics.count(mangledName))
+                    if ((!activeTypeSubstitutions.empty() || !activeValueSubstitutions.empty())
+                        && !instantiatedGenerics.count(mangledName))
                     {
                         bool isKnownTemplate = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
                         if (isKnownTemplate)
@@ -1362,6 +1390,7 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
         : genericStructTemplates(compilerLLVM->gts.genericStructTemplates)
         , genericClassTemplates(compilerLLVM->gts.genericClassTemplates)
         , genericStructTypeParams(compilerLLVM->gts.genericStructTypeParams)
+        , genericStructValueParams(compilerLLVM->gts.genericStructValueParams)
         , instantiatedGenerics(compilerLLVM->gts.instantiatedGenerics)
         , genericStructConstraints(compilerLLVM->gts.genericStructConstraints)
         , genericClassConstraints(compilerLLVM->gts.genericClassConstraints)
@@ -1371,9 +1400,11 @@ MainListener::MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const
         , genericInterfacePackIndex(compilerLLVM->gts.genericInterfacePackIndex)
         , genericInterfaceTemplates(compilerLLVM->gts.genericInterfaceTemplates)
         , genericInterfaceTypeParams(compilerLLVM->gts.genericInterfaceTypeParams)
+        , genericInterfaceValueParams(compilerLLVM->gts.genericInterfaceValueParams)
         , instantiatedInterfaces(compilerLLVM->gts.instantiatedInterfaces)
         , genericFunctionTemplates(compilerLLVM->gts.genericFunctionTemplates)
         , genericFunctionTypeParams(compilerLLVM->gts.genericFunctionTypeParams)
+        , genericFunctionValueParams(compilerLLVM->gts.genericFunctionValueParams)
         , instantiatedGenericFunctions(compilerLLVM->gts.instantiatedGenericFunctions)
         , genericFunctionConstraints(compilerLLVM->gts.genericFunctionConstraints)
         , pendingInstantiations(compilerLLVM->gts.pendingInstantiations)
@@ -1431,10 +1462,12 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
                     name));
             // Keyed on the namespace-QUALIFIED name, like a generic struct or class. The use site
             // resolves its spelled base to this key via LLVMBackend::ResolveGenericTemplateBase.
-            auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters());
+            std::vector<std::string> valueParams;
+            auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters(), &valueParams);
             genericInterfaceTemplates[name] = ctx;
             Compiler()->gts.genericTemplateNamespace[name] = Compiler()->GetCurrentNamespace();
             genericInterfaceTypeParams[name] = typeParams;
+            compilerLLVM->gts.genericInterfaceValueParams[name] = valueParams;
             {
                 auto entries = nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry();
                 bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
@@ -2293,12 +2326,14 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // If this is a generic function template definition (not an instantiation), store it and return.
         if (nameOverride.empty() && func->genericTypeParameters() != nullptr)
         {
-            auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters());
+            std::vector<std::string> valueParams;
+            auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
             genericFunctionTemplates[name] = func;
             // Record the declaring namespace, never re-derive it from the key: a call site's bare
             // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
             Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
             genericFunctionTypeParams[name] = typeParams;
+            compilerLLVM->gts.genericFunctionValueParams[name] = valueParams;
             genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
             auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
             bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;

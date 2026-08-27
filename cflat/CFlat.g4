@@ -339,7 +339,7 @@ typeSpecifier
 
 // Builtin special-form vector type: simd<T,N>. 'simd' is an inline-literal soft keyword
 // (same mechanism as 'function'). N is parsed as an expression and constant-folded in the
-// listener (mirrors arrayDimSpec); it must be a power-of-2 integer literal.
+// listener (mirrors arrayDimSpec); it must fold to a power-of-2 integer in [2,64].
 simdTypeSpecifier
     : 'simd' '<' typeSpecifier ',' assignmentExpression '>'
     ;
@@ -408,7 +408,29 @@ typeParameterList
     ;
 
 typeParameterEntry
-    : Identifier? typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
+    : valueParameterDeclaration
+    | Identifier? typeSpecifier pointer? arrayTypeSuffix? Ellipsis?   // leading Identifier is the `unique` ownership qualifier (soft keyword, validated in the listener); `T[]` arg = a noalias array-view; `[N]`/`[]*` rejected in the listener
+    | shiftExpression                                                 // compile-time VALUE argument, e.g. `8`, `CAP*2`, `(A>B)`
+    ;
+
+// A compile-time VALUE generic parameter: `struct Buf<T, int N>`. The primitive type token
+// decides the branch on the FIRST token, so it can never collide with the `unique`/`alias`
+// leading Identifier of a type argument. No `const` marker - const is implied by the position.
+valueParameterDeclaration
+    : valueParameterType Identifier
+    | nonIntegralValueParameterType Identifier
+    ;
+
+valueParameterType
+    : 'char' | 'short' | 'int' | 'long' | 'bool'
+    | 'i8' | 'i16' | 'i32' | 'i64' | 'u8' | 'u16' | 'u32' | 'u64'
+    ;
+
+// Recognized only to be REJECTED in the listener with a message naming the allowed set - the
+// same parse-then-diagnose shape the C-style array declarator uses. Dropping this alternative
+// would report `float N` as an unparseable token soup instead.
+nonIntegralValueParameterType
+    : 'float' | 'double' | 'string' | 'void'
     ;
 
 whereClause
@@ -416,7 +438,8 @@ whereClause
     ;
 
 typeParameterConstraint
-    : Identifier ':' Identifier
+    : Identifier ':' genericIdentifier
+    | assignmentExpression
     ;
 
 structClassUnion

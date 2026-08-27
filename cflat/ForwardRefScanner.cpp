@@ -153,7 +153,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         auto* sd = typeSpec->simdTypeSpecifier();
                         uint64_t lanes = 0;
                         std::string err;
-                        TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err);
+                        TryParseSimdLaneCount(compiler, sd->assignmentExpression(), lanes, err);
                         declType.TypeName = sd->typeSpecifier()->getText();
                         declType.IsSimd = true;
                         declType.SimdLanes = lanes;
@@ -737,6 +737,75 @@ ForwardRefScanner::ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compi
 
 void ForwardRefScanner::SetTokens(antlr4::BufferedTokenStream* t) { tokens_ = t; }
 
+void ForwardRefScanner::SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu)
+{
+    if (tu == nullptr || compilerLLVM == nullptr) return;
+
+    auto isConstIntDeclaration = [&](CFlatParser::DeclarationContext* decl,
+                                      std::vector<CFlatParser::InitDeclaratorContext*>& out) {
+        out.clear();
+        auto* specs = decl != nullptr ? decl->declarationSpecifiers() : nullptr;
+        auto* list = decl != nullptr ? decl->initDeclaratorList() : nullptr;
+        if (specs == nullptr || list == nullptr) return false;
+        bool isConst = false;
+        bool hasPointer = false;
+        std::string typeName;
+        for (auto* spec : specs->declarationSpecifier())
+        {
+            if (spec->typeQualifier() != nullptr && spec->typeQualifier()->getText() == "const")
+                isConst = true;
+            if (auto* type = spec->typeSpecifier())
+            {
+                if (typeName.empty()) typeName = compilerLLVM->ResolveTypeAlias(type->getText());
+                hasPointer = hasPointer || spec->pointer() != nullptr || spec->arrayTypeSuffix() != nullptr;
+            }
+        }
+        if (!isConst || hasPointer || typeName.empty()) return false;
+        LLVMBackend::TypeAndValue tv{ .TypeName = typeName };
+        if (tv.IsInteger() == -1 && tv.IsUnsignedInteger() == -1 && typeName != "bool") return false;
+        for (auto* init : list->initDeclarator()) out.push_back(init);
+        return true;
+    };
+
+    auto seedDeclaration = [&](CFlatParser::DeclarationContext* decl, bool& changed) {
+        std::vector<CFlatParser::InitDeclaratorContext*> declarators;
+        if (decl == nullptr || !isConstIntDeclaration(decl, declarators)) return;
+        for (auto* init : declarators)
+        {
+            auto* direct = init->declarator() != nullptr ? init->declarator()->directDeclarator() : nullptr;
+            auto* initializer = init->initializer();
+            if (direct == nullptr || direct->assignmentExpression() != nullptr || initializer == nullptr
+                || initializer->assignmentExpression() == nullptr)
+                continue;
+            std::string name = getDirectDeclName(direct);
+            int64_t already = 0;
+            // A -D define and the platform builtins own the name; never shadow one, and never
+            // re-seed a name already recorded (that is what makes the fixpoint monotone).
+            if (name.empty() || compilerLLVM->IsReservedMacroName(name)
+                || compilerLLVM->GetCompileTimeMacro(name).value != nullptr
+                || compilerLLVM->TryGetConstGlobalInt(name, already))
+                continue;
+            auto folded = FoldCompileTimeInt(compilerLLVM, initializer->assignmentExpression());
+            if (!folded) continue;
+            compilerLLVM->SetConstGlobalInt(name, *folded);
+            changed = true;
+        }
+    };
+
+    // Deliberately FILE SCOPE ONLY - a namespaced `const int X` would seed under its bare name
+    // while the main pass resolves the qualified global, and two namespaces declaring the same
+    // name would make the first one win everywhere. A disagreement between the two folders is
+    // exactly the failure this seeding exists to remove, so a namespaced const stays unfoldable
+    // in the scanner (unchanged from before) rather than folding to a possibly wrong value.
+    for (int round = 0; round < 4; round++)
+    {
+        bool changed = false;
+        for (auto* ext : tu->externalDeclaration())
+            if (ext != nullptr) seedDeclaration(ext->declaration(), changed);
+        if (!changed) break;
+    }
+}
+
 void ForwardRefScanner::ValidateIsolatedIntegralPointerCasts(antlr4::tree::ParseTree* tree)
 {
     if (!compilerLLVM->IsIsolated() || compilerLLVM->currentSourceIsCore_
@@ -847,6 +916,13 @@ void ForwardRefScanner::PreRegisterRenameAliases(antlr4::RuleContext* ctx) {
     }
 
 std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry) {
+        if (entry->shiftExpression() != nullptr && entry->typeSpecifier() == nullptr)
+        {
+            auto folded = FoldCompileTimeInt(Compiler(entry), entry->shiftExpression());
+            if (!folded)
+                return "0";
+            return std::to_string(*folded);
+        }
         bool isUnique = TypeArgHasUnique(entry);
         bool isAlias = TypeArgHasAlias(entry);
         auto* typeSpec = entry->typeSpecifier();
@@ -870,6 +946,17 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             // during the scan), so a bare 'Item' inside 'namespace A' names A.Item in both passes.
             resolved = Compiler(entry)->ResolveTypeArgBaseName(
                 typeSpec ? typeSpec->getText() : entry->getText());
+            if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
+                && entry->Identifier() == nullptr && typeSpec != nullptr
+                && typeSpec->genericIdentifier() != nullptr
+                && typeSpec->genericIdentifier()->genericTypeParameters() == nullptr)
+            {
+                if (Compiler(entry)->IsTypeArgTypeKey(resolved)
+                    || Compiler(entry)->IsKnownTypeName(resolved))
+                    ;
+                else if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
+                    return std::to_string(*folded);
+            }
         }
         // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
         // bracket forms are rejected in the main pass, so the forward scan just names them.
@@ -931,258 +1018,11 @@ std::string ForwardRefScanner::EncodeClosureScanner(CFlatParser::FunctionPointer
     }
 
 std::optional<int64_t> ForwardRefScanner::ScannerFoldIfConst(antlr4::tree::ParseTree* node) {
-        if (node == nullptr) return std::nullopt;
-        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
-        {
-            if (c->expression() != nullptr)
-            {
-                auto cond = ScannerFoldIfConst(c->logicalOrExpression());
-                if (!cond) return std::nullopt;
-                return (*cond != 0) ? ScannerFoldIfConst(c->expression())
-                                    : ScannerFoldIfConst(c->conditionalExpression());
-            }
-            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
-            return ScannerFoldIfConst(c->logicalOrExpression());
-        }
-        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
-        {
-            auto operands = o->logicalAndExpression();
-            if (operands.size() == 1) return ScannerFoldIfConst(operands[0]);
-            bool allKnownFalse = true;
-            for (auto* op : operands)
-            {
-                auto v = ScannerFoldIfConst(op);
-                if (v && *v != 0) return (int64_t)1;
-                if (!v) allKnownFalse = false;
-            }
-            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
-        }
-        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
-        {
-            auto operands = a->inclusiveOrExpression();
-            if (operands.size() == 1) return ScannerFoldIfConst(operands[0]);
-            bool allKnownTrue = true;
-            for (auto* op : operands)
-            {
-                auto v = ScannerFoldIfConst(op);
-                if (v && *v == 0) return (int64_t)0;
-                if (!v) allKnownTrue = false;
-            }
-            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
-        }
-        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
-            return ScannerFoldIfConst(e->assignmentExpression());
-        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
-        {
-            if (asn->conditionalExpression() != nullptr)
-                return ScannerFoldIfConst(asn->conditionalExpression());
-            return std::nullopt;  // an actual assignment is not a constant
-        }
-        return ScannerFoldIfConstLeaf(node);
+        return FoldCompileTimeInt(compilerLLVM, node);
     }
 
 std::optional<int64_t> ForwardRefScanner::ScannerFoldIfConstLeaf(antlr4::tree::ParseTree* node) {
-        if (node == nullptr) return std::nullopt;
-
-        // Left-associative binary chains: fold pairwise using the operator token between operands.
-        auto foldChain = [&](const std::vector<antlr4::tree::ParseTree*>& ops,
-                            antlr4::RuleContext* parent) -> std::optional<int64_t>
-        {
-            if (ops.empty()) return std::nullopt;
-            auto acc = ScannerFoldIfConstLeaf(ops[0]);
-            if (ops.size() == 1 || !acc) return acc;
-            // Walk the parent's children to recover the operator tokens in source order.
-            size_t opIdx = 0;
-            for (size_t i = 0; i < parent->children.size(); i++)
-            {
-                auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i]);
-                if (term == nullptr) continue;
-                std::string op = term->getText();
-                if (op == "<" || op == ">")
-                {
-                    // '>' '>' is a shift written as two tokens; join it when adjacent.
-                    if (i + 1 < parent->children.size())
-                        if (auto* n2 = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i + 1]))
-                            if (op == ">" && n2->getText() == ">") { op = ">>"; i++; }
-                }
-                if (++opIdx > ops.size() - 1) break;
-                auto rhs = ScannerFoldIfConstLeaf(ops[opIdx]);
-                if (!rhs) return std::nullopt;
-                int64_t l = *acc, r = *rhs, out = 0;
-                // Every operand is already inside the 32-bit range (ParseScannerIntegerLiteral and
-                // the macro leaf both guarantee it), so computing in int64 and rejecting an
-                // out-of-range RESULT means no fold can differ from codegen's i32 arithmetic by a
-                // wraparound - it becomes undecidable instead.
-                if (op == "|")       out = l | r;
-                else if (op == "^")  out = l ^ r;
-                else if (op == "&")  out = l & r;
-                else if (op == "==") out = (l == r) ? 1 : 0;
-                else if (op == "!=") out = (l != r) ? 1 : 0;
-                else if (op == "<")  out = (l < r) ? 1 : 0;
-                else if (op == ">")  out = (l > r) ? 1 : 0;
-                else if (op == "<=") out = (l <= r) ? 1 : 0;
-                else if (op == ">=") out = (l >= r) ? 1 : 0;
-                else if (op == "<<") { if (r < 0 || r > 31) return std::nullopt; out = l << r; }
-                else if (op == ">>") { if (r < 0 || r > 31) return std::nullopt; out = l >> r; }
-                else if (op == "+")  { if (ScannerAddOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "-")  { if (ScannerSubOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "*")  { if (ScannerMulOverflow(l, r, &out)) return std::nullopt; }
-                else if (op == "/")  { if (r == 0) return std::nullopt; out = l / r; }
-                else if (op == "%")  { if (r == 0) return std::nullopt; out = l % r; }
-                else return std::nullopt;
-                if (!InScannerInt32Range(out)) return std::nullopt;
-                acc = out;
-            }
-            return acc;
-        };
-
-        if (auto* n = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
-        {
-            auto ops = n->exclusiveOrExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
-        {
-            auto ops = n->andExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
-        {
-            auto ops = n->equalityExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
-        {
-            auto ops = n->typeCheckExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
-        {
-            // `is` / `as` are not integer constants; a bare relational passes through.
-            if (n->children.size() != 1) return std::nullopt;
-            return ScannerFoldIfConstLeaf(n->relationalExpression());
-        }
-        if (auto* n = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
-        {
-            auto ops = n->shiftExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
-        {
-            auto ops = n->additiveExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
-        {
-            auto ops = n->multiplicativeExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
-        {
-            auto ops = n->castExpression();
-            return foldChain({ops.begin(), ops.end()}, n);
-        }
-        if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
-        {
-            if (n->typeName() != nullptr) return std::nullopt;  // a cast is not folded here
-            if (n->unaryExpression() != nullptr) return ScannerFoldIfConstLeaf(n->unaryExpression());
-            return ParseScannerIntegerLiteral(n->getText());
-        }
-        if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
-        {
-            if (n->postfixExpression() != nullptr) return ScannerFoldIfConstLeaf(n->postfixExpression());
-            if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
-            {
-                auto v = ScannerFoldIfConstLeaf(n->castExpression());
-                if (!v) return std::nullopt;
-                std::string op = n->unaryOperator()->getText();
-                if (op == "!") return (*v == 0) ? (int64_t)1 : (int64_t)0;
-                if (op == "+") return *v;
-                int64_t out = 0;
-                if (op == "-")      { if (ScannerSubOverflow((int64_t)0, *v, &out)) return std::nullopt; }
-                else if (op == "~") out = ~*v;
-                else return std::nullopt;  // '&' / '*' are not integer constants
-                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
-            }
-            return std::nullopt;      // sizeof/alignof/new/delete/move/operator
-        }
-        if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-        {
-            // Only a bare primary folds - a call, index or member access does not.
-            if (n->children.size() != 1) return std::nullopt;
-            return ScannerFoldIfConstLeaf(n->primaryExpression());
-        }
-        if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
-        {
-            if (n->expression() != nullptr && n->children.size() == 3)
-                return ScannerFoldIfConstLeaf(n->expression());   // redundant parens
-            if (n->expression() != nullptr) return std::nullopt;  // nameof/typeof(expr)
-            if (auto* gid = n->genericIdentifier())
-            {
-                if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr)
-                    return std::nullopt;
-                const auto& macros = compilerLLVM->compileTimeMacros;
-                auto it = macros.find(gid->Identifier()->getText());
-                if (it == macros.end()) return std::nullopt;
-                auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(it->second.value);
-                if (ci == nullptr || it->second.type != "int") return std::nullopt;
-                int64_t mv = (int64_t)ci->getSExtValue();
-                return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
-            }
-            return ParseScannerIntegerLiteral(n->getText());
-        }
-        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
-            return ScannerFoldIfConst(e);
-        return std::nullopt;
-    }
-
-bool ForwardRefScanner::InScannerInt32Range(int64_t v) {
-        return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
-    }
-
-bool ForwardRefScanner::ScannerAddOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a + (uint64_t)b);
-        return ((a ^ *out) & (b ^ *out)) < 0;
-    }
-
-bool ForwardRefScanner::ScannerSubOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a - (uint64_t)b);
-        return ((a ^ b) & (a ^ *out)) < 0;
-    }
-
-bool ForwardRefScanner::ScannerMulOverflow(int64_t a, int64_t b, int64_t* out) {
-        *out = (int64_t)((uint64_t)a * (uint64_t)b);
-        if (a == 0) return false;
-        if (a == -1 && b == INT64_MIN) return true;
-        return *out / a != b;
-    }
-
-std::optional<int64_t> ForwardRefScanner::ParseScannerIntegerLiteral(const std::string& textIn) {
-        if (textIn == "true") return (int64_t)1;
-        if (textIn == "false") return (int64_t)0;
-        std::string text = textIn;
-        if (!text.empty() && (text.back() == 'u' || text.back() == 'U'
-                           || text.back() == 'l' || text.back() == 'L'))
-            return std::nullopt;   // suffixed literal - codegen's type differs from ours
-        bool neg = false;
-        size_t pos = 0;
-        if (!text.empty() && text[0] == '-') { neg = true; pos = 1; }
-        if (pos >= text.size()) return std::nullopt;
-        int base = 10;
-        if (text.size() > pos + 1 && text[pos] == '0')
-        {
-            char c = text[pos + 1];
-            if (c == 'x' || c == 'X')      { base = 16; pos += 2; }
-            else if (c == 'b' || c == 'B') { base = 2;  pos += 2; }
-            else return std::nullopt;      // C octal (leading 0) - not folded here
-        }
-        if (pos >= text.size()) return std::nullopt;
-        uint64_t v = 0;
-        auto res = std::from_chars(text.data() + pos, text.data() + text.size(), v, base);
-        if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return std::nullopt;
-        if (v > (uint64_t)INT32_MAX) return std::nullopt;
-        int64_t out = neg ? -(int64_t)v : (int64_t)v;
-        return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+        return FoldCompileTimeIntLeaf(compilerLLVM, node);
     }
 
 int ForwardRefScanner::ScannerDecideIfConst(CFlatParser::ExpressionContext* expr) {
@@ -1345,18 +1185,36 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                         compiler->gts.genericFunctionTemplates[key] = fd;
                         compiler->gts.genericTemplateNamespace[key] = ns;
                         std::vector<std::string> params;
+                        std::vector<std::string> valueParams;
                         for (auto* entry : gp->typeParameterList()->typeParameterEntry())
-                            params.push_back(entry->typeSpecifier() != nullptr
-                                ? entry->typeSpecifier()->getText() : entry->getText());
+                        {
+                            if (IsValueParameterDeclaration(entry))
+                            {
+                                // A non-integral value parameter is rejected by the listener and dropped there;
+                                // drop it here too or these vectors disagree with the listener's.
+                                if (ValueParameterTypeSpelling(entry).empty()) continue;
+                                params.push_back(entry->valueParameterDeclaration()->Identifier()->getText());
+                                valueParams.push_back(ValueParameterTypeSpelling(entry));
+                            }
+                            else
+                            {
+                                params.push_back(entry->typeSpecifier() != nullptr
+                                    ? entry->typeSpecifier()->getText() : entry->getText());
+                                valueParams.push_back("");
+                            }
+                        }
                         compiler->gts.genericFunctionTypeParams[key] = params;
+                        compiler->gts.genericFunctionValueParams[key] = valueParams;
                         std::unordered_map<std::string, std::vector<std::string>> constraints;
                         if (auto* where = fd->whereClause(); where != nullptr)
                         {
                             for (auto* constraint : where->typeParameterConstraint())
                             {
-                                auto ids = constraint->Identifier();
-                                if (ids.size() >= 2)
-                                    constraints[ids[0]->getText()].push_back(ids[1]->getText());
+                                if (constraint->assignmentExpression() != nullptr) continue;
+                                auto* target = constraint->genericIdentifier();
+                                auto* typeParam = constraint->Identifier();
+                                if (target != nullptr && typeParam != nullptr)
+                                    constraints[typeParam->getText()].push_back(target->getText());
                             }
                         }
                         compiler->gts.genericFunctionConstraints[key] = std::move(constraints);

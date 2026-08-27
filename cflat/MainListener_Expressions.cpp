@@ -11727,7 +11727,7 @@ LLVMBackend::TypeAndValue MainListener::ParseSimdTypeSpec(CFlatParser::SimdTypeS
             elemType = substIt->second;
         uint64_t lanes = 0;
         std::string err;
-        if (!TryParseSimdLaneCount(sd->assignmentExpression()->getText(), lanes, err))
+        if (!TryParseSimdLaneCount(Compiler(), sd->assignmentExpression(), lanes, err))
             LogErrorContext(sd, err);
         tv.TypeName = elemType;
         tv.IsSimd = true;

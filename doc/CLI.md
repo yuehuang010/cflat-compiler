@@ -189,7 +189,9 @@ The builtin macros (`__PLATFORM__`, `__WINDOWS__`, `__POSIX__`, `__LINUX__`, `__
 `__DARWIN__`, `__WIN32__`, `__WIN64__`, `__X86__`, `__ARM64__`, `__FILE__`, `__LINE__`,
 `__FUNCTION__`) are reserved - redefining one is an error.
 
-A define is an ordinary compile-time macro, so it folds in `if const` and reads as a value:
+A define is an ordinary compile-time macro, so it folds in `if const` and reads as a value
+anywhere a constant is legal - including a `simd<T,N>` lane count and a generic value argument
+(`Buf<int, CAP>`, `Buf<int, CAP * 2>`):
 
 ```bash
 cflat app.cb -DFEATURE_X -DLEVEL=7 -DBUILD_TAG=nightly -o app.exe

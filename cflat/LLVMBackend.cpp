@@ -2192,6 +2192,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
                 // must see the same set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);
+                scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
@@ -3228,6 +3229,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         {
             // Pure-rename `using` aliases first (see the main-file scan for why).
             scanner.PreRegisterRenameAliases(tu);
+            scanner.SeedConstIntGlobals(tu);
             scanner.ScanGenericInterfaceTemplateNames(tu);
             for (auto* decl : tu->externalDeclaration())
                 scanner.ScanGenericTypeUses(decl);
@@ -3329,10 +3331,26 @@ void LLVMBackend::ProcessPendingMacroSources()
             if (!gtps) continue;
             std::string name = ::getFunctionName(func);
             std::vector<std::string> typeParams;
+            std::vector<std::string> valueParams;
             for (auto* entry : gtps->typeParameterList()->typeParameterEntry())
-                typeParams.push_back(entry->getText());
+            {
+                if (IsValueParameterDeclaration(entry))
+                {
+                    // A non-integral value parameter is rejected by the listener and dropped there;
+                    // drop it here too or these vectors disagree with the listener's.
+                    if (ValueParameterTypeSpelling(entry).empty()) continue;
+                    typeParams.push_back(entry->valueParameterDeclaration()->Identifier()->getText());
+                    valueParams.push_back(ValueParameterTypeSpelling(entry));
+                }
+                else
+                {
+                    typeParams.push_back(entry->getText());
+                    valueParams.push_back("");
+                }
+            }
             gts.genericFunctionTemplates[name] = func;
             gts.genericFunctionTypeParams[name] = typeParams;
+            gts.genericFunctionValueParams[name] = valueParams;
             ++registered;
         }
         if (verbose)
@@ -4078,6 +4096,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
                 // Pure-rename `using` aliases first: MangleTypeArg folds them, and both passes
                 // must see the same set no matter where the `using` sits in the file.
                 scanner.PreRegisterRenameAliases(tu);
+                scanner.SeedConstIntGlobals(tu);
                 scanner.ScanGenericInterfaceTemplateNames(tu);
                 for (auto* decl : tu->externalDeclaration())
                     scanner.ScanGenericTypeUses(decl);
@@ -4266,6 +4285,7 @@ void LLVMBackend::ResetForReanalysis()
     namespaceAliasTable.clear();
     returnBlockTable.clear();
     compileTimeMacros.clear();
+    constGlobalInts_.clear();
     stringLiteralLenByPtr.clear();
     strConcatRegistered = false;
     stringDtorRegistered = false;
@@ -6747,6 +6767,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     using TypeParamsMap  = std::unordered_map<std::string, std::vector<std::string>>;
     using PackIndexMap   = std::unordered_map<std::string, size_t>;
     using ConstraintsMap = std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>;
+    using ValueParamsMap = std::unordered_map<std::string, std::vector<std::string>>;
 
     // "decl_ns" is load-bearing for the --init round-trip: TemplateNamespaceScope reads the
     // declaring namespace when instantiating a cached template, and it cannot be re-derived from
@@ -6756,6 +6777,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     auto serializeGenericTemplates = [&](
         const auto&           templatesMap,
         const TypeParamsMap&  typeParams,
+        const ValueParamsMap& valueParams,
         const PackIndexMap&   packIndex,
         const ConstraintsMap* constraints,
         llvm::StringRef       jsonKey)
@@ -6774,6 +6796,10 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             if (auto it = typeParams.find(name); it != typeParams.end())
                 for (auto& tp : it->second) tps.push_back(tp);
             to["type_params"] = std::move(tps);
+            llvm::json::Array vps;
+            if (auto it = valueParams.find(name); it != valueParams.end())
+                for (auto& vp : it->second) vps.push_back(vp);
+            to["value_param_types"] = std::move(vps);
             if (auto pit = packIndex.find(name); pit != packIndex.end())
                 to["pack_index"] = static_cast<int64_t>(pit->second);
             if (constraints)
@@ -6795,6 +6821,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Generic struct templates: source text + type params + constraints
     serializeGenericTemplates(gts.genericStructTemplates,
                               gts.genericStructTypeParams,
+                              gts.genericStructValueParams,
                               gts.genericStructPackIndex,
                               &gts.genericStructConstraints,
                               "generic_structs");
@@ -6802,6 +6829,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Generic class templates (share genericStructTypeParams - no separate class type-param map)
     serializeGenericTemplates(gts.genericClassTemplates,
                               gts.genericStructTypeParams,
+                              gts.genericStructValueParams,
                               gts.genericClassPackIndex,
                               &gts.genericClassConstraints,
                               "generic_classes");
@@ -6809,6 +6837,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Generic interface templates (no constraints)
     serializeGenericTemplates(gts.genericInterfaceTemplates,
                               gts.genericInterfaceTypeParams,
+                              gts.genericInterfaceValueParams,
                               gts.genericInterfacePackIndex,
                               nullptr,
                               "generic_interfaces");
@@ -6816,6 +6845,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Generic function templates
     serializeGenericTemplates(gts.genericFunctionTemplates,
                               gts.genericFunctionTypeParams,
+                              gts.genericFunctionValueParams,
                               gts.genericFunctionPackIndex,
                               &gts.genericFunctionConstraints,
                               "generic_functions");
@@ -7244,7 +7274,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     // so a compile pays the parse cost only for the generics it actually uses.
     { llvm::TimeTraceScope s("CoreDes:GenericRegister", jsonPath);
     auto registerLazyTemplates = [&](const char* key,
-        auto& templateMap, auto& typeParamsMap, auto& constraintsMap, auto& packIndexMap)
+        auto& templateMap, auto& typeParamsMap, auto& valueParamsMap,
+        auto& constraintsMap, auto& packIndexMap)
     {
         auto* arr = root->getArray(key);
         if (!arr) return;
@@ -7264,6 +7295,11 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 
             templateMap[name] = nullptr;            // parsed on first use (MaterializeGeneric*)
             typeParamsMap[name] = std::move(tps);
+            std::vector<std::string> vps;
+            if (auto* vpsArr = to->getArray("value_param_types"))
+                for (auto& vp : *vpsArr)
+                    if (auto v = vp.getAsString()) vps.push_back(v->str());
+            valueParamsMap[name] = std::move(vps);
             if (auto* cobj = to->getObject("constraints"))
                 constraintsMap[name] = DeserializeConstraints(cobj);
             if (auto v = to->getInteger("pack_index"))
@@ -7278,20 +7314,24 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 
     registerLazyTemplates("generic_structs",
         gts.genericStructTemplates, gts.genericStructTypeParams,
+        gts.genericStructValueParams,
         gts.genericStructConstraints, gts.genericStructPackIndex);
 
     registerLazyTemplates("generic_classes",
         gts.genericClassTemplates, gts.genericStructTypeParams,
+        gts.genericStructValueParams,
         gts.genericClassConstraints, gts.genericClassPackIndex);
 
     // Interfaces have no constraints map; use a local dummy to satisfy the lambda signature.
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> ifaceConstraintsDummy;
     registerLazyTemplates("generic_interfaces",
         gts.genericInterfaceTemplates, gts.genericInterfaceTypeParams,
+        gts.genericInterfaceValueParams,
         ifaceConstraintsDummy, gts.genericInterfacePackIndex);
 
     registerLazyTemplates("generic_functions",
         gts.genericFunctionTemplates, gts.genericFunctionTypeParams,
+        gts.genericFunctionValueParams,
         gts.genericFunctionConstraints, gts.genericFunctionPackIndex);
 
     } // end CoreDes:GenericRegister

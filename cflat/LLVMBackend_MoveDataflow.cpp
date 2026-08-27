@@ -905,6 +905,19 @@ void LLVMBackend::SetCompileTimeMacro(const std::string& name, llvm::Constant* v
         compileTimeMacros[name] = {name, value, type};
     }
 
+void LLVMBackend::SetConstGlobalInt(const std::string& name, int64_t value)
+{
+        constGlobalInts_[name] = value;
+    }
+
+bool LLVMBackend::TryGetConstGlobalInt(const std::string& name, int64_t& out) const
+{
+        auto it = constGlobalInts_.find(name);
+        if (it == constGlobalInts_.end()) return false;
+        out = it->second;
+        return true;
+    }
+
 void LLVMBackend::SetPlatformMacros()
 {
         auto i32 = llvm::Type::getInt32Ty(*context);
@@ -1188,6 +1201,17 @@ llvm::Value* LLVMBackend::CreateFunctionCall(llvm::Function* func, const std::ve
                     callArgs.push_back(builder->CreateSExt(value, builder->getInt32Ty(), "conv"));
                 else if (valueType->is16bitFPTy() || valueType->isFloatTy())
                     callArgs.push_back(builder->CreateFPExt(value, builder->getDoubleTy(), "conv"));
+                else if (valueType->isVectorTy())
+                {
+                    // A simd vector has no default argument promotion, so printf would read
+                    // whatever the ABI put in the first slot - 1065353216 for a 1.0f splat.
+                    auto* fv = llvm::dyn_cast<llvm::FixedVectorType>(valueType);
+                    LogError(std::format(
+                        "cannot pass simd vector storage with {} lanes to a variadic function - "
+                        "pass one lane with 'v[i]', or reduce it with 'simd<T,N>.reduce_add(v)'.",
+                        fv != nullptr ? (uint64_t)fv->getNumElements() : (uint64_t)0));
+                    callArgs.push_back(value);
+                }
                 else
                     callArgs.push_back(value);
             }

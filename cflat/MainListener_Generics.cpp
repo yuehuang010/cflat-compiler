@@ -1,8 +1,58 @@
 #include "MainListener.h"
 
+
+bool MainListener::ValidateGenericArgumentKinds(const std::string& templateName,
+    const std::vector<std::string>& typeParams, const std::vector<std::string>& valueParams,
+    const std::vector<std::string>& typeArgs)
+{
+    bool valid = true;
+    for (size_t i = 0; i < typeParams.size() && i < typeArgs.size(); i++)
+    {
+        std::string valueType = i < valueParams.size() ? valueParams[i] : std::string{};
+        bool expectsValue = !valueType.empty();
+        bool isValue = IsDecimalIntegerSpelling(typeArgs[i]);
+        if (expectsValue != isValue)
+        {
+            Compiler()->LogError(std::format(
+                "generic argument for {} parameter '{}' in template '{}' has the wrong kind; expected a {}",
+                expectsValue ? "value" : "type", typeParams[i], templateName,
+                expectsValue ? "compile-time value" : "type"));
+            valid = false;
+            continue;
+        }
+        if (!expectsValue) continue;
+
+        int64_t value = ParseValueArg(typeArgs[i]);
+        auto* llvmType = Compiler()->GetType(LLVMBackend::TypeAndValue{ .TypeName = valueType });
+        unsigned bits = llvmType != nullptr && llvmType->isIntegerTy()
+            ? llvmType->getIntegerBitWidth() : 0;
+        bool unsignedType = valueType.starts_with("u");
+        bool inRange = bits != 0;
+        if (inRange && valueType == "bool") inRange = value == 0 || value == 1;
+        else if (inRange && unsignedType)
+            inRange = value >= 0 && (bits == 64 || static_cast<uint64_t>(value) < (uint64_t{1} << bits));
+        else if (inRange && bits < 64)
+        {
+            int64_t minValue = -(int64_t{1} << (bits - 1));
+            int64_t maxValue = (int64_t{1} << (bits - 1)) - 1;
+            inRange = value >= minValue && value <= maxValue;
+        }
+        if (!inRange)
+        {
+            Compiler()->LogError(std::format(
+                "value argument '{}' is outside the range of '{}' for parameter '{}' in template '{}'",
+                typeArgs[i], valueType, typeParams[i], templateName));
+            valid = false;
+        }
+    }
+    return valid;
+}
+
+
 void MainListener::InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
                                      const std::unordered_map<std::string, std::string>& substitutions,
-                                     const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions) {
+                                     const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions,
+                                     const std::unordered_map<std::string, std::string>& valueSubstitutions) {
         if (instantiatedInterfaces.count(mangledName)) return;
         instantiatedInterfaces.insert(mangledName);
 
@@ -16,11 +66,18 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
 
         // Apply substitutions to instantiate the interface methods
         auto savedSubst = activeTypeSubstitutions;
+        auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
+        GenericValueMacroScope valueMacros(compilerLLVM);
         for (const auto& [k, v] : substitutions)
             activeTypeSubstitutions[k] = v;
         for (const auto& [k, v] : packSubstitutions)
             activePackSubstitutions[k] = v;
+        for (const auto& [k, v] : valueSubstitutions)
+        {
+            activeValueSubstitutions[k] = v;
+            valueMacros.Bind(k, ParseValueArg(v));
+        }
 
         // Resolve and materialize generic parents after the child substitutions are active.
         // BaseSpecifierName intentionally drops the parent's type arguments, so passing that
@@ -47,13 +104,20 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
                 std::unordered_map<std::string, std::string> parentSubst;
                 std::unordered_map<std::string, std::vector<std::string>> parentPackSubst;
                 const auto& parentParams = genericInterfaceTypeParams[parentBase];
+                const auto& parentValueParams = genericInterfaceValueParams[parentBase];
                 auto packIt = genericInterfacePackIndex.find(parentBase);
                 size_t packIndex = packIt != genericInterfacePackIndex.end()
                     ? packIt->second : std::string::npos;
+                std::unordered_map<std::string, std::string> parentValueSubst;
                 if (packIndex == std::string::npos)
                 {
                     for (size_t i = 0; i < parentParams.size() && i < parentArgs.size(); i++)
-                        parentSubst[parentParams[i]] = parentArgs[i];
+                    {
+                        if (i < parentValueParams.size() && !parentValueParams[i].empty())
+                            parentValueSubst[parentParams[i]] = parentArgs[i];
+                        else
+                            parentSubst[parentParams[i]] = parentArgs[i];
+                    }
                 }
                 else
                 {
@@ -62,7 +126,8 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
                     parentPackSubst[parentParams[packIndex]] =
                         std::vector<std::string>(parentArgs.begin() + packIndex, parentArgs.end());
                 }
-                InstantiateGenericInterface(parentBase, parentMangled, parentSubst, parentPackSubst);
+                InstantiateGenericInterface(parentBase, parentMangled, parentSubst, parentPackSubst,
+                                            parentValueSubst);
             }
         }
 
@@ -88,7 +153,9 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
 
         auto fields = ParseInterfaceFields(ctx);
         activeTypeSubstitutions = savedSubst;
+        activeValueSubstitutions = savedValueSubst;
         activePackSubstitutions = savedPackSubst;
+        valueMacros.Restore();
         Compiler()->CreateInterfaceDefinition(mangledName, parentNames, methods, fields);
     }
 
@@ -150,11 +217,23 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             return {};
 
         auto savedSubst = activeTypeSubstitutions;
+        auto savedValueSubst = activeValueSubstitutions;
         auto savedPackSubst = activePackSubstitutions;
+        GenericValueMacroScope valueMacros(compilerLLVM);
+        const auto& valueParams = genericFunctionValueParams[baseName];
+        if (!ValidateGenericArgumentKinds(baseName, typeParams, valueParams, typeArgs))
+            return {};
         if (packIdx == std::string::npos)
         {
             for (size_t i = 0; i < typeParams.size(); i++)
-                activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+            {
+                if (i < valueParams.size() && !valueParams[i].empty())
+                {
+                    activeValueSubstitutions[typeParams[i]] = typeArgs[i];
+                    valueMacros.Bind(typeParams[i], ParseValueArg(typeArgs[i]));
+                }
+                else activeTypeSubstitutions[typeParams[i]] = typeArgs[i];
+            }
         }
         else
         {
@@ -165,6 +244,15 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
             if (!activePackSubstitutions[typeParams[packIdx]].empty())
                 activeTypeSubstitutions[typeParams[packIdx]] =
                     activePackSubstitutions[typeParams[packIdx]].front();
+        }
+
+        if (!CheckValueConstraints(baseName, tmplCtx->whereClause(), typeParams, valueParams, typeArgs))
+        {
+            activeTypeSubstitutions = savedSubst;
+            activeValueSubstitutions = savedValueSubst;
+            activePackSubstitutions = savedPackSubst;
+            valueMacros.Restore();
+            return {};
         }
 
         // A generic member method is keyed "Owner.method". An instance method must be
@@ -189,7 +277,9 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         savedState.restore();
 
         activeTypeSubstitutions = savedSubst;
+        activeValueSubstitutions = savedValueSubst;
         activePackSubstitutions = savedPackSubst;
+        valueMacros.Restore();
         return mangledName;
     }
 
@@ -433,12 +523,21 @@ void MainListener::ProcessPendingInstantiations() {
                     std::unordered_map<std::string, std::string> ifaceSubst;
                     std::unordered_map<std::string, std::vector<std::string>> ifacePackSubst;
                     const auto& ifaceTypeParams = genericInterfaceTypeParams[pending.templateName];
+                    const auto& ifaceValueParams = genericInterfaceValueParams[pending.templateName];
                     auto packIdxIt = genericInterfacePackIndex.find(pending.templateName);
                     size_t packIdx = (packIdxIt != genericInterfacePackIndex.end()) ? packIdxIt->second : std::string::npos;
+                    std::unordered_map<std::string, std::string> ifaceValueSubst;
                     if (packIdx == std::string::npos)
                     {
                         for (size_t i = 0; i < ifaceTypeParams.size() && i < pending.typeArgs.size(); i++)
-                            ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                        {
+                            if (i < ifaceValueParams.size() && !ifaceValueParams[i].empty())
+                                ifaceValueSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                            else ifaceSubst[ifaceTypeParams[i]] = pending.typeArgs[i];
+                        }
+                        if (!ValidateGenericArgumentKinds(pending.templateName,
+                                                           ifaceTypeParams, ifaceValueParams, pending.typeArgs))
+                            continue;
                     }
                     else
                     {
@@ -447,7 +546,8 @@ void MainListener::ProcessPendingInstantiations() {
                         ifacePackSubst[ifaceTypeParams[packIdx]] =
                             std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
                     }
-                    InstantiateGenericInterface(pending.templateName, pending.mangledName, ifaceSubst, ifacePackSubst);
+                    InstantiateGenericInterface(pending.templateName, pending.mangledName,
+                        ifaceSubst, ifacePackSubst, ifaceValueSubst);
                 }
                 else if (compilerLLVM->InstantiateWinrtGenericInterface(
                              pending.templateName, pending.typeArgs, pending.mangledName))
@@ -467,6 +567,7 @@ void MainListener::ProcessPendingInstantiations() {
                 std::cout << "[verbose]   instantiate generic: " << pending.mangledName << "\n";
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
+            const auto& valueParams = genericStructValueParams[pending.templateName];
 
             // Materialize the template context (lazy-parses cached source on first use),
             // then verify where-clause constraints before instantiating.
@@ -481,10 +582,15 @@ void MainListener::ProcessPendingInstantiations() {
                 ? genericStructConstraints : genericClassConstraints;
             if (!CheckConstraints(pending.templateName, typeParams, pending.typeArgs, constraintMap, ctxForError))
                 continue;
+            if (!ValidateGenericArgumentKinds(pending.templateName, typeParams,
+                                               valueParams, pending.typeArgs))
+                continue;
 
             // Set up type substitutions for this instantiation
             auto savedSubst = activeTypeSubstitutions;
+            auto savedValueSubst = activeValueSubstitutions;
             auto savedPackSubst = activePackSubstitutions;
+            GenericValueMacroScope valueMacros(compilerLLVM);
 
             auto packMapIt = genericStructPackIndex.find(pending.templateName);
             size_t packIdx = (packMapIt != genericStructPackIndex.end()) ? packMapIt->second : std::string::npos;
@@ -493,7 +599,14 @@ void MainListener::ProcessPendingInstantiations() {
             {
                 // Non-variadic: 1:1 mapping
                 for (size_t i = 0; i < typeParams.size() && i < pending.typeArgs.size(); i++)
-                    activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                {
+                    if (i < valueParams.size() && !valueParams[i].empty())
+                    {
+                        activeValueSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                        valueMacros.Bind(typeParams[i], ParseValueArg(pending.typeArgs[i]));
+                    }
+                    else activeTypeSubstitutions[typeParams[i]] = pending.typeArgs[i];
+                }
             }
             else
             {
@@ -505,6 +618,17 @@ void MainListener::ProcessPendingInstantiations() {
                     std::vector<std::string>(pending.typeArgs.begin() + packIdx, pending.typeArgs.end());
             }
 
+            auto* whereClause = isStruct ? structCtx->whereClause() : classCtx->whereClause();
+            if (!CheckValueConstraints(pending.templateName, whereClause, typeParams, valueParams,
+                                       pending.typeArgs))
+            {
+                activeTypeSubstitutions = savedSubst;
+                activeValueSubstitutions = savedValueSubst;
+                activePackSubstitutions = savedPackSubst;
+                valueMacros.Restore();
+                continue;
+            }
+
             {
                 TemplateNamespaceScope nsScope(compilerLLVM, pending.templateName);
                 if (isStruct)
@@ -514,7 +638,9 @@ void MainListener::ProcessPendingInstantiations() {
             }
 
             activeTypeSubstitutions = savedSubst;
+            activeValueSubstitutions = savedValueSubst;
             activePackSubstitutions = savedPackSubst;
+            valueMacros.Restore();
         }
     }
 

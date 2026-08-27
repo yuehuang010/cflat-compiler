@@ -1,8 +1,57 @@
 # Value (non-type) generic parameters: `struct Buf<T, int N>`
 
-Status: **Design ratified 2026-08-26 by the maintainer, NOT implemented.** Written after a
-review of C++ / C# / Rust prior art against what CFlat already has. Every "measured" claim
-below was run on `x64/Release/cflat` at the `-D` defines change (uncommitted on `master`).
+Status: **Design ratified 2026-08-26. Stages 0-5 IMPLEMENTED 2026-08-27** (`./test.sh Release`
+720 passed / 0 failed / 8 skipped). Written after a review of C++ / C# / Rust prior art against
+what CFlat already has; the "measured" claims below describe the state BEFORE implementation and
+are kept as the record of why each decision was made.
+
+**As-built notes, where the implementation refined the design:**
+
+- The use-site value-argument alternative is `shiftExpression`, NOT `assignmentExpression`.
+  Decision #5 said only that a comparison must be parenthesized; admitting a full
+  `assignmentExpression` turned out to swallow ordinary code - `a < X && b > c` parsed as a
+  generic instantiation, breaking `test_generics`, `test_hpc_kernels` and `test_c_interop`.
+  Narrowing the alternative to shift level puts `<`, relational, equality, bitwise and logical
+  operators structurally out of reach at the top level of an argument, which enforces decision
+  #5 in the grammar instead of by convention. The cost is that a `>>` shift as a value argument
+  needs parentheses, exactly as in C++.
+- **The grammar stays 100% rule-driven.** An attempt to resolve the same ambiguity with
+  `@parser::members` plus semantic predicates (a 256-token lookahead on `blockItem`, a
+  float-literal sniff on `genericIdentifier`) was rejected by the maintainer on 2026-08-27. The
+  fix for an ambiguous alternative is to NARROW the alternative, never to guard it. Do not
+  reintroduce a predicate or an action block into `CFlat.g4`.
+- `nonIntegralValueParameterType` (`float`/`double`/`string`/`void`) is in the grammar solely so
+  `struct Buf<T, float N>` is REJECTED with a message naming the allowed set, rather than
+  reported as unparseable token soup. Same parse-then-diagnose shape as the C-style array
+  declarator.
+- Value parameters are bound by `MainListener::GenericValueMacroScope`, which saves and restores
+  only the names it binds. An earlier version copied the whole `compileTimeMacros` map on every
+  instantiation, value parameters or not.
+- **Seeded `const` globals live in their own map, NOT in `compileTimeMacros`.** The open item
+  below recommended seeding them into `compileTimeMacros`; that recommendation was WRONG and is
+  superseded. `MainListener::ParseIdentifier` consults `compileTimeMacros` BEFORE any scope
+  lookup, so seeding a global there made it shadow same-named locals and parameters program-wide
+  (silent wrong values, no diagnostic), narrowed every declared width to i32 (`const long BIG = 3;
+  BIG << 40` lost its high bits), and stripped the global's storage so `&BIG` stopped compiling.
+  All three were caught by an Opus review of the checkpoint commit and fixed on 2026-08-27:
+  `LLVMBackend::SetConstGlobalInt` / `TryGetConstGlobalInt` back a separate `constGlobalInts_`
+  map that ONLY the parse-tree folder reads. Regression coverage is
+  `Test/test_basic.cb::testConstGlobalIsNotAMacro`. Do not merge the two maps back together.
+- **The folder must accept a bare `genericIdentifier` node.** `Buf<int, CAP>` - decision #4's own
+  example - was dead in BOTH passes at the checkpoint commit, because the macro lookup lived only
+  in `FoldCompileTimeIntLeaf`'s `PrimaryExpressionContext` arm while the argument funnels hand the
+  folder a bare `GenericIdentifierContext`. Only `Buf<int, (CAP)>` and `Buf<int, CAP * 2>` worked,
+  and the suite missed it because the fixture only ever exercised `CAP * 2`. Fixed by
+  `FoldCompileTimeIdentifier`, which both arms now share; the fixture asserts the bare spelling.
+- **Gaps, deliberate:** value predicates do not work at INTERFACE scope (`interfaceDefinition`
+  has no `whereClause` slot in the grammar); a value parameter cannot be combined with a
+  parameter pack (rejected at the declaration, since the pack machinery binds every parameter
+  through the TYPE substitution map); and a `const` integer inside a `namespace` does not fold in
+  a value argument, reporting the kind-mismatch diagnostic rather than a "does not fold" one -
+  see the file-scope-only note under `SeedConstIntGlobals`. All three are documented in
+  `doc/LANGUAGE.md`.
+
+Every "measured" claim below was run on `x64/Release/cflat` at the `-D` defines change.
 
 The goal is a generic parameter that carries a compile-time VALUE, not a type, so a container
 author can write `struct Buf<T, int N>` and a coder can write `Buf<int, 8>`. The coder's
@@ -131,9 +180,10 @@ where T : int          // ERROR: found 'int' but expected Identifier
 ```
 
 The second form is the example `doc/LANGUAGE.md:774` advertises
-(`T maxOf<T>(T a, T b) where T : IComparable<T>`). **That is a shipped doc/grammar mismatch
-independent of this plan** - file it under `internal/issue/` whether or not value params are
-built. Stage 4 fixes it as a side effect of widening the rule.
+(`T maxOf<T>(T a, T b) where T : IComparable<T>`). **That was a shipped doc/grammar mismatch
+independent of this plan.** It was filed, then fixed on 2026-08-27 by widening the constraint
+target to `genericIdentifier`; the issue file is deleted. `where T : int` stays rejected - the
+rule is a name-to-name binding and no use case needs a primitive there.
 
 ### 4. The constant-folding machinery already exists, in two copies
 
@@ -172,10 +222,9 @@ the global's initializer.
 Mangled names are computed while instantiations are QUEUED, i.e. in the scanner. So without
 a fix, `Buf<int, CAP>` (a define) would instantiate while `Buf<int, KONST>` (a const global)
 would not - the same literal-only asymmetry as the simd bug in (2), reached from the other
-direction. **Stage 0 must close it**, by either seeding const globals into `compileTimeMacros`
-at declaration time, or deferring mangled-name construction to a point where the main-pass
-folder is available. Prefer the first: it is one insertion point and it makes the two folders
-agree on their input set rather than papering over the difference.
+direction. **Stage 0 must close it.** (As built, it does - but NOT the way this paragraph
+recommended. Seeding into `compileTimeMacros` was tried and reverted; see the as-built note at
+the top of this file. The seeded values live in a separate fold-only map.)
 
 > **`const` is currently unenforced - deliberate, do not "fix" it here.** `const` on a global
 > is accepted and then dropped: `const int KONST = 7;` emits `@KONST = global i32 7` (plain
@@ -215,7 +264,7 @@ a second scheme here.
 Each stage is independently reviewable. Stage 0 has standalone value and should land first
 whether or not the rest proceeds.
 
-### Stage 0 - one shared const-argument evaluator (+ simd retrofit)
+### Stage 0 - one shared const-argument evaluator (+ simd retrofit)  [LANDED]
 
 A three-part pipeline, callable from the scanner pass:
 
@@ -233,7 +282,7 @@ produces the power-of-two diagnostic verbatim; `simd<float, LANES>` with `-DLANE
 the same diagnostic; and a `const` global lane count (`simd<float, LANES8>`) folds too, which
 requires closing the scanner/main-pass reach gap documented in (4) above.
 
-### Stage 1 - grammar
+### Stage 1 - grammar  [LANDED]
 
 - `typeParameterEntry`: admit the value-param form. Primitive type token then Identifier, so
   the branch is decided on the first token and never collides with `unique T`.
@@ -243,7 +292,7 @@ requires closing the scanner/main-pass reach gap documented in (4) above.
 - Adopt the C++ rule that `>` closes the argument list. Note `ScannerFoldIfConstLeaf` already
   rejoins `'>' '>'` into a shift - the same token hazard, already handled once.
 
-### Stage 2 - mangling scheme
+### Stage 2 - mangling scheme  [LANDED]
 
 Settle this BEFORE any code, because it must be collision-free against a future string value
 param even though only ints ship:
@@ -253,7 +302,7 @@ param even though only ints ship:
   arg: e.g. `__s5_hello`
 - keep compatible with `internal/plan/funcptr-type-mangling.md`
 
-### Stage 3 - instantiation
+### Stage 3 - instantiation  [LANDED]
 
 Bind the parameter as a SCOPED compile-time macro pushed for the duration of the
 instantiation and popped after - the same `compileTimeMacros` entry shape a `-D` define
@@ -261,7 +310,7 @@ produces, differing only in lifetime. Everything downstream (`if const` at funct
 and file scope; fixed-array bounds; ordinary expression use) then works with no further
 change, which is exactly what the `cli_defines` regression already demonstrates for defines.
 
-### Stage 4 - widened `where`
+### Stage 4 - widened `where`  [LANDED (struct/class/function scope; not interfaces)]
 
 Extend `typeParameterConstraint` past `Identifier ':' Identifier` to cover, in one change:
 
@@ -273,7 +322,7 @@ A violated value constraint reports at the instantiation site. Note the body-lev
 already exists (`if const (...) { compile_error("..."); }`), so Stage 4 is a diagnostics and
 readability improvement, not a capability gate - it can slip without blocking Stage 3.
 
-### Stage 5 - diagnostics and tests
+### Stage 5 - diagnostics and tests  [LANDED]
 
 Diagnostics to write (LogError only, ASCII only):
 

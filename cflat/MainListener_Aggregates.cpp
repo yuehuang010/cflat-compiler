@@ -48,7 +48,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 LogErrorContext(ctx, std::format(
                     "generic struct '{}' conflicts with a generic interface of the same name",
                     structName));
-            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
+            std::vector<std::string> valueParams;
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
             genericStructTemplates[structName] = ctx;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
@@ -60,6 +61,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
+            genericStructValueParams[structName] = valueParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
             // Record which param (if any) is variadic - always the last one
             {
@@ -528,7 +530,10 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
                     // separates the owner, not a namespace, so only this tells the two apart.
                     Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
-                    genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
+                    std::vector<std::string> valueParams;
+                    genericFunctionTypeParams[qualifiedName] =
+                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
+                    genericFunctionValueParams[qualifiedName] = valueParams;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
@@ -2666,7 +2671,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 LogErrorContext(ctx, std::format(
                     "generic class '{}' conflicts with a generic interface of the same name",
                     structName));
-            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters());
+            std::vector<std::string> valueParams;
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
             genericClassTemplates[structName] = ctx;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
@@ -2678,6 +2684,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             Compiler()->gts.genericTemplateNamespace[structName] = Compiler()->GetCurrentNamespace();
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
+            genericStructValueParams[structName] = valueParams;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
             return;
         }
@@ -3179,7 +3186,10 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // Declaring NAMESPACE of the owner, recorded not derived: the key's last dot
                     // separates the owner, not a namespace, so only this tells the two apart.
                     Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
-                    genericFunctionTypeParams[qualifiedName] = ParseGenericTypeParameters(func->genericTypeParameters());
+                    std::vector<std::string> valueParams;
+                    genericFunctionTypeParams[qualifiedName] =
+                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
+                    genericFunctionValueParams[qualifiedName] = valueParams;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
@@ -3236,15 +3246,21 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
 
                 // Build substitution maps for the interface template's type params (pack-aware)
                 std::unordered_map<std::string, std::string> ifaceSubstitutions;
+                std::unordered_map<std::string, std::string> ifaceValueSubstitutions;
                 std::unordered_map<std::string, std::vector<std::string>> ifacePackSubstitutions;
                 const auto& ifaceTypeParams = genericInterfaceTypeParams[ifaceBaseName];
+                const auto& ifaceValueParams = genericInterfaceValueParams[ifaceBaseName];
                 auto ifacePackIdxIt = genericInterfacePackIndex.find(ifaceBaseName);
                 size_t ifacePackIdx = (ifacePackIdxIt != genericInterfacePackIndex.end())
                                       ? ifacePackIdxIt->second : std::string::npos;
                 if (ifacePackIdx == std::string::npos)
                 {
                     for (size_t i = 0; i < ifaceTypeParams.size() && i < concreteTypeArgs.size(); i++)
-                        ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                    {
+                        if (i < ifaceValueParams.size() && !ifaceValueParams[i].empty())
+                            ifaceValueSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                        else ifaceSubstitutions[ifaceTypeParams[i]] = concreteTypeArgs[i];
+                    }
                 }
                 else
                 {
@@ -3254,7 +3270,8 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                         std::vector<std::string>(concreteTypeArgs.begin() + ifacePackIdx, concreteTypeArgs.end());
                 }
 
-                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions, ifacePackSubstitutions);
+                InstantiateGenericInterface(ifaceBaseName, ifaceName, ifaceSubstitutions,
+                    ifacePackSubstitutions, ifaceValueSubstitutions);
             }
 
             ifaceNames.push_back(ifaceName);
@@ -3278,8 +3295,10 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         structScopeStack.pop_back();
     }
 
-std::vector<std::string> MainListener::ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams) {
+std::vector<std::string> MainListener::ParseGenericTypeParameters(
+    CFlatParser::GenericTypeParametersContext* genericParams, std::vector<std::string>* valueTypes) {
         std::vector<std::string> typeParams;
+        if (valueTypes != nullptr) valueTypes->clear();
         if (!genericParams)
             return typeParams;
 
@@ -3290,6 +3309,22 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(CFlatParser::G
         bool seenPack = false;
         for (auto* entry : typeParamList->typeParameterEntry())
         {
+            if (IsValueParameterDeclaration(entry))
+            {
+                if (ValueParameterTypeSpelling(entry).empty())
+                {
+                    LogErrorContext(entry, "value parameter must use an integral type: char, short, int, long, bool, i8, i16, i32, i64, u8, u16, u32, u64");
+                    continue;
+                }
+                if (seenPack)
+                {
+                    LogErrorContext(entry, "Only the last type parameter may be a pack (T...)");
+                    continue;
+                }
+                typeParams.push_back(entry->valueParameterDeclaration()->Identifier()->getText());
+                if (valueTypes != nullptr) valueTypes->push_back(ValueParameterTypeSpelling(entry));
+                continue;
+            }
             auto* typeSpec = entry->typeSpecifier();
             // Generic type parameters must be simple identifiers, not built-in types
             if (!typeSpec || !typeSpec->genericIdentifier() || !typeSpec->genericIdentifier()->Identifier())
@@ -3303,8 +3338,22 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(CFlatParser::G
                 continue;
             }
             typeParams.push_back(typeSpec->genericIdentifier()->Identifier()->getText());
+            if (valueTypes != nullptr) valueTypes->push_back("");
             if (entry->Ellipsis() != nullptr)
+            {
                 seenPack = true;
+                // The pack machinery binds every parameter through the TYPE substitution map, so
+                // a value parameter alongside it would silently never be bound. Say so here
+                // rather than let the body fail with "Undefined variable N".
+                if (valueTypes != nullptr)
+                    for (const auto& vt : *valueTypes)
+                        if (!vt.empty())
+                        {
+                            LogErrorContext(entry, "a compile-time value parameter cannot be "
+                                "combined with a parameter pack (T...) in the same generic");
+                            break;
+                        }
+            }
         }
 
         return typeParams;
@@ -3316,11 +3365,78 @@ std::unordered_map<std::string, std::vector<std::string>>
         if (!wc) return result;
         for (auto* constraint : wc->typeParameterConstraint())
         {
-            auto ids = constraint->Identifier();
-            if (ids.size() < 2) continue;
-            result[ids[0]->getText()].push_back(ids[1]->getText());
+            if (constraint->assignmentExpression() != nullptr) continue;
+            auto* target = constraint->genericIdentifier();
+            auto* typeParam = constraint->Identifier();
+            if (target == nullptr || typeParam == nullptr) continue;
+            result[typeParam->getText()].push_back(target->getText());
         }
         return result;
+    }
+
+bool MainListener::CheckValueConstraints(
+    const std::string& templateName,
+    CFlatParser::WhereClauseContext* whereClause,
+    const std::vector<std::string>& typeParams,
+    const std::vector<std::string>& valueParams,
+    const std::vector<std::string>& typeArgs) {
+        if (whereClause == nullptr) return true;
+
+        auto findValueParam = [&](antlr4::tree::ParseTree* node) {
+            std::string found;
+            auto visit = [&](auto&& self, antlr4::tree::ParseTree* current) -> void {
+                if (current == nullptr || !found.empty()) return;
+                if (auto* terminal = dynamic_cast<antlr4::tree::TerminalNode*>(current))
+                {
+                    for (size_t i = 0; i < typeParams.size() && i < valueParams.size(); i++)
+                        if (!valueParams[i].empty() && terminal->getText() == typeParams[i])
+                        {
+                            found = typeParams[i];
+                            return;
+                        }
+                }
+                for (auto* child : current->children)
+                    self(self, child);
+            };
+            visit(visit, node);
+            return found;
+        };
+
+        std::string instantiation = templateName + "<";
+        for (size_t i = 0; i < typeArgs.size(); i++)
+        {
+            if (i != 0) instantiation += ", ";
+            instantiation += typeArgs[i];
+        }
+        instantiation += ">";
+
+        for (auto* constraint : whereClause->typeParameterConstraint())
+        {
+            auto* predicate = constraint->assignmentExpression();
+            if (predicate == nullptr) continue;
+
+            auto folded = FoldCompileTimeInt(Compiler(), predicate);
+            std::string constraintText = "where " + CollapsedSourceText(constraint);
+            if (!folded)
+            {
+                Compiler()->LogError(std::format(
+                    "constraint '{}' on '{}' does not fold to a compile-time constant",
+                    constraintText, templateName));
+                return false;
+            }
+            if (*folded != 0) continue;
+
+            std::string valueName = findValueParam(predicate);
+            std::string value = "0";
+            for (size_t i = 0; i < typeParams.size() && i < valueParams.size(); i++)
+                if (!valueName.empty() && typeParams[i] == valueName && i < typeArgs.size())
+                    value = typeArgs[i];
+            Compiler()->LogError(std::format(
+                "constraint '{}' is not satisfied by '{}' ({} = {})",
+                constraintText, instantiation, valueName.empty() ? "value" : valueName, value));
+            return false;
+        }
+        return true;
     }
 
 bool MainListener::CheckConstraints(
@@ -3331,17 +3447,83 @@ bool MainListener::CheckConstraints(
         antlr4::ParserRuleContext* ctx) {
         auto cit = constraintMap.find(templateName);
         if (cit == constraintMap.end()) return true;
+
+        std::unordered_map<std::string, std::string> substitutions;
+        for (size_t i = 0; i < typeParams.size() && i < typeArgs.size(); i++)
+            substitutions[typeParams[i]] = typeArgs[i];
+
+        auto splitGeneric = [](const std::string& spelling, std::string& base,
+                               std::vector<std::string>& args) {
+            size_t lt = spelling.find('<');
+            if (lt == std::string::npos || spelling.empty() || spelling.back() != '>')
+                return false;
+            base = spelling.substr(0, lt);
+            args = SplitTopLevelTypeArgs(spelling.substr(lt + 1, spelling.size() - lt - 2));
+            return !base.empty();
+        };
+
+        std::function<std::string(const std::string&)> substituteType;
+        substituteType = [&](const std::string& spelling) {
+            auto it = substitutions.find(spelling);
+            if (it != substitutions.end()) return it->second;
+
+            std::string base;
+            std::vector<std::string> args;
+            if (!splitGeneric(spelling, base, args)) return spelling;
+
+            std::string result = base + "<";
+            for (size_t i = 0; i < args.size(); i++)
+            {
+                if (i > 0) result += ",";
+                result += substituteType(args[i]);
+            }
+            return result + ">";
+        };
+
+        std::function<std::string(const std::string&)> mangleType;
+        mangleType = [&](const std::string& spelling) {
+            std::string substituted = substituteType(spelling);
+            std::string base;
+            std::vector<std::string> args;
+            if (!splitGeneric(substituted, base, args))
+                return MangleTypeArg(Compiler(), substituted);
+
+            std::vector<std::string> mangledArgs;
+            for (const auto& arg : args)
+            {
+                std::string nestedBase;
+                std::vector<std::string> nestedArgs;
+                if (splitGeneric(arg, nestedBase, nestedArgs))
+                    mangledArgs.push_back(mangleType(arg));
+                else
+                    mangledArgs.push_back(MangleTypeArg(Compiler(), arg));
+            }
+            return MangledGenericName(base, mangledArgs);
+        };
+
         for (size_t i = 0; i < typeParams.size() && i < typeArgs.size(); i++)
         {
             auto pit = cit->second.find(typeParams[i]);
             if (pit == cit->second.end()) continue;
             for (const auto& iface : pit->second)
             {
-                if (!Compiler(ctx)->TypeImplementsInterface(typeArgs[i], iface))
+                std::string sourceIface = substituteType(iface);
+                std::string concreteIface = iface;
+                std::string base;
+                std::vector<std::string> args;
+                if (splitGeneric(sourceIface, base, args))
                 {
-                    Compiler(ctx)->LogError(std::format(
+                    std::vector<std::string> mangledArgs;
+                    for (const auto& arg : args)
+                        mangledArgs.push_back(mangleType(arg));
+                    concreteIface = MangledGenericName(base, mangledArgs);
+                }
+
+                if (!Compiler()->TypeImplementsInterface(typeArgs[i], concreteIface))
+                {
+                    Compiler()->LogError(std::format(
                         "type '{}' does not implement '{}', required by constraint 'where {} : {}'",
-                        typeArgs[i], iface, typeParams[i], iface));
+                        typeArgs[i], sourceIface, typeParams[i], iface));
                     return false;
                 }
             }

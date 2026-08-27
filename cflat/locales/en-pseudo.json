@@ -425,6 +425,9 @@
       "f",
       "move"
     ],
+    "hintarg0": [
+      "structs cannot implement interfaces; use 'class' instead"
+    ],
     "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
       "Bar.winmd"
     ],
@@ -471,6 +474,7 @@
       "bool",
       "Foo"
     ],
+    "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": [],
     "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"

@@ -900,6 +900,42 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         }
 
         /*
+         * A simd VECTOR is not an aggregate to LLVM - Type::isAggregateType() covers struct and
+         * array only - so the two aggregate guards below never see one, and it used to fall all
+         * the way through to the fallback bitcast. That bitcast is invalid whenever the sizes
+         * differ (<8 x float> is 256 bits, i32 is 32), and when the source is a Constant it folds
+         * into an unchecked ConstantExpr instead, which reaches SelectionDAG. Reject it here with
+         * a source location. Scalar -> vector is deliberately NOT handled: that is the splat
+         * (`simd<float,8> v = 1.0;`), which the declaration path converts before reaching here.
+         */
+        if (srcType->isVectorTy() && srcType != destType)
+        {
+            auto laneCount = [](llvm::Type* t) {
+                auto* fv = llvm::dyn_cast<llvm::FixedVectorType>(t);
+                return fv != nullptr ? (uint64_t)fv->getNumElements() : (uint64_t)0;
+            };
+            if (destType->isVectorTy())
+                LogError(std::format(
+                    "cannot convert simd vector storage with {} lanes to simd vector storage with "
+                    "{} lanes - a simd vector converts only to the same lane count and element "
+                    "type. Rebuild the value at the destination shape instead.",
+                    laneCount(srcType), laneCount(destType)));
+            else if (destType->isAggregateType())
+                LogError(std::format(
+                    "cannot store simd vector storage with {} lanes into {} - store the lanes "
+                    "individually with 'simd<T,N>.store(array, index)', or read one lane with "
+                    "'v[i]'.",
+                    laneCount(srcType), DescribeAggregateStorageShape(destType)));
+            else
+                LogError(std::format(
+                    "cannot convert simd vector storage with {} lanes to a single value - read one "
+                    "lane with 'v[i]', or reduce the vector with 'simd<T,N>.reduce_add(v)' "
+                    "('reduce_min' / 'reduce_max' also reduce to a scalar).",
+                    laneCount(srcType)));
+            return value;
+        }
+
+        /*
          * A bitcast may not have an aggregate operand at all, so a non-aggregate -> aggregate
          * conversion here is a pure backstop: every spelling that reaches it would otherwise fail
          * module verification, or - when the source is a Constant, which folds the cast into an

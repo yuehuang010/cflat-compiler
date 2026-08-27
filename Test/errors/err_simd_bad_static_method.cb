@@ -7,6 +7,20 @@ extern int main()
         auto v = simd<double,4>.gather(a, 0);
     }
 
+    // A simd vector is not an LLVM aggregate, so the aggregate guards in CreateCast never saw
+    // one and it fell through to a bitcast between differently-sized types - an invalid module,
+    // or a silently folded ConstantExpr when the source was constant. Each shape gets a message.
+    simd<float,8> reject = 1.0;
+    expect_error("cannot convert simd vector storage with 8 lanes to a single value") {
+        int narrowed = reject;
+    }
+    expect_error("cannot convert simd vector storage with 8 lanes to simd vector storage with 4 lanes") {
+        simd<float,4> relaned = reject;
+    }
+    expect_error("cannot pass simd vector storage with 8 lanes to a variadic function") {
+        printf("%d\n", reject);
+    }
+
     // A simd type reaching EXPRESSION position with no '.method' is a pointer declaration the
     // parser re-read as a multiplication. Both spellings used to land on the static-call list,
     // which says nothing about what was written; the fixed-array one was accepted outright in
@@ -23,4 +37,18 @@ extern int main()
 // because the simd branch tested declSpec->pointer() while the trailing '*' is an arrayPtrSuffix.
 expect_error("pointer to fixed array 'simd<float,4>[N]*' is not a valid type") {
     struct SimdPtrField { simd<float,4>[2]* p = default; };
+}
+
+// The lane count is a folded compile-time expression now, not a raw literal. A name that is
+// neither a define nor a const int global still cannot fold, and must report the same
+// "integer literal" message the raw-text parse used to.
+expect_error("simd lane count must be an integer literal (got 'notAConstant')") {
+    struct SimdBadLanes { simd<float, notAConstant> v = default; };
+}
+
+// A folded lane count is still held to the power-of-2 rule, hint included.
+const int SimdOddLanes = 7;
+expect_error("simd lane count must be a power of 2 in [2,64] (got 7)") {
+    struct SimdOddField { simd<float, SimdOddLanes> v = default; };
+
 }

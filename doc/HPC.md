@@ -157,10 +157,11 @@ simd<i32, 4> q = p * p;        // 25 per lane
 
 - **Element type** `T` must be a numeric scalar (`i8`-`i64`, `u8`-`u64`, `float`, `double`).
   `bool` and struct/pointer types are rejected.
-- **Lane count** `N` must be a **power-of-two integer literal** in `[2, 64]`. A non-power-of-two
-  (e.g. `simd<float,7>`) is a compile error - the explicit SIMD type exists to control the
-  hardware mapping, so a count that would silently waste a lane is rejected with a hint
-  (`did you mean simd<...,8>?`).
+- **Lane count** `N` may be any expression that folds to a compile-time integer, including an
+  integer literal, a `-D` define, a `const` integer global, or an arithmetic combination. The
+  result must be a **power of two** in `[2, 64]`. A non-power-of-two (e.g. `simd<float,7>`)
+  is a compile error - the explicit SIMD type exists to control the hardware mapping, so a
+  count that would silently waste a lane is rejected with a hint (`did you mean simd<...,8>?`).
 - **Construction**: a scalar initializer is *splatted* across all lanes (`simd<float,8> v = 1.0;`).
   A scalar *assigned* to an existing vector splats the same way (`v = 3.0;` sets every lane).
   An unsigned source zero-extends into a wider lane type at every splat site - declaration,

@@ -131,6 +131,9 @@ struct GenericTemplateState
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>      genericStructTemplates;
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>       genericClassTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericStructTypeParams;
+    // Parallel to the type-parameter vectors: empty means a TYPE parameter; otherwise this is
+    // the primitive spelling of a compile-time VALUE parameter.
+    std::unordered_map<std::string, std::vector<std::string>>                   genericStructValueParams;
     std::unordered_set<std::string>                                             instantiatedGenerics;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
@@ -140,6 +143,7 @@ struct GenericTemplateState
     std::unordered_map<std::string, size_t>                                     genericInterfacePackIndex;
     std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>   genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceTypeParams;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceValueParams;
     std::unordered_set<std::string>                                             instantiatedInterfaces;
     // Mangled names known to name a generic INTERFACE instantiation (Container__int). Recorded
     // wherever such a use is seen so it lowers to a fat pointer before interfaceTable has it.
@@ -203,6 +207,7 @@ struct GenericTemplateState
     std::unordered_map<std::string, std::string>                                genericTemplateNamespace;
     std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionValueParams;
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
     std::vector<PendingInstantiation>                                           pendingInstantiations;
@@ -2802,6 +2807,9 @@ private:
         std::string type;  // "int", "string", etc.
     };
     std::unordered_map<std::string, CompileTimeMacro> compileTimeMacros;
+
+    // Fold-only view of file-scope `const` integer globals (see SetConstGlobalInt).
+    std::unordered_map<std::string, int64_t> constGlobalInts_;
     // A -D define from the command line. Parsed once at arg time; re-applied by
     // SetPlatformMacros on every (re)analysis since compileTimeMacros is cleared.
     struct UserDefine
@@ -6891,6 +6899,17 @@ public:
     static bool IsReservedMacroName(const std::string& name);
 
     CompileTimeMacro GetCompileTimeMacro(const std::string& name);
+
+    /*
+     * Compile-time integer value of a file-scope `const` integer global, seeded by the forward
+     * scanner so the parse-tree constant folder can see it in BOTH passes. Deliberately kept
+     * OUT of compileTimeMacros: ParseIdentifier consults that map before any scope lookup, so a
+     * global seeded there would shadow same-named locals and parameters, lose its storage
+     * (breaking `&g`), and be narrowed to i32 whatever its declared type. Only the folder reads
+     * this map; every ordinary use of the global still goes through the normal global path.
+     */
+    void SetConstGlobalInt(const std::string& name, int64_t value);
+    bool TryGetConstGlobalInt(const std::string& name, int64_t& out) const;
 
     StructData GetDataStructure(const std::string& structName);
 

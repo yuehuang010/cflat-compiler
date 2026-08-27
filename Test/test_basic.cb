@@ -1028,6 +1028,37 @@ int GlobalNegPlainI8    = -101;
 int GlobalNegPlainI16   = -150;
 int GlobalNegPlainI32   = -70000;
 
+// A file-scope `const` integer global is seeded into the compile-time constant FOLDER so an
+// `if const` / generic value argument can see it. It must stay an ordinary global everywhere
+// else: seeding it as a compile-time macro instead made it shadow same-named locals and
+// parameters, narrowed every width to i32, and broke address-of.
+const int ConstFoldShadow = 8;
+const long ConstFoldWide  = 3;
+
+int constFoldShadowParam(int ConstFoldShadow)
+{
+    return ConstFoldShadow + 1;
+}
+
+bool testConstGlobalIsNotAMacro()
+{
+    bool result = true;
+    int ConstFoldShadow = 3;
+    result &= Test("const_global_local_shadows", ConstFoldShadow, 3);
+    result &= Test("const_global_param_shadows", constFoldShadowParam(100), 101);
+    ConstFoldShadow = 5;
+    result &= Test("const_global_local_assignable", ConstFoldShadow, 5);
+
+    // Narrowing the global to i32 made this shift lose the high bits.
+    long wide = ConstFoldWide << 40;
+    result &= Test("const_global_keeps_width", wide == 3298534883328, true);
+
+    // A macro has no storage, so address-of stopped compiling.
+    int* p = &ConstFoldShadow;
+    result &= Test("const_global_addressable", *p, 5);
+    return result;
+}
+
 bool testNegativeGlobalInit()
 {
     bool result = true;
@@ -4038,6 +4069,7 @@ extern int main()
     total++; passed += testAssertReturnBlock()           ? 1 : 0;
     total++; passed += testExplicitIntTypes()            ? 1 : 0;
     total++; passed += testNegativeGlobalInit()          ? 1 : 0;
+    total++; passed += testConstGlobalIsNotAMacro()      ? 1 : 0;
     total++; passed += testNullConditional()             ? 1 : 0;
     total++; passed += testNullCoalescing()              ? 1 : 0;
     total++; passed += testNullCoalescingAssignment()    ? 1 : 0;

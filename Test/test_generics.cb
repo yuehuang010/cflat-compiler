@@ -1758,6 +1758,43 @@ int SumScores<T>(T* a, T* b) where T : IScorer
     return a.Score() + b.Score();
 }
 
+interface ICmp<T>
+{
+    int cmp(T o);
+};
+
+class Num : ICmp<Num>
+{
+    int value = default;
+    int cmp(Num o) { return value - o.value; }
+};
+
+struct CmpHolder<T> where T : ICmp<T>
+{
+    T value = default;
+
+    int compare(T other)
+    {
+        return value.cmp(other);
+    }
+};
+
+T maxOf<T>(T a, T b) where T : ICmp<T>
+{
+    return a.cmp(b) >= 0 ? a : b;
+}
+
+struct PositiveBuffer<T, int N> where N > 0
+{
+    T[N] values = default;
+    int capacity() { return N; }
+};
+
+T mixedMax<T, int N>(T a, T b) where T : ICmp<T>, N > 0
+{
+    return a.cmp(b) >= 0 ? a : b;
+}
+
 bool testBasicStructConstraint()
 {
     bool result = true;
@@ -1842,6 +1879,35 @@ bool testConstrainedFunction()
     r2.power = 4;
     result &= Test("constraint_func_max_robot", MaxScore<Robot>(&r1, &r2), 12);
     result &= Test("constraint_func_sum_robot", SumScores<Robot>(&r1, &r2), 20);
+    return result;
+}
+
+bool testGenericInterfaceConstraint()
+{
+    bool result = true;
+    Num a = default;
+    a.value = 7;
+    Num b = default;
+    b.value = 3;
+    result &= Test("generic_constraint_function", maxOf<Num>(a, b).value, 7);
+
+    CmpHolder<Num> holder = default;
+    holder.value.value = 9;
+    result &= Test("generic_constraint_struct", holder.compare(b), 6);
+    return result;
+}
+
+bool testValuePredicates()
+{
+    bool result = true;
+    PositiveBuffer<int, 3> buffer = default;
+    buffer.values[0] = 12;
+    result &= Test("generic_value_struct_predicate", buffer.values[0] + buffer.capacity(), 15);
+    Num a = default;
+    a.value = 7;
+    Num b = default;
+    b.value = 3;
+    result &= Test("generic_value_function_predicate", mixedMax<Num, 2>(a, b).value, 7);
     return result;
 }
 
@@ -4351,6 +4417,8 @@ extern int main()
     total++; passed += testMultipleConstraintsSameParam() ? 1 : 0;
     total++; passed += testConstrainedClass()            ? 1 : 0;
     total++; passed += testConstrainedFunction()         ? 1 : 0;
+    total++; passed += testGenericInterfaceConstraint()  ? 1 : 0;
+    total++; passed += testValuePredicates()              ? 1 : 0;
     total++; passed += testVariadicStruct()              ? 1 : 0;
     total++; passed += testVariadicSizeof()              ? 1 : 0;
     total++; passed += testVariadicFixedPlusPack()       ? 1 : 0;

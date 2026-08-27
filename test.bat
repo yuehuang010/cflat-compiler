@@ -285,8 +285,9 @@ REM compile-time constants in generic code, and the reserved-name rejection.
 set DEFINES_NAME=cli_defines
 set DEFINES_LOG=%OUT%\results\%DEFINES_NAME%.log
 set DEFINES_OFF_LOG=%OUT%\results\%DEFINES_NAME%.off.log
+set DEFINES_IR=%OUT%\results\%DEFINES_NAME%.ll
 set DEFINES_RESULT=%OUT%\results\%DEFINES_NAME%.result
-"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_ON -D CLI_DEF_LEVEL=6 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_LOG%" 2>&1
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_ON -D CLI_DEF_LEVEL=6 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_LOG%" 2>&1
 if errorlevel 1 (
     echo FAILED: -D fixture did not compile or run >"%DEFINES_RESULT%"
     goto DefinesDone
@@ -301,24 +302,57 @@ if errorlevel 1 (
     echo FAILED: -D constant did not fold as a value >"%DEFINES_RESULT%"
     goto DefinesDone
 )
-findstr /c:"generic cap=7 count=2 pick=10" "%DEFINES_LOG%" >nul
+findstr /c:"generic cap=8 alias=8 count=2 pick=10" "%DEFINES_LOG%" >nul
 if errorlevel 1 (
     echo FAILED: -D constant did not reach generic code >"%DEFINES_RESULT%"
     goto DefinesDone
 )
-"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_OFF_LOG%" 2>&1
+findstr /c:"value member=80 function=8 negative=-1 nested=8" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: generic value parameter specialization is wrong >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"value bare=4 constarg=16" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: a bare -D define or const global did not fold as a value argument >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"simd define=3 const=4" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: -D or const global did not reach simd lane count >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+REM Decision #6: the FOLDED VALUE is mangled, so Buf<int,8> and Buf<int,CAP*2> must be ONE
+REM instantiation. Counted in the IR because nothing observable at runtime distinguishes them.
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=1 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 --out-lli "%DEFINES_IR%" --nologo %CFLAT_PLATFORM_FLAG% >>"%DEFINES_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: value-parameter IR probe did not compile >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+set DEFINES_IR_COUNT=0
+for /f %%c in ('findstr /r /c:"^%%Buf__i32__8 = type" "%DEFINES_IR%" ^| find /c /v ""') do set DEFINES_IR_COUNT=%%c
+if not "%DEFINES_IR_COUNT%"=="1" (
+    echo FAILED: equivalent folded values did not share one generic instantiation >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_OFF_LOG%" 2>&1
 if errorlevel 1 (
     echo FAILED: -D fixture did not run with the off define set >"%DEFINES_RESULT%"
     goto DefinesDone
 )
 findstr /c:"mode=off level=7 tag=nightly" "%DEFINES_OFF_LOG%" >nul
 if errorlevel 1 (
+    echo FAILED: flipping a -D did not respecialize the generic >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"generic cap=8 alias=8 count=2 pick=20" "%DEFINES_OFF_LOG%" >nul
+if errorlevel 1 (
     echo FAILED: flipping a -D did not reselect the if const arm >"%DEFINES_RESULT%"
     goto DefinesDone
 )
-findstr /c:"generic cap=7 count=2 pick=20" "%DEFINES_OFF_LOG%" >nul
+findstr /c:"simd define=3 const=4" "%DEFINES_OFF_LOG%" >nul
 if errorlevel 1 (
-    echo FAILED: flipping a -D did not respecialize the generic >"%DEFINES_RESULT%"
+    echo FAILED: -D or const global did not reach simd lane count >"%DEFINES_RESULT%"
     goto DefinesDone
 )
 "%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -D__MACOS__=0 --check %CFLAT_PLATFORM_FLAG% >>"%DEFINES_LOG%" 2>&1

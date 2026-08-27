@@ -38,6 +38,74 @@ struct Plain
     int x = 0;
 };
 
+interface IComparable<T>
+{
+    int CompareTo(T o);
+};
+
+struct GenericBest<T> where T : IComparable<T>
+{
+    T first = default;
+};
+
+struct ValueBest<T, int N>
+{
+    T[N] first = default;
+};
+
+struct ByteBest<T, i8 N>
+{
+    T[N] first = default;
+};
+
+struct PositiveOnly<T, int N> where N > 0
+{
+    T[N] first = default;
+};
+
+struct UnfoldableOnly<T, int N> where N > UNKNOWN_VALUE
+{
+    T[N] first = default;
+};
+
+int PositiveFunction<T, int N>() where N > 0
+{
+    return N;
+}
+
+expect_error("value parameter must use an integral type") {
+    struct BadValueType<T, float N> { T[N] first = default; };
+}
+
+// Anchor on the full sentence, not on "wrong kind": both polarities of the message contain
+// that phrase, so a bare substring would still pass if expected and actual were swapped.
+expect_error("generic argument for value parameter 'N' in template 'ValueBest' has the wrong kind; expected a compile-time value") {
+    ValueBest<int, int> value_kind = default;
+}
+expect_error("generic argument for type parameter 'T' in template 'ValueBest' has the wrong kind; expected a type") {
+    ValueBest<8, 8> type_kind = default;
+}
+
+// A compile-time value parameter cannot be bound by the pack machinery, which routes every
+// parameter through the TYPE substitution map. Rejected at the declaration.
+expect_error("a compile-time value parameter cannot be combined with a parameter pack") {
+    struct ValueAndPack<int N, T...> { int v() { return N; } };
+}
+expect_error("does not fold") { ValueBest<int, UNKNOWN_VALUE + 1> not_constant = default; }
+expect_error("outside the range") { ByteBest<int, 256> out_of_range = default; }
+expect_error("constraint 'where N > 0' is not satisfied by 'PositiveOnly<int, 0>' (N = 0)") {
+    PositiveOnly<int, 0> violated = default;
+}
+expect_error("constraint 'where N > UNKNOWN_VALUE' on 'UnfoldableOnly' does not fold to a compile-time constant") {
+    UnfoldableOnly<int, 1> unfoldable = default;
+}
+expect_error("constraint 'where N > 0' is not satisfied by 'PositiveFunction<int, 0>' (N = 0)") {
+    int test_constraint_function_value()
+    {
+        return PositiveFunction<int, 0>();
+    }
+}
+
 expect_error("does not implement 'IScorer'") {
     int test_constraint_struct()
     {
@@ -59,6 +127,14 @@ expect_error("does not implement 'ILabeled'") {
     int test_constraint_multi()
     {
         TaggedBest<PartialType> tb;
+        return 0;
+    }
+}
+
+expect_error("does not implement 'IComparable<Plain>', required by constraint 'where T : IComparable<T>'") {
+    int test_constraint_generic()
+    {
+        GenericBest<Plain> f;
         return 0;
     }
 }

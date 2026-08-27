@@ -757,6 +757,44 @@ p.first  = 1;
 p.second = 3.14f;
 ```
 
+### Value Generic Parameters
+
+A generic may declare a compile-time value parameter by writing an integral primitive followed by
+its name. `const` is not written because it is implied by this position:
+
+```c
+struct Buf<T, int N> where N > 0
+{
+    T[N] items = default;
+    int cap() { return N; }
+};
+
+Buf<int, 8> fixed = default;
+Buf<int, CAP * 2> fromDefine = default;
+```
+
+Value parameters may be constrained with a compile-time predicate such as `where N > 0`; the
+predicate must fold to a nonzero value. Type and value constraints may be mixed, for example
+`where T : IShow<T>, N > 0`.
+
+Value arguments are constant expressions that must fold at compile time. The closing `>` ends the
+generic argument list, so comparisons must be parenthesized, as in `Buf<int, (A > B)>`. The folded
+value determines the specialization identity: `Buf<int, CAP * 2>` and `Buf<int, 16>` are the same
+instantiation when `CAP` is `8`. Value parameters use integral primitives only: `char`, `short`,
+`int`, `long`, `bool`, `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`.
+
+A value argument may name a `-D` define or a file-scope `const` integer global as well as a
+literal, so `Buf<int, CAP>` and `Buf<int, LANES * 2>` both work. A `const` integer declared inside
+a `namespace` does not fold in a value argument - only file-scope ones do.
+
+Specialization uses `if const` in the generic body, including at member scope; CFlat does not use
+C++-style partial specialization.
+
+Two limits are worth stating. A value parameter cannot be combined with a parameter pack
+(`struct Bag<int N, T...>` is rejected at the declaration), and a value predicate in a `where`
+clause works on generic structs, classes and functions but not on interfaces, which have no
+`where` clause of their own.
+
 ### Generic Functions
 
 ```c

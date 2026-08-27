@@ -200,6 +200,36 @@ def vcpkg_example_ports_installed() -> bool:
     return any(d.joinpath("include").is_dir() for d in installed.glob("*")) if installed.is_dir() else False
 
 
+# Sweep exclusions, as data rather than as a chain of list rebuilds. Each entry carries the
+# reason it cannot be analyzed standalone, so adding one is a table row and the "why" travels
+# with it. Matched against the REPO_ROOT-relative posix path, computed once per file.
+#
+# By BASENAME - host-neutral components that import only the element model and resolve their
+# native* host drivers (hostWidth/hostHeight/canvasCreateImage/...) from whichever LAUNCHER
+# imports them, sharing one global scope with it. The launchers are swept; example.bat
+# exercises the components. Plus one fixture the CLI drivers parameterize.
+_SKIP_BY_NAME = {
+    "gallery_app.cb": "host-neutral component; drivers resolve from gallery.cb / winui_gallery.cb",
+    "todo_app.cb": "host-neutral component; drivers resolve from todo_test.cb",
+    "map_app.cb": "host-neutral component; drivers resolve from map.cb",
+    "cli_defines_fixture.cb": "needs -DCLI_DEF_ON / -DCLI_DEF_LEVEL / -DCLI_DEF_TAG from test.sh / test.bat",
+}
+
+# By RELATIVE PATH - path-qualified, not by basename, since core/ui_native/ is not the only
+# place a file could plausibly be named winui.cb.
+_SKIP_BY_RELPATH = {
+    "cflat/core/ui_native/winui.cb":
+        "WinUI 3 host; imports the Windows App SDK winmds via package-nuget (example.bat --worker-winui covers it)",
+}
+
+# By DIRECTORY PREFIX - example/ui/06-winui/* import the WinUI 3 runtime winmds from a sibling
+# winmd/ dir plus the Windows App SDK bootstrapper; the bare sweep has neither the -i dir nor
+# the App SDK. Covered by example.bat's --worker-winui gate with the right flags.
+_SKIP_BY_PREFIX = {
+    "example/ui/06-winui/": "WinUI 3 launcher; needs the winmd/ -i dir and the Windows App SDK",
+}
+
+
 def collect_files(include_win32_demo: bool) -> list[Path]:
     files: list[Path] = []
     files += sorted((REPO_ROOT / "Test").glob("*.cb"))
@@ -214,50 +244,30 @@ def collect_files(include_win32_demo: bool) -> list[Path]:
     # they were split out of core/*.cb.
     files += sorted((REPO_ROOT / "cflat" / "core" / "ui_native").glob("*.cb"))
     files += sorted((REPO_ROOT / "cflat" / "core" / "ui_canvas").glob("*.cb"))
+
+    # Conditional exclusions, folded into the same tables so the filter stays one pass.
+    by_relpath = dict(_SKIP_BY_RELPATH)
+    by_prefix = dict(_SKIP_BY_PREFIX)
     if not include_win32_demo:
-        demo = (REPO_ROOT / WIN32_METADATA_DEMO).resolve()
-        files = [f for f in files if f.resolve() != demo]
-    # example/ui/06-winui/* import the WinUI 3 runtime winmds (Microsoft.UI.Xaml.winmd) from a
-    # sibling `winmd/` dir plus the Windows App SDK bootstrapper; the bare sweep has neither
-    # the -i dir nor the App SDK, so it cannot resolve them. They are exercised by example.bat's
-    # --worker-winui gate with the right flags. Skip them here (like the Win32-metadata demo).
-    winui_dir = (REPO_ROOT / "example" / "ui" / "06-winui").resolve()
-    files = [f for f in files if winui_dir not in f.resolve().parents]
-    # core/ui_native/winui.cb is the WinUI 3 host: it imports the Windows App SDK runtime
-    # winmds (Microsoft.UI.Xaml.winmd) via package-nuget, which the bare sweep cannot resolve
-    # (no -i dir, no App SDK). It is exercised by example.bat's --worker-winui gate with the
-    # right flags; skip it here like the example/ui/06-winui/* launchers above.
-    # Path-qualified (not bare "winui.cb") since core/ui_native/ is not the only place
-    # a file could plausibly be named winui.cb.
-    files = [
-        f for f in files
-        if f.relative_to(REPO_ROOT).as_posix() != "cflat/core/ui_native/winui.cb"
-    ]
-    # gallery_app.cb is the host-neutral gallery component: it imports only ui.cb by
-    # design and resolves the native* host drivers from whichever LAUNCHER imports it
-    # (gallery.cb or winui_gallery.cb share one global scope with it). Standalone
-    # analysis therefore cannot resolve those drivers; both launchers are swept and
-    # example.bat exercises the component on both hosts. Skip it here.
-    files = [f for f in files if f.name != "gallery_app.cb"]
-    # todo_app.cb (example/ui/07-testing/) is the ui_test.cb template's host-neutral app module:
-    # like gallery_app.cb it imports only the element model and resolves the native* host
-    # drivers (hostWidth/hostHeight/...) from its LAUNCHER, todo_test.cb, which shares one
-    # global scope with it. Standalone analysis cannot resolve those drivers; todo_test.cb is
-    # swept and example.bat's --worker-uitest exercises the module. Skip it here.
-    files = [f for f in files if f.name != "todo_app.cb"]
-    # map_app.cb (example/ui/09-map/) is the same split: the host-neutral MapView + MapApp
-    # component, whose host drivers (hostWidth/canvasCreateImage/...) resolve from its
-    # LAUNCHER, map.cb, which shares one global scope with it. map.cb is swept, and
-    # example.bat exercises the app. Skip the standalone component here.
-    files = [f for f in files if f.name != "map_app.cb"]
-    if not vcpkg_example_ports_installed():
-        before = len(files)
-        files = [
-            f for f in files
-            if not f.relative_to(REPO_ROOT).as_posix().startswith(VCPKG_EXAMPLE_DIR + "/")
-        ]
-        print(f"vcpkg example ports: not installed - skipping {before - len(files)} {VCPKG_EXAMPLE_DIR}/ source(s)")
-    return files
+        by_relpath[WIN32_METADATA_DEMO] = "Win32 metadata demo; WinMetadata not installed"
+    vcpkg_missing = not vcpkg_example_ports_installed()
+    if vcpkg_missing:
+        by_prefix[VCPKG_EXAMPLE_DIR + "/"] = "vcpkg example ports not installed"
+
+    kept: list[Path] = []
+    vcpkg_skipped = 0
+    for f in files:
+        rel = f.relative_to(REPO_ROOT).as_posix()
+        if rel in by_relpath or f.name in _SKIP_BY_NAME:
+            continue
+        if any(rel.startswith(prefix) for prefix in by_prefix):
+            if vcpkg_missing and rel.startswith(VCPKG_EXAMPLE_DIR + "/"):
+                vcpkg_skipped += 1
+            continue
+        kept.append(f)
+    if vcpkg_missing:
+        print(f"vcpkg example ports: not installed - skipping {vcpkg_skipped} {VCPKG_EXAMPLE_DIR}/ source(s)")
+    return kept
 
 
 def run_bulk(exe: str, extra_args: list, show_timings: bool = False,

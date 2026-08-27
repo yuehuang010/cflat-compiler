@@ -351,6 +351,312 @@ inline std::vector<LLVMBackend::AnnotationValue> ExtractAnnotations(CFlatParser:
     return result;
 }
 
+static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler,
+                                                     antlr4::tree::ParseTree* node);
+static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
+                                                        CFlatParser::GenericIdentifierContext* gid);
+static bool InScannerInt32Range(int64_t v);
+static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
+static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
+static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
+static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
+
+/*
+ * The shared compile-time integer folder, callable from BOTH passes (the ForwardRefScanner
+ * members ScannerFoldIfConst / ...Leaf are thin forwarders onto it). It mirrors
+ * EvalIfConstConstant's tree walk arm for arm - ?:, ||, &&, expression / assignmentExpression
+ * unwrap, and the same "any known-false wins" partial-knowledge rules - and only substitutes a
+ * constant-folding leaf for the emitting one. Any change to EvalIfConstConstant's structure must
+ * be mirrored here. Whatever folds to nullopt is undecidable, which every caller handles safely.
+ */
+static std::optional<int64_t> FoldCompileTimeInt(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
+        if (node == nullptr) return std::nullopt;
+        if (auto* c = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+        {
+            if (c->expression() != nullptr)
+            {
+                auto cond = FoldCompileTimeInt(compiler, c->logicalOrExpression());
+                if (!cond) return std::nullopt;
+                return (*cond != 0) ? FoldCompileTimeInt(compiler, c->expression())
+                                    : FoldCompileTimeInt(compiler, c->conditionalExpression());
+            }
+            if (c->children.size() > 1) return std::nullopt;  // `??` null-coalescing
+            return FoldCompileTimeInt(compiler, c->logicalOrExpression());
+        }
+        if (auto* o = dynamic_cast<CFlatParser::LogicalOrExpressionContext*>(node))
+        {
+            auto operands = o->logicalAndExpression();
+            if (operands.size() == 1) return FoldCompileTimeInt(compiler, operands[0]);
+            bool allKnownFalse = true;
+            for (auto* op : operands)
+            {
+                auto v = FoldCompileTimeInt(compiler, op);
+                if (v && *v != 0) return (int64_t)1;
+                if (!v) allKnownFalse = false;
+            }
+            return allKnownFalse ? std::optional<int64_t>(0) : std::nullopt;
+        }
+        if (auto* a = dynamic_cast<CFlatParser::LogicalAndExpressionContext*>(node))
+        {
+            auto operands = a->inclusiveOrExpression();
+            if (operands.size() == 1) return FoldCompileTimeInt(compiler, operands[0]);
+            bool allKnownTrue = true;
+            for (auto* op : operands)
+            {
+                auto v = FoldCompileTimeInt(compiler, op);
+                if (v && *v == 0) return (int64_t)0;
+                if (!v) allKnownTrue = false;
+            }
+            return allKnownTrue ? std::optional<int64_t>(1) : std::nullopt;
+        }
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return FoldCompileTimeInt(compiler, e->assignmentExpression());
+        if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        {
+            if (asn->conditionalExpression() != nullptr)
+                return FoldCompileTimeInt(compiler, asn->conditionalExpression());
+            return std::nullopt;  // an actual assignment is not a constant
+        }
+        return FoldCompileTimeIntLeaf(compiler, node);
+    }
+
+// The leaf half: constant-folds the integer operator chain without emitting IR. Covers a
+// compile-time macro (a -D define, a platform builtin, or a seeded const int global), an integer
+// literal, redundant parens, unary !/-/~/+, and the comparison / bitwise / arithmetic chain over
+// those. Anything else folds to nullopt.
+static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antlr4::tree::ParseTree* node) {
+        if (node == nullptr) return std::nullopt;
+
+        // Left-associative binary chains: fold pairwise using the operator token between operands.
+        auto foldChain = [&](const std::vector<antlr4::tree::ParseTree*>& ops,
+                            antlr4::RuleContext* parent) -> std::optional<int64_t>
+        {
+            if (ops.empty()) return std::nullopt;
+            auto acc = FoldCompileTimeIntLeaf(compiler, ops[0]);
+            if (ops.size() == 1 || !acc) return acc;
+            // Walk the parent's children to recover the operator tokens in source order.
+            size_t opIdx = 0;
+            for (size_t i = 0; i < parent->children.size(); i++)
+            {
+                auto* term = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i]);
+                if (term == nullptr) continue;
+                std::string op = term->getText();
+                if (op == "<" || op == ">")
+                {
+                    // '>' '>' is a shift written as two tokens; join it when adjacent.
+                    if (i + 1 < parent->children.size())
+                        if (auto* n2 = dynamic_cast<antlr4::tree::TerminalNode*>(parent->children[i + 1]))
+                            if (op == ">" && n2->getText() == ">") { op = ">>"; i++; }
+                }
+                if (++opIdx > ops.size() - 1) break;
+                auto rhs = FoldCompileTimeIntLeaf(compiler, ops[opIdx]);
+                if (!rhs) return std::nullopt;
+                int64_t l = *acc, r = *rhs, out = 0;
+                // Every operand is already inside the 32-bit range (ParseScannerIntegerLiteral and
+                // the macro leaf both guarantee it), so computing in int64 and rejecting an
+                // out-of-range RESULT means no fold can differ from codegen's i32 arithmetic by a
+                // wraparound - it becomes undecidable instead.
+                if (op == "|")       out = l | r;
+                else if (op == "^")  out = l ^ r;
+                else if (op == "&")  out = l & r;
+                else if (op == "==") out = (l == r) ? 1 : 0;
+                else if (op == "!=") out = (l != r) ? 1 : 0;
+                else if (op == "<")  out = (l < r) ? 1 : 0;
+                else if (op == ">")  out = (l > r) ? 1 : 0;
+                else if (op == "<=") out = (l <= r) ? 1 : 0;
+                else if (op == ">=") out = (l >= r) ? 1 : 0;
+                else if (op == "<<") { if (r < 0 || r > 31) return std::nullopt; out = l << r; }
+                else if (op == ">>") { if (r < 0 || r > 31) return std::nullopt; out = l >> r; }
+                else if (op == "+")  { if (ScannerAddOverflow(l, r, &out)) return std::nullopt; }
+                else if (op == "-")  { if (ScannerSubOverflow(l, r, &out)) return std::nullopt; }
+                else if (op == "*")  { if (ScannerMulOverflow(l, r, &out)) return std::nullopt; }
+                else if (op == "/")  { if (r == 0) return std::nullopt; out = l / r; }
+                else if (op == "%")  { if (r == 0) return std::nullopt; out = l % r; }
+                else return std::nullopt;
+                if (!InScannerInt32Range(out)) return std::nullopt;
+                acc = out;
+            }
+            return acc;
+        };
+
+        if (auto* n = dynamic_cast<CFlatParser::InclusiveOrExpressionContext*>(node))
+        {
+            auto ops = n->exclusiveOrExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::ExclusiveOrExpressionContext*>(node))
+        {
+            auto ops = n->andExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::AndExpressionContext*>(node))
+        {
+            auto ops = n->equalityExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::EqualityExpressionContext*>(node))
+        {
+            auto ops = n->typeCheckExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::TypeCheckExpressionContext*>(node))
+        {
+            // `is` / `as` are not integer constants; a bare relational passes through.
+            if (n->children.size() != 1) return std::nullopt;
+            return FoldCompileTimeIntLeaf(compiler, n->relationalExpression());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::RelationalExpressionContext*>(node))
+        {
+            auto ops = n->shiftExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::ShiftExpressionContext*>(node))
+        {
+            auto ops = n->additiveExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::AdditiveExpressionContext*>(node))
+        {
+            auto ops = n->multiplicativeExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::MultiplicativeExpressionContext*>(node))
+        {
+            auto ops = n->castExpression();
+            return foldChain({ops.begin(), ops.end()}, n);
+        }
+        if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+        {
+            if (n->typeName() != nullptr) return std::nullopt;  // a cast is not folded here
+            if (n->unaryExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->unaryExpression());
+            return ParseScannerIntegerLiteral(n->getText());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+        {
+            if (n->postfixExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->postfixExpression());
+            if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
+            {
+                auto v = FoldCompileTimeIntLeaf(compiler, n->castExpression());
+                if (!v) return std::nullopt;
+                std::string op = n->unaryOperator()->getText();
+                if (op == "!") return (*v == 0) ? (int64_t)1 : (int64_t)0;
+                if (op == "+") return *v;
+                int64_t out = 0;
+                if (op == "-")      { if (ScannerSubOverflow((int64_t)0, *v, &out)) return std::nullopt; }
+                else if (op == "~") out = ~*v;
+                else return std::nullopt;  // '&' / '*' are not integer constants
+                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+            }
+            return std::nullopt;      // sizeof/alignof/new/delete/move/operator
+        }
+        if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+        {
+            // Only a bare primary folds - a call, index or member access does not.
+            if (n->children.size() != 1) return std::nullopt;
+            return FoldCompileTimeIntLeaf(compiler, n->primaryExpression());
+        }
+        if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+        {
+            if (n->expression() != nullptr && n->children.size() == 3)
+                return FoldCompileTimeIntLeaf(compiler, n->expression());   // redundant parens
+            if (n->expression() != nullptr) return std::nullopt;  // nameof/typeof(expr)
+            if (auto* gid = n->genericIdentifier())
+                return FoldCompileTimeIdentifier(compiler, gid);
+            return ParseScannerIntegerLiteral(n->getText());
+        }
+        // A bare `genericIdentifier` node, which is what the generic-argument funnels hand us for
+        // `Buf<int, CAP>` - it never reaches this folder wrapped in a primaryExpression.
+        if (auto* gid = dynamic_cast<CFlatParser::GenericIdentifierContext*>(node))
+            return FoldCompileTimeIdentifier(compiler, gid);
+        if (auto* e = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+            return FoldCompileTimeInt(compiler, e);
+        return std::nullopt;
+    }
+
+// A bare identifier that names a compile-time integer: a -D define or a platform builtin
+// (compileTimeMacros), or a file-scope `const` integer global the scanner seeded. Anything
+// generic, qualified or unknown is not constant.
+static std::optional<int64_t> FoldCompileTimeIdentifier(LLVMBackend* compiler,
+                                                        CFlatParser::GenericIdentifierContext* gid)
+{
+    if (compiler == nullptr || gid == nullptr) return std::nullopt;
+    if (gid->genericTypeParameters() != nullptr || gid->Identifier() == nullptr) return std::nullopt;
+    const std::string name = gid->Identifier()->getText();
+    auto macro = compiler->GetCompileTimeMacro(name);
+    if (auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(macro.value); ci != nullptr && macro.type == "int")
+    {
+        int64_t mv = (int64_t)ci->getSExtValue();
+        return InScannerInt32Range(mv) ? std::optional<int64_t>(mv) : std::nullopt;
+    }
+    int64_t cv = 0;
+    if (!compiler->TryGetConstGlobalInt(name, cv)) return std::nullopt;
+    return InScannerInt32Range(cv) ? std::optional<int64_t>(cv) : std::nullopt;
+}
+
+// True when a value is representable as codegen's default `int` (i32). Every value this folder
+// produces is kept inside this range, so no fold can silently differ from codegen by a 32-bit
+// wraparound - the alternative reproduces codegen's exact literal typing, which the folder
+// cannot see (suffixes, u32/long promotion), so out-of-range folds to nullopt instead.
+static bool InScannerInt32Range(int64_t v) {
+        return v >= (int64_t)INT32_MIN && v <= (int64_t)INT32_MAX;
+    }
+
+// Portable stand-ins for __builtin_*_overflow, which MSVC does not provide. Each computes in
+// unsigned (well-defined wraparound) and reports whether the signed result overflowed.
+static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out) {
+        *out = (int64_t)((uint64_t)a + (uint64_t)b);
+        return ((a ^ *out) & (b ^ *out)) < 0;
+    }
+
+static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out) {
+        *out = (int64_t)((uint64_t)a - (uint64_t)b);
+        return ((a ^ b) & (a ^ *out)) < 0;
+    }
+
+static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out) {
+        *out = (int64_t)((uint64_t)a * (uint64_t)b);
+        if (a == 0) return false;
+        if (a == -1 && b == INT64_MIN) return true;
+        return *out / a != b;
+    }
+
+// An integer literal this folder can type EXACTLY the way codegen does, else nullopt.
+// Deliberately narrow, because a literal typed differently from codegen is a silent
+// scanner/main-pass disagreement, which surfaces as a raw LLVM verifier failure with no source
+// location:
+//   - a u/U/l/L suffix changes the type (unsigned / 64-bit) -> refuse
+//   - a C OCTAL literal (leading 0) is base 8 to codegen -> refuse rather than misread as decimal
+//   - a value outside i32 (0xFFFFFFFF, 0x80000000, 2147483648) is typed and wrapped by codegen
+//     in a way this folder cannot reproduce -> refuse
+// Refusing only makes the condition undecidable, which the if-const walk already handles safely.
+static std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn) {
+        if (textIn == "true") return (int64_t)1;
+        if (textIn == "false") return (int64_t)0;
+        std::string text = textIn;
+        if (!text.empty() && (text.back() == 'u' || text.back() == 'U'
+                           || text.back() == 'l' || text.back() == 'L'))
+            return std::nullopt;   // suffixed literal - codegen's type differs from ours
+        bool neg = false;
+        size_t pos = 0;
+        if (!text.empty() && text[0] == '-') { neg = true; pos = 1; }
+        if (pos >= text.size()) return std::nullopt;
+        int base = 10;
+        if (text.size() > pos + 1 && text[pos] == '0')
+        {
+            char c = text[pos + 1];
+            if (c == 'x' || c == 'X')      { base = 16; pos += 2; }
+            else if (c == 'b' || c == 'B') { base = 2;  pos += 2; }
+            else return std::nullopt;      // C octal (leading 0) - not folded here
+        }
+        if (pos >= text.size()) return std::nullopt;
+        uint64_t v = 0;
+        auto res = std::from_chars(text.data() + pos, text.data() + text.size(), v, base);
+        if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return std::nullopt;
+        if (v > (uint64_t)INT32_MAX) return std::nullopt;
+        int64_t out = neg ? -(int64_t)v : (int64_t)v;
+        return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+    }
+
 // Extract the plain identifier from a directDeclarator (handles both bare names and C-style array syntax).
 static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
 {
@@ -406,6 +712,39 @@ static bool TypeArgHasAlias(CFlatParser::TypeParameterEntryContext* entry)
         && entry->Identifier()->getText() == "alias";
 }
 
+static bool IsValueParameterDeclaration(CFlatParser::TypeParameterEntryContext* entry)
+{
+    return entry != nullptr && entry->valueParameterDeclaration() != nullptr;
+}
+
+static std::string ValueParameterTypeSpelling(CFlatParser::TypeParameterEntryContext* entry)
+{
+    auto* decl = entry != nullptr ? entry->valueParameterDeclaration() : nullptr;
+    return decl != nullptr && decl->valueParameterType() != nullptr
+        ? decl->valueParameterType()->getText() : std::string{};
+}
+
+static bool IsDecimalIntegerSpelling(const std::string& text)
+{
+    if (text.empty()) return false;
+    size_t start = text[0] == '-' ? 1 : 0;
+    if (start == text.size()) return false;
+    for (size_t i = start; i < text.size(); i++)
+        if (text[i] < '0' || text[i] > '9') return false;
+    return true;
+}
+
+// A generic VALUE argument is carried as a decimal spelling ("8", "-8"); this is the one place
+// it turns back into a number. Not a validity check - IsDecimalIntegerSpelling gates that.
+static int64_t ParseValueArg(const std::string& text)
+{
+    int64_t out = 0;
+    size_t start = (!text.empty() && text[0] == '-') ? 1 : 0;
+    auto res = std::from_chars(text.data() + start, text.data() + text.size(), out);
+    if (res.ec != std::errc() || res.ptr != text.data() + text.size()) return 0;
+    return start == 1 ? -out : out;
+}
+
 // Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
 // present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type as the
 // unqualified spelling; the alias prefix only drives distinct monomorphization + borrow tagging.
@@ -436,6 +775,11 @@ static void StripOwnershipQualifiers(std::string& name)
 // call site reaches one; a nullptr is only correct where the string cannot name a source alias.
 static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string& typeName)
 {
+    if (IsDecimalIntegerSpelling(typeName))
+    {
+        // Reserve __s<length>_<text> for a future string value parameter; do not implement it here.
+        return typeName[0] == '-' ? "n" + typeName.substr(1) : typeName;
+    }
     std::string result;
     size_t start = 0;
     // The `unique` qualifier (D10) mangles to a "unique_" token so list<unique Circle*>
@@ -919,29 +1263,29 @@ inline void ForgetIfConstGuardedImpls(LLVMBackend* compiler, antlr4::tree::Parse
     std::vector<CFlatParser::InterfaceMethodContext*> InterfaceMethods(CFlatParser::InterfaceDefinitionContext* ctx) { return MemberFilter<CFlatParser::InterfaceMethodContext>(ResolveInterfaceMembers(ctx), [](auto* m){ return m->interfaceMethod(); }); } \
     std::vector<CFlatParser::InterfaceFieldContext*>  InterfaceFields(CFlatParser::InterfaceDefinitionContext* ctx)  { return MemberFilter<CFlatParser::InterfaceFieldContext> (ResolveInterfaceMembers(ctx), [](auto* m){ return m->interfaceField();  }); }
 
-// simd<T,N>: validate the lane count N. It must be a plain power-of-2 integer literal in [2,64]
+// simd<T,N>: validate the lane count N. It must fold to a power-of-2 integer in [2,64]
 // (the explicit SIMD type is the hardware-control escape hatch, so a non-power-of-2 that would
 // silently waste a lane is rejected rather than padded). Returns true and sets lanesOut on
 // success; otherwise sets errorOut and returns false.
-static bool TryParseSimdLaneCount(const std::string& text, uint64_t& lanesOut, std::string& errorOut)
+static bool TryParseSimdLaneCount(LLVMBackend* compiler,
+                                  CFlatParser::AssignmentExpressionContext* expr,
+                                  uint64_t& lanesOut, std::string& errorOut)
 {
-    uint64_t v = 0;
-    try
+    auto folded = FoldCompileTimeInt(compiler, expr);
+    if (!folded)
     {
-        size_t pos = 0;
-        v = std::stoull(text, &pos, 0);   // base 0 also accepts 0x.. forms
-        if (pos != text.size())
-            throw std::invalid_argument("trailing characters");
-    }
-    catch (...)
-    {
+        const std::string text = expr != nullptr ? expr->getText() : "";
         errorOut = std::format("simd lane count must be an integer literal (got '{}')", text);
         return false;
     }
+    // A value that FOLDED is a lane count, however unusable - 0 and negatives belong in the
+    // range diagnostic below, not in the "not an integer literal" one. Signed throughout so a
+    // negative cannot wrap into a huge unsigned and skip the hint.
+    int64_t v = *folded;
     if (v < 2 || v > 64 || (v & (v - 1)) != 0)
     {
-        uint64_t up = 2; while (up < v && up < 64) up <<= 1;
-        uint64_t down = (up > 2) ? (up >> 1) : 2;
+        int64_t up = 2; while (up < v && up < 64) up <<= 1;
+        int64_t down = (up > 2) ? (up >> 1) : 2;
         if (down == up)
             errorOut = std::format("simd lane count must be a power of 2 in [2,64] (got {}); did you mean simd<...,{}>?", v, up);
         else
@@ -2018,6 +2362,9 @@ public:
      */
     void PreRegisterRenameAliases(antlr4::RuleContext* ctx);
 
+    // Seed file-scope const integer globals into the scanner's compile-time macro set.
+    void SeedConstIntGlobals(CFlatParser::TranslationUnitContext* tu);
+
     // Resolve a type-argument entry to the same string MainListener::ResolveTypeArgEntry
     // would produce at the top level (no active substitutions during the forward scan),
     // recursing into nested generics so list<int> inside list<list<int>> mangles to
@@ -2061,30 +2408,6 @@ public:
     // redundant parens, unary !/-/~/+, and the comparison / bitwise / arithmetic chain over those
     // (`__PLATFORM__ == 32`, `__MACOS__ != 0`). Anything else folds to nullopt.
     std::optional<int64_t> ScannerFoldIfConstLeaf(antlr4::tree::ParseTree* node);
-
-    // True when a value is representable as codegen's default `int` (i32). Every value this folder
-    // produces is kept inside this range, so no fold can silently differ from codegen by a 32-bit
-    // wraparound - the alternative reproduces codegen's exact literal typing, which the scanner
-    // cannot see (suffixes, u32/long promotion), so out-of-range folds to nullopt instead.
-    static bool InScannerInt32Range(int64_t v);
-
-    // Portable stand-ins for __builtin_*_overflow, which MSVC does not provide. Each computes in
-    // unsigned (well-defined wraparound) and reports whether the signed result overflowed.
-    static bool ScannerAddOverflow(int64_t a, int64_t b, int64_t* out);
-
-    static bool ScannerSubOverflow(int64_t a, int64_t b, int64_t* out);
-
-    static bool ScannerMulOverflow(int64_t a, int64_t b, int64_t* out);
-
-    // An integer literal this pass can type EXACTLY the way codegen does, else nullopt. Deliberately
-    // narrow, because a literal typed differently from codegen is a silent scanner/main-pass
-    // disagreement, which surfaces as a raw LLVM verifier failure with no source location:
-    //   - a u/U/l/L suffix changes the type (unsigned / 64-bit) -> refuse
-    //   - a C OCTAL literal (leading 0) is base 8 to codegen -> refuse rather than misread as decimal
-    //   - a value outside i32 (0xFFFFFFFF, 0x80000000, 2147483648) is typed and wrapped by codegen
-    //     in a way this pass cannot reproduce -> refuse
-    // Refusing only makes the condition undecidable, which the if-const walk already handles safely.
-    std::optional<int64_t> ParseScannerIntegerLiteral(const std::string& textIn);
 
     // Tri-state, same contract as the main pass's DecideIfConstCondition: 1 taken, 0 not taken,
     // -1 undecidable at scan time.
@@ -2299,12 +2622,15 @@ private:
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>&     genericStructTemplates;
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>&      genericClassTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericStructTypeParams;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericStructValueParams;
     std::unordered_set<std::string>&                                            instantiatedGenerics;
     // Constraints: templateName -> { typeParamName -> [requiredInterface, ...] }
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericClassConstraints;
     // Active type parameter substitutions during generic instantiation (e.g. "T" -> "int")
     std::unordered_map<std::string, std::string> activeTypeSubstitutions;
+    // Active compile-time value substitutions during generic instantiation (e.g. "N" -> "8").
+    std::unordered_map<std::string, std::string> activeValueSubstitutions;
 
     // Pack param index per template: index of the variadic param, or npos if not variadic
     std::unordered_map<std::string, size_t>& genericStructPackIndex;
@@ -2354,10 +2680,12 @@ private:
 
     std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>&  genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericInterfaceTypeParams;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericInterfaceValueParams;
     std::unordered_set<std::string>&                                            instantiatedInterfaces;
 
     std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>&   genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>&                  genericFunctionTypeParams;
+    std::unordered_map<std::string, std::vector<std::string>>&                  genericFunctionValueParams;
     std::unordered_set<std::string>&                                            instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& genericFunctionConstraints;
 
@@ -2700,7 +3028,47 @@ public:
 
     void InstantiateGenericInterface(const std::string& baseName, const std::string& mangledName,
                                      const std::unordered_map<std::string, std::string>& substitutions,
-                                     const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions = {});
+                                     const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions = {},
+                                     const std::unordered_map<std::string, std::string>& valueSubstitutions = {});
+
+    /*
+     * Binds generic VALUE parameters as scoped compile-time macros for the duration of one
+     * instantiation. Only the names actually bound are saved and restored, so a template with
+     * no value parameters costs nothing on this hot path. Restore() is idempotent and the
+     * destructor is only a backstop; each caller restores where it restores the type
+     * substitutions.
+     */
+    struct GenericValueMacroScope
+    {
+        LLVMBackend* compiler = nullptr;
+        std::vector<std::pair<std::string, LLVMBackend::CompileTimeMacro>> shadowed;
+        std::vector<std::string> introduced;
+
+        explicit GenericValueMacroScope(LLVMBackend* c) : compiler(c) {}
+        ~GenericValueMacroScope() { Restore(); }
+
+        void Bind(const std::string& name, int64_t value)
+        {
+            auto it = compiler->compileTimeMacros.find(name);
+            if (it != compiler->compileTimeMacros.end()) shadowed.push_back({ name, it->second });
+            else                                         introduced.push_back(name);
+            auto* intType = llvm::Type::getInt32Ty(*compiler->context);
+            compiler->SetCompileTimeMacro(name,
+                llvm::ConstantInt::get(intType, (uint64_t)value, true), "int");
+        }
+
+        void Restore()
+        {
+            for (const auto& name : introduced) compiler->compileTimeMacros.erase(name);
+            for (const auto& [name, prior] : shadowed) compiler->compileTimeMacros[name] = prior;
+            introduced.clear();
+            shadowed.clear();
+        }
+    };
+
+    bool ValidateGenericArgumentKinds(const std::string& templateName,
+        const std::vector<std::string>& typeParams, const std::vector<std::string>& valueParams,
+        const std::vector<std::string>& typeArgs);
 
     // Owner struct of a generic template keyed "Owner.method", or "" when the template is a
     // free function or a static member (a static has no receiver, so it stays free-shaped).
@@ -5192,7 +5560,8 @@ public:
 
     void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {});
 
-    std::vector<std::string> ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams);
+    std::vector<std::string> ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams,
+                                                        std::vector<std::string>* valueTypes = nullptr);
 
     // Returns { typeParamName -> [requiredInterface, ...] } from a whereClause context.
     std::unordered_map<std::string, std::vector<std::string>>
@@ -5206,6 +5575,13 @@ public:
         const std::vector<std::string>& typeArgs,
         const std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>>& constraintMap,
         antlr4::ParserRuleContext* ctx);
+
+    bool CheckValueConstraints(
+        const std::string& templateName,
+        CFlatParser::WhereClauseContext* whereClause,
+        const std::vector<std::string>& typeParams,
+        const std::vector<std::string>& valueParams,
+        const std::vector<std::string>& typeArgs);
 
     void ParseConstructorDefinition(CFlatParser::FunctionDefinitionContext* func, const std::string& structName, bool suppliesNoArgCtor = false);
 
