@@ -32,7 +32,14 @@ is why the old blanket "no threads under --run" guard was broader than the actua
    constants (`__real@...`, `__xmm@...`) they disagree and ORC asserts
    `"Resolving symbol with incorrect flags"` (Debug) - the program had already run correctly, the
    assert fires at teardown, so it looks like a teardown crash.
-3. **Define `__ImageBase`.** COFF/x86_64 lowering (`COFFLinkGraphLowering_x86_64::getImageBaseAddress`)
+3. **Define `__ImageBase`.** (LLVM 22 update: the COFF builder now pre-creates `__ImageBase`
+   as an **external** symbol whenever the object has `ADDR32NB` relocations
+   (`COFFLinkGraphBuilder::addImageBaseSymbol`), and `GetImageBaseSymbol` prefers external over
+   absolute over defined - so simply *adding* a defined one is silently ignored, the external
+   resolves to the host process image base gigabytes away, and every `.pdata` RVA overflows its
+   `Pointer32` fixup (`--run` fails at every optimization level). `FixImageBase` therefore
+   `makeAbsolute`s the external symbol onto the lowest block, and only falls back to
+   `addDefinedSymbol` when no external one exists - which is the LLVM 18 shape below.) COFF/x86_64 lowering (`COFFLinkGraphLowering_x86_64::getImageBaseAddress`)
    resolves the image base by scanning `defined_symbols()` for `__ImageBase`; only if absent does
    it fall back to an external process lookup that fails (`JIT session error: Symbols not found:
    [ __ImageBase ]`). The symbol does **not** exist at PostAllocation - COFF creates it lazily

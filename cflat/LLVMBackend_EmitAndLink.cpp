@@ -1630,7 +1630,9 @@ bool LLVMBackend::JitRun(int& runExitCode)
         jitBuilder.setJITTargetMachineBuilder(std::move(*jtmb));
 #if defined(_WIN32)
         jitBuilder.setObjectLinkingLayerCreator(
-            [](llvm::orc::ExecutionSession& ES, const llvm::Triple&)
+            // LLVM 21 dropped the Triple parameter from ObjectLinkingLayerCreator; the
+            // trailing pack makes the lambda convertible to either signature.
+            [](llvm::orc::ExecutionSession& ES, auto&&...)
                 -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
                 auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES);
                 // Under LLJIT, the IR layer pre-computes symbol flags from the IR; JITLink

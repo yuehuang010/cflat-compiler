@@ -119,6 +119,20 @@ Current skills:
 
 ## Building
 
+**Fresh clone on Windows: run `bootstrap.bat`.** It is the one command that takes a clean
+checkout to a verified Release build - toolchain check (VS/vcvars64, cmake, ninja, git,
+antlr4) -> vcpkg deps -> clone + source-build + install **LLVM 22.1.8** into
+`%USERPROFILE%\.cflat-compiler-deps\llvm-22.1.8` -> `cmake_build.bat release` ->
+`cflat --init-local` -> `test.bat Release`. Every step is idempotent, so re-running it is
+cheap; `/skip-llvm`, `/skip-tests`, `/llvm-only` and `/fresh` narrow the work. The ~5 GB
+LLVM ninja tree is deleted once the install succeeds (`/keep-build` retains it for an
+incremental re-bump); what stays is the ~3.3 GB install tree plus the ~1.9 GB source
+clone, both shared by every worktree. Budget ~35-60
+min for the LLVM build (it is mandatory: no RTTI-enabled LLVM prebuilt exists for Windows,
+and vcpkg's port is stuck at 18). It builds only the `/MT` LLVM, which is what cflat Release
+links; **`cmake_build.bat debug` needs a second `/MTd` install that the script does not build
+yet**. See `internal/plan/llvm-version-migration.md`.
+
 The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/plan/llvm-version-migration.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
 
 **Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
@@ -176,10 +190,11 @@ wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64
 
 ### Git worktrees
 
-`vcpkg_installed` is 12 GB (macOS) / ~26 GB (Windows) and rarely changes. On **both**
-platforms it lives *outside* the source tree in a fixed per-user location - macOS
-`~/.cflat-compiler-deps/vcpkg_installed`, Windows `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed`
-(override either with `CFLAT_VCPKG_INSTALLED`) - so a plain `git worktree add` just
+`vcpkg_installed` (~0.2 GB since LLVM left the manifest) and the source-built
+`llvm-<ver>` install (~3.3 GB) rarely change. On **both** platforms they live
+*outside* the source tree in a fixed per-user location - `~/.cflat-compiler-deps/`
+on macOS, `%USERPROFILE%\.cflat-compiler-deps\` on Windows (override the vcpkg tree
+with `CFLAT_VCPKG_INSTALLED`) - so a plain `git worktree add` just
 works with zero post-processing, no junction, no symlink, and no deletion hazard:
 
 ```bash

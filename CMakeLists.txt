@@ -381,20 +381,27 @@ add_custom_target(deploy_locales ALL DEPENDS ${_locale_stamp})
 if(WIN32)
   # lld-link + clang-cl (the C-interop / native link drivers) and the LLVM
   # plugin DLLs that the existing build copies next to the exe.
+  # Where the plugin DLLs live depends on the provider: vcpkg splits them into
+  # <triplet>/bin and <triplet>/debug/bin (tools sit in tools/llvm), while a
+  # source install keeps everything in one bin/. Probe both; a statically linked
+  # source-built lld-link needs neither, so a miss is not an error.
   get_filename_component(_llvm_triplet_root "${LLVM_TOOLS_BINARY_DIR}/../.." ABSOLUTE)
   if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(_llvm_bin_dir "${_llvm_triplet_root}/debug/bin")
+    set(_llvm_dll_dirs "${_llvm_triplet_root}/debug/bin" "${LLVM_TOOLS_BINARY_DIR}")
   else()
-    set(_llvm_bin_dir "${_llvm_triplet_root}/bin")
+    set(_llvm_dll_dirs "${_llvm_triplet_root}/bin" "${LLVM_TOOLS_BINARY_DIR}")
   endif()
 
   set(_deploy_tools
     "${LLVM_TOOLS_BINARY_DIR}/lld-link.exe"
     "${LLVM_TOOLS_BINARY_DIR}/clang-cl.exe")
   foreach(_dll LTO.dll Remarks.dll)
-    if(EXISTS "${_llvm_bin_dir}/${_dll}")
-      list(APPEND _deploy_tools "${_llvm_bin_dir}/${_dll}")
-    endif()
+    foreach(_dir ${_llvm_dll_dirs})
+      if(EXISTS "${_dir}/${_dll}")
+        list(APPEND _deploy_tools "${_dir}/${_dll}")
+        break()
+      endif()
+    endforeach()
   endforeach()
 
   add_custom_command(TARGET cflat POST_BUILD

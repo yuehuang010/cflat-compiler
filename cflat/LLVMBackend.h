@@ -352,12 +352,25 @@ namespace cflat_jit
 
         static llvm::Error FixImageBase(llvm::jitlink::LinkGraph& G)
         {
-            for (auto* S : G.defined_symbols())
-                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
-                    return llvm::Error::success(); // graph already supplies one
             llvm::jitlink::Block* lowest = LowestBlock(G);
             if (!lowest)
                 return llvm::Error::success(); // empty graph - nothing to anchor to
+
+            // From LLVM 22 the COFF builder pre-creates __ImageBase as an EXTERNAL symbol
+            // whenever the object carries ADDR32NB relocations, and GetImageBaseSymbol prefers
+            // an external over a defined one. Left alone it resolves to the host process image
+            // base - gigabytes away from the JIT'd code - so every .pdata RVA overflows its
+            // Pointer32 fixup. Pin that symbol to the JIT'd image instead of adding a second one.
+            for (auto* S : G.external_symbols())
+                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
+                {
+                    G.makeAbsolute(*S, lowest->getAddress());
+                    return llvm::Error::success();
+                }
+
+            for (auto* S : G.defined_symbols())
+                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
+                    return llvm::Error::success(); // graph already supplies one
             // Local scope: consumed by the lowering pass within this graph; not exported.
             G.addDefinedSymbol(*lowest, 0, "__ImageBase", 0, llvm::jitlink::Linkage::Strong,
                                llvm::jitlink::Scope::Local, /*IsCallable=*/false, /*IsLive=*/true);

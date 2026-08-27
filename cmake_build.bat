@@ -14,7 +14,7 @@ REM
 REM Worktree-friendly (same scheme as cmake_build.sh). The vcpkg dependency tree
 REM lives OUTSIDE the source tree at %CFLAT_VCPKG_INSTALLED% (default
 REM %USERPROFILE%\.cflat-compiler-deps\vcpkg_installed), so every worktree shares
-REM one 26 GB copy and `git worktree add` needs no junction or post-processing.
+REM one copy and `git worktree add` needs no junction or post-processing.
 
 set VS_ROOT=C:\Program Files\Microsoft Visual Studio\18\Community
 if not defined VCPKG_ROOT set VCPKG_ROOT=%VS_ROOT%\VC\vcpkg

@@ -9,15 +9,17 @@ REM
 REM Usage:
 REM   vcpkg-build.bat
 REM
-REM Cost: ~26 GB installed, ~50 min cold (LLVM dominates; ~1.7 h fully cold).
+REM Cost: minutes, ~1 GB - LLVM is no longer a vcpkg dependency (it is a separate
+REM source build; see bootstrap.bat and internal/plan/llvm-version-migration.md).
+REM bootstrap.bat runs this step for you on a fresh clone.
 REM
 REM Layout note: the tree lives OUTSIDE the source dir, at
 REM   %CFLAT_VCPKG_INSTALLED% (default %USERPROFILE%\.cflat-compiler-deps\vcpkg_installed)
 REM so every git worktree shares it (see internal/worktree-vcpkg-sharing.md).
 REM The vcpkg toolchain appends the target triplet, so packages land in
 REM   <tree>\x64-windows-static\
-REM --clean-after-build drops build trees + staging so the tree stays ~26 GB
-REM instead of ballooning past 200 GB.
+REM --clean-after-build drops build trees + staging so the tree stays small
+REM (~0.2 GB now that LLVM is out of the manifest).
 setlocal
 
 set SCRIPT_DIR=%~dp0
@@ -32,16 +34,16 @@ if not exist "%VCPKG_ROOT%\vcpkg.exe" (
 
 pushd "%SCRIPT_DIR%"
 
-echo === Installing dependencies from vcpkg.json into "%CFLAT_VCPKG_INSTALLED%" (this can take ~50 min) ===
+echo === Installing dependencies from vcpkg.json into "%CFLAT_VCPKG_INSTALLED%" ===
 "%VCPKG_ROOT%\vcpkg.exe" install ^
   --triplet x64-windows-static ^
   --host-triplet x64-windows ^
   --x-install-root="%CFLAT_VCPKG_INSTALLED%" ^
   --clean-after-build
-set RC=%errorlevel%
+set STEP_RC=%errorlevel%
 
 popd
 
-if %RC% neq 0 ( echo vcpkg install failed & exit /b %RC% )
+if %STEP_RC% neq 0 ( echo vcpkg install failed & exit /b %STEP_RC% )
 echo === Done: dependency tree populated. Now run cmake_build.bat. ===
 endlocal

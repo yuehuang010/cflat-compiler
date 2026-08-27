@@ -122,9 +122,13 @@ cmake --install "$BUILD"
   auto-detected). The lld multicall binary installs `ld64.lld` (+ `lld-link`,
   `ld.lld`) as symlinks in `<install>/bin`; clang installs a `clang-cl` symlink -
   so `LLVM_TOOLS_BINARY_DIR` (= `<install>/bin`) satisfies cflat's tool-copy step.
-- **Windows**: match the vcpkg `x64-windows-static` runtime with
-  `-DLLVM_USE_CRT_RELEASE=MT` (and `MTd` for a debug build) so the CRT linkage
-  agrees with cflat's `/MT`. Build from an `x64 Native Tools` shell (MSVC).
+- **Windows**: match the `x64-windows-static` runtime with
+  **`-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`** (`MultiThreadedDebug` for a
+  debug-CRT build). `-DLLVM_USE_CRT_RELEASE=MT` alone does NOT do it any more -
+  on 22 that knob only validates against `CMAKE_MSVC_RUNTIME_LIBRARY`, so passing
+  it by itself silently produces a `/MD` LLVM and cflat's link dies with a wall of
+  `msvcprt.lib ... LNK2005 already defined` plus `LNK4098 LIBCMT conflicts`.
+  Build from an `x64 Native Tools` shell (MSVC). `bootstrap.bat` passes both.
 - **Linux**: this replaces apt `/usr/lib/llvm-18`. Build with clang + `-DLLVM_USE_LINKER=lld`
   (or `mold`) for a much faster link. A static source build removes the current
   apt-vs-vcpkg version split.

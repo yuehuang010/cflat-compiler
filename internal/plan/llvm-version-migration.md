@@ -274,5 +274,38 @@ Going static moves macOS off the `TARGET LLVM` dylib branch onto
 `X86CodeGen X86AsmParser X86Disassembler X86Desc X86Info` alongside the
 `AArch64*` libs. The duplicate-library link warning that follows is benign.
 
-Windows can now follow the same path with `-DLLVM_USE_CRT_RELEASE=MT`, which is
-its only route - no RTTI-enabled prebuilt exists for it.
+Windows can now follow the same path, which is its only route - no RTTI-enabled
+prebuilt exists for it.
+
+### Phase 2 done - Windows on static, source-built LLVM 22.1.8 (2026-08-26)
+
+`bootstrap.bat` (new, repo root) provisions a clean clone end to end: toolchain
+check -> vcpkg deps -> clone + source-build + install LLVM 22.1.8 -> build cflat
+-> `--init-local` -> `test.bat Release`. Each step is skippable/idempotent.
+Result on a 32-core box: `test.bat Release` **all passed, 0 skipped**,
+`test_lsp.bat` all passed, `example.bat` **99 passed / 0 failed / 42 skipped**.
+Install tree ~2.6 GB; the LLVM build is ~35 min, everything else is minutes.
+
+Three Windows-specific findings, none of which macOS could have surfaced:
+
+1. **`LLVM_USE_CRT_RELEASE=MT` no longer selects the CRT.** On 22 it only
+   validates against `CMAKE_MSVC_RUNTIME_LIBRARY`, whose default is
+   `MultiThreadedDLL`. Passing only the old knob yields a `/MD` LLVM that fails
+   cflat's link with a wall of `msvcprt.lib ... LNK2005 already defined` plus
+   `LNK4098 LIBCMT conflicts`. Pass
+   `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded`.
+2. **`ObjectLinkingLayerCreator` lost its `Triple` parameter** (LLVM 21). The
+   `--run` JITLink override in `LLVMBackend_EmitAndLink.cpp` now takes a trailing
+   `auto&&...` pack so the lambda converts to either signature.
+3. **`__ImageBase` is now pre-created as an EXTERNAL symbol** by the COFF
+   LinkGraph builder, and it wins the lookup over the defined symbol
+   `SehRegistrationPlugin` was adding - so it resolved to the host exe's image
+   base and every JIT'd `.pdata` RVA overflowed its `Pointer32` fixup. `--run`
+   was broken at *every* optimization level (only the `-O2` HPC checks exercise
+   it, which is why exactly one test caught it). `FixImageBase` now
+   `makeAbsolute`s that external symbol onto the lowest block. See
+   `internal/run-jit-unwind.md`.
+
+Only the `/MT` (Release) LLVM is built. cflat Debug is `/MTd` and cannot link it;
+a second `MultiThreadedDebug` install is needed before `cmake_build.bat debug`
+works on 22.
