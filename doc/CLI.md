@@ -153,7 +153,7 @@ program argument, so program args are never mistaken for compiler flags or sourc
 | `-O2` | `-2` | | Optimize for speed (level 2). The loop vectorizer (and the `vectorize` keyword enforcement) runs only at `-O2`. |
 | `--no-opt` | | | Disable the baseline passes (sroa, mem2reg, instcombine, simplifycfg) that run even at `-O0`. |
 | `--platform` | `-p` | `win64`\|`win32`\|`linux`\|`macos` | Target platform. Defaults to the native host OS (`win64` on Windows, `macos` -> arm64 Mach-O on Apple Silicon, `linux` -> x64 ELF on Linux). `macos` cross-compiles an arm64 Mach-O object. |
-| `--cpu` | | name\|`native` | Target CPU: sets ISA features and tuning. Names come from `--print-supported-cpus`. |
+| `--cpu` | | name\|`native` | Target CPU: sets ISA features and tuning. Names come from `--print-supported-cpus` for the same `--platform`. |
 | `--tune` | | name\|`native` | Tune scheduling for this CPU without changing the instruction set. |
 
 See [`doc/HPC.md`](HPC.md) for `--cpu`/`-O2` and vectorization guidance.
@@ -413,7 +413,7 @@ definitions from imported files.
 |--------|-------|-------------|
 | `--help` | `-h` | Print usage and exit. |
 | `--version` | | Print the compiler version and exit. |
-| `--print-supported-cpus` | | List target CPUs supported on Windows x86/x64, then exit. |
+| `--print-supported-cpus` | | List the CPU names `--cpu`/`--tune` accept for the active `--platform` (X86 table for `win64`/`win32`/`linux`, AArch64 for `macos`), then exit. Combine with `-p` to list another platform's CPUs. |
 | `--print-host-cpu` | | Print the LLVM name of the host CPU (what `--cpu native` resolves to), then exit. |
 
 ## Examples

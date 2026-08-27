@@ -7,6 +7,7 @@
 #include <optional>
 #include <memory>
 #include <utility>
+#include <type_traits>
 
 #include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/JITLink/JITLink.h>
@@ -15,6 +16,7 @@
 #include <llvm/IR/Module.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Target/TargetMachine.h>
+#include <llvm/TargetParser/AArch64TargetParser.h>
 
 #if defined(CFLAT_LLVM_COMPAT_CLANG)
 #include <clang/Frontend/CompilerInstance.h>
@@ -28,6 +30,19 @@
 
 namespace cflat_llvm_compat
 {
+
+// AArch64 keeps CPU aliases (apple-m1, cyclone, ...) out of the subtarget's
+// processor table, so enumerating CPUs has to merge them in separately. The
+// field holding the alias spelling was renamed AltName in LLVM 21.
+inline llvm::StringRef AArch64AliasName(
+    const std::remove_reference_t<decltype(llvm::AArch64::CpuAliases[0])>& alias)
+{
+#if LLVM_VERSION_MAJOR >= 21
+    return alias.AltName;
+#else
+    return alias.Alias;
+#endif
+}
 
 inline void SetModuleTriple(llvm::Module& module, llvm::StringRef triple)
 {

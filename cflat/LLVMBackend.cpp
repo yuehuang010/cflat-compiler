@@ -1615,14 +1615,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     importSearchDirs = args.getMultiOption("import-dir");
     // Default target platform = native host OS. Overridable with --platform for
     // cross-compilation (e.g. macos Mach-O emission from a Windows/WSL host).
-#if defined(_WIN32)
-    const char* kDefaultPlatform = "win64";
-#elif defined(__APPLE__)
-    const char* kDefaultPlatform = "macos";
-#else
-    const char* kDefaultPlatform = "linux";
-#endif
-    auto platformOption = args.getOption("platform").value_or(kDefaultPlatform);
+    auto platformOption = args.getOption("platform").value_or(DefaultPlatform());
 
     // Windows images must be named *.exe to be runnable, so `-o foo` would produce a
     // file the shell refuses to launch. Supply the extension when none was given.
@@ -1648,12 +1641,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
 
     // Resolve and validate --cpu / --tune once, up front, so an unknown name is a clean
     // error before any clang-cl spawn or codegen, and both the C-interop and native-object
-    // paths can use the resolved values verbatim. The CPU table is identical for both
-    // triples (shared X86 backend); we validate against the active platform's triple.
+    // paths can use the resolved values verbatim. Validated against the active platform's
+    // triple - the same one --print-supported-cpus lists, so the two never disagree.
     {
-        std::string triple = (platformOption == "macos" || platformOption == "macos-arm64")
-            ? "arm64-apple-macosx"
-            : ((platformOption == "win32") ? "i686-pc-windows-msvc" : "x86_64-pc-windows-msvc");
+        std::string triple = PlatformTargetTriple(platformOption);
         if (auto cpuOpt = args.getOption("cpu"))
             if (!ResolveCpuName(*cpuOpt, triple, "--cpu", verbose, targetCpu_))
                 return false;
@@ -1713,7 +1704,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // Effective codegen CPU: the platform default unless --cpu overrode it. Tune
         // defaults to the target CPU unless --tune set it (mirrors -mtune semantics).
         std::string effectiveCpu = targetCpu_.empty()
-            ? (platformOption == "win32" ? "i686" : "x86-64") : targetCpu_;
+            ? DefaultCpuForPlatform(platformOption) : targetCpu_;
         std::cout << std::format("[verbose] target cpu:   {}\n", effectiveCpu);
         std::cout << std::format("[verbose] tune:         {}\n", tuneCpu_.empty() ? effectiveCpu + " (same as target cpu)" : tuneCpu_);
     }
@@ -5175,15 +5166,45 @@ LinkerPaths LLVMBackend::FindLinkerPaths(const std::string& arch, const std::str
     return paths;
 }
 
-bool LLVMBackend::PrintSupportedCpus()
+const char* LLVMBackend::DefaultPlatform()
+{
+#if defined(_WIN32)
+    return "win64";
+#elif defined(__APPLE__)
+    return "macos";
+#else
+    return "linux";
+#endif
+}
+
+std::string LLVMBackend::PlatformTargetTriple(const std::string& platform)
+{
+    if (platform == "macos" || platform == "macos-arm64") return "arm64-apple-macosx";
+    if (platform == "win32") return "i686-pc-windows-msvc";
+    if (platform == "win64") return "x86_64-pc-windows-msvc";
+    if (platform == "linux") return "x86_64-pc-linux-gnu";
+    return llvm::sys::getProcessTriple();
+}
+
+std::string LLVMBackend::DefaultCpuForPlatform(const std::string& platform)
+{
+    if (platform == "macos" || platform == "macos-arm64") return "apple-m1";
+    if (platform == "win32") return "i686";
+    if (platform == "win64") return "x86-64";
+    return llvm::sys::getHostCPUName().str();
+}
+
+bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
 {
     llvm::InitializeAllTargets();
     llvm::InitializeAllTargetMCs();
 
-    // CFlat currently targets only Windows on the X86 family (win64 / win32). Both
-    // platforms map to LLVM's X86 backend, which exposes a single CPU table regardless
-    // of pointer width, so listing it once via the win64 triple covers both.
-    const char* triple = "x86_64-pc-windows-msvc";
+    // Each platform's CPU table comes from its own backend - X86 for win32/win64/linux,
+    // AArch64 for macos - so the list must follow the active --platform. Listing the
+    // wrong backend's table is worse than useless: every name in it is rejected by
+    // ResolveCpuName, which validates against this same triple.
+    const std::string tripleStr = PlatformTargetTriple(platform);
+    const char* triple = tripleStr.c_str();
     std::string err;
     const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
     if (!target)
@@ -5200,14 +5221,23 @@ bool LLVMBackend::PrintSupportedCpus()
         return false;
     }
 
-    // getAllProcessorDescriptions() is required to be sorted by Key, so we can print
-    // it in order directly. Skip any empty key defensively.
-    std::cout << "Supported target CPUs (Windows x86/x64):\n";
+    // getAllProcessorDescriptions() carries the processor models, but AArch64 keeps
+    // its CPU aliases (apple-m1, cyclone, ...) in a separate table that --cpu accepts
+    // all the same - including apple-m1, the macOS default. Merge both and re-sort,
+    // so the list is exactly the set ResolveCpuName lets through.
+    std::vector<std::string> cpus;
     for (const auto& kv : sti->getAllProcessorDescriptions())
-    {
-        if (kv.Key && *kv.Key)
-            std::cout << std::format("  {}\n", kv.Key);
-    }
+        if (kv.Key && *kv.Key) cpus.emplace_back(kv.Key);
+    if (llvm::Triple(tripleStr).isAArch64())
+        for (const auto& alias : llvm::AArch64::CpuAliases)
+            cpus.emplace_back(cflat_llvm_compat::AArch64AliasName(alias).str());
+    std::sort(cpus.begin(), cpus.end());
+    cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
+
+    std::cout << std::format("Supported target CPUs for --platform {} ({}):\n",
+                             platform, tripleStr);
+    for (const auto& cpu : cpus)
+        std::cout << std::format("  {}\n", cpu);
     return true;
 }
 

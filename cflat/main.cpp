@@ -175,7 +175,7 @@ int main(int argc, char* argv[])
     args.addFlag("init-local", 0, "Populate <exe dir>/.cflat cache instead of the per-user cache, then exit; later compiles from this exe pick it up automatically");
     args.addFlag("init-clear", 0, "Delete BOTH the per-user (%USERPROFILE%\\.cflat / ~/.cflat) and local (<exe dir>/.cflat) cache directories and exit; re-run --init/--init-local afterward to repopulate");
     args.addFlag("init-clear-local", 0, "Delete only the <exe dir>/.cflat cache directory and exit; leaves the per-user cache alone");
-    args.addFlag("print-supported-cpus", 0, "List target CPUs supported on Windows x86/x64, then exit");
+    args.addFlag("print-supported-cpus", 0, "List the target CPUs accepted by --cpu/--tune for the active --platform, then exit");
     args.addFlag("print-host-cpu", 0, "Print the LLVM name of the host CPU (what --cpu native resolves to), then exit");
     args.addOption("cpu", 0, "Target CPU for code generation (name from --print-supported-cpus, or 'native'); sets ISA features + tuning", "");
     args.addOption("tune", 0, "Tune scheduling for this CPU without changing the instruction set (name or 'native')", "");
@@ -395,7 +395,8 @@ int main(int argc, char* argv[])
     }
 
     if (args.hasFlag("print-supported-cpus"))
-        return LLVMBackend::PrintSupportedCpus() ? 0 : 1;
+        return LLVMBackend::PrintSupportedCpus(
+            args.getOption("platform").value_or(LLVMBackend::DefaultPlatform())) ? 0 : 1;
 
     if (args.hasFlag("print-host-cpu"))
         return LLVMBackend::PrintHostCpu() ? 0 : 1;

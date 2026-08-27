@@ -7477,10 +7477,21 @@ public:
     static std::string MacStubSdkVersion();
 #endif
 
-    // List the target CPUs supported on the currently supported platforms
-    // (Windows x86/x64, which both use LLVM's X86 backend and share one CPU table).
+    // Native target platform for this host build ("win64" / "macos" / "linux"),
+    // i.e. what --platform defaults to.
+    static const char* DefaultPlatform();
+
+    // LLVM target triple for a --platform value. An unrecognized value falls back to
+    // the host triple, so a new platform name degrades to the native target.
+    static std::string PlatformTargetTriple(const std::string& platform);
+
+    // Default codegen CPU for a --platform value when --cpu was not given. Linux
+    // targets the host CPU; the others pin a baseline so output stays portable.
+    static std::string DefaultCpuForPlatform(const std::string& platform);
+
+    // List the target CPUs the given --platform accepts (its backend's CPU table).
     // Prints the sorted CPU names to stdout. Returns false on failure.
-    static bool PrintSupportedCpus();
+    static bool PrintSupportedCpus(const std::string& platform);
 
     // Print the LLVM name of the host CPU (what --cpu native resolves to), e.g.
     // "znver4". Returns false if the host CPU cannot be determined.

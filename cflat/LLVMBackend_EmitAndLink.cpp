@@ -189,9 +189,9 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
                              : llvm::sys::getProcessTriple();
         std::string cpu = !targetCpu_.empty()
             ? targetCpu_
-            : (targetMacOS_ ? std::string("apple-m1")
-                            : targetWindows_ ? (platformValue == 32 ? std::string("i686") : std::string("x86-64"))
-                                             : llvm::sys::getHostCPUName().str());
+            : DefaultCpuForPlatform(targetMacOS_ ? "macos"
+                                    : targetWindows_ ? (platformValue == 32 ? "win32" : "win64")
+                                                     : "linux");
 
         std::string err;
         const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
