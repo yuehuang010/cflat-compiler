@@ -1033,7 +1033,7 @@ int GlobalNegPlainI32   = -70000;
 // else: seeding it as a compile-time macro instead made it shadow same-named locals and
 // parameters, narrowed every width to i32, and broke address-of.
 const int ConstFoldShadow = 8;
-const long ConstFoldWide  = 3;
+const i64 ConstFoldWide   = 3;
 
 int constFoldShadowParam(int ConstFoldShadow)
 {
@@ -1049,8 +1049,9 @@ bool testConstGlobalIsNotAMacro()
     ConstFoldShadow = 5;
     result &= Test("const_global_local_assignable", ConstFoldShadow, 5);
 
-    // Narrowing the global to i32 made this shift lose the high bits.
-    long wide = ConstFoldWide << 40;
+    // Narrowing the global to i32 made this shift lose the high bits. Declared i64 (not `long`,
+    // which is only 32-bit on Windows LLP64) so this holds on every target.
+    i64 wide = ConstFoldWide << 40;
     result &= Test("const_global_keeps_width", wide == 3298534883328, true);
 
     // A macro has no storage, so address-of stopped compiling.
