@@ -167,6 +167,76 @@ See [`doc/HPC.md`](HPC.md) for `--cpu`/`-O2` and vectorization guidance.
 
 The `core/` directory is always on the import search path; only `runtime.cb` is auto-imported.
 
+## Compile-time defines
+
+| Switch | Short | Value | Description |
+|--------|-------|-------|-------------|
+| `--define` | `-D` | `NAME[=value]` | Define a global compile-time macro (repeatable). |
+
+`-DNAME` and `-D NAME` are both accepted, as is `-DNAME=value`. With no `=value` the macro is
+`1`. A value that parses as a whole integer (base 0, so `0x1f` works) becomes an `int` macro;
+anything else becomes a `string` macro.
+
+Defines are **global and immutable for the whole compilation**: a `.cb` source can read them
+but can neither add nor change one. That is what keeps module and bitcode processing
+cacheable - the define set is fixed before the first file is parsed, and it is part of the
+`-o` dependency manifest, so changing a `-D` rebuilds the output.
+
+Order matters: a later `-D` of the same name overwrites an earlier one, so
+`-DLEVEL=6 -DLEVEL=7` leaves `LEVEL` at `7`.
+
+The builtin macros (`__PLATFORM__`, `__WINDOWS__`, `__POSIX__`, `__LINUX__`, `__MACOS__`,
+`__DARWIN__`, `__WIN32__`, `__WIN64__`, `__X86__`, `__ARM64__`, `__FILE__`, `__LINE__`,
+`__FUNCTION__`) are reserved - redefining one is an error.
+
+A define is an ordinary compile-time macro, so it folds in `if const` and reads as a value:
+
+```bash
+cflat app.cb -DFEATURE_X -DLEVEL=7 -DBUILD_TAG=nightly -o app.exe
+```
+
+```cflat
+if const (FEATURE_X)
+{
+    printf("level %d, build %s\n", LEVEL, BUILD_TAG);
+}
+```
+
+A define is also a constant everywhere a constant is legal - a global initializer, a fixed
+array bound, or any expression:
+
+```cflat
+int gScaled = LEVEL * 2;
+
+extern int main()
+{
+    int[LEVEL] buf;
+    return gScaled;
+}
+```
+
+Both uses reach generic code, which is how a define specializes a generic: it can size a
+fixed array member of a generic struct, and an `if const (DEFINE)` inside a generic body
+picks an arm the same way `is_pointer(T)` / `is_unique(T)` do.
+
+```cflat
+struct Buf<T>
+{
+    T[LEVEL] items;
+};
+
+T pick<T>(T a, T b)
+{
+    if const (FEATURE_X) { return a; } else { return b; }
+}
+```
+
+A define is a *value*, not a type: `Buf<ELEM>` with `-DELEM=int` does not resolve, because
+a string define does not name a type.
+
+Referencing a name that was never defined is an ordinary "Undefined variable" error - there
+is no implicit zero.
+
 ## C library bindings
 
 | Switch | Value | Description |

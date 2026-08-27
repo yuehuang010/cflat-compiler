@@ -153,10 +153,21 @@ public:
 				{
 					// Allow single-dash long flags like -O2, -O1
 					std::string name = arg.substr(1);
+					std::string attached = resolveShort(arg[1]);
 					if (isFlag(name))
 					{
 						m_flagValues[name] = true;
 						if (name != "force") m_normalizedArguments.push_back("--" + name);
+					}
+					// Attached short-option value, e.g. -DNAME=value or -ipath. Checked after
+					// the long-flag form so -O2 keeps winning over a short 'O' option.
+					else if (!attached.empty() && (isOption(attached) || isMultiOption(attached)))
+					{
+						std::string value = arg.substr(2);
+						if (isOption(attached)) m_optionValues[attached] = value;
+						else                    m_multiOptionValues[attached].push_back(value);
+						m_normalizedArguments.push_back("--" + attached);
+						m_normalizedArguments.push_back(value);
 					}
 					else
 					{

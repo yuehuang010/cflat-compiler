@@ -2874,6 +2874,31 @@ else
 declarations - functions, structs, globals, `import`, `using`, and nested `if const`.
 At function scope each arm holds ordinary statements.
 
+**Conditions come from the compiler or the command line.** Besides the builtin macros
+(`__PLATFORM__`, `__WINDOWS__`, `__MACOS__`, ...), a condition can read a global define
+passed with `-D`:
+
+```bash
+cflat app.cb -DFEATURE_X -DLEVEL=7 -o app.exe
+```
+
+```c
+if const (FEATURE_X && LEVEL >= 4)
+{
+    // compiled only when both defines say so
+}
+```
+
+Defines are fixed for the whole compilation - a `.cb` source can read a define but can
+neither add nor change one, which is what keeps module processing cacheable. A later `-D`
+of the same name overwrites an earlier one, and the builtin macros cannot be redefined.
+See [`doc/CLI.md`](CLI.md) for the full `-D` rules.
+
+A define is a constant, not just a condition, so it also works as a global initializer, a
+fixed array bound, or any other expression - including inside generic code, where it can
+size a fixed array member of a generic struct and where `if const (DEFINE)` selects the arm
+a generic body specializes to.
+
 ---
 
 ## `program` Keyword

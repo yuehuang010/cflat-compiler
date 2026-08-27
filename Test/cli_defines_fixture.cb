@@ -1,0 +1,64 @@
+// Fixture for the CLI -D regression driven by test.sh / test.bat. Deliberately not named
+// test_*.cb: it only compiles when the driver supplies CLI_DEF_ON, CLI_DEF_LEVEL and
+// CLI_DEF_TAG. Covers a define as an if const condition, as an ordinary value, and as a
+// compile-time constant inside generic code.
+
+// A define is a constant everywhere a constant is legal, including a global initializer.
+int gScaled = CLI_DEF_LEVEL * 2;
+
+// Generic groundwork: a define sizes a fixed array member of a generic struct, so the
+// monomorphized shell is built from it in the ForwardRefScanner pass.
+struct Buf<T>
+{
+    T[CLI_DEF_LEVEL] items;
+    int count;
+
+    void add(T v)
+    {
+        if (count < CLI_DEF_LEVEL) { items[count] = v; count = count + 1; }
+    }
+
+    int cap() { return CLI_DEF_LEVEL; }
+};
+
+// Generic groundwork: a define selects which arm a generic body specializes to, the same
+// mechanism is_pointer(T) / is_unique(T) use.
+T pick<T>(T a, T b)
+{
+    if const (CLI_DEF_ON)
+    {
+        return a;
+    }
+    else
+    {
+        return b;
+    }
+}
+
+extern int main()
+{
+    if const (CLI_DEF_ON)
+    {
+        printf("mode=on level=%d tag=%s\n", CLI_DEF_LEVEL, CLI_DEF_TAG);
+    }
+    else
+    {
+        printf("mode=off level=%d tag=%s\n", CLI_DEF_LEVEL, CLI_DEF_TAG);
+    }
+
+    // Define as a value: local fixed-array bound, loop bound, and arithmetic.
+    int[CLI_DEF_LEVEL] local;
+    int sum = 0;
+    for (int i = 0; i < CLI_DEF_LEVEL; i++)
+    {
+        local[i] = i;
+        sum = sum + local[i];
+    }
+    printf("value sum=%d scaled=%d\n", sum, gScaled);
+
+    Buf<int> b = default;
+    b.add(3);
+    b.add(4);
+    printf("generic cap=%d count=%d pick=%d\n", b.cap(), b.count, pick<int>(10, 20));
+    return 0;
+}

@@ -2802,6 +2802,16 @@ private:
         std::string type;  // "int", "string", etc.
     };
     std::unordered_map<std::string, CompileTimeMacro> compileTimeMacros;
+    // A -D define from the command line. Parsed once at arg time; re-applied by
+    // SetPlatformMacros on every (re)analysis since compileTimeMacros is cleared.
+    struct UserDefine
+    {
+        std::string name;
+        std::string stringValue;
+        int64_t     intValue = 0;
+        bool        isInt = false;
+    };
+    std::vector<UserDefine> userDefines_;
     // ANTLR ecosystem kept alive so generic-template ctx pointers remain valid. Core-library
     // entries reused across compiles; deliberately survives ResetForReanalysis.
     struct CachedParseTree
@@ -6872,6 +6882,13 @@ public:
     void SetCompileTimeMacro(const std::string& name, llvm::Constant* value, const std::string& type);
 
     void SetPlatformMacros();
+
+    // Parse and validate the raw -D values (NAME or NAME=value). Later duplicates
+    // overwrite earlier ones. Returns false (after LogError) on a bad or reserved name.
+    bool SetUserDefines(const std::vector<std::string>& defines);
+
+    // Names owned by the compiler that -D must not shadow.
+    static bool IsReservedMacroName(const std::string& name);
 
     CompileTimeMacro GetCompileTimeMacro(const std::string& name);
 

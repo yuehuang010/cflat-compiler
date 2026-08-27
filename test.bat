@@ -279,6 +279,56 @@ if errorlevel 1 (
     )
 )
 
+REM CLI regression: -D global defines. Covers the attached and separated spellings, an int
+REM and a string value, later-wins ordering, defines used as ordinary values and as
+REM compile-time constants in generic code, and the reserved-name rejection.
+set DEFINES_NAME=cli_defines
+set DEFINES_LOG=%OUT%\results\%DEFINES_NAME%.log
+set DEFINES_OFF_LOG=%OUT%\results\%DEFINES_NAME%.off.log
+set DEFINES_RESULT=%OUT%\results\%DEFINES_NAME%.result
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_ON -D CLI_DEF_LEVEL=6 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: -D fixture did not compile or run >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"mode=on level=7 tag=nightly" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: -D value or later-wins ordering is wrong >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"value sum=21 scaled=14" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: -D constant did not fold as a value >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"generic cap=7 count=2 pick=10" "%DEFINES_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: -D constant did not reach generic code >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -DCLI_DEF_ON=0 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly --run --nologo %CFLAT_PLATFORM_FLAG% >"%DEFINES_OFF_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: -D fixture did not run with the off define set >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"mode=off level=7 tag=nightly" "%DEFINES_OFF_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: flipping a -D did not reselect the if const arm >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+findstr /c:"generic cap=7 count=2 pick=20" "%DEFINES_OFF_LOG%" >nul
+if errorlevel 1 (
+    echo FAILED: flipping a -D did not respecialize the generic >"%DEFINES_RESULT%"
+    goto DefinesDone
+)
+"%COMPILER%" "%SRC%\cli_defines_fixture.cb" -i "%LIB%" -D__MACOS__=0 --check %CFLAT_PLATFORM_FLAG% >>"%DEFINES_LOG%" 2>&1
+if errorlevel 1 (
+    echo PASS 0.00s >"%DEFINES_RESULT%"
+) else (
+    echo FAILED: -D redefined a builtin macro >"%DEFINES_RESULT%"
+)
+:DefinesDone
+
 :Collect
 set /a ERRORS=0
 set /a SKIPS=0

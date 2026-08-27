@@ -1667,6 +1667,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     cIncludeDirs_ = args.getMultiOption("c-include");
     cLinkLibs_    = args.getMultiOption("c-lib");
     cDefines_     = args.getMultiOption("c-define");
+    // Global compile-time defines (-D). Fixed for the whole compilation: .cb sources can
+    // neither add nor mutate them, which keeps module/bitcode processing cacheable.
+    if (!SetUserDefines(args.getMultiOption("define")))
+        return false;
     // Positional `.c` inputs are dispatched to clang only after the module-end analyses have
     // run, so note their presence now for RunNullIfaceGlobalCheck's interop gate.
     positionalCSource_ = false;

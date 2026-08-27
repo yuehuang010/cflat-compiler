@@ -924,6 +924,92 @@ void LLVMBackend::SetPlatformMacros()
         // Target architecture: every prior target was x86; arm64 is macOS-only for now.
         SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, targetArm64_ ? 0 : 1),     "int");
         SetCompileTimeMacro("__ARM64__",    llvm::ConstantInt::get(i32, targetArm64_ ? 1 : 0),     "int");
+
+        // Command-line -D defines land last, in command-line order, so a later -D of the
+        // same name wins. Reserved names were rejected in SetUserDefines, so nothing above
+        // can be shadowed here.
+        for (const auto& def : userDefines_)
+        {
+            if (def.isInt)
+            {
+                SetCompileTimeMacro(def.name, llvm::ConstantInt::get(i32, def.intValue), "int");
+                continue;
+            }
+            // String define: a private constant global, same shape as __FILE__. The symbol is
+            // prefixed so a define can never collide with a real global of the same name.
+            const std::string symbol = "__cflat_define_" + def.name;
+            auto* global = module->getOrInsertGlobal(symbol,
+                llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), def.stringValue.size() + 1));
+            if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(global))
+            {
+                gv->setInitializer(llvm::ConstantDataArray::getString(*context, def.stringValue, true));
+                gv->setConstant(true);
+                SetCompileTimeMacro(def.name, gv, "string");
+            }
+        }
+    }
+
+bool LLVMBackend::IsReservedMacroName(const std::string& name)
+{
+        static const std::unordered_set<std::string> reserved = {
+            "__PLATFORM__", "__WIN64__", "__WIN32__", "__WINDOWS__",
+            "__POSIX__", "__LINUX__", "__MACOS__", "__DARWIN__",
+            "__X86__", "__ARM64__",
+            "__FILE__", "__LINE__", "__FUNCTION__",
+        };
+        return reserved.count(name) != 0;
+    }
+
+bool LLVMBackend::SetUserDefines(const std::vector<std::string>& defines)
+{
+        userDefines_.clear();
+        for (const auto& raw : defines)
+        {
+            auto eq = raw.find('=');
+            std::string name  = (eq == std::string::npos) ? raw : raw.substr(0, eq);
+            std::string value = (eq == std::string::npos) ? std::string("1") : raw.substr(eq + 1);
+            if (name.empty() || (!std::isalpha((unsigned char)name[0]) && name[0] != '_'))
+            {
+                LogError(std::format("-D define name '{}' is not a valid identifier.", name));
+                return false;
+            }
+            for (char c : name)
+            {
+                if (!std::isalnum((unsigned char)c) && c != '_')
+                {
+                    LogError(std::format("-D define name '{}' is not a valid identifier.", name));
+                    return false;
+                }
+            }
+            if (IsReservedMacroName(name))
+            {
+                LogError(std::format("-D cannot redefine the builtin compile-time macro '{}'.", name));
+                return false;
+            }
+
+            UserDefine def;
+            def.name = name;
+            // A fully-consumed integer literal (base 0, so 0x/0 prefixes work) in int range
+            // becomes an int macro; anything else is kept as a string macro.
+            const char* begin = value.c_str();
+            char* end = nullptr;
+            errno = 0;
+            long long parsed = std::strtoll(begin, &end, 0);
+            if (!value.empty() && end != nullptr && *end == '\0' && errno == 0
+                && parsed >= INT32_MIN && parsed <= INT32_MAX)
+            {
+                def.isInt = true;
+                def.intValue = (int64_t)parsed;
+            }
+            else
+            {
+                def.stringValue = value;
+            }
+            // Later duplicates win: drop any earlier definition of the same name.
+            std::erase_if(userDefines_, [&](const UserDefine& d) { return d.name == def.name; });
+            userDefines_.push_back(std::move(def));
+        }
+        return true;
     }
 
 LLVMBackend::CompileTimeMacro LLVMBackend::GetCompileTimeMacro(const std::string& name)
