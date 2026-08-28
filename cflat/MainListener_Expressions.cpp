@@ -898,7 +898,7 @@ bool MainListener::NestedJoinArmsBoxable(llvm::Value* value, const std::string& 
         for (const auto& arm : arms)
         {
             if (arm.Value == nullptr || arm.Block == nullptr) return false;
-            if (cflat_llvm_compat::GetTerminatorOrNull(arm.Block) == nullptr) return false;
+            if (cflat_llvm::GetTerminatorOrNull(arm.Block) == nullptr) return false;
             if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
             ResolvedJoinArmClass resolved;
             if (!ResolveJoinArmClass(arm.Value, resolved))
@@ -1073,7 +1073,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                 // other), so it has no class of its own - box it recursively in its own block.
                 std::string nestedFailure;
                 if (NestedJoinArmsBoxable(incoming, interfaceName, &nestedFailure)
-                    && cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block) != nullptr)
+                    && cflat_llvm::GetTerminatorOrNull(arms[i].Block) != nullptr)
                 {
                     armIsNestedJoin[i] = true;
                     continue;
@@ -1091,7 +1091,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                     *armFailure = std::format("'{}' does not implement it", armTypes[i]);
                 return nullptr;
             }
-            if (cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block) == nullptr) return nullptr;
+            if (cflat_llvm::GetTerminatorOrNull(arms[i].Block) == nullptr) return nullptr;
             /*
              * A 'move' return transfers EVERY arm, so an arm that owns nothing would hand the
              * caller a second owner of a live borrow (double free). The whole-expression check on
@@ -1151,7 +1151,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                 boxed[i] = llvm::Constant::getNullValue(fatTy);
                 continue;
             }
-            compiler->builder->SetInsertPoint(cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block));
+            compiler->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(arms[i].Block));
             auto* vtable = compiler->GetOrCreateVTable(armTypes[i], interfaceName);
             llvm::Value* armData = arms[i].Value;
             boxed[i] = compiler->BuildInterfaceFatValue(vtable, armData);
@@ -1613,10 +1613,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // Third arg of CreateCast is isSigned (used only when widening); flip
                 // BitfieldUnsigned to get sign-extension for signed bitfields.
                 auto* valAsStorage = compiler->CreateCast(val, storageTy, !namedVar.BitfieldUnsigned);
-                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm_compat::GetIntTruncated(storageTy, valMask));
-                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, off));
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm::GetIntTruncated(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm::GetIntTruncated(storageTy, off));
                 auto* word = compiler->CreateLoad(storageTy, namedVar.BitfieldStorage);
-                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm_compat::GetIntTruncated(storageTy, ~windowMask));
+                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm::GetIntTruncated(storageTy, ~windowMask));
                 auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
                 compiler->builder->CreateStore(newWord, namedVar.BitfieldStorage);
 
@@ -1630,8 +1630,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 else
                 {
                     unsigned leftShift = storageBits - w;
-                    auto* shl = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, leftShift));
-                    result = compiler->builder->CreateAShr(shl, cflat_llvm_compat::GetIntTruncated(storageTy, leftShift));
+                    auto* shl = compiler->builder->CreateShl(valMasked, cflat_llvm::GetIntTruncated(storageTy, leftShift));
+                    result = compiler->builder->CreateAShr(shl, cflat_llvm::GetIntTruncated(storageTy, leftShift));
                 }
                 return result;
             };
@@ -4387,7 +4387,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
             for (auto* bb : { trueBlock, falseBlock })
             {
-                if (cflat_llvm_compat::GetTerminatorOrNull(bb) != nullptr) continue;
+                if (cflat_llvm::GetTerminatorOrNull(bb) != nullptr) continue;
                 compiler->SwitchToBlock(bb);
                 compiler->builder->CreateBr(resumeBlock);
             }
@@ -4404,12 +4404,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // may be void calls, so it has no value to join and no PHI/select type to unify.
         if (use == ResultUse::Discard)
         {
-            if (trueEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(trueEnd) == nullptr)
+            if (trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr)
             {
                 compiler->builder->SetInsertPoint(trueEnd);
                 compiler->CreateJump(resumeBlock);
             }
-            if (falseEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(falseEnd) == nullptr)
+            if (falseEnd != nullptr && cflat_llvm::GetTerminatorOrNull(falseEnd) == nullptr)
             {
                 compiler->builder->SetInsertPoint(falseEnd);
                 compiler->CreateJump(resumeBlock);
@@ -4420,8 +4420,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         // An arm whose own lowering terminated its block never reaches the join; the ternary can
         // then only yield the other arm, so no PHI is needed (and none is legal).
-        bool trueLive = trueEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(trueEnd) == nullptr;
-        bool falseLive = falseEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(falseEnd) == nullptr;
+        bool trueLive = trueEnd != nullptr && cflat_llvm::GetTerminatorOrNull(trueEnd) == nullptr;
+        bool falseLive = falseEnd != nullptr && cflat_llvm::GetTerminatorOrNull(falseEnd) == nullptr;
         if (!trueLive || !falseLive)
         {
             if (trueLive)
@@ -4696,7 +4696,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
                 for (auto* block : { nullBlock, notNullBlock })
                 {
-                    if (cflat_llvm_compat::GetTerminatorOrNull(block) == nullptr)
+                    if (cflat_llvm::GetTerminatorOrNull(block) == nullptr)
                     {
                         compiler->SwitchToBlock(block);
                         compiler->builder->CreateBr(resumeBlock);
@@ -4778,7 +4778,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // In a function, branch so only the selected arm runs. A constant context (enum,
                 // bitfield width, alignas, global init) has no live block and keeps the eager form.
                 auto* insertBB = compiler->builder->GetInsertBlock();
-                if (insertBB != nullptr && cflat_llvm_compat::GetTerminatorOrNull(insertBB) == nullptr
+                if (insertBB != nullptr && cflat_llvm::GetTerminatorOrNull(insertBB) == nullptr
                     && compiler->currentFunction != nullptr
                     && insertBB->getParent() == compiler->currentFunction)
                 {
@@ -8997,10 +8997,10 @@ void MainListener::EmitFieldInitializer(
                 uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
                 uint64_t windowMask = valMask << off;
                 auto* valAsStorage = compiler->CreateCast(val, storageTy, !bfHit->IsUnsigned);
-                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm_compat::GetIntTruncated(storageTy, valMask));
-                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, off));
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm::GetIntTruncated(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm::GetIntTruncated(storageTy, off));
                 auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
-                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm_compat::GetIntTruncated(storageTy, ~windowMask));
+                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm::GetIntTruncated(storageTy, ~windowMask));
                 auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
                 compiler->builder->CreateStore(newWord, storagePtr);
                 continue;
@@ -11809,7 +11809,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             std::vector<llvm::Value*> ops;
             for (int k = 0; k < intrin->Arity; k++)
                 ops.push_back(requireSimdArg(ctx, argValue(k), k, vecTy, method));
-            auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), intrin->Id, {vecTy});
+            auto* fn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), intrin->Id, {vecTy});
             result.Primary = compiler->builder->CreateCall(fn, ops, "simdmath");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
@@ -11825,8 +11825,8 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             llvm::Value* x  = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
             llvm::Value* lo = requireSimdArg(ctx, argValue(1), 1, vecTy, method);
             llvm::Value* hi = requireSimdArg(ctx, argValue(2), 2, vecTy, method);
-            auto* maxFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::maxnum, {vecTy});
-            auto* minFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::minnum, {vecTy});
+            auto* maxFn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), llvm::Intrinsic::maxnum, {vecTy});
+            auto* minFn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), llvm::Intrinsic::minnum, {vecTy});
             llvm::Value* lower = compiler->builder->CreateCall(maxFn, {x, lo}, "simdclamplo");
             result.Primary = compiler->builder->CreateCall(minFn, {lower, hi}, "simdclamp");
             result.BaseType = vecTy;
@@ -11845,7 +11845,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             llvm::Value* x = requireSimdArg(ctx, argValue(0), 0, vecTy, method);
             auto* one  = llvm::ConstantFP::get(vecTy, 1.0);
             auto* zero = llvm::ConstantFP::get(vecTy, 0.0);
-            auto* csFn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::copysign, {vecTy});
+            auto* csFn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), llvm::Intrinsic::copysign, {vecTy});
             llvm::Value* magOne = compiler->builder->CreateCall(csFn, {one, x}, "simdsignmag");
             llvm::Value* isZero = compiler->builder->CreateFCmpOEQ(x, zero, "simdsigniszero");
             result.Primary = compiler->builder->CreateSelect(isZero, zero, magOne, "simdsign");
@@ -11894,7 +11894,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             {
                 if (isFloat)
                 {
-                    auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::vector_reduce_fadd, {vecTy});
+                    auto* fn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_fadd, {vecTy});
                     auto* start = llvm::ConstantFP::get(elemTy, 0.0);
                     auto* call = compiler->builder->CreateCall(fn, {start, v}, "simdreduceadd");
                     call->setHasAllowReassoc(true);
@@ -11902,7 +11902,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                 }
                 else
                 {
-                    auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), llvm::Intrinsic::vector_reduce_add, {vecTy});
+                    auto* fn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), llvm::Intrinsic::vector_reduce_add, {vecTy});
                     reduced = compiler->builder->CreateCall(fn, {v}, "simdreduceadd");
                 }
             }
@@ -11914,7 +11914,7 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                     : isUnsigned
                         ? (isMin ? llvm::Intrinsic::vector_reduce_umin : llvm::Intrinsic::vector_reduce_umax)
                         : (isMin ? llvm::Intrinsic::vector_reduce_smin : llvm::Intrinsic::vector_reduce_smax);
-                auto* fn = cflat_llvm_compat::GetIntrinsicDecl(compiler->module.get(), rid, {vecTy});
+                auto* fn = llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(), rid, {vecTy});
                 reduced = compiler->builder->CreateCall(fn, {v}, "simdreduce");
             }
             result.Primary = reduced;
@@ -11969,9 +11969,10 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             }
             llvm::Value* passthru = requireSimdArg(ctx, argValue(3), 3, vecTy, method);
             llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
-            result.Primary = cflat_llvm_compat::CreateMaskedLoad(*compiler->builder,
-                compiler->module.get(), vecTy, compiler->builder->getPtrTy(), elemPtr, mask,
-                passthru, (uint32_t)al.value(), "simdloadmasked");
+            result.Primary = compiler->builder->CreateCall(
+                llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(),
+                    llvm::Intrinsic::masked_load, { vecTy, compiler->builder->getPtrTy() }),
+                { elemPtr, mask, passthru }, "simdloadmasked");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
@@ -11996,9 +11997,10 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
                 return result;
             }
             llvm::Value* elemPtr = compiler->CreateGEP(elemTy, basePtr, index);
-            cflat_llvm_compat::CreateMaskedStore(*compiler->builder, compiler->module.get(),
-                vecTy, compiler->builder->getPtrTy(), vecVal, elemPtr, mask,
-                (uint32_t)al.value());
+            compiler->builder->CreateCall(
+                llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(),
+                    llvm::Intrinsic::masked_store, { vecTy, compiler->builder->getPtrTy() }),
+                { vecVal, elemPtr, mask });
             // store returns nothing
         }
         else if (method == "load_gather")
@@ -12026,9 +12028,10 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
             llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
             llvm::Value* passthru = llvm::PoisonValue::get(vecTy);
-            result.Primary = cflat_llvm_compat::CreateMaskedGather(*compiler->builder,
-                compiler->module.get(), vecTy, ptrVecTy, ptrVec, allTrue, passthru,
-                (uint32_t)al.value(), "simdgather");
+            result.Primary = compiler->builder->CreateCall(
+                llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(),
+                    llvm::Intrinsic::masked_gather, { vecTy, ptrVecTy }),
+                { ptrVec, allTrue, passthru }, "simdgather");
             result.BaseType = vecTy;
             result.TypeAndValue = simdTv;
             result.Storage = nullptr;
@@ -12057,8 +12060,10 @@ LLVMBackend::NamedVariable MainListener::ParseSimdStaticMethod(
             auto* ptrVecTy = llvm::FixedVectorType::get(compiler->builder->getPtrTy(), vecTy->getNumElements());
             auto* maskTy = llvm::FixedVectorType::get(compiler->builder->getInt1Ty(), vecTy->getNumElements());
             llvm::Value* allTrue = llvm::ConstantInt::get(maskTy, 1);
-            cflat_llvm_compat::CreateMaskedScatter(*compiler->builder, compiler->module.get(),
-                vecTy, ptrVecTy, vecVal, ptrVec, allTrue, (uint32_t)al.value());
+            compiler->builder->CreateCall(
+                llvm::Intrinsic::getOrInsertDeclaration(compiler->module.get(),
+                    llvm::Intrinsic::masked_scatter, { vecTy, ptrVecTy }),
+                { vecVal, ptrVec, allTrue });
             // store returns nothing
         }
         else

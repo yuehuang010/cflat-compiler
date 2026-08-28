@@ -2975,3 +2975,35 @@ reproduce - a fix that passes the driver suite can still be visibly broken in th
 - **NSTextAlignment uses the UNIFIED TextKit numbering on modern macOS: center=1, right=2.**
   The legacy AppKit values (right=1, center=2) render swapped. A right-aligned header with a
   sort chevron LOOKS centered - screenshot a chevron-free column before trusting the mapping.
+
+## The ForwardRefScanner must NEVER compute a struct layout (ruling 2026-08-27)
+
+Context: LLVM 23 tightened `FunctionType::get` - an opaque (body-less) struct is not a valid
+by-value PARAMETER type and now asserts, where an assertions-off LLVM silently accepted it.
+`ForwardRefScanner` registers signatures before any struct body exists, so core's
+`move string toString(string_view self)` tripped it on EVERY compile, including a file
+containing nothing but `extern int main() { return 0; }`.
+
+- **Rejected approach - do not retry: having the scanner compute the layout itself.** Giving
+  `ForwardRefScanner` its own field-walk so it can `setBody` early passes the full test suite
+  while SILENTLY MISCOMPILING. `setBody` is one-shot (guarded by `isOpaque()`), and
+  `StructType` is uniqued by identity, so the scanner's guess retroactively becomes the real
+  type. A struct that the main pass lays out as `{ i32, i32, [24 x i8] }` (sizeof 32) came out
+  as `{ i32, i32 }`, and `sizeof` disagreed with the emitted layout. The suite stayed green
+  because no test compared the two. The reference branch for this attempt was
+  `llvm-assert-scanner-reference` (ab046e9), deleted after this entry was written.
+- **Why it cannot work:** the main pass's layout code depends on `ParseDeclarationList`,
+  `activeTypeSubstitutions` / `activePackSubstitutions`, `ScanAndQueueGenericTypeUses`,
+  `MemberLockFieldGroups` and the pending-instantiation drain - listener-walk state the
+  scanner does not have. Any scanner-side layout is a guess by construction.
+- **Sanctioned approach:** defer the FUNCTION TYPE, not the layout. Emit a provisional
+  declaration (an `i8` stand-in for the offending parameter only), record it, and re-derive
+  the real signature from the body the MAIN pass sets, replacing the provisional
+  `llvm::Function` via the existing `.preabi` repair pattern.
+- **An opaque struct is invalid only as a PARAMETER; it is legal as a RETURN type** and stays
+  correct on its own, because `setBody` completes the very same `StructType` object.
+  Substituting the return type too caused a real miscompile (`insertvalue` of `i8` into the
+  aggregate's slot).
+- **Verification rule this produced:** for any fix in this area, read the emitted IR type and
+  compare `sizeof` against it. A green suite does not distinguish a correct layout from a
+  guessed one.

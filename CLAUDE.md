@@ -144,18 +144,19 @@ Current skills:
 
 **Fresh clone on Windows: run `bootstrap.bat`.** It is the one command that takes a clean
 checkout to a verified Release build - toolchain check (VS/vcvars64, cmake, ninja, git,
-antlr4) -> vcpkg deps -> clone + source-build + install **LLVM 22.1.8** into
-`%USERPROFILE%\.cflat-compiler-deps\llvm-22.1.8` -> `cmake_build.bat release` ->
+antlr4) -> vcpkg deps -> clone + source-build + install **LLVM 23.1.0** into
+`%USERPROFILE%\.cflat-compiler-deps\llvm-23.1.0` -> `cmake_build.bat release` ->
 `cflat --init-local` -> `test.bat Release`. Every step is idempotent, so re-running it is
 cheap; `/skip-llvm`, `/skip-tests`, `/llvm-only` and `/fresh` narrow the work. The ~5 GB
 LLVM ninja tree is deleted once the install succeeds (`/keep-build` retains it for an
 incremental re-bump); what stays is the ~3.3 GB install tree plus the ~1.9 GB source
 clone, both shared by every worktree. Budget ~35-60
 min for the LLVM build (it is mandatory: no RTTI-enabled LLVM prebuilt exists for Windows,
-and vcpkg's port is stuck at 18). It builds only the `/MT` LLVM, which is what cflat Release
-links; **`cmake_build.bat debug` needs a second install that the script does not build
-yet** - `/MTd` CRT **and `LLVM_ENABLE_ASSERTIONS=ON`**, installed to
-`llvm-<ver>-assert`, which is what the Debug presets now point at. See
+and vcpkg's port is stuck at 18). **cflat supports LLVM 23 only** - the version
+shims are gone, so an older LLVM will not compile. It provisions **both** installs: the
+`/MT`, assertions-OFF tree that cflat Release links, and a second `/MTd` CRT
+**`LLVM_ENABLE_ASSERTIONS=ON`** tree installed to `llvm-<ver>-assert`, which is what the
+Debug presets point at - so budget roughly double the build time for a fresh clone. See
 `internal/plan/llvm-version-migration.md` and the
 [Two installs](internal/plan/llvm-from-source-build.md) section for the recipe.
 

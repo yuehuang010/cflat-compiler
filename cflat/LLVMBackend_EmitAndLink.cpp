@@ -194,13 +194,13 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
                                                      : "linux");
 
         std::string err;
-        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
         if (!target)
             return nullptr;
 
         llvm::TargetOptions opt;
         return std::unique_ptr<llvm::TargetMachine>(
-            cflat_llvm_compat::CreateTargetMachine(*target, triple, cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
     }
 
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
@@ -306,7 +306,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         targetMachine = CreateOptTargetMachine();
         if (!targetMachine)
             return false;
-        cflat_llvm_compat::SetModuleTriple(*view, targetMachine->getTargetTriple().str());
+        view->setTargetTriple(targetMachine->getTargetTriple());
         view->setDataLayout(targetMachine->createDataLayout());
     }
 
@@ -317,7 +317,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         llvm::FunctionAnalysisManager functionAnalysis;
         llvm::CGSCCAnalysisManager cgsccAnalysis;
         llvm::ModuleAnalysisManager moduleAnalysis;
-        llvm::TargetLibraryInfoImpl tli(llvm::Triple(cflat_llvm_compat::GetModuleTripleStr(*view)));
+        llvm::TargetLibraryInfoImpl tli(view->getTargetTriple());
         functionAnalysis.registerPass([&] { return llvm::TargetLibraryAnalysis(tli); });
         passBuilder.registerModuleAnalyses(moduleAnalysis);
         passBuilder.registerCGSCCAnalyses(cgsccAnalysis);
@@ -620,10 +620,10 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         llvm::InitializeAllAsmPrinters();
 
         const std::string triple = llvm::sys::getProcessTriple(); // e.g. x86_64-unknown-linux-gnu
-        cflat_llvm_compat::SetModuleTriple(*module, triple);
+        module->setTargetTriple(llvm::Triple(triple));
 
         std::string err;
-        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -637,7 +637,7 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         // PIC so the object links into a position-independent executable (the
         // default on modern Linux toolchains).
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            cflat_llvm_compat::CreateTargetMachine(*target, triple, cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
         module->setDataLayout(TM->createDataLayout());
 
         // Keep cflat's runtime DEFINITIONS out of the dynamic symbol table so they do
@@ -762,10 +762,10 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         // emitted Mach-O carries an LC_BUILD_VERSION load command; without a
         // version ld64 warns "no platform load command found" on every link.
         const std::string triple = "arm64-apple-macosx11.0.0";
-        cflat_llvm_compat::SetModuleTriple(*module, triple);
+        module->setTargetTriple(llvm::Triple(triple));
 
         std::string err;
-        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}. The macOS arm64 "
@@ -781,7 +781,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         opt.DataSections     = true;
         // Darwin code is always PIC.
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            cflat_llvm_compat::CreateTargetMachine(*target, triple, cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
         module->setDataLayout(TM->createDataLayout());
 
         if (lliPath)
@@ -1094,10 +1094,10 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         llvm::InitializeAllTargetMCs();
         llvm::InitializeAllAsmPrinters();
 
-        cflat_llvm_compat::SetModuleTriple(*module, triple);
+        module->setTargetTriple(llvm::Triple(triple));
 
         std::string err;
-        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -1116,7 +1116,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         opt.FunctionSections = true;
         opt.DataSections     = true;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            cflat_llvm_compat::CreateTargetMachine(*target, triple, cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
         module->setDataLayout(TM->createDataLayout());
 
         // --out-lli for an -o build: dump the IR here, after the target triple and data layout
@@ -1535,7 +1535,7 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         // (report-only); reportLeaks itself prints every live allocation to stderr.
         for (llvm::BasicBlock& bb : *mainFn)
         {
-            auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm_compat::GetTerminatorOrNull(&bb));
+            auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm::GetTerminatorOrNull(&bb));
             if (!ret) continue;
             llvm::IRBuilder<> b(ret);
             b.SetCurrentDebugLocation(debugLocNear(ret));
@@ -1659,7 +1659,7 @@ bool LLVMBackend::JitRun(int& runExitCode)
         // The module's data layout must match the JIT's. Set both layout and triple to the
         // JIT's host values before handing the module over.
         module->setDataLayout(jit->getDataLayout());
-        cflat_llvm_compat::SetModuleTriple(*module, jit->getTargetTriple().str());
+        module->setTargetTriple(jit->getTargetTriple());
 
         // Disable builtin libcall recognition for the in-process JIT (equivalent to -fno-builtin).
         // cflat DEFINES its own hook-aware libc functions (printf/vsnprintf/memcpy/...). LLVM's

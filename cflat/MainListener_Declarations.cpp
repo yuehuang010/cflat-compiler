@@ -1197,7 +1197,7 @@ static llvm::Constant* FoldConstructedValueToConstantImpl(
             return nullptr;
         }
         state.ConstructorFrames++;
-        auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm_compat::GetTerminatorOrNull(&callee->back()));
+        auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm::GetTerminatorOrNull(&callee->back()));
         if (ret == nullptr || ret->getReturnValue() == nullptr)
         {
             state.ConstructorFrames--;
@@ -2501,7 +2501,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // a fresh entry block) when a matching definition was already emitted by a
         // transitive import. Detect that here and skip body emission - re-emitting
         // into the live function's blocks would corrupt its IR.
-        if (!fn->empty() && cflat_llvm_compat::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
+        if (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
             return;
 
         compiler->InitializeBlock(&fn->front(), false);
@@ -2941,7 +2941,7 @@ void MainListener::CloseStaticLocalGuard(StaticLocalGuard& guard, const std::str
         bool fold = false;
         llvm::StoreInst* valueStore = nullptr;
         if (storage != nullptr && compiler->builder->GetInsertBlock() == guard.InitBB
-            && cflat_llvm_compat::GetTerminatorOrNull(guard.InitBB) == nullptr)
+            && cflat_llvm::GetTerminatorOrNull(guard.InitBB) == nullptr)
         {
             if (guard.InitBB->size() == 1)
             {
@@ -5925,9 +5925,9 @@ void MainListener::EmitImplicitUniqueFieldMove(LLVMBackend::NamedVariable& right
                 for (const auto& source : join->Sources)
                 {
                     if (source.Storage == nullptr || source.Block == nullptr
-                        || cflat_llvm_compat::GetTerminatorOrNull(source.Block) == nullptr)
+                        || cflat_llvm::GetTerminatorOrNull(source.Block) == nullptr)
                         continue;
-                    compilerLLVM->builder->SetInsertPoint(cflat_llvm_compat::GetTerminatorOrNull(source.Block));
+                    compilerLLVM->builder->SetInsertPoint(cflat_llvm::GetTerminatorOrNull(source.Block));
                     if (right->getType()->isPointerTy())
                         compilerLLVM->builder->CreateStore(
                             llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(right->getType())),

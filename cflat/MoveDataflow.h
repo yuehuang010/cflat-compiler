@@ -358,7 +358,7 @@ namespace nulldf
         {
             llvm::BasicBlock* bb = work.back();
             work.pop_back();
-            auto* terminator = cflat_llvm_compat::GetTerminatorOrNull(bb);
+            auto* terminator = cflat_llvm::GetTerminatorOrNull(bb);
             if (terminator == nullptr) continue;
             if (BlockTerminatesProgram(bb, proven)) continue;
             if (llvm::isa<llvm::ReturnInst>(terminator)) return false;

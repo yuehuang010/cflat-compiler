@@ -173,7 +173,13 @@ LLVM 22.1.8 - identical to the LLVM 18 baseline. The same tree, reconfigured bac
 to `llvm@18`, also passes 719/0, so the dual-version claim is verified on both
 sides, not just asserted.**
 
-#### The API surface that actually moved (all shimmed in `LLVMCompat.h`)
+#### The API surface that actually moved (was shimmed in `LLVMCompat.h`)
+
+> **Superseded 2026-08-27.** cflat targets LLVM 23 only; `cflat/LLVMCompat.h` has been
+> deleted and every shim inlined at its call site. The two helpers that were not version
+> dispatch - the null-tolerant `GetTerminatorOrNull` and the explicitly truncating
+> `GetIntTruncated` - live in `cflat/LLVMBackend.h` under `namespace cflat_llvm`. The list
+> below is kept as the record of what moved between 18 and 23.
 
 | Change | Since | Shim |
 |--------|-------|------|

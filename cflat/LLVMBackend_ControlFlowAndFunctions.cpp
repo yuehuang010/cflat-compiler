@@ -128,7 +128,7 @@ void LLVMBackend::AbortFunctionBlocks(size_t targetDepth)
         {
             for (auto& bb : fn)
             {
-                if (!cflat_llvm_compat::GetTerminatorOrNull(&bb))
+                if (!cflat_llvm::GetTerminatorOrNull(&bb))
                 {
                     builder->SetInsertPoint(&bb);
                     builder->CreateUnreachable();

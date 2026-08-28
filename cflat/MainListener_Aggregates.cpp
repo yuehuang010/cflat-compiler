@@ -3557,7 +3557,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
 
         // CreateFunctionDefinition took its !fn->empty() early return, so no function scope was
         // pushed. Continuing would index one. Same guard as ParseFunctionDefinition.
-        if (!fn->empty() && cflat_llvm_compat::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
+        if (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
             return;
 
         compiler->InitializeBlock(&fn->front(), false);
@@ -3786,7 +3786,7 @@ void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefin
         // fell through to an already-terminated block (an explicit `return;` at the tail),
         // the teardown would be both unreachable and emitted past a terminator, so reject it
         // with a clear message instead of producing invalid IR / silently skipping cleanup.
-        if (cflat_llvm_compat::GetTerminatorOrNull(compiler->builder->GetInsertBlock()) != nullptr)
+        if (cflat_llvm::GetTerminatorOrNull(compiler->builder->GetInsertBlock()) != nullptr)
         {
             LogErrorContext(ctx, std::format(
                 "program '{}': ~{}() must not end with an explicit 'return;'. The builtin "

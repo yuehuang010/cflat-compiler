@@ -77,7 +77,35 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/TargetParser/Host.h>
 #pragma warning(pop)
-#include "LLVMCompat.h"
+/*
+ * Two small LLVM helpers. These are NOT version shims - cflat targets LLVM 23 only -
+ * they exist because the raw LLVM spellings are easy to get wrong at a call site.
+ */
+namespace cflat_llvm
+{
+
+// BasicBlock::getTerminator() asserts on a block that has none; this is the nullable
+// query, and it also tolerates a null block (IRBuilder::GetInsertBlock() can return one).
+inline llvm::Instruction* GetTerminatorOrNull(llvm::BasicBlock* block)
+{
+    return block == nullptr ? nullptr : block->getTerminatorOrNull();
+}
+
+inline const llvm::Instruction* GetTerminatorOrNull(const llvm::BasicBlock* block)
+{
+    return block == nullptr ? nullptr : block->getTerminatorOrNull();
+}
+
+// APInt rejects a value that does not fit the target bit width instead of truncating it
+// silently, so ConstantInt::get(iN, uint64) asserts. Bitfield masks and C macro constants
+// are built at 64 bits and narrowed ON PURPOSE, so truncate explicitly.
+inline llvm::ConstantInt* GetIntTruncated(llvm::Type* type, uint64_t value)
+{
+    const unsigned bits = type->getIntegerBitWidth();
+    return llvm::ConstantInt::get(type->getContext(), llvm::APInt(64, value).zextOrTrunc(bits));
+}
+
+} // namespace cflat_llvm
 #include "platform/GeneratedParser.h" // antlr runtime + generated parser/lexer/listener + kTokenEOF
 #include <fstream>
 #include "ArgParser.h"
@@ -322,7 +350,7 @@ namespace cflat_jit
         {
             llvm::jitlink::Symbol* handler = nullptr;
             for (auto* S : G.external_symbols())
-                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__C_specific_handler") { handler = S; break; }
+                if (S->hasName() && (*S->getName()) == "__C_specific_handler") { handler = S; break; }
             if (!handler)
                 return llvm::Error::success(); // no SEH personality in this graph
 
@@ -367,14 +395,14 @@ namespace cflat_jit
             // base - gigabytes away from the JIT'd code - so every .pdata RVA overflows its
             // Pointer32 fixup. Pin that symbol to the JIT'd image instead of adding a second one.
             for (auto* S : G.external_symbols())
-                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
+                if (S->hasName() && (*S->getName()) == "__ImageBase")
                 {
                     G.makeAbsolute(*S, lowest->getAddress());
                     return llvm::Error::success();
                 }
 
             for (auto* S : G.defined_symbols())
-                if (S->hasName() && cflat_llvm_compat::JitLinkSymbolName(*S) == "__ImageBase")
+                if (S->hasName() && (*S->getName()) == "__ImageBase")
                     return llvm::Error::success(); // graph already supplies one
             // Local scope: consumed by the lowering pass within this graph; not exported.
             G.addDefinedSymbol(*lowest, 0, "__ImageBase", 0, llvm::jitlink::Linkage::Strong,

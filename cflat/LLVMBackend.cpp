@@ -1,6 +1,7 @@
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/TargetParser/AArch64TargetParser.h>  // AArch64::CpuAliases + StrTab (--print-supported-cpus)
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
@@ -721,7 +722,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
                        llvm::BasicBlock::Create(ctx, "store", heapMalloc));
-        auto* store = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* store = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                           ->getSuccessor(1);
         b.SetInsertPoint(null);
         b.CreateCall(heapRelease, {size});
@@ -743,7 +744,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* user = heapFree->getArg(0);
         b.CreateCondBr(b.CreateICmpEQ(user, llvm::ConstantPointerNull::get(ptr)), done,
                        llvm::BasicBlock::Create(ctx, "release", heapFree));
-        auto* release = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* release = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                             ->getSuccessor(1);
         b.SetInsertPoint(release);
         auto* header = headerFor(b, user);
@@ -786,7 +787,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
                        llvm::BasicBlock::Create(ctx, "store", wrapper));
-        auto* store = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* store = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                           ->getSuccessor(1);
         b.SetInsertPoint(null);
         b.CreateCall(heapRelease, {productValue});
@@ -840,9 +841,9 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCondBr(b.CreateICmpUGT(newSize, oldSize),
                        llvm::BasicBlock::Create(ctx, "call_grow", wrapper),
                        llvm::BasicBlock::Create(ctx, "call_shrink", wrapper));
-        auto* callGrow = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* callGrow = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                              ->getSuccessor(0);
-        auto* callShrink = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* callShrink = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                ->getSuccessor(1);
         b.SetInsertPoint(callGrow);
         auto* growTotal = b.CreateAdd(newSize, b.getInt64(16));
@@ -871,9 +872,9 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCondBr(b.CreateICmpUGT(oldSize, newSize),
                        llvm::BasicBlock::Create(ctx, "release_shrink", wrapper),
                        llvm::BasicBlock::Create(ctx, "return", wrapper));
-        auto* releaseShrink = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* releaseShrink = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                   ->getSuccessor(0);
-        auto* returnBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* returnBlock = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
         b.SetInsertPoint(releaseShrink);
         b.CreateCall(heapRelease, {b.CreateSub(oldSize, newSize)});
@@ -924,7 +925,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)),
                        llvm::BasicBlock::Create(ctx, "alloc_fail", wrapper), store);
-        auto* allocFail = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+        auto* allocFail = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                               ->getSuccessor(0);
         b.SetInsertPoint(allocFail);
         b.CreateCall(heapRelease, {total});
@@ -997,7 +998,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
                                            {b.getInt64(16)});
             b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
                            noPacket, llvm::BasicBlock::Create(ctx, "start", create));
-            auto* startBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+            auto* startBlock = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                    ->getSuccessor(1);
             b.SetInsertPoint(noPacket);
             b.CreateCall(release, {b.getInt64(1)});
@@ -1012,7 +1013,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
             realCalls.emplace_back(createResult, realCreate);
             b.CreateCondBr(b.CreateICmpNE(createResult, b.getInt32(0)), failed,
                            llvm::BasicBlock::Create(ctx, "success", create));
-            auto* success = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+            auto* success = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
             b.SetInsertPoint(failed);
             if (threadFree)
@@ -1070,7 +1071,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
                                            {b.getInt64(16)});
             b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
                            noPacket, llvm::BasicBlock::Create(ctx, "start", create));
-            auto* startBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+            auto* startBlock = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                    ->getSuccessor(1);
             b.SetInsertPoint(noPacket);
             b.CreateCall(release, {b.getInt64(1)});
@@ -1088,7 +1089,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
             realCalls.emplace_back(createResult, realCreateThread);
             b.CreateCondBr(b.CreateICmpEQ(createResult, llvm::ConstantPointerNull::get(ptr)),
                            failed, llvm::BasicBlock::Create(ctx, "success", create));
-            auto* success = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
+            auto* success = cflat_llvm::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
             b.SetInsertPoint(failed);
             if (threadFree)
@@ -1397,7 +1398,7 @@ bool LLVMBackend::WriteIsolatedManifest(const std::string& manifestPath, const s
     manifest["format_version"] = 1;
     manifest["compiler_build_id"] = CFLAT_VERSION_STRING;
     manifest["llvm_major"] = LLVM_VERSION_MAJOR;
-    std::string targetTriple = cflat_llvm_compat::GetModuleTripleStr(*module);
+    std::string targetTriple = module->getTargetTriple().str();
     if (targetTriple.empty())
         targetTriple = targetMacOS_ ? "arm64-apple-macosx11.0.0"
             : targetWindows_ ? (platformValue == 32 ? "i686-pc-windows-msvc"
@@ -3375,7 +3376,7 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
     // __vfprintf_chk libc calls back into cflat's own vsnprintf/vfprintf and recurse
     // forever on ELF. Register before registerFunctionAnalyses so it wins.
     llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(
-        llvm::Triple(cflat_llvm_compat::GetModuleTripleStr(*module)));
+        llvm::Triple(module->getTargetTriple().str()));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
@@ -3601,7 +3602,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
         // triple / ELF-shaped defaults it already worked with).
         if (targetMacOS_)
         {
-            cflat_llvm_compat::SetModuleTriple(*module, "arm64-apple-macosx11.0.0");
+            module->setTargetTriple(llvm::Triple("arm64-apple-macosx11.0.0"));
 
             // Apple's asan runtime self-verifies interception at startup by
             // dlsym-ing "puts" and checking it resolves into the asan dylib.
@@ -3732,7 +3733,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
     // intact so they reach libc. Register this TLI before registerFunctionAnalyses so
     // it wins over the default (registerPass is a no-op once an analysis exists).
     llvm::TargetLibraryInfoImpl TLII = MakeStdioSafeTLII(
-        llvm::Triple(cflat_llvm_compat::GetModuleTripleStr(*module)));
+        llvm::Triple(module->getTargetTriple().str()));
     FAM.registerPass([&] { return llvm::TargetLibraryAnalysis(TLII); });
 
     PB.registerModuleAnalyses(MAM);
@@ -3779,7 +3780,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
             std::optional<llvm::DominatorTree> domTree;  // built lazily for this function
             for (auto& BB : F)
             {
-                auto* term = cflat_llvm_compat::GetTerminatorOrNull(&BB);
+                auto* term = cflat_llvm::GetTerminatorOrNull(&BB);
                 if (!term) continue;
                 auto* loopID = term->getMetadata(llvm::LLVMContext::MD_loop);
                 if (!loopID) continue;
@@ -5232,7 +5233,7 @@ bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
     const std::string tripleStr = PlatformTargetTriple(platform);
     const char* triple = tripleStr.c_str();
     std::string err;
-    const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
     if (!target)
     {
         std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -5254,12 +5255,12 @@ bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
     std::vector<std::string> cpus;
     for (const auto& kv : sti->getAllProcessorDescriptions())
     {
-        const char* key = cflat_llvm_compat::SubtargetKey(kv);
+        const char* key = kv.key();
         if (key && *key) cpus.emplace_back(key);
     }
     if (llvm::Triple(tripleStr).isAArch64())
         for (const auto& alias : llvm::AArch64::CpuAliases)
-            cpus.emplace_back(cflat_llvm_compat::AArch64AliasName(alias).str());
+            cpus.emplace_back(llvm::AArch64::StrTab[alias.AltName].str());
     std::sort(cpus.begin(), cpus.end());
     cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
 
@@ -5299,7 +5300,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     llvm::InitializeAllTargetMCs();
 
     std::string err;
-    const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
     if (!target)
     {
         std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -6441,9 +6442,9 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
         ? "e-m:o-i64:64-i128:128-n32:64-S128"
         : PlatformDataLayout(platformValue);
     module->setDataLayout(llvm::DataLayout(dl));
-    cflat_llvm_compat::SetModuleTriple(*module, targetMacOS_ ? "arm64-apple-macosx"
+    module->setTargetTriple(llvm::Triple(targetMacOS_ ? "arm64-apple-macosx"
                             : (platformValue == 32) ? "i686-pc-windows-msvc"
-                                                    : "x86_64-pc-windows-msvc");
+                                                    : "x86_64-pc-windows-msvc"));
     RegisterBuiltinString();
     RegisterBuiltinClosure();   // closure fat type as an owning value type (Option A)
 

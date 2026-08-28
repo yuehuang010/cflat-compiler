@@ -12,7 +12,6 @@
 #include "CClangExtract.h"
 
 #define CFLAT_LLVM_COMPAT_CLANG
-#include "LLVMCompat.h"
 #undef CFLAT_LLVM_COMPAT_CLANG
 
 #include "clang/AST/ASTConsumer.h"
@@ -26,6 +25,7 @@
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/CompilerInstance.h"
 #include "clang/Frontend/CompilerInvocation.h"
+#include "clang/Driver/CreateInvocationFromArgs.h"
 #include "clang/Frontend/FrontendAction.h"
 #include "clang/Frontend/FrontendActions.h"
 #include "clang/Frontend/Utils.h"
@@ -318,7 +318,7 @@ namespace cflat_cinterop
                         {
                             RawField rf;
                             rf.isBitfield = true;
-                            rf.bitWidth = cflat_llvm_compat::GetBitWidthValue(*f, ctx);
+                            rf.bitWidth = f->getBitWidthValue();
                             rf.ctype = CanonicalSpelling(ctx, f->getType());
                             rec.fields.push_back(std::move(rf));
                             continue;
@@ -405,7 +405,7 @@ namespace cflat_cinterop
                     if (f->isBitField())
                     {
                         rf.isBitfield = true;
-                        rf.bitWidth = cflat_llvm_compat::GetBitWidthValue(*f, ctx);
+                        rf.bitWidth = f->getBitWidthValue();
                     }
                     rec.fields.push_back(std::move(rf));
                 }
@@ -722,16 +722,20 @@ namespace cflat_cinterop
             cargs.push_back(inputName.c_str());
 
             llvm::IntrusiveRefCntPtr<DiagnosticIDs> diagIDs(new DiagnosticIDs());
-            cflat_llvm_compat::ClangDiagnosticsState<DiagnosticsEngine,
-                                                      llvm::IntrusiveRefCntPtr<DiagnosticIDs>,
-                                                      DiagnosticOptions>
-                diagState(diagIDs, new IgnoringDiagConsumer());
+            DiagnosticOptions diagOptions;
+            llvm::IntrusiveRefCntPtr<DiagnosticsEngine> diagEngine(
+                new DiagnosticsEngine(diagIDs, diagOptions, new IgnoringDiagConsumer(), true));
 
             std::shared_ptr<CompilerInvocation> invocation;
             {
                 llvm::TimeTraceScope invScope("CreateInvocation", inputName);
                 std::unique_ptr<CompilerInvocation> invocationUP =
-                    cflat_llvm_compat::CreateClangInvocation(cargs, diagState.engine);
+                    [&]() {
+                        clang::CreateInvocationOptions invOptions;
+                        invOptions.Diags = diagEngine;
+                        invOptions.RecoverOnError = true;
+                        return clang::createInvocation(cargs, invOptions);
+                    }();
                 if (!invocationUP) { err = "createInvocation failed"; return false; }
                 // Header binds only need declarations. Skipping function bodies avoids parsing
                 // inline definitions in system headers (e.g. an `&`-taking __inline in math.h
@@ -742,7 +746,7 @@ namespace cflat_cinterop
                 invocation.reset(invocationUP.release());
             }
 
-            auto ci = cflat_llvm_compat::CreateClangCompilerInstance(invocation);
+            auto ci = std::make_unique<clang::CompilerInstance>(std::move(invocation));
             // Own the consumer via the engine, but keep a raw pointer so the prereq tally can be
             // read back after the parse (the engine, hence the consumer, outlives this scope).
             PrereqDiagConsumer* prereqConsumer = new PrereqDiagConsumer();

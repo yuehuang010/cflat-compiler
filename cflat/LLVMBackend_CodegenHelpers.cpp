@@ -1821,8 +1821,8 @@ llvm::StructType* LLVMBackend::VaListTagType()
 
 void LLVMBackend::CreateVaStart(llvm::Value* apAlloca)
 {
-        auto* fn = cflat_llvm_compat::GetVaIntrinsicDecl(module.get(), llvm::Intrinsic::vastart,
-                                                         apAlloca->getType());
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::vastart,
+                                                                { apAlloca->getType() });
         // macOS arm64 (Darwin): va_list is a plain char* (Apple passes every variadic
         // argument on the stack), so the slot IS the va_list - init it directly, exactly
         // like the Windows path. NOT the x86-64 SysV __va_list_tag indirection below.
@@ -1839,8 +1839,8 @@ void LLVMBackend::CreateVaStart(llvm::Value* apAlloca)
 
 void LLVMBackend::CreateVaEnd(llvm::Value* apAlloca)
 {
-        auto* fn = cflat_llvm_compat::GetVaIntrinsicDecl(module.get(), llvm::Intrinsic::vaend,
-                                                         apAlloca->getType());
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::vaend,
+                                                                { apAlloca->getType() });
         if (!targetWindows_ && !targetMacOS_)
         {
             // x86-64 SysV: the slot holds the tag pointer (set by CreateVaStart); va_end takes the tag.
@@ -1871,14 +1871,14 @@ llvm::Value* LLVMBackend::CreateFloatIntrinsic(const std::string& methodName, ll
         else if (methodName == "log10")     id = llvm::Intrinsic::log10;
         else return nullptr;
 
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), id, {floatVal->getType()});
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), id, {floatVal->getType()});
         return builder->CreateCall(fn, {floatVal});
     }
 
 llvm::Value* LLVMBackend::CreateRdtscp()
 {
         // llvm.x86.rdtscp returns { i64 cycles, i32 aux } and takes no arguments.
-        auto* fn   = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::x86_rdtscp);
+        auto* fn   = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::x86_rdtscp);
         auto* call = builder->CreateCall(fn, {});
         return builder->CreateExtractValue(call, { 0u }, "rdtscp");
     }
@@ -1888,14 +1888,14 @@ llvm::Value* LLVMBackend::CreateReadCycleCounter()
         // llvm.readcyclecounter is target-independent: it returns an i64 cycle
         // count and takes no arguments. Lowers to RDTSC on x86, the cycle-count
         // register elsewhere (e.g. mftb/CNTVCT), or 0 where unsupported.
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::readcyclecounter);
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::readcyclecounter);
         return builder->CreateCall(fn, {}, "cyclecount");
     }
 
 void LLVMBackend::CreateLfence()
 {
         // llvm.x86.sse2.lfence returns void and takes no arguments.
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::x86_sse2_lfence);
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::x86_sse2_lfence);
         builder->CreateCall(fn, {});
     }
 
@@ -1907,32 +1907,32 @@ void LLVMBackend::CreateFenceAcquire()
 void LLVMBackend::CreatePause()
 {
         // llvm.x86.sse2.pause returns void and takes no arguments.
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::x86_sse2_pause);
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::x86_sse2_pause);
         builder->CreateCall(fn, {});
     }
 
 llvm::Value* LLVMBackend::CreatePopcount(llvm::Value* intVal)
 {
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::ctpop, { intVal->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::ctpop, { intVal->getType() });
         return builder->CreateCall(fn, { intVal }, "popcount");
     }
 
 llvm::Value* LLVMBackend::CreateCtz(llvm::Value* intVal)
 {
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::cttz, { intVal->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::cttz, { intVal->getType() });
         return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "ctz");
     }
 
 llvm::Value* LLVMBackend::CreateClz(llvm::Value* intVal)
 {
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::ctlz, { intVal->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::ctlz, { intVal->getType() });
         return builder->CreateCall(fn, { intVal, llvm::ConstantInt::getFalse(*context) }, "clz");
     }
 
 void LLVMBackend::CreatePrefetch(llvm::Value* addr)
 {
         auto* i32ty = llvm::Type::getInt32Ty(*context);
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::prefetch, { addr->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::prefetch, { addr->getType() });
         builder->CreateCall(fn, {
             addr,
             llvm::ConstantInt::get(i32ty, 0),   // rw: 0 = read
@@ -1942,13 +1942,13 @@ void LLVMBackend::CreatePrefetch(llvm::Value* addr)
 
 llvm::Value* LLVMBackend::CreateFma(llvm::Value* a, llvm::Value* b, llvm::Value* c)
 {
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::fma, { a->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::fma, { a->getType() });
         return builder->CreateCall(fn, { a, b, c }, "fma");
     }
 
 llvm::Value* LLVMBackend::CreateExpect(llvm::Value* cond, bool expected)
 {
-        auto* fn = cflat_llvm_compat::GetIntrinsicDecl(module.get(), llvm::Intrinsic::expect, { cond->getType() });
+        auto* fn = llvm::Intrinsic::getOrInsertDeclaration(module.get(), llvm::Intrinsic::expect, { cond->getType() });
         return builder->CreateCall(fn, { cond, llvm::ConstantInt::get(cond->getType(), expected ? 1 : 0) }, "expect");
     }
 

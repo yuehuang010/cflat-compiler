@@ -273,7 +273,7 @@ bool LLVMBackend::IsBlockTerminated()
 void LLVMBackend::ReopenAfterTerminator()
 {
         auto* bb = builder->GetInsertBlock();
-        if (bb == nullptr || bb->getParent() == nullptr || cflat_llvm_compat::GetTerminatorOrNull(bb) == nullptr)
+        if (bb == nullptr || bb->getParent() == nullptr || cflat_llvm::GetTerminatorOrNull(bb) == nullptr)
             return;
         builder->SetInsertPoint(CreateBasicBlock("unreachable", bb->getParent()));
     }
@@ -329,8 +329,8 @@ void LLVMBackend::CreateContinueCall()
 
 void LLVMBackend::AttachVectorizeHintToCurrentLatch(int sourceLine)
 {
-        auto* term = cflat_llvm_compat::GetTerminatorOrNull(builder->GetInsertBlock());
-        if (!cflat_llvm_compat::IsBranch(term))
+        auto* term = cflat_llvm::GetTerminatorOrNull(builder->GetInsertBlock());
+        if (!llvm::isa_and_nonnull<llvm::UncondBrInst, llvm::CondBrInst>(term))
             return;  // body did not fall through to a back-edge (e.g. ended in return)
 
         auto* i1True = llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context), 1);

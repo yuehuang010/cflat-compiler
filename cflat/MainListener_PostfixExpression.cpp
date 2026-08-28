@@ -651,7 +651,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                 auto* compiler = Compiler(ctx);
                 if (!compiler->IsBlockTerminated())
                     compiler->builder->CreateUnreachable();
-                if (ncChainNullBlock != nullptr && cflat_llvm_compat::GetTerminatorOrNull(ncChainNullBlock) == nullptr)
+                if (ncChainNullBlock != nullptr && cflat_llvm::GetTerminatorOrNull(ncChainNullBlock) == nullptr)
                 {
                     compiler->SwitchToBlock(ncChainNullBlock);
                     compiler->builder->CreateUnreachable();
