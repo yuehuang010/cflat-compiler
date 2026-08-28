@@ -721,7 +721,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
                        llvm::BasicBlock::Create(ctx, "store", heapMalloc));
-        auto* store = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* store = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                           ->getSuccessor(1);
         b.SetInsertPoint(null);
         b.CreateCall(heapRelease, {size});
@@ -743,7 +743,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* user = heapFree->getArg(0);
         b.CreateCondBr(b.CreateICmpEQ(user, llvm::ConstantPointerNull::get(ptr)), done,
                        llvm::BasicBlock::Create(ctx, "release", heapFree));
-        auto* release = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* release = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                             ->getSuccessor(1);
         b.SetInsertPoint(release);
         auto* header = headerFor(b, user);
@@ -786,7 +786,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)), null,
                        llvm::BasicBlock::Create(ctx, "store", wrapper));
-        auto* store = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* store = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                           ->getSuccessor(1);
         b.SetInsertPoint(null);
         b.CreateCall(heapRelease, {productValue});
@@ -840,9 +840,9 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCondBr(b.CreateICmpUGT(newSize, oldSize),
                        llvm::BasicBlock::Create(ctx, "call_grow", wrapper),
                        llvm::BasicBlock::Create(ctx, "call_shrink", wrapper));
-        auto* callGrow = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* callGrow = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                              ->getSuccessor(0);
-        auto* callShrink = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* callShrink = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                ->getSuccessor(1);
         b.SetInsertPoint(callGrow);
         auto* growTotal = b.CreateAdd(newSize, b.getInt64(16));
@@ -871,9 +871,9 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCondBr(b.CreateICmpUGT(oldSize, newSize),
                        llvm::BasicBlock::Create(ctx, "release_shrink", wrapper),
                        llvm::BasicBlock::Create(ctx, "return", wrapper));
-        auto* releaseShrink = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* releaseShrink = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                   ->getSuccessor(0);
-        auto* returnBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* returnBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
         b.SetInsertPoint(releaseShrink);
         b.CreateCall(heapRelease, {b.CreateSub(oldSize, newSize)});
@@ -924,7 +924,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* raw = rawCallInst;
         b.CreateCondBr(b.CreateICmpEQ(raw, llvm::ConstantPointerNull::get(ptr)),
                        llvm::BasicBlock::Create(ctx, "alloc_fail", wrapper), store);
-        auto* allocFail = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+        auto* allocFail = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                               ->getSuccessor(0);
         b.SetInsertPoint(allocFail);
         b.CreateCall(heapRelease, {total});
@@ -997,7 +997,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
                                            {b.getInt64(16)});
             b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
                            noPacket, llvm::BasicBlock::Create(ctx, "start", create));
-            auto* startBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+            auto* startBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                    ->getSuccessor(1);
             b.SetInsertPoint(noPacket);
             b.CreateCall(release, {b.getInt64(1)});
@@ -1012,7 +1012,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
             realCalls.emplace_back(createResult, realCreate);
             b.CreateCondBr(b.CreateICmpNE(createResult, b.getInt32(0)), failed,
                            llvm::BasicBlock::Create(ctx, "success", create));
-            auto* success = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+            auto* success = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
             b.SetInsertPoint(failed);
             if (threadFree)
@@ -1070,7 +1070,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
                                            {b.getInt64(16)});
             b.CreateCondBr(b.CreateICmpEQ(packetValue, llvm::ConstantPointerNull::get(ptr)),
                            noPacket, llvm::BasicBlock::Create(ctx, "start", create));
-            auto* startBlock = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+            auto* startBlock = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                    ->getSuccessor(1);
             b.SetInsertPoint(noPacket);
             b.CreateCall(release, {b.getInt64(1)});
@@ -1088,7 +1088,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
             realCalls.emplace_back(createResult, realCreateThread);
             b.CreateCondBr(b.CreateICmpEQ(createResult, llvm::ConstantPointerNull::get(ptr)),
                            failed, llvm::BasicBlock::Create(ctx, "success", create));
-            auto* success = llvm::cast<llvm::BranchInst>(b.GetInsertBlock()->getTerminator())
+            auto* success = cflat_llvm_compat::GetTerminatorOrNull(b.GetInsertBlock())
                                 ->getSuccessor(1);
             b.SetInsertPoint(failed);
             if (threadFree)
@@ -3615,7 +3615,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
             // override hook (a strong definition here wins over the runtime's
             // own weak default).
             llvm::IRBuilder<> optsBuilder(*context);
-            llvm::Constant* optsStr = optsBuilder.CreateGlobalStringPtr(
+            llvm::Constant* optsStr = optsBuilder.CreateGlobalString(
                 "verify_interceptors=0", "asan_default_options_str", 0, module.get());
             llvm::FunctionType* optsFnTy =
                 llvm::FunctionType::get(llvm::PointerType::get(*context, 0), false);
@@ -3779,7 +3779,7 @@ void LLVMBackend::OptimizeModule(int optimizationLevel)
             std::optional<llvm::DominatorTree> domTree;  // built lazily for this function
             for (auto& BB : F)
             {
-                auto* term = BB.getTerminator();
+                auto* term = cflat_llvm_compat::GetTerminatorOrNull(&BB);
                 if (!term) continue;
                 auto* loopID = term->getMetadata(llvm::LLVMContext::MD_loop);
                 if (!loopID) continue;

@@ -273,7 +273,7 @@ bool LLVMBackend::IsBlockTerminated()
 void LLVMBackend::ReopenAfterTerminator()
 {
         auto* bb = builder->GetInsertBlock();
-        if (bb == nullptr || bb->getParent() == nullptr || bb->getTerminator() == nullptr)
+        if (bb == nullptr || bb->getParent() == nullptr || cflat_llvm_compat::GetTerminatorOrNull(bb) == nullptr)
             return;
         builder->SetInsertPoint(CreateBasicBlock("unreachable", bb->getParent()));
     }
@@ -329,9 +329,8 @@ void LLVMBackend::CreateContinueCall()
 
 void LLVMBackend::AttachVectorizeHintToCurrentLatch(int sourceLine)
 {
-        auto* term = builder->GetInsertBlock()->getTerminator();
-        auto* br = llvm::dyn_cast_or_null<llvm::BranchInst>(term);
-        if (!br)
+        auto* term = cflat_llvm_compat::GetTerminatorOrNull(builder->GetInsertBlock());
+        if (!cflat_llvm_compat::IsBranch(term))
             return;  // body did not fall through to a back-edge (e.g. ended in return)
 
         auto* i1True = llvm::ConstantInt::get(llvm::Type::getInt1Ty(*context), 1);
@@ -352,7 +351,7 @@ void LLVMBackend::AttachVectorizeHintToCurrentLatch(int sourceLine)
         llvm::SmallVector<llvm::Metadata*, 3> ops{ nullptr, enableMD, lineMD };
         auto* loopID = llvm::MDNode::getDistinct(*context, ops);
         loopID->replaceOperandWith(0, loopID);
-        br->setMetadata(llvm::LLVMContext::MD_loop, loopID);
+        term->setMetadata(llvm::LLVMContext::MD_loop, loopID);
     }
 
 std::string LLVMBackend::GetSourceFileName() const

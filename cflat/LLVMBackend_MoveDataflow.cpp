@@ -347,7 +347,7 @@ const llvm::Constant* LLVMBackend::NullIfaceStoredConstant(const llvm::Value* v)
         const llvm::Constant* result = nullptr;
         for (const llvm::BasicBlock& b : *callee)
         {
-            const auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(b.getTerminator());
+            const auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm_compat::GetTerminatorOrNull(&b));
             if (ret == nullptr) continue;
             if (result != nullptr) return nullptr;
             const auto* rv = llvm::dyn_cast_or_null<llvm::Constant>(ret->getReturnValue());

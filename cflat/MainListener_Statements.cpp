@@ -2669,7 +2669,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;  // manual check after block
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 auto* entryBB = compilerLLVM->builder->GetInsertBlock();
-                bool entryWasUnterminated = entryBB != nullptr && entryBB->getTerminator() == nullptr;
+                bool entryWasUnterminated = entryBB != nullptr && cflat_llvm_compat::GetTerminatorOrNull(entryBB) == nullptr;
                 // Rewind point for the per-function pending logs (see PendingAnalysisMark).
                 auto* markedFn = entryBB != nullptr ? entryBB->getParent() : nullptr;
                 auto pendingMark = compilerLLVM->MarkPendingAnalyses(markedFn);
@@ -2708,7 +2708,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         {
                             if (&abandoned == resume)
                                 continue;
-                            if (abandoned.getTerminator() == nullptr)
+                            if (cflat_llvm_compat::GetTerminatorOrNull(&abandoned) == nullptr)
                             {
                                 compilerLLVM->builder->SetInsertPoint(&abandoned);
                                 compilerLLVM->builder->CreateUnreachable();
@@ -2716,7 +2716,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         }
                         if (entryWasUnterminated && entryBB->getParent() == function)
                         {
-                            if (auto* terminator = entryBB->getTerminator())
+                            if (auto* terminator = cflat_llvm_compat::GetTerminatorOrNull(entryBB))
                                 terminator->eraseFromParent();
                             compilerLLVM->builder->SetInsertPoint(entryBB);
                             compilerLLVM->builder->CreateBr(resume);

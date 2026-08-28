@@ -31,6 +31,42 @@
 namespace cflat_llvm_compat
 {
 
+// LLVM 23 turned BasicBlock::getTerminator() into an asserting accessor that
+// returns the list sentinel when the block has no terminator, and added
+// getTerminatorOrNull() for the nullable query. cflat uses the nullable form
+// throughout, and because LLVM is built with assertions off the 23 accessor
+// would silently hand back garbage instead of null.
+inline llvm::Instruction* GetTerminatorOrNull(llvm::BasicBlock* block)
+{
+    if (block == nullptr) return nullptr;
+#if LLVM_VERSION_MAJOR >= 23
+    return block->getTerminatorOrNull();
+#else
+    return block->getTerminator();
+#endif
+}
+
+inline const llvm::Instruction* GetTerminatorOrNull(const llvm::BasicBlock* block)
+{
+    if (block == nullptr) return nullptr;
+#if LLVM_VERSION_MAJOR >= 23
+    return block->getTerminatorOrNull();
+#else
+    return block->getTerminator();
+#endif
+}
+
+// LLVM 23 split the Br opcode into UncondBr/CondBr and deprecated BranchInst.
+// isa_and_nonnull because the terminator query above is nullable.
+inline bool IsBranch(const llvm::Instruction* terminator)
+{
+#if LLVM_VERSION_MAJOR >= 23
+    return llvm::isa_and_nonnull<llvm::UncondBrInst, llvm::CondBrInst>(terminator);
+#else
+    return llvm::isa_and_nonnull<llvm::BranchInst>(terminator);
+#endif
+}
+
 // AArch64 keeps CPU aliases (apple-m1, cyclone, ...) out of the subtarget's
 // processor table, so enumerating CPUs has to merge them in separately. The
 // field holding the alias spelling was renamed AltName in LLVM 21.

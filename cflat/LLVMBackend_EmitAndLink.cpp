@@ -1535,7 +1535,7 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         // (report-only); reportLeaks itself prints every live allocation to stderr.
         for (llvm::BasicBlock& bb : *mainFn)
         {
-            auto* ret = llvm::dyn_cast<llvm::ReturnInst>(bb.getTerminator());
+            auto* ret = llvm::dyn_cast_or_null<llvm::ReturnInst>(cflat_llvm_compat::GetTerminatorOrNull(&bb));
             if (!ret) continue;
             llvm::IRBuilder<> b(ret);
             b.SetCurrentDebugLocation(debugLocNear(ret));

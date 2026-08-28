@@ -898,7 +898,7 @@ bool MainListener::NestedJoinArmsBoxable(llvm::Value* value, const std::string& 
         for (const auto& arm : arms)
         {
             if (arm.Value == nullptr || arm.Block == nullptr) return false;
-            if (arm.Block->getTerminator() == nullptr) return false;
+            if (cflat_llvm_compat::GetTerminatorOrNull(arm.Block) == nullptr) return false;
             if (llvm::isa<llvm::ConstantPointerNull>(arm.Value)) continue;
             ResolvedJoinArmClass resolved;
             if (!ResolveJoinArmClass(arm.Value, resolved))
@@ -1073,7 +1073,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                 // other), so it has no class of its own - box it recursively in its own block.
                 std::string nestedFailure;
                 if (NestedJoinArmsBoxable(incoming, interfaceName, &nestedFailure)
-                    && arms[i].Block->getTerminator() != nullptr)
+                    && cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block) != nullptr)
                 {
                     armIsNestedJoin[i] = true;
                     continue;
@@ -1091,7 +1091,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                     *armFailure = std::format("'{}' does not implement it", armTypes[i]);
                 return nullptr;
             }
-            if (arms[i].Block->getTerminator() == nullptr) return nullptr;
+            if (cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block) == nullptr) return nullptr;
             /*
              * A 'move' return transfers EVERY arm, so an arm that owns nothing would hand the
              * caller a second owner of a live borrow (double free). The whole-expression check on
@@ -1151,7 +1151,7 @@ llvm::Value* MainListener::BoxInterfaceJoinArms(const std::vector<InterfaceJoinA
                 boxed[i] = llvm::Constant::getNullValue(fatTy);
                 continue;
             }
-            compiler->builder->SetInsertPoint(arms[i].Block->getTerminator());
+            compiler->builder->SetInsertPoint(cflat_llvm_compat::GetTerminatorOrNull(arms[i].Block));
             auto* vtable = compiler->GetOrCreateVTable(armTypes[i], interfaceName);
             llvm::Value* armData = arms[i].Value;
             boxed[i] = compiler->BuildInterfaceFatValue(vtable, armData);
@@ -4387,7 +4387,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
             for (auto* bb : { trueBlock, falseBlock })
             {
-                if (bb->getTerminator() != nullptr) continue;
+                if (cflat_llvm_compat::GetTerminatorOrNull(bb) != nullptr) continue;
                 compiler->SwitchToBlock(bb);
                 compiler->builder->CreateBr(resumeBlock);
             }
@@ -4404,12 +4404,12 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // may be void calls, so it has no value to join and no PHI/select type to unify.
         if (use == ResultUse::Discard)
         {
-            if (trueEnd != nullptr && trueEnd->getTerminator() == nullptr)
+            if (trueEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(trueEnd) == nullptr)
             {
                 compiler->builder->SetInsertPoint(trueEnd);
                 compiler->CreateJump(resumeBlock);
             }
-            if (falseEnd != nullptr && falseEnd->getTerminator() == nullptr)
+            if (falseEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(falseEnd) == nullptr)
             {
                 compiler->builder->SetInsertPoint(falseEnd);
                 compiler->CreateJump(resumeBlock);
@@ -4420,8 +4420,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         // An arm whose own lowering terminated its block never reaches the join; the ternary can
         // then only yield the other arm, so no PHI is needed (and none is legal).
-        bool trueLive = trueEnd != nullptr && trueEnd->getTerminator() == nullptr;
-        bool falseLive = falseEnd != nullptr && falseEnd->getTerminator() == nullptr;
+        bool trueLive = trueEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(trueEnd) == nullptr;
+        bool falseLive = falseEnd != nullptr && cflat_llvm_compat::GetTerminatorOrNull(falseEnd) == nullptr;
         if (!trueLive || !falseLive)
         {
             if (trueLive)
@@ -4696,7 +4696,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 if (compiler->IsInsertBlockLive()) compiler->builder->CreateBr(resumeBlock);
                 for (auto* block : { nullBlock, notNullBlock })
                 {
-                    if (block->getTerminator() == nullptr)
+                    if (cflat_llvm_compat::GetTerminatorOrNull(block) == nullptr)
                     {
                         compiler->SwitchToBlock(block);
                         compiler->builder->CreateBr(resumeBlock);
@@ -4778,7 +4778,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // In a function, branch so only the selected arm runs. A constant context (enum,
                 // bitfield width, alignas, global init) has no live block and keeps the eager form.
                 auto* insertBB = compiler->builder->GetInsertBlock();
-                if (insertBB != nullptr && insertBB->getTerminator() == nullptr
+                if (insertBB != nullptr && cflat_llvm_compat::GetTerminatorOrNull(insertBB) == nullptr
                     && compiler->currentFunction != nullptr
                     && insertBB->getParent() == compiler->currentFunction)
                 {

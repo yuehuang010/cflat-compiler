@@ -359,7 +359,7 @@ namespace nulldf
             llvm::BasicBlock* bb = work.back();
             work.pop_back();
             if (BlockTerminatesProgram(bb, proven)) continue;
-            if (llvm::isa<llvm::ReturnInst>(bb->getTerminator())) return false;
+            if (llvm::isa<llvm::ReturnInst>(cflat_llvm_compat::GetTerminatorOrNull(bb))) return false;
             for (llvm::BasicBlock* s : llvm::successors(bb))
                 if (seen.insert(s).second) work.push_back(s);
         }

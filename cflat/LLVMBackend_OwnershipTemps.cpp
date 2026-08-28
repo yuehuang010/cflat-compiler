@@ -1835,7 +1835,7 @@ bool LLVMBackend::FunctionBodyIsReadable(const llvm::Function* fn) const
 {
         if (fn == nullptr || fn->isDeclaration()) return false;
         for (const auto& bb : *fn)
-            if (bb.getTerminator() == nullptr) return false;
+            if (cflat_llvm_compat::GetTerminatorOrNull(&bb) == nullptr) return false;
         return true;
     }
 
@@ -3019,7 +3019,7 @@ void LLVMBackend::UnregisterOwnedPtrTemp(llvm::Value* value)
 bool LLVMBackend::IsInsertBlockLive() const
 {
         auto* b = builder->GetInsertBlock();
-        return b != nullptr && b->getTerminator() == nullptr;
+        return b != nullptr && cflat_llvm_compat::GetTerminatorOrNull(b) == nullptr;
     }
 
 bool LLVMBackend::OwnedTempDominatesHere(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock,
@@ -3251,7 +3251,7 @@ void LLVMBackend::EmitOwnedStructTempFree(const PendingOwnedStructTemp& temp)
 
 bool LLVMBackend::HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::BasicBlock* hoistTo)
 {
-        if (hoistTo == nullptr || hoistTo->getTerminator() == nullptr) return false;
+        if (hoistTo == nullptr || cflat_llvm_compat::GetTerminatorOrNull(hoistTo) == nullptr) return false;
         if (!IsInsertBlockLive()) return false;   // no live point in the arm to set the flag from
         auto* alloca = llvm::dyn_cast_or_null<llvm::AllocaInst>(temp.Alloca);
         if (alloca == nullptr || alloca->getFunction() != hoistTo->getParent()) return false;
@@ -3269,7 +3269,7 @@ bool LLVMBackend::HoistOwnedStructTempTo(PendingOwnedStructTemp& temp, llvm::Bas
             temp.LiveFlag = AllocaAtEntry(builder->getInt1Ty(), nullptr, "owntemp.livef");
             builder->CreateStore(builder->getInt1(true), temp.LiveFlag);
         }
-        builder->SetInsertPoint(hoistTo->getTerminator());
+        builder->SetInsertPoint(cflat_llvm_compat::GetTerminatorOrNull(hoistTo));
         builder->CreateStore(llvm::Constant::getNullValue(alloca->getAllocatedType()), alloca);
         builder->CreateStore(builder->getInt1(false), temp.LiveFlag);
         if (saveBlock != nullptr) builder->SetInsertPoint(saveBlock, savePoint);
@@ -3281,7 +3281,7 @@ bool LLVMBackend::HoistOwnedStringTempTo(llvm::Value* value, llvm::BasicBlock* h
 {
         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
         if (value == nullptr || strTy == nullptr || value->getType() != strTy) return false;
-        if (hoistTo == nullptr || hoistTo->getTerminator() == nullptr) return false;
+        if (hoistTo == nullptr || cflat_llvm_compat::GetTerminatorOrNull(hoistTo) == nullptr) return false;
         auto* inst = llvm::dyn_cast<llvm::Instruction>(value);
         if (inst == nullptr || inst->getFunction() != hoistTo->getParent()) return false;
         if (inst->isTerminator() || inst->getNextNode() == nullptr) return false;
@@ -3294,7 +3294,7 @@ bool LLVMBackend::HoistOwnedStringTempTo(llvm::Value* value, llvm::BasicBlock* h
         auto* slot = AllocaAtEntry(strTy, nullptr, "nc.strtmp");
         // Zero it in the dominating block: on the short-circuit path the store below never runs,
         // and a zeroed string makes the destructor a no-op.
-        builder->SetInsertPoint(hoistTo->getTerminator());
+        builder->SetInsertPoint(cflat_llvm_compat::GetTerminatorOrNull(hoistTo));
         builder->CreateStore(llvm::Constant::getNullValue(strTy), slot);
         builder->SetInsertPoint(inst->getNextNode());
         builder->CreateStore(value, slot);

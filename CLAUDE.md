@@ -153,8 +153,17 @@ incremental re-bump); what stays is the ~3.3 GB install tree plus the ~1.9 GB so
 clone, both shared by every worktree. Budget ~35-60
 min for the LLVM build (it is mandatory: no RTTI-enabled LLVM prebuilt exists for Windows,
 and vcpkg's port is stuck at 18). It builds only the `/MT` LLVM, which is what cflat Release
-links; **`cmake_build.bat debug` needs a second `/MTd` install that the script does not build
-yet**. See `internal/plan/llvm-version-migration.md`.
+links; **`cmake_build.bat debug` needs a second install that the script does not build
+yet** - `/MTd` CRT **and `LLVM_ENABLE_ASSERTIONS=ON`**, installed to
+`llvm-<ver>-assert`, which is what the Debug presets now point at. See
+`internal/plan/llvm-version-migration.md` and the
+[Two installs](internal/plan/llvm-from-source-build.md) section for the recipe.
+
+**Debug links an assertions-enabled LLVM on purpose.** Release builds LLVM with
+`LLVM_ENABLE_ASSERTIONS=OFF`, so LLVM APIs that assert on misuse instead return
+garbage silently - the LLVM 23 `getTerminator()` change is a worked example in that
+doc. Debug is the only config where that safety net can exist, so keep the two
+installs in sync when bumping the LLVM version.
 
 The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/plan/llvm-version-migration.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
 
