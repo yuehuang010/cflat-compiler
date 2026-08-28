@@ -1630,11 +1630,13 @@ bool LLVMBackend::JitRun(int& runExitCode)
         jitBuilder.setJITTargetMachineBuilder(std::move(*jtmb));
 #if defined(_WIN32)
         jitBuilder.setObjectLinkingLayerCreator(
-            // LLVM 21 dropped the Triple parameter from ObjectLinkingLayerCreator; the
-            // trailing pack makes the lambda convertible to either signature.
-            [](llvm::orc::ExecutionSession& ES, auto&&...)
+            // LLVM 21 dropped the Triple parameter from ObjectLinkingLayerCreator; LLVM 23
+            // added a JITLinkMemoryManager& and removed the ES-only ObjectLinkingLayer ctor,
+            // so pass through the memory manager LLJIT owns instead of making our own.
+            [](llvm::orc::ExecutionSession& ES,
+               llvm::jitlink::JITLinkMemoryManager& memMgr)
                 -> llvm::Expected<std::unique_ptr<llvm::orc::ObjectLayer>> {
-                auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES);
+                auto ol = std::make_unique<llvm::orc::ObjectLinkingLayer>(ES, memMgr);
                 // Under LLJIT, the IR layer pre-computes symbol flags from the IR; JITLink
                 // recomputes them from the linked COFF object and they can disagree
                 // (weak/COMDAT constants), tripping ORC's "Resolving symbol with incorrect
