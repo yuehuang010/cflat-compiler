@@ -30,7 +30,12 @@
       "name": "win-x64-debug",
       "displayName": "Windows x64 Debug",
       "inherits": "win-x64",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LLVM_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/llvm",
+        "Clang_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/bin"
+      }
     },
     {
       "name": "win-x64-release",
@@ -82,7 +87,12 @@
       "name": "macos-arm64-debug",
       "displayName": "macOS arm64 Debug - Stage 4 (prepare)",
       "inherits": "macos-arm64",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/llvm",
+        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/bin"
+      }
     },
     {
       "name": "macos-arm64-release",

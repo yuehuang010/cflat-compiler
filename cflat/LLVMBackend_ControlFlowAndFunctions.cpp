@@ -1054,8 +1054,100 @@ static bool IsImplicitEntryMain(const std::string& functionName,
         return a1.Pointer && a1.ElemPointer;
     }
 
+/*
+ * Rebuild the real FunctionType for every signature that was declared while one of its
+ * by-value aggregates was still an opaque shell, now that the main pass has set that body.
+ * Nothing here computes a layout: the signature is recomputed from the SAME completed
+ * StructType the main pass built, and the provisional body-less declaration is replaced.
+ */
+void LLVMBackend::FlushPendingFunctionDeclarations()
+{
+        if (flushingPendingDeclarations_ || pendingFunctionDeclarations_.empty()) return;
+        flushingPendingDeclarations_ = true;
+        auto parked = std::move(pendingFunctionDeclarations_);
+        pendingFunctionDeclarations_.clear();
+        for (auto& d : parked)
+        {
+            // Still incomplete: park it again, untouched.
+            if (FindIncompleteByValueAggregate(d.Arguments, d.External) != nullptr)
+            {
+                pendingFunctionDeclarations_.push_back(std::move(d));
+                continue;
+            }
+
+            AbiRecipe recipe;
+            bool useRecipe = false;
+            if (d.External)
+            {
+                recipe = ComputeAbiRecipe(d.ReturnType, d.Arguments);
+                useRecipe = recipe.hasLowering;
+            }
+            llvm::FunctionType* wanted = useRecipe
+                ? BuildExternFunctionType(d.ReturnType, d.Arguments, d.Varargs, recipe)
+                : GetFunctionType(d.ReturnType, d.Arguments, d.Varargs, d.External);
+
+            llvm::Function* provisional = module->getFunction(d.MangledName);
+            if (provisional == nullptr || wanted == nullptr
+                || provisional->getFunctionType() == wanted)
+                continue;
+            if (!provisional->empty() || !provisional->use_empty())
+            {
+                LogError(std::format(
+                    "'{}' was used before the by-value type in its signature was complete, so its "
+                    "calling convention cannot be repaired. Define that type before the signature.",
+                    d.FunctionName));
+                continue;
+            }
+
+            auto conv = provisional->getCallingConv();
+            provisional->setName(d.MangledName + ".provisional");
+            llvm::Function* repaired = createFunctionProto(d.MangledName, wanted);
+            repaired->setCallingConv(conv);
+            if (useRecipe)
+                ApplyAbiAttributes(repaired, recipe);
+            provisional->replaceAllUsesWith(repaired);
+            provisional->eraseFromParent();
+
+            auto it = functionTable.find(d.FunctionName);
+            if (it != functionTable.end())
+                for (auto& sym : it->second)
+                    if (sym.UniqueName == d.MangledName)
+                    {
+                        sym.Function = repaired;
+                        if (d.External) sym.Recipe = recipe;
+                    }
+        }
+        flushingPendingDeclarations_ = false;
+    }
+
+// Module end: nothing else will complete these aggregates. A provisional declaration that is
+// actually used from here on would carry the wrong ABI, so report it instead.
+void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
+{
+        FlushPendingFunctionDeclarations();
+        auto leftovers = std::move(pendingFunctionDeclarations_);
+        pendingFunctionDeclarations_.clear();
+        for (const auto& d : leftovers)
+        {
+            llvm::Function* fn = module ? module->getFunction(d.MangledName) : nullptr;
+            if (fn == nullptr || (fn->empty() && fn->use_empty())) continue;
+            auto* incomplete = FindIncompleteByValueAggregate(d.Arguments, d.External);
+            LogError(std::format(
+                "type '{}' is never completed, so '{}' cannot take it by value. "
+                "Define the type's body, or pass it by pointer.",
+                incomplete != nullptr ? incomplete->getName().str() : std::string("<unknown>"),
+                d.FunctionName));
+        }
+    }
+
 void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
 {
+        // ForwardRefScanner registers signatures before any struct BODY exists. An opaque
+        // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
+        // PROVISIONAL signature and re-derived by FlushPendingFunctionDeclarations once the main
+        // pass sets the real body. Registration order in functionTable is unchanged.
+        bool provisional = FindIncompleteByValueAggregate(arguments, external) != nullptr;
+
         if (external)
         {
             auto it = functionTable.find(functionName);
@@ -1070,7 +1162,7 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
         // recipe has no lowering (scalar/pointer only) the existing GetFunctionType path is used.
         AbiRecipe recipe;
         bool useRecipe = false;
-        if (external)
+        if (external && !provisional)
         {
             recipe = ComputeAbiRecipe(returnType, arguments);
             useRecipe = recipe.hasLowering;
@@ -1078,7 +1170,7 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
 
         llvm::FunctionType* functionType = useRecipe
             ? BuildExternFunctionType(returnType, arguments, varargs, recipe)
-            : GetFunctionType(returnType, arguments, varargs, external);
+            : GetFunctionType(returnType, arguments, varargs, external, provisional);
         // Only a `main` declared in the root translation unit is the program entry point -
         // an imported library's own `main` must mangle normally or it collides with the app's.
         bool entryMain = !external && currentSourceFilePath_ == analyzedRootPath_
@@ -1148,6 +1240,16 @@ void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBacken
             }
 
             symList.push_back(funcSym);
+
+            if (provisional)
+                pendingFunctionDeclarations_.push_back(PendingFunctionDeclaration{
+                    .FunctionName = functionName,
+                    .MangledName = mangledName,
+                    .ReturnType = returnType,
+                    .Arguments = arguments,
+                    .External = external,
+                    .Varargs = varargs,
+                });
         }
     }
 
@@ -1167,6 +1269,20 @@ void LLVMBackend::SetFunctionRequiredLocks(const std::string& functionName, std:
             it->second.back().RequiredLocks = std::move(locks);
     }
 
+static llvm::StructType* AsOpaqueStruct(llvm::Type* type)
+{
+        auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(type);
+        return (structTy != nullptr && structTy->isOpaque()) ? structTy : nullptr;
+    }
+
+// LLVM rejects an unsized (opaque) PARAMETER type - isValidArgumentType - but accepts an
+// opaque RETURN type, which stays correct on its own because setBody completes the very same
+// StructType object. So only parameters ever need a stand-in.
+static llvm::Type* SizedParamOrPlaceholder(llvm::Type* type, llvm::IRBuilder<>& b)
+{
+        return AsOpaqueStruct(type) != nullptr ? b.getInt8Ty() : type;
+    }
+
 llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
 {
         std::vector<llvm::Type*> paramTypes;
@@ -1174,7 +1290,7 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         {
             TypeAndValue pTV; pTV.TypeName = p.TypeName; pTV.Pointer = p.Pointer;
             pTV.IsMove = p.IsMove;
-            paramTypes.push_back(GetType(pTV));
+            paramTypes.push_back(SizedParamOrPlaceholder(GetType(pTV), *builder));
             if (ParameterCarriesRawArrayCount(pTV))
                 paramTypes.push_back(builder->getInt64Ty());
         }
@@ -1234,17 +1350,42 @@ llvm::Type* LLVMBackend::GetCCompatibleType(const TypeAndValue& tv) const
         return GetType(tv);
     }
 
-llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs, bool externC)
+llvm::StructType* LLVMBackend::FindIncompleteByValueAggregate(
+        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool externC)
 {
+        // Mirrors the parameter type selection in GetFunctionType below: anything it wraps in a
+        // pointer is legal while opaque, so only the raw by-value shapes are inspected here.
+        for (const LLVMBackend::TypeAndValue& arg : arguments)
+        {
+            if (!externC && ParameterIsAliasByPointer(arg)) continue;
+            if (auto* opaque = AsOpaqueStruct(externC ? GetCCompatibleType(arg) : GetType(arg)))
+                return opaque;
+        }
+        return nullptr;
+    }
+
+llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs, bool externC, bool allowIncomplete)
+{
+        // Last line of defence: an opaque aggregate is not a valid LLVM argument type.
+        // Report it instead of letting llvm::FunctionType::get assert.
+        llvm::StructType* incomplete = FindIncompleteByValueAggregate(arguments, externC);
+        if (incomplete != nullptr && !allowIncomplete)
+            LogError(std::format(
+                "type '{}' is incomplete here, so it cannot be passed by value. "
+                "Define its body before this signature, or pass it by pointer.",
+                incomplete->getName().str()));
+
         std::vector<llvm::Type*> types;
         types.reserve(arguments.size());
+
+        auto sized = [this](llvm::Type* type) { return SizedParamOrPlaceholder(type, *builder); };
 
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
             if (!externC && ParameterIsAliasByPointer(arg))
                 types.emplace_back(GetType(arg)->getPointerTo());
             else
-                types.emplace_back(externC ? GetCCompatibleType(arg) : GetType(arg));
+                types.emplace_back(sized(externC ? GetCCompatibleType(arg) : GetType(arg)));
             if (!externC && ParameterCarriesRawArrayCount(arg))
                 types.emplace_back(builder->getInt64Ty());
         }
@@ -1327,6 +1468,9 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
 
 llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
 {
+        // A signature parked during the scan must reach the function table before this body
+        // (and its call sites) are emitted.
+        FlushPendingFunctionDeclarations();
         AbiRecipe recipe;
         bool useRecipe = false;
         if (external)

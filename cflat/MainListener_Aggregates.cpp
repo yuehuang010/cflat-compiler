@@ -275,6 +275,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             // so that alloca/sizeof work correctly (e.g. when passed via interface).
             if (structType->isOpaque())
                 structType->setBody(llvm::ArrayRef<llvm::Type*>());
+            compiler->FlushPendingFunctionDeclarations();
         }
         if (compiler->IsVerbose())
             std::cout << "[verbose]     create default ctor: " << structName << "\n";
@@ -2020,6 +2021,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
         auto* structType = compiler->CreateStructType(name, declList);
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        compiler->FlushPendingFunctionDeclarations();
 
         // Create default constructor
         {
@@ -2368,6 +2370,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
         auto* structType = compiler->CreateStructType(name, declList);
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        compiler->FlushPendingFunctionDeclarations();
 
         // Create default constructor (same pattern as ParseStructDefinition)
         {
@@ -2905,6 +2908,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
         // so that alloca/sizeof work correctly (e.g. when passed via interface).
         if (structType->isOpaque())
             structType->setBody(llvm::ArrayRef<llvm::Type*>());
+        compiler->FlushPendingFunctionDeclarations();
         // Record validated type-level annotations for annotationof(Type,"Ann") queries.
         compiler->SetTypeAnnotations(structName, classAnnotations);
         if (compiler->IsVerbose())

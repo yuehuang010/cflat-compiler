@@ -1276,6 +1276,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
                     dataStructures[name].UserRequestedAlignment = userAlign;
 
                 RejectUniqueDestructionCycles(name, typeAndValues);
+                FlushPendingFunctionDeclarations();
                 return myStruct;
             }
 
@@ -1290,6 +1291,7 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
                 structData.UserRequestedAlignment = userAlign;
 
             RejectUniqueDestructionCycles(name, typeAndValues);
+            FlushPendingFunctionDeclarations();
             return structData.StructType;
         }
         else
@@ -1368,6 +1370,7 @@ llvm::StructType* LLVMBackend::CreateUnionType(std::string name, std::vector<Dec
                 llvm::GlobalValue::InternalLinkage,
                 builder->getInt8(0), name + "_typedesc");
         }
+        FlushPendingFunctionDeclarations();
         return unionTy;
     }
 

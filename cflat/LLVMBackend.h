@@ -2154,6 +2154,26 @@ private:
     std::unordered_map<llvm::Function*, std::vector<PendingNullIfaceDispatch>> pendingNullIfaceDispatch_;
 
     /*
+     * A function signature that mentions a still-opaque aggregate BY VALUE has no legal LLVM
+     * FunctionType: llvm::FunctionType::get asserts on an unsized parameter. ForwardRefScanner
+     * pre-registers signatures before any struct BODY exists, so such a declaration is emitted
+     * with a PROVISIONAL signature and recorded here. FlushPendingFunctionDeclarations re-derives
+     * the real signature - from the body the MAIN pass sets - and replaces the declaration.
+     * Nothing here computes, approximates, or freezes a struct layout.
+     */
+    struct PendingFunctionDeclaration
+    {
+        std::string FunctionName;
+        std::string MangledName;
+        TypeAndValue ReturnType;
+        std::vector<TypeAndValue> Arguments;
+        bool External = false;
+        bool Varargs = false;
+    };
+    std::vector<PendingFunctionDeclaration> pendingFunctionDeclarations_;
+    bool flushingPendingDeclarations_ = false;
+
+    /*
      * The same access with a module-level GLOBAL receiver. A global's null-ness is its
      * INITIALIZER, not a store - `PLive g = default;` emits no instruction anywhere - and the
      * "never assigned" fact is whole-module, so this cannot be answered at end-of-body. Resolved
@@ -6002,7 +6022,21 @@ public:
     // Used for extern function declarations to preserve C ABI compatibility.
     llvm::Type* GetCCompatibleType(const TypeAndValue& tv) const;
 
-    llvm::FunctionType* GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false, bool externC = false);
+    // allowIncomplete: the caller is emitting a PROVISIONAL declaration during the forward-ref
+    // scan and will re-derive the signature once the aggregate body exists; stay quiet.
+    llvm::FunctionType* GetFunctionType(const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false, bool externC = false, bool allowIncomplete = false);
+
+    // First by-value PARAMETER whose LLVM type is a still-opaque struct, or nullptr. LLVM
+    // rejects an unsized argument type; an opaque RETURN type is legal and needs no stand-in.
+    llvm::StructType* FindIncompleteByValueAggregate(
+        const std::vector<LLVMBackend::TypeAndValue>& arguments, bool externC);
+
+    // Re-derive the real signature of every provisional declaration whose aggregates now
+    // have bodies, replacing the body-less provisional llvm::Function.
+    void FlushPendingFunctionDeclarations();
+
+    // Module end: report any provisional declaration that is used but never completed.
+    void ReportUnresolvedProvisionalDeclarations();
 
     std::string ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs = false);
 

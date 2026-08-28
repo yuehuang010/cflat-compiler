@@ -4162,6 +4162,8 @@ void LLVMBackend::ResetForReanalysis()
     joinAddressInProgress_.clear();
     pendingReturnDangleChecks_.clear();
     pendingNullIfaceDispatch_.clear();
+    pendingFunctionDeclarations_.clear();
+    flushingPendingDeclarations_ = false;
     pendingNullIfaceGlobal_.clear();
     DropModuleEscapeMemo();
 

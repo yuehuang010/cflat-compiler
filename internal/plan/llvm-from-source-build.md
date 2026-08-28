@@ -113,7 +113,46 @@ cmake --install "$BUILD"
 | `LLVM_BUILD_LLVM_DYLIB=OFF` + `LLVM_LINK_LLVM_DYLIB=OFF` | **The static switch.** Produces per-component `.a`/`.lib` and makes `find_package` *not* define a `TARGET LLVM` dylib, so cflat takes the `llvm_map_components_to_libnames` path uniformly. |
 | `LLVM_ENABLE_ZLIB/ZSTD/LIBXML2/TERMINFO=OFF` | Removes transitive external-dylib deps that would otherwise leak into the static consumer's link line and re-introduce dynamic dependencies. Turn a specific one back ON only if a needed feature requires it, and then prefer a static build of that dep. |
 | `LLVM_INCLUDE_TESTS/BENCHMARKS/EXAMPLES/DOCS=OFF` | Cuts build time/size substantially; none are consumed. |
-| `LLVM_ENABLE_ASSERTIONS` | OFF for the fast consumer build. Build a second `-DLLVM_ENABLE_ASSERTIONS=ON` install if you want LLVM's internal asserts to fire through cflat's `CompilerManager` crash handler during debugging. |
+| `LLVM_ENABLE_ASSERTIONS` | OFF for the Release consumer build, **ON for the Debug one** - these are two separate installs. See [Two installs: Release and Debug](#two-installs-release-and-debug) below; the Debug preset links the assertions-enabled tree. |
+
+### Two installs: Release and Debug
+
+cflat builds against **two** LLVM installs, differing only in assertions:
+
+| cflat config | LLVM install | `LLVM_ENABLE_ASSERTIONS` |
+|--------------|--------------|--------------------------|
+| Release | `~/.cflat-compiler-deps/llvm-<ver>` | `OFF` |
+| Debug | `~/.cflat-compiler-deps/llvm-<ver>-assert` | `ON` |
+
+The Debug install keeps `CMAKE_BUILD_TYPE=Release` and turns assertions on
+(the "RelWithAsserts" shape) rather than using a true `Debug` LLVM. A full Debug
+LLVM is several times larger and links far more slowly, and the assertions are
+what actually catch bugs; LLVM's own docs recommend this combination downstream.
+
+Build it with the same recipe plus one flag and a different prefix:
+
+```bash
+cmake -G Ninja -S "$SRC/llvm" -B "$BUILD-assert" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_ASSERTIONS=ON \
+  -DCMAKE_INSTALL_PREFIX="$HOME/.cflat-compiler-deps/llvm-<ver>-assert" \
+  ... # every other flag exactly as above
+```
+
+On Windows add `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDebug` to the assert
+build, because `cmake_build.bat debug` links cflat against the `/MTd` CRT and the
+runtime must match. (The Release install uses `MultiThreaded` = `/MT`.)
+
+**Why this matters - a real bug it would have caught.** LLVM 23 changed
+`BasicBlock::getTerminator()` from returning `nullptr` on an unterminated block to
+`assert(hasTerminator()); return &InstList.back();`, adding `getTerminatorOrNull()`
+for the nullable query. With assertions OFF the assert compiles away and the call
+returns the **list sentinel** - silent garbage. cflat used the nullable form in ~47
+places, and the result was a bogus argument type reaching overload resolution with
+no crash and no diagnostic anywhere near the cause. An assertions-ON LLVM turns that
+entire class of failure into an immediate, located abort through `CompilerManager`.
+Since assertions-OFF is what Release links, Debug is the only place that safety net
+can exist - which is the whole reason for the second install.
 
 ### Platform specifics
 

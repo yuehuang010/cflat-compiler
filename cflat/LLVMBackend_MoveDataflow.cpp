@@ -719,6 +719,9 @@ void LLVMBackend::RunNullIfaceGlobalCheck()
 
 void LLVMBackend::RunMoveDataflow()
 {
+        // Module end: no aggregate body will appear after this point.
+        ReportUnresolvedProvisionalDeclarations();
+
         // Sweep any function whose null-state log was not consumed at end-of-body (lambdas and
         // synthesized bodies do not go through the named-function completion point).
         if (module)
