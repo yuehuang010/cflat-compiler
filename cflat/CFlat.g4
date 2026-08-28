@@ -195,8 +195,10 @@ logicalOrExpression
     ;
 
 conditionalExpression
-    : logicalOrExpression ('?' expression ':' conditionalExpression)?
-    | logicalOrExpression QuestionQuestion conditionalExpression
+    : logicalOrExpression (
+        '?' expression ':' conditionalExpression
+        | QuestionQuestion conditionalExpression
+    )?
     ;
 
 assignmentExpression
@@ -650,8 +652,7 @@ expressionStatement
     ;
 
 selectionStatement
-    : 'if' '(' expression ')' statement ('else' statement)?
-    | 'if' 'const' '(' expression ')' statement ('else' statement)?
+    : 'if' 'const'? '(' expression ')' statement ('else' statement)?
     | 'switch' '(' expression ')' statement
     ;
 

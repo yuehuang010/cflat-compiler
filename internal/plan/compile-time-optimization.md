@@ -338,3 +338,93 @@ vector.**
 The pseudo-locale discovery pass is 12s serial and the policy discovery loop is ~13 serial 0.7s
 invocations. Sharding discovery across jobs would cut the `-j 18` wall further without touching the
 compiler. Independent of tiers 1 and 2.
+
+## ANTLR prediction - SLL null result + conditionalExpression left-factor - 2026-08-28
+
+Measured with a temp env-gated ProfilingATNSimulator hook (recipe: scratch/parse_profiler.patch,
+apply to LLVMBackend.cpp, set CFLAT_PARSE_PROFILE=1, aggregate PARSEPROF stderr lines).
+test_move parse prediction was 380ms of a 1.28s compile (~30%).
+
+Landed: left-factored conditionalExpression ('?' / '??' merged into one optional tail after
+logicalOrExpression). Accessors unchanged, zero listener edits. Prediction 380 -> 295ms;
+test_move 1.27-1.28 -> 1.16s (-9%); err batch 4.14-4.16 -> 3.90s (-6%). IR 0/40 diff,
+test.sh 720/0/8, LSP green.
+
+Do NOT retry:
+- PredictionMode::SLL two-stage (SLL+bail, LL fallback): measured null. The cost is DFA
+  construction (closure_), which SLL pays identically; full-context escalation was not the
+  bottleneck. Implemented, A/B'd 0ms delta, reverted.
+- Left-factoring parameterDeclaration (declarator vs abstractDeclarator alts): behavior-CHANGING.
+  The two-alt form is load-bearing: full-context prediction is what stops the greedy
+  declarationSpecifiers loop before the parameter name ('i32 fd' otherwise swallows 'fd' as a
+  specifier -> "Function parameter name is missing"). Its 26ms is the price of that resolution.
+
+Remaining prediction profile (post-factor): assignmentExpression decision 116ms (39%),
+postfixExpression 35ms (7k LL fallbacks), parameterDeclaration 26ms (see above).
+Next candidate: restructure assignmentExpression from
+  unaryExpression assignmentOperator assignmentExpression | conditionalExpression
+to the standard
+  conditionalExpression (assignmentOperator assignmentExpression)?
+Tree-shape CHANGE: assignment LHS becomes a conditionalExpression node; ~22 AssignmentExpression
++ ~15 assignmentOperator listener sites must adapt, and invalid-LHS (a+b = c) moves from syntax
+error to a listener LogError. Est. up to ~100ms (~8%) on parse-heavy compiles. Not started.
+
+## ANTLR experiment timebox - RESULTS 2026-08-28 (2h, concluded)
+
+Landed (both in CFlat.g4, zero listener edits, accessors preserved):
+- conditionalExpression left-factor (earlier same day; see section above).
+- selectionStatement left-factor: 'if' 'const'? '(' ... merged from two alts. Sole consumer
+  sel->If() && sel->Const() (MainListener.h:1952) unchanged. Selection prediction 50.3ms ->
+  1.2ms in the worktree A/B; 6-file IR diff identical; suite green.
+Final serial numbers (both factors): test_move 1.15-1.16s (from 1.27-1.28 baseline, -9%),
+err batch 3.81-3.82s (from 4.14-4.16, -8%). IR 0/40 vs pre-change capture, test.sh 720/0/8,
+LSP green.
+
+Do NOT retry (adds to the list in the section above):
+- assignmentExpression restructure to 'conditionalExpression (assignmentOperator
+  assignmentExpression)?' (the standard ANTLR-Java shape): NET LOSS, fully implemented,
+  measured, reverted. assignmentExpression prediction fell 116 -> 9.3ms, but the C
+  declaration-vs-expression ambiguity it was absorbing moved into blockItem (9.6 -> 149ms;
+  'T* p = x;' becomes a valid expression, so blockItem needed assignment-free expression
+  alternatives before declaration to keep tie-breaks). Totals: 295ms before, 325ms after
+  (316ms best variant); test_move 1.16 -> 1.24s. The prediction cost is the PRICE of the
+  ambiguity, conserved under grammar restructuring - same lesson as parameterDeclaration.
+  Also required narrowing simdTypeSpecifier's lane count to shiftExpression because
+  '(4>mask)=a' became grammatical. Full working diff preserved at scratch/assign_full.diff
+  (hardened variant: assign_verify.sh-era tree) if the shape is ever wanted for language
+  reasons; do not re-do it for performance.
+- postfixExpression loop (35ms, ~7k SLL->LL fallbacks): conflicts are loop-enter vs loop-exit
+  on '(' 7016 / '.' 4029 / '[' 1121 / '->' 887 across 4 test files (ContextSensitivityInfo
+  dump). Only fix is a recursive postfixSuffix restructure that changes every accessor -
+  investigated, not attempted; revisit only with a language-level reason.
+
+Remaining prediction profile after both factors (test_move): postfix 35ms, parameterDecl 26ms
+(load-bearing), declarationSpecifiers 17ms (load-bearing), genericIdentifier 13ms (volume),
+initializer/fieldInit ~17ms (deliberate order-resolved ties). ANTLR prediction is now ~245ms
+of a 1.16s compile; the cheap grammar wins are exhausted.
+
+## LLVM-side fixed-cost audit (opus subagent, read-only) - 2026-08-28
+
+Full ranked list from a call-graph decomposition of scratch/p_small.txt / p_large.txt.
+Batch (--check x326, 3.9s) opportunities, deferred with the batch bucket by user ruling:
+ 1. Lazy core bitcode materialization (getLazyBitcodeModule, --check/LSP only) ~16.8%
+ 2. Memoize core meta.json DOM across batch files (parse 12.4% + destroy 1.9%) ~14.2%
+ 3. Discard local value names on cache load (context->setDiscardValueNames one-liner) ~4.5%
+ 4. Scope VerifyModule to functions defined by the TU instead of whole core per file ~4.6%
+    (LLVMBackend.cpp:2344 unconditional-in-Release; blanket #ifndef NDEBUG rejected as it
+    moves malformed-IR detection out of the gating suite; scoped variant recommended)
+ 5. Memoize ComputeCoreHash + weakly_canonical(runtimeDir) per process ~2.8%
+ 6. Write "Debug Info Version" module flag in SaveCoreBitcode to skip StripDebugInfo walk ~0.6%
+ 7. Mid-batch Module teardown 6.8% - do NOT attack directly; falls out of item 1.
+Combined low-risk (2,3,5,6) ~22% of batch; with 1 + scoped 4: ~40%.
+
+Single-compile findings:
+ 8. ~20% of a 1.16s test_move -o compile is MachineFunctionPass/SelectionDAG over the WHOLE
+    core library linked into every exe (EmitExecutableMachO 24.8%). Next step is measurement
+    only: count isel'd functions that are core-origin post-GlobalDCE; if core dominates,
+    cache a precompiled core OBJECT next to core_macos.bc and link it. High risk, structural.
+ 9. Free deletion, no ruling needed: LLVMBackend_OwnershipTemps.cpp:963 calls
+    llvm::verifyFunction on every fresh body-less prototype and DISCARDS the result.
+ 10. Profile caveat: the p_large test_move -o run was cache-COLD (LoadCoreBitcodeIfFresh 0
+    samples; core arrived via CompileImportedFile). Why -o missed the warm cache there needs
+    a follow-up check before trusting single-compile cache assumptions.
