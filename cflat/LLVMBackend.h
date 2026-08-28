@@ -5646,7 +5646,7 @@ public:
 
     // Returns the variable's STORAGE: an alloca normally, or an internal module global when the
     // pending-static request below matches this declaration (a `static` local).
-    llvm::Value* CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
+    llvm::Value* CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType = nullptr, llvm::Value* arraySize = nullptr, size_t line = 0, uint64_t userAlign = 0);
 
     // Return a live local binding, assigning its declaration sequence on first insertion.
     NamedVariable& GetOrCreateStackVariable(const std::string& name);
@@ -6036,7 +6036,7 @@ public:
     // linkageName: optional override of the emitted LLVM symbol for externs. A namespaced
     // extern (namespace os.windows { extern ... Sleep(...); }) registers in the function
     // table under the qualified lookup name but must link against the bare C symbol.
-    void CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {});
+    void CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, const std::string& linkageName = {});
 
     // Return the FunctionSymbol whose LLVM function pointer matches fn, or nullptr.
     const FunctionSymbol* GetFunctionSymbol(llvm::Function* fn) const;
@@ -6107,7 +6107,7 @@ public:
         const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs,
         std::string* originFile, size_t* originLine);
 
-    llvm::Function* CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0);
+    llvm::Function* CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external = false, bool varargs = false, size_t line = 0, bool returnsOwned = false, bool isMethod = false, CallingConv callConv = CallingConv::Default, size_t scopeLine = 0);
 
     // True when 'name' resolves to a type in the current compilation: a scalar
     // keyword, an enum, a type alias, an interface, or a registered struct. Used by
@@ -6425,7 +6425,7 @@ public:
     std::string DescribeCodeValueAsCompoundOperand(const std::string& spelling, const std::string& op,
                                                    bool destIsPointer) const;
 
-    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const;
+    std::pair<std::vector<NamedVariable>, FunctionSymbol> ComputeOverloadFunction(const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates) const;
 
     // How a call site's arguments bind to declared parameter slots (see ComputeArgumentPositions).
     struct ArgumentBinding

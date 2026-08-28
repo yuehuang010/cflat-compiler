@@ -1140,7 +1140,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         }
     }
 
-void LLVMBackend::CreateFunctionDeclaration(std::string functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
+void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, bool returnsOwned, bool isMethod, CallingConv callConv, const std::string& linkageName)
 {
         // ForwardRefScanner registers signatures before any struct BODY exists. An opaque
         // by-value aggregate has no legal FunctionType yet, so the declaration is emitted with a
@@ -1466,7 +1466,7 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
         return true;
     }
 
-llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, LLVMBackend::TypeAndValue returnType, std::vector<LLVMBackend::TypeAndValue> arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
+llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool external, bool varargs, size_t line, bool returnsOwned, bool isMethod, CallingConv callConv, size_t scopeLine)
 {
         // A signature parked during the scan must reach the function table before this body
         // (and its call sites) are emitted.

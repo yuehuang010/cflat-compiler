@@ -359,7 +359,7 @@ void LLVMBackend::SetStackVariable(const std::string& name, NamedVariable namedV
         slot.DeclSequence = sequence;
     }
 
-llvm::Value* LLVMBackend::CreateLocalVariable(TypeAndValue typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
+llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llvm::Type* autoType, llvm::Value* arraySize, size_t line, uint64_t userAlign)
 {
         // No enclosing scope means a file-scope declaration reached the local path (a stale
         // global_scope). back() on the empty scope stack is UB - diagnose instead of corrupting.

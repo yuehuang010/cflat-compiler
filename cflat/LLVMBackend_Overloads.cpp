@@ -61,7 +61,7 @@ static std::string PointerStars(const LLVMBackend::TypeAndValue& tv)
     return (deep && tv.DepthIsAboutThisValue()) ? "**" : "*";
 }
 
-std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>> candidates) const
+std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> LLVMBackend::ComputeOverloadFunction(const std::vector<std::pair<std::vector<NamedVariable>, FunctionSymbol>>& candidates) const
 {
         std::pair<std::vector<NamedVariable>, FunctionSymbol> possibleResult;
         std::pair<std::vector<NamedVariable>, FunctionSymbol> bestPerfect;
@@ -738,7 +738,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto matched = MatchFunction(arguments, candidate.Parameters, true, true);
                 if (matched.size() > 0)
                 {
-                    resolvedCandidate.emplace_back(matched, candidate);
+                    resolvedCandidate.emplace_back(std::move(matched), candidate);
                     break;
                 }
             }
@@ -752,7 +752,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 auto matched = MatchFunction(arguments, candidate.Parameters, false, true);
                 if (matched.size() > 0)
                 {
-                    resolvedCandidate.emplace_back(matched, candidate);
+                    resolvedCandidate.emplace_back(std::move(matched), candidate);
                 }
             }
         }

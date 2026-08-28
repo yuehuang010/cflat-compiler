@@ -284,6 +284,55 @@ symbol-index path that item B gates.
 
 ---
 
+## Large-object copy elimination - MEASURED NULL RESULT 2026-08-28
+
+Investigated because the profile attributes ~25% of small-file self time to the allocator, and
+the hot types are big:
+
+| Type | sizeof |
+|---|---|
+| `NamedVariable` | 1216 B |
+| `DeclTypeAndValue` | 432 B |
+| `TypeAndValue` | 320 B |
+
+`NamedVariable` embeds `TypeAndValue` plus several `std::string`s and a vector, so each copy is
+several mallocs.
+
+Found and fixed real deep copies: `ComputeOverloadFunction` took
+`vector<pair<vector<NamedVariable>, FunctionSymbol>>` BY VALUE (both call sites pass lvalues, so
+the whole candidate set was deep-copied per overloaded call); `CreateFunctionDeclaration`,
+`CreateFunctionDefinition` and `CreateLocalVariable` took `TypeAndValue` / `vector<TypeAndValue>`
+by value; and two `resolvedCandidate.emplace_back(matched, ...)` copied a dead vector.
+All converted to `const&` / `std::move`.
+
+**Result: no measurable improvement.** 326-file batch 4.17s vs 4.09-4.18s baseline; `test_move`
+1.26-1.28s vs 1.29s; hello-world floor unchanged at 0.02s. IR 0/39 differences, both suites green.
+The copies were real but not hot enough to show. Do not re-investigate this angle expecting a win.
+
+### What NOT to retry
+
+- **`CreateGlobalVariable` must stay by value** - its body does
+  `typeValue.GuardedBy = pendingGlobalGuardedBy;`.
+- **`SetStackVariable` / `RegisterFunctionArgument` are not bugs.** They take `NamedVariable` by
+  value and `std::move` internally - the correct sink idiom.
+- **`-Wlarge-by-value-copy` cannot automate this sweep.** It fires only for trivially-copyable
+  types, so it silently skips every type in the table above except the POD-ish ones; a clean build
+  under it is a false negative, verified against a synthetic test. `-Wrange-loop-construct` did not
+  fire on an obvious copy either.
+
+### The aliasing rule these conversions had to clear
+
+A by-value parameter also protects against aliasing. `CreateFunctionDeclaration`'s body does
+`functionTable[functionName].push_back(funcSym)` and then keeps reading `arguments` afterwards -
+so if any call site ever passes a `FunctionSymbol::Parameters` owned by `functionTable`, the
+`const&` dangles on reallocation. Verified safe by extracting the argument expression at all 66
+`CreateFunctionDeclaration` / `CreateFunctionDefinition` call sites: every one passes a braced
+temporary or a plain local (`allParams`, `wrapperParams`, `params`, `e.params` from a local
+`CSigEntry` list). **Re-run that check before adding a call site that passes a registry-owned
+vector.**
+
+---
+
 ## Tier 3 - suite-level, not the compiler
 
 The pseudo-locale discovery pass is 12s serial and the policy discovery loop is ~13 serial 0.7s
