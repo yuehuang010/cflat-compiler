@@ -1371,7 +1371,7 @@ void LLVMBackend::ResolvePendingAliasReturnInference()
                 // The forward-ref pass may have emitted this declaration before the
                 // struct fields were known well enough to infer the borrow return. Keep
                 // its LLVM ABI in sync before the main pass attaches the body.
-                if (sym.Function != nullptr && sym.Function->empty() && sym.Function->use_empty())
+                if (sym.Function != nullptr && !FunctionHasDefinition(sym.Function) && sym.Function->use_empty())
                 {
                     auto* inferredType = GetFunctionType(sym.ReturnType, sym.Parameters,
                                                          sym.Variadic, sym.External);

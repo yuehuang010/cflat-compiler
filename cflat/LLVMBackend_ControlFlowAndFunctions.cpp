@@ -1090,7 +1090,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
             if (provisional == nullptr || wanted == nullptr
                 || provisional->getFunctionType() == wanted)
                 continue;
-            if (!provisional->empty() || !provisional->use_empty())
+            if (FunctionHasDefinition(provisional) || !provisional->use_empty())
             {
                 LogError(std::format(
                     "'{}' was used before the by-value type in its signature was complete, so its "
@@ -1130,7 +1130,7 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
         for (const auto& d : leftovers)
         {
             llvm::Function* fn = module ? module->getFunction(d.MangledName) : nullptr;
-            if (fn == nullptr || (fn->empty() && fn->use_empty())) continue;
+            if (fn == nullptr || (!FunctionHasDefinition(fn) && fn->use_empty())) continue;
             auto* incomplete = FindIncompleteByValueAggregate(d.Arguments, d.External);
             LogError(std::format(
                 "type '{}' is never completed, so '{}' cannot take it by value. "
@@ -1459,7 +1459,7 @@ bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const L
 {
         std::string mangledName = ComputeMangledName(functionName, returnType, arguments, varargs);
         auto* fn = module->getFunction(mangledName);
-        if (fn == nullptr || fn->empty()) return false;
+        if (fn == nullptr || !FunctionHasDefinition(fn)) return false;
         auto it = functionBodyOrigin_.find(mangledName);
         if (originFile) *originFile = it != functionBodyOrigin_.end() ? it->second.first : std::string();
         if (originLine) *originLine = it != functionBodyOrigin_.end() ? it->second.second : 0;
@@ -1501,7 +1501,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
             // record was completed. Replace that body-less placeholder once the real ABI recipe
             // is available; retaining it would force the definition and every caller onto the
             // wrong C ABI signature.
-            if (fn->empty() && fn->use_empty())
+            if (!FunctionHasDefinition(fn) && fn->use_empty())
             {
                 fn->setName(mangledName + ".preabi");
                 fn = createFunctionProto(mangledName, functionType);
@@ -1527,7 +1527,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 
         if (fn != nullptr)
         {
-            if (!fn->empty())
+            if (FunctionHasDefinition(fn))
             {
                 DiagnoseDuplicateFunctionBody(functionName, mangledName, line);
                 if (verbose) std::cout << std::format("[verbose] skipping duplicate definition of '{}'\n", functionName);

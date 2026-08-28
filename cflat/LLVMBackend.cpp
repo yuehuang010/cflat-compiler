@@ -1126,6 +1126,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
 bool LLVMBackend::AuditIsolatedModule()
 {
     if (!isolatedPolicy_) return true;
+    MaterializeCoreIfLazy();
 
     auto auditCtorArray = [&](llvm::StringRef name) {
         auto* array = module->getGlobalVariable(name);
@@ -1787,6 +1788,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // import/core-bitcode cache is disabled here just like an explicit --no-cache.
     // Batch (--check) loads the cache too: ResetForReanalysis leaves each file in the same
     // state a fresh backend is in at this point, and the load replaces context/module wholesale.
+    cachedFunctionNames_.reset();
     bool bitcodeLoaded = false;
     // Isolated mode reparses core sources so import gating sees source import statements;
     // warm-path capability gating is deferred to a later stage.
@@ -1801,6 +1803,12 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         {
             llvm::TimeTraceScope bcScope("RuntimeImport", "core.bc");
             bitcodeLoaded = LoadCoreBitcodeIfFresh(bcCacheDir, platformOption);
+            if (bitcodeLoaded)
+            {
+                cachedFunctionNames_.emplace();
+                for (const auto& function : module->functions())
+                    cachedFunctionNames_->insert(function.getName().str());
+            }
             if (verbose)
                 std::cout << std::format("[verbose] core bitcode cache: {}\n", bitcodeLoaded ? "hit" : "miss");
             if (bitcodeLoaded)
@@ -1810,6 +1818,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                 for (const auto& imported : importedFiles)
                     RecordDependency(imported);
             }
+            // Output compilation may fold core constructors while walking user code. Keep that
+            // eager frontend behavior; --check and LSP Analyze retain the lazy, body-free path.
+            if (bitcodeLoaded && !checkOnly)
+                MaterializeCoreIfLazy();
         }
     }
 
@@ -2351,6 +2363,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     // Isolated-policy checks audit the optimized module, so retain DCE for that consumer.
     if (!checkOnly || isolatedPolicy_)
     {
+        MaterializeCoreIfLazy();
         if (!args.hasFlag("no-opt"))
         {
             llvm::TimeTraceScope baselineScope("BaselinePasses");
@@ -2386,6 +2399,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     if (isolatedPolicy_ && !InstrumentIsolatedResources())
         return false;
 
+    if (isolatedPolicy_)
+        MaterializeCoreIfLazy();
     if (isolatedPolicy_ && !VerifyModule())
     {
         std::cout << "Error: module verification failed after isolated resource instrumentation.\n";
@@ -3416,6 +3431,7 @@ void LLVMBackend::RunModulePasses(llvm::ModulePassManager& MPM)
 
 void LLVMBackend::RunBaselinePasses()
 {
+    MaterializeCoreIfLazy();
     llvm::FunctionPassManager FPM;
     FPM.addPass(llvm::SROAPass(llvm::SROAOptions::ModifyCFG));
     FPM.addPass(llvm::PromotePass());
@@ -3435,6 +3451,7 @@ void LLVMBackend::RunBaselinePasses()
 // O1+ already get this via buildPerModuleDefaultPipeline, so this is the -O0-only path.
 void LLVMBackend::RunGlobalDCE()
 {
+    MaterializeCoreIfLazy();
     llvm::ModulePassManager MPM;
     MPM.addPass(llvm::GlobalDCEPass());
     RunModulePasses(MPM);
@@ -4164,6 +4181,8 @@ void LLVMBackend::ResetForReanalysis()
 {
     analyzeDebugInfo_ = false;
     isolatedPolicy_.reset();
+    // Core hashes are per-analysis so LSP notices edits; batch mode keeps one process-wide hash.
+    if (!batchMode_) coreHashCache_.clear();
     dependencyPathMemo_.clear();
     dependencyFileSet_.clear();
     manifestFragments_.clear();
@@ -4195,8 +4214,10 @@ void LLVMBackend::ResetForReanalysis()
     flushingPendingDeclarations_ = false;
     pendingNullIfaceGlobal_.clear();
     DropModuleEscapeMemo();
+    cachedFunctionNames_.reset();
 
     module.reset();
+    coreBitcodeBuffer_.reset();
     builder.reset();
     context = std::make_unique<llvm::LLVMContext>();
     module = std::make_unique<llvm::Module>("cflat", *context);
@@ -4423,7 +4444,8 @@ void LLVMBackend::ResetForReanalysis()
     xthreadReported_.clear();
 
     // Clear all import state so core files (string, runtime, etc.) are fully re-imported
-    // on the next Analyze() call.
+    // on the next Analyze() call. Core JSON DOM caches deliberately survive this reset: their
+    // path, core hash, mtime, and size validation keeps their StringRefs safe and fresh.
     importedFiles.clear();
     importStack.clear();
     importAliasMembers.clear();
@@ -5956,7 +5978,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             std::cout << std::format("  Warning: core compilation failed for {}.\n", platform);
             continue;
         }
-        std::string bcCacheDir = LLVMBackend::GetRuntimeBitcodeDir(runtimeDir);
+        std::string bcCacheDir = coreCompiler.GetRuntimeBitcodeDir(runtimeDir);
         if (bcCacheDir.empty())
         {
             std::cout << "  Warning: could not determine bitcode cache dir.\n";
@@ -6026,7 +6048,7 @@ bool LLVMBackend::RunInit(const std::string& runtimeDir, bool verbose)
             std::cout << std::format("  Warning: core compilation failed for {}.\n", platform);
             continue;
         }
-        std::string bcCacheDir = LLVMBackend::GetRuntimeBitcodeDir(runtimeDir);
+        std::string bcCacheDir = coreCompiler.GetRuntimeBitcodeDir(runtimeDir);
         if (bcCacheDir.empty())
         {
             std::cout << "  Warning: could not determine bitcode cache dir.\n";
@@ -6067,33 +6089,44 @@ static uint64_t FnvHash64(const void* data, size_t len)
 
 // FNV-1a hash over all .cb file modification times in runtimeDir/core, sorted by path.
 // Returns a 16-hex-char string. Returns "" if the core dir is inaccessible.
-static std::string ComputeCoreHash(const std::string& runtimeDir)
+std::string LLVMBackend::ComputeCoreHash(const std::string& runtimeDir) const
 {
-    auto coreDir = std::filesystem::path(runtimeDir) / "core";
+    auto cached = coreHashCache_.find(runtimeDir);
+    if (cached != coreHashCache_.end()) return cached->second.hash;
+
+    CoreHashCacheEntry entry;
     std::error_code ec;
+    entry.canonicalRuntimeDir = std::filesystem::weakly_canonical(runtimeDir, ec);
+    if (ec) entry.canonicalRuntimeDir = std::filesystem::path(runtimeDir);
+
+    auto coreDir = entry.canonicalRuntimeDir / "core";
     std::vector<std::filesystem::path> files;
     for (auto& e : std::filesystem::directory_iterator(coreDir, ec))
         if (e.path().extension() == ".cb") files.push_back(e.path());
-    if (ec) return {};
-    std::sort(files.begin(), files.end());
-
-    uint64_t h = 14695981039346656037ULL;
-    for (auto& f : files)
+    if (!ec)
     {
-        auto wt = std::filesystem::last_write_time(f, ec);
-        if (ec) continue;
-        auto ns = wt.time_since_epoch().count();
-        h ^= FnvHash64(&ns, sizeof(ns));
-        h *= 1099511628211ULL;
+        std::sort(files.begin(), files.end());
+
+        uint64_t h = 14695981039346656037ULL;
+        for (auto& f : files)
+        {
+            auto wt = std::filesystem::last_write_time(f, ec);
+            if (ec) continue;
+            auto ns = wt.time_since_epoch().count();
+            h ^= FnvHash64(&ns, sizeof(ns));
+            h *= 1099511628211ULL;
+        }
+        char buf[17];
+        snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
+        entry.hash = buf;
     }
-    char buf[17];
-    snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(h));
-    return buf;
+    coreHashCache_.emplace(runtimeDir, std::move(entry));
+    return coreHashCache_.find(runtimeDir)->second.hash;
 }
 
 // Returns <cache>/runtime/<hash>  or "" on failure. Built with std::filesystem
 // so the separator is correct on every platform (backslash on Windows, slash otherwise).
-std::string LLVMBackend::GetRuntimeBitcodeDir(const std::string& runtimeDir)
+std::string LLVMBackend::GetRuntimeBitcodeDir(const std::string& runtimeDir) const
 {
     std::string base = GetCflatCacheDir();
     if (base.empty()) return {};
@@ -6457,6 +6490,7 @@ bool LLVMBackend::CompileCoreOnly(const std::string& platform)
     {
         builder.reset();
         module.reset();
+        coreBitcodeBuffer_.reset();
         functionTable.clear();
         cAbiFunctionThunkCache_.clear();
         dataStructures.clear();
@@ -6928,14 +6962,48 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (!std::filesystem::exists(bcPath) || !std::filesystem::exists(jsonPath))
         return false;
 
+    std::string coreHash = ComputeCoreHash(runtimeDir);
+    if (coreHash.empty()) return false;
+
+    auto loadJson = [&](const std::string& path,
+                        std::unordered_map<std::string, CoreJsonCacheEntry>& cache,
+                        const char* traceName) -> llvm::json::Value*
+    {
+        std::error_code ec;
+        auto writeTime = std::filesystem::last_write_time(path, ec);
+        if (ec) return nullptr;
+        auto fileSize = std::filesystem::file_size(path, ec);
+        if (ec) return nullptr;
+
+        auto cached = cache.find(path);
+        if (cached != cache.end()
+            && cached->second.coreHash == coreHash
+            && cached->second.writeTime == writeTime
+            && cached->second.fileSize == fileSize
+            && cached->second.buffer && cached->second.value)
+            return &*cached->second.value;
+
+        auto jsonBuf = llvm::MemoryBuffer::getFile(path);
+        if (!jsonBuf) return nullptr;
+        auto parsed = [&] {
+            llvm::TimeTraceScope jsonScope(traceName, path);
+            return llvm::json::parse((*jsonBuf)->getBuffer());
+        }();
+        if (!parsed) return nullptr;
+
+        CoreJsonCacheEntry entry;
+        entry.coreHash = coreHash;
+        entry.writeTime = writeTime;
+        entry.fileSize = fileSize;
+        entry.buffer = std::move(*jsonBuf);
+        entry.value = std::move(*parsed);
+        auto inserted = cache.insert_or_assign(path, std::move(entry));
+        return &*inserted.first->second.value;
+    };
+
     // Load and validate JSON metadata. Scope the read+parse separately from the
     // bitcode parse and the deserialization walk so -ftime-trace shows each slice.
-    auto jsonBuf = llvm::MemoryBuffer::getFile(jsonPath);
-    if (!jsonBuf) return false;
-    auto parsed = [&] {
-        llvm::TimeTraceScope jsonScope("CoreCacheJsonParse", jsonPath);
-        return llvm::json::parse((*jsonBuf)->getBuffer());
-    }();
+    auto* parsed = loadJson(jsonPath, coreMetaJsonCache_, "CoreCacheJsonParse");
     if (!parsed) return false;
     auto* root = parsed->getAsObject();
     if (!root) return false;
@@ -6945,22 +7013,18 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto storedH  = root->getString("core_hash");
     if (!ver || *ver != 9) return false;   // v8 predates the split LSP symbol sidecar (see writer)
     if (!storedPl || storedPl->str() != platform) return false;
-    if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
+    if (!storedH || storedH->str() != coreHash) return false;
     if (!std::filesystem::exists(symbolsPath)) return false;
 
     // Read the LSP symbol sidecar here, BEFORE the context swap below, and only when a consumer
     // will use it. Every failure exit in this function must precede that swap: returning false
     // afterwards reports a cache miss on an already-deserialized backend, and the caller then
     // re-imports core on top of it. The parse itself is ~68% of the metadata, hence the gate.
-    std::optional<llvm::json::Value> symbolsJson;
+    llvm::json::Value* symbolsJson = nullptr;
     if (symbolSink_ != nullptr)
     {
-        auto symbolsBuf = llvm::MemoryBuffer::getFile(symbolsPath);
-        if (!symbolsBuf) return false;
-        llvm::TimeTraceScope symbolsScope("CoreCacheSymbolsParse", symbolsPath);
-        auto symbolsParsed = llvm::json::parse((*symbolsBuf)->getBuffer());
-        if (!symbolsParsed || !symbolsParsed->getAsObject()) return false;
-        symbolsJson = std::move(*symbolsParsed);
+        symbolsJson = loadJson(symbolsPath, coreSymbolsJsonCache_, "CoreCacheSymbolsParse");
+        if (!symbolsJson || !symbolsJson->getAsObject()) return false;
     }
 
     // Load bitcode into a FRESH LLVMContext so named types (e.g. %string) from
@@ -6971,7 +7035,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (!bcBuf) return false;
     auto parsedMod = [&] {
         llvm::TimeTraceScope bcScope("CoreCacheBitcodeParse", bcPath);
-        return llvm::parseBitcodeFile((*bcBuf)->getMemBufferRef(), *freshCtx);
+        return llvm::getLazyBitcodeModule((*bcBuf)->getMemBufferRef(), *freshCtx);
     }();
     if (!parsedMod)
     {
@@ -6982,8 +7046,10 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     // Replace the current LLVM state.  Destroy builder/module before context.
     builder.reset();
     module.reset();
+    coreBitcodeBuffer_.reset();
     context = std::move(freshCtx);
     module  = std::move(*parsedMod);
+    coreBitcodeBuffer_ = std::move(*bcBuf);
     builder = std::make_unique<llvm::IRBuilder<>>(*context);
 
     // Clear tables populated by Init()/RegisterBuiltinString() whose LLVM pointers
@@ -7422,6 +7488,14 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     if (dataStructures.count("string") && dataStructures["string"].Destructor) stringDtorRegistered = true;
 
     return true;
+}
+
+void LLVMBackend::MaterializeCoreIfLazy()
+{
+    if (!module || !coreBitcodeBuffer_ || module->isMaterialized()) return;
+    if (auto error = module->materializeAll())
+        LogError("failed to materialize cached core bitcode: " + llvm::toString(std::move(error)));
+    coreBitcodeBuffer_.reset();
 }
 
 // Lazy materializers: parse a cached generic template's source on first instantiation.

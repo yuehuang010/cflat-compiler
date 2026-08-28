@@ -79,7 +79,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             if (sd.StructType != nullptr && !sd.StructType->isOpaque())
             {
                 if (auto* existing = compiler->GetFunction(structName);
-                    existing != nullptr && !existing->empty())
+                    existing != nullptr && compiler->FunctionHasDefinition(existing))
                 {
                     if (compiler->IsVerbose())
                         std::cout << "[verbose]     skipping duplicate struct definition: " << structName << "\n";
@@ -2747,7 +2747,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             if (sd.StructType != nullptr && !sd.StructType->isOpaque())
             {
                 if (auto* existing = compiler->GetFunction(structName);
-                    existing != nullptr && !existing->empty())
+                    existing != nullptr && compiler->FunctionHasDefinition(existing))
                 {
                     if (compiler->IsVerbose())
                         std::cout << "[verbose]     skipping duplicate struct definition: " << structName << "\n";
@@ -3557,7 +3557,8 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
 
         // CreateFunctionDefinition took its !fn->empty() early return, so no function scope was
         // pushed. Continuing would index one. Same guard as ParseFunctionDefinition.
-        if (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
+        if (fn->isMaterializable()
+            || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
 
         compiler->InitializeBlock(&fn->front(), false);

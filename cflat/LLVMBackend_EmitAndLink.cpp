@@ -177,6 +177,16 @@ static std::wstring ManifestAsciiToWide(const std::string& text)
 
 // ---- Definitions moved out of LLVMBackend.h (EmitAndLink) ----
 
+// Map cflat -O to codegen effort the way clang does: the default -O0 build gets FastISel +
+// fast regalloc (CodeGenOptLevel::None); optimized builds keep SelectionDAG quality.
+static llvm::CodeGenOptLevel CodeGenLevelFor(int optLevel)
+{
+    if (optLevel <= 0) return llvm::CodeGenOptLevel::None;
+    if (optLevel == 1) return llvm::CodeGenOptLevel::Less;
+    if (optLevel == 2) return llvm::CodeGenOptLevel::Default;
+    return llvm::CodeGenOptLevel::Aggressive;
+}
+
 std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
 {
         llvm::InitializeAllTargets();
@@ -200,7 +210,8 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
 
         llvm::TargetOptions opt;
         return std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+                                        std::nullopt, CodeGenLevelFor(cOptLevel_)));
     }
 
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
@@ -637,7 +648,8 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         // PIC so the object links into a position-independent executable (the
         // default on modern Linux toolchains).
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+                                        std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 
         // Keep cflat's runtime DEFINITIONS out of the dynamic symbol table so they do
@@ -781,7 +793,8 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         opt.DataSections     = true;
         // Darwin code is always PIC.
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+                                        std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 
         if (lliPath)
@@ -1061,6 +1074,7 @@ bool LLVMBackend::ValidateManifestActivationContext(const std::string& xml) cons
 bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& platform, bool debugInfo,
                         const std::optional<std::string>& lliPath)
 {
+        MaterializeCoreIfLazy();
         // macOS arm64 cross-target: Mach-O object emission, independent of host OS
         // (handled before the host-specific COFF/ELF split below).
         if (targetMacOS_)
@@ -1116,7 +1130,8 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         opt.FunctionSections = true;
         opt.DataSections     = true;
         auto TM = std::unique_ptr<llvm::TargetMachine>(
-            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_));
+            target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
+                                        std::nullopt, CodeGenLevelFor(cOptLevel_)));
         module->setDataLayout(TM->createDataLayout());
 
         // --out-lli for an -o build: dump the IR here, after the target triple and data layout

@@ -1061,7 +1061,8 @@ static bool CalleeHasSideEffectsSafe(
     llvm::DenseSet<llvm::Function*>& visiting,
     llvm::DenseMap<llvm::Function*, bool>& memo)
 {
-    if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return true;
+    if (callee == nullptr || callee->isDeclaration() || callee->isMaterializable()
+        || callee->isVarArg()) return true;
     auto memoIt = memo.find(callee);
     if (memoIt != memo.end()) return memoIt->second;
     if (!visiting.insert(callee).second) return true;
@@ -1175,7 +1176,8 @@ static llvm::Constant* FoldConstructedValueToConstantImpl(
     if (auto* call = llvm::dyn_cast<llvm::CallBase>(value))
     {
         llvm::Function* callee = call->getCalledFunction();
-        if (callee == nullptr || callee->isDeclaration() || callee->isVarArg()) return nullptr;
+        if (callee == nullptr || callee->isDeclaration() || callee->isMaterializable()
+            || callee->isVarArg()) return nullptr;
         if (callee->size() != 1) return nullptr;
         if (call->arg_size() != callee->arg_size()) return nullptr;
         if (call->arg_size() == 0)
@@ -2501,7 +2503,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // a fresh entry block) when a matching definition was already emitted by a
         // transitive import. Detect that here and skip body emission - re-emitting
         // into the live function's blocks would corrupt its IR.
-        if (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr)
+        if (fn->isMaterializable()
+            || (!fn->empty() && cflat_llvm::GetTerminatorOrNull(&fn->getEntryBlock()) != nullptr))
             return;
 
         compiler->InitializeBlock(&fn->front(), false);

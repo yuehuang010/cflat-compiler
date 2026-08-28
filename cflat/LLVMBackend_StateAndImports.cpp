@@ -142,7 +142,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
 
         // If a function with the new mangled name already exists (e.g. another
         // instantiation of the same template hit the same inferred type), reuse it.
-        if (auto* existing = module->getFunction(newMangledName); existing && !existing->empty())
+        if (auto* existing = module->getFunction(newMangledName);
+            existing && FunctionHasDefinition(existing))
         {
             // Discard the placeholder; the existing definition wins.
             if (!oldFn->use_empty())

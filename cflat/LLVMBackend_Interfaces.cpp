@@ -1716,7 +1716,7 @@ void LLVMBackend::AdoptInterfaceReboxThunksFromModule()
 {
         for (llvm::Function& fn : module->functions())
         {
-            if (!fn.empty()) continue;
+            if (!fn.empty() || fn.isMaterializable()) continue;
             llvm::StringRef name = fn.getName();
             llvm::StringRef prefix(kInterfaceReboxPrefix.data(), kInterfaceReboxPrefix.size());
             if (!name.starts_with(prefix)) continue;
@@ -1748,7 +1748,7 @@ void LLVMBackend::EmitDeferredInterfaceReboxBodies()
 void LLVMBackend::EmitInterfaceReboxBody(DeferredInterfaceRebox site)
 {
         llvm::Function* fn = site.Thunk;
-        if (!fn->empty()) return;
+        if (!fn->empty() || fn->isMaterializable()) return;
         const std::string& dstIface = site.DstInterface;
 
         auto fatTy = GetFatPtrType();

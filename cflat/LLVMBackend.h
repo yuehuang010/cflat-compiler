@@ -2399,7 +2399,10 @@ public:
 private:
     std::unique_ptr<llvm::IRBuilder<>> builder;
     std::unique_ptr<llvm::Module> module;
+    std::unique_ptr<llvm::MemoryBuffer> coreBitcodeBuffer_;
     std::unique_ptr<llvm::LLVMContext> context;
+    // Names present when a core bitcode cache was loaded; later functions are user IR.
+    std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
 
     std::vector<StackState> stackNamedVariable;
     uint64_t nextDeclSequence = 1;
@@ -2885,6 +2888,27 @@ private:
     // Core-library imports only (stable for the process lifetime). User imports deliberately
     // excluded: they change during editing, so bounding to core keeps staleness trivial.
     std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
+    struct CoreHashCacheEntry
+    {
+        std::filesystem::path canonicalRuntimeDir;
+        std::string hash;
+    };
+    // Hashes are per-backend except in batch mode, where ResetForReanalysis preserves them.
+    mutable std::unordered_map<std::string, CoreHashCacheEntry> coreHashCache_;
+
+    struct CoreJsonCacheEntry
+    {
+        std::string coreHash;
+        std::filesystem::file_time_type writeTime{};
+        uintmax_t fileSize = 0;
+        // The JSON DOM stores StringRefs into the buffer, so the buffer must be declared first.
+        std::unique_ptr<llvm::MemoryBuffer> buffer;
+        std::optional<llvm::json::Value> value;
+    };
+    // Core metadata and symbol DOMs are validated by path, hash, mtime, and size and deliberately
+    // survive ResetForReanalysis like parseTreeCache_.
+    std::unordered_map<std::string, CoreJsonCacheEntry> coreMetaJsonCache_;
+    std::unordered_map<std::string, CoreJsonCacheEntry> coreSymbolsJsonCache_;
     // Per-compile lifetime anchor for NON-core imported parse trees (generic-template ctx
     // pointers point into them). Cleared by ResetForReanalysis; parseTreeCache_ is not.
     std::vector<std::unique_ptr<CachedParseTree>> importedParseStates;
@@ -4093,11 +4117,17 @@ private:
     void RunModulePasses(llvm::ModulePassManager& MPM);
     void RunBaselinePasses();
     void RunGlobalDCE();
+    void MaterializeCoreIfLazy();
     void OptimizeModule(int optimizationLevel);
 
     bool SaveToFile(const std::string& filename);
 
     bool WriteBitcode(const std::string& filename);
+
+    bool FunctionHasDefinition(const llvm::Function* function) const
+    {
+        return function != nullptr && (!function->empty() || function->isMaterializable());
+    }
 
     std::string FindClangCl() const;
 
@@ -7618,7 +7648,8 @@ public:
 
     // Core bitcode cache: returns %USERPROFILE%\.cflat\runtime\<hash> or "" on failure.
     // The hash is derived from the modification times of all .cb files in runtimeDir/core.
-    static std::string GetRuntimeBitcodeDir(const std::string& runtimeDir);
+    std::string GetRuntimeBitcodeDir(const std::string& runtimeDir) const;
+    std::string ComputeCoreHash(const std::string& runtimeDir) const;
 
     // Initialize the module for the given platform and run RuntimeImport.
     // Used by RunInit to pre-compile core libraries for the bitcode cache.

@@ -428,3 +428,96 @@ Single-compile findings:
  10. Profile caveat: the p_large test_move -o run was cache-COLD (LoadCoreBitcodeIfFresh 0
     samples; core arrived via CompileImportedFile). Why -o missed the warm cache there needs
     a follow-up check before trusting single-compile cache assumptions.
+
+## Core sharing / sharding design notes - 2026-08-28 (investigation, no code)
+
+Question: can the core library stop being re-loaded (batch) and re-codegen'd (per exe), given
+each compile mutates the module it lives in?
+
+Measurements (Release, warm cache, LLVM 23 llvm-nm on core_macos.bc = 580 defined symbols):
+- hello-world -o: 0.06s total; final IR has 38 defines / 1157 lines. GlobalDCE already strips
+  core hard for small programs.
+- test_move -o (1.16s): 911 defines, of which only 69 are pristine-core (1.7k of 39.7k IR
+  lines, ~4%). The isel weight is user functions + core-template MONOMORPHIZATIONS
+  (list<UserT> etc.), which are program-specific by construction.
+- REVISES the LLVM audit item 8: a precompiled core OBJECT would save ~4%, not ~20% - the
+  audit could not separate core from monomorphs in sample data; the symbol intersection can.
+  Do not build core-object caching for performance. Pre-instantiating common builtin-typed
+  generics (list<i32>, list<string>...) in the cache is the surviving variant of that idea,
+  but test_move showed ~1 builtin-typed instantiation vs ~20 user-typed - needs measurement
+  over real programs (example/ tree) before any design work.
+
+Why the module cannot simply be shared across batch files: user codegen appends functions,
+globals, and string-pool entries into the SAME llvm::Module the core was loaded into, and all
+symbol tables (functionTable etc.) hold llvm::Value* into it; ResetForReanalysis swaps
+context+module wholesale. A two-module design (immutable core + per-file user module with
+external declarations) founders on cross-module Value*: every table entry pointing into the
+core module becomes invalid for CreateCall in the user module. Large refactor, rejected while
+the reload can instead be made nearly free.
+
+What --check actually needs from core (verified in code):
+- returnBlockTable stores CompoundStatementContext* (parse contexts) - return-block inlining
+  regenerates from source, never reads core IR bodies.
+- Baseline passes / DCE / codegen are gated off under checkOnly (LLVMBackend.cpp:2352).
+- The ONLY body consumer left is the unconditional VerifyModule (2344) - already flagged as
+  audit item 4 (scope it to TU-defined functions).
+So for --check/LSP, core function bodies are dead weight end to end, and "sharding" reduces to
+the audit's low-risk batch items: memoized ComputeCoreHash (5) + cached meta.json DOM (2) +
+lazy bitcode module (1) + scoped verify (4) = the reload becomes metadata-deserialize only
+(~1ms-shaped), no architectural change, est ~35-40% of the 3.8s batch. That combination IS the
+recommended "avoid contention" design; implement in that order (5, 2 first: trivial and
+independent; then 4; then 1 with the materialize-on-emit guard for -o/-l paths).
+
+## Batch items 5+2+4+9 - LANDED 2026-08-28 (timebox 2)
+
+Implemented (audit items from the LLVM-side section above): ComputeCoreHash + canonical-path
+memo (member cache; cleared by ResetForReanalysis unless the pre-existing batchMode_ flag is
+set - SetBatchMode came with --check batch, reused); meta.json + symbols.json DOM caches
+(CoreJsonCacheEntry: buffer declared before Value - the DOM holds StringRefs into it; keyed
+path+core_hash+mtime+size; survives ResetForReanalysis like parseTreeCache_, comment says so);
+scoped VerifyModule (cachedFunctionNames_ snapshot after cache load, verifyFunction on
+non-snapshot definitions only, full verifyModule on any cold/miss path - snapshot reset at
+Compile/Analyze entry so a miss can never inherit one); deleted the discarded verifyFunction
+on body-less prototypes (LLVMBackend_OwnershipTemps.cpp).
+
+Serial results: err batch 3.81-3.82 -> 2.96-2.98s (-22%); test_move 1.15-1.16 -> 1.14s.
+IR 0/40 vs pre-change capture; test.sh 720/0/8; LSP all pass. All failure exits in
+LoadCoreBitcodeIfFresh remain before the context/module swap (re-verified).
+
+Item 10 CLOSED: test_move -o with -v prints "core bitcode cache: hit" - the cache-cold look
+of the p_large sample was sampling-resolution artifact, not a bug.
+
+Item 1 (lazy bitcode) in flight; spec scratch/SPEC_lazybc.md includes the mandatory hazard
+audit: unmaterialized functions have empty()==true / isDeclaration()==false, so every
+"already has a body?" decision must treat isMaterializable() as having a body.
+
+## Batch item 1 - lazy core bitcode - LANDED 2026-08-28 (timebox 2)
+
+getLazyBitcodeModule replaces parseBitcodeFile; MemoryBuffer owned alongside the module
+(swap/reset lifecycle). Output compiles (-o/-l/-b/isolated) materialize EAGERLY right after
+cache load (frontend may fold core ctors while walking user code); only --check and LSP
+Analyze stay lazy end-to-end. MaterializeCoreIfLazy() choke points also guard RunBaselinePasses,
+GlobalDCE, AuditIsolatedModule, emit paths. Hazard audit done: every body-presence check
+(fn->empty()/isDeclaration()/size()) now treats isMaterializable() as HAVING a body
+(definition-skip sites in Aggregates/Declarations/Interfaces); CalleeHasSideEffectsSafe goes
+conservative (assume effects) for unmaterialized callees - a discard-hint could diverge
+between --check (lazy) and -o (eager) for pure core callees; no test depends on it.
+
+Serial: err batch 2.96-2.98 -> 1.91-1.95s (-35%); test_move 1.14 -> 1.11-1.17s; hello --check
+floor 0.03 -> 0.01s. IR 0/40; test.sh 720/0/8; LSP green.
+
+Timebox-2 cumulative: batch 3.81 -> 1.93s (-50%), all four audit items + free deletion landed.
+
+## CodeGenOptLevel mapping - LANDED 2026-08-28 (timebox 2, final item)
+
+createTargetMachine at all 4 emit sites (and CreateOptTargetMachine) now passes
+CodeGenLevelFor(cOptLevel_): -O0 (the default) -> CodeGenOptLevel::None (FastISel + fast
+regalloc, exactly clang -O0), -O1 -> Less, -O2 -> Default, -O3+ -> Aggressive. Previously
+every build paid O2-grade SelectionDAG + full regalloc while the IR side ran only baseline
+passes. Behavior note for review: default-build executables now get -O0-quality code (faster
+compile, slower runtime); -O2/-O3 builds are byte-for-byte unchanged, and performance.bat
+already mandates -O2. IR is emitted before isel, so --out-lli output is unchanged (0/40).
+
+Serial: test_move -o 1.14 -> 0.92s (-19%); err batch unchanged ~1.99s (no codegen in --check).
+test.sh 720/0/8 (all programs still pass running -O0 code within timeouts); LSP green;
+-O2 compile sanity-checked.

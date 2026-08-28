@@ -77,6 +77,22 @@ bool LLVMBackend::VerifyModule()
 {
         std::string errors;
         llvm::raw_string_ostream errorStream(errors);
+        if (cachedFunctionNames_)
+        {
+            // Cached module-level artifacts are not checked here; cold compiles still use verifyModule.
+            for (auto& function : module->functions())
+            {
+                if (function.isDeclaration()
+                    || cachedFunctionNames_->contains(function.getName().str()))
+                    continue;
+                if (llvm::verifyFunction(function, &errorStream))
+                {
+                    std::cout << std::format("Module verification failed:\n{}\n", errorStream.str());
+                    return false;
+                }
+            }
+            return true;
+        }
         if (llvm::verifyModule(*module, &errorStream))
         {
             std::cout << std::format("Module verification failed:\n{}\n", errorStream.str());
@@ -100,6 +116,7 @@ llvm::TargetLibraryInfoImpl LLVMBackend::MakeStdioSafeTLII(const llvm::Triple& t
 
 bool LLVMBackend::SaveToFile(const std::string& filename)
 {
+        MaterializeCoreIfLazy();
         std::error_code errorCode;
         llvm::raw_fd_ostream outLL(filename, errorCode);
         if (errorCode)
@@ -113,6 +130,7 @@ bool LLVMBackend::SaveToFile(const std::string& filename)
 
 bool LLVMBackend::WriteBitcode(const std::string& filename)
 {
+        MaterializeCoreIfLazy();
         std::error_code errorCode;
         llvm::raw_fd_ostream outBC(filename, errorCode, llvm::sys::fs::OF_None);
         if (errorCode)

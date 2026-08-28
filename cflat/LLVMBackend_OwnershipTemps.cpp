@@ -3,7 +3,6 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
-#include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
 #include <llvm/IR/CFG.h>
 #include <unordered_set>
@@ -959,8 +958,6 @@ llvm::Function* LLVMBackend::createFunctionProto(const std::string& name, llvm::
         // CFlat treats null pointer dereferences as defined behavior (hardware fault -> SEH).
         // NullPointerIsValid prevents instcombine from removing null loads/stores as UB.
         fn->addFnAttr(llvm::Attribute::NullPointerIsValid);
-
-        llvm::verifyFunction(*fn);
 
         return fn;
     }
