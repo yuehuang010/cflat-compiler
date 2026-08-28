@@ -2678,6 +2678,8 @@ private:
     std::vector<std::string> cLinkLibs_;
     std::vector<std::string> cDefines_;
     std::vector<std::string> dependencyFiles_;
+    std::unordered_map<std::string, std::string> dependencyPathMemo_;
+    std::unordered_set<std::string> dependencyFileSet_;
     void RecordDependency(const std::string& path);
     // A positional `.c` input, noted at arg-parse time because clang is only invoked for it
     // AFTER the module-end analyses run. Read by RunNullIfaceGlobalCheck.

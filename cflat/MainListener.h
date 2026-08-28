@@ -1721,14 +1721,52 @@ static bool ComputeReturnsOwned(const LLVMBackend::DeclTypeAndValue& returnType,
     return false;
 }
 
+// Map a generated parser context type to its rule index, so a node-type test is an integer
+// compare instead of the RTTI hierarchy walk dynamic_cast performs on every tree node.
+// LOAD-BEARING INVARIANT: this is exact only because CFlat.g4 has NO labeled alternatives
+// (`# Label`). ANTLR generates a context SUBCLASS per labeled alternative, and such a subclass
+// shares its parent's rule index - dynamic_cast would distinguish the two, AsRuleCtx cannot.
+// If a labeled alternative is ever added to the grammar, revisit every AsRuleCtx call site.
+template <typename Ctx> struct RuleIndexOf;
+
+template <> struct RuleIndexOf<CFlatParser::LambdaExpressionContext>
+{ static constexpr size_t value = CFlatParser::RuleLambdaExpression; };
+template <> struct RuleIndexOf<CFlatParser::JumpStatementContext>
+{ static constexpr size_t value = CFlatParser::RuleJumpStatement; };
+template <> struct RuleIndexOf<CFlatParser::SelectionStatementContext>
+{ static constexpr size_t value = CFlatParser::RuleSelectionStatement; };
+template <> struct RuleIndexOf<CFlatParser::IterationStatementContext>
+{ static constexpr size_t value = CFlatParser::RuleIterationStatement; };
+template <> struct RuleIndexOf<CFlatParser::LabeledStatementContext>
+{ static constexpr size_t value = CFlatParser::RuleLabeledStatement; };
+template <> struct RuleIndexOf<CFlatParser::ConditionalExpressionContext>
+{ static constexpr size_t value = CFlatParser::RuleConditionalExpression; };
+template <> struct RuleIndexOf<CFlatParser::MoveExpressionContext>
+{ static constexpr size_t value = CFlatParser::RuleMoveExpression; };
+template <> struct RuleIndexOf<CFlatParser::FunctionDefinitionContext>
+{ static constexpr size_t value = CFlatParser::RuleFunctionDefinition; };
+template <> struct RuleIndexOf<CFlatParser::AssignmentExpressionContext>
+{ static constexpr size_t value = CFlatParser::RuleAssignmentExpression; };
+template <> struct RuleIndexOf<CFlatParser::InitDeclaratorContext>
+{ static constexpr size_t value = CFlatParser::RuleInitDeclarator; };
+
+template <typename Ctx>
+inline Ctx* AsRuleCtx(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr || node->getTreeType() != antlr4::tree::ParseTreeType::RULE)
+        return nullptr;
+    auto* rule = static_cast<antlr4::RuleContext*>(node);
+    return rule->getRuleIndex() == RuleIndexOf<Ctx>::value ? static_cast<Ctx*>(rule) : nullptr;
+}
+
 // Collect the 'return <expr>;' expressions a function body owns itself. A nested lambda's
 // returns belong to the lambda, so its subtree is skipped.
 static void CollectOwnReturnExpressions(antlr4::tree::ParseTree* node,
                                         std::vector<CFlatParser::ExpressionContext*>& out)
 {
     if (node == nullptr) return;
-    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr) return;
-    if (auto* jump = dynamic_cast<CFlatParser::JumpStatementContext*>(node))
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node) != nullptr) return;
+    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
         if (jump->expression() != nullptr) out.push_back(jump->expression());
     for (auto* child : node->children)
         CollectOwnReturnExpressions(child, out);
@@ -1855,17 +1893,37 @@ inline const char* CapabilityForLockMode(const std::string& mode)
     return "ILockable";
 }
 
+using ReturnScanMemo = std::unordered_map<const antlr4::tree::ParseTree*, bool>;
+
 // True if executing `node` can RETURN from the enclosing function - a `return` (value,
 // return-block, or `return default`) that is not inside a nested lambda. `break`/`continue`
 // exit a loop, not the function, so they do not count (jump->Return() is null for them).
-inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node)
+inline bool SubtreeContainsFunctionReturn(antlr4::tree::ParseTree* node, ReturnScanMemo* memo = nullptr)
 {
     if (node == nullptr) return false;
-    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return false;
-    if (auto* jump = dynamic_cast<CFlatParser::JumpStatementContext*>(node))
-        if (jump->Return() != nullptr) return true;
+    if (memo != nullptr)
+    {
+        auto it = memo->find(node);
+        if (it != memo->end()) return it->second;
+    }
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node))
+    {
+        if (memo != nullptr) (*memo)[node] = false;
+        return false;
+    }
+    if (auto* jump = AsRuleCtx<CFlatParser::JumpStatementContext>(node))
+        if (jump->Return() != nullptr)
+        {
+            if (memo != nullptr) (*memo)[node] = true;
+            return true;
+        }
     for (auto* child : node->children)
-        if (SubtreeContainsFunctionReturn(child)) return true;
+        if (SubtreeContainsFunctionReturn(child, memo))
+        {
+            if (memo != nullptr) (*memo)[node] = true;
+            return true;
+        }
+    if (memo != nullptr) (*memo)[node] = false;
     return false;
 }
 
@@ -1882,10 +1940,11 @@ using IfConstEvaluator = std::function<int(CFlatParser::ExpressionContext*)>;
 // whose condition is a compile-time constant for this instantiation is NOT runtime-conditional:
 // its live branch is straight-line code, so `evalIfConst` lets us descend into it.
 inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::unordered_set<std::string>& out,
-                                           const IfConstEvaluator& evalIfConst = {})
+                                           const IfConstEvaluator& evalIfConst = {},
+                                           ReturnScanMemo* returnScanMemo = nullptr)
 {
     if (node == nullptr) return;
-    if (auto* sel = dynamic_cast<CFlatParser::SelectionStatementContext*>(node))
+    if (auto* sel = AsRuleCtx<CFlatParser::SelectionStatementContext>(node))
     {
         // `if const (COND)`: the live branch (COND-true, or the else on COND-false) executes
         // unconditionally for this instantiation, so descend into it. A dead branch is skipped;
@@ -1895,32 +1954,32 @@ inline void CollectUnconditionalMovedNames(antlr4::tree::ParseTree* node, std::u
             int taken = evalIfConst(sel->expression());
             auto inner = sel->statement();
             if (taken == 1 && inner.size() > 0)
-                CollectUnconditionalMovedNames(inner[0], out, evalIfConst);
+                CollectUnconditionalMovedNames(inner[0], out, evalIfConst, returnScanMemo);
             else if (taken == 0 && inner.size() > 1)
-                CollectUnconditionalMovedNames(inner[1], out, evalIfConst);
+                CollectUnconditionalMovedNames(inner[1], out, evalIfConst, returnScanMemo);
         }
         // A runtime `if`/`switch` (or an undecidable if-const) is conditional - stop descending.
         return;
     }
     // A move reached only through one of these executes conditionally (or in a captured
     // scope), so it cannot make the parameter a sink - stop descending here.
-    if (dynamic_cast<CFlatParser::IterationStatementContext*>(node)
-        || dynamic_cast<CFlatParser::LabeledStatementContext*>(node)
-        || dynamic_cast<CFlatParser::LambdaExpressionContext*>(node))
+    if (AsRuleCtx<CFlatParser::IterationStatementContext>(node)
+        || AsRuleCtx<CFlatParser::LabeledStatementContext>(node)
+        || AsRuleCtx<CFlatParser::LambdaExpressionContext>(node))
         return;
     // A ternary `a ? b : c` (or `a ?? b`) makes its branches conditional.
-    if (auto* cond = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+    if (auto* cond = AsRuleCtx<CFlatParser::ConditionalExpressionContext>(node))
         if (cond->children.size() > 1) return;
-    if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+    if (auto* mv = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
         if (auto* u = mv->unaryExpression())
             out.insert(BareSourceText(u));
     for (auto* child : node->children)
     {
-        CollectUnconditionalMovedNames(child, out, evalIfConst);
+        CollectUnconditionalMovedNames(child, out, evalIfConst, returnScanMemo);
         // A statement that can return from the function makes every LATER sibling conditional,
         // so a `move` after an early exit (e.g. `if (b) return; g = move v;`) is not a sink -
         // consuming the caller there would leak on the not-moved path.
-        if (SubtreeContainsFunctionReturn(child)) break;
+        if (SubtreeContainsFunctionReturn(child, returnScanMemo)) break;
     }
 }
 
@@ -1950,13 +2009,13 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
                                       WrappedSourceNames* wrapped = nullptr)
 {
     if (node == nullptr) return;
-    if (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node)) return;
-    if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node)) return;
-    if (auto* asn = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+    if (AsRuleCtx<CFlatParser::LambdaExpressionContext>(node)) return;
+    if (AsRuleCtx<CFlatParser::FunctionDefinitionContext>(node)) return;
+    if (auto* asn = AsRuleCtx<CFlatParser::AssignmentExpressionContext>(node))
         if (asn->assignmentOperator() != nullptr && asn->assignmentOperator()->getText() == "="
             && asn->assignmentExpression() != nullptr)
             RecordConsumeSourceName(asn->assignmentExpression(), out, wrapped);
-    if (auto* init = dynamic_cast<CFlatParser::InitDeclaratorContext*>(node))
+    if (auto* init = AsRuleCtx<CFlatParser::InitDeclaratorContext>(node))
     {
         if (auto* iz = init->initializer(); iz != nullptr)
         {
@@ -1967,7 +2026,7 @@ inline void CollectConsumedStoreNames(antlr4::tree::ParseTree* node, std::unorde
         // `T[N] d { p };` - the brace-ctor alternative hangs the list off the declarator itself.
         CollectPositionalBraceElementNames(init->initializerList(), out, wrapped);
     }
-    if (auto* mv = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+    if (auto* mv = AsRuleCtx<CFlatParser::MoveExpressionContext>(node))
         if (auto* u = mv->unaryExpression())
             out.insert(BareSourceText(u));
     for (auto* child : node->children)
@@ -2015,7 +2074,8 @@ inline void ApplyOwningSinkInferenceToBody(const LLVMBackend* compiler,
 {
     if (body == nullptr) return;
     std::unordered_set<std::string> movedNames;
-    CollectUnconditionalMovedNames(body, movedNames, evalIfConst);
+    ReturnScanMemo returnScanMemo;
+    CollectUnconditionalMovedNames(body, movedNames, evalIfConst, &returnScanMemo);
     std::unordered_set<std::string> consumedNames;
     WrappedSourceNames wrappedConsumed;
     CollectConsumedStoreNames(body, consumedNames, &wrappedConsumed);

@@ -173,11 +173,26 @@ bool ReadFileStamp(const std::filesystem::path& path, int64_t& mtime, int64_t& s
 void LLVMBackend::RecordDependency(const std::string& path)
 {
     if (path.empty()) return;
+
+    auto cached = dependencyPathMemo_.find(path);
+    if (cached != dependencyPathMemo_.end())
+    {
+        if (cached->second.empty()) return;
+        if (dependencyFileSet_.insert(cached->second).second)
+            dependencyFiles_.push_back(cached->second);
+        return;
+    }
+
     std::error_code ec;
     auto absolute = ExistingAbsolutePath(path, ec);
-    if (ec || !std::filesystem::is_regular_file(absolute, ec) || ec) return;
+    if (ec || !std::filesystem::is_regular_file(absolute, ec) || ec)
+    {
+        dependencyPathMemo_.emplace(path, "");
+        return;
+    }
     auto text = absolute.string();
-    if (std::find(dependencyFiles_.begin(), dependencyFiles_.end(), text) == dependencyFiles_.end())
+    dependencyPathMemo_.emplace(path, text);
+    if (dependencyFileSet_.insert(text).second)
         dependencyFiles_.push_back(std::move(text));
 }
 
@@ -1590,8 +1605,15 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     bool checkOnly = args.hasFlag("check");
     auto filename = inputOverride.empty() ? args.getPositional(0).value_or("") : inputOverride;
     dependencyFiles_.clear();
-    for (size_t i = 0; i < args.positionalCount(); ++i)
-        RecordDependency(*args.getPositional(i));
+    dependencyPathMemo_.clear();
+    dependencyFileSet_.clear();
+    if (inputOverride.empty())
+    {
+        for (size_t i = 0; i < args.positionalCount(); ++i)
+            RecordDependency(*args.getPositional(i));
+    }
+    else
+        RecordDependency(filename);
     sourceFileName = std::filesystem::path(filename).filename().string();
     llvm::TimeTraceScope compileScope("Compilation", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filename).string();
@@ -2326,31 +2348,35 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
-    if (!args.hasFlag("no-opt"))
+    // Isolated-policy checks audit the optimized module, so retain DCE for that consumer.
+    if (!checkOnly || isolatedPolicy_)
     {
-        llvm::TimeTraceScope baselineScope("BaselinePasses");
-        if (verbose) std::cout << "[verbose] running baseline passes (sroa, mem2reg, instcombine, simplifycfg)\n";
-        RunBaselinePasses();
-    }
+        if (!args.hasFlag("no-opt"))
+        {
+            llvm::TimeTraceScope baselineScope("BaselinePasses");
+            if (verbose) std::cout << "[verbose] running baseline passes (sroa, mem2reg, instcombine, simplifycfg)\n";
+            RunBaselinePasses();
+        }
 
-    int optLevel = args.getOptimizationLevel();
-    // OptimizeModule also hosts the AddressSanitizer pass, which must run even at -O0,
-    // so enter it when --asan is set regardless of the optimization level.
-    if (optLevel > 0 || asan_)
-    {
-        llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
-        if (verbose) std::cout << std::format("[verbose] running optimizations (O{}{})\n", optLevel, asan_ ? ", asan" : "");
-        OptimizeModule(optLevel);
-    }
-    else if (!args.hasFlag("no-opt"))
-    {
-        // -O0 (no asan): OptimizeModule was skipped, so nothing pruned the unreachable
-        // internal functions the whole core library contributes. Run GlobalDCE alone so
-        // codegen does not instruction-select dead core. Before the --out-lli write below
-        // so the dumped IR still matches what lands in the object.
-        llvm::TimeTraceScope dceScope("GlobalDCE", "O0");
-        if (verbose) std::cout << "[verbose] running -O0 global dead-code elimination\n";
-        RunGlobalDCE();
+        int optLevel = args.getOptimizationLevel();
+        // OptimizeModule also hosts the AddressSanitizer pass, which must run even at -O0,
+        // so enter it when --asan is set regardless of the optimization level.
+        if (optLevel > 0 || asan_)
+        {
+            llvm::TimeTraceScope optScope("OptimizePasses", std::format("O{}", optLevel));
+            if (verbose) std::cout << std::format("[verbose] running optimizations (O{}{})\n", optLevel, asan_ ? ", asan" : "");
+            OptimizeModule(optLevel);
+        }
+        else if (!args.hasFlag("no-opt"))
+        {
+            // -O0 (no asan): OptimizeModule was skipped, so nothing pruned the unreachable
+            // internal functions the whole core library contributes. Run GlobalDCE alone so
+            // codegen does not instruction-select dead core. Before the --out-lli write below
+            // so the dumped IR still matches what lands in the object.
+            llvm::TimeTraceScope dceScope("GlobalDCE", "O0");
+            if (verbose) std::cout << "[verbose] running -O0 global dead-code elimination\n";
+            RunGlobalDCE();
+        }
     }
 
     if (isolatedPolicy_ && IsIsolatedCoreSource())
@@ -4138,6 +4164,8 @@ void LLVMBackend::ResetForReanalysis()
 {
     analyzeDebugInfo_ = false;
     isolatedPolicy_.reset();
+    dependencyPathMemo_.clear();
+    dependencyFileSet_.clear();
     manifestFragments_.clear();
     compileTimeStringConstants_.clear();
     // Reset the LLVM context so named struct types from a previous analysis do
@@ -6502,13 +6530,14 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // Build metadata JSON. Scope the serialization walk separately from the file
     // write below so -ftime-trace mirrors the read-side split (deserialize vs parse).
     llvm::json::Object root;
+    llvm::json::Object symbolsRoot;
     {
         llvm::TimeTraceScope buildScope("CoreCacheJsonBuild", prefix);
     // Each version added tables an older cache lacks, so an older cache must be rejected rather
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI - such a parameter is now passed as a pointer to the
     // caller's object, so cached v7 core bitcode has the wrong calling convention for it).
-    root["version"]   = 8;
+    root["version"]   = 9;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -6683,10 +6712,10 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         root["globals"] = std::move(arr);
     }
 
-    // LSP symbol definitions are emitted by the core listener walk. Keep them beside the
-    // compiler tables so a cache hit can replay core hover and completion entries.
-    // File paths are stored relative to runtimeDir (like imported_files above) so the
-    // cache stays portable between Debug/Release builds sharing one cache directory.
+    // LSP symbol definitions are emitted by the core listener walk. Keep them in a sidecar so
+    // CLI cache loads do not parse data that only LSP and symbol-query consumers need.
+    // File paths are stored relative to runtimeDir (like imported_files above) so the cache stays
+    // portable between Debug/Release builds sharing one cache directory.
     auto relToRuntime = [&](const std::string& file) -> std::string
     {
         std::error_code rec;
@@ -6722,7 +6751,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             so["overloads"] = std::move(overloads);
             arr.push_back(std::move(so));
         }
-        root["core_symbols"] = std::move(arr);
+        symbolsRoot["core_symbols"] = std::move(arr);
     }
 
     {
@@ -6737,7 +6766,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             vo["column"] = static_cast<int64_t>(info.column);
             arr.push_back(std::move(vo));
         }
-        root["core_variables"] = std::move(arr);
+        symbolsRoot["core_variables"] = std::move(arr);
     }
 
     // manifest fragments and their [JsonText] leaf records. These are compile-time state from
@@ -6881,6 +6910,10 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         llvm::raw_fd_ostream jsonOut(prefix + ".meta.json", ec);
         if (ec) return false;
         jsonOut << llvm::json::Value(std::move(root));
+
+        llvm::raw_fd_ostream symbolsOut(prefix + ".symbols.json", ec);
+        if (ec) return false;
+        symbolsOut << llvm::json::Value(std::move(symbolsRoot));
     }
     return true;
 }
@@ -6890,6 +6923,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     std::string prefix   = (std::filesystem::path(cacheDir) / ("core_" + platform)).string();
     std::string bcPath   = prefix + ".bc";
     std::string jsonPath = prefix + ".meta.json";
+    std::string symbolsPath = prefix + ".symbols.json";
 
     if (!std::filesystem::exists(bcPath) || !std::filesystem::exists(jsonPath))
         return false;
@@ -6909,9 +6943,25 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 8) return false;   // v7 predates the `alias T` reference ABI (see writer)
+    if (!ver || *ver != 9) return false;   // v8 predates the split LSP symbol sidecar (see writer)
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != ComputeCoreHash(runtimeDir)) return false;
+    if (!std::filesystem::exists(symbolsPath)) return false;
+
+    // Read the LSP symbol sidecar here, BEFORE the context swap below, and only when a consumer
+    // will use it. Every failure exit in this function must precede that swap: returning false
+    // afterwards reports a cache miss on an already-deserialized backend, and the caller then
+    // re-imports core on top of it. The parse itself is ~68% of the metadata, hence the gate.
+    std::optional<llvm::json::Value> symbolsJson;
+    if (symbolSink_ != nullptr)
+    {
+        auto symbolsBuf = llvm::MemoryBuffer::getFile(symbolsPath);
+        if (!symbolsBuf) return false;
+        llvm::TimeTraceScope symbolsScope("CoreCacheSymbolsParse", symbolsPath);
+        auto symbolsParsed = llvm::json::parse((*symbolsBuf)->getBuffer());
+        if (!symbolsParsed || !symbolsParsed->getAsObject()) return false;
+        symbolsJson = std::move(*symbolsParsed);
+    }
 
     // Load bitcode into a FRESH LLVMContext so named types (e.g. %string) from
     // RegisterBuiltinString don't conflict with the bitcode's versions.  After
@@ -7178,66 +7228,76 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
 
     } // end CoreDes:Globals
 
-    // Restore the symbol-sink entries emitted while the core cache was built. They are
-    // replayed into each LSP analysis index after this load completes. Stored paths are
-    // runtimeDir-relative (cache is shared across builds); rejoin against this runtimeDir.
-    auto rejoinRuntime = [&](llvm::StringRef file) -> std::string
+    // Restore symbol-sink entries only for LSP and symbol-query consumers. SetSymbolSink is
+    // installed before Analyze() on both paths, so CLI cache loads skip this sidecar entirely.
+    if (symbolsJson)
     {
-        std::filesystem::path p(file.str());
-        if (p.is_relative())
-            return std::filesystem::weakly_canonical(
-                std::filesystem::path(runtimeDir) / p).string();
-        return file.str();
-    };
-    { llvm::TimeTraceScope s("CoreDes:Symbols", jsonPath);
-    if (auto* arr = root->getArray("core_symbols"))
-        for (auto& elem : *arr)
-        {
-            auto* so = elem.getAsObject();
-            if (!so) continue;
-            auto name = so->getString("name");
-            auto kind = so->getInteger("kind");
-            auto file = so->getString("file");
-            auto line = so->getInteger("line");
-            auto column = so->getInteger("column");
-            auto signature = so->getString("signature");
-            if (!name || !kind || !file || !line || !column || !signature
-                || *kind < 0 || *kind > static_cast<int64_t>(SymbolKind::Variable))
-                continue;
-            SymbolDef def;
-            def.name = name->str();
-            def.kind = static_cast<SymbolKind>(*kind);
-            def.file = rejoinRuntime(*file);
-            def.line = static_cast<int>(*line);
-            def.column = static_cast<int>(*column);
-            def.signatureMarkdown = signature->str();
-            if (auto doc = so->getString("doc")) def.docComment = doc->str();
-            if (auto* members = so->getArray("members"))
-                for (auto& member : *members)
-                    if (auto value = member.getAsString()) def.memberNames.push_back(value->str());
-            if (auto* overloads = so->getArray("overloads"))
-                for (auto& overload : *overloads)
-                    if (auto value = overload.getAsString()) def.overloadSignatures.push_back(value->str());
-            coreSymbolIndex_.RegisterDefinition(def);
-        }
-    } // end CoreDes:Symbols
+        auto* symbolsRoot = symbolsJson->getAsObject();
 
-    { llvm::TimeTraceScope s("CoreDes:Variables", jsonPath);
-    if (auto* arr = root->getArray("core_variables"))
-        for (auto& elem : *arr)
+        std::unordered_map<std::string, std::string> rejoinRuntimeMemo;
+        auto rejoinRuntime = [&](llvm::StringRef file) -> std::string
         {
-            auto* vo = elem.getAsObject();
-            if (!vo) continue;
-            auto name = vo->getString("name");
-            auto type = vo->getString("type");
-            auto file = vo->getString("file");
-            auto line = vo->getInteger("line");
-            auto column = vo->getInteger("column");
-            if (!name || !type || !file || !line || !column) continue;
-            coreSymbolIndex_.RegisterVariable(name->str(), type->str(), rejoinRuntime(*file),
-                                               static_cast<int>(*line), static_cast<int>(*column));
-        }
-    } // end CoreDes:Variables
+            std::string raw = file.str();
+            if (auto cached = rejoinRuntimeMemo.find(raw); cached != rejoinRuntimeMemo.end())
+                return cached->second;
+
+            std::filesystem::path p(raw);
+            std::string result = raw;
+            if (p.is_relative())
+                result = std::filesystem::weakly_canonical(
+                    std::filesystem::path(runtimeDir) / p).string();
+            return rejoinRuntimeMemo.emplace(std::move(raw), std::move(result)).first->second;
+        };
+        { llvm::TimeTraceScope s("CoreDes:Symbols", symbolsPath);
+        if (auto* arr = symbolsRoot->getArray("core_symbols"))
+            for (auto& elem : *arr)
+            {
+                auto* so = elem.getAsObject();
+                if (!so) continue;
+                auto name = so->getString("name");
+                auto kind = so->getInteger("kind");
+                auto file = so->getString("file");
+                auto line = so->getInteger("line");
+                auto column = so->getInteger("column");
+                auto signature = so->getString("signature");
+                if (!name || !kind || !file || !line || !column || !signature
+                    || *kind < 0 || *kind > static_cast<int64_t>(SymbolKind::Variable))
+                    continue;
+                SymbolDef def;
+                def.name = name->str();
+                def.kind = static_cast<SymbolKind>(*kind);
+                def.file = rejoinRuntime(*file);
+                def.line = static_cast<int>(*line);
+                def.column = static_cast<int>(*column);
+                def.signatureMarkdown = signature->str();
+                if (auto doc = so->getString("doc")) def.docComment = doc->str();
+                if (auto* members = so->getArray("members"))
+                    for (auto& member : *members)
+                        if (auto value = member.getAsString()) def.memberNames.push_back(value->str());
+                if (auto* overloads = so->getArray("overloads"))
+                    for (auto& overload : *overloads)
+                        if (auto value = overload.getAsString()) def.overloadSignatures.push_back(value->str());
+                coreSymbolIndex_.RegisterDefinition(def);
+            }
+        } // end CoreDes:Symbols
+
+        { llvm::TimeTraceScope s("CoreDes:Variables", symbolsPath);
+        if (auto* arr = symbolsRoot->getArray("core_variables"))
+            for (auto& elem : *arr)
+            {
+                auto* vo = elem.getAsObject();
+                if (!vo) continue;
+                auto name = vo->getString("name");
+                auto type = vo->getString("type");
+                auto file = vo->getString("file");
+                auto line = vo->getInteger("line");
+                auto column = vo->getInteger("column");
+                if (!name || !type || !file || !line || !column) continue;
+                coreSymbolIndex_.RegisterVariable(name->str(), type->str(), rejoinRuntime(*file),
+                                                   static_cast<int>(*line), static_cast<int>(*column));
+            }
+        } // end CoreDes:Variables
+    }
 
     // Manifest fragments and their [JsonText] leaf records.
     { llvm::TimeTraceScope s("CoreDes:Manifest", jsonPath);

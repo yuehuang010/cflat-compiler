@@ -3007,3 +3007,23 @@ containing nothing but `extern int main() { return 0; }`.
 - **Verification rule this produced:** for any fix in this area, read the emitted IR type and
   compare `sizeof` against it. A green suite does not distinguish a correct layout from a
   guessed one.
+
+## Benchmarking or IR-diffing the compiler: warm the core cache first (2026-08-28)
+
+Both compile TIME and emitted IR depend on whether the core bitcode cache hits, and
+`cmake_build.sh` redeploys `core/`, which rotates the cache-directory hash - so a build lands on a
+populated dir (hit) or a fresh one (miss) more or less at random.
+
+Measured with IDENTICAL source across two consecutive builds: `test_move` took 1.74s vs 1.30s, and
+the emitted IR differed on 39/39 test files (global emission order - `@__FILE__` position - and SSA
+value numbering; semantically equivalent). A cache miss re-parses core and builds the module; a hit
+reconstructs it from bitcode.
+
+So: run `cflat --init-local` after every build and before measuring, and confirm `-v` prints
+`core bitcode cache: hit` on BOTH sides of an A/B. With that step the same comparison gave 0/39 IR
+differences and timings stable to +/-0.02s.
+
+A before/after IR diff without this warm-up is not evidence of anything - and neither is a
+before/after timing. This cost most of a round: an agent reported a 1.64s -> 1.80s REGRESSION and a
+clean IR diff; the truth was a 1.64s -> 1.29s improvement with identical IR. Both of its numbers
+were cache-state artifacts, in opposite directions.
