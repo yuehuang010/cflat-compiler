@@ -39,11 +39,7 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CFLAT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cflat)
-if(APPLE)
-  option(CFLAT_USE_MIMALLOC "Link mimalloc into the cflat executable" ON)
-else()
-  option(CFLAT_USE_MIMALLOC "Link mimalloc into the cflat executable" OFF)
-endif()
+option(CFLAT_USE_MIMALLOC "Link mimalloc into the cflat executable" ON)
 
 # ---------------------------------------------------------------------------
 # Dependencies (provided by vcpkg via the toolchain file in the preset).
@@ -358,10 +354,13 @@ endif()
 if(CFLAT_USE_MIMALLOC AND APPLE)
   target_link_options(cflat PRIVATE
     "-Wl,-force_load,$<TARGET_FILE:${CFLAT_MIMALLOC_TARGET}>")
-elseif(CFLAT_USE_MIMALLOC AND WIN32)
-  # Windows static override needs mimalloc new/delete or the redirect DLL;
-  # validate before enabling by default.
+elseif(CFLAT_USE_MIMALLOC)
+  # Windows and Linux have no link-time malloc interposition the way Darwin's force_load
+  # gives, so the library alone overrides nothing. CFLAT_USE_MIMALLOC makes main.cpp include
+  # mimalloc-new-delete.h, which defines operator new/delete against mimalloc - that covers
+  # LLVM/ANTLR/std, the hot allocators. C malloc/free stays on the system allocator.
   target_link_libraries(cflat PRIVATE ${CFLAT_MIMALLOC_TARGET})
+  target_compile_definitions(cflat PRIVATE CFLAT_USE_MIMALLOC=1)
 endif()
 
 # ---------------------------------------------------------------------------

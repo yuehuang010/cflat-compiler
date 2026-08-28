@@ -3991,7 +3991,8 @@ Guid IID_IXamlMetadataProvider()
 }
 
 // Vtable = IInspectable (6 slots) + IXamlMetadataProvider (3 slots). GetXamlType takes a TypeName
-// {HSTRING Name; TypeKind Kind} by value, which splats into two args (void* + i32) on x64.
+// {HSTRING Name; TypeKind Kind} by value; at 16 bytes the x64 ABI passes it INDIRECTLY, so the
+// slot takes a TypeName* - the thunk only forwards it, so it stays an opaque void*.
 struct IXamlMetaVtbl
 {
     function<i32(void*, void*, void**)>      QueryInterface      = nullptr;
@@ -4000,7 +4001,7 @@ struct IXamlMetaVtbl
     function<i32(void*, u32*, void**)>       GetIids             = nullptr;
     function<i32(void*, void**)>             GetRuntimeClassName = nullptr;
     function<i32(void*, i32*)>               GetTrustLevel       = nullptr;
-    function<i32(void*, void*, i32, void**)> GetXamlType         = nullptr;
+    function<i32(void*, void*, void**)>      GetXamlType         = nullptr;
     function<i32(void*, void*, void**)>      GetXamlTypeByName   = nullptr;
     function<i32(void*, u32*, void**)>       GetXmlnsDefinitions = nullptr;
 };
@@ -4039,10 +4040,10 @@ i32 _outerGetIids(void* self, u32* count, void** iids) { count[0] = 0u; iids[0] 
 i32 _outerGetRcn(void* self, void** name) { name[0] = hstring("CFlatWinUI.App"); return 0; }
 i32 _outerGetTrust(void* self, i32* level) { level[0] = 0; return 0; }
 // The three IXamlMetadataProvider methods forward verbatim to the activated provider (_gMeta).
-i32 _outerGetXamlType(void* self, void* nameH, i32 kind, void** out)
+i32 _outerGetXamlType(void* self, void* typeName, void** out)
 {
     if (_gMeta == nullptr) { out[0] = nullptr; return (i32)0x80004005; }
-    return ((MetaObj*)_gMeta)->lpVtbl->GetXamlType(_gMeta, nameH, kind, out);
+    return ((MetaObj*)_gMeta)->lpVtbl->GetXamlType(_gMeta, typeName, out);
 }
 i32 _outerGetXamlTypeByName(void* self, void* fullName, void** out)
 {

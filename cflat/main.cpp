@@ -1,6 +1,13 @@
 // main.cpp : This file contains the 'main' function. Program execution begins and ends there.
 //
 
+// Route the C++ allocator through mimalloc. The header defines operator new/delete and MUST be
+// included in exactly one TU; this is that TU. The static triplet links it into the exe, so
+// nothing extra ships. C malloc/free stays on the CRT - consistent, since nothing crosses.
+#ifdef CFLAT_USE_MIMALLOC
+#include <mimalloc-new-delete.h>
+#endif
+
 #include <iostream>
 #include <filesystem>
 #include <stdlib.h>
