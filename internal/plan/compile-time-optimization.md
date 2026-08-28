@@ -508,6 +508,73 @@ floor 0.03 -> 0.01s. IR 0/40; test.sh 720/0/8; LSP green.
 
 Timebox-2 cumulative: batch 3.81 -> 1.93s (-50%), all four audit items + free deletion landed.
 
+## Timebox 3 - test_lsp.sh + example_mac.sh focus - 2026-08-28
+
+Baselines (macOS arm64, Release, warm --init-local, post-timebox-2 compiler):
+
+| Suite | Wall | CPU | Shape |
+|---|---|---|---|
+| test_lsp.sh Release | 18.2s | 65s (375%) | 17.6s of it is the 171-file bulk sweep; pool=4 |
+| example_mac.sh | 30.8s | 26.6s (92%) | fully SERIAL, 44 cases |
+
+Bulk-sweep profile (sample of the cflat LSP process, pool=4): ANTLR prediction dominates
+(closure_ + ATNConfig churn + malloc), i.e. the sweep is parse-bound; ~4.5% DFA-lock
+contention (psynch_mutexwait). Avg ~340ms CPU per swept file.
+
+Why per-file cost is that high: ui examples pay ~1s per analysis importing the core ui
+library. Time-trace of `gallery.cb --check` (1.06s total): ProcessImports 987ms - Parse of
+ui_native.cb / ui_native/cocoa.cb / host.cb / gallery_app.cb totals 638ms, the rest is the
+codegen walk of those imports. Two structural reasons:
+- The core bitcode cache holds ONLY runtime.cb's transitive closure (CompileCoreOnly
+  imports just runtime.cb). ui_native/* are opt-in core libs, re-compiled per compile.
+  Auto-adding them to the cache would be a SEMANTIC change (their symbols would resolve
+  without the explicit import) - do not do it naively.
+- parseTreeCache_ cached core imports only; user imports re-parsed per analysis.
+
+Landed this timebox:
+- example_mac.sh parallel job pool (JOBS arg/env, default physical cores): compiles +
+  tier-2/3 in the pool, tier-1 GUI selftests still run SERIALLY (Cocoa activation
+  flakiness), ordered result aggregation via $OUT/<name>.result files.
+  **30.8s -> ~4.9s wall**, 44/0 twice, forced-failure path verified.
+- Import parse-tree cache generalized: GetOrParseFile now caches EVERY successfully parsed
+  import (not just core) in parseTreeCache_, validated by mtime + file size;
+  importedParseStates deleted. Correctness basis: the LSP server has NO unsaved-edit
+  overlay for imports (analyzed doc goes via temp file; imports always read from disk), so
+  an mtime-validated cache is exactly as fresh as the old re-parse. Only error-free parses
+  are cached. (Results below.)
+
+### Timebox 3 results (verified in the main session, warm cache, Release)
+
+| Metric | Before | After |
+|---|---|---|
+| LSP bulk sweep (171 files, pool 4) | 16.1-19.1s | **9.5-9.7s** (-40%) |
+| example_mac.sh | 30.8s | **4.8s** warm (parallel pool; first run after a binary swap is ~11s while compiles re-warm) |
+| err batch --check x326 | 1.91-1.95s | 1.83-2.0s (unchanged - err files share few imports) |
+| hello --check floor | 0.02s | 0.02s (the extra per-import stat is free) |
+| test.sh Release | - | 720 passed, 0 failed, 8 skipped |
+| test_lsp.sh Release | - | all pass |
+
+### mimalloc - MEASURED NULL RESULT 2026-08-28
+
+The one-shot compile profile shows malloc/free as the largest top-of-stack bucket
+(ANTLR ATNConfig churn). A/B with mimalloc 3.5 via DYLD_INSERT_LIBRARIES (interposition
+CONFIRMED active via MIMALLOC_VERBOSE banner): gallery -o 1.33-1.34s both sides, delta
+zero. macOS xzone malloc is not the bottleneck; the sample attribution is diffuse churn,
+not contention. Do not propose an allocator dependency for compile throughput.
+
+### Remaining one-shot-compile levers, ranked (NOT started)
+
+1. **Per-library bitcode sidecars for opt-in core libs** (ui_native/ui_canvas/...): same
+   mechanism as the core cache (bitcode + serialized tables), loaded on `import` via
+   llvm::Linker merge + table replay. Kills BOTH the ~638ms parse and the ~340ms codegen
+   walk of a ui-example compile (~75% of gallery --check, ~60% of -o). Multi-day,
+   structural; the import is still required, so semantics are unchanged - this is the
+   correct version of "put ui_native in the core cache".
+2. Pre-instantiated common builtin-typed generics in the core cache - still needs the
+   example/-tree instantiation census before any design (see the sharing-design section).
+3. ANTLR prediction: cheap grammar wins exhausted (see the timebox-1/2 do-not-retry
+   lists); what remains is load-bearing ambiguity or accessor-breaking restructures.
+
 ## CodeGenOptLevel mapping - LANDED 2026-08-28 (timebox 2, final item)
 
 createTargetMachine at all 4 emit sites (and CreateOptTargetMachine) now passes

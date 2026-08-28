@@ -2609,24 +2609,23 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     return true;
 }
 
-LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& canonicalPath, const std::string& displayName, bool isCore)
+LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& canonicalPath, const std::string& displayName)
 {
-    // Reuse a previously parsed core tree when the file on disk is unchanged.
-    if (isCore)
+    // Reuse an imported tree when the file on disk is unchanged.
+    auto it = parseTreeCache_.find(canonicalPath);
+    if (it != parseTreeCache_.end())
     {
-        auto it = parseTreeCache_.find(canonicalPath);
-        if (it != parseTreeCache_.end())
+        std::error_code tec;
+        std::error_code sec;
+        auto wt = std::filesystem::last_write_time(canonicalPath, tec);
+        auto fileSize = std::filesystem::file_size(canonicalPath, sec);
+        if (!tec && !sec && wt == it->second->writeTime && fileSize == it->second->fileSize)
         {
-            std::error_code tec;
-            auto wt = std::filesystem::last_write_time(canonicalPath, tec);
-            if (!tec && wt == it->second->writeTime)
-            {
-                llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
-                if (verbose) std::cout << std::format("[verbose]   parse cache hit: {}\n", displayName);
-                return it->second.get();
-            }
-            parseTreeCache_.erase(it);  // stale - re-parse below
+            llvm::TimeTraceScope cacheScope("Parse", "cached:" + displayName);
+            if (verbose) std::cout << std::format("[verbose]   parse cache hit: {}\n", displayName);
+            return it->second.get();
         }
+        parseTreeCache_.erase(it);  // stale or unstatable - re-parse below
     }
 
     auto entry = std::make_unique<CachedParseTree>();
@@ -2672,16 +2671,11 @@ LLVMBackend::CachedParseTree* LLVMBackend::GetOrParseFile(const std::string& can
     entry->parser->removeErrorListeners();
 
     CachedParseTree* raw = entry.get();
-    if (isCore)
-    {
-        std::error_code tec;
-        entry->writeTime = std::filesystem::last_write_time(canonicalPath, tec);
-        parseTreeCache_[canonicalPath] = std::move(entry);
-    }
-    else
-    {
-        importedParseStates.push_back(std::move(entry));
-    }
+    std::error_code tec;
+    std::error_code sec;
+    entry->writeTime = std::filesystem::last_write_time(canonicalPath, tec);
+    entry->fileSize = std::filesystem::file_size(canonicalPath, sec);
+    parseTreeCache_[canonicalPath] = std::move(entry);
     return raw;
 }
 
@@ -3128,9 +3122,7 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     if (verbose) std::cout << std::format("[verbose] importing: {}\n", canonicalStr);
     llvm::TimeTraceScope importScope("ImportFile", importFilename);
 
-    // Implicit core-library imports (files under runtimeDir/core) have stable content for
-    // the process, so their parse trees are cached and reused across compiles and LSP
-    // re-analyses. User imports are parsed fresh and anchored for this compile only.
+    // Keep the source-origin classification for code-generation behavior.
     bool isCoreImport = false;
     if (!runtimeDir.empty())
     {
@@ -3140,10 +3132,9 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
             isCoreImport = IsPathUnderDirectory(canonicalStr, coreDir);
     }
 
-    // Get-or-parse the tree (cached for core, freshly parsed otherwise). Generic-template
-    // ctx pointers point into this tree; its owner (parseTreeCache_ for core,
-    // importedParseStates for user files) keeps it alive long enough to stay valid.
-    CachedParseTree* tree = GetOrParseFile(canonicalStr, importFilename, isCoreImport);
+    // All imported trees are mtime-and-size validated and retained for the process lifetime.
+    // Generic-template ctx pointers therefore remain valid across re-analysis.
+    CachedParseTree* tree = GetOrParseFile(canonicalStr, importFilename);
     if (!tree)
         return false;
 
@@ -4443,13 +4434,11 @@ void LLVMBackend::ResetForReanalysis()
     threadSharedTypes_.clear();  // re-derived per top-level file by ScanCrossThreadEscapes
     xthreadReported_.clear();
 
-    // Clear all import state so core files (string, runtime, etc.) are fully re-imported
-    // on the next Analyze() call. Core JSON DOM caches deliberately survive this reset: their
-    // path, core hash, mtime, and size validation keeps their StringRefs safe and fresh.
+    // Clear per-analysis import state. Imported parse trees deliberately survive this reset;
+    // their path, mtime, and size validation keeps them safe and fresh.
     importedFiles.clear();
     importStack.clear();
     importAliasMembers.clear();
-    importedParseStates.clear();
     syntheticParseStates_.clear();
     pendingMacroSources_.clear();
     pipeStreamCounter = 0;

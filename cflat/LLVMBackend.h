@@ -2873,20 +2873,21 @@ private:
         bool        isInt = false;
     };
     std::vector<UserDefine> userDefines_;
-    // ANTLR ecosystem kept alive so generic-template ctx pointers remain valid. Core-library
-    // entries reused across compiles; deliberately survives ResetForReanalysis.
+    // ANTLR ecosystem kept alive so generic-template ctx pointers remain valid. Imported
+    // entries are reused across compiles and deliberately survive ResetForReanalysis.
     struct CachedParseTree
     {
         std::string canonicalPath;                 // absolute canonical path
-        std::filesystem::file_time_type writeTime; // for staleness validation
+        std::filesystem::file_time_type writeTime{}; // for staleness validation
+        uintmax_t fileSize = 0;                    // for staleness validation
         std::unique_ptr<antlr4::ANTLRInputStream> input;
         std::unique_ptr<CFlatLexer> lexer;
         std::unique_ptr<antlr4::CommonTokenStream> tokens;
         std::unique_ptr<CFlatParser> parser;
         CFlatParser::CompilationUnitContext* unit = nullptr;  // owned by `parser`
     };
-    // Core-library imports only (stable for the process lifetime). User imports deliberately
-    // excluded: they change during editing, so bounding to core keeps staleness trivial.
+    // All imported parse trees are cached for the process lifetime and validated by mtime
+    // and size before reuse.
     std::unordered_map<std::string, std::unique_ptr<CachedParseTree>> parseTreeCache_;
     struct CoreHashCacheEntry
     {
@@ -2909,11 +2910,7 @@ private:
     // survive ResetForReanalysis like parseTreeCache_.
     std::unordered_map<std::string, CoreJsonCacheEntry> coreMetaJsonCache_;
     std::unordered_map<std::string, CoreJsonCacheEntry> coreSymbolsJsonCache_;
-    // Per-compile lifetime anchor for NON-core imported parse trees (generic-template ctx
-    // pointers point into them). Cleared by ResetForReanalysis; parseTreeCache_ is not.
-    std::vector<std::unique_ptr<CachedParseTree>> importedParseStates;
-
-    CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName, bool isCore);
+    CachedParseTree* GetOrParseFile(const std::string& canonicalPath, const std::string& displayName);
     // Parser ecosystem must outlive instantiation: genericFunctionTemplates holds raw
     // FunctionDefinitionContext pointers into these trees.
     struct SyntheticParseState
