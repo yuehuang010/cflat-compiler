@@ -3,7 +3,16 @@
   "version": "1.0",
   "dependencies": [
     "antlr4",
+    {
+      "name": "mimalloc",
+      "features": [
+        { "name": "override", "platform": "!windows" }
+      ]
+    },
     "nlohmann-json",
     "simdjson"
+  ],
+  "overrides": [
+    { "name": "mimalloc", "version": "3.3.2" }
   ]
 }

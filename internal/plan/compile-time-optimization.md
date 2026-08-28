@@ -554,13 +554,51 @@ Landed this timebox:
 | test.sh Release | - | 720 passed, 0 failed, 8 skipped |
 | test_lsp.sh Release | - | all pass |
 
-### mimalloc - MEASURED NULL RESULT 2026-08-28
+### mimalloc - CONFIRMED WIN via static link 2026-08-28 (insert-mode A/B was a false null)
 
-The one-shot compile profile shows malloc/free as the largest top-of-stack bucket
-(ANTLR ATNConfig churn). A/B with mimalloc 3.5 via DYLD_INSERT_LIBRARIES (interposition
-CONFIRMED active via MIMALLOC_VERBOSE banner): gallery -o 1.33-1.34s both sides, delta
-zero. macOS xzone malloc is not the bottleneck; the sample attribution is diffuse churn,
-not contention. Do not propose an allocator dependency for compile throughput.
+The one-shot compile profile shows malloc/free as the largest top-of-stack bucket (ANTLR
+ATNConfig churn). Two A/Bs with OPPOSITE results - the measurement lesson matters:
+
+- DYLD_INSERT_LIBRARIES=libmimalloc.dylib: ZERO delta (gallery 1.33-1.34s both sides),
+  despite the MIMALLOC_VERBOSE banner proving the library initialized. FALSE NULL: the
+  profile's allocation entry points are macOS typed-malloc (`malloc_type_malloc`, xzone),
+  which insert-mode interposition evidently does not fully capture.
+- Static link, `-Wl,-force_load,/opt/homebrew/lib/libmimalloc.a` (worktree
+  feature/mimalloc, CFLAT_USE_MIMALLOC option, default OFF): **-20-22% across the board**,
+  independently re-verified. gallery -o 1.33 -> 1.03s; test_move -o 0.92 -> 0.73s; err
+  batch 2.0 -> 1.6s. test.sh 720/0/8 with the mimalloc binary.
+
+LESSON: on macOS, do not accept a DYLD-insert allocator A/B as evidence in either
+direction; only a link-time A/B counts.
+
+Memory (peak RSS, measured): LOWER with mimalloc, not higher - gallery -o 251 -> 237MB,
+test_move -o 209 -> 187MB, LSP server over the 171-file bulk sweep 1285 -> 1195MB. The
+"reserving 1048576 KiB" banner is virtual reserve only. The pooled LSP server gains even
+more speed than one-shot compiles: bulk sweep 10.4 -> 7.3s (-30%) with the mimalloc
+binary (allocator contention across the 4 workers).
+
+Full-run A/B (peak per-process RSS via /usr/bin/time -l over the whole suite; both green):
+test.sh Release 209 -> 187MB (-11%), wall 24.5 -> 18.4s, CPU 67 -> 55s; example_mac.sh
+255 -> 237MB (-7%), CPU 32.3 -> 28.6s.
+
+Where the speedup lives (phase A/B, test_move -O2 time-trace): Parse -35%, listener
+CodeGeneration -21%, GenericMaterialize -33%; LLVM OptimizePasses -3% and EmitExecutable
+-2% (LLVM allocates via its own BumpPtrAllocator arenas, so the allocator swap barely
+touches it). Default -O0 builds therefore gain the most (-20-22%); -O2 gains ~-13%.
+
+LANDED on master (f105b1d) via vcpkg. Two port pitfalls that cost a debugging round,
+recorded so nobody retries the broken shapes:
+- The port's malloc override is a NON-DEFAULT feature: without `"features": ["override"]`
+  (MI_OVERRIDE) the lib initializes - banner and all - but never takes over malloc, and
+  the binary measures SLOWER than system malloc. The feature is platform-qualified
+  `!windows` because the port marks override unsupported on windows-static triplets.
+- The baseline resolves mimalloc to 2.2.4, which measured a REGRESSION (gallery 1.39s vs
+  1.33 system); pinned 3.3.2 via a manifest override (1.10-1.12s; brew 3.5.0 measured
+  1.03 - revisit the pin on the next baseline bump).
+Also: the macOS presets set VCPKG_MANIFEST_INSTALL=OFF, so any vcpkg.json change needs the
+manual populate step from cmake_build.sh's error text before it takes effect.
+Windows: CFLAT_USE_MIMALLOC stays default OFF there; needs new/delete override or the
+redirect DLL, validated on a Windows host, before flipping.
 
 ### Remaining one-shot-compile levers, ranked (NOT started)
 

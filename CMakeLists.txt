@@ -39,6 +39,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 set(CFLAT_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cflat)
+if(APPLE)
+  option(CFLAT_USE_MIMALLOC "Link mimalloc into the cflat executable" ON)
+else()
+  option(CFLAT_USE_MIMALLOC "Link mimalloc into the cflat executable" OFF)
+endif()
 
 # ---------------------------------------------------------------------------
 # Dependencies (provided by vcpkg via the toolchain file in the preset).
@@ -51,6 +56,16 @@ find_package(Clang CONFIG REQUIRED)
 find_package(antlr4-runtime CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(simdjson CONFIG REQUIRED)
+if(CFLAT_USE_MIMALLOC)
+  find_package(mimalloc CONFIG REQUIRED)
+  if(TARGET mimalloc-static)
+    set(CFLAT_MIMALLOC_TARGET mimalloc-static)
+  elseif(TARGET mimalloc)
+    set(CFLAT_MIMALLOC_TARGET mimalloc)
+  else()
+    message(FATAL_ERROR "mimalloc package exports no supported target")
+  endif()
+endif()
 
 message(STATUS "LLVM ${LLVM_PACKAGE_VERSION} (targets: ${LLVM_TARGETS_TO_BUILD})")
 message(STATUS "LLVM tools dir: ${LLVM_TOOLS_BINARY_DIR}")
@@ -338,6 +353,15 @@ elseif(UNIX)
   # find_package(Threads) + LLVM's interface libs cover most; filled in Stage 2.
   find_package(Threads REQUIRED)
   target_link_libraries(cflat PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+if(CFLAT_USE_MIMALLOC AND APPLE)
+  target_link_options(cflat PRIVATE
+    "-Wl,-force_load,$<TARGET_FILE:${CFLAT_MIMALLOC_TARGET}>")
+elseif(CFLAT_USE_MIMALLOC AND WIN32)
+  # Windows static override needs mimalloc new/delete or the redirect DLL;
+  # validate before enabling by default.
+  target_link_libraries(cflat PRIVATE ${CFLAT_MIMALLOC_TARGET})
 endif()
 
 # ---------------------------------------------------------------------------
