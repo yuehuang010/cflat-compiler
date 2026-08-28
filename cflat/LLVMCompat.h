@@ -1,6 +1,6 @@
 #pragma once
 
-// Small LLVM API shims shared by the LLVM 18 and LLVM 22 builds.
+// Small LLVM API shims shared by the LLVM 18, 22 and 23 builds.
 
 #include <string>
 #include <cstdint>
@@ -14,6 +14,7 @@
 #include <llvm/IR/Intrinsics.h>
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Module.h>
+#include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/AArch64TargetParser.h>
@@ -73,10 +74,35 @@ inline bool IsBranch(const llvm::Instruction* terminator)
 inline llvm::StringRef AArch64AliasName(
     const std::remove_reference_t<decltype(llvm::AArch64::CpuAliases[0])>& alias)
 {
-#if LLVM_VERSION_MAJOR >= 21
+#if LLVM_VERSION_MAJOR >= 23
+    // 23 turned the alias fields into StringTable offsets into AArch64::StrTab.
+    return llvm::AArch64::StrTab[alias.AltName];
+#elif LLVM_VERSION_MAJOR >= 21
     return alias.AltName;
 #else
     return alias.Alias;
+#endif
+}
+
+// LLVM 23 made SubtargetSubTypeKV use a relative string offset, replacing the
+// Key member with a key() accessor.
+inline const char* SubtargetKey(const llvm::SubtargetSubTypeKV& kv)
+{
+#if LLVM_VERSION_MAJOR >= 23
+    return kv.key();
+#else
+    return kv.Key;
+#endif
+}
+
+// LLVM 23 dropped the string-triple overload of lookupTarget; only the
+// Triple-typed form and the (ArchName, Triple&) form remain.
+inline const llvm::Target* LookupTarget(llvm::StringRef triple, std::string& err)
+{
+#if LLVM_VERSION_MAJOR >= 23
+    return llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), err);
+#else
+    return llvm::TargetRegistry::lookupTarget(triple, err);
 #endif
 }
 
@@ -262,5 +288,16 @@ inline std::unique_ptr<clang::CompilerInstance> CreateClangCompilerInstance(
 }
 
 #endif
+
+/*
+ * LLVM 23 made APInt reject a value that does not fit the target bit width instead of
+ * truncating it silently, so ConstantInt::get(iN, uint64) now asserts. Bitfield masks and
+ * C macro constants are built at 64 bits and narrowed ON PURPOSE, so truncate explicitly.
+ */
+inline llvm::ConstantInt* GetIntTruncated(llvm::Type* type, uint64_t value)
+{
+    const unsigned bits = type->getIntegerBitWidth();
+    return llvm::ConstantInt::get(type->getContext(), llvm::APInt(64, value).zextOrTrunc(bits));
+}
 
 } // namespace cflat_llvm_compat

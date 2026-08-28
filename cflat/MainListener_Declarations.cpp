@@ -1837,6 +1837,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 std::string rawText = expectErrDecl->StringLiteral()->getText();
                 compilerLLVM->expectedError = ProcessRawText(rawText);
                 compilerLLVM->expectedErrorScopeDepth = SIZE_MAX;
+                auto ownedTempMark = compilerLLVM->MarkOwnedTemps();
                 std::unordered_set<std::string> typesBefore;
                 for (const auto& [name, _] : compilerLLVM->dataStructures)
                     typesBefore.insert(name);
@@ -1883,6 +1884,7 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                     // The rest of the block never ran, so its `if const` arms were never decided.
                     ForgetIfConstGuardedImpls(compilerLLVM, expectErrDecl);
                     compilerLLVM->AbortFunctionBlocks(0);
+                    compilerLLVM->DiscardOwnedTempsSince(ownedTempMark);
                     compilerLLVM->ClearCurrentSubprogram();
                     compilerLLVM->RestoreFileScopeExpectedError();
                     // The throw unwound past the `global_scope = true` restore in the

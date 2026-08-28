@@ -1613,10 +1613,10 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // Third arg of CreateCast is isSigned (used only when widening); flip
                 // BitfieldUnsigned to get sign-extension for signed bitfields.
                 auto* valAsStorage = compiler->CreateCast(val, storageTy, !namedVar.BitfieldUnsigned);
-                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, llvm::ConstantInt::get(storageTy, valMask));
-                auto* valShifted = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, off));
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm_compat::GetIntTruncated(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, off));
                 auto* word = compiler->CreateLoad(storageTy, namedVar.BitfieldStorage);
-                auto* cleared = compiler->builder->CreateAnd(word, llvm::ConstantInt::get(storageTy, ~windowMask));
+                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm_compat::GetIntTruncated(storageTy, ~windowMask));
                 auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
                 compiler->builder->CreateStore(newWord, namedVar.BitfieldStorage);
 
@@ -1630,8 +1630,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 else
                 {
                     unsigned leftShift = storageBits - w;
-                    auto* shl = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, leftShift));
-                    result = compiler->builder->CreateAShr(shl, llvm::ConstantInt::get(storageTy, leftShift));
+                    auto* shl = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, leftShift));
+                    result = compiler->builder->CreateAShr(shl, cflat_llvm_compat::GetIntTruncated(storageTy, leftShift));
                 }
                 return result;
             };
@@ -8997,10 +8997,10 @@ void MainListener::EmitFieldInitializer(
                 uint64_t valMask = (w == 64) ? ~uint64_t(0) : ((uint64_t(1) << w) - 1);
                 uint64_t windowMask = valMask << off;
                 auto* valAsStorage = compiler->CreateCast(val, storageTy, !bfHit->IsUnsigned);
-                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, llvm::ConstantInt::get(storageTy, valMask));
-                auto* valShifted = compiler->builder->CreateShl(valMasked, llvm::ConstantInt::get(storageTy, off));
+                auto* valMasked = compiler->builder->CreateAnd(valAsStorage, cflat_llvm_compat::GetIntTruncated(storageTy, valMask));
+                auto* valShifted = compiler->builder->CreateShl(valMasked, cflat_llvm_compat::GetIntTruncated(storageTy, off));
                 auto* word = compiler->builder->CreateLoad(storageTy, storagePtr);
-                auto* cleared = compiler->builder->CreateAnd(word, llvm::ConstantInt::get(storageTy, ~windowMask));
+                auto* cleared = compiler->builder->CreateAnd(word, cflat_llvm_compat::GetIntTruncated(storageTy, ~windowMask));
                 auto* newWord = compiler->builder->CreateOr(cleared, valShifted);
                 compiler->builder->CreateStore(newWord, storagePtr);
                 continue;

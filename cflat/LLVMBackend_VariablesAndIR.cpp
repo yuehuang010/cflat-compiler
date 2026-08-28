@@ -76,10 +76,13 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 else if (destinationType->isIntegerTy()
                     && intValue->getIntegerType()->getBitWidth() != destinationType->getIntegerBitWidth())
                 {
-                    uint64_t converted = srcIsUnsigned
-                        ? intValue->getZExtValue() : intValue->getSExtValue();
-                    initValue = builder->getIntN(destinationType->getIntegerBitWidth(),
-                        converted);
+                    // Extend/truncate as an APInt: getIntN takes uint64_t, so a negative
+                    // getSExtValue would arrive as 0xFFFF... and fail LLVM 23's bit-width check.
+                    unsigned destBits = destinationType->getIntegerBitWidth();
+                    llvm::APInt converted = srcIsUnsigned
+                        ? intValue->getValue().zextOrTrunc(destBits)
+                        : intValue->getValue().sextOrTrunc(destBits);
+                    initValue = llvm::ConstantInt::get(*context, converted);
                 }
             }
             else if (auto fpValue = llvm::dyn_cast<llvm::ConstantFP>(initValue))
@@ -530,12 +533,14 @@ llvm::Value* LLVMBackend::CreateIncrement(llvm::Value* destination, int amount, 
             // Pointer increment/decrement: step by elemType-sized strides (C semantics).
             // Fall back to i8 (byte stride) only when element type is unknown.
             auto* stepTy = elemType ? elemType : builder->getInt8Ty();
-            auto* step = llvm::ConstantInt::get(builder->getInt64Ty(), amount);
+            // getSigned, not get: `amount` is a signed int and get() takes uint64_t, so a
+            // decrement would widen to 0xFFFF... and fail LLVM 23's APInt bit-width check.
+            auto* step = llvm::ConstantInt::getSigned(builder->getInt64Ty(), amount);
             auto* newPtr = builder->CreateGEP(stepTy, loadInst, step, "ptrinc");
             return builder->CreateStore(newPtr, destination);
         }
 
-        auto value = llvm::ConstantInt::get(loadInst->getType(), amount);
+        auto value = llvm::ConstantInt::getSigned(loadInst->getType(), amount);
         auto newValue = CreateOperation(Operation::Add, loadInst, value);
         return builder->CreateStore(newValue, destination);
     }

@@ -5,6 +5,8 @@
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
 #include <llvm/IR/Dominators.h>
+#include <llvm/IR/CFG.h>
+#include <unordered_set>
 #include <llvm/Bitcode/BitcodeWriter.h>
 #include <llvm/Bitcode/BitcodeReader.h>
 #include <llvm/Linker/Linker.h>
@@ -3022,13 +3024,49 @@ bool LLVMBackend::IsInsertBlockLive() const
         return b != nullptr && cflat_llvm_compat::GetTerminatorOrNull(b) == nullptr;
     }
 
+/*
+ * Dominance over a CFG that is still being built. llvm::DominatorTree requires a
+ * well-formed function - its DFS asserts on a block with no terminator - but these
+ * queries run mid-codegen, where the block being emitted has none yet. `bb` dominates
+ * `curBlock` exactly when `curBlock` is unreachable from entry once `bb` is removed;
+ * a terminator-less block is treated as having no successors, which is what LLVM 22's
+ * walk did in effect.
+ */
+static bool DominatesInPartialCfg(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock)
+{
+        llvm::BasicBlock* entry = &curBlock->getParent()->getEntryBlock();
+        if (bb == entry) return true;
+        std::unordered_set<llvm::BasicBlock*> seen{ entry };
+        std::vector<llvm::BasicBlock*> work{ entry };
+        while (!work.empty())
+        {
+            llvm::BasicBlock* n = work.back();
+            work.pop_back();
+            if (n == curBlock) return false;
+            if (cflat_llvm_compat::GetTerminatorOrNull(n) == nullptr) continue;
+            for (llvm::BasicBlock* s : llvm::successors(n))
+                if (s != bb && seen.insert(s).second) work.push_back(s);
+        }
+        return true;
+    }
+
+static bool FunctionIsWellFormed(llvm::Function* f)
+{
+        for (llvm::BasicBlock& bb : *f)
+            if (cflat_llvm_compat::GetTerminatorOrNull(&bb) == nullptr) return false;
+        return true;
+    }
+
 bool LLVMBackend::OwnedTempDominatesHere(llvm::BasicBlock* bb, llvm::BasicBlock* curBlock,
                                 std::optional<llvm::DominatorTree>& dt) const
 {
         if (bb == nullptr || curBlock == nullptr) return false;
         if (bb == curBlock) return true;
         if (bb->getParent() != curBlock->getParent()) return false;
-        if (!dt) dt.emplace(*curBlock->getParent());
+        llvm::Function* f = curBlock->getParent();
+        // The tree is only legal once every block is terminated; mid-codegen it is not.
+        if (!FunctionIsWellFormed(f)) return DominatesInPartialCfg(bb, curBlock);
+        if (!dt) dt.emplace(*f);
         return dt->dominates(bb, curBlock);
     }
 

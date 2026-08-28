@@ -2670,6 +2670,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 size_t savedDepth = compilerLLVM->stackNamedVariable.size();
                 auto* entryBB = compilerLLVM->builder->GetInsertBlock();
                 bool entryWasUnterminated = entryBB != nullptr && cflat_llvm_compat::GetTerminatorOrNull(entryBB) == nullptr;
+                auto ownedTempMark = compiler->MarkOwnedTemps();
                 // Rewind point for the per-function pending logs (see PendingAnalysisMark).
                 auto* markedFn = entryBB != nullptr ? entryBB->getParent() : nullptr;
                 auto pendingMark = compilerLLVM->MarkPendingAnalyses(markedFn);
@@ -2692,6 +2693,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // The swallowed diagnostic already answered everything this block queued;
                     // leaving it queued makes the end-of-module sweep report it a second time.
                     compilerLLVM->RewindPendingAnalyses(markedFn, pendingMark);
+                    compilerLLVM->DiscardOwnedTempsSince(ownedTempMark);
                     // Terminate abandoned blocks and reconnect the live path to recovery.
                     if (auto* bb = compilerLLVM->builder->GetInsertBlock())
                     {

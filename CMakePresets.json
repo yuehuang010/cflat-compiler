@@ -20,9 +20,9 @@
         "VCPKG_TARGET_TRIPLET": "x64-windows-static",
         "VCPKG_HOST_TRIPLET": "x64-windows",
         "VCPKG_INSTALLED_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/vcpkg_installed",
-        "LLVM_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8/lib/cmake/llvm",
-        "Clang_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8/lib/cmake/clang",
-        "CFLAT_LLD_BIN_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8/bin"
+        "LLVM_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/llvm",
+        "Clang_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0/bin"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
@@ -32,9 +32,9 @@
       "inherits": "win-x64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "LLVM_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/llvm",
-        "Clang_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/clang",
-        "CFLAT_LLD_BIN_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-22.1.8-assert/bin"
+        "LLVM_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0-assert/lib/cmake/llvm",
+        "Clang_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0-assert/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{USERPROFILE}/.cflat-compiler-deps/llvm-23.1.0-assert/bin"
       }
     },
     {
@@ -77,9 +77,9 @@
         "VCPKG_HOST_TRIPLET": "arm64-osx",
         "VCPKG_INSTALLED_DIR": "$env{HOME}/.cflat-compiler-deps/vcpkg_installed",
         "ANTLR4_JAR": "/opt/homebrew/opt/antlr/antlr-4.13.2-complete.jar",
-        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8/lib/cmake/llvm",
-        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8/lib/cmake/clang",
-        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8/bin"
+        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/llvm",
+        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0/bin"
       },
       "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Darwin" }
     },
@@ -89,9 +89,9 @@
       "inherits": "macos-arm64",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
-        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/llvm",
-        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/lib/cmake/clang",
-        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-22.1.8-assert/bin"
+        "LLVM_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-assert/lib/cmake/llvm",
+        "Clang_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-assert/lib/cmake/clang",
+        "CFLAT_LLD_BIN_DIR": "$env{HOME}/.cflat-compiler-deps/llvm-23.1.0-assert/bin"
       }
     },
     {

@@ -194,7 +194,7 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
                                                      : "linux");
 
         std::string err;
-        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
         if (!target)
             return nullptr;
 
@@ -623,7 +623,7 @@ bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
         cflat_llvm_compat::SetModuleTriple(*module, triple);
 
         std::string err;
-        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -765,7 +765,7 @@ bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo
         cflat_llvm_compat::SetModuleTriple(*module, triple);
 
         std::string err;
-        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}. The macOS arm64 "
@@ -1097,7 +1097,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         cflat_llvm_compat::SetModuleTriple(*module, triple);
 
         std::string err;
-        const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+        const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
         if (!target)
         {
             std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);

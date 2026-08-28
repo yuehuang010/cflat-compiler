@@ -5232,7 +5232,7 @@ bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
     const std::string tripleStr = PlatformTargetTriple(platform);
     const char* triple = tripleStr.c_str();
     std::string err;
-    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+    const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
     if (!target)
     {
         std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -5240,7 +5240,7 @@ bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
     }
 
     std::unique_ptr<llvm::MCSubtargetInfo> sti(
-        target->createMCSubtargetInfo(triple, "", ""));
+        target->createMCSubtargetInfo(llvm::Triple(triple), "", ""));
     if (!sti)
     {
         std::cout << std::format("Error: could not create subtarget info for '{}'.\n", triple);
@@ -5253,7 +5253,10 @@ bool LLVMBackend::PrintSupportedCpus(const std::string& platform)
     // so the list is exactly the set ResolveCpuName lets through.
     std::vector<std::string> cpus;
     for (const auto& kv : sti->getAllProcessorDescriptions())
-        if (kv.Key && *kv.Key) cpus.emplace_back(kv.Key);
+    {
+        const char* key = cflat_llvm_compat::SubtargetKey(kv);
+        if (key && *key) cpus.emplace_back(key);
+    }
     if (llvm::Triple(tripleStr).isAArch64())
         for (const auto& alias : llvm::AArch64::CpuAliases)
             cpus.emplace_back(cflat_llvm_compat::AArch64AliasName(alias).str());
@@ -5296,7 +5299,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     llvm::InitializeAllTargetMCs();
 
     std::string err;
-    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, err);
+    const llvm::Target* target = cflat_llvm_compat::LookupTarget(triple, err);
     if (!target)
     {
         std::cout << std::format("Error: no target for triple '{}': {}\n", triple, err);
@@ -5304,7 +5307,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
     }
 
     std::unique_ptr<llvm::MCSubtargetInfo> sti(
-        target->createMCSubtargetInfo(triple, "", ""));
+        target->createMCSubtargetInfo(llvm::Triple(triple), "", ""));
     if (sti && !sti->isCPUStringValid(name))
     {
         std::cout << std::format("Error: unknown {} '{}'. Run --print-supported-cpus for the list.\n", label, name);

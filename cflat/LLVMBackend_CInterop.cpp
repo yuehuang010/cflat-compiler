@@ -1856,8 +1856,8 @@ void LLVMBackend::RegisterCMacros(const std::vector<CMacroEntry>& macros)
                 tv.TypeName = m.intTypeName;
                 tv.Pointer  = false;
                 unsigned bits = BitfieldStorageBits(m.intTypeName);
-                c = llvm::ConstantInt::get(llvm::IntegerType::get(*context, bits),
-                                           (uint64_t)m.value, /*isSigned*/ true);
+                c = cflat_llvm_compat::GetIntTruncated(llvm::IntegerType::get(*context, bits),
+                                                      (uint64_t)m.value);
                 valSuffix = ConstIntValueSuffix(tv.TypeName, m.value);
             }
             else
