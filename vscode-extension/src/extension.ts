@@ -19,13 +19,20 @@ interface ViewChoice {
     id: string;
     label: string;
     optimized: boolean;
-    currentFunction: boolean;
 }
 
 interface ViewMapping {
     srcLine: number;
     start: number;
     end: number;
+    stack?: ViewFrame[];
+}
+
+interface ViewFrame {
+    file: string;
+    line: number;
+    func: string;
+    root: boolean;
 }
 
 interface ViewState {
@@ -33,19 +40,21 @@ interface ViewState {
     sourceUri: string;
     kind: ViewKind;
     optimized: boolean;
-    line?: number;
     text: string;
     mappings: ViewMapping[];
     decoration: vscode.TextEditorDecorationType;
+    outerDecoration: vscode.TextEditorDecorationType;
 }
 
 const viewChoices: ViewChoice[] = [
-    { id: 'whole', label: 'Whole file', optimized: false, currentFunction: false },
-    { id: 'whole-optimized', label: 'Whole file (optimized)', optimized: true, currentFunction: false },
-    { id: 'function', label: 'Current function', optimized: false, currentFunction: true },
-    { id: 'function-optimized', label: 'Current function (optimized)', optimized: true, currentFunction: true }
+    { id: 'unoptimized', label: 'Not optimized', optimized: false },
+    { id: 'optimized', label: 'Optimized (-O2)', optimized: true }
 ];
 let lastViewChoiceId: string | undefined;
+
+// How far from the cursor the jump heuristic will look for a line that produced code.
+// Beyond this the nearest mapping is more likely a different function than the one asked for.
+const maxJumpLineDistance = 40;
 
 class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
     private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
@@ -54,8 +63,8 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
 
     constructor(private readonly getClient: () => LanguageClient | undefined) {}
 
-    createView(sourceUri: string, kind: ViewKind, choice: ViewChoice, line?: number): vscode.Uri {
-        const key = `${sourceUri}|${kind}|${choice.id}|${line ?? ''}`;
+    createView(sourceUri: string, kind: ViewKind, choice: ViewChoice): vscode.Uri {
+        const key = `${sourceUri}|${kind}|${choice.id}`;
         // Name the tab after the source file with the output extension (foo.cb -> foo.ll / foo.s).
         const sourceName = path.basename(vscode.Uri.parse(sourceUri).fsPath).replace(/\.[^.]+$/, '');
         const uri = vscode.Uri.from({
@@ -63,17 +72,21 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
             path: `/${sourceName}${kind === 'ir' ? '.ll' : '.s'}`,
             query: `key=${encodeURIComponent(key)}`
         });
-        this.states.get(uri.toString())?.decoration.dispose();
+        const oldState = this.states.get(uri.toString());
+        oldState?.decoration.dispose();
+        oldState?.outerDecoration.dispose();
         this.states.set(uri.toString(), {
             uri,
             sourceUri,
             kind,
             optimized: choice.optimized,
-            line,
             text: '',
             mappings: [],
             decoration: vscode.window.createTextEditorDecorationType({
                 backgroundColor: new vscode.ThemeColor('editor.rangeHighlightBackground')
+            }),
+            outerDecoration: vscode.window.createTextEditorDecorationType({
+                backgroundColor: new vscode.ThemeColor('editor.wordHighlightBackground')
             })
         });
         return uri;
@@ -94,13 +107,13 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
             uri: string;
             kind: ViewKind;
             optimized: boolean;
-            filter?: { line: number };
+            optLevel: 0 | 2;
         } = {
             uri: state.sourceUri,
             kind: state.kind,
-            optimized: state.optimized
+            optimized: state.optimized,
+            optLevel: state.optimized ? 2 : 0
         };
-        if (state.line !== undefined) params.filter = { line: state.line };
         try {
             const result = await activeClient.sendRequest<{
                 kind: string;
@@ -110,9 +123,24 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
                 'cflat/viewAssembly', params);
             state.text = result.text;
             state.mappings = Array.isArray(result.mappings)
-                ? result.mappings.filter(mapping => Number.isInteger(mapping.srcLine) &&
-                    Number.isInteger(mapping.start) && Number.isInteger(mapping.end) &&
-                    mapping.srcLine > 0 && mapping.start > 0 && mapping.end >= mapping.start)
+                ? result.mappings.reduce<ViewMapping[]>((valid, mapping) => {
+                    if (!mapping || !Number.isInteger(mapping.srcLine) ||
+                        !Number.isInteger(mapping.start) || !Number.isInteger(mapping.end) ||
+                        mapping.srcLine <= 0 || mapping.start <= 0 || mapping.end < mapping.start) {
+                        return valid;
+                    }
+                    const stack = Array.isArray(mapping.stack) && mapping.stack.every(frame =>
+                        frame && typeof frame.file === 'string' && Number.isInteger(frame.line) &&
+                        frame.line > 0 && typeof frame.func === 'string' &&
+                        typeof frame.root === 'boolean') ? mapping.stack : undefined;
+                    valid.push({
+                        srcLine: mapping.srcLine,
+                        start: mapping.start,
+                        end: mapping.end,
+                        ...(stack ? { stack } : {})
+                    });
+                    return valid;
+                }, [])
                 : [];
         } catch (error) {
             state.text = `; view request failed\n; ${String(error)}`;
@@ -138,6 +166,7 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         const state = this.states.get(key);
         if (!state) return;
         state.decoration.dispose();
+        state.outerDecoration.dispose();
         this.states.delete(key);
     }
 
@@ -146,17 +175,29 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         if (viewState) {
             this.clearSourceHighlights(viewState.sourceUri);
             this.clearViewHighlights(viewState);
-            const sourceLine = viewState.mappings.find(mapping =>
-                editor.selection.active.line + 1 >= mapping.start &&
-                editor.selection.active.line + 1 <= mapping.end)?.srcLine;
-            if (sourceLine === undefined) return;
+            const mapping = viewState.mappings.find(candidate =>
+                editor.selection.active.line + 1 >= candidate.start &&
+                editor.selection.active.line + 1 <= candidate.end);
+            if (!mapping) return;
             const sourceEditor = vscode.window.visibleTextEditors.find(candidate =>
                 candidate.document.uri.toString() === viewState.sourceUri);
             if (!sourceEditor) return;
-            const range = this.lineRange(sourceEditor.document, sourceLine);
-            if (!range) return;
-            sourceEditor.setDecorations(viewState.decoration, [range]);
-            sourceEditor.revealRange(range, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            const rootFrames = mapping.stack?.filter(frame => frame.root) ?? [];
+            const sourceLines = rootFrames.length > 0
+                ? rootFrames.map(frame => frame.line)
+                : [mapping.srcLine];
+            const ranges = sourceLines
+                .map(line => this.lineRange(sourceEditor.document, line))
+                .filter((range): range is vscode.Range => range !== undefined);
+            if (ranges.length === 0) return;
+            sourceEditor.setDecorations(viewState.decoration, [ranges[0]]);
+            sourceEditor.setDecorations(viewState.outerDecoration, ranges.slice(1));
+            sourceEditor.revealRange(ranges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            if (mapping.stack && mapping.stack.length > 1) {
+                const description = mapping.stack.map(frame =>
+                    frame.file + ':' + frame.line + ' (' + frame.func + ')').join(' <- inlined at ');
+                vscode.window.setStatusBarMessage(description, 5000);
+            }
             return;
         }
 
@@ -164,23 +205,74 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         for (const state of states) {
             this.clearSourceHighlights(state.sourceUri);
             this.clearViewHighlights(state);
-            const sourceLine = editor.selection.active.line + 1;
-            const ranges = state.mappings
-                .filter(mapping => mapping.srcLine === sourceLine)
-                .flatMap(mapping => this.viewRanges(state, mapping));
-            const viewEditor = vscode.window.visibleTextEditors.find(candidate =>
-                candidate.document.uri.toString() === state.uri.toString());
-            if (!viewEditor || ranges.length === 0) continue;
-            viewEditor.setDecorations(state.decoration, ranges);
-            viewEditor.revealRange(ranges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            this.revealInView(state, editor.selection.active.line + 1);
         }
+    }
+
+    // Move a just-opened view to the output generated for the given source line, using the
+    // debug-info line mappings the server returned.
+    revealSourceLine(viewUri: vscode.Uri, sourceLine: number): void {
+        const state = this.states.get(viewUri.toString());
+        if (!state || this.revealInView(state, sourceLine, true)) return;
+
+        // Blank lines, comments, braces and declarations emit no code of their own, so an exact
+        // match often does not exist. Land on the closest line that did emit code instead of
+        // leaving the view where it opened.
+        const nearest = this.nearestMappedLine(state, sourceLine);
+        if (nearest === undefined || !this.revealInView(state, nearest, true)) return;
+        vscode.window.setStatusBarMessage(
+            `cflat: line ${sourceLine} produced no ${state.kind === 'ir' ? 'IR' : 'assembly'}`
+            + ` - showing the nearest emitted line ${nearest}`, 5000);
+    }
+
+    // Closest emitted line to the cursor, preferring the one below when two are equidistant:
+    // that puts a function signature on its own body rather than on the function above it.
+    private nearestMappedLine(state: ViewState, sourceLine: number): number | undefined {
+        let best: number | undefined;
+        let bestDistance = Number.POSITIVE_INFINITY;
+        for (const line of this.mappedSourceLines(state)) {
+            const distance = Math.abs(line - sourceLine);
+            if (distance > maxJumpLineDistance) continue;
+            if (distance < bestDistance || (distance === bestDistance && line > sourceLine)) {
+                best = line;
+                bestDistance = distance;
+            }
+        }
+        return best;
+    }
+
+    private mappedSourceLines(state: ViewState): Set<number> {
+        const lines = new Set<number>();
+        for (const mapping of state.mappings) {
+            lines.add(mapping.srcLine);
+            for (const frame of mapping.stack ?? [])
+                if (frame.root) lines.add(frame.line);
+        }
+        return lines;
+    }
+
+    private revealInView(state: ViewState, sourceLine: number, moveCursor = false): boolean {
+        const ranges = state.mappings
+            .filter(mapping => mapping.srcLine === sourceLine ||
+                mapping.stack?.some(frame => frame.root && frame.line === sourceLine))
+            .flatMap(mapping => this.viewRanges(state, mapping));
+        const viewEditor = vscode.window.visibleTextEditors.find(candidate =>
+            candidate.document.uri.toString() === state.uri.toString());
+        if (!viewEditor || ranges.length === 0) return false;
+        viewEditor.setDecorations(state.decoration, ranges);
+        if (moveCursor) viewEditor.selection = new vscode.Selection(ranges[0].start, ranges[0].start);
+        viewEditor.revealRange(ranges[0], vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+        return true;
     }
 
     private clearSourceHighlights(sourceUri: string): void {
         for (const editor of vscode.window.visibleTextEditors) {
             if (editor.document.uri.toString() !== sourceUri) continue;
             for (const state of this.states.values()) {
-                if (state.sourceUri === sourceUri) editor.setDecorations(state.decoration, []);
+                if (state.sourceUri === sourceUri) {
+                    editor.setDecorations(state.decoration, []);
+                    editor.setDecorations(state.outerDecoration, []);
+                }
             }
         }
     }
@@ -219,7 +311,10 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
     }
 
     dispose(): void {
-        for (const state of this.states.values()) state.decoration.dispose();
+        for (const state of this.states.values()) {
+            state.decoration.dispose();
+            state.outerDecoration.dispose();
+        }
         this.changeEmitter.dispose();
     }
 }
@@ -460,7 +555,7 @@ async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKi
     const activeChoice = viewChoices.find(choice => choice.id === lastViewChoiceId);
     const quickPick = vscode.window.createQuickPick<ViewChoice>();
     quickPick.items = viewChoices;
-    quickPick.placeholder = 'Choose the compiler view scope';
+    quickPick.placeholder = 'Choose the compiler view';
     if (activeChoice) quickPick.activeItems = [activeChoice];
     const choice = await new Promise<ViewChoice | undefined>(resolve => {
         let settled = false;
@@ -478,8 +573,8 @@ async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKi
     if (!choice) return;
     lastViewChoiceId = choice.id;
 
-    const line = choice.currentFunction ? editor.selection.active.line + 1 : undefined;
-    const viewUri = provider.createView(editor.document.uri.toString(), kind, choice, line);
+    const sourceLine = editor.selection.active.line + 1;
+    const viewUri = provider.createView(editor.document.uri.toString(), kind, choice);
     await provider.refresh(viewUri);
     const document = await vscode.workspace.openTextDocument(viewUri);
     const languages = await vscode.languages.getLanguages();
@@ -492,6 +587,7 @@ async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKi
         preserveFocus: false,
         preview: false
     });
+    provider.revealSourceLine(viewUri, sourceLine);
 }
 
 export function activate(context: vscode.ExtensionContext): void {

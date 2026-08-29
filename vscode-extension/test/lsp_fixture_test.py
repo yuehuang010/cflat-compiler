@@ -510,6 +510,70 @@ def test_server_resilience(client: LspClient) -> str | None:
 # Test runner
 # ---------------------------------------------------------------------------
 
+def test_view_assembly(client: LspClient) -> str | None:
+    """Check inline-stack attribution and selectable optimization levels."""
+    source = (
+        "int ir_view_helper(int value) {\n"
+        "    return value * 3 + 1;\n"
+        "}\n"
+        "\n"
+        "extern int main(int argc, char** argv) {\n"
+        "    return ir_view_helper(argc);\n"
+        "}\n"
+    )
+    uri = _uri_for("view_assembly")
+    _open_doc(client, uri, source)
+    diagnostics = wait_diagnostics_for(client, uri)
+    if diagnostics:
+        return f"viewAssembly: unexpected diagnostics: {diagnostics}"
+
+    helper_line = 2
+    call_line = 6
+    for kind in ("ir", "asm"):
+        response = client.request("cflat/viewAssembly", {
+            "uri": uri, "kind": kind, "optLevel": 2
+        })
+        if "error" in response:
+            return f"viewAssembly {kind} O2: unexpected error: {response}"
+        result = response.get("result")
+        if not isinstance(result, dict) or not result.get("text") or not result.get("mappings"):
+            return f"viewAssembly {kind} O2: missing text or mappings: {response}"
+        inline = next((mapping for mapping in result["mappings"]
+                       if isinstance(mapping.get("stack"), list)
+                       and len(mapping["stack"]) >= 2), None)
+        if inline is None:
+            return f"viewAssembly {kind} O2: no multi-frame mapping: {result['mappings']}"
+        stack = inline["stack"]
+        if stack[0].get("line") != helper_line or not stack[0].get("root"):
+            return f"viewAssembly {kind} O2: wrong innermost frame: {stack}"
+        if not any(frame.get("line") == call_line and frame.get("root") for frame in stack[1:]):
+            return f"viewAssembly {kind} O2: missing call-site frame: {stack}"
+        if kind == "ir":
+            lines = result["text"].splitlines()
+            start = inline.get("start", 0)
+            if start <= 0 or start > len(lines) or not re.search(r"\b(ret|add|mul|load|store|call)\b", lines[start - 1]):
+                return f"viewAssembly IR O2: mapping is not aligned to an instruction at {start}: {lines[max(0, start - 2):start + 1]}"
+
+    no_inline = client.request("cflat/viewAssembly", {
+        "uri": uri, "kind": "ir", "optLevel": 0
+    })
+    if "error" in no_inline:
+        return f"viewAssembly O0: unexpected error: {no_inline}"
+    o0 = no_inline.get("result", {})
+    if any(isinstance(mapping.get("stack"), list) and len(mapping["stack"]) >= 2
+           for mapping in o0.get("mappings", [])):
+        return f"viewAssembly O0: helper unexpectedly has an inline stack: {o0}"
+
+    legacy = client.request("cflat/viewAssembly", {
+        "uri": uri, "kind": "ir", "optimized": True
+    })
+    legacy_result = legacy.get("result")
+    if "error" in legacy or not isinstance(legacy_result, dict) or not legacy_result.get("text"):
+        return f"viewAssembly legacy optimized request failed: {legacy}"
+    return None
+
+
+
 def _status(name: str, err: str | None) -> tuple:
     """Turn a run_fixture()/test_*() error result into a (name, status, message) triple."""
     return (name, "fail" if err else "pass", err)
@@ -573,7 +637,7 @@ def _run_fixture_shard(exe: str, shard_args: list, fixture_items: list) -> tuple
 
 
 def _run_scenario_shard(exe: str, shard_args: list) -> tuple:
-    """Runs the four hardcoded scenario tests serially on one client. Returns (results, stderr)."""
+    """Runs the hardcoded scenario tests serially on one client. Returns (results, stderr)."""
     client = LspClient(exe, shard_args)
     results = []
     try:
@@ -583,6 +647,7 @@ def _run_scenario_shard(exe: str, shard_args: list) -> tuple:
             ("server resilience", test_server_resilience),
             ("def: non-primitives (namespace/struct/local var)", test_def_non_primitives),
             ("def: nested struct/class", test_def_nested_struct),
+            ("viewAssembly: inline attribution", test_view_assembly),
         ]
         for name, fn in scenarios:
             try:

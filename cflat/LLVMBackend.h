@@ -520,11 +520,20 @@ inline const std::string& CanonicalPrimitiveSpelling(const std::string& base)
 class LLVMBackend
 {
 public:
+    struct LineFrame
+    {
+        std::string file;
+        int line = 0;
+        std::string func;
+        bool root = false;
+    };
+
     struct LineMapping
     {
         int srcLine = 0;
         int viewStart = 0;
         int viewEnd = 0;
+        std::vector<LineFrame> stack;
     };
 
     // Width of the `long` keyword, in bits. `long` follows the TARGET's native C ABI:
@@ -4479,7 +4488,7 @@ private:
     // instructions and silently declines to vectorize (only memcpy/memset idioms
     // and SLP still fire). Mirrors the triple/CPU resolution in EmitExecutable.
     // Returns null on failure (the optimizer then runs target-agnostic, as before).
-    std::unique_ptr<llvm::TargetMachine> CreateOptTargetMachine();
+    std::unique_ptr<llvm::TargetMachine> CreateOptTargetMachine(int optLevel = -1);
 
     // Native ELF code emission + link for Linux (and other ELF/Unix hosts).
     // Emits an x86-64 ELF object for the host triple and links it with the
@@ -7735,7 +7744,7 @@ public:
 
     bool Analyze(const std::string& filePath, const std::vector<std::string>& importDirs, const std::string& runtimeDirPath);
     void ResetForReanalysis();
-    bool PrintModuleView(std::string& out, const std::string& kind, bool optimized,
+    bool PrintModuleView(std::string& out, const std::string& kind, int optLevel,
                          const std::string& functionName,
                          std::vector<LineMapping>* mappings = nullptr);
 

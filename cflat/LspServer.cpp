@@ -1355,7 +1355,7 @@ private:
 
         const std::string uri = (*params)["uri"].get<std::string>();
         const std::string kind = (*params)["kind"].get<std::string>();
-        bool optimized = false;
+        int optLevel = 0;
         if (params->contains("optimized"))
         {
             if (!(*params)["optimized"].is_boolean())
@@ -1363,7 +1363,24 @@ private:
                 SendError(id, -32602, "Invalid cflat/viewAssembly optimized parameter");
                 return;
             }
-            optimized = (*params)["optimized"].get<bool>();
+            if ((*params)["optimized"].get<bool>())
+                optLevel = 2;
+        }
+        if (params->contains("optLevel"))
+        {
+            const auto& value = (*params)["optLevel"];
+            if (!value.is_number_integer())
+            {
+                SendError(id, -32602, "Invalid cflat/viewAssembly optLevel parameter");
+                return;
+            }
+            auto rawLevel = value.get<int64_t>();
+            if (rawLevel < 0 || rawLevel > 2)
+            {
+                SendError(id, -32602, "Invalid cflat/viewAssembly optLevel parameter");
+                return;
+            }
+            optLevel = static_cast<int>(rawLevel);
         }
 
         std::optional<std::string> function;
@@ -1419,7 +1436,7 @@ private:
             doc = it->second;
         }
         EnqueueAnalysis(uri, doc.filePath, doc.text,
-                        IrRequest{*id, kind, optimized, std::move(function), line});
+                        IrRequest{*id, kind, optLevel, std::move(function), line});
     }
 
     // -----------------------------------------------------------------------
@@ -1436,7 +1453,7 @@ private:
         {
             nlohmann::json id;
             std::string kind;
-            bool optimized = false;
+            int optLevel = 0;
             std::optional<std::string> function;
             std::optional<int> line;
         };
@@ -1789,7 +1806,7 @@ private:
         std::string output;
         std::vector<LLVMBackend::LineMapping> mappings;
         bool emitted = backend->PrintModuleView(output, job.irRequest->kind,
-                                                job.irRequest->optimized, functionName, &mappings);
+                                                job.irRequest->optLevel, functionName, &mappings);
         if (!emitted)
         {
             SendViewFailure(job, "failed to emit " + job.irRequest->kind);
@@ -1821,11 +1838,25 @@ private:
         if (!job.irRequest) return;
         nlohmann::json mappingJson = nlohmann::json::array();
         for (const auto& mapping : mappings)
-            mappingJson.push_back({
+        {
+            nlohmann::json entry = {
                 {"srcLine", mapping.srcLine},
                 {"start", mapping.viewStart},
                 {"end", mapping.viewEnd}
-            });
+            };
+            if (!mapping.stack.empty())
+            {
+                entry["stack"] = nlohmann::json::array();
+                for (const auto& frame : mapping.stack)
+                    entry["stack"].push_back({
+                        {"file", frame.file},
+                        {"line", frame.line},
+                        {"func", frame.func},
+                        {"root", frame.root}
+                    });
+            }
+            mappingJson.push_back(std::move(entry));
+        }
         SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
             {"kind", job.irRequest->kind},
             {"text", std::move(text)},

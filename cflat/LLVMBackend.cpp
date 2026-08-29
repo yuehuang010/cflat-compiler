@@ -2432,7 +2432,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         if (verbose) std::cout << std::format("[verbose] writing asm to {}\n", *asmPath);
         std::string assembly;
         std::ofstream output(*asmPath, std::ios::binary | std::ios::trunc);
-        if (!PrintModuleView(assembly, "asm", false, "")
+        if (!PrintModuleView(assembly, "asm", 0, "")
             || !output
             || !(output.write(assembly.data(), static_cast<std::streamsize>(assembly.size()))))
         {

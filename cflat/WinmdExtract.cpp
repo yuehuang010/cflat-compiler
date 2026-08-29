@@ -136,24 +136,39 @@ namespace
         IMetaDataImport2* md = nullptr;
 
         // Resolve a TypeDef/TypeRef token to its full dotted name (arity suffix stripped).
-        std::string ResolveTypeName(mdToken tk)
+        // Nested types carry only a bare name (every anonymous member is '_Anonymous_e__Struct'),
+        // so qualify with the enclosing type to keep distinct nestings distinct.
+        std::string ResolveTypeName(mdToken tk, int depth = 0)
         {
-            if (IsNilToken(tk)) return "";
+            if (IsNilToken(tk) || depth > 8) return "";
             wchar_t buf[1024];
             ULONG len = 0;
             if (TypeFromToken(tk) == kmdtTypeDef)
             {
                 if (FAILED(md->GetTypeDefProps(tk, buf, 1024, &len, nullptr, nullptr))) return "";
+                std::string name = StripArity(ToUtf8(buf, len > 0 ? len - 1 : 0));
+                mdTypeDef enclosing = mdTypeDefNil;
+                if (md->GetNestedClassProps(tk, &enclosing) == S_OK && !IsNilToken(enclosing))
+                {
+                    std::string outer = ResolveTypeName(enclosing, depth + 1);
+                    if (!outer.empty()) return outer + "." + name;
+                }
+                return name;
             }
-            else if (TypeFromToken(tk) == kmdtTypeRef)
+            if (TypeFromToken(tk) == kmdtTypeRef)
             {
-                if (FAILED(md->GetTypeRefProps(tk, nullptr, buf, 1024, &len))) return "";
+                mdToken scope = mdTokenNil;
+                if (FAILED(md->GetTypeRefProps(tk, &scope, buf, 1024, &len))) return "";
+                std::string name = StripArity(ToUtf8(buf, len > 0 ? len - 1 : 0));
+                // A nested TypeRef's resolution scope is the enclosing TypeRef, not a module.
+                if (TypeFromToken(scope) == kmdtTypeRef)
+                {
+                    std::string outer = ResolveTypeName(scope, depth + 1);
+                    if (!outer.empty()) return outer + "." + name;
+                }
+                return name;
             }
-            else
-            {
-                return "";   // TypeSpec base - rare in a base-class slot; not needed for Phase 0
-            }
-            return StripArity(ToUtf8(buf, len > 0 ? len - 1 : 0));
+            return "";   // TypeSpec base - rare in a base-class slot; not needed for Phase 0
         }
 
         // Decode one type from a signature cursor (ECMA-335 II.23.2.12).
@@ -491,6 +506,15 @@ namespace cflat_winmd
                     continue;
                 std::string fullName = ToUtf8(nameBuf, nameLen > 0 ? nameLen - 1 : 0);
                 if (fullName.empty() || fullName[0] == '<') continue;   // <Module>
+
+                // Nested TypeDefs have no namespace in their name; qualify with the enclosing
+                // type so field signatures (which resolve the same way) match the registration.
+                mdTypeDef enclosing = mdTypeDefNil;
+                if (r.md->GetNestedClassProps(td, &enclosing) == S_OK && !IsNilToken(enclosing))
+                {
+                    std::string outer = r.ResolveTypeName(enclosing);
+                    if (!outer.empty()) fullName = outer + "." + fullName;
+                }
 
                 if (flags & ktdInterface)
                 {

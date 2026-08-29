@@ -49,26 +49,94 @@
 #include <set>
 #include <fstream>
 #include <cstdint>
+#include <tuple>
 #include <vector>
 
 namespace {
+
+using RootFilePredicate = std::function<bool(const llvm::DIFile*)>;
+
+std::string DebugFilePath(const llvm::DIFile* file)
+{
+    if (!file) return {};
+    std::filesystem::path path(file->getFilename().str());
+    if (!path.is_absolute() && !file->getDirectory().empty())
+        path = std::filesystem::path(file->getDirectory().str()) / path;
+    return path.lexically_normal().string();
+}
+
+std::string DebugFileName(const llvm::DIFile* file)
+{
+    if (!file) return {};
+    return std::filesystem::path(file->getFilename().str()).filename().string();
+}
+
+// Frontend-expanded return-block bodies retain the call-site location and have no inline chain.
+// They cannot be attributed to their source callee.
+std::vector<LLVMBackend::LineFrame> BuildLineStack(const llvm::DILocation* location,
+                                                   const RootFilePredicate& isRootFile)
+{
+    std::vector<LLVMBackend::LineFrame> stack;
+    for (auto* current = location; current; current = current->getInlinedAt())
+    {
+        const llvm::DIFile* file = current->getFile();
+        std::string functionName;
+        if (auto* scope = current->getScope())
+            if (auto* subprogram = scope->getSubprogram())
+                functionName = subprogram->getName().str();
+        stack.push_back({DebugFileName(file), static_cast<int>(current->getLine()),
+                         std::move(functionName), isRootFile(file)});
+    }
+    return stack;
+}
+
+LLVMBackend::LineMapping MakeLineMapping(const std::vector<LLVMBackend::LineFrame>& stack)
+{
+    LLVMBackend::LineMapping mapping;
+    for (const auto& frame : stack)
+        if (frame.root)
+        {
+            mapping.srcLine = frame.line;
+            break;
+        }
+    if (stack.size() > 1
+        || std::any_of(stack.begin(), stack.end(), [](const auto& frame) { return !frame.root; }))
+        mapping.stack = stack;
+    return mapping;
+}
+
+bool SameLineFrame(const LLVMBackend::LineFrame& left,
+                  const LLVMBackend::LineFrame& right)
+{
+    return left.file == right.file && left.line == right.line
+        && left.func == right.func && left.root == right.root;
+}
+
+bool SameLineStack(const std::vector<LLVMBackend::LineFrame>& left,
+                   const std::vector<LLVMBackend::LineFrame>& right)
+{
+    if (left.size() != right.size()) return false;
+    return std::equal(left.begin(), left.end(), right.begin(), SameLineFrame);
+}
 
 class LineMappingAnnotationWriter final : public llvm::AssemblyAnnotationWriter
 {
 public:
     LineMappingAnnotationWriter(std::vector<LLVMBackend::LineMapping>& mappings,
-                                 const std::function<int(const llvm::DILocation*)>& sourceLine)
-        : mappings_(mappings), sourceLine_(sourceLine) {}
+                                 std::function<LLVMBackend::LineMapping(const llvm::DILocation*)> makeMapping)
+        : mappings_(mappings), makeMapping_(std::move(makeMapping)) {}
 
     void emitInstructionAnnot(const llvm::Instruction* instruction,
                               llvm::formatted_raw_ostream& stream) override
     {
         llvm::DebugLoc debugLoc = instruction->getDebugLoc();
         if (!debugLoc) return;
-        int sourceLine = sourceLine_(debugLoc.get());
-        if (sourceLine <= 0) return;
+        auto mapping = makeMapping_(debugLoc.get());
+        if (mapping.srcLine <= 0) return;
         int viewLine = baseLine_ + static_cast<int>(stream.getLine()) + 1;
-        mappings_.push_back({sourceLine, viewLine, viewLine});
+        mapping.viewStart = viewLine;
+        mapping.viewEnd = viewLine;
+        mappings_.push_back(std::move(mapping));
     }
 
     // Function::print creates a fresh formatted_raw_ostream (line counter reset to 0)
@@ -77,7 +145,7 @@ public:
 
 private:
     std::vector<LLVMBackend::LineMapping>& mappings_;
-    const std::function<int(const llvm::DILocation*)>& sourceLine_;
+    std::function<LLVMBackend::LineMapping(const llvm::DILocation*)> makeMapping_;
     int baseLine_ = 0;
 };
 
@@ -88,6 +156,7 @@ void ConsolidateLineMappings(std::vector<LLVMBackend::LineMapping>& mappings)
     {
         if (!consolidated.empty()
             && consolidated.back().srcLine == mapping.srcLine
+            && SameLineStack(consolidated.back().stack, mapping.stack)
             && consolidated.back().viewEnd + 1 == mapping.viewStart)
             consolidated.back().viewEnd = mapping.viewEnd;
         else
@@ -187,7 +256,7 @@ static llvm::CodeGenOptLevel CodeGenLevelFor(int optLevel)
     return llvm::CodeGenOptLevel::Aggressive;
 }
 
-std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
+std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int optLevel)
 {
         llvm::InitializeAllTargets();
         llvm::InitializeAllTargetMCs();
@@ -209,18 +278,29 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine()
             return nullptr;
 
         llvm::TargetOptions opt;
+        if (optLevel < 0) optLevel = cOptLevel_;
         return std::unique_ptr<llvm::TargetMachine>(
             target->createTargetMachine(llvm::Triple(triple), cpu, "", opt, llvm::Reloc::PIC_,
-                                        std::nullopt, CodeGenLevelFor(cOptLevel_)));
+                                        std::nullopt, CodeGenLevelFor(optLevel)));
     }
 
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
-                                  bool optimized, const std::string& functionName,
+                                  int optLevel, const std::string& functionName,
                                   std::vector<LineMapping>* mappings)
 {
-    if (!module || (kind != "ir" && kind != "asm"))
+    if (!module || (kind != "ir" && kind != "asm") || optLevel < 0 || optLevel > 2)
         return false;
     if (mappings) mappings->clear();
+
+    // A warm compiler cache leaves the core as a lazily-loaded bitcode module, and
+    // CloneModule requires a materialized one. Every other module consumer materializes
+    // first; without this the clone walks unread function bodies and faults.
+    MaterializeCoreIfLazy();
+    if (!module->isMaterialized())
+    {
+        LogError("cannot render " + kind + " view: cached core bitcode is not materialized.");
+        return false;
+    }
 
     auto view = llvm::CloneModule(*module);
     if (!view)
@@ -276,14 +356,15 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     }
 
     auto optimizedAwayBanner = [&](const std::vector<llvm::Function*>& postMatches) {
-        if (!optimized || preOptimizationMatches.empty() || !postMatches.empty())
+        if (optLevel == 0 || preOptimizationMatches.empty() || !postMatches.empty())
             return std::string();
 
         std::string banner;
         for (const auto& info : preOptimizationMatches)
         {
             banner += "; function " + info.name
-                + " was optimized away at O2 (inlined or removed)\n";
+                + " was optimized away at O" + std::to_string(optLevel)
+                + " (inlined or removed)\n";
             if (info.addressTaken)
                 banner += "; its address was also used\n";
         }
@@ -312,30 +393,35 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     };
 
     std::unique_ptr<llvm::TargetMachine> targetMachine;
-    if (optimized || kind == "asm")
+    if (optLevel > 0 || kind == "asm")
     {
-        targetMachine = CreateOptTargetMachine();
+        targetMachine = CreateOptTargetMachine(optLevel);
         if (!targetMachine)
             return false;
         view->setTargetTriple(targetMachine->getTargetTriple());
         view->setDataLayout(targetMachine->createDataLayout());
     }
 
-    if (optimized)
+    if (optLevel > 0)
     {
-        llvm::PassBuilder passBuilder(targetMachine.get());
+        llvm::PipelineTuningOptions pto;
+        pto.LoopVectorization = true;
+        pto.SLPVectorization = true;
+        llvm::PassBuilder passBuilder(targetMachine.get(), pto);
         llvm::LoopAnalysisManager loopAnalysis;
         llvm::FunctionAnalysisManager functionAnalysis;
         llvm::CGSCCAnalysisManager cgsccAnalysis;
         llvm::ModuleAnalysisManager moduleAnalysis;
-        llvm::TargetLibraryInfoImpl tli(view->getTargetTriple());
+        llvm::TargetLibraryInfoImpl tli = MakeStdioSafeTLII(view->getTargetTriple());
         functionAnalysis.registerPass([&] { return llvm::TargetLibraryAnalysis(tli); });
         passBuilder.registerModuleAnalyses(moduleAnalysis);
         passBuilder.registerCGSCCAnalyses(cgsccAnalysis);
         passBuilder.registerFunctionAnalyses(functionAnalysis);
         passBuilder.registerLoopAnalyses(loopAnalysis);
         passBuilder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis, moduleAnalysis);
-        auto passes = passBuilder.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O2);
+        auto pipelineLevel = optLevel == 1 ? llvm::OptimizationLevel::O1
+                                           : llvm::OptimizationLevel::O2;
+        auto passes = passBuilder.buildPerModuleDefaultPipeline(pipelineLevel);
         passes.run(*view, moduleAnalysis);
     }
 
@@ -367,11 +453,16 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         return false;
     };
 
-    std::function<int(const llvm::DILocation*)> sourceLine = [&](const llvm::DILocation* location) {
+    auto sourceLine = [&](const llvm::DILocation* location) {
         for (auto* current = location; current; current = current->getInlinedAt())
             if (isRootFile(current->getFile()))
                 return static_cast<int>(current->getLine());
         return 0;
+    };
+    auto makeLineMapping = [&](const llvm::DILocation* location) {
+        auto mapping = MakeLineMapping(BuildLineStack(location, isRootFile));
+        mapping.srcLine = sourceLine(location);
+        return mapping;
     };
 
     if (kind == "ir")
@@ -396,12 +487,11 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                         for (auto it = block.begin(); it != block.end(); )
                         {
                             auto current = it++;
-                            if (llvm::isa<llvm::DbgInfoIntrinsic>(&*current))
-                                current->eraseFromParent();
+                            current->dropDbgRecords();
                         }
                 std::string mappingText;
                 llvm::raw_string_ostream mappingStream(mappingText);
-                LineMappingAnnotationWriter writer(*mappings, sourceLine);
+                LineMappingAnnotationWriter writer(*mappings, makeLineMapping);
                 if (functionName.empty())
                     mappingView->print(mappingStream, &writer);
                 else
@@ -464,8 +554,14 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                                   std::vector<std::string>& values) {
         size_t pos = 0;
         while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-        if (line.compare(pos, 5, ".file") != 0) return false;
-        pos += 5;
+        size_t directiveLength = 0;
+        if (line.compare(pos, 5, ".file") == 0)
+            directiveLength = 5;
+        else if (line.compare(pos, 8, ".cv_file") == 0)
+            directiveLength = 8;
+        else
+            return false;
+        pos += directiveLength;
         if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
         while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
         size_t start = pos;
@@ -475,11 +571,20 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         values = parseQuotedStrings(line, pos);
         return !values.empty();
     };
-    auto parseLocDirective = [&](const std::string& line, int& id, int& sourceLine) {
+    auto parseLocDirective = [&](const std::string& line, int& id, int& sourceLine,
+                                 int& column) {
         size_t pos = 0;
         while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-        if (line.compare(pos, 4, ".loc") != 0) return false;
-        pos += 4;
+        bool codeView = false;
+        if (line.compare(pos, 4, ".loc") == 0)
+            pos += 4;
+        else if (line.compare(pos, 7, ".cv_loc") == 0)
+        {
+            pos += 7;
+            codeView = true;
+        }
+        else
+            return false;
         if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
         auto nextInt = [&](int& value) {
             while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
@@ -489,21 +594,26 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             value = std::stoi(line.substr(start, pos - start));
             return true;
         };
-        return nextInt(id) && nextInt(sourceLine);
+        column = 0;
+        int functionId = 0;
+        if (codeView && !nextInt(functionId)) return false;
+        if (!nextInt(id) || !nextInt(sourceLine)) return false;
+        nextInt(column);
+        return true;
     };
-    auto isRootAsmFile = [&](const std::vector<std::string>& values) {
-        if (values.empty() || rootName.empty()) return false;
+    auto normalizeFilePath = [](const std::string& path) {
+        return std::filesystem::path(path).lexically_normal().string();
+    };
+    auto asmFilePath = [&](const std::vector<std::string>& values) {
+        if (values.empty()) return std::string();
         std::filesystem::path candidate;
         if (values.size() == 1)
             candidate = values[0];
         else
             candidate = std::filesystem::path(values[0]) / values[1];
-        std::error_code ec;
-        if (!rootPath.empty() && std::filesystem::weakly_canonical(candidate, ec).string() == rootPath)
-            return true;
-        return candidate.filename().string() == rootName;
+        return normalizeFilePath(candidate.string());
     };
-    std::set<int> rootAsmFileIds;
+    std::map<int, std::string> asmFiles;
     {
         size_t lineStart = 0;
         while (lineStart < assembly.size())
@@ -513,22 +623,109 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             int id = 0;
             std::vector<std::string> values;
             std::string line = assembly.substr(lineStart, lineEnd - lineStart);
-            if (parseFileDirective(line, id, values) && isRootAsmFile(values))
-                rootAsmFileIds.insert(id);
+            if (parseFileDirective(line, id, values))
+                asmFiles[id] = asmFilePath(values);
             lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
         }
     }
 
+    auto isRootAsmFile = [&](const std::string& path) {
+        if (path.empty() || rootName.empty()) return false;
+        if (!rootPath.empty() && normalizeFilePath(path) == normalizeFilePath(rootPath))
+            return true;
+        return std::filesystem::path(path).filename().string() == rootName;
+    };
+
+    struct DebugLocationKey
+    {
+        std::string function;
+        std::string file;
+        int line = 0;
+        int column = 0;
+
+        bool operator<(const DebugLocationKey& other) const
+        {
+            return std::tie(function, file, line, column)
+                < std::tie(other.function, other.file, other.line, other.column);
+        }
+    };
+    std::map<DebugLocationKey, std::vector<std::vector<LineFrame>>> inlineStacks;
+    std::map<std::string, std::string> functionDisplayNames;
+    for (auto& function : *view)
+    {
+        if (function.isDeclaration()) continue;
+        std::string displayName = function.getName().str();
+        if (auto* subprogram = function.getSubprogram())
+            if (!subprogram->getName().empty())
+                displayName = subprogram->getName().str();
+        functionDisplayNames[function.getName().str()] = std::move(displayName);
+        for (auto& block : function)
+            for (auto& instruction : block)
+            {
+                llvm::DebugLoc debugLoc = instruction.getDebugLoc();
+                if (!debugLoc || debugLoc->getLine() == 0) continue;
+                auto stack = BuildLineStack(debugLoc.get(), isRootFile);
+                if (stack.empty()) continue;
+                DebugLocationKey key{function.getName().str(),
+                                     normalizeFilePath(DebugFilePath(debugLoc->getFile())),
+                                     static_cast<int>(debugLoc->getLine()),
+                                     static_cast<int>(debugLoc->getColumn())};
+                auto& candidates = inlineStacks[key];
+                if (std::none_of(candidates.begin(), candidates.end(),
+                                 [&](const auto& candidate) { return SameLineStack(candidate, stack); }))
+                    candidates.push_back(std::move(stack));
+            }
+    }
+
+    auto resolveAsmStack = [&](const std::string& function, const std::string& file,
+                               int line, int column,
+                               const std::vector<LineFrame>& fallback) {
+        DebugLocationKey key{function, normalizeFilePath(file), line, column};
+        auto it = inlineStacks.find(key);
+        if (it == inlineStacks.end() || it->second.empty()) return fallback;
+        const auto& candidates = it->second;
+        if (candidates.size() == 1) return candidates.front();
+        for (const auto& candidate : candidates)
+            if (candidate.empty() || !SameLineFrame(candidate.front(), candidates.front().front()))
+                return fallback;
+
+        size_t commonSuffix = 0;
+        while (commonSuffix < candidates.front().size())
+        {
+            const auto& frame = candidates.front()[candidates.front().size() - commonSuffix - 1];
+            bool same = true;
+            for (const auto& candidate : candidates)
+                if (candidate.size() <= commonSuffix
+                    || !SameLineFrame(candidate[candidate.size() - commonSuffix - 1], frame))
+                {
+                    same = false;
+                    break;
+                }
+            if (!same) break;
+            ++commonSuffix;
+        }
+        std::vector<LineFrame> result{candidates.front().front()};
+        if (commonSuffix > 1)
+            result.insert(result.end(), candidates.front().end() - commonSuffix + 1,
+                          candidates.front().end());
+        return result;
+    };
+
     auto appendAsmMappings = [&](const std::string& text) {
-        if (!mappings || rootAsmFileIds.empty()) return;
+        if (!mappings || asmFiles.empty()) return;
         size_t lineStart = 0;
         int lineNumber = 0;
-        int activeSourceLine = 0;
         int activeStart = 0;
+        std::optional<LineMapping> activeMapping;
+        std::string currentFunction;
         auto finish = [&](int endLine) {
-            if (activeSourceLine > 0 && activeStart <= endLine)
-                mappings->push_back({activeSourceLine, activeStart, endLine});
-            activeSourceLine = 0;
+            if (activeMapping && activeStart <= endLine)
+            {
+                activeMapping->viewStart = activeStart;
+                activeMapping->viewEnd = endLine;
+                mappings->push_back(std::move(*activeMapping));
+            }
+            activeMapping.reset();
             activeStart = 0;
         };
         while (lineStart < text.size())
@@ -539,14 +736,36 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             std::string line = text.substr(lineStart, lineEnd - lineStart);
             size_t first = 0;
             while (first < line.size() && std::isspace((unsigned char)line[first])) ++first;
+            if (first == 0 && !line.empty() && line.ends_with(":"))
+            {
+                std::string label = line.substr(0, line.size() - 1);
+                if (functionDisplayNames.contains(label))
+                    currentFunction = label;
+                else if (label.starts_with("_")
+                         && functionDisplayNames.contains(label.substr(1)))
+                    currentFunction = label.substr(1);
+            }
             int id = 0;
             int source = 0;
-            if (parseLocDirective(line, id, source))
+            int column = 0;
+            if (parseLocDirective(line, id, source, column))
             {
                 finish(lineNumber - 1);
-                if (rootAsmFileIds.contains(id) && source > 0)
+                auto fileIt = asmFiles.find(id);
+                if (fileIt != asmFiles.end() && source > 0)
                 {
-                    activeSourceLine = source;
+                    std::string displayName;
+                    auto functionIt = functionDisplayNames.find(currentFunction);
+                    if (functionIt != functionDisplayNames.end())
+                        displayName = functionIt->second;
+                    LineFrame fallback{std::filesystem::path(fileIt->second).filename().string(),
+                                        source, std::move(displayName),
+                                        isRootAsmFile(fileIt->second)};
+                    auto stack = resolveAsmStack(currentFunction, fileIt->second,
+                                                 source, column, {fallback});
+                    auto mapping = MakeLineMapping(stack);
+                    if (mapping.srcLine > 0)
+                        activeMapping = std::move(mapping);
                     activeStart = lineNumber + 1;
                 }
             }
