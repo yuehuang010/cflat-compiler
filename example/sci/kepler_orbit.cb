@@ -1,0 +1,272 @@
+// kepler_orbit.cb - why symplectic integrators exist, shown on a two-body orbit.
+//
+// A test particle orbits a fixed central mass in normalized units (GM = 1,
+// semi-major axis a = 1), so the orbital period is exactly 2*pi and the total
+// specific energy is exactly -0.5. The orbit is deliberately eccentric
+// (e = 0.6) so the particle whips through perihelion, which is where an
+// integrator does its worst work.
+//
+// The same orbit is integrated two ways, both compared against the EXACT
+// analytic position:
+//
+//   Ode.rk45_step   - adaptive Dormand-Prince 5(4). Higher order, error
+//                     controlled per step, and NOT symplectic.
+//   Ode.verlet_step - fixed-step velocity Verlet. Only 2nd order, but
+//                     symplectic: it exactly conserves a nearby "shadow"
+//                     energy, so its energy error oscillates within a bounded
+//                     envelope instead of accumulating.
+//
+// The exact reference needs Kepler's equation M = E - e*sin(E) solved for the
+// eccentric anomaly E. That is a transcendental root, so this is a genuine use
+// of Roots.brent rather than a decorative one.
+//
+// MEASUREMENT NOTE (this is easy to get wrong): a symplectic integrator's
+// energy error OSCILLATES over each orbit, with the swing largest at
+// perihelion. Sampling once per orbit aliases that oscillation and makes
+// Verlet look like it is drifting when it is not. So we sample many times per
+// orbit and report the per-orbit ENVELOPE - the worst error within each orbit.
+// The envelope is the quantity that is bounded for a symplectic method.
+//
+// Build:
+//   cflat example/sci/kepler_orbit.cb -o out/kepler_orbit.exe
+import "cruntime.cb";
+import "math.cb";
+import "sci/ode.cb";
+import "sci/roots.cb";
+import "sci/stats.cb";
+
+const double GM = 1.0;          // gravitational parameter, normalized
+const double SEMI_MAJOR = 1.0;  // a
+const double ECC = 0.6;         // e
+const double TWO_PI = 6.28318530717958647692;
+
+// Specific orbital energy: v^2/2 - GM/r. Exactly -GM/(2a) on the true orbit.
+double energy_of(double x, double y, double vx, double vy)
+{
+    double r = Math.hypot(x, y);
+    return 0.5 * (vx * vx + vy * vy) - GM / r;
+}
+
+// Exact position at time t via Kepler's equation. |E - M| <= e always, so
+// [M - e, M + e] is a guaranteed bracket for Brent.
+bool exact_position(double t, double* px, double* py)
+{
+    double meanAnomaly = t * Math.sqrt(GM / (SEMI_MAJOR * SEMI_MAJOR * SEMI_MAJOR));
+    double lo = meanAnomaly - ECC - 0.000001;
+    double hi = meanAnomaly + ECC + 0.000001;
+
+    Roots.Result r = Roots.brent(
+        (double e) => e - ECC * Math.sin(e) - meanAnomaly, lo, hi, 0.000000000001, 200);
+    if (!r.converged) return false;
+
+    double ecc_anom = r.x;
+    px[0] = SEMI_MAJOR * (Math.cos(ecc_anom) - ECC);
+    py[0] = SEMI_MAJOR * Math.sqrt(1.0 - ECC * ECC) * Math.sin(ecc_anom);
+    return true;
+}
+
+// Start at perihelion: r = a(1-e) on the +x axis, velocity purely +y.
+void initial_state(double* x, double* y, double* vx, double* vy)
+{
+    double rp = SEMI_MAJOR * (1.0 - ECC);
+    x[0] = rp;
+    y[0] = 0.0;
+    vx[0] = 0.0;
+    vy[0] = Math.sqrt(GM / SEMI_MAJOR * (1.0 + ECC) / (1.0 - ECC));
+}
+
+// Mean, worst and last value of a per-orbit envelope series.
+void report(string label, double[] perOrbit, int orbits)
+{
+    double worst = 0.0;
+    for (int i = 0; i < orbits; i = i + 1)
+        if (perOrbit[i] > worst) worst = perOrbit[i];
+    printf("  %-20s mean %.3e   worst %.3e   last orbit %.3e\n",
+           label.data(), Stats.mean(perOrbit, orbits), worst, perOrbit[orbits - 1]);
+}
+
+// Ratio of the mean envelope over the last quarter of the run to the first
+// quarter. Bounded (symplectic) stays near 1; accumulating grows with time.
+double growth(double[] perOrbit, int orbits)
+{
+    int quarter = orbits / 4;
+    if (quarter < 1) return 0.0;
+    double early = Stats.mean(perOrbit, quarter);
+    double late = 0.0;
+    for (int i = orbits - quarter; i < orbits; i = i + 1) late = late + perOrbit[i];
+    late = late / (double)quarter;
+    if (early <= 0.0) return 0.0;
+    return late / early;
+}
+
+int main()
+{
+    int orbits = 120;
+    int samplesPerOrbit = 64;
+    int stepsPerOrbit = 4096;           // divisible by samplesPerOrbit
+    double period = TWO_PI;             // a = 1, GM = 1
+    double sampleDt = period / (double)samplesPerOrbit;
+    double exactEnergy = -GM / (2.0 * SEMI_MAJOR);
+
+    printf("Two-body Kepler orbit: GM=%.1f  a=%.1f  e=%.1f  period=%.6f\n",
+           GM, SEMI_MAJOR, ECC, period);
+    printf("Exact specific energy: %.15f\n", exactEnergy);
+    printf("Integrating %d orbits, sampling %d times per orbit.\n",
+           orbits, samplesPerOrbit);
+    printf("Reporting the per-orbit ENVELOPE (worst error within each orbit).\n\n");
+
+    double[] rkPos = new double[orbits];
+    double[] rkEne = new double[orbits];
+    double[] vlPos = new double[orbits];
+    double[] vlEne = new double[orbits];
+
+    // ---- RK45 (adaptive Dormand-Prince, not symplectic) ----
+    {
+        double[] state = new double[4];         // x, y, vx, vy
+        double[] scratch = new double[10 * 4];  // rk45 needs 10*n
+        double x = 0.0; double y = 0.0; double vx = 0.0; double vy = 0.0;
+        initial_state(&x, &y, &vx, &vy);
+        state[0] = x; state[1] = y; state[2] = vx; state[3] = vy;
+
+        double t = 0.0;
+        double h = period / (double)stepsPerOrbit;
+        int stepCount = 0;
+        bool stalled = false;
+
+        // rk45_step never proposes a step LARGER than h_try, so the step size is
+        // monotonically non-increasing across calls. Clamping h_try to land
+        // exactly on a sample time would feed that tiny remainder back in and
+        // permanently ruin h, so we step freely and compare at the t reached.
+        for (int orbit = 0; orbit < orbits && !stalled; orbit = orbit + 1)
+        {
+            double posEnv = 0.0;
+            double eneEnv = 0.0;
+            for (int s = 0; s < samplesPerOrbit && !stalled; s = s + 1)
+            {
+                double target = ((double)(orbit * samplesPerOrbit + s + 1)) * sampleDt;
+                while (t < target && !stalled)
+                {
+                    double taken = Ode.rk45_step(
+                        (double tt, double* yy, double* dy, int n) =>
+                        {
+                            double rr = Math.hypot(yy[0], yy[1]);
+                            double r3 = rr * rr * rr;
+                            dy[0] = yy[2];
+                            dy[1] = yy[3];
+                            dy[2] = -GM * yy[0] / r3;
+                            dy[3] = -GM * yy[1] / r3;
+                        },
+                        &t, state, 4, h, 0.000000001, 0.000000001, scratch);
+                    if (taken <= 0.0) { stalled = true; break; }
+                    h = taken;
+                    stepCount = stepCount + 1;
+                }
+                if (stalled) break;
+
+                double ex = 0.0; double ey = 0.0;
+                if (!exact_position(t, &ex, &ey)) { stalled = true; break; }
+                double pe = Math.hypot(state[0] - ex, state[1] - ey);
+                double ee = Math.abs(energy_of(state[0], state[1], state[2], state[3])
+                                     - exactEnergy);
+                if (pe > posEnv) posEnv = pe;
+                if (ee > eneEnv) eneEnv = ee;
+            }
+            rkPos[orbit] = posEnv;
+            rkEne[orbit] = eneEnv;
+        }
+
+        if (stalled)
+        {
+            printf("RK45: integration stalled - reporting is not meaningful.\n");
+            delete[_] state; delete[_] scratch;
+            delete[_] rkPos; delete[_] rkEne; delete[_] vlPos; delete[_] vlEne;
+            return 1;
+        }
+
+        printf("RK45 (adaptive Dormand-Prince 5(4), %d steps, final h=%.3e):\n",
+               stepCount, h);
+        report("position envelope", rkPos, orbits);
+        report("energy envelope", rkEne, orbits);
+        delete[_] state;
+        delete[_] scratch;
+    }
+
+    printf("\n");
+
+    // ---- Velocity Verlet (fixed step, symplectic) ----
+    {
+        double h = period / (double)stepsPerOrbit;
+        double[] pos = new double[2];
+        double[] vel = new double[2];
+        double[] acc = new double[2];
+        double x = 0.0; double y = 0.0; double vx = 0.0; double vy = 0.0;
+        initial_state(&x, &y, &vx, &vy);
+        pos[0] = x; pos[1] = y; vel[0] = vx; vel[1] = vy;
+
+        int stepsPerSample = stepsPerOrbit / samplesPerOrbit;
+        bool stalled = false;
+
+        for (int orbit = 0; orbit < orbits && !stalled; orbit = orbit + 1)
+        {
+            double posEnv = 0.0;
+            double eneEnv = 0.0;
+            for (int s = 0; s < samplesPerOrbit && !stalled; s = s + 1)
+            {
+                for (int k = 0; k < stepsPerSample; k = k + 1)
+                {
+                    Ode.verlet_step(
+                        (double* p, double* a, int n) =>
+                        {
+                            double rr = Math.hypot(p[0], p[1]);
+                            double r3 = rr * rr * rr;
+                            a[0] = -GM * p[0] / r3;
+                            a[1] = -GM * p[1] / r3;
+                        },
+                        pos, vel, acc, 2, h);
+                }
+
+                double t = ((double)(orbit * samplesPerOrbit + s + 1)) * sampleDt;
+                double ex = 0.0; double ey = 0.0;
+                if (!exact_position(t, &ex, &ey)) { stalled = true; break; }
+                double pe = Math.hypot(pos[0] - ex, pos[1] - ey);
+                double ee = Math.abs(energy_of(pos[0], pos[1], vel[0], vel[1])
+                                     - exactEnergy);
+                if (pe > posEnv) posEnv = pe;
+                if (ee > eneEnv) eneEnv = ee;
+            }
+            vlPos[orbit] = posEnv;
+            vlEne[orbit] = eneEnv;
+        }
+
+        if (stalled)
+        {
+            printf("Verlet: Kepler solve failed - reporting is not meaningful.\n");
+            delete[_] pos; delete[_] vel; delete[_] acc;
+            delete[_] rkPos; delete[_] rkEne; delete[_] vlPos; delete[_] vlEne;
+            return 1;
+        }
+
+        printf("Velocity Verlet (symplectic, %d fixed steps/orbit, h=%.3e):\n",
+               stepsPerOrbit, h);
+        report("position envelope", vlPos, orbits);
+        report("energy envelope", vlEne, orbits);
+        delete[_] pos;
+        delete[_] vel;
+        delete[_] acc;
+    }
+
+    printf("\nEnvelope growth over the run (last quarter / first quarter):\n");
+    printf("  RK45   position x%-10.2f energy x%.2f\n",
+           growth(rkPos, orbits), growth(rkEne, orbits));
+    printf("  Verlet position x%-10.2f energy x%.2f\n",
+           growth(vlPos, orbits), growth(vlEne, orbits));
+    printf("\nBoth methods lose track of WHERE the particle is: a tiny period error\n");
+    printf("accumulates into a phase drift, so the position envelope grows for each.\n");
+    printf("The difference is the conserved quantity - compare the energy columns.\n");
+
+    delete[_] rkPos;
+    delete[_] rkEne;
+    delete[_] vlPos;
+    delete[_] vlEne;
+    return 0;
+}

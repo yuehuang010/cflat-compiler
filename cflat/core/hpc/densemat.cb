@@ -18,6 +18,7 @@
 
 import "threadpool.cb";    // ThreadPool (pool-parallel gemm)
 import "hpc/parallel.cb";  // parallel_for_n_pool
+import "hpc/vecmath.cb";   // Vec.transpose (Mat.transpose forwards to it)
 
 // Compute one GEMM output tile: C[i0..i0+mblk, j0..j0+nblk] = beta * C + alpha * A*B
 // restricted to that tile, walking k in GEMM_KB slabs (kstep) in ascending order so the
@@ -196,13 +197,10 @@ namespace Mat
     }
 
     // B = A^T.  A is (m x n) row-major, B is (n x m) row-major.
+    // The implementation lives in Vec so that callers needing only a transpose
+    // are not forced to import this module's threading dependencies.
     void transpose(double[] a, double[] b, int m, int n)
     {
-        for (int i = 0; i < m; i = i + 1)
-        {
-            int arow = i * n;
-            int j = 0;
-            while (j < n) { b[j * m + i] = a[arow + j]; j = j + 1; }
-        }
+        Vec.transpose(a, b, m, n);
     }
 }

@@ -1,0 +1,513 @@
+// svd.cb - thin singular value decomposition over row-major double[].
+//
+// svd computes A = U * S * V^T for m >= n. U is m x n with singular vectors
+// in columns, while vt is V TRANSPOSED: row j is v_j. This is the LAPACK and
+// SciPy convention, and is intentionally called out because V itself is the
+// most common source of caller mistakes.
+//
+// The implementation is the Golub-Kahan-Reinsch algorithm: Householder
+// bidiagonalization followed by implicit-shift QR sweeps on the bidiagonal
+// matrix. The caller owns all output and scratch storage.
+
+import "math.cb";
+
+namespace Svd
+{
+    const double SVD_EPS = 0.00000000000000022204460492503131;
+
+    // Every routine that accepts scratch needs m*n + n doubles. The first m*n
+    // entries hold the working matrix and the last n hold the QR workspace.
+
+    double __abs(double x)
+    {
+        return x < 0.0 ? -x : x;
+    }
+
+    double __hypot(double x, double y)
+    {
+        x = __abs(x);
+        y = __abs(y);
+        if (x < y)
+        {
+            double t = x;
+            x = y;
+            y = t;
+        }
+        if (x == 0.0) return 0.0;
+        double t = y / x;
+        return x * Math.sqrt(1.0 + t * t);
+    }
+
+    // Return the default rank threshold for an m x n matrix with singular
+    // values in descending order. The vector-only rank API uses n for both
+    // dimensions because its signature does not carry the original m.
+    double __tol(double[] s, int n, int m, double tol)
+    {
+        if (tol >= 0.0) return tol;
+        if (n <= 0 || s[0] == 0.0) return 0.0;
+        int scale = m > n ? m : n;
+        return (double)scale * SVD_EPS * s[0];
+    }
+
+    // Sort singular values descending while carrying U and V columns along.
+    void __sort(double[] s, double[] u, double[] v, int m, int n)
+    {
+        for (int i = 0; i < n - 1; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < n; j = j + 1)
+                if (s[j] > s[best]) best = j;
+            if (best == i) continue;
+
+            double sv = s[i];
+            s[i] = s[best];
+            s[best] = sv;
+            for (int r = 0; r < m; r = r + 1)
+            {
+                double t = u[r * n + i];
+                u[r * n + i] = u[r * n + best];
+                u[r * n + best] = t;
+            }
+            for (int r = 0; r < n; r = r + 1)
+            {
+                double t = v[r * n + i];
+                v[r * n + i] = v[r * n + best];
+                v[r * n + best] = t;
+            }
+        }
+    }
+
+    // Transpose an n x n matrix in place.
+    void __transpose_square(double[] a, int n)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = i + 1; j < n; j = j + 1)
+            {
+                double t = a[i * n + j];
+                a[i * n + j] = a[j * n + i];
+                a[j * n + i] = t;
+            }
+    }
+
+    // Golub-Kahan-Reinsch SVD core. scratch is exactly m*n+n doubles: work is
+    // the first region and rv1, the bidiagonal superdiagonal, is the second.
+    bool __core(double[] a, int m, int n, double[] u, double[] s,
+                double[] vt, int max_iter, double[] scratch)
+    {
+        if (m < n || n < 1 || max_iter < 1) return false;
+
+        double[] work = (double[])&scratch[0];
+        double[] rv1 = (double[])&scratch[m * n];
+        for (int i = 0; i < m * n; i = i + 1) work[i] = a[i];
+        for (int i = 0; i < n * n; i = i + 1) vt[i] = 0.0;
+
+        double g = 0.0;
+        double scale = 0.0;
+        double anorm = 0.0;
+
+        // Householder reduction to upper bidiagonal form.
+        for (int i = 0; i < n; i = i + 1)
+        {
+            int l = i + 1;
+            rv1[i] = scale * g;
+            g = 0.0;
+            double ss = 0.0;
+            scale = 0.0;
+            for (int k = i; k < m; k = k + 1)
+            {
+                double av = __abs(work[k * n + i]);
+                if (av > scale) scale = av;
+            }
+            if (scale != 0.0)
+            {
+                for (int k = i; k < m; k = k + 1)
+                {
+                    work[k * n + i] = work[k * n + i] / scale;
+                    ss = ss + work[k * n + i] * work[k * n + i];
+                }
+                double f = work[i * n + i];
+                g = f >= 0.0 ? -Math.sqrt(ss) : Math.sqrt(ss);
+                double h = f * g - ss;
+                work[i * n + i] = f - g;
+                if (i != n - 1)
+                {
+                    for (int j = l; j < n; j = j + 1)
+                    {
+                        ss = 0.0;
+                        for (int k = i; k < m; k = k + 1)
+                            ss = ss + work[k * n + i] * work[k * n + j];
+                        f = ss / h;
+                        for (int k = i; k < m; k = k + 1)
+                            work[k * n + j] = work[k * n + j] + f * work[k * n + i];
+                    }
+                }
+                for (int k = i; k < m; k = k + 1)
+                    work[k * n + i] = work[k * n + i] * scale;
+            }
+            s[i] = scale * g;
+
+            g = 0.0;
+            ss = 0.0;
+            scale = 0.0;
+            if (i < m && i != n - 1)
+            {
+                for (int k = l; k < n; k = k + 1)
+                {
+                    double av = __abs(work[i * n + k]);
+                    if (av > scale) scale = av;
+                }
+                if (scale != 0.0)
+                {
+                    for (int k = l; k < n; k = k + 1)
+                    {
+                        work[i * n + k] = work[i * n + k] / scale;
+                        ss = ss + work[i * n + k] * work[i * n + k];
+                    }
+                    double f = work[i * n + l];
+                    g = f >= 0.0 ? -Math.sqrt(ss) : Math.sqrt(ss);
+                    double h = f * g - ss;
+                    work[i * n + l] = f - g;
+                    for (int k = l; k < n; k = k + 1)
+                        rv1[k] = work[i * n + k] / h;
+                    if (i != m - 1)
+                    {
+                        for (int j = l; j < m; j = j + 1)
+                        {
+                            ss = 0.0;
+                            for (int k = l; k < n; k = k + 1)
+                                ss = ss + work[j * n + k] * work[i * n + k];
+                            for (int k = l; k < n; k = k + 1)
+                                work[j * n + k] = work[j * n + k] + ss * rv1[k];
+                        }
+                    }
+                    for (int k = l; k < n; k = k + 1)
+                        work[i * n + k] = work[i * n + k] * scale;
+                }
+            }
+            double size = __abs(s[i]) + __abs(rv1[i]);
+            if (size > anorm) anorm = size;
+        }
+
+        // Accumulate right reflectors into V. vt is V until the final transpose.
+        for (int i = n - 1; i >= 0; i = i - 1)
+        {
+            int l = i + 1;
+            if (i < n - 1)
+            {
+                if (g != 0.0)
+                {
+                    for (int j = l; j < n; j = j + 1)
+                        vt[j * n + i] = (work[i * n + j] / work[i * n + l]) / g;
+                    for (int j = l; j < n; j = j + 1)
+                    {
+                        double ss = 0.0;
+                        for (int k = l; k < n; k = k + 1)
+                            ss = ss + work[i * n + k] * vt[k * n + j];
+                        for (int k = l; k < n; k = k + 1)
+                            vt[k * n + j] = vt[k * n + j] + ss * vt[k * n + i];
+                    }
+                }
+                for (int j = l; j < n; j = j + 1)
+                {
+                    vt[i * n + j] = 0.0;
+                    vt[j * n + i] = 0.0;
+                }
+            }
+            vt[i * n + i] = 1.0;
+            g = rv1[i];
+        }
+
+        // Accumulate left reflectors. This turns work into the thin U matrix.
+        int nr = m < n ? m : n;
+        for (int i = nr - 1; i >= 0; i = i - 1)
+        {
+            int l = i + 1;
+            g = s[i];
+            for (int j = l; j < n; j = j + 1)
+                work[i * n + j] = 0.0;
+            if (g != 0.0)
+            {
+                for (int j = l; j < n; j = j + 1)
+                {
+                    double ss = 0.0;
+                    for (int k = l; k < m; k = k + 1)
+                        ss = ss + work[k * n + i] * work[k * n + j];
+                    double f = (ss / work[i * n + i]) / g;
+                    for (int k = i; k < m; k = k + 1)
+                        work[k * n + j] = work[k * n + j] + f * work[k * n + i];
+                }
+                double inv = 1.0 / g;
+                for (int k = i; k < m; k = k + 1)
+                    work[k * n + i] = work[k * n + i] * inv;
+            }
+            else
+            {
+                for (int k = i; k < m; k = k + 1)
+                    work[k * n + i] = 0.0;
+            }
+            work[i * n + i] = work[i * n + i] + 1.0;
+        }
+
+        bool all_ok = true;
+        // Implicit-shift QR sweeps on the bidiagonal matrix. Each outer pass
+        // deflates one singular value; the scan also splits at tiny diagonals.
+        for (int k = n - 1; k >= 0 && all_ok; k = k - 1)
+        {
+            bool converged = false;
+            for (int its = 0; its < max_iter; its = its + 1)
+            {
+                bool flag = true;
+                int l = k;
+                int nm = -1;
+                double sn = 1.0;
+                while (l >= 0)
+                {
+                    nm = l - 1;
+                    if (__abs(rv1[l]) + anorm == anorm)
+                    {
+                        flag = false;
+                        break;
+                    }
+                    if (nm < 0 || __abs(s[nm]) + anorm == anorm) break;
+                    l = l - 1;
+                }
+                if (flag)
+                {
+                    double c = 0.0;
+                    sn = 1.0;
+                    for (int i = l; i <= k; i = i + 1)
+                    {
+                        double f = sn * rv1[i];
+                        rv1[i] = c * rv1[i];
+                        if (__abs(f) + anorm == anorm) break;
+                        double old = s[i];
+                        double h = __hypot(f, old);
+                        s[i] = h;
+                        if (h == 0.0)
+                        {
+                            c = 1.0;
+                            sn = 0.0;
+                        }
+                        else
+                        {
+                            h = 1.0 / h;
+                            c = old * h;
+                            sn = -f * h;
+                        }
+                        if (nm >= 0)
+                            for (int j = 0; j < m; j = j + 1)
+                            {
+                                double x = work[j * n + nm];
+                                double z = work[j * n + i];
+                                work[j * n + nm] = x * c + z * sn;
+                                work[j * n + i] = z * c - x * sn;
+                            }
+                    }
+                }
+
+                double z = s[k];
+                if (l == k)
+                {
+                    if (z < 0.0)
+                    {
+                        s[k] = -z;
+                        for (int j = 0; j < n; j = j + 1)
+                            vt[j * n + k] = -vt[j * n + k];
+                    }
+                    converged = true;
+                    break;
+                }
+                if (its == max_iter - 1) break;
+
+                double x = s[l];
+                nm = k - 1;
+                double y = s[nm];
+                double right = rv1[nm];
+                double htail = rv1[k];
+                double f = 0.0;
+                if (htail != 0.0 && y != 0.0 && x != 0.0)
+                {
+                    f = ((y - z) * (y + z) + (right - htail) * (right + htail))
+                        / (2.0 * htail * y);
+                    double root = __hypot(f, 1.0);
+                    double denom = f >= 0.0 ? f + root : f - root;
+                    if (denom != 0.0)
+                        f = ((x - z) * (x + z) + htail * (y / denom - htail)) / x;
+                    else
+                        f = 0.0;
+                }
+
+                double cs = 1.0;
+                sn = 1.0;
+                for (int i = l + 1; i <= k; i = i + 1)
+                {
+                    double gi = rv1[i];
+                    y = s[i];
+                    double h = sn * gi;
+                    gi = cs * gi;
+                    z = __hypot(f, h);
+                    rv1[i - 1] = z;
+                    if (z == 0.0)
+                    {
+                        cs = 1.0;
+                        sn = 0.0;
+                    }
+                    else
+                    {
+                        z = 1.0 / z;
+                        cs = f * z;
+                        sn = h * z;
+                    }
+                    f = x * cs + gi * sn;
+                    gi = gi * cs - x * sn;
+                    h = y * sn;
+                    y = y * cs;
+                    for (int j = 0; j < n; j = j + 1)
+                    {
+                        double old = vt[j * n + i - 1];
+                        double cur = vt[j * n + i];
+                        vt[j * n + i - 1] = old * cs + cur * sn;
+                        vt[j * n + i] = cur * cs - old * sn;
+                    }
+                    z = __hypot(f, h);
+                    s[i - 1] = z;
+                    if (z == 0.0)
+                    {
+                        cs = 1.0;
+                        sn = 0.0;
+                    }
+                    else
+                    {
+                        z = 1.0 / z;
+                        cs = f * z;
+                        sn = h * z;
+                    }
+                    f = cs * gi + sn * y;
+                    x = cs * y - sn * gi;
+                    for (int j = 0; j < m; j = j + 1)
+                    {
+                        double old = work[j * n + i - 1];
+                        double cur = work[j * n + i];
+                        work[j * n + i - 1] = old * cs + cur * sn;
+                        work[j * n + i] = cur * cs - old * sn;
+                    }
+                }
+                rv1[l] = 0.0;
+                rv1[k] = f;
+                s[k] = x;
+            }
+            if (!converged) all_ok = false;
+        }
+
+        if (!all_ok) return false;
+        __sort(s, work, vt, m, n);
+        for (int i = 0; i < m * n; i = i + 1) u[i] = work[i];
+        __transpose_square(vt, n);
+        return true;
+    }
+
+    // Thin SVD. scratch must contain exactly m*n+n doubles. The input a is
+    // copied before it is touched, and vt is V TRANSPOSED: row j is v_j.
+    bool svd(double[] a, int m, int n, double[] u, double[] s, double[] vt,
+             int max_iter, double[] scratch)
+    {
+        return __core(a, m, n, u, s, vt, max_iter, scratch);
+    }
+
+    // Singular values only. scratch must contain m*n+n doubles.
+    bool singular_values(double[] a, int m, int n, double[] s, int max_iter,
+                         double[] scratch)
+    {
+        if (m < n || n < 1) return false;
+        double[] u = new double[m * n];
+        double[] vt = new double[n * n];
+        bool ok = svd(a, m, n, u, s, vt, max_iter, scratch);
+        delete[_] u;
+        delete[_] vt;
+        return ok;
+    }
+
+    // Numerical rank of descending singular values. With tol < 0, the default
+    // is n * eps * s[0], since the original row count is not in this API.
+    int rank(double[] s, int n, double tol)
+    {
+        if (n <= 0) return 0;
+        double floor = __tol(s, n, n, tol);
+        int r = 0;
+        for (int i = 0; i < n; i = i + 1)
+            if (s[i] > floor) r = r + 1;
+        return r;
+    }
+
+    // Condition number from descending singular values. A numerically singular
+    // matrix returns IEEE infinity instead of dividing by its zero pivot.
+    double cond(double[] s, int n)
+    {
+        if (n <= 0 || s[0] == 0.0) return 1.0 / 0.0;
+        int r = rank(s, n, -1.0);
+        if (r <= 0) return 1.0 / 0.0;
+        return s[0] / s[r - 1];
+    }
+
+    // Moore-Penrose pseudoinverse, stored as n x m row-major. scratch must
+    // contain m*n+n doubles. Singular values <= tol are truncated.
+    bool pinv(double[] a, int m, int n, double[] ainv, double tol,
+              int max_iter, double[] scratch)
+    {
+        if (m < n || n < 1) return false;
+        double[] u = new double[m * n];
+        double[] s = new double[n];
+        double[] vt = new double[n * n];
+        bool ok = svd(a, m, n, u, s, vt, max_iter, scratch);
+        if (ok)
+        {
+            double floor = __tol(s, n, m, tol);
+            for (int i = 0; i < n; i = i + 1)
+                for (int j = 0; j < m; j = j + 1)
+                {
+                    double value = 0.0;
+                    for (int k = 0; k < n; k = k + 1)
+                        if (s[k] > floor)
+                            value = value + vt[k * n + i] * (1.0 / s[k]) * u[j * n + k];
+                    ainv[i * m + j] = value;
+                }
+        }
+        delete[_] u;
+        delete[_] s;
+        delete[_] vt;
+        return ok;
+    }
+
+    // Minimum-norm overdetermined least squares via the SVD. This handles
+    // rank-deficient A by truncating small singular values; Qr.lstsq cannot.
+    // scratch must contain m*n+n doubles, and b is not modified.
+    bool lstsq(double[] a, int m, int n, double[] b, double[] x, double tol,
+               int max_iter, double[] scratch)
+    {
+        if (m < n || n < 1) return false;
+        double[] u = new double[m * n];
+        double[] s = new double[n];
+        double[] vt = new double[n * n];
+        bool ok = svd(a, m, n, u, s, vt, max_iter, scratch);
+        if (ok)
+        {
+            double floor = __tol(s, n, m, tol);
+            for (int j = 0; j < n; j = j + 1) x[j] = 0.0;
+            for (int i = 0; i < n; i = i + 1)
+            {
+                if (s[i] <= floor) continue;
+                double projection = 0.0;
+                for (int j = 0; j < m; j = j + 1)
+                    projection = projection + u[j * n + i] * b[j];
+                projection = projection / s[i];
+                for (int j = 0; j < n; j = j + 1)
+                    x[j] = x[j] + vt[i * n + j] * projection;
+            }
+        }
+        delete[_] u;
+        delete[_] s;
+        delete[_] vt;
+        return ok;
+    }
+}
+

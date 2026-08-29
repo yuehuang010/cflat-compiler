@@ -7,10 +7,21 @@
 //   ifft(buf, n)  : inverse DFT, scaled by 1/N
 //   dft_naive     : O(N^2) reference transform, for correctness checking
 //
-// Single-threaded; the only heap use is the trig calls. Twiddles are computed on the fly
-// via sin/cos rather than precomputed into a twiddle table, to keep the kernel self-contained.
+// The three entry points above take N on trust and compute twiddles on the fly, which
+// keeps the kernel self-contained. Everything below them is additive and validates N:
+//
+//   fft_checked / ifft_checked : same transform, but reject a non-power-of-two N
+//   FftPlan (plan_create)      : precomputed twiddle table, no sin/cos in the butterfly
+//   rfft / irfft               : real-input transform via a half-length complex FFT
+//   fft2 / ifft2               : 2-D transform (rows, complex transpose, rows, transpose)
+//   convolve / correlate       : linear real convolution and full cross-correlation
+//   fft_any / ifft_any         : arbitrary N via Bluestein's chirp-z algorithm
+//
+// Single-threaded. The additive entry points allocate scratch from the heap and free it
+// before returning; the caller always owns the input and output buffers.
 
-import "math.cb";   // Math.sin / Math.cos (llvm.sin / llvm.cos intrinsics)
+import "math.cb";        // Math.sin / Math.cos (llvm.sin / llvm.cos intrinsics)
+import "hpc/vecmath.cb";   // Vec.transpose (the 2-D transform's transpose step)
 
 namespace FFT
 {
@@ -96,4 +107,427 @@ namespace FFT
             out[2 * kk] = sr; out[2 * kk + 1] = si;
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // Size validation and checked radix-2 entry points
+    // ---------------------------------------------------------------------------
+
+    bool is_power_of_two(int n)
+    {
+        if (n < 1) return false;
+        return (n & (n - 1)) == 0;
+    }
+
+    // Smallest power of two >= n, for n >= 1. Saturates rather than overflowing.
+    int next_power_of_two(int n)
+    {
+        if (n < 1) return 1;
+        int p = 1;
+        while (p < n && p < 0x40000000) p = p << 1;
+        return p;
+    }
+
+    // fft/ifft take n on trust; these reject a bad n instead of mis-transforming.
+    // The buffer is left untouched when false is returned.
+    bool fft_checked(double[] buf, int n)
+    {
+        if (!is_power_of_two(n)) return false;
+        transform(buf, n, -1.0);
+        return true;
+    }
+
+    bool ifft_checked(double[] buf, int n)
+    {
+        if (!is_power_of_two(n)) return false;
+        ifft(buf, n);
+        return true;
+    }
+
+    // ---------------------------------------------------------------------------
+    // FftPlan - precomputed twiddle table
+    // ---------------------------------------------------------------------------
+
+    // A plan owns a table of the N/2 roots w^j = exp(sign*2*pi*i*j/N), j in [0, N/2).
+    // Stage `len` reads w_len^k as tw[k * (N/len)], so one table serves every stage and
+    // no butterfly calls sin/cos. `ok` is false if the requested N was not a power of two.
+    // Build one with plan_create and release it with destroy(); the table is not freed
+    // automatically, so a plan that outlives its scope without destroy() leaks.
+    struct FftPlan
+    {
+        int n = default;
+        double sign = default;
+        bool ok = default;
+        double* tw = default;
+
+        void destroy()
+        {
+            if (tw == nullptr) return;
+            delete[_] tw;
+            tw = nullptr;
+            ok = false;
+        }
+
+        // In-place transform of 2*n doubles using this plan's twiddle table. An inverse
+        // plan (sign > 0) applies the 1/N scaling, matching ifft.
+        bool apply(double[] buf)
+        {
+            if (!ok) return false;
+            double[] table = (double[])tw;
+
+            FFT.bit_reverse(buf, n);
+            int len = 2;
+            while (len <= n)
+            {
+                int half = len >> 1;
+                int step = n / len;
+                for (int start = 0; start < n; start = start + len)
+                {
+                    for (int k = 0; k < half; k = k + 1)
+                    {
+                        int t = 2 * k * step;
+                        double cr = table[t]; double ci = table[t + 1];
+                        int even = 2 * (start + k);
+                        int odd = 2 * (start + k + half);
+                        double er = buf[even]; double ei = buf[even + 1];
+                        double or_ = buf[odd]; double oi = buf[odd + 1];
+                        double tr = cr * or_ - ci * oi;
+                        double ti = cr * oi + ci * or_;
+                        buf[even] = er + tr; buf[even + 1] = ei + ti;
+                        buf[odd] = er - tr; buf[odd + 1] = ei - ti;
+                    }
+                }
+                len = len << 1;
+            }
+
+            if (sign > 0.0)
+            {
+                double inv = 1.0 / (double)n;
+                int total = 2 * n;
+                for (int i = 0; i < total; i = i + 1) buf[i] = buf[i] * inv;
+            }
+            return true;
+        }
+    };
+
+    // sign is -1.0 for a forward plan, +1.0 for an inverse plan (which scales by 1/N).
+    // The caller must call destroy() on the returned plan when done.
+    FftPlan plan_create(int n, double sign)
+    {
+        FftPlan plan = default;
+        plan.n = n;
+        plan.sign = sign;
+        plan.ok = is_power_of_two(n);
+        if (!plan.ok) return plan;
+
+        int cells = n >> 1;
+        if (cells < 1) cells = 1;             // n == 1 has no butterflies; keep a live buffer
+        double[] table = new double[2 * cells];
+        for (int j = 0; j < cells; j = j + 1)
+        {
+            double ang = sign * 2.0 * PI * (double)j / (double)n;
+            table[2 * j] = Math.cos(ang);
+            table[2 * j + 1] = Math.sin(ang);
+        }
+        plan.tw = move table;
+        return plan;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Real-input transform
+    // ---------------------------------------------------------------------------
+
+    // rfft: N real samples in x (length N, N a power of two) -> the N/2+1 non-redundant
+    // spectrum bins in spec (length 2*(N/2+1), interleaved). x and spec must not overlap.
+    // The N real samples are read as N/2 complex points, transformed at half length, and
+    // untangled: X[k] = Fe[k] + exp(-2*pi*i*k/N) * Fo[k], where Fe/Fo are the even/odd
+    // half-spectra recovered from Z[k] and conj(Z[N/2-k]).
+    bool rfft(double[] x, double[] spec, int n)
+    {
+        if (!is_power_of_two(n)) return false;
+        if (n == 1)
+        {
+            spec[0] = x[0];
+            spec[1] = 0.0;
+            return true;
+        }
+
+        int m = n >> 1;
+        for (int j = 0; j < n; j = j + 1) spec[j] = x[j];
+        transform(spec, m, -1.0);
+
+        // Bins 0 and N/2 are purely real and come straight off Z[0].
+        double z0r = spec[0]; double z0i = spec[1];
+        spec[2 * m] = z0r - z0i; spec[2 * m + 1] = 0.0;
+        spec[0] = z0r + z0i; spec[1] = 0.0;
+
+        int half = m >> 1;
+        for (int k = 1; k <= half; k = k + 1)
+        {
+            int j = m - k;
+            double ar = spec[2 * k]; double ai = spec[2 * k + 1];     // Z[k]
+            double br = spec[2 * j]; double bi = spec[2 * j + 1];     // Z[m-k]
+
+            // Fe = (Z[k] + conj(Z[m-k])) / 2,  Fo = (Z[k] - conj(Z[m-k])) / (2i)
+            double er = 0.5 * (ar + br); double ei = 0.5 * (ai - bi);
+            double dr = ar - br; double di = ai + bi;
+            double fr = 0.5 * di; double fi = -0.5 * dr;
+
+            double angk = -PI * (double)k / (double)m;                // -2*pi*k/n
+            double wkr = Math.cos(angk); double wki = Math.sin(angk);
+            double tr = wkr * fr - wki * fi;
+            double ti = wkr * fi + wki * fr;
+
+            // Bin m-k uses Fe[m-k] = conj(Fe[k]) and Fo[m-k] = conj(Fo[k]).
+            double angj = -PI * (double)j / (double)m;
+            double wjr = Math.cos(angj); double wji = Math.sin(angj);
+            double ur = wjr * fr + wji * fi;
+            double ui = wji * fr - wjr * fi;
+
+            spec[2 * k] = er + tr; spec[2 * k + 1] = ei + ti;
+            spec[2 * j] = er + ur; spec[2 * j + 1] = ui - ei;
+        }
+        return true;
+    }
+
+    // irfft: the inverse of rfft. spec holds the N/2+1 bins (length 2*(N/2+1)), x receives
+    // the N real samples. The half-length complex sequence is rebuilt in x itself - Z[k] is
+    // written to (x[2k], x[2k+1]), which is exactly where the inverse transform leaves the
+    // two real samples - so no scratch buffer and no final shuffle are needed.
+    bool irfft(double[] spec, double[] x, int n)
+    {
+        if (!is_power_of_two(n)) return false;
+        if (n == 1)
+        {
+            x[0] = spec[0];
+            return true;
+        }
+
+        int m = n >> 1;
+        for (int k = 0; k < m; k = k + 1)
+        {
+            int j = m - k;
+            double ar = spec[2 * k]; double ai = spec[2 * k + 1];     // X[k]
+            double br = spec[2 * j]; double bi = spec[2 * j + 1];     // X[m-k]
+
+            // X[k+m] = conj(X[m-k]), so Fe and w^k*Fo separate directly.
+            double er = 0.5 * (ar + br); double ei = 0.5 * (ai - bi);
+            double gr = 0.5 * (ar - br); double gi = 0.5 * (ai + bi);
+
+            double ang = PI * (double)k / (double)m;                  // +2*pi*k/n
+            double cr = Math.cos(ang); double ci = Math.sin(ang);
+            double fr = cr * gr - ci * gi;                            // Fo = conj(w^k) * (w^k Fo)
+            double fi = cr * gi + ci * gr;
+
+            x[2 * k] = er - fi;                                       // Z[k] = Fe + i*Fo
+            x[2 * k + 1] = ei + fr;
+        }
+
+        transform(x, m, 1.0);
+        double inv = 1.0 / (double)m;
+        for (int i = 0; i < n; i = i + 1) x[i] = x[i] * inv;
+        return true;
+    }
+
+    // ---------------------------------------------------------------------------
+    // 2-D transform
+    // ---------------------------------------------------------------------------
+
+    // Transpose a rows x cols interleaved complex matrix in place. The real and imaginary
+    // planes are deinterleaved, transposed by Vec.transpose, and reinterleaved; scratch
+    // must hold 4*rows*cols doubles (source plane pair, then destination plane pair).
+    void ctranspose(double[] buf, int rows, int cols, double[] scratch)
+    {
+        int total = rows * cols;
+        double[] re = (double[])&scratch[0];
+        double[] im = (double[])&scratch[total];
+        double[] tre = (double[])&scratch[2 * total];
+        double[] tim = (double[])&scratch[3 * total];
+
+        for (int i = 0; i < total; i = i + 1)
+        {
+            re[i] = buf[2 * i];
+            im[i] = buf[2 * i + 1];
+        }
+        Vec.transpose(re, tre, rows, cols);
+        Vec.transpose(im, tim, rows, cols);
+        for (int i = 0; i < total; i = i + 1)
+        {
+            buf[2 * i] = tre[i];
+            buf[2 * i + 1] = tim[i];
+        }
+    }
+
+    // Separable 2-D transform of a rows x cols interleaved complex matrix stored row-major
+    // (length 2*rows*cols): transform every row, transpose, transform every row of the
+    // transpose (the original columns), transpose back. sign = -1 forward, +1 inverse.
+    // The 1/(rows*cols) scaling of the inverse is applied once at the end.
+    bool transform2(double[] buf, int rows, int cols, double sign)
+    {
+        if (!is_power_of_two(rows) || !is_power_of_two(cols)) return false;
+
+        int total = rows * cols;
+        double[] scratch = new double[4 * total];
+
+        for (int r = 0; r < rows; r = r + 1)
+        {
+            double[] row = (double[])&buf[2 * r * cols];
+            transform(row, cols, sign);
+        }
+        ctranspose(buf, rows, cols, scratch);
+        for (int r = 0; r < cols; r = r + 1)
+        {
+            double[] row = (double[])&buf[2 * r * rows];
+            transform(row, rows, sign);
+        }
+        ctranspose(buf, cols, rows, scratch);
+
+        delete[_] scratch;
+
+        if (sign > 0.0)
+        {
+            double inv = 1.0 / (double)total;
+            int cells = 2 * total;
+            for (int i = 0; i < cells; i = i + 1) buf[i] = buf[i] * inv;
+        }
+        return true;
+    }
+
+    bool fft2(double[] buf, int rows, int cols) { return transform2(buf, rows, cols, -1.0); }
+
+    bool ifft2(double[] buf, int rows, int cols) { return transform2(buf, rows, cols, 1.0); }
+
+    // ---------------------------------------------------------------------------
+    // Convolution and correlation
+    // ---------------------------------------------------------------------------
+
+    // Linear convolution of two real sequences: out[k] = sum_j a[j] * b[k-j], with out of
+    // length na+nb-1. Both inputs are zero-padded to the next power of two >= na+nb-1, so
+    // the circular convolution the FFT computes has no wraparound.
+    bool convolve(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        if (na < 1 || nb < 1) return false;
+        int need = na + nb - 1;
+        int len = next_power_of_two(need);
+        int cells = 2 * len;
+
+        double[] fa = new double[cells];
+        double[] fb = new double[cells];
+        for (int i = 0; i < cells; i = i + 1) { fa[i] = 0.0; fb[i] = 0.0; }
+        for (int j = 0; j < na; j = j + 1) fa[2 * j] = a[j];
+        for (int j = 0; j < nb; j = j + 1) fb[2 * j] = b[j];
+
+        transform(fa, len, -1.0);
+        transform(fb, len, -1.0);
+        for (int k = 0; k < len; k = k + 1)
+        {
+            double xr = fa[2 * k]; double xi = fa[2 * k + 1];
+            double yr = fb[2 * k]; double yi = fb[2 * k + 1];
+            fa[2 * k] = xr * yr - xi * yi;
+            fa[2 * k + 1] = xr * yi + xi * yr;
+        }
+        ifft(fa, len);
+        for (int k = 0; k < need; k = k + 1) out[k] = fa[2 * k];
+
+        delete[_] fa;
+        delete[_] fb;
+        return true;
+    }
+
+    // Full linear cross-correlation, equal to convolve(a, reverse(b)): out has length
+    // na+nb-1 and out[k] = sum_j a[j] * b[j + nb - 1 - k], i.e. lag nb-1-k.
+    bool correlate(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        if (na < 1 || nb < 1) return false;
+        double[] rev = new double[nb];
+        for (int j = 0; j < nb; j = j + 1) rev[j] = b[nb - 1 - j];
+        bool ok = convolve(a, na, rev, nb, out);
+        delete[_] rev;
+        return ok;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Bluestein's chirp-z algorithm - arbitrary N
+    // ---------------------------------------------------------------------------
+
+    // DFT of any N >= 1 into a separate output buffer (both interleaved, length 2*N).
+    // A power-of-two N takes the radix-2 path. Otherwise j*k is rewritten as
+    // (j^2 + k^2 - (k-j)^2)/2, which turns the DFT into the linear convolution
+    //   X[k] = P[k] * sum_j (x[j] * P[j]) * conj(P[k-j]),   P[m] = exp(sign*pi*i*m^2/N),
+    // evaluated with a power-of-two FFT of length >= 2N-1. P[m] depends on m^2 only
+    // through m^2 mod 2N, which is what keeps the chirp phase accurate for large N.
+    // sign = -1 forward, +1 inverse (scaled by 1/N).
+    bool dft_arbitrary(double[] src, double[] out, int n, double sign)
+    {
+        if (n < 1) return false;
+
+        if (is_power_of_two(n))
+        {
+            int cells = 2 * n;
+            for (int i = 0; i < cells; i = i + 1) out[i] = src[i];
+            transform(out, n, sign);
+            if (sign > 0.0)
+            {
+                double inv = 1.0 / (double)n;
+                for (int i = 0; i < cells; i = i + 1) out[i] = out[i] * inv;
+            }
+            return true;
+        }
+
+        int len = next_power_of_two(2 * n - 1);
+        int cells = 2 * len;
+        double[] fa = new double[cells];
+        double[] fb = new double[cells];
+        for (int i = 0; i < cells; i = i + 1) { fa[i] = 0.0; fb[i] = 0.0; }
+
+        i64 period = (i64)2 * (i64)n;
+        for (int j = 0; j < n; j = j + 1)
+        {
+            i64 sq = (i64)j * (i64)j;
+            double ang = sign * PI * (double)(sq % period) / (double)n;
+            double pr = Math.cos(ang); double pi_ = Math.sin(ang);
+            double xr = src[2 * j]; double xi = src[2 * j + 1];
+            fa[2 * j] = xr * pr - xi * pi_;
+            fa[2 * j + 1] = xr * pi_ + xi * pr;
+
+            // conj(P[m]) at m = j, mirrored to index len-j so the circular convolution
+            // supplies the negative lags too (P[-m] == P[m]).
+            fb[2 * j] = pr; fb[2 * j + 1] = -pi_;
+            if (j > 0)
+            {
+                fb[2 * (len - j)] = pr;
+                fb[2 * (len - j) + 1] = -pi_;
+            }
+        }
+
+        transform(fa, len, -1.0);
+        transform(fb, len, -1.0);
+        for (int k = 0; k < len; k = k + 1)
+        {
+            double xr = fa[2 * k]; double xi = fa[2 * k + 1];
+            double yr = fb[2 * k]; double yi = fb[2 * k + 1];
+            fa[2 * k] = xr * yr - xi * yi;
+            fa[2 * k + 1] = xr * yi + xi * yr;
+        }
+        ifft(fa, len);
+
+        double scale = 1.0;
+        if (sign > 0.0) scale = 1.0 / (double)n;
+        for (int k = 0; k < n; k = k + 1)
+        {
+            i64 sq = (i64)k * (i64)k;
+            double ang = sign * PI * (double)(sq % period) / (double)n;
+            double pr = Math.cos(ang); double pi_ = Math.sin(ang);
+            double cr = fa[2 * k]; double ci = fa[2 * k + 1];
+            out[2 * k] = scale * (pr * cr - pi_ * ci);
+            out[2 * k + 1] = scale * (pr * ci + pi_ * cr);
+        }
+
+        delete[_] fa;
+        delete[_] fb;
+        return true;
+    }
+
+    bool fft_any(double[] src, double[] out, int n) { return dft_arbitrary(src, out, n, -1.0); }
+
+    bool ifft_any(double[] src, double[] out, int n) { return dft_arbitrary(src, out, n, 1.0); }
 }

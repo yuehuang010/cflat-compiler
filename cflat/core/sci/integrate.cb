@@ -1,0 +1,130 @@
+// integrate.cb - scalar quadrature routines.
+// 
+// The routines accept capturing Lambda values and do not retain the callback
+// after returning. Gauss-Legendre uses fixed classical node and weight tables.
+import "math.cb";
+
+namespace Integrate
+{
+    double trapezoid(Lambda<double(double)> f, double a, double b, int n)
+    {
+        if (n <= 0) return 0.0;
+        double h = (b - a) / (double)n;
+        double sum = 0.5 * (f(a) + f(b));
+        for (int i = 1; i < n; i = i + 1)
+            sum = sum + f(a + h * (double)i);
+        return h * sum;
+    }
+
+    double simpson(Lambda<double(double)> f, double a, double b, int n)
+    {
+        if (n <= 0) return 0.0;
+        if ((n & 1) != 0) n = n + 1;
+        double h = (b - a) / (double)n;
+        double sum = f(a) + f(b);
+        for (int i = 1; i < n; i = i + 1)
+            sum = sum + ((i & 1) != 0 ? 4.0 : 2.0) * f(a + h * (double)i);
+        return h * sum / 3.0;
+    }
+
+    double _adaptive(Lambda<double(double)> f, double a, double b, double fa,
+                     double fm, double fb, double whole, double tol, int depth)
+    {
+        double m = (a + b) * 0.5;
+        double lm = (a + m) * 0.5;
+        double rm = (m + b) * 0.5;
+        double fl = f(lm);
+        double fr = f(rm);
+        double left = (m - a) * (fa + 4.0 * fl + fm) / 6.0;
+        double right = (b - m) * (fm + 4.0 * fr + fb) / 6.0;
+        double delta = left + right - whole;
+        if (depth <= 0 || Math.abs(delta) <= 15.0 * tol)
+            return left + right + delta / 15.0;
+        return _adaptive(f, a, m, fa, fl, fm, left, tol * 0.5, depth -
+ 1)
+             + _adaptive(f, m, b, fm, fr, fb, right, tol * 0.5, depth - 1);
+    }
+
+    double adaptive_simpson(Lambda<double(double)> f, double a, double b,
+                            double tol, int max_depth)
+    {
+        if (max_depth < 0) max_depth = 0;
+        if (tol <= 0.0) tol = 0.000000000001;
+        double m = (a + b) * 0.5;
+        double fa = f(a);
+        double fm = f(m);
+        double fb = f(b);
+        double whole = (b - a) * (fa + 4.0 * fm + fb) / 6.0;
+        return _adaptive(f, a, b, fa, fm, fb, whole, tol, max_depth);
+    }
+
+    double gauss_legendre(Lambda<double(double)> f, double a, double b, int points)
+    {
+        if (points != 2 && points != 4 && points != 8 && points != 16)
+            return 0.0;
+
+        double[] nodes = new double[16];
+        double[] weights = new double[16];
+        if (points == 2)
+        {
+            nodes[0] = -0.5773502691896258;
+            nodes[1] = 0.5773502691896258;
+            weights[0] = 1.0;
+            weights[1] = 1.0;
+        }
+        else if (points == 4)
+        {
+            nodes[0] = -0.8611363115940526;
+            nodes[1] = -0.3399810435848563;
+            nodes[2] = -nodes[1];
+            nodes[3] = -nodes[0];
+            weights[0] = 0.3478548451374539;
+            weights[1] = 0.6521451548625461;
+            weights[2] = weights[1];
+            weights[3] = weights[0];
+        }
+        else if (points == 8)
+        {
+            nodes[0] = -0.9602898564975362;
+            nodes[1] = -0.7966664774136267;
+            nodes[2] = -0.5255324099163290;
+            nodes[3] = -0.1834346424956498;
+            for (int i = 4; i < 8; i = i + 1) nodes[i] = -nodes[7 - i];
+            weights[0] = 0.1012285362903763;
+            weights[1] = 0.2223810344533745;
+            weights[2] = 0.3137066458778873;
+            weights[3] = 0.3626837833783620;
+            for (int i = 4; i < 8; i = i + 1) weights[i] = weights[7 - i];
+        }
+        else
+        {
+            nodes[0] = -0.9894009349916499;
+            nodes[1] = -0.9445750230732326;
+            nodes[2] = -0.8656312023878317;
+            nodes[3] = -0.7554044083550030;
+            nodes[4] = -0.6178762444026437;
+            nodes[5] = -0.4580167776572274;
+            nodes[6] = -0.2816035507792589;
+            nodes[7] = -0.0950125098376374;
+            for (int i = 8; i < 16; i = i + 1) nodes[i] = -nodes[15 - i];
+            weights[0] = 0.0271524594117541;
+            weights[1] = 0.0622535239386479;
+            weights[2] = 0.0951585116824928;
+            weights[3] = 0.1246289712555339;
+            weights[4] = 0.1495959888165767;
+            weights[5] = 0.1691565193950025;
+            weights[6] = 0.1826034150449236;
+            weights[7] = 0.1894506104550685;
+            for (int i = 8; i < 16; i = i + 1) weights[i] = weights[15 - i];
+        }
+
+        double midpoint = (a + b) * 0.5;
+        double half_width = (b - a) * 0.5;
+        double sum = 0.0;
+        for (int i = 0; i < points; i = i + 1)
+            sum = sum + weights[i] * f(midpoint + half_width * nodes[i]);
+        delete[_] nodes;
+        delete[_] weights;
+        return half_width * sum;
+    }
+}

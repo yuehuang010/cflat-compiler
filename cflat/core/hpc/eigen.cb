@@ -1,0 +1,545 @@
+// eigen.cb - eigenvalues and eigenvectors over row-major double[].
+//
+// Storage matches hpc/factor.cb and hpc/qr.cb: a matrix is one flat row-major
+// double[] indexed A[i*n + j], owned by the caller.
+//
+//   jacobi_symmetric : cyclic Jacobi for a real symmetric A. Every eigenvalue
+//                      and a full orthonormal eigenvector set, always real.
+//   power_iteration  : dominant eigenpair from a caller-supplied matvec, so it
+//                      works on a sparse or matrix-free operator too.
+//   qr_algorithm     : eigenvalues of a general real matrix - Householder
+//                      reduction to Hessenberg form, then implicit
+//                      double-shift QR with deflation. Complex in general.
+//
+// Design notes:
+//   - Jacobi is chosen over tridiagonal-QL because it needs no reduction phase
+//     and delivers eigenvectors that are orthonormal to working precision by
+//     construction: every update is an exact plane rotation applied to an
+//     accumulator that starts at the identity.
+//   - Convergence is measured as the Frobenius norm of the strict upper
+//     triangle, which is the quantity Jacobi provably drives to zero, and it is
+//     reported rather than assumed.
+
+import "math.cb";          // Math.sqrt / Math.abs
+import "complex.cb";       // complex / Cx.make (general eigenvalues)
+
+namespace Eigen
+{
+    // Frobenius norm of the strict upper triangle of the symmetric a.
+    double __off_norm(double[] a, int n)
+    {
+        double s = 0.0;
+        for (int p = 0; p < n; p = p + 1)
+            for (int q = p + 1; q < n; q = q + 1)
+            {
+                double e = a[p * n + q];
+                s = s + e * e;
+            }
+        return Math.sqrt(s);
+    }
+
+    // Sort the eigenvalues in w ascending, carrying the matching columns of v
+    // along. n is small in every realistic Jacobi use, so selection sort keeps
+    // the column swap simple and the order deterministic.
+    void __sort_pairs(double[] w, double[] v, int n)
+    {
+        for (int i = 0; i < n - 1; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < n; j = j + 1)
+                if (w[j] < w[best]) best = j;
+            if (best == i) continue;
+            double t = w[i]; w[i] = w[best]; w[best] = t;
+            for (int r = 0; r < n; r = r + 1)
+            {
+                double c = v[r * n + i];
+                v[r * n + i] = v[r * n + best];
+                v[r * n + best] = c;
+            }
+        }
+    }
+
+    // Cyclic Jacobi eigensolve of the real symmetric n x n a. Only the upper
+    // triangle needs to be correct on entry; a is destroyed. Eigenvalues go to
+    // w[n] in ascending order, and the matching orthonormal eigenvectors are the
+    // COLUMNS of v[n*n] (v[i*n + j] is component i of eigenvector j).
+    //
+    // Returns true when the off-diagonal Frobenius norm fell to tol within
+    // max_sweeps, false otherwise - in which case w and v still hold the last
+    // iterate, which is a valid partial diagonalization but is not converged.
+    bool jacobi_symmetric(double[] a, int n, double[] w, double[] v,
+                          double tol, int max_sweeps)
+    {
+        if (n <= 0) return true;
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = 0; j < n; j = j + 1)
+                v[i * n + j] = i == j ? 1.0 : 0.0;
+
+        // Mirror the upper triangle down so the rotations see a symmetric a.
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = i + 1; j < n; j = j + 1)
+                a[j * n + i] = a[i * n + j];
+
+        if (n == 1)
+        {
+            w[0] = a[0];
+            return true;
+        }
+
+        bool converged = false;
+        for (int sweep = 0; sweep < max_sweeps; sweep = sweep + 1)
+        {
+            if (__off_norm(a, n) <= tol) { converged = true; break; }
+            for (int p = 0; p < n - 1; p = p + 1)
+            {
+                for (int q = p + 1; q < n; q = q + 1)
+                {
+                    double apq = a[p * n + q];
+                    if (apq == 0.0) continue;
+                    double app = a[p * n + p];
+                    double aqq = a[q * n + q];
+
+                    // Negligible against both diagonals: zero it and move on,
+                    // rather than spending a rotation that cannot change them.
+                    double g = 100.0 * Math.abs(apq);
+                    if (Math.abs(app) + g == Math.abs(app)
+                        && Math.abs(aqq) + g == Math.abs(aqq))
+                    {
+                        a[p * n + q] = 0.0;
+                        a[q * n + p] = 0.0;
+                        continue;
+                    }
+
+                    // t = tan of the rotation, taken as the smaller root so the
+                    // rotation stays under 45 degrees and the diagonal is stable.
+                    double theta = (aqq - app) / (2.0 * apq);
+                    double t = 0.0;
+                    if (Math.abs(theta) > 100000000000000000000.0)
+                    {
+                        t = 1.0 / (2.0 * theta);
+                    }
+                    else if (theta >= 0.0)
+                    {
+                        t = 1.0 / (theta + Math.sqrt(1.0 + theta * theta));
+                    }
+                    else
+                    {
+                        t = -1.0 / (-theta + Math.sqrt(1.0 + theta * theta));
+                    }
+                    double c = 1.0 / Math.sqrt(1.0 + t * t);
+                    double s = t * c;
+
+                    a[p * n + p] = app - t * apq;
+                    a[q * n + q] = aqq + t * apq;
+                    a[p * n + q] = 0.0;
+                    a[q * n + p] = 0.0;
+                    for (int k = 0; k < n; k = k + 1)
+                    {
+                        if (k == p || k == q) continue;
+                        double akp = a[k * n + p];
+                        double akq = a[k * n + q];
+                        double np = c * akp - s * akq;
+                        double nq = s * akp + c * akq;
+                        a[k * n + p] = np;
+                        a[p * n + k] = np;
+                        a[k * n + q] = nq;
+                        a[q * n + k] = nq;
+                    }
+                    for (int k = 0; k < n; k = k + 1)
+                    {
+                        double vkp = v[k * n + p];
+                        double vkq = v[k * n + q];
+                        v[k * n + p] = c * vkp - s * vkq;
+                        v[k * n + q] = s * vkp + c * vkq;
+                    }
+                }
+            }
+        }
+        if (!converged && __off_norm(a, n) <= tol) converged = true;
+
+        for (int i = 0; i < n; i = i + 1) w[i] = a[i * n + i];
+        __sort_pairs(w, v, n);
+        return converged;
+    }
+
+    // Deterministic restart vector, used when the iterate collapses to zero.
+    // The varying stride makes successive restarts point somewhere else, so a
+    // start that happens to lie in the null space is not retried unchanged.
+    void __seed(double[] v, int n, int attempt)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            v[i] = 1.0 + (double)((i * (attempt + 1) + attempt) % 7) * 0.25;
+    }
+
+    // Restarts allowed before power_iteration gives up. Each one costs a matvec,
+    // and three consecutive collapses to zero mean the operator is degenerate
+    // rather than the start vector being unlucky.
+    const int POWER_MAX_RESTARTS = 3;
+
+    // Dominant eigenvalue of the operator applied by matvec, which must compute
+    // y = A*x for n-vectors (a raw double* plus the length: CFlat does not allow
+    // an array view inside a function type). v[n] carries the start vector in
+    // and the unit-norm eigenvector estimate out; it is normalized in place.
+    //
+    // The return value is the Rayleigh quotient of the final iterate. converged
+    // MUST be checked: on non-convergence within max_iter, or on an operator
+    // that keeps mapping the iterate to zero, it is set false and the returned
+    // number is only the last estimate, not an eigenvalue.
+    //
+    // A zero or accidentally-null start vector is re-seeded deterministically
+    // rather than divided by; note that a start vector merely ORTHOGONAL to the
+    // dominant eigenvector is a different matter - that is convergence to a
+    // subdominant eigenpair, and no implementation can detect it from matvecs.
+    double power_iteration(Lambda<void(double*, double*, int)> matvec,
+                           double[] v, int n, double tol, int max_iter,
+                           bool* converged)
+    {
+        converged[0] = false;
+        if (n <= 0) return 0.0;
+
+        double[] y = new double[n];
+        int restarts = 0;
+
+        double nv = 0.0;
+        for (int i = 0; i < n; i = i + 1) nv = nv + v[i] * v[i];
+        nv = Math.sqrt(nv);
+        if (nv == 0.0)
+        {
+            __seed(v, n, 0);
+            restarts = 1;
+            nv = 0.0;
+            for (int i = 0; i < n; i = i + 1) nv = nv + v[i] * v[i];
+            nv = Math.sqrt(nv);
+        }
+        for (int i = 0; i < n; i = i + 1) v[i] = v[i] / nv;
+
+        double lambda = 0.0;
+        double prev = 0.0;
+        bool have_prev = false;
+        for (int it = 0; it < max_iter; it = it + 1)
+        {
+            matvec(v, y, n);
+
+            double ny = 0.0;
+            for (int i = 0; i < n; i = i + 1) ny = ny + y[i] * y[i];
+            ny = Math.sqrt(ny);
+            if (ny == 0.0)
+            {
+                // A*v = 0 exactly: the iterate landed in the null space, so
+                // restart somewhere else instead of dividing by zero.
+                if (restarts >= POWER_MAX_RESTARTS) break;
+                __seed(v, n, restarts);
+                restarts = restarts + 1;
+                double ns = 0.0;
+                for (int i = 0; i < n; i = i + 1) ns = ns + v[i] * v[i];
+                ns = Math.sqrt(ns);
+                for (int i = 0; i < n; i = i + 1) v[i] = v[i] / ns;
+                have_prev = false;
+                continue;
+            }
+
+            // v is a unit vector here, so v.y is exactly the Rayleigh quotient
+            // and carries the right sign for a negative dominant eigenvalue.
+            lambda = 0.0;
+            for (int i = 0; i < n; i = i + 1) lambda = lambda + v[i] * y[i];
+            for (int i = 0; i < n; i = i + 1) v[i] = y[i] / ny;
+
+            if (have_prev)
+            {
+                double scale = Math.abs(lambda);
+                if (scale < 1.0) scale = 1.0;
+                if (Math.abs(lambda - prev) <= tol * scale)
+                {
+                    converged[0] = true;
+                    break;
+                }
+            }
+            prev = lambda;
+            have_prev = true;
+        }
+
+        delete[_] y;
+        return lambda;
+    }
+
+    // Relative floor for calling a subdiagonal entry of the Hessenberg form
+    // zero. 2^-52, the double epsilon.
+    const double HQR_EPS = 0.00000000000000022204460492503131;
+
+    // Reduce the n x n a to upper Hessenberg form by Householder similarity,
+    // in place. Only the eigenvalues are wanted, so the transformations are
+    // applied and discarded rather than accumulated.
+    void __hessenberg(double[] a, int n)
+    {
+        double[] v = new double[n];
+        for (int k = 0; k + 2 < n; k = k + 1)
+        {
+            double scale = 0.0;
+            bool below = false;
+            for (int i = k + 1; i < n; i = i + 1)
+            {
+                double av = Math.abs(a[i * n + k]);
+                if (av > scale) scale = av;
+                if (i > k + 1 && a[i * n + k] != 0.0) below = true;
+            }
+            if (!below || scale == 0.0) continue;
+
+            double ssq = 0.0;
+            for (int i = k + 1; i < n; i = i + 1)
+            {
+                double t = a[i * n + k] / scale;
+                ssq = ssq + t * t;
+            }
+            double norm = scale * Math.sqrt(ssq);
+            double alpha = a[(k + 1) * n + k];
+            double beta = alpha >= 0.0 ? -norm : norm;
+            double d = 1.0 / (alpha - beta);
+            v[k + 1] = 1.0;
+            for (int i = k + 2; i < n; i = i + 1) v[i] = a[i * n + k] * d;
+            double tau = (beta - alpha) / beta;
+
+            // Left: A[k+1.., k..] := (I - tau v v^T) A[k+1.., k..]
+            for (int j = k; j < n; j = j + 1)
+            {
+                double w = 0.0;
+                for (int i = k + 1; i < n; i = i + 1) w = w + v[i] * a[i * n + j];
+                w = w * tau;
+                for (int i = k + 1; i < n; i = i + 1)
+                    a[i * n + j] = a[i * n + j] - v[i] * w;
+            }
+            // Right: A[.., k+1..] := A[.., k+1..] (I - tau v v^T)
+            for (int i = 0; i < n; i = i + 1)
+            {
+                double w = 0.0;
+                for (int j = k + 1; j < n; j = j + 1) w = w + a[i * n + j] * v[j];
+                w = w * tau;
+                for (int j = k + 1; j < n; j = j + 1)
+                    a[i * n + j] = a[i * n + j] - w * v[j];
+            }
+
+            a[(k + 1) * n + k] = beta;
+            for (int i = k + 2; i < n; i = i + 1) a[i * n + k] = 0.0;
+        }
+        delete[_] v;
+    }
+
+    // One implicit double-shift (Francis) QR sweep on the active Hessenberg
+    // block rows/columns lo..hi, with the shift pair given by its sum and
+    // product. The bulge is created from the first column of
+    // (H - s1 I)(H - s2 I) = H^2 - ssum H + tdet I and chased off the bottom.
+    //
+    // Only the block is touched: this computes eigenvalues, not a full Schur
+    // form, so the couplings to the already-deflated rows and columns outside
+    // lo..hi are left alone.
+    void __francis_step(double[] a, int n, int lo, int hi, double ssum, double tdet)
+    {
+        double h00 = a[lo * n + lo];
+        double x = h00 * h00 + a[lo * n + lo + 1] * a[(lo + 1) * n + lo]
+                 - ssum * h00 + tdet;
+        double y = a[(lo + 1) * n + lo] * (h00 + a[(lo + 1) * n + lo + 1] - ssum);
+        double z = a[(lo + 2) * n + lo + 1] * a[(lo + 1) * n + lo];
+
+        for (int k = lo; k <= hi - 1; k = k + 1)
+        {
+            if (k > lo)
+            {
+                x = a[k * n + k - 1];
+                y = a[(k + 1) * n + k - 1];
+                z = k + 2 <= hi ? a[(k + 2) * n + k - 1] : 0.0;
+            }
+            bool three = k + 2 <= hi;
+
+            double scale = Math.abs(x) + Math.abs(y) + Math.abs(z);
+            if (scale == 0.0) continue;
+            double xs = x / scale;
+            double ys = y / scale;
+            double zs = three ? z / scale : 0.0;
+            double nrm = Math.sqrt(xs * xs + ys * ys + zs * zs);
+            double beta = xs >= 0.0 ? -nrm : nrm;
+            if (beta == 0.0) continue;
+            double d = 1.0 / (xs - beta);
+            double v1 = ys * d;
+            double v2 = three ? zs * d : 0.0;
+            double tau = (beta - xs) / beta;
+
+            // Left over the columns that can be nonzero in these rows: the
+            // bulge-creating step starts at lo, every later step at k-1 (the
+            // column whose subdiagonal the reflector is annihilating).
+            int cstart = k == lo ? lo : k - 1;
+            for (int j = cstart; j <= hi; j = j + 1)
+            {
+                double w = a[k * n + j] + v1 * a[(k + 1) * n + j];
+                if (three) w = w + v2 * a[(k + 2) * n + j];
+                w = w * tau;
+                a[k * n + j] = a[k * n + j] - w;
+                a[(k + 1) * n + j] = a[(k + 1) * n + j] - v1 * w;
+                if (three) a[(k + 2) * n + j] = a[(k + 2) * n + j] - v2 * w;
+            }
+
+            // Right over the rows that can be nonzero in these columns.
+            int rend = k + 3;
+            if (rend > hi) rend = hi;
+            for (int i = lo; i <= rend; i = i + 1)
+            {
+                double w = a[i * n + k] + v1 * a[i * n + k + 1];
+                if (three) w = w + v2 * a[i * n + k + 2];
+                w = w * tau;
+                a[i * n + k] = a[i * n + k] - w;
+                a[i * n + k + 1] = a[i * n + k + 1] - v1 * w;
+                if (three) a[i * n + k + 2] = a[i * n + k + 2] - v2 * w;
+            }
+        }
+
+        // The sweep preserves Hessenberg form exactly in real arithmetic; drop
+        // the rounding noise left below the subdiagonal so the deflation scan
+        // and the next sweep see a true Hessenberg block.
+        for (int i = lo + 2; i <= hi; i = i + 1)
+            for (int j = lo; j <= i - 2; j = j + 1)
+                a[i * n + j] = 0.0;
+    }
+
+    // Eigenvalues of the trailing 2 x 2 block at rows/columns hi-1, hi, written
+    // to w[hi-1] and w[hi]. The larger-magnitude root is formed first and the
+    // other from the product, so neither loses digits to cancellation.
+    void __eig2x2(double[] a, int n, int hi, complex[] w)
+    {
+        int i0 = hi - 1;
+        double p = a[i0 * n + i0];
+        double q = a[i0 * n + hi];
+        double r = a[hi * n + i0];
+        double s = a[hi * n + hi];
+        double half = 0.5 * (p - s);
+        double disc = half * half + q * r;
+        if (disc >= 0.0)
+        {
+            double root = Math.sqrt(disc);
+            double zz = half >= 0.0 ? half + root : half - root;
+            double l1 = s + zz;
+            double l2 = zz == 0.0 ? s : s - q * r / zz;
+            w[i0] = Cx.make(l1, 0.0);
+            w[hi] = Cx.make(l2, 0.0);
+        }
+        else
+        {
+            double re = s + half;
+            double im = Math.sqrt(-disc);
+            w[i0] = Cx.make(re, -im);
+            w[hi] = Cx.make(re, im);
+        }
+    }
+
+    // Sort eigenvalues ascending by real part, then by imaginary part, so a
+    // conjugate pair always comes out negative-imaginary first and the order
+    // does not depend on the deflation sequence.
+    void __sort_complex(complex[] w, int n)
+    {
+        for (int i = 0; i < n - 1; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < n; j = j + 1)
+            {
+                bool less = w[j].re < w[best].re
+                            || (w[j].re == w[best].re && w[j].im < w[best].im);
+                if (less) best = j;
+            }
+            if (best == i) continue;
+            complex t = w[i];
+            w[i] = w[best];
+            w[best] = t;
+        }
+    }
+
+    // Eigenvalues of a general real n x n a: Householder reduction to upper
+    // Hessenberg, then implicit double-shift QR with deflation. a is destroyed.
+    // The n eigenvalues go to w, sorted ascending by real part then imaginary
+    // part; complex ones come out as exact conjugate pairs.
+    //
+    // max_iter bounds the shifted sweeps spent on ONE deflation (30 is the
+    // usual budget; the counter resets whenever a block splits off). Returns
+    // false if any block fails to deflate inside it, in which case w holds
+    // only whatever had already deflated and must not be used.
+    //
+    // Accuracy note: eigenvalues of a non-normal matrix are conditioned by the
+    // eigenvector basis, not by the matrix norm. A defective eigenvalue of
+    // multiplicity k is only accurate to about eps^(1/k) - a triple root lands
+    // near 1e-5, and that is the problem's conditioning, not this routine's.
+    bool qr_algorithm(double[] a, int n, complex[] w, int max_iter)
+    {
+        if (n <= 0) return true;
+        __hessenberg(a, n);
+
+        double anorm = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+        {
+            int j0 = i > 0 ? i - 1 : 0;
+            for (int j = j0; j < n; j = j + 1)
+                anorm = anorm + Math.abs(a[i * n + j]);
+        }
+
+        int hi = n - 1;
+        int its = 0;
+        while (hi >= 0)
+        {
+            int lo = hi;
+            while (lo > 0)
+            {
+                double s = Math.abs(a[(lo - 1) * n + lo - 1])
+                         + Math.abs(a[lo * n + lo]);
+                if (s == 0.0) s = anorm;
+                if (Math.abs(a[lo * n + lo - 1]) <= HQR_EPS * s)
+                {
+                    a[lo * n + lo - 1] = 0.0;
+                    break;
+                }
+                lo = lo - 1;
+            }
+
+            if (lo == hi)
+            {
+                w[hi] = Cx.make(a[hi * n + hi], 0.0);
+                hi = hi - 1;
+                its = 0;
+            }
+            else if (lo == hi - 1)
+            {
+                __eig2x2(a, n, hi, w);
+                hi = hi - 2;
+                its = 0;
+            }
+            else
+            {
+                if (its >= max_iter) return false;
+                its = its + 1;
+
+                double ssum = 0.0;
+                double tdet = 0.0;
+                if (its % 10 == 0)
+                {
+                    // Stagnant: replace the trailing 2x2 by an ad-hoc block
+                    // scaled to the local subdiagonal, which breaks the cycles
+                    // that a repeated equal-magnitude shift pair falls into.
+                    double ex = Math.abs(a[hi * n + hi - 1])
+                              + Math.abs(a[(hi - 1) * n + hi - 2]);
+                    double e11 = 0.75 * ex + a[hi * n + hi];
+                    double e12 = ex;
+                    double e21 = -0.4375 * ex;
+                    ssum = e11 + e11;
+                    tdet = e11 * e11 - e12 * e21;
+                }
+                else
+                {
+                    double p = a[(hi - 1) * n + hi - 1];
+                    double q = a[(hi - 1) * n + hi];
+                    double r = a[hi * n + hi - 1];
+                    double s = a[hi * n + hi];
+                    ssum = p + s;
+                    tdet = p * s - q * r;
+                }
+                __francis_step(a, n, lo, hi, ssum, tdet);
+            }
+        }
+
+        __sort_complex(w, n);
+        return true;
+    }
+}

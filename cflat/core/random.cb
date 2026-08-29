@@ -1,3 +1,4 @@
+import "math.cb";
 // random.cb - Pseudo-random number generation using splitmix64.
 //
 // Uses the splitmix64 algorithm: state advances by a fixed golden-ratio-derived
@@ -20,6 +21,8 @@ extern int QueryPerformanceCounter(i64* count);
 struct Random
 {
     i64 _state = 0;
+    double _spare = default;
+    bool _hasSpare = false;
 
     // Seed from the current high-resolution performance counter.
     void seedFromTime()
@@ -33,6 +36,7 @@ struct Random
     void seed(i64 s)
     {
         _state = s;
+        _hasSpare = false;
     }
 
     // Advance the splitmix64 state by one step and return the scrambled output.
@@ -72,6 +76,149 @@ struct Random
         return (double)v * (1.0 / 9223372036854775808.0);
     }
 
+    // Pseudo-random double in [lo, hi).
+    double nextDouble(double lo, double hi)
+    {
+        return lo + (hi - lo) * nextDouble();
+    }
+
+    float nextFloat() { return (float)nextDouble(); }
+    bool nextBool() { return (next() & (i64)1) != 0; }
+    bool nextBool(double p) { return nextDouble() < p; }
+
+    // Standard normal using Marsaglia polar; the second variate is cached.
+    double nextGaussian()
+    {
+        if (_hasSpare)
+        {
+            _hasSpare = false;
+            return _spare;
+        }
+        double u = 0.0;
+        double v = 0.0;
+        double radius = 2.0;
+        while (radius >= 1.0 || radius == 0.0)
+        {
+            u = 2.0 * nextDouble() - 1.0;
+            v = 2.0 * nextDouble() - 1.0;
+            radius = u * u + v * v;
+        }
+        double scale = Math.sqrt(-2.0 * Math.log(radius) / radius);
+        _spare = v * scale;
+        _hasSpare = true;
+        return u * scale;
+    }
+
+    double nextGaussian(double mean, double stddev)
+    {
+        return mean + stddev * nextGaussian();
+    }
+
+    double nextExponential(double lambda)
+    {
+        return -Math.log(1.0 - nextDouble()) / lambda;
+    }
+
+    i64 nextPoisson(double lambda)
+    {
+        if (lambda <= 0.0) return (i64)0;
+        if (lambda < 30.0)
+        {
+            double limit = Math.exp(-lambda);
+            double product = 1.0;
+            i64 count = (i64)0;
+            while (product > limit)
+            {
+                count = count + (i64)1;
+                product = product * nextDouble();
+            }
+            return count - (i64)1;
+        }
+        // A normal approximation avoids the unbounded Knuth loop for large means.
+        double candidate = Math.floor(lambda + Math.sqrt(lambda) * nextGaussian() + 0.5);
+        if (candidate < 0.0) return (i64)0;
+        return (i64)candidate;
+
+    }
+    i64 nextBinomial(i64 trials, double p)
+    {
+        if (trials <= (i64)0 || p <= 0.0) return (i64)0;
+        if (p >= 1.0) return trials;
+        i64 successes = (i64)0;
+        i64 i = (i64)0;
+        while (i < trials)
+        {
+            if (nextDouble() < p) successes = successes + (i64)1;
+            i = i + (i64)1;
+        }
+        return successes;
+    }
+
+    double nextGamma(double shape, double scale)
+    {
+        if (shape <= 0.0 || scale <= 0.0) return 0.0;
+        if (shape < 1.0)
+            return nextGamma(shape + 1.0, scale) * Math.pow(nextDouble(), 1.0 / shape);
+        double d = shape - 1.0 / 3.0;
+        double c = 1.0 / Math.sqrt(9.0 * d);
+        while (true)
+        {
+            double x = nextGaussian();
+            double v = 1.0 + c * x;
+            if (v <= 0.0) continue;
+            v = v * v * v;
+            double u = nextDouble();
+            if (u < 1.0 - 0.0331 * x * x * x * x
+                || Math.log(u) < 0.5 * x * x + d * (1.0 - v + Math.log(v)))
+                return scale * d * v;
+        }
+    }
+    void shuffle(double[] x, int n)
+    {
+        int i = n - 1;
+        while (i > 0)
+        {
+            int j = (int)(next() % (i + 1));
+            double temp = x[i]; x[i] = x[j]; x[j] = temp;
+            i = i - 1;
+        }
+    }
+
+    void shuffle(int[] x, int n)
+    {
+        int i = n - 1;
+        while (i > 0)
+        {
+            int j = (int)(next() % (i + 1));
+            int temp = x[i]; x[i] = x[j]; x[j] = temp;
+            i = i - 1;
+        }
+    }
+
+    int weightedChoice(double[] weights, int n)
+    {
+        double total = 0.0;
+        int i = 0;
+        while (i < n)
+        {
+            if (weights[i] > 0.0) total = total + weights[i];
+            i = i + 1;
+        }
+        if (total <= 0.0) return -1;
+        double target = nextDouble() * total;
+        double cumulative = 0.0;
+        i = 0;
+        while (i < n)
+        {
+            if (weights[i] > 0.0)
+            {
+                cumulative = cumulative + weights[i];
+                if (target < cumulative) return i;
+            }
+            i = i + 1;
+        }
+        return n - 1;
+    }
     // ------------------------------------------------------------------
     // Independent substreams (for parallel Monte Carlo / per-thread RNG).
     //
@@ -100,6 +247,7 @@ struct Random
     void jump(i64 n)
     {
         _state += _gamma() * n;
+        _hasSpare = false;
     }
 
     // Return a fresh generator that is statistically independent of this
@@ -108,6 +256,7 @@ struct Random
     Random split()
     {
         Random child = default;
+        _hasSpare = false;
         child.seed(_advance());
         return child;
     }

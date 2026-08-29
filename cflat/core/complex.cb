@@ -1,0 +1,171 @@
+// complex.cb - scalar complex arithmetic.
+//
+// This is a small value type, not a vector kernel. Complex division and
+// reciprocal use Smith scaling so large finite operands do not overflow in
+// the intermediate square-and-sum calculation.
+//
+// Lives at the core root, beside math.cb, because it is a general numeric
+// type with nothing science-specific in it: hpc/eigen.cb needs it too, and
+// a lower layer must not have to reach up into sci/ to get it.
+
+import "math.cb";
+
+struct complex
+{
+    double re = default;
+    double im = default;
+
+    complex operator+(complex o)
+    {
+        complex r = default;
+        r.re = re + o.re;
+        r.im = im + o.im;
+        return r;
+    }
+
+    complex operator-(complex o)
+    {
+        complex r = default;
+        r.re = re - o.re;
+        r.im = im - o.im;
+        return r;
+    }
+
+    complex operator-()
+    {
+        complex r = default;
+        r.re = -re;
+        r.im = -im;
+        return r;
+    }
+
+    complex operator*(complex o)
+    {
+        complex r = default;
+        r.re = re * o.re - im * o.im;
+        r.im = re * o.im + im * o.re;
+        return r;
+    }
+
+    complex operator/(complex o)
+    {
+        complex r = default;
+        double ac = Math.abs(o.re);
+        double ad = Math.abs(o.im);
+        if (ac >= ad)
+        {
+            double ratio = o.im / o.re;
+            double denom = 1.0 + ratio * ratio;
+            r.re = (re / o.re + (im / o.re) * ratio) / denom;
+            r.im = (im / o.re - (re / o.re) * ratio) / denom;
+        }
+        else
+        {
+            double ratio = o.re / o.im;
+            double denom = 1.0 + ratio * ratio;
+            r.re = ((re / o.im) * ratio + im / o.im) / denom;
+            r.im = ((im / o.im) * ratio - re / o.im) / denom;
+        }
+        return r;
+    }
+
+    complex operator*(double s)
+    {
+        complex r = default;
+        r.re = re * s;
+        r.im = im * s;
+        return r;
+    }
+
+    complex operator/(double s)
+    {
+        complex r = default;
+        r.re = re / s;
+        r.im = im / s;
+        return r;
+    }
+
+    bool operator==(complex o) { return re == o.re && im == o.im; }
+
+    double abs() { return Math.hypot(re, im); }
+    double abs2() { return re * re + im * im; }
+    double arg() { return Math.atan2(im, re); }
+
+    complex conj()
+    {
+        complex r = default;
+        r.re = re;
+        r.im = -im;
+        return r;
+    }
+
+    complex reciprocal()
+    {
+        complex r = default;
+        double ac = Math.abs(re);
+        double ad = Math.abs(im);
+        if (ac >= ad)
+        {
+            double ratio = im / re;
+            double denom = 1.0 + ratio * ratio;
+            r.re = (1.0 / re) / denom;
+            r.im = (-ratio / re) / denom;
+        }
+        else
+        {
+            double ratio = re / im;
+            double denom = 1.0 + ratio * ratio;
+            r.re = (ratio / im) / denom;
+            r.im = (-1.0 / im) / denom;
+        }
+        return r;
+    }
+};
+namespace Cx
+{
+    complex make(double re, double im)
+    {
+        complex r = default;
+        r.re = re;
+        r.im = im;
+        return r;
+    }
+
+    complex polar(double r, double theta)
+    {
+        return Cx.make(r * Math.cos(theta), r * Math.sin(theta));
+    }
+
+    complex exp(complex z)
+    {
+        double scale = Math.exp(z.re);
+        return Cx.make(scale * Math.cos(z.im), scale * Math.sin(z.im));
+    }
+
+    complex log(complex z)
+    {
+        return Cx.make(Math.log(z.abs()), z.arg());
+    }
+
+    complex sqrt(complex z)
+    {
+        double magnitude = z.abs();
+        if (magnitude == 0.0) return Cx.make(0.0, 0.0);
+        if (z.re >= 0.0)
+        {
+            double r = Math.sqrt((magnitude + z.re) / 2.0);
+            complex out = Cx.make(r, z.im / (2.0 * r));
+            if (r == 0.0) out.im = 0.0;
+            return out;
+        }
+
+        double im = Math.sqrt((magnitude - z.re) / 2.0);
+        return Cx.make(Math.abs(z.im) / (2.0 * im), Math.copysign(im, z.im));
+    }
+
+    complex pow(complex z, complex w)
+    {
+        return Cx.exp(w * Cx.log(z));
+    }
+}
+

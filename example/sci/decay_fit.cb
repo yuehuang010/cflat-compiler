@@ -1,0 +1,204 @@
+// decay_fit.cb - fitting a decay curve, and asking whether the fit is any good.
+//
+// Fitting parameters is the easy half. The half people skip is deciding
+// whether the model that produced those parameters is the right model at all.
+// A least-squares routine will happily fit a straight line to a circle and
+// report parameters to six decimal places.
+//
+// This program measures a fluorescence decay - photon counts against time -
+// and does three things:
+//
+//   1. Fits the correct model, y = A*exp(-t/tau) + B, with per-point errors.
+//   2. Reports parameter uncertainties from the covariance matrix, and checks
+//      that the true values sit inside them.
+//   3. Fits a DELIBERATELY WRONG model (same curve, no baseline term) and
+//      shows that its parameters still come with respectable-looking error
+//      bars, while the goodness-of-fit p-value collapses to zero.
+//
+// Point 3 is the one worth remembering. The wrong fit does not announce
+// itself in the parameters or their error bars; it announces itself in
+// chi-square. That is what chi-square is for.
+//
+// Counting statistics give this problem its per-point errors for free: a bin
+// holding N photons has standard deviation sqrt(N). The errors therefore vary
+// by a factor of four across the scan, which is exactly the situation where an
+// unweighted fit quietly goes wrong, so the fit is weighted throughout.
+//
+// A note on what `sigma` buys you. Optimize.curve_fit follows SciPy's default
+// convention: `sigma` sets the RELATIVE weights, and the covariance is then
+// rescaled by the reduced chi-square so that it comes out at 1 by
+// construction. Uncertainties reported below are therefore the rescaled ones.
+// The p-value is not affected - it is computed from the chi-square that the
+// supplied absolute errors imply.
+//
+// Build:
+//   x64\Release\cflat.exe example\sci\decay_fit.cb -o out\decay_fit.exe
+import "cruntime.cb";
+import "math.cb";
+import "random.cb";
+import "sci/optimize.cb";
+import "sci/distributions.cb";
+
+const int    NDATA = 60;
+const double TRUE_A = 100.0;      // amplitude, counts
+const double TRUE_TAU = 2.5;      // lifetime, microseconds
+const double TRUE_B = 20.0;       // flat background, counts
+const double T_MIN = 0.25;
+const double T_MAX = 20.0;
+
+double absd(double v) { return v < 0.0 ? -v : v; }
+
+// One character per point, bucketed by pull. Systematic model error shows up
+// as long runs of the same symbol; honest noise looks shuffled.
+char pull_glyph(double pull)
+{
+    if (pull < -2.0) return 'v';
+    if (pull < -0.5) return '-';
+    if (pull <= 0.5) return '.';
+    if (pull <= 2.0) return '+';
+    return '^';
+}
+
+int main()
+{
+    Random rng = default;
+    rng.seed(20260829);
+
+    // ---- 1. Simulate the measurement.
+    double[] t = new double[NDATA];
+    double[] y = new double[NDATA];
+    double[] sigma = new double[NDATA];
+    for (int i = 0; i < NDATA; i = i + 1)
+    {
+        double frac = (double)i / (double)(NDATA - 1);
+        double ti = T_MIN + frac * (T_MAX - T_MIN);
+        double truth = TRUE_A * Math.exp(-ti / TRUE_TAU) + TRUE_B;
+        // Counting noise: standard deviation is sqrt of the expected count.
+        double sd = Math.sqrt(truth);
+        t[i] = ti;
+        y[i] = truth + rng.nextGaussian(0.0, sd);
+        sigma[i] = sd;
+    }
+
+    printf("Fluorescence decay, %d points from %.2f to %.2f us\n", NDATA, T_MIN, T_MAX);
+    printf("Truth: A = %.1f counts, tau = %.2f us, baseline B = %.1f counts\n", TRUE_A, TRUE_TAU, TRUE_B);
+    printf("Errors: counting statistics, sd = sqrt(expected count), %.1f down to %.1f\n\n",
+           sigma[0], sigma[NDATA - 1]);
+
+    double[] scratch = new double[8 * NDATA * 8 + 512];
+
+    // ---- 2. The correct model: A*exp(-t/tau) + B.
+    Lambda<double(double, double*, int)> full =
+        (double x, double* p, int np) => {
+            return p[0] * Math.exp(-x / p[1]) + p[2];
+        };
+
+    double[3] pf = default;
+    pf[0] = 50.0;
+    pf[1] = 1.0;
+    pf[2] = 0.0;
+    double[9] covf = default;
+    // curve_fit builds its Jacobian by finite differences, so the gradient
+    // norm floors out near 1e-11; asking for less than that never converges.
+    Optimize.CurveFitResult rf = Optimize.curve_fit(full, t, y, sigma, NDATA,
+                                                    pf, 3, 1.0e-12, 1.0e-12, 1.0e-8,
+                                                    200, covf, scratch);
+
+    // ---- 3. The wrong model: the same decay with no baseline.
+    Lambda<double(double, double*, int)> nobase =
+        (double x, double* p, int np) => {
+            return p[0] * Math.exp(-x / p[1]);
+        };
+
+    double[2] pw = default;
+    pw[0] = 50.0;
+    pw[1] = 1.0;
+    double[4] covw = default;
+    Optimize.CurveFitResult rw = Optimize.curve_fit(nobase, t, y, sigma, NDATA,
+                                                    pw, 2, 1.0e-12, 1.0e-12, 1.0e-8,
+                                                    200, covw, scratch);
+
+    // covariance_valid, not converged, is the precondition for reporting
+    // uncertainties: it says the normal matrix inverted, which is the question.
+    if (!rf.covariance_valid || !rw.covariance_valid)
+    {
+        printf("a fit produced no usable covariance (full=%d nobase=%d)\n",
+               rf.covariance_valid, rw.covariance_valid);
+        return 1;
+    }
+
+    // ---- 4. Goodness of fit. cost is 0.5*sum of squared weighted residuals,
+    // so chi-square is twice it, and dof is points minus fitted parameters.
+    double chi2f = 2.0 * rf.cost;
+    double chi2w = 2.0 * rw.cost;
+    double doff = (double)(NDATA - 3);
+    double dofw = (double)(NDATA - 2);
+    double pf_value = 1.0 - Dist.chi2_cdf(chi2f, doff);
+    double pw_value = 1.0 - Dist.chi2_cdf(chi2w, dofw);
+
+    printf("Correct model   y = A*exp(-t/tau) + B\n");
+    printf("  A     = %8.3f +/- %.3f   (true %.1f, off by %.2f sigma)\n",
+           pf[0], Math.sqrt(covf[0]), TRUE_A, absd(pf[0] - TRUE_A) / Math.sqrt(covf[0]));
+    printf("  tau   = %8.3f +/- %.3f   (true %.2f, off by %.2f sigma)\n",
+           pf[1], Math.sqrt(covf[4]), TRUE_TAU, absd(pf[1] - TRUE_TAU) / Math.sqrt(covf[4]));
+    printf("  B     = %8.3f +/- %.3f   (true %.1f, off by %.2f sigma)\n",
+           pf[2], Math.sqrt(covf[8]), TRUE_B, absd(pf[2] - TRUE_B) / Math.sqrt(covf[8]));
+    printf("  chi2 = %.2f on %.0f dof   chi2/dof = %.3f   p = %.4f\n",
+           chi2f, doff, chi2f / doff, pf_value);
+    printf("  iterations %d, function evaluations %d\n\n", rf.iterations, rf.evaluations);
+
+    printf("Wrong model     y = A*exp(-t/tau)      (baseline omitted)\n");
+    printf("  A     = %8.3f +/- %.3f\n", pw[0], Math.sqrt(covw[0]));
+    printf("  tau   = %8.3f +/- %.3f   (true %.2f, off by %.2f sigma)\n",
+           pw[1], Math.sqrt(covw[3]), TRUE_TAU, absd(pw[1] - TRUE_TAU) / Math.sqrt(covw[3]));
+    printf("  chi2 = %.2f on %.0f dof   chi2/dof = %.3f   p = %.6f\n",
+           chi2w, dofw, chi2w / dofw, pw_value);
+    printf("  iterations %d, function evaluations %d\n\n", rw.iterations, rw.evaluations);
+
+    // ---- 5. Pulls. The numbers above are a summary; this is the picture.
+    printf("Pulls, (data - model) / sigma, one character per point, t increasing:\n");
+    printf("  legend: v < -2   - < -0.5   . within 0.5   + > 0.5   ^ > 2\n");
+
+    printf("  correct: ");
+    double sumf = 0.0;
+    double sumf2 = 0.0;
+    for (int i = 0; i < NDATA; i = i + 1)
+    {
+        double pull = (y[i] - full(t[i], (double*)pf, 3)) / sigma[i];
+        sumf = sumf + pull;
+        sumf2 = sumf2 + pull * pull;
+        printf("%c", pull_glyph(pull));
+    }
+    printf("\n");
+
+    printf("  wrong:   ");
+    double sumw = 0.0;
+    double sumw2 = 0.0;
+    for (int i = 0; i < NDATA; i = i + 1)
+    {
+        double pull = (y[i] - nobase(t[i], (double*)pw, 2)) / sigma[i];
+        sumw = sumw + pull;
+        sumw2 = sumw2 + pull * pull;
+        printf("%c", pull_glyph(pull));
+    }
+    printf("\n\n");
+
+    double nd = (double)NDATA;
+    printf("Pull mean / rms:  correct %+.3f / %.3f     wrong %+.3f / %.3f\n",
+           sumf / nd, Math.sqrt(sumf2 / nd), sumw / nd, Math.sqrt(sumw2 / nd));
+    printf("Well-specified fit gives mean near 0 and rms near 1.\n\n");
+
+    printf("Both fits produced parameters with respectable-looking error bars -\n");
+    printf("%.1f +/- %.1f and %.1f +/- %.1f are numbers you could put in a table,\n",
+           pw[0], Math.sqrt(covw[0]), pw[1], Math.sqrt(covw[3]));
+    printf("and nothing about their SIZE says one model is wrong. What separates\n");
+    printf("them is the p-value: %.4f against %.6f, and the runs of same-signed\n",
+           pf_value, pw_value);
+    printf("pulls above, which is the same fact drawn rather than summarised.\n");
+
+    delete[_] t;
+    delete[_] y;
+    delete[_] sigma;
+    delete[_] scratch;
+    return 0;
+}

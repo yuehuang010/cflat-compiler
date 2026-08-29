@@ -1,0 +1,349 @@
+// cluster.cb - k-means and hierarchical agglomerative clustering.
+//
+// kmeans uses Lloyd iterations and k-means++ initialization. Its caller-owned
+// scratch must have n + k + k*ndim doubles: nearest squared distances, counts
+// (stored as doubles), and centroid sums, in that order. The input points are
+// unchanged; centroids and labels are outputs.
+//
+// linkage consumes and reuses a condensed distance array of exactly n*(n-1)/2
+// doubles. It returns the standard SciPy linkage matrix column-for-column:
+// merge_a, merge_b, merge_dist, merge_size are the four columns of n-1 rows.
+// The condensed input is read-only. fcluster needs labels[n].
+// Empty k-means clusters are reseeded at the point furthest from its assigned
+// centroid, which keeps centroids finite and makes the recovery deterministic.
+
+import "math.cb";
+import "random.cb";
+import "sci/spatial.cb";
+
+namespace Cluster
+{
+    const int LINKAGE_SINGLE = 0;
+    const int LINKAGE_COMPLETE = 1;
+    const int LINKAGE_AVERAGE = 2;
+    const int LINKAGE_WARD = 3;
+
+    struct KMeansResult
+    {
+        bool converged = false;
+        int iterations = 0;
+        double inertia = 0.0;
+    };
+
+    void _assign(double[] x, int n, int ndim, int k, int metric,
+                 double[] centroids, int[] labels, double[] scratch)
+    {
+        double[] nearest = scratch;
+        double[] counts = (double[])(&scratch[n]);
+        double[] sums = (double[])(&scratch[n + k]);
+        for (int c = 0; c < k; c = c + 1)
+        {
+            counts[c] = 0.0;
+            for (int d = 0; d < ndim; d = d + 1) sums[c * ndim + d] = 0.0;
+        }
+        for (int i = 0; i < n; i = i + 1)
+        {
+            int best = 0;
+            double best_distance = Spatial.distance(
+                metric, &x[i * ndim], &centroids[0], ndim);
+            for (int c = 1; c < k; c = c + 1)
+            {
+                double candidate = Spatial.distance(
+                    metric, &x[i * ndim], &centroids[c * ndim], ndim);
+                if (candidate < best_distance)
+                {
+                    best_distance = candidate;
+                    best = c;
+                }
+            }
+            labels[i] = best;
+            nearest[i] = best_distance * best_distance;
+            counts[best] = counts[best] + 1.0;
+            for (int d = 0; d < ndim; d = d + 1)
+                sums[best * ndim + d] = sums[best * ndim + d] + x[i * ndim + d];
+        }
+    }
+
+    void _seed_centroid(double[] x, int n, int ndim, int index, double[] centroids, int c)
+    {
+        for (int d = 0; d < ndim; d = d + 1)
+            centroids[c * ndim + d] = x[index * ndim + d];
+    }
+
+    void _kmeans_plus_plus(double[] x, int n, int ndim, int k, int metric,
+                           double[] centroids, Random* rng, double[] nearest)
+    {
+        int first = 0;
+        if (rng != nullptr) first = rng->nextInt(0, n - 1);
+        Cluster._seed_centroid(x, n, ndim, first, centroids, 0);
+        for (int c = 1; c < k; c = c + 1)
+        {
+            double total = 0.0;
+            int fallback = 0;
+            double fallback_distance = -1.0;
+            for (int i = 0; i < n; i = i + 1)
+            {
+                double best = Spatial.distance(
+                    metric, &x[i * ndim], &centroids[0], ndim);
+                for (int old = 1; old < c; old = old + 1)
+                {
+                    double candidate = Spatial.distance(
+                        metric, &x[i * ndim], &centroids[old * ndim], ndim);
+                    if (candidate < best) best = candidate;
+                }
+                nearest[i] = best * best;
+                total = total + nearest[i];
+                if (nearest[i] > fallback_distance)
+                {
+                    fallback_distance = nearest[i];
+                    fallback = i;
+                }
+            }
+            int chosen = fallback;
+            if (total > 0.0)
+            {
+                double target = rng == nullptr ? 0.0 : rng->nextDouble() * total;
+                double cumulative = 0.0;
+                for (int i = 0; i < n; i = i + 1)
+                {
+                    cumulative = cumulative + nearest[i];
+                    if (target < cumulative)
+                    {
+                        chosen = i;
+                        break;
+                    }
+                }
+            }
+            Cluster._seed_centroid(x, n, ndim, chosen, centroids, c);
+        }
+    }
+
+    KMeansResult kmeans(double[] x, int n, int ndim, int k, int metric,
+                        double[] centroids, int[] labels, int max_iter, double tol,
+                        Random* rng, double[] scratch)
+    {
+        KMeansResult result = default;
+        if (n <= 0 || ndim <= 0 || k <= 0 || k > n) return result;
+        Cluster._kmeans_plus_plus(x, n, ndim, k, metric, centroids, rng, scratch);
+        double tolerance = tol < 0.0 ? -tol : tol;
+        int iterations = 0;
+        while (iterations < max_iter)
+        {
+            Cluster._assign(x, n, ndim, k, metric, centroids, labels, scratch);
+            double[] nearest = scratch;
+            double[] counts = (double[])(&scratch[n]);
+            double[] sums = (double[])(&scratch[n + k]);
+            int furthest = -1;
+            double furthest_distance = -1.0;
+            for (int i = 0; i < n; i = i + 1)
+            {
+                if (nearest[i] > furthest_distance)
+                {
+                    furthest_distance = nearest[i];
+                    furthest = i;
+                }
+            }
+            for (int c = 0; c < k; c = c + 1)
+            {
+                if (counts[c] == 0.0)
+                {
+                    if (furthest < 0) furthest = 0;
+                    Cluster._seed_centroid(x, n, ndim, furthest, centroids, c);
+                    nearest[furthest] = -1.0;
+                    furthest = -1;
+                    furthest_distance = -1.0;
+                    for (int i = 0; i < n; i = i + 1)
+                    {
+                        if (nearest[i] > furthest_distance)
+                        {
+                            furthest_distance = nearest[i];
+                            furthest = i;
+                        }
+                    }
+                }
+                else
+                {
+                    for (int d = 0; d < ndim; d = d + 1)
+                        sums[c * ndim + d] = sums[c * ndim + d] / counts[c];
+                }
+            }
+            double max_shift = 0.0;
+            for (int c = 0; c < k; c = c + 1)
+            {
+                if (counts[c] == 0.0) continue;
+                for (int d = 0; d < ndim; d = d + 1)
+                {
+                    double old = centroids[c * ndim + d];
+                    double next = sums[c * ndim + d];
+                    double shift = Math.abs(next - old);
+                    if (shift > max_shift) max_shift = shift;
+                    centroids[c * ndim + d] = next;
+                }
+            }
+            iterations = iterations + 1;
+            if (max_shift <= tolerance) { result.converged = true; break; }
+        }
+        Cluster._assign(x, n, ndim, k, metric, centroids, labels, scratch);
+        result.iterations = iterations;
+        result.inertia = 0.0;
+        for (int i = 0; i < n; i = i + 1) result.inertia = result.inertia + scratch[i];
+        return result;
+    }
+
+    double _condensed_get(double[] values, int i, int j, int n)
+    {
+        return values[Spatial.condensed_index(i, j, n)];
+    }
+
+    void _condensed_set(double[] values, int i, int j, int n, double value)
+    {
+        values[Spatial.condensed_index(i, j, n)] = value;
+    }
+
+    double _linkage_update(int method, double da, double db, double dab,
+                           int sa, int sb, int sx)
+    {
+        if (method == LINKAGE_SINGLE) return Math.min(da, db);
+        if (method == LINKAGE_COMPLETE) return Math.max(da, db);
+        if (method == LINKAGE_AVERAGE)
+            return ((double)sa * da + (double)sb * db) / (double)(sa + sb);
+        double total = (double)(sa + sb + sx);
+        double value = ((double)(sa + sx) * da * da
+                      + (double)(sb + sx) * db * db
+                      - (double)sx * dab * dab) / total;
+        return value <= 0.0 ? 0.0 : Math.sqrt(value);
+    }
+
+    bool linkage(double[] condensed, int n, int method, int[] merge_a, int[] merge_b,
+                 double[] merge_dist, int[] merge_size)
+    {
+        if (n <= 0 || method < LINKAGE_SINGLE || method > LINKAGE_WARD) return false;
+        int condensed_size = n * (n - 1) / 2;
+        double[] working = new double[condensed_size];
+        for (int i = 0; i < condensed_size; i = i + 1) working[i] = condensed[i];
+        int* active = new int[n];
+        int* sizes = new int[n];
+        for (int i = 0; i < n; i = i + 1)
+        {
+            active[i] = i;
+            sizes[i] = 1;
+        }
+        int active_count = n;
+        for (int step = 0; step < n - 1; step = step + 1)
+        {
+            int ia = 0;
+            int ib = 1;
+            double best = Cluster._condensed_get(working, 0, 1, active_count);
+            for (int i = 0; i < active_count; i = i + 1)
+                for (int j = i + 1; j < active_count; j = j + 1)
+                {
+                    double candidate = Cluster._condensed_get(working, i, j, active_count);
+                    if (candidate < best)
+                    {
+                        best = candidate;
+                        ia = i;
+                        ib = j;
+                    }
+                }
+            int id_a = active[ia];
+            int id_b = active[ib];
+            int size_a = sizes[ia];
+            int size_b = sizes[ib];
+            merge_a[step] = id_a < id_b ? id_a : id_b;
+            merge_b[step] = id_a < id_b ? id_b : id_a;
+            merge_dist[step] = best;
+            merge_size[step] = size_a + size_b;
+            if (ia > ib)
+            {
+                int temp = ia;
+                ia = ib;
+                ib = temp;
+            }
+            for (int x = 0; x < active_count; x = x + 1)
+            {
+                if (x == ia || x == ib) continue;
+                double da = Cluster._condensed_get(working, ia, x, active_count);
+                double db = Cluster._condensed_get(working, ib, x, active_count);
+                double next = Cluster._linkage_update(method, da, db, best,
+                                                       size_a, size_b, sizes[x]);
+                Cluster._condensed_set(working, ia, x, active_count, next);
+            }
+            for (int i = 0; i < active_count - 1; i = i + 1)
+                for (int j = i + 1; j < active_count - 1; j = j + 1)
+                {
+                    int old_i = i < ib ? i : i + 1;
+                    int old_j = j < ib ? j : j + 1;
+                    double value = Cluster._condensed_get(
+                        working, old_i, old_j, active_count);
+                    Cluster._condensed_set(working, i, j, active_count - 1, value);
+                }
+            active[ia] = n + step;
+            sizes[ia] = size_a + size_b;
+            for (int i = ib; i < active_count - 1; i = i + 1)
+            {
+                active[i] = active[i + 1];
+                sizes[i] = sizes[i + 1];
+            }
+            active_count = active_count - 1;
+        }
+        delete[] active;
+        delete[] sizes;
+        delete[] working;
+        return true;
+    }
+
+    int _find_root(int* parent, int value)
+    {
+        int root = value;
+        while (parent[root] != root) root = parent[root];
+        while (parent[value] != value)
+        {
+            int next = parent[value];
+            parent[value] = root;
+            value = next;
+        }
+        return root;
+    }
+
+    int fcluster(int[] merge_a, int[] merge_b, double[] merge_dist, int n,
+                 double threshold, int[] labels)
+    {
+        if (n <= 0) return 0;
+        int total = 2 * n - 1;
+        int* parent = new int[total];
+        int* root_labels = new int[total];
+        for (int i = 0; i < total; i = i + 1)
+        {
+            parent[i] = i;
+            root_labels[i] = -1;
+        }
+        for (int step = 0; step < n - 1; step = step + 1)
+        {
+            int cluster = n + step;
+            if (merge_dist[step] <= threshold)
+            {
+                int ra = Cluster._find_root(parent, merge_a[step]);
+                int rb = Cluster._find_root(parent, merge_b[step]);
+                parent[ra] = cluster;
+                parent[rb] = cluster;
+            }
+        }
+        int count = 0;
+        for (int i = 0; i < n; i = i + 1)
+        {
+            int root = Cluster._find_root(parent, i);
+            if (root_labels[root] < 0)
+            {
+                root_labels[root] = count;
+                count = count + 1;
+            }
+            labels[i] = root_labels[root];
+        }
+        delete[] parent;
+        delete[] root_labels;
+        return count;
+    }
+}
+
+
+

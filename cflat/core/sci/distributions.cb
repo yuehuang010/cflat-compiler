@@ -1,0 +1,575 @@
+// distributions.cb - probability distributions and inverse CDFs.
+//
+// Parameters are validated by every public function. Invalid parameters return
+// NaN. Geometric uses the one-based convention: k = 1, 2, 3, ... . Continuous
+// quantiles use safeguarded bisection after a bracket is expanded from a mean
+// based guess. Discrete quantiles search for the first k whose CDF reaches p.
+
+import "math.cb";
+import "random.cb";
+import "sci/special.cb";
+extern double nan(const char* tag);
+
+namespace Dist
+{
+    double _nan()
+    {
+        return global::nan("nan");
+    }
+
+    double _infinity()
+    {
+        double one = 1.0;
+        double zero = 0.0;
+        return one / zero;
+    }
+
+    bool _valid_probability(double p)
+    {
+        return p >= 0.0 && p <= 1.0;
+    }
+
+    double _cdf(int kind, double x, double p1, double p2)
+    {
+        if (kind == 0)
+        {
+            if (x <= 0.0) return 0.0;
+            if (x >= 1.0) return 1.0;
+            return x;
+        }
+        if (kind == 1) return Special.normal_cdf(x, p1, p2);
+        if (kind == 2)
+        {
+            if (x <= 0.0) return 0.0;
+            return Special.normal_cdf(Math.log(x), p1, p2);
+        }
+        if (kind == 3)
+        {
+            if (x <= 0.0) return 0.0;
+            return -Math.expm1(-p1 * x);
+        }
+        if (kind == 4)
+        {
+            if (x <= 0.0) return 0.0;
+            return Special._regularized_gamma(p1, x / p2);
+        }
+        if (kind == 5)
+        {
+            if (x <= 0.0) return 0.0;
+            if (x >= 1.0) return 1.0;
+            return Special._regularized_beta(p1, p2, x);
+        }
+        if (kind == 6) return Special.chi2_cdf(x, p1);
+        if (kind == 7) return Special.student_t_cdf(x, p1);
+        if (x <= 0.0) return 0.0;
+        double z = p1 * x / (p1 * x + p2);
+        return Special._regularized_beta(p1 / 2.0, p2 / 2.0, z);
+    }
+
+    double _pdf(int kind, double x, double p1, double p2)
+    {
+        if (kind == 0) return x >= 0.0 && x <= 1.0 ? 1.0 : 0.0;
+        if (kind == 1) return Special.normal_pdf(x, p1, p2);
+        if (kind == 2)
+        {
+            if (x <= 0.0) return 0.0;
+            double z = (Math.log(x) - p1) / p2;
+            return Math.exp(-0.5 * z * z) / (x * p2 * 2.5066282746310002);
+        }
+        if (kind == 3)
+        {
+            if (x < 0.0) return 0.0;
+            return p1 * Math.exp(-p1 * x);
+        }
+        if (kind == 4)
+        {
+            if (x < 0.0) return 0.0;
+            if (x == 0.0)
+            {
+                if (p1 < 1.0) return _infinity();
+                if (p1 == 1.0) return 1.0 / p2;
+                return 0.0;
+            }
+            double logValue = (p1 - 1.0) * Math.log(x) - x / p2;
+            logValue = logValue - Special.lgamma(p1) - p1 * Math.log(p2);
+            return Math.exp(logValue);
+        }
+        if (kind == 5)
+        {
+            if (x < 0.0 || x > 1.0) return 0.0;
+            if (x == 0.0)
+            {
+                if (p1 < 1.0) return _infinity();
+                if (p1 == 1.0) return 1.0 / Special.beta(p1, p2);
+                return 0.0;
+            }
+            if (x == 1.0)
+            {
+                if (p2 < 1.0) return _infinity();
+                if (p2 == 1.0) return 1.0 / Special.beta(p1, p2);
+                return 0.0;
+            }
+            double logValue = (p1 - 1.0) * Math.log(x);
+            logValue = logValue + (p2 - 1.0) * Math.log(1.0 - x);
+            logValue = logValue - Special.lgamma(p1) - Special.lgamma(p2);
+            logValue = logValue + Special.lgamma(p1 + p2);
+            return Math.exp(logValue);
+        }
+        if (kind == 6) return _pdf(4, x, p1 / 2.0, 2.0);
+        if (kind == 7)
+        {
+            double half = p1 / 2.0;
+            double logValue = Special.lgamma(half + 0.5) - Special.lgamma(half);
+            logValue = logValue - 0.5 * Math.log(p1 * Math.PI);
+            logValue = logValue - (half + 0.5) * Math.log(1.0 + x * x / p1);
+            return Math.exp(logValue);
+        }
+        if (x < 0.0) return 0.0;
+        double half1 = p1 / 2.0;
+        if (x == 0.0)
+        {
+            if (half1 < 1.0) return _infinity();
+            if (half1 > 1.0) return 0.0;
+            double edge = half1 * Math.log(p1 / p2);
+            edge = edge - Special.lgamma(half1) - Special.lgamma(p2 / 2.0);
+            edge = edge + Special.lgamma(half1 + p2 / 2.0);
+            return Math.exp(edge);
+        }
+        double half2 = p2 / 2.0;
+        double ratio = p1 * x / p2;
+        double logValue = half1 * Math.log(p1 / p2);
+        logValue = logValue + (half1 - 1.0) * Math.log(x);
+        logValue = logValue - (half1 + half2) * Math.log(1.0 + ratio);
+        logValue = logValue - Special.lgamma(half1) - Special.lgamma(half2);
+        logValue = logValue + Special.lgamma(half1 + half2);
+        return Math.exp(logValue);
+    }
+
+    double _continuous_ppf(int kind, double p, double p1, double p2)
+    {
+        double infinity = _infinity();
+        if (p <= 0.0)
+        {
+            if (kind == 1 || kind == 7) return -infinity;
+            return 0.0;
+        }
+        if (p >= 1.0)
+        {
+            if (kind == 0 || kind == 5) return 1.0;
+            return infinity;
+        }
+        if (p == 0.5)
+        {
+            if (kind == 1) return p1;
+            if (kind == 2) return Math.exp(p1);
+            if (kind == 7) return 0.0;
+        }
+        double lo = 0.0;
+        double hi = 1.0;
+        if (kind == 0 || kind == 5)
+        {
+            hi = 1.0;
+        }
+        else if (kind == 1)
+        {
+            lo = p1 - p2;
+            hi = p1 + p2;
+            while (_cdf(kind, lo, p1, p2) > p) lo = p1 - 2.0 * (p1 - lo);
+            while (_cdf(kind, hi, p1, p2) < p) hi = p1 + 2.0 * (hi - p1);
+        }
+        else if (kind == 2)
+        {
+            hi = Math.exp(p1) * (1.0 + p2);
+            if (hi < 1.0) hi = 1.0;
+        }
+        else if (kind == 4)
+        {
+            hi = p1 * p2;
+            if (hi < 1.0) hi = 1.0;
+        }
+        else if (kind == 6)
+        {
+            hi = p1;
+            if (hi < 1.0) hi = 1.0;
+        }
+        else if (kind == 7)
+        {
+            if (p < 0.5)
+            {
+                lo = -1.0;
+                while (_cdf(kind, lo, p1, p2) > p) lo = lo * 2.0;
+                hi = 0.0;
+            }
+            else
+            {
+                lo = 0.0;
+                hi = 1.0;
+                while (_cdf(kind, hi, p1, p2) < p) hi = hi * 2.0;
+            }
+        }
+        while (kind != 0 && kind != 5 && _cdf(kind, hi, p1, p2) < p) hi = hi * 2.0;
+        int i = 0;
+        while (i < 200)
+        {
+            double mid = (lo + hi) * 0.5;
+            // Stop once the bracket is down to one ulp: further halving cannot
+            // move mid, and each step costs a full incomplete beta or gamma.
+            if (mid <= lo || mid >= hi) break;
+            if (_cdf(kind, mid, p1, p2) >= p) hi = mid;
+            else lo = mid;
+            i = i + 1;
+        }
+        return (lo + hi) * 0.5;
+    }
+
+    double uniform_pdf(double x, double a, double b)
+    {
+        if (b <= a) return _nan();
+        return x >= a && x <= b ? 1.0 / (b - a) : 0.0;
+    }
+
+    double uniform_cdf(double x, double a, double b)
+    {
+        if (b <= a) return _nan();
+        if (x <= a) return 0.0;
+        if (x >= b) return 1.0;
+        return (x - a) / (b - a);
+    }
+
+    double uniform_ppf(double p, double a, double b)
+    {
+        if (b <= a || !_valid_probability(p)) return _nan();
+        if (p <= 0.0) return a;
+        if (p >= 1.0) return b;
+        return a + p * (b - a);
+    }
+
+    double uniform_rvs(Random* rng, double a, double b)
+    {
+        if (b <= a) return _nan();
+        return rng->nextDouble(a, b);
+    }
+
+    double normal_pdf(double x, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        return Special.normal_pdf(x, mu, sigma);
+    }
+
+    double normal_cdf(double x, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        return Special.normal_cdf(x, mu, sigma);
+    }
+
+    double normal_ppf(double p, double mu, double sigma)
+    {
+        if (sigma <= 0.0 || !_valid_probability(p)) return _nan();
+        if (p <= 0.0) return -_infinity();
+        if (p >= 1.0) return _infinity();
+        if (p == 0.5) return mu;
+        return mu + sigma * Special.normal_quantile(p);
+    }
+
+    double normal_rvs(Random* rng, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        return rng->nextGaussian(mu, sigma);
+    }
+
+    double lognormal_pdf(double x, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        if (x <= 0.0) return 0.0;
+        double z = (Math.log(x) - mu) / sigma;
+        return Math.exp(-0.5 * z * z) / (x * sigma * 2.5066282746310002);
+    }
+
+    double lognormal_cdf(double x, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        if (x <= 0.0) return 0.0;
+        return Special.normal_cdf(Math.log(x), mu, sigma);
+    }
+
+    double lognormal_ppf(double p, double mu, double sigma)
+    {
+        if (sigma <= 0.0 || !_valid_probability(p)) return _nan();
+        if (p <= 0.0) return 0.0;
+        if (p >= 1.0) return _infinity();
+        if (p == 0.5) return Math.exp(mu);
+        return Math.exp(mu + sigma * Special.normal_quantile(p));
+    }
+
+    double lognormal_rvs(Random* rng, double mu, double sigma)
+    {
+        if (sigma <= 0.0) return _nan();
+        return Math.exp(rng->nextGaussian(mu, sigma));
+    }
+
+    double exponential_pdf(double x, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        if (x < 0.0) return 0.0;
+        return lambda * Math.exp(-lambda * x);
+    }
+
+    double exponential_cdf(double x, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        if (x <= 0.0) return 0.0;
+        return 1.0 - Math.exp(-lambda * x);
+    }
+
+    double exponential_ppf(double p, double lambda)
+    {
+        if (lambda <= 0.0 || !_valid_probability(p)) return _nan();
+        if (p <= 0.0) return 0.0;
+        if (p >= 1.0) return _infinity();
+        return -Math.log1p(-p) / lambda;
+    }
+
+    double exponential_rvs(Random* rng, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        return rng->nextExponential(lambda);
+    }
+
+    double gamma_pdf(double x, double shape, double scale)
+    {
+        if (shape <= 0.0 || scale <= 0.0) return _nan();
+        return _pdf(4, x, shape, scale);
+    }
+
+    double gamma_cdf(double x, double shape, double scale)
+    {
+        if (shape <= 0.0 || scale <= 0.0) return _nan();
+        return _cdf(4, x, shape, scale);
+    }
+
+    double gamma_ppf(double p, double shape, double scale)
+    {
+        if (shape <= 0.0 || scale <= 0.0 || !_valid_probability(p)) return _nan();
+        return _continuous_ppf(4, p, shape, scale);
+    }
+
+    double gamma_rvs(Random* rng, double shape, double scale)
+    {
+        if (shape <= 0.0 || scale <= 0.0) return _nan();
+        return rng->nextGamma(shape, scale);
+    }
+
+    double beta_pdf(double x, double a, double b)
+    {
+        if (a <= 0.0 || b <= 0.0) return _nan();
+        return _pdf(5, x, a, b);
+    }
+
+    double beta_cdf(double x, double a, double b)
+    {
+        if (a <= 0.0 || b <= 0.0) return _nan();
+        return _cdf(5, x, a, b);
+    }
+
+    double beta_ppf(double p, double a, double b)
+    {
+        if (a <= 0.0 || b <= 0.0 || !_valid_probability(p)) return _nan();
+        return _continuous_ppf(5, p, a, b);
+    }
+
+    double beta_rvs(Random* rng, double a, double b)
+    {
+        if (a <= 0.0 || b <= 0.0) return _nan();
+        double x = rng->nextGamma(a, 1.0);
+        double y = rng->nextGamma(b, 1.0);
+        return x / (x + y);
+    }
+
+    double chi2_pdf(double x, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return _pdf(6, x, df, 0.0);
+    }
+
+    double chi2_cdf(double x, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return Special.chi2_cdf(x, df);
+    }
+
+    double chi2_ppf(double p, double df)
+    {
+        if (df <= 0.0 || !_valid_probability(p)) return _nan();
+        return _continuous_ppf(6, p, df, 0.0);
+    }
+
+    double chi2_rvs(Random* rng, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return rng->nextGamma(df / 2.0, 2.0);
+    }
+
+    double student_t_pdf(double x, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return _pdf(7, x, df, 0.0);
+    }
+
+    double student_t_cdf(double x, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return Special.student_t_cdf(x, df);
+    }
+
+    double student_t_ppf(double p, double df)
+    {
+        if (df <= 0.0 || !_valid_probability(p)) return _nan();
+        return _continuous_ppf(7, p, df, 0.0);
+    }
+
+    double student_t_rvs(Random* rng, double df)
+    {
+        if (df <= 0.0) return _nan();
+        return rng->nextGaussian() / Math.sqrt(rng->nextGamma(df / 2.0, 2.0) / df);
+    }
+
+    double f_pdf(double x, double df1, double df2)
+    {
+        if (df1 <= 0.0 || df2 <= 0.0) return _nan();
+        return _pdf(8, x, df1, df2);
+    }
+
+    double f_cdf(double x, double df1, double df2)
+    {
+        if (df1 <= 0.0 || df2 <= 0.0) return _nan();
+        return _cdf(8, x, df1, df2);
+    }
+
+    double f_ppf(double p, double df1, double df2)
+    {
+        if (df1 <= 0.0 || df2 <= 0.0 || !_valid_probability(p)) return _nan();
+        return _continuous_ppf(8, p, df1, df2);
+    }
+
+    double f_rvs(Random* rng, double df1, double df2)
+    {
+        if (df1 <= 0.0 || df2 <= 0.0) return _nan();
+        double numerator = rng->nextGamma(df1 / 2.0, 2.0) / df1;
+        double denominator = rng->nextGamma(df2 / 2.0, 2.0) / df2;
+        return numerator / denominator;
+    }
+
+    double poisson_pmf(i64 k, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        if (k < 0) return 0.0;
+        return Math.exp((double)k * Math.log(lambda) - lambda
+            - Special.lgamma((double)k + 1.0));
+    }
+
+    double poisson_cdf(i64 k, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        if (k < 0) return 0.0;
+        return 1.0 - Special._regularized_gamma((double)k + 1.0, lambda);
+    }
+
+    double poisson_ppf(double p, double lambda)
+    {
+        if (lambda <= 0.0 || !_valid_probability(p)) return _nan();
+        if (p <= 0.0) return 0.0;
+        if (p >= 1.0) return _infinity();
+        i64 k = 0;
+        while (poisson_cdf(k, lambda) < p) k = k + (i64)1;
+        return (double)k;
+    }
+
+    double poisson_rvs(Random* rng, double lambda)
+    {
+        if (lambda <= 0.0) return _nan();
+        return (double)rng->nextPoisson(lambda);
+    }
+
+    double binomial_pmf(i64 k, i64 n, double prob)
+    {
+        if (n < 0 || !_valid_probability(prob)) return _nan();
+        if (k < 0 || k > n) return 0.0;
+        if (prob == 0.0) return k == 0 ? 1.0 : 0.0;
+        if (prob == 1.0) return k == n ? 1.0 : 0.0;
+        double nd = (double)n;
+        double kd = (double)k;
+        double logValue = Special.lgamma(nd + 1.0) - Special.lgamma(kd + 1.0);
+        logValue = logValue - Special.lgamma(nd - kd + 1.0);
+        logValue = logValue + kd * Math.log(prob);
+        logValue = logValue + (nd - kd) * Math.log(1.0 - prob);
+        return Math.exp(logValue);
+    }
+
+    double binomial_cdf(i64 k, i64 n, double prob)
+    {
+        if (n < 0 || !_valid_probability(prob)) return _nan();
+        if (k < 0) return 0.0;
+        if (k >= n) return 1.0;
+        double sum = 0.0;
+        i64 i = 0;
+        while (i <= k)
+        {
+            sum = sum + binomial_pmf(i, n, prob);
+            i = i + (i64)1;
+        }
+        return sum > 1.0 ? 1.0 : sum;
+    }
+
+    double binomial_ppf(double quantile, i64 n, double prob)
+    {
+        if (n < 0 || !_valid_probability(prob) || !_valid_probability(quantile)) return _nan();
+        if (quantile <= 0.0) return 0.0;
+        if (quantile >= 1.0) return (double)n;
+        i64 k = 0;
+        while (k < n && binomial_cdf(k, n, prob) < quantile) k = k + (i64)1;
+        return (double)k;
+    }
+
+    double binomial_rvs(Random* rng, i64 n, double prob)
+    {
+        if (n < 0 || !_valid_probability(prob)) return _nan();
+        return (double)rng->nextBinomial(n, prob);
+    }
+
+    double geometric_pmf(i64 k, double prob)
+    {
+        if (prob <= 0.0 || prob > 1.0) return _nan();
+        if (k < 1) return 0.0;
+        return prob * Math.pow(1.0 - prob, (double)(k - (i64)1));
+    }
+
+    double geometric_cdf(i64 k, double prob)
+    {
+        if (prob <= 0.0 || prob > 1.0) return _nan();
+        if (k < 1) return 0.0;
+        return 1.0 - Math.pow(1.0 - prob, (double)k);
+    }
+
+    double geometric_ppf(double quantile, double prob)
+    {
+        if (prob <= 0.0 || prob > 1.0 || !_valid_probability(quantile)) return _nan();
+        if (quantile <= 0.0) return 1.0;
+        if (quantile >= 1.0) return _infinity();
+        i64 k = 1;
+        while (geometric_cdf(k, prob) < quantile) k = k + (i64)1;
+        return (double)k;
+    }
+
+    double geometric_rvs(Random* rng, double prob)
+    {
+        if (prob <= 0.0 || prob > 1.0) return _nan();
+        return geometric_ppf(rng->nextDouble(), prob);
+    }
+}
+
+
+
+
+
+
+

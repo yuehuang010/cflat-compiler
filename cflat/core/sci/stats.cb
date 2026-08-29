@@ -1,0 +1,268 @@
+// stats.cb - allocation-free descriptive statistics over double[].
+//
+// Mean, variance, and standard deviation use Scan.Welford for a stable
+// one-pass calculation. Order statistics use type 7 quantiles: linear
+// interpolation between order statistics, the default in numpy and R.
+// Callers provide scratch storage for sorted-copy operations; input arrays
+// are never modified and this module does not allocate.
+
+import "math.cb";
+import "hpc/scan.cb";
+
+namespace Stats
+{
+    double mean(double[] x, int n)
+    {
+        if (n <= 0) return 0.0;
+        Welford w = default;
+        int i = 0;
+        while (i < n) { w.add(x[i]); i = i + 1; }
+        return w.mean;
+    }
+
+    double variance(double[] x, int n)
+    {
+        if (n <= 0) return 0.0;
+        Welford w = default;
+        int i = 0;
+        while (i < n) { w.add(x[i]); i = i + 1; }
+        return w.m2 / (double)w.count;
+    }
+
+    double sample_variance(double[] x, int n)
+    {
+        if (n <= 1) return 0.0;
+        Welford w = default;
+        int i = 0;
+        while (i < n) { w.add(x[i]); i = i + 1; }
+        return w.m2 / (double)(w.count - (i64)1);
+    }
+
+    double stddev(double[] x, int n) { return Math.sqrt(Stats.variance(x, n)); }
+
+    double sample_stddev(double[] x, int n)
+    {
+        return Math.sqrt(Stats.sample_variance(x, n));
+    }
+
+    void _sort(double[] a, int n)
+    {
+        int i = 1;
+        while (i < n)
+        {
+            double value = a[i];
+            int j = i;
+            while (j > 0 && a[j - 1] > value)
+            {
+                a[j] = a[j - 1];
+                j = j - 1;
+            }
+            a[j] = value;
+            i = i + 1;
+        }
+    }
+
+    void _copy_and_sort(double[] x, int n, double[] scratch)
+    {
+        int i = 0;
+        while (i < n) { scratch[i] = x[i]; i = i + 1; }
+        Stats._sort(scratch, n);
+    }
+
+    double quantile(double[] x, int n, double q, double[] scratch)
+    {
+        if (n <= 0) return 0.0;
+        Stats._copy_and_sort(x, n, scratch);
+        if (q <= 0.0) return scratch[0];
+        if (q >= 1.0) return scratch[n - 1];
+        double position = (double)(n - 1) * q;
+        int lower = (int)position;
+        int upper = lower + 1;
+        double fraction = position - (double)lower;
+        return scratch[lower] + fraction * (scratch[upper] - scratch[lower]);
+    }
+
+    double median(double[] x, int n, double[] scratch)
+    {
+        return Stats.quantile(x, n, 0.5, scratch);
+    }
+
+    double iqr(double[] x, int n, double[] scratch)
+    {
+        double hi = Stats.quantile(x, n, 0.75, scratch);
+        double lo = Stats.quantile(x, n, 0.25, scratch);
+        return hi - lo;
+    }
+
+    double covariance(double[] x, double[] y, int n)
+    {
+        if (n <= 0) return 0.0;
+        double mx = Stats.mean(x, n);
+        double my = Stats.mean(y, n);
+        double sum = 0.0;
+        int i = 0;
+        while (i < n)
+        {
+            sum = sum + (x[i] - mx) * (y[i] - my);
+            i = i + 1;
+        }
+        return sum / (double)n;
+    }
+
+    double correlation(double[] x, double[] y, int n)
+    {
+        if (n <= 0) return 0.0;
+        double mx = Stats.mean(x, n);
+        double my = Stats.mean(y, n);
+        double xx = 0.0;
+        double yy = 0.0;
+        double xy = 0.0;
+        int i = 0;
+        while (i < n)
+        {
+            double dx = x[i] - mx;
+            double dy = y[i] - my;
+            xx = xx + dx * dx;
+            yy = yy + dy * dy;
+            xy = xy + dx * dy;
+            i = i + 1;
+        }
+        if (xx == 0.0 || yy == 0.0) return 0.0;
+        return Math.clamp(xy / Math.sqrt(xx * yy), -1.0, 1.0);
+    }
+
+    double _rank(double value, double[] values, int n)
+    {
+        int less = 0;
+        int equal = 0;
+        int i = 0;
+        while (i < n)
+        {
+            if (values[i] < value) less = less + 1;
+            else if (values[i] == value) equal = equal + 1;
+            i = i + 1;
+        }
+        return (double)less + 1.0 + (double)(equal - 1) * 0.5;
+    }
+
+    double spearman(double[] x, double[] y, int n, double[] scratch)
+    {
+        if (n <= 0) return 0.0;
+        // Scratch holds x ranks; y ranks are counted directly, avoiding a second buffer.
+        // _rank is O(n) per element, so this is O(n^2) overall - intended for modest n.
+        int i = 0;
+        while (i < n)
+        {
+            scratch[i] = Stats._rank(x[i], x, n);
+            i = i + 1;
+        }
+        double mx = (double)(n + 1) * 0.5;
+        double xx = 0.0;
+        double yy = 0.0;
+        double xy = 0.0;
+        i = 0;
+        while (i < n)
+        {
+            double dx = scratch[i] - mx;
+            double dy = Stats._rank(y[i], y, n) - mx;
+            xx = xx + dx * dx;
+            yy = yy + dy * dy;
+            xy = xy + dx * dy;
+            i = i + 1;
+        }
+        if (xx == 0.0 || yy == 0.0) return 0.0;
+        return Math.clamp(xy / Math.sqrt(xx * yy), -1.0, 1.0);
+    }
+
+    struct LinearFit
+    {
+        double slope = default;
+        double intercept = default;
+        double r2 = default;
+    };
+    LinearFit linfit(double[] x, double[] y, int n)
+    {
+        LinearFit result = default;
+        if (n <= 0) return result;
+        double mx = Stats.mean(x, n);
+        double my = Stats.mean(y, n);
+        double xx = 0.0;
+        double xy = 0.0;
+        int i = 0;
+        while (i < n)
+        {
+            double dx = x[i] - mx;
+            xx = xx + dx * dx;
+            xy = xy + dx * (y[i] - my);
+            i = i + 1;
+        }
+        if (xx == 0.0) { result.intercept = my; return result; }
+        result.slope = xy / xx;
+        result.intercept = my - result.slope * mx;
+        double residual = 0.0;
+        double total = 0.0;
+        i = 0;
+        while (i < n)
+        {
+            double error = y[i] - (result.slope * x[i] + result.intercept);
+            residual = residual + error * error;
+            double dy = y[i] - my;
+            total = total + dy * dy;
+            i = i + 1;
+        }
+        result.r2 = total == 0.0 ? 1.0 : Math.clamp(1.0 - residual / total, 0.0, 1.0);
+        return result;
+    }
+
+    void histogram(double[] x, int n, double lo, double hi, i64[] bins, int nbins)
+    {
+        int i = 0;
+        while (i < nbins) { bins[i] = (i64)0; i = i + 1; }
+        if (n <= 0 || nbins <= 0 || hi <= lo) return;
+        double width = hi - lo;
+        i = 0;
+        while (i < n)
+        {
+            if (x[i] >= lo && x[i] <= hi)
+            {
+                int bucket = x[i] == hi ? nbins - 1 : (int)((x[i] - lo) * (double)nbins / width);
+                if (bucket >= 0 && bucket < nbins) bins[bucket] = bins[bucket] + (i64)1;
+            }
+            i = i + 1;
+        }
+    }
+
+    void zscore(double[] x, int n)
+    {
+        if (n <= 0) return;
+        double m = Stats.mean(x, n);
+        double s = Stats.stddev(x, n);
+        if (s == 0.0)
+        {
+            vectorize for (int i = 0; i < n; i = i + 1) x[i] = 0.0;
+            return;
+        }
+        vectorize for (int i = 0; i < n; i = i + 1) x[i] = (x[i] - m) / s;
+    }
+
+    void minmax_scale(double[] x, int n)
+    {
+        if (n <= 0) return;
+        double lo = x[0];
+        double hi = x[0];
+        int j = 1;
+        while (j < n)
+        {
+            if (x[j] < lo) lo = x[j];
+            if (x[j] > hi) hi = x[j];
+            j = j + 1;
+        }
+        double width = hi - lo;
+        if (width == 0.0)
+        {
+            vectorize for (int i = 0; i < n; i = i + 1) x[i] = 0.0;
+            return;
+        }
+        vectorize for (int i = 0; i < n; i = i + 1) x[i] = (x[i] - lo) / width;
+    }
+}

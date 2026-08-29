@@ -1,0 +1,188 @@
+// tone_detection.cb - pulling sinusoids out of noise, and deciding honestly
+// whether what you found is real.
+//
+// Two tones are buried in Gaussian noise. Neither stands out in the raw
+// samples: the stronger tone's amplitude only equals the noise standard
+// deviation, and the weaker one sits 16 dB below it. Averaging in the
+// frequency domain is what recovers them. The program then does what a
+// working engineer would do:
+//
+//   1. Estimate the power spectral density with Welch's method.
+//   2. Set a DETECTION THRESHOLD from the statistics of the noise, rather than
+//      by eyeballing the plot.
+//   3. Report which peaks clear it, and how well the frequencies were located.
+//   4. Band-pass the stronger tone out and confirm the noise power drops by
+//      the amount the filter bandwidth predicts.
+//
+// The statistical step is the interesting one, and it is where sci/signal.cb
+// and sci/distributions.cb meet. A periodogram bin of Gaussian noise is not a
+// clean number: it is chi-square distributed with 2 degrees of freedom, which
+// has a standard deviation as large as its mean. Averaging K independent
+// Welch segments gives 2K degrees of freedom, so the estimate concentrates
+// like chi2_{2K} / (2K). The false-alarm threshold at probability p is
+// therefore
+//
+//     threshold = mean_noise_psd * chi2_ppf(1 - p, 2K) / (2K)
+//
+// which is exactly what Dist.chi2_ppf is for. Picking a threshold by eye
+// instead is how people "detect" tones that are not there.
+//
+// Note on the segment count: Welch segments overlapping by half are NOT
+// independent, so 2K overstates the true degrees of freedom and the threshold
+// below is mildly conservative in the safe direction. That is stated here
+// rather than quietly ignored.
+//
+// Build:
+//   x64\Release\cflat.exe example\sci\tone_detection.cb -o out\tone_detection.exe
+import "cruntime.cb";
+import "math.cb";
+import "random.cb";
+import "sci/signal.cb";
+import "sci/distributions.cb";
+import "sci/stats.cb";
+
+const double FS = 1000.0;          // sampling rate, Hz
+const int    NSAMP = 8192;
+const int    NPERSEG = 256;
+const int    NBINS = 129;          // NPERSEG/2 + 1; a global initializer must be literal
+
+const double F1 = 120.0;           // strong tone
+const double A1 = 1.0;
+const double F2 = 305.0;           // weak tone, below the visible noise floor
+const double A2 = 0.22;
+const double NOISE_SD = 1.0;
+
+double absd(double v) { return v < 0.0 ? -v : v; }
+
+int main()
+{
+    double twopi = 6.28318530717958647692;
+
+    // ---- 1. Build the test signal. Fixed seed: this must be reproducible.
+    Random rng = default;
+    rng.seed(20260829);
+
+    double[] x = new double[NSAMP];
+    double[] clean = new double[NSAMP];
+    for (int i = 0; i < NSAMP; i = i + 1)
+    {
+        double t = (double)i / FS;
+        double s = A1 * Math.sin(twopi * F1 * t) + A2 * Math.sin(twopi * F2 * t);
+        clean[i] = s;
+        x[i] = s + rng.nextGaussian(0.0, NOISE_SD);
+    }
+
+    double sigPower = A1 * A1 * 0.5 + A2 * A2 * 0.5;
+    printf("Signal: %.0f Hz at amplitude %.2f, %.0f Hz at amplitude %.2f\n", F1, A1, F2, A2);
+    printf("Noise:  white Gaussian, sd %.2f (variance %.3f)\n", NOISE_SD, NOISE_SD * NOISE_SD);
+    printf("Total SNR: %.1f dB   weak tone alone: %.1f dB\n\n",
+           10.0 * Math.log10(sigPower / (NOISE_SD * NOISE_SD)),
+           10.0 * Math.log10(A2 * A2 * 0.5 / (NOISE_SD * NOISE_SD)));
+
+    // ---- 2. Welch PSD. Half-overlapped Hann segments.
+    int noverlap = NPERSEG / 2;
+    double[] freqs = new double[NBINS];
+    double[] psd = new double[NBINS];
+    double[] wscratch = new double[16 * NPERSEG + 256];
+    if (!Signal.welch(x, NSAMP, NPERSEG, noverlap, Signal.HANN, FS, freqs, psd, wscratch))
+    {
+        printf("welch failed\n");
+        return 1;
+    }
+    int nseg = (NSAMP - noverlap) / (NPERSEG - noverlap);
+    double df = FS / (double)NPERSEG;
+
+    // ---- 3. Threshold from the noise statistics, not from the picture.
+    // The noise floor is estimated with the MEDIAN of the bins, which the two
+    // tones cannot drag upward the way the mean would.
+    double[] sorted = new double[NBINS];
+    double[] medscratch = new double[NBINS];
+    for (int i = 0; i < NBINS; i = i + 1) sorted[i] = psd[i];
+    double floorPsd = Stats.median(sorted, NBINS, medscratch);
+
+    double dof = 2.0 * (double)nseg;
+    double pfa = 0.0001;
+    double thresh = floorPsd * Dist.chi2_ppf(1.0 - pfa, dof) / dof;
+
+    printf("Welch: %d segments of %d, %d bins, resolution %.3f Hz\n", nseg, NPERSEG, NBINS, df);
+    printf("Noise floor (median bin): %.4e   equivalent variance %.3f\n",
+           floorPsd, floorPsd * FS * 0.5);
+    printf("Detection threshold at p_fa = %.0e over %.0f dof: %.4e (%.1f dB over floor)\n\n",
+           pfa, dof, thresh, 10.0 * Math.log10(thresh / floorPsd));
+
+    // ---- 4. Peaks above the threshold.
+    int[] peaks = new int[16];
+    int npk = Signal.find_peaks(psd, NBINS, thresh, 0.0, 2, peaks, 16);
+
+    printf("Detections:\n");
+    printf("  %-12s %-12s %-12s %s\n", "bin freq", "nearest tone", "error", "PSD / threshold");
+    int matched = 0;
+    for (int k = 0; k < npk; k = k + 1)
+    {
+        int b = peaks[k];
+        double f = freqs[b];
+        double d1 = absd(f - F1);
+        double d2 = absd(f - F2);
+        double truth = d1 < d2 ? F1 : F2;
+        double err = d1 < d2 ? d1 : d2;
+        // Within half a bin is the best any DFT-based estimate can do.
+        bool ok = err <= df * 0.5;
+        if (ok) matched = matched + 1;
+        printf("  %-12.2f %-12.0f %-12.3f %.1fx  %s\n",
+               f, truth, err, psd[b] / thresh, ok ? "" : "(spurious)");
+    }
+
+    printf("\n%d peak(s) cleared the threshold; %d matched a real tone to within\n", npk, matched);
+    printf("half a bin (%.3f Hz). False alarms: %d.\n", df * 0.5, npk - matched);
+
+    // ---- 5. Band-pass the strong tone and check the noise reduction.
+    // A brick-wall filter of bandwidth B keeps a fraction B/(FS/2) of white
+    // noise power, so the predicted drop is that ratio. A real Butterworth
+    // has skirts, so the measured drop is somewhat less - which is the point
+    // of comparing them rather than just asserting the filter "works".
+    double flo = 100.0;
+    double fhi = 140.0;
+    double wlo = flo / (FS * 0.5);
+    double whi = fhi / (FS * 0.5);
+    int order = 4;
+    double[] bb = new double[2 * order + 1];
+    double[] ba = new double[2 * order + 1];
+    if (!Signal.butter_bandpass(order, wlo, whi, bb, ba))
+    {
+        printf("bandpass design failed\n");
+        return 1;
+    }
+
+    // Filter the NOISE ALONE to measure what the filter does to it.
+    double[] noise = new double[NSAMP];
+    for (int i = 0; i < NSAMP; i = i + 1) noise[i] = x[i] - clean[i];
+    double[] fnoise = new double[NSAMP];
+    double[] fscratch = new double[8 * NSAMP + 256];
+    Signal.filtfilt(bb, 2 * order + 1, ba, 2 * order + 1, noise, NSAMP, fnoise, fscratch);
+
+    double rawVar = Stats.variance(noise, NSAMP);
+    double filtVar = Stats.variance(fnoise, NSAMP);
+    double predicted = (fhi - flo) / (FS * 0.5);
+
+    printf("\nBand-pass %.0f-%.0f Hz, Butterworth order %d, zero-phase (filtfilt):\n",
+           flo, fhi, order);
+    printf("  noise variance %.4f -> %.4f  (ratio %.4f)\n", rawVar, filtVar, filtVar / rawVar);
+    printf("  brick-wall prediction for this bandwidth: %.4f\n", predicted);
+    printf("  filtfilt applies the response twice, which narrows the effective\n");
+    printf("  band further - so a ratio below the brick-wall figure is expected.\n");
+
+    delete[_] x;
+    delete[_] clean;
+    delete[_] freqs;
+    delete[_] psd;
+    delete[_] wscratch;
+    delete[_] sorted;
+    delete[_] medscratch;
+    delete[_] peaks;
+    delete[_] bb;
+    delete[_] ba;
+    delete[_] noise;
+    delete[_] fnoise;
+    delete[_] fscratch;
+    return 0;
+}

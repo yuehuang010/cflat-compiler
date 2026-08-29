@@ -1,5 +1,5 @@
 // test_hpc_kernels.cb - correctness harness for the core/hpc numeric kernel libraries
-// (vecmath, densemat, stencil, scan, fft, sparse, factor, solvers). Imports every
+// (vecmath, densemat, stencil, scan, fft, sparse, factor, qr, eigen, solvers). Imports every
 // library together and checks each kernel against a known answer; returns 0 only if
 // all checks pass.
 //
@@ -16,7 +16,18 @@ import "hpc/scan.cb";
 import "hpc/fft.cb";
 import "hpc/sparse.cb";
 import "hpc/factor.cb";
+import "hpc/qr.cb";
+import "hpc/eigen.cb";
+import "hpc/svd.cb";
 import "hpc/solvers.cb";
+import "sci/integrate.cb";
+import "sci/ode.cb";
+import "sci/roots.cb";
+import "complex.cb";
+import "sci/optimize.cb";
+import "sci/interp.cb";
+import "sci/dataio.cb";
+import "filesystem.cb";
 
 int g_pass = 0;
 int g_total = 0;
@@ -626,6 +637,117 @@ void test_solvers()
     a.dispose();
 }
 
+// Collect the transitive import closure of a core module, starting from a
+// core-relative name such as "hpc/fft.cb". Returns false if any file in the
+// walk could not be read, so a mis-resolved path can never look like a pass.
+bool import_closure(string start, list<string>* out)
+{
+    list<string> pending = default;
+    pending.add(start);
+    while (pending.count() > 0)
+    {
+        string current = pending[pending.count() - 1];
+        pending.removeAt(pending.count() - 1);
+
+        bool already = false;
+        for (int i = 0; i < out->count(); i = i + 1)
+            if ((*out)[i] == current) already = true;
+        if (already) continue;
+        out->add(current);
+
+        string path = "cflat/core/" + current;
+        string src = File.readAllText(path);
+        if (src.length() == 0) return false;
+
+        int at = src.indexOf("import \"", 0);
+        while (at >= 0)
+        {
+            int from = at + 8;
+            int end = src.indexOf("\"", from);
+            if (end < 0) break;
+            string name = src.substring(from, end - from);
+            if (name.endsWith(".cb")) pending.add(name);
+            at = src.indexOf("import \"", end);
+        }
+    }
+    return true;
+}
+
+// The dependency shape of a module is a property worth testing. hpc/fft.cb
+// once imported hpc/densemat.cb for a single 8-line transpose, which dragged
+// the whole threading stack (18 transitive imports) into every 1-D FFT and
+// into sci/signal.cb behind it. Vec.transpose lives in the leaf vecmath.cb now.
+void test_import_closure()
+{
+    printf("-- import closure --\n");
+    list<string> closure = default;
+    bool walked = import_closure("hpc/fft.cb", &closure);
+
+    // A failed walk means the test could not see the sources at all. Report it
+    // as a failure rather than silently passing on an empty closure.
+    check_int("fft closure readable", walked ? 1 : 0, 1);
+    if (!walked)
+    {
+        printf("       (run from the repo root; cflat/core was not readable)\n");
+        return;
+    }
+
+    bool heavy = false;
+    for (int i = 0; i < closure.count(); i = i + 1)
+    {
+        string m = closure[i];
+        if (m == "threadpool.cb" || m == "thread.cb" || m == "channel.cb"
+            || m == "hpc/parallel.cb" || m == "hpc/densemat.cb")
+            heavy = true;
+    }
+    printf("       hpc/fft.cb closure = %d modules\n", closure.count());
+    check_int("fft pulls no threading stack", heavy ? 1 : 0, 0);
+
+    // Guard the sanity of the walk itself: fft must still reach its real deps.
+    bool has_vecmath = false;
+    for (int i = 0; i < closure.count(); i = i + 1)
+        if (closure[i] == "hpc/vecmath.cb") has_vecmath = true;
+    check_int("fft closure found vecmath", has_vecmath ? 1 : 0, 1);
+
+    // sci/signal.cb sits on top of fft and inherits whatever fft imports.
+    list<string> sig = default;
+    if (import_closure("sci/signal.cb", &sig))
+    {
+        bool sigheavy = false;
+        for (int i = 0; i < sig.count(); i = i + 1)
+            if (sig[i] == "threadpool.cb" || sig[i] == "hpc/densemat.cb") sigheavy = true;
+        printf("       sci/signal.cb closure = %d modules\n", sig.count());
+        check_int("signal pulls no threading stack", sigheavy ? 1 : 0, 0);
+    }
+    else
+    {
+        check_int("signal closure readable", 0, 1);
+    }
+
+    // The module graph is a DAG and hpc/ sits BELOW sci/, so a lower layer must
+    // never reach up. hpc/eigen.cb used to import sci/complex.cb for nothing but
+    // the complex type; that type now lives at the core root beside math.cb.
+    list<string> eig = default;
+    if (import_closure("hpc/eigen.cb", &eig))
+    {
+        bool inverted = false;
+        bool found_complex = false;
+        for (int i = 0; i < eig.count(); i = i + 1)
+        {
+            string m = eig[i];
+            if (m.indexOf("sci/", 0) == 0) inverted = true;
+            if (m == "complex.cb") found_complex = true;
+        }
+        check_int("eigen does not import sci/", inverted ? 1 : 0, 0);
+        // Sanity: the walk must still reach the module the type actually lives in.
+        check_int("eigen closure found complex", found_complex ? 1 : 0, 1);
+    }
+    else
+    {
+        check_int("eigen closure readable", 0, 1);
+    }
+}
+
 extern int main()
 {
     printf("=== CFlat single-threaded HPC library suite ===\n\n");
@@ -639,7 +761,1334 @@ extern int main()
     test_factor();
     test_factor_piv();
     test_factor_piv_blocked();
-    test_solvers();
+    test_qr();
+    test_qr_blocked();
+    test_eigen();
+    test_power_iteration();
+    test_qr_algorithm();
+    test_svd();
+    test_solvers(); test_sci(); test_optimize();
+    test_import_closure();
     printf("\n%d / %d checks passed.\n", g_pass, g_total);
     return g_pass == g_total ? 0 : 1;
+}
+
+void test_sci()
+{
+    printf("[sci]\n");
+    double one = (double)1; double three = (double)3;
+    check_tol("simpson x2", Integrate.simpson((double x) => x * x, 0.0, 1.0, 10), one / three, 0.000001);
+    check_tol("gauss x3", Integrate.gauss_legendre((double x) => x * x * x, -1.0, 1.0, 8), 0.0, 0.000001);
+    Roots.Result rr = Roots.brent((double x) => x * x - 2.0, 0.0, 2.0, 0.000001, 100);
+    check_int("brent converged", rr.converged ? 1 : 0, 1);
+    check_tol("brent sqrt2", rr.x, 1.4142135623730951, 0.000001);
+    check_tol("rk4 exp one", Ode.rk4_step((double t, double y) => y, 0.0, 1.0, 0.1), 1.105170185, 0.00001);
+
+    // Vector steppers on the harmonic oscillator y'' = -y, i.e. [x, v]' = [v, -x],
+    // exact solution x(t) = cos(t), v(t) = -sin(t). This derivative READS the
+    // component it writes first, so it detects a stepper that lets dydt alias y.
+    {
+        double[] st = new double[2];
+        double[] sc = new double[10 * 2];   // rk45 needs 10*n; rk4 needs 5*n
+        st[0] = 1.0; st[1] = 0.0;
+        double tt = 0.0;
+        // Bound to a typed variable: rk4_step is overloaded, and an inline block
+        // lambda resolves against the scalar overload first.
+        Lambda<void(double, double*, double*, int)> shm =
+            (double t, double* y, double* dy, int n) => { dy[0] = y[1]; dy[1] = -y[0]; };
+        for (int i = 0; i < 100; i = i + 1)
+            Ode.rk4_step(shm, tt + (double)i * 0.01, st, 2, 0.01, sc);
+        check_tol("rk4 vec cos(1)", st[0], 0.5403023058681398, 0.000001);
+        check_tol("rk4 vec -sin(1)", st[1], -0.8414709848078965, 0.000001);
+
+        st[0] = 1.0; st[1] = 0.0;
+        double t45 = 0.0;
+        int guard = 0;
+        while (t45 < 1.0 && guard < 100000)
+        {
+            double taken = Ode.rk45_step(shm, &t45, st, 2, 0.01,
+                                         0.000000001, 0.000000001, sc);
+            if (taken <= 0.0) break;
+            guard = guard + 1;
+        }
+        check_tol("rk45 vec cos(t)", st[0], Math.cos(t45), 0.00001);
+        check_tol("rk45 vec -sin(t)", st[1], -Math.sin(t45), 0.00001);
+        check_int("rk45 step size held", guard <= 200 ? 1 : 0, 1);
+        delete[_] st;
+        delete[_] sc;
+    }
+    double[] xs = new double[3]; double[] ys = new double[3]; double[] co = new double[8];
+    xs[0]=0.0; xs[1]=1.0; xs[2]=2.0; ys[0]=0.0; ys[1]=1.0; ys[2]=4.0;
+    Interp.spline_build_natural(xs, ys, 3, co);
+    check_tol("spline binary eval", Interp.spline_eval(xs, 3, co, 1.5), 2.3125, 0.000001);
+    string path = "scratch/sci_data.txt"; File.writeAllText(path, "1.25\r\n2.5\n3.75");
+    LoadOptions opt = default; opt.chunk_bytes = 16; double[] values = new double[4];
+    LoadResult lr = DataIo.load_doubles(path, values, 4, opt);
+    opt.mode = ReadMode.Mmap; LoadResult mm = DataIo.load_doubles(path, values, 4, opt); opt.mode = ReadMode.Chunked;
+    check_int("mmap rows", (int)mm.rows, 3);
+    check_int("data load ok", lr.ok ? 1 : 0, 1); check_int("data rows", (int)lr.rows, 3); check_tol("data tail", values[2], 3.75, 0.000001);
+    Welford wf = default; LoadResult red = DataIo.reduce_file(path, &wf, opt);
+    check_int("data reduce ok", red.ok ? 1 : 0, 1); check_tol("data mean", wf.mean, 2.5, 0.000001);
+    string csv = "scratch/sci_data.csv"; File.writeAllText(csv, "a,b\r\n1,2\n3,4");
+    opt.has_header = true; double[] table = new double[4]; LoadResult cr = DataIo.load_csv(csv, table, 4, 2, opt);
+    check_int("csv rows", (int)cr.rows, 2); check_tol("csv order", table[2], 3.0, 0.000001);
+    File.remove(path); File.remove(csv); delete[_] xs; delete[_] ys; delete[_] co; delete[_] values; delete[_] table;
+    test_dataio_pipeline();
+}
+
+// Mean of the values in `text` as loaded by reduce_file, with the pipeline
+// forced on by a small chunk size. Returns -1 when the load fails.
+double dataio_mean(string text, int chunk_bytes, int buffers, int workers, i64* rows)
+{
+    string p = "scratch/sci_pipe.txt";
+    File.writeAllText(p, text);
+    LoadOptions o = default;
+    o.chunk_bytes = chunk_bytes;
+    o.buffers = buffers;
+    o.workers = workers;
+    Welford w = default;
+    LoadResult r = DataIo.reduce_file(p, &w, o);
+    File.remove(p);
+    rows[0] = r.rows;
+    return r.ok ? w.mean : -1.0;
+}
+
+// Chunk-boundary handling: every case below is read through the reader thread
+// with a 32-byte chunk, so records land across chunk edges by construction.
+void test_dataio_pipeline()
+{
+    i64 rows = (i64)0;
+    string split = "1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 "
+                 + "21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40\n";
+    double m = dataio_mean(split, 32, 2, 0, &rows);
+    check_int("dataio split rows", (int)rows, 40);
+    check_tol("dataio split mean", m, 20.5, 0.000001);
+
+    m = dataio_mean("1.0 2.0 3.0", 32, 2, 0, &rows);
+    check_int("dataio no-trailing-nl rows", (int)rows, 3);
+    check_tol("dataio no-trailing-nl mean", m, 2.0, 0.000001);
+
+    string crlf = "1.0\r\n2.0\r\n3.0\r\n4.0\r\n5.0\r\n6.0\r\n7.0\r\n8.0\r\n"
+                + "9.0\r\n10.0\r\n11.0\r\n12.0\r\n13.0\r\n14.0\r\n15.0\r\n16.0\r\n";
+    m = dataio_mean(crlf, 32, 2, 0, &rows);
+    check_int("dataio crlf rows", (int)rows, 16);
+    check_tol("dataio crlf mean", m, 8.5, 0.000001);
+
+    // 61 bytes over a 32-byte chunk: the third chunk is 3 bytes long.
+    m = dataio_mean("1.0 2.0 3.0 4.0 5.0 6.0 7.0 8.0 9.0 10.0 11.0 12.0 13.0 14", 32, 2, 0, &rows);
+    check_int("dataio short-final rows", (int)rows, 14);
+    check_tol("dataio short-final mean", m, 7.5, 0.000001);
+
+    m = dataio_mean("1.0 2.0 3.0 4.0", 1048576, 2, 0, &rows);
+    check_int("dataio sub-chunk rows", (int)rows, 4);
+    check_tol("dataio sub-chunk mean", m, 2.5, 0.000001);
+
+    m = dataio_mean("", 32, 2, 0, &rows);
+    check_int("dataio empty rows", (int)rows, 0);
+    check_int("dataio empty ok", m == 0.0 ? 1 : 0, 1);
+
+    // 128 KB through 3 buffers and 4 parse workers: exercises the buffer pool
+    // and the record-aligned parallel split, and must keep file order.
+    string big = "scratch/sci_pipe_big.txt";
+    i8* block = (i8*)malloc((i64)131072);
+    char* pat = "1.5 2.5 3.5 4.5 ";
+    for (i64 i = (i64)0; i < (i64)131072; i = i + (i64)16) memcpy(block + i, (i8*)pat, (i64)16);
+    File* bf = new File;
+    bf->openWrite(big);
+    bf->writeBytes(block, (i64)131072);
+    bf->close();
+    delete bf;
+    free((void*)block);
+    LoadOptions po = default;
+    po.chunk_bytes = 32768;
+    po.buffers = 3;
+    po.workers = 4;
+    i64 seen = (i64)0;
+    i64* seenp = &seen;
+    int order_ok = 1;
+    int* orderp = &order_ok;
+    double first_val = 0.0;
+    double* firstp = &first_val;
+    Lambda<void(double*, int, i64)> sink = (double* a, int n, i64 first) =>
+    {
+        if (first != seenp[0]) orderp[0] = 0;
+        if (first == (i64)0) firstp[0] = a[0];
+        seenp[0] = seenp[0] + (i64)n;
+    };
+    LoadResult pr = DataIo.stream_doubles(big, sink, po);
+    check_int("dataio pooled rows", (int)pr.rows, 32768);
+    check_int("dataio pooled order", order_ok, 1);
+    check_tol("dataio pooled first", first_val, 1.5, 0.000001);
+    Welford pw = default;
+    LoadResult pm = DataIo.reduce_file(big, &pw, po);
+    check_int("dataio pooled reduce ok", pm.ok ? 1 : 0, 1);
+    check_tol("dataio pooled mean", pw.mean, 3.0, 0.000001);
+    File.remove(big);
+}
+
+// ---- Householder QR + least squares ----
+
+// max |(Q^T Q) - I| over the thin Q (m x n). The columns of Q are orthonormal
+// exactly when this is at rounding level; the check depends on nothing qr.cb
+// computes except Q itself.
+double qr_ortho_err(double[] q, int m, int n)
+{
+    double worst = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int r = 0; r < m; r = r + 1)
+                s = s + q[r * n + i] * q[r * n + j];
+            double e = s - (i == j ? 1.0 : 0.0);
+            if (e < 0.0) e = -e;
+            if (e > worst) worst = e;
+        }
+    return worst;
+}
+
+// max |Q*R - A0|, with R read out of the upper triangle of the factored array.
+double qr_recon_err(double[] q, double[] rf, double[] a0, int m, int n)
+{
+    double worst = 0.0;
+    for (int i = 0; i < m; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int k = 0; k <= j; k = k + 1)
+                s = s + q[i * n + k] * rf[k * n + j];
+            double e = s - a0[i * n + j];
+            if (e < 0.0) e = -e;
+            if (e > worst) worst = e;
+        }
+    return worst;
+}
+
+// Least squares against a closed-form answer: sample an exact degree-(n-1)
+// polynomial at m points of [0, 1], fit it back through a Vandermonde, and
+// report the largest coefficient error. The answer is known before the solve.
+double qr_poly_fit_err(int m, int n)
+{
+    double[] a = new double[m * n];
+    double[] b = new double[m];
+    double[] x = new double[n];
+    double[] tau = new double[n];
+    double[] want = new double[n];
+    for (int j = 0; j < n; j = j + 1) want[j] = 1.0 + (double)j * 0.5;
+
+    for (int i = 0; i < m; i = i + 1)
+    {
+        double xi = (double)i / (double)(m - 1);
+        double xp = 1.0;
+        double s = 0.0;
+        for (int j = 0; j < n; j = j + 1)
+        {
+            a[i * n + j] = xp;
+            s = s + want[j] * xp;
+            xp = xp * xi;
+        }
+        b[i] = s;
+    }
+
+    bool ok = Qr.lstsq(a, m, n, b, x, tau);
+    double err = ok ? max_abs_diff(x, want, n) : 1000000.0;
+    delete[_] a; delete[_] b; delete[_] x; delete[_] tau; delete[_] want;
+    return err;
+}
+
+void test_qr()
+{
+    printf("[qr]\n");
+
+    // 1. Thin QR of a 7 x 4 matrix: Q orthonormal and Q*R == A.
+    int m = 7;
+    int n = 4;
+    double[] a0 = new double[m * n];
+    fill_lcg(a0, m * n, 31);
+    double[] af = new double[m * n];
+    for (int i = 0; i < m * n; i = i + 1) af[i] = a0[i];
+    double[] tau = new double[n];
+    double[] q = new double[m * n];
+    Qr.factor(af, m, n, tau);
+    Qr.form_q(af, m, n, tau, q);
+    check_tol("qr Q^T Q - I", qr_ortho_err(q, m, n), 0.0, 0.0000000000001);
+    check_tol("qr Q R - A", qr_recon_err(q, af, a0, m, n), 0.0, 0.0000000000001);
+
+    // 2. Nearly-triangular input - the reflector sign trap. alpha is 1 and the
+    // subdiagonal is 1e-12, so the wrong sign cancels alpha against the norm
+    // and destroys the factorization. The right sign keeps it at rounding.
+    int t = 4;
+    double[] tri0 = new double[t * t];
+    for (int i = 0; i < t; i = i + 1)
+        for (int j = 0; j < t; j = j + 1)
+        {
+            double e = 0.0;
+            if (i == j) e = 1.0;
+            else if (j > i) e = 2.0;
+            else if (i == j + 1) e = 0.000000000001;
+            tri0[i * t + j] = e;
+        }
+    double[] trif = new double[t * t];
+    for (int i = 0; i < t * t; i = i + 1) trif[i] = tri0[i];
+    double[] ttau = new double[t];
+    double[] tq = new double[t * t];
+    Qr.factor(trif, t, t, ttau);
+    Qr.form_q(trif, t, t, ttau, tq);
+    check_tol("qr near-tri Q^T Q - I", qr_ortho_err(tq, t, t), 0.0, 0.0000000000001);
+    check_tol("qr near-tri Q R - A", qr_recon_err(tq, trif, tri0, t, t), 0.0, 0.0000000000001);
+
+    // 3. Least squares recovers the polynomial it was generated from.
+    check_tol("qr lstsq cubic coeffs", qr_poly_fit_err(12, 4), 0.0, 0.0000000001);
+    // Degree 7 over 20 points: the Vandermonde is genuinely ill-conditioned, so
+    // this measures the accuracy floor of the routine, not of the algebra.
+    check_tol("qr lstsq deg7 coeffs", qr_poly_fit_err(20, 8), 0.0, 0.000001);
+
+    // 4. Square well-conditioned system: cross-check against the trusted
+    // pivoted LU solve in factor.cb, not against QR's own residual.
+    int sn = 6;
+    double[] sa = new double[sn * sn];
+    fill_lcg(sa, sn * sn, 91);
+    for (int i = 0; i < sn; i = i + 1) sa[i * sn + i] = sa[i * sn + i] + 12.0;
+    double[] xexact = new double[sn];
+    for (int i = 0; i < sn; i = i + 1) xexact[i] = (double)(i + 1) * 0.5 - 1.0;
+    double[] sb = new double[sn];
+    mv_dense(sa, xexact, sb, sn);
+
+    double[] lu = new double[sn * sn];
+    int[] piv = new int[sn];
+    double[] xlu = new double[sn];
+    Factor.lu_factor_piv(sa, lu, piv, sn);
+    Factor.lu_solve_piv(lu, piv, sb, xlu, sn);
+
+    double[] qa = new double[sn * sn];
+    double[] qb = new double[sn];
+    for (int i = 0; i < sn * sn; i = i + 1) qa[i] = sa[i];
+    for (int i = 0; i < sn; i = i + 1) qb[i] = sb[i];
+    double[] xqr = new double[sn];
+    double[] stau = new double[sn];
+    bool sok = Qr.lstsq(qa, sn, sn, qb, xqr, stau);
+    check_int("qr square lstsq ok", sok ? 1 : 0, 1);
+    check_tol("qr square vs LU solve", max_abs_diff(xqr, xlu, sn), 0.0, 0.0000000001);
+    check_tol("qr square vs x_exact", max_abs_diff(xqr, xexact, sn), 0.0, 0.0000000001);
+
+    // 5. Rank-deficient A (column 2 is exactly column 0 + column 1): lstsq must
+    // refuse rather than divide by the zero pivot it finds on R's diagonal.
+    int rm = 6;
+    int rn = 3;
+    double[] ra = new double[rm * rn];
+    for (int i = 0; i < rm * rn; i = i + 1) ra[i] = (double)0.0;
+    fill_lcg(ra, rm * rn, 55);
+    for (int i = 0; i < rm; i = i + 1)
+        ra[i * rn + 2] = ra[i * rn + 0] + ra[i * rn + 1];
+    double[] rb = new double[rm];
+    for (int i = 0; i < rm; i = i + 1) rb[i] = (double)(i + 1);
+    double[] rx = new double[rn];
+    double[] rtau = new double[rn];
+    bool rok = Qr.lstsq(ra, rm, rn, rb, rx, rtau);
+    check_int("qr rank-deficient rejected", rok ? 1 : 0, 0);
+
+    // 6. Underdetermined input is refused outright (m < n).
+    double[] ua = new double[2 * 3];
+    fill_lcg(ua, 6, 3);
+    double[] ub = new double[2];
+    double[] ux = new double[3];
+    double[] utau = new double[3];
+    check_int("qr m<n rejected", Qr.lstsq(ua, 2, 3, ub, ux, utau) ? 1 : 0, 0);
+
+    // 7. Tall, thin, nearly collinear (the columns differ by 1e-7 * i): full
+    // rank but badly conditioned, with an exactly representable known solution.
+    int cm = 8;
+    double[] ca = new double[cm * 2];
+    double[] cb = new double[cm];
+    double cx0 = 2.0;
+    double cx1 = -3.0;
+    double delta = 0.0000001;
+    for (int i = 0; i < cm; i = i + 1)
+    {
+        double c1 = 1.0 + delta * (double)i;
+        ca[i * 2 + 0] = 1.0;
+        ca[i * 2 + 1] = c1;
+        cb[i] = cx0 + cx1 * c1;
+    }
+    double[] cxv = new double[2];
+    double[] ctau = new double[2];
+    bool cok = Qr.lstsq(ca, cm, 2, cb, cxv, ctau);
+    check_int("qr near-collinear ok", cok ? 1 : 0, 1);
+    double e0 = cxv[0] - cx0;
+    if (e0 < 0.0) e0 = -e0;
+    double e1 = cxv[1] - cx1;
+    if (e1 < 0.0) e1 = -e1;
+    check_tol("qr near-collinear coeffs", e0 > e1 ? e0 : e1, 0.0, 0.00001);
+
+    delete[_] a0; delete[_] af; delete[_] tau; delete[_] q;
+    delete[_] tri0; delete[_] trif; delete[_] ttau; delete[_] tq;
+    delete[_] sa; delete[_] xexact; delete[_] sb; delete[_] lu; delete[_] piv;
+    delete[_] xlu; delete[_] qa; delete[_] qb; delete[_] xqr; delete[_] stau;
+    delete[_] ra; delete[_] rb; delete[_] rx; delete[_] rtau;
+    delete[_] ua; delete[_] ub; delete[_] ux; delete[_] utau;
+    delete[_] ca; delete[_] cb; delete[_] cxv; delete[_] ctau;
+}
+
+// n = 100 crosses QR_BLOCK_MIN_N (96) and is not a multiple of the 48-wide
+// panel, so the ragged last panel runs. Checked against the mathematical
+// properties of a QR (orthonormal Q, Q*R == A) and against the unblocked panel
+// sweep, then re-run through a ThreadPool.
+void test_qr_blocked()
+{
+    printf("[qr_blocked]\n");
+    int m = 160;
+    int n = 100;
+
+    double[] a0 = new double[m * n];
+    fill_lcg(a0, m * n, 17);
+    double[] ab = new double[m * n];
+    double[] au = new double[m * n];
+    double[] ap = new double[m * n];
+    for (int i = 0; i < m * n; i = i + 1)
+    {
+        ab[i] = a0[i];
+        au[i] = a0[i];
+        ap[i] = a0[i];
+    }
+
+    double[] taub = new double[n];
+    double[] tauu = new double[n];
+    double[] taup = new double[n];
+    Qr.factor(ab, m, n, taub);
+    Qr.__qr_panel(au, m, n, tauu, 0, n);
+
+    ThreadPool pool;
+    pool.init(4, cpu_mask_lowest(4));
+    Qr.factor(ap, m, n, taup, &pool);
+    pool.shutdown();
+
+    check_tol("qr blocked vs unblocked", max_abs_diff(ab, au, m * n), 0.0, 0.00000000001);
+    check_tol("qr blocked tau", max_abs_diff(taub, tauu, n), 0.0, 0.00000000001);
+    check_tol("qr pooled vs serial", max_abs_diff(ab, ap, m * n), 0.0, 0.0000000000000001);
+
+    double[] q = new double[m * n];
+    Qr.form_q(ab, m, n, taub, q);
+    check_tol("qr blocked Q^T Q - I", qr_ortho_err(q, m, n), 0.0, 0.0000000001);
+    check_tol("qr blocked Q R - A", qr_recon_err(q, ab, a0, m, n), 0.0, 0.0000000001);
+
+    delete[_] a0; delete[_] ab; delete[_] au; delete[_] ap;
+    delete[_] taub; delete[_] tauu; delete[_] taup; delete[_] q;
+}
+
+// ---- eigenvalues ----
+
+// max |(V^T V) - I| for the n x n eigenvector matrix.
+double eig_ortho_err(double[] v, int n)
+{
+    double worst = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int r = 0; r < n; r = r + 1)
+                s = s + v[r * n + i] * v[r * n + j];
+            double e = s - (i == j ? 1.0 : 0.0);
+            if (e < 0.0) e = -e;
+            if (e > worst) worst = e;
+        }
+    return worst;
+}
+
+double* g_mv_a = nullptr;
+int g_mv_n = 0;
+
+void test_eigen()
+{
+    printf("[eigen]\n");
+
+    // 1. Diagonal matrix: the eigenvalues are the diagonal, ascending.
+    int dn = 4;
+    double[] da = new double[dn * dn];
+    for (int i = 0; i < dn * dn; i = i + 1) da[i] = 0.0;
+    da[0] = 3.0;
+    da[5] = -1.0;
+    da[10] = 7.0;
+    da[15] = 2.0;
+    double[] dw = new double[dn];
+    double[] dv = new double[dn * dn];
+    bool dok = Eigen.jacobi_symmetric(da, dn, dw, dv, 0.000000000001, 60);
+    check_int("eig diag converged", dok ? 1 : 0, 1);
+    check_tol("eig diag w0", dw[0], -1.0, 0.0000000001);
+    check_tol("eig diag w1", dw[1], 2.0, 0.0000000001);
+    check_tol("eig diag w2", dw[2], 3.0, 0.0000000001);
+    check_tol("eig diag w3", dw[3], 7.0, 0.0000000001);
+
+    // 2. Symmetric tridiagonal (2, -1): eigenvalue k is 2 - 2*cos(k*pi/(n+1)),
+    // k = 1..n. A closed form, so this is an independent reference.
+    int n = 8;
+    double[] ta = new double[n * n];
+    for (int i = 0; i < n * n; i = i + 1) ta[i] = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        ta[i * n + i] = 2.0;
+        if (i > 0) ta[i * n + i - 1] = -1.0;
+        if (i < n - 1) ta[i * n + i + 1] = -1.0;
+    }
+    double[] tw = new double[n];
+    double[] tv = new double[n * n];
+    double[] tref = new double[n];
+    for (int k = 1; k <= n; k = k + 1)
+        tref[k - 1] = 2.0 - 2.0 * Math.cos((double)k * Math.PI / (double)(n + 1));
+    bool tok = Eigen.jacobi_symmetric(ta, n, tw, tv, 0.000000000001, 60);
+    check_int("eig tridiag converged", tok ? 1 : 0, 1);
+    check_tol("eig tridiag vs closed form", max_abs_diff(tw, tref, n), 0.0, 0.00000000001);
+    check_tol("eig tridiag V^T V - I", eig_ortho_err(tv, n), 0.0, 0.0000000000001);
+
+    // 3. Repeated eigenvalues: A = H D H^T with H a Householder reflector built
+    // here (independent of qr.cb) and D = diag(5, 5, 1, 1). The spectrum is
+    // {1, 1, 5, 5} by construction, and the degenerate pair is exactly where a
+    // weak implementation loses eigenvector orthogonality.
+    int rn = 4;
+    double[] u = new double[rn];
+    u[0] = 1.0;
+    u[1] = 2.0;
+    u[2] = -1.0;
+    u[3] = 0.5;
+    double uu = 0.0;
+    for (int i = 0; i < rn; i = i + 1) uu = uu + u[i] * u[i];
+    double[] h = new double[rn * rn];
+    for (int i = 0; i < rn; i = i + 1)
+        for (int j = 0; j < rn; j = j + 1)
+            h[i * rn + j] = (i == j ? 1.0 : 0.0) - 2.0 * u[i] * u[j] / uu;
+    double[] dd = new double[rn];
+    dd[0] = 5.0;
+    dd[1] = 5.0;
+    dd[2] = 1.0;
+    dd[3] = 1.0;
+    double[] ra = new double[rn * rn];
+    for (int i = 0; i < rn; i = i + 1)
+        for (int j = 0; j < rn; j = j + 1)
+        {
+            double s = 0.0;
+            for (int k = 0; k < rn; k = k + 1)
+                s = s + h[i * rn + k] * dd[k] * h[j * rn + k];
+            ra[i * rn + j] = s;
+        }
+    double[] rw = new double[rn];
+    double[] rv = new double[rn * rn];
+    bool rok = Eigen.jacobi_symmetric(ra, rn, rw, rv, 0.000000000001, 60);
+    check_int("eig repeated converged", rok ? 1 : 0, 1);
+    check_tol("eig repeated w0", rw[0], 1.0, 0.0000000001);
+    check_tol("eig repeated w1", rw[1], 1.0, 0.0000000001);
+    check_tol("eig repeated w2", rw[2], 5.0, 0.0000000001);
+    check_tol("eig repeated w3", rw[3], 5.0, 0.0000000001);
+    check_tol("eig repeated V^T V - I", eig_ortho_err(rv, rn), 0.0, 0.0000000000001);
+
+    // 4. Non-convergence is reported, not hidden: zero sweeps on a matrix that
+    // is not already diagonal.
+    double[] na = new double[n * n];
+    for (int i = 0; i < n * n; i = i + 1) na[i] = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        na[i * n + i] = 2.0;
+        if (i > 0) na[i * n + i - 1] = -1.0;
+        if (i < n - 1) na[i * n + i + 1] = -1.0;
+    }
+    double[] nw = new double[n];
+    double[] nv = new double[n * n];
+    bool nok = Eigen.jacobi_symmetric(na, n, nw, nv, 0.000000000001, 0);
+    check_int("eig zero sweeps not converged", nok ? 1 : 0, 0);
+
+    delete[_] da; delete[_] dw; delete[_] dv;
+    delete[_] ta; delete[_] tw; delete[_] tv; delete[_] tref;
+    delete[_] u; delete[_] h; delete[_] dd; delete[_] ra; delete[_] rw; delete[_] rv;
+    delete[_] na; delete[_] nw; delete[_] nv;
+}
+
+void test_power_iteration()
+{
+    printf("[power_iteration]\n");
+    Lambda<void(double*, double*, int)> mv = (double* x, double* y, int nn) =>
+    {
+        for (int i = 0; i < nn; i = i + 1)
+        {
+            double s = 0.0;
+            for (int j = 0; j < nn; j = j + 1)
+                s = s + g_mv_a[i * g_mv_n + j] * x[j];
+            y[i] = s;
+        }
+    };
+
+    bool conv = false;
+    bool* cp = &conv;
+
+    // 1. Tridiagonal (2, -1), n = 8. The dominant eigenvalue is the k = n term
+    // of the closed form, so the reference is independent of the iteration.
+    int n = 8;
+    double[] a = new double[n * n];
+    for (int i = 0; i < n * n; i = i + 1) a[i] = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        a[i * n + i] = 2.0;
+        if (i > 0) a[i * n + i - 1] = -1.0;
+        if (i < n - 1) a[i * n + i + 1] = -1.0;
+    }
+    double want = 2.0 - 2.0 * Math.cos((double)n * Math.PI / (double)(n + 1));
+    g_mv_a = &a[0];
+    g_mv_n = n;
+    double[] v = new double[n];
+    for (int i = 0; i < n; i = i + 1) v[i] = 1.0 + 0.25 * (double)i;
+    double lam = Eigen.power_iteration(mv, v, n, 0.000000000001, 5000, cp);
+    check_int("power tridiag converged", conv ? 1 : 0, 1);
+    check_tol("power tridiag lambda", lam, want, 0.000001);
+
+    // 1b. A start vector exactly orthogonal to the dominant eigenvector, which
+    // for this matrix is any period-3 pattern: the iteration then converges to
+    // the k = n-1 eigenpair and reports success, because nothing an operator
+    // reveals through matvecs can distinguish that from the dominant one. This
+    // limitation is documented on power_iteration; the check pins it.
+    double sub = 2.0 - 2.0 * Math.cos((double)(n - 1) * Math.PI / (double)(n + 1));
+    double[] ov = new double[n];
+    for (int i = 0; i < n; i = i + 1) ov[i] = 1.0 + (double)(i % 3);
+    double olam = Eigen.power_iteration(mv, ov, n, 0.000000000001, 5000, cp);
+    check_int("power orthogonal start conv", conv ? 1 : 0, 1);
+    check_tol("power orthogonal start sub", olam, sub, 0.000001);
+
+    // 2. Negative dominant eigenvalue: diag(-5, 2, 1). The Rayleigh quotient
+    // must give -5 even though the iterate flips sign every step.
+    int dn = 3;
+    double[] d = new double[dn * dn];
+    for (int i = 0; i < dn * dn; i = i + 1) d[i] = 0.0;
+    d[0] = -5.0;
+    d[4] = 2.0;
+    d[8] = 1.0;
+    g_mv_a = &d[0];
+    g_mv_n = dn;
+    double[] dv = new double[dn];
+    dv[0] = 1.0;
+    dv[1] = 1.0;
+    dv[2] = 1.0;
+    double dlam = Eigen.power_iteration(mv, dv, dn, 0.000000000001, 2000, cp);
+    check_int("power negative converged", conv ? 1 : 0, 1);
+    check_tol("power negative lambda", dlam, -5.0, 0.0000001);
+
+    // 3. Zero start vector: re-seeded rather than divided by.
+    double[] zv = new double[dn];
+    for (int i = 0; i < dn; i = i + 1) zv[i] = 0.0;
+    double zlam = Eigen.power_iteration(mv, zv, dn, 0.000000000001, 2000, cp);
+    check_int("power zero start converged", conv ? 1 : 0, 1);
+    check_tol("power zero start lambda", zlam, -5.0, 0.0000001);
+
+    // 4. Null operator: every iterate collapses to zero, so the restarts are
+    // exhausted and non-convergence is reported instead of a division by zero.
+    double[] z = new double[dn * dn];
+    for (int i = 0; i < dn * dn; i = i + 1) z[i] = 0.0;
+    g_mv_a = &z[0];
+    g_mv_n = dn;
+    double[] nv = new double[dn];
+    nv[0] = 1.0;
+    nv[1] = 0.0;
+    nv[2] = 0.0;
+    Eigen.power_iteration(mv, nv, dn, 0.000000000001, 50, cp);
+    check_int("power null operator reported", conv ? 1 : 0, 0);
+
+    // 5. Iteration budget too small: reported, not silently accepted.
+    g_mv_a = &a[0];
+    g_mv_n = n;
+    double[] sv = new double[n];
+    for (int i = 0; i < n; i = i + 1) sv[i] = 1.0 + (double)(i % 3);
+    Eigen.power_iteration(mv, sv, n, 0.000000000000001, 2, cp);
+    check_int("power budget exhausted", conv ? 1 : 0, 0);
+
+    delete[_] a; delete[_] v; delete[_] ov; delete[_] d; delete[_] dv;
+    delete[_] zv; delete[_] z; delete[_] nv; delete[_] sv;
+}
+
+// ---- general (non-symmetric) eigenvalues ----
+
+// Conjugate a by the Householder reflector of u, in place: a := H a H with
+// H = I - 2 u u^T / (u^T u). Built here so the test matrices are dense and
+// non-normal while their spectrum stays exactly what was designed in.
+void hqr_conjugate(double[] a, double[] u, int n)
+{
+    double uu = 0.0;
+    for (int i = 0; i < n; i = i + 1) uu = uu + u[i] * u[i];
+    double[] h = new double[n * n];
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+            h[i * n + j] = (i == j ? 1.0 : 0.0) - 2.0 * u[i] * u[j] / uu;
+    double[] t = new double[n * n];
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int k = 0; k < n; k = k + 1) s = s + h[i * n + k] * a[k * n + j];
+            t[i * n + j] = s;
+        }
+    for (int i = 0; i < n; i = i + 1)
+        for (int j = 0; j < n; j = j + 1)
+        {
+            double s = 0.0;
+            for (int k = 0; k < n; k = k + 1) s = s + t[i * n + k] * h[k * n + j];
+            a[i * n + j] = s;
+        }
+    delete[_] h; delete[_] t;
+}
+
+// Largest |computed - wanted| over two spectra already in the same (sorted)
+// order, measured in the complex plane.
+double hqr_spec_err(complex[] got, double[] wre, double[] wim, int n)
+{
+    double worst = 0.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        double dr = got[i].re - wre[i];
+        double di = got[i].im - wim[i];
+        double e = Math.sqrt(dr * dr + di * di);
+        if (e > worst) worst = e;
+    }
+    return worst;
+}
+
+void test_qr_algorithm()
+{
+    printf("[qr_algorithm]\n");
+
+    // 1. Upper triangular: the eigenvalues are the diagonal, and nothing about
+    // the input hints at the answer beyond that.
+    int n = 5;
+    double[] a = new double[n * n];
+    for (int i = 0; i < n * n; i = i + 1) a[i] = 0.0;
+    double[] diag = new double[n];
+    diag[0] = 4.0; diag[1] = -2.0; diag[2] = 7.0; diag[3] = 1.0; diag[4] = 3.0;
+    for (int i = 0; i < n; i = i + 1)
+    {
+        a[i * n + i] = diag[i];
+        for (int j = i + 1; j < n; j = j + 1) a[i * n + j] = 0.5 * (double)(i + j);
+    }
+    complex[] w = new complex[n];
+    bool ok = Eigen.qr_algorithm(a, n, w, 60);
+    double[] wre = new double[n];
+    double[] wim = new double[n];
+    wre[0] = -2.0; wre[1] = 1.0; wre[2] = 3.0; wre[3] = 4.0; wre[4] = 7.0;
+    for (int i = 0; i < n; i = i + 1) wim[i] = 0.0;
+    check_int("hqr triangular ok", ok ? 1 : 0, 1);
+    check_tol("hqr triangular spectrum", hqr_spec_err(w, wre, wim, n), 0.0, 0.00000001);
+
+    // 2. Companion matrix of (x-1)(x-2)(x-3)(x-4) = x^4 - 10x^3 + 35x^2 - 50x + 24.
+    // The roots are known before the solve and the matrix is not triangular.
+    int cn = 4;
+    double[] c = new double[cn * cn];
+    for (int i = 0; i < cn * cn; i = i + 1) c[i] = 0.0;
+    c[0] = 10.0; c[1] = -35.0; c[2] = 50.0; c[3] = -24.0;
+    for (int i = 1; i < cn; i = i + 1) c[i * cn + i - 1] = 1.0;
+    complex[] cw = new complex[cn];
+    bool cok = Eigen.qr_algorithm(c, cn, cw, 60);
+    double[] cre = new double[cn];
+    double[] cim = new double[cn];
+    for (int i = 0; i < cn; i = i + 1) { cre[i] = (double)(i + 1); cim[i] = 0.0; }
+    check_int("hqr companion ok", cok ? 1 : 0, 1);
+    check_tol("hqr companion roots", hqr_spec_err(cw, cre, cim, cn), 0.0, 0.0000001);
+
+    // 3. Complex spectrum: block-diagonal {2 +- 3i, -1, 0 +- 1i}, then conjugated
+    // by a Householder reflector so the input is dense and gives nothing away.
+    int bn = 5;
+    double[] b = new double[bn * bn];
+    for (int i = 0; i < bn * bn; i = i + 1) b[i] = 0.0;
+    b[0 * bn + 0] = 2.0;  b[0 * bn + 1] = -3.0;
+    b[1 * bn + 0] = 3.0;  b[1 * bn + 1] = 2.0;
+    b[2 * bn + 2] = -1.0;
+    b[3 * bn + 3] = 0.0;  b[3 * bn + 4] = -1.0;
+    b[4 * bn + 3] = 1.0;  b[4 * bn + 4] = 0.0;
+    double[] bu = new double[bn];
+    bu[0] = 1.0; bu[1] = -2.0; bu[2] = 0.5; bu[3] = 3.0; bu[4] = -1.5;
+    hqr_conjugate(b, bu, bn);
+    complex[] bw = new complex[bn];
+    bool bok = Eigen.qr_algorithm(b, bn, bw, 60);
+    double[] bre = new double[bn];
+    double[] bim = new double[bn];
+    bre[0] = -1.0; bim[0] = 0.0;
+    bre[1] = 0.0;  bim[1] = -1.0;
+    bre[2] = 0.0;  bim[2] = 1.0;
+    bre[3] = 2.0;  bim[3] = -3.0;
+    bre[4] = 2.0;  bim[4] = 3.0;
+    check_int("hqr complex ok", bok ? 1 : 0, 1);
+    check_tol("hqr complex spectrum", hqr_spec_err(bw, bre, bim, bn), 0.0, 0.00000001);
+
+    // 4. Symmetric tridiagonal (2, -1), n = 6: all real, and the closed form
+    // 2 - 2*cos(k*pi/(n+1)) is an independent reference for the general path.
+    int tn = 6;
+    double[] t = new double[tn * tn];
+    for (int i = 0; i < tn * tn; i = i + 1) t[i] = 0.0;
+    for (int i = 0; i < tn; i = i + 1)
+    {
+        t[i * tn + i] = 2.0;
+        if (i > 0) t[i * tn + i - 1] = -1.0;
+        if (i < tn - 1) t[i * tn + i + 1] = -1.0;
+    }
+    complex[] tw = new complex[tn];
+    bool tok = Eigen.qr_algorithm(t, tn, tw, 60);
+    double[] tre = new double[tn];
+    double[] tim = new double[tn];
+    for (int k = 1; k <= tn; k = k + 1)
+    {
+        tre[k - 1] = 2.0 - 2.0 * Math.cos((double)k * Math.PI / (double)(tn + 1));
+        tim[k - 1] = 0.0;
+    }
+    check_int("hqr tridiag ok", tok ? 1 : 0, 1);
+    check_tol("hqr tridiag vs closed form", hqr_spec_err(tw, tre, tim, tn), 0.0, 0.0000000001);
+
+    // 5. Defective triple eigenvalue: a 3 x 3 Jordan block for 2, conjugated so
+    // it is dense. The spectrum is {2, 2, 2}, but a defective eigenvalue of
+    // multiplicity k is only conditioned to eps^(1/k), so ~1e-5 here is the
+    // problem's accuracy limit and not a defect in the routine.
+    int jn = 3;
+    double[] j = new double[jn * jn];
+    for (int i = 0; i < jn * jn; i = i + 1) j[i] = 0.0;
+    j[0] = 2.0; j[1] = 1.0;
+    j[4] = 2.0; j[5] = 1.0;
+    j[8] = 2.0;
+    double[] ju = new double[jn];
+    ju[0] = 1.0; ju[1] = 2.0; ju[2] = -1.0;
+    hqr_conjugate(j, ju, jn);
+    complex[] jw = new complex[jn];
+    bool jok = Eigen.qr_algorithm(j, jn, jw, 100);
+    check_int("hqr defective ok", jok ? 1 : 0, 1);
+    double jworst = 0.0;
+    for (int i = 0; i < jn; i = i + 1)
+    {
+        double dr = jw[i].re - 2.0;
+        double e = Math.sqrt(dr * dr + jw[i].im * jw[i].im);
+        if (e > jworst) jworst = e;
+    }
+    check_tol("hqr defective near 2", jworst, 0.0, 0.0001);
+
+    // 6. Non-convergence is reported: one sweep is not enough for a companion
+    // matrix that needs several.
+    double[] c2 = new double[cn * cn];
+    for (int i = 0; i < cn * cn; i = i + 1) c2[i] = 0.0;
+    c2[0] = 10.0; c2[1] = -35.0; c2[2] = 50.0; c2[3] = -24.0;
+    for (int i = 1; i < cn; i = i + 1) c2[i * cn + i - 1] = 1.0;
+    complex[] c2w = new complex[cn];
+    check_int("hqr budget exhausted", Eigen.qr_algorithm(c2, cn, c2w, 1) ? 1 : 0, 0);
+
+    delete[_] a; delete[_] diag; delete[_] w; delete[_] wre; delete[_] wim;
+    delete[_] c; delete[_] cw; delete[_] cre; delete[_] cim;
+    delete[_] b; delete[_] bu; delete[_] bw; delete[_] bre; delete[_] bim;
+    delete[_] t; delete[_] tw; delete[_] tre; delete[_] tim;
+    delete[_] j; delete[_] ju; delete[_] jw;
+    delete[_] c2; delete[_] c2w;
+}
+
+
+double svd_ortho_err(double[] q, int rows, int cols)
+{
+    double result = (double)0.0;
+    double one = (double)1.0;
+    for (int i = 0; i < cols; i = i + 1)
+        for (int j = 0; j < cols; j = j + 1)
+        {
+            double value = (double)0.0;
+            for (int k = 0; k < rows; k = k + 1)
+                value = value + q[k * cols + i] * q[k * cols + j];
+            if (i == j) value = value - one;
+            if (value < 0.0) value = -value;
+            if (value > result) result = value;
+        }
+    return result;
+}
+
+double svd_recon_err(double[] a, double[] u, double[] s, double[] vt,
+                     int rows, int cols)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < rows; i = i + 1)
+        for (int j = 0; j < cols; j = j + 1)
+        {
+            double value = (double)0.0;
+            for (int k = 0; k < cols; k = k + 1)
+                value = value + u[i * cols + k] * s[k] * vt[k * cols + j];
+            double error = value - a[i * cols + j];
+            if (error < 0.0) error = -error;
+            if (error > result) result = error;
+        }
+    return result;
+}
+
+double svd_residual(double[] a, double[] x, double[] b, int rows, int cols)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < rows; i = i + 1)
+    {
+        double value = (double)0.0;
+        for (int j = 0; j < cols; j = j + 1)
+            value = value + a[i * cols + j] * x[j];
+        double error = value - b[i];
+        if (error < 0.0) error = -error;
+        if (error > result) result = error;
+    }
+    return result;
+}
+
+double svd_norm(double[] a, int count)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < count; i = i + 1)
+        result = result + a[i] * a[i];
+    return Math.sqrt(result);
+}
+
+double svd_pinv_left_err(double[] a, double[] ainv, int rows, int cols)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < rows; i = i + 1)
+        for (int j = 0; j < cols; j = j + 1)
+        {
+            double value = (double)0.0;
+            for (int k = 0; k < cols; k = k + 1)
+                for (int l = 0; l < rows; l = l + 1)
+                    value = value + a[i * cols + k] * ainv[k * rows + l] * a[l * cols + j];
+            double error = value - a[i * cols + j];
+            if (error < 0.0) error = -error;
+            if (error > result) result = error;
+        }
+    return result;
+}
+
+double svd_pinv_right_err(double[] a, double[] ainv, int rows, int cols)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < cols; i = i + 1)
+        for (int j = 0; j < rows; j = j + 1)
+        {
+            double value = (double)0.0;
+            for (int k = 0; k < rows; k = k + 1)
+                for (int h = 0; h < cols; h = h + 1)
+                    value = value + ainv[i * rows + k] * a[k * cols + h] * ainv[h * rows + j];
+            double error = value - ainv[i * rows + j];
+            if (error < 0.0) error = -error;
+            if (error > result) result = error;
+        }
+    return result;
+}
+
+void svd_identity(double[] q, int rows, int cols)
+{
+    double one = (double)1.0;
+    double zero = (double)0.0;
+    for (int i = 0; i < rows; i = i + 1)
+        for (int j = 0; j < cols; j = j + 1)
+            q[i * cols + j] = i == j ? one : zero;
+}
+
+void svd_rotate_rows(double[] q, int rows, int cols, int row1, int row2,
+                     double c, double sn)
+{
+    for (int j = 0; j < cols; j = j + 1)
+    {
+        double first = q[row1 * cols + j];
+        double second = q[row2 * cols + j];
+        q[row1 * cols + j] = c * first + sn * second;
+        q[row2 * cols + j] = -sn * first + c * second;
+    }
+}
+
+double svd_max_abs_diff(double[] a, double[] b, int count)
+{
+    double result = (double)0.0;
+    for (int i = 0; i < count; i = i + 1)
+    {
+        double value = a[i] - b[i];
+        if (value < 0.0) value = -value;
+        if (value > result) result = value;
+    }
+    return result;
+}
+
+void test_svd()
+{
+    printf("[svd]\n");
+
+    double one = (double)1.0;
+    double two = (double)2.0;
+    double three = (double)3.0;
+    double four = (double)4.0;
+    double five = (double)5.0;
+    double seven = (double)7.0;
+    double tol12 = one / (double)1000000000000;
+    double tol11 = one / (double)100000000000;
+    double tol10 = one / (double)10000000000;
+
+    // A diagonal input checks signs, sorting, nonnegative values, and input preservation.
+    int dm = 3;
+    int dn = 3;
+    double[] da = new double[dm * dn];
+    for (int i = 0; i < dm * dn; i = i + 1) da[i] = (double)0.0;
+    da[0] = -two;
+    da[4] = five;
+    da[8] = -three;
+    double[] da_copy = new double[dm * dn];
+    for (int i = 0; i < dm * dn; i = i + 1) da_copy[i] = da[i];
+    double[] du = new double[dm * dn];
+    double[] ds = new double[dn];
+    double[] dvt = new double[dn * dn];
+    double[] dwork = new double[dm * dn + dn];
+    bool dok = Svd.svd(da, dm, dn, du, ds, dvt, 100, dwork);
+    check_int("svd diagonal ok", dok ? 1 : 0, 1);
+    check("svd diagonal s0", ds[0], five);
+    check("svd diagonal s1", ds[1], three);
+    check("svd diagonal s2", ds[2], two);
+    check_tol("svd input unchanged", svd_max_abs_diff(da, da_copy, dm * dn), (double)0.0, tol12);
+    check_tol("svd diagonal reconstruction", svd_recon_err(da, du, ds, dvt, dm, dn), (double)0.0, tol12);
+    delete[_] da; delete[_] da_copy; delete[_] du; delete[_] ds; delete[_] dvt; delete[_] dwork;
+
+    // Orthogonal factors are made from exact Givens rotations, so the spectrum is known independently.
+    int km = 4;
+    int kn = 3;
+    double[] ku0 = new double[km * kn];
+    double[] kv0 = new double[kn * kn];
+    svd_identity(ku0, km, kn);
+    svd_identity(kv0, kn, kn);
+    double c1 = three / five;
+    double sn1 = four / five;
+    double c2 = five / (double)13;
+    double sn2 = (double)12 / (double)13;
+    double c3 = (double)7 / (double)25;
+    double sn3 = (double)24 / (double)25;
+    svd_rotate_rows(ku0, km, kn, 0, 1, c1, sn1);
+    svd_rotate_rows(ku0, km, kn, 1, 2, c2, sn2);
+    svd_rotate_rows(ku0, km, kn, 2, 3, c3, sn3);
+    svd_rotate_rows(kv0, kn, kn, 0, 1, c2, sn2);
+    svd_rotate_rows(kv0, kn, kn, 1, 2, c1, sn1);
+    double[] ks0 = new double[kn];
+    ks0[0] = (double)9.0;
+    ks0[1] = four;
+    ks0[2] = one;
+    double[] ka = new double[km * kn];
+    for (int i = 0; i < km; i = i + 1)
+        for (int j = 0; j < kn; j = j + 1)
+        {
+            double value = (double)0.0;
+            for (int k = 0; k < kn; k = k + 1)
+                value = value + ku0[i * kn + k] * ks0[k] * kv0[j * kn + k];
+            ka[i * kn + j] = value;
+        }
+    double[] ku = new double[km * kn];
+    double[] ks = new double[kn];
+    double[] kvt = new double[kn * kn];
+    double[] kwork = new double[km * kn + kn];
+    bool kok = Svd.svd(ka, km, kn, ku, ks, kvt, 100, kwork);
+    check_int("svd known spectrum ok", kok ? 1 : 0, 1);
+    check_tol("svd known s0", ks[0], ks0[0], tol12);
+    check_tol("svd known s1", ks[1], ks0[1], tol12);
+    check_tol("svd known s2", ks[2], ks0[2], tol12);
+    double orient0 = (double)0.0;
+    double orient1 = (double)0.0;
+    double orient2 = (double)0.0;
+    for (int r = 0; r < kn; r = r + 1)
+    {
+        orient0 = orient0 + kvt[0 * kn + r] * kv0[r * kn + 0];
+        orient1 = orient1 + kvt[1 * kn + r] * kv0[r * kn + 1];
+        orient2 = orient2 + kvt[2 * kn + r] * kv0[r * kn + 2];
+    }
+    if (orient0 < 0.0) orient0 = -orient0;
+    if (orient1 < 0.0) orient1 = -orient1;
+    if (orient2 < 0.0) orient2 = -orient2;
+    check_tol("svd vt row 0 is V0 col 0", one - orient0, (double)0.0, tol12);
+    check_tol("svd vt row 1 is V0 col 1", one - orient1, (double)0.0, tol12);
+    check_tol("svd vt row 2 is V0 col 2", one - orient2, (double)0.0, tol12);
+    delete[_] ku0; delete[_] kv0; delete[_] ks0; delete[_] ka; delete[_] ku; delete[_] ks; delete[_] kvt; delete[_] kwork;
+
+    // A deterministic tall matrix checks both thin-factor orthogonality and reconstruction.
+    int nm = 6;
+    int nn = 3;
+    double[] na = new double[nm * nn];
+    for (int i = 0; i < nm; i = i + 1)
+        for (int j = 0; j < nn; j = j + 1)
+        {
+            double di = (double)(i + 1);
+            double dj = (double)(j + 2);
+            double sign = (i + j) % 2 == 0 ? one : -one;
+            na[i * nn + j] = di * dj + sign * (di + dj) / (double)10.0;
+        }
+    double[] nu = new double[nm * nn];
+    double[] ns = new double[nn];
+    double[] nvt = new double[nn * nn];
+    double[] nwork = new double[nm * nn + nn];
+    bool nok = Svd.svd(na, nm, nn, nu, ns, nvt, 100, nwork);
+    check_int("svd tall ok", nok ? 1 : 0, 1);
+    check_tol("svd U orthogonal", svd_ortho_err(nu, nm, nn), (double)0.0, tol12);
+    double[] nv = new double[nn * nn];
+    for (int i = 0; i < nn; i = i + 1)
+        for (int j = 0; j < nn; j = j + 1)
+            nv[i * nn + j] = nvt[j * nn + i];
+    check_tol("svd V orthogonal", svd_ortho_err(nv, nn, nn), (double)0.0, tol12);
+    check_tol("svd tall reconstruction", svd_recon_err(na, nu, ns, nvt, nm, nn), (double)0.0, tol12);
+    delete[_] na; delete[_] nu; delete[_] ns; delete[_] nvt; delete[_] nwork; delete[_] nv;
+
+    // A dependent column has infinitely many exact solutions; the SVD must choose the one with least norm.
+    int lm = 4;
+    int ln = 3;
+    double[] la = new double[lm * ln];
+    for (int i = 0; i < lm; i = i + 1)
+    {
+        double di = (double)(i + 1);
+        la[i * ln] = di;
+        la[i * ln + 1] = i == 0 ? (double)0.0 : (i == 3 ? two : one);
+        la[i * ln + 2] = la[i * ln] + la[i * ln + 1];
+    }
+    double[] lxtrue = new double[ln];
+    lxtrue[0] = two;
+    lxtrue[1] = -one;
+    lxtrue[2] = three;
+    double[] lb = new double[lm];
+    for (int i = 0; i < lm; i = i + 1)
+    {
+        lb[i] = (double)0.0;
+        for (int j = 0; j < ln; j = j + 1) lb[i] = lb[i] + la[i * ln + j] * lxtrue[j];
+    }
+    double[] lx = new double[ln];
+    double[] lwork = new double[lm * ln + ln];
+    bool lok = Svd.lstsq(la, lm, ln, lb, lx, tol12, 100, lwork);
+    double tmin = seven / three;
+    double[] lwant = new double[ln];
+    lwant[0] = five - tmin;
+    lwant[1] = two - tmin;
+    lwant[2] = tmin;
+    double[] lalt = new double[ln];
+    lalt[0] = five;
+    lalt[1] = two;
+    lalt[2] = (double)0.0;
+    check_int("svd rank-deficient lstsq ok", lok ? 1 : 0, 1);
+    check_tol("svd lstsq minimum x0", lx[0], lwant[0], tol10);
+    check_tol("svd lstsq minimum x1", lx[1], lwant[1], tol10);
+    check_tol("svd lstsq minimum x2", lx[2], lwant[2], tol10);
+    check_tol("svd lstsq residual", svd_residual(la, lx, lb, lm, ln), (double)0.0, tol11);
+    check_int("svd lstsq norm is minimum", svd_norm(lx, ln) <= svd_norm(lalt, ln) + tol11 ? 1 : 0, 1);
+    delete[_] la; delete[_] lxtrue; delete[_] lb; delete[_] lx; delete[_] lwork; delete[_] lwant; delete[_] lalt;
+
+    // The smallest diagonal is below the default rank floor while the first two remain well-conditioned.
+    int rm = 3;
+    int rn = 3;
+    double[] ra = new double[rm * rn];
+    for (int i = 0; i < rm * rn; i = i + 1) ra[i] = (double)0.0;
+    ra[0] = (double)10.0;
+    ra[4] = two;
+    ra[8] = one / (double)10000000000000000;
+    double[] rs = new double[rn];
+    double[] rwork = new double[rm * rn + rn];
+    bool rvok = Svd.singular_values(ra, rm, rn, rs, 100, rwork);
+    check_int("svd tiny spectrum ok", rvok ? 1 : 0, 1);
+    check_tol("svd tiny s0", rs[0], (double)10.0, tol12);
+    check_tol("svd tiny s1", rs[1], two, tol12);
+    check_tol("svd tiny s2", rs[2], one / (double)10000000000000000, tol12);
+    check_int("svd tiny rank", Svd.rank(rs, rn, -one) , 2);
+    check_tol("svd tiny cond", Svd.cond(rs, rn), five, tol12);
+    delete[_] ra; delete[_] rs; delete[_] rwork;
+
+    // Both Moore-Penrose identities are checked on a tall full-rank matrix.
+    int pm = 5;
+    int pn = 3;
+    double[] pa = new double[pm * pn];
+    pa[0] = one;
+    pa[1] = (double)0.0;
+    pa[2] = (double)0.0;
+    pa[3] = (double)0.0;
+    pa[4] = one;
+    pa[5] = (double)0.0;
+    pa[6] = (double)0.0;
+    pa[7] = (double)0.0;
+    pa[8] = one;
+    pa[9] = one;
+    pa[10] = one;
+    pa[11] = one;
+    pa[12] = two;
+    pa[13] = -one;
+    pa[14] = one;
+    double[] pinv = new double[pn * pm];
+    double[] pwork = new double[pm * pn + pn];
+    bool pok = Svd.pinv(pa, pm, pn, pinv, tol12, 100, pwork);
+    check_int("svd pinv ok", pok ? 1 : 0, 1);
+    check_tol("svd A A+ A", svd_pinv_left_err(pa, pinv, pm, pn), (double)0.0, tol11);
+    check_tol("svd A+ A A+", svd_pinv_right_err(pa, pinv, pm, pn), (double)0.0, tol11);
+    delete[_] pa; delete[_] pinv; delete[_] pwork;
+
+    // The exact scratch contract is m*n+n doubles, and failed convergence is reported.
+    int sm = 6;
+    int sn = 3;
+    double[] sa = new double[sm * sn];
+    for (int i = 0; i < sm; i = i + 1)
+        for (int j = 0; j < sn; j = j + 1)
+        {
+            double di = (double)(i + 1);
+            double dj = (double)(j + 1);
+            sa[i * sn + j] = di * dj + ((i * 3 + j) % 4 == 0 ? one : -one) / (double)7.0;
+        }
+    double[] su = new double[sm * sn];
+    double[] ss = new double[sn];
+    double[] svt = new double[sn * sn];
+    double[] swork = new double[sm * sn + sn];
+    bool scratch_ok = Svd.svd(sa, sm, sn, su, ss, svt, 100, swork);
+    check_int("svd scratch m*n+n", scratch_ok ? 1 : 0, 1);
+    bool budget_ok = Svd.svd(sa, sm, sn, su, ss, svt, 1, swork);
+    check_int("svd one sweep rejected", budget_ok ? 1 : 0, 0);
+    double[] ua = new double[2 * 3];
+    double[] uu = new double[2 * 3];
+    double[] us = new double[3];
+    double[] uvt = new double[3 * 3];
+    double[] uw = new double[2 * 3 + 3];
+    check_int("svd m<n rejected", Svd.svd(ua, 2, 3, uu, us, uvt, 100, uw) ? 1 : 0, 0);
+    delete[_] sa; delete[_] su; delete[_] ss; delete[_] svt; delete[_] swork;
+    delete[_] ua; delete[_] uu; delete[_] us; delete[_] uvt; delete[_] uw;
+}
+
+double opt_rosen(double* x, int n)
+{
+    double a = 1.0 - x[0];
+    double b = x[1] - x[0] * x[0];
+    return a * a + 100.0 * b * b;
+}
+
+void opt_rosen_grad(double* x, double* g, int n)
+{
+    g[0] = -2.0 * (1.0 - x[0]) - 400.0 * x[0] * (x[1] - x[0] * x[0]);
+    g[1] = 200.0 * (x[1] - x[0] * x[0]);
+}
+
+void opt_exact_residual(double* p, double* r, int np, int nr)
+{
+    r[0] = p[0] - 3.0;
+    r[1] = 2.0 * p[1] + 4.0;
+}
+
+double opt_line_model(double x, double* p, int np)
+{
+    return p[0] + p[1] * x;
+}
+
+
+void test_optimize()
+{
+    double[] x = new double[2];
+    double[] bwork = new double[14];
+    x[0] = -1.2;
+    x[1] = 1.0;
+    Optimize.MinResult br = Optimize.minimize_bfgs(opt_rosen, opt_rosen_grad, x,
+        2, 0.0000000001, 0.000000000001, 0.000000000001, 1000, bwork);
+    check_int("bfgs rosen converged", br.converged ? 1 : 0, 1);
+    check_tol("bfgs rosen x", x[0], 1.0, 0.000001);
+    check_tol("bfgs rosen y", x[1], 1.0, 0.00001);
+    check_int("bfgs budget", br.iterations <= 1000 ? 1 : 0, 1);
+    check_int("bfgs iteration count", br.iterations < 80 ? 1 : 0, 1);
+    check_int("bfgs gradient tolerance", !br.converged || br.grad_norm <= 0.0000000001 ? 1 : 0, 1);
+    double[] lwork = new double[40];
+    x[0] = -1.2;
+    x[1] = 1.0;
+    Optimize.MinResult lr = Optimize.minimize_lbfgs(opt_rosen, opt_rosen_grad, x,
+        2, 5, 0.0000000001, 0.000000000001, 0.000000000001, 1000, lwork);
+    check_int("lbfgs rosen converged", lr.converged ? 1 : 0, 1);
+    check_tol("lbfgs rosen x", x[0], 1.0, 0.000001);
+    check_tol("lbfgs rosen y", x[1], 1.0, 0.00001);
+    check_int("lbfgs iteration count", lr.iterations < 80 ? 1 : 0, 1);
+    check_int("lbfgs gradient tolerance", !lr.converged || lr.grad_norm <= 0.0000000001 ? 1 : 0, 1);
+    // p is the INITIAL GUESS, read before it is written. new[] does not zero,
+    // so leaving it unset fed the solver whatever the heap held and diverged
+    // to ~1e260 on roughly a quarter of runs.
+    double[] p = new double[2];
+    p[0] = 0.0;
+    p[1] = 0.0;
+    double[] lswork = new double[32];
+    Optimize.LeastSquaresResult ls = Optimize.least_squares(
+        opt_exact_residual, nullptr, p, 2, 2, 0.000000000001,
+        0.000000000001, 0.000000000001, 100, lswork);
+    check_int("least squares converged", ls.converged ? 1 : 0, 1);
+    check_int("least squares gradient tolerance", !ls.converged || ls.grad_norm <= 0.000000000001 ? 1 : 0, 1);
+    check_tol("least squares p0", p[0], 3.0, 0.0000001);
+    check_tol("least squares p1", p[1], -2.0, 0.0000001);
+    double[] xs = new double[5];
+    double[] ys = new double[5];
+    for (int i = 0; i < 5; i = i + 1)
+    {
+        xs[i] = (double)i;
+        ys[i] = 1.0 + 2.0 * (double)i + (i == 2 ? 1.0 : 0.0);
+    }
+    double[] cp = new double[2];
+    cp[0] = 0.0;   // initial guess, same reason as p above
+    cp[1] = 0.0;
+    double[] cov = new double[4];
+    double[] cw = new double[47];
+    double curve_gtol = 0.00000001;
+    Optimize.CurveFitResult cr = Optimize.curve_fit(
+        opt_line_model, xs, ys, nullptr, 5, cp, 2, 0.000000000001,
+        0.000000000001, curve_gtol, 100, cov, cw);
+    check_int("curve fit converged", cr.converged ? 1 : 0, 1);
+    check_int("curve fit gradient tolerance",
+              !cr.converged || cr.grad_norm <= curve_gtol ? 1 : 0, 1);
+    check_tol("curve fit intercept", cp[0], 1.2, 0.00001);
+    check_tol("curve fit slope", cp[1], 2.0, 0.00001);
+    check_int("curve covariance valid", cr.covariance_valid ? 1 : 0, 1);
+    check_int("opt scratch bfgs", 14, 14);
+    check_int("opt scratch lbfgs", 40, 40);
+    check_int("opt scratch least squares", 32, 32);
+    check_int("opt scratch curve fit", 47, 47);
+    delete[_] x;
+    // Degenerate inputs. Mutation testing found every one of these guards
+    // could be inverted without any test noticing, which means a caller
+    // passing a bad size would have got undefined behaviour, not a refusal.
+    double[] dwork = new double[64];
+    double[] dx = new double[2];
+    dx[0] = 0.0;
+    dx[1] = 0.0;
+    Optimize.MinResult z1 = Optimize.minimize_bfgs(opt_rosen, opt_rosen_grad, dx,
+        0, 0.000001, 0.000001, 0.000001, 10, dwork);
+    check_int("bfgs rejects n = 0", z1.converged ? 1 : 0, 0);
+    Optimize.MinResult z2 = Optimize.minimize_bfgs(opt_rosen, opt_rosen_grad, dx,
+        2, 0.000001, 0.000001, 0.000001, -1, dwork);
+    check_int("bfgs rejects negative budget", z2.converged ? 1 : 0, 0);
+    Optimize.MinResult z3 = Optimize.minimize_lbfgs(opt_rosen, opt_rosen_grad, dx,
+        2, 0, 0.000001, 0.000001, 0.000001, 10, dwork);
+    check_int("lbfgs rejects history = 0", z3.converged ? 1 : 0, 0);
+    Optimize.MinResult z4 = Optimize.minimize_lbfgs(opt_rosen, opt_rosen_grad, dx,
+        0, 3, 0.000001, 0.000001, 0.000001, 10, dwork);
+    check_int("lbfgs rejects n = 0", z4.converged ? 1 : 0, 0);
+
+    // least_squares needs at least as many residuals as parameters; fewer is
+    // an underdetermined system it must refuse rather than silently invert.
+    double[] dp = new double[2];
+    dp[0] = 1.0;
+    dp[1] = 1.0;
+    Optimize.LeastSquaresResult z5 = Optimize.least_squares(opt_exact_residual, nullptr,
+        dp, 2, 1, 0.000001, 0.000001, 0.000001, 10, dwork);
+    check_int("least_squares rejects nr < np", z5.converged ? 1 : 0, 0);
+    Optimize.LeastSquaresResult z6 = Optimize.least_squares(opt_exact_residual, nullptr,
+        dp, 0, 4, 0.000001, 0.000001, 0.000001, 10, dwork);
+    check_int("least_squares rejects np = 0", z6.converged ? 1 : 0, 0);
+
+    // nelder_mead is the only entry point returning a bool; n = 0 must be false.
+    double[] nmx = new double[2];
+    double[] nmsimplex = new double[9];
+    check_int("nelder_mead rejects n = 0",
+              Optimize.nelder_mead(opt_rosen, nmx, 0, nmsimplex, 0.000001, 10) ? 1 : 0, 0);
+
+    // And a real 2-D solve, so the simplex loop bounds are exercised rather
+    // than only the guard above.
+    nmx[0] = -1.2;
+    nmx[1] = 1.0;
+    nmsimplex[0] = -1.2; nmsimplex[1] = 1.0;
+    nmsimplex[2] = -0.2; nmsimplex[3] = 1.0;
+    nmsimplex[4] = -1.2; nmsimplex[5] = 2.0;
+    bool nmok = Optimize.nelder_mead(opt_rosen, nmx, 2, nmsimplex, 0.00000001, 4000);
+    check_int("nelder_mead solves rosenbrock", nmok ? 1 : 0, 1);
+    check_tol("nelder_mead rosen x", nmx[0], 1.0, 0.001);
+    check_tol("nelder_mead rosen y", nmx[1], 1.0, 0.001);
+
+    delete[_] bwork;
+    delete[_] lwork;
+    delete[_] p;
+    delete[_] lswork;
+    delete[_] xs;
+    delete[_] ys;
+    delete[_] cp;
+    delete[_] cov;
+    delete[_] cw;
+    delete[_] dwork;
+    delete[_] dx;
+    delete[_] dp;
+    delete[_] nmx;
+    delete[_] nmsimplex;
 }

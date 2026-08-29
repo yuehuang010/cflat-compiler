@@ -84,4 +84,17 @@ namespace Vec
         }
         return best;
     }
+
+    // B = A^T.  A is (m x n) row-major, B is (n x m) row-major.
+    // Lives here rather than in densemat.cb because it needs nothing from that
+    // module's threaded gemm path; Mat.transpose forwards to this.
+    void transpose(double[] a, double[] b, int m, int n)
+    {
+        for (int i = 0; i < m; i = i + 1)
+        {
+            int arow = i * n;
+            int j = 0;
+            while (j < n) { b[j * m + i] = a[arow + j]; j = j + 1; }
+        }
+    }
 }

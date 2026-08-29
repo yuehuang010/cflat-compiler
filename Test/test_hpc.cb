@@ -18,6 +18,8 @@ import "view.cb";
 import "hpc/btree.cb";
 import "thread.cb";
 import "atomic.cb";
+import "math.cb";
+import "hpc/fft.cb";
 
 // Global SIMD accept cells: bare, fixed-array default, and empty brace-list initialization.
 simd<float,4> gSimdBare = default;
@@ -1833,6 +1835,482 @@ int testCacheLinePadding()
     return passed;
 }
 
+// ---------------------------------------------------------------------------
+// hpc/fft.cb - the additive transforms (rfft/irfft, FftPlan, 2-D, convolve, Bluestein)
+// ---------------------------------------------------------------------------
+// Every new transform is checked against FFT.dft_naive, the module's own O(N^2)
+// reference, or against a direct loop written here - never against another new
+// transform. Sizes deliberately include N=1, N=2, a non-power-of-two that must be
+// REJECTED by the radix-2 path, and non-power-of-two sizes that Bluestein must
+// actually get right.
+
+int gFftChecks = 0;
+i64 gFftRng = 12345;
+
+// Deterministic LCG in [-1, 1). Kept small enough that the multiply cannot overflow i64.
+double fftRand()
+{
+    gFftRng = (gFftRng * 1103515245 + 12345) % 2147483648;
+    return (double)gFftRng / 1073741824.0 - 1.0;
+}
+
+int fftNear(const char* name, double actual, double expected, double tol)
+{
+    gFftChecks = gFftChecks + 1;
+    double d = actual - expected;
+    if (d < 0.0) d = -d;
+    if (d <= tol) return 1;
+    printf("%s FAILED (expected %e got %e, err %e > tol %e).\n", name, expected, actual, d, tol);
+    return 0;
+}
+
+int fftBool(const char* name, bool actual, bool expected)
+{
+    gFftChecks = gFftChecks + 1;
+    if (actual == expected) return 1;
+    printf("%s FAILED (expected %d got %d).\n", name, (int)expected, (int)actual);
+    return 0;
+}
+
+double fftAbs(double v) { return v < 0.0 ? -v : v; }
+
+// Max |a-b| over `cells` doubles - on interleaved data this compares both parts at once.
+double fftMaxDiff(double[] a, double[] b, int cells)
+{
+    double worst = 0.0;
+    for (int i = 0; i < cells; i = i + 1)
+    {
+        double d = fftAbs(a[i] - b[i]);
+        if (d > worst) worst = d;
+    }
+    return worst;
+}
+
+// Direct O(R^2 * C^2) 2-D DFT, written here so the 2-D transform has a reference that
+// shares no code with it.
+void fftNaive2(double[] src, double[] out, int rows, int cols)
+{
+    double twoPi = 2.0 * FFT.PI;
+    for (int u = 0; u < rows; u = u + 1)
+    {
+        for (int v = 0; v < cols; v = v + 1)
+        {
+            double sr = 0.0;
+            double si = 0.0;
+            for (int r = 0; r < rows; r = r + 1)
+            {
+                for (int c = 0; c < cols; c = c + 1)
+                {
+                    double ang = -twoPi * ((double)(u * r) / (double)rows
+                                           + (double)(v * c) / (double)cols);
+                    double wr = Math.cos(ang);
+                    double wi = Math.sin(ang);
+                    int idx = 2 * (r * cols + c);
+                    double xr = src[idx];
+                    double xi = src[idx + 1];
+                    sr = sr + xr * wr - xi * wi;
+                    si = si + xr * wi + xi * wr;
+                }
+            }
+            int o = 2 * (u * cols + v);
+            out[o] = sr;
+            out[o + 1] = si;
+        }
+    }
+}
+
+// Size validation: the checked entry points must refuse a non-power-of-two N rather
+// than running the radix-2 butterfly over it and returning plausible garbage.
+int testFftSizeChecks()
+{
+    int passed = 0;
+
+    passed += fftBool("fft is_power_of_two 0", FFT.is_power_of_two(0), false);
+    passed += fftBool("fft is_power_of_two 1", FFT.is_power_of_two(1), true);
+    passed += fftBool("fft is_power_of_two 2", FFT.is_power_of_two(2), true);
+    passed += fftBool("fft is_power_of_two 6", FFT.is_power_of_two(6), false);
+    passed += fftBool("fft is_power_of_two 1024", FFT.is_power_of_two(1024), true);
+    passed += fftBool("fft is_power_of_two -8", FFT.is_power_of_two(-8), false);
+
+    passed += fftNear("fft next_pow2 1", (double)FFT.next_power_of_two(1), 1.0, 0.0);
+    passed += fftNear("fft next_pow2 5", (double)FFT.next_power_of_two(5), 8.0, 0.0);
+    passed += fftNear("fft next_pow2 8", (double)FFT.next_power_of_two(8), 8.0, 0.0);
+
+    // A length-6 buffer must come back bit-for-bit untouched.
+    double[] buf = new double[12];
+    for (int i = 0; i < 12; i = i + 1) buf[i] = (double)(i + 1);
+    passed += fftBool("fft_checked rejects n=6", FFT.fft_checked(buf, 6), false);
+    passed += fftBool("ifft_checked rejects n=6", FFT.ifft_checked(buf, 6), false);
+    passed += fftNear("fft_checked n=6 left buf[0]", buf[0], 1.0, 0.0);
+    passed += fftNear("fft_checked n=6 left buf[11]", buf[11], 12.0, 0.0);
+    passed += fftBool("fft_checked rejects n=0", FFT.fft_checked(buf, 0), false);
+
+    passed += fftBool("rfft rejects n=6", FFT.rfft(buf, buf, 6), false);
+    passed += fftBool("irfft rejects n=6", FFT.irfft(buf, buf, 6), false);
+    passed += fftBool("fft2 rejects rows=3", FFT.fft2(buf, 3, 4), false);
+    passed += fftBool("fft2 rejects cols=6", FFT.fft2(buf, 4, 6), false);
+    passed += fftBool("ifft2 rejects rows=6", FFT.ifft2(buf, 6, 2), false);
+    passed += fftBool("convolve rejects na=0", FFT.convolve(buf, 0, buf, 4, buf), false);
+    passed += fftBool("correlate rejects nb=0", FFT.correlate(buf, 4, buf, 0, buf), false);
+    passed += fftBool("fft_any rejects n=0", FFT.fft_any(buf, buf, 0), false);
+    passed += fftNear("rejections left buf[0]", buf[0], 1.0, 0.0);
+
+    passed += fftBool("fft_checked accepts n=4", FFT.fft_checked(buf, 4), true);
+    delete[_] buf;
+    return passed;
+}
+
+// FftPlan must reproduce the unplanned path. A twiddle table with a sign or indexing
+// error still looks like a transform, so this compares element by element.
+int testFftPlan()
+{
+    int passed = 0;
+    double worst = 0.0;
+
+    int[4] sizes = {1, 2, 8, 64};
+    for (int s = 0; s < 4; s = s + 1)
+    {
+        int n = sizes[s];
+        int cells = 2 * n;
+        double[] a = new double[cells];
+        double[] b = new double[cells];
+        for (int i = 0; i < cells; i = i + 1)
+        {
+            double v = fftRand();
+            a[i] = v;
+            b[i] = v;
+        }
+
+        FFT.FftPlan fwd = FFT.plan_create(n, -1.0);
+        passed += fftBool("fft plan ok", fwd.ok, true);
+        passed += fftBool("fft plan apply", fwd.apply(a), true);
+        FFT.fft(b, n);
+        double d = fftMaxDiff(a, b, cells);
+        if (d > worst) worst = d;
+        passed += fftNear("fft plan matches fft", d, 0.0, 1.0e-12);
+        fwd.destroy();
+
+        // Inverse plan against ifft, including the 1/N scaling.
+        FFT.FftPlan inv = FFT.plan_create(n, 1.0);
+        passed += fftBool("fft inverse plan apply", inv.apply(a), true);
+        FFT.ifft(b, n);
+        d = fftMaxDiff(a, b, cells);
+        if (d > worst) worst = d;
+        passed += fftNear("fft inverse plan matches ifft", d, 0.0, 1.0e-12);
+        inv.destroy();
+
+        delete[_] a;
+        delete[_] b;
+    }
+
+    // A rejected plan reports ok = false and refuses to run.
+    FFT.FftPlan bad = FFT.plan_create(6, -1.0);
+    passed += fftBool("fft plan rejects n=6", bad.ok, false);
+    double[] dummy = new double[16];
+    passed += fftBool("fft bad plan refuses apply", bad.apply(dummy), false);
+    bad.destroy();
+    delete[_] dummy;
+
+    printf("[fft] plan vs unplanned: max |diff| = %e\n", worst);
+    return passed;
+}
+
+// rfft against BOTH references the task demands: dft_naive on the complex-packed real
+// input, and the existing complex fft's first N/2+1 bins.
+int testFftReal()
+{
+    int passed = 0;
+    double worstRef = 0.0;
+    double worstRound = 0.0;
+
+    int[6] sizes = {1, 2, 4, 8, 32, 256};
+    for (int s = 0; s < 6; s = s + 1)
+    {
+        int n = sizes[s];
+        int bins = n / 2 + 1;
+
+        double[] x = new double[n];
+        for (int i = 0; i < n; i = i + 1) x[i] = fftRand();
+
+        double[] spec = new double[2 * bins];
+        passed += fftBool("rfft ok", FFT.rfft(x, spec, n), true);
+
+        // Reference 1: O(N^2) DFT of the real data packed as complex.
+        double[] packed = new double[2 * n];
+        double[] ref = new double[2 * n];
+        for (int i = 0; i < n; i = i + 1)
+        {
+            packed[2 * i] = x[i];
+            packed[2 * i + 1] = 0.0;
+        }
+        FFT.dft_naive(packed, ref, n);
+        double d = fftMaxDiff(spec, ref, 2 * bins);
+        if (d > worstRef) worstRef = d;
+        passed += fftNear("rfft vs dft_naive", d, 0.0, 1.0e-9);
+
+        // Reference 2: the existing complex fft, first N/2+1 bins.
+        FFT.fft(packed, n);
+        d = fftMaxDiff(spec, packed, 2 * bins);
+        if (d > worstRef) worstRef = d;
+        passed += fftNear("rfft vs complex fft bins", d, 0.0, 1.0e-9);
+
+        // Round trip.
+        double[] back = new double[n];
+        passed += fftBool("irfft ok", FFT.irfft(spec, back, n), true);
+        d = fftMaxDiff(back, x, n);
+        if (d > worstRound) worstRound = d;
+        passed += fftNear("irfft(rfft(x)) == x", d, 0.0, 1.0e-12);
+
+        delete[_] x;
+        delete[_] spec;
+        delete[_] packed;
+        delete[_] ref;
+        delete[_] back;
+    }
+
+    // Hand-checked N=8 ramp: bin 0 is the sum, bin N/2 is the alternating sum.
+    double[] ramp = new double[8];
+    for (int i = 0; i < 8; i = i + 1) ramp[i] = (double)(i + 1);
+    double[] rspec = new double[10];
+    FFT.rfft(ramp, rspec, 8);
+    passed += fftNear("rfft ramp DC", rspec[0], 36.0, 1.0e-12);
+    passed += fftNear("rfft ramp DC imag", rspec[1], 0.0, 1.0e-12);
+    passed += fftNear("rfft ramp nyquist", rspec[8], -4.0, 1.0e-12);
+    passed += fftNear("rfft ramp nyquist imag", rspec[9], 0.0, 1.0e-12);
+    delete[_] ramp;
+    delete[_] rspec;
+
+    // N=1 and N=2 spelled out rather than left to the loop's random data.
+    double[] one = new double[1];
+    double[] onespec = new double[2];
+    one[0] = 3.5;
+    passed += fftBool("rfft n=1 ok", FFT.rfft(one, onespec, 1), true);
+    passed += fftNear("rfft n=1 bin0", onespec[0], 3.5, 0.0);
+    passed += fftNear("rfft n=1 bin0 imag", onespec[1], 0.0, 0.0);
+    one[0] = 0.0;
+    passed += fftBool("irfft n=1 ok", FFT.irfft(onespec, one, 1), true);
+    passed += fftNear("irfft n=1", one[0], 3.5, 0.0);
+    delete[_] one;
+    delete[_] onespec;
+
+    double[] two = new double[2];
+    double[] twospec = new double[4];
+    two[0] = 2.0;
+    two[1] = -0.5;
+    passed += fftBool("rfft n=2 ok", FFT.rfft(two, twospec, 2), true);
+    passed += fftNear("rfft n=2 bin0", twospec[0], 1.5, 1.0e-15);
+    passed += fftNear("rfft n=2 bin1", twospec[2], 2.5, 1.0e-15);
+    two[0] = 0.0;
+    two[1] = 0.0;
+    passed += fftBool("irfft n=2 ok", FFT.irfft(twospec, two, 2), true);
+    passed += fftNear("irfft n=2 x0", two[0], 2.0, 1.0e-15);
+    passed += fftNear("irfft n=2 x1", two[1], -0.5, 1.0e-15);
+    delete[_] two;
+    delete[_] twospec;
+
+    printf("[fft] rfft vs references: max |diff| = %e, round trip = %e\n", worstRef, worstRound);
+    return passed;
+}
+
+// 2-D transform against the direct O(R^2*C^2) 2-D DFT above, plus the round trip.
+int testFft2()
+{
+    int passed = 0;
+    double worstRef = 0.0;
+    double worstRound = 0.0;
+
+    int[8] rowSizes = {1, 1, 2, 2, 4, 8, 4, 16};
+    int[8] colSizes = {1, 8, 2, 4, 8, 4, 1, 16};
+    for (int s = 0; s < 8; s = s + 1)
+    {
+        int rows = rowSizes[s];
+        int cols = colSizes[s];
+        int cells = 2 * rows * cols;
+
+        double[] src = new double[cells];
+        double[] buf = new double[cells];
+        double[] ref = new double[cells];
+        for (int i = 0; i < cells; i = i + 1)
+        {
+            double v = fftRand();
+            src[i] = v;
+            buf[i] = v;
+        }
+
+        passed += fftBool("fft2 ok", FFT.fft2(buf, rows, cols), true);
+        fftNaive2(src, ref, rows, cols);
+        double d = fftMaxDiff(buf, ref, cells);
+        if (d > worstRef) worstRef = d;
+        passed += fftNear("fft2 vs naive 2-D DFT", d, 0.0, 1.0e-9);
+
+        passed += fftBool("ifft2 ok", FFT.ifft2(buf, rows, cols), true);
+        d = fftMaxDiff(buf, src, cells);
+        if (d > worstRound) worstRound = d;
+        passed += fftNear("ifft2(fft2(x)) == x", d, 0.0, 1.0e-12);
+
+        delete[_] src;
+        delete[_] buf;
+        delete[_] ref;
+    }
+
+    printf("[fft] fft2 vs naive 2-D: max |diff| = %e, round trip = %e\n", worstRef, worstRound);
+    return passed;
+}
+
+// convolve/correlate against direct O(N*M) loops computed here.
+int testFftConvolve()
+{
+    int passed = 0;
+    double worstConv = 0.0;
+    double worstCorr = 0.0;
+
+    int[6] aSizes = {1, 1, 3, 5, 8, 40};
+    int[6] bSizes = {1, 6, 3, 2, 13, 7};
+    for (int s = 0; s < 6; s = s + 1)
+    {
+        int na = aSizes[s];
+        int nb = bSizes[s];
+        int need = na + nb - 1;
+
+        double[] a = new double[na];
+        double[] b = new double[nb];
+        for (int i = 0; i < na; i = i + 1) a[i] = fftRand();
+        for (int i = 0; i < nb; i = i + 1) b[i] = fftRand();
+
+        double[] out = new double[need];
+        double[] ref = new double[need];
+        passed += fftBool("convolve ok", FFT.convolve(a, na, b, nb, out), true);
+        for (int k = 0; k < need; k = k + 1)
+        {
+            double acc = 0.0;
+            for (int j = 0; j < na; j = j + 1)
+            {
+                int t = k - j;
+                if (t >= 0 && t < nb) acc = acc + a[j] * b[t];
+            }
+            ref[k] = acc;
+        }
+        double d = fftMaxDiff(out, ref, need);
+        if (d > worstConv) worstConv = d;
+        passed += fftNear("convolve vs direct O(N*M)", d, 0.0, 1.0e-10);
+
+        passed += fftBool("correlate ok", FFT.correlate(a, na, b, nb, out), true);
+        for (int k = 0; k < need; k = k + 1)
+        {
+            double acc = 0.0;
+            for (int j = 0; j < na; j = j + 1)
+            {
+                int t = j + nb - 1 - k;
+                if (t >= 0 && t < nb) acc = acc + a[j] * b[t];
+            }
+            ref[k] = acc;
+        }
+        d = fftMaxDiff(out, ref, need);
+        if (d > worstCorr) worstCorr = d;
+        passed += fftNear("correlate vs direct O(N*M)", d, 0.0, 1.0e-10);
+
+        delete[_] a;
+        delete[_] b;
+        delete[_] out;
+        delete[_] ref;
+    }
+
+    // A hand-computed case, so the direct loops above are themselves pinned down.
+    double[] p = new double[3];
+    double[] q = new double[2];
+    double[] r = new double[4];
+    p[0] = 1.0;
+    p[1] = 2.0;
+    p[2] = 3.0;
+    q[0] = 4.0;
+    q[1] = 5.0;
+    FFT.convolve(p, 3, q, 2, r);
+    passed += fftNear("convolve 1,2,3 * 4,5 [0]", r[0], 4.0, 1.0e-10);
+    passed += fftNear("convolve 1,2,3 * 4,5 [1]", r[1], 13.0, 1.0e-10);
+    passed += fftNear("convolve 1,2,3 * 4,5 [2]", r[2], 22.0, 1.0e-10);
+    passed += fftNear("convolve 1,2,3 * 4,5 [3]", r[3], 15.0, 1.0e-10);
+    FFT.correlate(p, 3, q, 2, r);
+    passed += fftNear("correlate 1,2,3 x 4,5 [0]", r[0], 5.0, 1.0e-10);
+    passed += fftNear("correlate 1,2,3 x 4,5 [1]", r[1], 14.0, 1.0e-10);
+    passed += fftNear("correlate 1,2,3 x 4,5 [2]", r[2], 23.0, 1.0e-10);
+    passed += fftNear("correlate 1,2,3 x 4,5 [3]", r[3], 12.0, 1.0e-10);
+    delete[_] p;
+    delete[_] q;
+    delete[_] r;
+
+    printf("[fft] convolve max |diff| = %e, correlate max |diff| = %e\n", worstConv, worstCorr);
+    return passed;
+}
+
+// Bluestein: every size below is checked against dft_naive, power-of-two and not.
+int testFftBluestein()
+{
+    int passed = 0;
+    double worstRef = 0.0;
+    double worstRound = 0.0;
+
+    int[14] sizes = {1, 2, 3, 5, 6, 7, 9, 10, 11, 12, 15, 17, 31, 100};
+    for (int s = 0; s < 14; s = s + 1)
+    {
+        int n = sizes[s];
+        int cells = 2 * n;
+
+        double[] src = new double[cells];
+        double[] out = new double[cells];
+        double[] ref = new double[cells];
+        for (int i = 0; i < cells; i = i + 1) src[i] = fftRand();
+
+        passed += fftBool("fft_any ok", FFT.fft_any(src, out, n), true);
+        FFT.dft_naive(src, ref, n);
+        double d = fftMaxDiff(out, ref, cells);
+        if (d > worstRef) worstRef = d;
+        passed += fftNear("fft_any vs dft_naive", d, 0.0, 1.0e-9);
+
+        passed += fftBool("ifft_any ok", FFT.ifft_any(out, ref, n), true);
+        d = fftMaxDiff(ref, src, cells);
+        if (d > worstRound) worstRound = d;
+        passed += fftNear("ifft_any(fft_any(x)) == x", d, 0.0, 1.0e-10);
+
+        delete[_] src;
+        delete[_] out;
+        delete[_] ref;
+    }
+
+    // A power-of-two size must take the radix-2 path and land exactly on fft.
+    double[] a = new double[32];
+    double[] b = new double[32];
+    for (int i = 0; i < 32; i = i + 1)
+    {
+        double v = fftRand();
+        a[i] = v;
+        b[i] = v;
+    }
+    double[] o = new double[32];
+    FFT.fft_any(a, o, 16);
+    FFT.fft(b, 16);
+    passed += fftNear("fft_any pow2 == fft", fftMaxDiff(o, b, 32), 0.0, 0.0);
+
+    // Real-valued ramp of a non-power-of-two length: bin 0 is the sum of the samples.
+    double[] ramp = new double[2 * 6];
+    for (int i = 0; i < 6; i = i + 1)
+    {
+        ramp[2 * i] = (double)(i + 1);
+        ramp[2 * i + 1] = 0.0;
+    }
+    double[] rampOut = new double[2 * 6];
+    FFT.fft_any(ramp, rampOut, 6);
+    passed += fftNear("fft_any n=6 DC", rampOut[0], 21.0, 1.0e-11);
+    passed += fftNear("fft_any n=6 DC imag", rampOut[1], 0.0, 1.0e-11);
+    delete[_] a;
+    delete[_] b;
+    delete[_] o;
+    delete[_] ramp;
+    delete[_] rampOut;
+
+    printf("[fft] fft_any vs dft_naive: max |diff| = %e, round trip = %e\n", worstRef, worstRound);
+    return passed;
+}
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
@@ -1962,6 +2440,15 @@ extern int main(int argc, char** argv)
     // ---- btree<K,V> concurrent (optimistic lock coupling) ----
     passed += testBtreeConcurrentLookupInsert();  total += 7;
     passed += testBtreeConcurrentInsertSplits();  total += 7;
+
+    // ---- hpc/fft.cb additive transforms ----
+    passed += testFftSizeChecks();
+    passed += testFftPlan();
+    passed += testFftReal();
+    passed += testFft2();
+    passed += testFftConvolve();
+    passed += testFftBluestein();
+    total += gFftChecks;
 
     printf("\n%d / %d HPC tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

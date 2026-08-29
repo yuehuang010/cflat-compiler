@@ -1,0 +1,616 @@
+// spatial.cb - distance metrics, pairwise distances, KDTree, and 2-D hulls.
+//
+// Points are flat row-major arrays: point i starts at x[i * ndim]. The pairwise
+// routines use SciPy's condensed upper-triangle layout. For i < j, the pair is
+// stored at n*i - i*(i+1)/2 + j-i-1; condensed_index() exposes that formula.
+//
+// Scratch contracts:
+//   pdist: out has at least n*(n-1)/2 doubles.
+//   cdist: out has at least na*nb doubles in row-major order.
+//   kdtree_build: no caller scratch; the tree owns its permutation and nodes.
+//   kdtree_query: indices and distances each have at least min(k,n) entries.
+//   kdtree_query_radius: indices has at least maxout entries.
+//   convex_hull_2d: hull has at least n entries. The input is not modified.
+
+import "math.cb";
+
+namespace Spatial
+{
+    const int METRIC_EUCLIDEAN = 0;
+    const int METRIC_SQEUCLIDEAN = 1;
+    const int METRIC_MANHATTAN = 2;
+    const int METRIC_CHEBYSHEV = 3;
+    const int METRIC_MINKOWSKI = 4;
+    const int METRIC_COSINE = 5;
+    const int METRIC_HAMMING = 6;
+    const int METRIC_CANBERRA = 7;
+
+    double sqeuclidean(double* a, double* b, int ndim)
+    {
+        double sum = 0.0;
+        for (int i = 0; i < ndim; i = i + 1)
+        {
+            double d = a[i] - b[i];
+            sum = sum + d * d;
+        }
+        return sum;
+    }
+
+    double euclidean(double* a, double* b, int ndim)
+    {
+        return Math.sqrt(Spatial.sqeuclidean(a, b, ndim));
+    }
+
+    double manhattan(double* a, double* b, int ndim)
+    {
+        double sum = 0.0;
+        for (int i = 0; i < ndim; i = i + 1) sum = sum + Math.abs(a[i] - b[i]);
+        return sum;
+    }
+
+    double chebyshev(double* a, double* b, int ndim)
+    {
+        double result = 0.0;
+        for (int i = 0; i < ndim; i = i + 1)
+            result = Math.max(result, Math.abs(a[i] - b[i]));
+        return result;
+    }
+
+    double minkowski(double* a, double* b, int ndim, double p)
+    {
+        if (p <= 0.0) return 0.0 / 0.0;
+        if (p == 1.0) return Spatial.manhattan(a, b, ndim);
+        if (p == 2.0) return Spatial.euclidean(a, b, ndim);
+        double sum = 0.0;
+        for (int i = 0; i < ndim; i = i + 1)
+            sum = sum + Math.pow(Math.abs(a[i] - b[i]), p);
+        return Math.pow(sum, 1.0 / p);
+    }
+
+    double cosine(double* a, double* b, int ndim)
+    {
+        double dot = 0.0;
+        double aa = 0.0;
+        double bb = 0.0;
+        for (int i = 0; i < ndim; i = i + 1)
+        {
+            dot = dot + a[i] * b[i];
+            aa = aa + a[i] * a[i];
+            bb = bb + b[i] * b[i];
+        }
+        if (aa == 0.0 || bb == 0.0) return aa == 0.0 && bb == 0.0 ? 0.0 : 1.0;
+        return 1.0 - dot / Math.sqrt(aa * bb);
+    }
+
+    double hamming(double* a, double* b, int ndim)
+    {
+        if (ndim <= 0) return 0.0;
+        int different = 0;
+        for (int i = 0; i < ndim; i = i + 1)
+            if (a[i] != b[i]) different = different + 1;
+        return (double)different / (double)ndim;
+    }
+
+    double canberra(double* a, double* b, int ndim)
+    {
+        double sum = 0.0;
+        for (int i = 0; i < ndim; i = i + 1)
+        {
+            double numerator = Math.abs(a[i] - b[i]);
+            double denominator = Math.abs(a[i]) + Math.abs(b[i]);
+            if (denominator != 0.0) sum = sum + numerator / denominator;
+        }
+        return sum;
+    }
+
+    double distance(int metric, double* a, double* b, int ndim)
+    {
+        if (metric == METRIC_EUCLIDEAN) return Spatial.euclidean(a, b, ndim);
+        if (metric == METRIC_SQEUCLIDEAN) return Spatial.sqeuclidean(a, b, ndim);
+        if (metric == METRIC_MANHATTAN) return Spatial.manhattan(a, b, ndim);
+        if (metric == METRIC_CHEBYSHEV) return Spatial.chebyshev(a, b, ndim);
+        if (metric == METRIC_COSINE) return Spatial.cosine(a, b, ndim);
+        if (metric == METRIC_HAMMING) return Spatial.hamming(a, b, ndim);
+        if (metric == METRIC_CANBERRA) return Spatial.canberra(a, b, ndim);
+        if (metric == METRIC_MINKOWSKI) return Spatial.minkowski(a, b, ndim, 2.0);
+        return 0.0 / 0.0;
+    }
+
+    int condensed_index(int i, int j, int n)
+    {
+        if (i > j)
+        {
+            int temp = i;
+            i = j;
+            j = temp;
+        }
+        return (int)((i64)n * (i64)i - (i64)i * (i64)(i + 1) / (i64)2
+                     + (i64)j - (i64)i - (i64)1);
+    }
+
+    void pdist(double[] x, int n, int ndim, int metric, double[] out)
+    {
+        // out is exactly the condensed upper triangle, with no diagonal entries.
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = i + 1; j < n; j = j + 1)
+                out[Spatial.condensed_index(i, j, n)] = Spatial.distance(
+                    metric, &x[i * ndim], &x[j * ndim], ndim);
+    }
+
+    void cdist(double[] xa, int na, double[] xb, int nb, int ndim, int metric, double[] out)
+    {
+        // out is a row-major na by nb full matrix.
+        for (int i = 0; i < na; i = i + 1)
+            for (int j = 0; j < nb; j = j + 1)
+                out[i * nb + j] = Spatial.distance(
+                    metric, &xa[i * ndim], &xb[j * ndim], ndim);
+    }
+
+    struct KdNode
+    {
+        int start = 0;
+        int count = 0;
+        int left = -1;
+        int right = -1;
+        int split_dim = -1;
+        double split_value = 0.0;
+    };
+
+    struct KdTree
+    {
+        double* points = nullptr;
+        int npoints = 0;
+        int ndim = 0;
+        int leafsize = 0;
+        int* permutation = nullptr;
+        KdNode* nodes = nullptr;
+        double* lower = nullptr;
+        double* upper = nullptr;
+        int node_count = 0;
+        int node_capacity = 0;
+        int* heap_indices = nullptr;
+        double* heap_distances = nullptr;
+        int heap_size = 0;
+        int visited_nodes = 0;
+    };
+
+    void _kd_delete_ints(move int* p)
+    {
+        if (p != nullptr) delete[_] p;
+    }
+
+    void _kd_delete_nodes(move KdNode* p)
+    {
+        if (p != nullptr) delete[_] p;
+    }
+
+    void _kd_delete_doubles(move double* p)
+    {
+        if (p != nullptr) delete[_] p;
+    }
+
+    void kdtree_free(KdTree* t)
+    {
+        if (t == nullptr) return;
+        int* permutation = t->permutation;
+        KdNode* nodes = t->nodes;
+        double* lower = t->lower;
+        double* upper = t->upper;
+        int* heap_indices = t->heap_indices;
+        double* heap_distances = t->heap_distances;
+        t->permutation = nullptr;
+        t->nodes = nullptr;
+        t->lower = nullptr;
+        t->upper = nullptr;
+        t->heap_indices = nullptr;
+        t->heap_distances = nullptr;
+        Spatial._kd_delete_ints(move permutation);
+        Spatial._kd_delete_nodes(move nodes);
+        Spatial._kd_delete_doubles(move lower);
+        Spatial._kd_delete_doubles(move upper);
+        Spatial._kd_delete_ints(move heap_indices);
+        Spatial._kd_delete_doubles(move heap_distances);
+        t->points = nullptr;
+        t->permutation = nullptr;
+        t->nodes = nullptr;
+        t->lower = nullptr;
+        t->upper = nullptr;
+        t->heap_indices = nullptr;
+        t->heap_distances = nullptr;
+        t->npoints = 0;
+        t->ndim = 0;
+        t->node_count = 0;
+        t->node_capacity = 0;
+        t->heap_size = 0;
+        t->visited_nodes = 0;
+    }
+
+    void _kd_bounds(KdTree* t, int node_index, int start, int end)
+    {
+        KdNode* node = &t->nodes[node_index];
+        for (int d = 0; d < t->ndim; d = d + 1)
+        {
+            double lo = t->points[t->permutation[start] * t->ndim + d];
+            double hi = lo;
+            for (int i = start + 1; i < end; i = i + 1)
+            {
+                double value = t->points[t->permutation[i] * t->ndim + d];
+                if (value < lo) lo = value;
+                if (value > hi) hi = value;
+            }
+            t->lower[node_index * t->ndim + d] = lo;
+            t->upper[node_index * t->ndim + d] = hi;
+        }
+        node->start = start;
+        node->count = end - start;
+    }
+
+    double _kd_key(KdTree* t, int point_index, int dimension)
+    {
+        return t->points[point_index * t->ndim + dimension];
+    }
+
+    void _kd_quickselect(KdTree* t, int start, int end, int kth, int dimension)
+    {
+        int left = start;
+        int right = end - 1;
+        while (left < right)
+        {
+            double pivot = Spatial._kd_key(t, t->permutation[(left + right) / 2], dimension);
+            int i = left;
+            int j = right;
+            while (i <= j)
+            {
+                while (Spatial._kd_key(t, t->permutation[i], dimension) < pivot) i = i + 1;
+                while (Spatial._kd_key(t, t->permutation[j], dimension) > pivot) j = j - 1;
+                if (i <= j)
+                {
+                    int temp = t->permutation[i];
+                    t->permutation[i] = t->permutation[j];
+                    t->permutation[j] = temp;
+                    i = i + 1;
+                    j = j - 1;
+                }
+            }
+            if (kth <= j) right = j;
+            else if (kth >= i) left = i;
+            else return;
+        }
+    }
+
+    int _kd_build(KdTree* t, int start, int end)
+    {
+        int node_index = t->node_count;
+        t->node_count = t->node_count + 1;
+        Spatial._kd_bounds(t, node_index, start, end);
+        KdNode* node = &t->nodes[node_index];
+        if (end - start <= t->leafsize || end - start <= 1) return node_index;
+
+        int split_dim = 0;
+        double widest = t->upper[node_index * t->ndim] - t->lower[node_index * t->ndim];
+        for (int d = 1; d < t->ndim; d = d + 1)
+        {
+            double width = t->upper[node_index * t->ndim + d]
+                         - t->lower[node_index * t->ndim + d];
+            if (width > widest)
+            {
+                widest = width;
+                split_dim = d;
+            }
+        }
+        int middle = start + (end - start) / 2;
+        Spatial._kd_quickselect(t, start, end, middle, split_dim);
+        node->split_dim = split_dim;
+        node->split_value = Spatial._kd_key(t, t->permutation[middle], split_dim);
+        node->left = Spatial._kd_build(t, start, middle);
+        node->right = Spatial._kd_build(t, middle, end);
+        return node_index;
+    }
+
+    bool kdtree_build(KdTree* t, double[] x, int n, int ndim, int leafsize)
+    {
+        if (t == nullptr || n <= 0 || ndim <= 0) return false;
+        Spatial.kdtree_free(t);
+        if (leafsize < 1) leafsize = 16;
+        t->points = &x[0];
+        t->npoints = n;
+        t->ndim = ndim;
+        t->leafsize = leafsize;
+        t->node_capacity = 2 * n + 1;
+        t->permutation = new int[n];
+        t->nodes = new KdNode[t->node_capacity];
+        t->lower = new double[t->node_capacity * ndim];
+        t->upper = new double[t->node_capacity * ndim];
+        t->heap_indices = new int[n];
+        t->heap_distances = new double[n];
+        for (int i = 0; i < n; i = i + 1) t->permutation[i] = i;
+        t->node_count = 0;
+        t->visited_nodes = 0;
+        Spatial._kd_build(t, 0, n);
+        return true;
+    }
+
+    double _kd_box_distance(KdTree* t, int node_index, double* point)
+    {
+        double sum = 0.0;
+        for (int d = 0; d < t->ndim; d = d + 1)
+        {
+            double delta = 0.0;
+            if (point[d] < t->lower[node_index * t->ndim + d])
+                delta = t->lower[node_index * t->ndim + d] - point[d];
+            else if (point[d] > t->upper[node_index * t->ndim + d])
+                delta = point[d] - t->upper[node_index * t->ndim + d];
+            sum = sum + delta * delta;
+        }
+        return sum;
+    }
+
+    bool _kd_worse(KdTree* t, int a, int b)
+    {
+        return t->heap_distances[a] > t->heap_distances[b]
+            || (t->heap_distances[a] == t->heap_distances[b]
+                && t->heap_indices[a] > t->heap_indices[b]);
+    }
+
+    bool _kd_better(double distance2, int point_index, double worst_distance2, int worst_index)
+    {
+        return distance2 < worst_distance2
+            || (distance2 == worst_distance2 && point_index < worst_index);
+    }
+
+    void _kd_heap_up(KdTree* t, int index)
+    {
+        while (index > 0)
+        {
+            int parent = (index - 1) / 2;
+            if (!Spatial._kd_worse(t, index, parent)) break;
+            int pi = t->heap_indices[parent];
+            double pd = t->heap_distances[parent];
+            t->heap_indices[parent] = t->heap_indices[index];
+            t->heap_distances[parent] = t->heap_distances[index];
+            t->heap_indices[index] = pi;
+            t->heap_distances[index] = pd;
+            index = parent;
+        }
+    }
+
+    void _kd_heap_down(KdTree* t, int index)
+    {
+        while (true)
+        {
+            int left = index * 2 + 1;
+            if (left >= t->heap_size) return;
+            int best = left;
+            int right = left + 1;
+            if (right < t->heap_size && Spatial._kd_worse(t, right, left)) best = right;
+            if (!Spatial._kd_worse(t, best, index)) return;
+            int pi = t->heap_indices[index];
+            double pd = t->heap_distances[index];
+            t->heap_indices[index] = t->heap_indices[best];
+            t->heap_distances[index] = t->heap_distances[best];
+            t->heap_indices[best] = pi;
+            t->heap_distances[best] = pd;
+            index = best;
+        }
+    }
+
+    void _kd_offer(KdTree* t, int point_index, double distance2, int k)
+    {
+        if (t->heap_size < k)
+        {
+            int slot = t->heap_size;
+            t->heap_indices[slot] = point_index;
+            t->heap_distances[slot] = distance2;
+            t->heap_size = t->heap_size + 1;
+            Spatial._kd_heap_up(t, slot);
+            return;
+        }
+        if (!Spatial._kd_better(distance2, point_index,
+                                t->heap_distances[0], t->heap_indices[0])) return;
+        t->heap_indices[0] = point_index;
+        t->heap_distances[0] = distance2;
+        Spatial._kd_heap_down(t, 0);
+    }
+
+    void _kd_query_node(KdTree* t, int node_index, double* point, int k)
+    {
+        KdNode* node = &t->nodes[node_index];
+        t->visited_nodes = t->visited_nodes + 1;
+        if (t->heap_size == k && Spatial._kd_box_distance(t, node_index, point)
+            > t->heap_distances[0]) return;
+        if (node->left < 0)
+        {
+            for (int i = node->start; i < node->start + node->count; i = i + 1)
+            {
+                int point_index = t->permutation[i];
+                double distance2 = Spatial.sqeuclidean(
+                    &t->points[point_index * t->ndim], point, t->ndim);
+                Spatial._kd_offer(t, point_index, distance2, k);
+            }
+            return;
+        }
+        int near = node->left;
+        int far = node->right;
+        if (point[node->split_dim] > node->split_value)
+        {
+            near = node->right;
+            far = node->left;
+        }
+        Spatial._kd_query_node(t, near, point, k);
+        Spatial._kd_query_node(t, far, point, k);
+    }
+
+    void _kd_sort_heap(KdTree* t)
+    {
+        for (int i = 0; i < t->heap_size - 1; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < t->heap_size; j = j + 1)
+                if (Spatial._kd_better(t->heap_distances[j], t->heap_indices[j],
+                                       t->heap_distances[best], t->heap_indices[best])) best = j;
+            if (best == i) continue;
+            int pi = t->heap_indices[i];
+            double pd = t->heap_distances[i];
+            t->heap_indices[i] = t->heap_indices[best];
+            t->heap_distances[i] = t->heap_distances[best];
+            t->heap_indices[best] = pi;
+            t->heap_distances[best] = pd;
+        }
+    }
+
+    int kdtree_query(KdTree* t, double* point, int k, int[] indices, double[] distances)
+    {
+        if (t == nullptr || t->nodes == nullptr || point == nullptr || k <= 0) return 0;
+        if (k > t->npoints) k = t->npoints;
+        t->heap_size = 0;
+        t->visited_nodes = 0;
+        Spatial._kd_query_node(t, 0, point, k);
+        Spatial._kd_sort_heap(t);
+        for (int i = 0; i < t->heap_size; i = i + 1)
+        {
+            indices[i] = t->heap_indices[i];
+            distances[i] = Math.sqrt(t->heap_distances[i]);
+        }
+        return t->heap_size;
+    }
+
+    int _kd_radius_node(KdTree* t, int node_index, double* point,
+                        double radius2, int[] indices, int maxout, int written)
+    {
+        if (Spatial._kd_box_distance(t, node_index, point) > radius2) return written;
+        KdNode* node = &t->nodes[node_index];
+        t->visited_nodes = t->visited_nodes + 1;
+        if (node->left < 0)
+        {
+            for (int i = node->start; i < node->start + node->count; i = i + 1)
+            {
+                int point_index = t->permutation[i];
+                double d2 = Spatial.sqeuclidean(
+                    &t->points[point_index * t->ndim], point, t->ndim);
+                if (d2 <= radius2 && written < maxout)
+                {
+                    indices[written] = point_index;
+                    written = written + 1;
+                }
+            }
+            return written;
+        }
+        written = Spatial._kd_radius_node(t, node->left, point, radius2,
+                                           indices, maxout, written);
+        if (written >= maxout) return written;
+        return Spatial._kd_radius_node(t, node->right, point, radius2,
+                                       indices, maxout, written);
+    }
+
+    int kdtree_query_radius(KdTree* t, double* point, double radius, int[] indices, int maxout)
+    {
+        if (t == nullptr || t->nodes == nullptr || point == nullptr || radius < 0.0 || maxout <= 0)
+            return 0;
+        t->visited_nodes = 0;
+        return Spatial._kd_radius_node(t, 0, point, radius * radius, indices, maxout, 0);
+    }
+
+    bool _hull_less(double[] pts, int a, int b)
+    {
+        double ax = pts[a * 2];
+        double ay = pts[a * 2 + 1];
+        double bx = pts[b * 2];
+        double by = pts[b * 2 + 1];
+        return ax < bx || (ax == bx && ay < by);
+    }
+
+    bool _hull_same(double[] pts, int a, int b)
+    {
+        return pts[a * 2] == pts[b * 2] && pts[a * 2 + 1] == pts[b * 2 + 1];
+    }
+
+    double _hull_cross(double[] pts, int a, int b, int c)
+    {
+        double abx = pts[b * 2] - pts[a * 2];
+        double aby = pts[b * 2 + 1] - pts[a * 2 + 1];
+        double acx = pts[c * 2] - pts[a * 2];
+        double acy = pts[c * 2 + 1] - pts[a * 2 + 1];
+        return abx * acy - aby * acx;
+    }
+
+    int convex_hull_2d(double[] pts, int n, int[] hull)
+    {
+        // Andrew's chain drops collinear edge points. Duplicates are returned once.
+        if (n <= 0) return 0;
+        int* order = new int[n];
+        int* chain = new int[n * 2];
+        for (int i = 0; i < n; i = i + 1)
+        {
+            int j = i;
+            while (j > 0 && Spatial._hull_less(pts, i, order[j - 1]))
+            {
+                order[j] = order[j - 1];
+                j = j - 1;
+            }
+            order[j] = i;
+        }
+        int unique_count = 0;
+        for (int i = 0; i < n; i = i + 1)
+        {
+            if (unique_count == 0 || !Spatial._hull_same(pts, order[i], order[unique_count - 1]))
+            {
+                order[unique_count] = order[i];
+                unique_count = unique_count + 1;
+            }
+        }
+        if (unique_count <= 2)
+        {
+            int first = 0;
+            for (int i = 1; i < unique_count; i = i + 1)
+            {
+                bool lower = pts[order[i] * 2 + 1] < pts[order[first] * 2 + 1];
+                bool same_y = pts[order[i] * 2 + 1] == pts[order[first] * 2 + 1];
+                if (lower || (same_y && pts[order[i] * 2] < pts[order[first] * 2])) first = i;
+            }
+            for (int i = 0; i < unique_count; i = i + 1)
+                hull[i] = order[(first + i) % unique_count];
+            delete[] order;
+            delete[] chain;
+            return unique_count;
+        }
+        int chain_count = 0;
+        for (int i = 0; i < unique_count; i = i + 1)
+        {
+            while (chain_count >= 2 && Spatial._hull_cross(
+                       pts, chain[chain_count - 2], chain[chain_count - 1], order[i]) <= 0.0)
+                chain_count = chain_count - 1;
+            chain[chain_count] = order[i];
+            chain_count = chain_count + 1;
+        }
+        int lower_count = chain_count;
+        for (int i = unique_count - 2; i >= 0; i = i - 1)
+        {
+            while (chain_count > lower_count && Spatial._hull_cross(
+                       pts, chain[chain_count - 2], chain[chain_count - 1], order[i]) <= 0.0)
+                chain_count = chain_count - 1;
+            chain[chain_count] = order[i];
+            chain_count = chain_count + 1;
+        }
+        int hull_count = chain_count - 1;
+        int first = 0;
+        for (int i = 1; i < hull_count; i = i + 1)
+        {
+            bool lower = pts[chain[i] * 2 + 1] < pts[chain[first] * 2 + 1];
+            bool same_y = pts[chain[i] * 2 + 1] == pts[chain[first] * 2 + 1];
+            if (lower || (same_y && pts[chain[i] * 2] < pts[chain[first] * 2])) first = i;
+        }
+        for (int i = 0; i < hull_count; i = i + 1) hull[i] = chain[(first + i) % hull_count];
+        delete[] order;
+        delete[] chain;
+        return hull_count;
+    }
+}
+
+
+
+
+
+
+
+
+

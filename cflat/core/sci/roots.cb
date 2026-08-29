@@ -1,0 +1,224 @@
+// roots.cb - bracketed and open scalar root finders and optimization.
+ //
+ // Root results always carry convergence explicitly. Optimize routines use
+ // caller-owned simplex storage where the API promises it.
+ import "math.cb";
+ 
+ namespace Roots
+ {
+     struct Result
+     {
+         double x = default;
+         int iterations = default;
+         bool converged = default;
+     };
+ 
+     Result bisect(Lambda<double(double)> f, double a, double b, double tol, int max_iter)
+     {
+         Result result = default;
+         if (max_iter < 0) max_iter = 0;
+         double fa = f(a);
+         double fb = f(b);
+         if (fa == 0.0)
+         {
+             result.x = a;
+             result.converged = true;
+             return result;
+         }
+         if (fb == 0.0)
+         {
+             result.x = b;
+             result.converged = true;
+             return result;
+         }
+         if (fa * fb > 0.0)
+         {
+             result.x = a;
+             return result;
+         }
+         for (int i = 0; i < max_iter; i = i + 1)
+         {
+             double middle = a + (b - a) * 0.5;
+             double fm = f(middle);
+             result.x = middle;
+             result.iterations = i + 1;
+             if (Math.abs(fm) <= tol || Math.abs(b - a) <= tol)
+             {
+                 result.converged = true;
+                 return result;
+             }
+             if (fa * fm < 0.0)
+             {
+                 b = middle;
+                 fb = fm;
+             }
+ 
+            else
+             {
+                 a = middle;
+                 fa = fm;
+             }
+         }
+         return result;
+     }
+ 
+     Result newton(Lambda<double(double)> f, Lambda<double(double)> df, double x0,
+                   double tol, int max_iter)
+     {
+         Result result = default;
+         result.x = x0;
+         for (int i = 0; i < max_iter; i = i + 1)
+         {
+             double fx = f(result.x);
+             double derivative = df(result.x);
+             if (Math.abs(fx) <= tol)
+             {
+                 result.iterations = i;
+                 result.converged = true;
+                 return result;
+             }
+             if (derivative == 0.0) return result;
+             double step = fx / derivative;
+             result.x = result.x - step;
+             result.iterations = i + 1;
+             if (Math.abs(step) <= tol || Math.abs(f(result.x)) <= tol)
+             {
+                 result.converged = true;
+                 return result;
+             }
+         }
+         return result;
+     }
+ 
+     Result secant(Lambda<double(double)> f, double x0, double x1, double tol, int max_iter)
+     {
+         Result result = default;
+         result.x = x1;
+         double f0 = f(x0);
+         double f1 = f(x1);
+         for (int i = 0; i < max_iter; i = i + 1)
+         {
+             if (Math.abs(f1) <= tol)
+             {
+                 result.converged = true;
+                 result.iterations = i;
+                 return result;
+             }
+             double denominator = f1 - f0;
+             if (denominator == 0.0) return result;
+             double x2 = x1 - f1 * (x1 - x0) / denominator;
+             result.x = x2;
+             result.iterations = i + 1;
+             if (Math.abs(x2 - x1) <= tol || Math.abs(f(x2)) <= tol)
+             {
+                 result.converged = true;
+                 return result;
+             }
+             x0 = x1;
+             f0 = f1;
+             x1 = x2;
+             f1 = f(x1);
+         }
+         return result;
+     }
+ 
+     Result brent(Lambda<double(double)> f, double a, double b, double tol, int max_iter)
+     {
+         Result result = default;
+         double fa = f(a);
+         double fb = f(b);
+         if (fa == 0.0)
+         {
+             result.x = a;
+             result.converged = true;
+             return result;
+         }
+         if (fb == 0.0)
+         {
+             result.x = b;
+             result.converged = true;
+             return result;
+         }
+         if (fa * fb > 0.0)
+         {
+             result.x = a;
+             return result;
+         }
+         double c = b;
+         double fc = fb;
+         double d = b - a;
+         double e = d;
+         for (int iteration = 1; iteration <= max_iter; iteration = iteration + 1)
+         {
+             if ((fb > 0.0 && fc > 0.0) || (fb < 0.0 && fc < 0.0))
+             {
+                 c = a;
+                 fc = fa;
+                 d = b - a;
+                 e = d;
+     
+        }
+             if (Math.abs(fc) < Math.abs(fb))
+             {
+                 a = b;
+                 b = c;
+                 c = a;
+                 fa = fb;
+                 fb = fc;
+                 fc = fa;
+             }
+             double middle = 0.5 * (c - b);
+             double limit = 2.0 * 0.000000000000001 * Math.abs(b) + 0.5 * tol;
+             result.x = b;
+             result.iterations = iteration;
+             if (Math.abs(middle) <= limit || fb == 0.0)
+             {
+                 result.converged = true;
+                 return result;
+             }
+             if (Math.abs(e) >= limit && Math.abs(fa) > Math.abs(fb))
+             {
+                 double s = fb / fa;
+                 double p;
+                 double q;
+                 if (a == c)
+                 {
+                     p = 2.0 * middle * s;
+                     q = 1.0 - s;
+                 }
+                 else
+                 {
+                     q = fa / fc;
+                     double z = fb / fc;
+                     p = s * (2.0 * middle * q * (q - z) - (b - a) * (z - 1.0));
+                     q = (q - 1.0) * (z - 1.0) * (s - 1.0);
+                 }
+                 if (p > 0.0) q = -q;
+                 else p = -p;
+                 double old = 3.0 * middle * q - Math.abs(limit * q);
+                 if (2.0 * p < (old < Math.abs(e * q) ? old : Math.abs(e * q)))
+                 {
+                     e = d;
+                     d = p / q;
+                
+ }
+                 else
+                 {
+                     d = middle;
+                     e = middle;
+                 }
+             }
+             else
+             {
+                 d = middle;
+                 e = middle;
+             }
+             a = b;
+             fa = fb;
+             if (Math.abs(d) > limit) b = b + d;
+             else b = b + (middle > 0.0 ? limit : -limit);
+             fb = f(b);
+         }
+         return result;
+     }
+ }

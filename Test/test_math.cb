@@ -1,6 +1,27 @@
+import "sci/distributions.cb";
+import "sci/constants.cb";
+import "sci/integrate.cb";
 import "test_helper.cb";
+import "random.cb";
+import "complex.cb";
+import "sci/stats.cb";
+import "sci/special.cb";
+import "sci/signal.cb";
+import "sci/spatial.cb";
+import "sci/cluster.cb";
 import "math.cb";
 
+
+bool MathClose(double actual, double expected, double tolerance)
+{
+    double scale = Math.max(1.0, Math.abs(expected));
+    return Math.abs(actual - expected) <= tolerance * scale;
+}
+
+bool IsNaN(double value)
+{
+    return !(value == value);
+}
 // p2 REGRESSION LEG: `main` is deliberately declared WITHOUT `extern` here. A file-scope
 // `int main()` is the program entry point by definition, so the compiler exports it
 // implicitly. Pre-fix this file compiled clean and then failed in the linker with
@@ -143,6 +164,710 @@ int main()
     u32 ulo = big2.to_u32();
     total++; passed += Test("i64.to_u32 truncate", ulo, 7);
 
+    // Sci complex arithmetic.
+    complex z = Cx.make(3.0, 4.0);
+    complex w = Cx.make(1.0, -2.0);
+    complex product = z * w;
+    complex quotient = z / w;
+    total++; passed += Test("complex abs", (float)z.abs(), 5.0f);
+    total++; passed += Test("complex product real", (float)product.re, 11.0f);
+    total++; passed += Test("complex product imag", (float)product.im, -2.0f);
+    total++; passed += Test("complex quotient real", (float)quotient.re, -1.0f);
+    total++; passed += Test("complex quotient imag", (float)quotient.im, 2.0f);
+    total++; passed += Test("complex exp zero", Cx.exp(Cx.make(0.0, 0.0)) == Cx.make(1.0, 0.0), true);
+
+    // Sci statistics. Order statistics use caller-owned scratch storage.
+    double[5] values = {1.0, 2.0, 3.0, 4.0, 100.0};
+    double[5] scratch = default;
+    total++; passed += Test("Stats.mean", (float)Stats.mean(values, 5), 22.0f);
+    total++; passed += Test("Stats.variance", (float)Stats.variance(values, 5), 1522.0f);
+    total++; passed += Test("Stats.median", (float)Stats.median(values, 5, scratch), 3.0f);
+    total++; passed += Test("Stats.quantile type7", (float)Stats.quantile(values, 5, 0.25, scratch), 2.0f);
+    total++; passed += Test("Stats.iqr", (float)Stats.iqr(values, 5, scratch), 2.0f);
+    total++; passed += Test("Stats.input preserved", values[0] == 1.0 && values[4] == 100.0, true);
+    double[5] linearX = {1.0, 2.0, 3.0, 4.0, 5.0};
+    double[5] linearY = {3.0, 5.0, 7.0, 9.0, 11.0};
+    Stats.LinearFit fit = Stats.linfit(linearX, linearY, 5);
+    total++; passed += Test("Stats.correlation", (float)Stats.correlation(linearX, linearY, 5), 1.0f);
+    total++; passed += Test("Stats.linfit slope", (float)fit.slope, 2.0f);
+    total++; passed += Test("Stats.linfit intercept", (float)fit.intercept, 1.0f);
+    // Portable special functions and distribution CDF checkpoints.
+    total++; passed += Test("Special.erf(0)", (float)Math.abs((float)Special.erf(0.0)) < 0.0001f, true);
+    total++; passed += Test("Special.erf(1)", Math.abs((float)Special.erf(1.0) - 0.84270079f) < 0.0001f, true);
+    total++; passed += Test("Special.normal_cdf(0)", (float)Special.normal_cdf(0.0, 0.0, 1.0), 0.5f);
+    total++; passed += Test("Special.normal_quantile(.5)", (float)Math.abs((float)Special.normal_quantile(0.5)) < 0.0001f, true);
+    total++; passed += Test("Special.student_t_cdf(1,1)", Math.abs((float)Special.student_t_cdf(1.0, 1.0) - 0.75f) < 0.0001f, true);
+    total++; passed += Test("Special.chi2_cdf(2,2)", Math.abs((float)Special.chi2_cdf(2.0, 2.0) - 0.63212055f) < 0.0001f, true);
+
+    // Tail accuracy, checked in RELATIVE terms on purpose. The float-tolerance
+    // assertions above pass even with a single-precision erf; only these fail.
+    double tailArg = 6.0;
+    double tailRef = 2.1519736712498913e-17;
+    double tailRel = Math.abs(Special.erfc(tailArg) - tailRef) / tailRef;
+    total++; passed += Test("Special.erfc tail relative accuracy", tailRel < 1.0e-12, true);
+    double cdfArg = -6.0;
+    double cdfRef = 9.8658764503769814e-10;
+    double cdfRel = Math.abs(Special.normal_cdf(cdfArg, 0.0, 1.0) - cdfRef) / cdfRef;
+    total++; passed += Test("Special.normal_cdf tail relative accuracy", cdfRel < 1.0e-12, true);
+
+    // Distribution methods and spare-cache stream resets.
+    Random rng = default;
+    rng.seed(1234);
+    double firstGaussian = rng.nextGaussian();
+    rng.nextGaussian();
+    rng.jump(4);
+    Random expectedRng = default;
+    expectedRng.seed(1234);
+    expectedRng.jump(6);
+    total++; passed += Test("Random jump clears spare", (float)rng.nextGaussian(), (float)expectedRng.nextGaussian());
+    rng.seed(1234);
+    total++; passed += Test("Random gaussian seed reset", (float)rng.nextGaussian(), (float)firstGaussian);
+    total++; passed += Test("Random poisson nonnegative", rng.nextPoisson(100.0) >= 0, true);
+    i64 binomial = rng.nextBinomial(20, 0.5);
+    total++; passed += Test("Random binomial range", binomial >= 0 && binomial <= 20, true);
+    int[4] shuffled = {1, 2, 3, 4};
+    rng.shuffle(shuffled, 4);
+    total++; passed += Test("Random shuffle preserves values", (shuffled[0] + shuffled[1] + shuffled[2] + shuffled[3]) == 10, true);
+
+    // Distribution CDF/PPF round trips, including tails.
+    total++; passed += Test("uniform round trip", MathClose(Dist.uniform_ppf(Dist.uniform_cdf(0.9, 0.0, 1.0), 0.0, 1.0), 0.9, 1.0e-9), true);
+    total++; passed += Test("normal left tail round trip", MathClose(Dist.normal_ppf(Dist.normal_cdf(-6.0, 0.0, 1.0), 0.0, 1.0), -6.0, 1.0e-9), true);
+    total++; passed += Test("normal median exact", Dist.normal_ppf(0.5, 4.0, 2.0) == 4.0, true);
+    total++; passed += Test("normal right tail round trip", MathClose(Dist.normal_ppf(Dist.normal_cdf(5.0, 0.0, 1.0), 0.0, 1.0), 5.0, 1.0e-9), true);
+    total++; passed += Test("lognormal tail round trip", MathClose(Dist.lognormal_ppf(Dist.lognormal_cdf(100.0, 0.0, 1.0), 0.0, 1.0), 100.0, 1.0e-9), true);
+    total++; passed += Test("exponential round trip", MathClose(Dist.exponential_ppf(Dist.exponential_cdf(20.0, 0.5), 0.5), 20.0, 1.0e-9), true);
+    total++; passed += Test("gamma left tail round trip", MathClose(Dist.gamma_ppf(Dist.gamma_cdf(0.01, 2.0, 2.0), 2.0, 2.0), 0.01, 1.0e-9), true);
+    total++; passed += Test("gamma body round trip", MathClose(Dist.gamma_ppf(Dist.gamma_cdf(4.0, 2.0, 2.0), 2.0, 2.0), 4.0, 1.0e-9), true);
+    total++; passed += Test("gamma right tail round trip", MathClose(Dist.gamma_ppf(Dist.gamma_cdf(20.0, 2.0, 2.0), 2.0, 2.0), 20.0, 1.0e-9), true);
+    total++; passed += Test("beta left tail round trip", MathClose(Dist.beta_ppf(Dist.beta_cdf(0.001, 2.0, 5.0), 2.0, 5.0), 0.001, 1.0e-9), true);
+    total++; passed += Test("beta body round trip", MathClose(Dist.beta_ppf(Dist.beta_cdf(0.5, 2.0, 5.0), 2.0, 5.0), 0.5, 1.0e-9), true);
+    total++; passed += Test("beta right tail round trip", MathClose(Dist.beta_ppf(Dist.beta_cdf(0.99, 2.0, 5.0), 2.0, 5.0), 0.99, 1.0e-9), true);
+    total++; passed += Test("chi2 left tail round trip", MathClose(Dist.chi2_ppf(Dist.chi2_cdf(0.01, 4.0), 4.0), 0.01, 1.0e-9), true);
+    total++; passed += Test("chi2 body round trip", MathClose(Dist.chi2_ppf(Dist.chi2_cdf(4.0, 4.0), 4.0), 4.0, 1.0e-9), true);
+    total++; passed += Test("chi2 right tail round trip", MathClose(Dist.chi2_ppf(Dist.chi2_cdf(30.0, 4.0), 4.0), 30.0, 1.0e-9), true);
+    total++; passed += Test("student t left tail round trip", MathClose(Dist.student_t_ppf(Dist.student_t_cdf(-8.0, 5.0), 5.0), -8.0, 1.0e-9), true);
+    total++; passed += Test("student t median exact", Dist.student_t_ppf(0.5, 5.0) == 0.0, true);
+    total++; passed += Test("student t right tail round trip", MathClose(Dist.student_t_ppf(Dist.student_t_cdf(8.0, 5.0), 5.0), 8.0, 1.0e-9), true);
+    total++; passed += Test("f left tail round trip", MathClose(Dist.f_ppf(Dist.f_cdf(0.01, 5.0, 8.0), 5.0, 8.0), 0.01, 1.0e-9), true);
+    total++; passed += Test("f body round trip", MathClose(Dist.f_ppf(Dist.f_cdf(1.0, 5.0, 8.0), 5.0, 8.0), 1.0, 1.0e-9), true);
+    total++; passed += Test("f right tail round trip", MathClose(Dist.f_ppf(Dist.f_cdf(20.0, 5.0, 8.0), 5.0, 8.0), 20.0, 1.0e-9), true);
+
+    // Independently check closed-form CDFs and a PDF/CDF integral.
+    double normalMass = Dist.normal_cdf(1.0, 0.0, 1.0) - Dist.normal_cdf(-1.0, 0.0, 1.0);
+    total++; passed += Test("normal +/-1 mass", MathClose(normalMass, 0.682689492137, 1.0e-9), true);
+    double normalMass2 = Dist.normal_cdf(2.0, 0.0, 1.0) - Dist.normal_cdf(-2.0, 0.0, 1.0);
+    total++; passed += Test("normal +/-2 mass", MathClose(normalMass2, 0.954499736104, 1.0e-9), true);
+    double normalMass3 = Dist.normal_cdf(3.0, 0.0, 1.0) - Dist.normal_cdf(-3.0, 0.0, 1.0);
+    total++; passed += Test("normal +/-3 mass", MathClose(normalMass3, 0.997300203937, 1.0e-9), true);
+    total++; passed += Test("uniform closed CDF", Dist.uniform_cdf(0.25, 0.0, 1.0) == 0.25, true);
+    total++; passed += Test("exponential closed CDF", MathClose(Dist.exponential_cdf(2.0, 0.5), 0.632120558829, 1.0e-9), true);
+    total++; passed += Test("chi2 df2 closed CDF", MathClose(Dist.chi2_cdf(2.0, 2.0), 0.632120558829, 1.0e-9), true);
+    double integratedNormal = Integrate.simpson((double x) => Dist.normal_pdf(x, 0.0, 1.0), -1.0, 1.0, 200);
+    total++; passed += Test("normal PDF integrates to CDF", MathClose(integratedNormal, normalMass, 1.0e-8), true);
+    double integratedGamma = Integrate.simpson((double x) => Dist.gamma_pdf(x, 2.0, 2.0), 0.5, 8.0, 200);
+    total++; passed += Test("gamma PDF integrates to CDF", MathClose(integratedGamma, Dist.gamma_cdf(8.0, 2.0, 2.0) - Dist.gamma_cdf(0.5, 2.0, 2.0), 1.0e-8), true);
+
+    // Discrete PMF sums and the geometric one-based convention.
+    double poissonSum = 0.0;
+    for (i64 k = 0; k <= 20; k = k + (i64)1) poissonSum = poissonSum + Dist.poisson_pmf(k, 3.0);
+    total++; passed += Test("poisson PMF sums to CDF", MathClose(poissonSum, Dist.poisson_cdf(20, 3.0), 1.0e-12), true);
+    total++; passed += Test("poisson PMF truncated total", MathClose(poissonSum, 1.0, 1.0e-8), true);
+    double binomialSum = 0.0;
+    for (i64 k = 0; k <= 10; k = k + (i64)1) binomialSum = binomialSum + Dist.binomial_pmf(k, 10, 0.4);
+    total++; passed += Test("binomial PMF total", MathClose(binomialSum, 1.0, 1.0e-12), true);
+    total++; passed += Test("geometric one-based PMF", Dist.geometric_pmf(1, 0.25) == 0.25, true);
+    total++; passed += Test("geometric one-based CDF", Dist.geometric_cdf(1, 0.25) == 0.25, true);
+    total++; passed += Test("discrete ppf searches CDF", Dist.poisson_ppf(Dist.poisson_cdf(4, 3.0), 3.0) == 4.0, true);
+
+    // Fixed-seed random variate sanity checks.
+    Random sampleRng = default;
+    sampleRng.seed(8675309);
+    double[1000] normalSamples = default;
+    for (int i = 0; i < 1000; i = i + 1) normalSamples[i] = Dist.normal_rvs(&sampleRng, 2.0, 3.0);
+    total++; passed += Test("normal rvs mean", Math.abs(Stats.mean(normalSamples, 1000) - 2.0) < 0.2, true);
+    total++; passed += Test("normal rvs variance", Math.abs(Stats.variance(normalSamples, 1000) - 9.0) < 0.5, true);
+    sampleRng.seed(8675309);
+    double[1000] poissonSamples = default;
+    for (int i = 0; i < 1000; i = i + 1) poissonSamples[i] = Dist.poisson_rvs(&sampleRng, 4.0);
+    total++; passed += Test("poisson rvs mean", Math.abs(Stats.mean(poissonSamples, 1000) - 4.0) < 0.3, true);
+
+    // Invalid parameters return NaN.
+    total++; passed += Test("uniform invalid", IsNaN(Dist.uniform_cdf(0.5, 2.0, 1.0)), true);
+    total++; passed += Test("normal invalid", IsNaN(Dist.normal_cdf(0.0, 0.0, -1.0)), true);
+    total++; passed += Test("lognormal invalid", IsNaN(Dist.lognormal_cdf(1.0, 0.0, 0.0)), true);
+    total++; passed += Test("exponential invalid", IsNaN(Dist.exponential_cdf(1.0, 0.0)), true);
+    total++; passed += Test("gamma invalid", IsNaN(Dist.gamma_cdf(1.0, 0.0, 1.0)), true);
+    total++; passed += Test("beta invalid", IsNaN(Dist.beta_cdf(0.5, 0.0, 1.0)), true);
+    total++; passed += Test("chi2 invalid", IsNaN(Dist.chi2_cdf(1.0, 0.0)), true);
+    total++; passed += Test("student t invalid", IsNaN(Dist.student_t_cdf(1.0, 0.0)), true);
+    total++; passed += Test("f invalid", IsNaN(Dist.f_cdf(1.0, 0.0, 1.0)), true);
+    total++; passed += Test("poisson invalid", IsNaN(Dist.poisson_cdf(1, 0.0)), true);
+    total++; passed += Test("binomial invalid", IsNaN(Dist.binomial_cdf(1, 2, -0.1)), true);
+    total++; passed += Test("geometric invalid", IsNaN(Dist.geometric_cdf(1, 0.0)), true);
+
+    // Constants are checked through dimensional identities and conversions.
+    total++; passed += Test("hbar identity", MathClose(Const.HBAR * 2.0 * Const.PI, Const.H, 1.0e-9), true);
+    total++; passed += Test("gas constant identity", MathClose(Const.N_A * Const.K_B, Const.R, 1.0e-9), true);
+    total++; passed += Test("electron volt identity", Const.EV == Const.E_CHARGE, true);
+    total++; passed += Test("zero Celsius", Const.celsius_to_kelvin(0.0) == 273.15, true);
+    double fahrenheit = Const.celsius_to_fahrenheit(Const.kelvin_to_celsius(300.0));
+    total++; passed += Test("temperature round trip", MathClose(Const.fahrenheit_to_kelvin(fahrenheit), 300.0, 1.0e-12), true);
+
+    // Signal windows, convolution, and stateful filtering.
+    double[8] sw = default;
+    Signal.hann(sw, 8, true);
+    total++; passed += Test("Signal hann endpoints", MathClose(sw[0], 0.0, 1.0e-12) && MathClose(sw[7], 0.0, 1.0e-12) && MathClose(sw[1], sw[6], 1.0e-12), true);
+    Signal.hamming(sw, 8, true);
+    total++; passed += Test("Signal hamming endpoint", MathClose(sw[0], 0.08, 1.0e-12), true);
+
+    // A mutation audit showed blackman/bartlett/kaiser had no value checks at
+    // all: every coefficient could be perturbed with the suite still green.
+    double[8] bw = default;
+    Signal.blackman(bw, 8, true);
+    // 0.42 - 0.5 + 0.08 is exactly 0 at the endpoints, so any one coefficient
+    // drifting breaks this; the periodic sum below pins 0.42 on its own.
+    total++; passed += Test("Signal blackman endpoints",
+        MathClose(bw[0], 0.0, 1.0e-12) && MathClose(bw[7], 0.0, 1.0e-12), true);
+    Signal.blackman(bw, 8, false);
+    double bsum = 0.0;
+    for (int i = 0; i < 8; i = i + 1) bsum = bsum + bw[i];
+    double blackman_dc = 0.42;
+    total++; passed += Test("Signal blackman periodic sum",
+        MathClose(bsum, blackman_dc * 8.0, 1.0e-12), true);
+
+    // Symmetric bartlett over 8 points peaks at 6/7 either side of the centre.
+    double[8] tw = default;
+    Signal.bartlett(tw, 8, true);
+    double bt_six = 6.0;
+    double bt_seven = 7.0;
+    total++; passed += Test("Signal bartlett shape",
+        MathClose(tw[0], 0.0, 1.0e-12) && MathClose(tw[3], bt_six / bt_seven, 1.0e-12)
+        && MathClose(tw[3], tw[4], 1.0e-12), true);
+
+    // Kaiser's I0 switches from a power series to an asymptotic expansion at
+    // ax = 15, and the asymptotic branch had no coverage whatsoever. w[0] is
+    // 1/I0(beta), and I0(x) ~ e^x / sqrt(2*pi*x), so straddling the switchover
+    // by a hair makes the two branches directly comparable.
+    double[8] kw = default;
+    double beta_lo = 14.999;
+    double beta_hi = 15.001;
+    Signal.kaiser(kw, 8, beta_lo, true);
+    double k_lo = kw[0];
+    Signal.kaiser(kw, 8, beta_hi, true);
+    double k_hi = kw[0];
+    double expected_ratio = Math.exp(beta_lo - beta_hi) * Math.sqrt(beta_hi / beta_lo);
+    total++; passed += Test("Signal kaiser I0 branch continuity",
+        MathClose(k_hi / (k_lo * expected_ratio), 1.0, 1.0e-5), true);
+    double[4] ca = {1.0, 2.0, 3.0, 4.0};
+    double[3] cb = {2.0, -1.0, 3.0};
+    double[6] cc = default;
+    Signal.convolve(ca, 4, cb, 3, cc);
+    total++; passed += Test("Signal convolution", cc[0] == 2.0 && cc[1] == 3.0 && cc[5] == 12.0, true);
+    double[1] unit = {1.0};
+    double[4] same = default;
+    Signal.convolve_same(ca, 4, unit, 1, same);
+    total++; passed += Test("Signal same length and identity", same[0] == 1.0 && same[3] == 4.0, true);
+    double[2] valid = default;
+    Signal.convolve_valid(ca, 4, cb, 3, valid);
+    total++; passed += Test("Signal valid length", valid[0] == 7.0 && valid[1] == 11.0, true);
+
+    double[2] lb = {0.5, 0.5};
+    double[2] la = {1.0, -0.5};
+    double[6] lx = {1.0, 2.0, 0.0, 3.0, 1.0, 4.0};
+    double[6] ly = default;
+    double[6] le = default;
+    double previous = 0.0;
+    for (int i = 0; i < 6; i = i + 1)
+    {
+        double prior = i == 0 ? 0.0 : lx[i - 1];
+        le[i] = 0.5 * lx[i] + 0.5 * prior + 0.5 * previous;
+        previous = le[i];
+    }
+    double[1] lz = default;
+    Signal.lfilter(lb, 2, la, 2, lx, 6, ly, lz);
+    double lerr = 0.0;
+    for (int i = 0; i < 6; i = i + 1) lerr = Math.max(lerr, Math.abs(ly[i] - le[i]));
+    total++; passed += Test("Signal lfilter recursion", lerr < 1.0e-12, true);
+
+    double[6] one = default;
+    double[3] first = default;
+    double[3] second = default;
+    double[1] zstream = default;
+    double[1] zfirst = default;
+    Signal.lfilter(lb, 2, la, 2, lx, 6, one, zstream);
+    Signal.lfilter(lb, 2, la, 2, lx, 3, first, zfirst);
+    Signal.lfilter(lb, 2, la, 2, (double[])&lx[3], 3, second, zfirst);
+    double streamerr = 0.0;
+    for (int i = 0; i < 3; i = i + 1)
+    {
+        streamerr = Math.max(streamerr, Math.abs(one[i] - first[i]));
+        streamerr = Math.max(streamerr, Math.abs(one[i + 3] - second[i]));
+    }
+    total++; passed += Test("Signal lfilter streaming", streamerr < 1.0e-12, true);
+
+    double[32] symmetric = default;
+    for (int i = 0; i < 32; i = i + 1) symmetric[i] = (double)(i < 16 ? i : 31 - i);
+    double[3] fb = default;
+    double[3] fa = default;
+    Signal.butter(2, 0.25, false, fb, fa);
+    double[32] filtered = default;
+    double[128] fwork = default;
+    Signal.filtfilt(fb, 3, fa, 3, symmetric, 32, filtered, fwork);
+    double ferr = 0.0;
+    for (int i = 0; i < 16; i = i + 1) ferr = Math.max(ferr, Math.abs(filtered[i] - filtered[31 - i]));
+    total++; passed += Test("Signal filtfilt symmetry", ferr < 1.0e-10, true);
+
+    // Butterworth designs use prewarping, so the requested cutoff is -3 dB.
+    double maxcutofferr = 0.0;
+    for (int order = 1; order <= 4; order = order + 1)
+    {
+        double[5] bb = default;
+        double[5] aa = default;
+        double wn = order == 4 ? 0.85 : (order == 3 ? 0.45 : 0.25);
+        Signal.butter(order, wn, false, bb, aa);
+        double omega = Math.PI * wn;
+        double nr = 0.0;
+        double ni = 0.0;
+        double dr = 0.0;
+        double di = 0.0;
+        for (int i = 0; i <= order; i = i + 1)
+        {
+            double co = Math.cos(omega * (double)i);
+            double si = Math.sin(omega * (double)i);
+            nr = nr + bb[i] * co;
+            ni = ni - bb[i] * si;
+            dr = dr + aa[i] * co;
+            di = di - aa[i] * si;
+        }
+        double mag = Math.sqrt((nr * nr + ni * ni) / (dr * dr + di * di));
+        maxcutofferr = Math.max(maxcutofferr, Math.abs(mag - 0.7071067811865475));
+    }
+    total++; passed += Test("Signal Butterworth cutoff", maxcutofferr < 1.0e-6, true);
+
+    // Regression: the highpass pole radius was once left at 1 instead of the
+    // warped cutoff, which only shows up as a wrong -3 dB point, never at
+    // Nyquist where the gain is normalised to 1 regardless.
+    double maxhperr = 0.0;
+    for (int order = 1; order <= 4; order = order + 1)
+    {
+        double[5] hb = default;
+        double[5] ha = default;
+        double[4] hcuts = {0.1, 0.3, 0.5, 0.8};
+        for (int c = 0; c < 4; c = c + 1)
+        {
+            double hwn = hcuts[c];
+            if (!Signal.butter(order, hwn, true, hb, ha)) continue;
+            double hnr = 0.0;
+            double hni = 0.0;
+            double hdr = 0.0;
+            double hdi = 0.0;
+            for (int k = 0; k <= order; k = k + 1)
+            {
+                double ang = -Math.PI * hwn * (double)k;
+                hnr = hnr + hb[k] * Math.cos(ang);
+                hni = hni + hb[k] * Math.sin(ang);
+                hdr = hdr + ha[k] * Math.cos(ang);
+                hdi = hdi + ha[k] * Math.sin(ang);
+            }
+            double hmag = Math.sqrt((hnr * hnr + hni * hni) / (hdr * hdr + hdi * hdi));
+            maxhperr = Math.max(maxhperr, Math.abs(hmag - 0.7071067811865475));
+        }
+    }
+    total++; passed += Test("Signal Butterworth highpass cutoff", maxhperr < 1.0e-6, true);
+
+    // butter_bandpass had no test at all. Its gain is normalised at the band
+    // centre, so measuring there proves nothing (the same trap that hid the
+    // highpass bug); the -3 dB band edges are the actual contract.
+    double half_power = 0.7071067811865475;
+    double maxbperr = 0.0;
+    double[2] blos = {0.2, 0.3};
+    double[2] bhis = {0.5, 0.7};
+    for (int order = 1; order <= 3; order = order + 1)
+    {
+        int bdeg = 2 * order;
+        double[7] pb = default;
+        double[7] pa = default;
+        for (int c = 0; c < 2; c = c + 1)
+        {
+            if (!Signal.butter_bandpass(order, blos[c], bhis[c], pb, pa)) continue;
+            for (int e = 0; e < 2; e = e + 1)
+            {
+                double we = e == 0 ? blos[c] : bhis[c];
+                double base = -Math.PI * we;
+                double pnr = 0.0;
+                double pni = 0.0;
+                double pdr = 0.0;
+                double pdi = 0.0;
+                for (int k = 0; k <= bdeg; k = k + 1)
+                {
+                    double ang = base * (double)k;
+                    pnr = pnr + pb[k] * Math.cos(ang);
+                    pni = pni + pb[k] * Math.sin(ang);
+                    pdr = pdr + pa[k] * Math.cos(ang);
+                    pdi = pdi + pa[k] * Math.sin(ang);
+                }
+                double pmag = Math.sqrt((pnr * pnr + pni * pni) / (pdr * pdr + pdi * pdi));
+                maxbperr = Math.max(maxbperr, Math.abs(pmag - half_power));
+            }
+        }
+    }
+    total++; passed += Test("Signal Butterworth bandpass edges", maxbperr < 1.0e-6, true);
+
+    double[6] sos = default;
+    Signal.butter_sos(2, 0.25, false, sos);
+    double[16] sx = default;
+    double[16] sy1 = default;
+    double[16] sy2 = default;
+    double[2] sz1 = default;
+    double[2] sz2 = default;
+    for (int i = 0; i < 16; i = i + 1) sx[i] = (double)(i % 5) - 1.0;
+    Signal.lfilter(fb, 3, fa, 3, sx, 16, sy1, sz1);
+    Signal.sosfilt(sos, 1, sx, 16, sy2, sz2);
+    double sose = 0.0;
+    for (int i = 0; i < 16; i = i + 1) sose = Math.max(sose, Math.abs(sy1[i] - sy2[i]));
+    total++; passed += Test("Signal SOS matches TF", sose < 1.0e-10, true);
+
+    double[7] taps = default;
+    Signal.firwin(7, 0.3, false, Signal.HAMMING, taps);
+    double dc = 0.0;
+    for (int i = 0; i < 7; i = i + 1) dc = dc + taps[i];
+    total++; passed += Test("Signal FIR DC gain", MathClose(dc, 1.0, 1.0e-12), true);
+    Signal.firwin(7, 0.3, true, Signal.HAMMING, taps);
+    double ny = 0.0;
+    for (int i = 0; i < 7; i = i + 1) ny = ny + taps[i] * ((i & 1) != 0 ? -1.0 : 1.0);
+    total++; passed += Test("Signal FIR highpass gain", MathClose(ny, 1.0, 1.0e-12) && taps[0] == taps[6], true);
+
+    // fs and nperseg are deliberately DIFFERENT. With fs == nperseg the bin
+    // spacing is 1.0, which hides any confusion between the two in the scaling.
+    double wfs = 200.0;
+    double[256] wx = default;
+    for (int i = 0; i < 256; i = i + 1)
+        wx[i] = 2.0 * Math.sin(2.0 * Math.PI * 25.0 * (double)i / wfs);
+    double[33] freqs = default;
+    double[33] psd = default;
+    double[1280] wscratch = default;
+    bool welchok = Signal.welch(wx, 256, 64, 32, Signal.BOXCAR, wfs, freqs, psd, wscratch);
+    double wdf = wfs / 64.0;
+    double power = 0.0;
+    for (int i = 0; i < 33; i = i + 1) power = power + psd[i] * wdf;
+    // A sine of amplitude A carries total power A*A/2, here 2.0.
+    total++; passed += Test("Signal Welch Parseval", welchok && Math.abs(power - 2.0) < 1.0e-6, true);
+    total++; passed += Test("Signal Welch bin spacing", MathClose(freqs[1], wdf, 1.0e-9), true);
+
+    double[10] px = {0.0, 1.5, 0.2, 0.0, 0.5, 3.0, 0.1, 0.0, 2.0, 0.0};
+    int[4] locations = default;
+    int found = Signal.find_peaks(px, 10, 0.8, 0.7, 4, locations, 4);
+    total++; passed += Test("Signal prominence peaks", found == 2 && locations[0] == 1 && locations[1] == 5, true);
+
+    double[8] trend = default;
+    for (int i = 0; i < 8; i = i + 1) trend[i] = 3.0 + 2.0 * (double)i + Math.sin(Math.PI * (double)i);
+    Signal.detrend(trend, 8, true);
+    double rmean = 0.0;
+    double rslope = 0.0;
+    for (int i = 0; i < 8; i = i + 1)
+    {
+        rmean = rmean + trend[i];
+        rslope = rslope + ((double)i - 3.5) * trend[i];
+    }
+    total++; passed += Test("Signal linear detrend", Math.abs(rmean) < 1.0e-12 && Math.abs(rslope) < 1.0e-12, true);
+
+    // Spatial metrics and condensed pairwise distances.
+    double[3] metricA = {0.0, 0.0, 0.0};
+    double[3] metricB = {3.0, 4.0, 0.0};
+    total++; passed += Test("Spatial sqeuclidean triangle",
+        MathClose(Spatial.sqeuclidean(&metricA[0], &metricB[0], 3), 25.0, 1.0e-12), true);
+    total++; passed += Test("Spatial euclidean triangle",
+        MathClose(Spatial.euclidean(&metricA[0], &metricB[0], 3), 5.0, 1.0e-12), true);
+    total++; passed += Test("Spatial euclidean sqrt identity",
+        MathClose(Spatial.euclidean(&metricA[0], &metricB[0], 3),
+                  Math.sqrt(Spatial.sqeuclidean(&metricA[0], &metricB[0], 3)), 1.0e-12), true);
+    total++; passed += Test("Spatial manhattan",
+        MathClose(Spatial.manhattan(&metricA[0], &metricB[0], 3), 7.0, 1.0e-12), true);
+    total++; passed += Test("Spatial chebyshev",
+        MathClose(Spatial.chebyshev(&metricA[0], &metricB[0], 3), 4.0, 1.0e-12), true);
+    total++; passed += Test("Spatial minkowski one",
+        MathClose(Spatial.minkowski(&metricA[0], &metricB[0], 3, 1.0), 7.0, 1.0e-12), true);
+    total++; passed += Test("Spatial minkowski two",
+        MathClose(Spatial.minkowski(&metricA[0], &metricB[0], 3, 2.0), 5.0, 1.0e-12), true);
+    total++; passed += Test("Spatial minkowski large",
+        MathClose(Spatial.minkowski(&metricA[0], &metricB[0], 3, 100.0), 4.0, 1.0e-3), true);
+    double[3] cosineA = {1.0, 0.0, 0.0};
+    double[3] cosineB = {0.0, 1.0, 0.0};
+    total++; passed += Test("Spatial cosine",
+        MathClose(Spatial.cosine(&cosineA[0], &cosineB[0], 3), 1.0, 1.0e-12), true);
+    total++; passed += Test("Spatial hamming",
+        MathClose(Spatial.hamming(&metricA[0], &metricB[0], 3), 0.6666666666666666, 1.0e-12), true);
+    total++; passed += Test("Spatial canberra",
+        MathClose(Spatial.canberra(&metricA[0], &metricB[0], 3), 2.0, 1.0e-12), true);
+
+    double[6] sixPoints = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0};
+    double[15] sixPair = default;
+    double[36] sixFull = default;
+    Spatial.pdist(sixPoints, 6, 1, Spatial.METRIC_EUCLIDEAN, sixPair);
+    Spatial.cdist(sixPoints, 6, sixPoints, 6, 1, Spatial.METRIC_EUCLIDEAN, sixFull);
+    bool condensedOk = true;
+    for (int i = 0; i < 6; i = i + 1)
+        for (int j = i + 1; j < 6; j = j + 1)
+            condensedOk = condensedOk
+                && sixPair[Spatial.condensed_index(i, j, 6)] == sixFull[i * 6 + j];
+    total++; passed += Test("Spatial condensed layout", condensedOk, true);
+    total++; passed += Test("Spatial condensed reverse index",
+        Spatial.condensed_index(5, 1, 6) == Spatial.condensed_index(1, 5, 6), true);
+
+    // KDTree queries are checked against an exhaustive sorted scan.
+    int kdN = 32;
+    double[] kdPoints = new double[kdN * 2];
+    for (int i = 0; i < kdN; i = i + 1)
+    {
+        kdPoints[i * 2] = (double)((i * 37) % 101) * 0.1;
+        kdPoints[i * 2 + 1] = (double)((i * 53 + 7) % 97) * 0.1;
+    }
+    double[2] kdQueryPoint = {3.2, 4.1};
+    double[] bruteDistance = new double[kdN];
+    int[] bruteIndex = new int[kdN];
+    for (int i = 0; i < kdN; i = i + 1)
+    {
+        bruteIndex[i] = i;
+        bruteDistance[i] = Spatial.euclidean(&kdPoints[i * 2], &kdQueryPoint[0], 2);
+    }
+    for (int i = 0; i < kdN - 1; i = i + 1)
+    {
+        int best = i;
+        for (int j = i + 1; j < kdN; j = j + 1)
+            if (bruteDistance[j] < bruteDistance[best]) best = j;
+        double tempDistance = bruteDistance[i];
+        bruteDistance[i] = bruteDistance[best];
+        bruteDistance[best] = tempDistance;
+        int tempIndex = bruteIndex[i];
+        bruteIndex[i] = bruteIndex[best];
+        bruteIndex[best] = tempIndex;
+    }
+    Spatial.KdTree kdTree = default;
+    bool kdBuilt = Spatial.kdtree_build(&kdTree, kdPoints, kdN, 2, 2);
+    int[32] kdIndices = default;
+    double[32] kdDistances = default;
+    int kdFound = Spatial.kdtree_query(&kdTree, &kdQueryPoint[0], 5, kdIndices, kdDistances);
+    bool kdFiveOk = kdFound == 5;
+    for (int i = 0; i < 5; i = i + 1)
+        kdFiveOk = kdFiveOk && kdIndices[i] == bruteIndex[i]
+            && MathClose(kdDistances[i], bruteDistance[i], 1.0e-12);
+    total++; passed += Test("KDTree build and five nearest", kdBuilt && kdFiveOk, true);
+    int kdOne = Spatial.kdtree_query(&kdTree, &kdQueryPoint[0], 1, kdIndices, kdDistances);
+    total++; passed += Test("KDTree one nearest",
+        kdOne == 1 && kdIndices[0] == bruteIndex[0]
+            && MathClose(kdDistances[0], bruteDistance[0], 1.0e-12), true);
+    int kdAll = Spatial.kdtree_query(&kdTree, &kdQueryPoint[0], kdN, kdIndices, kdDistances);
+    bool kdAllOk = kdAll == kdN;
+    for (int i = 0; i < kdN; i = i + 1)
+        kdAllOk = kdAllOk && kdIndices[i] == bruteIndex[i]
+            && MathClose(kdDistances[i], bruteDistance[i], 1.0e-12);
+    total++; passed += Test("KDTree degenerate k n", kdAllOk, true);
+
+    int bigN = 2048;
+    double[] bigPoints = new double[bigN * 2];
+    for (int i = 0; i < bigN; i = i + 1)
+    {
+        bigPoints[i * 2] = (double)((i * 97) % 1009);
+        bigPoints[i * 2 + 1] = (double)((i * 193 + 11) % 1013);
+    }
+    Spatial.KdTree bigTree = default;
+    Spatial.kdtree_build(&bigTree, bigPoints, bigN, 2, 8);
+    int[1] pruneIndex = default;
+    double[1] pruneDistance = default;
+    Spatial.kdtree_query(&bigTree, &bigPoints[0], 1, pruneIndex, pruneDistance);
+    total++; passed += Test("KDTree pruning",
+        bigTree.visited_nodes * 10 < bigTree.node_count, true);
+    int[] radiusIndices = new int[bigN];
+    int radiusNone = Spatial.kdtree_query_radius(&kdTree, &kdQueryPoint[0], 0.0001,
+                                                  radiusIndices, kdN);
+    int radiusAll = Spatial.kdtree_query_radius(&kdTree, &kdQueryPoint[0], 1000.0,
+                                                 radiusIndices, kdN);
+    delete[_] radiusIndices;
+    total++; passed += Test("KDTree radius bounds",
+        radiusNone == 0 && radiusAll == kdN, true);
+    int kdVisited = bigTree.visited_nodes;
+    total++; passed += Test("KDTree visit counter exposed", kdVisited > 0, true);
+    Spatial.kdtree_free(&kdTree);
+    Spatial.kdtree_free(&bigTree);
+    delete[] kdPoints;
+    delete[] bruteDistance;
+    delete[] bruteIndex;
+    delete[] bigPoints;
+
+    // Convex hull returns unique vertices in counter-clockwise order.
+    double[10] squarePoints = {0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.5, 0.5};
+    int[5] squareHull = default;
+    int squareHullSize = Spatial.convex_hull_2d(squarePoints, 5, squareHull);
+    bool squareOk = squareHullSize == 4 && squareHull[0] == 0 && squareHull[1] == 1
+        && squareHull[2] == 2 && squareHull[3] == 3;
+    total++; passed += Test("convex hull square", squareOk, true);
+    double[8] collinearPoints = {0.0, 0.0, 1.0, 1.0, 2.0, 2.0, 1.0, 1.0};
+    int[4] collinearHull = default;
+    int collinearSize = Spatial.convex_hull_2d(collinearPoints, 4, collinearHull);
+    total++; passed += Test("convex hull collinear endpoints",
+        collinearSize == 2 && collinearHull[0] == 0 && collinearHull[1] == 2, true);
+    double[14] hullPoints = {0.0, 0.0, 2.0, 0.0, 3.0, 1.0, 2.0, 3.0,
+                             0.0, 3.0, -1.0, 1.0, 1.0, 1.0};
+    int[7] hull = default;
+    int hullSize = Spatial.convex_hull_2d(hullPoints, 7, hull);
+    bool hullHalfPlanes = hullSize == 6;
+    for (int e = 0; e < hullSize; e = e + 1)
+    {
+        int aIndex = hull[e];
+        int bIndex = hull[(e + 1) % hullSize];
+        for (int p = 0; p < 7; p = p + 1)
+            hullHalfPlanes = hullHalfPlanes && Spatial._hull_cross(
+                hullPoints, aIndex, bIndex, p) >= -1.0e-12;
+    }
+    total++; passed += Test("convex hull half planes", hullHalfPlanes, true);
+
+    // k-means++ on three deterministic, separated blobs.
+    double[18] blobs = {0.0, 0.0, 0.2, -0.1, -0.1, 0.2,
+                        10.0, 0.0, 10.2, -0.1, 9.9, 0.2,
+                        0.0, 10.0, 0.2, 9.9, -0.1, 10.2};
+    double[6] blobCentroids = default;
+    int[9] blobLabels = default;
+    double[30] blobScratch = default;
+    Random clusterRng = default;
+    clusterRng.seed(2468);
+    Cluster.KMeansResult blobResult = Cluster.kmeans(blobs, 9, 2, 3,
+        Spatial.METRIC_EUCLIDEAN, blobCentroids, blobLabels, 100, 0.000001,
+        &clusterRng, blobScratch);
+    bool blobGroups = blobLabels[0] == blobLabels[1] && blobLabels[1] == blobLabels[2]
+        && blobLabels[3] == blobLabels[4] && blobLabels[4] == blobLabels[5]
+        && blobLabels[6] == blobLabels[7] && blobLabels[7] == blobLabels[8]
+        && blobLabels[0] != blobLabels[3] && blobLabels[0] != blobLabels[6]
+        && blobLabels[3] != blobLabels[6];
+    double directInertia = 0.0;
+    for (int i = 0; i < 9; i = i + 1)
+        directInertia = directInertia + Spatial.sqeuclidean(
+            &blobs[i * 2], &blobCentroids[blobLabels[i] * 2], 2);
+    total++; passed += Test("kmeans separated blobs",
+        blobResult.converged && blobGroups && MathClose(blobResult.inertia, directInertia, 1.0e-12), true);
+
+    double[6] repeatCentroidsA = default;
+    double[6] repeatCentroidsB = default;
+    int[9] repeatLabelsA = default;
+    int[9] repeatLabelsB = default;
+    double[30] repeatScratchA = default;
+    double[30] repeatScratchB = default;
+    Random repeatRngA = default;
+    Random repeatRngB = default;
+    repeatRngA.seed(999);
+    repeatRngB.seed(999);
+    Cluster.kmeans(blobs, 9, 2, 3, Spatial.METRIC_EUCLIDEAN, repeatCentroidsA,
+                   repeatLabelsA, 100, 0.000001, &repeatRngA, repeatScratchA);
+    Cluster.kmeans(blobs, 9, 2, 3, Spatial.METRIC_EUCLIDEAN, repeatCentroidsB,
+                   repeatLabelsB, 100, 0.000001, &repeatRngB, repeatScratchB);
+    bool repeatOk = true;
+    for (int i = 0; i < 9; i = i + 1) repeatOk = repeatOk && repeatLabelsA[i] == repeatLabelsB[i];
+    for (int i = 0; i < 6; i = i + 1)
+        repeatOk = repeatOk && repeatCentroidsA[i] == repeatCentroidsB[i];
+    total++; passed += Test("kmeans reproducible seed", repeatOk, true);
+
+    double[12] duplicatePoints = {1.0, 1.0, 1.0, 1.0, 2.0, 2.0,
+                                   2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    double[8] duplicateCentroids = default;
+    int[6] duplicateLabels = default;
+    double[18] duplicateScratch = default;
+    Random duplicateRng = default;
+    duplicateRng.seed(7);
+    Cluster.kmeans(duplicatePoints, 6, 2, 4, Spatial.METRIC_EUCLIDEAN,
+                   duplicateCentroids, duplicateLabels, 20, 0.000001,
+                   &duplicateRng, duplicateScratch);
+    bool duplicateFinite = true;
+    for (int i = 0; i < 8; i = i + 1) duplicateFinite = duplicateFinite
+        && !IsNaN(duplicateCentroids[i]);
+    total++; passed += Test("kmeans empty cluster recovery", duplicateFinite, true);
+
+    // Linkage uses the condensed matrix and emits the four SciPy columns.
+    double[5] linkagePoints = {0.0, 1.0, 4.0, 9.0, 10.0};
+    double[10] singleCondensed = default;
+    int[4] singleA = default;
+    int[4] singleB = default;
+    double[4] singleDistance = default;
+    int[4] singleSize = default;
+    Spatial.pdist(linkagePoints, 5, 1, Spatial.METRIC_EUCLIDEAN, singleCondensed);
+    bool singleLinked = Cluster.linkage(singleCondensed, 5, Cluster.LINKAGE_SINGLE,
+                                        singleA, singleB, singleDistance, singleSize);
+    bool singleExpected = singleLinked
+        && singleA[0] == 0 && singleB[0] == 1 && singleSize[0] == 2
+        && singleA[1] == 3 && singleB[1] == 4 && singleSize[1] == 2
+        && singleA[2] == 2 && singleB[2] == 5 && singleSize[2] == 3
+        && singleA[3] == 6 && singleB[3] == 7 && singleSize[3] == 5
+        && MathClose(singleDistance[0], 1.0, 1.0e-12)
+        && MathClose(singleDistance[1], 1.0, 1.0e-12)
+        && MathClose(singleDistance[2], 3.0, 1.0e-12)
+        && MathClose(singleDistance[3], 5.0, 1.0e-12);
+    total++; passed += Test("single linkage hand example", singleExpected, true);
+
+    double[10] completeCondensed = default;
+    double[10] averageCondensed = default;
+    double[10] wardCondensed = default;
+    int[4] completeA = default;
+    int[4] completeB = default;
+    double[4] completeDistance = default;
+    int[4] completeSize = default;
+    int[4] averageA = default;
+    int[4] averageB = default;
+    double[4] averageDistance = default;
+    int[4] averageSize = default;
+    int[4] wardA = default;
+    int[4] wardB = default;
+    double[4] wardDistance = default;
+    int[4] wardSize = default;
+    double fortyseven = 47.0;
+    double six = 6.0;
+    double fortynine = 49.0;
+    double three = 3.0;
+    double wardNumerator = 2209.0;
+    double fifteen = 15.0;
+    double wardMiddle = Math.sqrt(fortynine / three);
+    double wardFinal = Math.sqrt(wardNumerator / fifteen);
+    Spatial.pdist(linkagePoints, 5, 1, Spatial.METRIC_EUCLIDEAN, completeCondensed);
+    Spatial.pdist(linkagePoints, 5, 1, Spatial.METRIC_EUCLIDEAN, averageCondensed);
+    Spatial.pdist(linkagePoints, 5, 1, Spatial.METRIC_EUCLIDEAN, wardCondensed);
+    bool completeExpected = Cluster.linkage(
+        completeCondensed, 5, Cluster.LINKAGE_COMPLETE, completeA, completeB,
+        completeDistance, completeSize);
+    completeExpected = completeExpected
+        && MathClose(completeDistance[0], 1.0, 1.0e-12)
+        && MathClose(completeDistance[1], 1.0, 1.0e-12)
+        && MathClose(completeDistance[2], 4.0, 1.0e-12)
+        && MathClose(completeDistance[3], 10.0, 1.0e-12)
+        && completeSize[0] == 2 && completeSize[1] == 2
+        && completeSize[2] == 3 && completeSize[3] == 5;
+    bool averageExpected = Cluster.linkage(
+        averageCondensed, 5, Cluster.LINKAGE_AVERAGE, averageA, averageB,
+        averageDistance, averageSize);
+    averageExpected = averageExpected
+        && MathClose(averageDistance[0], 1.0, 1.0e-12)
+        && MathClose(averageDistance[1], 1.0, 1.0e-12)
+        && MathClose(averageDistance[2], 3.5, 1.0e-12)
+        && MathClose(averageDistance[3], fortyseven / six, 1.0e-12)
+        && averageSize[0] == 2 && averageSize[1] == 2
+        && averageSize[2] == 3 && averageSize[3] == 5;
+    bool wardExpected = Cluster.linkage(
+        wardCondensed, 5, Cluster.LINKAGE_WARD, wardA, wardB,
+        wardDistance, wardSize);
+    wardExpected = wardExpected
+        && MathClose(wardDistance[0], 1.0, 1.0e-12)
+        && MathClose(wardDistance[1], 1.0, 1.0e-12)
+        && MathClose(wardDistance[2], wardMiddle, 1.0e-12)
+        && MathClose(wardDistance[3], wardFinal, 1.0e-12)
+        && wardSize[0] == 2 && wardSize[1] == 2
+        && wardSize[2] == 3 && wardSize[3] == 5;
+    total++; passed += Test("complete linkage full sequence", completeExpected, true);
+    total++; passed += Test("average linkage full sequence", averageExpected, true);
+    total++; passed += Test("ward linkage full sequence", wardExpected, true);
+
+    int[5] flatLabels = default;
+    int flatCount = Cluster.fcluster(singleA, singleB, singleDistance, 5, 1.1, flatLabels);
+    total++; passed += Test("fcluster threshold",
+        flatCount == 3 && flatLabels[0] == flatLabels[1]
+            && flatLabels[3] == flatLabels[4] && flatLabels[0] != flatLabels[2], true);
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
+
 }

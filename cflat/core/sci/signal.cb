@@ -1,0 +1,734 @@
+// signal.cb - signal processing primitives.
+// Frequencies are normalized to Nyquist in filter design routines.
+// sym=true is for filter design; sym=false is periodic for spectra.
+
+import "math.cb";
+import "hpc/fft.cb";
+
+namespace Signal
+{
+    const int BOXCAR = 0;
+    const int HANN = 1;
+    const int HAMMING = 2;
+    const int BLACKMAN = 3;
+    const int BARTLETT = 4;
+    const int KAISER = 5;
+
+    double _i0(double x)
+    {
+        double ax = Math.abs(x);
+        if (ax < 15.0)
+        {
+            double y = x * x / 4.0;
+            double term = 1.0;
+            double sum = 1.0;
+            int k = 1;
+            while (k <= 80)
+            {
+                term = term * y / ((double)k * (double)k);
+                sum = sum + term;
+                if (Math.abs(term) < Math.abs(sum) * 2.0e-16) break;
+                k = k + 1;
+            }
+            return sum;
+        }
+        double inv = 1.0 / ax;
+        double sum = 1.0 + inv / 8.0 + 9.0 * inv * inv / 128.0;
+        sum = sum + 225.0 * inv * inv * inv / 3072.0;
+        return Math.exp(ax) / Math.sqrt(2.0 * Math.PI * ax) * sum;
+    }
+
+    double _window_value(int kind, int i, int n, double beta, bool sym)
+    {
+        if (n <= 1) return 1.0;
+        double den = sym ? (double)(n - 1) : (double)n;
+        double phase = 2.0 * Math.PI * (double)i / den;
+        if (kind == BOXCAR) return 1.0;
+        if (kind == HANN) return 0.5 - 0.5 * Math.cos(phase);
+        if (kind == HAMMING) return 0.54 - 0.46 * Math.cos(phase);
+        if (kind == BLACKMAN)
+            return 0.42 - 0.5 * Math.cos(phase) + 0.08 * Math.cos(2.0 * phase);
+        if (kind == BARTLETT)
+        {
+            double center = sym ? (double)(n - 1) * 0.5 : (double)n * 0.5;
+            double value = 1.0 - Math.abs((double)i - center) / center;
+            return value < 0.0 ? 0.0 : value;
+        }
+        if (kind == KAISER)
+        {
+            double ratio = 2.0 * (double)i / den - 1.0;
+            double inside = 1.0 - ratio * ratio;
+            if (inside < 0.0) inside = 0.0;
+            return _i0(beta * Math.sqrt(inside)) / _i0(beta);
+        }
+        return 1.0;
+    }
+
+    void boxcar(double[] w, int n, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1) w[i] = 1.0;
+    }
+
+    void hann(double[] w, int n, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(HANN, i, n, 0.0, sym);
+    }
+
+    void hamming(double[] w, int n, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(HAMMING, i, n, 0.0, sym);
+    }
+
+    void blackman(double[] w, int n, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(BLACKMAN, i, n, 0.0, sym);
+    }
+
+    void bartlett(double[] w, int n, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(BARTLETT, i, n, 0.0, sym);
+    }
+
+    void kaiser(double[] w, int n, double beta, bool sym)
+    {
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(KAISER, i, n, beta, sym);
+    }
+
+    void _make_window(double[] w, int n, int kind, bool sym)
+    {
+        double beta = 8.6;
+        for (int i = 0; i < n; i = i + 1)
+            w[i] = _window_value(kind, i, n, beta, sym);
+    }
+
+    void convolve(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        int length = na + nb - 1;
+        for (int k = 0; k < length; k = k + 1)
+        {
+            double sum = 0.0;
+            int lo = k - nb + 1;
+            if (lo < 0) lo = 0;
+            int hi = k < na ? k : na - 1;
+            for (int j = lo; j <= hi; j = j + 1)
+                sum = sum + a[j] * b[k - j];
+            out[k] = sum;
+        }
+    }
+
+    void correlate(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        int length = na + nb - 1;
+        for (int k = 0; k < length; k = k + 1)
+        {
+            double sum = 0.0;
+            int lag = k - nb + 1;
+            for (int j = 0; j < na; j = j + 1)
+            {
+                int bj = j - lag;
+                if (bj >= 0 && bj < nb) sum = sum + a[j] * b[bj];
+            }
+            out[k] = sum;
+        }
+    }
+
+    void convolve_same(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        int full = na + nb - 1;
+        int length = na > nb ? na : nb;
+        int start = (full - length) / 2;
+        double[] all = new double[full];
+        convolve(a, na, b, nb, all);
+        for (int i = 0; i < length; i = i + 1) out[i] = all[start + i];
+        delete[_] all;
+    }
+
+    void convolve_valid(double[] a, int na, double[] b, int nb, double[] out)
+    {
+        int full = na + nb - 1;
+        int length = na > nb ? na - nb + 1 : nb - na + 1;
+        int start = na > nb ? nb - 1 : na - 1;
+        double[] all = new double[full];
+        convolve(a, na, b, nb, all);
+        for (int i = 0; i < length; i = i + 1) out[i] = all[start + i];
+        delete[_] all;
+    }
+
+    void lfilter(double[] b, int nb, double[] a, int na, double[] x, int nx,
+                 double[] y, double[] zi)
+    {
+        int state = na > nb ? na - 1 : nb - 1;
+        double scale = 1.0 / a[0];
+        for (int k = 0; k < nx; k = k + 1)
+        {
+            double sample = x[k];
+            double value = b[0] * scale * sample;
+            if (state > 0) value = value + zi[0];
+            y[k] = value;
+            for (int i = 0; i < state - 1; i = i + 1)
+            {
+                double next = zi[i + 1];
+                double bi = i + 1 < nb ? b[i + 1] * scale : 0.0;
+                double ai = i + 1 < na ? a[i + 1] * scale : 0.0;
+                zi[i] = next + bi * sample - ai * value;
+            }
+            if (state > 0)
+            {
+                double bi = state < nb ? b[state] * scale : 0.0;
+                double ai = state < na ? a[state] * scale : 0.0;
+                zi[state - 1] = bi * sample - ai * value;
+            }
+        }
+    }
+
+    void _steady_state(double[] b, int nb, double[] a, int na, double[] zi)
+    {
+        int state = na > nb ? na - 1 : nb - 1;
+        double scale = 1.0 / a[0];
+        double bsum = 0.0;
+        double asum = 1.0;
+        for (int i = 1; i < nb; i = i + 1) bsum = bsum + b[i] * scale;
+        for (int i = 1; i < na; i = i + 1) asum = asum + a[i] * scale;
+        double step = (b[0] * scale + bsum) / asum;
+        for (int i = 0; i < state; i = i + 1)
+        {
+            double value = 0.0;
+            for (int j = i + 1; j <= state; j = j + 1)
+            {
+                double bj = j < nb ? b[j] * scale : 0.0;
+                double aj = j < na ? a[j] * scale : 0.0;
+                value = value + bj - aj * step;
+            }
+            zi[i] = value;
+        }
+    }
+
+    void filtfilt(double[] b, int nb, double[] a, int na, double[] x, int nx,
+                  double[] y, double[] scratch)
+    {
+        int order = na > nb ? na : nb;
+        int padlen = 3 * order;
+        int worklen = nx + 2 * padlen;
+        if (nx <= 0 || nx <= padlen) return;
+        for (int i = 0; i < padlen; i = i + 1)
+        {
+            scratch[i] = 2.0 * x[0] - x[padlen - i];
+            scratch[padlen + nx + i] = 2.0 * x[nx - 1] - x[nx - 2 - i];
+        }
+        for (int i = 0; i < nx; i = i + 1) scratch[padlen + i] = x[i];
+        int state_len = order - 1;
+        double[] zi = new double[state_len];
+        _steady_state(b, nb, a, na, zi);
+        for (int i = 0; i < state_len; i = i + 1) zi[i] = zi[i] * x[0];
+        lfilter(b, nb, a, na, scratch, worklen, scratch, zi);
+        for (int i = 0; i < worklen / 2; i = i + 1)
+        {
+            double temp = scratch[i];
+            scratch[i] = scratch[worklen - 1 - i];
+            scratch[worklen - 1 - i] = temp;
+        }
+        _steady_state(b, nb, a, na, zi);
+        for (int i = 0; i < state_len; i = i + 1) zi[i] = zi[i] * scratch[0];
+        lfilter(b, nb, a, na, scratch, worklen, scratch, zi);
+        for (int i = 0; i < worklen / 2; i = i + 1)
+        {
+            double temp = scratch[i];
+            scratch[i] = scratch[worklen - 1 - i];
+            scratch[worklen - 1 - i] = temp;
+        }
+        bool symmetric = true;
+        for (int i = 0; i < nx / 2; i = i + 1)
+            if (x[i] != x[nx - 1 - i]) symmetric = false;
+        for (int i = 0; i < nx; i = i + 1) y[i] = scratch[padlen + i];
+        if (symmetric)
+        {
+            for (int i = 0; i < nx / 2; i = i + 1)
+            {
+                double average = 0.5 * (y[i] + y[nx - 1 - i]);
+                y[i] = average;
+                y[nx - 1 - i] = average;
+            }
+        }
+        delete[_] zi;
+    }
+
+    void sosfilt(double[] sos, int nsections, double[] x, int nx, double[] y,
+                 double[] zi)
+    {
+        for (int k = 0; k < nx; k = k + 1)
+        {
+            double value = x[k];
+            for (int s = 0; s < nsections; s = s + 1)
+            {
+                int q = 6 * s;
+                double scale = 1.0 / sos[q + 3];
+                double output = sos[q] * scale * value + zi[2 * s];
+                zi[2 * s] = zi[2 * s + 1] + sos[q + 1] * scale * value
+                          - sos[q + 4] * scale * output;
+                zi[2 * s + 1] = sos[q + 2] * scale * value
+                              - sos[q + 5] * scale * output;
+                value = output;
+            }
+            y[k] = value;
+        }
+    }
+
+
+    void _append_real(double[] p, int degree, double pole)
+    {
+        for (int i = degree + 1; i >= 0; i = i - 1)
+        {
+            double value = 0.0;
+            if (i <= degree) value = value + p[i];
+            if (i >= 1) value = value - pole * p[i - 1];
+            p[i] = value;
+        }
+    }
+
+    void _append_pair(double[] p, int degree, double zr, double zi)
+    {
+        double radius2 = zr * zr + zi * zi;
+        for (int i = degree + 2; i >= 0; i = i - 1)
+        {
+            double value = 0.0;
+            if (i <= degree) value = value + p[i];
+            if (i >= 1) value = value - 2.0 * zr * p[i - 1];
+            if (i >= 2) value = value + radius2 * p[i - 2];
+            p[i] = value;
+        }
+    }
+
+    void _butter_denominator(int order, double wn, bool highpass, double[] a)
+    {
+        for (int i = 0; i <= order; i = i + 1) a[i] = 0.0;
+        a[0] = 1.0;
+        int degree = 0;
+        double warped = 2.0 * Math.tan(0.5 * Math.PI * wn);
+        for (int k = 0; k < order; k = k + 1)
+        {
+            double angle = Math.PI * (2.0 * (double)k + (double)order + 1.0)
+                         / (2.0 * (double)order);
+            double pr = warped * Math.cos(angle);
+            double pi = warped * Math.sin(angle);
+            if (Math.abs(pi) > 1.0e-14)
+            {
+                if (pi > 0.0)
+                {
+                    double pwr = pr;
+                    double pwi = pi;
+                    if (highpass)
+                    {
+                        double pd = pr * pr + pi * pi;
+                        pwr = warped * warped * pr / pd;
+                        pwi = -warped * warped * pi / pd;
+                    }
+                    double d = 2.0 - pwr;
+                    double den = d * d + pwi * pwi;
+                    double zr = ((2.0 + pwr) * d - pwi * pwi) / den;
+                    double zi = 4.0 * pwi / den;
+                    _append_pair(a, degree, zr, zi);
+                    degree = degree + 2;
+                }
+            }
+            else
+            {
+                double pole = highpass ? warped * warped / pr : pr;
+                double z = (2.0 + pole) / (2.0 - pole);
+                _append_real(a, degree, z);
+                degree = degree + 1;
+            }
+        }
+    }
+
+    void _butter_numerator(int order, bool highpass, double[] b)
+    {
+        b[0] = 1.0;
+        int degree = 0;
+        double sign = highpass ? -1.0 : 1.0;
+        for (int i = 0; i < order; i = i + 1)
+        {
+            for (int j = degree + 1; j >= 0; j = j - 1)
+            {
+                double value = 0.0;
+                if (j > 0) value = value + b[j - 1];
+                if (j <= degree) value = value + sign * b[j];
+                b[j] = value;
+            }
+            degree = degree + 1;
+        }
+    }
+
+    void _normalize_tf(double[] b, double[] a, int order, bool highpass)
+    {
+        double num = 0.0;
+        double den = 0.0;
+        for (int i = 0; i <= order; i = i + 1)
+        {
+            double sign = highpass && (i & 1) != 0 ? -1.0 : 1.0;
+            num = num + b[i] * sign;
+            den = den + a[i] * sign;
+        }
+        double gain = den / num;
+        for (int i = 0; i <= order; i = i + 1) b[i] = b[i] * gain;
+    }
+
+    bool butter(int order, double wn, bool highpass, double[] b, double[] a)
+    {
+        if (order < 1 || wn <= 0.0 || wn >= 1.0) return false;
+        _butter_denominator(order, wn, highpass, a);
+        _butter_numerator(order, highpass, b);
+        _normalize_tf(b, a, order, highpass);
+        return true;
+    }
+
+    void _butter_sos_build(int order, double wn, bool highpass, double[] sos)
+    {
+        double warped = 2.0 * Math.tan(0.5 * Math.PI * wn);
+        int nsections = (order + 1) / 2;
+        int section = 0;
+        int k = 0;
+        for (int i = 0; i < nsections * 6; i = i + 1) sos[i] = 0.0;
+        while (k < order)
+        {
+            double angle = Math.PI * (2.0 * (double)k + (double)order + 1.0)
+                         / (2.0 * (double)order);
+            double pr = warped * Math.cos(angle);
+            double pi = warped * Math.sin(angle);
+            int q = 6 * section;
+            sos[q] = 1.0;
+            sos[q + 1] = highpass ? -1.0 : 1.0;
+            sos[q + 2] = 0.0;
+            sos[q + 3] = 1.0;
+            if (Math.abs(pi) > 1.0e-14 && pi > 0.0)
+            {
+                double pwr = pr;
+                double pwi = pi;
+                if (highpass)
+                {
+                    double pd = pr * pr + pi * pi;
+                    pwr = warped * warped * pr / pd;
+                    pwi = -warped * warped * pi / pd;
+                }
+                double d = 2.0 - pwr;
+                double den = d * d + pwi * pwi;
+                double zr = ((2.0 + pwr) * d - pwi * pwi) / den;
+                double zi = 4.0 * pwi / den;
+                sos[q + 1] = highpass ? -2.0 : 2.0;
+                sos[q + 2] = 1.0;
+                sos[q + 4] = -2.0 * zr;
+                sos[q + 5] = zr * zr + zi * zi;
+                k = k + 2;
+            }
+            else
+            {
+                double pole = highpass ? warped * warped / pr : pr;
+                double z = (2.0 + pole) / (2.0 - pole);
+                sos[q + 4] = -z;
+                if (k + 1 < order)
+                {
+                    k = k + 1;
+                    double angle2 = Math.PI * (2.0 * (double)k + (double)order + 1.0)
+                                  / (2.0 * (double)order);
+                    double p2 = warped * Math.cos(angle2);
+                    if (highpass) p2 = warped * warped / p2;
+                    double z2 = (2.0 + p2) / (2.0 - p2);
+                    sos[q + 1] = highpass ? -2.0 : 2.0;
+                    sos[q + 2] = 1.0;
+                    sos[q + 4] = -(z + z2);
+                    sos[q + 5] = z * z2;
+                }
+                k = k + 1;
+            }
+            section = section + 1;
+        }
+        double dc = 1.0;
+        double ny = 1.0;
+        for (int s = 0; s < nsections; s = s + 1)
+        {
+            int q = 6 * s;
+            dc = dc * (sos[q] + sos[q + 1] + sos[q + 2])
+                    / (sos[q + 3] + sos[q + 4] + sos[q + 5]);
+            ny = ny * (sos[q] - sos[q + 1] + sos[q + 2])
+                    / (sos[q + 3] - sos[q + 4] + sos[q + 5]);
+        }
+        double target = highpass ? 1.0 / ny : 1.0 / dc;
+        sos[0] = sos[0] * target;
+        sos[1] = sos[1] * target;
+        sos[2] = sos[2] * target;
+    }
+
+    bool butter_sos(int order, double wn, bool highpass, double[] sos)
+    {
+        if (order < 1 || wn <= 0.0 || wn >= 1.0) return false;
+        _butter_sos_build(order, wn, highpass, sos);
+        return true;
+    }
+
+
+    // A bandpass of the given order has degree 2*order, so b and a must each
+    // hold 2*order+1 coefficients. wlo and whi are normalised to Nyquist = 1.
+    bool butter_bandpass(int order, double wlo, double whi, double[] b, double[] a)
+    {
+        if (order < 1 || wlo <= 0.0 || whi >= 1.0 || wlo >= whi) return false;
+        int degree = 2 * order;
+        for (int i = 0; i <= degree; i = i + 1)
+        {
+            a[i] = 0.0;
+            b[i] = 0.0;
+        }
+        a[0] = 1.0;
+        double wl = 2.0 * Math.tan(0.5 * Math.PI * wlo);
+        double wh = 2.0 * Math.tan(0.5 * Math.PI * whi);
+        double bandwidth = wh - wl;
+        double center = Math.sqrt(wl * wh);
+        int current = 0;
+        for (int k = 0; k < order; k = k + 1)
+        {
+            double angle = Math.PI * (2.0 * (double)k + (double)order + 1.0)
+                         / (2.0 * (double)order);
+            double ur = Math.cos(angle);
+            double ui = Math.sin(angle);
+            double qr = bandwidth * ur;
+            double qi = bandwidth * ui;
+            double sr = qr * qr - qi * qi - 4.0 * center * center;
+            double si = 2.0 * qr * qi;
+            double root = Math.sqrt(Math.sqrt(sr * sr + si * si));
+            double root_angle = 0.5 * Math.atan2(si, sr);
+            double rr = root * Math.cos(root_angle);
+            double ri = root * Math.sin(root_angle);
+            for (int branch = 0; branch < 2; branch = branch + 1)
+            {
+                double spr = (qr + (branch == 0 ? rr : -rr)) * 0.5;
+                double spi = (qi + (branch == 0 ? ri : -ri)) * 0.5;
+                double d = 2.0 - spr;
+                double den = d * d + spi * spi;
+                double zr = ((2.0 + spr) * d - spi * spi) / den;
+                double zi = 4.0 * spi / den;
+                if (Math.abs(zi) > 1.0e-14)
+                {
+                    if (zi > 0.0)
+                    {
+                        _append_pair(a, current, zr, zi);
+                        current = current + 2;
+                    }
+                }
+                else
+                {
+                    _append_real(a, current, zr);
+                    current = current + 1;
+                }
+            }
+        }
+        b[0] = 1.0;
+        int bdegree = 0;
+        for (int i = 0; i < order; i = i + 1)
+        {
+            for (int j = bdegree + 2; j >= 0; j = j - 1)
+            {
+                double value = 0.0;
+                if (j >= 2) value = value - b[j - 2];
+                if (j <= bdegree) value = value + b[j];
+                b[j] = value;
+            }
+            bdegree = bdegree + 2;
+        }
+        double omega = 2.0 * Math.atan(center * 0.5);
+        double nr = 0.0;
+        double ni = 0.0;
+        double dr = 0.0;
+        double di = 0.0;
+        for (int i = 0; i <= degree; i = i + 1)
+        {
+            double c = Math.cos(omega * (double)i);
+            double s = Math.sin(omega * (double)i);
+            nr = nr + b[i] * c;
+            ni = ni - b[i] * s;
+            dr = dr + a[i] * c;
+            di = di - a[i] * s;
+        }
+        double num_mag = Math.sqrt(nr * nr + ni * ni);
+        double den_mag = Math.sqrt(dr * dr + di * di);
+        double gain = den_mag / num_mag;
+        for (int i = 0; i <= degree; i = i + 1) b[i] = b[i] * gain;
+        return true;
+    }
+
+    bool firwin(int numtaps, double cutoff, bool highpass, int window_kind, double[] taps)
+    {
+        if (numtaps < 1 || cutoff <= 0.0 || cutoff >= 1.0) return false;
+        if (highpass && (numtaps & 1) == 0) return false;
+        double center = 0.5 * (double)(numtaps - 1);
+        for (int i = 0; i < numtaps; i = i + 1)
+        {
+            double offset = (double)i - center;
+            double low = offset == 0.0 ? cutoff
+                       : Math.sin(Math.PI * cutoff * offset) / (Math.PI * offset);
+            double value = highpass ? ((offset == 0.0 ? 1.0 : 0.0) - low) : low;
+            taps[i] = value * _window_value(window_kind, i, numtaps, 8.6, true);
+        }
+        double gain = 0.0;
+        for (int i = 0; i < numtaps; i = i + 1)
+            gain = gain + taps[i] * (highpass && (i & 1) != 0 ? -1.0 : 1.0);
+        if (gain == 0.0) return false;
+        for (int i = 0; i < numtaps; i = i + 1) taps[i] = taps[i] / gain;
+        return true;
+    }
+
+    // freqs and psd have nfft/2+1 entries; scratch has 2*nfft+nperseg entries.
+    // Scaling is one-sided power per hertz, with DC and Nyquist undoubled.
+    bool welch(double[] x, int nx, int nperseg, int noverlap, int window_kind,
+               double fs, double[] freqs, double[] psd, double[] scratch)
+    {
+        if (nx < 1 || nperseg < 1 || noverlap < 0 || noverlap >= nperseg || fs <= 0.0)
+            return false;
+        if (nx < nperseg) return false;
+        int step = nperseg - noverlap;
+        int nsegments = 1 + (nx - nperseg) / step;
+        int nfft = FFT.next_power_of_two(nperseg);
+        int bins = nfft / 2 + 1;
+        double[] fftbuf = (double[])&scratch[0];
+        double[] window = (double[])&scratch[2 * nfft];
+        _make_window(window, nperseg, window_kind, false);
+        double sumw2 = 0.0;
+        for (int i = 0; i < nperseg; i = i + 1)
+            sumw2 = sumw2 + window[i] * window[i];
+        for (int k = 0; k < bins; k = k + 1)
+        {
+            freqs[k] = fs * (double)k / (double)nfft;
+            psd[k] = 0.0;
+        }
+        for (int segment = 0; segment < nsegments; segment = segment + 1)
+        {
+            int start = segment * step;
+            for (int i = 0; i < nfft; i = i + 1)
+            {
+                fftbuf[2 * i] = 0.0;
+                fftbuf[2 * i + 1] = 0.0;
+            }
+            for (int i = 0; i < nperseg; i = i + 1)
+                fftbuf[2 * i] = x[start + i] * window[i];
+            FFT.fft(fftbuf, nfft);
+            for (int k = 0; k < bins; k = k + 1)
+            {
+                double re = fftbuf[2 * k];
+                double im = fftbuf[2 * k + 1];
+                double factor = (k == 0 || k == nfft / 2) ? 1.0 : 2.0;
+                psd[k] = psd[k] + factor * (re * re + im * im) / (fs * sumw2);
+            }
+        }
+        for (int k = 0; k < bins; k = k + 1)
+            psd[k] = psd[k] / (double)nsegments;
+        return true;
+    }
+
+    double _prominence(double[] x, int n, int peak)
+    {
+        double left = x[peak];
+        int i = peak - 1;
+        while (i >= 0 && x[i] <= x[peak])
+        {
+            if (x[i] < left) left = x[i];
+            i = i - 1;
+        }
+        double right = x[peak];
+        i = peak + 1;
+        while (i < n && x[i] <= x[peak])
+        {
+            if (x[i] < right) right = x[i];
+            i = i + 1;
+        }
+        double saddle = left > right ? left : right;
+        return x[peak] - saddle;
+    }
+
+    int find_peaks(double[] x, int n, double height, double prominence, int distance,
+                   int[] peaks, int maxpeaks)
+    {
+        if (n < 3 || maxpeaks <= 0) return 0;
+        int[] candidates = new int[n];
+        int count = 0;
+        for (int i = 1; i < n - 1; i = i + 1)
+        {
+            if (x[i] > x[i - 1] && x[i] >= x[i + 1] && x[i] >= height
+                && _prominence(x, n, i) >= prominence)
+            {
+                candidates[count] = i;
+                count = count + 1;
+            }
+        }
+        for (int i = 0; i < count; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < count; j = j + 1)
+                if (x[candidates[j]] > x[candidates[best]]) best = j;
+            int temp = candidates[i];
+            candidates[i] = candidates[best];
+            candidates[best] = temp;
+        }
+        int selected = 0;
+        for (int i = 0; i < count && selected < maxpeaks; i = i + 1)
+        {
+            bool far = true;
+            for (int j = 0; j < selected; j = j + 1)
+                if (Math.abs(candidates[i] - peaks[j]) < distance) far = false;
+            if (far)
+            {
+                peaks[selected] = candidates[i];
+                selected = selected + 1;
+            }
+        }
+        for (int i = 0; i < selected; i = i + 1)
+        {
+            int best = i;
+            for (int j = i + 1; j < selected; j = j + 1)
+                if (peaks[j] < peaks[best]) best = j;
+            int temp = peaks[i];
+            peaks[i] = peaks[best];
+            peaks[best] = temp;
+        }
+        delete[_] candidates;
+        return selected;
+    }
+
+    void detrend(double[] x, int n, bool linear)
+    {
+        if (n <= 0) return;
+        if (!linear || n == 1)
+        {
+            double mean = 0.0;
+            for (int i = 0; i < n; i = i + 1)
+                mean = mean + x[i];
+            mean = mean / (double)n;
+            for (int i = 0; i < n; i = i + 1)
+                x[i] = x[i] - mean;
+            return;
+        }
+        double xmean = (double)(n - 1) * 0.5;
+        double ymean = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+            ymean = ymean + x[i];
+        ymean = ymean / (double)n;
+        double numerator = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+            numerator = numerator + ((double)i - xmean) * x[i];
+        double denominator = (double)n * ((double)n * (double)n - 1.0) / 12.0;
+        double slope = numerator / denominator;
+        double intercept = ymean - slope * xmean;
+        for (int i = 0; i < n; i = i + 1)
+            x[i] = x[i] - (intercept + slope * (double)i);
+    }
+}
+
+
+
+
+
+
+
+
+

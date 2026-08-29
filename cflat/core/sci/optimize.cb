@@ -1,0 +1,867 @@
+// optimize.cb - multivariate minimization, nonlinear least squares, and curve fitting.
+// Scratch: numeric_gradient 2; BFGS n*n+5*n; L-BFGS 2*m*n+2*m+5*n.
+// Least squares and curve_fit: nparam*nres+3*nparam*nparam+5*nparam+3*nres.
+import "math.cb";
+import "sci/roots.cb";
+
+
+namespace Optimize
+{
+    struct MinResult
+    {
+        bool converged;
+        int iterations;
+        int evaluations;
+        double value;
+        double grad_norm;
+    };
+
+    struct LeastSquaresResult
+    {
+        bool converged;
+        int iterations;
+        int evaluations;
+        double cost;
+        double grad_norm;
+    };
+
+    struct CurveFitResult
+    {
+        bool converged;
+        bool covariance_valid;
+        int iterations;
+        int evaluations;
+        double cost;
+        double grad_norm;
+    };
+
+    struct _LineResult
+    {
+        bool ok;
+        double value;
+        int evaluations;
+    };
+
+    const double _EPS = 0.00000000000000022204460492503131;
+    const double _MAX = 1.79769313486231570815e308;
+    const double _C1 = 0.0001;
+    const double _C2 = 0.9;
+
+    double _abs(double x)
+    {
+        return x < 0.0 ? -x : x;
+    }
+
+    bool _finite(double x)
+    {
+        return x == x && x < _MAX && x > -_MAX;
+    }
+
+    double _dot(double* a, double* b, int n)
+    {
+        double z = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+            z = z + a[i] * b[i];
+        return z;
+    }
+
+    double _norm_inf(double* a, int n)
+    {
+        double z = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+            if (_abs(a[i]) > z) z = _abs(a[i]);
+        return z;
+    }
+
+    // Strong Wolfe zoom retains sufficient decrease and the curvature condition.
+    _LineResult _zoom(Lambda<double(double*, int)> f,
+                      Lambda<void(double*, double*, int)> grad, double* x,
+                      double* p, double* trial, double* gout, int n,
+                      double f0, double d0, double lo, double hi,
+                      double flo, double fhi, double dlo, int evaluations)
+    {
+        _LineResult r = default;
+        r.evaluations = evaluations;
+        for (int it = 0; it < 96; it = it + 1)
+        {
+            double width = hi - lo;
+            double denominator = fhi - flo - dlo * width;
+            double a = (lo + hi) * 0.5;
+            if (_finite(denominator) && _abs(denominator) > _EPS)
+            {
+                double candidate = lo - width * width * dlo / (2.0 * denominator);
+                if (candidate > lo + 0.1 * width && candidate < hi - 0.1 * width)
+                    a = candidate;
+            }
+            for (int i = 0; i < n; i = i + 1)
+                trial[i] = x[i] + a * p[i];
+            double fa = f((double*)trial, n);
+            r.evaluations = r.evaluations + 1;
+            if (!_finite(fa) || fa > f0 + _C1 * a * d0 || fa >= flo)
+            {
+                hi = a;
+                fhi = fa;
+            }
+            else
+            {
+                grad((double*)trial, (double*)gout, n);
+                double da = _dot(gout, p, n);
+                if (_abs(da) <= -_C2 * d0)
+                {
+                    r.ok = true;
+                    r.value = fa;
+                    return r;
+                }
+                if (da * (hi - lo) >= 0.0)
+                {
+                    hi = lo;
+                    fhi = flo;
+                }
+                lo = a;
+                flo = fa;
+                dlo = da;
+            }
+            if (_abs(hi - lo) <= 0.00000000000000000001 * (1.0 + _abs(lo)))
+            {
+                for (int i = 0; i < n; i = i + 1)
+                    trial[i] = x[i] + lo * p[i];
+                grad((double*)trial, (double*)gout, n);
+                double dlo_check = _dot(gout, p, n);
+                if (_abs(dlo_check) <= -_C2 * d0)
+                {
+                    r.ok = true;
+                    r.value = flo;
+                    return r;
+                }
+                return r;
+            }
+        }
+        return r;
+    }
+
+    // The curvature condition is required to keep the BFGS update positive definite.
+    _LineResult _wolfe(Lambda<double(double*, int)> f,
+                       Lambda<void(double*, double*, int)> grad, double* x,
+                       double* p, double* g, double* trial, double* gout,
+                       int n, double f0, int evaluations)
+    {
+        _LineResult r = default;
+        r.evaluations = evaluations;
+        double d0 = _dot(g, p, n);
+        if (!(d0 < 0.0) || !_finite(d0)) return r;
+        double previous_a = 0.0;
+        double previous_f = f0;
+        double previous_d = d0;
+        double a = 1.0;
+        for (int it = 0; it < 96; it = it + 1)
+        {
+            for (int i = 0; i < n; i = i + 1)
+                trial[i] = x[i] + a * p[i];
+            double fa = f((double*)trial, n);
+            r.evaluations = r.evaluations + 1;
+            if (!_finite(fa))
+            {
+                a = a * 0.5;
+                if (a < 0.0000000000000001) return r;
+                continue;
+            }
+            if (fa > f0 + _C1 * a * d0 || (it > 0 && fa >= previous_f))
+                return _zoom(f, grad, x, p, trial, gout, n, f0, d0,
+                             previous_a, a, previous_f, fa, previous_d,
+                             r.evaluations);
+            grad((double*)trial, (double*)gout, n);
+            double da = _dot(gout, p, n);
+            if 
+(_abs(da) <= -_C2 * d0)
+            {
+                r.ok = true;
+                r.value = fa;
+                return r;
+            }
+            if (da >= 0.0)
+                return _zoom(f, grad, x, p, trial, gout, n, f0, d0,
+                             previous_a, a, previous_f, fa, previous_d,
+                             r.evaluations);
+            previous_a = a;
+            previous_f = fa;
+            a = a * 2.0;
+            if (a > 1048576.0) a = 1048576.0;
+        }
+        return r;
+    }
+
+    // Scratch length is 2 doubles. Central differences lose fewer digits than forward differences.
+    void numeric_gradient(Lambda<double(double*, int)> f, double[] x, int n,
+                          double[] g, double[] scratch)
+    {
+        double scale = Math.cbrt(_EPS);
+        for (int i = 0; i < n; i = i + 1)
+        {
+            double old = x[i];
+            double size = _abs(old);
+            if (size < 1.0) size = 1.0;
+            double h = scale * size;
+            x[i] = old + h;
+            scratch[0] = f((double*)x, n);
+            x[i] = old - h;
+            scratch[1] = f((double*)x, n);
+            x[i] = old;
+            g[i] = (scratch[0] - scratch[1]) / (2.0 * h);
+        }
+    }
+
+    // Scratch length is n*n + 5*n.
+    MinResult minimize_bfgs(Lambda<double(double*, int)> f,
+                            Lambda<void(double*, double*, int)> grad, double[] x,
+                            int n, double gtol, double ftol, double xtol,
+                            int max_iter, double[] scratch)
+    {
+        MinResult out = default;
+        if (n <= 0 || max_iter < 0) return out;
+        double[] h = scratch;
+        double* g = (double*)&scratch[n * n];
+        double* ng = (double*)&scratch[n * n + n];
+        double* p = (double*)&scratch[n * n + 2 * n];
+        double* trial = (double*)&scratch[n * n + 3 * n];
+        double* gout = (double*)&scratch[n * n + 4 * n];
+        for (int i = 0; i < n; i = i + 1)
+            for (int j = 0; j < n; j = j + 1)
+                h[i * n + j] = i == j ? 1.0 : 0.0;
+        double value = f((double*)x, n);
+        out.evaluations = 1;
+        grad((double*)x, (double*)g, n);
+        out.value = value;
+        out.grad_norm = _norm_inf(g, n);
+        if (out.grad_norm <= gtol)
+        {
+            out.converged = true;
+            return out;
+        }
+        for (int it = 0; it < max_iter; it = it + 1)
+        {
+            for (int i = 0; i < n; i = i + 1)
+            {
+                p[i] = 0.0;
+                for (int j = 0; j < n; j = j + 1)
+                    p[i] = p[i] - h[i * n + j] * g[j];
+            }
+
+            if (!(_dot(p, g, n) < 0.0)) break;
+
+            _LineResult line = _wolfe(f, grad, (double*)x, p, g, trial, gout,
+                                      n, value, out.evaluations);
+            out.evaluations = line.evaluations;
+
+            if (!line.ok) break;
+
+            for (int i = 0; i < n; i = i + 1)
+            {
+                p[i] = trial[i] - x[i];
+                ng[i] = gout[i] - g[i];
+            }
+            double ys = _dot(ng, p, n);
+            for (int i = 0; i < n; i = i + 1)
+                trial[i] = gout[i];
+            if (ys > 0.000000000000000001)
+            {
+                double hy = 0.0;
+                for (int i = 0; i < n; i = i + 1)
+                    for (int j = 0; j < n; j = j + 1)
+                        hy = hy + ng[i] * h[i * n + j] * ng[j];
+                for (int i = 0; i < n; i = i + 1)
+                {
+                    gout[i] = 0.0;
+                    for (int j = 0; j < n; j = j + 1)
+                        gout[i] = gout[i] + h[i * n + j] * ng[j];
+                }
+                double rho = 1.0 / ys;
+                double c = rho * rho * hy + rho;
+                for (int i = 0; i < n; i = i + 1)
+                    for (int j = 0; j < n; j = j + 1)
+                        h[i * n + j] = h[i * n + j] - rho * p[i] * gout[j]
+                                      - rho * gout[i] * p[j] + c * p[i] * p[j];
+            }
+            for (int i = 0; i < n; i = i + 1)
+            {
+                x[i] = x[i] + p[i];
+                g[i] = trial[i];
+            }
+            value = line.value;
+            out.iterations = it + 1;
+            out.value = value;
+            out.grad_norm = _norm_inf(g, n);
+            if (out.grad_norm <= gtol)
+            {
+                out.converged = true;
+                return out;
+            }
+        }
+        out.value = value;
+        out.grad_norm = _norm_inf(g, n);
+        return out;
+    }
+
+    // Scratch length is 2*m*n + 2*m + 5*n.
+    MinResult minimize_lbfgs(Lambda<double(double*, int)> f,
+                             Lambda<void(double*, double*, int)> grad, double[] x,
+                             int n, int history, double gtol, double ftol,
+                             double xtol, int max_iter, double[] scratch)
+    {
+        MinResult out = default;
+        if (n <= 0 || history <= 0 || max_iter < 0) return out;
+
+
+        double* sh = (double*)scratch;
+        double* yh = (double*)&scratch[history * n];
+        double* rho = (double*)&scratch[2 * history * n];
+        double* alpha = (double*)&scratch[2 * history * n + history];
+        double* g = (double*)&scratch[2 * history * n + 2 * history];
+        double* p = (double*)&scratch[2 * history * n + 2 * history + n];
+        double* q = (double*)&scratch[2 * history * n + 2 * history + 2 * n];
+        double* trial = (double*)&scratch[2 * history * n + 2 * history + 3 * n];
+        double* gout = (double*)&scratch[2 * history * n + 2 * history + 4 * n];
+        double value = f((double*)x, n);
+        out.evaluations = 1;
+        grad((double*)x, (double*)g, n);
+        out.value = value;
+        out.grad_norm = _norm_inf(g, n);
+        if (out.grad_norm <= gtol)
+        {
+            out.converged = true;
+            return out;
+        }
+        int count = 0;
+        for (int it = 0; it < max_iter; it = it + 1)
+        {
+            for (int i = 0; i < n; i = i + 1) q[i] = g[i];
+            for (int k = 0; k < count; k = k + 1)
+            {
+                int index = count - 1 - k;
+                alpha[k] = rho[index] * _dot((double*)&sh[index * n], q, n);
+                for (int i = 0; i < n; i = i + 1)
+                    q[i] = q[i] - alpha[k] * yh[index * n + i];
+            }
+            double gamma = 1.0;
+            if (count > 0)
+            {
+                int last = count - 1;
+                double sy = _dot((double*)&sh[last * n], (double*)&yh[last * n], n);
+                double yy = _dot((double*)&yh[last * n], (double*)&yh[last * n], n);
+                if (yy > 0.0) gamma = sy / yy;
+            }
+            for (int i = 0; i < n; i = i + 1) p[i] = gamma * q[i];
+            for (int k = count - 1; k >= 0; k = k - 1)
+            {
+                int index = count - 1 - k;
+                double beta = rho[index] * _dot((double*)&yh[index * n], p, n);
+                for (int i = 0; i < n; i = i + 1)
+                    p[i] = p[i] + (alpha[k] - beta) * sh[index * n + i];
+            }
+            for (int i = 0; i < n; i = i + 1) p[i] = -p[i];
+            if (!(_dot(p, g, n) < 0.0)) break;
+            _LineResult line = _wolfe(f, grad, (double*)x, p, g, trial, gout,
+                                      n, value, out.evaluations);
+            out.evaluations = line.evaluations;
+
+            if (!line.ok) break;
+
+            for (int i = 0; i < n; i = i + 1)
+            {
+                p[i] = trial[i] - x[i];
+                q[i] = gout[i] - g[i];
+            }
+            double sy = _dot(p, q, n);
+            bool keep_pair = sy > 0.000000000000000000000000000001;
+            if (keep_pair)
+            {
+                int index = count;
+                if (count == history)
+                {
+                    for (int slot = 1; slot < history; slot = slot + 1)
+                        for (int i = 0; i < n; i = i + 1)
+                        {
+                            sh[(slot - 1) * n + i] = sh[slot * n + i];
+                            yh[(slot - 1) * n + i] = yh[slot * n + i];
+                        }
+                    index = history - 1;
+                }
+                else count = count + 1;
+                for (int i = 0; i < n; i = i + 1)
+                {
+                    sh[index * n + i] = p[i];
+                    yh[index * n + i] = q[i];
+                }
+                rho[index] = 1.0 / sy;
+            }
+            for (int i = 0; i < n; i = i + 1)
+            {
+                x[i] = trial[i];
+                g[i] = gout[i];
+            }
+            value = line.value;
+            out.iterations = it + 1;
+            out.value = value;
+            out.grad_norm = _norm_inf(g, n);
+            if (out.grad_norm <= gtol)
+            {
+                out.converged = true;
+                return out;
+            }
+        }
+        out.value = value;
+        out.grad_norm = _norm_inf(g, n);
+        return out;
+    }
+
+    void _normal(double* j, double* r, int np, int nr, double* a, double* b)
+    {
+        for (int i = 0; i < np; i = i + 1)
+        {
+            double bsum = 0.0;
+            double bcorrection = 0.0;
+            for (int row = 0; row < nr; row = row + 1)
+            {
+                double term = j[row * np + i] * r[row] - bcorrection;
+                double next = bsum + term;
+                bcorrection = (next - bsum) - term;
+                bsum = next;
+            }
+            b[i] = bsum;
+            for (int k = 0; k < np; k = k + 1)
+            {
+                double asum = 0.0;
+                double acorrection = 0.0;
+                for (int row = 0; row < nr; row = row + 1)
+                {
+                    double term = j[row * np + i] * j[row * np + k] - acorrection;
+                    double next = asum + term;
+                    acorrection = (next - asum) - term;
+                    asum = next;
+                }
+                a[i * np + k] = asum;
+            }
+        }
+    }
+
+    double _cost(double* r, int n)
+    {
+        double z = 0.0;
+        for (int i = 0; i < n; i = i + 1) z = z + r[i] * r[i];
+        return 0.5 * z;
+    }
+
+    // Scratch length is 2*nres for positive and negative residual vectors.
+    void numeric_jacobian(Lambda<void(double*, double*, int, int)> residual,
+                          double* p, int np, int nr, double* j, double* scratch)
+    {
+        double scale = Math.cbrt(_EPS);
+        for (int col = 0; col < np; col = col + 1)
+        {
+            double old = p[col];
+            double size = _abs(old);
+            if (size < 1.0) size = 1.0;
+            double h = scale * size;
+            p[col] = old + h;
+            residual((double*)p, (double*)scratch, np, nr);
+            p[col] = old - h;
+            residual((double*)p, (double*)&scratch[nr], np, nr);
+            p[col] = old;
+            for (int row = 0; row < nr; row = row + 1)
+                j[row * np + col] = (scratch[row] - scratch[nr + row]) / (2.0 * h);
+        }
+    }
+
+
+    bool _solve(double* a, int n, double* b, double* x)
+    {
+        for (int col = 0; col < n; col = col + 1)
+        {
+            int pivot = col;
+            double best = _abs(a[col * n + col]);
+            for (int row = col + 1; row < n; row = row + 1)
+                if (_abs(a[row * n + col]) > best)
+                {
+                    best = _abs(a[row * n + col]);
+                    pivot = row;
+                }
+            if (best <= 0.000000000000000001) return false;
+            if (pivot != col)
+            {
+                for (int k = col; k < n; k = k + 1)
+                {
+                    double t = a[col * n + k];
+                    a[col * n + k] = a[pivot * n + k];
+                    a[pivot * n + k] = t;
+                }
+                double tb = b[col];
+                b[col] = b[pivot];
+                b[pivot] = tb;
+            }
+            for (int row = col + 1; row < n; row = row + 1)
+            {
+                double factor = a[row * n + col] / a[col * n + col];
+                for (int k = col + 1; k < n; k = k + 1)
+                    a[row * n + k] = a[row * n + k] - factor * a[col * n + k];
+                b[row] = b[row] - factor * b[col];
+            }
+        }
+        for (int row = n - 1; row >= 0; row = row - 1)
+        {
+            double z = b[row];
+            for (int k = row + 1; k < n; k = k + 1) z = z - a[row * n + k] * x[k];
+            x[row] = z / a[row * n + row];
+        }
+        return true;
+    }
+    // Scratch length is np*nr + 3*np*np + 5*np + 3*nr.
+    LeastSquaresResult least_squares(
+        Lambda<void(double*, double*, int, int)> residual,
+        Lambda<void(double*, double*, int, int)> jacobian, double[] p,
+        int np, int nr, double ftol, double xtol, double gtol, int max_iter,
+        double[] scratch)
+    {
+        LeastSquaresResult out = default;
+        if (np <= 0 || nr < np || max_iter < 0) return out;
+        int js = np * nr;
+        double* j = (double*)scratch;
+        double* r = (double*)&scratch[js];
+        double* fd = (double*)&scratch[js + nr];
+        double* a = (double*)&scratch[js + 3 * nr];
+        double* b = (double*)&scratch[js + 3 * nr + np * np];
+        double* dp = (double*)&scratch[js + 3 * nr + np * np + np];
+        double* pt = (double*)&scratch[js + 3 * nr + np * np + 2 * np];
+        double* sa = (double*)&scratch[js + 3 * nr + np * np + 3 * np];
+        double* sb = (double*)&scratch[js + 3 * nr + 2 * np * np + 3 * np];
+        double* sw = (double*)&scratch[js + 3 * nr + 2 * np * np + 4 * np];
+        residual((double*)p, (double*)r, np, nr);
+        out.evaluations = 1;
+        double cost = _cost(r, nr);
+        double lambda = 0.001;
+        for (int it = 0; it < max_iter; it = it + 1)
+        {
+            if (jacobian == nullptr) numeric_jacobian(residual, p, np, nr, j, fd);
+            else jacobian((double*)p, (double*)j, np, nr);
+            _normal(j, r, np, nr, a, b);
+            out.cost = cost;
+            out.grad_norm = _norm_inf(b, np);
+            if (out.grad_norm <= gtol)
+            {
+                out.converged = true;
+                return out;
+            }
+            double maxdiag = 0.0;
+            for (int i = 0; i < np; i = i + 1)
+                if (a[i * np + i] > maxdiag)
+                    maxdiag = a[i * np + i];
+            if (it == 0 && maxdiag > 0.0) lambda = 0.001 * maxdiag;
+            if (out.grad_norm <= gtol * 10000.0) lambda = 0.0;
+            for (int i = 0; i < np; i = i + 1)
+                for (int k = 0; k < np; k = k + 1) sa[i * np + k] = a[i * np + k];
+            for (int i = 0; i < np; i = i + 1)
+            {
+                double d = a[i * np + i];
+                if (d <= 0.0) d = 1.0;
+                sa[i * np + i] = sa[i * np + i] + lambda * d;
+                sb[i] = -b[i];
+            }
+            bool solved = _solve(sa, np, sb, dp);
+            if (!solved)
+            {
+                lambda = lambda * 10.0;
+                continue;
+            }
+            for (int i = 0; i < np; i = i + 1) pt[i] = p[i] + dp[i];
+            residual((double*)pt, (double*)fd, np, nr);
+            out.evaluations = out.evaluations + 1;
+            double trial_cost = _cost(fd, nr);
+            double trial_grad_norm = _MAX;
+            if (_finite(trial_cost))
+            {
+                for (int i = 0; i < np; i = i + 1)
+                {
+                    sw[i] = 0.0;
+                    for (int row = 0; row < nr; row = row + 1)
+                        sw[i] = sw[i] + j[row * np + i] * fd[row];
+                }
+                trial_grad_norm = _norm_inf(sw, np);
+            }
+            bool accept_trial = _finite(trial_cost) && trial_cost < cost;
+            if (!accept_trial && _finite(trial_cost)
+                && trial_cost <= cost + 0.000000000000000000000001 * (1.0 + _abs(cost)))
+                accept_trial = true;
+            if (!accept_trial && _finite(trial_cost)
+                && trial_grad_norm < out.grad_norm)
+                accept_trial = true;
+            if (accept_trial)
+            {
+                for (int i = 0; i < np; i = i + 1)
+                    p[i] = pt[i];
+                for (int row = 0; row < nr; row = row + 1) r[row] = fd[row];
+                cost = trial_cost;
+                lambda = lambda * 0.3;
+                if (lambda < 0.00000000000000000001) lambda = 0.00000000000000000001;
+            }
+            else
+            {
+                lambda = lambda * 10.0;
+            }
+            out.iterations = it + 1;
+        }
+        out.cost = cost;
+        return out;
+    }
+
+    // sigma == nullptr requests an unweighted fit. Scratch length is
+    // nparam*ndata + 3*nparam*nparam + 5*nparam + 3*ndata.
+    // A finite-difference Jacobian bottoms out near sqrt(eps) * scale, so
+    // gtol below roughly 1e-11 is usually unreachable without an analytic Jacobian.
+    // Covariance is computed independently of convergence when the normal matrix inverts.
+    // It is scaled by s2 = 2 * cost / dof, following SciPy's absolute_sigma=False default.
+    // sigma therefore supplies relative weights; divide covariance by s2 to recover the
+    // unscaled covariance when sigma contains absolute measurement errors.
+    CurveFitResult curve_fit(Lambda<double(double, double*, int)> model,
+                             double[] xdata, double[] ydata, double[] sigma,
+                             int ndata, double[] params, int nparam,
+                             double ftol, double xtol, double gtol, int max_iter,
+                             double[] covariance, double[] scratch)
+    {
+        CurveFitResult out = default;
+        Lambda<void(double*, double*, int, int)> residual =
+            (double* p, double* r, int np, int nr) => {
+                for (int i = 0; i < nr; i = i + 1)
+                {
+                    double w = 1.0;
+                    if (sigma != nullptr && sigma[i] > 0.0) w = 1.0 / sigma[i];
+                    r[i] = (model(xdata[i], p, np) - ydata[i]) * w;
+                }
+            };
+        LeastSquaresResult fit = least_squares(residual, nullptr, params, nparam,
+                                               ndata, ftol, xtol, gtol, max_iter,
+                                               scratch);
+        out.converged = fit.converged;
+        out.iterations = fit.iterations;
+        out.evaluations = fit.evaluations;
+        out.cost = fit.cost;
+        out.grad_norm = fit.grad_norm;
+        for (int i = 0; i < nparam; i = i + 1)
+            if (!_finite(params[i])) return out;
+
+        int js = nparam * ndata;
+        double* j = (double*)scratch;
+        double* r = (double*)&scratch[js];
+        double* fd = (double*)&scratch[js + ndata];
+        double* a = (double*)&scratch[js + 3 * ndata];
+        double* work = (double*)&scratch[js + 3 * ndata + nparam * nparam];
+        residual((double*)params, (double*)r, nparam, ndata);
+        numeric_jacobian(residual, params, nparam, ndata, j, fd);
+        for (int i = 0; i < nparam; i = i + 1)
+            for (int k = 0; k < nparam; k = k + 1)
+            {
+                double z = 0.0;
+                for (int row = 0; row < ndata; row = row + 1)
+                    z = z + j[row * nparam + i] * j[row * nparam + k];
+                a[i * nparam + k] = z;
+                work[i * nparam + k] = z;
+                covariance[i * nparam + k] = i == k ? 1.0 : 0.0;
+            }
+        int dof = ndata - nparam;
+        if (dof < 1) dof = 1;
+        double s2 = 2.0 * fit.cost / (double)dof;
+        bool inverse_ok = true;
+        for (int column = 0; column < nparam; column = column + 1)
+        {
+            int 
+pivot = column;
+            double best = _abs(work[column * nparam + column]);
+            for (int row = column + 1; row < nparam; row = row + 1)
+            {
+                double candidate = _abs(work[row * nparam + column]);
+                if (candidate > best) { best = candidate; pivot = row; }
+            }
+            if (best <= 0.000000000000000001)
+            {
+                inverse_ok = false;
+                break;
+            }
+            if (pivot != column)
+                for (int k = 0; k < nparam; k = k + 1)
+                {
+                    double t = work[column * nparam + k];
+                    work[column * nparam + k] = work[pivot * nparam + k];
+                    work[pivot * nparam + k] = t;
+                    t = covariance[column * nparam + k];
+                    covariance[column * nparam + k] = covariance[pivot * nparam + k];
+                    covariance[pivot * nparam + k] = t;
+                }
+            double diagonal = work[column * nparam + column];
+            for (int k = 0; k < nparam; k = k + 1)
+            {
+                work[column * nparam + k] = work[column * nparam + k] / diagonal;
+                covariance[column * nparam + k] = covariance[column * nparam + k] / diagonal;
+            }
+            for (int row = 0; row < nparam; row = row + 1)
+                if (row != column)
+                {
+                    double factor = work[row * nparam + column];
+                    for (int k = 0; k < nparam; k = k + 1)
+                    {
+                        work[row * nparam + k] = work[row * nparam + k]
+                                               - factor * work[column * nparam + k];
+                        covariance[row * nparam + k] = covariance[row * nparam + k]
+                                                    - factor * covariance[column * nparam + k];
+                    }
+                }
+        }
+        if (inverse_ok)
+        {
+            for (int i = 0; i < nparam * nparam; i = i + 1)
+                covariance[i] = covariance[i] * s2;
+            out.covariance_valid = true;
+
+        }
+        return out;
+    }
+
+    Roots.Result golden_section(Lambda<double(double)> f, double a, double b,
+                                double tol, int max_iter)
+    {
+        Roots.Result r = default;
+        double ratio = 0.61803398874989484820;
+        double c = b - ratio * (b - a);
+        double d = a + ratio * (b - a);
+        double fc = f(c);
+        double fd = f(d);
+        for (int i = 0; i < max_iter; i = i + 1)
+        {
+            r.iterations = i + 1;
+            if (Math.abs(b - a) <= tol)
+            {
+                r.x = (a + b) * 0.5;
+                r.converged = true;
+                return r;
+            }
+            if (fc < fd)
+            {
+                b = d;
+                d = c;
+                fd = fc;
+                c = b - ratio * (b - a);
+                fc = f(c);
+            }
+            else
+            {
+                a = c;
+                c = d;
+                fc = fd;
+                d = a + ratio * (b - a);
+                fd = f(d);
+            }
+        }
+        r.x = (a + b) * 0.5;
+        return r;
+    }
+
+    bool nelder_mead(Lambda<double(double*, int)> f, double[] x, int n,
+                     double[] simplex, double tol, int max_iter)
+    {
+        if (n <= 0) return false;
+        double[] values = new double[n + 1];
+        double[] centroid = new double[n];
+        double[] trial = new double[n];
+        for (int i = 0; i <= n; i = i + 1)
+            values[i] = f((double*)simplex + i * n, n);
+        bool ok = false;
+        for (int iteration = 0; iteration < max_iter; iteration = iteration + 1)
+        {
+            for (int i = 0; i <= n; i = i + 1)
+                for (int j = i + 1; j <= n; j = j + 1)
+                    if (values[j] < values[i])
+                    {
+                        double value = values[i];
+                        values[i] = values[j];
+                        values[j] = value;
+                        for (int k = 0; k < n; k = k + 1)
+                        {
+                            double swap = simplex[i * n + k];
+                            simplex[i * n + k] = simplex[j * n + k];
+                            simplex[j * n + k] = swap;
+                        }
+                    }
+            double spread = values[n] 
+- values[0];
+            double size = 0.0;
+            for (int k = 0; k < n; k = k + 1)
+            {
+                centroid[k] = 0.0;
+                for (int i = 0; i < n; i = i + 1)
+                    centroid[k] = centroid[k] + simplex[i * n + k];
+                centroid[k] = centroid[k] / (double)n;
+                double distance = Math.abs(simplex[k] - simplex[n * n + k]);
+                if (distance > size) size = distance;
+            }
+            if (spread <= tol && size <= tol)
+            {
+                ok = true;
+                break;
+            }
+            for (int k = 0; k < n; k = k + 1)
+                trial[k] = centroid[k] + (centroid[k] - simplex[n * n + k]);
+            double reflected = f((double*)trial, n);
+            if (reflected < values[0])
+            {
+                double[] expanded = new double[n];
+                for (int k = 0; k < n; k = k + 1)
+                    expanded[k] = centroid[k] + 2.0 * (trial[k] - centroid[k]);
+                double expanded_value = f((double*)expanded, n);
+                if (expanded_value < reflected)
+                {
+                    for (int k = 0; k < n; k = k + 1)
+                        simplex[n * n + k] = expanded[k];
+                    values[n] = expanded_value;
+                }
+                else
+                {
+                    for (int k = 0; k < n; k = k + 1)
+                        simplex[n * n + k] = trial[k];
+                    values[n] = reflected;
+                }
+                delete[_] expanded;
+            }
+            else if (reflected < values[n - 1])
+            {
+                for (int k = 0; k < n; k = k + 1)
+                    simplex[n * n + k] = trial[k];
+                values[n] = reflected;
+            }
+            else
+            {
+                double[] contracted = new double[n];
+                for (int k = 0; k < n; k = k + 1)
+                    contracted[k] = centroid[k] + 0.5 * (simplex[n * n + k] - centroid[k]);
+                double contracted_value = f((double*)contracted, n);
+                if (contracted_value < values[n])
+                {
+                    for (int k = 0; k < n; k = k + 1)
+                        simplex[n * n + k] = contracted[k];
+                    values[n] = contracted_value;
+                }
+                else
+                {
+                    for (int i = 1; i <= n; i = i + 1)
+                    {
+                        for (int k = 0; k < n; k = k + 1)
+                            simplex[i * n + k] = simplex[k] + 0.5
+                                               * (simplex[i * n + k] - simplex[k]);
+                        values[i] = f((double*)simplex + i * n, n);
+                    }
+                }
+                delete[_] contracted;
+            }
+        }
+        for (int k = 0; k < n; k = k + 1) x[k] = simplex[k];
+        delete[_] values;
+        delete[_] centroid;
+        delete[_] trial;
+        return ok;
+    }
+}

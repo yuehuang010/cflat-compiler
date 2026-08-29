@@ -1,0 +1,314 @@
+// qr.cb - Householder QR factorization and dense linear least squares.
+//
+// Storage matches hpc/factor.cb: every matrix is one flat row-major double[]
+// indexed A[i*n + j], and the caller owns it.
+//
+//   factor   : in-place Householder QR of an m x n A (R in the upper triangle,
+//              the reflectors below it, their scalars in tau[])
+//   apply_qt : b := Q^T b, the "form the RHS" half of a least-squares solve
+//   form_q   : materialize the thin Q (m x n) when the caller needs it
+//   lstsq    : min ||Ax - b||_2 for m >= n, with a rank check on R
+//
+// Design notes:
+//   - The reflector uses the LAPACK dlarfg convention: beta = -sign(alpha)*||x||
+//     so that alpha - beta never cancels, v is scaled to v[k] = 1 (the implicit
+//     1 is not stored), and H = I - tau*v*v^T. Choosing the other sign loses
+//     most of the working precision on a nearly-triangular column, which is the
+//     classic trap in this algorithm.
+//   - Column norms are computed with a max-element rescale, so a column whose
+//     entries square to an overflow (or to zero) still gives the right norm.
+//   - At large n the trailing update goes blocked: a panel of QR_NB columns is
+//     factored unblocked, its reflectors are collapsed into a compact-WY pair
+//     (V, T) with H_1...H_ib = I - V T V^T, and the rest of the matrix is
+//     updated by three Mat.gemm_ld calls. Same pattern, and the same reason, as
+//     the blocked pivoted LU in hpc/factor.cb.
+
+import "math.cb";          // Math.sqrt / Math.abs
+import "threadpool.cb";    // ThreadPool (pool-parallel trailing update)
+import "hpc/densemat.cb";  // Mat.gemm_ld (blocked trailing update)
+
+namespace Qr
+{
+    // Column count from which factor() switches to the blocked trailing update.
+    // Below it the trailing submatrix is cache-resident and the unblocked
+    // reflector sweep is already at full speed, so the panel's extra V/T/W
+    // scratch traffic would only cost. Measured at -O2 on m = 1.5n: blocked is
+    // ~1.4x SLOWER at n = 48-64, a wash at n = 96, then 1.8x faster at n = 128
+    // and 4-10x from n = 256 up.
+    const int QR_BLOCK_MIN_N = 96;
+
+    // Panel width for the blocked path. Narrow enough that the unblocked panel
+    // sweep stays a small fraction of the work, wide enough that each trailing
+    // gemm has k = QR_NB to amortize its packing.
+    const int QR_NB = 48;
+
+    // Relative floor for calling a diagonal of R zero, in units of the largest
+    // |R[i][i]|. 2^-52 is the double epsilon; the max(m, n) factor is the usual
+    // allowance for the growth of rounding error across the sweep.
+    const double QR_RANK_EPS = 0.00000000000000022204460492503131;
+
+    // Factor columns k0..kend-1 of the m x n A in place, applying each reflector
+    // only to columns k+1..kend-1. kend == n gives the plain unblocked QR; a
+    // smaller kend leaves the trailing columns to the caller's block update.
+    void __qr_panel(double[] a, int m, int n, double[] tau, int k0, int kend)
+    {
+        for (int k = k0; k < kend; k = k + 1)
+        {
+            // Rescaled 2-norm of A[k..m-1, k], and whether anything is below
+            // the diagonal at all (if not, the reflector is the identity).
+            double scale = 0.0;
+            bool below = false;
+            for (int i = k; i < m; i = i + 1)
+            {
+                double av = Math.abs(a[i * n + k]);
+                if (av > scale) scale = av;
+                if (i > k && a[i * n + k] != 0.0) below = true;
+            }
+            if (!below || scale == 0.0)
+            {
+                tau[k] = 0.0;
+                continue;
+            }
+            double ssq = 0.0;
+            for (int i = k; i < m; i = i + 1)
+            {
+                double t = a[i * n + k] / scale;
+                ssq = ssq + t * t;
+            }
+            double norm = scale * Math.sqrt(ssq);
+
+            // beta takes the opposite sign to alpha, so alpha - beta adds
+            // magnitudes instead of cancelling.
+            double alpha = a[k * n + k];
+            double beta = alpha >= 0.0 ? -norm : norm;
+            double vscale = 1.0 / (alpha - beta);
+            for (int i = k + 1; i < m; i = i + 1)
+                a[i * n + k] = a[i * n + k] * vscale;
+            double tk = (beta - alpha) / beta;
+            tau[k] = tk;
+            a[k * n + k] = beta;
+
+            // Trailing columns of the panel: A[:, j] -= tau * v * (v^T A[:, j]),
+            // with the implicit v[k] = 1 handled separately from the stored tail.
+            for (int j = k + 1; j < kend; j = j + 1)
+            {
+                double w = a[k * n + j];
+                for (int i = k + 1; i < m; i = i + 1)
+                    w = w + a[i * n + k] * a[i * n + j];
+                w = w * tk;
+                a[k * n + j] = a[k * n + j] - w;
+                for (int i = k + 1; i < m; i = i + 1)
+                    a[i * n + j] = a[i * n + j] - a[i * n + k] * w;
+            }
+        }
+    }
+
+    // Compact-WY factor of one panel: given the ib reflectors sitting in columns
+    // k0..k0+ib-1 of a (rows k0..m-1), materialize V (mv x ib, unit lower
+    // trapezoidal, leading dimension ldv), its transpose vt (ib x mv, leading
+    // dimension ldvt), the upper-triangular T (ib x ib, leading dimension ldt)
+    // with H_k0 ... H_k0+ib-1 = I - V T V^T, and T^T in tt.
+    void __qr_form_wy(double[] a, int m, int n, double[] tau, int k0, int ib,
+                      double[] v, int ldv, double[] vt, int ldvt,
+                      double[] t, double[] tt, int ldt)
+    {
+        int mv = m - k0;
+        for (int r = 0; r < mv; r = r + 1)
+        {
+            for (int c = 0; c < ib; c = c + 1)
+            {
+                double e = 0.0;
+                if (r == c) e = 1.0;
+                else if (r > c) e = a[(k0 + r) * n + (k0 + c)];
+                v[r * ldv + c] = e;
+                vt[c * ldvt + r] = e;
+            }
+        }
+
+        for (int i = 0; i < ib * ib; i = i + 1) t[i] = 0.0;
+        for (int i = 0; i < ib; i = i + 1)
+        {
+            double ti = tau[k0 + i];
+            if (ti == 0.0)
+            {
+                for (int j = 0; j <= i; j = j + 1) t[j * ldt + i] = 0.0;
+                continue;
+            }
+            // T[0..i-1, i] = -tau_i * V[i.., 0..i-1]^T * V[i.., i]
+            for (int j = 0; j < i; j = j + 1)
+            {
+                double s = 0.0;
+                for (int r = i; r < mv; r = r + 1)
+                    s = s + v[r * ldv + j] * v[r * ldv + i];
+                t[j * ldt + i] = -ti * s;
+            }
+            // Then multiply that column by the already-built upper triangle.
+            // Ascending j is required: entry j reads entries j..i-1, none of
+            // which have been overwritten yet.
+            for (int j = 0; j < i; j = j + 1)
+            {
+                double s = 0.0;
+                for (int p = j; p < i; p = p + 1)
+                    s = s + t[j * ldt + p] * t[p * ldt + i];
+                t[j * ldt + i] = s;
+            }
+            t[i * ldt + i] = ti;
+        }
+
+        for (int r = 0; r < ib; r = r + 1)
+            for (int c = 0; c < ib; c = c + 1)
+                tt[c * ldt + r] = t[r * ldt + c];
+    }
+
+    // Blocked right-looking Householder QR, in place on a. Per panel: factor it
+    // unblocked, collapse it to (V, T), then apply Q_panel^T = I - V T^T V^T to
+    // the trailing columns as W = V^T A2, W := T^T W, A2 -= V W - three gemms.
+    void __qr_blocked(double[] a, int m, int n, double[] tau,
+                      ThreadPool* pool, int workers)
+    {
+        int nb = QR_NB;
+        double[] v  = new double[m * nb];
+        double[] vt = new double[nb * m];
+        double[] t  = new double[nb * nb];
+        double[] tt = new double[nb * nb];
+        double[] w  = new double[nb * n];
+        double[] w2 = new double[nb * n];
+
+        // The gemms write w/w2 with beta = 0, which scales rather than
+        // overwrites, so the scratch must start finite.
+        for (int i = 0; i < nb * n; i = i + 1) { w[i] = 0.0; w2[i] = 0.0; }
+
+        for (int k0 = 0; k0 < n; k0 = k0 + nb)
+        {
+            int ib = n - k0;
+            if (ib > nb) ib = nb;
+            int kend = k0 + ib;
+
+            __qr_panel(a, m, n, tau, k0, kend);
+            if (kend >= n) break;
+
+            int mv = m - k0;
+            int ntrail = n - kend;
+            __qr_form_wy(a, m, n, tau, k0, ib, v, nb, vt, m, t, tt, nb);
+
+            // The three scratch views and the A2 view touch disjoint memory, as
+            // Mat.gemm_ld's re-blessing contract requires.
+            Mat.gemm_ld(1.0, vt, m, (double[])&a[k0 * n + kend], n,
+                        0.0, w, n, ib, mv, ntrail, pool, workers);
+            Mat.gemm_ld(1.0, tt, nb, w, n,
+                        0.0, w2, n, ib, ib, ntrail, pool, workers);
+            Mat.gemm_ld(-1.0, v, nb, w2, n,
+                        1.0, (double[])&a[k0 * n + kend], n,
+                        mv, ib, ntrail, pool, workers);
+        }
+
+        delete[_] v; delete[_] vt; delete[_] t;
+        delete[_] tt; delete[_] w; delete[_] w2;
+    }
+
+    // In-place Householder QR of the row-major m x n A. On return the upper
+    // triangle of A holds R, the strict lower triangle holds the reflector
+    // tails (the leading 1 of each v is implicit), and tau[k] is the scalar of
+    // reflector k for k < min(m, n), and zero above that. tau needs n entries.
+    //
+    // A pool is used only by the blocked trailing update (n >= QR_BLOCK_MIN_N
+    // and m >= n); it partitions gemm output tiles, so the result is identical
+    // to the serial blocked run. workers <= 0 uses the pool's worker count.
+    void factor(double[] a, int m, int n, double[] tau,
+                ThreadPool* pool = nullptr, int workers = 0)
+    {
+        if (m <= 0 || n <= 0) return;
+        if (n >= QR_BLOCK_MIN_N && m >= n)
+        {
+            __qr_blocked(a, m, n, tau, pool, workers);
+            return;
+        }
+        int nr = m < n ? m : n;
+        __qr_panel(a, m, n, tau, 0, n);
+        for (int k = nr; k < n; k = k + 1) tau[k] = 0.0;
+    }
+
+    // b := Q^T b, in place, for the factorization left in a/tau by factor().
+    // b has m entries.
+    void apply_qt(double[] a, int m, int n, double[] tau, double[] b)
+    {
+        int nr = m < n ? m : n;
+        for (int k = 0; k < nr; k = k + 1)
+        {
+            double tk = tau[k];
+            if (tk == 0.0) continue;
+            double w = b[k];
+            for (int i = k + 1; i < m; i = i + 1)
+                w = w + a[i * n + k] * b[i];
+            w = w * tk;
+            b[k] = b[k] - w;
+            for (int i = k + 1; i < m; i = i + 1)
+                b[i] = b[i] - a[i * n + k] * w;
+        }
+    }
+
+    // Materialize the thin Q (m x n, row-major) from the factorization in
+    // a/tau. Q = H_0 H_1 ... H_{nr-1} applied to the first n columns of I_m, so
+    // the reflectors go on in descending order. Column j < k is still e_j when
+    // H_k is applied and H_k leaves it alone, hence the j >= k inner bound.
+    void form_q(double[] a, int m, int n, double[] tau, double[] q)
+    {
+        for (int i = 0; i < m; i = i + 1)
+            for (int j = 0; j < n; j = j + 1)
+                q[i * n + j] = i == j ? 1.0 : 0.0;
+
+        int nr = m < n ? m : n;
+        for (int k = nr - 1; k >= 0; k = k - 1)
+        {
+            double tk = tau[k];
+            if (tk == 0.0) continue;
+            for (int j = k; j < n; j = j + 1)
+            {
+                double w = q[k * n + j];
+                for (int i = k + 1; i < m; i = i + 1)
+                    w = w + a[i * n + k] * q[i * n + j];
+                w = w * tk;
+                q[k * n + j] = q[k * n + j] - w;
+                for (int i = k + 1; i < m; i = i + 1)
+                    q[i * n + j] = q[i * n + j] - a[i * n + k] * w;
+            }
+        }
+    }
+
+    // Solve min ||Ax - b||_2 for the overdetermined case (m >= n) by QR.
+    // BOTH a and b are destroyed: a receives the factorization and b receives
+    // Q^T b. tau needs n entries, x receives the n solution components.
+    //
+    // Returns false when m < n, or when R is rank-deficient to working
+    // precision - a zero pivot on the diagonal of R means the columns of A are
+    // numerically dependent and back substitution would return noise, so this
+    // reports the failure instead of dividing by it.
+    bool lstsq(double[] a, int m, int n, double[] b, double[] x, double[] tau)
+    {
+        if (n <= 0 || m < n) return false;
+
+        factor(a, m, n, tau);
+        apply_qt(a, m, n, tau, b);
+
+        double maxdiag = 0.0;
+        for (int i = 0; i < n; i = i + 1)
+        {
+            double d = Math.abs(a[i * n + i]);
+            if (d > maxdiag) maxdiag = d;
+        }
+        if (maxdiag == 0.0) return false;
+        int big = m > n ? m : n;
+        double floor = QR_RANK_EPS * (double)big * maxdiag;
+        for (int i = 0; i < n; i = i + 1)
+            if (Math.abs(a[i * n + i]) <= floor) return false;
+
+        for (int i = n - 1; i >= 0; i = i - 1)
+        {
+            double s = b[i];
+            for (int k = i + 1; k < n; k = k + 1)
+                s = s - a[i * n + k] * x[k];
+            x[i] = s / a[i * n + i];
+        }
+        return true;
+    }
+}

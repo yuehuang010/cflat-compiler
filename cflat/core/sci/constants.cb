@@ -1,0 +1,104 @@
+// constants.cb - mathematical, physical, and unit-conversion constants.
+//
+// Physical values are from the NIST CODATA 2018 adjustment. Conversion values
+// use the internationally defined SI relationships and the US customary units.
+
+import "math.cb";
+
+namespace Const
+{
+    const double PI = 3.14159265358979323846;
+    const double TAU = 6.28318530717958647692;
+    const double E = 2.71828182845904523536;
+    const double GOLDEN = 1.6180339887498948482;
+    const double SQRT2 = 1.41421356237309504880;
+    const double LN2 = 0.69314718055994530941;
+    const double LN10 = 2.30258509299404568401;
+
+    // NIST CODATA 2018: speed of light in vacuum, exact.
+    const double C = 299792458.0;
+    const double SPEED_OF_LIGHT = 299792458.0;
+    // NIST CODATA 2018: Planck constant, exact.
+    const double H = 6.62607015e-34;
+    const double HBAR = 1.0545718176461565e-34;
+    // NIST CODATA 2018: Newtonian constant of gravitation.
+    const double G = 6.67430e-11;
+    // NIST CODATA 2018: elementary charge, exact.
+    const double E_CHARGE = 1.602176634e-19;
+    // NIST CODATA 2018: electron, proton, and neutron masses.
+    const double M_E = 9.1093837015e-31;
+    const double M_P = 1.67262192369e-27;
+    const double M_N = 1.67492749804e-27;
+    // NIST CODATA 2018: Avogadro and Boltzmann constants, exact.
+    const double N_A = 6.02214076e23;
+    const double K_B = 1.380649e-23;
+    const double AVOGADRO = 6.02214076e23;
+    const double BOLTZMANN = 1.380649e-23;
+    // NIST CODATA 2018: molar gas constant, exact.
+    const double R = 8.31446261815324;
+    const double GAS_CONSTANT = 8.31446261815324;
+    // NIST CODATA 2018: Stefan-Boltzmann constant, exact.
+    const double SIGMA = 5.670374419e-8;
+    const double STEFAN_BOLTZMANN = 5.670374419e-8;
+    // NIST CODATA 2018: fine-structure constant.
+    const double ALPHA = 7.2973525693e-3;
+    const double FINE_STRUCTURE = 7.2973525693e-3;
+    // NIST CODATA 2018: vacuum permittivity and permeability.
+    const double EPSILON_0 = 8.8541878128e-12;
+    const double MU_0 = 1.25663706212e-6;
+    const double VACUUM_PERMITTIVITY = 8.8541878128e-12;
+    const double VACUUM_PERMEABILITY = 1.25663706212e-6;
+    // NIST CODATA 2018: unified atomic mass unit and electron volt, exact where noted.
+    const double U = 1.66053906660e-27;
+    const double ATOMIC_MASS_UNIT = 1.66053906660e-27;
+    const double EV = 1.602176634e-19;
+    const double ELECTRON_VOLT = 1.602176634e-19;
+    // NIST CODATA 2018: standard acceleration of gravity, exact.
+    const double STANDARD_GRAVITY = 9.80665;
+
+    const double DEG_TO_RAD = 0.017453292519943295;
+    const double RAD_TO_DEG = 57.29577951308232;
+    const double INCH_TO_METRE = 0.0254;
+    const double FOOT_TO_METRE = 0.3048;
+    const double MILE_TO_METRE = 1609.344;
+    const double POUND_TO_KILOGRAM = 0.45359237;
+    const double OUNCE_TO_KILOGRAM = 0.028349523125;
+    const double GALLON_TO_LITRE = 3.785411784;
+    const double LITRE_TO_GALLON = 0.2641720523581484;
+    const double CALORIE_TO_JOULE = 4.184;
+    const double ATM_TO_PASCAL = 101325.0;
+    const double BAR_TO_PASCAL = 100000.0;
+    const double PSI_TO_PASCAL = 6894.757293168;
+
+    double celsius_to_kelvin(double celsius)
+    {
+        return celsius + 273.15;
+    }
+
+    double kelvin_to_celsius(double kelvin)
+    {
+        return kelvin - 273.15;
+    }
+
+    double fahrenheit_to_celsius(double fahrenheit)
+    {
+        return (fahrenheit - 32.0) * 0.55555555555555555556;
+    }
+
+    double celsius_to_fahrenheit(double celsius)
+    {
+        return celsius * 1.8 + 32.0;
+    }
+
+    double fahrenheit_to_kelvin(double fahrenheit)
+    {
+        return Const.celsius_to_kelvin(Const.fahrenheit_to_celsius(fahrenheit));
+    }
+
+    double kelvin_to_fahrenheit(double kelvin)
+    {
+        return Const.celsius_to_fahrenheit(Const.kelvin_to_celsius(kelvin));
+    }
+}
+
+

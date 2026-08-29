@@ -1,0 +1,251 @@
+// pca_cluster.cb - finding structure in data that has more columns than it has
+// real dimensions.
+//
+// Sixty measurements arrive with six columns each. The generating process only
+// ever had TWO degrees of freedom: every sample is a point in a hidden plane,
+// mapped into six columns and then blurred with a little isotropic noise. This
+// program recovers that fact without being told it, and then clusters the
+// result:
+//
+//   1. Centre the data and take its singular value decomposition. The squared
+//      singular values are the variances along the principal directions.
+//   2. Read off how many directions actually carry signal. Here it is two, and
+//      the program shows WHY: the remaining four singular values are all about
+//      the same size, which is what isotropic noise looks like and what
+//      "no more structure" looks like.
+//   3. Project onto the top two directions and cluster with k-means.
+//   4. Check the clusters against the truth by GROUPING, not by label value -
+//      cluster ids are arbitrary, so comparing them literally is meaningless.
+//
+// The honest caveat, stated up front: these blobs are far enough apart that
+// k-means finds them in the raw six columns too, and the program shows that.
+// PCA is not rescuing the clustering here. What it buys is a two-dimensional
+// picture you can actually look at, and the explained-variance diagnostic that
+// tells you two dimensions were enough - which you would not otherwise know.
+//
+// Build:
+//   x64\Release\cflat.exe example\sci\pca_cluster.cb -o out\pca_cluster.exe
+import "cruntime.cb";
+import "math.cb";
+import "random.cb";
+import "hpc/svd.cb";
+import "sci/spatial.cb";
+import "sci/cluster.cb";
+
+const int NPER = 20;
+const int NBLOB = 3;
+const int NSAMP = 60;        // NPER * NBLOB
+const int NCOL = 6;
+const double NOISE_SD = 0.30;
+
+double absd(double v) { return v < 0.0 ? -v : v; }
+
+int main()
+{
+    Random rng = default;
+    rng.seed(20260829);
+
+    // ---- 1. Generate. Two orthonormal directions in six-dimensional space,
+    // both spread across every column so the structure is not axis-aligned
+    // and picking columns by eye could not find it.
+    double[6] dir1 = default;
+    double[6] dir2 = default;
+    double six = 6.0;
+    double inv = 1.0 / Math.sqrt(six);
+    for (int k = 0; k < NCOL; k = k + 1)
+    {
+        dir1[k] = inv;
+        dir2[k] = (k % 2 == 0) ? inv : -inv;
+    }
+
+    double[6] blobs = default;      // three centres in the hidden plane
+    blobs[0] = 0.0;  blobs[1] = 0.0;
+    blobs[2] = 10.0; blobs[3] = 0.0;
+    blobs[4] = 5.0;  blobs[5] = 8.0;
+
+    double[] data = new double[NSAMP * NCOL];
+    int[] truth = new int[NSAMP];
+    double twopi = 6.28318530717958647692;
+    for (int b = 0; b < NBLOB; b = b + 1)
+    {
+        for (int i = 0; i < NPER; i = i + 1)
+        {
+            int idx = b * NPER + i;
+            double ang = twopi * (double)i / (double)NPER;
+            double lat1 = blobs[b * 2 + 0] + 0.5 * Math.cos(ang);
+            double lat2 = blobs[b * 2 + 1] + 0.5 * Math.sin(ang);
+            for (int k = 0; k < NCOL; k = k + 1)
+                data[idx * NCOL + k] = lat1 * dir1[k] + lat2 * dir2[k]
+                                     + rng.nextGaussian(0.0, NOISE_SD);
+            truth[idx] = b;
+        }
+    }
+
+    printf("%d samples, %d columns, generated from a 2-D hidden plane\n", NSAMP, NCOL);
+    printf("plus isotropic noise of sd %.2f in every column.\n\n", NOISE_SD);
+
+    // ---- 2. Centre each column, then decompose.
+    double[] centered = new double[NSAMP * NCOL];
+    for (int k = 0; k < NCOL; k = k + 1)
+    {
+        double mean = 0.0;
+        for (int i = 0; i < NSAMP; i = i + 1) mean = mean + data[i * NCOL + k];
+        mean = mean / (double)NSAMP;
+        for (int i = 0; i < NSAMP; i = i + 1)
+            centered[i * NCOL + k] = data[i * NCOL + k] - mean;
+    }
+
+    // u is required by the svd signature. The projection below goes through vt
+    // instead, so the principal DIRECTIONS stay visible in the code.
+    double[] u = new double[NSAMP * NCOL];
+    double[] sv = new double[NCOL];
+    double[] vt = new double[NCOL * NCOL];
+    double[] svscratch = new double[NSAMP * NCOL + NCOL];
+    if (!Svd.svd(centered, NSAMP, NCOL, u, sv, vt, 200, svscratch))
+    {
+        printf("svd failed\n");
+        return 1;
+    }
+
+    double totalvar = 0.0;
+    for (int k = 0; k < NCOL; k = k + 1) totalvar = totalvar + sv[k] * sv[k];
+
+    printf("Principal directions, by share of total variance:\n");
+    double cumulative = 0.0;
+    for (int k = 0; k < NCOL; k = k + 1)
+    {
+        double share = sv[k] * sv[k] / totalvar;
+        cumulative = cumulative + share;
+        printf("  PC%d  singular value %8.4f   variance share %6.2f%%   cumulative %6.2f%%\n",
+               k + 1, sv[k], 100.0 * share, 100.0 * cumulative);
+    }
+
+    // The tell that only two directions carry signal: PC3..PC6 are all about
+    // the same size. Structure produces a gap; isotropic noise produces a floor.
+    double top2 = (sv[0] * sv[0] + sv[1] * sv[1]) / totalvar;
+    double tailmin = sv[2];
+    double tailmax = sv[2];
+    for (int k = 3; k < NCOL; k = k + 1)
+    {
+        if (sv[k] < tailmin) tailmin = sv[k];
+        if (sv[k] > tailmax) tailmax = sv[k];
+    }
+    printf("\nTop two directions hold %.2f%% of the variance.\n", 100.0 * top2);
+    printf("Gap PC2 -> PC3 is a factor of %.1f; the PC3..PC6 tail spans only a\n",
+           sv[1] / sv[2]);
+    printf("factor of %.2f, which is the flat floor isotropic noise produces.\n",
+           tailmax / tailmin);
+    printf("That flatness is the evidence that there is no third direction to find.\n\n");
+
+    // ---- 3. Project onto the top two directions. vt is V TRANSPOSED, so
+    // row j of vt is the j-th principal direction.
+    double[] scores = new double[NSAMP * 2];
+    for (int i = 0; i < NSAMP; i = i + 1)
+    {
+        for (int j = 0; j < 2; j = j + 1)
+        {
+            double z = 0.0;
+            for (int k = 0; k < NCOL; k = k + 1)
+                z = z + centered[i * NCOL + k] * vt[j * NCOL + k];
+            scores[i * 2 + j] = z;
+        }
+    }
+
+    // ---- 4. Cluster the projection, and the raw columns, and compare.
+    double[] scratch = new double[16 * NSAMP + 512];
+    double[] cent2 = new double[NBLOB * 2];
+    int[] lab2 = new int[NSAMP];
+    Random r2 = default;
+    r2.seed(99);
+    Cluster.KMeansResult k2 = Cluster.kmeans(scores, NSAMP, 2, NBLOB,
+                                             Spatial.METRIC_EUCLIDEAN, cent2, lab2,
+                                             200, 1.0e-12, &r2, scratch);
+
+    double[] cent6 = new double[NBLOB * NCOL];
+    int[] lab6 = new int[NSAMP];
+    Random r6 = default;
+    r6.seed(99);
+    Cluster.KMeansResult k6 = Cluster.kmeans(data, NSAMP, NCOL, NBLOB,
+                                             Spatial.METRIC_EUCLIDEAN, cent6, lab6,
+                                             200, 1.0e-12, &r6, scratch);
+
+    // Agreement measured by grouping: for every pair of samples, do the two
+    // labellings agree about whether they belong together? Label values
+    // themselves are arbitrary and comparing them directly would be wrong.
+    int agree2 = 0;
+    int agree6 = 0;
+    int pairs = 0;
+    for (int i = 0; i < NSAMP; i = i + 1)
+    {
+        for (int j = i + 1; j < NSAMP; j = j + 1)
+        {
+            pairs = pairs + 1;
+            bool same = truth[i] == truth[j];
+            if ((lab2[i] == lab2[j]) == same) agree2 = agree2 + 1;
+            if ((lab6[i] == lab6[j]) == same) agree6 = agree6 + 1;
+        }
+    }
+
+    printf("k-means with k = %d:\n", NBLOB);
+    printf("  on the 2-D projection: converged=%d, %d iterations, inertia %.3f\n",
+           k2.converged, k2.iterations, k2.inertia);
+    printf("    pair agreement with truth: %d / %d (%.1f%%)\n",
+           agree2, pairs, 100.0 * (double)agree2 / (double)pairs);
+    printf("  on the raw %d columns:  converged=%d, %d iterations, inertia %.3f\n",
+           NCOL, k6.converged, k6.iterations, k6.inertia);
+    printf("    pair agreement with truth: %d / %d (%.1f%%)\n\n",
+           agree6, pairs, 100.0 * (double)agree6 / (double)pairs);
+
+    // ---- 5. The picture that the projection makes possible.
+    int gw = 62;
+    int gh = 19;
+    double xlo = scores[0];
+    double xhi = scores[0];
+    double ylo = scores[1];
+    double yhi = scores[1];
+    for (int i = 1; i < NSAMP; i = i + 1)
+    {
+        if (scores[i * 2] < xlo) xlo = scores[i * 2];
+        if (scores[i * 2] > xhi) xhi = scores[i * 2];
+        if (scores[i * 2 + 1] < ylo) ylo = scores[i * 2 + 1];
+        if (scores[i * 2 + 1] > yhi) yhi = scores[i * 2 + 1];
+    }
+
+    char[] grid = new char[gw * gh];
+    for (int i = 0; i < gw * gh; i = i + 1) grid[i] = ' ';
+    for (int i = 0; i < NSAMP; i = i + 1)
+    {
+        int cx = (int)((scores[i * 2] - xlo) / (xhi - xlo) * (double)(gw - 1));
+        int cy = (int)((yhi - scores[i * 2 + 1]) / (yhi - ylo) * (double)(gh - 1));
+        grid[cy * gw + cx] = (char)((int)'A' + lab2[i]);
+    }
+
+    printf("The 2-D projection, one letter per sample, letter = cluster:\n");
+    for (int r = 0; r < gh; r = r + 1)
+    {
+        printf("  ");
+        for (int c = 0; c < gw; c = c + 1) printf("%c", grid[r * gw + c]);
+        printf("\n");
+    }
+    printf("  PC1 %.2f to %.2f, PC2 %.2f to %.2f\n\n", xlo, xhi, ylo, yhi);
+
+    printf("Six columns went in; two directions came out holding %.1f%% of the\n",
+           100.0 * top2);
+    printf("variance, and the three groups are visible in a picture you can read.\n");
+
+    delete[_] data;
+    delete[_] truth;
+    delete[_] centered;
+    delete[_] u;
+    delete[_] sv;
+    delete[_] vt;
+    delete[_] svscratch;
+    delete[_] scores;
+    delete[_] scratch;
+    delete[_] cent2;
+    delete[_] lab2;
+    delete[_] cent6;
+    delete[_] lab6;
+    delete[_] grid;
+    return 0;
+}

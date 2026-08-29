@@ -1,0 +1,615 @@
+// dataio.cb - pipelined ingest of numeric files with bounded memory.
+//
+// Chunked (the default) runs a real two-stage pipeline. A dedicated reader
+// thread fills chunk buffers taken from a fixed pool while the calling thread
+// parses the previously filled one. The stages hand buffer indices to each
+// other over a pair of spsc_queue<int> rings - one producer and one consumer
+// per ring, as that queue requires - so buffers are recycled and the steady
+// state allocates nothing. Peak memory is opts.buffers * opts.chunk_bytes
+// regardless of file size: a 500 MB file loads in the same footprint as a
+// 5 MB one.
+//
+// A chunk boundary lands mid-record, so the reader trims every chunk back to
+// the last complete record and carries the tail into the next chunk. Only the
+// final chunk may end on an unterminated record, and that record is kept. A
+// single record longer than chunk_bytes cannot be split and is reported as a
+// failure.
+//
+// Files at or below one chunk skip the thread entirely and take one serial
+// read, because thread and queue setup costs more than the read itself.
+//
+// opts.workers > 1 fans the parse of a chunk out over record-aligned
+// sub-ranges with parallel_for_n. Output order is preserved without locking: a
+// counting pass gives every sub-range a starting index, so each one writes a
+// disjoint slice of the destination. This applies to the whitespace-decimal
+// entry points (load_doubles, stream_doubles, reduce_file). load_csv and
+// load_binary_f64 parse each chunk serially and ignore opts.workers.
+//
+// ReadMode.Mmap is opt-in. It maps the file and hands the whole mapping to the
+// parser in a single call, which removes the copy but does NOT bound memory,
+// so Chunked stays the default for one-pass loads.
+import "filesystem.cb";
+import "math.cb";
+import "thread.cb";
+import "spsc_queue.cb";
+import "hpc/parallel.cb";
+import "hpc/scan.cb";
+
+enum ReadMode : int { Chunked, Mmap };
+
+struct LoadOptions
+{
+    ReadMode mode = default;      // Chunked
+    int chunk_bytes = default;    // 0 -> 1 MB
+    int buffers = default;        // 0 -> 2 (double buffering)
+    int workers = default;        // 0 or 1 -> serial parse
+    char delimiter = default;     // CSV: 0 -> ','
+    bool has_header = default;
+};
+
+struct LoadResult
+{
+    i64 rows = default;
+    i64 cols = default;
+    i64 bytes_read = default;
+    double seconds = default;
+    bool ok = default;
+};
+
+// One pooled chunk buffer. data is a plain malloc block owned by the pipeline.
+struct DataIoChunk
+{
+    i8* data = default;
+    i64 len = default;
+    i64 cap = default;
+};
+
+// State shared between the reader thread and the parsing thread. Only the
+// reader writes carry/bytes_read/overflow; the parser reads them after join.
+struct DataIoPipe
+{
+    void* file = default;      // File*
+    void* chunks = default;    // DataIoChunk*
+    void* freeq = default;     // spsc_queue<int>*
+    void* fullq = default;     // spsc_queue<int>*
+    i8* carry = default;       // partial trailing record, carried forward
+    i64 carry_len = default;
+    i64 bytes_read = default;
+    int record_mode = default; // 0 = whitespace, 1 = line, 2 = 8-byte binary
+    bool overflow = default;   // a single record did not fit in one chunk
+};
+
+// Scratch buffer reused by stream_doubles across chunks, so the streaming
+// path allocates once rather than once per chunk.
+struct DataIoScratch
+{
+    double* buf = default;
+    i64 cap = default;
+};
+
+bool __dataio_is_space(i8 c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+// Byte offset just past the last complete record in [0, len).
+// Returns 0 when the buffer holds no record boundary at all.
+i64 __dataio_boundary(int mode, i8* p, i64 len)
+{
+    if (mode == 2) return len - (len % (i64)8);
+    i64 i = len;
+    while (i > (i64)0)
+    {
+        i = i - (i64)1;
+        if (mode == 1)
+        {
+            if (p[i] == (i8)10) return i + (i64)1;
+        }
+        else if (__dataio_is_space(p[i])) return i + (i64)1;
+    }
+    return (i64)0;
+}
+
+// Reader thread body. Takes an index off the free ring, fills that buffer with
+// the carry plus a fresh read, trims it to a record boundary, and publishes it
+// on the full ring. Publishes -1 once the file is exhausted.
+int __dataio_reader(void* raw)
+{
+    DataIoPipe* p = (DataIoPipe*)raw;
+    File* f = (File*)p->file;
+    DataIoChunk* chunks = (DataIoChunk*)p->chunks;
+    spsc_queue<int>* freeq = (spsc_queue<int>*)p->freeq;
+    spsc_queue<int>* fullq = (spsc_queue<int>*)p->fullq;
+    while (true)
+    {
+        int idx = freeq->pop();
+        DataIoChunk* b = &chunks[idx];
+        i64 off = p->carry_len;
+        if (off > (i64)0) memcpy(b->data, p->carry, off);
+        i64 want = b->cap - off;
+        i64 got = f->readBytes(b->data + off, want);
+        p->bytes_read = p->bytes_read + got;
+        i64 total = off + got;
+        bool eof = got < want;
+        if (total == (i64)0)
+        {
+            fullq->push(-1);
+            break;
+        }
+        i64 cut = total;
+        if (!eof)
+        {
+            cut = __dataio_boundary(p->record_mode, b->data, total);
+            if (cut <= (i64)0)
+            {
+                p->overflow = true;
+                cut = total;
+            }
+        }
+        p->carry_len = total - cut;
+        if (p->carry_len > (i64)0) memcpy(p->carry, b->data + cut, p->carry_len);
+        b->len = cut;
+        fullq->push(idx);
+        if (eof)
+        {
+            fullq->push(-1);
+            break;
+        }
+    }
+    return 0;
+}
+
+namespace DataIo
+{
+    void _error(string path, i64 at)
+    {
+        printf("DataIo: parse error in %s at byte %lld\n", path.data(), at);
+    }
+
+    bool _digit(i8 c)
+    {
+        return c >= '0' && c <= '9';
+    }
+
+    void _space(i8* p, i64 end, i64* at)
+    {
+        while (at[0] < end && __dataio_is_space(p[at[0]])) at[0] = at[0] + (i64)1;
+    }
+
+    // Direct decimal scanner: sign, integer part, fraction, optional exponent.
+    // Faster than sscanf and the one place a hand-rolled loop belongs here.
+    bool _number(i8* p, i64 end, i64* at, double* out)
+    {
+        i64 i = at[0];
+        bool neg = false;
+        if (i < end && (p[i] == '+' || p[i] == '-'))
+        {
+            neg = p[i] == '-';
+            i = i + (i64)1;
+        }
+        double v = 0.0;
+        int nd = 0;
+        while (i < end && _digit(p[i]))
+        {
+            v = v * 10.0 + (double)(p[i] - '0');
+            i = i + (i64)1;
+            nd = nd + 1;
+        }
+        if (i < end && p[i] == '.')
+        {
+            i = i + (i64)1;
+            double place = 0.1;
+            while (i < end && _digit(p[i]))
+            {
+                v = v + (double)(p[i] - '0') * place;
+                place = place * 0.1;
+                i = i + (i64)1;
+                nd = nd + 1;
+            }
+        }
+        if (nd == 0) return false;
+        if (i < end && (p[i] == 'e' || p[i] == 'E'))
+        {
+            i = i + (i64)1;
+            bool eneg = false;
+            if (i < end && (p[i] == '+' || p[i] == '-'))
+            {
+                eneg = p[i] == '-';
+                i = i + (i64)1;
+            }
+            int ex = 0;
+            int ne = 0;
+            while (i < end && _digit(p[i]))
+            {
+                ex = ex * 10 + (int)(p[i] - '0');
+                i = i + (i64)1;
+                ne = ne + 1;
+            }
+            if (ne == 0) return false;
+            if (eneg) ex = -ex;
+            v = v * Math.pow(10.0, (double)ex);
+        }
+        out[0] = neg ? -v : v;
+        at[0] = i;
+        return true;
+    }
+
+    LoadResult _base(i64 bytes, i64 rows, i64 cols, i64 start, bool ok)
+    {
+        LoadResult r = default;
+        r.rows = rows;
+        r.cols = cols;
+        r.bytes_read = bytes;
+        r.seconds = ((double)(os.monotonic_nanos() - start)) / (double)os.monotonic_freq();
+        r.ok = ok;
+        return r;
+    }
+
+    i64 _chunk_bytes(LoadOptions opts)
+    {
+        i64 chunk = opts.chunk_bytes > 0 ? (i64)opts.chunk_bytes : (i64)1048576;
+        if (chunk < (i64)32) chunk = (i64)32;
+        return chunk;
+    }
+
+    // Scan whitespace-separated decimals in [from, to). When store is true the
+    // values land in dst[at...]. Returns the count, or -1 on a bad field.
+    i64 _scan(i8* p, i64 from, i64 to, double* dst, i64 at, i64 cap, bool store)
+    {
+        i64 i = from;
+        i64 n = (i64)0;
+        while (i < to)
+        {
+            _space(p, to, &i);
+            if (i >= to) break;
+            double v = 0.0;
+            if (!_number(p, to, &i, &v)) return (i64)-1;
+            if (store)
+            {
+                if (at + n >= cap) return (i64)-1;
+                dst[at + n] = v;
+            }
+            n = n + (i64)1;
+        }
+        return n;
+    }
+
+    // Pick nw record-aligned split points over [0, len); starts[nw] == len.
+    // Each point is advanced past the record it landed inside, so no value is
+    // scanned twice and none is missed.
+    void _split(i8* p, i64 len, i64* starts, int nw)
+    {
+        starts[0] = (i64)0;
+        for (int w = 1; w < nw; w = w + 1)
+        {
+            i64 s = (len * (i64)w) / (i64)nw;
+            while (s < len && !__dataio_is_space(p[s])) s = s + (i64)1;
+            while (s < len && __dataio_is_space(p[s])) s = s + (i64)1;
+            if (s < starts[w - 1]) s = starts[w - 1];
+            starts[w] = s;
+        }
+        starts[nw] = len;
+    }
+
+    // Parse a record-aligned chunk of decimals into dst[base...]. With workers
+    // > 1 a counting pass fixes each sub-range's starting index, so the fill
+    // pass writes disjoint slices in order without locking.
+    i64 _parse_block(i8* p, i64 len, double* dst, i64 base, i64 cap, int workers)
+    {
+        if (workers <= 1 || len < (i64)65536)
+            return _scan(p, (i64)0, len, dst, base, cap, true);
+
+        int nw = workers;
+        i64* starts = (i64*)malloc((i64)(nw + 1) * (i64)sizeof(i64));
+        i64* counts = (i64*)malloc((i64)nw * (i64)sizeof(i64));
+        int* bad = (int*)malloc((i64)sizeof(int));
+        bad[0] = 0;
+        _split(p, len, starts, nw);
+        parallel_for_n((i64)nw, nw, (i64 lo, i64 hi) =>
+        {
+            for (i64 w = lo; w < hi; w = w + (i64)1)
+            {
+                i64 c = _scan(p, starts[w], starts[w + (i64)1], dst, (i64)0, cap, false);
+                if (c < (i64)0)
+                {
+                    bad[0] = 1;
+                    c = (i64)0;
+                }
+                counts[w] = c;
+            }
+        });
+        i64 total = (i64)0;
+        for (int w = 0; w < nw; w = w + 1)
+        {
+            i64 c = counts[w];
+            counts[w] = total;
+            total = total + c;
+        }
+        if (bad[0] == 0 && base + total <= cap)
+        {
+            parallel_for_n((i64)nw, nw, (i64 lo, i64 hi) =>
+            {
+                for (i64 w = lo; w < hi; w = w + (i64)1)
+                {
+                    i64 r = _scan(p, starts[w], starts[w + (i64)1], dst,
+                                  base + counts[w], cap, true);
+                    if (r < (i64)0) bad[0] = 1;
+                }
+            });
+        }
+        else bad[0] = 1;
+        int failed = bad[0];
+        free((void*)starts);
+        free((void*)counts);
+        free((void*)bad);
+        if (failed != 0) return (i64)-1;
+        return total;
+    }
+
+    // Serial path for inputs at or below one chunk, and for the mmap backend's
+    // single whole-file region.
+    bool _run_serial(File* f, i64 chunk, Lambda<bool(i8*, i64)> consume, i64* bytes_out)
+    {
+        i8* buf = (i8*)malloc(chunk);
+        i64 got = f->readBytes(buf, chunk);
+        bytes_out[0] = got;
+        bool ok = true;
+        if (got > (i64)0) ok = consume(buf, got);
+        free((void*)buf);
+        return ok;
+    }
+
+    // Drive the reader thread and hand each record-aligned chunk to consume.
+    // Returns false on open failure, an oversized record, or a consumer error.
+    bool _run_pipeline(File* f, i64 chunk, int nbuf, int record_mode,
+                       Lambda<bool(i8*, i64)> consume, i64* bytes_out)
+    {
+        DataIoChunk* chunks = (DataIoChunk*)calloc((i64)nbuf, (i64)sizeof(DataIoChunk));
+        for (int i = 0; i < nbuf; i = i + 1)
+        {
+            chunks[i].data = (i8*)malloc(chunk);
+            chunks[i].cap = chunk;
+            chunks[i].len = (i64)0;
+        }
+        spsc_queue<int> freeq;
+        spsc_queue<int> fullq;
+        freeq.init(nbuf + 2);
+        fullq.init(nbuf + 2);
+
+        DataIoPipe pipe = default;
+        pipe.file = (void*)f;
+        pipe.chunks = (void*)chunks;
+        pipe.freeq = (void*)&freeq;
+        pipe.fullq = (void*)&fullq;
+        pipe.carry = (i8*)malloc(chunk);
+        pipe.record_mode = record_mode;
+        for (int i = 0; i < nbuf; i = i + 1) freeq.try_push(i);
+
+        Thread reader;
+        reader.start(__dataio_reader, (void*)&pipe);
+
+        // Drain to completion even after an error, or the reader would block
+        // forever waiting for a buffer to come back.
+        bool ok = true;
+        while (true)
+        {
+            int idx = fullq.pop();
+            if (idx < 0) break;
+            if (ok && chunks[idx].len > (i64)0)
+                ok = consume(chunks[idx].data, chunks[idx].len);
+            freeq.push(idx);
+        }
+        reader.join();
+
+        bytes_out[0] = pipe.bytes_read;
+        if (pipe.overflow) ok = false;
+        for (int i = 0; i < nbuf; i = i + 1) free((void*)chunks[i].data);
+        free((void*)chunks);
+        free((void*)pipe.carry);
+        freeq.destroy();
+        fullq.destroy();
+        return ok;
+    }
+
+    // Entry point for every loader: picks the mmap, serial, or pipelined
+    // backend and feeds record-aligned chunks to consume.
+    bool _run(string path, LoadOptions opts, int record_mode,
+              Lambda<bool(i8*, i64)> consume, i64* bytes_out)
+    {
+        bytes_out[0] = (i64)0;
+        if (opts.mode == ReadMode.Mmap)
+        {
+            MappedFile mf = default;
+            if (!mf.openRead(path)) return false;
+            i64 len = mf.length();
+            bytes_out[0] = len;
+            if (len == (i64)0) return true;
+            return consume(mf.data(), len);
+        }
+
+        i64 chunk = _chunk_bytes(opts);
+        int nbuf = opts.buffers > 0 ? opts.buffers : 2;
+        if (nbuf < 1) nbuf = 1;
+
+        File* f = new File;
+        if (!f->openRead(path))
+        {
+            delete f;
+            return false;
+        }
+        i64 fsize = f->size();
+        bool ok = false;
+        if (fsize >= (i64)0 && fsize <= chunk) ok = _run_serial(f, chunk, consume, bytes_out);
+        else ok = _run_pipeline(f, chunk, nbuf, record_mode, consume, bytes_out);
+        delete f;
+        return ok;
+    }
+
+    // Load whitespace-separated decimals into dst, up to cap values.
+    LoadResult load_doubles(string path, double[] dst, i64 cap, LoadOptions opts)
+    {
+        i64 start = os.monotonic_nanos();
+        i64 count = (i64)0;
+        i64* countp = &count;
+        double* out = &dst[0];
+        int workers = opts.workers;
+        Lambda<bool(i8*, i64)> consume = (i8* p, i64 len) =>
+        {
+            i64 n = _parse_block(p, len, out, countp[0], cap, workers);
+            if (n < (i64)0) return false;
+            countp[0] = countp[0] + n;
+            return true;
+        };
+        i64 bytes = (i64)0;
+        bool ok = _run(path, opts, 0, consume, &bytes);
+        if (!ok) _error(path, bytes);
+        return _base(bytes, count, (i64)1, start, ok);
+    }
+
+    // Parse a chunk of complete CSV rows into dst starting at row base.
+    // Returns the row count, or -1 on a malformed row.
+    i64 _parse_csv(i8* p, i64 len, double* dst, i64 base, i64 cap,
+                   i64 expected, i8 delim, int* cols_io)
+    {
+        i64 at = (i64)0;
+        i64 row = (i64)0;
+        while (at < len)
+        {
+            while (at < len && (p[at] == '\r' || p[at] == '\n')) at = at + (i64)1;
+            if (at >= len) break;
+            int col = 0;
+            while (true)
+            {
+                while (at < len && (p[at] == ' ' || p[at] == '\t')) at = at + (i64)1;
+                double v = 0.0;
+                if (!_number(p, len, &at, &v)) return (i64)-1;
+                if (expected > (i64)0 && (i64)col >= expected) return (i64)-1;
+                i64 slot = expected > (i64)0 ? (base + row) * expected + (i64)col : (i64)col;
+                if (expected > (i64)0)
+                {
+                    if (slot >= cap) return (i64)-1;
+                    dst[slot] = v;
+                }
+                else if (base + row == (i64)0 && slot < cap) dst[slot] = v;
+                col = col + 1;
+                while (at < len && (p[at] == ' ' || p[at] == '\t')) at = at + (i64)1;
+                if (at >= len || p[at] == '\r' || p[at] == '\n') break;
+                if (p[at] != delim) return (i64)-1;
+                at = at + (i64)1;
+            }
+            if (cols_io[0] == 0) cols_io[0] = col;
+            if (col != cols_io[0]) return (i64)-1;
+            if (expected > (i64)0 && (i64)col != expected) return (i64)-1;
+            row = row + (i64)1;
+            while (at < len && p[at] != '\n') at = at + (i64)1;
+            if (at < len) at = at + (i64)1;
+        }
+        return row;
+    }
+
+    // Load a delimited numeric table row-major into dst. expected > 0 fixes the
+    // column count; chunks parse serially, so opts.workers is not used here.
+    LoadResult load_csv(string path, double[] dst, i64 cap, i64 expected, LoadOptions opts)
+    {
+        i64 start = os.monotonic_nanos();
+        i64 rows = (i64)0;
+        i64* rowsp = &rows;
+        double* out = &dst[0];
+        int cols = 0;
+        int* colsp = &cols;
+        int header = opts.has_header ? 1 : 0;
+        int* headerp = &header;
+        i8 delim = opts.delimiter == 0 ? (i8)',' : (i8)opts.delimiter;
+        Lambda<bool(i8*, i64)> consume = (i8* p, i64 len) =>
+        {
+            i8* q = p;
+            i64 n = len;
+            if (headerp[0] != 0)
+            {
+                headerp[0] = 0;
+                i64 skip = (i64)0;
+                while (skip < n && q[skip] != '\n') skip = skip + (i64)1;
+                if (skip < n) skip = skip + (i64)1;
+                q = q + skip;
+                n = n - skip;
+            }
+            i64 r = _parse_csv(q, n, out, rowsp[0], cap, expected, delim, colsp);
+            if (r < (i64)0) return false;
+            rowsp[0] = rowsp[0] + r;
+            return true;
+        };
+        i64 bytes = (i64)0;
+        bool ok = _run(path, opts, 1, consume, &bytes);
+        if (!ok) _error(path, bytes);
+        i64 ncols = expected > (i64)0 ? expected : (i64)cols;
+        return _base(bytes, rows, ncols, start, ok);
+    }
+
+    // Load a raw little-endian f64 array. Chunks are cut on 8-byte boundaries.
+    LoadResult load_binary_f64(string path, double[] dst, i64 cap, LoadOptions opts)
+    {
+        i64 start = os.monotonic_nanos();
+        i64 count = (i64)0;
+        i64* countp = &count;
+        double* out = &dst[0];
+        Lambda<bool(i8*, i64)> consume = (i8* p, i64 len) =>
+        {
+            i64 n = len / (i64)8;
+            if ((len % (i64)8) != (i64)0) return false;
+            if (countp[0] + n > cap) return false;
+            memcpy(out + countp[0], p, n * (i64)8);
+            countp[0] = countp[0] + n;
+            return true;
+        };
+        i64 bytes = (i64)0;
+        bool ok = _run(path, opts, 2, consume, &bytes);
+        if (!ok) _error(path, bytes);
+        return _base(bytes, count, (i64)1, start, ok);
+    }
+
+    // Stream whitespace-separated decimals to sink in file order, one batch per
+    // chunk. sink receives (values, count, index of the first value).
+    LoadResult stream_doubles(string path, Lambda<void(double*, int, i64)> sink,
+                              LoadOptions opts)
+    {
+        i64 start = os.monotonic_nanos();
+        i64 total = (i64)0;
+        i64* totalp = &total;
+        int workers = opts.workers;
+        DataIoScratch sc = default;
+        DataIoScratch* scp = &sc;
+        Lambda<bool(i8*, i64)> consume = (i8* p, i64 len) =>
+        {
+            // Worst case is one value per two bytes ("1 1 1 ...").
+            i64 need = len / (i64)2 + (i64)2;
+            if (need > scp->cap)
+            {
+                if (scp->buf != nullptr) free((void*)scp->buf);
+                scp->buf = (double*)malloc(need * (i64)8);
+                scp->cap = need;
+            }
+            i64 n = _parse_block(p, len, scp->buf, (i64)0, scp->cap, workers);
+            if (n < (i64)0) return false;
+            if (n > (i64)0) sink(scp->buf, (int)n, totalp[0]);
+            totalp[0] = totalp[0] + n;
+            return true;
+        };
+        i64 bytes = (i64)0;
+        bool ok = _run(path, opts, 0, consume, &bytes);
+        if (sc.buf != nullptr) free((void*)sc.buf);
+        if (!ok) _error(path, bytes);
+        return _base(bytes, total, (i64)1, start, ok);
+    }
+
+    // Accumulate every value in the file into a Welford running moment set
+    // without ever holding the file in memory.
+    LoadResult reduce_file(string path, Welford* acc, LoadOptions opts)
+    {
+        acc->reset();
+        Lambda<void(double*, int, i64)> sink = (double* a, int n, i64 first) =>
+        {
+            for (int i = 0; i < n; i = i + 1) acc->add(a[i]);
+        };
+        return stream_doubles(path, sink, opts);
+    }
+}
