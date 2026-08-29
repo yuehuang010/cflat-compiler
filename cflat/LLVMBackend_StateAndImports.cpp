@@ -1056,26 +1056,42 @@ uint64_t LLVMBackend::CHeaderDiskCacheKey(const std::vector<std::string>& header
 
 nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
 {
+        auto s = SerializedTav::From(tv);
         nlohmann::json j;
-        j["t"] = tv.TypeName;
-        if (tv.Pointer)        j["p"]   = true;
-        if (tv.ElemPointer)    j["ep"]  = true;
-        if (tv.PointerDepth)   j["pd"]  = tv.PointerDepth;
-        if (tv.IsMove)         j["mv"]  = true;
-        if (tv.CallConv != CallingConv::Default) j["cc"] = static_cast<int>(tv.CallConv);
-        if (tv.ConstArraySize) j["arr"] = tv.ConstArraySize;
-        if (!tv.ConstInnerDimensions.empty()) j["idims"] = tv.ConstInnerDimensions;
-        if (tv.IsSimd) { j["sd"] = true; j["sdl"] = tv.SimdLanes; }
-        if (tv.IsArrayView) j["av"] = true;
-        if (tv.IsFunctionPointer)
+        j["t"] = s.TypeName;
+        if (!s.VariableName.empty()) j["n"] = s.VariableName;
+        if (s.Pointer)        j["p"]   = true;
+        if (s.ElemPointer)    j["ep"]  = true;
+        if (s.PointerDepth)   j["pd"]  = s.PointerDepth;
+        if (s.IsInterface)    j["if"]  = true;
+        if (s.IsInterfacePointer) j["ifp"] = true;
+        if (s.IsNullable)     j["nl"]  = true;
+        if (s.IsMove)         j["mv"]  = true;
+        if (s.IsAdopt)        j["ad"]  = true;
+        if (s.IsAlias)        j["al"]  = true;
+        if (s.IsUniqueTypeArg) j["unt"] = true;
+        if (s.ElementOwningUnique) j["eou"] = true;
+        if (s.IsOwningSink)   j["osk"] = true;
+        if (s.IsConsumeInferredSink) j["cis"] = true;
+        if (s.IsBorrowOfUniqueElement) j["bue"] = true;
+        if (s.IsBorrowOfAliasElement) j["bae"] = true;
+        if (s.IsBond)          j["bd"] = true;
+        if (s.IsUnique)        j["uq"] = true;
+        if (s.CallConv != CallingConv::Default) j["cc"] = static_cast<int>(s.CallConv);
+        if (s.LockThis)        j["lt"] = true;
+        if (s.LockThisMode != LockMode::Exclusive) j["ltm"] = static_cast<int>(s.LockThisMode);
+        if (!s.GuardedBy.empty()) j["gb"] = s.GuardedBy;
+        if (s.IsFunctionPointer)
         {
             j["fp"]  = true;
-            j["fpr"] = tv.FuncPtrReturnTypeName;
-            if (tv.FuncPtrReturnPointer) j["fprp"] = true;
-            if (tv.FuncPtrReturnOwned) j["fpro"] = true;
-            if (tv.FuncPtrReturnAlias) j["fpra"] = true;
+            j["fpr"] = s.FuncPtrReturnTypeName;
+            if (s.FuncPtrReturnPointer) j["fprp"] = true;
+            if (s.FuncPtrReturnOwned) j["fpro"] = true;
+            if (s.FuncPtrReturnAlias) j["fpra"] = true;
+            if (s.FuncPtrReturnPointerDepth > 1) j["fprd"] = s.FuncPtrReturnPointerDepth;
+            if (!s.FuncPtrReturnResolvedKey.empty()) j["fprk"] = s.FuncPtrReturnResolvedKey;
             nlohmann::json fps = nlohmann::json::array();
-            for (const auto& p : tv.FuncPtrParams)
+            for (const auto& p : s.FuncPtrParams)
             {
                 nlohmann::json pj;
                 pj["t"] = p.TypeName;
@@ -1084,48 +1100,77 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
                 if (p.IsMove)  pj["mv"] = true;
                 if (p.IsOwningSink) pj["osk"] = true;
                 if (p.IsConsumeInferredSink) pj["cis"] = true;
+                if (p.PointerDepth > 1) pj["pd"] = p.PointerDepth;
+                if (!p.ResolvedTypeKey.empty()) pj["rk"] = p.ResolvedTypeKey;
                 fps.push_back(pj);
             }
-            j["fps"] = fps;
+            j["fpp"] = fps;
         }
+        if (s.ConstArraySize > 0) j["as"] = s.ConstArraySize;
+        if (!s.ConstInnerDimensions.empty()) j["aid"] = s.ConstInnerDimensions;
+        if (s.IsSimd) { j["sd"] = true; j["sdl"] = s.SimdLanes; }
+        if (s.IsArrayView) j["av"] = true;
+        if (s.AllocAlignValue > 0) j["aa"] = s.AllocAlignValue;
         return j;
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
 {
-        TypeAndValue tv;
-        tv.TypeName       = j.value("t",   std::string{});
-        tv.Pointer        = j.value("p",   false);
-        tv.ElemPointer    = j.value("ep",  false);
-        tv.PointerDepth   = j.value("pd",  0);
-        tv.IsMove         = j.value("mv",  false);
-        tv.CallConv = static_cast<CallingConv>(j.value("cc", 0));
-        tv.ConstArraySize = j.value("arr", uint64_t{0});
-        if (j.contains("idims")) tv.ConstInnerDimensions = j["idims"].to_u64_vector();
-        tv.IsSimd   = j.value("sd",  false);
-        tv.SimdLanes = j.value("sdl", uint64_t{0});
-        tv.IsArrayView = j.value("av", false);
-        tv.IsFunctionPointer = j.value("fp", false);
-        if (tv.IsFunctionPointer)
+        SerializedTav s;
+        s.TypeName = j.value("t", std::string{});
+        s.VariableName = j.value("n", std::string{});
+        s.Pointer = j.value("p", false);
+        s.ElemPointer = j.value("ep", false);
+        s.PointerDepth = j.value("pd", 0);
+        s.IsInterface = j.value("if", false);
+        s.IsInterfacePointer = j.value("ifp", false);
+        s.IsNullable = j.value("nl", false);
+        s.IsMove = j.value("mv", false);
+        s.IsAdopt = j.value("ad", false);
+        s.IsAlias = j.value("al", false);
+        s.IsUniqueTypeArg = j.value("unt", false);
+        s.ElementOwningUnique = j.value("eou", false);
+        s.IsOwningSink = j.value("osk", false);
+        s.IsConsumeInferredSink = j.value("cis", false);
+        s.IsBorrowOfUniqueElement = j.value("bue", false);
+        s.IsBorrowOfAliasElement = j.value("bae", false);
+        s.IsBond = j.value("bd", false);
+        s.IsUnique = j.value("uq", false);
+        s.CallConv = static_cast<CallingConv>(j.value("cc", 0));
+        s.LockThis = j.value("lt", false);
+        s.LockThisMode = static_cast<LockMode>(j.value("ltm", 0));
+        s.GuardedBy = j.value("gb", std::string{});
+        s.IsFunctionPointer = j.value("fp", false);
+        if (s.IsFunctionPointer)
         {
-            tv.FuncPtrReturnTypeName = j.value("fpr",  std::string{});
-            tv.FuncPtrReturnPointer  = j.value("fprp", false);
-            tv.FuncPtrReturnOwned = j.value("fpro", false);
-            tv.FuncPtrReturnAlias = j.value("fpra", false);
-            if (j.contains("fps"))
-                for (const auto& pj : j["fps"])
+            s.FuncPtrReturnTypeName = j.value("fpr", std::string{});
+            s.FuncPtrReturnPointer = j.value("fprp", false);
+            s.FuncPtrReturnOwned = j.value("fpro", false);
+            s.FuncPtrReturnAlias = j.value("fpra", false);
+            s.FuncPtrReturnPointerDepth = j.value("fprd", s.FuncPtrReturnPointerDepth);
+            s.FuncPtrReturnResolvedKey = j.value("fprk", std::string{});
+            if (j.contains("fpp"))
+                for (const auto& pj : j["fpp"])
                 {
-                    TypeAndValue::FuncPtrParam p;
-                    p.TypeName = pj.value("t",  std::string{});
-                    p.Pointer  = pj.value("p",  false);
+                    SerializedTav::FuncPtrParam p;
+                    p.TypeName = pj.value("t", std::string{});
+                    p.Pointer = pj.value("p", false);
                     p.AllocAlignValue = pj.value("aav", uint64_t{0});
-                    p.IsMove   = pj.value("mv", false);
+                    p.IsMove = pj.value("mv", false);
                     p.IsOwningSink = pj.value("osk", false);
                     p.IsConsumeInferredSink = pj.value("cis", false);
-                    tv.FuncPtrParams.push_back(p);
+                    p.PointerDepth = pj.value("pd", p.PointerDepth);
+                    p.ResolvedTypeKey = pj.value("rk", std::string{});
+                    s.FuncPtrParams.push_back(std::move(p));
                 }
         }
-        return tv;
+        s.ConstArraySize = j.value("as", uint64_t{0});
+        if (j.contains("aid")) s.ConstInnerDimensions = j["aid"].to_u64_vector();
+        s.IsSimd = j.value("sd", false);
+        s.SimdLanes = j.value("sdl", uint64_t{0});
+        s.IsArrayView = j.value("av", false);
+        s.AllocAlignValue = j.value("aa", uint64_t{0});
+        return s.ToTypeAndValue();
     }
 
 nlohmann::json LLVMBackend::SigToJson(const CSigEntry& e)
@@ -1357,8 +1402,9 @@ bool LLVMBackend::TryLoadCHeaderDiskCache(
         // would still be missing.
         // v11 carries alias macros (`#define A B`); a v10 entry dropped every one of them.
         // v12 carries typedef aliases for the LSP symbol sink.
-        // v13 records anonymous-struct typedef identity in that alias cache.
-        if (version != 13) return false;
+        // v13 records anonymous-struct typedef identity in that alias cache. v14 adopts the
+        // canonical SerializedTav field set and key spellings, including the core fpp/as/aid keys.
+        if (version != 14) return false;
 
         // Accept on mtime match (fast) or content hash match (authoritative on mtime drift).
         auto storedMtime = j.value("mtime", int64_t{-1});
@@ -1423,7 +1469,7 @@ void LLVMBackend::WriteCHeaderDiskCache(
         if (ec) return;
 
         nlohmann::json j;
-        j["version"] = 13;
+        j["version"] = 14;
         j["mtime"]   = (int64_t)mtime.time_since_epoch().count();
         j["hash"]    = contentHash;
 

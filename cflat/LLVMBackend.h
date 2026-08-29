@@ -1021,6 +1021,170 @@ public:
         std::vector<std::string> Values;
     };
 
+    // Neutral schema shared by the core and C-header cache adapters. Fields absent from this
+    // DTO are transient or derived state and must not be reconstructed from either cache.
+    struct SerializedTav
+    {
+        std::string TypeName;
+        std::string VariableName;
+        bool Pointer = false;
+        bool ElemPointer = false;
+        int PointerDepth = 0;
+        bool IsInterface = false;
+        bool IsInterfacePointer = false;
+        bool IsNullable = false;
+        bool IsMove = false;
+        bool IsAdopt = false;
+        bool IsAlias = false;
+        bool IsUniqueTypeArg = false;
+        bool ElementOwningUnique = false;
+        bool IsOwningSink = false;
+        bool IsConsumeInferredSink = false;
+        bool IsBorrowOfUniqueElement = false;
+        bool IsBorrowOfAliasElement = false;
+        bool IsBond = false;
+        bool IsUnique = false;
+        CallingConv CallConv = CallingConv::Default;
+        bool LockThis = false;
+        LockMode LockThisMode = LockMode::Exclusive;
+        std::string GuardedBy;
+        bool IsFunctionPointer = false;
+        std::string FuncPtrReturnTypeName;
+        bool FuncPtrReturnPointer = false;
+        bool FuncPtrReturnOwned = false;
+        bool FuncPtrReturnAlias = false;
+        int FuncPtrReturnPointerDepth = 0;
+        std::string FuncPtrReturnResolvedKey;
+        struct FuncPtrParam
+        {
+            std::string TypeName;
+            bool Pointer = false;
+            uint64_t AllocAlignValue = 0;
+            bool IsMove = false;
+            bool IsOwningSink = false;
+            bool IsConsumeInferredSink = false;
+            int PointerDepth = 0;
+            std::string ResolvedTypeKey;
+        };
+        std::vector<FuncPtrParam> FuncPtrParams;
+        uint64_t ConstArraySize = 0;
+        std::vector<uint64_t> ConstInnerDimensions;
+        bool IsSimd = false;
+        uint64_t SimdLanes = 0;
+        bool IsArrayView = false;
+        uint64_t AllocAlignValue = 0;
+
+        static SerializedTav From(const TypeAndValue& t)
+        {
+            SerializedTav s;
+            s.TypeName = t.TypeName;
+            s.VariableName = t.VariableName;
+            s.Pointer = t.Pointer;
+            s.ElemPointer = t.ElemPointer;
+            s.PointerDepth = t.PointerDepth;
+            s.IsInterface = t.IsInterface;
+            s.IsInterfacePointer = t.IsInterfacePointer;
+            s.IsNullable = t.IsNullable;
+            s.IsMove = t.IsMove;
+            s.IsAdopt = t.IsAdopt;
+            s.IsAlias = t.IsAlias;
+            s.IsUniqueTypeArg = t.IsUniqueTypeArg;
+            s.ElementOwningUnique = t.ElementOwningUnique;
+            s.IsOwningSink = t.IsOwningSink;
+            s.IsConsumeInferredSink = t.IsConsumeInferredSink;
+            s.IsBorrowOfUniqueElement = t.IsBorrowOfUniqueElement;
+            s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
+            s.IsBond = t.IsBond;
+            s.IsUnique = t.IsUnique;
+            s.CallConv = t.CallConv;
+            s.LockThis = t.LockThis;
+            s.LockThisMode = t.LockThisMode;
+            s.GuardedBy = t.GuardedBy;
+            s.IsFunctionPointer = t.IsFunctionPointer;
+            s.FuncPtrReturnTypeName = t.FuncPtrReturnTypeName;
+            s.FuncPtrReturnPointer = t.FuncPtrReturnPointer;
+            s.FuncPtrReturnOwned = t.FuncPtrReturnOwned;
+            s.FuncPtrReturnAlias = t.FuncPtrReturnAlias;
+            s.FuncPtrReturnPointerDepth = t.FuncPtrReturnPointerDepth;
+            s.FuncPtrReturnResolvedKey = t.FuncPtrReturnResolvedKey;
+            for (const auto& p : t.FuncPtrParams)
+            {
+                FuncPtrParam q;
+                q.TypeName = p.TypeName;
+                q.Pointer = p.Pointer;
+                q.AllocAlignValue = p.AllocAlignValue;
+                q.IsMove = p.IsMove;
+                q.IsOwningSink = p.IsOwningSink;
+                q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.PointerDepth = p.PointerDepth;
+                q.ResolvedTypeKey = p.ResolvedTypeKey;
+                s.FuncPtrParams.push_back(std::move(q));
+            }
+            s.ConstArraySize = t.ConstArraySize;
+            s.ConstInnerDimensions = t.ConstInnerDimensions;
+            s.IsSimd = t.IsSimd;
+            s.SimdLanes = t.SimdLanes;
+            s.IsArrayView = t.IsArrayView;
+            s.AllocAlignValue = t.AllocAlignValue;
+            return s;
+        }
+
+        TypeAndValue ToTypeAndValue() const
+        {
+            TypeAndValue t;
+            t.TypeName = TypeName;
+            t.VariableName = VariableName;
+            t.Pointer = Pointer;
+            t.ElemPointer = ElemPointer;
+            t.PointerDepth = PointerDepth;
+            t.IsInterface = IsInterface;
+            t.IsInterfacePointer = IsInterfacePointer;
+            t.IsNullable = IsNullable;
+            t.IsMove = IsMove;
+            t.IsAdopt = IsAdopt;
+            t.IsAlias = IsAlias;
+            t.IsUniqueTypeArg = IsUniqueTypeArg;
+            t.ElementOwningUnique = ElementOwningUnique;
+            t.IsOwningSink = IsOwningSink;
+            t.IsConsumeInferredSink = IsConsumeInferredSink;
+            t.IsBorrowOfUniqueElement = IsBorrowOfUniqueElement;
+            t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
+            t.IsBond = IsBond;
+            t.IsUnique = IsUnique;
+            t.CallConv = CallConv;
+            t.LockThis = LockThis;
+            t.LockThisMode = LockThisMode;
+            t.GuardedBy = GuardedBy;
+            t.IsFunctionPointer = IsFunctionPointer;
+            t.FuncPtrReturnTypeName = FuncPtrReturnTypeName;
+            t.FuncPtrReturnPointer = FuncPtrReturnPointer;
+            t.FuncPtrReturnOwned = FuncPtrReturnOwned;
+            t.FuncPtrReturnAlias = FuncPtrReturnAlias;
+            t.FuncPtrReturnPointerDepth = FuncPtrReturnPointerDepth;
+            t.FuncPtrReturnResolvedKey = FuncPtrReturnResolvedKey;
+            for (const auto& p : FuncPtrParams)
+            {
+                TypeAndValue::FuncPtrParam q;
+                q.TypeName = p.TypeName;
+                q.Pointer = p.Pointer;
+                q.AllocAlignValue = p.AllocAlignValue;
+                q.IsMove = p.IsMove;
+                q.IsOwningSink = p.IsOwningSink;
+                q.IsConsumeInferredSink = p.IsConsumeInferredSink;
+                q.PointerDepth = p.PointerDepth;
+                q.ResolvedTypeKey = p.ResolvedTypeKey;
+                t.FuncPtrParams.push_back(std::move(q));
+            }
+            t.ConstArraySize = ConstArraySize;
+            t.ConstInnerDimensions = ConstInnerDimensions;
+            t.IsSimd = IsSimd;
+            t.SimdLanes = SimdLanes;
+            t.IsArrayView = IsArrayView;
+            t.AllocAlignValue = AllocAlignValue;
+            return t;
+        }
+    };
+
     struct DeclTypeAndValue : public TypeAndValue
     {
         // Used for delayed Initialization
@@ -7441,7 +7605,7 @@ public:
             double   d; if (t.get(d) == simdjson::SUCCESS) return static_cast<T>(d);
             return defv;
         }
-        // Replaces the single nlohmann j["idims"].get<std::vector<uint64_t>>() site.
+        // Converts the canonical array-dimensions field from the simdjson DOM.
         std::vector<uint64_t> to_u64_vector() const
         {
             std::vector<uint64_t> out;

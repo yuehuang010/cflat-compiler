@@ -6135,52 +6135,43 @@ using IM   = LLVMBackend::InterfaceMethod;
 
 static llvm::json::Object SerializeTav(const TAV& t)
 {
+    auto s = LLVMBackend::SerializedTav::From(t);
     llvm::json::Object o;
-    o["t"] = t.TypeName;
-    if (!t.VariableName.empty())  o["n"]   = t.VariableName;
-    if (t.Pointer)                o["p"]   = true;
-    if (t.ElemPointer)            o["ep"]  = true;
-    // Read by the overload depth gate; dropped on a warm cache it would false-reject a
-    // generic-substituted `T*` parameter, so it rides the round-trip with its siblings.
-    // Positive depth proof. Dropped on a warm cache the reverse-direction gate stops firing, so
-    // it rides the round-trip with its siblings.
-    if (t.PointerDepth)           o["pd"]  = static_cast<int64_t>(t.PointerDepth);
-    if (t.IsInterface)            o["if"]  = true;
-    if (t.IsInterfacePointer)     o["ifp"] = true;
-    if (t.IsNullable)             o["nl"]  = true;
-    if (t.IsMove)                 o["mv"]  = true;
-    if (t.IsAdopt)                o["ad"]  = true;
-    // 'alias' joins its ownership siblings here because VerifyInterfaceMethodContract reads it:
-    // dropped on a warm cache, an interface's `alias` return would silently stop matching its
-    // implementor's and the contract check would misfire.
-    if (t.IsAlias)                o["al"]  = true;
-    if (t.IsUniqueTypeArg)        o["unt"] = true;
-    if (t.ElementOwningUnique)    o["eou"] = true;
-    if (t.IsOwningSink)           o["osk"] = true;
-    if (t.IsConsumeInferredSink)  o["cis"] = true;
-    if (t.IsBorrowOfUniqueElement) o["bue"] = true;
-    if (t.IsBorrowOfAliasElement) o["bae"] = true;
-    if (t.IsBond)                 o["bd"]  = true;
-    if (t.IsUnique)               o["uq"]  = true;
-    if (t.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(t.CallConv);
-    if (t.LockThis)               o["lt"]  = true;
-    if (t.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(t.LockThisMode);
-    if (!t.GuardedBy.empty())     o["gb"]  = t.GuardedBy;
-    if (t.IsFunctionPointer)
+    o["t"] = s.TypeName;
+    if (!s.VariableName.empty())  o["n"]   = s.VariableName;
+    if (s.Pointer)                o["p"]   = true;
+    if (s.ElemPointer)            o["ep"]  = true;
+    if (s.PointerDepth)           o["pd"]  = static_cast<int64_t>(s.PointerDepth);
+    if (s.IsInterface)            o["if"]  = true;
+    if (s.IsInterfacePointer)     o["ifp"] = true;
+    if (s.IsNullable)             o["nl"]  = true;
+    if (s.IsMove)                 o["mv"]  = true;
+    if (s.IsAdopt)                o["ad"]  = true;
+    if (s.IsAlias)                o["al"]  = true;
+    if (s.IsUniqueTypeArg)        o["unt"] = true;
+    if (s.ElementOwningUnique)    o["eou"] = true;
+    if (s.IsOwningSink)           o["osk"] = true;
+    if (s.IsConsumeInferredSink)  o["cis"] = true;
+    if (s.IsBorrowOfUniqueElement) o["bue"] = true;
+    if (s.IsBorrowOfAliasElement) o["bae"] = true;
+    if (s.IsBond)                 o["bd"]  = true;
+    if (s.IsUnique)               o["uq"]  = true;
+    if (s.CallConv != LLVMBackend::CallingConv::Default) o["cc"] = static_cast<int64_t>(s.CallConv);
+    if (s.LockThis)               o["lt"]  = true;
+    if (s.LockThisMode != LockMode::Exclusive) o["ltm"] = static_cast<int64_t>(s.LockThisMode);
+    if (!s.GuardedBy.empty())     o["gb"]  = s.GuardedBy;
+    if (s.IsFunctionPointer)
     {
         o["fp"]  = true;
-        o["fpr"] = t.FuncPtrReturnTypeName;
-        if (t.FuncPtrReturnPointer) o["fprp"] = true;
-        if (t.FuncPtrReturnOwned) o["fpro"] = true;
-        if (t.FuncPtrReturnAlias) o["fpra"] = true;
-        // Depth is only written when it is above the single level a bare `Pointer` already
-        // implies, so a warm cache written before depth existed still reads back identically.
-        if (t.FuncPtrReturnPointerDepth > 1)
-            o["fprd"] = static_cast<int64_t>(t.FuncPtrReturnPointerDepth);
-        // Omitted when empty, which is exactly "not recorded" on the way back in.
-        if (!t.FuncPtrReturnResolvedKey.empty()) o["fprk"] = t.FuncPtrReturnResolvedKey;
+        o["fpr"] = s.FuncPtrReturnTypeName;
+        if (s.FuncPtrReturnPointer) o["fprp"] = true;
+        if (s.FuncPtrReturnOwned) o["fpro"] = true;
+        if (s.FuncPtrReturnAlias) o["fpra"] = true;
+        if (s.FuncPtrReturnPointerDepth > 1)
+            o["fprd"] = static_cast<int64_t>(s.FuncPtrReturnPointerDepth);
+        if (!s.FuncPtrReturnResolvedKey.empty()) o["fprk"] = s.FuncPtrReturnResolvedKey;
         llvm::json::Array fps;
-        for (auto& p : t.FuncPtrParams)
+        for (const auto& p : s.FuncPtrParams)
         {
             llvm::json::Object po;
             po["t"] = p.TypeName;
@@ -6195,68 +6186,67 @@ static llvm::json::Object SerializeTav(const TAV& t)
         }
         o["fpp"] = std::move(fps);
     }
-    if (t.ConstArraySize > 0)
+    if (s.ConstArraySize > 0)
     {
-        o["as"] = static_cast<int64_t>(t.ConstArraySize);
-        if (!t.ConstInnerDimensions.empty())
+        o["as"] = static_cast<int64_t>(s.ConstArraySize);
+        if (!s.ConstInnerDimensions.empty())
         {
             llvm::json::Array dims;
-            for (auto d : t.ConstInnerDimensions) dims.push_back(static_cast<int64_t>(d));
+            for (auto d : s.ConstInnerDimensions) dims.push_back(static_cast<int64_t>(d));
             o["aid"] = std::move(dims);
         }
     }
-    if (t.IsSimd)
+    if (s.IsSimd)
     {
         o["sd"] = true;
-        o["sdl"] = static_cast<int64_t>(t.SimdLanes);
+        o["sdl"] = static_cast<int64_t>(s.SimdLanes);
     }
-    if (t.IsArrayView) o["av"] = true;
-    if (t.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(t.AllocAlignValue);
+    if (s.IsArrayView) o["av"] = true;
+    if (s.AllocAlignValue > 0) o["aa"] = static_cast<int64_t>(s.AllocAlignValue);
     return o;
 }
 
 static TAV DeserializeTav(const llvm::json::Object& o)
 {
-    TAV t;
-    if (auto v = o.getString("t"))   t.TypeName = v->str();
-    if (auto v = o.getString("n"))   t.VariableName = v->str();
-    if (auto v = o.getBoolean("p"))  t.Pointer = *v;
-    if (auto v = o.getBoolean("ep")) t.ElemPointer = *v;
-    if (auto v = o.getInteger("pd")) t.PointerDepth = static_cast<int>(*v);
-    if (auto v = o.getBoolean("if")) t.IsInterface = *v;
-    if (auto v = o.getBoolean("ifp"))t.IsInterfacePointer = *v;
-    if (auto v = o.getBoolean("nl")) t.IsNullable = *v;
-    if (auto v = o.getBoolean("mv")) t.IsMove = *v;
-    if (auto v = o.getBoolean("ad")) t.IsAdopt = *v;
-    if (auto v = o.getBoolean("al")) t.IsAlias = *v;
-    if (auto v = o.getBoolean("unt")) t.IsUniqueTypeArg = *v;
-    if (auto v = o.getBoolean("eou")) t.ElementOwningUnique = *v;
-    if (auto v = o.getBoolean("osk")) t.IsOwningSink = *v;
-    if (auto v = o.getBoolean("cis")) t.IsConsumeInferredSink = *v;
-    if (auto v = o.getBoolean("bue")) t.IsBorrowOfUniqueElement = *v;
-    if (auto v = o.getBoolean("bae")) t.IsBorrowOfAliasElement = *v;
-    if (auto v = o.getBoolean("bd")) t.IsBond = *v;
-    if (auto v = o.getBoolean("uq")) t.IsUnique = *v;
-    if (auto v = o.getInteger("cc")) t.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
-    if (auto v = o.getBoolean("lt")) t.LockThis = *v;
-    if (auto v = o.getInteger("ltm")) t.LockThisMode = static_cast<LockMode>(*v);
-    if (auto v = o.getString("gb"))  t.GuardedBy = v->str();
-    if (auto v = o.getBoolean("fp")) t.IsFunctionPointer = *v;
-    if (t.IsFunctionPointer)
+    LLVMBackend::SerializedTav s;
+    if (auto v = o.getString("t"))   s.TypeName = v->str();
+    if (auto v = o.getString("n"))   s.VariableName = v->str();
+    if (auto v = o.getBoolean("p"))  s.Pointer = *v;
+    if (auto v = o.getBoolean("ep")) s.ElemPointer = *v;
+    if (auto v = o.getInteger("pd")) s.PointerDepth = static_cast<int>(*v);
+    if (auto v = o.getBoolean("if")) s.IsInterface = *v;
+    if (auto v = o.getBoolean("ifp"))s.IsInterfacePointer = *v;
+    if (auto v = o.getBoolean("nl")) s.IsNullable = *v;
+    if (auto v = o.getBoolean("mv")) s.IsMove = *v;
+    if (auto v = o.getBoolean("ad")) s.IsAdopt = *v;
+    if (auto v = o.getBoolean("al")) s.IsAlias = *v;
+    if (auto v = o.getBoolean("unt")) s.IsUniqueTypeArg = *v;
+    if (auto v = o.getBoolean("eou")) s.ElementOwningUnique = *v;
+    if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
+    if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
+    if (auto v = o.getBoolean("bue")) s.IsBorrowOfUniqueElement = *v;
+    if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
+    if (auto v = o.getBoolean("bd")) s.IsBond = *v;
+    if (auto v = o.getBoolean("uq")) s.IsUnique = *v;
+    if (auto v = o.getInteger("cc")) s.CallConv = static_cast<LLVMBackend::CallingConv>(*v);
+    if (auto v = o.getBoolean("lt")) s.LockThis = *v;
+    if (auto v = o.getInteger("ltm")) s.LockThisMode = static_cast<LockMode>(*v);
+    if (auto v = o.getString("gb"))  s.GuardedBy = v->str();
+    if (auto v = o.getBoolean("fp")) s.IsFunctionPointer = *v;
+    if (s.IsFunctionPointer)
     {
-        if (auto v = o.getString("fpr"))   t.FuncPtrReturnTypeName = v->str();
-        if (auto v = o.getBoolean("fprp")) t.FuncPtrReturnPointer = *v;
-        if (auto v = o.getBoolean("fpro")) t.FuncPtrReturnOwned = *v;
-        if (auto v = o.getBoolean("fpra")) t.FuncPtrReturnAlias = *v;
-        // A pointer with no explicit depth is depth 1 - the level `Pointer` itself asserts.
-        if (t.FuncPtrReturnPointer) t.FuncPtrReturnPointerDepth = 1;
-        if (auto v = o.getInteger("fprd")) t.FuncPtrReturnPointerDepth = static_cast<int>(*v);
-        if (auto v = o.getString("fprk")) t.FuncPtrReturnResolvedKey = v->str();
+        if (auto v = o.getString("fpr"))   s.FuncPtrReturnTypeName = v->str();
+        if (auto v = o.getBoolean("fprp")) s.FuncPtrReturnPointer = *v;
+        if (auto v = o.getBoolean("fpro")) s.FuncPtrReturnOwned = *v;
+        if (auto v = o.getBoolean("fpra")) s.FuncPtrReturnAlias = *v;
+        if (s.FuncPtrReturnPointer) s.FuncPtrReturnPointerDepth = 1;
+        if (auto v = o.getInteger("fprd")) s.FuncPtrReturnPointerDepth = static_cast<int>(*v);
+        if (auto v = o.getString("fprk")) s.FuncPtrReturnResolvedKey = v->str();
         if (auto* fps = o.getArray("fpp"))
             for (auto& elem : *fps)
                 if (auto* po = elem.getAsObject())
                 {
-                    TAV::FuncPtrParam p;
+                    LLVMBackend::SerializedTav::FuncPtrParam p;
                     if (auto v = po->getString("t"))  p.TypeName = v->str();
                     if (auto v = po->getBoolean("p")) p.Pointer = *v;
                     if (auto v = po->getInteger("aav")) p.AllocAlignValue = static_cast<uint64_t>(*v);
@@ -6266,18 +6256,18 @@ static TAV DeserializeTav(const llvm::json::Object& o)
                     if (p.Pointer) p.PointerDepth = 1;
                     if (auto v = po->getInteger("pd")) p.PointerDepth = static_cast<int>(*v);
                     if (auto v = po->getString("rk")) p.ResolvedTypeKey = v->str();
-                    t.FuncPtrParams.push_back(std::move(p));
+                    s.FuncPtrParams.push_back(std::move(p));
                 }
     }
-    if (auto v = o.getInteger("as")) t.ConstArraySize = static_cast<uint64_t>(*v);
+    if (auto v = o.getInteger("as")) s.ConstArraySize = static_cast<uint64_t>(*v);
     if (auto* dims = o.getArray("aid"))
         for (auto& d : *dims)
-            if (auto v = d.getAsInteger()) t.ConstInnerDimensions.push_back(static_cast<uint64_t>(*v));
-    if (auto v = o.getBoolean("sd")) t.IsSimd = *v;
-    if (auto v = o.getInteger("sdl")) t.SimdLanes = static_cast<uint64_t>(*v);
-    if (auto v = o.getBoolean("av")) t.IsArrayView = *v;
-    if (auto v = o.getInteger("aa")) t.AllocAlignValue = static_cast<uint64_t>(*v);
-    return t;
+            if (auto v = d.getAsInteger()) s.ConstInnerDimensions.push_back(static_cast<uint64_t>(*v));
+    if (auto v = o.getBoolean("sd")) s.IsSimd = *v;
+    if (auto v = o.getInteger("sdl")) s.SimdLanes = static_cast<uint64_t>(*v);
+    if (auto v = o.getBoolean("av")) s.IsArrayView = *v;
+    if (auto v = o.getInteger("aa")) s.AllocAlignValue = static_cast<uint64_t>(*v);
+    return s.ToTypeAndValue();
 }
 
 static llvm::json::Array SerializeAnnotations(const std::vector<ANN>& anns)
