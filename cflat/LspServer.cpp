@@ -582,6 +582,8 @@ private:
             HandleRunDiagnostics(msg);
         else if (method == "cflat/viewAssembly")
             HandleViewAssembly(msg, id);
+        else if (method == "cflat/optimizationInfo")
+            HandleOptimizationInfo(msg, id);
         else if (method == "shutdown")
         {
             shutdownReceived_ = true;
@@ -1439,6 +1441,65 @@ private:
                         IrRequest{*id, kind, optLevel, std::move(function), line});
     }
 
+    // Rides the IrRequest path deliberately: every "a response is owed" guard, the
+    // generation-skip bypass, and SetAnalyzeDebugInfo all key on irRequest being present.
+    void HandleOptimizationInfo(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
+    {
+        const auto* params = GetParams(msg);
+        if (!id || !params || !params->contains("uri") || !(*params)["uri"].is_string())
+        {
+            SendError(id, -32602, "Invalid cflat/optimizationInfo parameters");
+            return;
+        }
+
+        const std::string uri = (*params)["uri"].get<std::string>();
+        int optLevel = 2;
+        if (params->contains("optLevel"))
+        {
+            const auto& value = (*params)["optLevel"];
+            if (!value.is_number_integer())
+            {
+                SendError(id, -32602, "Invalid cflat/optimizationInfo optLevel parameter");
+                return;
+            }
+            auto rawLevel = value.get<int64_t>();
+            if (rawLevel < 0 || rawLevel > 2)
+            {
+                SendError(id, -32602, "Invalid cflat/optimizationInfo optLevel parameter");
+                return;
+            }
+            optLevel = static_cast<int>(rawLevel);
+        }
+
+        // Remarks make the pipeline build a diagnostic for every decision it reports, so
+        // a client that only wants the counters can opt out.
+        bool withRemarks = true;
+        if (params->contains("remarks"))
+        {
+            if (!(*params)["remarks"].is_boolean())
+            {
+                SendError(id, -32602, "Invalid cflat/optimizationInfo remarks parameter");
+                return;
+            }
+            withRemarks = (*params)["remarks"].get<bool>();
+        }
+
+        OpenDocument doc;
+        {
+            std::lock_guard<std::mutex> lock(docsMutex_);
+            auto it = docs_.find(uri);
+            if (it == docs_.end())
+            {
+                SendError(id, -32602, "Unknown document URI");
+                return;
+            }
+            doc = it->second;
+        }
+        IrRequest request{*id, "optinfo", optLevel, std::nullopt, std::nullopt};
+        request.withRemarks = withRemarks;
+        EnqueueAnalysis(uri, doc.filePath, doc.text, std::move(request));
+    }
+
     // -----------------------------------------------------------------------
     // Job dispatch - every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
@@ -1456,6 +1517,7 @@ private:
             int optLevel = 0;
             std::optional<std::string> function;
             std::optional<int> line;
+            bool withRemarks = true;   // optinfo only
         };
         std::optional<IrRequest> irRequest;
     };
@@ -1781,6 +1843,30 @@ private:
         if (!job.irRequest)
             return true;
 
+        if (job.irRequest->kind == "optinfo")
+        {
+            if (!recovered || !ok)
+            {
+                SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603,
+                          "analysis failed: " + BuildViewError(diagnostics));
+                return true;
+            }
+            std::vector<LLVMBackend::SourceFunction> sourceFunctions;
+            for (const auto* range : newIndex->FunctionsIn(filePath))
+                sourceFunctions.push_back({range->name, {range->startLine, range->endLine}});
+
+            LLVMBackend::OptimizationInfo collected;
+            if (!backend->CollectOptimizationInfo(job.irRequest->optLevel, sourceFunctions,
+                                                  collected, job.irRequest->withRemarks))
+            {
+                SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603,
+                          "could not collect optimization info");
+                return true;
+            }
+            SendOptimizationInfoResult(job, collected);
+            return true;
+        }
+
         if (!recovered || !ok)
         {
             SendViewResult(job, BuildViewError(diagnostics));
@@ -1864,10 +1950,95 @@ private:
         });
     }
 
+    // Every "a response is owed" path funnels here, so route by kind: an optinfo caller
+    // must never receive a view-shaped payload.
     void SendViewFailure(const AnalysisJob& job, const std::string& message)
     {
         if (!job.irRequest) return;
+        if (job.irRequest->kind == "optinfo")
+        {
+            SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603, message);
+            return;
+        }
         SendViewResult(job, "; view unavailable - " + message + "\n");
+    }
+
+    void SendOptimizationInfoResult(const AnalysisJob& job,
+                                    const LLVMBackend::OptimizationInfo& collected)
+    {
+        if (!job.irRequest) return;
+        nlohmann::json functions = nlohmann::json::array();
+        for (const auto& info : collected.functions)
+        {
+            nlohmann::json lines = nlohmann::json::array();
+            for (const auto& line : info.lines)
+                lines.push_back({
+                    {"srcLine", line.srcLine},
+                    {"irInstructions", line.irInstructions},
+                    {"machineInstructions", line.machineInstructions},
+                    {"inlined", line.inlined}
+                });
+            functions.push_back({
+                {"name", info.name},
+                {"symbol", info.symbol},
+                {"startLine", info.startLine},
+                {"endLine", info.endLine},
+                {"irInstructions", info.irInstructions},
+                {"machineInstructions", info.machineInstructions},
+                {"bytes", info.bytes},
+                {"stackBytes", info.stackBytes},
+                {"spills", info.spills},
+                {"reloads", info.reloads},
+                {"inlinedInto", info.inlinedInto},
+                {"eliminated", info.eliminated},
+                {"lines", std::move(lines)}
+            });
+        }
+        nlohmann::json costs = nlohmann::json::array();
+        for (const auto& cost : collected.costs)
+            costs.push_back({
+                {"kind", cost.kind},
+                {"detail", cost.detail},
+                {"srcLine", cost.srcLine},
+                {"bytes", cost.bytes},
+                {"count", cost.count}
+            });
+
+        nlohmann::json remarks = nlohmann::json::array();
+        for (const auto& remark : collected.remarks)
+        {
+            nlohmann::json args = nlohmann::json::object();
+            for (const auto& arg : remark.args) args[arg.first] = arg.second;
+            remarks.push_back({
+                {"pass", remark.pass},
+                {"name", remark.name},
+                {"kind", remark.kind},
+                {"message", remark.message},
+                {"function", remark.function},
+                {"file", remark.file},
+                {"srcLine", remark.srcLine},
+                {"srcColumn", remark.srcColumn},
+                {"args", std::move(args)}
+            });
+        }
+
+        nlohmann::json instantiations = nlohmann::json::array();
+        for (const auto& group : collected.instantiations)
+            instantiations.push_back({
+                {"base", group.base},
+                {"count", group.count},
+                {"bytes", group.bytes},
+                {"symbols", group.symbols}
+            });
+
+        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
+            {"optLevel", job.irRequest->optLevel},
+            {"functions", std::move(functions)},
+            {"costs", std::move(costs)},
+            {"remarks", std::move(remarks)},
+            {"remarksTruncated", collected.remarksTruncated},
+            {"instantiations", std::move(instantiations)}
+        });
     }
 
     std::filesystem::path BeginTimeTrace(const AnalysisJob& job)

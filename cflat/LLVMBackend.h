@@ -536,6 +536,85 @@ public:
         std::vector<LineFrame> stack;
     };
 
+    // Tier 1 facts for one source line. Code inlined elsewhere still counts against the
+    // line that wrote it, so a line inside an eliminated function can still be non-empty.
+    struct LineOptInfo
+    {
+        int  srcLine = 0;
+        int  irInstructions = 0;
+        int  machineInstructions = 0;
+        bool inlined = false;   // some of this line's code landed in another function
+    };
+
+    // Tier 3: one LLVM optimization remark, kept verbatim. `args` carries the pass's own
+    // key/value pairs (Cost, Threshold, VectorizationFactor, ...) - the actionable part.
+    struct OptRemark
+    {
+        std::string pass;       // "inline", "loop-vectorize", ...
+        std::string name;       // "NotInlined", "Vectorized", ...
+        std::string kind;       // "passed" | "missed" | "analysis"
+        std::string message;
+        std::string function;
+        std::string file;       // basename the remark's location points at
+        int srcLine = 0;
+        int srcColumn = 0;
+        std::vector<std::pair<std::string, std::string>> args;
+    };
+
+    // Tier 2: a cflat-level cost the optimizer left behind, attributed to a source line.
+    // These are facts about emitted IR, not predictions.
+    struct OptCost
+    {
+        std::string kind;   // "copy" | "alloc" | "free" | "destructor" | "indirect-call"
+        std::string detail; // callee or type name, when there is a useful one
+        int srcLine = 0;
+        int bytes = 0;      // constant transfer size for "copy", else 0
+        int count = 0;      // occurrences merged into this entry
+    };
+
+    // Tier 2: one generic base and how much code its instantiations cost in total.
+    struct OptInstantiation
+    {
+        std::string base;   // "Box" for Box__i32 / Box__float
+        int count = 0;
+        int bytes = 0;
+        std::vector<std::string> symbols;
+    };
+
+    // Tier 1 optimization facts for one source function, measured on a private
+    // clone of the module optimized at the requested level. Counters left at 0
+    // mean "not available", never "measured as zero" - see CollectOptimizationInfo.
+    struct FunctionOptInfo
+    {
+        std::string name;
+        std::string symbol;
+        int  startLine = 0;
+        int  endLine = 0;
+        int  irInstructions = 0;
+        int  machineInstructions = 0;
+        int  bytes = 0;
+        int  stackBytes = 0;
+        int  spills = 0;
+        int  reloads = 0;
+        int  inlinedInto = 0;
+        bool eliminated = false;
+        std::vector<LineOptInfo> lines;   // only lines that emitted something, ascending
+    };
+
+    // Source-level function to measure: {name, {startLine, endLine}}.
+    using SourceFunction = std::pair<std::string, std::pair<int, int>>;
+
+    // Everything CollectOptimizationInfo produces. Tier 1 hangs off each function;
+    // Tiers 2 and 3 are module-wide and carry their own source lines.
+    struct OptimizationInfo
+    {
+        std::vector<FunctionOptInfo>  functions;
+        std::vector<OptCost>          costs;
+        std::vector<OptRemark>        remarks;
+        std::vector<OptInstantiation> instantiations;
+        bool remarksTruncated = false;
+    };
+
     // Width of the `long` keyword, in bits. `long` follows the TARGET's native C ABI:
     // Windows is LLP64 (32-bit long), 64-bit POSIX is LP64 (64-bit long), 32-bit is 32.
     // Set by SetTargetLongWidth() when the target platform is resolved; a static because
@@ -4490,6 +4569,12 @@ private:
     // Returns null on failure (the optimizer then runs target-agnostic, as before).
     std::unique_ptr<llvm::TargetMachine> CreateOptTargetMachine(int optLevel = -1);
 
+    // Shared prologue for PrintModuleView and CollectOptimizationInfo. Keep them on one
+    // path: the core materialization below is load-bearing on a warm cache.
+    std::unique_ptr<llvm::Module> CloneModuleForView(const std::string& purpose);
+    bool OptimizeViewModule(llvm::Module& view, int optLevel, bool needTargetMachine,
+                            std::unique_ptr<llvm::TargetMachine>& outMachine);
+
     // Native ELF code emission + link for Linux (and other ELF/Unix hosts).
     // Emits an x86-64 ELF object for the host triple and links it with the
     // system C compiler driver (cc/gcc/clang), which supplies crt1.o (_start ->
@@ -7747,6 +7832,15 @@ public:
     bool PrintModuleView(std::string& out, const std::string& kind, int optLevel,
                          const std::string& functionName,
                          std::vector<LineMapping>* mappings = nullptr);
+
+    // Measure optimization facts at optLevel: Tier 1 per function (one entry per input,
+    // in input order, even when nothing survived), plus Tier 2 costs / instantiations and
+    // Tier 3 remarks for the analyzed file. Collecting remarks slows the pipeline, so
+    // withRemarks is opt-in.
+    bool CollectOptimizationInfo(int optLevel,
+                                 const std::vector<SourceFunction>& sourceFunctions,
+                                 OptimizationInfo& out,
+                                 bool withRemarks = true);
 
     /*
         Resolution order: (1) process override set via SetCacheDirOverride (used by

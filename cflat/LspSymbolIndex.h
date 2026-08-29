@@ -88,6 +88,8 @@ public:
 
     size_t SymbolCount() const { return symbols_.size(); }
     std::vector<const FunctionRange*> FunctionsEnclosing(const std::string& file, int line) const;
+    // Every function defined in the given file, ordered by start line.
+    std::vector<const FunctionRange*> FunctionsIn(const std::string& file) const;
 
 private:
     std::unordered_map<std::string, SymbolDef> symbols_;

@@ -120,6 +120,20 @@ std::vector<const FunctionRange*> LspSymbolIndex::FunctionsEnclosing(const std::
     return results;
 }
 
+std::vector<const FunctionRange*> LspSymbolIndex::FunctionsIn(const std::string& file) const
+{
+    std::vector<const FunctionRange*> results;
+    for (const auto& range : functionRanges_)
+        if (range.file == file)
+            results.push_back(&range);
+    std::sort(results.begin(), results.end(),
+              [](const FunctionRange* a, const FunctionRange* b) {
+                  if (a->startLine != b->startLine) return a->startLine < b->startLine;
+                  return a->name < b->name;
+              });
+    return results;
+}
+
 void LspSymbolIndex::RegisterCandidate(const UnusedCandidate& cand)
 {
     if (cand.name.empty()) return;

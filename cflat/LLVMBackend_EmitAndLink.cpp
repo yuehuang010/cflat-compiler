@@ -24,6 +24,8 @@
 #include <llvm/Object/Binary.h>
 #include <llvm/Object/Archive.h>
 #include <llvm/Object/COFFImportFile.h>
+#include <llvm/Object/ObjectFile.h>
+#include <llvm/Object/SymbolSize.h>
 #include <llvm/ADT/StringSet.h>
 #include <llvm/Support/CommandLine.h>
 #include <llvm/Support/TimeProfiler.h>
@@ -69,6 +71,138 @@ std::string DebugFileName(const llvm::DIFile* file)
 {
     if (!file) return {};
     return std::filesystem::path(file->getFilename().str()).filename().string();
+}
+
+// --- Assembly directive parsing, shared by the view and the optimization-info collector ---
+
+std::vector<std::string> ParseQuotedStrings(const std::string& line, size_t pos)
+{
+    std::vector<std::string> values;
+    while (pos < line.size())
+    {
+        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+        if (pos >= line.size() || line[pos] != '"') break;
+        ++pos;
+        std::string value;
+        while (pos < line.size() && line[pos] != '"')
+        {
+            if (line[pos] == '\\' && pos + 1 < line.size()) ++pos;
+            value += line[pos++];
+        }
+        if (pos < line.size()) ++pos;
+        values.push_back(std::move(value));
+    }
+    return values;
+}
+
+// Windows targets emit CodeView (.cv_file/.cv_loc); other targets emit DWARF (.file/.loc).
+bool ParseFileDirective(const std::string& line, int& id, std::vector<std::string>& values)
+{
+    size_t pos = 0;
+    while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+    size_t directiveLength = 0;
+    if (line.compare(pos, 5, ".file") == 0)
+        directiveLength = 5;
+    else if (line.compare(pos, 8, ".cv_file") == 0)
+        directiveLength = 8;
+    else
+        return false;
+    pos += directiveLength;
+    if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
+    while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+    size_t start = pos;
+    while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
+    if (start == pos) return false;
+    id = std::stoi(line.substr(start, pos - start));
+    values = ParseQuotedStrings(line, pos);
+    return !values.empty();
+}
+
+bool ParseLocDirective(const std::string& line, int& id, int& sourceLine, int& column)
+{
+    size_t pos = 0;
+    while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+    bool codeView = false;
+    if (line.compare(pos, 4, ".loc") == 0)
+        pos += 4;
+    else if (line.compare(pos, 7, ".cv_loc") == 0)
+    {
+        pos += 7;
+        codeView = true;
+    }
+    else
+        return false;
+    if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
+    auto nextInt = [&](int& value) {
+        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
+        size_t start = pos;
+        while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
+        if (start == pos) return false;
+        value = std::stoi(line.substr(start, pos - start));
+        return true;
+    };
+    column = 0;
+    int functionId = 0;
+    if (codeView && !nextInt(functionId)) return false;
+    if (!nextInt(id) || !nextInt(sourceLine)) return false;
+    nextInt(column);
+    return true;
+}
+
+std::string NormalizeFilePath(const std::string& path)
+{
+    return std::filesystem::path(path).lexically_normal().string();
+}
+
+std::string AsmFilePath(const std::vector<std::string>& values)
+{
+    if (values.empty()) return std::string();
+    std::filesystem::path candidate;
+    if (values.size() == 1)
+        candidate = values[0];
+    else
+        candidate = std::filesystem::path(values[0]) / values[1];
+    return NormalizeFilePath(candidate.string());
+}
+
+// File-id -> path table built from the .file/.cv_file directives in an assembly listing.
+std::map<int, std::string> BuildAsmFileTable(const std::string& assembly)
+{
+    std::map<int, std::string> asmFiles;
+    size_t lineStart = 0;
+    while (lineStart < assembly.size())
+    {
+        size_t lineEnd = assembly.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = assembly.size();
+        int id = 0;
+        std::vector<std::string> values;
+        std::string line = assembly.substr(lineStart, lineEnd - lineStart);
+        if (ParseFileDirective(line, id, values))
+            asmFiles[id] = AsmFilePath(values);
+        lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
+    }
+    return asmFiles;
+}
+
+// Definitions whose symbol corresponds to the given source-level function name, covering
+// plain, namespace-qualified and generic-mangled spellings. Empty name matches nothing.
+std::vector<llvm::Function*> MatchingFunctions(llvm::Module& m, const std::string& functionName)
+{
+    std::vector<llvm::Function*> matches;
+    if (functionName.empty()) return matches;
+    const std::string mangledPrefix = "_" + functionName + "_";
+    const std::string qualifiedPrefix = "." + functionName + "_";
+    for (auto& function : m)
+    {
+        if (function.isDeclaration()) continue;
+        llvm::StringRef name = function.getName();
+        if (name == functionName
+            || name.starts_with(mangledPrefix)
+            || name.starts_with(functionName + "__")
+            || name.contains(qualifiedPrefix))
+            matches.push_back(&function);
+    }
+    return matches;
 }
 
 // Frontend-expanded return-block bodies retain the call-site location and have no inline chain.
@@ -284,6 +418,64 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int opt
                                         std::nullopt, CodeGenLevelFor(optLevel)));
     }
 
+// Materialize the core and clone the module so a view/measurement pass can mutate it
+// freely. `purpose` names the caller in the error message.
+std::unique_ptr<llvm::Module> LLVMBackend::CloneModuleForView(const std::string& purpose)
+{
+    if (!module)
+        return nullptr;
+
+    // A warm compiler cache leaves the core as a lazily-loaded bitcode module, and
+    // CloneModule requires a materialized one. Every other module consumer materializes
+    // first; without this the clone walks unread function bodies and faults.
+    MaterializeCoreIfLazy();
+    if (!module->isMaterialized())
+    {
+        LogError("cannot render " + purpose + ": cached core bitcode is not materialized.");
+        return nullptr;
+    }
+    return llvm::CloneModule(*module);
+}
+
+// Point the clone at the target machine and run the O<optLevel> pipeline on it. The
+// machine is only created when the caller needs one; codegen always does.
+bool LLVMBackend::OptimizeViewModule(llvm::Module& view, int optLevel, bool needTargetMachine,
+                                     std::unique_ptr<llvm::TargetMachine>& outMachine)
+{
+    if (needTargetMachine)
+    {
+        outMachine = CreateOptTargetMachine(optLevel);
+        if (!outMachine)
+            return false;
+        view.setTargetTriple(outMachine->getTargetTriple());
+        view.setDataLayout(outMachine->createDataLayout());
+    }
+
+    if (optLevel > 0)
+    {
+        llvm::PipelineTuningOptions pto;
+        pto.LoopVectorization = true;
+        pto.SLPVectorization = true;
+        llvm::PassBuilder passBuilder(outMachine.get(), pto);
+        llvm::LoopAnalysisManager loopAnalysis;
+        llvm::FunctionAnalysisManager functionAnalysis;
+        llvm::CGSCCAnalysisManager cgsccAnalysis;
+        llvm::ModuleAnalysisManager moduleAnalysis;
+        llvm::TargetLibraryInfoImpl tli = MakeStdioSafeTLII(view.getTargetTriple());
+        functionAnalysis.registerPass([&] { return llvm::TargetLibraryAnalysis(tli); });
+        passBuilder.registerModuleAnalyses(moduleAnalysis);
+        passBuilder.registerCGSCCAnalyses(cgsccAnalysis);
+        passBuilder.registerFunctionAnalyses(functionAnalysis);
+        passBuilder.registerLoopAnalyses(loopAnalysis);
+        passBuilder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis, moduleAnalysis);
+        auto pipelineLevel = optLevel == 1 ? llvm::OptimizationLevel::O1
+                                           : llvm::OptimizationLevel::O2;
+        auto passes = passBuilder.buildPerModuleDefaultPipeline(pipelineLevel);
+        passes.run(view, moduleAnalysis);
+    }
+    return true;
+}
+
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                                   int optLevel, const std::string& functionName,
                                   std::vector<LineMapping>* mappings)
@@ -292,36 +484,12 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         return false;
     if (mappings) mappings->clear();
 
-    // A warm compiler cache leaves the core as a lazily-loaded bitcode module, and
-    // CloneModule requires a materialized one. Every other module consumer materializes
-    // first; without this the clone walks unread function bodies and faults.
-    MaterializeCoreIfLazy();
-    if (!module->isMaterialized())
-    {
-        LogError("cannot render " + kind + " view: cached core bitcode is not materialized.");
-        return false;
-    }
-
-    auto view = llvm::CloneModule(*module);
+    auto view = CloneModuleForView(kind + " view");
     if (!view)
         return false;
 
     auto matchingFunctions = [&](llvm::Module& m) {
-        std::vector<llvm::Function*> matches;
-        if (functionName.empty()) return matches;
-        for (auto& function : m)
-        {
-            if (function.isDeclaration()) continue;
-            llvm::StringRef name = function.getName();
-            const std::string mangledPrefix = "_" + functionName + "_";
-            const std::string qualifiedPrefix = "." + functionName + "_";
-            if (name == functionName
-                || name.starts_with(mangledPrefix)
-                || name.starts_with(functionName + "__")
-                || name.contains(qualifiedPrefix))
-                matches.push_back(&function);
-        }
-        return matches;
+        return MatchingFunctions(m, functionName);
     };
 
     struct PreOptimizationMatch
@@ -393,37 +561,8 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     };
 
     std::unique_ptr<llvm::TargetMachine> targetMachine;
-    if (optLevel > 0 || kind == "asm")
-    {
-        targetMachine = CreateOptTargetMachine(optLevel);
-        if (!targetMachine)
-            return false;
-        view->setTargetTriple(targetMachine->getTargetTriple());
-        view->setDataLayout(targetMachine->createDataLayout());
-    }
-
-    if (optLevel > 0)
-    {
-        llvm::PipelineTuningOptions pto;
-        pto.LoopVectorization = true;
-        pto.SLPVectorization = true;
-        llvm::PassBuilder passBuilder(targetMachine.get(), pto);
-        llvm::LoopAnalysisManager loopAnalysis;
-        llvm::FunctionAnalysisManager functionAnalysis;
-        llvm::CGSCCAnalysisManager cgsccAnalysis;
-        llvm::ModuleAnalysisManager moduleAnalysis;
-        llvm::TargetLibraryInfoImpl tli = MakeStdioSafeTLII(view->getTargetTriple());
-        functionAnalysis.registerPass([&] { return llvm::TargetLibraryAnalysis(tli); });
-        passBuilder.registerModuleAnalyses(moduleAnalysis);
-        passBuilder.registerCGSCCAnalyses(cgsccAnalysis);
-        passBuilder.registerFunctionAnalyses(functionAnalysis);
-        passBuilder.registerLoopAnalyses(loopAnalysis);
-        passBuilder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis, moduleAnalysis);
-        auto pipelineLevel = optLevel == 1 ? llvm::OptimizationLevel::O1
-                                           : llvm::OptimizationLevel::O2;
-        auto passes = passBuilder.buildPerModuleDefaultPipeline(pipelineLevel);
-        passes.run(*view, moduleAnalysis);
-    }
+    if (!OptimizeViewModule(*view, optLevel, optLevel > 0 || kind == "asm", targetMachine))
+        return false;
 
     const std::string rootPath = analyzedRootPath_;
     const std::string rootName = std::filesystem::path(rootPath).filename().string();
@@ -532,106 +671,11 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     pass.run(*view);
     std::string assembly(buffer.data(), buffer.size());
 
-    auto parseQuotedStrings = [](const std::string& line, size_t pos) {
-        std::vector<std::string> values;
-        while (pos < line.size())
-        {
-            while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-            if (pos >= line.size() || line[pos] != '"') break;
-            ++pos;
-            std::string value;
-            while (pos < line.size() && line[pos] != '"')
-            {
-                if (line[pos] == '\\' && pos + 1 < line.size()) ++pos;
-                value += line[pos++];
-            }
-            if (pos < line.size()) ++pos;
-            values.push_back(std::move(value));
-        }
-        return values;
-    };
-    auto parseFileDirective = [&](const std::string& line, int& id,
-                                  std::vector<std::string>& values) {
-        size_t pos = 0;
-        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-        size_t directiveLength = 0;
-        if (line.compare(pos, 5, ".file") == 0)
-            directiveLength = 5;
-        else if (line.compare(pos, 8, ".cv_file") == 0)
-            directiveLength = 8;
-        else
-            return false;
-        pos += directiveLength;
-        if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
-        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-        size_t start = pos;
-        while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
-        if (start == pos) return false;
-        id = std::stoi(line.substr(start, pos - start));
-        values = parseQuotedStrings(line, pos);
-        return !values.empty();
-    };
-    auto parseLocDirective = [&](const std::string& line, int& id, int& sourceLine,
-                                 int& column) {
-        size_t pos = 0;
-        while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-        bool codeView = false;
-        if (line.compare(pos, 4, ".loc") == 0)
-            pos += 4;
-        else if (line.compare(pos, 7, ".cv_loc") == 0)
-        {
-            pos += 7;
-            codeView = true;
-        }
-        else
-            return false;
-        if (pos < line.size() && !std::isspace((unsigned char)line[pos])) return false;
-        auto nextInt = [&](int& value) {
-            while (pos < line.size() && std::isspace((unsigned char)line[pos])) ++pos;
-            size_t start = pos;
-            while (pos < line.size() && std::isdigit((unsigned char)line[pos])) ++pos;
-            if (start == pos) return false;
-            value = std::stoi(line.substr(start, pos - start));
-            return true;
-        };
-        column = 0;
-        int functionId = 0;
-        if (codeView && !nextInt(functionId)) return false;
-        if (!nextInt(id) || !nextInt(sourceLine)) return false;
-        nextInt(column);
-        return true;
-    };
-    auto normalizeFilePath = [](const std::string& path) {
-        return std::filesystem::path(path).lexically_normal().string();
-    };
-    auto asmFilePath = [&](const std::vector<std::string>& values) {
-        if (values.empty()) return std::string();
-        std::filesystem::path candidate;
-        if (values.size() == 1)
-            candidate = values[0];
-        else
-            candidate = std::filesystem::path(values[0]) / values[1];
-        return normalizeFilePath(candidate.string());
-    };
-    std::map<int, std::string> asmFiles;
-    {
-        size_t lineStart = 0;
-        while (lineStart < assembly.size())
-        {
-            size_t lineEnd = assembly.find('\n', lineStart);
-            if (lineEnd == std::string::npos) lineEnd = assembly.size();
-            int id = 0;
-            std::vector<std::string> values;
-            std::string line = assembly.substr(lineStart, lineEnd - lineStart);
-            if (parseFileDirective(line, id, values))
-                asmFiles[id] = asmFilePath(values);
-            lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
-        }
-    }
+    const std::map<int, std::string> asmFiles = BuildAsmFileTable(assembly);
 
     auto isRootAsmFile = [&](const std::string& path) {
         if (path.empty() || rootName.empty()) return false;
-        if (!rootPath.empty() && normalizeFilePath(path) == normalizeFilePath(rootPath))
+        if (!rootPath.empty() && NormalizeFilePath(path) == NormalizeFilePath(rootPath))
             return true;
         return std::filesystem::path(path).filename().string() == rootName;
     };
@@ -667,7 +711,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                 auto stack = BuildLineStack(debugLoc.get(), isRootFile);
                 if (stack.empty()) continue;
                 DebugLocationKey key{function.getName().str(),
-                                     normalizeFilePath(DebugFilePath(debugLoc->getFile())),
+                                     NormalizeFilePath(DebugFilePath(debugLoc->getFile())),
                                      static_cast<int>(debugLoc->getLine()),
                                      static_cast<int>(debugLoc->getColumn())};
                 auto& candidates = inlineStacks[key];
@@ -680,7 +724,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     auto resolveAsmStack = [&](const std::string& function, const std::string& file,
                                int line, int column,
                                const std::vector<LineFrame>& fallback) {
-        DebugLocationKey key{function, normalizeFilePath(file), line, column};
+        DebugLocationKey key{function, NormalizeFilePath(file), line, column};
         auto it = inlineStacks.find(key);
         if (it == inlineStacks.end() || it->second.empty()) return fallback;
         const auto& candidates = it->second;
@@ -748,7 +792,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             int id = 0;
             int source = 0;
             int column = 0;
-            if (parseLocDirective(line, id, source, column))
+            if (ParseLocDirective(line, id, source, column))
             {
                 finish(lineNumber - 1);
                 auto fileIt = asmFiles.find(id);
@@ -841,6 +885,567 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     return true;
 }
 
+namespace {
+
+struct FrameRemark
+{
+    int stackBytes = 0;
+    int spills = 0;
+    int reloads = 0;
+};
+
+// Passes whose remarks are worth an IDE annotation. Deliberately an allowlist: enabling
+// everything (instcombine especially) buries the actionable remarks in noise.
+bool IsReportedRemarkPass(llvm::StringRef passName)
+{
+    return passName == "inline" || passName == "loop-vectorize"
+        || passName == "slp-vectorizer" || passName == "loop-unroll"
+        || passName == "gvn" || passName == "licm" || passName == "sroa"
+        || passName == "prologepilog" || passName == "regalloc";
+}
+
+// Upper bound on collected remarks. A whole-module O2 run over the core libraries can
+// emit thousands; the caller is told when this clamps.
+constexpr size_t kMaxCollectedRemarks = 400;
+
+// Collects Tier 3 remarks, and doubles as the Tier 1 source for exact frame size and
+// spill counts (prologepilog / regalloc) - scraping the prologue text would be guesswork.
+struct RemarkCollector : public llvm::DiagnosticHandler
+{
+    std::map<std::string, FrameRemark>& frames;
+    std::vector<LLVMBackend::OptRemark>* remarks;   // null when only frames are wanted
+    std::function<bool(const llvm::DiagnosticLocation&)> isRootLocation;
+    bool& truncated;   // a reference: the context destroys this handler on restore
+
+    RemarkCollector(std::map<std::string, FrameRemark>& frameOut,
+                    std::vector<LLVMBackend::OptRemark>* remarkOut,
+                    std::function<bool(const llvm::DiagnosticLocation&)> rootFilter,
+                    bool& truncatedOut)
+        : frames(frameOut), remarks(remarkOut), isRootLocation(std::move(rootFilter)),
+          truncated(truncatedOut) {}
+
+    // The remark emitters skip building a remark at all unless some category is enabled.
+    bool isAnyRemarkEnabled() const override { return true; }
+    bool isAnalysisRemarkEnabled(llvm::StringRef passName) const override { return IsReportedRemarkPass(passName); }
+    bool isMissedOptRemarkEnabled(llvm::StringRef passName) const override { return IsReportedRemarkPass(passName); }
+    bool isPassedOptRemarkEnabled(llvm::StringRef passName) const override { return IsReportedRemarkPass(passName); }
+
+    static const char* KindOf(const llvm::DiagnosticInfo& di)
+    {
+        switch (di.getKind())
+        {
+        case llvm::DK_OptimizationRemark:
+        case llvm::DK_MachineOptimizationRemark:
+            return "passed";
+        case llvm::DK_OptimizationRemarkMissed:
+        case llvm::DK_MachineOptimizationRemarkMissed:
+            return "missed";
+        default:
+            return "analysis";
+        }
+    }
+
+    bool handleDiagnostics(const llvm::DiagnosticInfo& di) override
+    {
+        const auto* opt = llvm::dyn_cast<llvm::DiagnosticInfoOptimizationBase>(&di);
+        if (!opt) return false;
+
+        const llvm::StringRef remarkName = opt->getRemarkName();
+        if (remarkName == "StackSize" || remarkName == "SpillReloadCopies")
+        {
+            FrameRemark& entry = frames[opt->getFunction().getName().str()];
+            for (const auto& arg : opt->getArgs())
+            {
+                int value = 0;
+                if (llvm::StringRef(arg.Val).getAsInteger(10, value)) continue;
+                if (arg.Key == "NumStackBytes") entry.stackBytes = value;
+                else if (arg.Key == "NumSpills") entry.spills = value;
+                else if (arg.Key == "NumReloads") entry.reloads = value;
+            }
+            return true;
+        }
+
+        if (!remarks) return true;
+        // Some emitters call the non-filtering emit() overload, so the isEnabled hooks
+        // above are not sufficient on their own - re-check the allowlist here.
+        if (!IsReportedRemarkPass(opt->getPassName())) return true;
+
+        const llvm::DiagnosticLocation location = opt->getLocation();
+        if (!location.isValid() || !isRootLocation(location))
+            return true;   // a remark about the core libraries is not the user's business
+        if (remarks->size() >= kMaxCollectedRemarks)
+        {
+            truncated = true;
+            return true;
+        }
+
+        LLVMBackend::OptRemark entry;
+        entry.pass = opt->getPassName().str();
+        entry.name = remarkName.str();
+        entry.kind = KindOf(di);
+        entry.message = opt->getMsg();
+        entry.function = opt->getFunction().getName().str();
+        entry.file = std::filesystem::path(location.getAbsolutePath()).filename().string();
+        entry.srcLine = static_cast<int>(location.getLine());
+        entry.srcColumn = static_cast<int>(location.getColumn());
+        for (const auto& arg : opt->getArgs())
+            if (arg.Key != "String") entry.args.push_back({arg.Key, arg.Val});
+        remarks->push_back(std::move(entry));
+        return true;  // consumed; do not let the default handler print it
+    }
+};
+
+// Tier 2: classify a surviving call as a cflat-level cost and merge it into totals keyed
+// by (line, kind, detail). Only costs the optimizer did NOT remove are recorded.
+void RecordOptCost(const llvm::Instruction& instruction, int rootLine,
+                   std::map<std::tuple<int, std::string, std::string>, LLVMBackend::OptCost>& totals)
+{
+    const auto* call = llvm::dyn_cast<llvm::CallBase>(&instruction);
+    if (!call || call->isInlineAsm()) return;
+
+    std::string kind;
+    std::string detail;
+    int bytes = 0;
+
+    const llvm::Function* callee = call->getCalledFunction();
+    if (!callee)
+    {
+        // An unresolved indirect call is a virtual/interface dispatch the optimizer could
+        // not devirtualize, or a call through a function pointer.
+        if (!call->isIndirectCall()) return;
+        kind = "indirect-call";
+    }
+    else
+    {
+        const std::string name = callee->getName().str();
+        auto starts = [&](const char* prefix) { return name.rfind(prefix, 0) == 0; };
+        if (starts("llvm.memcpy") || starts("llvm.memmove") || starts("llvm.memset"))
+        {
+            kind = "copy";
+            detail = starts("llvm.memset") ? "memset"
+                   : starts("llvm.memmove") ? "memmove" : "memcpy";
+            if (call->arg_size() >= 3)
+                if (auto* size = llvm::dyn_cast<llvm::ConstantInt>(call->getArgOperand(2)))
+                    bytes = static_cast<int>(size->getZExtValue());
+        }
+        else if (name == "malloc" || name == "calloc" || name == "realloc")
+        {
+            kind = "alloc";
+            detail = name;
+        }
+        else if (name == "free")
+        {
+            kind = "free";
+            detail = name;
+        }
+        else if (name.find(".dtor") != std::string::npos)
+        {
+            kind = "destructor";
+            detail = name.substr(0, name.find(".dtor"));
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    auto key = std::make_tuple(rootLine, kind, detail);
+    auto it = totals.find(key);
+    if (it == totals.end())
+    {
+        LLVMBackend::OptCost cost;
+        cost.kind = kind;
+        cost.detail = detail;
+        cost.srcLine = rootLine;
+        cost.bytes = bytes;
+        cost.count = 1;
+        totals.emplace(std::move(key), std::move(cost));
+        return;
+    }
+    it->second.count++;
+    // Merged entries share a line and kind; report the largest transfer seen.
+    if (bytes > it->second.bytes) it->second.bytes = bytes;
+}
+
+// Real instructions in an assembly body: not blank, not a comment, not a directive,
+// not a bare label.
+bool IsAsmInstructionLine(const std::string& line)
+{
+    size_t pos = line.find_first_not_of(" \t");
+    if (pos == std::string::npos) return false;
+    const char first = line[pos];
+    if (first == '.' || first == '#' || first == ';') return false;
+    if (first == '/' && pos + 1 < line.size() && line[pos + 1] == '/') return false;
+    std::string trimmed = line.substr(pos);
+    trimmed.erase(trimmed.find_last_not_of(" \t\r") + 1);
+    if (trimmed.empty()) return false;
+    // A label is a single token ending in ':' with nothing after it.
+    if (trimmed.back() == ':' && trimmed.find_first_of(" \t") == std::string::npos)
+        return false;
+    return true;
+}
+
+// The symbol a label line defines, or empty when the line is not a label.
+std::string AsmLabelName(const std::string& line)
+{
+    if (line.empty() || line[0] == ' ' || line[0] == '\t') return {};
+    size_t colon = line.find(':');
+    if (colon == std::string::npos || colon == 0) return {};
+    std::string name = line.substr(0, colon);
+    if (name.find_first_of(" \t") != std::string::npos) return {};
+    return name;
+}
+
+}  // namespace
+
+bool LLVMBackend::CollectOptimizationInfo(int optLevel,
+                                          const std::vector<SourceFunction>& sourceFunctions,
+                                          OptimizationInfo& info,
+                                          bool withRemarks)
+{
+    info = OptimizationInfo{};
+    std::vector<FunctionOptInfo>& out = info.functions;
+    if (!module || optLevel < 0 || optLevel > 2)
+        return false;
+
+    auto view = CloneModuleForView("optimization info");
+    if (!view)
+        return false;
+
+    const std::string rootName = std::filesystem::path(analyzedRootPath_).filename().string();
+
+    // cflat emits ONE DIFile for the whole module, so imported core-library code carries
+    // the root file's name with its own line numbers. Filtering on the file therefore
+    // cannot separate user code from core code; the analyzed function ranges can.
+    std::vector<std::pair<int, int>> userRanges;
+    for (const auto& source : sourceFunctions)
+        if (source.second.first > 0 && source.second.second >= source.second.first)
+            userRanges.push_back(source.second);
+    auto lineInUserRange = [userRanges](int line) {
+        for (const auto& range : userRanges)
+            if (line >= range.first && line <= range.second) return true;
+        return false;
+    };
+    auto isRootDiagLocation = [lineInUserRange](const llvm::DiagnosticLocation& location) {
+        return location.isValid() && lineInUserRange(static_cast<int>(location.getLine()));
+    };
+
+    // The handler stays installed across BOTH the IR pipeline (inline / vectorize / unroll
+    // / gvn / licm / sroa) and codegen (prologepilog / regalloc); the two emit at different
+    // stages and a handler installed for only one of them silently loses the other's half.
+    std::map<std::string, FrameRemark> frameRemarks;
+    auto previousHandler = context->getDiagnosticHandler();
+    context->setDiagnosticHandler(
+        std::make_unique<RemarkCollector>(frameRemarks,
+                                          withRemarks ? &info.remarks : nullptr,
+                                          isRootDiagLocation, info.remarksTruncated),
+        /*RespectFilters=*/false);
+    struct HandlerRestore
+    {
+        llvm::LLVMContext* context;
+        std::unique_ptr<llvm::DiagnosticHandler> previous;
+        ~HandlerRestore() { context->setDiagnosticHandler(std::move(previous), false); }
+    } restore{context.get(), std::move(previousHandler)};
+
+    std::unique_ptr<llvm::TargetMachine> targetMachine;
+    if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
+        return false;
+
+    // Seed one entry per source function and index every surviving symbol back to it,
+    // so generic instantiations aggregate into the function the user wrote.
+    std::map<std::string, size_t> entryBySymbol;
+    out.reserve(sourceFunctions.size());
+    for (const auto& source : sourceFunctions)
+    {
+        FunctionOptInfo info;
+        info.name = source.first;
+        info.startLine = source.second.first;
+        info.endLine = source.second.second;
+
+        auto matches = MatchingFunctions(*view, info.name);
+        // Name matching alone cannot separate overloads, which share a source name and
+        // differ only in mangling. Prefer the definitions whose debug info places them
+        // in this file at this function's own lines.
+        std::vector<llvm::Function*> located;
+        for (auto* function : matches)
+        {
+            auto* subprogram = function->getSubprogram();
+            if (!subprogram) continue;
+            const int line = static_cast<int>(subprogram->getLine());
+            if (line < info.startLine || line > info.endLine) continue;
+            if (!rootName.empty() && DebugFileName(subprogram->getFile()) != rootName) continue;
+            located.push_back(function);
+        }
+        if (!located.empty()) matches = std::move(located);
+
+        info.eliminated = matches.empty();
+        for (auto* function : matches)
+        {
+            info.irInstructions += static_cast<int>(function->getInstructionCount());
+            if (info.symbol.empty()) info.symbol = function->getName().str();
+            entryBySymbol[function->getName().str()] = out.size();
+        }
+        out.push_back(std::move(info));
+    }
+
+    // One walk serves two purposes: which functions absorbed an inlined body, and how
+    // much IR each source line produced wherever that code ended up.
+    std::map<std::string, std::set<std::string>> absorbedBy;
+    std::map<int, LineOptInfo> lineTotals;
+    std::map<std::tuple<int, std::string, std::string>, OptCost> costTotals;
+    for (auto& function : *view)
+    {
+        if (function.isDeclaration()) continue;
+        const std::string container = function.getName().str();
+        const bool userFunction = entryBySymbol.count(container) != 0;
+        for (auto& block : function)
+            for (auto& instruction : block)
+            {
+                const llvm::DILocation* location = instruction.getDebugLoc().get();
+                if (!location) continue;
+                for (auto* frame = location; frame && frame->getInlinedAt();
+                     frame = frame->getInlinedAt())
+                {
+                    auto* scope = frame->getScope();
+                    auto* subprogram = scope ? scope->getSubprogram() : nullptr;
+                    if (subprogram) absorbedBy[subprogram->getName().str()].insert(container);
+                }
+
+                // Line attribution only makes sense inside the user's own functions.
+                if (!userFunction) continue;
+
+                // Walk outward and take the first frame that lands in this file's code. A
+                // same-file callee keeps its own line; a core-library callee inlined here
+                // has no line of its own to claim, so it falls back to the call site.
+                int rootLine = 0;
+                for (auto* frame = location; frame; frame = frame->getInlinedAt())
+                {
+                    const int line = static_cast<int>(frame->getLine());
+                    if (!lineInUserRange(line)) continue;
+                    rootLine = line;
+                    LineOptInfo& entry = lineTotals[rootLine];
+                    entry.srcLine = rootLine;
+                    entry.irInstructions++;
+                    if (frame != location || location->getInlinedAt()) entry.inlined = true;
+                    break;
+                }
+
+                if (rootLine > 0)
+                    RecordOptCost(instruction, rootLine, costTotals);
+            }
+    }
+
+    // A remark's enclosing function is the one physically holding the code, so anything
+    // reported against a non-user function is core-library noise that shares our line span.
+    if (!info.remarks.empty())
+    {
+        std::vector<OptRemark> kept;
+        for (auto& remark : info.remarks)
+            if (entryBySymbol.count(remark.function)) kept.push_back(std::move(remark));
+        info.remarks = std::move(kept);
+    }
+
+    for (auto& [key, cost] : costTotals) info.costs.push_back(cost);
+    std::sort(info.costs.begin(), info.costs.end(),
+              [](const OptCost& a, const OptCost& b) {
+                  if (a.srcLine != b.srcLine) return a.srcLine < b.srcLine;
+                  if (a.kind != b.kind) return a.kind < b.kind;
+                  return a.detail < b.detail;
+              });
+    for (auto& info : out)
+    {
+        auto it = absorbedBy.find(info.name);
+        if (it == absorbedBy.end()) continue;
+        int count = 0;
+        for (const auto& container : it->second)
+        {
+            // A function inlined into itself (or into its own instantiation) is not fan-out.
+            auto owner = entryBySymbol.find(container);
+            if (owner != entryBySymbol.end() && out[owner->second].name == info.name) continue;
+            ++count;
+        }
+        info.inlinedInto = count;
+    }
+
+    // Exact byte sizes need the object file: COFF symbols carry no size field, so sizes
+    // come from address-sorted deltas. Best effort - a failure just leaves bytes at 0.
+    std::map<std::string, int> symbolBytes;
+    if (auto objectView = llvm::CloneModule(*view))
+    {
+        llvm::SmallString<0> objectBuffer;
+        llvm::raw_svector_ostream objectStream(objectBuffer);
+        llvm::legacy::PassManager objectPass;
+        if (!targetMachine->addPassesToEmitFile(objectPass, objectStream, nullptr,
+                                                llvm::CodeGenFileType::ObjectFile))
+        {
+            objectPass.run(*objectView);
+            auto binary = llvm::object::ObjectFile::createObjectFile(
+                llvm::MemoryBufferRef(llvm::StringRef(objectBuffer.data(), objectBuffer.size()),
+                                      "optinfo"));
+            if (binary)
+            {
+                for (const auto& sized : llvm::object::computeSymbolSizes(**binary))
+                {
+                    auto name = sized.first.getName();
+                    if (!name) { llvm::consumeError(name.takeError()); continue; }
+                    llvm::StringRef symbol = *name;
+                    auto entry = entryBySymbol.find(symbol.str());
+                    if (entry == entryBySymbol.end() && symbol.starts_with("_"))
+                        entry = entryBySymbol.find(symbol.substr(1).str());
+                    if (entry != entryBySymbol.end())
+                        out[entry->second].bytes += static_cast<int>(sized.second);
+                    symbolBytes[symbol.str()] = static_cast<int>(sized.second);
+                }
+            }
+            else
+            {
+                llvm::consumeError(binary.takeError());
+            }
+        }
+    }
+
+    // Monomorphization bloat, taken from the compiler's own instantiation registry rather
+    // than guessed from mangled symbols. Each entry is a full instantiation name (list__i32);
+    // group them by the generic they came from and charge every function that mentions one.
+    {
+        std::map<std::string, OptInstantiation> byBase;
+        for (const auto& instantiation : gts.instantiatedGenerics)
+        {
+            const size_t marker = instantiation.find("__");
+            if (marker == std::string::npos || marker == 0) continue;
+            OptInstantiation& group = byBase[instantiation.substr(0, marker)];
+            group.base = instantiation.substr(0, marker);
+            group.count++;
+            if (group.symbols.size() < 12) group.symbols.push_back(instantiation);
+        }
+        for (auto& function : *view)
+        {
+            if (function.isDeclaration()) continue;
+            const std::string symbol = function.getName().str();
+            auto size = symbolBytes.find(symbol);
+            if (size == symbolBytes.end()) continue;
+            // Charge the longest matching instantiation so list__list__i32 does not also
+            // count against list__i32.
+            const OptInstantiation* best = nullptr;
+            size_t bestLength = 0;
+            for (const auto& [base, group] : byBase)
+                for (const auto& name : group.symbols)
+                    if (name.size() > bestLength && symbol.find(name) != std::string::npos)
+                    {
+                        best = &group;
+                        bestLength = name.size();
+                    }
+            if (best) byBase[best->base].bytes += size->second;
+        }
+        for (auto& [base, group] : byBase)
+            if (group.count > 0) info.instantiations.push_back(std::move(group));
+        // Biggest first: this list answers "where is my binary going".
+        std::sort(info.instantiations.begin(), info.instantiations.end(),
+                  [](const OptInstantiation& a, const OptInstantiation& b) {
+                      if (a.bytes != b.bytes) return a.bytes > b.bytes;
+                      if (a.count != b.count) return a.count > b.count;
+                      return a.base < b.base;
+                  });
+        if (info.instantiations.size() > 50) info.instantiations.resize(50);
+    }
+
+    // Assembly gives the machine instruction count; the codegen remarks emitted during
+    // this same run give the frame size and spill counts.
+    llvm::SmallString<0> asmBuffer;
+    {
+        llvm::raw_svector_ostream asmStream(asmBuffer);
+        llvm::legacy::PassManager asmPass;
+        if (targetMachine->addPassesToEmitFile(asmPass, asmStream, nullptr,
+                                               llvm::CodeGenFileType::AssemblyFile))
+            return false;
+        asmPass.run(*view);
+    }
+
+    const std::string assembly(asmBuffer.data(), asmBuffer.size());
+    const std::map<int, std::string> asmFiles = BuildAsmFileTable(assembly);
+    const std::string rootPath = analyzedRootPath_;
+    auto isRootAsmFile = [&](const std::string& path) {
+        if (path.empty() || rootName.empty()) return false;
+        if (!rootPath.empty() && NormalizeFilePath(path) == NormalizeFilePath(rootPath))
+            return true;
+        return std::filesystem::path(path).filename().string() == rootName;
+    };
+
+    size_t lineStart = 0;
+    size_t current = out.size();
+    int currentSourceLine = 0;   // from the most recent root-file .loc / .cv_loc
+    while (lineStart < assembly.size())
+    {
+        size_t lineEnd = assembly.find('\n', lineStart);
+        if (lineEnd == std::string::npos) lineEnd = assembly.size();
+        std::string line = assembly.substr(lineStart, lineEnd - lineStart);
+        lineStart = lineEnd == assembly.size() ? assembly.size() : lineEnd + 1;
+
+        int locFile = 0, locLine = 0, locColumn = 0;
+        if (ParseLocDirective(line, locFile, locLine, locColumn))
+        {
+            auto file = asmFiles.find(locFile);
+            // Same single-DIFile caveat as the IR walk: the file id alone cannot rule out
+            // core-library code, so the line must also fall inside a function of this file.
+            currentSourceLine = (file != asmFiles.end() && isRootAsmFile(file->second)
+                                 && lineInUserRange(locLine)) ? locLine : 0;
+            continue;
+        }
+
+        const std::string label = AsmLabelName(line);
+        if (!label.empty())
+        {
+            // Local labels (.Lfunc_begin, .Ltmp, block labels) sit inside a function body
+            // and must not end it; only .Lfunc_end does. A named label switches function.
+            if (label[0] == '.')
+            {
+                if (label.rfind(".Lfunc_end", 0) == 0) current = out.size();
+                continue;
+            }
+            auto entry = entryBySymbol.find(label);
+            current = entry == entryBySymbol.end() ? out.size() : entry->second;
+            currentSourceLine = 0;
+            continue;
+        }
+        if (line.find(".seh_endproc") != std::string::npos
+            || line.find(".cfi_endproc") != std::string::npos)
+        {
+            current = out.size();
+            currentSourceLine = 0;
+            continue;
+        }
+        if (!IsAsmInstructionLine(line)) continue;
+        if (current < out.size()) out[current].machineInstructions++;
+        // Counted even outside a matched function: the code may be an inlined body that
+        // still belongs to the source line that wrote it.
+        if (currentSourceLine > 0)
+        {
+            LineOptInfo& entry = lineTotals[currentSourceLine];
+            entry.srcLine = currentSourceLine;
+            entry.machineInstructions++;
+        }
+    }
+
+    // Hand each line to the function whose source range contains it. Lines outside every
+    // range (file-scope initializers, for one) have no lens to hang on and are dropped.
+    for (const auto& [srcLine, totals] : lineTotals)
+        for (auto& info : out)
+            if (srcLine >= info.startLine && srcLine <= info.endLine)
+            {
+                info.lines.push_back(totals);
+                break;
+            }
+
+    for (auto& info : out)
+    {
+        auto remark = frameRemarks.find(info.symbol);
+        if (info.symbol.empty() || remark == frameRemarks.end()) continue;
+        info.stackBytes = remark->second.stackBytes;
+        info.spills = remark->second.spills;
+        info.reloads = remark->second.reloads;
+    }
+    return true;
+}
 
 bool LLVMBackend::EmitExecutableElf(const std::string& exePath, bool debugInfo,
                            const std::optional<std::string>& lliPath)

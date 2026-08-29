@@ -510,6 +510,215 @@ def test_server_resilience(client: LspClient) -> str | None:
 # Test runner
 # ---------------------------------------------------------------------------
 
+def test_optimization_info(client: LspClient) -> str | None:
+    """Check the Tier 1 per-function optimization facts behind the CodeLens."""
+    source = (
+        "int opt_info_helper(int value) {\n"
+        "    return value * 3 + 1;\n"
+        "}\n"
+        "\n"
+        "extern int main(int argc, char** argv) {\n"
+        "    return opt_info_helper(argc);\n"
+        "}\n"
+    )
+    uri = _uri_for("optimization_info")
+    _open_doc(client, uri, source)
+    diagnostics = wait_diagnostics_for(client, uri)
+    if diagnostics:
+        return f"optimizationInfo: unexpected diagnostics: {diagnostics}"
+
+    counters = ("irInstructions", "machineInstructions", "bytes",
+                "stackBytes", "spills", "reloads", "inlinedInto")
+
+    def collect(opt_level: int):
+        response = client.request("cflat/optimizationInfo",
+                                  {"uri": uri, "optLevel": opt_level}, timeout=120.0)
+        if "error" in response:
+            return None, f"optimizationInfo O{opt_level}: unexpected error: {response}"
+        result = response.get("result")
+        if not isinstance(result, dict) or result.get("optLevel") != opt_level:
+            return None, f"optimizationInfo O{opt_level}: bad result envelope: {response}"
+        functions = result.get("functions")
+        if not isinstance(functions, list) or not functions:
+            return None, f"optimizationInfo O{opt_level}: no functions: {result}"
+        by_name = {}
+        for entry in functions:
+            for field in ("name", "startLine", "endLine", "eliminated"):
+                if field not in entry:
+                    return None, f"optimizationInfo O{opt_level}: entry missing {field}: {entry}"
+            for field in counters:
+                if not isinstance(entry.get(field), int):
+                    return None, f"optimizationInfo O{opt_level}: {field} not an int: {entry}"
+            lines = entry.get("lines")
+            if not isinstance(lines, list):
+                return None, f"optimizationInfo O{opt_level}: lines not a list: {entry}"
+            previous = 0
+            for line in lines:
+                for field in ("srcLine", "irInstructions", "machineInstructions"):
+                    if not isinstance(line.get(field), int):
+                        return None, (f"optimizationInfo O{opt_level}: line {field} "
+                                      f"not an int: {line}")
+                if not isinstance(line.get("inlined"), bool):
+                    return None, f"optimizationInfo O{opt_level}: line inlined not a bool: {line}"
+                if line["srcLine"] <= previous:
+                    return None, (f"optimizationInfo O{opt_level}: lines not ascending "
+                                  f"in {entry['name']}: {lines}")
+                previous = line["srcLine"]
+                if not (entry["startLine"] <= line["srcLine"] <= entry["endLine"]):
+                    return None, (f"optimizationInfo O{opt_level}: line {line['srcLine']} "
+                                  f"outside {entry['name']} range: {entry}")
+                if line["irInstructions"] <= 0 and line["machineInstructions"] <= 0:
+                    return None, (f"optimizationInfo O{opt_level}: empty line entry "
+                                  f"in {entry['name']}: {line}")
+            by_name[entry["name"]] = entry
+        return by_name, None
+
+    optimized, err = collect(2)
+    if err:
+        return err
+    for name in ("opt_info_helper", "main"):
+        if name not in optimized:
+            return f"optimizationInfo O2: missing function {name}: {sorted(optimized)}"
+
+    main_entry = optimized["main"]
+    if main_entry["eliminated"]:
+        return f"optimizationInfo O2: main was eliminated: {main_entry}"
+    if main_entry["machineInstructions"] <= 0 and main_entry["irInstructions"] <= 0:
+        return f"optimizationInfo O2: main has no instructions: {main_entry}"
+    if main_entry["startLine"] != 5:
+        return f"optimizationInfo O2: wrong startLine for main: {main_entry}"
+
+    # Inlining is a heuristic: accept either outcome, but the two must agree with
+    # each other - an eliminated body has to have landed somewhere.
+    helper = optimized["opt_info_helper"]
+    if helper["eliminated"] and helper["inlinedInto"] < 1:
+        return f"optimizationInfo O2: helper eliminated but not inlined anywhere: {helper}"
+    if not helper["eliminated"]:
+        if helper["machineInstructions"] <= 0 and helper["irInstructions"] <= 0:
+            return f"optimizationInfo O2: helper survived with no instructions: {helper}"
+
+    unoptimized, err = collect(0)
+    if err:
+        return err
+    helper0 = unoptimized.get("opt_info_helper")
+    if helper0 is None or helper0["eliminated"]:
+        return f"optimizationInfo O0: helper should survive: {helper0}"
+    if helper0["irInstructions"] <= 0:
+        return f"optimizationInfo O0: helper has no IR instructions: {helper0}"
+
+    # The body line must be attributed at -O0, where nothing has moved yet.
+    if not any(line["srcLine"] == 2 for line in helper0["lines"]):
+        return f"optimizationInfo O0: helper body line 2 not attributed: {helper0['lines']}"
+    # An eliminated body still has to account for its code somewhere.
+    if helper["eliminated"] and helper["lines"]:
+        if not any(line["inlined"] for line in helper["lines"]):
+            return (f"optimizationInfo O2: eliminated helper has lines but none marked "
+                    f"inlined: {helper['lines']}")
+
+    bad = client.request("cflat/optimizationInfo", {"uri": uri, "optLevel": 7}, timeout=30.0)
+    if "error" not in bad:
+        return f"optimizationInfo: optLevel 7 should be rejected: {bad}"
+    return _check_optimization_tiers(client)
+
+
+def _check_optimization_tiers(client: LspClient) -> str | None:
+    """Tier 2 costs / instantiations and Tier 3 remarks, on a file that imports core.
+
+    The import matters: cflat emits one DIFile for the whole module, so core-library
+    code carries this file's name with its own line numbers. Everything reported must
+    still land inside a function of THIS file.
+    """
+    source = (
+        'import "list.cb";\n'
+        "\n"
+        "extern int main(int argc, char** argv) {\n"
+        "    list<int> nums = default;\n"
+        "    for (int i = 0; i < argc; i = i + 1) { nums.add(i * 2); }\n"
+        "    int total = 0;\n"
+        "    for (int i = 0; i < nums.count(); i = i + 1) { total = total + nums.get(i); }\n"
+        "    return total;\n"
+        "}\n"
+    )
+    uri = _uri_for("optimization_tiers")
+    _open_doc(client, uri, source)
+    diagnostics = wait_diagnostics_for(client, uri)
+    if diagnostics:
+        return f"optimizationInfo tiers: unexpected diagnostics: {diagnostics}"
+
+    response = client.request("cflat/optimizationInfo",
+                              {"uri": uri, "optLevel": 2}, timeout=180.0)
+    if "error" in response:
+        return f"optimizationInfo tiers: unexpected error: {response}"
+    result = response.get("result")
+    for field in ("costs", "remarks", "instantiations"):
+        if not isinstance(result.get(field), list):
+            return f"optimizationInfo tiers: {field} is not a list: {result.keys()}"
+    if not isinstance(result.get("remarksTruncated"), bool):
+        return f"optimizationInfo tiers: remarksTruncated not a bool: {result}"
+
+    ranges = [(f["startLine"], f["endLine"]) for f in result["functions"]]
+    if not ranges:
+        return "optimizationInfo tiers: no functions returned"
+
+    def in_range(line: int) -> bool:
+        return any(start <= line <= end for start, end in ranges)
+
+    # The regression this guards: core-library lines leaking in as this file's lines.
+    for cost in result["costs"]:
+        for field in ("kind", "detail"):
+            if not isinstance(cost.get(field), str):
+                return f"optimizationInfo tiers: cost {field} not a string: {cost}"
+        for field in ("srcLine", "bytes", "count"):
+            if not isinstance(cost.get(field), int):
+                return f"optimizationInfo tiers: cost {field} not an int: {cost}"
+        if not in_range(cost["srcLine"]):
+            return f"optimizationInfo tiers: cost outside every function: {cost}"
+
+    user_functions = {f["name"] for f in result["functions"]}
+    for remark in result["remarks"]:
+        for field in ("pass", "name", "kind", "message", "function", "file"):
+            if not isinstance(remark.get(field), str):
+                return f"optimizationInfo tiers: remark {field} not a string: {remark}"
+        if remark["kind"] not in ("passed", "missed", "analysis"):
+            return f"optimizationInfo tiers: bad remark kind: {remark}"
+        if not isinstance(remark.get("args"), dict):
+            return f"optimizationInfo tiers: remark args not an object: {remark}"
+        if not in_range(remark["srcLine"]):
+            return f"optimizationInfo tiers: remark outside every function: {remark}"
+        if remark["function"] not in user_functions:
+            return f"optimizationInfo tiers: remark on a non-user function: {remark}"
+
+    for group in result["instantiations"]:
+        if not isinstance(group.get("base"), str) or not group["base"]:
+            return f"optimizationInfo tiers: bad instantiation base: {group}"
+        for field in ("count", "bytes"):
+            if not isinstance(group.get(field), int):
+                return f"optimizationInfo tiers: instantiation {field} not an int: {group}"
+        if not isinstance(group.get("symbols"), list):
+            return f"optimizationInfo tiers: instantiation symbols not a list: {group}"
+
+    # list<int> is instantiated by this file, so the registry must report it.
+    if not any(group["base"] == "list" for group in result["instantiations"]):
+        bases = [group["base"] for group in result["instantiations"]]
+        return f"optimizationInfo tiers: list instantiation not reported: {bases}"
+
+    # Opting out of remarks must actually skip them, not just hide them.
+    without = client.request("cflat/optimizationInfo",
+                             {"uri": uri, "optLevel": 2, "remarks": False}, timeout=180.0)
+    if "error" in without:
+        return f"optimizationInfo tiers: remarks:false errored: {without}"
+    if without["result"]["remarks"]:
+        return f"optimizationInfo tiers: remarks:false still returned remarks"
+    if not without["result"]["functions"]:
+        return "optimizationInfo tiers: remarks:false lost the Tier 1 data"
+
+    bad = client.request("cflat/optimizationInfo",
+                         {"uri": uri, "remarks": "yes"}, timeout=30.0)
+    if "error" not in bad:
+        return f"optimizationInfo tiers: non-boolean remarks should be rejected: {bad}"
+    return None
+
+
 def test_view_assembly(client: LspClient) -> str | None:
     """Check inline-stack attribution and selectable optimization levels."""
     source = (
@@ -648,6 +857,7 @@ def _run_scenario_shard(exe: str, shard_args: list) -> tuple:
             ("def: non-primitives (namespace/struct/local var)", test_def_non_primitives),
             ("def: nested struct/class", test_def_nested_struct),
             ("viewAssembly: inline attribution", test_view_assembly),
+            ("optimizationInfo: tier 1 facts", test_optimization_info),
         ]
         for name, fn in scenarios:
             try:

@@ -548,6 +548,163 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
     );
 }
 
+// One entry per source function, as returned by cflat/optimizationInfo. A zero counter
+// means "not available" rather than "measured as zero", so zeros are omitted from the lens.
+interface OptFunctionInfo {
+    name: string;
+    symbol: string;
+    startLine: number;
+    endLine: number;
+    irInstructions: number;
+    machineInstructions: number;
+    bytes: number;
+    stackBytes: number;
+    spills: number;
+    reloads: number;
+    inlinedInto: number;
+    eliminated: boolean;
+}
+
+interface OptInfoResult {
+    optLevel: number;
+    functions: OptFunctionInfo[];
+}
+
+interface OptInfoCacheEntry {
+    key: string;
+    optLevel: number;
+    functions: OptFunctionInfo[];
+}
+
+function plural(count: number, noun: string): string {
+    return `${count} ${noun}${count === 1 ? '' : 's'}`;
+}
+
+// Optimization facts above each function. The optimizer only runs on an explicit refresh
+// (command or save) - provideCodeLenses never triggers one, since it fires on every edit.
+class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
+    private readonly changeEmitter = new vscode.EventEmitter<void>();
+    readonly onDidChangeCodeLenses = this.changeEmitter.event;
+    private readonly cache = new Map<string, OptInfoCacheEntry>();
+    private readonly inFlight = new Set<string>();
+
+    constructor(private readonly getClient: () => LanguageClient | undefined) {}
+
+    private static enabled(): boolean {
+        return vscode.workspace.getConfiguration('cflat').get<boolean>('optimizationInfo.enable', false);
+    }
+
+    private static optLevel(): number {
+        const level = vscode.workspace.getConfiguration('cflat').get<number>('optimizationInfo.optLevel', 2);
+        return level === 0 || level === 1 || level === 2 ? level : 2;
+    }
+
+    private static cacheKey(document: vscode.TextDocument): string {
+        return `${CflatOptimizationLensProvider.optLevel()}|${document.version}`;
+    }
+
+    provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
+        if (!CflatOptimizationLensProvider.enabled()) return [];
+        const entry = this.cache.get(document.uri.toString());
+        if (!entry || entry.key !== CflatOptimizationLensProvider.cacheKey(document)) return [];
+
+        const lenses: vscode.CodeLens[] = [];
+        for (const info of entry.functions) {
+            const line = info.startLine - 1;
+            if (line < 0 || line >= document.lineCount) continue;
+            const range = document.lineAt(line).range;
+            lenses.push(new vscode.CodeLens(range, {
+                title: this.lensTitle(info, entry.optLevel),
+                tooltip: this.lensTooltip(info, entry.optLevel),
+                command: 'cflat.showIrForFunction',
+                arguments: [document.uri.toString(), info.startLine, entry.optLevel > 0]
+            }));
+        }
+        return lenses;
+    }
+
+    private lensTitle(info: OptFunctionInfo, optLevel: number): string {
+        const prefix = `O${optLevel}: `;
+        if (info.eliminated) {
+            return info.inlinedInto > 0
+                ? `${prefix}optimized away - inlined into ${plural(info.inlinedInto, 'site')}`
+                : `${prefix}optimized away`;
+        }
+
+        const parts: string[] = [];
+        parts.push(info.machineInstructions > 0
+            ? `${plural(info.machineInstructions, 'instr')}`
+            : `${info.irInstructions} IR instr`);
+        if (info.bytes > 0) parts.push(`${info.bytes} B`);
+        if (info.stackBytes > 0) parts.push(`${info.stackBytes} B stack`);
+        if (info.spills > 0) {
+            parts.push(info.reloads > 0
+                ? `${plural(info.spills, 'spill')}/${plural(info.reloads, 'reload')}`
+                : plural(info.spills, 'spill'));
+        }
+        if (info.inlinedInto > 0) parts.push(`inlined into ${plural(info.inlinedInto, 'site')}`);
+        return prefix + parts.join(' - ');
+    }
+
+    private lensTooltip(info: OptFunctionInfo, optLevel: number): string {
+        const lines = [`${info.name} at -O${optLevel}`];
+        if (info.eliminated) lines.push('No code emitted (inlined or removed)');
+        else {
+            lines.push(`Machine instructions: ${info.machineInstructions}`);
+            lines.push(`LLVM IR instructions: ${info.irInstructions}`);
+            if (info.bytes > 0) lines.push(`Emitted size: ${info.bytes} bytes`);
+            if (info.stackBytes > 0) lines.push(`Stack frame: ${info.stackBytes} bytes`);
+            lines.push(`Spills / reloads: ${info.spills} / ${info.reloads}`);
+            if (info.symbol) lines.push(`Symbol: ${info.symbol}`);
+        }
+        if (info.inlinedInto > 0)
+            lines.push(`Body inlined into ${plural(info.inlinedInto, 'function')}`);
+        lines.push('Click to open the LLVM IR for this function');
+        return lines.join('\n');
+    }
+
+    async refresh(document: vscode.TextDocument, silent = false): Promise<void> {
+        if (!CflatOptimizationLensProvider.enabled() || document.languageId !== 'cflat') return;
+        const client = this.getClient();
+        if (!client) return;
+
+        const uri = document.uri.toString();
+        if (this.inFlight.has(uri)) return;
+        this.inFlight.add(uri);
+        const optLevel = CflatOptimizationLensProvider.optLevel();
+        const key = CflatOptimizationLensProvider.cacheKey(document);
+        try {
+            const result = await client.sendRequest<OptInfoResult>('cflat/optimizationInfo',
+                { uri, optLevel });
+            this.cache.set(uri, { key, optLevel: result.optLevel, functions: result.functions ?? [] });
+            this.changeEmitter.fire();
+            if (!silent) {
+                vscode.window.setStatusBarMessage(
+                    `cflat: optimization info updated at -O${result.optLevel}`, 4000);
+            }
+        } catch (error) {
+            this.cache.delete(uri);
+            this.changeEmitter.fire();
+            if (!silent) {
+                vscode.window.showWarningMessage(
+                    `cflat: could not collect optimization info - ${error}`);
+            }
+        } finally {
+            this.inFlight.delete(uri);
+        }
+    }
+
+    invalidate(uri?: string): void {
+        if (uri) this.cache.delete(uri);
+        else this.cache.clear();
+        this.changeEmitter.fire();
+    }
+
+    dispose(): void {
+        this.changeEmitter.dispose();
+    }
+}
+
 async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKind): Promise<void> {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.document.languageId !== 'cflat' || !client) return;
@@ -572,9 +729,14 @@ async function showCompilerView(provider: CflatViewContentProvider, kind: ViewKi
     });
     if (!choice) return;
     lastViewChoiceId = choice.id;
+    await openCompilerView(provider, kind, choice, editor.document, editor.selection.active.line + 1);
+}
 
-    const sourceLine = editor.selection.active.line + 1;
-    const viewUri = provider.createView(editor.document.uri.toString(), kind, choice);
+// Open (or re-open) a compiler view for a document and jump to the output for sourceLine.
+async function openCompilerView(provider: CflatViewContentProvider, kind: ViewKind,
+                                choice: ViewChoice, source: vscode.TextDocument,
+                                sourceLine: number): Promise<void> {
+    const viewUri = provider.createView(source.uri.toString(), kind, choice);
     await provider.refresh(viewUri);
     const document = await vscode.workspace.openTextDocument(viewUri);
     const languages = await vscode.languages.getLanguages();
@@ -657,6 +819,52 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
         vscode.commands.registerCommand('cflat.showAssembly', () => {
             void showCompilerView(viewProvider, 'asm');
+        })
+    );
+
+    // Optimization info: CodeLens above each function, refreshed on demand and on save.
+    const lensProvider = new CflatOptimizationLensProvider(() => client);
+    context.subscriptions.push(
+        lensProvider,
+        vscode.languages.registerCodeLensProvider({ scheme: 'file', language: 'cflat' }, lensProvider),
+        // Invoked by the lens itself, so it is deliberately not in the command palette.
+        vscode.commands.registerCommand('cflat.showIrForFunction',
+            async (sourceUri: string, line: number, optimized: boolean) => {
+                const choice = viewChoices.find(candidate => candidate.optimized === optimized)
+                    ?? viewChoices[0];
+                const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(sourceUri));
+                await openCompilerView(viewProvider, 'ir', choice, document, line);
+            }),
+        vscode.commands.registerCommand('cflat.showOptimizationInfo', () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor || editor.document.languageId !== 'cflat') return;
+            if (!vscode.workspace.getConfiguration('cflat').get<boolean>('optimizationInfo.enable', false)) {
+                void vscode.window.showInformationMessage(
+                    'cflat: optimization info is disabled. Enable cflat.optimizationInfo.enable first.');
+                return;
+            }
+            void lensProvider.refresh(editor.document);
+        }),
+        vscode.commands.registerCommand('cflat.toggleOptimizationInfo', async () => {
+            const config = vscode.workspace.getConfiguration('cflat');
+            const next = !config.get<boolean>('optimizationInfo.enable', false);
+            await config.update('optimizationInfo.enable', next, vscode.ConfigurationTarget.Global);
+            const editor = vscode.window.activeTextEditor;
+            if (next && editor && editor.document.languageId === 'cflat')
+                void lensProvider.refresh(editor.document);
+        }),
+        vscode.workspace.onDidSaveTextDocument((document: vscode.TextDocument) => {
+            if (document.languageId === 'cflat') void lensProvider.refresh(document, true);
+        }),
+        vscode.workspace.onDidCloseTextDocument((document: vscode.TextDocument) => {
+            lensProvider.invalidate(document.uri.toString());
+        }),
+        vscode.workspace.onDidChangeConfiguration((e: vscode.ConfigurationChangeEvent) => {
+            if (!e.affectsConfiguration('cflat.optimizationInfo')) return;
+            lensProvider.invalidate();
+            const editor = vscode.window.activeTextEditor;
+            if (editor && editor.document.languageId === 'cflat')
+                void lensProvider.refresh(editor.document, true);
         })
     );
 
