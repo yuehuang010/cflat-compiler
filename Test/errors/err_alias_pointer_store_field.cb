@@ -1,0 +1,62 @@
+import "string.cb";
+
+struct Owner { string title = default; };
+struct Sink { Owner* owner = nullptr; };
+Owner g = default;
+alias Owner* cur() { return &g; }
+
+struct TypedPointerOwner
+{
+    string text = default;
+    int item = 0;
+    char* textPointer = nullptr;
+    int** itemPointer = nullptr;
+    int*[2] pointers = default;
+};
+struct TypedPointerSink
+{
+    char* textPointer = nullptr;
+    int** itemPointer = nullptr;
+    int* pointer = nullptr;
+};
+alias TypedPointerOwner* borrowTyped(TypedPointerOwner* p) { return p; }
+
+void rejectCharPointerMember()
+{
+    TypedPointerOwner* owner = new TypedPointerOwner();
+    owner.text = "owned".copy();
+    owner.textPointer = owner.text.data();
+    TypedPointerOwner* borrowed = borrowTyped(owner);
+    TypedPointerSink sink = default;
+    expect_error("cannot store an 'alias' value");
+    sink.textPointer = borrowed.textPointer;
+}
+
+void rejectElemPointerMember()
+{
+    TypedPointerOwner* owner = new TypedPointerOwner();
+    owner.itemPointer = &owner.item;
+    TypedPointerOwner* borrowed = borrowTyped(owner);
+    TypedPointerSink sink = default;
+    expect_error("cannot store an 'alias' value");
+    sink.itemPointer = borrowed.itemPointer;
+}
+
+void rejectPointerArrayElement()
+{
+    TypedPointerOwner* owner = new TypedPointerOwner();
+    owner.pointers[0] = &owner.item;
+    TypedPointerOwner* borrowed = borrowTyped(owner);
+    TypedPointerSink sink = default;
+    expect_error("cannot store an 'alias' value");
+    sink.pointer = borrowed.pointers[0];
+}
+
+extern int main()
+{
+    Owner* borrowed = cur();
+    Sink s = default;
+    expect_error("cannot store an 'alias' value");
+    s.owner = borrowed;
+    return 0;
+}

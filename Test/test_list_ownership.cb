@@ -653,6 +653,7 @@ class RawHandle
 {
     void* handle = nullptr;
     int id = default;
+    string ownerTag = default;
     ~RawHandle() { g_dtor = g_dtor + 1; }
 };
 struct RawHandleSink { void* handle = nullptr; int id = default; };
@@ -673,8 +674,58 @@ int testAliasPointerRawFieldStore()
     passed += Test("alias temp raw pointer field copied", *(int*)sink.handle, 77);
     passed += Test("alias temp scalar field copied", sink.id, 9);
 
+    RawHandle* borrowed = borrowHandle(h);
+    RawHandleSink localSink = default;
+    localSink.handle = borrowed.handle;
+    passed += Test("alias local raw pointer field copied", *(int*)localSink.handle, 77);
+    RawHandleSink braceSink = { handle = borrowed.handle };
+    passed += Test("alias local raw pointer brace field copied", *(int*)braceSink.handle, 77);
+
     delete h;
     passed += Test("alias accessor freed nothing itself", g_dtor, 1);
+    return passed;
+}
+
+// Explicit move into indirect owning lvalues must transfer the existing value, including its
+// backing resource, instead of copying after the move expression has nulled the source.
+int testExplicitMoveIndirectAssignments()
+{
+    int passed = 0;
+
+    {
+        AliasRow a = default; a.text = "old".copy();
+        AliasRow t = default; t.text = "new".copy();
+        AliasRow* p = &a;
+        *p = move t;
+        passed += Test("pointer-deref move stores value", p->text, "new");
+    }
+    passed += Test("pointer-deref move has no leaks", (int)HeapAudit.reportLeaks(), 0);
+
+    {
+        list<AliasRow> rows = default;
+        AliasRow old = default; old.text = "old".copy(); rows.add(move old);
+        AliasRow t = default; t.text = "new".copy();
+        rows[0] = move t;
+        passed += Test("list index move stores value", rows[0].text, "new");
+    }
+    passed += Test("list index move has no leaks", (int)HeapAudit.reportLeaks(), 0);
+
+    {
+        list<AliasRow> rows = default;
+        AliasRow old = default; old.text = "old".copy(); rows.add(move old);
+        AliasRow t = default; t.text = "new".copy();
+        rows.get(0) = move t;
+        passed += Test("list get move stores value", rows.get(0).text, "new");
+    }
+    passed += Test("list get move has no leaks", (int)HeapAudit.reportLeaks(), 0);
+
+    {
+        string a = "old".copy(); string t = "new".copy(); string* p = &a;
+        *p = move t;
+        passed += Test("string pointer move stores value", p->data(), "new");
+    }
+    passed += Test("string pointer move has no leaks", (int)HeapAudit.reportLeaks(), 0);
+
     return passed;
 }
 
@@ -1290,6 +1341,7 @@ extern int main()
     total += 16; passed += testAliasParameterBorrows();
     total += 12; passed += testAliasParameterTempsDestruct();
     total += 7;  passed += testAliasLvalueAssignDropsOldOwner();
+    total += 8;  passed += testExplicitMoveIndirectAssignments();
     total += 5;  passed += testValueCopySemantics();
     total += 2;  passed += testStringCopySemantics();
     total += 1;  passed += testStringMoveSemantics();
@@ -1299,7 +1351,7 @@ extern int main()
     total += 5;  passed += testBarePointerBorrows();
     total += 4;  passed += testBorrowedPointerElementBorrows();
     total += 7;  passed += testAliasPointerElementBorrows();
-    total += 3;  passed += testAliasPointerRawFieldStore();
+    total += 5;  passed += testAliasPointerRawFieldStore();
     total += 4;  passed += testStringFieldStoreThroughPointer();
     total += 3;  passed += testUniquePointerOwns();
     total += 2;  passed += testUniquePointerSetFreesOld();

@@ -1,0 +1,16 @@
+import "string.cb";
+
+struct InnerOwner { string value = default; };
+struct Owner { InnerOwner inner = default; };
+struct Sink { InnerOwner inner = default; };
+Owner g = default;
+alias Owner* cur() { return &g; }
+
+extern int main()
+{
+    Owner* borrowed = cur();
+    Sink s = default;
+    expect_error("cannot store an 'alias' value");
+    s.inner = borrowed.inner;
+    return 0;
+}

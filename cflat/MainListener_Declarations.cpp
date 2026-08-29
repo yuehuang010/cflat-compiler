@@ -6342,6 +6342,18 @@ bool MainListener::RejectAliasStoreIntoField(
         // Let the dedicated unique-field gate below name this more specific ownership hazard.
         if (IsUniqueTempFieldRead(rightNV)) return false;
 
+        // An opaque void pointer member is copied by value, even when its containing object is
+        // borrowed. Typed pointers can point into owned storage, so keep them on the reject set.
+        if (!rightNV.FieldName.empty()
+            && rightNV.TypeAndValue.TypeName == "void"
+            && rightNV.TypeAndValue.Pointer
+            && !rightNV.TypeAndValue.ElemPointer
+            && !rightNV.TypeAndValue.IsArrayView
+            && rightNV.TypeAndValue.ConstArraySize == 0
+            && !IsOwningUniquePointerField(rightNV.TypeAndValue)
+            && !IsOwningUniqueInterfaceField(rightNV.TypeAndValue))
+            return false;
+
         if (rightNV.FromOwningTempField && rightNV.TypeAndValue.TypeName != "string")
         {
             // A raw, non-owning pointer read out of the temp (a `void*` OS handle, a back-pointer)
