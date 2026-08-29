@@ -4378,23 +4378,27 @@ int testBucketAExpressionOwnership()
     passed += Test("bucket_pointer_move_string_freed_once_no_slot_dtor",
                    (int)HeapAudit.reportLeaks(), 0);
 
-    string receiver = "abc";
-    passed += Test("bucket_string_pointer_arrow_length", bucketStringArrowLength(&receiver), 3);
-    passed += Test("bucket_string_pointer_deref_length", bucketStringDerefLength(&receiver), 3);
-    passed += Test("bucket_string_value_length", bucketStringValueLength(receiver), 3);
+    {
+        string receiver = "abc";
+        passed += Test("bucket_string_pointer_arrow_length", bucketStringArrowLength(&receiver), 3);
+        passed += Test("bucket_string_pointer_deref_length", bucketStringDerefLength(&receiver), 3);
+        passed += Test("bucket_string_value_length", bucketStringValueLength(receiver), 3);
 
-    // Embedded NUL: strlen disagrees with the stored length, so a receiver rebuilt from the
-    // char* answers 2 here while the whole-string load answers 5.
-    string embeddedNul = "ab";
-    embeddedNul = embeddedNul + "\0cd";
-    passed += Test("bucket_string_pointer_arrow_embedded_nul",
-                   bucketStringArrowLength(&embeddedNul), 5);
-    passed += Test("bucket_string_pointer_deref_embedded_nul",
-                   bucketStringDerefLength(&embeddedNul), 5);
-    passed += Test("bucket_string_value_embedded_nul",
-                   bucketStringValueLength(embeddedNul), 5);
+        // Embedded NUL: strlen disagrees with the stored length, so a receiver rebuilt from the
+        // char* answers 2 here while the whole-string load answers 5.
+        string embeddedNul = "ab";
+        embeddedNul = embeddedNul + "\0cd";
+        passed += Test("bucket_string_pointer_arrow_embedded_nul",
+                       bucketStringArrowLength(&embeddedNul), 5);
+        passed += Test("bucket_string_pointer_deref_embedded_nul",
+                       bucketStringDerefLength(&embeddedNul), 5);
+        passed += Test("bucket_string_value_embedded_nul",
+                       bucketStringValueLength(embeddedNul), 5);
+    }
 
     int bucketHeapBaseline = (int)HeapAudit.reportLeaks();
+    passed += Test("bucket_string_embedded_nul_freed_before_baseline",
+                   bucketHeapBaseline, 0);
 
     // A parenthesized produced owner is the same temporary as an unparenthesized receiver.
     dtorCount = 0;
@@ -11678,7 +11682,7 @@ extern int main()
     total += 107;
 
     passed += testBucketAExpressionOwnership();
-    total += 108;
+    total += 109;
 
     passed += testDiscardMoveReturningCall();
     total += 6;
