@@ -1293,6 +1293,10 @@ int testStringConcat()
     string c = a + b;
     passed += Test("concat length",  c.length(), 11);
     passed += Test("concat data",    c.data(),   "hello world");
+    passed += Test("parenthesized concat data", (a + " " + b).data(), "hello  world");
+    passed += Test("nested parenthesized concat data", ((a + " " + b)).data(), "hello  world");
+    passed += Test("parenthesized literal data", ("literal").data(), "literal");
+    passed += Test("parenthesized concat chain data", (a + " " + b).copy().data(), "hello  world");
 
     string d = a + " there";
     passed += Test("concat char* length", d.length(), 11);
@@ -3237,7 +3241,7 @@ extern int main()
     r = testListPtrOwnership(); passed += r; total += 4;
     r = testFor();              passed += r; total += 10;
     r = testString();           passed += r; total += 26;
-    r = testStringConcat();     passed += r; total += 10;
+    r = testStringConcat();     passed += r; total += 14;
     r = testStringIString();    passed += r; total += 4;
     r = testStringInterpolation(); passed += r; total += 10;
     r = testStringSwitch();     passed += r; total += 6;

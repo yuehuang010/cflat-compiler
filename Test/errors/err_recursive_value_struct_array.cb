@@ -1,0 +1,4 @@
+// A fixed array of the containing type is still by-value recursive storage.
+expect_error("field 'RecursiveArray.arr'");
+struct RecursiveArray { RecursiveArray[4] arr; };
+extern int main() { return 0; }

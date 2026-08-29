@@ -1231,11 +1231,61 @@ void LLVMBackend::RejectUniqueDestructionCycles(const std::string& name, const s
         }
     }
 
+void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
+                                                  const std::vector<LLVMBackend::DeclTypeAndValue>& fields)
+{
+        std::unordered_set<std::string> seen;
+        std::vector<std::string> path{ name };
+
+        auto fieldsFor = [&](const std::string& typeName) -> const std::vector<DeclTypeAndValue>* {
+            if (typeName == name) return &fields;
+            auto it = dataStructures.find(typeName);
+            if (it == dataStructures.end() || it->second.StructFields.empty()
+                || it->second.IsUnion)
+                return nullptr;
+            return &it->second.StructFields;
+        };
+
+        std::function<void(const std::string&)> visit = [&](const std::string& typeName) {
+            if (!seen.insert(typeName).second) return;
+            const auto* nestedFields = fieldsFor(typeName);
+            if (nestedFields == nullptr) return;
+            for (const auto& field : *nestedFields)
+            {
+                if (field.Pointer || field.ElemPointer || field.IsInterface
+                    || field.IsInterfacePointer || field.IsArrayView)
+                    continue;
+                const std::string target = ResolveTypeAlias(field.TypeName);
+                if (target.empty() || target == "void" || fieldsFor(target) == nullptr)
+                    continue;
+                path.push_back(target);
+                if (target == name)
+                {
+                    std::string cycle;
+                    for (size_t i = 0; i < path.size(); i++)
+                    {
+                        if (i > 0) cycle += " -> ";
+                        cycle += path[i];
+                    }
+                    LogError("field '" + typeName + "." + field.VariableName
+                             + "' contains a by-value cycle (" + cycle
+                             + "); recursive value types have no finite size. Make it a pointer ('"
+                             + target + "*') or break the cycle.");
+                }
+                visit(target);
+                path.pop_back();
+            }
+        };
+
+        visit(name);
+    }
+
 llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LLVMBackend::DeclTypeAndValue> typeAndValues, uint64_t userAlign, std::vector<BitfieldInfo>* bitfields)
 {
 
         if (typeAndValues.size() > 0)
         {
+            RejectByValueContainmentCycles(name, typeAndValues);
             std::vector<llvm::Type*> types;
 
             for (const auto& typeValue : typeAndValues)
@@ -1763,6 +1813,17 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
                 // ptr +/- int (no element-type context here): byte arithmetic via i8 GEP.
                 auto* ptrVal = leftIsPtr  ? left  : right;
                 auto* intVal = leftIsPtr  ? right : left;
+                if (!intVal->getType()->isIntegerTy())
+                {
+                    const std::string indexType = LlvmTypeToTypeName(intVal->getType());
+                    if ((op == Operation::Add || op == Operation::AddAssignment)
+                        && indexType == "string")
+                        LogError("cannot add a value of type '" + indexType
+                                 + "' to a pointer; convert the pointer to a string first, e.g. \"\" + ptr");
+                    else
+                        LogError("cannot use a value of type '" + indexType
+                                 + "' as a pointer arithmetic index; the index must be an integer");
+                }
                 if ((op == Operation::Subtract || op == Operation::MinusAssignment) && leftIsPtr)
                     intVal = builder->CreateNeg(intVal, "neg");
                 intVal = Upconvert(intVal, i64Ty);

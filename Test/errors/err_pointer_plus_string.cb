@@ -1,0 +1,10 @@
+// Pointer arithmetic requires an integer index; char* + string must be diagnosed before GEP.
+expect_error("cannot add a value of type 'string' to a pointer") {
+    extern int main()
+    {
+        char* p = "abc";
+        string s = "x";
+        char* q = p + s;
+        return q == nullptr ? 0 : 1;
+    }
+}

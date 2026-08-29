@@ -1,0 +1,7 @@
+// A nested aggregate can close a cycle through its enclosing value type.
+expect_error("by-value cycle");
+struct RecursiveNestedOuter {
+    struct RecursiveNestedInner { RecursiveNestedOuter outer; };
+    RecursiveNestedInner inner;
+};
+extern int main() { return 0; }

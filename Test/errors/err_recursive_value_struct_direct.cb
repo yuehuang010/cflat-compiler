@@ -1,0 +1,4 @@
+// A direct non-pointer self field has no finite layout.
+expect_error("field 'RecursiveDirect.inner'");
+struct RecursiveDirect { RecursiveDirect inner; int x = 1; };
+extern int main() { return 0; }

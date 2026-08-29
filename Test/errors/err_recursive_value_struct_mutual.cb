@@ -1,0 +1,5 @@
+// The second definition closes the mutual by-value cycle.
+expect_error("field 'RecursiveMutualA.b'");
+struct RecursiveMutualA { RecursiveMutualB b; };
+struct RecursiveMutualB { RecursiveMutualA a; };
+extern int main() { return 0; }

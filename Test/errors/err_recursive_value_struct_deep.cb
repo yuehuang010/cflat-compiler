@@ -1,0 +1,6 @@
+// A seen set must catch a cycle longer than two types.
+expect_error("by-value cycle");
+struct RecursiveDeepA { RecursiveDeepB b; };
+struct RecursiveDeepB { RecursiveDeepC c; };
+struct RecursiveDeepC { RecursiveDeepA a; };
+extern int main() { return 0; }

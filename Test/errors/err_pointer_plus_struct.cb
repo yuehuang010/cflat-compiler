@@ -1,0 +1,11 @@
+// The predicate is about pointer GEP indices, not only the string type.
+struct PointerIndexPair { int x = 1; };
+expect_error("cannot use a value of type 'PointerIndexPair' as a pointer arithmetic index") {
+    extern int main()
+    {
+        int* p = default;
+        PointerIndexPair v = default;
+        int* q = p + v;
+        return q == nullptr ? 0 : 1;
+    }
+}

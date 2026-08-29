@@ -4396,6 +4396,24 @@ int testBucketAExpressionOwnership()
 
     int bucketHeapBaseline = (int)HeapAudit.reportLeaks();
 
+    // A parenthesized produced owner is the same temporary as an unparenthesized receiver.
+    dtorCount = 0;
+    {
+        int got = (makeUniqueBox(112)).boxId();
+        passed += Test("bucket_paren_receiver_temp_value", got, 112);
+        passed += Test("bucket_paren_receiver_temp_freed_once", dtorCount, 1);
+    }
+
+    // Parentheses around an lvalue must not turn its existing storage into a temp owner.
+    dtorCount = 0;
+    {
+        UniqueBox local = makeUniqueBox(113);
+        int got = (local).boxId();
+        passed += Test("bucket_paren_receiver_lvalue_value", got, 113);
+        passed += Test("bucket_paren_receiver_lvalue_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("bucket_paren_receiver_lvalue_freed_once", dtorCount, 1);
+
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(1);
@@ -11627,7 +11645,7 @@ extern int main()
     total += 107;
 
     passed += testBucketAExpressionOwnership();
-    total += 94;
+    total += 99;
 
     passed += testDiscardMoveReturningCall();
     total += 6;

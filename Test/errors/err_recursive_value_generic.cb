@@ -1,0 +1,5 @@
+// The instantiated generic's by-value self field must be checked after substitution.
+expect_error("by-value cycle");
+struct RecursiveGeneric<T> { RecursiveGeneric<T> inner; };
+RecursiveGeneric<int> value = default;
+extern int main() { return 0; }

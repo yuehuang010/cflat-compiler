@@ -1,0 +1,10 @@
+// The compound pointer spelling must use the same non-integer-index diagnostic.
+expect_error("cannot add a value of type 'string' to a pointer") {
+    extern int main()
+    {
+        char* p = "abc";
+        string s = "x";
+        p += s;
+        return 0;
+    }
+}

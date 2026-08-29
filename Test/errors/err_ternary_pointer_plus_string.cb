@@ -1,0 +1,9 @@
+// A literal ternary is char* at the pointer-arithmetic site, so it must not reach LLVM GEP.
+expect_error("cannot add a value of type 'string' to a pointer") {
+    extern int main()
+    {
+        string name = "world";
+        string s = (true ? "a " : "b ") + name;
+        return s.length();
+    }
+}

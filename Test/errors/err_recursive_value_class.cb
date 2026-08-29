@@ -1,0 +1,4 @@
+// cflat classes are value types for layout and reject the same cycle.
+expect_error("field 'RecursiveClass.inner'");
+class RecursiveClass { RecursiveClass inner; int x = 1; };
+extern int main() { return 0; }

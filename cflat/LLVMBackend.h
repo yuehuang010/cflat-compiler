@@ -1328,6 +1328,8 @@ public:
         // The ternary result is already covered by a temp registration. Alias lowering uses this
         // to avoid registering its materialized copy a second time.
         bool TernaryTempAlreadyRegistered = false;
+        // True only for a parenthesized produced rvalue whose recovery spill is not an lvalue.
+        bool IsParenthesizedProducedTemp = false;
 
         llvm::Value* GetValue() const
         {
@@ -5810,6 +5812,9 @@ public:
     // D2: a `unique` field whose pointee transitively reaches a `unique` field of the same
     // type would synthesize a self-recursive destructor that overflows the stack on a long chain.
     void RejectUniqueDestructionCycles(const std::string& name, const std::vector<LLVMBackend::DeclTypeAndValue>& fields);
+
+    // Reject a transitive cycle through non-pointer aggregate fields, which has no finite layout.
+    void RejectByValueContainmentCycles(const std::string& name, const std::vector<LLVMBackend::DeclTypeAndValue>& fields);
 
     // Create StructType or OpaqueStruct
     //

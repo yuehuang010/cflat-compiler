@@ -901,6 +901,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 structVar.TypeAndValue = namedVar.TypeAndValue;
                                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                                structVar.IsParenthesizedProducedTemp = namedVar.IsParenthesizedProducedTemp;
+                                structVar.TernaryTempAlreadyRegistered = namedVar.TernaryTempAlreadyRegistered;
                                 structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
                                 structVar.BondedSources = namedVar.BondedSources;
                             }
@@ -1964,25 +1966,33 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             // temp slot, the same materialization the two-statement workaround
                             // (`string t = "abc"; t.length()`) performs. The wrapper points at a
                             // global constant, so the temp owns NOTHING and needs no destruction.
-                            if (prevPrimary->StringLiteral().size() == 1
-                                && childLimit > 1 && ctx->children[1]->getText() == "."
+                            if (childLimit > 1 && ctx->children[1]->getText() == "."
                                 && namedVar.Primary != nullptr
                                 && namedVar.TypeAndValue.TypeName.empty())
                             {
                                 auto* compilerP = Compiler(ctx);
-                                if (auto* strTy = llvm::StructType::getTypeByName(
-                                        *compilerP->context, "string"))
+                                bool isStringLiteral = prevPrimary->StringLiteral().size() == 1;
+                                if (!isStringLiteral && prevPrimary->expression() != nullptr)
                                 {
-                                    llvm::Value* strVal = namedVar.Primary->getType() == strTy
-                                        ? namedVar.Primary
-                                        : compilerP->WrapStringLiteralAsString(namedVar.Primary);
-                                    auto* tmp = compilerP->CreateAlloca(strTy);
-                                    compilerP->builder->CreateStore(strVal, tmp);
-                                    namedVar.Primary  = strVal;
-                                    namedVar.Storage  = tmp;
-                                    namedVar.BaseType = strTy;
-                                    namedVar.TypeAndValue = {};
-                                    namedVar.TypeAndValue.TypeName = "string";
+                                    if (auto* literalValue = llvm::dyn_cast<llvm::Constant>(namedVar.Primary))
+                                        isStringLiteral = compilerP->stringLiteralLenByPtr.count(literalValue) != 0;
+                                }
+                                if (isStringLiteral)
+                                {
+                                    if (auto* strTy = llvm::StructType::getTypeByName(
+                                            *compilerP->context, "string"))
+                                    {
+                                        llvm::Value* strVal = namedVar.Primary->getType() == strTy
+                                            ? namedVar.Primary
+                                            : compilerP->WrapStringLiteralAsString(namedVar.Primary);
+                                        auto* tmp = compilerP->CreateAlloca(strTy);
+                                        compilerP->builder->CreateStore(strVal, tmp);
+                                        namedVar.Primary  = strVal;
+                                        namedVar.Storage  = tmp;
+                                        namedVar.BaseType = strTy;
+                                        namedVar.TypeAndValue = {};
+                                        namedVar.TypeAndValue.TypeName = "string";
+                                    }
                                 }
                             }
                             // If the primary is a parenthesized cast expression, propagate its type
@@ -2025,6 +2035,34 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             lastParenExprCallerName.clear();
                             auto parenInnerNamed = lastParenExprNamed;
                             lastParenExprNamed = {};
+                            // A redundant inner paren already spilled the temp and proved the flag;
+                            // carry it out, or `((makeBox())).m()` leaks the receiver.
+                            bool parenthesizedProducedTemp = prevPrimary->expression() != nullptr
+                                && (parenInnerNamed.IsParenthesizedProducedTemp
+                                || (parenInnerNamed.Storage == nullptr
+                                    && parenInnerNamed.Primary != nullptr
+                                    && Compiler(ctx)->IsProducedTempValue(parenInnerNamed.Primary)
+                                    && !parenInnerNamed.TypeAndValue.Pointer
+                                    && !parenInnerNamed.TypeAndValue.IsAlias
+                                    && !parenInnerNamed.FromOwningTempField));
+
+                            // An expression result can carry its named struct type only in LLVM.
+                            // Recover it before materializing so method dispatch sees the receiver.
+                            if (prevPrimary->expression() != nullptr
+                                && namedVar.TypeAndValue.TypeName.empty()
+                                && namedVar.Primary != nullptr)
+                            {
+                                if (auto* st = llvm::dyn_cast<llvm::StructType>(namedVar.Primary->getType());
+                                    st != nullptr && st->hasName())
+                                {
+                                    std::string typeName = st->getName().str();
+                                    if (Compiler(ctx)->IsDataStructure(typeName))
+                                    {
+                                        namedVar.TypeAndValue.TypeName = typeName;
+                                        namedVar.BaseType = st;
+                                    }
+                                }
+                            }
 
                             // A parenthesized expression yielding a known struct publishes its type
                             // and (for an lvalue) its storage through the side channel above, but
@@ -2056,6 +2094,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         namedVar.Storage = tmp;
                                     }
                                 }
+                            }
+                            if (parenthesizedProducedTemp)
+                            {
+                                namedVar.IsParenthesizedProducedTemp = true;
+                                namedVar.TernaryTempAlreadyRegistered = parenInnerNamed.TernaryTempAlreadyRegistered;
                             }
                             // A parenthesized POINTER lvalue keeps its element type too: the
                             // delete-retire null store pairs Storage with BaseType, and without it
@@ -7221,7 +7264,9 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
                                     LLVMBackend::NamedVariable& thisArg,
                                     const std::string& functionName) {
         const std::string& typeName = receiver.TypeAndValue.TypeName;
-        if (receiver.Primary == nullptr || receiver.Storage != nullptr) return;
+        bool parenthesizedSpill = receiver.IsParenthesizedProducedTemp;
+        if (receiver.Primary == nullptr && (!parenthesizedSpill || receiver.Storage == nullptr)) return;
+        if (receiver.Storage != nullptr && !parenthesizedSpill) return;
         if (receiver.BaseType == nullptr || !receiver.BaseType->isStructTy()) return;
         if (receiver.TypeAndValue.Pointer) return;
         if (typeName.empty() || typeName == "__closure_fat_ptr") return;
@@ -7235,6 +7280,14 @@ void MainListener::RegisterOwningTempReceiver(antlr4::ParserRuleContext* ctx,
         }
         if (!compiler->IsOwningValueType(typeName)) return;
         if (MethodConsumesReceiver(functionName, typeName)) return;
+
+        if (parenthesizedSpill && receiver.Storage != nullptr)
+        {
+            if (!receiver.TernaryTempAlreadyRegistered)
+                compiler->RegisterOwnedStructTemp(receiver.Storage, typeName);
+            thisArg.Storage = receiver.Storage;
+            return;
+        }
 
         auto* tempAlloca = compiler->AllocaAtEntry(receiver.BaseType, nullptr, "recvtemp");
         compiler->builder->CreateStore(receiver.Primary, tempAlloca);

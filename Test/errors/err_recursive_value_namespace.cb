@@ -1,0 +1,4 @@
+// Qualified type names must retain the field's namespace in the diagnostic.
+expect_error("by-value cycle");
+namespace RecursiveNS { struct Recursive { Recursive inner; }; }
+extern int main() { return 0; }
