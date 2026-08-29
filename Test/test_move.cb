@@ -4404,6 +4404,29 @@ int testBucketAExpressionOwnership()
         passed += Test("bucket_paren_receiver_temp_freed_once", dtorCount, 1);
     }
 
+    // A redundant inner paren already spills the temp; the flag must carry out or the
+    // receiver leaks (review-caught: ((make())).m() ran zero destructors).
+    dtorCount = 0;
+    {
+        int got = ((makeUniqueBox(114))).boxId();
+        passed += Test("bucket_double_paren_receiver_temp_value", got, 114);
+        passed += Test("bucket_double_paren_receiver_temp_freed_once", dtorCount, 1);
+    }
+    dtorCount = 0;
+    {
+        int got = (((makeUniqueBox(115)))).boxId();
+        passed += Test("bucket_triple_paren_receiver_temp_value", got, 115);
+        passed += Test("bucket_triple_paren_receiver_temp_freed_once", dtorCount, 1);
+    }
+
+    // A parenthesized ternary of produced temps registers destruction exactly once.
+    dtorCount = 0;
+    {
+        int got = ((identityBool(false) ? makeUniqueBox(116) : makeUniqueBox(117))).boxId();
+        passed += Test("bucket_double_paren_ternary_temp_value", got, 117);
+        passed += Test("bucket_double_paren_ternary_temp_freed_once", dtorCount, 1);
+    }
+
     // Parentheses around an lvalue must not turn its existing storage into a temp owner.
     dtorCount = 0;
     {
@@ -4413,6 +4436,16 @@ int testBucketAExpressionOwnership()
         passed += Test("bucket_paren_receiver_lvalue_not_freed_early", dtorCount, 0);
     }
     passed += Test("bucket_paren_receiver_lvalue_freed_once", dtorCount, 1);
+
+    // Double parens around an lvalue: still borrowed, still exactly one scope-exit dtor.
+    dtorCount = 0;
+    {
+        UniqueBox local = makeUniqueBox(118);
+        int got = ((local)).boxId();
+        passed += Test("bucket_double_paren_lvalue_value", got, 118);
+        passed += Test("bucket_double_paren_lvalue_not_freed_early", dtorCount, 0);
+    }
+    passed += Test("bucket_double_paren_lvalue_freed_once", dtorCount, 1);
 
     dtorCount = 0;
     {
@@ -11645,7 +11678,7 @@ extern int main()
     total += 107;
 
     passed += testBucketAExpressionOwnership();
-    total += 99;
+    total += 108;
 
     passed += testDiscardMoveReturningCall();
     total += 6;
