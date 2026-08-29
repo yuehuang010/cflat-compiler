@@ -2801,6 +2801,11 @@ target type, an overload, an enclosing expression) can still widen it:
 
 - **Integers**: `5` is `i8`, `300` is `i16`, `100000` is `i32`, and a value past `i32`
   is `i64`. Widening to a larger type is implicit; narrowing is not.
+- **Overload resolution sees the inferred type.** In a set that overloads on integer
+  width, `f(5)` picks `f(i8)` over `f(i32)` because `5` is typed `i8` - unlike C, where
+  an unsuffixed literal is always `int`. This is by design; use a suffix (`5u`, `123L`)
+  or a cast to steer the pick. Calls with a single candidate are unaffected (widening
+  is implicit), and variadic arguments are promoted as in C.
 - **Floating point**: a no-suffix decimal is `float` (f32) when it round-trips through
   float without loss of precision, otherwise `double` (f64). So `1.5` and `100.0` are
   `float`, while `0.1` and `3.141592653589793` (which lose precision in float) are
