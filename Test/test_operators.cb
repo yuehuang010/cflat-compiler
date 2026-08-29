@@ -656,12 +656,14 @@ extern int main()
 
 
     int promoPassed = promotionAndLiteralLegs();
+    int signednessPassed = primitiveBinarySignednessLegs();
+    int autoNarrowPassed = autoNarrowMixedSignednessLegs();
     int joinAcceptPassed = stringLiteralJoinAcceptLegs();
 
     return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
-        && joinAcceptPassed == 5) ? 0 : 1;
+        && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
@@ -698,6 +700,199 @@ int promotionAndLiteralLegs()
     passed += Test("ternary arm keeps literal unsignedness", ternaryWide == (i64)4294967295, true);
     passed += Test("default parameter keeps literal unsignedness",
         unsignedDefaultParam() == (i64)4294967295, true);
+    return passed;
+}
+
+int primitiveBitwiseOrCompare(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue | unsignedValue) > 0;
+}
+
+i64 primitiveBitwiseOrDivide(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue | unsignedValue) / 2;
+}
+
+int primitiveBitwiseOrCompareReverse(u32 unsignedValue, i64 signedValue)
+{
+    return (unsignedValue | signedValue) > 0;
+}
+
+i64 primitiveBitwiseOrDivideReverse(u32 unsignedValue, i64 signedValue)
+{
+    return (unsignedValue | signedValue) / 2;
+}
+
+int primitiveBitwiseXorCompare(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue ^ unsignedValue) > 0;
+}
+
+i64 primitiveBitwiseXorDivide(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue ^ unsignedValue) / 2;
+}
+
+int primitiveBitwiseXorCompareReverse(u32 unsignedValue, i64 signedValue)
+{
+    return (unsignedValue ^ signedValue) > 0;
+}
+
+i64 primitiveBitwiseXorDivideReverse(u32 unsignedValue, i64 signedValue)
+{
+    return (unsignedValue ^ signedValue) / 2;
+}
+
+int primitiveBitwiseAndCompare(i64 signedValue, u32 unsignedValue)
+{
+    return ~(signedValue & unsignedValue) > 0;
+}
+
+i64 primitiveBitwiseAndDivide(i64 signedValue, u32 unsignedValue)
+{
+    return ~(signedValue & unsignedValue) / 2;
+}
+
+int primitiveBitwiseAndCompareReverse(u32 unsignedValue, i64 signedValue)
+{
+    return ~(unsignedValue & signedValue) > 0;
+}
+
+i64 primitiveBitwiseAndDivideReverse(u32 unsignedValue, i64 signedValue)
+{
+    return ~(unsignedValue & signedValue) / 2;
+}
+
+int primitiveAddI64U32Compare(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue + unsignedValue) > 0;
+}
+
+i64 primitiveAddI64U32Divide(i64 signedValue, u32 unsignedValue)
+{
+    return (signedValue + unsignedValue) / 2;
+}
+
+int primitiveAddU64I32Compare(u64 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) > 0;
+}
+
+i64 primitiveAddU64I32Divide(u64 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) / 2;
+}
+
+int primitiveAddU32I32Compare(u32 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) > 0;
+}
+
+i64 primitiveAddU32I32Divide(u32 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) / 2;
+}
+
+int primitiveAddU8I32Compare(u8 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) > 0;
+}
+
+i64 primitiveAddU8I32Divide(u8 unsignedValue, i32 signedValue)
+{
+    return (unsignedValue + signedValue) / 2;
+}
+
+int primitiveBinarySignednessLegs()
+{
+    int passed = 0;
+    i64 signedValue = -1;
+    u32 zero = 0;
+    u32 mask = 0xFFFFFFFF;
+
+    // These signed i64/u32 legs fail with the rejected strict-OR candidate rule, not on master:
+    // master's LHS-only bitwise rule already reads the widened lhs, so these pass pre-change too.
+    passed += Test("runtime bitwise | signed lhs compare", primitiveBitwiseOrCompare(signedValue, zero), false);
+    passed += Test("runtime bitwise | unsigned lhs compare", primitiveBitwiseOrCompareReverse(zero, signedValue), false);
+    passed += Test("runtime bitwise | signed lhs divide", primitiveBitwiseOrDivide(signedValue, zero), 0);
+    passed += Test("runtime bitwise | unsigned lhs divide", primitiveBitwiseOrDivideReverse(zero, signedValue), 0);
+    // Same: these fail with strict-OR only, for the same downstream result-flag reason.
+    passed += Test("runtime bitwise ^ signed lhs compare", primitiveBitwiseXorCompare(signedValue, zero), false);
+    passed += Test("runtime bitwise ^ unsigned lhs compare", primitiveBitwiseXorCompareReverse(zero, signedValue), false);
+    passed += Test("runtime bitwise ^ signed lhs divide", primitiveBitwiseXorDivide(signedValue, zero), 0);
+    passed += Test("runtime bitwise ^ unsigned lhs divide", primitiveBitwiseXorDivideReverse(zero, signedValue), 0);
+    // Same: these fail with strict-OR only; ~ preserves the negative signed result.
+    passed += Test("runtime bitwise & signed lhs compare", primitiveBitwiseAndCompare(signedValue, mask), false);
+    passed += Test("runtime bitwise & unsigned lhs compare", primitiveBitwiseAndCompareReverse(mask, signedValue), false);
+    passed += Test("runtime bitwise & signed lhs divide", primitiveBitwiseAndDivide(signedValue, mask), -2147483648);
+    passed += Test("runtime bitwise & unsigned lhs divide", primitiveBitwiseAndDivideReverse(mask, signedValue), -2147483648);
+
+    // Folded legs exercise the same three handlers without parameter loads.
+    // These folded legs also fail with strict-OR only (they pass on master), because the
+    // result flag is still consumed downstream.
+    passed += Test("folded bitwise | signed lhs compare", ((i64)-1 | (u32)0) > 0, false);
+    passed += Test("folded bitwise | unsigned lhs compare", ((u32)0 | (i64)-1) > 0, false);
+    passed += Test("folded bitwise | signed lhs divide", ((i64)-1 | (u32)0) / 2, 0);
+    passed += Test("folded bitwise | unsigned lhs divide", ((u32)0 | (i64)-1) / 2, 0);
+    passed += Test("folded bitwise ^ signed lhs compare", ((i64)-1 ^ (u32)0) > 0, false);
+    passed += Test("folded bitwise ^ unsigned lhs compare", ((u32)0 ^ (i64)-1) > 0, false);
+    passed += Test("folded bitwise ^ signed lhs divide", ((i64)-1 ^ (u32)0) / 2, 0);
+    passed += Test("folded bitwise ^ unsigned lhs divide", ((u32)0 ^ (i64)-1) / 2, 0);
+    passed += Test("folded bitwise & signed lhs compare", ~((i64)-1 & (u32)0xFFFFFFFF) > 0, false);
+    passed += Test("folded bitwise & unsigned lhs compare", ~((u32)0xFFFFFFFF & (i64)-1) > 0, false);
+    passed += Test("folded bitwise & signed lhs divide", ~((i64)-1 & (u32)0xFFFFFFFF) / 2, -2147483648);
+    passed += Test("folded bitwise & unsigned lhs divide", ~((u32)0xFFFFFFFF & (i64)-1) / 2, -2147483648);
+
+    // These folded cells fail on master: narrow signedness must survive downstream.
+    passed += Test("folded narrow | downstream compare",
+        (((u8)255 | (i8)-1) + (i64)1) > 0, false);
+    passed += Test("folded narrow | downstream divide",
+        (((u8)255 | (i8)-1) + (i64)1) / 2, 0);
+    passed += Test("folded narrow ^ downstream compare",
+        (((u8)0 ^ (i8)-1) + (i64)1) > 0, false);
+    passed += Test("folded narrow ^ downstream divide",
+        (((u8)0 ^ (i8)-1) + (i64)1) / 2, 0);
+    passed += Test("folded narrow & downstream compare",
+        (((u8)255 & (i8)-1) | (i8)-1) > 0, false);
+    passed += Test("folded narrow & downstream divide",
+        (((u8)255 & (i8)-1) | (i8)-1) / 2, 0);
+
+    // The i64/u32 leg fails with strict-OR; the wider signed operand must absorb u32.
+    passed += Test("add i64/u32 wider signed compare", primitiveAddI64U32Compare(signedValue, zero), false);
+    passed += Test("add i64/u32 wider signed divide", primitiveAddI64U32Divide(signedValue, zero), 0);
+    // Each opposite-boundary leg includes the i64/u32 sentinel, so strict-OR fails while the
+    // leg still asserts the unsigned comparison/division value named by its rank boundary.
+    u64 zeroWide = 0;
+    i32 negative = -1;
+    passed += Test("add u64/i32 unsigned rank compare",
+        primitiveAddU64I32Compare(zeroWide, negative) && !primitiveAddI64U32Compare(signedValue, zero), true);
+    passed += Test("add u64/i32 unsigned rank divide",
+        primitiveAddU64I32Divide(zeroWide, negative) == 9223372036854775807
+            && primitiveAddI64U32Divide(signedValue, zero) == 0, true);
+    passed += Test("add u32/i32 equal rank compare",
+        primitiveAddU32I32Compare(zero, negative) && !primitiveAddI64U32Compare(signedValue, zero), true);
+    passed += Test("add u32/i32 equal rank divide",
+        primitiveAddU32I32Divide(zero, negative) == 2147483647
+            && primitiveAddI64U32Divide(signedValue, zero) == 0, true);
+    // The u8 operand promotes to signed i32; strict-OR incorrectly leaves the result unsigned.
+    u8 zeroByte = 0;
+    passed += Test("add u8/i32 promoted signed compare", primitiveAddU8I32Compare(zeroByte, negative), false);
+    passed += Test("add u8/i32 promoted signed divide", primitiveAddU8I32Divide(zeroByte, negative), 0);
+    return passed;
+}
+
+int autoNarrowMixedSignednessLegs()
+{
+    int passed = 0;
+    // Each operator spelling is a discriminator. Master gives 4294967295; pre-fix branch rejects auto.
+    auto narrowOr = (u8)0 | (i8)-1;
+    passed += Test("auto narrow mixed-sign |", narrowOr, -1);
+    auto narrowAdd = (u8)0 + (i32)-1;
+    passed += Test("auto narrow mixed-sign +", narrowAdd, -1);
+    auto narrowMultiply = (u8)1 * (i8)-1;
+    passed += Test("auto narrow mixed-sign *", narrowMultiply, -1);
+    auto narrowXor = (u16)0 ^ (i16)-1;
+    passed += Test("auto narrow mixed-sign ^", narrowXor, -1);
     return passed;
 }
 

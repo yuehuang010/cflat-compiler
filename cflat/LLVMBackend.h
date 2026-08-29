@@ -1510,6 +1510,7 @@ public:
     {
         llvm::Value* value      = nullptr;
         bool         isUnsigned = false;
+        bool         isUnsignedStorage = false;
         llvm::Type*  elemType   = nullptr;  // non-null when value is a pointer (enables ptr+int GEP)
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join

@@ -307,13 +307,14 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                 if (result.Primary)
                 {
                     result.BaseType = result.Primary->getType();
-                    if (tv.isUnsigned && result.Primary->getType()->isIntegerTy())
+                    if (result.Primary->getType()->isIntegerTy())
                     {
                         unsigned bits = result.Primary->getType()->getIntegerBitWidth();
-                        if      (bits == 8)  result.TypeAndValue.TypeName = "u8";
-                        else if (bits == 16) result.TypeAndValue.TypeName = "u16";
-                        else if (bits == 32) result.TypeAndValue.TypeName = "u32";
-                        else if (bits == 64) result.TypeAndValue.TypeName = "u64";
+                        bool isUnsigned = tv.isUnsigned || tv.isUnsignedStorage;
+                        if      (bits == 8)  result.TypeAndValue.TypeName = isUnsigned ? "u8"  : "i8";
+                        else if (bits == 16) result.TypeAndValue.TypeName = isUnsigned ? "u16" : "i16";
+                        else if (bits == 32) result.TypeAndValue.TypeName = isUnsigned ? "u32" : "int";
+                        else if (bits == 64) result.TypeAndValue.TypeName = isUnsigned ? "u64" : "i64";
                     }
                     // A '?:' join of two interface values yields a phi/select with no NamedVariable
                     // of its own to carry IsInterface/TypeName - it is a bare fat {vtable,data}
@@ -4051,14 +4052,25 @@ static bool TernaryJoinIsUnsigned(bool trueUnsigned, unsigned trueBits,
     return trueUnsigned ? trueBits >= falseBits : falseBits >= trueBits;
 }
 
-static bool BinaryJoinIsUnsigned(bool leftUnsigned, llvm::Value* left,
-                                 bool rightUnsigned, llvm::Value* right)
+static unsigned BinaryOperandBits(llvm::Value* value)
 {
-    unsigned leftBits = left != nullptr && left->getType()->isIntegerTy()
-        ? left->getType()->getIntegerBitWidth() : 0;
-    unsigned rightBits = right != nullptr && right->getType()->isIntegerTy()
-        ? right->getType()->getIntegerBitWidth() : 0;
-    return TernaryJoinIsUnsigned(leftUnsigned, leftBits, rightUnsigned, rightBits);
+    return value != nullptr && value->getType()->isIntegerTy()
+        ? value->getType()->getIntegerBitWidth() : 0;
+}
+
+static bool BinaryJoinIsUnsigned(bool leftUnsigned, unsigned leftBits,
+                                 bool rightUnsigned, unsigned rightBits)
+{
+    if (leftBits == 0 || rightBits == 0)
+        return leftUnsigned || rightUnsigned;
+
+    // C promotes every integer narrower than int to signed int before this rank check.
+    if (leftBits < 32) { leftBits = 32; leftUnsigned = false; }
+    if (rightBits < 32) { rightBits = 32; rightUnsigned = false; }
+
+    if (leftUnsigned == rightUnsigned)
+        return leftUnsigned;
+    return leftUnsigned ? leftBits >= rightBits : rightBits >= leftBits;
 }
 
 bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContext* ctx,
@@ -5028,6 +5040,7 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
+            bool unsignedStorage = false;
             for (size_t i = 1; i < exclusiveCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
@@ -5052,13 +5065,19 @@ LLVMBackend::TypedValue MainListener::ParseInclusiveOrExpression(CFlatParser::In
                 }
                 else
                 {
-                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    bool resultUnsigned = BinaryJoinIsUnsigned(
+                        lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseOr, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
+                        && acc->getType()->getIntegerBitWidth() < 32
+                        && (lv.isUnsigned || rv.isUnsigned);
                     lv.isUnsigned = resultUnsigned;
                 }
             }
-            return { acc, lv.isUnsigned };
+            LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
+            result.isUnsignedStorage = unsignedStorage;
+            return result;
         }
 
         LogErrorContext(ctx, "Inclusive-OR expression has no operands.");
@@ -5079,6 +5098,7 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
+            bool unsignedStorage = false;
             for (size_t i = 1; i < andCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
@@ -5103,13 +5123,19 @@ LLVMBackend::TypedValue MainListener::ParseExclusiveOrExpression(CFlatParser::Ex
                 }
                 else
                 {
-                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    bool resultUnsigned = BinaryJoinIsUnsigned(
+                        lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseXor, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
+                        && acc->getType()->getIntegerBitWidth() < 32
+                        && (lv.isUnsigned || rv.isUnsigned);
                     lv.isUnsigned = resultUnsigned;
                 }
             }
-            return { acc, lv.isUnsigned };
+            LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
+            result.isUnsignedStorage = unsignedStorage;
+            return result;
         }
 
         LogErrorContext(ctx, "Exclusive-OR expression has no operands.");
@@ -5130,6 +5156,7 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
             RegisterBorrowedStringOperandTemp(compiler, lv.value);
             compiler->RegisterOwnedPtrTemp(lv.value);
             llvm::Value* acc = lv.value;
+            bool unsignedStorage = false;
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 compiler->lastCallReturnsOwned = false;
@@ -5154,13 +5181,19 @@ LLVMBackend::TypedValue MainListener::ParseAndExpression(CFlatParser::AndExpress
                 }
                 else
                 {
-                    bool resultUnsigned = BinaryJoinIsUnsigned(lv.isUnsigned, acc, rv.isUnsigned, rv.value);
+                    bool resultUnsigned = BinaryJoinIsUnsigned(
+                        lv.isUnsigned, BinaryOperandBits(acc), rv.isUnsigned, BinaryOperandBits(rv.value));
                     acc = compiler->CreateOperation(LLVMBackend::Operation::BitwiseAnd, acc, rv.value,
                                                      lv.isUnsigned, rv.isUnsigned);
+                    unsignedStorage = acc != nullptr && acc->getType()->isIntegerTy()
+                        && acc->getType()->getIntegerBitWidth() < 32
+                        && (lv.isUnsigned || rv.isUnsigned);
                     lv.isUnsigned = resultUnsigned;
                 }
             }
-            return { acc, lv.isUnsigned };
+            LLVMBackend::TypedValue result{ acc, lv.isUnsigned };
+            result.isUnsignedStorage = unsignedStorage;
+            return result;
         }
 
         LogErrorContext(ctx, "Bitwise-AND expression has no operands.");
@@ -6327,6 +6360,7 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
             llvm::Value* lvalue = lv.value;
             bool lu = lv.isUnsigned;
             llvm::Type* elemType = lv.elemType;
+            bool unsignedStorage = false;
             TrackOwnedStringOperatorResult(Compiler(ctx), lvalue);
             // String concat (+) only borrows its operands: a plain (non-move) string-returning
             // call leaves lastCallReturnsOwned false, so TrackOwnedStringOperatorResult skips it.
@@ -6377,7 +6411,9 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                 }
                 else
                 {
-                auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
+                    unsigned leftBits = BinaryOperandBits(lvalue);
+                    unsigned rightBits = BinaryOperandBits(rvalue);
+                    auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
                                                               rv.pointerDepth, rv.elemPointer);
 
                 // char* + char* concatenation: TryBinaryOperatorOverload dispatches off a struct lvalue
@@ -6417,13 +6453,17 @@ LLVMBackend::TypedValue MainListener::ParseAdditiveExpression(CFlatParser::Addit
                         DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                     }
                     lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                    unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
+                        && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
                     // An overload's signedness is its RETURN type, not the operands' flags.
-                    lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1 : (lu || ru);
+                    lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1
+                                  : BinaryJoinIsUnsigned(lu, leftBits, ru, rightBits);
                     elemType = nullptr;  // arithmetic result is no longer a pointer
                 }
             }
 
             LLVMBackend::TypedValue result{ lvalue, lu };
+            result.isUnsignedStorage = unsignedStorage;
             result.elemType = elemType;
             return result;
         }
@@ -6967,12 +7007,15 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
             auto firstNV = ParseCastExpression(nextCtxs[0], false, ResultUse::Value);
             bool lu = firstNV.TypeAndValue.IsUnsignedInteger() != -1;
             llvm::Value* lvalue = LoadNamedVariable(firstNV);
+            bool unsignedStorage = false;
 
             for (size_t i = 1; i < nextCtxs.size(); i++)
             {
                 auto rightNV = ParseCastExpression(nextCtxs[i], false, ResultUse::Value);
                 bool ru = rightNV.TypeAndValue.IsUnsignedInteger() != -1;
                 llvm::Value* rvalue = LoadNamedVariable(rightNV);
+                unsigned leftBits = BinaryOperandBits(lvalue);
+                unsigned rightBits = BinaryOperandBits(rvalue);
                 std::string op = ctx->children[i * 2 - 1]->getText();
 
                 auto* overload = TryBinaryOperatorOverload(lvalue, op, rvalue, ctx, nullptr,
@@ -6987,11 +7030,16 @@ LLVMBackend::TypedValue MainListener::ParseMultiplicativeExpression(CFlatParser:
                     DiagnoseVoidResultConsumed(ctx, resultNV, use, std::format("'operator{}'", op));
                 }
                 lvalue = overload ? overload : Compiler(ctx)->CreateOperation(op, lvalue, rvalue, lu, ru);
+                unsignedStorage = !overload && lvalue != nullptr && lvalue->getType()->isIntegerTy()
+                    && lvalue->getType()->getIntegerBitWidth() < 32 && (lu || ru);
                 // An overload's signedness is its RETURN type, not the operands' flags.
-                lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1 : (lu || ru);
+                lu = overload ? Compiler(ctx)->lastCallReturnType.IsUnsignedInteger() != -1
+                              : BinaryJoinIsUnsigned(lu, leftBits, ru, rightBits);
             }
 
-            return { lvalue, lu };
+            LLVMBackend::TypedValue result{ lvalue, lu };
+            result.isUnsignedStorage = unsignedStorage;
+            return result;
         }
 
         LogErrorContext(ctx, "Multiplicative expression has no operands.");
