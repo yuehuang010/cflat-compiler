@@ -62,6 +62,32 @@ test_basic.cb). Items 4-6 remain.
    choices, whole-unoptimized / whole-optimized) and status-bar timings (last refresh's
    analyze/emit ms, cached flag) - item complete.
 
+## In progress: item 4, incremental -O2 rebuild (timeboxed attempt 2026-08-30)
+
+A 3-hour timeboxed attempt lives on branch feature/incremental-o2-wip (commit
+a6ae198); it is NOT on master. Design that survived contact with the code:
+snapshot the optimized module as context-free bitcode (+ pre-opt
+StructuralHash per function, global content hashes, name-keyed call graph,
+address-taken set, remarks) in ResetForReanalysis - required because reset
+destroys the LLVMContext; diff against the next analysis; re-optimize only
+changed functions + transitive callers (+ their callee closure for faithful
+inlining); rebuild the module by llvm::Linker OverrideFromSrc with dest = full
+clone of the NEW analyzed module and src = old optimized snapshot with the
+re-optimized bodies deleted (the reverse direction crashes: erasing
+functions/globals whose uses remain in kept bodies is UB with assertions-off
+LLVM); protect kept bodies with optnone+noinline through the pipeline.
+
+Works end-to-end on a small file (demo_view.cb: reopt=9/468, emit 75ms vs
+104ms full, semantically identical output). Three blockers before landing,
+recorded in the WIP commit message: (1) the callee closure explodes to the
+too-wide fallback on test_basic-sized files - needs an inlining-depth-bounded
+closure or a measured decision to inline old-optimized callee bodies; (2)
+private-global/attribute-group renumbering plus one extra surviving function
+break byte-faithfulness; (3) the scratch/measure_incremental_o2.py driver's
+new-string scenarios report no invalidation - driver bug. The snapshot struct
+is deliberately file-serializable so the same machinery can later persist next
+to -o outputs for incremental normal builds (maintainer request 2026-08-30).
+
 ## Rejected: two-stage SLL parsing (investigated 2026-08-30)
 
 Parse (~300 ms on test_basic) looked like the biggest single analyze cost, so the
