@@ -7831,6 +7831,7 @@ public:
     void ResetForReanalysis();
     bool PrintModuleView(std::string& out, const std::string& kind, int optLevel,
                          const std::string& functionName,
+                         bool wholeModule = false,
                          std::vector<LineMapping>* mappings = nullptr);
 
     // Measure optimization facts at optLevel: Tier 1 per function (one entry per input,

@@ -17,6 +17,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <thread>
+#include <chrono>
 #include <unordered_map>
 #include <atomic>
 #include <csignal>
@@ -502,6 +503,7 @@ public:
             poolSize_ = poolSizeOverride;
         backendPool_.reserve(poolSize_);
         backendAnalyzed_.resize(poolSize_, false);
+        analysisRecords_.resize(poolSize_);
         for (unsigned int i = 0; i < poolSize_; ++i)
         {
             auto b = std::make_unique<LLVMBackend>();
@@ -1385,6 +1387,17 @@ private:
             optLevel = static_cast<int>(rawLevel);
         }
 
+        bool wholeModule = false;
+        if (params->contains("wholeModule"))
+        {
+            if (!(*params)["wholeModule"].is_boolean())
+            {
+                SendError(id, -32602, "Invalid cflat/viewAssembly wholeModule parameter");
+                return;
+            }
+            wholeModule = (*params)["wholeModule"].get<bool>();
+        }
+
         std::optional<std::string> function;
         std::optional<int> line;
         if (params->contains("filter"))
@@ -1437,8 +1450,10 @@ private:
             }
             doc = it->second;
         }
-        EnqueueAnalysis(uri, doc.filePath, doc.text,
-                        IrRequest{*id, kind, optLevel, std::move(function), line});
+        IrRequest request{*id, kind, optLevel, function, line, wholeModule};
+        if (TrySendCachedView(uri, doc.text, request))
+            return;
+        EnqueueAnalysis(uri, doc.filePath, doc.text, std::move(request));
     }
 
     // Rides the IrRequest path deliberately: every "a response is owed" guard, the
@@ -1497,6 +1512,8 @@ private:
         }
         IrRequest request{*id, "optinfo", optLevel, std::nullopt, std::nullopt};
         request.withRemarks = withRemarks;
+        if (TrySendCachedView(uri, doc.text, request))
+            return;
         EnqueueAnalysis(uri, doc.filePath, doc.text, std::move(request));
     }
 
@@ -1504,11 +1521,19 @@ private:
     // Job dispatch - every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
 
+    struct ViewTimings
+    {
+        int64_t analyzeMs = 0;
+        int64_t emitMs = 0;
+        int64_t totalMs = 0;
+    };
+
     struct AnalysisJob
     {
         std::string uri;
         std::string filePath;
         std::string text;
+        uint64_t    textHash = 0;
         uint64_t    generation = 0;
         struct IrRequest
         {
@@ -1517,12 +1542,68 @@ private:
             int optLevel = 0;
             std::optional<std::string> function;
             std::optional<int> line;
+            bool wholeModule = false;
             bool withRemarks = true;   // optinfo only
         };
         std::optional<IrRequest> irRequest;
     };
 
     using IrRequest = AnalysisJob::IrRequest;
+
+    struct ViewCacheKey
+    {
+        std::string uri;
+        uint64_t textHash = 0;
+        uint64_t textLen = 0;
+        std::string kind;
+        int optLevel = 0;
+        std::optional<std::string> function;
+        std::optional<int> line;
+        bool wholeModule = false;
+        bool withRemarks = true;
+
+        bool operator==(const ViewCacheKey& other) const
+        {
+            return uri == other.uri && textHash == other.textHash && textLen == other.textLen
+                && kind == other.kind && optLevel == other.optLevel
+                && function == other.function && line == other.line
+                && wholeModule == other.wholeModule
+                && withRemarks == other.withRemarks;
+        }
+    };
+
+    struct ViewCacheEntry
+    {
+        ViewCacheKey key;
+        nlohmann::json result;
+    };
+
+    static constexpr size_t kViewCacheCapacity = 8;
+
+    struct AnalysisRecord
+    {
+        std::string uri;
+        uint64_t textHash = 0;
+        uint64_t textLen = 0;
+        bool analyzeDebugInfo = false;
+        bool ok = false;
+        std::shared_ptr<LspSymbolIndex> index;
+    };
+
+    static uint64_t TextHash(const std::string& text)
+    {
+        return static_cast<uint64_t>(std::hash<std::string>{}(text));
+    }
+
+    ViewCacheKey MakeViewCacheKey(const std::string& uri, const std::string& text,
+                                  const IrRequest& request) const
+    {
+        return {
+            uri, TextHash(text), static_cast<uint64_t>(text.size()), request.kind,
+            request.optLevel, request.function, request.line, request.wholeModule,
+            request.withRemarks
+        };
+    }
 
     void EnqueueAnalysis(const std::string& uri, const std::string& filePath, const std::string& text,
                          std::optional<IrRequest> irRequest = std::nullopt)
@@ -1531,6 +1612,7 @@ private:
         job.uri = uri;
         job.filePath = filePath;
         job.text = text;
+        job.textHash = TextHash(text);
         job.irRequest = std::move(irRequest);
         {
             std::lock_guard<std::mutex> lock(uriGenMutex_);
@@ -1541,6 +1623,120 @@ private:
             jobQueue_.push_back(std::move(job));
         }
         jobCV_.notify_one();
+    }
+
+    std::optional<nlohmann::json> TakeCachedView(const ViewCacheKey& key)
+    {
+        std::lock_guard<std::mutex> lock(viewCacheMutex_);
+        for (auto it = viewCache_.begin(); it != viewCache_.end(); ++it)
+        {
+            if (!(it->key == key))
+                continue;
+            nlohmann::json result = it->result;
+            auto entry = std::move(*it);
+            viewCache_.erase(it);
+            viewCache_.push_front(std::move(entry));
+            return result;
+        }
+        return std::nullopt;
+    }
+
+    void InsertCachedView(const ViewCacheKey& key, nlohmann::json result)
+    {
+        std::lock_guard<std::mutex> lock(viewCacheMutex_);
+        for (auto it = viewCache_.begin(); it != viewCache_.end();)
+        {
+            if (it->key == key)
+                it = viewCache_.erase(it);
+            else
+                ++it;
+        }
+        viewCache_.push_front({key, std::move(result)});
+        if (viewCache_.size() > kViewCacheCapacity)
+            viewCache_.pop_back();
+    }
+
+    static void SetResponseTimings(nlohmann::json& result, const ViewTimings& timings)
+    {
+        result["timings"] = {
+            {"analyzeMs", timings.analyzeMs},
+            {"emitMs", timings.emitMs},
+            {"totalMs", timings.totalMs}
+        };
+    }
+
+    bool TrySendCachedView(const std::string& uri, const std::string& text,
+                           const IrRequest& request)
+    {
+        auto cached = TakeCachedView(MakeViewCacheKey(uri, text, request));
+        if (!cached)
+            return false;
+
+        AnalysisJob job;
+        job.uri = uri;
+        job.text = text;
+        job.textHash = TextHash(text);
+        job.irRequest = request;
+        ViewTimings timings;
+        SetResponseTimings(*cached, timings);
+        (*cached)["cached"] = true;
+        if (request.kind == "optinfo")
+        {
+            size_t functions = (*cached).value("functions", nlohmann::json::array()).size();
+            size_t remarks = (*cached).value("remarks", nlohmann::json::array()).size();
+            LogViewTiming(job, timings, 0, 0, functions, remarks, true);
+        }
+        else
+        {
+            size_t textSize = (*cached).value("text", std::string{}).size();
+            size_t mappings = (*cached).value("mappings", nlohmann::json::array()).size();
+            LogViewTiming(job, timings, textSize, mappings, 0, 0, true);
+        }
+        SendResponse(std::optional<nlohmann::json>{request.id}, std::move(*cached));
+        return true;
+    }
+
+    bool AnalysisRecordMatches(size_t slot, const AnalysisJob& job) const
+    {
+        if (!job.irRequest)
+            return false;
+        std::lock_guard<std::mutex> lock(analysisRecordMutex_);
+        const auto& record = analysisRecords_[slot];
+        return record.ok && record.analyzeDebugInfo
+            && record.uri == job.uri
+            && record.textHash == job.textHash
+            && record.textLen == static_cast<uint64_t>(job.text.size())
+            && record.index != nullptr;
+    }
+
+    std::shared_ptr<LspSymbolIndex> ReusableAnalysisIndex(size_t slot, const AnalysisJob& job) const
+    {
+        if (!job.irRequest)
+            return nullptr;
+        std::lock_guard<std::mutex> lock(analysisRecordMutex_);
+        const auto& record = analysisRecords_[slot];
+        if (!record.ok || !record.analyzeDebugInfo || record.uri != job.uri
+            || record.textHash != job.textHash
+            || record.textLen != static_cast<uint64_t>(job.text.size())
+            || !record.index)
+            return nullptr;
+        return record.index;
+    }
+
+    void ClearAnalysisRecord(size_t slot)
+    {
+        std::lock_guard<std::mutex> lock(analysisRecordMutex_);
+        analysisRecords_[slot] = {};
+    }
+
+    void SetAnalysisRecord(size_t slot, const AnalysisJob& job, bool analyzeDebugInfo,
+                           const std::shared_ptr<LspSymbolIndex>& index)
+    {
+        std::lock_guard<std::mutex> lock(analysisRecordMutex_);
+        analysisRecords_[slot] = {
+            job.uri, job.textHash, static_cast<uint64_t>(job.text.size()),
+            analyzeDebugInfo, true, index
+        };
     }
 
     void ScheduleAnalysis(const std::string& uri, const std::string& filePath,
@@ -1629,8 +1825,28 @@ private:
             {
                 std::unique_lock<std::mutex> lock(backendMutex_);
                 backendCV_.wait(lock, [&] { return !freeBackends_.empty(); });
-                slot = freeBackends_.back();
-                freeBackends_.pop_back();
+                auto preferred = freeBackends_.end();
+                if (job.irRequest)
+                {
+                    for (auto it = freeBackends_.begin(); it != freeBackends_.end(); ++it)
+                    {
+                        if (AnalysisRecordMatches(*it, job))
+                        {
+                            preferred = it;
+                            break;
+                        }
+                    }
+                }
+                if (preferred != freeBackends_.end())
+                {
+                    slot = *preferred;
+                    freeBackends_.erase(preferred);
+                }
+                else
+                {
+                    slot = freeBackends_.back();
+                    freeBackends_.pop_back();
+                }
             }
 
             // A single analysis must never take down the whole server: any C++ exception
@@ -1664,6 +1880,13 @@ private:
 
     bool RunAnalysisOnSlot(size_t slot, const AnalysisJob& job)
     {
+        const auto requestStart = std::chrono::steady_clock::now();
+        ViewTimings timings;
+        auto finishTiming = [&]
+        {
+            timings.totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - requestStart).count();
+        };
         const std::string& uri      = job.uri;
         const std::string& filePath = job.filePath;
         const std::string& text     = job.text;
@@ -1671,182 +1894,208 @@ private:
         auto tracePath = BeginTimeTrace(job);
         LspTraceGuard traceGuard([this, tracePath](bool writeFile) { FinishTimeTrace(tracePath, writeFile); });
 
-        std::string tempPath;
-        {
-            int counter;
-            { std::lock_guard<std::mutex> lock(tempCounterMutex_); counter = tempFileCounter_++; }
-            std::error_code tmpEc;
-            std::filesystem::path tempDir = std::filesystem::temp_directory_path(tmpEc);
-            std::string fileName = std::format("cflat_lsp_{}_{}_{}.cb", _getpid(), (int)slot, counter);
-            tempPath = (tempDir / fileName).string();
-        }
-
-        {
-            std::ofstream tmp(tempPath, std::ios::binary);
-            if (!tmp)
-            {
-                if (job.irRequest) SendViewFailure(job, "could not create analysis input");
-                return !job.irRequest;
-            }
-            tmp.write(text.data(), text.size());
-        }
-
-        std::vector<lsp::Diagnostic> diagnostics;
-        auto newIndex = std::make_shared<LspSymbolIndex>();
-
         LLVMBackend* backend = backendPool_[slot].get();
+        std::shared_ptr<LspSymbolIndex> newIndex = ReusableAnalysisIndex(slot, job);
+        const bool reuseAnalysis = newIndex != nullptr;
+        bool analysisRecovered = reuseAnalysis;
+        bool analysisOk = reuseAnalysis;
+        std::vector<lsp::Diagnostic> diagnostics;
 
-        // Each backend slot is sticky across runs - reset before re-use.
-        if (backendAnalyzed_[slot])
-            backend->ResetForReanalysis();
-        backendAnalyzed_[slot] = true;
-
-        if (!filePath.empty())
+        if (!reuseAnalysis)
         {
-            std::filesystem::path fp(filePath);
-            backend->SetSourceFileDir(fp.parent_path().string());
-            backend->SetSourceDisplayName(fp.filename().string());  // make diagnostics point at the real document
-        }
-        else
-        {
-            backend->SetSourceDisplayName("");
-        }
+            ClearAnalysisRecord(slot);
 
-        backend->SetDiagnosticSink([&](const std::string& /*file*/, size_t line, size_t col, const std::string& msg, int severity)
-        {
-            lsp::Diagnostic diag;
-            diag.range    = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
-            diag.message  = msg;
-            diag.severity = severity;
-            diagnostics.push_back(diag);
-        });
-        // Faded hint regions reported during analysis (e.g. unreachable code). Positions
-        // are document-relative (same text as the temp copy), so no remap is needed.
-        backend->SetHintRegionSink([&](int sl, int sc, int el, int ec, const std::string& msg)
-        {
-            lsp::Diagnostic diag;
-            diag.range    = { { sl - 1, sc }, { el - 1, ec } };
-            diag.message  = msg;
-            diag.severity = lsp::DiagnosticSeverityHint;
-            diag.tags     = { lsp::DiagnosticTagUnnecessary };
-            diagnostics.push_back(diag);
-        });
-        backend->SetSymbolSink(newIndex.get());
-        backend->SetAnalyzeDebugInfo(job.irRequest.has_value());
+            std::string tempPath;
+            {
+                int counter;
+                { std::lock_guard<std::mutex> lock(tempCounterMutex_); counter = tempFileCounter_++; }
+                std::error_code tmpEc;
+                std::filesystem::path tempDir = std::filesystem::temp_directory_path(tmpEc);
+                std::string fileName = std::format("cflat_lsp_{}_{}_{}.cb", _getpid(), (int)slot, counter);
+                tempPath = (tempDir / fileName).string();
+            }
 
-        bool ok = false;
-        llvm::CrashRecoveryContext crc;
-        bool recovered = crc.RunSafely([&]
-        {
-            ok = backend->Analyze(tempPath, importSearchDirs_, runtimeDir_);
-        });
+            {
+                std::ofstream tmp(tempPath, std::ios::binary);
+                if (!tmp)
+                {
+                    if (job.irRequest)
+                    {
+                        finishTiming();
+                        SendViewFailure(job, "could not create analysis input");
+                    }
+                    return !job.irRequest;
+                }
+                tmp.write(text.data(), text.size());
+            }
 
-        // CrashRecoveryContext can bypass C++ destructors. Finish explicitly here so a
-        // crashed analysis cannot leave this worker's profiler active for the next job.
-        // On a crash the skipped TimeTraceScope destructors leave the profiler stack
-        // non-empty and timeTraceProfilerWrite would assert - discard instead of writing.
-        traceGuard.Finish(recovered);
+            newIndex = std::make_shared<LspSymbolIndex>();
 
-        if (!recovered)
-        {
-            // Name the actual fault. CrashRecoveryContext::RetCode is the signal number on
-            // POSIX and the SEH exception code on Windows; a generic wrapper here is what
-            // kept the stack-overflow root cause of this crash class dark for so long.
-            std::string cause = DescribeCrash(crc.RetCode);
-            std::cerr << std::format("[lsp] compiler crash on slot {} analyzing '{}': {}\n",
-                                     slot, filePath.empty() ? uri : filePath, cause);
+            // Each backend slot is sticky across runs - reset before re-use.
+            if (backendAnalyzed_[slot])
+                backend->ResetForReanalysis();
+            backendAnalyzed_[slot] = true;
 
-            auto fresh = std::make_unique<LLVMBackend>();
-            fresh->SetRuntimeDir(runtimeDir_);
-            fresh->SetVerbose(verbose_);
-            ApplyLocale(*fresh);
-            backendPool_[slot] = std::move(fresh);
-            backendAnalyzed_[slot] = false;
-
-            lsp::Diagnostic crashDiag;
-            crashDiag.range   = { {0, 0}, {0, 1} };
-            crashDiag.message = "Internal compiler error during analysis: " + cause;
-            diagnostics.push_back(crashDiag);
-        }
-        else
-        {
-            backend->SetDiagnosticSink(nullptr);
-            backend->SetHintRegionSink(nullptr);
-            backend->SetSymbolSink(nullptr);
-        }
-
-        // Non-throwing remove: a child process spawned during analysis (clang-cl, for
-        // C-interop signature extraction) can transiently hold an inherited handle to a
-        // temp .cb, making removal fail with a sharing violation. The throwing overload
-        // would escape this worker thread and call std::terminate; tolerate the failure
-        // (the temp file lives in %TEMP% and is reaped later) instead of crashing.
-        {
-            std::error_code rmEc;
-            std::filesystem::remove(tempPath, rmEc);
-        }
-
-        if (!filePath.empty())
-        {
-            newIndex->RemapFile(tempPath, filePath);
-            newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
-            // The backend canonicalizes source paths (weakly_canonical) when recording
-            // candidate/symbol files. On macOS $TMPDIR (/var/folders/...) is a symlink to
-            // /private/var/..., so the recorded form differs from the raw tempPath and the
-            // exact-match remaps above miss it - remap the resolved form too, else
-            // file-scoped filters (e.g. unused-symbol hints) drop every entry.
-            std::error_code canonEc;
-            auto canonTemp = std::filesystem::weakly_canonical(tempPath, canonEc);
-            if (!canonEc && canonTemp.string() != tempPath)
-                newIndex->RemapFile(canonTemp.string(), filePath);
-        }
-
-        // Last-known-good cache - kept global for now. Edits land sequentially in
-        // practice (debounce + single editor); bulk sweeps don't use this index.
-        {
-            std::lock_guard<std::mutex> lock(indexMutex_);
-            bool hasErrors    = !diagnostics.empty();
-            size_t newCount   = newIndex->SymbolCount();
-            size_t cachedCount = currentIndex_ ? currentIndex_->SymbolCount() : 0;
-            bool keepCached   = hasErrors && newCount < cachedCount;
-
-            if (!keepCached)
-                currentIndex_ = newIndex;
+            if (!filePath.empty())
+            {
+                std::filesystem::path fp(filePath);
+                backend->SetSourceFileDir(fp.parent_path().string());
+                backend->SetSourceDisplayName(fp.filename().string());  // make diagnostics point at the real document
+            }
             else
             {
-                // Keep complete symbol definitions, but refresh variables for receiver
-                // completion. Copy-and-swap: readers hold shared_ptr snapshots of
-                // currentIndex_ without a lock, so never mutate the shared object.
-                auto merged = std::make_shared<LspSymbolIndex>(*currentIndex_);
-                merged->MergeVariablesFrom(*newIndex);
-                currentIndex_ = std::move(merged);
-                if (verbose_)
-                    std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
+                backend->SetSourceDisplayName("");
             }
-        }
 
-        // Occurrence-based unused-code hints (functions / locals / params / imports).
-        // Suppressed while the file has errors: the candidate and use sets are then
-        // incomplete (e.g. a call site in a half-typed region), which would produce
-        // spurious "unused" hints mid-edit. Unreachable-code hints are unaffected -
-        // they were already emitted by the backend during analysis.
-        if (!filePath.empty())
-        {
-            bool hasError = false;
-            for (const auto& d : diagnostics)
-                if (d.severity == lsp::DiagnosticSeverityError) { hasError = true; break; }
-            if (!hasError)
-                AppendUnusedDiagnostics(*backendPool_[slot], text, filePath, *newIndex, diagnostics);
-        }
+            backend->SetDiagnosticSink([&](const std::string& /*file*/, size_t line, size_t col, const std::string& msg, int severity)
+            {
+                lsp::Diagnostic diag;
+                diag.range    = { { (int)line - 1, (int)col }, { (int)line - 1, (int)col + 1 } };
+                diag.message  = msg;
+                diag.severity = severity;
+                diagnostics.push_back(diag);
+            });
+            // Faded hint regions reported during analysis (e.g. unreachable code). Positions
+            // are document-relative (same text as the temp copy), so no remap is needed.
+            backend->SetHintRegionSink([&](int sl, int sc, int el, int ec, const std::string& msg)
+            {
+                lsp::Diagnostic diag;
+                diag.range    = { { sl - 1, sc }, { el - 1, ec } };
+                diag.message  = msg;
+                diag.severity = lsp::DiagnosticSeverityHint;
+                diag.tags     = { lsp::DiagnosticTagUnnecessary };
+                diagnostics.push_back(diag);
+            });
+            backend->SetSymbolSink(newIndex.get());
+            backend->SetAnalyzeDebugInfo(job.irRequest.has_value());
 
-        PublishDiagnostics(uri, diagnostics);
+            bool ok = false;
+            llvm::CrashRecoveryContext crc;
+            const auto analyzeStart = std::chrono::steady_clock::now();
+            bool recovered = crc.RunSafely([&]
+            {
+                ok = backend->Analyze(tempPath, importSearchDirs_, runtimeDir_);
+            });
+            if (job.irRequest)
+                timings.analyzeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - analyzeStart).count();
+            analysisRecovered = recovered;
+            analysisOk = ok;
+
+            // CrashRecoveryContext can bypass C++ destructors. Finish explicitly here so a
+            // crashed analysis cannot leave this worker's profiler active for the next job.
+            // On a crash the skipped TimeTraceScope destructors leave the profiler stack
+            // non-empty and timeTraceProfilerWrite would assert - discard immediately; on
+            // success the guard writes at scope exit so view and optinfo emission is captured.
+            if (!recovered)
+                traceGuard.Finish(false);
+
+            if (!recovered)
+            {
+                // Name the actual fault. CrashRecoveryContext::RetCode is the signal number on
+                // POSIX and the SEH exception code on Windows; a generic wrapper here is what
+                // kept the stack-overflow root cause of this crash class dark for so long.
+                std::string cause = DescribeCrash(crc.RetCode);
+                std::cerr << std::format("[lsp] compiler crash on slot {} analyzing '{}': {}\n",
+                                         slot, filePath.empty() ? uri : filePath, cause);
+
+                auto fresh = std::make_unique<LLVMBackend>();
+                fresh->SetRuntimeDir(runtimeDir_);
+                fresh->SetVerbose(verbose_);
+                ApplyLocale(*fresh);
+                backendPool_[slot] = std::move(fresh);
+                backendAnalyzed_[slot] = false;
+                backend = backendPool_[slot].get();
+
+                lsp::Diagnostic crashDiag;
+                crashDiag.range   = { {0, 0}, {0, 1} };
+                crashDiag.message = "Internal compiler error during analysis: " + cause;
+                diagnostics.push_back(crashDiag);
+            }
+            else
+            {
+                if (recovered && ok)
+                    SetAnalysisRecord(slot, job, job.irRequest.has_value(), newIndex);
+                backend->SetDiagnosticSink(nullptr);
+                backend->SetHintRegionSink(nullptr);
+                backend->SetSymbolSink(nullptr);
+            }
+
+            // Non-throwing remove: a child process spawned during analysis (clang-cl, for
+            // C-interop signature extraction) can transiently hold an inherited handle to a
+            // temp .cb, making removal fail with a sharing violation. The throwing overload
+            // would escape this worker thread and call std::terminate; tolerate the failure
+            // (the temp file lives in %TEMP% and is reaped later) instead of crashing.
+            {
+                std::error_code rmEc;
+                std::filesystem::remove(tempPath, rmEc);
+            }
+
+            if (!filePath.empty())
+            {
+                newIndex->RemapFile(tempPath, filePath);
+                newIndex->RemapFile(std::filesystem::path(tempPath).filename().string(), filePath);
+                // The backend canonicalizes source paths (weakly_canonical) when recording
+                // candidate/symbol files. On macOS $TMPDIR (/var/folders/...) is a symlink to
+                // /private/var/..., so the recorded form differs from the raw tempPath and the
+                // exact-match remaps above miss it - remap the resolved form too, else
+                // file-scoped filters (e.g. unused-symbol hints) drop every entry.
+                std::error_code canonEc;
+                auto canonTemp = std::filesystem::weakly_canonical(tempPath, canonEc);
+                if (!canonEc && canonTemp.string() != tempPath)
+                    newIndex->RemapFile(canonTemp.string(), filePath);
+            }
+
+            // Last-known-good cache - kept global for now. Edits land sequentially in
+            // practice (debounce + single editor); bulk sweeps don't use this index.
+            {
+                std::lock_guard<std::mutex> lock(indexMutex_);
+                bool hasErrors    = !diagnostics.empty();
+                size_t newCount   = newIndex->SymbolCount();
+                size_t cachedCount = currentIndex_ ? currentIndex_->SymbolCount() : 0;
+                bool keepCached   = hasErrors && newCount < cachedCount;
+
+                if (!keepCached)
+                    currentIndex_ = newIndex;
+                else
+                {
+                    // Keep complete symbol definitions, but refresh variables for receiver
+                    // completion. Copy-and-swap: readers hold shared_ptr snapshots of
+                    // currentIndex_ without a lock, so never mutate the shared object.
+                    auto merged = std::make_shared<LspSymbolIndex>(*currentIndex_);
+                    merged->MergeVariablesFrom(*newIndex);
+                    currentIndex_ = std::move(merged);
+                    if (verbose_)
+                        std::cerr << std::format("[lsp] keeping cached index ({} symbols) over partial parse ({} symbols)\n", cachedCount, newCount);
+                }
+            }
+
+            // Occurrence-based unused-code hints (functions / locals / params / imports).
+            // Suppressed while the file has errors: the candidate and use sets are then
+            // incomplete (e.g. a call site in a half-typed region), which would produce
+            // spurious "unused" hints mid-edit. Unreachable-code hints are unaffected -
+            // they were already emitted by the backend during analysis.
+            if (!filePath.empty())
+            {
+                bool hasError = false;
+                for (const auto& d : diagnostics)
+                    if (d.severity == lsp::DiagnosticSeverityError) { hasError = true; break; }
+                if (!hasError)
+                    AppendUnusedDiagnostics(*backendPool_[slot], text, filePath, *newIndex, diagnostics);
+            }
+
+            PublishDiagnostics(uri, diagnostics);
+        }
 
         if (!job.irRequest)
             return true;
 
         if (job.irRequest->kind == "optinfo")
         {
-            if (!recovered || !ok)
+            if (!analysisRecovered || !analysisOk)
             {
+                finishTiming();
+                LogViewTiming(job, timings, 0, 0, 0, 0);
                 SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603,
                           "analysis failed: " + BuildViewError(diagnostics));
                 return true;
@@ -1856,20 +2105,31 @@ private:
                 sourceFunctions.push_back({range->name, {range->startLine, range->endLine}});
 
             LLVMBackend::OptimizationInfo collected;
+            const auto emitStart = std::chrono::steady_clock::now();
             if (!backend->CollectOptimizationInfo(job.irRequest->optLevel, sourceFunctions,
                                                   collected, job.irRequest->withRemarks))
             {
+                timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - emitStart).count();
+                finishTiming();
+                LogViewTiming(job, timings, 0, 0, collected.functions.size(), collected.remarks.size());
                 SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603,
                           "could not collect optimization info");
                 return true;
             }
-            SendOptimizationInfoResult(job, collected);
+            timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - emitStart).count();
+            finishTiming();
+            auto response = BuildOptimizationInfoResponse(job, collected, timings);
+            InsertCachedView(MakeViewCacheKey(uri, text, *job.irRequest), response);
+            SendOptimizationInfoResult(job, std::move(response), timings);
             return true;
         }
 
-        if (!recovered || !ok)
+        if (!analysisRecovered || !analysisOk)
         {
-            SendViewResult(job, BuildViewError(diagnostics));
+            finishTiming();
+            SendViewResult(job, BuildViewError(diagnostics), {}, timings);
             return true;
         }
 
@@ -1882,8 +2142,9 @@ private:
             if (ranges.empty())
             {
                 std::string displayName = std::filesystem::path(filePath).filename().string();
+                finishTiming();
                 SendViewResult(job, "; " + displayName + ":"
-                    + std::to_string(*job.irRequest->line) + " has no function\n", {});
+                    + std::to_string(*job.irRequest->line) + " has no function\n", {}, timings);
                 return true;
             }
             functionName = ranges.front()->name;
@@ -1891,14 +2152,22 @@ private:
 
         std::string output;
         std::vector<LLVMBackend::LineMapping> mappings;
+        const auto emitStart = std::chrono::steady_clock::now();
         bool emitted = backend->PrintModuleView(output, job.irRequest->kind,
-                                                job.irRequest->optLevel, functionName, &mappings);
+                                                job.irRequest->optLevel, functionName,
+                                                job.irRequest->wholeModule, &mappings);
+        timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - emitStart).count();
         if (!emitted)
         {
-            SendViewFailure(job, "failed to emit " + job.irRequest->kind);
+            finishTiming();
+            SendViewFailure(job, "failed to emit " + job.irRequest->kind, timings);
             return true;
         }
-        SendViewResult(job, std::move(output), std::move(mappings));
+        finishTiming();
+        auto response = BuildViewResponse(job, std::move(output), std::move(mappings), timings);
+        InsertCachedView(MakeViewCacheKey(uri, text, *job.irRequest), response);
+        SendViewResult(job, std::move(response), timings);
         return true;
     }
 
@@ -1918,10 +2187,29 @@ private:
         return text;
     }
 
-    void SendViewResult(const AnalysisJob& job, std::string text,
-                        std::vector<LLVMBackend::LineMapping> mappings = {})
+    void LogViewTiming(const AnalysisJob& job, const ViewTimings& timings,
+                       size_t textSize, size_t mappingCount,
+                       size_t functionCount, size_t remarkCount, bool cached = false)
     {
         if (!job.irRequest) return;
+        const auto& request = *job.irRequest;
+        const std::string function = request.function.value_or("");
+        std::cerr << std::format("[lsp] view kind={} opt={} fn='{}' analyze={}ms emit={}ms total={}ms",
+                                 request.kind, request.optLevel, function,
+                                 timings.analyzeMs, timings.emitMs, timings.totalMs);
+        if (request.kind == "optinfo")
+            std::cerr << std::format(" functions={} remarks={}", functionCount, remarkCount);
+        else
+            std::cerr << std::format(" text={}B mappings={}", textSize, mappingCount);
+        if (cached)
+            std::cerr << " cached=1";
+        std::cerr << '\n';
+    }
+
+    nlohmann::json BuildViewResponse(const AnalysisJob& job, std::string text,
+                                     std::vector<LLVMBackend::LineMapping> mappings,
+                                     const ViewTimings& timings)
+    {
         nlohmann::json mappingJson = nlohmann::json::array();
         for (const auto& mapping : mappings)
         {
@@ -1943,30 +2231,57 @@ private:
             }
             mappingJson.push_back(std::move(entry));
         }
-        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
+        return {
             {"kind", job.irRequest->kind},
             {"text", std::move(text)},
-            {"mappings", std::move(mappingJson)}
-        });
+            {"mappings", std::move(mappingJson)},
+            {"timings", {
+                {"analyzeMs", timings.analyzeMs},
+                {"emitMs", timings.emitMs},
+                {"totalMs", timings.totalMs}
+            }}
+        };
+    }
+
+    void SendViewResult(const AnalysisJob& job, std::string text,
+                        std::vector<LLVMBackend::LineMapping> mappings = {},
+                        const ViewTimings& timings = {})
+    {
+        if (!job.irRequest) return;
+        LogViewTiming(job, timings, text.size(), mappings.size(), 0, 0);
+        SendResponse(std::optional<nlohmann::json>{job.irRequest->id},
+                     BuildViewResponse(job, std::move(text), std::move(mappings), timings));
+    }
+
+    void SendViewResult(const AnalysisJob& job, nlohmann::json result,
+                        const ViewTimings& timings)
+    {
+        if (!job.irRequest) return;
+        size_t textSize = result.value("text", std::string{}).size();
+        size_t mappingCount = result.value("mappings", nlohmann::json::array()).size();
+        LogViewTiming(job, timings, textSize, mappingCount, 0, 0);
+        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, std::move(result));
     }
 
     // Every "a response is owed" path funnels here, so route by kind: an optinfo caller
     // must never receive a view-shaped payload.
-    void SendViewFailure(const AnalysisJob& job, const std::string& message)
+    void SendViewFailure(const AnalysisJob& job, const std::string& message,
+                         const ViewTimings& timings = {})
     {
         if (!job.irRequest) return;
         if (job.irRequest->kind == "optinfo")
         {
+            LogViewTiming(job, timings, 0, 0, 0, 0);
             SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603, message);
             return;
         }
-        SendViewResult(job, "; view unavailable - " + message + "\n");
+        SendViewResult(job, "; view unavailable - " + message + "\n", {}, timings);
     }
 
-    void SendOptimizationInfoResult(const AnalysisJob& job,
-                                    const LLVMBackend::OptimizationInfo& collected)
+    nlohmann::json BuildOptimizationInfoResponse(
+        const AnalysisJob& job, const LLVMBackend::OptimizationInfo& collected,
+        const ViewTimings& timings)
     {
-        if (!job.irRequest) return;
         nlohmann::json functions = nlohmann::json::array();
         for (const auto& info : collected.functions)
         {
@@ -2031,14 +2346,29 @@ private:
                 {"symbols", group.symbols}
             });
 
-        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, {
+        return {
             {"optLevel", job.irRequest->optLevel},
             {"functions", std::move(functions)},
             {"costs", std::move(costs)},
             {"remarks", std::move(remarks)},
             {"remarksTruncated", collected.remarksTruncated},
-            {"instantiations", std::move(instantiations)}
-        });
+            {"instantiations", std::move(instantiations)},
+            {"timings", {
+                {"analyzeMs", timings.analyzeMs},
+                {"emitMs", timings.emitMs},
+                {"totalMs", timings.totalMs}
+            }}
+        };
+    }
+
+    void SendOptimizationInfoResult(const AnalysisJob& job, nlohmann::json result,
+                                    const ViewTimings& timings)
+    {
+        if (!job.irRequest) return;
+        size_t functions = result.value("functions", nlohmann::json::array()).size();
+        size_t remarks = result.value("remarks", nlohmann::json::array()).size();
+        LogViewTiming(job, timings, 0, 0, functions, remarks);
+        SendResponse(std::optional<nlohmann::json>{job.irRequest->id}, std::move(result));
     }
 
     std::filesystem::path BeginTimeTrace(const AnalysisJob& job)
@@ -2310,6 +2640,8 @@ private:
     unsigned int poolSize_ = 1;
     std::vector<std::unique_ptr<LLVMBackend>> backendPool_;
     std::vector<bool> backendAnalyzed_;  // sized to poolSize_ in the constructor; tracks per-slot reset need
+    std::vector<AnalysisRecord> analysisRecords_;
+    mutable std::mutex analysisRecordMutex_;
     std::vector<size_t> freeBackends_;
     std::mutex backendMutex_;
     std::condition_variable backendCV_;
@@ -2337,6 +2669,9 @@ private:
 
     std::mutex indexMutex_;
     std::shared_ptr<LspSymbolIndex> currentIndex_;
+
+    std::deque<ViewCacheEntry> viewCache_;
+    std::mutex viewCacheMutex_;
 
     std::thread debounceThread_;
     std::mutex debounceMutex_;

@@ -36,6 +36,7 @@
 #include <llvm/Support/JSON.h>
 #include <llvm/IR/DiagnosticInfo.h>
 #include <llvm/IR/DiagnosticHandler.h>
+#include <llvm/ADT/DenseMap.h>
 #pragma warning(pop)
 #include <antlr4-runtime.h>
 
@@ -422,13 +423,17 @@ std::unique_ptr<llvm::TargetMachine> LLVMBackend::CreateOptTargetMachine(int opt
 // freely. `purpose` names the caller in the error message.
 std::unique_ptr<llvm::Module> LLVMBackend::CloneModuleForView(const std::string& purpose)
 {
+    llvm::TimeTraceScope cloneScope("ViewCloneModule", purpose);
     if (!module)
         return nullptr;
 
     // A warm compiler cache leaves the core as a lazily-loaded bitcode module, and
     // CloneModule requires a materialized one. Every other module consumer materializes
     // first; without this the clone walks unread function bodies and faults.
-    MaterializeCoreIfLazy();
+    {
+        llvm::TimeTraceScope materializeScope("ViewMaterializeCore", purpose);
+        MaterializeCoreIfLazy();
+    }
     if (!module->isMaterialized())
     {
         LogError("cannot render " + purpose + ": cached core bitcode is not materialized.");
@@ -453,6 +458,8 @@ bool LLVMBackend::OptimizeViewModule(llvm::Module& view, int optLevel, bool need
 
     if (optLevel > 0)
     {
+        llvm::TimeTraceScope pipelineScope("ViewOptPipeline",
+                                           "O" + std::to_string(optLevel));
         llvm::PipelineTuningOptions pto;
         pto.LoopVectorization = true;
         pto.SLPVectorization = true;
@@ -478,8 +485,10 @@ bool LLVMBackend::OptimizeViewModule(llvm::Module& view, int optLevel, bool need
 
 bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                                   int optLevel, const std::string& functionName,
+                                  bool wholeModule,
                                   std::vector<LineMapping>* mappings)
 {
+    llvm::TimeTraceScope printScope("PrintModuleView", kind);
     if (!module || (kind != "ir" && kind != "asm") || optLevel < 0 || optLevel > 2)
         return false;
     if (mappings) mappings->clear();
@@ -574,7 +583,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         cuDirectory = compileUnit->getFile()->getDirectory().str();
     }
 
-    auto isRootFile = [&](const llvm::DIFile* file) {
+    auto uncachedIsRootFile = [&](const llvm::DIFile* file) {
         if (!file) return false;
         const std::string filename = file->getFilename().str();
         const std::string directory = file->getDirectory().str();
@@ -592,17 +601,79 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         return false;
     };
 
-    auto sourceLine = [&](const llvm::DILocation* location) {
-        for (auto* current = location; current; current = current->getInlinedAt())
-            if (isRootFile(current->getFile()))
-                return static_cast<int>(current->getLine());
-        return 0;
-    };
+    struct DebugLocationCache
+    {
+        RootFilePredicate uncachedIsRootFile;
+        llvm::DenseMap<const llvm::DIFile*, bool> rootFiles;
+        llvm::DenseMap<const llvm::DILocation*, std::vector<LLVMBackend::LineFrame>> lineStacks;
+        llvm::DenseMap<const llvm::DILocation*, int> sourceLines;
+
+        explicit DebugLocationCache(RootFilePredicate rootFile)
+            : uncachedIsRootFile(std::move(rootFile)), rootFiles(0), lineStacks(0), sourceLines(0)
+        {
+        }
+
+        bool IsRootFile(const llvm::DIFile* file)
+        {
+            auto it = rootFiles.find(file);
+            if (it != rootFiles.end()) return it->second;
+            const bool result = uncachedIsRootFile(file);
+            rootFiles.try_emplace(file, result);
+            return result;
+        }
+
+        const std::vector<LLVMBackend::LineFrame>& LineStack(const llvm::DILocation* location)
+        {
+            auto [it, inserted] = lineStacks.try_emplace(location);
+            if (inserted)
+                it->second = BuildLineStack(
+                    location, [this](const llvm::DIFile* file) { return IsRootFile(file); });
+            return it->second;
+        }
+
+        int SourceLine(const llvm::DILocation* location)
+        {
+            auto it = sourceLines.find(location);
+            if (it != sourceLines.end()) return it->second;
+            int result = 0;
+            for (const auto& frame : LineStack(location))
+                if (frame.root)
+                {
+                    result = frame.line;
+                    break;
+                }
+            sourceLines.try_emplace(location, result);
+            return result;
+        }
+    } debugLocationCache{RootFilePredicate(uncachedIsRootFile)};
+
     auto makeLineMapping = [&](const llvm::DILocation* location) {
-        auto mapping = MakeLineMapping(BuildLineStack(location, isRootFile));
-        mapping.srcLine = sourceLine(location);
+        auto mapping = MakeLineMapping(debugLocationCache.LineStack(location));
+        mapping.srcLine = debugLocationCache.SourceLine(location);
         return mapping;
     };
+
+    const size_t definedFunctionCount = static_cast<size_t>(std::count_if(
+        view->begin(), view->end(), [](const llvm::Function& function) {
+            return !function.isDeclaration();
+        }));
+    std::vector<llvm::Function*> rootFunctions;
+    if (functionName.empty() && !wholeModule)
+        for (auto& function : *view)
+        {
+            if (function.isDeclaration()) continue;
+            auto* subprogram = function.getSubprogram();
+            if (subprogram && debugLocationCache.IsRootFile(subprogram->getFile()))
+                rootFunctions.push_back(&function);
+        }
+    const bool rootScopedView = functionName.empty() && !wholeModule && !rootFunctions.empty();
+    // The analyzed root is an LSP temp copy; prefer the real document name for the banner.
+    const std::string bannerName = sourceDisplayName_.empty() ? rootName : sourceDisplayName_;
+    const std::string rootViewBanner = rootScopedView
+        ? "; showing " + std::to_string(rootFunctions.size()) + " of "
+            + std::to_string(definedFunctionCount) + " defined functions from " + bannerName
+            + "; imports hidden (request wholeModule for all)\n"
+        : std::string();
 
     if (kind == "ir")
     {
@@ -618,59 +689,99 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
 
         if (mappings)
         {
-            auto mappingView = llvm::CloneModule(*view);
-            if (mappingView)
-            {
-                for (auto& function : *mappingView)
-                    for (auto& block : function)
-                        for (auto it = block.begin(); it != block.end(); )
-                        {
-                            auto current = it++;
-                            current->dropDbgRecords();
-                        }
-                std::string mappingText;
-                llvm::raw_string_ostream mappingStream(mappingText);
-                LineMappingAnnotationWriter writer(*mappings, makeLineMapping);
-                if (functionName.empty())
-                    mappingView->print(mappingStream, &writer);
-                else
-                    for (auto* function : matchingFunctions(*mappingView))
+            llvm::TimeTraceScope mappingScope("ViewIrMappingPrint");
+            for (auto& function : *view)
+                for (auto& block : function)
+                    for (auto it = block.begin(); it != block.end(); )
                     {
-                        mappingStream << "; function: " << function->getName() << "\n";
-                        mappingStream.flush();
-                        writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
-                        function->print(mappingStream, &writer);
-                        mappingStream << "\n";
+                        auto current = it++;
+                        current->dropDbgRecords();
                     }
-                mappingStream.flush();
+            std::string mappingText;
+            llvm::raw_string_ostream mappingStream(mappingText);
+            LineMappingAnnotationWriter writer(*mappings, makeLineMapping);
+            // !dbg attachments and the metadata tail are the only mapping/display line differences.
+            // Instruction and define lines stay aligned until the unmapped metadata tail.
+            if (rootScopedView)
+            {
+                mappingStream << rootViewBanner;
+                for (auto* function : rootFunctions)
+                {
+                    mappingStream << "; function: " << function->getName() << "\n";
+                    mappingStream.flush();
+                    writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
+                    function->print(mappingStream, &writer);
+                    mappingStream << "\n";
+                }
             }
+            else if (functionName.empty())
+                view->print(mappingStream, &writer);
+            else
+                for (auto* function : matchingFunctions(*view))
+                {
+                    mappingStream << "; function: " << function->getName() << "\n";
+                    mappingStream.flush();
+                    writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
+                    function->print(mappingStream, &writer);
+                    mappingStream << "\n";
+                }
+            mappingStream.flush();
             llvm::StripDebugInfo(*view);
         }
 
-        llvm::raw_string_ostream stream(out);
-        if (functionName.empty())
-            view->print(stream, nullptr);
-        else
-            for (auto* function : matches)
+        {
+            llvm::TimeTraceScope displayScope("ViewIrDisplayPrint");
+            llvm::raw_string_ostream stream(out);
+            if (rootScopedView)
+            {
+                stream << rootViewBanner;
+                for (auto* function : rootFunctions)
+                {
+                    stream << "; function: " << function->getName() << "\n";
+                    function->print(stream, nullptr);
+                    stream << "\n";
+                }
+            }
+            else if (functionName.empty())
+                view->print(stream, nullptr);
+            else
+                for (auto* function : matches)
             {
                 stream << "; function: " << function->getName() << "\n";
                 function->print(stream, nullptr);
                 stream << "\n";
             }
-        stream.flush();
+            stream.flush();
+        }
         if (mappings) ConsolidateLineMappings(*mappings);
         return true;
     }
 
-    llvm::legacy::PassManager pass;
-    llvm::SmallString<0> buffer;
-    llvm::raw_svector_ostream stream(buffer);
-    if (targetMachine->addPassesToEmitFile(pass, stream, nullptr,
-                                           llvm::CodeGenFileType::AssemblyFile))
-        return false;
-    pass.run(*view);
-    std::string assembly(buffer.data(), buffer.size());
+    if (rootScopedView)
+        for (auto& function : *view)
+        {
+            if (function.isDeclaration()) continue;
+            auto* subprogram = function.getSubprogram();
+            if (subprogram && debugLocationCache.IsRootFile(subprogram->getFile())) continue;
+            function.setComdat(nullptr);
+            function.setLinkage(llvm::GlobalValue::ExternalLinkage);
+            function.deleteBody();
+        }
 
+    std::string assembly;
+    {
+        llvm::TimeTraceScope codegenScope("ViewAsmCodegen");
+        llvm::legacy::PassManager pass;
+        llvm::SmallString<0> buffer;
+        llvm::raw_svector_ostream stream(buffer);
+        if (targetMachine->addPassesToEmitFile(pass, stream, nullptr,
+                                               llvm::CodeGenFileType::AssemblyFile))
+            return false;
+        pass.run(*view);
+        assembly.assign(buffer.data(), buffer.size());
+    }
+
+    llvm::TimeTraceScope mappingScope("ViewAsmMappings");
     const std::map<int, std::string> asmFiles = BuildAsmFileTable(assembly);
 
     auto isRootAsmFile = [&](const std::string& path) {
@@ -708,7 +819,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             {
                 llvm::DebugLoc debugLoc = instruction.getDebugLoc();
                 if (!debugLoc || debugLoc->getLine() == 0) continue;
-                auto stack = BuildLineStack(debugLoc.get(), isRootFile);
+                const auto& stack = debugLocationCache.LineStack(debugLoc.get());
                 if (stack.empty()) continue;
                 DebugLocationKey key{function.getName().str(),
                                      NormalizeFilePath(DebugFilePath(debugLoc->getFile())),
@@ -717,7 +828,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                 auto& candidates = inlineStacks[key];
                 if (std::none_of(candidates.begin(), candidates.end(),
                                  [&](const auto& candidate) { return SameLineStack(candidate, stack); }))
-                    candidates.push_back(std::move(stack));
+                    candidates.push_back(stack);
             }
     }
 
@@ -823,7 +934,10 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
 
     if (functionName.empty())
     {
-        out = std::move(assembly);
+        if (rootScopedView)
+            out = rootViewBanner + assembly;
+        else
+            out = std::move(assembly);
         appendAsmMappings(out);
         return true;
     }
@@ -1103,6 +1217,7 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
                                           OptimizationInfo& info,
                                           bool withRemarks)
 {
+    llvm::TimeTraceScope collectScope("CollectOptimizationInfo");
     info = OptimizationInfo{};
     std::vector<FunctionOptInfo>& out = info.functions;
     if (!module || optLevel < 0 || optLevel > 2)
@@ -1148,8 +1263,12 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     } restore{context.get(), std::move(previousHandler)};
 
     std::unique_ptr<llvm::TargetMachine> targetMachine;
-    if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
-        return false;
+    {
+        llvm::TimeTraceScope pipelineScope("OptInfoPipeline",
+                                           "O" + std::to_string(optLevel));
+        if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
+            return false;
+    }
 
     // Seed one entry per source function and index every surviving symbol back to it,
     // so generic instantiations aggregate into the function the user wrote.
@@ -1237,12 +1356,15 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
 
     // A remark's enclosing function is the one physically holding the code, so anything
     // reported against a non-user function is core-library noise that shares our line span.
-    if (!info.remarks.empty())
     {
-        std::vector<OptRemark> kept;
+        llvm::TimeTraceScope remarksScope("OptInfoRemarks");
+        if (!info.remarks.empty())
+        {
+            std::vector<OptRemark> kept;
         for (auto& remark : info.remarks)
             if (entryBySymbol.count(remark.function)) kept.push_back(std::move(remark));
-        info.remarks = std::move(kept);
+            info.remarks = std::move(kept);
+        }
     }
 
     for (auto& [key, cost] : costTotals) info.costs.push_back(cost);
@@ -1270,7 +1392,9 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     // Exact byte sizes need the object file: COFF symbols carry no size field, so sizes
     // come from address-sorted deltas. Best effort - a failure just leaves bytes at 0.
     std::map<std::string, int> symbolBytes;
-    if (auto objectView = llvm::CloneModule(*view))
+    {
+        llvm::TimeTraceScope objectCodegenScope("OptInfoObjectCodegen");
+        if (auto objectView = llvm::CloneModule(*view))
     {
         llvm::SmallString<0> objectBuffer;
         llvm::raw_svector_ostream objectStream(objectBuffer);
@@ -1301,6 +1425,7 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
             {
                 llvm::consumeError(binary.takeError());
             }
+        }
         }
     }
 
@@ -1353,6 +1478,7 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     // this same run give the frame size and spill counts.
     llvm::SmallString<0> asmBuffer;
     {
+        llvm::TimeTraceScope asmCodegenScope("OptInfoAsmCodegen");
         llvm::raw_svector_ostream asmStream(asmBuffer);
         llvm::legacy::PassManager asmPass;
         if (targetMachine->addPassesToEmitFile(asmPass, asmStream, nullptr,
