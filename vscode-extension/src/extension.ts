@@ -19,6 +19,8 @@ interface ViewChoice {
     id: string;
     label: string;
     optimized: boolean;
+    wholeModule: boolean;
+    description?: string;
 }
 
 interface ViewMapping {
@@ -40,6 +42,7 @@ interface ViewState {
     sourceUri: string;
     kind: ViewKind;
     optimized: boolean;
+    wholeModule: boolean;
     text: string;
     mappings: ViewMapping[];
     decoration: vscode.TextEditorDecorationType;
@@ -47,8 +50,22 @@ interface ViewState {
 }
 
 const viewChoices: ViewChoice[] = [
-    { id: 'unoptimized', label: 'Not optimized', optimized: false },
-    { id: 'optimized', label: 'Optimized (-O2)', optimized: true }
+    { id: 'unoptimized', label: 'Unoptimized', optimized: false, wholeModule: false },
+    { id: 'optimized', label: 'Optimized -O2', optimized: true, wholeModule: false },
+    {
+        id: 'whole-unoptimized',
+        label: 'Whole module (unoptimized)',
+        optimized: false,
+        wholeModule: true,
+        description: 'Includes imported/core code'
+    },
+    {
+        id: 'whole-optimized',
+        label: 'Whole module -O2',
+        optimized: true,
+        wholeModule: true,
+        description: 'Includes imported/core code'
+    }
 ];
 let lastViewChoiceId: string | undefined;
 
@@ -60,6 +77,8 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
     private readonly changeEmitter = new vscode.EventEmitter<vscode.Uri>();
     readonly onDidChange = this.changeEmitter.event;
     private readonly states = new Map<string, ViewState>();
+    private readonly statusBar =
+        vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
 
     constructor(private readonly getClient: () => LanguageClient | undefined) {}
 
@@ -80,6 +99,7 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
             sourceUri,
             kind,
             optimized: choice.optimized,
+            wholeModule: choice.wholeModule,
             text: '',
             mappings: [],
             decoration: vscode.window.createTextEditorDecorationType({
@@ -108,19 +128,24 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
             kind: ViewKind;
             optimized: boolean;
             optLevel: 0 | 2;
+            wholeModule?: boolean;
         } = {
             uri: state.sourceUri,
             kind: state.kind,
             optimized: state.optimized,
-            optLevel: state.optimized ? 2 : 0
+            optLevel: state.optimized ? 2 : 0,
+            ...(state.wholeModule ? { wholeModule: true } : {})
         };
         try {
             const result = await activeClient.sendRequest<{
                 kind: string;
                 text: string;
                 mappings?: ViewMapping[];
+                cached?: boolean;
+                timings?: { analyzeMs?: number; emitMs?: number; totalMs?: number };
             }>(
                 'cflat/viewAssembly', params);
+            this.showTimings(state, result.timings, result.cached === true);
             state.text = result.text;
             state.mappings = Array.isArray(result.mappings)
                 ? result.mappings.reduce<ViewMapping[]>((valid, mapping) => {
@@ -175,6 +200,7 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         state.decoration.dispose();
         state.outerDecoration.dispose();
         this.states.delete(key);
+        if (this.states.size === 0) this.statusBar.hide();
     }
 
     updateSelection(editor: vscode.TextEditor): void {
@@ -317,12 +343,33 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         if (editor) this.updateSelection(editor);
     }
 
+    // Status-bar line for the last view refresh, so a slow request is self-explaining.
+    private showTimings(state: ViewState,
+        timings: { analyzeMs?: number; emitMs?: number; totalMs?: number } | undefined,
+        cached: boolean): void {
+        const label = `${state.kind === 'ir' ? 'IR' : 'asm'}${state.optimized ? ' -O2' : ''}`;
+        if (cached || !timings) {
+            this.statusBar.text = `$(watch) ${label} view: cached`;
+            this.statusBar.tooltip = 'cflat view served from the response cache';
+        } else {
+            const analyze = timings.analyzeMs ?? 0;
+            const emit = timings.emitMs ?? 0;
+            const total = timings.totalMs ?? analyze + emit;
+            this.statusBar.text = `$(watch) ${label} view: ${total}ms`;
+            this.statusBar.tooltip =
+                `cflat view refresh: analyze ${analyze}ms + emit ${emit}ms` +
+                (analyze === 0 ? ' (analysis reused)' : '');
+        }
+        this.statusBar.show();
+    }
+
     dispose(): void {
         for (const state of this.states.values()) {
             state.decoration.dispose();
             state.outerDecoration.dispose();
         }
         this.changeEmitter.dispose();
+        this.statusBar.dispose();
     }
 }
 
@@ -856,7 +903,8 @@ export function activate(context: vscode.ExtensionContext): void {
         // Invoked by the lens itself, so it is deliberately not in the command palette.
         vscode.commands.registerCommand('cflat.showIrForFunction',
             async (sourceUri: string, line: number, optimized: boolean) => {
-                const choice = viewChoices.find(candidate => candidate.optimized === optimized)
+                const choice = viewChoices.find(candidate =>
+                    candidate.optimized === optimized && !candidate.wholeModule)
                     ?? viewChoices[0];
                 const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(sourceUri));
                 await openCompilerView(viewProvider, 'ir', choice, document, line);

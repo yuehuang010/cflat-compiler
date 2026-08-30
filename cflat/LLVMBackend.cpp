@@ -3908,6 +3908,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     sourceFileName = sourceDisplayName_.empty()
         ? std::filesystem::path(filePath).filename().string()
         : sourceDisplayName_;
+    llvm::TimeTraceScope analyzeScope("Analyze", sourceFileName);
     auto rootCanonical = std::filesystem::weakly_canonical(filePath).string();
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
@@ -4021,9 +4022,15 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         parser.addErrorListener(&analyzeErrorListener);
         parser.setErrorHandler(std::make_shared<CFlatErrorStrategy>(localizeMessage));
 
-        tokens.fill();
-
-        auto computeUnit = parser.compilationUnit();
+        CFlatParser::CompilationUnitContext* computeUnit;
+        {
+            llvm::TimeTraceScope parseScope("Parse", sourceFileName);
+            {
+                llvm::TimeTraceScope lexScope("Lex", sourceFileName);
+                tokens.fill();
+            }
+            computeUnit = parser.compilationUnit();
+        }
 
         if (analyzeErrorListener.hasErrors())
         {
@@ -4033,6 +4040,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
         // Process top-level imports before scanning
         if (auto* tu = computeUnit->translationUnit()) {
+            llvm::TimeTraceScope importsScope("ProcessImports", sourceFileName);
             for (auto* decl : tu->externalDeclaration()) {
                 if (auto* imp = decl->importDeclaration()) {
                     // Point diagnostics at this import statement (mirrors Compile's ProcessImports):
@@ -4121,6 +4129,7 @@ bool LLVMBackend::Analyze(const std::string& filePath,
 
         // Forward-ref scan
         {
+            llvm::TimeTraceScope scanScope("ForwardRefScan", sourceFileName);
             ForwardRefScanner scanner(this);
             scanner.SetTokens(&tokens);
             scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
@@ -4142,20 +4151,23 @@ bool LLVMBackend::Analyze(const std::string& filePath,
         }
 
         // Code-gen walk
-        auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
-        auto walker = antlr4::tree::ParseTreeWalker();
-        walker.walk(myListener.get(), computeUnit);
         {
-            NoCurrentFunctionScope noCurrent(this);
-            myListener->ResolvePendingGlobalDefaultConstructions();
+            llvm::TimeTraceScope codegenScope("CodeGeneration", sourceFileName);
+            auto myListener = std::make_unique<MainListener>(&parser, this, sourceFileName);
+            auto walker = antlr4::tree::ParseTreeWalker();
+            walker.walk(myListener.get(), computeUnit);
+            {
+                NoCurrentFunctionScope noCurrent(this);
+                myListener->ResolvePendingGlobalDefaultConstructions();
+            }
+            // Now that every implementor is registered, emit the interface rebox if-chains.
+            // Resolve-created calls can register deferred interface work, so resolve first.
+            EmitDeferredInterfaceReboxBodies();
+            // Now that every type and generic monomorphization is registered, fill in the
+            // bodies of deferred delete-site destructor wrappers (recursive containers whose
+            // element type was incomplete when the container dtor was emitted).
+            EmitDeferredFullDestructorBodies();
         }
-        // Now that every implementor is registered, emit the interface rebox if-chains.
-        // Resolve-created calls can register deferred interface work, so resolve first.
-        EmitDeferredInterfaceReboxBodies();
-        // Now that every type and generic monomorphization is registered, fill in the
-        // bodies of deferred delete-site destructor wrappers (recursive containers whose
-        // element type was incomplete when the container dtor was emitted).
-        EmitDeferredFullDestructorBodies();
         ResolveMaterializedInterfaceUses();
         stream.close();
     }

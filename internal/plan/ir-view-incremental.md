@@ -16,8 +16,11 @@ the faithfulness checker.
 
 After an edit, the first view request pays:
 1. analyze (full front-end recompile with debug info): ~40 ms small file,
-   ~500-700 ms test_basic.cb. Dominated by ImportFile of user imports; core rides the
-   bitcode cache.
+   ~500-700 ms test_basic.cb. Traced breakdown (test_basic, warm cache): Analyze
+   ~640 ms = Parse ~300 ms (of which lexing is only ~20 ms - the rest is ANTLR LL
+   parsing) + CodeGeneration ~240 ms + ForwardRefScan ~45 ms + ProcessImports ~10 ms.
+   User-import caching is therefore worthless; the parse and codegen walks are the
+   levers.
 2. emit: O0 ~10-100 ms; O2 pays the whole-module opt pipeline (~0.7-1.0 s on
    test_basic) plus codegen for asm.
 Subsequent views of the same text are free (slot reuse skips analyze; identical
@@ -55,8 +58,23 @@ test_basic.cb). Items 4-6 remain.
    so VS Code does not re-tokenize a megabyte-scale virtual document per save.
    (Root scoping already shrank typical payloads enough that this is deferred.)
 6. Extension UX for the new server behavior: surface the "showing N of M functions"
-   banner as a toggle (sends wholeModule: true), and show timings.cached/analyzeMs in
-   the status bar so slow requests are self-explaining.
+   banner as a toggle (sends wholeModule: true) - DONE 2026-08-30 (two extra view
+   choices, whole-unoptimized / whole-optimized) and status-bar timings (last refresh's
+   analyze/emit ms, cached flag) - item complete.
+
+## Rejected: two-stage SLL parsing (investigated 2026-08-30)
+
+Parse (~300 ms on test_basic) looked like the biggest single analyze cost, so the
+standard ANTLR two-stage strategy (PredictionMode::SLL + BailErrorStrategy, LL
+fallback on ParseCancellationException) was implemented and measured. Outcome: SLL
+bails within ~5 ms on ordinary valid input - test_basic trips it at the close-paren
+of a plain method declaration ('int get(int i)' line 32), and core files trip it
+too - so every parse paid a wasted SLL attempt plus the full LL parse. The grammar
+is not SLL-clean (likely the cast/paren-expression and declarator ambiguities), and
+making it so is a grammar-redesign project, not a tuning change. Change reverted;
+the Lex/Parse trace split that produced the finding was kept. If parse time ever
+matters enough, the real project is an SLL-clean grammar refactor - measure with
+the same probe (TimeTraceScope ParseSLL/ParseLLFallback + bail-token print).
 
 ## Constraints learned this round
 
