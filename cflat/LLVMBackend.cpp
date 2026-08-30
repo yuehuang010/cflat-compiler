@@ -4192,6 +4192,7 @@ void LLVMBackend::ResetForReanalysis()
     moveEventLog_.clear();
     // Origin slots hold llvm::Value* into the module being discarded - drop them too.
     ownOriginSlots_.clear();
+    optimizedViewCache_ = OptimizedViewCache{};
     // Same: both borrow-provenance ledgers are keyed by Functions/CallInsts of the old module.
     uniqueFieldBorrowReturns_.clear();
     uniqueFieldBorrowResults_.clear();

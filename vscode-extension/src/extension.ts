@@ -161,6 +161,13 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         await Promise.all(refreshes);
     }
 
+    hasViewsFor(sourceUri: string): boolean {
+        for (const state of this.states.values()) {
+            if (state.sourceUri === sourceUri) return true;
+        }
+        return false;
+    }
+
     closeView(uri: vscode.Uri): void {
         const key = uri.toString();
         const state = this.states.get(key);
@@ -777,7 +784,12 @@ export function activate(context: vscode.ExtensionContext): void {
     void startClient();
 
     const viewProvider = new CflatViewContentProvider(() => client);
+    const editRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
     context.subscriptions.push(
+        new vscode.Disposable(() => {
+            for (const timer of editRefreshTimers.values()) clearTimeout(timer);
+            editRefreshTimers.clear();
+        }),
         vscode.workspace.registerTextDocumentContentProvider('cflat-view', viewProvider),
         viewProvider,
         vscode.window.onDidChangeTextEditorSelection(event => {
@@ -788,6 +800,20 @@ export function activate(context: vscode.ExtensionContext): void {
         }),
         vscode.workspace.onDidSaveTextDocument(document => {
             void viewProvider.refreshSource(document.uri.toString());
+        }),
+        vscode.workspace.onDidChangeTextDocument(event => {
+            const document = event.document;
+            if (document.uri.scheme !== 'file' || document.languageId !== 'cflat' ||
+                event.contentChanges.length === 0) return;
+            const sourceUri = document.uri.toString();
+            if (!viewProvider.hasViewsFor(sourceUri)) return;
+            const oldTimer = editRefreshTimers.get(sourceUri);
+            if (oldTimer !== undefined) clearTimeout(oldTimer);
+            const timer = setTimeout(() => {
+                editRefreshTimers.delete(sourceUri);
+                void viewProvider.refreshSource(sourceUri);
+            }, 400);
+            editRefreshTimers.set(sourceUri, timer);
         })
     );
 

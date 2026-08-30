@@ -24,6 +24,7 @@
 #include <deque>
 #include <functional>
 #include <limits>
+#include <set>
 #if defined(_WIN32)
 #include <windows.h>
 #endif
@@ -756,6 +757,10 @@ private:
 
         std::string uri = (*params)["textDocument"].value("uri", "");
         {
+            std::lock_guard<std::mutex> lock(viewUrisMutex_);
+            viewUris_.erase(uri);
+        }
+        {
             std::lock_guard<std::mutex> lock(docsMutex_);
             docs_.erase(uri);
         }
@@ -1358,6 +1363,10 @@ private:
         }
 
         const std::string uri = (*params)["uri"].get<std::string>();
+        {
+            std::lock_guard<std::mutex> lock(viewUrisMutex_);
+            viewUris_.insert(uri);
+        }
         const std::string kind = (*params)["kind"].get<std::string>();
         int optLevel = 0;
         if (params->contains("optimized"))
@@ -1456,8 +1465,8 @@ private:
         EnqueueAnalysis(uri, doc.filePath, doc.text, std::move(request));
     }
 
-    // Rides the IrRequest path deliberately: every "a response is owed" guard, the
-    // generation-skip bypass, and SetAnalyzeDebugInfo all key on irRequest being present.
+    // Rides the IrRequest path deliberately: every "a response is owed" guard and the
+    // generation-skip bypass key on irRequest being present.
     void HandleOptimizationInfo(const nlohmann::json& msg, const std::optional<nlohmann::json>& id)
     {
         const auto* params = GetParams(msg);
@@ -1468,6 +1477,10 @@ private:
         }
 
         const std::string uri = (*params)["uri"].get<std::string>();
+        {
+            std::lock_guard<std::mutex> lock(viewUrisMutex_);
+            viewUris_.insert(uri);
+        }
         int optLevel = 2;
         if (params->contains("optLevel"))
         {
@@ -1535,6 +1548,7 @@ private:
         std::string text;
         uint64_t    textHash = 0;
         uint64_t    generation = 0;
+        bool        analyzeDebugInfo = false;
         struct IrRequest
         {
             nlohmann::json id;
@@ -1546,6 +1560,29 @@ private:
             bool withRemarks = true;   // optinfo only
         };
         std::optional<IrRequest> irRequest;
+    };
+
+    struct InFlightAnalysisKey
+    {
+        std::string uri;
+        uint64_t textHash = 0;
+        uint64_t textLen = 0;
+
+        bool operator==(const InFlightAnalysisKey& other) const
+        {
+            return uri == other.uri && textHash == other.textHash && textLen == other.textLen;
+        }
+    };
+
+    struct InFlightAnalysisKeyHash
+    {
+        size_t operator()(const InFlightAnalysisKey& key) const
+        {
+            size_t result = std::hash<std::string>{}(key.uri);
+            result ^= std::hash<uint64_t>{}(key.textHash) + 0x9e3779b9u + (result << 6) + (result >> 2);
+            result ^= std::hash<uint64_t>{}(key.textLen) + 0x9e3779b9u + (result << 6) + (result >> 2);
+            return result;
+        }
     };
 
     using IrRequest = AnalysisJob::IrRequest;
@@ -1614,6 +1651,12 @@ private:
         job.text = text;
         job.textHash = TextHash(text);
         job.irRequest = std::move(irRequest);
+        job.analyzeDebugInfo = job.irRequest.has_value();
+        if (!job.analyzeDebugInfo)
+        {
+            std::lock_guard<std::mutex> lock(viewUrisMutex_);
+            job.analyzeDebugInfo = viewUris_.contains(uri);
+        }
         {
             std::lock_guard<std::mutex> lock(uriGenMutex_);
             job.generation = ++uriGeneration_[uri];
@@ -1709,6 +1752,44 @@ private:
             && record.index != nullptr;
     }
 
+    bool AnalysisInFlight(const AnalysisJob& job) const
+    {
+        if (!job.analyzeDebugInfo)
+            return false;
+        const InFlightAnalysisKey key{
+            job.uri, job.textHash, static_cast<uint64_t>(job.text.size())
+        };
+        return inFlightAnalyses_.find(key) != inFlightAnalyses_.end();
+    }
+
+    void PublishAnalysisInFlight(const AnalysisJob& job, size_t slot)
+    {
+        if (!job.analyzeDebugInfo)
+            return;
+        const InFlightAnalysisKey key{
+            job.uri, job.textHash, static_cast<uint64_t>(job.text.size())
+        };
+        inFlightAnalyses_.emplace(key, slot);
+    }
+
+    void RemoveAnalysisInFlight(const AnalysisJob& job, size_t slot)
+    {
+        if (!job.analyzeDebugInfo)
+            return;
+        const InFlightAnalysisKey key{
+            job.uri, job.textHash, static_cast<uint64_t>(job.text.size())
+        };
+        auto range = inFlightAnalyses_.equal_range(key);
+        for (auto it = range.first; it != range.second; ++it)
+        {
+            if (it->second == slot)
+            {
+                inFlightAnalyses_.erase(it);
+                return;
+            }
+        }
+    }
+
     std::shared_ptr<LspSymbolIndex> ReusableAnalysisIndex(size_t slot, const AnalysisJob& job) const
     {
         if (!job.irRequest)
@@ -1729,13 +1810,13 @@ private:
         analysisRecords_[slot] = {};
     }
 
-    void SetAnalysisRecord(size_t slot, const AnalysisJob& job, bool analyzeDebugInfo,
+    void SetAnalysisRecord(size_t slot, const AnalysisJob& job,
                            const std::shared_ptr<LspSymbolIndex>& index)
     {
         std::lock_guard<std::mutex> lock(analysisRecordMutex_);
         analysisRecords_[slot] = {
             job.uri, job.textHash, static_cast<uint64_t>(job.text.size()),
-            analyzeDebugInfo, true, index
+            job.analyzeDebugInfo, true, index
         };
     }
 
@@ -1824,7 +1905,17 @@ private:
             size_t slot;
             {
                 std::unique_lock<std::mutex> lock(backendMutex_);
-                backendCV_.wait(lock, [&] { return !freeBackends_.empty(); });
+                backendCV_.wait(lock, [&]
+                {
+                    if (freeBackends_.empty())
+                        return false;
+                    if (!job.irRequest)
+                        return true;
+                    for (size_t freeSlot : freeBackends_)
+                        if (AnalysisRecordMatches(freeSlot, job))
+                            return true;
+                    return !AnalysisInFlight(job);
+                });
                 auto preferred = freeBackends_.end();
                 if (job.irRequest)
                 {
@@ -1847,6 +1938,7 @@ private:
                     slot = freeBackends_.back();
                     freeBackends_.pop_back();
                 }
+                PublishAnalysisInFlight(job, slot);
             }
 
             // A single analysis must never take down the whole server: any C++ exception
@@ -1872,9 +1964,10 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(backendMutex_);
+                RemoveAnalysisInFlight(job, slot);
                 freeBackends_.push_back(slot);
             }
-            backendCV_.notify_one();
+            backendCV_.notify_all();
         }
     }
 
@@ -1967,7 +2060,7 @@ private:
                 diagnostics.push_back(diag);
             });
             backend->SetSymbolSink(newIndex.get());
-            backend->SetAnalyzeDebugInfo(job.irRequest.has_value());
+            backend->SetAnalyzeDebugInfo(job.analyzeDebugInfo);
 
             bool ok = false;
             llvm::CrashRecoveryContext crc;
@@ -2015,7 +2108,7 @@ private:
             else
             {
                 if (recovered && ok)
-                    SetAnalysisRecord(slot, job, job.irRequest.has_value(), newIndex);
+                    SetAnalysisRecord(slot, job, newIndex);
                 backend->SetDiagnosticSink(nullptr);
                 backend->SetHintRegionSink(nullptr);
                 backend->SetSymbolSink(nullptr);
@@ -2634,6 +2727,9 @@ private:
     std::mutex docsMutex_;
     std::unordered_map<std::string, OpenDocument> docs_;
 
+    std::mutex viewUrisMutex_;
+    std::set<std::string> viewUris_;
+
     // Backend pool - one LLVMBackend per slot. Workers check out a free slot,
     // run analysis, and return it. backendAnalyzed_[slot] tracks whether
     // ResetForReanalysis is needed before the next run on that slot.
@@ -2642,6 +2738,7 @@ private:
     std::vector<bool> backendAnalyzed_;  // sized to poolSize_ in the constructor; tracks per-slot reset need
     std::vector<AnalysisRecord> analysisRecords_;
     mutable std::mutex analysisRecordMutex_;
+    std::unordered_multimap<InFlightAnalysisKey, size_t, InFlightAnalysisKeyHash> inFlightAnalyses_;
     std::vector<size_t> freeBackends_;
     std::mutex backendMutex_;
     std::condition_variable backendCV_;

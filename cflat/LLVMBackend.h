@@ -536,6 +536,13 @@ public:
         std::vector<LineFrame> stack;
     };
 
+    struct FrameRemark
+    {
+        int stackBytes = 0;
+        int spills = 0;
+        int reloads = 0;
+    };
+
     // Tier 1 facts for one source line. Code inlined elsewhere still counts against the
     // line that wrote it, so a line inside an eliminated function can still be non-empty.
     struct LineOptInfo
@@ -2656,6 +2663,14 @@ private:
     std::unique_ptr<llvm::Module> module;
     std::unique_ptr<llvm::MemoryBuffer> coreBitcodeBuffer_;
     std::unique_ptr<llvm::LLVMContext> context;
+    struct OptimizedViewCache
+    {
+        int optLevel = -1;
+        std::unique_ptr<llvm::Module> module;
+        std::map<std::string, FrameRemark> frameRemarks;
+        std::vector<OptRemark> remarks;
+        bool remarksTruncated = false;
+    } optimizedViewCache_;
     // Names present when a core bitcode cache was loaded; later functions are user IR.
     std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
 
@@ -4572,6 +4587,7 @@ private:
     // Shared prologue for PrintModuleView and CollectOptimizationInfo. Keep them on one
     // path: the core materialization below is load-bearing on a warm cache.
     std::unique_ptr<llvm::Module> CloneModuleForView(const std::string& purpose);
+    std::unique_ptr<llvm::Module> GetOrBuildOptimizedView(int optLevel);
     bool OptimizeViewModule(llvm::Module& view, int optLevel, bool needTargetMachine,
                             std::unique_ptr<llvm::TargetMachine>& outMachine);
 

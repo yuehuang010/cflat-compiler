@@ -570,7 +570,22 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
     };
 
     std::unique_ptr<llvm::TargetMachine> targetMachine;
-    if (!OptimizeViewModule(*view, optLevel, optLevel > 0 || kind == "asm", targetMachine))
+    if (optLevel > 0)
+    {
+        view = GetOrBuildOptimizedView(optLevel);
+        if (!view)
+            return false;
+        if (kind == "asm")
+        {
+            targetMachine = CreateOptTargetMachine(optLevel);
+            if (!targetMachine)
+                return false;
+            // The cached module was retargeted when built; re-applying is a no-op.
+            view->setTargetTriple(targetMachine->getTargetTriple());
+            view->setDataLayout(targetMachine->createDataLayout());
+        }
+    }
+    else if (!OptimizeViewModule(*view, optLevel, kind == "asm", targetMachine))
         return false;
 
     const std::string rootPath = analyzedRootPath_;
@@ -1001,13 +1016,6 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
 
 namespace {
 
-struct FrameRemark
-{
-    int stackBytes = 0;
-    int spills = 0;
-    int reloads = 0;
-};
-
 // Passes whose remarks are worth an IDE annotation. Deliberately an allowlist: enabling
 // everything (instcombine especially) buries the actionable remarks in noise.
 bool IsReportedRemarkPass(llvm::StringRef passName)
@@ -1026,12 +1034,12 @@ constexpr size_t kMaxCollectedRemarks = 400;
 // spill counts (prologepilog / regalloc) - scraping the prologue text would be guesswork.
 struct RemarkCollector : public llvm::DiagnosticHandler
 {
-    std::map<std::string, FrameRemark>& frames;
+    std::map<std::string, LLVMBackend::FrameRemark>& frames;
     std::vector<LLVMBackend::OptRemark>* remarks;   // null when only frames are wanted
     std::function<bool(const llvm::DiagnosticLocation&)> isRootLocation;
     bool& truncated;   // a reference: the context destroys this handler on restore
 
-    RemarkCollector(std::map<std::string, FrameRemark>& frameOut,
+    RemarkCollector(std::map<std::string, LLVMBackend::FrameRemark>& frameOut,
                     std::vector<LLVMBackend::OptRemark>* remarkOut,
                     std::function<bool(const llvm::DiagnosticLocation&)> rootFilter,
                     bool& truncatedOut)
@@ -1067,7 +1075,7 @@ struct RemarkCollector : public llvm::DiagnosticHandler
         const llvm::StringRef remarkName = opt->getRemarkName();
         if (remarkName == "StackSize" || remarkName == "SpillReloadCopies")
         {
-            FrameRemark& entry = frames[opt->getFunction().getName().str()];
+            LLVMBackend::FrameRemark& entry = frames[opt->getFunction().getName().str()];
             for (const auto& arg : opt->getArgs())
             {
                 int value = 0;
@@ -1212,6 +1220,48 @@ std::string AsmLabelName(const std::string& line)
 
 }  // namespace
 
+std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
+{
+    if (optLevel <= 0 || !context)
+        return nullptr;
+    if (optimizedViewCache_.optLevel == optLevel && optimizedViewCache_.module)
+        return llvm::CloneModule(*optimizedViewCache_.module);
+
+    OptimizedViewCache next;
+    auto view = CloneModuleForView("optimized view");
+    if (!view)
+        return nullptr;
+
+    {
+        auto previousHandler = context->getDiagnosticHandler();
+        context->setDiagnosticHandler(
+            std::make_unique<RemarkCollector>(
+                next.frameRemarks, &next.remarks,
+                // Request-specific source ranges are applied when optinfo consumes the cache.
+                [](const llvm::DiagnosticLocation& location) { return location.isValid(); },
+                next.remarksTruncated),
+            /*RespectFilters=*/false);
+        struct HandlerRestore
+        {
+            llvm::LLVMContext* context;
+            std::unique_ptr<llvm::DiagnosticHandler> previous;
+            ~HandlerRestore() { context->setDiagnosticHandler(std::move(previous), false); }
+        } restore{context.get(), std::move(previousHandler)};
+
+        std::unique_ptr<llvm::TargetMachine> targetMachine;
+        llvm::TimeTraceScope pipelineScope("OptViewCachePipeline",
+                                           "O" + std::to_string(optLevel));
+        if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
+            return nullptr;
+    }
+
+    next.optLevel = optLevel;
+    // Keep the post-pipeline module untouched; every consumer receives a fresh clone.
+    next.module = std::move(view);
+    optimizedViewCache_ = std::move(next);
+    return llvm::CloneModule(*optimizedViewCache_.module);
+}
+
 bool LLVMBackend::CollectOptimizationInfo(int optLevel,
                                           const std::vector<SourceFunction>& sourceFunctions,
                                           OptimizationInfo& info,
@@ -1221,10 +1271,6 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     info = OptimizationInfo{};
     std::vector<FunctionOptInfo>& out = info.functions;
     if (!module || optLevel < 0 || optLevel > 2)
-        return false;
-
-    auto view = CloneModuleForView("optimization info");
-    if (!view)
         return false;
 
     const std::string rootName = std::filesystem::path(analyzedRootPath_).filename().string();
@@ -1245,10 +1291,29 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
         return location.isValid() && lineInUserRange(static_cast<int>(location.getLine()));
     };
 
-    // The handler stays installed across BOTH the IR pipeline (inline / vectorize / unroll
-    // / gvn / licm / sroa) and codegen (prologepilog / regalloc); the two emit at different
-    // stages and a handler installed for only one of them silently loses the other's half.
+    std::unique_ptr<llvm::Module> view;
     std::map<std::string, FrameRemark> frameRemarks;
+    if (optLevel > 0)
+    {
+        view = GetOrBuildOptimizedView(optLevel);
+        if (!view)
+            return false;
+        frameRemarks = optimizedViewCache_.frameRemarks;
+        if (withRemarks)
+        {
+            info.remarks = optimizedViewCache_.remarks;
+            info.remarksTruncated = optimizedViewCache_.remarksTruncated;
+        }
+    }
+    else
+    {
+        view = CloneModuleForView("optimization info");
+        if (!view)
+            return false;
+    }
+
+    // The handler stays installed across codegen (prologepilog / regalloc), which emits
+    // separately from the cached IR pipeline.
     auto previousHandler = context->getDiagnosticHandler();
     context->setDiagnosticHandler(
         std::make_unique<RemarkCollector>(frameRemarks,
@@ -1263,11 +1328,21 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     } restore{context.get(), std::move(previousHandler)};
 
     std::unique_ptr<llvm::TargetMachine> targetMachine;
+    if (optLevel == 0)
     {
         llvm::TimeTraceScope pipelineScope("OptInfoPipeline",
                                            "O" + std::to_string(optLevel));
         if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
             return false;
+    }
+    else
+    {
+        targetMachine = CreateOptTargetMachine(optLevel);
+        if (!targetMachine)
+            return false;
+        // The cached module was retargeted when built; re-applying is a no-op.
+        view->setTargetTriple(targetMachine->getTargetTriple());
+        view->setDataLayout(targetMachine->createDataLayout());
     }
 
     // Seed one entry per source function and index every surviving symbol back to it,
@@ -1361,8 +1436,10 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
         if (!info.remarks.empty())
         {
             std::vector<OptRemark> kept;
-        for (auto& remark : info.remarks)
-            if (entryBySymbol.count(remark.function)) kept.push_back(std::move(remark));
+            for (auto& remark : info.remarks)
+                if (entryBySymbol.count(remark.function)
+                    && lineInUserRange(remark.srcLine))
+                    kept.push_back(std::move(remark));
             info.remarks = std::move(kept);
         }
     }
