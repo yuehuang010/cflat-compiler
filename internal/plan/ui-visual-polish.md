@@ -28,7 +28,7 @@ no typographic hierarchy.
 - **Tests**: tui_demo self-test +1 (`testTextFont`, 19/19); gallery self-test stays
   33/33 (card backdrops key off container paths, not policed by the stress census).
   Gates on the mac box: tui_demo 19/19, gallery 33/33, fedit 15/15, `test.sh Release`
-  160/0, `example_mac.sh Release` 34/0. Owed on Windows before commit: test.bat +
+  160/0, `example.sh Release` 34/0. Owed on Windows before commit: test.bat +
   example.bat. A live gallery window launch (visual) is left to the review session.
   Note: gallery cards still use `column` (ELEM_VIEW) so they now show backdrops; the
   Phase C remake will lean on this plus `FONT_TITLE`/`FONT_CAPTION` for the cards.
@@ -71,7 +71,7 @@ no typographic hierarchy.
   Live-only for the actual popup (human-verified); the existing synthetic route
   (assert 14) still covers command dispatch, and the code path survives a live launch.
 - **Gates (mac)**: gallery 39/39 (was 37, +24b/+10b), tui_demo 23/23, fedit 15/15,
-  `test.sh Release` 160/0, `example_mac.sh Release` 34/0. Live gallery launch = no
+  `test.sh Release` 160/0, `example.sh Release` 34/0. Live gallery launch = no
   crash (3s probe). Owed on Windows before commit: `test.bat` + `test_lsp.bat`
   (nativeContainerBg added to win32/winui but not built/run on the mac box).
 - **List/Tree rows tall + text top-aligned (Cocoa cell-based tables, screenshot)**:
@@ -86,7 +86,7 @@ no typographic hierarchy.
   enum-uncertainty guidance, relying on the explicit row height alone. Row height is
   a visual metric, not headless-assertable; gates below stayed green and a fresh
   live gallery build launched cleanly. Gates (mac): gallery 39/39, tui_demo 23/23,
-  fedit 15/15, `test.sh Release` 160/0, `example_mac.sh Release` 34/0.
+  fedit 15/15, `test.sh Release` 160/0, `example.sh Release` 34/0.
 
 ## Root causes found in review (screenshot-verified on the Cocoa host)
 
@@ -203,13 +203,13 @@ Phase C is the workaround. Revisit only if C still looks sparse.
 
 Host-neutral + Cocoa-host .cb changes only (no compiler C++). On the mac box:
 tui_demo.cb self-test, gallery --selftest, fedit --selftest, ./test.sh Release,
-./example_mac.sh Release, plus a live gallery launch for visual confirmation.
+./example.sh Release, plus a live gallery launch for visual confirmation.
 Owed on the Windows box before commit: test.bat + example.bat. Deploy edited
 core files to x64/Release/core/ when iterating (compiler loads core next to
 the exe).
 
 Phase C gate results (mac box, this pass, Release): `out/gallery_mac
---selftest` 35/35, `example_mac.sh Release` 34/0, `test.sh Release` 160/0.
+--selftest` 35/35, `example.sh Release` 34/0, `test.sh Release` 160/0.
 A live (non-selftest) build was compiled to the reviewer's scratchpad
 (`gallery_v3`) but not launched - left for the visual-review session. Owed:
 Windows `test.bat` + `example.bat` (example-only change touching no compiler

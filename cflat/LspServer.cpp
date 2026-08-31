@@ -451,6 +451,14 @@ private:
     std::function<void(bool)> finish_;
 };
 
+struct ViewTimings
+{
+    int64_t analyzeMs = 0;
+    int64_t emitMs = 0;
+    int64_t totalMs = 0;
+    bool incremental = false;
+};
+
 class LspServer
 {
 public:
@@ -1533,14 +1541,6 @@ private:
     // -----------------------------------------------------------------------
     // Job dispatch - every analysis goes through the worker pool.
     // -----------------------------------------------------------------------
-
-    struct ViewTimings
-    {
-        int64_t analyzeMs = 0;
-        int64_t emitMs = 0;
-        int64_t totalMs = 0;
-        bool incremental = false;
-    };
 
     struct AnalysisJob
     {

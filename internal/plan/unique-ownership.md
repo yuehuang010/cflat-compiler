@@ -50,7 +50,7 @@ change survives as staged working-tree edits. If a future session finds staged-b
 `unique` work with no explanation, this is why - it is not an abandoned experiment.
 
 **Verified baselines to measure against:** `bash test.sh Release` = 448 passed, 0 failed,
-8 skipped. `bash example_mac.sh` = 35 passed, 0 failed. `bash test_lsp.sh` = 152 passed, 0 failed
+8 skipped. `bash example.sh` = 35 passed, 0 failed. `bash test_lsp.sh` = 152 passed, 0 failed
 (449 faded hints). macOS host - do NOT add "needs Windows verification" caveats; the maintainer
 owns that and is aware.
 
@@ -232,7 +232,7 @@ the call sites - C#-like local readability, with the complexity paid once in the
    `std::terminate()` when a joinable `std::thread` is destroyed.
 
    **OUTCOME 2026-07-20 - the RAII migration, with its copy-path audit.** Executed on macOS;
-   `test.sh Release` 448/0/8 and `example_mac.sh` 35/0 both green after.
+   `test.sh Release` 448/0/8 and `example.sh` 35/0 both green after.
 
    | Type | Copy path found | Verdict |
    |---|---|---|

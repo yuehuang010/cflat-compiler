@@ -182,7 +182,7 @@ The prompt must also contain:
   `--init` cache round-trip in `LLVMBackend.cpp`.
 - Verification bar: `./cmake_build.sh release && ./test.sh Release` must be green
   in the worktree, AND the host example gate must pass with 0 failures
-  (`bash example_mac.sh Release` on macOS, `example.bat` on Windows). The example
+  (`bash example.sh Release` on macOS, `example.bat` on Windows). The example
   gate is mandatory whenever the diff touches the compiler or `core/*.cb` -
   examples exercise core libraries (GUI, shell) that `test.sh` never compiles, and
   a diagnostics change can break them while the test suite stays green. Report the
@@ -380,7 +380,7 @@ git -C ../cflat-fix-<slug> rev-list --count master..HEAD   # must print 1
 git -C ../cflat-fix-<slug> rebase master
 # re-verify after rebase (skippable ONLY if the rebase was a no-op - "up to date" -
 # and the full bar already ran green on this exact commit)
-cd ../cflat-fix-<slug> && ./cmake_build.sh release && ./test.sh Release && bash example_mac.sh Release
+cd ../cflat-fix-<slug> && ./cmake_build.sh release && ./test.sh Release && bash example.sh Release
 # fast-forward master in the main checkout
 git -C <repo> merge --ff-only fix/<slug>
 ```
@@ -404,7 +404,7 @@ git branch -d fix/<slug>
 ```
 
 - **Rebuild the main checkout at the merged HEAD and re-run the full bar there**
-  (`./cmake_build.sh release && ./test.sh Release && bash example_mac.sh Release`).
+  (`./cmake_build.sh release && ./test.sh Release && bash example.sh Release`).
   This is not redundant: the worktree verified the commit, but the main checkout's
   binary is still pre-merge, and a stale binary silently passes checks against the
   OLD compiler - any later "quick check" against it gives false confidence.

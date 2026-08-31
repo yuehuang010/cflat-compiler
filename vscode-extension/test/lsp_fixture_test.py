@@ -782,6 +782,59 @@ def test_view_assembly(client: LspClient) -> str | None:
     return None
 
 
+def test_view_assembly_incremental(client: LspClient) -> str | None:
+    """Exercise the O2 incremental view and root-scoped assembly mappings."""
+    source = (
+        "int incremental_view_helper(int value) {\n"
+        "    return value * 3 + 1;\n"
+        "}\n\n"
+        "extern int main(int argc, char** argv) {\n"
+        "    return incremental_view_helper(argc);\n"
+        "}\n"
+    )
+    edited = source.replace("return value * 3 + 1;", "return value * 4 + 1;")
+    uri = _uri_for("view_assembly_incremental")
+    _open_doc(client, uri, source)
+    diagnostics = wait_diagnostics_for(client, uri)
+    if diagnostics:
+        return f"viewAssembly incremental: unexpected diagnostics: {diagnostics}"
+    first = client.request("cflat/viewAssembly", {
+        "uri": uri, "kind": "ir", "optLevel": 2, "wholeModule": True
+    })
+    if "error" in first:
+        return f"viewAssembly incremental: initial request failed: {first}"
+    first_result = first.get("result", {})
+    client.notify("textDocument/didChange", {
+        "textDocument": {"uri": uri, "version": 2},
+        "contentChanges": [{"text": edited}],
+    })
+    client.notify("textDocument/didSave", {
+        "textDocument": {"uri": uri}, "text": edited
+    })
+    diagnostics = wait_diagnostics_for(client, uri)
+    if diagnostics:
+        return f"viewAssembly incremental: edited diagnostics: {diagnostics}"
+    second = client.request("cflat/viewAssembly", {
+        "uri": uri, "kind": "ir", "optLevel": 2, "wholeModule": True
+    })
+    if "error" in second:
+        return f"viewAssembly incremental: edited request failed: {second}"
+    result = second.get("result", {})
+    if result.get("text") == first_result.get("text"):
+        return "viewAssembly incremental: edited text did not change"
+    if result.get("timings", {}).get("incremental") is not True:
+        return f"viewAssembly incremental: timings did not report incremental: {result}"
+    asm = client.request("cflat/viewAssembly", {
+        "uri": uri, "kind": "asm", "optLevel": 2, "wholeModule": False
+    })
+    if "error" in asm:
+        return f"viewAssembly incremental asm: request failed: {asm}"
+    asm_result = asm.get("result", {})
+    if not asm_result.get("mappings"):
+        return f"viewAssembly incremental asm: mappings are empty: {asm_result}"
+    return None
+
+
 
 def _status(name: str, err: str | None) -> tuple:
     """Turn a run_fixture()/test_*() error result into a (name, status, message) triple."""
@@ -857,6 +910,7 @@ def _run_scenario_shard(exe: str, shard_args: list) -> tuple:
             ("def: non-primitives (namespace/struct/local var)", test_def_non_primitives),
             ("def: nested struct/class", test_def_nested_struct),
             ("viewAssembly: inline attribution", test_view_assembly),
+            ("viewAssembly: incremental O2 and asm mappings", test_view_assembly_incremental),
             ("optimizationInfo: tier 1 facts", test_optimization_info),
         ]
         for name, fn in scenarios:

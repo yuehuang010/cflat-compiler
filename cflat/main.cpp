@@ -191,6 +191,8 @@ int main(int argc, char* argv[])
     args.addFlag("c-header-cache-deep", 0, "For C headers opted in with the 'cache' import clause, validate every transitively included file (mtime/hash), not just the top header");
     args.addMultiOption("symbol", 0, "Look up one or more symbols (IDE-style quick search) and exit. An exact name match prints detailed info (kind, signature, location, members); a miss suggests the closest symbols. Indexes the positional source file if given, otherwise the whole core library");
     args.addMultiOption("symbol-dump", 0, "Dump symbol info for source elements, then exit (repeatable). Selector: line:<n>, line:<a>-<b>, or function:<name>. Requires a positional source file");
+    args.addMultiOption("symbol-dump-ir", 0, "Dump unoptimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
+    args.addMultiOption("symbol-dump-opt", 0, "Dump optimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
     args.addOption("dump-manifest", 0, "Write the merged Win32 manifest XML (exactly what is embedded as the RT_MANIFEST resource) to the given file, or to stdout with '-'. Works with --check");
     args.addOption("dump-winmd", 0, "Read a WinRT metadata file (.winmd) into the projection model and dump it (diagnostic), then exit");
     args.addOption("emit-winmd", 0, "After compiling, write this program's [winrt] interfaces and classes to the given .winmd file");
@@ -216,7 +218,9 @@ int main(int argc, char* argv[])
         && !args.getOption("dump-winmd") && !args.getOption("winmd-instantiate")
         && !args.getOption("out-lli") && !args.getOption("out-asm")
         && !args.getOption("bitcode") && args.getMultiOption("symbol").empty()
-        && args.getMultiOption("symbol-dump").empty();
+        && args.getMultiOption("symbol-dump").empty()
+        && args.getMultiOption("symbol-dump-ir").empty()
+        && args.getMultiOption("symbol-dump-opt").empty();
     if (manifestEligible && !args.hasFlag("force"))
     {
         std::string effectiveOutput = *args.getOption("output");
@@ -456,6 +460,9 @@ int main(int argc, char* argv[])
         return RunSymbolQuery(args, runtimeDir, !args.hasFlag("nologo"));
     if (!args.getMultiOption("symbol-dump").empty())
         return RunSymbolDumpQuery(args, runtimeDir, !args.hasFlag("nologo"));
+    if (!args.getMultiOption("symbol-dump-ir").empty()
+        || !args.getMultiOption("symbol-dump-opt").empty())
+        return RunSymbolDumpIrQuery(args, runtimeDir);
 
     auto filename = args.getPositional(0);
     if (!filename)

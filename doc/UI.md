@@ -1271,7 +1271,7 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 ### IElement x host parity matrix (v18)
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
-compile-checked and runtime-verified on this arm64 Mac by `bash example_mac.sh Release`;
+compile-checked and runtime-verified on this arm64 Mac by `bash example.sh Release`;
 the gate covers the gallery and map native self-tests. On every host the data controls carry REAL items, and the `native*`
 drivers read their answers back out of the control - an empty control cannot pass a driver assert.
 

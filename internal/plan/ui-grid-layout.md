@@ -26,7 +26,7 @@ overflowing children into lines with per-line flex distribution. Landed record:
   NSScrollView, flipped document view, framework scrollY stays 0, one nesting
   level) plus layoutRootBounded so native roots lay out with bounded height.
   Gallery remade as a scrollable column of cards.
-- All .cb, zero compiler changes. Verified on mac (test.sh, example_mac.sh,
+- All .cb, zero compiler changes. Verified on mac (test.sh, example.sh,
   tui_demo self-test, gallery selftest) and Windows gates.
 
 Key contracts that part 2 builds on:

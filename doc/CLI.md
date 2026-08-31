@@ -468,12 +468,24 @@ cflat.exe app.cb -i lib --symbol Math
 | Switch | Value | Description |
 |--------|-------|-------------|
 | `--symbol-dump` | selector | Dump symbol info for source elements, then exit (repeatable). Requires a positional source file. |
+| `--symbol-dump-ir` | selector | Dump unoptimized LLVM IR for a selector, then exit (repeatable). Requires a positional source file. |
+| `--symbol-dump-opt` | selector | Dump optimized LLVM IR for a selector, then exit (repeatable). Defaults to `-O2`; explicit `-O0`, `-O1`, or `-O2` overrides it. Requires a positional source file. |
 
 Selectors are:
 
 - `line:<n>` dumps one 1-based source line, for example `--symbol-dump line:49`.
 - `line:<a>-<b>` dumps an inclusive line range, for example `--symbol-dump line:41-49`.
 - `function:<name>` dumps the definition's function body, for example `--symbol-dump function:main`.
+
+IR dump selectors are `module`, `line:<n>`, and `function:<name>`. Line ranges are not supported
+for IR dumps. A line selector resolves to the function enclosing that 1-based source line.
+With multiple positional files, each file is analyzed in order and its output is separated by a
+file banner. The optimized view reuses the previous file's optimized snapshot when applicable:
+
+```bash
+cflat scratch/inc/1/probe.cb scratch/inc/2/probe.cb --symbol-dump-opt module
+CFLAT_VIEW_NO_INCREMENTAL=1 cflat scratch/inc/1/probe.cb scratch/inc/2/probe.cb --symbol-dump-opt module
+```
 
 Line dumps ignore comments and string or character literals; unresolved identifiers produce no
 symbol detail. Function dumps read the source file containing the indexed definition, including

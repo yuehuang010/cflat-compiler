@@ -11,31 +11,20 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(ROOT / "Test" / "tools"))
 from lsp_client import LspClient, find_exe, initialize, wait_diagnostics_for
+from view_compare import Comparison, Scenario, big_scenarios, compare_views, demo_scenarios, split_blocks
 
 VIEW = {"kind": "ir", "optLevel": 2, "wholeModule": True}
 ERROR = 1
 HIT_RE = re.compile(
     r"\[view-incremental\] hit reopt=(\d+)/(\d+) seeds=(\d+)(?: depth=(\S+))?")
 MISS_RE = re.compile(r"\[view-incremental\] miss reason=([^\s]+)")
-DEFINE_RE = re.compile(r"^define\b")
-NAME_RE = re.compile(r"@([^\s(]+)\(")
-
-
-@dataclass
-class Scenario:
-    name: str
-    edit: Callable[[str], str]
-    executable: bool
-    target: Optional[str] = None
-    edit2: Optional[Callable[[str], str]] = None
-
-
 @dataclass
 class View:
     text: str
@@ -51,24 +40,6 @@ class IncLine:
     total: int = 0
     seeds: int = 0
     depth: str = "-"
-
-
-@dataclass
-class BlockSet:
-    preamble: str
-    functions: dict[str, str]
-    normalized_preamble: str
-    normalized_functions: dict[str, str]
-
-
-@dataclass
-class Comparison:
-    identical: int
-    renumber: int
-    semantic: int
-    inc_functions: int
-    full_functions: int
-    details: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -176,184 +147,6 @@ def parse_inc_line(stderr: str) -> Optional[IncLine]:
     return IncLine("miss", reason=match.group(1))
 
 
-NUMBERED_ID_RE = re.compile(r"(@|#|!|%)(\d+)")
-# LLVM renames struct types parsed into a context that already has the name
-# (%T -> %T.1). Types only - @-name suffixes must stay visible (dup detection).
-TYPE_SUFFIX_RE = re.compile(r"(%[A-Za-z_][A-Za-z0-9_$]*(?:\.[A-Za-z_][A-Za-z0-9_$]*)*)\.\d+\b")
-
-
-def canonical_renumber(text: str) -> str:
-    # Map each distinct numbered id (per sigil class) to its first-occurrence
-    # index, so consistent renumbering compares equal but swaps do not.
-    counters: dict[str, dict[str, int]] = {}
-
-    def sub(match: re.Match) -> str:
-        sigil, number = match.group(1), match.group(2)
-        table = counters.setdefault(sigil, {})
-        if number not in table:
-            table[number] = len(table)
-        return "%s{%d}" % (sigil, table[number])
-
-    return NUMBERED_ID_RE.sub(sub, TYPE_SUFFIX_RE.sub(r"\1", text))
-
-
-def split_blocks(text: str) -> BlockSet:
-    lines = text.splitlines(keepends=True)
-    preamble: list[str] = []
-    functions: dict[str, str] = {}
-    index = 0
-    while index < len(lines):
-        # A "; Function Attrs:" comment belongs to the define that follows it.
-        attrs_line = (lines[index].startswith("; Function Attrs:")
-                      and index + 1 < len(lines)
-                      and DEFINE_RE.match(lines[index + 1]))
-        if not attrs_line and not DEFINE_RE.match(lines[index]):
-            if not lines[index].startswith("; ModuleID"):
-                preamble.append(lines[index])
-            index += 1
-            continue
-        start = index
-        if attrs_line:
-            index += 1
-        match = NAME_RE.search(lines[index])
-        name = match.group(1) if match else "<unnamed-%d>" % len(functions)
-        depth = lines[index].count("{") - lines[index].count("}")
-        index += 1
-        while index < len(lines) and depth > 0:
-            depth += lines[index].count("{") - lines[index].count("}")
-            index += 1
-        functions[name] = "".join(lines[start:index])
-    raw_preamble = "".join(preamble)
-    return BlockSet(raw_preamble, functions, canonical_renumber(raw_preamble),
-                    {name: canonical_renumber(body)
-                     for name, body in functions.items()})
-
-
-def first_difference(left: str, right: str) -> tuple[str, str]:
-    a, b = left.splitlines(), right.splitlines()
-    for index in range(max(len(a), len(b))):
-        la = a[index] if index < len(a) else "<missing>"
-        lb = b[index] if index < len(b) else "<missing>"
-        if la != lb:
-            return la, lb
-    return "<different>", "<different>"
-
-
-def compare_views(inc_text: str, full_text: str) -> Comparison:
-    inc, full = split_blocks(inc_text), split_blocks(full_text)
-    identical = renumber = semantic = 0
-    details: list[str] = []
-    names = list(dict.fromkeys(list(inc.functions) + list(full.functions)))
-    for name in names:
-        inc_raw, full_raw = inc.functions.get(name), full.functions.get(name)
-        inc_norm, full_norm = inc.normalized_functions.get(name), full.normalized_functions.get(name)
-        if inc_raw is None or full_raw is None:
-            semantic += 1
-            details.append("%s: %s vs %s" % (
-                name, "missing" if inc_raw is None else "present",
-                "missing" if full_raw is None else "present"))
-        elif inc_raw == full_raw:
-            identical += 1
-        elif inc_norm == full_norm:
-            renumber += 1
-        else:
-            semantic += 1
-            left, right = first_difference(inc_norm, full_norm)
-            details.append("%s: inc=%s | full=%s" % (name, left, right))
-    if inc.preamble == full.preamble:
-        identical += 1
-    elif inc.normalized_preamble == full.normalized_preamble:
-        renumber += 1
-    else:
-        # Preamble line order (type/global/attr declarations) is not part of
-        # the bar - compare as multisets of canonically-renumbered lines.
-        inc_set = sorted(canonical_renumber(line)
-                         for line in inc.preamble.splitlines() if line.strip())
-        full_set = sorted(canonical_renumber(line)
-                          for line in full.preamble.splitlines() if line.strip())
-        if inc_set == full_set:
-            renumber += 1
-        else:
-            semantic += 1
-            missing = [line for line in full_set if line not in inc_set]
-            extra = [line for line in inc_set if line not in full_set]
-            details.append("<preamble>: %d lines only-in-full (e.g. %s) | "
-                           "%d only-in-inc (e.g. %s)" % (
-                               len(missing), missing[0] if missing else "-",
-                               len(extra), extra[0] if extra else "-"))
-    return Comparison(identical, renumber, semantic, len(inc.functions),
-                      len(full.functions), details)
-
-
-
-def replace_once(source: str, old: str, new: str) -> str:
-    if source.count(old) != 1:
-        raise ValueError("expected one occurrence of %r" % old)
-    return source.replace(old, new)
-
-
-def demo_scenarios() -> list[Scenario]:
-    return [
-        Scenario("comment-only", lambda s: s + "// x\n", False),
-        Scenario("body-const", lambda s: replace_once(
-            s, "int total = top(4)", "int total = top(5)"), True, "main"),
-        Scenario("body-new-string", lambda s: replace_once(
-            s, 'string text = "stable literal";\n    return (int)text.length();',
-            'string text = "stable literal";\n'
-            '    string extra = "new incremental literal";\n'
-            '    return (int)text.length() + (int)extra.length();'),
-            True, "stringScore"),
-        Scenario("add-func", lambda s: replace_once(
-            s, "extern int main()",
-            "int addedHelper(int value) { return value + 17; }\n\nextern int main()"
-        ).replace("sideHelper(3);", "sideHelper(3) + addedHelper(2);"),
-            True, "main"),
-        Scenario("remove-func", lambda s: replace_once(
-            replace_once(s, "int sideHelper(int value)\n{\n"
-                           "    return value + 11;\n}\n\n", ""),
-            " + sideHelper(3)", ""),
-            True, "main"),
-        Scenario("edit-global", lambda s: replace_once(
-            s, "int gScale = 3;", "int gScale = 9;"), True),
-        # Second consecutive edit: snapshot and analysis then share the same
-        # module composition (the first edit mixes bitcode-cache vs re-analysis).
-        Scenario("second-edit", lambda s: replace_once(
-            s, "int total = top(4)", "int total = top(5)"), True, "main",
-            edit2=lambda s: replace_once(
-                s, "int total = top(5)", "int total = top(6)")),
-        Scenario("signature", lambda s: replace_once(
-            replace_once(s, "int offsetValue(int value)",
-                         "int offsetValue(int value, int amount)"),
-            "return value + 2;", "return value + amount;"
-        ).replace("offsetValue(5)", "offsetValue(5, 9)"),
-            True, "offsetValue"),
-    ]
-
-
-def big_scenarios() -> list[Scenario]:
-    return [
-        Scenario("helper-body", lambda s: replace_once(
-            s, "    return value.StructNamedMethod();\n}",
-            "    return value.StructNamedMethod() * 3;\n}"),
-            True, "testStructNamedMethod"),
-        Scenario("body-const", lambda s: replace_once(
-            s, 'Test("struct_named_method", testStructNamedMethod(), 7)',
-            'Test("struct_named_method", testStructNamedMethod(), 8)'),
-            True, "main"),
-        Scenario("body-new-string", lambda s: replace_once(
-            s, 'printf("%d/%d tests passed.\\n", passed, total);',
-            'printf("incremental-new-string\\n");\n'
-            '    printf("%d/%d tests passed.\\n", passed, total);'),
-            True, "main"),
-        Scenario("add-func", lambda s: replace_once(
-            replace_once(s, "extern int main()",
-                         "int incrementalAddedFunction(int value) { return value + 17; }\n\n"
-                         "extern int main()"),
-            "int passed = 0;", "int passed = incrementalAddedFunction(0);"),
-            True, "main"),
-    ]
-
-
 def run_case(exe: str, path: Path, base: str, scenario: Scenario,
              depth: Optional[int]) -> Result:
     uri = uri_for(path)
@@ -415,6 +208,11 @@ def run_case(exe: str, path: Path, base: str, scenario: Scenario,
             problems.append("no post-edit [view-incremental] stderr line")
         else:
             line = parsed
+            if path.name == "test_basic.cb":
+                if line.kind != "miss" or line.reason != "too-wide":
+                    problems.append("pinned expectation: miss/too-wide")
+            elif line.kind != "hit":
+                problems.append("pinned expectation: hit")
         # Baseline: SAME edit flow with incremental disabled, so the full rebuild
         # runs on the same re-analysis module composition (a fresh server's first
         # analysis differs: core loads from bitcode cache with different linkage).
@@ -442,7 +240,7 @@ def run_case(exe: str, path: Path, base: str, scenario: Scenario,
             close_client(client)
     if problems or comparison is None:
         verdict = "INVALID"
-    elif comparison.semantic or (
+    elif comparison.unexplained or (
             comparison.inc_functions != comparison.full_functions):
         verdict = "DIVERGE"
     elif comparison.renumber:
@@ -460,8 +258,8 @@ def print_result(result: Result) -> None:
     reopt = "%d/%d" % (line.reopt, line.total) if line.kind == "hit" else "-"
     seeds = str(line.seeds) if line.kind == "hit" else "-"
     c = result.comparison
-    counts = "-/-/-" if c is None else "%d/%d/%d" % (
-        c.identical, c.renumber, c.semantic)
+    counts = "-/-/-/-" if c is None else "%d/%d/%d/%d" % (
+        c.identical, c.renumber, c.known, c.semantic)
     funcs = "-/-" if c is None else "%d/%d" % (c.inc_functions, c.full_functions)
     it = result.inc.timings if result.inc else {}
     ft = result.full.timings if result.full else {}
@@ -504,14 +302,14 @@ def main() -> int:
     big = big_path.read_text(encoding="utf-8")
     cases = [(fixture, demo, s) for s in demo_scenarios()]
     cases += [(big_path, big, s) for s in big_scenarios()]
-    print("scenario           file           hit/reason      reopt     seeds analyze I/F emit I/F wall I/F blocks      funcs   verdict")
-    print("-" * 138)
+    print("scenario           file           hit/reason      reopt     seeds analyze I/F emit I/F wall I/F blocks          funcs   verdict")
+    print("-" * 142)
     results = []
     for path, source, scenario in cases:
         result = run_case(exe, path, source, scenario, args.depth)
         results.append(result)
         print_result(result)
-    print("\nDetails (semantic blocks):")
+    print("\nDetails (unexplained blocks):")
     count = omitted = 0
     for result in results:
         if not result.comparison:
@@ -528,7 +326,7 @@ def main() -> int:
     diverged = sum(result.verdict == "DIVERGE" for result in results)
     print("\nSummary: %d rows, %d PASS, %d DIVERGE, %d INVALID" % (
         len(results), len(results) - invalid - diverged, diverged, invalid))
-    return 1 if invalid else 0
+    return 1 if invalid or diverged else 0
 
 
 if __name__ == "__main__":

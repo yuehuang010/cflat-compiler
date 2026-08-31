@@ -844,6 +844,73 @@ static bool ParseSymbolDumpSelector(const std::string& text, SymbolDumpSelector&
     return true;
 }
 
+enum class SymbolDumpIrSelectorKind { Line, Function, Module };
+
+struct SymbolDumpIrSelector
+{
+    SymbolDumpIrSelectorKind kind;
+    size_t line = 0;
+    std::string functionName;
+};
+
+static bool ParseSymbolDumpIrSelector(const std::string& text,
+                                      const std::string& optionName,
+                                      SymbolDumpIrSelector& selector)
+{
+    if (text == "module")
+    {
+        selector.kind = SymbolDumpIrSelectorKind::Module;
+        return true;
+    }
+
+    const size_t colon = text.find(':');
+    const auto printSyntaxError = [&]() {
+        std::cout << std::format(
+            "Error: {} selector must be module, line:<n>, or function:<name>: '{}'\n",
+            optionName, text);
+    };
+    if (colon == std::string::npos)
+    {
+        printSyntaxError();
+        return false;
+    }
+
+    const std::string prefix = text.substr(0, colon);
+    const std::string value = text.substr(colon + 1);
+    if (prefix == "function")
+    {
+        if (value.empty())
+        {
+            printSyntaxError();
+            return false;
+        }
+        selector.kind = SymbolDumpIrSelectorKind::Function;
+        selector.functionName = value;
+        return true;
+    }
+
+    if (prefix != "line")
+    {
+        printSyntaxError();
+        return false;
+    }
+
+    if (value.find('-') != std::string::npos)
+    {
+        std::cout << std::format(
+            "Error: {} does not support line ranges: '{}'\n", optionName, text);
+        return false;
+    }
+    if (!TryParsePositiveLine(value, selector.line))
+    {
+        std::cout << std::format(
+            "Error: {} line selector requires a positive integer: '{}'\n", optionName, text);
+        return false;
+    }
+    selector.kind = SymbolDumpIrSelectorKind::Line;
+    return true;
+}
+
 static bool ReadSourceLines(const std::string& path, std::vector<std::string>& lines)
 {
     std::ifstream input(path, std::ios::binary);
@@ -1081,4 +1148,119 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
         }
     }
     return 0;
+}
+
+int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
+{
+    const auto irArguments = args.getMultiOption("symbol-dump-ir");
+    const auto optArguments = args.getMultiOption("symbol-dump-opt");
+    if (args.positionalCount() == 0)
+    {
+        std::cout << "Error: --symbol-dump-ir and --symbol-dump-opt require an input source file\n";
+        return 1;
+    }
+
+    struct Query
+    {
+        std::string optionName;
+        int optLevel;
+        const std::vector<std::string>* arguments;
+    };
+    std::vector<Query> queries;
+    if (!irArguments.empty())
+        queries.push_back({ "--symbol-dump-ir", 0, &irArguments });
+    if (!optArguments.empty())
+    {
+        const int optLevel = args.hasFlag("O2") ? 2 : args.hasFlag("O1") ? 1
+                                                                    : args.hasFlag("O0") ? 0 : 2;
+        queries.push_back({ "--symbol-dump-opt", optLevel, &optArguments });
+    }
+
+    struct ParsedQuery
+    {
+        Query query;
+        std::vector<SymbolDumpIrSelector> selectors;
+    };
+    std::vector<ParsedQuery> parsedQueries;
+    for (const auto& query : queries)
+    {
+        ParsedQuery parsed{ query, {} };
+        for (const auto& argument : *query.arguments)
+        {
+            SymbolDumpIrSelector selector;
+            if (!ParseSymbolDumpIrSelector(argument, query.optionName, selector))
+                return 1;
+            parsed.selectors.push_back(std::move(selector));
+        }
+        parsedQueries.push_back(std::move(parsed));
+    }
+
+    const std::vector<std::string> importDirs = args.getMultiOption("import-dir");
+    LLVMBackend compiler;
+    compiler.SetRuntimeDir(runtimeDir);
+    compiler.SetVerbose(args.hasFlag("verbose"));
+    compiler.SetBatchMode(true);
+    const char* symbolLocale = std::getenv("CFLAT_LOCALE");
+    compiler.SetLocale(args.getOption("locale").value_or(
+        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
+    compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
+        (std::filesystem::path(runtimeDir) / "locales").string()));
+    compiler.LoadLocale(args.hasFlag("verbose"));
+
+    int failures = 0;
+    for (size_t fileIndex = 0; fileIndex < args.positionalCount(); ++fileIndex)
+    {
+        const std::string file = *args.getPositional(fileIndex);
+        if (fileIndex > 0)
+            compiler.ResetForReanalysis();
+        compiler.SetSourceDisplayName(std::filesystem::path(file).filename().string());
+        if (args.positionalCount() > 1)
+            std::cout << "; ==== " << file << " ====\n";
+
+        LspSymbolIndex index;
+        compiler.SetSymbolSink(&index);
+        const bool analysisOk = compiler.Analyze(file, importDirs, runtimeDir);
+        compiler.SetSymbolSink(nullptr);
+        const std::string analyzedFile = compiler.GetSourceFilePath();
+        if (!analysisOk)
+            ++failures;
+
+        for (const auto& parsed : parsedQueries)
+        {
+            for (size_t selectorIndex = 0; selectorIndex < parsed.selectors.size(); ++selectorIndex)
+            {
+                const auto& selector = parsed.selectors[selectorIndex];
+                const std::string& selectorText = (*parsed.query.arguments)[selectorIndex];
+                std::string functionName;
+                bool wholeModule = false;
+                if (selector.kind == SymbolDumpIrSelectorKind::Module)
+                    wholeModule = true;
+                else if (selector.kind == SymbolDumpIrSelectorKind::Function)
+                    functionName = selector.functionName;
+                else
+                {
+                    auto ranges = index.FunctionsEnclosing(analyzedFile, (int)selector.line);
+                    if (ranges.empty())
+                    {
+                        std::cout << std::format(
+                            "; {}:{} has no function\n", file, selector.line);
+                        continue;
+                    }
+                    functionName = ranges.front()->name;
+                }
+
+                std::string output;
+                if (!compiler.PrintModuleView(output, "ir", parsed.query.optLevel,
+                                              functionName, wholeModule))
+                {
+                    std::cout << std::format(
+                        "Error: failed to emit IR for '{}' selector '{}'\n", file, selectorText);
+                    ++failures;
+                    continue;
+                }
+                std::cout << output;
+            }
+        }
+    }
+    return failures == 0 ? 0 : 1;
 }

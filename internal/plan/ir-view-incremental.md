@@ -62,9 +62,9 @@ test_basic.cb). Items 4-6 remain.
    choices, whole-unoptimized / whole-optimized) and status-bar timings (last refresh's
    analyze/emit ms, cached flag) - item complete.
 
-## In progress: item 4, incremental -O2 rebuild (rounds 1-2, 2026-08-30)
+## Item 4: incremental -O2 rebuild (rounds 1-4, 2026-08-30)
 
-Lives on branch feature/incremental-o2-wip; NOT on master. Design: snapshot
+Landed on master as e6ceebd. Design: snapshot
 the optimized module as context-free bitcode (+ pre-opt StructuralHash per
 function, global content hashes, name-keyed call graph, address-taken set,
 remarks) in ResetForReanalysis - required because reset destroys the
@@ -171,7 +171,9 @@ already-optimized kept callees than the full pipeline has at the same point);
 inliner bookkeeping; inlining happened in both, via different step counts).
 These are inherent to re-running a pipeline over a partially frozen module.
 MAINTAINER RULING NEEDED: is instruction-identical + attr/metadata-delta an
-acceptable bar, or must the driver normalize these classes too? The snapshot
+acceptable bar, or must the driver normalize these classes too? See round 5
+below for why (3) should be split out of that question rather than ruled on
+with (1) and (2). The snapshot
 struct stays file-serializable so the same machinery can later persist next
 to -o outputs for incremental normal builds (maintainer request 2026-08-30).
 CFLAT_VIEW_INC_DUMP=1 prints the reopt set per rebuild for diagnosis.
@@ -200,3 +202,195 @@ the same probe (TimeTraceScope ParseSLL/ParseLLFallback + bail-token print).
 - Mapping faithfulness is checkable: retained functions must be instruction-identical
   to the whole-module print modulo metadata/local-label renumbering - see
   scratch/check_root_subset.py.
+
+## Round 5: test coverage (2026-08-30)
+
+Coverage review of what round 4 shipped. Three findings, in severity order.
+
+**1. CI never enters the incremental path.** measure_incremental_o2.py is not
+called by test_lsp.sh (which runs lsp_test.py, lsp_fixture_test.py,
+lsp_bulk_test.py only), and no test in the suite performs didChange -> view at
+O2. The path arms only on a second analysis with a live snapshot, so every
+guard round 4 shipped - too-wide bailout, address-taken seed, transplant
+conflict, the named-local promote/restore around llvm::Linker, the
+post-pipeline re-stomp, the GlobalDCE of duplicated literals - is unexercised
+by CI. Deleting the whole incremental branch leaves the suite green.
+
+**2. The driver reports failure but exits 0.** measure_incremental_o2.py ends
+`return 1 if invalid else 0`; DIVERGE is not a failure. Re-measured on master:
+8 DIVERGE, 4 PASS, exit 0 - and the 4 PASS rows are all `miss/too-wide` on
+test_basic, i.e. the only green rows are the ones that fell back to a full
+rebuild. As a gate this is inverted: it would stay green if a regression made
+the feature disable itself entirely. Any wiring-in must pin the EXPECTED
+hit/miss reason per row, not just the verdict.
+
+**3. Residual delta (3) is not attr noise.** Of the three round-4 residuals,
+(1) mustprogress on intrinsic declarations and (2) the extra range() param
+attr are cosmetic, but (3) the missing !inline_history is the metadata the
+inline-attribution feature is built on - test_view_assembly asserts multi-frame
+inline stacks off exactly it. A kept body that lost the tag can render a
+different call stack than a full build. Proposed acceptance bar, replacing the
+single open ruling: byte-exact for anything mapping-visible (!inline_history,
+DILocations, function sets), explicit allowlist for declaration attributes.
+One global tolerance would let a real regression hide in the noise bucket.
+
+Also uncovered: the round-3 rootPathAliases fix (kept bodies carrying DIFiles
+for stale temp paths, collapsing root-scoped views to whole-module with empty
+mappings) has no regression test, though it is the one field bug found and the
+plan already records a deterministic repro. That repro belongs in
+lsp_fixture_test.py.
+
+### Split: example.sh owns codegen equivalence, test_lsp.sh owns the protocol
+
+Ruled 2026-08-30. The equivalence property is a CODEGEN property, not an LSP
+one, so it does not belong behind a JSON-RPC server: driving it over LSP costs
+two server lifetimes per scenario, needs stderr scraping for the hit/miss line,
+and cannot share the exe cache with test_lsp.sh (hence the driver's standalone
+caveat). It moves to example.sh - already the mac gate over the example/ corpus
+- as a CLI-only comparison. test_lsp.sh keeps only the cheap protocol-level
+assertions.
+
+LANDED 2026-08-30: the CLI surface. `--symbol-dump-ir <selector>` and
+`--symbol-dump-opt <selector>` (cflat/SymbolQuery.cpp `RunSymbolDumpIrQuery`,
+registered cflat/main.cpp) print PrintModuleView output from the command line,
+modelled on the existing `--symbol-dump`. Selectors are `module`,
+`function:<name>`, and `line:<n>` (resolved through
+LspSymbolIndex::FunctionsEnclosing, as LspServer does); line RANGES are rejected,
+since a range does not name a function. `--symbol-dump-opt` defaults to -O2 and
+honours an explicit -O0/-O1/-O2. PrintModuleView now has a second caller, so the
+IDE view is reproducible from a shell for bug reports.
+
+Two details in that implementation are load-bearing and must not be "tidied":
+
+- The query loops over EVERY positional and calls ResetForReanalysis between
+  them (mirroring the --check batch loop, cflat/main.cpp:540). That reset is
+  what snapshots the optimized module, so `--symbol-dump-opt a.cb b.cb` walks
+  the same snapshot-then-incremental-rebuild sequence the LSP walks.
+- It calls SetSourceDisplayName(basename) per file, mirroring
+  LspServer.cpp:2056. The applicability guard at
+  LLVMBackend_EmitAndLink.cpp:1443 compares `rootFile`, which is
+  sourceDisplayName_ when set and the full analyzed path otherwise. Setting it
+  to the basename lets two positionals sharing a basename in different
+  directories - an original and its edited copy - count as the same logical
+  root. Without it the second file misses with reason=root-file and the gate
+  silently measures nothing.
+
+Verified end to end on a demo_view.cb probe pair:
+
+```
+$ cflat scratch/inc/1/probe.cb scratch/inc/2/probe.cb --symbol-dump-opt module
+[view-incremental] miss reason=no-snapshot      <- file 1 builds the snapshot
+[view-incremental] hit reopt=18/485 seeds=1 depth=2   <- file 2 rebuilds incrementally
+$ CFLAT_VIEW_NO_INCREMENTAL=1 cflat <same>
+[view-incremental] miss reason=no-snapshot
+[view-incremental] miss reason=env-disabled
+```
+
+reopt 18/485 seeds=1 is byte-for-byte the operating point the LSP driver
+reports, so the CLI reproduces the LSP path faithfully at a fraction of the
+cost: no server lifetimes, no stderr scraping for the verdict beyond the one
+[view-incremental] line, and no cache contention with test_lsp.sh.
+
+CORRECTION - `diff` is NOT sufficient as the comparator. The first measured run
+produced 454 diff lines, which decompose as: private unnamed globals renumber
+(@0/@1/@2 reorder as GlobalDCE drops duplicated literals), that renumbering
+cascades into local value numbering, and functions are emitted in a different
+ORDER so a line diff reports a moved function as one deletion plus one
+insertion (___os_thread_shim_U8Ptr_U8Ptr_ looked like it had vanished; the
+function SETS are in fact identical, 48/48 across both dumped modules).
+Normalized per function, the picture matches the LSP driver exactly: 4
+byte-identical, ~18 renumber-only, ~3 semantic - i.e. the same three round-4
+residual classes and nothing new.
+
+So example.sh needs a small comparator, not a shell diff: split the dump into
+per-function blocks keyed by name, normalize local/global renumbering, and
+classify identical / renumber / semantic. That logic already exists as
+split_blocks + compare_views inside measure_incremental_o2.py. Extract it into
+a shared module both gates import, so the CLI gate and the LSP driver can never
+drift into two different definitions of "equivalent". Add a fourth normalized
+class while doing it: private-literal renumbering, currently lumped into
+"renumber" (it is expected - GlobalDCE cleans duplicated literals - but it is a
+different cause from local value renumbering and worth counting separately).
+
+### Round 5 landed: incremental view gates
+
+The shared comparator and scenarios live in `Test/tools/view_compare.py`; both
+`Test/tools/incremental_o2_gate.py` and
+`vscode-extension/test/measure_incremental_o2.py` import them. The CLI gate is
+run by `example.sh` and can also be run directly:
+
+```
+python3 Test/tools/incremental_o2_gate.py
+python3 Test/tools/incremental_o2_gate.py --corpus --jobs 4
+```
+
+The pinned CLI cases are:
+
+| case | source/edit | expected |
+|------|-------------|----------|
+| comment-only | demo_view.cb comment | hit, reopt = 0 |
+| body-const | demo_view.cb | hit, reopt <= 25 |
+| body-new-string | demo_view.cb | hit, reopt <= 25 |
+| add-func | demo_view.cb | hit, reopt <= 25 |
+| remove-func | demo_view.cb | hit, reopt <= 25 |
+| edit-global | demo_view.cb | hit, reopt <= 25 |
+| signature | demo_view.cb | hit, reopt <= 25 |
+| second-edit | demo_view.cb, consecutive | hit |
+| too-wide | Test/test_basic.cb body-const | miss, reason=too-wide |
+
+`--corpus` additionally checks six standalone example programs with a comment
+edit and an unused-function edit. Every hit must compare equivalently; misses
+must use a known guard reason, and the sweep must contain a hit. The work files
+use `probe.cb` in separate directories with the same basename so the CLI arms
+the snapshot path. The fixed corpus is `example/tools/huffman.cb`,
+`example/sci/tone_detection.cb`, `example/sci/kepler_orbit.cb`,
+`example/shell/tetris.cb`, `example/shell/echo.cb`, and `example/shell/pwd.cb`.
+
+The comparator's provisional allowlist is R1 range attributes, R2
+`!inline_history`, and R3 declaration `; Function Attrs:` lines. R1/R2 apply to
+function bodies and are accepted only when the two bodies have the same line
+count AND every differing line pair is explained; a function present on one side
+only is never explainable. R3 applies only to the preamble, which by
+construction holds declaration attributes: split_blocks attaches a
+`; Function Attrs:` line preceding a `define` to that function's block.
+
+R2 and R3 also have a PREAMBLE side - the `attributes #N = {...}` group
+definitions and the metadata nodes `!inline_history` points at. Those are
+matched BY REFERENCE, not by content (`droppable_preamble_ids`): an attribute
+group is droppable only when no `define` uses it, and a metadata node only when
+an `!inline_history` reference is what names it. This matters - an earlier
+implementation dropped every `attributes #N` line and pattern-matched node
+CONTENT, which both masked changes to a group a define actually uses and
+hard-coded one fixture's metadata. Verified by planting regressions: a body
+instruction edit, a define-referenced attribute-group edit, and a deleted
+function are each reported unexplained.
+
+This is a provisional baseline pin pending the open maintainer ruling above; R2
+remains the plan's not-merely-cosmetic concern.
+
+Gaps the current 12 rows do not touch, to fill as the table grows: depth
+sensitivity (CFLAT_VIEW_INC_DEPTH 0/1/3 - the default 2 is asserted nowhere); a
+fixture sized just UNDER too-wide, so the boundary is tested and not only its
+far sides; recursion and mutual recursion; an edit adding a new import;
+edit-to-broken-then-fixed, proving a failed analysis does not poison the
+snapshot; and an N=10 consecutive-edit chain, since snapshot-of-snapshot drift
+is cumulative by construction and only N=2 is tested. Note every current demo
+row lands on reopt 17-19 / seeds 1-2: one operating point, measured eight times.
+
+Cheap additions once the harness exists: idempotence (same view twice, no edit,
+must be byte-identical - comment-only reopts 0 functions yet still shows one
+semantic block today, which is suspicious on its own), and a loose perf floor
+asserting incremental emit beats full emit on demo_view, since this is a
+performance feature with no performance assertion.
+
+### What stays in test_lsp.sh
+
+- open -> view O2 -> didChange -> view O2, asserting the text changed and
+  `result.timings.incremental == true`. The flag is already in the protocol
+  response (LspServer.cpp), so this needs no stderr scraping.
+- The rootPathAliases repro from round 3.
+- Coverage of kind:"asm" and wholeModule:false after an edit. Both go through
+  the transplanted module, and root-scoped views are exactly where the round-3
+  bug lived; the driver only ever measured kind:"ir" with wholeModule:true.
+- cflat/optimizationInfo at O2 after an edit: its remarks come from the
+  snapshot, and nothing checks them for staleness.

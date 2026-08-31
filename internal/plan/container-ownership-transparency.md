@@ -144,7 +144,7 @@ can queue/stack be re-collapsed and list/dictionary collapsed. Until then the co
 ## Stages (agent-ready)
 
 Ordered by dependency and risk. Each stage is independently verifiable and leaves ALL suites green
-(`test.sh Release`, `example_mac.sh`, `test_lsp.sh`) unless it lists an intended, enumerated test
+(`test.sh Release`, `example.sh`, `test_lsp.sh`) unless it lists an intended, enumerated test
 delta. Do stages in order; 5 fans out. Every stage inherits the cross-cutting constraints at the end.
 
 The pilot is `queue`; `list`/`stack`/`dictionary` follow the proven shape in stage 5. `queue.cb` is
@@ -190,7 +190,7 @@ currently the UNSOUND collapsed spike - Stage 0 resets it, so start there.
   there, not as a separate escape analysis here.
 - Files: `cflat/LLVMBackend.h` (predicate, +3 lines), `Test/errors/err_move_owning_value_to_borrow_param.cb`.
 - Verify (met): `move Holder` / `move string` into a plain param both error; test.sh 468/0,
-  example_mac.sh 35/0, test_lsp.sh 152/0 - zero false positives from the wider predicate.
+  example.sh 35/0, test_lsp.sh 152/0 - zero false positives from the wider predicate.
 - Depends: 0. Open Q (deferred to 3): predicate for the no-`move` "would alias-and-escape" case.
 
 ### Stage 3 - Compiler ENABLER: owning-value by-value param becomes a move-sink (gap 1)   [opus, HIGH risk]
@@ -218,7 +218,7 @@ currently the UNSOUND collapsed spike - Stage 0 resets it, so start there.
   `Test/test_collection_leaks.cb` (direct non-container sink regression, HeapAudit-clean),
   `Test/errors/err_owning_value_sink_consumes.cb` (use-of-moved contract, string + Holder).
 - Verify (met): gates a-e all pass; early-return leak repro is leaks=0; test.sh 470/0 (cold AND warm),
-  example_mac.sh 35/0, test_lsp.sh 152/0.
+  example.sh 35/0, test_lsp.sh 152/0.
 - Depends: 2. Note: ScanFunctionDefinition returns early for generic templates, so CONTAINER inserts
   are not yet marked - that wiring is Stage 4.
 
@@ -253,7 +253,7 @@ currently the UNSOUND collapsed spike - Stage 0 resets it, so start there.
   `Test/errors/err_queue_noncopyable_elem.cb`.
 - Verify (met): queue matrix HeapAudit-clean (312/312, no 134); `Box<string>::put` consumes,
   `Box<int|T*>::put` do not; queue.cb insert has ZERO `if const`; test.sh 470/0 (cold AND warm),
-  example_mac.sh 35/0, test_lsp.sh 152/0.
+  example.sh 35/0, test_lsp.sh 152/0.
 - Depends: 3.
 
 ### Stage 5 - Propagate to list, stack, dictionary   [sonnet x3, parallel, low-medium risk]
@@ -273,7 +273,7 @@ currently the UNSOUND collapsed spike - Stage 0 resets it, so start there.
   `_storeValue`, the add/set poison, the `add(move V)`/`set(move V)` overloads. KEEP the KEY `if const`
   (keys are not the owning-value insert), `_releaseValue`/`_freeValue` `if const`, and `copy()`.
 - Files: `cflat/core/list.cb`, `stack.cb` (done), `dictionary.cb` (+ their tests / err tests).
-- Verify: per-container matrix; `test.sh` + `example_mac.sh` green (examples exercise these heavily).
+- Verify: per-container matrix; `test.sh` + `example.sh` green (examples exercise these heavily).
 - Depends: 4.
 
 ### Stage 6 - (DEEP, deferrable) model `string` as an owning value (gap 4)   [opus, high risk]
@@ -343,7 +343,7 @@ closure-env leak was fixed. See the closure issue file (updated) for detail.
   move -> sink). Subtlety handled: `unique V*` is is_copyable==TRUE (takes the copyable arm) yet its
   param is a move sink, so a refused duplicate must `_freeValue` it or it leaks (a bare
   `move unique V*` param is not auto-freed at scope exit the way an owning struct is).
-- Verified: `test.sh` 472/0 (cold+warm), `example_mac.sh` 35/0, `test_lsp.sh` pass.
+- Verified: `test.sh` 472/0 (cold+warm), `example.sh` 35/0, `test_lsp.sh` pass.
 
 ## Acceptance (revised)
 

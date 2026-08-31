@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# example_mac.sh - macOS example gate (the mac counterpart of example.bat).
+# example.sh - macOS example gate (the mac counterpart of example.bat).
 #
 # Covers the platform-portable subset of example/*.cb on an Apple Silicon Mac.
 # Windows-only examples (COM/WinRT, Win32 GUI, WinUI3, os.windows.* content,
@@ -14,7 +14,7 @@
 #      argv/a tty/stdin to do anything - the build itself is the coverage).
 #
 # Run from the repo root on an Apple Silicon Mac (Homebrew tools on PATH):
-#   ./example_mac.sh [JOBS]     # builds Release binaries into out/, runs the gate
+#   ./example.sh [JOBS]     # builds Release binaries into out/, runs the gate
 # JOBS may also be set in the environment; a positional value takes precedence.
 #
 # Note: --heap-audit's C shim (diagnostic/heap_audit.c) is portable (POSIX branch via
@@ -160,7 +160,7 @@ POOL_ACTIVE=0
 POOL_SEQUENCE=0
 start_pool_job()
 {
-    done="$OUT/.example_mac_job_$$.$POOL_SEQUENCE.done"
+    done="$OUT/.example_job_$$.$POOL_SEQUENCE.done"
     rm -f "$done"
     (
         "$@"
@@ -378,6 +378,19 @@ print_result "trade_fetch"
 print_result "trade_backtest"
 print_result "trade_analysis"
 print_result "trade_edgar_fetch"
+
+echo "-- incremental O2 view gate --"
+if [ "${SKIP_INCREMENTAL:-0}" = "1" ]; then
+    echo "  incremental-o2 SKIP (SKIP_INCREMENTAL=1)"
+elif ! command -v python3 >/dev/null 2>&1; then
+    echo "  incremental-o2 SKIP (python3 unavailable)"
+elif python3 Test/tools/incremental_o2_gate.py --exe "$CFLAT"; then
+    echo "  incremental-o2 PASS"
+    PASS=$((PASS + 1))
+else
+    echo "  incremental-o2 FAIL"
+    FAIL=$((FAIL + 1))
+fi
 
 # Remove artifacts the run_case demos write into the tree (raytracer -> render.bmp
 # in cwd; json_config -> config.out.json next to its input) so the gate is clean.

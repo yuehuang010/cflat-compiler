@@ -12,7 +12,7 @@ pinch, POINTS coords, opt-in via setOn*/has* flags) + canvas image handles
 host; TUI host + drivers headless-testable; Win32/WinUI recorded as a parity gap
 (internal/issue/ui/ui-native-canvas-input-images-win32-winui.md). Gates on the mac
 box: tui_demo 22/22 (was 19), gallery 35/35, fedit pass, test.sh 160/0,
-example_mac.sh 34/0; live cocoa event path smoke-verified (no crash). Docs in
+example.sh 34/0; live cocoa event path smoke-verified (no crash). Docs in
 doc/UI.md. See the annotated M1/M2 sections below for the shipped seam.
 
 ## Framing
@@ -142,7 +142,7 @@ All logic headless-testable with no host:
 
 - File: `example/ui/09-map/map_engine.cb` (new). Pure host-independent
   library - no main(), imports only `math.cb`, `list.cb`, `dictionary.cb`.
-  Not wired into `example.bat`/`example_mac.sh` yet (no launcher/self-test
+  Not wired into `example.bat`/`example.sh` yet (no launcher/self-test
   entry there; M4 will add one following the 05-gallery split).
 - API surface: `ScreenPt`/`WorldPt` (struct-return, not out-params) for
   `MapCamera.worldToScreen`/`screenToWorld`/`panBy`/`zoomAt`/`visibleTiles()`;
@@ -201,7 +201,7 @@ All logic headless-testable with no host:
   + MapView control + mapSelfTest, no main) and `example/ui/09-map/map.cb`
   (new - thin Win32/Cocoa launcher via ui_native/host.cb, owns main,
   forwards --selftest). map_engine.cb untouched (tested M3 API reused
-  as-is). Wired into `example_mac.sh` (selftest_case "map") and
+  as-is). Wired into `example.sh` (selftest_case "map") and
   `example.bat` (--worker-map block, --heap-audit + headless selftest;
   map/map_app/map_engine added to the plain-sweep EXCLUDE).
 - MapView public surface (class, owned by MapApp): `camera`/`tileCache`/
@@ -238,7 +238,7 @@ All logic headless-testable with no host:
   counting Canvas fake, ancestor placeholders after zoom, cancelNotIn
   after a big pan). Windowed input drives MapView's public methods so the
   suite is host-neutral; the Cocoa drivers are exercised in the gated block.
-- Gates (mac box): map selftest 13/13, example_mac.sh 35/0 (map joined),
+- Gates (mac box): map selftest 13/13, example.sh 35/0 (map joined),
   test.sh Release 160/0; live map_v1 launched, survived >4s rendering
   tiles unattended (paint+worker+post loop verified), then killed.
   example.bat owed on the Windows box (worker added, not yet run there).
@@ -302,7 +302,7 @@ All logic headless-testable with no host:
   fix it exits 0 (8/8). Implementation: mapLiveProbe + ProbeWatch watchdog
   thread in map_app.cb.
 - Gates after the fix (mac box): map --selftest 13/13, map --probe 8/8 exit 0,
-  example_mac.sh Release 35/0, test.sh Release 160/0 (core touched).
+  example.sh Release 35/0, test.sh Release 160/0 (core touched).
 - Human-verified only: interactive pan/zoom smoothness + anchor correctness in
   the live window (map_v2 handed off). The probe proves tiles resolve live and
   the run loop stays responsive; it does not judge visual pan quality.
@@ -350,7 +350,7 @@ All logic headless-testable with no host:
   asserts: 2000 markVisible/request/cancelNotIn rounds terminate, pinned holds
   the last window, cancelNotIn(empty) drains the queue) -> suite is now 14/14.
 - Gates after the fix (mac box): test.sh Release 160/0 and Debug 160/0, map
-  --selftest 14/14, map --probe 8/8 exit 0, example_mac.sh Release 35/0.
+  --selftest 14/14, map --probe 8/8 exit 0, example.sh Release 35/0.
   Compiler C++ untouched, so no rebuild was needed; the fixed core .cb files
   were deployed to x64/Release/core/ and x64/Debug/core/.
 - Owed on the Windows box: test.bat (core touched - dictionary/hashset are used
@@ -390,7 +390,7 @@ All logic headless-testable with no host:
 
 All .cb, no compiler C++ expected. Mac box: new map example self-test,
 tui_demo/gallery/fedit self-tests stay green, bash test.sh Release,
-bash example_mac.sh Release (map example joins the sweep). Deploy edited
+bash example.sh Release (map example joins the sweep). Deploy edited
 core files to x64/<Config>/core/ when iterating. Owed on the Windows box
 before commit: test.bat + example.bat (map example will SKIP on Win32
 until the canvas-input parity issue is closed - record in the issue file).
