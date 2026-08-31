@@ -47,7 +47,7 @@ change. (This rule is important enough that a short form stays in CLAUDE.md.)
 
 `Test/tools/incremental_o2_gate.py` compares the CLI incremental view with the
 same multi-file flow using `CFLAT_VIEW_NO_INCREMENTAL=1`; the pinned gate runs
-from `example.sh`, while `--corpus` adds six example programs. Run it directly
+from `test_example.sh`, while `--corpus` adds six example programs. Run it directly
 with `python3 Test/tools/incremental_o2_gate.py`. The input copies must retain
 the basename `probe.cb` in different directories: changing the basename makes
 the root-file guard miss and silently avoids measuring the incremental path.

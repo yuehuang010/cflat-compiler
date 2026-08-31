@@ -10,7 +10,7 @@
 //   x64/Release/cflat.exe example/ui/04-native-controls/win32_native_settings.cb -o out/nsettings.exe
 //   out\nsettings.exe
 //
-// Headless state-assert self-test (no visible window; example.bat gate):
+// Headless state-assert self-test (no visible window):
 //   x64/Release/cflat.exe example/ui/04-native-controls/win32_native_settings.cb --heap-audit -o out/nsettings.exe
 //   out\nsettings.exe --selftest
 import "ui_native/win32.cb";

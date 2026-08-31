@@ -32,7 +32,7 @@ which compiles each core library standalone).
 ## The rule
 
 After **any** edit to `cflat/core/*.cb`, rebuild **before** running `test.bat` /
-`example.bat`, so the `deploy_core` target re-copies the tree:
+`test_example.bat`, so the `deploy_core` target re-copies the tree:
 
 ```bash
 ./cmake_build.bat release

@@ -508,14 +508,14 @@ floor 0.03 -> 0.01s. IR 0/40; test.sh 720/0/8; LSP green.
 
 Timebox-2 cumulative: batch 3.81 -> 1.93s (-50%), all four audit items + free deletion landed.
 
-## Timebox 3 - test_lsp.sh + example.sh focus - 2026-08-28
+## Timebox 3 - test_lsp.sh + test_example.sh focus - 2026-08-28
 
 Baselines (macOS arm64, Release, warm --init-local, post-timebox-2 compiler):
 
 | Suite | Wall | CPU | Shape |
 |---|---|---|---|
 | test_lsp.sh Release | 18.2s | 65s (375%) | 17.6s of it is the 171-file bulk sweep; pool=4 |
-| example.sh | 30.8s | 26.6s (92%) | fully SERIAL, 44 cases |
+| test_example.sh | 30.8s | 26.6s (92%) | fully SERIAL, 44 cases |
 
 Bulk-sweep profile (sample of the cflat LSP process, pool=4): ANTLR prediction dominates
 (closure_ + ATNConfig churn + malloc), i.e. the sweep is parse-bound; ~4.5% DFA-lock
@@ -532,7 +532,7 @@ codegen walk of those imports. Two structural reasons:
 - parseTreeCache_ cached core imports only; user imports re-parsed per analysis.
 
 Landed this timebox:
-- example.sh parallel job pool (JOBS arg/env, default physical cores): compiles +
+- test_example.sh parallel job pool (JOBS arg/env, default physical cores): compiles +
   tier-2/3 in the pool, tier-1 GUI selftests still run SERIALLY (Cocoa activation
   flakiness), ordered result aggregation via $OUT/<name>.result files.
   **30.8s -> ~4.9s wall**, 44/0 twice, forced-failure path verified.
@@ -548,7 +548,7 @@ Landed this timebox:
 | Metric | Before | After |
 |---|---|---|
 | LSP bulk sweep (171 files, pool 4) | 16.1-19.1s | **9.5-9.7s** (-40%) |
-| example.sh | 30.8s | **4.8s** warm (parallel pool; first run after a binary swap is ~11s while compiles re-warm) |
+| test_example.sh | 30.8s | **4.8s** warm (parallel pool; first run after a binary swap is ~11s while compiles re-warm) |
 | err batch --check x326 | 1.91-1.95s | 1.83-2.0s (unchanged - err files share few imports) |
 | hello --check floor | 0.02s | 0.02s (the extra per-import stat is free) |
 | test.sh Release | - | 720 passed, 0 failed, 8 skipped |
@@ -578,7 +578,7 @@ more speed than one-shot compiles: bulk sweep 10.4 -> 7.3s (-30%) with the mimal
 binary (allocator contention across the 4 workers).
 
 Full-run A/B (peak per-process RSS via /usr/bin/time -l over the whole suite; both green):
-test.sh Release 209 -> 187MB (-11%), wall 24.5 -> 18.4s, CPU 67 -> 55s; example.sh
+test.sh Release 209 -> 187MB (-11%), wall 24.5 -> 18.4s, CPU 67 -> 55s; test_example.sh
 255 -> 237MB (-7%), CPU 32.3 -> 28.6s.
 
 Where the speedup lives (phase A/B, test_move -O2 time-trace): Parse -35%, listener

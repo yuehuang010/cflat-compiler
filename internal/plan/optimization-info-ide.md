@@ -3,7 +3,7 @@
 Status: Tiers 1, 2 and 3 DONE (2026-08-29) on branch `feature/optimization-info-ide`;
 Tier 4 and the later phases PROPOSED. Verified on Windows: `cmake_build.bat release`,
 `test.bat Release` (all passed, 0 skipped), `test_lsp.bat Release` (all passed, incl. the
-`optimizationInfo: tier 1 facts` scenario extended to cover Tiers 2/3), `example.bat
+`optimizationInfo: tier 1 facts` scenario extended to cover Tiers 2/3), `test_example.bat
 Release` (100/0/41), extension `build.bat`.
 
 The whole surface is one LSP request, `cflat/optimizationInfo`

@@ -21,7 +21,7 @@ Do not touch root `./vcpkg.json` without explicit permission.
 
 ALL temp files -> repo-root `scratch/`: throwaway `.cb` repros, scripts, intermediate output,
 one-off binaries. Not system temp, not session scratchpad. Gitignored; never picked up by
-`test.bat` / `example.bat` wildcards.
+`test.bat` / `test_example.bat` wildcards.
 
 ## Agent Delegation
 
@@ -157,12 +157,12 @@ port is far behind.
 version lives in `CMakePresets.json`; read it there, not here. `bootstrap.bat` provisions BOTH
 installs: `/MT` assertions-OFF tree (Release links this), and `/MTd` CRT
 `LLVM_ENABLE_ASSERTIONS=ON` tree with `-assert` suffix (Debug presets point here). So a fresh clone
-builds LLVM twice. Recipe + migration history: `internal/plan/llvm-version-migration.md`,
-[Two installs](internal/plan/llvm-from-source-build.md).
+builds LLVM twice. Recipe + the two-install rationale:
+[`internal/llvm-from-source-build.md`](internal/llvm-from-source-build.md).
 
 **Debug links assertions-enabled LLVM on purpose.** Release LLVM has `LLVM_ENABLE_ASSERTIONS=OFF`,
 so LLVM APIs that assert on misuse silently return garbage instead - a `getTerminator()` behaviour
-change is the worked example in that doc. Debug is the only config where that safety net exists.
+change is the worked example. Debug is the only config where that safety net exists.
 Keep both installs in sync when bumping.
 
 ### Shared dependency tree (all platforms)
@@ -254,7 +254,7 @@ git worktree remove ../cflat-feature                   # shared tree untouched
 worktree and config fights over, so `--init` in one worktree silently replaces core bitcode another
 is about to compile against. `--init-local` -> `<exe dir>/.cflat` (i.e. `x64/Release/.cflat`), and
 every later compile from that exe picks it up automatically, no flag. Preferred collision-avoidance
-for worktrees AND for Debug vs Release side by side. `test.sh`, `test.bat`, `example.bat` already
+for worktrees AND for Debug vs Release side by side. `test.sh`, `test.bat`, `test_example.bat` already
 run `--init-local`, so a suite run never clobbers your per-user cache. `git worktree remove` takes
 the local cache with it.
 
@@ -375,9 +375,9 @@ Scripts by host - Windows `.bat`, macOS/Linux `.sh`:
 ```bash
 test.bat            # compiler suite, Release default; also: test.bat Debug | Release
 test_lsp.bat        # LSP suite, Release default; also: test_lsp.bat Debug
-example.bat         # example programs, Release default; also: example.bat Debug
+test_example.bat         # example programs, Release default; also: test_example.bat Debug
 bash test.sh Release   # test.bat counterpart (also Debug, -j N)
-./example.sh           # example.bat counterpart
+./test_example.sh           # test_example.bat counterpart
 ```
 
 Config: first arg wins; `CFLAT_CONFIG` env var is respected otherwise. **Pitfall**: a stale
@@ -393,7 +393,7 @@ rationale + warm-cache second pass: [`internal/testing-notes.md`](internal/testi
 `test.bat` runs parallel and should finish quickly; a hung test is killed after `TIMEOUT_SECS` (top
 of `test.bat`, default 120s).
 
-`example.bat` compiles all runnable `.cb` in `example/`, skips library/helper files
+`test_example.bat` compiles all runnable `.cb` in `example/`, skips library/helper files
 (`threadpool.cb`, `test_helper.cb`, internal network modules), sets import paths per category,
 exits 1 if any example fails.
 

@@ -119,7 +119,7 @@ That seed happens **only when the per-user record is absent or stale** - stale m
 is missing, unreadable, blank, or names a path that no longer exists on disk. A record naming a
 compiler that is still there is left untouched: it is a deliberate registration, and silently
 repointing it at a worktree or portable build is exactly the collision `--init-local` exists to
-prevent - `test.sh`, `test.bat`, and `example.bat` run `--init-local` on every suite run, so
+prevent - `test.sh`, `test.bat`, and `test_example.bat` run `--init-local` on every suite run, so
 without that rule a test run inside a worktree would hijack the extension's compiler.
 
 The staleness half matters just as much: a record pointing into a worktree that has since been

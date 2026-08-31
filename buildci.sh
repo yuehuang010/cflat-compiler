@@ -4,9 +4,10 @@
 # Stages:
 #   1. BUILD Release        (cmake_build.sh release)
 #   2. TESTS                (test.sh Release)
-#   3. LSP TESTS            (test_lsp.sh Release)
-#   4. BUILD vscode-extension (vscode-extension/build.sh)
-#   5. PACKAGE              (package_release.sh -> out/cflat-macos-arm64-v<ver>.tar.gz)
+#   3. EXAMPLES             (test_example.sh - Release-only, takes JOBS not a config)
+#   4. LSP TESTS            (test_lsp.sh Release)
+#   5. BUILD vscode-extension (vscode-extension/build.sh)
+#   6. PACKAGE              (package_release.sh -> out/cflat-macos-arm64-v<ver>.tar.gz)
 #
 # A failed BUILD (stage 1) aborts; test/package failures are counted and CI
 # continues, mirroring buildci.bat. Exits 0 only if every stage passed.
@@ -45,6 +46,14 @@ fi
 banner "TESTS [Release]: test.sh"
 if ! bash "$SCRIPT_DIR/test.sh" Release; then
     echo "TESTS FAILED: Release test.sh"
+    OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
+fi
+
+# Ahead of test_lsp.sh on purpose, as in buildci.bat: this is the only stage that
+# CLI-compiles example/vcpkg, which is what installs the ports its LSP sweep reads.
+banner "EXAMPLES [Release]: test_example.sh"
+if ! bash "$SCRIPT_DIR/test_example.sh"; then
+    echo "EXAMPLES FAILED: Release test_example.sh"
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
 fi
 

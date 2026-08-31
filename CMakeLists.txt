@@ -10,7 +10,7 @@
 # and every git worktree shares the one 26 GB tree. Populate it once with
 # vcpkg-build.bat (Windows); cmake_build.sh prints the `vcpkg install` line for
 # macOS. vcpkg supplies antlr4 / nlohmann-json / simdjson only - LLVM comes from
-# a source build (see internal/plan/llvm-version-migration.md), since vcpkg's
+# a source build (see internal/llvm-from-source-build.md), since vcpkg's
 # llvm port is stuck at 18.1.6. Linux uses apt LLVM and no vcpkg at all.
 #
 # Output layout so test.bat works unchanged:

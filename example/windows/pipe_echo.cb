@@ -11,8 +11,8 @@
 //   pipe_echo.exe client [nMsgs]   - open the pipe (retrying while the server
 //       comes up), send nMsgs numbered lines, verify each echo byte-for-byte,
 //       and return exit code 0 only if every echo matched.
-//   pipe_echo.exe                  - print usage and exit 0 (so example.bat, which
-//       only compiles, and any accidental bare run never block).
+//   pipe_echo.exe                  - print usage and exit 0, so a compile-only check
+//       or an accidental bare run never blocks.
 //
 // Coverage exercise for cflat's `import "windows.h"` C-interop, targeting the
 // async-I/O / event-multiplexing surface that the prior probes (run_capture,

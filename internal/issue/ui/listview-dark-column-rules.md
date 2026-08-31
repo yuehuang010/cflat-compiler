@@ -66,4 +66,4 @@ is gitignored, so this issue file is the durable record of the findings above.
 Pixel-sample the mempress body at column edges (rule pair was
 `318:82,87,96 / 319:48,62,82` over bg 52,58,68): expect pure background.
 Confirm scrollbar stays dark and selection stays dark blue. Gates: test.bat,
-example.bat, mempress --selftest 5/5.
+test_example.bat, mempress --selftest 5/5.

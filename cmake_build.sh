@@ -43,7 +43,7 @@ if [ "$(uname -s)" = "Darwin" ]; then
   if [ ! -x "$VCPKG_ROOT/vcpkg" ]; then
     echo "ERROR: no usable vcpkg at \"$VCPKG_ROOT\"." >&2
     echo "vcpkg supplies antlr4, nlohmann-json and simdjson (LLVM is a separate" >&2
-    echo "source build - see internal/plan/llvm-version-migration.md)." >&2
+    echo "source build - see internal/llvm-from-source-build.md)." >&2
     if [ -d "$VCPKG_ROOT" ]; then
       echo "The clone exists but is not bootstrapped. Run:" >&2
       echo "  \"$VCPKG_ROOT/bootstrap-vcpkg.sh\"" >&2

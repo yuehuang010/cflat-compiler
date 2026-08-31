@@ -50,7 +50,7 @@ change survives as staged working-tree edits. If a future session finds staged-b
 `unique` work with no explanation, this is why - it is not an abandoned experiment.
 
 **Verified baselines to measure against:** `bash test.sh Release` = 448 passed, 0 failed,
-8 skipped. `bash example.sh` = 35 passed, 0 failed. `bash test_lsp.sh` = 152 passed, 0 failed
+8 skipped. `bash test_example.sh` = 35 passed, 0 failed. `bash test_lsp.sh` = 152 passed, 0 failed
 (449 faded hints). macOS host - do NOT add "needs Windows verification" caveats; the maintainer
 owns that and is aware.
 
@@ -232,7 +232,7 @@ the call sites - C#-like local readability, with the complexity paid once in the
    `std::terminate()` when a joinable `std::thread` is destroyed.
 
    **OUTCOME 2026-07-20 - the RAII migration, with its copy-path audit.** Executed on macOS;
-   `test.sh Release` 448/0/8 and `example.sh` 35/0 both green after.
+   `test.sh Release` 448/0/8 and `test_example.sh` 35/0 both green after.
 
    | Type | Copy path found | Verdict |
    |---|---|---|
@@ -688,8 +688,8 @@ for interfaces needs a vtable copy slot every implementor fills; for pointers, a
 
 ## Interaction with interface fields (F1)
 
-`internal/plan/interface-fields-feasibility.md` F1 makes interfaces more value-like. Layering
-rule that keeps the two plans independent:
+Interface fields (the F1 feasibility spike, plan deleted 2026-08-31 as landed) make
+interfaces more value-like. Layering rule that keeps the two independent:
 
 - **Fields are owned by the implementor object, or by a `unique` interface value that owns
   the object - never by a borrowed view.** All field-store rules apply through the interface
@@ -718,8 +718,8 @@ rule that keeps the two plans independent:
 ## Related
 
 - `internal/plan/ownership-move-alias-discipline.md` - parameter discipline
-- `internal/plan/interface-fields-feasibility.md` - F1; see "Interaction with interface
-  fields"
+- interface fields (F1) - see "Interaction with interface fields" above; the
+  feasibility spike plan was deleted 2026-08-31 as landed (doc/UI.md is the record)
 - `internal/plan/ownership-sanitizer.md`, doc/LANGUAGE.md ("Local ownership";
   cflat/MoveDataflow.h) - runtime and dataflow companions to the static rules here
 - `internal/issue/brace-init-field-store-not-at-parity.md` - the durable store-path-parity

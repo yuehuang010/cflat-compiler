@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# example.sh - macOS example gate (the mac counterpart of example.bat).
+# test_example.sh - macOS example gate (the mac counterpart of test_example.bat).
 #
 # Covers the platform-portable subset of example/*.cb on an Apple Silicon Mac.
 # Windows-only examples (COM/WinRT, Win32 GUI, WinUI3, os.windows.* content,
 # winsock/windows.h imports) and vcpkg-package demos are SKIPped - compile those
-# on their native platform instead. Three tiers, mirroring example.bat:
+# on their native platform instead. Three tiers, mirroring test_example.bat:
 #
 #   1. GUI/editor self-tests  - compile, run "<bin> --selftest", expect a PASS
 #      line + exit 0 (Cocoa NativeHost bridge, cocoa_window, native settings, fedit).
@@ -14,13 +14,13 @@
 #      argv/a tty/stdin to do anything - the build itself is the coverage).
 #
 # Run from the repo root on an Apple Silicon Mac (Homebrew tools on PATH):
-#   ./example.sh [JOBS]     # builds Release binaries into out/, runs the gate
+#   ./test_example.sh [JOBS]     # builds Release binaries into out/, runs the gate
 # JOBS may also be set in the environment; a positional value takes precedence.
 #
 # Note: --heap-audit's C shim (diagnostic/heap_audit.c) is portable (POSIX branch via
 # pthread/backtrace/dladdr) and works here too, but this gate does not build with it -
 # the leak-clean teardown (nativeTeardownForTest) is the same code exercised by
-# --heap-audit on the Windows box (see example.bat).
+# --heap-audit on the Windows box (see test_example.bat).
 set -u
 
 DEFAULT_JOBS=8

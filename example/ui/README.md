@@ -42,7 +42,7 @@ terminal and dispatches mouse and key input back into it.
 - `boxes.cb` - an interactive resizable bordered-box demo; click to nest a box.
 
 Both are interactive on a real console and fall back to a deterministic headless
-self-test when I/O is redirected (which is how `example.bat` gates them).
+self-test when I/O is redirected (which is how `test_example.bat` gates them).
 
 ```bash
 x64/Release/cflat.exe example/ui/02-terminal/tui_demo.cb --run

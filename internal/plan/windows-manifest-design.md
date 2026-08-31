@@ -5,7 +5,8 @@ Status: IMPLEMENTED 2026-08-14 (Phases A, B, C1, C2 all landed and verified; see
 winui.cb adoption, helper-function folding, LSP brace-init completion).
 This doc absorbed `internal/issue/ui/win32-classic-common-controls-v5.md` (issue removed
 2026-08-14); the comctl32 v6 dependency is the first fragment this design must carry, and
-`internal/plan/ui-win32-native-polish.md` Phase 5 is the first consumer.
+The Win32 host's comctl32 v6 manifest was the first consumer (that plan is now
+folded into `internal/plan/ui.md`).
 
 Background (from the absorbed issue): a cflat-linked exe contains NO application manifest
 at all - no `assemblyIdentity` of any kind - so every cflat GUI app binds the CLASSIC (v5)
@@ -22,7 +23,8 @@ Scope: the Windows application-manifest system in general - SxS assembly depende
 entries for registration-free WinRT activation (what unpackaged WinUI apps need).
 AppxManifest.xml (packaged apps) is out of scope for v1 but the mechanism generalizes.
 
-Builds on the verified findings and constraints in `internal/plan/ui-win32-native-polish.md`
+Builds on the verified findings and constraints from the Win32 native-host polish work
+(folded into `internal/plan/ui.md`)
 Phase 5.1a: no XML in `.cb`, no user-visible `.manifest` file, no manifest vocabulary in the
 compiler, lld-link merges multiple `/manifestinput:` fragments without `mt.exe`, and
 `CreateActCtxW` validates SxS semantics but NOT `windowsSettings` values.
@@ -331,7 +333,7 @@ feature of supporting it there).
     inside vcvars shells where mt.exe exists). `/manifestinput:` is therefore
     unusable for a self-contained toolchain.
   - **C2 DONE 2026-08-14** (verified in a CLEAN shell with no mt.exe on PATH:
-    test_windows 57/57 direct, test.bat all-pass, LSP all-pass, example.bat 90/0/27
+    test_windows 57/57 direct, test.bat all-pass, LSP all-pass, test_example.bat 90/0/27
     including gallery cold+warm-cache byte checks): replace lld manifest machinery with compiler-side merge +
     self-written RT_MANIFEST `.res` link input (lld's built-in cvtres consumes it, no
     external tool - this also means lld no longer injects its default trustInfo, so

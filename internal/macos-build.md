@@ -37,7 +37,7 @@ tarballs are unusable, they are built `-fno-rtti`. `lld` supplies the bundled
 vcpkg's `llvm`; LLVM is no longer a vcpkg dependency (its port is stuck at 18.1.6),
 so they are now `-DLLVM_ENABLE_RTTI=ON`, `-DLLVM_TARGETS_TO_BUILD="X86;AArch64"` and
 `-DLLVM_ENABLE_PROJECTS="clang;lld"` on the source build. See
-[plan/llvm-version-migration.md](plan/llvm-version-migration.md).
+[llvm-from-source-build.md](llvm-from-source-build.md).
 
 ## One-time Mac toolchain
 

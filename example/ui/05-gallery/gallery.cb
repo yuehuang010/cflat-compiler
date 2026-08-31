@@ -8,7 +8,7 @@
 // Build & run (live window):
 //   x64/Release/cflat.exe example/ui/05-gallery/gallery.cb -i example/ui -o out/gallery.exe
 //   out\gallery.exe
-// Headless self-test (no visible window; example.bat --worker-gallery):
+// Headless self-test (no visible window):
 //   out\gallery.exe --selftest
 // Doc screenshots (light + dark BMP into out/):
 //   out\gallery.exe --shots out

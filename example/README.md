@@ -3,13 +3,13 @@
 Runnable CFlat programs, grouped by the part of the language or platform they exercise.
 Each folder is self-contained; most files carry a build/run line in their header comment.
 
-Build them all at once with [`example.bat`](../example.bat) (Release by default), which
+Build them all at once with [`test_example.bat`](../test_example.bat) (Release by default), which
 compiles every runnable `.cb` here, skips the library/helper files, and supplies the
 per-folder import paths automatically:
 
 ```bash
-example.bat            # Release
-example.bat Debug
+test_example.bat            # Release
+test_example.bat Debug
 ```
 
 To build one by hand:

@@ -1,8 +1,11 @@
 # Building LLVM from source (statically linkable, find_package-consumable)
 
-> Migration sequencing (phase 1 = leave vcpkg at 18, phase 2 = move to 22)
-> lives in [`llvm-version-migration.md`](llvm-version-migration.md). This file is
-> the build recipe it references.
+> This file is the build recipe. The 18 -> 22 -> 23 migration that got cflat off
+> vcpkg's LLVM is finished; its plan was deleted 2026-08-31. Two facts from it are
+> worth keeping: llvm.org prebuilts are unusable because they ship
+> `LLVM_ENABLE_RTTI=OFF` and cflat derives from polymorphic LLVM/Clang bases, and
+> vcpkg's `llvm` port is stuck at 18.1.6 on master, so bumping the baseline buys
+> nothing. Windows is the only platform with no RTTI-enabled prebuilt at all.
 
 ## Objective
 

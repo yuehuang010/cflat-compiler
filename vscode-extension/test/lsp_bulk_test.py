@@ -128,8 +128,12 @@ HOST_IS_MACOS = sys.platform == "darwin"
 # Windows - keep in sync with the same-named content in test.sh when files move.
 _WIN_ONLY_DIRS = ("example/windows", "example/COM", "example/vcpkg")
 _WIN_ONLY_FILES = {
-    # Test/: os.windows.* usage, WinMD, or CRT header binding that collides with POSIX libc.
-    "test_crt.cb", "test_stream.cb", "test_threadpool.cb",
+    # Test/: windows.h binding or WinMD. Keep this HONEST, exactly like test.sh's list:
+    # test_crt.cb, test_stream.cb and test_threadpool.cb used to sit here for an
+    # incidental Windows tie they no longer have (test_crt binds the system CRT headers,
+    # not windows.h; test_stream has no Windows reference at all; test_threadpool's only
+    # one is an `if const (!__WINDOWS__)` guard). All three analyze clean off Windows and
+    # run in test.sh, so they sweep here too. Prove a file is Windows-bound before adding it.
     "test_windows.cb", "test_windows_cache.cb", "test_winmd.cb",
     # example/hpc: os.windows.* high-resolution timing.
     "heat_stencil.cb", "nbody2.cb", "spectrum.cb",
@@ -190,7 +194,7 @@ def is_macos_only(path: Path) -> bool:
 # example/vcpkg/vcpkg_installed/<triplet>/include. LSP analysis deliberately never runs
 # `vcpkg install` (it would build ports from source on a keystroke), so until the first CLI
 # build of those examples that tree is absent, the header binding degrades to a silent skip,
-# and every C symbol in the file then reports as an undefined variable. example.bat is what
+# and every C symbol in the file then reports as an undefined variable. test_example.bat is what
 # populates it; skip them here until it has.
 VCPKG_EXAMPLE_DIR = "example/vcpkg"
 
@@ -206,7 +210,7 @@ def vcpkg_example_ports_installed() -> bool:
 #
 # By BASENAME - host-neutral components that import only the element model and resolve their
 # native* host drivers (hostWidth/hostHeight/canvasCreateImage/...) from whichever LAUNCHER
-# imports them, sharing one global scope with it. The launchers are swept; example.bat
+# imports them, sharing one global scope with it. The launchers are swept; test_example.bat
 # exercises the components. Plus one fixture the CLI drivers parameterize.
 _SKIP_BY_NAME = {
     "gallery_app.cb": "host-neutral component; drivers resolve from gallery.cb / winui_gallery.cb",
@@ -219,12 +223,12 @@ _SKIP_BY_NAME = {
 # place a file could plausibly be named winui.cb.
 _SKIP_BY_RELPATH = {
     "cflat/core/ui_native/winui.cb":
-        "WinUI 3 host; imports the Windows App SDK winmds via package-nuget (example.bat --worker-winui covers it)",
+        "WinUI 3 host; imports the Windows App SDK winmds via package-nuget (test_example.bat --worker-winui covers it)",
 }
 
 # By DIRECTORY PREFIX - example/ui/06-winui/* import the WinUI 3 runtime winmds from a sibling
 # winmd/ dir plus the Windows App SDK bootstrapper; the bare sweep has neither the -i dir nor
-# the App SDK. Covered by example.bat's --worker-winui gate with the right flags.
+# the App SDK. Covered by test_example.bat's --worker-winui gate with the right flags.
 _SKIP_BY_PREFIX = {
     "example/ui/06-winui/": "WinUI 3 launcher; needs the winmd/ -i dir and the Windows App SDK",
 }

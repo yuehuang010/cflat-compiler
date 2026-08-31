@@ -40,6 +40,6 @@ declaration instead of a resource toolchain.
 - Version-info block: fixed field set and its declaration spelling.
 - Build behaviour: path resolution relative to the source file, staleness/dependency
   tracking (interaction with the `<out>.cflat-dep.json` up-to-date check).
-- Verification: `example.bat` gate - a `example/ui/` app embedding an icon and loading it
+- Verification: `test_example.bat` gate - a `example/ui/` app embedding an icon and loading it
   back from its own module, asserting a non-null handle. Implementation and gate are
   Windows-host-bound.

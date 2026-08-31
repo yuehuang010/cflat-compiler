@@ -104,7 +104,7 @@ The demo sources OpenBLAS through vcpkg, the same way `example/vcpkg/sqlite_demo
 [`example/vcpkg/vcpkg.json`](../../example/vcpkg/vcpkg.json) (the repo's root `vcpkg.json` stays
 untouched). No download, no `%BLAS_SDK%` env var, no CLI paths - `cflat.exe` invokes
 `vcpkg install` itself against that manifest on first compile and resolves the include dir, link
-lib, and runtime DLL automatically. `example.bat` builds `blas_gemm.cb` unconditionally as part of
+lib, and runtime DLL automatically. `test_example.bat` builds `blas_gemm.cb` unconditionally as part of
 the `example/vcpkg/` sweep (there is no SDK-discovery gate to skip).
 
 The first compile triggers a **source build** of OpenBLAS (vcpkg has no prebuilt binary cache for

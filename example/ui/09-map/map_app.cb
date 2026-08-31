@@ -18,7 +18,7 @@
 // (an upscaled-but-correct progressive backdrop - drawing it per-missing-child
 // would blit the same ancestor 4+ times), then (3) every resolved tile on top.
 // A true per-tile ancestor crop is recorded as the "src-rect drawImage overload"
-// M5 unlock in internal/plan/ui-map-canvas.md.
+// M5 unlock in internal/plan/ui.md ("Open 2: map canvas M5").
 import "ui_native.cb";
 import "ui_test.cb";
 import "map_engine.cb";

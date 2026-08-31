@@ -3,8 +3,8 @@
 //
 // The same Counter tree that counter.cb builds with view()/text()/button() is here
 // authored as JSX-like sugar. The sugar lowers 1:1 to construction + children.add,
-// so the two trees serialize to identical JSON - which this file asserts, gating
-// example.bat on desugaring correctness.
+// so the two trees serialize to identical JSON - which this file asserts, so any
+// desugaring regression fails this example.
 //
 // Run:  x64/Release/cflat.exe example/ui/01-elements/counter_jsx.cb --run
 
@@ -19,8 +19,8 @@ class CounterJsx : IComponent
         // An owned-string expression (the interpolated label) used directly as a child
         // attribute alongside a sibling capturing closure is leak-clean: the intermediate
         // temp is freed by the outer function's end-of-expression flush, which the nested
-        // closure invoker's own flush no longer clobbers. example.bat's --heap-audit gate
-        // covers this exact shape.
+        // closure invoker's own flush no longer clobbers. Building this example with
+        // --heap-audit covers this exact shape.
         return <View style={makeStyle(16, 0, 0)}>
                  <Text text={"Count: " + this.count.toString()} />
                  <Button title="+1" onPress={() => { this.count = this.count + 1; }} />

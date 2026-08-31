@@ -19,7 +19,7 @@ Do not modify the root `./vcpkg.json` without explicit permission.
 
 ## Scratch Directory
 
-Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` repros, scratch scripts, intermediate outputs, compiled binaries used for one-off checks. Do not use the system temp directory or the session scratchpad; keeping temp files in `scratch/` makes them easy to inspect and clean up. `scratch/` is gitignored, and files there are never picked up by `test.bat` / `example.bat` wildcards.
+Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` repros, scratch scripts, intermediate outputs, compiled binaries used for one-off checks. Do not use the system temp directory or the session scratchpad; keeping temp files in `scratch/` makes them easy to inspect and clean up. `scratch/` is gitignored, and files there are never picked up by `test.bat` / `test_example.bat` wildcards.
 
 ## Agent Delegation: Cost vs Intelligence
 
@@ -134,9 +134,9 @@ shims are gone, so an older LLVM will not compile. It provisions **both** instal
 `/MT`, assertions-OFF tree that cflat Release links, and a second `/MTd` CRT
 **`LLVM_ENABLE_ASSERTIONS=ON`** tree installed to `llvm-<ver>-assert`, which is what the
 Debug presets point at - so budget roughly double the build time for a fresh clone.
-See `internal/plan/llvm-version-migration.md`.
+See `internal/llvm-from-source-build.md`.
 
-The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/plan/llvm-version-migration.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
+The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/llvm-from-source-build.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
 
 **Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
 
@@ -214,7 +214,7 @@ silently replaces the core bitcode another worktree is about to compile against.
 `--init-local` puts the cache in `<exe dir>/.cflat` - i.e. `x64/Release/.cflat` inside that
 worktree - and every later compile from that same exe picks it up automatically, no flag
 needed. This is the preferred collision-avoidance mechanism for worktrees, and for Debug vs
-Release side by side. `test.sh`, `test.bat`, and `example.bat` already run `--init-local`
+Release side by side. `test.sh`, `test.bat`, and `test_example.bat` already run `--init-local`
 for exactly this reason, so a suite run never clobbers your per-user cache.
 `git worktree remove` takes the local cache with it; nothing to clean up separately.
 
@@ -308,7 +308,7 @@ See [`doc/CLI.md`](doc/CLI.md) for the full reference. Most-used flags:
 - `--run`: JIT-compile and run in-process
 
 ## Testing
-- **Windows**: `test.bat` / `test_lsp.bat` / `example.bat` (batch scripts).
+- **Windows**: `test.bat` / `test_lsp.bat` / `test_example.bat` (batch scripts).
 - **Linux/WSL and macOS**: `test.sh` is the `test.bat` counterpart - it compiles+runs the platform-portable subset of `Test/*.cb` (plus `Test/errors/*.cb`) against the native cflat, in parallel with a per-test timeout, and prints a PASS/FAIL/SKIP summary. Run it as `bash test.sh Release` (or `Debug`, `-j N`). It maintains an explicit SKIP list of genuinely Windows-only tests; before adding one, prove the *whole file* is Windows-bound. The SKIP-list rationale and the warm-cache second pass are documented in [`internal/testing-notes.md`](internal/testing-notes.md).
 - **`--init` serializer rule** (load-bearing): `--init` reconstructs compiler state from a hand-written serializer, so any new field on `TypeAndValue` / `StructData` / `AnnotationValue` that an analysis reads MUST be added to the `LLVMBackend.cpp` cache round-trip in the same change - otherwise it is silently dropped on a warm cache and `expect_error` tests stop firing. See `internal/testing-notes.md`.
 - **Verify on the host you are on, and only that host.** On a macOS/Linux host, a green `./test.sh` is the bar for declaring work complete; on Windows it is `test.bat` (Release). Run the suite for the current host after compiler changes, before saying you are done.
@@ -349,11 +349,11 @@ LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`,
 Build all example programs in `example/` and subdirectories:
 
 ```bash
-example.bat           # runs against Release (default)
-example.bat Debug     # runs against Debug
+test_example.bat           # runs against Release (default)
+test_example.bat Debug     # runs against Debug
 ```
 
-`example.bat` compiles all runnable `.cb` files in the `example/` tree, automatically skipping library/helper files (`threadpool.cb`, `test_helper.cb`, internal network modules) and setting appropriate import paths per category. Reports pass/fail/skip counts; exits with code 1 if any example fails to compile.
+`test_example.bat` compiles all runnable `.cb` files in the `example/` tree, automatically skipping library/helper files (`threadpool.cb`, `test_helper.cb`, internal network modules) and setting appropriate import paths per category. Reports pass/fail/skip counts; exits with code 1 if any example fails to compile.
 
 To compile a single example manually:
 

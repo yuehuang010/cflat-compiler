@@ -1,5 +1,5 @@
 // hugepage_bench.cb - TLB-bound dependent pointer-chase, normal pages vs huge
-// pages (G7: internal/plan/hpc-g7-huge-pages.md).
+// pages (G7: internal/plan/hpc-gaps.md, "G7. Smaller items").
 //
 // The buffer is divided into N_SLOTS chunks, each exactly HUGE_PAGE (2 MB)
 // apart. Each chunk's first 8 bytes hold the index of the NEXT chunk to visit,

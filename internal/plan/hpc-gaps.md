@@ -13,10 +13,10 @@ in full in that section and should be read before building on it. G6 (SoA
 generic, a design project) is the one remaining PROPOSED item.
 The former detailed sub-plans for G2/G3/G4/G5
 (internal/plan/hpc-g2..g5-*.md) have been consolidated in-file below and
-deleted. G7's huge-pages detail plan
-(internal/plan/hpc-g7-huge-pages.md) is kept standalone: it carries the
-as-built note plus the design rationale (why THP and not MAP_HUGETLB, why
-macOS is a no-op tier) that the G7 bullet below only summarizes.
+deleted. G7's huge-pages detail plan was deleted the same way on
+2026-08-31 (fully landed): its as-built note and design rationale (why THP
+and not MAP_HUGETLB, why macOS is a no-op tier) are carried by the G7
+bullet below.
 WSL test.sh re-verification for the core library changes deliberately
 skipped (user decision at integration), except where a later item
 (G5 POSIX parity, G7 huge pages) explicitly re-ran it.
@@ -53,7 +53,7 @@ sound: per-site alignment is carried on the owning local
 scope-exit auto-free (EmitOwningPtrCleanup) and explicit delete route to
 __delete_aligned. doc/HPC.md gained an Alignment section. Tests:
 Test/test_basic.cb testAlignas + err_new_alignas_not_power_of_two.cb. Gates
-green: test.bat, test_lsp.bat (201/0), example.bat (88/0/24).
+green: test.bat, test_lsp.bat (201/0), test_example.bat (88/0/24).
 
 G1 free-routing fixed 2026-07-14 (agent). Three separate heap-corruption bugs,
 all from the same root: the free site chose aligned-vs-ordinary from a tag that
@@ -185,7 +185,7 @@ WSL test.sh re-verification skipped at integration (user decision).
 ## G3. SIMD completeness
 
 DONE 2026-07-09 (agent, all 3 phases), integrated on master, gates
-green: test.bat all pass, test_lsp 201/0, example.bat 88/0/24.
+green: test.bat all pass, test_lsp 201/0, test_example.bat 88/0/24.
 
 Today: no lane writes, no shuffles (doc says so), no horizontal reduce,
 no masked load/store, no gather/scatter.
@@ -322,7 +322,7 @@ Gates (Release, all green): build + ANTLR regen; `test.bat` all pass
 span-noalias); `test_lsp.bat` 202/0 (one run showed 4 transient
 `example/vcpkg/*` failures from a cold header-bind cache under the
 parallel sweep - a warm-cache re-run was 202/0 and the baseline exe
-passed them too, not a regression); `example.bat` 88/0/24.
+passed them too, not a regression); `test_example.bat` 88/0/24.
 Perf-evidence benchmarking beyond the `.ll`/asm spot checks above was
 left to the main session (skipped in this pass per instructions).
 Both-pass ParseDeclarationSpecifiers and the vectorize
@@ -463,8 +463,10 @@ Write its own plan before starting; do not fold into a gap-fix pass.
 
 ## G7. Smaller items
 
-- Huge pages: DONE 2026-07-11 (agent, Phases 1-3). Detail plan (kept
-  standalone, carries the as-built note): internal/plan/hpc-g7-huge-pages.md.
+- Huge pages: DONE 2026-07-11 (agent, Phases 1-3). Phase 4 (arena/kernel-buffer
+  integration) was intentionally never started - gated on real benchmark evidence
+  that has not arrived. The standalone detail plan was deleted 2026-08-31; the
+  as-built record is this bullet.
   MEM_LARGE_PAGES / madvise(MADV_HUGEPAGE) in the vmem layer for multi-GB
   kernel buffers (TLB relief), degrading gracefully everywhere.
   AS-BUILT: os.huge_page_bytes()/huge_pages_enable() plus a single
@@ -503,7 +505,7 @@ Write its own plan before starting; do not fold into a gap-fix pass.
   Linux host with THP in madvise/always mode) before claiming a TLB win.
   Deferred: Phase 4 (huge-backed segments for arena_allocator and the
   core/hpc kernel buffers) - deliberately gated on that missing evidence.
-  Gates green: test.bat 45/45, test_lsp.bat 204/0, example.bat 89/0/24,
+  Gates green: test.bat 45/45, test_lsp.bat 204/0, test_example.bat 89/0/24,
   WSL test.sh 159/0/16.
 - BLAS binding example DONE 2026-07-09 (agent), RE-SOURCED 2026-07-09
   (agent) to the example-local vcpkg manifest: example/vcpkg/blas_gemm.cb
@@ -515,7 +517,7 @@ Write its own plan before starting; do not fold into a gap-fix pass.
   or CLI paths needed); calls cblas_dgemm (CblasRowMajor/CblasNoTrans
   straight from the header, no hand-proto) and benchmarks it against
   Mat.gemm at 256/512/1024 with a naive-triple-loop correctness check.
-  example.bat picks it up automatically via the example/vcpkg/ sweep (the
+  test_example.bat picks it up automatically via the example/vcpkg/ sweep (the
   earlier %BLAS_SDK% discovery/gate block AND a second per-file
   `--c-lib libopenblas.lib` special-case in the --worker-example block
   were both removed). The vcpkg `openblas` port gates multithreading
@@ -626,7 +628,7 @@ wording should be tightened in its own pass.
 
 Gates: test.bat 45/45 (test_filesystem 88/88, +14 new MappedFile
 assertions covering round-trip, empty file, missing file, asSpan values,
-and a 2000-iteration map/drop loop); example.bat 89/0/24; WSL test.sh
+and a 2000-iteration map/drop loop); test_example.bat 89/0/24; WSL test.sh
 159/0/16. test_lsp.bat not run - no compiler file touched.
 
 Caveat on the Linux coverage: test_filesystem.cb is on test.sh's
@@ -697,5 +699,5 @@ the first real-fd mmap call on the POSIX side.
 - LogError/LogErrorContext only; ASCII only; no new test files - extend
   Test/test_hpc_kernels.cb and friends.
 - Gates per item: build Release, test.bat green, test_lsp.bat green if
-  MainListener/LspServer touched, example.bat green; update doc/HPC.md
+  MainListener/LspServer touched, test_example.bat green; update doc/HPC.md
   in the same change.

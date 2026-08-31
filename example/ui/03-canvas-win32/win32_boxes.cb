@@ -14,7 +14,7 @@
 //   x64/Release/cflat.exe example/ui/03-canvas-win32/win32_boxes.cb -o out/win32_boxes.exe
 //   out\win32_boxes.exe
 //
-// Headless GDI self-test (no window, used by example.bat):
+// Headless GDI self-test (no window):
 //   out\win32_boxes.exe --selftest
 //
 // Type in the field (click/Tab to focus it), click "[ add box ]" to nest a box in
@@ -75,7 +75,7 @@ class BoxApp : IComponent
 // Text + an overflowing ScrollView) into a memory bitmap through GdiCanvas, then
 // reads pixels back to assert the geometry landed - a box border drew black, the
 // text drew ink, and the ScrollView clipped the part of its child below the
-// viewport. Deterministic and console-free, so example.bat can gate it.
+// viewport. Deterministic and console-free, so it can run unattended.
 
 bool _isBlack(u32 c) { return (c & 0xFFFFFFu) == 0u; }
 
@@ -369,7 +369,7 @@ int guiWidgetSelfTest()
 
 extern int main(int argc, char** argv)
 {
-    // Headless GDI readback self-test path (example.bat passes --selftest); no
+    // Headless GDI readback self-test path (--selftest); no
     // window is created. Runs the geometry test and the interaction-state test.
     if (argc > 1 && strcmp(argv[1], "--selftest") == 0)
     {

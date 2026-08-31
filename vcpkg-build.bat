@@ -10,7 +10,7 @@ REM Usage:
 REM   vcpkg-build.bat
 REM
 REM Cost: minutes, ~1 GB - LLVM is no longer a vcpkg dependency (it is a separate
-REM source build; see bootstrap.bat and internal/plan/llvm-version-migration.md).
+REM source build; see bootstrap.bat and internal/llvm-from-source-build.md).
 REM bootstrap.bat runs this step for you on a fresh clone.
 REM
 REM Layout note: the tree lives OUTSIDE the source dir, at

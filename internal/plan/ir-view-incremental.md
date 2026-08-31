@@ -240,13 +240,13 @@ mappings) has no regression test, though it is the one field bug found and the
 plan already records a deterministic repro. That repro belongs in
 lsp_fixture_test.py.
 
-### Split: example.sh owns codegen equivalence, test_lsp.sh owns the protocol
+### Split: test_example.sh owns codegen equivalence, test_lsp.sh owns the protocol
 
 Ruled 2026-08-30. The equivalence property is a CODEGEN property, not an LSP
 one, so it does not belong behind a JSON-RPC server: driving it over LSP costs
 two server lifetimes per scenario, needs stderr scraping for the hit/miss line,
 and cannot share the exe cache with test_lsp.sh (hence the driver's standalone
-caveat). It moves to example.sh - already the mac gate over the example/ corpus
+caveat). It moves to test_example.sh - already the mac gate over the example/ corpus
 - as a CLI-only comparison. test_lsp.sh keeps only the cheap protocol-level
 assertions.
 
@@ -302,7 +302,7 @@ Normalized per function, the picture matches the LSP driver exactly: 4
 byte-identical, ~18 renumber-only, ~3 semantic - i.e. the same three round-4
 residual classes and nothing new.
 
-So example.sh needs a small comparator, not a shell diff: split the dump into
+So test_example.sh needs a small comparator, not a shell diff: split the dump into
 per-function blocks keyed by name, normalize local/global renumbering, and
 classify identical / renumber / semantic. That logic already exists as
 split_blocks + compare_views inside measure_incremental_o2.py. Extract it into
@@ -317,7 +317,7 @@ different cause from local value renumbering and worth counting separately).
 The shared comparator and scenarios live in `Test/tools/view_compare.py`; both
 `Test/tools/incremental_o2_gate.py` and
 `vscode-extension/test/measure_incremental_o2.py` import them. The CLI gate is
-run by `example.sh` and can also be run directly:
+run by `test_example.sh` and can also be run directly:
 
 ```
 python3 Test/tools/incremental_o2_gate.py

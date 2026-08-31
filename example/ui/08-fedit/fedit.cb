@@ -14,7 +14,7 @@
 //   x64/Release/cflat.exe example/ui/08-fedit/fedit.cb -i example/ui -o out/fedit.exe
 //   out\fedit.exe
 //
-// Headless state-assert self-test (example.bat gate; drives via SendMessage + direct
+// Headless state-assert self-test (drives via SendMessage + direct
 // load/save, since OS file dialogs cannot run unattended):
 //   out\fedit.exe --selftest
 import "ui_native/host.cb";

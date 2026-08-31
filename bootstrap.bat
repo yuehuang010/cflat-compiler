@@ -26,7 +26,7 @@ REM %USERPROFILE%\.cflat-compiler-deps and shared by every worktree.
 REM
 REM Windows has no RTTI-enabled LLVM prebuilt (llvm.org ships RTTI OFF, and vcpkg
 REM is stuck at 18), so the source build is mandatory - see
-REM internal/plan/llvm-version-migration.md. Budget ~1-1.5 h for step 3; the rest
+REM internal/llvm-from-source-build.md. Budget ~1-1.5 h for step 3; the rest
 REM is minutes. By default only the /MT (Release) LLVM is built; /debug adds the
 REM second install cflat Debug links against - same Release optimization level with
 REM LLVM_ENABLE_ASSERTIONS=ON, built against the /MTd CRT because MSVC's debug and

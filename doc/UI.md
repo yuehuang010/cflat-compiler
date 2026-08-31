@@ -1036,7 +1036,7 @@ root.add(save);
   `<Button onPress={() => {...}} />`) is leak-clean - the intermediate temp is
   freed by the outer flush, which a nested closure invoker no longer clobbers. No
   bind-to-local workaround is needed; `counter_jsx.cb` exercises this exact shape
-  under example.bat's `--heap-audit` gate.
+  under test_example.bat's `--heap-audit` gate.
 
 ### Sugar-compatible element contract
 
@@ -1255,7 +1255,7 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 - **TUI** (`core/ui_canvas/term.cb` host loop; `example/ui/02-terminal/tui_demo.cb`,
   `example/ui/02-terminal/boxes.cb` demos): a double-buffered terminal host. Real console =
   interactive; redirected I/O (`--run`, CI) falls back to a deterministic
-  headless self-test that gates `example.bat` on behavior AND leaks (built with
+  headless self-test that gates `test_example.bat` on behavior AND leaks (built with
   `--heap-audit`).
 - **Win32** (`core/ui_canvas/win32.cb` host + `example/ui/03-canvas-win32/win32_boxes.cb`): a native
   GDI host reusing the framework unchanged behind the `ICanvas` seam.
@@ -1271,7 +1271,7 @@ a driver reads the control's own items/selection, so an empty control cannot ans
 ### IElement x host parity matrix (v18)
 
 Y = real native control; the notes call out deliberate differences and gaps. Cocoa is
-compile-checked and runtime-verified on this arm64 Mac by `bash example.sh Release`;
+compile-checked and runtime-verified on this arm64 Mac by `bash test_example.sh Release`;
 the gate covers the gallery and map native self-tests. On every host the data controls carry REAL items, and the `native*`
 drivers read their answers back out of the control - an empty control cannot pass a driver assert.
 
@@ -1504,7 +1504,7 @@ out\myapp_test.exe <nul            # exit 0 = all cases passed
 findstr /C:"heap-audit: LEAK" run.log
 ```
 
-This is precisely what `example.bat`'s `--worker-uitest` does for the template.
+This is precisely what `test_example.bat`'s `--worker-uitest` does for the template.
 
 **Per-host guarantee levels.** The framework is host-neutral, but what a run proves differs by host:
 

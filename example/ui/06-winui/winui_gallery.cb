@@ -13,7 +13,7 @@
 // Build (needs -i to both winui/ and ui/ + gallery/; the winmds/bootstrapper come from NuGet):
 //   cflat winui_gallery.cb -i example/ui/06-winui -i example/ui -i example/ui/05-gallery -o winui_gallery.exe
 // Headless self-test:  winui_gallery.exe --selftest
-// (example.bat runs it via --worker-winui when the WindowsAppSDK NuGet packages are cached.)
+// (Needs the WindowsAppSDK NuGet packages cached.)
 
 import "ui_native/winui.cb";
 import "gallery_app.cb";

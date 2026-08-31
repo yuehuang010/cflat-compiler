@@ -1,6 +1,6 @@
 @echo off
 REM Build all examples in example/ and subdirectories - in parallel.
-REM Usage: example.bat [Release|Debug]
+REM Usage: test_example.bat [Release|Debug]
 REM
 REM Mirrors test.bat: worker-mode blocks (below) each build/gate one item and
 REM write a .result file; the main body fans them all out with `start /b`, then

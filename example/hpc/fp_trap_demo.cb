@@ -11,8 +11,8 @@
 // Run (CRASHES on purpose when armed):
 //     out/fp_trap_demo.exe
 //
-// Kept out of test.bat precisely because it is supposed to fault. example.bat
-// only compiles examples, so this file passes there without being executed.
+// Meant to be run by hand: it is supposed to fault, so automation only ever
+// compiles it and never executes it.
 
 import "thread.cb";
 

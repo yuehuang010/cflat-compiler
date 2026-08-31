@@ -64,10 +64,10 @@ prebuilt-C-library rejection check; the default suite remains the AOT plus diagn
 
 ## Examples and Benchmarks
 
-`example.bat` builds every runnable example program in the `example/` tree to verify they still compile:
+`test_example.bat` builds every runnable example program in the `example/` tree to verify they still compile:
 
 ```bash
-./example.bat
+./test_example.bat
 ```
 
 `performance.bat` runs the performance benchmarks to check compiler/runtime throughput:
