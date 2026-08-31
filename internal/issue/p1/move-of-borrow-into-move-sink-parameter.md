@@ -123,7 +123,7 @@ destination-agnostic rejection at the `move` expression; that was measured and d
 
 ## Related
 
-[[interface-issue-queue]] - `fix/move-borrowed-plain-dest`'s landed record, which holds the
+`internal/fix-issue-lessons.md` (landed design records digest) - `fix/move-borrowed-plain-dest`'s landed record, which holds the
 destination table this is the last open row of.
 
 ## From the q10 bucket file (deleted 2026-08-12)

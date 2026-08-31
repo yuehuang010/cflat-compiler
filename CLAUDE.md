@@ -1,308 +1,314 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+Guidance for Claude Code in this repo. Terse style is deliberate - condensed, not sloppy.
+Every line is a rule or a fact. Grammar is clipped to save tokens; meaning is not.
 
 ## Overview
 
-cflat is a C-dialect compiler targeting LLVM IR. It compiles CFlat (.cb files) - an extended C language with modern features - generics, interfaces, namespaces, operator overloading, ownership/lifetime, and null-safe access - to LLVM Intermediate Representation for native execution.
+cflat = C-dialect compiler -> LLVM IR. Source `.cb`. Extended C: generics, interfaces,
+namespaces, operator overloading, ownership/lifetime, null-safe access.
 
 ## Git
-Do not commit to git.  Stash is allowed.  
-Keep `master` linear: every commit on `master` must have a single parent.  Do not create merge commits (no merge commits on `master`); integrate work by rebasing so history stays linear.
+
+Do not commit. Stash ok. `master` stays linear - single parent per commit, no merge commits,
+integrate by rebase. (`fix-issue` skill is the one exception; see Skills.)
 
 ## Dependencies
-Do not modify the root `./vcpkg.json` without explicit permission.
+
+Do not touch root `./vcpkg.json` without explicit permission.
 
 ## Scratch Directory
 
-Use the repo-root `scratch/` folder for ALL temporary files - throwaway `.cb` repros, scratch scripts, intermediate outputs, compiled binaries used for one-off checks. Do not use the system temp directory or the session scratchpad; keeping temp files in `scratch/` makes them easy to inspect and clean up. `scratch/` is gitignored, and files there are never picked up by `test.bat` / `example.bat` wildcards.
+ALL temp files -> repo-root `scratch/`: throwaway `.cb` repros, scripts, intermediate output,
+one-off binaries. Not system temp, not session scratchpad. Gitignored; never picked up by
+`test.bat` / `example.bat` wildcards.
 
-## Agent Delegation: Cost vs Intelligence
+## Agent Delegation
 
-**Codex Luna is the default implementation agent for ALL delegated work.** It replaces the
-former `sonnet` / `opus` tier split - there is no tier choice to make any more, for mechanical
-work or for hard compiler work. The main session plans, coordinates, and reviews the results.
+**Codex Luna = default implementation agent for ALL delegated work.** No tier choice - mechanical
+work and hard compiler work alike. Main session plans, coordinates, reviews.
 
-This section addresses the MAIN SESSION only. A spawned implementation agent does the work
-itself in its own session; it must never re-delegate to another agent - if it believes the task
-is wrong for it, it should say so in its report instead of spawning a sub-agent.
+Applies to MAIN SESSION only. A spawned agent does the work itself; it must NEVER re-delegate.
+Wrong task for it -> say so in the report, do not spawn a sub-agent.
 
-| Tier | Relative cost | Right for |
-|------|---------------|-----------|
-| Codex Luna (`gpt-5.6-luna`, High effort) | Low | **Default for everything.** High intelligence at low cost, so there is no reason to trade down: mechanical work (renames, builds/tests, doc updates, regression tests) and hard compiler work alike (multi-file changes across grammar + ForwardRefScanner + codegen, debugging with unclear root cause, ownership/lifetime work) |
-| `opus` (`opus-general-purpose`) | High | Fallback only: Codex unavailable, or the task genuinely needs the Claude toolchain (skills, worktree tooling) |
-| `sonnet` (`general-purpose-sonnet`) | Low | Not used - Codex Luna covers this range at comparable cost and higher intelligence |
-
-Codex Luna is not an Agent-tool subagent - it is the `codex` CLI (`~/.local/bin/codex`), run
-non-interactively from Bash. `~/.codex/config.toml` already pins `model = "gpt-5.6-luna"` and
-`model_reasoning_effort = "high"`, so no flags are needed for the model or effort:
+Codex Luna is not an Agent-tool subagent. It is the `codex` CLI (`~/.local/bin/codex`), run from
+Bash. `~/.codex/config.toml` already pins `model = "gpt-5.6-luna"` + `model_reasoning_effort =
+"high"` - no flags needed:
 
 ```bash
 codex exec --sandbox workspace-write -C /Users/felixhuang/source/cflat-compiler "<self-contained prompt>"
 ```
 
-Add `-m` / `-c model_reasoning_effort=...` only to override those defaults. The prompt must be
-self-contained - Codex does not see this session's context.
+`-m` / `-c model_reasoning_effort=...` only to override. Prompt must be self-contained - Codex
+does not see this session.
 
-Guidelines:
-
-- Delegate implementation to Codex Luna by default. Fall back to a Claude `opus` Agent-tool
-  subagent only when Codex is unavailable or the task genuinely needs the Claude toolchain
-  (skills, worktree tooling); never to `sonnet` or `haiku`.
-- Default flow: main session writes the plan and acceptance criteria, runs Codex Luna, then
-  verifies the result (build + the current host's suite: `test.bat` on Windows, `./test.sh` on
-  macOS/Linux).
-- Give the implementation agent a self-contained prompt: exact files, the plan, constraints from
-  this file (both-pass ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), and
-  how to verify.
-- Use the read-only `Explore` agent for broad codebase searches instead of burning main-session context.
-- If Codex Luna fails or flails, re-run with the failure context added, or escalate to an `opus`
-  subagent - do not re-run the same prompt unchanged, and do not silently absorb the work into
-  the main session for convenience.
-- Independent sub-tasks should be run in parallel when they touch disjoint files.
+- Fall back to Claude `opus` Agent-tool subagent (`opus-general-purpose`) ONLY if Codex
+  unavailable, or task needs Claude toolchain (skills, worktree tooling). Never `sonnet`, never
+  `haiku`.
+- Flow: main session writes plan + acceptance criteria -> run Codex -> main session verifies
+  (build + current host suite).
+- Prompt must carry: exact files, plan, constraints from this file (both-pass
+  ParseDeclarationSpecifiers, LogError-only, ASCII, no new test files), how to verify.
+- Broad "where is X handled" searches -> read-only `Explore` agent, not main context.
+- Codex fails/flails -> re-run WITH failure context added, or escalate to `opus`. Never re-run
+  same prompt unchanged. Never silently absorb the work into main session.
+- Independent sub-tasks touching disjoint files -> run parallel.
 
 ## Token Efficiency
 
-Tokens cost real money and energy. Treat context as a budget, not a scratch pad. The goal is
-the same answer for fewer tokens - not a worse answer.
+Tokens cost money and energy. Same answer, fewer tokens - not a worse answer.
 
-- **Read narrowly.** Use `Grep`/`Glob` to find the exact spot, then `Read` with `offset`/`limit`.
-  Try not to re-read a file you just edited to confirm the edit - `Edit` fails loudly if it did not apply.
-- **Delegate bulk reading.** Broad "where is X handled" sweeps go to the read-only `Explore`
-  agent, which returns the conclusion instead of dumping files into the main session. See
-  [Agent Delegation](#agent-delegation-cost-vs-intelligence) for tier choice.
-- **Cap command output.** Pipe noisy commands through `Select-Object -Last N` / `-First N`, or
-  redirect to a file under `scratch/` and read only the tail. Never dump a whole build log.
-- **Batch independent work.** Issue independent tool calls in a single message so they run in
-  parallel; do not serialize them into one-per-turn round trips.
-- **Do not re-derive.** Facts already established earlier in the conversation stand. Do not
-  re-run a passing suite, re-confirm a decision, or restate the plan each turn.
-- **Write tersely.** No preamble, no recap of what the user just said, no summary table when a
-  sentence does. Skip options you are not going to take.
-- **Bisect, do not brute-force.** When narrowing a failure, binary-search the input rather than
-  reading everything; verify the probe is actually reproducing the failure before trusting a
-  run of "passes" (a probe that fails for an unrelated reason makes the search vacuous).
+- **Read narrow.** `Grep`/`Glob` to find spot, then `Read` with `offset`/`limit`. Do not re-read a
+  file you just edited - `Edit` fails loudly if it did not apply.
+- **Delegate bulk reading** to `Explore`. It returns the conclusion, not the files.
+- **Cap output.** Pipe through `Select-Object -Last N` / `-First N`, or redirect to `scratch/` and
+  read the tail. Never dump a whole build log.
+- **Batch.** Independent tool calls in one message. No one-per-turn round trips.
+- **No re-derive.** Established facts stand. Do not re-run a passing suite, re-confirm a decision,
+  restate the plan each turn.
+- **Write tersely.** No preamble, no recap, no summary table where a sentence does. Skip options
+  you will not take.
+- **Bisect, do not brute-force.** Binary-search the input. Verify the probe actually reproduces the
+  failure first - a probe failing for an unrelated reason makes the whole search vacuous.
 
 ## Skills
 
-Project skills are **authored and tracked in `internal/skill/<name>/SKILL.md`** (tracked in
-git, like `internal/plan/` and `internal/issue/`). `.gitignore` ignores all of `.claude/`,
-so a skill living only under `.claude/skills/` is invisible to git and lost on a fresh
-clone - that is why the source of truth is `internal/skill/`.
+Authored + tracked in `internal/skill/<name>/SKILL.md` (git-tracked, like `internal/plan/` and
+`internal/issue/`). `.gitignore` ignores all of `.claude/`, so a skill living only there is
+invisible to git and dies on fresh clone.
 
-**Claude Code only auto-discovers project skills under `.claude/skills/`**, so a skill in
-`internal/skill/` is NOT invocable as `/<name>` - verified: with nothing under
-`.claude/skills/`, a fresh session reports no project skills. `internal/skill/` is the
-tracked, reviewable home; it is deliberately not the live one, and no symlink bridges them.
+Claude Code auto-discovers project skills ONLY under `.claude/skills/`. So `internal/skill/` is
+NOT invocable as `/<name>` - verified. It is the tracked home, deliberately not the live one. No
+symlink bridges them.
 
-Two ways to use a skill from here:
-
-- **Read it directly.** The file is a plain procedure - point at
-  `internal/skill/<name>/SKILL.md` and follow it. This is the default and needs no setup.
-- **Activate it for a session**, if you want the `/<name>` slash command:
-
+Two uses:
+- **Read it directly** - plain procedure, point at `internal/skill/<name>/SKILL.md`, follow it.
+  Default, no setup.
+- **Activate for a session** (want the `/<name>` command):
   ```bash
   mkdir -p .claude/skills/<name>
-  cp internal/skill/<name>/SKILL.md .claude/skills/<name>/SKILL.md   # restart the session to pick it up
+  cp internal/skill/<name>/SKILL.md .claude/skills/<name>/SKILL.md   # restart session to pick up
   ```
-
-  That copy is gitignored and can drift. `internal/skill/` stays the source of truth: edit
-  there, re-copy, and never edit the copy under `.claude/`.
-
-Current skills:
+  That copy is gitignored and drifts. `internal/skill/` stays source of truth - edit there,
+  re-copy, never edit the copy.
 
 | Skill | Purpose |
 |-------|---------|
-| `fix-issue` | Fix an `internal/issue/` entry in an isolated worktree with a delegated agent, review with an opus code-review agent until clean, then merge to `master` as a single-parent commit. This skill is the one place the "do not commit" rule is lifted. |
+| `fix-issue` | Fix an `internal/issue/` entry in an isolated worktree via delegated agent, review with opus code-review agent until clean, merge to `master` as single-parent commit. Only place the do-not-commit rule is lifted. |
 
 ## Text Output
 
-- Use plain ASCII characters for readable text in source files, comments, log messages, and documentation. Avoid Unicode punctuation such as en/em dashes, smart quotes, and ellipsis characters. Use ASCII `-`, `"`, `'`, and three dots `...` instead.
+Plain ASCII in source, comments, log messages, docs. No Unicode punctuation (no en/em dash, smart
+quotes, ellipsis char). Use `-`, `"`, `'`, three dots.
 
 ## Comments
 
-- Keep inline comments to 2 lines or fewer. Multiline comments are allowed above a function or at the beginning entry into a new scope.
+Inline comments <= 2 lines. Multiline allowed above a function, or at entry to a new scope.
 
 ## Logging Conventions
 
-- Use `LogError` or `LogErrorContext` for all error reporting in the compiler. Do not introduce `LogWarning` or leave `std::cout`.
+`LogError` / `LogErrorContext` for ALL compiler error reporting. Never add `LogWarning`. Never
+leave `std::cout`.
 
 ## Localization
 
-- Do NOT edit the locale JSON files under `cflat/locales/` directly - not by hand, not with sed/scripts, and not from an agent. This covers every file there (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, en-simple, en-pseudo). They are GENERATED: `en-pseudo.json` is produced by the build/test tooling from the `LogError*` format strings in code, and the translations are maintained externally from it. When adding or changing a diagnostic, write only the new `LogError*` format string in code; let the scripts/tests regenerate the locale files, and commit the regenerated result as-is. A diff under `cflat/locales/` that did not come from the generator is a review defect.
+**Never edit `cflat/locales/` directly** - not by hand, not by sed/script, not from an agent.
+Covers every file there (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, en-simple, en-pseudo). They are
+GENERATED: `en-pseudo.json` comes from the `LogError*` format strings in code via build/test
+tooling; translations are maintained externally from it. New/changed diagnostic -> write ONLY the
+`LogError*` format string in code, let scripts/tests regenerate, commit regenerated result as-is.
+A `cflat/locales/` diff not from the generator = review defect.
 
 ## Debugging Workflow
 
-- Before editing, state the hypothesized root cause and verify against the codebase. Avoid speculative edits based on a single guess (e.g., do not assume lexer token conflicts before checking parser/grammar paths).
+- State hypothesized root cause + verify against codebase BEFORE editing. No speculative edits off
+  one guess (e.g. do not blame lexer token conflicts before checking parser/grammar paths).
+- Root cause found -> consider a regression test.
+- Hit an LLVM assert -> after root-causing, add a proper compiler error message to prevent that case.
+- Read `internal/fix-issue-lessons.md` before any non-trivial compiler fix: review sequencing, guard
+  polarity, what to distrust in an agent report, how tests go vacuous. Add to it when a lesson
+  changes an outcome twice. Landed design records (ratified changes, approaches never to retry)
+  live in the digest at the bottom of that file.
 
-- After finding the root cause of the issue, consider writing a regression test.
-- When encountering a LLVM assert, after identifying the root cause, then write an proper error message in the compiler to avoid that case.
-- Known, diagnosed-but-deferred bugs/gaps live in `internal/issue/` (tracked in git, like `internal/plan/`). Check there before re-investigating a failure, and record new known issues there (one file per issue: summary, repro, root cause, fix direction). Delete the file when the issue is fixed. `internal/issue/` holds ACTIVE items only (one file per issue under `p1/`, `p2/`, `p3/`, `p4/`, `ui/`). `p1/`-`p3/` are bugs and gaps by severity; `p4/` is small quality-of-life FEATURES - language or library conveniences (e.g. `arr.length()` on a fixed array) that are too small to justify an `internal/plan/` entry but still need a maintainer ruling on the surface before they are built. A `p4/` file records the proposed spelling, the alternatives, and the acceptance; once the maintainer ratifies it, work it with the same fix-issue workflow (it may land with or without a plan). Do not file a bug under `p4/`, and do not start a `p4/` item without the ruling. The landed design records (ratified behaviour changes and approaches that must not be retried) live in the digest at the bottom of `internal/fix-issue-lessons.md`.
-- Durable lessons from past fix rounds - review sequencing, guard polarity, what to distrust in an agent report, how tests go vacuous - live in `internal/fix-issue-lessons.md`. Read it before starting a non-trivial compiler fix; add to it when a lesson changes an outcome twice.
+**`internal/issue/` = ACTIVE items only**, one file per issue (summary, repro, root cause, fix
+direction). Check before re-investigating a failure; file new known issues there; delete the file
+on fix. Buckets: `p1/`-`p3/` bugs+gaps by severity, `p4/` small quality-of-life FEATURES (language
+or library conveniences too small for `internal/plan/`, e.g. `arr.length()` on a fixed array),
+`ui/`. A `p4/` file records proposed spelling, alternatives, acceptance - and needs a maintainer
+ruling on the surface before build. Never file a bug under `p4/`. Never start a `p4/` item without
+the ruling.
 
 ## Building
 
-**Fresh clone on Windows: run `bootstrap.bat`.** It is the one command that takes a clean
-checkout to a verified Release build - toolchain check (VS/vcvars64, cmake, ninja, git,
-antlr4) -> vcpkg deps -> clone + source-build + install **LLVM 23.1.0** into
-`%USERPROFILE%\.cflat-compiler-deps\llvm-23.1.0` -> `cmake_build.bat release` ->
-`cflat --init-local` -> `test.bat Release`. Every step is idempotent, so re-running it is
-cheap; `/skip-llvm`, `/skip-tests`, `/llvm-only` and `/fresh` narrow the work. The ~5 GB
-LLVM ninja tree is deleted once the install succeeds (`/keep-build` retains it for an
-incremental re-bump); what stays is the ~3.3 GB install tree plus the ~1.9 GB source
-clone, both shared by every worktree. Budget ~35-60
-min for the LLVM build (it is mandatory: no RTTI-enabled LLVM prebuilt exists for Windows,
-and vcpkg's port is stuck at 18). **cflat supports LLVM 23 only** - the version
-shims are gone, so an older LLVM will not compile. It provisions **both** installs: the
-`/MT`, assertions-OFF tree that cflat Release links, and a second `/MTd` CRT
-**`LLVM_ENABLE_ASSERTIONS=ON`** tree installed to `llvm-<ver>-assert`, which is what the
-Debug presets point at - so budget roughly double the build time for a fresh clone. See
-`internal/plan/llvm-version-migration.md` and the
-[Two installs](internal/plan/llvm-from-source-build.md) section for the recipe.
+### Fresh clone (Windows): `bootstrap.bat`
 
-**Debug links an assertions-enabled LLVM on purpose.** Release builds LLVM with
-`LLVM_ENABLE_ASSERTIONS=OFF`, so LLVM APIs that assert on misuse instead return
-garbage silently - the LLVM 23 `getTerminator()` change is a worked example in that
-doc. Debug is the only config where that safety net can exist, so keep the two
-installs in sync when bumping the LLVM version.
+One command, clean checkout -> verified Release build: toolchain check (VS/vcvars64, cmake, ninja,
+git, antlr4) -> vcpkg deps -> clone + source-build + install LLVM into
+`%USERPROFILE%\.cflat-compiler-deps\` -> `cmake_build.bat release` -> `cflat --init-local` ->
+`test.bat Release`. Every step idempotent, re-running is cheap. Narrow with `/skip-llvm`,
+`/skip-tests`, `/llvm-only`, `/fresh`. LLVM ninja build tree is deleted after install succeeds
+(`/keep-build` keeps it for incremental re-bump); install tree + source clone stay, shared by every
+worktree.
 
-The Windows build uses **CMake + vcpkg (Ninja + MSVC)** - this is the default path, and what the dev scripts (`buildAndRun.bat`, `buildci.bat`) invoke. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is a separate source build - see `internal/plan/llvm-version-migration.md`); the build also deploys `core/*.cb` next to the exe. See [Cross-platform builds](#cross-platform-builds-cmake-windows-linuxwsl-macos) below for the `cmake_build.bat` helper and the presets. The CMake build writes `cflat.exe` to the `x64/<Config>/` layout that `test.bat` / `test_lsp.bat` expect.
+LLVM source build is mandatory and slow - no RTTI-enabled LLVM prebuilt exists for Windows, vcpkg's
+port is far behind.
 
-**Quick dev loop** - `buildAndRun.bat` builds Debug + Release (via `cmake_build.bat`), then runs `Test/test_basic.cb`:
+**cflat pins one exact LLVM version, no version shims** - a different LLVM will not compile. Pinned
+version lives in `CMakePresets.json`; read it there, not here. `bootstrap.bat` provisions BOTH
+installs: `/MT` assertions-OFF tree (Release links this), and `/MTd` CRT
+`LLVM_ENABLE_ASSERTIONS=ON` tree with `-assert` suffix (Debug presets point here). So a fresh clone
+builds LLVM twice. Recipe + migration history: `internal/plan/llvm-version-migration.md`,
+[Two installs](internal/plan/llvm-from-source-build.md).
+
+**Debug links assertions-enabled LLVM on purpose.** Release LLVM has `LLVM_ENABLE_ASSERTIONS=OFF`,
+so LLVM APIs that assert on misuse silently return garbage instead - a `getTerminator()` behaviour
+change is the worked example in that doc. Debug is the only config where that safety net exists.
+Keep both installs in sync when bumping.
+
+### Shared dependency tree (all platforms)
+
+`vcpkg_installed` (small since LLVM left the manifest) + source-built LLVM install (large) rarely
+change, so both live OUTSIDE the source tree at a fixed per-user location:
+`~/.cflat-compiler-deps/` (macOS/Linux), `%USERPROFILE%\.cflat-compiler-deps\` (Windows). Override
+the vcpkg tree with `CFLAT_VCPKG_INSTALLED`. Consequence: plain `git worktree add` just works - no
+junction, no symlink, no deletion hazard, no vcpkg step per worktree.
+
+Populate on a fresh clone with `vcpkg-build.bat` (Windows). Full mechanism:
+[`internal/worktree-vcpkg-sharing.md`](internal/worktree-vcpkg-sharing.md).
+
+**What forces a full LLVM source rebuild** (any platform): vcpkg keys its binary cache
+(`~/.cache/vcpkg/archives`, user-global) on an ABI hash over port version (registry baseline in
+`vcpkg-configuration.json`), **feature list in `vcpkg.json`**, triplet, host compiler, **CMake
+version**. Source dir is NOT an input - a worktree can never cause a rebuild. Editing `vcpkg.json`
+features, bumping the baseline, or `brew upgrade cmake`/Xcode can.
+
+### Per-platform build
+
+CMake + vcpkg is the build system - only path, and the only one working on Linux/WSL and macOS.
+Presets in `CMakePresets.json`. vcpkg supplies ANTLR4 / nlohmann-json / simdjson (LLVM is separate,
+source-built). Build also deploys `core/*.cb` next to the exe. Windows output goes to the
+`x64/<Config>/` layout `test.bat` / `test_lsp.bat` expect.
+
+**Windows (Ninja + MSVC).** Default path; `buildAndRun.bat` / `buildci.bat` invoke it. Helper runs
+`vcvars64`, sets `VCPKG_ROOT`, resolves the shared tree:
 
 ```bash
-./buildAndRun.bat            # builds Debug + Release, runs test_basic.cb
-./buildAndRun.bat test_foo.cb  # same but runs test_foo.cb instead
+./cmake_build.bat release    # -> x64/Release/cflat.exe
+./cmake_build.bat debug      # -> x64/Debug/cflat.exe
+cmake --preset win-x64-release && cmake --build --preset win-x64-release   # manual equivalent
 ```
 
-### Cross-platform builds (CMake: Windows, Linux/WSL, macOS)
-
-**CMake + vcpkg is the build system.** It is the only path, and the only one that works on Linux/WSL and macOS. Presets live in `CMakePresets.json`. See `internal/macos-build.md` for the macOS internals. Working end-to-end: Windows + Linux/WSL host build, Linux ELF target, and macOS arm64 native build + link + run on Apple Silicon (`./test.sh` passes 178/0 in both Debug and Release; run it with Homebrew tools on PATH).
-
-> The CMake build writes the Windows `cflat.exe` to the `x64/<Config>/` layout, so `test.bat` / `test_lsp.bat` work unchanged after a CMake build.
-
-**Windows (Ninja + MSVC).** Use the helper - it runs `vcvars64`, sets `VCPKG_ROOT`, and resolves the shared dependency tree that lives **outside the source dir** at `%USERPROFILE%\.cflat-compiler-deps\vcpkg_installed` (override with `CFLAT_VCPKG_INSTALLED`; no rebuild). On a fresh clone, populate it once with `vcpkg-build.bat`:
+Quick dev loop - builds Debug + Release, then runs a test:
 
 ```bash
-./cmake_build.bat release    # builds win-x64-release -> x64/Release/cflat.exe
-./cmake_build.bat debug      # builds win-x64-debug   -> x64/Debug/cflat.exe
+./buildAndRun.bat              # runs Test/test_basic.cb
+./buildAndRun.bat test_foo.cb  # runs that instead
 ```
 
-Equivalent manual invocation (from a dev shell with `VCPKG_ROOT` set and `vcvars64` sourced):
+**macOS arm64 (validated on Apple Silicon).** Homebrew tools + `openjdk` on PATH.
+`cmake_build.sh` = counterpart to `cmake_build.bat` (`debug` | `release`, picks preset from
+`uname`), resolves `VCPKG_ROOT` + openjdk PATH:
 
 ```bash
-cmake --preset win-x64-release && cmake --build --preset win-x64-release
+./cmake_build.sh release
+./test.sh Release
 ```
 
-**Linux / WSL (Ninja + apt clang/llvm-18).** Source of truth stays on `/mnt/c`; build artifacts go to the native fs (`~/cflat-build`). The Linux preset is standalone (no vcpkg toolchain) and points at apt's `/usr/lib/llvm-18` + the antlr 4.10 jar at `/opt/antlr`. One-time toolchain (Ubuntu-24.04): `apt install clang llvm-18-dev cmake ninja-build default-jre nlohmann-json3-dev libsimdjson-dev libantlr4-runtime-dev uuid-dev` plus the antlr 4.10.1 jar in `/opt/antlr`.
+Self-contained - no Xcode / Command Line Tools - after one-time `cflat --init` (bundled `ld64.lld`
++ harvested libSystem tbd stub). Toolchain, link path, self-contained mechanism, Darwin specifics
+(`if const (__MACOS__)`), `--run` on Mach-O: [`internal/macos-build.md`](internal/macos-build.md).
 
-From inside WSL:
+**Linux / WSL (Ninja + apt clang/llvm).** Source stays on `/mnt/c`; artifacts to native fs
+(`~/cflat-build`). Preset is standalone (no vcpkg toolchain), points at apt LLVM under `/usr/lib/`
++ antlr jar at `/opt/antlr`. One-time toolchain (Ubuntu-24.04): `apt install clang cmake
+ninja-build default-jre nlohmann-json3-dev libsimdjson-dev libantlr4-runtime-dev uuid-dev` plus
+matching `llvm-<N>-dev` and the antlr 4.10.1 jar in `/opt/antlr`.
 
 ```bash
 cd /mnt/c/source/cflat-compiler
 cmake --preset linux-x64-release && cmake --build --preset linux-x64-release
-# binary -> ~/cflat-build/linux-x64-release/cflat
+# -> ~/cflat-build/linux-x64-release/cflat
+# from Windows host: wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64-release && cmake --build --preset linux-x64-release"
 ```
 
-Driving the Linux build from the Windows host:
+> **Linux preset is STALE.** Its `CMAKE_PREFIX_PATH` points at an apt LLVM several majors behind the
+> pinned version, and the compat shims that bridged that gap were removed - this path does not build
+> today. Fix the preset before trusting this subsection.
 
-```bash
-wsl.exe -e bash -lc "cd /mnt/c/source/cflat-compiler && cmake --preset linux-x64-release && cmake --build --preset linux-x64-release"
-```
-
-> antlr versions **must** match the runtime: Linux pins generator 4.10.1 against libantlr4-runtime 4.10 (Windows uses 4.13.2). Don't cross them.
-
-**macOS arm64 native build (validated on Apple Silicon).** Build with Homebrew tools + `openjdk` on PATH:
-
-```bash
-./cmake_build.sh release   # resolves VCPKG_ROOT + openjdk PATH, then configures/builds
-./test.sh Release          # 554 passed, 0 failed, 8 skipped
-```
-
-`cmake_build.sh` is the Mac/Linux counterpart to `cmake_build.bat` (`debug` | `release`, picks the preset from `uname`). The macOS preset points `VCPKG_INSTALLED_DIR` at a **shared tree outside the source dir** (`~/.cflat-compiler-deps/vcpkg_installed`, override with `CFLAT_VCPKG_INSTALLED`) - see [Git worktrees](#git-worktrees) below. The build is **self-contained (no Xcode / Command Line Tools)** after a one-time `cflat --init` (bundled `ld64.lld` + a harvested libSystem tbd stub). Toolchain, link path, self-contained mechanism, Darwin runtime specifics (`if const (__MACOS__)`), and `--run` on Mach-O are documented in [`internal/macos-build.md`](internal/macos-build.md).
+> antlr generator and runtime versions MUST match: Linux pins generator 4.10.1 against
+> libantlr4-runtime 4.10; Windows uses 4.13.2. Do not cross them.
 
 ### Git worktrees
 
-`vcpkg_installed` (~0.2 GB since LLVM left the manifest) and the source-built
-`llvm-<ver>` install (~3.3 GB) rarely change. On **both** platforms they live
-*outside* the source tree in a fixed per-user location - `~/.cflat-compiler-deps/`
-on macOS, `%USERPROFILE%\.cflat-compiler-deps\` on Windows (override the vcpkg tree
-with `CFLAT_VCPKG_INSTALLED`) - so a plain `git worktree add` just
-works with zero post-processing, no junction, no symlink, and no deletion hazard:
+Shared dep tree (above) means no post-processing:
 
 ```bash
 git worktree add ../cflat-feature -b feature/foo
-cd ../cflat-feature && ./cmake_build.sh release   # or cmake_build.bat on Windows; no vcpkg step
-cd ../cflat-feature && x64/Release/cflat --init-local   # per-worktree compiler cache
-git worktree remove ../cflat-feature               # shared tree untouched
+cd ../cflat-feature && ./cmake_build.sh release        # or cmake_build.bat; no vcpkg step
+cd ../cflat-feature && x64/Release/cflat --init-local  # per-worktree compiler cache
+git worktree remove ../cflat-feature                   # shared tree untouched
 ```
 
-**In a worktree, use `--init-local`, not `--init`.** The compiler cache is *not* shared the
-way `vcpkg_installed` is: `--init` writes one per-user `~/.cflat` / `%USERPROFILE%\.cflat`
-that every worktree and every build config would fight over, so a `--init` in one worktree
-silently replaces the core bitcode another worktree is about to compile against.
-`--init-local` puts the cache in `<exe dir>/.cflat` - i.e. `x64/Release/.cflat` inside that
-worktree - and every later compile from that same exe picks it up automatically, no flag
-needed. This is the preferred collision-avoidance mechanism for worktrees, and for Debug vs
-Release side by side. `test.sh`, `test.bat`, and `example.bat` already run `--init-local`
-for exactly this reason, so a suite run never clobbers your per-user cache.
-`git worktree remove` takes the local cache with it; nothing to clean up separately.
+**In a worktree use `--init-local`, NOT `--init`.** Compiler cache is NOT shared the way
+`vcpkg_installed` is: `--init` writes one per-user `~/.cflat` / `%USERPROFILE%\.cflat` that every
+worktree and config fights over, so `--init` in one worktree silently replaces core bitcode another
+is about to compile against. `--init-local` -> `<exe dir>/.cflat` (i.e. `x64/Release/.cflat`), and
+every later compile from that exe picks it up automatically, no flag. Preferred collision-avoidance
+for worktrees AND for Debug vs Release side by side. `test.sh`, `test.bat`, `example.bat` already
+run `--init-local`, so a suite run never clobbers your per-user cache. `git worktree remove` takes
+the local cache with it.
 
-`cmake_build.sh` resolves `VCPKG_ROOT` from the main checkout's gitignored `./vcpkg`
-clone (a linked worktree has none); `cmake_build.bat` does the equivalent via
-`VCPKG_ROOT`/`vcvars64`. Both scripts wipe a build dir whose cached `VCPKG_INSTALLED_DIR`
-no longer matches, since a moved dependency tree leaves stale absolute paths (`LLVM_DIR`
-etc.) behind. See [`internal/worktree-vcpkg-sharing.md`](internal/worktree-vcpkg-sharing.md)
-for the full mechanism and how to populate the shared tree on a fresh clone.
-
-**What forces a 50-min LLVM source rebuild** (on any platform): vcpkg keys its binary cache (`~/.cache/vcpkg/archives`, user-global) on an ABI hash whose inputs are the port version (registry baseline in `vcpkg-configuration.json`), the **feature list in `vcpkg.json`**, the triplet, the host compiler, and the **CMake version**. The source directory is not an input - a worktree can never cause a rebuild. Editing `vcpkg.json` features, bumping the baseline, or `brew upgrade cmake`/Xcode can.
+`cmake_build.sh` resolves `VCPKG_ROOT` from the main checkout's gitignored `./vcpkg` clone (a linked
+worktree has none); `cmake_build.bat` does it via `VCPKG_ROOT`/`vcvars64`. Both wipe a build dir
+whose cached `VCPKG_INSTALLED_DIR` no longer matches - a moved dep tree leaves stale absolute paths
+(`LLVM_DIR` etc.) behind.
 
 ## Running
 
 ```bash
-# Compile to native executable
-x64/Debug/cflat.exe input.cb -o out.exe
-
-# Also dump LLVM IR
-x64/Debug/cflat.exe input.cb -o out.exe --out-lli out.ll
-
-# Execute IR directly via lli
-x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll
+x64/Debug/cflat.exe input.cb -o out.exe                        # native exe
+x64/Debug/cflat.exe input.cb -o out.exe --out-lli out.ll       # also dump IR
+x64/Debug/cflat.exe input.cb --out-lli out.ll && lli.exe out.ll  # run IR via lli
 ```
 
-The compiler automatically locates `runtime.cb` next to the executable. The CFlat source uses the `.cb` extension.
+Compiler auto-locates `runtime.cb` next to the exe. Source extension is `.cb`.
 
 ### In-process execution (`--run`)
 
 ```bash
-# JIT-compile and run in-process - no exe on disk; exit code is the program's
-x64/Debug/cflat.exe input.cb --run
-
-# Pass arguments to the program (everything after `--` becomes argv[1..])
-x64/Debug/cflat.exe input.cb --run -- arg1 arg2
+x64/Debug/cflat.exe input.cb --run                # no exe on disk; exit code is the program's
+x64/Debug/cflat.exe input.cb --run -- arg1 arg2   # everything after -- becomes argv[1..]
 ```
 
-Entry must be `int main()` or `int main(int argc, char** argv)`. Read-only: cannot be combined with `-o`, `-l/--out-lli`, or `-b/--bitcode`, and single-threaded only (programs that spawn a `thread<T>` or use the `program` construct are rejected - compile to an exe instead). See [`doc/CLI.md`](doc/CLI.md) for the full command-line reference.
+Entry must be `int main()` or `int main(int argc, char** argv)`. Read-only: cannot combine with
+`-o`, `-l/--out-lli`, `-b/--bitcode`. Single-threaded only - programs spawning `thread<T>` or using
+`program` are rejected, compile to an exe instead.
 
 ### Compiler cache (`--init`)
 
-Run once after installing or updating cflat to populate `%USERPROFILE%\.cflat\`:
-
 ```bash
-x64/Debug/cflat.exe --init
+x64/Debug/cflat.exe --init        # populate per-user %USERPROFILE%\.cflat\
 ```
 
-Pre-compiles the core `.cb` libraries to LLVM bitcode and caches resolved linker paths, so subsequent compiles load bitcode instead of re-parsing (~44% faster cold start). The cache is keyed on the core `.cb` mod-times and auto-invalidates.
+Pre-compiles core `.cb` libs to LLVM bitcode + caches resolved linker paths, so later compiles load
+bitcode instead of re-parsing - substantial cold-start win. Keyed on core `.cb` mod-times,
+auto-invalidates.
 
-`--init-local` populates `<exe dir>/.cflat` instead of the per-user cache; once created, later compiles from that same exe pick it up automatically (no flag needed) - useful for portable installs, CI, or keeping several builds/worktrees from sharing one cache. `--init-clear` deletes **both** the per-user and local caches; `--init-clear-local` deletes only the local one. A `CFLAT_CACHE_DIR` env var override and the full 4-step resolution order are documented in [`doc/CACHING.md`](doc/CACHING.md), which also covers the full design and troubleshooting.
+`--init-local` -> `<exe dir>/.cflat` instead (portable installs, CI, several builds/worktrees not
+sharing one cache; see Git worktrees). `--init-clear` deletes BOTH caches; `--init-clear-local`
+only the local one. `CFLAT_CACHE_DIR` override + full 4-step resolution order + design +
+troubleshooting: [`doc/CACHING.md`](doc/CACHING.md).
 
 ### C interop (`.c` files compiled by clang)
 
-`.c` inputs are treated as **real C** and compiled by `clang-cl` into objects that are merged into the final image by `lld-link`. They are NOT parsed by the CFlat parser.
+`.c` inputs = REAL C. Compiled by `clang-cl` into objects, merged into the final image by
+`lld-link`. NOT parsed by the CFlat parser. (CFlat test fixtures use `.cb`, e.g. `Test/test_c.cb`.)
 
-**Auto-extern**: when a `.c` is brought in, the compiler auto-registers every externally-linkable function via clang's JSON AST dump - `import "util.c";` works without hand-written prototypes. Hand-written `extern` declarations take precedence.
+**Auto-extern**: bringing in a `.c` auto-registers every externally-linkable function via clang's
+JSON AST dump, so `import "util.c";` works with no hand-written prototypes. Hand-written `extern`
+declarations take precedence.
 
-Two ways to bring a C file in (both require `-o`):
+Two ways in, both require `-o`:
 
 ```bash
 x64/Debug/cflat.exe app.cb util.c -o app.exe   # positional input
@@ -315,136 +321,157 @@ x64/Debug/cflat.exe app.cb util.c -o app.exe   # positional input
 x64/Debug/cflat.exe app.cb --c-include <inc-dir> --c-lib <path/to/lib.lib> --c-define CURL_STATICLIB -o app.exe
 ```
 
-- **Source**: `import package "curl/curl.h" lib "libcurl.lib";` - `.h`/`.hpp`/`.hh` extension routes to header binding. Use `lib { "a.lib", "b.lib" }` for multi-lib. Use `define "NAME"` for per-import defines. Use `cache` clause for large headers (e.g. `import "windows.h" cache;`).
-- **Non-self-contained headers**: use grouped import `import {"windows.h", "tlhelp32.h"};` when a header assumes another was included first.
+- **Source form**: `import package "curl/curl.h" lib "libcurl.lib";` - `.h`/`.hpp`/`.hh` routes to
+  header binding. `lib { "a.lib", "b.lib" }` for multi-lib. `define "NAME"` for per-import defines.
+  `cache` clause for large headers (`import "windows.h" cache;`).
+- **Non-self-contained headers**: grouped import `import {"windows.h", "tlhelp32.h"};` when a header
+  assumes another was included first.
 - **CLI**: `--c-include <dir>`, `--c-lib <path>`, `--c-define NAME[=val]`, `--c-header-cache-deep`.
 
-See `internal/c-interop-anon-records.md` for struct/union detail. See [`doc/CLI.md`](doc/CLI.md) for full flag list.
-
-> Note: `.c` means real C. CFlat test fixtures use `.cb` (e.g. `Test/test_c.cb`).
+Struct/union detail: `internal/c-interop-anon-records.md`.
 
 ### Key CLI flags
 
-See [`doc/CLI.md`](doc/CLI.md) for the full reference. Most-used flags:
+Full reference: [`doc/CLI.md`](doc/CLI.md). Most-used:
 
-- `-o / --output`: Output native executable (.exe)
-- `-l / --out-lli`: Output LLVM IR file (.ll)
-- `-g / --debug-info`: Emit DWARF debug information
-- `-i / --import-dir`: Directory to search for imported modules
-- `-v / --verbose`: Print detailed diagnostic messages
-- `-ftime-trace`: Write Chrome-trace JSON to `<input>.time-trace.json`
-- `--symbol <name>`: IDE-style quick symbol lookup, then exit (repeatable)
-- `--check`: Check source files for errors without emitting output
+- `-o / --output`: native executable
+- `-l / --out-lli`: LLVM IR file (.ll)
+- `-g / --debug-info`: DWARF debug info
+- `-i / --import-dir`: import search dir
+- `-v / --verbose`: detailed diagnostics
+- `-ftime-trace`: Chrome-trace JSON -> `<input>.time-trace.json`
+- `--symbol <name>`: IDE-style quick symbol lookup then exit (repeatable)
+- `--check`: check for errors, emit nothing
 - `--run`: JIT-compile and run in-process
 
+**`--symbol-dump` family** - dump ONE section of output instead of the whole thing, then exit. All
+three are repeatable and need a positional source file. Use these to inspect a single function
+instead of diffing a whole `--out-lli` dump.
+
+| Switch | Dumps |
+|--------|-------|
+| `--symbol-dump` | symbol info for source elements |
+| `--symbol-dump-ir` | unoptimized LLVM IR |
+| `--symbol-dump-opt` | optimized LLVM IR; defaults to `-O2`, explicit `-O0`/`-O1`/`-O2` overrides |
+
+Selectors: `line:<n>`, `line:<a>-<b>` (`--symbol-dump` only), `function:<name>`, and `module` (IR
+dumps only). No line ranges for IR dumps; an IR line selector resolves to the function enclosing
+that 1-based line.
+
+```bash
+cflat probe.cb --symbol-dump function:main
+cflat probe.cb --symbol-dump-opt module
+```
+
+Multiple positional files -> analyzed in order, output split by a file banner; the optimized view
+reuses the previous file's snapshot where applicable (`CFLAT_VIEW_NO_INCREMENTAL=1` disables that,
+useful when comparing). Line dumps skip comments and string/char literals; unresolved identifiers
+yield no detail. Function dumps read the file holding the indexed definition, imports included.
+
 ## Testing
-- **Windows**: `test.bat` / `test_lsp.bat` / `example.bat` (batch scripts).
-- **Linux/WSL and macOS**: `test.sh` is the `test.bat` counterpart - it compiles+runs the platform-portable subset of `Test/*.cb` (plus `Test/errors/*.cb`) against the native cflat, in parallel with a per-test timeout, and prints a PASS/FAIL/SKIP summary. Run it as `bash test.sh Release` (or `Debug`, `-j N`). It maintains an explicit SKIP list of genuinely Windows-only tests; before adding one, prove the *whole file* is Windows-bound. The SKIP-list rationale and the warm-cache second pass are documented in [`internal/testing-notes.md`](internal/testing-notes.md).
-- **`--init` serializer rule** (load-bearing): `--init` reconstructs compiler state from a hand-written serializer, so any new field on `TypeAndValue` / `StructData` / `AnnotationValue` that an analysis reads MUST be added to the `LLVMBackend.cpp` cache round-trip in the same change - otherwise it is silently dropped on a warm cache and `expect_error` tests stop firing. See `internal/testing-notes.md`.
-- **Verify on the host you are on, and only that host.** On a macOS/Linux host, a green `./test.sh` is the bar for declaring work complete; on Windows it is `test.bat` (Release). Run the suite for the current host after compiler changes, before saying you are done.
-- **Do NOT append "but this still needs verification on Windows/WSL" caveats.** The maintainer owns cross-platform verification and is already aware that a macOS session cannot run `test.bat`. Repeating it every turn is noise. Just report what you ran and what passed. Flag a *specific*, concrete cross-platform risk only when you have an actual reason to believe a change behaves differently on another platform (e.g. an ifdef'd path you could not exercise) - not as a routine disclaimer.
-- `test.bat` runs all tests in parallel and should complete in under a minute. A test that hangs will be killed after a configurable timeout (default 120 seconds, set via `TIMEOUT_SECS` at the top of `test.bat`).
-- Do NOT create separate compiler integration tests - test.bat already validates the compiler end-to-end.
-- Do NOT create new test files (e.g. in `Test/`) unless explicitly instructed to. Add regression cases by extending an existing, related test file instead.
-- Do NOT revert changes to check if baseline is correct.  Assume all tests are passing and failed test are from the current changes.  Ask before reverting changes to validate baseline.
-- When tests fail after a fix, investigate root causes; do not weaken/dilute test assertions to make them pass. Ask before disabling tests.
 
-## Running Tests
+Scripts by host - Windows `.bat`, macOS/Linux `.sh`:
 
 ```bash
-test.bat              # runs against Release (default)
-test.bat Debug        # runs against Debug
-test.bat Release      # explicit Release
+test.bat            # compiler suite, Release default; also: test.bat Debug | Release
+test_lsp.bat        # LSP suite, Release default; also: test_lsp.bat Debug
+example.bat         # example programs, Release default; also: example.bat Debug
+bash test.sh Release   # test.bat counterpart (also Debug, -j N)
+./example.sh           # example.bat counterpart
 ```
 
-> **Performance tip**: Building Release and running `test.bat` (Release) is significantly faster than `test.bat Debug`. Prefer Release for the full test loop; use Debug only when you need symbols for a specific failure.
+Config: first arg wins; `CFLAT_CONFIG` env var is respected otherwise. **Pitfall**: a stale
+`CFLAT_CONFIG` in the invoking shell silently becomes the default - clear/update it after
+rebuilding a different config. Prefer Release for the full loop (much faster than Debug); use Debug
+only when you need symbols for a specific failure.
 
-`test.bat` defaults to Release. Pass `Debug` or `Release` as the first argument to override. The `CFLAT_CONFIG` environment variable is also respected (command-line arg takes precedence).
+`test.sh` compiles+runs the platform-portable subset of `Test/*.cb` plus `Test/errors/*.cb` against
+native cflat, parallel, per-test timeout, PASS/FAIL/SKIP summary. It keeps an explicit SKIP list of
+genuinely Windows-only tests - before adding one, prove the WHOLE file is Windows-bound. SKIP-list
+rationale + warm-cache second pass: [`internal/testing-notes.md`](internal/testing-notes.md).
 
-> **Pitfall**: If `CFLAT_CONFIG` is set in the shell that invokes `test.bat`, it will be used as the default unless a command-line arg overrides it. After rebuilding with a different configuration, clear or update `CFLAT_CONFIG` so tests run against the intended binary.
+`test.bat` runs parallel and should finish quickly; a hung test is killed after `TIMEOUT_SECS` (top
+of `test.bat`, default 120s).
 
-### LSP Tests
+`example.bat` compiles all runnable `.cb` in `example/`, skips library/helper files
+(`threadpool.cb`, `test_helper.cb`, internal network modules), sets import paths per category,
+exits 1 if any example fails.
 
-Run the LSP test suite (smoke tests + fixture/scenario tests) with:
+Run `test_lsp.bat` after ANY change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h`
+(symbol registration). LSP tests live in `vscode-extension/test/`, kept separate from `test.bat`.
 
-```bash
-test_lsp.bat          # runs against Release (default)
-test_lsp.bat Debug    # runs against Debug
-```
+### Rules
 
-LSP tests live in `vscode-extension/test/`. After any change to `LspServer.cpp`, `LspSymbolIndex.cpp`, or `MainListener.h` (symbol registration), run `test_lsp.bat` to verify LSP behaviour. These are kept separate from `test.bat`.
+- **Verify on the host you are on, and only that host.** macOS/Linux -> green `./test.sh` is the
+  bar. Windows -> `test.bat` Release. Run it after compiler changes before saying you are done.
+- **No "still needs verification on Windows/WSL" caveats.** Maintainer owns cross-platform
+  verification and knows a macOS session cannot run `test.bat`. Report what you ran and what
+  passed. Flag a cross-platform risk only when SPECIFIC and concrete (e.g. an ifdef'd path you
+  could not exercise), never as routine disclaimer.
+- **`--init` serializer rule (load-bearing).** `--init` rebuilds compiler state from a hand-written
+  serializer. Any new field on `TypeAndValue` / `StructData` / `AnnotationValue` that an analysis
+  reads MUST be added to the `LLVMBackend.cpp` cache round-trip in the SAME change - else it is
+  silently dropped on a warm cache and `expect_error` tests stop firing. See
+  `internal/testing-notes.md`.
+- Do NOT create separate compiler integration tests - `test.bat` already covers end-to-end.
+- Do NOT create new test files (e.g. in `Test/`) unless told to. Extend an existing related file.
+- Do NOT revert changes to check the baseline. Assume tests passed before; failures come from the
+  current change. Ask first if you really need a baseline check.
+- Tests fail after a fix -> find root cause. Never weaken/dilute assertions to go green. Ask before
+  disabling a test.
 
-### Example Programs
-
-Build all example programs in `example/` and subdirectories:
-
-```bash
-example.bat           # runs against Release (default)
-example.bat Debug     # runs against Debug
-```
-
-`example.bat` compiles all runnable `.cb` files in the `example/` tree, automatically skipping library/helper files (`threadpool.cb`, `test_helper.cb`, internal network modules) and setting appropriate import paths per category. Reports pass/fail/skip counts; exits with code 1 if any example fails to compile.
-
-To compile a single example manually:
-
-```bash
-x64/Debug/cflat.exe example/bitmap.cb -o out/bitmap.exe
-```
-
-To run a single test manually:
+### Manual single runs
 
 ```bash
 x64/Debug/cflat.exe Test/test_operators.cb -i Test/library -o out/test_operators.exe --out-lli out/test_operators.ll
 out\test_operators.exe
+x64/Debug/cflat.exe example/bitmap.cb -o out/bitmap.exe
 ```
 
-Current tests (all in `Test/`, all CFlat with `-i Test\library`) (`test_helper.cb` is a shared helper, not run directly.)
-
-test.bat and test.sh glob `Test/test_*.cb` plus `Test/errors/err_*.cb` (non-recursive) to locate tests; `Test/library/` and other prefixes are never picked up. Remember to remove debug tests matching those prefixes or they would be picked up by the wildcard expansion.
+Test discovery: `test.bat`/`test.sh` glob `Test/test_*.cb` + `Test/errors/err_*.cb`, non-recursive.
+`Test/library/` and other prefixes are never picked up (`test_helper.cb` is a shared helper, not run
+directly). Remove debug files matching those prefixes or the wildcard grabs them.
 
 ### Error tests
 
-Negative tests live in `Test/errors/` and use the `expect_error` compiler built-in. `test.bat` compiles each `err_*.cb` and expects exit code 0. To run one individually:
+Negative tests in `Test/errors/`, using the `expect_error` built-in. Each `err_*.cb` must compile
+with exit code 0. New test = new `Test/errors/err_<description>.cb`, no script changes.
 
 ```bash
 x64/Debug/cflat.exe Test/errors/err_missing_return.cb -i Test/library
-# prints: PASS: expected error received
-# exit code: 0
+# prints: PASS: expected error received   (exit 0)
 ```
 
-Two forms are supported:
+Forms:
 
 ```cflat
-// Bare-semicolon form - error must occur before the enclosing scope closes
+// Bare semicolon - error must occur before the enclosing scope closes
 extern int main()
 {
     expect_error("Undefined variable foo.");
     int x = foo + 1;
 }
 
-// Scoped block form (statement scope) - error must occur inside the braces
+// Scoped block, statement scope - error must occur inside the braces
 expect_error("nullable '?' is not allowed on primitive type 'int'") {
     int? x = 0;
 }
 
-// Scoped block form (file scope) - for testing function/struct definitions
+// Scoped block, file scope - for function/struct definitions
 expect_error("missing a return statement") {
     int compute(int x) { int y = x * 2; }
 }
 
-// Bare-semicolon form at file scope - covers IMPORT-TIME errors (raised during
-// ProcessImports, before the listener walk): the expectation is armed before imports run.
+// Bare semicolon at file scope - covers IMPORT-TIME errors (raised during ProcessImports,
+// before the listener walk): expectation is armed before imports run.
 expect_error("does not compile on its own");
 import "tlhelp32.h";
 ```
 
-The substring in `expect_error` is matched against the error message text (not the `file(line,col):` prefix). The compiler exits 0 on match, 1 with a diagnostic on mismatch or if the block compiles without error.
-
-To add a new error test: create `Test/errors/err_<description>.cb`. No script changes needed.
+Substring matches the error message TEXT, not the `file(line,col):` prefix. Exit 0 on match; exit 1
+with a diagnostic on mismatch or if the block compiles clean.
 
 ## Architecture
-
-### Compilation Pipeline
 
 ```
 Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
@@ -453,80 +480,88 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
     -> LLVM Module -> .ll / .bc -> native .exe
 ```
 
-### Two-Pass Compilation
+### Two-pass compilation
 
-1. **ForwardRefScanner** (`MainListener.h`): Pre-registers struct shells, function signatures, and generic instantiations before codegen. Enables forward references and monomorphizes generics (`Box<int>` -> symbol `Box__int`, double-underscore mangling). Also detects `move` parameters and `if const` blocks.
-2. **MainListener** (`MainListener.h`): Walks the AST and emits LLVM IR using `LLVMBackend` as the backend.
+1. **ForwardRefScanner** (`MainListener.h`): pre-registers struct shells, function signatures,
+   generic instantiations before codegen. Enables forward refs; monomorphizes generics (`Box<int>`
+   -> `Box__int`, double-underscore mangling). Also detects `move` params and `if const` blocks.
+2. **MainListener** (`MainListener.h`): walks the AST, emits LLVM IR via `LLVMBackend`.
 
-Both passes share `ParseDeclarationSpecifiers()` - any change to type parsing must be applied in **both** the `ForwardRefScanner` copy and the main `MainListener` copy.
+Both share `ParseDeclarationSpecifiers()` - **any type-parsing change must be applied to BOTH
+copies** (the `ForwardRefScanner` one and the `MainListener` one).
 
-### Core Components
+### Core components
 
 | File | Role |
 |------|------|
-| `CFlat.g4` | ANTLR4 grammar defining CFlat syntax |
-| `LLVMBackend.h/.cpp` | Compiler engine: type system, symbol tables, LLVM IR generation |
-| `MainListener.h` | AST visitor implementing both ForwardRefScanner and codegen passes |
-| `CompilerManager.h` | Singleton crash handler - installs CRT assert hook, SIGABRT handler, and LLVM fatal error handler; dumps compiler state on any assert/crash |
-| `ArgParser.h` | CLI argument parsing |
+| `CFlat.g4` | ANTLR4 grammar |
+| `LLVMBackend.h/.cpp` | Engine: type system, symbol tables, IR generation |
+| `MainListener.h` | AST visitor - both ForwardRefScanner and codegen passes |
+| `CompilerManager.h` | Singleton crash handler: CRT assert hook, SIGABRT, LLVM fatal error handler; dumps compiler state on assert/crash |
+| `ArgParser.h` | CLI parsing |
 | `main.cpp` | Entry point |
-| `LspServer.h/.cpp` | Language Server Protocol server (hover, completion, go-to-definition) |
-| `LspSymbolIndex.h/.cpp` | LSP symbol index built during compilation |
-| `JsonRpcLoop.h/.cpp` | JSON-RPC protocol loop for LSP communication |
+| `LspServer.h/.cpp` | LSP server (hover, completion, go-to-definition) |
+| `LspSymbolIndex.h/.cpp` | Symbol index built during compilation |
+| `JsonRpcLoop.h/.cpp` | JSON-RPC loop for LSP |
 | `LspTypes.h` | LSP type definitions |
-| `core/` | Standard library - compiled alongside every program |
+| `core/` | Standard library, compiled alongside every program |
 
-### Key Internal State (in `LLVMBackend`)
+### Key internal state (`LLVMBackend`)
 
-- `stackNamedVariable`: Deque of scopes tracking local variables per block/function
-- `globalNamedVariable`: Global variable map
-- `dataStructures`: Struct type registry (fields, destructor, interface VTables)
-- `functionTable`: Function overload registry and resolution
-- `interfaceTable`: Interface method contracts
-- `stringPool`: Interned string literals
-- `returnBlockTable`: Inlined return-block function bodies
-- `builder / module / context`: LLVM IR generation state
-- `diBuilder`: DWARF debug info builder (active with `-g`)
-- `parseTreeCache_`: timestamp-validated cache of parsed ANTLR trees for **implicit core-library imports only** (files under `runtimeDir/core`). Reused across compiles and LSP re-analyses since core content is stable; deliberately **not** cleared by `ResetForReanalysis`. User imports are parsed fresh into `importedParseStates` (per-compile, cleared on reset). `ResetForReanalysis` must clear *all* transient per-call state (e.g. `lastCallIsBonded`) or a value left set by an aborted compile leaks into the next file's analysis.
+- `stackNamedVariable`: deque of scopes, locals per block/function
+- `globalNamedVariable`: global variable map
+- `dataStructures`: struct registry (fields, destructor, interface VTables)
+- `functionTable`: overload registry + resolution
+- `interfaceTable`: interface method contracts
+- `stringPool`: interned string literals
+- `returnBlockTable`: inlined return-block function bodies
+- `builder / module / context`: IR generation state
+- `diBuilder`: DWARF builder (active with `-g`)
+- `parseTreeCache_`: timestamp-validated cache of parsed ANTLR trees for **implicit core-library
+  imports only** (`runtimeDir/core`). Reused across compiles and LSP re-analyses since core content
+  is stable; deliberately NOT cleared by `ResetForReanalysis`. User imports parse fresh into
+  `importedParseStates` (per-compile, cleared on reset). `ResetForReanalysis` must clear ALL
+  transient per-call state (e.g. `lastCallIsBonded`) or a value left by an aborted compile leaks
+  into the next file's analysis.
 
-`NamedVariable` has an `IsOwning` flag; `TypeAndValue` has an `IsMove` flag - both drive the ownership/lifetime system.
+`NamedVariable` has `IsOwning`; `TypeAndValue` has `IsMove`. Both drive ownership/lifetime.
 
-### Language Features
+### Language features
 
-See `internal/language-features.md` for the full feature list (generics, interfaces, arrays, module system, brace-init, ownership/move, compile-time features).
+Full list (generics, interfaces, arrays, module system, brace-init, ownership/move, compile-time):
+`internal/language-features.md`. User-facing reference: `doc/LANGUAGE.md`.
 
-Quick reference: `doc/LANGUAGE.md` is the user-facing language reference.
+### Adding new language features
 
-### Adding New Language Features
-
-| Goal | Where to change |
-|------|----------------|
-| New syntax | Edit `CFlat.g4`; rebuild triggers ANTLR regeneration |
-| New type or IR operation | Add methods to `LLVMBackend.h` |
-| New statement or expression | Add `Parse*()` / `exit*()` handler in `MainListener.h` |
-| Forward-declare a new construct | Add scan logic to `ForwardRefScanner` in `MainListener.h` |
+| Goal | Where |
+|------|-------|
+| New syntax | `CFlat.g4`; rebuild regenerates ANTLR |
+| New type or IR operation | methods on `LLVMBackend.h` |
+| New statement or expression | `Parse*()` / `exit*()` handler in `MainListener.h` |
+| Forward-declare a new construct | scan logic in `ForwardRefScanner` (`MainListener.h`) |
 | New binary operator | `TryBinaryOperatorOverload()` in `MainListener.h` + `Operation` enum in `LLVMBackend.h` |
-| New soft keyword (like `move`) | Text-match in both `ParseDeclarationSpecifiers()` copies in `MainListener.h` - do NOT add to the ANTLR lexer |
-| New grammar keyword statement | Add rule to `CFlat.g4`; add `ctx->newRule()` retrieval in `ParseStatement`; add no-op overrides in `ForwardRefScanner` if the rule can appear at file scope |
+| New soft keyword (like `move`) | text-match in BOTH `ParseDeclarationSpecifiers()` copies - do NOT add to the ANTLR lexer |
+| New grammar keyword statement | rule in `CFlat.g4` + `ctx->newRule()` retrieval in `ParseStatement` + no-op overrides in `ForwardRefScanner` if it can appear at file scope |
 
-### Debugging Compiler Crashes
+### Debugging compiler crashes
 
-- `CompilerManager.h` installs crash handlers that dump compiler state on assert/abort
-- Rerun with `-v` to see detailed diagnostics
-- Check `.ll` output (`--out-lli`) to inspect LLVM IR
-- LLVM assertion `"Ptr must have pointer type"` usually means `GetType()` was called without `allowPointer=true` for a pointer parameter
+- `CompilerManager.h` handlers dump compiler state on assert/abort
+- `-v` for detailed diagnostics
+- `--out-lli` to inspect the IR
+- LLVM assert `"Ptr must have pointer type"` usually = `GetType()` called without
+  `allowPointer=true` for a pointer parameter
 
-### Standard Library
+### Standard library
 
-Only `runtime.cb` is auto-imported. All other core libraries require an explicit `import "filename.cb"`.
+Only `runtime.cb` is auto-imported; everything else needs explicit `import "filename.cb"`. Full
+table of `core/*.cb` and exports: `internal/stdlib-reference.md`.
 
-See `internal/stdlib-reference.md` for the full table of all core/*.cb files and their exports.
+New core library = drop the `.cb` into `cflat/core/`. CMake `CONFIGURE_DEPENDS` glob copies the
+whole dir next to the exe, so a rebuild picks it up - no project file entry.
 
-To add a new core library: add the `.cb` file to `cflat/core/`. CMake's `CONFIGURE_DEPENDS` glob copies the whole `core/` directory to the exe dir automatically, so a rebuild picks it up - no project file entry needed.
+Use `nullptr`, not `null`. Always assign `default` to fields.
 
-Use `nullptr` instead of `null`. Always assign `default` to fields.
-
-### VS Code Extension
+### VS Code extension
 
 ```bash
 cd vscode-extension
@@ -534,8 +569,9 @@ build.bat    # compile
 install.bat  # install into VS Code
 ```
 
-Reload VS Code to activate syntax highlighting for `.cb` files.
+Reload VS Code to activate `.cb` syntax highlighting.
 
 ## Performance Benchmarking
 
-Always use `performance.bat` with `-O2`. See `internal/performance-benchmarks.md` for benchmark files, reference throughput numbers, and stream/channel design notes.
+Always `performance.bat` with `-O2`. Benchmark files, reference throughput, stream/channel design
+notes: `internal/performance-benchmarks.md`.

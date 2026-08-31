@@ -3027,3 +3027,26 @@ A before/after IR diff without this warm-up is not evidence of anything - and ne
 before/after timing. This cost most of a round: an agent reported a 1.64s -> 1.80s REGRESSION and a
 clean IR diff; the truth was a 1.64s -> 1.29s improvement with identical IR. Both of its numbers
 were cache-state artifacts, in opposite directions.
+
+## Retiring the queue buckets: two triage lessons (2026-08-31)
+
+`internal/issue/queue/` was deleted on 2026-08-31 - all 18 buckets (q01-q18) had landed and the
+README itself said "No open buckets". The per-bucket rulings it carried were already folded into
+this digest and into the surviving `p1`/`p2`/`p3` item files when each bucket was retired. Two
+lessons from the 2026-08-11 triage session were recorded ONLY in that README and are kept here.
+
+**A bucket summary that reads as an open question is a failure mode, not a neutral one.** Six
+buckets were flagged as needing a maintainer decision before any fix work. Two of them (q06, q09)
+turned out to need NO decision at all: the repo had already ratified the rule and the bucket file
+had wrongly re-opened it, proposing an inversion that contradicted a ruling reached after three
+abandoned attempts. Before presenting a design block, check whether a tracked record already
+contains the answer - re-opening a settled ruling costs a full round and risks ratifying a
+regression.
+
+**Re-check a named prerequisite against `git log` before deferring on it.** The q09 round skipped
+its p1 member as "blocked on `p3/interface-boxing-keyed-on-source-binding`" AFTER that blocker had
+already landed in `b911ccc` and its issue file had been deleted. A named blocker is a claim with a
+shelf life: verify the commit and the file's existence before repeating it.
+
+See also the governing rule for the guard family (unknown ACCEPTS; a false rejection is a blocker,
+a missed dangle is today's behaviour), recorded above.

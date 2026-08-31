@@ -147,7 +147,7 @@ even though one path escapes nothing (safe direction, measured flip on `fix/selg
 polarities are deliberate - the slot rule is the older, blunter one - but they disagree on the
 same program written two ways. Reconciling them is unfiled work, not a regression.
 
-Related: [[interface-issue-queue]]
+Related: `internal/fix-issue-lessons.md` (landed design records digest)
 
 ## From the q06 bucket file (deleted 2026-08-12)
 
