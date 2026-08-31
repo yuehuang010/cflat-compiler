@@ -867,6 +867,9 @@ LLVMBackend::MakeDiagnosticLocalizer() const
 void LLVMBackend::SetVerbose(bool v)
 { verbose = v; }
 
+void LLVMBackend::SetViewTraceEnabled(bool enabled)
+{ viewTraceEnabled_ = enabled; }
+
 bool LLVMBackend::IsVerbose() const
 { return verbose; }
 

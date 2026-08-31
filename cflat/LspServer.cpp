@@ -34,6 +34,12 @@ namespace {
 
 constexpr std::string_view kFileUriPrefix = "file:///";
 
+static int64_t ElapsedMs(std::chrono::steady_clock::time_point start)
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
 // URI <-> file path conversion
 std::string uriToFilePath(const std::string& uri)
 {
@@ -518,6 +524,7 @@ public:
             auto b = std::make_unique<LLVMBackend>();
             b->SetRuntimeDir(runtimeDir_);
             b->SetVerbose(verbose_);
+            b->SetViewTraceEnabled(true);
             ApplyLocale(*b);
             backendPool_.push_back(std::move(b));
             freeBackends_.push_back(i);
@@ -1669,18 +1676,17 @@ private:
         jobCV_.notify_one();
     }
 
-    std::optional<nlohmann::json> TakeCachedView(const ViewCacheKey& key)
+    std::optional<nlohmann::json> TouchCachedView(const ViewCacheKey& key)
     {
         std::lock_guard<std::mutex> lock(viewCacheMutex_);
         for (auto it = viewCache_.begin(); it != viewCache_.end(); ++it)
         {
             if (!(it->key == key))
                 continue;
-            nlohmann::json result = it->result;
             auto entry = std::move(*it);
             viewCache_.erase(it);
             viewCache_.push_front(std::move(entry));
-            return result;
+            return viewCache_.front().result;
         }
         return std::nullopt;
     }
@@ -1715,7 +1721,7 @@ private:
     bool TrySendCachedView(const std::string& uri, const std::string& text,
                            const IrRequest& request)
     {
-        auto cached = TakeCachedView(MakeViewCacheKey(uri, text, request));
+        auto cached = TouchCachedView(MakeViewCacheKey(uri, text, request));
         if (!cached)
             return false;
 
@@ -1997,8 +2003,7 @@ private:
         ViewTimings timings;
         auto finishTiming = [&]
         {
-            timings.totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - requestStart).count();
+            timings.totalMs = ElapsedMs(requestStart);
         };
         const std::string& uri      = job.uri;
         const std::string& filePath = job.filePath;
@@ -2090,8 +2095,7 @@ private:
                 ok = backend->Analyze(tempPath, importSearchDirs_, runtimeDir_);
             });
             if (job.irRequest)
-                timings.analyzeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - analyzeStart).count();
+                timings.analyzeMs = ElapsedMs(analyzeStart);
             analysisRecovered = recovered;
             analysisOk = ok;
 
@@ -2115,6 +2119,7 @@ private:
                 auto fresh = std::make_unique<LLVMBackend>();
                 fresh->SetRuntimeDir(runtimeDir_);
                 fresh->SetVerbose(verbose_);
+                fresh->SetViewTraceEnabled(true);
                 ApplyLocale(*fresh);
                 backendPool_[slot] = std::move(fresh);
                 backendAnalyzed_[slot] = false;
@@ -2222,16 +2227,14 @@ private:
             if (!backend->CollectOptimizationInfo(job.irRequest->optLevel, sourceFunctions,
                                                   collected, job.irRequest->withRemarks))
             {
-                timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - emitStart).count();
+                timings.emitMs = ElapsedMs(emitStart);
                 finishTiming();
                 LogViewTiming(job, timings, 0, 0, collected.functions.size(), collected.remarks.size());
                 SendError(std::optional<nlohmann::json>{job.irRequest->id}, -32603,
                           "could not collect optimization info");
                 return true;
             }
-            timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - emitStart).count();
+            timings.emitMs = ElapsedMs(emitStart);
             timings.incremental = backend->LastOptimizedViewWasIncremental();
             finishTiming();
             auto response = BuildOptimizationInfoResponse(job, collected, timings);
@@ -2270,8 +2273,7 @@ private:
         bool emitted = backend->PrintModuleView(output, job.irRequest->kind,
                                                 job.irRequest->optLevel, functionName,
                                                 job.irRequest->wholeModule, &mappings);
-        timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - emitStart).count();
+        timings.emitMs = ElapsedMs(emitStart);
         timings.incremental = backend->LastOptimizedViewWasIncremental();
         if (!emitted)
         {

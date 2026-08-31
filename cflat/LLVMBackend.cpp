@@ -4221,13 +4221,13 @@ void LLVMBackend::ResetForReanalysis()
         snapshot.optLevel = optimizedViewCache_.optLevel;
         snapshot.rootFile = sourceDisplayName_.empty() ? analyzedRootPath_ : sourceDisplayName_;
         snapshot.bitcode = std::move(bitcode);
-        snapshot.funcHashes = optimizedViewCache_.funcHashes;
-        snapshot.globalHashes = optimizedViewCache_.globalHashes;
-        snapshot.callees = optimizedViewCache_.callees;
-        snapshot.addressTaken = optimizedViewCache_.addressTaken;
-        snapshot.rootPathAliases = optimizedViewCache_.rootPathAliases;
-        snapshot.frameRemarks = optimizedViewCache_.frameRemarks;
-        snapshot.remarks = optimizedViewCache_.remarks;
+        snapshot.funcHashes = std::move(optimizedViewCache_.funcHashes);
+        snapshot.globalHashes = std::move(optimizedViewCache_.globalHashes);
+        snapshot.callees = std::move(optimizedViewCache_.callees);
+        snapshot.addressTaken = std::move(optimizedViewCache_.addressTaken);
+        snapshot.rootPathAliases = std::move(optimizedViewCache_.rootPathAliases);
+        snapshot.frameRemarks = std::move(optimizedViewCache_.frameRemarks);
+        snapshot.remarks = std::move(optimizedViewCache_.remarks);
         snapshot.remarksTruncated = optimizedViewCache_.remarksTruncated;
         incrementalViewSnapshot_ = std::move(snapshot);
     }

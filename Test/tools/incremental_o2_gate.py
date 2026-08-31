@@ -95,6 +95,7 @@ def run_dump(exe: str, paths: list[Path], import_dir: Path | None,
         command += ["-i", str(ROOT / "Test"), "-i", str(import_dir)]
     command += ["--symbol-dump-opt", "module"]
     environment = os.environ.copy()
+    environment["CFLAT_VIEW_INC_TRACE"] = "1"
     if disabled:
         environment["CFLAT_VIEW_NO_INCREMENTAL"] = "1"
     return subprocess.run(command, cwd=ROOT, env=environment,

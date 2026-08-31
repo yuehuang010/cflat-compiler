@@ -2674,7 +2674,7 @@ private:
         bool remarksTruncated = false;
         bool preOptMetadataRecorded = false;
         std::map<std::string, uint64_t> funcHashes;
-        std::map<std::string, std::string> globalHashes;
+        std::map<std::string, uint64_t> globalHashes;
         std::map<std::string, std::set<std::string>> callees;
         std::set<std::string> addressTaken;
         // Analyzed-root temp paths whose debug info may appear in this module
@@ -2687,7 +2687,7 @@ private:
         std::string rootFile;
         std::string bitcode;
         std::map<std::string, uint64_t> funcHashes;
-        std::map<std::string, std::string> globalHashes;
+        std::map<std::string, uint64_t> globalHashes;
         std::map<std::string, std::set<std::string>> callees;
         std::set<std::string> addressTaken;
         std::set<std::string> rootPathAliases;
@@ -2697,6 +2697,7 @@ private:
     };
     std::optional<IncrementalViewSnapshot> incrementalViewSnapshot_;
     bool optimizedViewWasIncremental_ = false;
+    bool viewTraceEnabled_ = false;
     // Names present when a core bitcode cache was loaded; later functions are user IR.
     std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
 
@@ -7576,6 +7577,7 @@ public:
                                 std::vector<std::string> arguments = {}) const;
     std::function<std::string(std::string, std::vector<std::string>)> MakeDiagnosticLocalizer() const;
     void SetVerbose(bool v);
+    void SetViewTraceEnabled(bool enabled);
     bool IsVerbose() const;
     // Enable AddressSanitizer instrumentation + runtime linking. Best paired with -g.
     void SetAsan(bool v);

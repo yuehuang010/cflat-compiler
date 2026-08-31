@@ -74,7 +74,9 @@ def start_client(exe: str, import_dir: Optional[Path], incremental: bool,
         args += ["--import-dir", str(import_dir)]
     old = os.environ.get("CFLAT_VIEW_INC_DEPTH")
     old_disable = os.environ.get("CFLAT_VIEW_NO_INCREMENTAL")
+    old_trace = os.environ.get("CFLAT_VIEW_INC_TRACE")
     try:
+        os.environ["CFLAT_VIEW_INC_TRACE"] = "1"
         if incremental and depth is not None:
             os.environ["CFLAT_VIEW_INC_DEPTH"] = str(depth)
         elif not incremental:
@@ -93,6 +95,10 @@ def start_client(exe: str, import_dir: Optional[Path], incremental: bool,
             os.environ.pop("CFLAT_VIEW_INC_DEPTH", None)
         else:
             os.environ["CFLAT_VIEW_INC_DEPTH"] = old
+        if old_trace is None:
+            os.environ.pop("CFLAT_VIEW_INC_TRACE", None)
+        else:
+            os.environ["CFLAT_VIEW_INC_TRACE"] = old_trace
     initialize(client)
     return client
 

@@ -54,6 +54,7 @@
 #include <map>
 #include <set>
 #include <fstream>
+#include <charconv>
 #include <cstdint>
 #include <tuple>
 #include <vector>
@@ -61,6 +62,54 @@
 namespace {
 
 using RootFilePredicate = std::function<bool(const llvm::DIFile*)>;
+
+struct PromotedSymbol
+{
+    std::string name;
+    llvm::GlobalValue::LinkageTypes linkage;
+    llvm::GlobalValue::VisibilityTypes visibility;
+    llvm::GlobalValue::UnnamedAddr unnamedAddr;
+    bool isFunction;
+};
+
+bool IsLocalLinkage(const llvm::GlobalValue& value)
+{
+    return value.getLinkage() == llvm::GlobalValue::InternalLinkage ||
+           value.getLinkage() == llvm::GlobalValue::PrivateLinkage;
+}
+
+void PreserveZeroInitializers(llvm::Module& source, const llvm::Module& work,
+                              const std::set<std::string>& changedGlobals)
+{
+    for (llvm::GlobalVariable& sourceGlobal : source.globals())
+    {
+        if (!sourceGlobal.hasName() || !sourceGlobal.hasInitializer() ||
+            !sourceGlobal.getInitializer()->isNullValue())
+            continue;
+        const llvm::GlobalVariable* workGlobal = work.getNamedGlobal(sourceGlobal.getName());
+        if (workGlobal && workGlobal->hasInitializer() &&
+            workGlobal->getInitializer()->isNullValue() &&
+            !changedGlobals.contains(sourceGlobal.getName().str()))
+            sourceGlobal.setInitializer(nullptr);
+    }
+}
+
+bool RestorePromotedLinkage(llvm::Module& module,
+                            const std::vector<PromotedSymbol>& promotedSymbols)
+{
+    for (const PromotedSymbol& symbol : promotedSymbols)
+    {
+        llvm::GlobalValue* value = symbol.isFunction
+            ? static_cast<llvm::GlobalValue*>(module.getFunction(symbol.name))
+            : static_cast<llvm::GlobalValue*>(module.getNamedGlobal(symbol.name));
+        if (!value)
+            return false;
+        value->setLinkage(symbol.linkage);
+        value->setVisibility(symbol.visibility);
+        value->setUnnamedAddr(symbol.unnamedAddr);
+    }
+    return true;
+}
 
 std::string DebugFilePath(const llvm::DIFile* file)
 {
@@ -1308,6 +1357,7 @@ bool ViewTypesCompatible(const llvm::Type* first, const llvm::Type* second)
 std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
 {
     optimizedViewWasIncremental_ = false;
+    const bool viewTraceEnabled = viewTraceEnabled_ || std::getenv("CFLAT_VIEW_INC_TRACE");
     if (optLevel <= 0 || !context)
         return nullptr;
 
@@ -1325,27 +1375,29 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             }
             else
             {
-                try
+                const char* begin = value.data();
+                const char* end = begin + value.size();
+                while (begin != end && std::isspace((unsigned char)*begin))
+                    ++begin;
+                if (begin != end && *begin == '+')
+                    ++begin;
+                int parsed = 0;
+                const auto [consumed, error] = std::from_chars(begin, end, parsed);
+                if (error == std::errc{} && consumed == end && parsed >= 0)
                 {
-                    size_t consumed = 0;
-                    const int parsed = std::stoi(value, &consumed);
-                    if (consumed == value.size() && parsed >= 0)
-                    {
-                        calleeDepth = parsed;
-                        calleeDepthText = std::to_string(parsed);
-                    }
-                }
-                catch (const std::exception&)
-                {
+                    calleeDepth = parsed;
+                    calleeDepthText = std::to_string(parsed);
                 }
             }
         }
     }
     if (optimizedViewCache_.optLevel == optLevel && optimizedViewCache_.module)
     {
-        std::cerr << "[view-incremental] hit reopt=0/"
-                  << optimizedViewCache_.funcHashes.size() << " seeds=0 depth="
-                  << calleeDepthText << "\n";
+        optimizedViewWasIncremental_ = true;
+        if (viewTraceEnabled)
+            std::cerr << "[view-incremental] hit reopt=0/"
+                      << optimizedViewCache_.funcHashes.size() << " seeds=0 depth="
+                      << calleeDepthText << "\n";
         return llvm::CloneModule(*optimizedViewCache_.module);
     }
 
@@ -1366,7 +1418,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             global.getInitializer()->print(initializerOut);
             text += "|" + initializer;
         }
-        return std::to_string(std::hash<std::string>{}(text));
+        return static_cast<uint64_t>(std::hash<std::string>{}(text));
     };
     OptimizedViewCache metadata;
     metadata.preOptMetadataRecorded = true;
@@ -1394,10 +1446,21 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
         metadata.globalHashes[global.getName().str()] = hashGlobal(global);
     const size_t definedFunctionCount = metadata.funcHashes.size();
     const std::string rootFile = sourceDisplayName_.empty() ? analyzedRootPath_ : sourceDisplayName_;
+    auto makeCache = [&] {
+        OptimizedViewCache next;
+        next.optLevel = optLevel;
+        next.preOptMetadataRecorded = true;
+        next.funcHashes = metadata.funcHashes;
+        next.globalHashes = metadata.globalHashes;
+        next.callees = metadata.callees;
+        next.addressTaken = metadata.addressTaken;
+        return next;
+    };
 
     auto runFullBuild = [&](const std::string& reason) -> std::unique_ptr<llvm::Module> {
-        std::cerr << "[view-incremental] miss reason=" << reason << "\n";
-        OptimizedViewCache next;
+        if (viewTraceEnabled)
+            std::cerr << "[view-incremental] miss reason=" << reason << "\n";
+        OptimizedViewCache next = makeCache();
         auto view = CloneModuleForView("optimized view");
         if (!view)
             return nullptr;
@@ -1424,12 +1487,6 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
                 return nullptr;
         }
 
-        next.optLevel = optLevel;
-        next.preOptMetadataRecorded = true;
-        next.funcHashes = metadata.funcHashes;
-        next.globalHashes = metadata.globalHashes;
-        next.callees = metadata.callees;
-        next.addressTaken = metadata.addressTaken;
         next.rootPathAliases = {analyzedRootPath_};
         next.module = std::move(view);
         optimizedViewCache_ = std::move(next);
@@ -1449,13 +1506,10 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
 
     const IncrementalViewSnapshot& snapshot = *incrementalViewSnapshot_;
     std::set<std::string> changedFuncs;
-    std::set<std::string> addedFuncs;
     std::set<std::string> removedFuncs;
     for (const auto& [name, hash] : metadata.funcHashes)
     {
         auto old = snapshot.funcHashes.find(name);
-        if (old == snapshot.funcHashes.end())
-            addedFuncs.insert(name);
         if (old == snapshot.funcHashes.end() || old->second != hash)
             changedFuncs.insert(name);
     }
@@ -1542,52 +1596,44 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             if (reopt.insert(callee).second)
                 calleePending.emplace_back(callee, depth + 1);
     }
-    reopt.insert(addedFuncs.begin(), addedFuncs.end());
     if (reopt.size() * 2 > definedFunctionCount)
     {
         return runFullBuild("too-wide");
     }
-    if (reopt.empty() && changedGlobals.empty() && removedFuncs.empty())
+    std::unique_ptr<llvm::Module> snapshotModule;
     {
         llvm::TimeTraceScope parseScope("ViewSnapshotParse");
-        auto bitcodeBuffer = llvm::MemoryBuffer::getMemBuffer(snapshot.bitcode, "incremental-view", false);
+        auto bitcodeBuffer = llvm::MemoryBuffer::getMemBuffer(snapshot.bitcode,
+                                                              "incremental-view", false);
         auto parsed = llvm::parseBitcodeFile(bitcodeBuffer->getMemBufferRef(), *context);
         if (!parsed)
         {
             llvm::consumeError(parsed.takeError());
             return runFullBuild("transplant-conflict");
         }
-        (*parsed)->setModuleIdentifier(module->getModuleIdentifier());
-        (*parsed)->setSourceFileName(module->getSourceFileName());
-        OptimizedViewCache next;
-        next.optLevel = optLevel;
-        next.preOptMetadataRecorded = true;
-        next.funcHashes = metadata.funcHashes;
-        next.globalHashes = metadata.globalHashes;
-        next.callees = metadata.callees;
-        next.addressTaken = metadata.addressTaken;
+        snapshotModule = std::move(*parsed);
+    }
+    if (reopt.empty() && changedGlobals.empty() && removedFuncs.empty())
+    {
+        snapshotModule->setModuleIdentifier(module->getModuleIdentifier());
+        snapshotModule->setSourceFileName(module->getSourceFileName());
+        OptimizedViewCache next = makeCache();
         next.rootPathAliases = snapshot.rootPathAliases;
         next.rootPathAliases.insert(analyzedRootPath_);
         next.frameRemarks = snapshot.frameRemarks;
         next.remarks = snapshot.remarks;
         next.remarksTruncated = snapshot.remarksTruncated;
-        next.module = std::move(*parsed);
+        next.module = std::move(snapshotModule);
         optimizedViewCache_ = std::move(next);
         optimizedViewWasIncremental_ = true;
-        std::cerr << "[view-incremental] hit reopt=0/" << definedFunctionCount
-                  << " seeds=0 depth=" << calleeDepthText << "\n";
+        if (viewTraceEnabled)
+            std::cerr << "[view-incremental] hit reopt=0/" << definedFunctionCount
+                      << " seeds=0 depth=" << calleeDepthText << "\n";
         return llvm::CloneModule(*optimizedViewCache_.module);
     }
-    llvm::TimeTraceScope parseScope("ViewSnapshotParse");
-    auto bitcodeBuffer = llvm::MemoryBuffer::getMemBuffer(snapshot.bitcode, "incremental-view", false);
-    auto parsed = llvm::parseBitcodeFile(bitcodeBuffer->getMemBufferRef(), *context);
-    if (!parsed)
-    {
-        llvm::consumeError(parsed.takeError());
-        return runFullBuild("transplant-conflict");
-    }
-    (*parsed)->setModuleIdentifier(module->getModuleIdentifier());
-    (*parsed)->setSourceFileName(module->getSourceFileName());
+    std::unique_ptr<llvm::Module> stomp = llvm::CloneModule(*snapshotModule);
+    snapshotModule->setModuleIdentifier(module->getModuleIdentifier());
+    snapshotModule->setSourceFileName(module->getSourceFileName());
     // Link direction: dest is a full clone of the NEW analyzed module; src is the
     // old optimized snapshot reduced to the bodies we keep. OverrideFromSrc then
     // swaps the old optimized body over the new pre-opt one for every function we
@@ -1598,7 +1644,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     std::unique_ptr<llvm::Module> work = CloneModule(*module);
     if (!work)
         return runFullBuild("transplant-conflict");
-    std::unique_ptr<llvm::Module> source = std::move(*parsed);
+    std::unique_ptr<llvm::Module> source = std::move(snapshotModule);
     // The snapshot went through OptimizeViewModule, which normalizes triple and
     // datalayout from the target machine; the fresh clone has not yet. Align them
     // before linking so IRMover does not see mismatched layouts.
@@ -1670,19 +1716,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
         global.eraseFromParent();
     }
 
-    struct PromotedSymbol
-    {
-        std::string name;
-        llvm::GlobalValue::LinkageTypes linkage;
-        llvm::GlobalValue::VisibilityTypes visibility;
-        llvm::GlobalValue::UnnamedAddr unnamedAddr;
-        bool isFunction;
-    };
     std::vector<PromotedSymbol> promotedSymbols;
-    auto isLocalLinkage = [](const llvm::GlobalValue& value) {
-        return value.getLinkage() == llvm::GlobalValue::InternalLinkage ||
-               value.getLinkage() == llvm::GlobalValue::PrivateLinkage;
-    };
     auto markTransplantConflict = [&](const char* reason) {
         transplantConflict = true;
         transplantReason = reason;
@@ -1695,8 +1729,8 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             if (name.empty())
                 continue;
             llvm::Function* sourceFunction = source->getFunction(name);
-            const bool workLocal = isLocalLinkage(workFunction);
-            const bool sourceLocal = sourceFunction && isLocalLinkage(*sourceFunction);
+            const bool workLocal = IsLocalLinkage(workFunction);
+            const bool sourceLocal = sourceFunction && IsLocalLinkage(*sourceFunction);
             if (!workLocal && !sourceLocal)
                 continue;
             // No src counterpart: no collision - srcMissing functions stay
@@ -1742,8 +1776,8 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             if (name.empty())
                 continue;
             llvm::GlobalVariable* sourceGlobal = source->getNamedGlobal(name);
-            const bool workLocal = isLocalLinkage(workGlobal);
-            const bool sourceLocal = sourceGlobal && isLocalLinkage(*sourceGlobal);
+            const bool workLocal = IsLocalLinkage(workGlobal);
+            const bool sourceLocal = sourceGlobal && IsLocalLinkage(*sourceGlobal);
             if (!workLocal && !sourceLocal)
                 continue;
             if (sourceGlobal && !changedGlobals.contains(name))
@@ -1764,34 +1798,29 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     // promotion - a local-linkage declaration would be invalid IR.
     if (!transplantConflict)
     {
-        for (llvm::GlobalVariable& sourceGlobal : source->globals())
-        {
-            if (!sourceGlobal.hasName() || !sourceGlobal.hasInitializer() ||
-                !sourceGlobal.getInitializer()->isNullValue())
-                continue;
-            llvm::GlobalVariable* workGlobal = work->getNamedGlobal(sourceGlobal.getName());
-            if (workGlobal && workGlobal->hasInitializer() &&
-                workGlobal->getInitializer()->isNullValue() &&
-                !changedGlobals.contains(sourceGlobal.getName().str()))
-                sourceGlobal.setInitializer(nullptr);
-        }
+        PreserveZeroInitializers(*source, *work, changedGlobals);
     }
     if (!transplantConflict)
     {
         struct LinkDiagPrinter : llvm::DiagnosticHandler
         {
+            explicit LinkDiagPrinter(bool enabled) : enabled(enabled) {}
+
             bool handleDiagnostics(const llvm::DiagnosticInfo& info) override
             {
                 std::string text;
                 llvm::raw_string_ostream stream(text);
                 llvm::DiagnosticPrinterRawOStream printer(stream);
                 info.print(printer);
-                std::cerr << "[view-incremental-diag] " << text << "\n";
+                if (enabled)
+                    std::cerr << "[view-incremental-diag] " << text << "\n";
                 return true;
             }
+
+            bool enabled;
         };
         auto previousHandler = context->getDiagnosticHandler();
-        context->setDiagnosticHandler(std::make_unique<LinkDiagPrinter>(), false);
+        context->setDiagnosticHandler(std::make_unique<LinkDiagPrinter>(viewTraceEnabled), false);
         transplantConflict = llvm::Linker::linkModules(*work, std::move(source),
                                                         llvm::Linker::OverrideFromSrc);
         if (transplantConflict)
@@ -1800,20 +1829,10 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     }
     if (!transplantConflict)
     {
-        for (const PromotedSymbol& symbol : promotedSymbols)
+        if (!RestorePromotedLinkage(*work, promotedSymbols))
         {
-            llvm::GlobalValue* value = symbol.isFunction
-                ? static_cast<llvm::GlobalValue*>(work->getFunction(symbol.name))
-                : static_cast<llvm::GlobalValue*>(work->getNamedGlobal(symbol.name));
-            if (!value)
-            {
-                transplantConflict = true;
-                transplantReason = "restore-miss";
-                break;
-            }
-            value->setLinkage(symbol.linkage);
-            value->setVisibility(symbol.visibility);
-            value->setUnnamedAddr(symbol.unnamedAddr);
+            transplantConflict = true;
+            transplantReason = "restore-miss";
         }
     }
     if (transplantConflict)
@@ -1830,13 +1849,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             protectedNames.insert(function.getName().str());
         }
 
-    OptimizedViewCache next;
-    next.optLevel = optLevel;
-    next.preOptMetadataRecorded = true;
-    next.funcHashes = metadata.funcHashes;
-    next.globalHashes = metadata.globalHashes;
-    next.callees = metadata.callees;
-    next.addressTaken = metadata.addressTaken;
+    OptimizedViewCache next = makeCache();
     next.rootPathAliases = snapshot.rootPathAliases;
     next.rootPathAliases.insert(analyzedRootPath_);
     next.remarksTruncated = snapshot.remarksTruncated;
@@ -1882,15 +1895,6 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     // pipeline: a kept function always displays exactly as the last full build
     // produced it. Reopt/added functions keep their freshly optimized bodies.
     {
-        auto stompBuffer = llvm::MemoryBuffer::getMemBuffer(snapshot.bitcode,
-                                                            "incremental-view", false);
-        auto stompParsed = llvm::parseBitcodeFile(stompBuffer->getMemBufferRef(), *context);
-        if (!stompParsed)
-        {
-            llvm::consumeError(stompParsed.takeError());
-            return runFullBuild("restomp-parse");
-        }
-        std::unique_ptr<llvm::Module> stomp = std::move(*stompParsed);
         for (llvm::Function& function : *stomp)
         {
             if (function.isDeclaration())
@@ -1927,7 +1931,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             llvm::Function* stompFunction = stomp->getFunction(name);
             if (!stompFunction)
                 continue;
-            if (!isLocalLinkage(workFunction) && !isLocalLinkage(*stompFunction))
+            if (!IsLocalLinkage(workFunction) && !IsLocalLinkage(*stompFunction))
                 continue;
             stompPromoted.push_back({name, workFunction.getLinkage(),
                                      workFunction.getVisibility(),
@@ -1943,7 +1947,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             llvm::GlobalVariable* stompGlobal = stomp->getNamedGlobal(name);
             if (!stompGlobal || changedGlobals.contains(name))
                 continue;
-            if (!isLocalLinkage(workGlobal) && !isLocalLinkage(*stompGlobal))
+            if (!IsLocalLinkage(workGlobal) && !IsLocalLinkage(*stompGlobal))
                 continue;
             stompPromoted.push_back({name, workGlobal.getLinkage(),
                                      workGlobal.getVisibility(),
@@ -1951,18 +1955,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             workGlobal.setLinkage(llvm::GlobalValue::ExternalLinkage);
             stompGlobal->setLinkage(llvm::GlobalValue::ExternalLinkage);
         }
-        // Same zero-initializer type-name preservation as the first link.
-        for (llvm::GlobalVariable& stompGlobal : stomp->globals())
-        {
-            if (!stompGlobal.hasName() || !stompGlobal.hasInitializer() ||
-                !stompGlobal.getInitializer()->isNullValue())
-                continue;
-            llvm::GlobalVariable* workGlobal = work->getNamedGlobal(stompGlobal.getName());
-            if (workGlobal && workGlobal->hasInitializer() &&
-                workGlobal->getInitializer()->isNullValue() &&
-                !changedGlobals.contains(stompGlobal.getName().str()))
-                stompGlobal.setInitializer(nullptr);
-        }
+        PreserveZeroInitializers(*stomp, *work, changedGlobals);
         // Linking unions declaration attributes, and the snapshot's set is
         // degraded by the bitcode round-trip (intrinsic attrs re-canonicalized).
         // Work's post-pipeline inference matches the full build - keep it exact.
@@ -1978,17 +1971,8 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             if (llvm::Function* function = work->getFunction(name))
                 if (function->isDeclaration())
                     function->setAttributes(attrs);
-        for (const PromotedSymbol& symbol : stompPromoted)
-        {
-            llvm::GlobalValue* value = symbol.isFunction
-                ? static_cast<llvm::GlobalValue*>(work->getFunction(symbol.name))
-                : static_cast<llvm::GlobalValue*>(work->getNamedGlobal(symbol.name));
-            if (!value)
-                return runFullBuild("restomp-restore");
-            value->setLinkage(symbol.linkage);
-            value->setVisibility(symbol.visibility);
-            value->setUnnamedAddr(symbol.unnamedAddr);
-        }
+        if (!RestorePromotedLinkage(*work, stompPromoted))
+            return runFullBuild("restomp-restore");
     }
 
     llvm::PassBuilder dceBuilder;
@@ -1996,8 +1980,7 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     llvm::FunctionAnalysisManager dceFunctions;
     llvm::CGSCCAnalysisManager dceCgscc;
     llvm::ModuleAnalysisManager dceModule;
-    llvm::TargetLibraryInfoImpl dceTli = MakeStdioSafeTLII(
-        llvm::Triple(work->getTargetTriple().str()));
+    llvm::TargetLibraryInfoImpl dceTli = MakeStdioSafeTLII(work->getTargetTriple());
     dceFunctions.registerPass([&] { return llvm::TargetLibraryAnalysis(dceTli); });
     dceBuilder.registerModuleAnalyses(dceModule);
     dceBuilder.registerCGSCCAnalyses(dceCgscc);
@@ -2015,10 +1998,11 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
     next.module = std::move(work);
     optimizedViewCache_ = std::move(next);
     optimizedViewWasIncremental_ = true;
-    std::cerr << "[view-incremental] hit reopt=" << reopt.size() << "/"
-              << definedFunctionCount << " seeds=" << seeds.size()
-              << " depth=" << calleeDepthText << "\n";
-    if (std::getenv("CFLAT_VIEW_INC_DUMP"))
+    if (viewTraceEnabled)
+        std::cerr << "[view-incremental] hit reopt=" << reopt.size() << "/"
+                  << definedFunctionCount << " seeds=" << seeds.size()
+                  << " depth=" << calleeDepthText << "\n";
+    if (viewTraceEnabled && std::getenv("CFLAT_VIEW_INC_DUMP"))
         for (const std::string& name : reopt)
             std::cerr << "[view-incremental-reopt] " << name << "\n";
     return llvm::CloneModule(*optimizedViewCache_.module);
