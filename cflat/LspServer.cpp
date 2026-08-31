@@ -1539,6 +1539,7 @@ private:
         int64_t analyzeMs = 0;
         int64_t emitMs = 0;
         int64_t totalMs = 0;
+        bool incremental = false;
     };
 
     struct AnalysisJob
@@ -1699,12 +1700,15 @@ private:
             viewCache_.pop_back();
     }
 
-    static void SetResponseTimings(nlohmann::json& result, const ViewTimings& timings)
+    static void SetResponseTimings(nlohmann::json& result, ViewTimings& timings)
     {
+        timings.incremental = result.value("timings", nlohmann::json::object())
+                              .value("incremental", false);
         result["timings"] = {
             {"analyzeMs", timings.analyzeMs},
             {"emitMs", timings.emitMs},
-            {"totalMs", timings.totalMs}
+            {"totalMs", timings.totalMs},
+            {"incremental", timings.incremental}
         };
     }
 
@@ -1750,6 +1754,15 @@ private:
             && record.textHash == job.textHash
             && record.textLen == static_cast<uint64_t>(job.text.size())
             && record.index != nullptr;
+    }
+
+    bool AnalysisRecordUriMatches(size_t slot, const AnalysisJob& job) const
+    {
+        if (!job.irRequest)
+            return false;
+        std::lock_guard<std::mutex> lock(analysisRecordMutex_);
+        const auto& record = analysisRecords_[slot];
+        return record.ok && record.analyzeDebugInfo && record.uri == job.uri;
     }
 
     bool AnalysisInFlight(const AnalysisJob& job) const
@@ -1927,6 +1940,13 @@ private:
                             break;
                         }
                     }
+                    if (preferred == freeBackends_.end())
+                        for (auto it = freeBackends_.begin(); it != freeBackends_.end(); ++it)
+                            if (AnalysisRecordUriMatches(*it, job))
+                            {
+                                preferred = it;
+                                break;
+                            }
                 }
                 if (preferred != freeBackends_.end())
                 {
@@ -2212,6 +2232,7 @@ private:
             }
             timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - emitStart).count();
+            timings.incremental = backend->LastOptimizedViewWasIncremental();
             finishTiming();
             auto response = BuildOptimizationInfoResponse(job, collected, timings);
             InsertCachedView(MakeViewCacheKey(uri, text, *job.irRequest), response);
@@ -2251,6 +2272,7 @@ private:
                                                 job.irRequest->wholeModule, &mappings);
         timings.emitMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - emitStart).count();
+        timings.incremental = backend->LastOptimizedViewWasIncremental();
         if (!emitted)
         {
             finishTiming();
@@ -2294,6 +2316,7 @@ private:
             std::cerr << std::format(" functions={} remarks={}", functionCount, remarkCount);
         else
             std::cerr << std::format(" text={}B mappings={}", textSize, mappingCount);
+        std::cerr << std::format(" incremental={}", timings.incremental ? 1 : 0);
         if (cached)
             std::cerr << " cached=1";
         std::cerr << '\n';
@@ -2331,7 +2354,8 @@ private:
             {"timings", {
                 {"analyzeMs", timings.analyzeMs},
                 {"emitMs", timings.emitMs},
-                {"totalMs", timings.totalMs}
+                {"totalMs", timings.totalMs},
+                {"incremental", timings.incremental}
             }}
         };
     }
@@ -2449,7 +2473,8 @@ private:
             {"timings", {
                 {"analyzeMs", timings.analyzeMs},
                 {"emitMs", timings.emitMs},
-                {"totalMs", timings.totalMs}
+                {"totalMs", timings.totalMs},
+                {"incremental", timings.incremental}
             }}
         };
     }

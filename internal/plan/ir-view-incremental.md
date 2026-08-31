@@ -62,31 +62,119 @@ test_basic.cb). Items 4-6 remain.
    choices, whole-unoptimized / whole-optimized) and status-bar timings (last refresh's
    analyze/emit ms, cached flag) - item complete.
 
-## In progress: item 4, incremental -O2 rebuild (timeboxed attempt 2026-08-30)
+## In progress: item 4, incremental -O2 rebuild (rounds 1-2, 2026-08-30)
 
-A 3-hour timeboxed attempt lives on branch feature/incremental-o2-wip (commit
-a6ae198); it is NOT on master. Design that survived contact with the code:
-snapshot the optimized module as context-free bitcode (+ pre-opt
-StructuralHash per function, global content hashes, name-keyed call graph,
-address-taken set, remarks) in ResetForReanalysis - required because reset
-destroys the LLVMContext; diff against the next analysis; re-optimize only
-changed functions + transitive callers (+ their callee closure for faithful
-inlining); rebuild the module by llvm::Linker OverrideFromSrc with dest = full
-clone of the NEW analyzed module and src = old optimized snapshot with the
-re-optimized bodies deleted (the reverse direction crashes: erasing
-functions/globals whose uses remain in kept bodies is UB with assertions-off
-LLVM); protect kept bodies with optnone+noinline through the pipeline.
+Lives on branch feature/incremental-o2-wip; NOT on master. Design: snapshot
+the optimized module as context-free bitcode (+ pre-opt StructuralHash per
+function, global content hashes, name-keyed call graph, address-taken set,
+remarks) in ResetForReanalysis - required because reset destroys the
+LLVMContext; diff against the next analysis; re-optimize changed functions +
+transitive callers + a DEPTH-BOUNDED callee closure (CFLAT_VIEW_INC_DEPTH,
+default 2, "full"/-1 = unbounded); rebuild by llvm::Linker OverrideFromSrc
+with dest = full clone of the NEW analyzed module and src = old optimized
+snapshot with re-optimized bodies deleted (the reverse direction crashes:
+erasing values with remaining uses is UB with assertions-off LLVM); protect
+kept bodies with optnone+noinline through the pipeline; GlobalDCE after
+stripping the protection so functions the full pipeline removes die here too.
 
-Works end-to-end on a small file (demo_view.cb: reopt=9/468, emit 75ms vs
-104ms full, semantically identical output). Three blockers before landing,
-recorded in the WIP commit message: (1) the callee closure explodes to the
-too-wide fallback on test_basic-sized files - needs an inlining-depth-bounded
-closure or a measured decision to inline old-optimized callee bodies; (2)
-private-global/attribute-group renumbering plus one extra surviving function
-break byte-faithfulness; (3) the scratch/measure_incremental_o2.py driver's
-new-string scenarios report no invalidation - driver bug. The snapshot struct
-is deliberately file-serializable so the same machinery can later persist next
+Round-2 lessons, all verified by vscode-extension/test/measure_incremental_o2.py
+- the committed LSP-driving equivalence driver (fixture:
+vscode-extension/test/fixtures/demo_view.cb; run it standalone, not
+concurrently with test_lsp.bat - both use the exe's local cache). The driver
+compares the incremental view against
+the SAME edit flow with CFLAT_VIEW_NO_INCREMENTAL=1: a fresh server is the
+WRONG baseline because its first analysis is a different module composition
+(see drift below). Its anti-vacuity rules (assert the probe edit changed the
+view text, assert a [view-incremental] stderr line was seen, fail on compile
+errors) exist because a prior driver silently reported no invalidation.
+
+- llvm::Linker never merges internal/private symbols by name: kept local
+  functions/globals from the snapshot get copied+renamed (.NNN) instead of
+  overridden. Fix: temporarily promote named locals (kept pairs AND the work
+  side of reopt'd locals, whose src half is only a declaration) to external
+  around the link, restoring the WORK-side linkage after. One-sided named
+  locals are safe (no collision). Unnamed private globals cannot be identity
+  matched; their duplicates die in GlobalDCE and the residual renumbering is
+  accepted (the driver normalizes it).
+- Functions with no body in the snapshot (fully inlined+DCE'd by the old
+  pipeline) cannot keep an old body: those transitively reachable as callees
+  of the reopt set are re-optimized fresh; the rest keep the pre-opt body
+  protected and die in the final GlobalDCE. A blanket "re-optimize all of
+  them" balloons reopt past too-wide on test_basic (1016/1042).
+- The address-taken guard applies to SEEDS only (their indirect callers are
+  invisible to the name-keyed graph); callers/callees entering reopt via
+  explicit edges are safe to re-optimize. Seeding every function containing
+  an indirect call instead of falling back was measured and REJECTED:
+  453/474 reopt on the small demo (main is address-taken; most core
+  functions hold indirect calls). The precise alternative - inline-remark
+  edges to find which kept bodies inlined the seed - fails today because
+  cached core has no debug locations, so those inline remarks are dropped.
+- test_basic-shaped files (mega-main directly calling hundreds of helpers)
+  hit too-wide at ANY depth once main enters the caller closure, and that is
+  honest: matching the full build there means re-optimizing most of what
+  main inlines. The win is real for demo-shaped files: reopt 18/474, emit
+  ~70ms vs ~93ms full, function sets identical (24/24) including a second
+  consecutive edit.
+
+FIXED (round 3): the test_lsp "viewAssembly: inline attribution" failure.
+Mechanism: the server analyzes each document via a TEMP COPY whose path
+changes per re-analysis, so kept snapshot bodies carry DIFiles pointing at an
+OLD temp path while PrintModuleView's root detection compares against the
+current analyzedRootPath_/compile unit - a snapshot-served view then matched
+zero root functions (rootScopedView collapsed to whole-module, mappings
+empty; only reproduced when another doc's analysis interleaved between two
+view requests on a pool-size-1 backend, hence flaky under full-suite load).
+Fix: OptimizedViewCache/IncrementalViewSnapshot carry a rootPathAliases set
+(each analysis' temp path, accumulated across incremental rebuilds);
+PrintModuleView's IsRootFile accepts any alias. Deterministic repro sequence
+(rebuild in scratch/ if needed): open other doc, open view doc, ir O2,
+edit+save the OTHER doc, asm O2, all on --lsp-pool-size 1.
+
+RESOLVED (round 4): the "composition drift" theory was WRONG. Probes proved
+first-analysis and re-analysis full builds are byte-identical (O0 and O2,
+trivial doc and demo_view.cb modulo the intended edit). The DIVERGEs were the
+incremental machinery itself, fixed by four changes:
+
+- OptNone was silently ignored: optnone skipping lives in
+  StandardInstrumentations (OptNoneInstrumentation), NOT the pass manager
+  core. OptimizeViewModule built a bare PassBuilder, so every function pass
+  re-optimized the "protected" kept bodies (jump-threading fgets etc.). Fix:
+  register PassInstrumentationCallbacks + StandardInstrumentations. No-op for
+  full builds (nothing carries optnone there).
+- Even with optnone honored, module-level IPO (IPSCCP, GlobalOpt) still
+  refines kept bodies. Fix: after the pipeline, parse the snapshot bitcode a
+  second time and re-link it OverrideFromSrc over the kept functions (same
+  promotion trick), so a kept function displays EXACTLY as the last full
+  build produced it. Declaration attrs are recorded from work post-pipeline
+  and reapplied after this link (linking unions them, and the snapshot's set
+  is degraded - the bitcode round-trip re-canonicalizes intrinsic attrs,
+  dropping e.g. mustprogress from llvm.va_start).
+- Unchanged-global override remapped initializer struct types to arbitrary
+  isomorphic ones (@__active_allocator: __iface_fat_ptr -> __closure_fat_ptr).
+  Fix: for zero-initialized unchanged pairs, reduce src to a declaration so
+  the work definition keeps its type names (zero content cannot hide a
+  GlobalOpt-folded initializer, so this is safe; non-zero pairs still take
+  the snapshot side).
+- The link warned about mismatched datalayouts: the fresh clone had not been
+  through OptimizeViewModule's triple/DL normalization yet. Aligned before
+  linking.
+
+Residual DIVERGEs after round 4 are three attr/metadata-level deltas, uniform
+across all demo scenarios, none structural (function sets 24/24, all bodies
+instruction-identical): (1) intrinsic-declaration attr comments differ by
+mustprogress (creation-time attrs vs pipeline-created decls vs bitcode
+round-trip canonicalization - the fast reopt=0 path returns the snapshot
+verbatim and has no pipeline to re-infer); (2) a reopt'd body carries an
+extra range() param attr (the incremental pipeline derives more facts from
+already-optimized kept callees than the full pipeline has at the same point);
+(3) one !inline_history metadata tag present in full but not inc (LLVM
+inliner bookkeeping; inlining happened in both, via different step counts).
+These are inherent to re-running a pipeline over a partially frozen module.
+MAINTAINER RULING NEEDED: is instruction-identical + attr/metadata-delta an
+acceptable bar, or must the driver normalize these classes too? The snapshot
+struct stays file-serializable so the same machinery can later persist next
 to -o outputs for incremental normal builds (maintainer request 2026-08-30).
+CFLAT_VIEW_INC_DUMP=1 prints the reopt set per rebuild for diagnosis.
 
 ## Rejected: two-stage SLL parsing (investigated 2026-08-30)
 

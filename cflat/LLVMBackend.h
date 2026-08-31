@@ -29,6 +29,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <optional>
 #if defined(_WIN32)
@@ -520,6 +521,7 @@ inline const std::string& CanonicalPrimitiveSpelling(const std::string& base)
 class LLVMBackend
 {
 public:
+    bool LastOptimizedViewWasIncremental() const;
     struct LineFrame
     {
         std::string file;
@@ -2670,7 +2672,31 @@ private:
         std::map<std::string, FrameRemark> frameRemarks;
         std::vector<OptRemark> remarks;
         bool remarksTruncated = false;
+        bool preOptMetadataRecorded = false;
+        std::map<std::string, uint64_t> funcHashes;
+        std::map<std::string, std::string> globalHashes;
+        std::map<std::string, std::set<std::string>> callees;
+        std::set<std::string> addressTaken;
+        // Analyzed-root temp paths whose debug info may appear in this module
+        // (kept snapshot bodies reference earlier analyses' temp copies).
+        std::set<std::string> rootPathAliases;
     } optimizedViewCache_;
+    struct IncrementalViewSnapshot
+    {
+        int optLevel = -1;
+        std::string rootFile;
+        std::string bitcode;
+        std::map<std::string, uint64_t> funcHashes;
+        std::map<std::string, std::string> globalHashes;
+        std::map<std::string, std::set<std::string>> callees;
+        std::set<std::string> addressTaken;
+        std::set<std::string> rootPathAliases;
+        std::map<std::string, FrameRemark> frameRemarks;
+        std::vector<OptRemark> remarks;
+        bool remarksTruncated = false;
+    };
+    std::optional<IncrementalViewSnapshot> incrementalViewSnapshot_;
+    bool optimizedViewWasIncremental_ = false;
     // Names present when a core bitcode cache was loaded; later functions are user IR.
     std::optional<std::unordered_set<std::string>> cachedFunctionNames_;
 

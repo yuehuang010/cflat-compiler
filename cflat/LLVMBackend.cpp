@@ -4180,6 +4180,11 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     return true;
 }
 
+bool LLVMBackend::LastOptimizedViewWasIncremental() const
+{
+    return optimizedViewWasIncremental_;
+}
+
 void LLVMBackend::ResetForReanalysis()
 {
     analyzeDebugInfo_ = false;
@@ -4204,7 +4209,30 @@ void LLVMBackend::ResetForReanalysis()
     moveEventLog_.clear();
     // Origin slots hold llvm::Value* into the module being discarded - drop them too.
     ownOriginSlots_.clear();
+    if (optimizedViewCache_.module && optimizedViewCache_.preOptMetadataRecorded)
+    {
+        llvm::TimeTraceScope snapshotScope("ViewSnapshotSerialize");
+        std::string bitcode;
+        llvm::raw_string_ostream bitcodeOut(bitcode);
+        llvm::WriteBitcodeToFile(*optimizedViewCache_.module, bitcodeOut);
+        bitcodeOut.flush();
+
+        IncrementalViewSnapshot snapshot;
+        snapshot.optLevel = optimizedViewCache_.optLevel;
+        snapshot.rootFile = sourceDisplayName_.empty() ? analyzedRootPath_ : sourceDisplayName_;
+        snapshot.bitcode = std::move(bitcode);
+        snapshot.funcHashes = optimizedViewCache_.funcHashes;
+        snapshot.globalHashes = optimizedViewCache_.globalHashes;
+        snapshot.callees = optimizedViewCache_.callees;
+        snapshot.addressTaken = optimizedViewCache_.addressTaken;
+        snapshot.rootPathAliases = optimizedViewCache_.rootPathAliases;
+        snapshot.frameRemarks = optimizedViewCache_.frameRemarks;
+        snapshot.remarks = optimizedViewCache_.remarks;
+        snapshot.remarksTruncated = optimizedViewCache_.remarksTruncated;
+        incrementalViewSnapshot_ = std::move(snapshot);
+    }
     optimizedViewCache_ = OptimizedViewCache{};
+    optimizedViewWasIncremental_ = false;
     // Same: both borrow-provenance ledgers are keyed by Functions/CallInsts of the old module.
     uniqueFieldBorrowReturns_.clear();
     uniqueFieldBorrowResults_.clear();

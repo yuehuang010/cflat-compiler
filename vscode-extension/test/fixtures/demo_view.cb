@@ -1,0 +1,57 @@
+int gScale = 3;
+
+int leaf(int value)
+{
+    return value * 2 + 1;
+}
+
+int middle(int value)
+{
+    return leaf(value) + 3;
+}
+
+int top(int value)
+{
+    return middle(value) - 4;
+}
+
+int square(int value)
+{
+    return value * value;
+}
+
+int globalValue(int value)
+{
+    return value + gScale;
+}
+
+int stringScore()
+{
+    string text = "stable literal";
+    return (int)text.length();
+}
+
+int branchValue(int value)
+{
+    if (value > 3)
+        return square(value);
+    return middle(value);
+}
+
+int offsetValue(int value)
+{
+    return value + 2;
+}
+
+int sideHelper(int value)
+{
+    return value + 11;
+}
+
+extern int main()
+{
+    int total = top(4) + globalValue(5) + stringScore();
+    total = total + branchValue(2) + offsetValue(5) + sideHelper(3);
+    printf("demo=%d\n", total);
+    return 0;
+}
