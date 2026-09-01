@@ -1902,7 +1902,7 @@ bool LLVMBackend::CompileNugetImport(const std::vector<std::string>& files,
             {
                 LogErrorMessage("import package-nuget '{}': WinRT metadata (.winmd) is only supported when "
                                 "targeting Windows; guard the import with "
-                                "'if const (__WINDOWS__) { import ...; }'.",
+                                "'if const (__WINDOWS__) {{ import ...; }}'.",
                                 { file });
                 return false;
             }

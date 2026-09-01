@@ -12,12 +12,25 @@ bool IsAsciiAlphaNumeric(char c)
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
 }
 
+// "{{" and "}}" are escaped literal braces (std::format's convention), so they must be
+// consumed as a pair - "{{}}" is two literals, not a literal brace plus a placeholder.
+bool IsEscapedBrace(std::string_view text, size_t i)
+{
+    return (text[i] == '{' || text[i] == '}') && i + 1 < text.size() && text[i + 1] == text[i];
+}
+
 std::string NormalizeKeyFull(std::string_view englishTemplate)
 {
     std::string key;
     size_t argument = 0;
     for (size_t i = 0; i < englishTemplate.size();)
     {
+        if (IsEscapedBrace(englishTemplate, i))
+        {
+            i += 2;
+            continue;
+        }
+
         if (englishTemplate[i] == '{' && i + 1 < englishTemplate.size() && englishTemplate[i + 1] == '}')
         {
             key += "arg" + std::to_string(argument++);
@@ -69,7 +82,13 @@ std::string SourceTemplateWithNumberedArguments(std::string_view text)
     size_t argument = 0;
     for (size_t i = 0; i < text.size();)
     {
-        if (text[i] == '{' && i + 1 < text.size() && text[i + 1] == '}')
+        // Escaped braces stay escaped: the numbered form uses the same convention.
+        if (IsEscapedBrace(text, i))
+        {
+            result += text.substr(i, 2);
+            i += 2;
+        }
+        else if (text[i] == '{' && i + 1 < text.size() && text[i + 1] == '}')
         {
             result += "{" + std::to_string(argument++) + "}";
             i += 2;
@@ -84,6 +103,16 @@ bool HasValidNumberedPlaceholders(std::string_view text, size_t argumentCount)
 {
     for (size_t i = 0; i < text.size();)
     {
+        if (IsEscapedBrace(text, i))
+        {
+            i += 2;
+            continue;
+        }
+
+        // A brace that is neither escaped nor part of "{N}" is a broken translation.
+        if (text[i] == '}')
+            return false;
+
         if (text[i] != '{')
         {
             ++i;
@@ -116,6 +145,13 @@ std::string FormatNumberedTemplate(std::string_view text,
     result.reserve(text.size());
     for (size_t i = 0; i < text.size();)
     {
+        if (IsEscapedBrace(text, i))
+        {
+            result += text[i];
+            i += 2;
+            continue;
+        }
+
         if (text[i] == '{')
         {
             size_t close = text.find('}', i + 1);
@@ -418,7 +454,17 @@ bool DiagnosticLocalization::WriteCollectedCatalog(const std::string& locale,
         return false;
     }
 
-    Json root;
+    // Start from the file on disk and replace only the sections written below. The
+    // extractor also writes argumentNames/sites, which this pass does not model -
+    // rebuilding root from scratch would silently delete them on every test run.
+    Json root = Json::object();
+    if (std::filesystem::exists(outputPath))
+    {
+        Json existing;
+        if (ReadJson(outputPath, existing, verbose) && existing.is_object())
+            root = std::move(existing);
+    }
+
     root["locale"] = locale;
     root["messages"] = Json::object();
     for (const auto& [key, value] : messages)

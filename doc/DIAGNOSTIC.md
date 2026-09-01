@@ -207,6 +207,12 @@ Rules that keep a call site translatable:
 
 ### Catalog keys
 
+A literal brace in the message text is escaped by doubling it - `{{` and `}}`,
+the same convention `std::format` uses. This applies to the English template in
+the C++ source and to the `{N}` form in a catalog alike: an unescaped brace that
+is not a `{N}` placeholder makes the catalog entry invalid, and the diagnostic
+silently falls back to the English source template.
+
 The key is derived, not written: lowercase the template, replace each `{}` with
 `arg0`, `arg1`, ..., drop every non-alphanumeric character, and compact anything
 over 40 characters to `<first 20>...<last 20><16-hex FNV-1a of the full key>`.
@@ -243,6 +249,11 @@ The compiler pass is the only source of real argument values, but it sees only
 diagnostics a test actually provokes. The extractor statically scans every
 `LogErrorMessage` call site, so it supplies the complete key set - and carries
 the observed examples forward. Run the compiler first, the extractor last.
+
+`--update-locale` rewrites only `locale`, `messages`, and `argumentExamples`; any
+other section it finds is carried through untouched, so the extractor's
+`argumentNames` and `sites` survive a `test.sh` run (which runs the compiler pass
+on every error-test batch).
 
 `--report` also prints the remaining unmigrated `LogError(` call sites and every
 key with no example, which is the missing-negative-test backlog. `--strict` exits

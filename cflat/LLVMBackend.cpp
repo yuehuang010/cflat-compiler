@@ -2967,9 +2967,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
     // found" that unhelpfully lists the (absent) Windows SDK / WinMetadata dirs.
     if (!targetWindows_ && LowerExtension(importFilename) == ".winmd")
     {
-        LogError(std::format("import '{}': WinRT metadata (.winmd) is only supported when targeting Windows. "
-                             "WinMD/WinRT is a Windows-only feature; guard the import with "
-                             "'if const (__WINDOWS__) {{ import \"...\"; }}'.", importFilename));
+        LogErrorMessage("import '{}': WinRT metadata (.winmd) is only supported when targeting Windows. "
+                        "WinMD/WinRT is a Windows-only feature; guard the import with "
+                        "'if const (__WINDOWS__) {{ import \"...\"; }}'.",
+                        { importFilename });
         return false;
     }
     std::string canonicalStr;

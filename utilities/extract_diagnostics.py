@@ -230,8 +230,8 @@ def count_placeholders(template):
     count = 0
     i = 0
     while i < len(template) - 1:
-        if template[i] == '{':
-            if template[i + 1] == '{':
+        if template[i] in '{}':
+            if template[i + 1] == template[i]:
                 i += 2
                 continue
             if template[i + 1] == '}':
@@ -365,11 +365,20 @@ def merge_entries(all_entries):
 # Port of NormalizeKeyFull in cflat/DiagnosticLocalization.cpp. Verified on
 # every key of the existing catalog on each run; a mismatch is reported as a
 # problem rather than silently written.
+# "{{" / "}}" are escaped literal braces; consume them as a pair so "{{}}" is not
+# misread as a literal brace followed by a placeholder. Port of IsEscapedBrace.
+def is_escaped_brace(text, i):
+    return text[i] in '{}' and i + 1 < len(text) and text[i + 1] == text[i]
+
+
 def normalize_key_full(template):
     key = []
     argument = 0
     i = 0
     while i < len(template):
+        if is_escaped_brace(template, i):
+            i += 2
+            continue
         if template[i] == '{' and i + 1 < len(template) and template[i + 1] == '}':
             key.append("arg%d" % argument)
             argument += 1
@@ -408,6 +417,10 @@ def numbered_template(template):
     argument = 0
     i = 0
     while i < len(template):
+        if is_escaped_brace(template, i):
+            out.append(template[i:i + 2])
+            i += 2
+            continue
         if template[i:i + 2] == '{}':
             out.append('{%d}' % argument)
             argument += 1

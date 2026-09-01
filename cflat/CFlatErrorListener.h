@@ -284,7 +284,7 @@ private:
             if (offendingIsEof &&
                 (dynamic_cast<CFlatParser::CompoundStatementContext*>(ctx) ||
                  dynamic_cast<CFlatParser::BlockItemListContext*>(ctx)))
-                return localizeMessage_("unclosed '{' - check for a missing closing brace", {});
+                return localizeMessage_("unclosed '{{' - check for a missing closing brace", {});
 
             if (dynamic_cast<CFlatParser::StructDefinitionContext*>(ctx)       ||
                 dynamic_cast<CFlatParser::StructOrUnionSpecifierContext*>(ctx) ||
