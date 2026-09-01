@@ -3708,7 +3708,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                 }
                                 else if (typeAndValue.TypeName == "string" &&
-                                         right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                                         right->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
                                 {
                                     // A raw i8*/char* assigned to a string variable.
                                     // If it is a compile-time string literal constant (length known at
@@ -4051,7 +4051,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             lambdaExpectedType = {};
                             // Implicit char* -> string coercion: string s = "hello" or string s = charPtr.
                             if (right && typeAndValue.TypeName == "string" && !typeAndValue.Pointer
-                                && right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                                && right->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
                             {
                                 auto* c = llvm::dyn_cast<llvm::Constant>(right);
                                 if (c && compiler->IsStringLiteralConstant(c))

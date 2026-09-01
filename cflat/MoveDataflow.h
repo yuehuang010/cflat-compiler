@@ -24,6 +24,8 @@
 #include <llvm/IR/InstrTypes.h>   // llvm::CallBase
 #include <llvm/IR/Instructions.h>  // llvm::ReturnInst
 
+#include "LlvmHelpers.h"   // cflat_llvm::GetTerminatorOrNull
+
 namespace movedf
 {
     // A movepath is "name" (whole var) or "name.field" (field subpath). Index/deref/any

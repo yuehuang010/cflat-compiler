@@ -354,7 +354,7 @@ void LLVMBackend::SwitchToBlock(llvm::BasicBlock* block)
         builder->SetInsertPoint(block);
     }
 
-llvm::BranchInst* LLVMBackend::CreateJump(llvm::BasicBlock* block)
+llvm::UncondBrInst* LLVMBackend::CreateJump(llvm::BasicBlock* block)
 {
         if (block && IsInsertBlockLive())
             return builder->CreateBr(block);
@@ -472,7 +472,7 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                                              std::vector<llvm::Value*> args,
                                              const std::vector<NamedVariable>* argNVs)
 {
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
         // Thin `function<T>`: a bare C function pointer. Direct call, no env, exact C signature.
         if (funcPtrType.IsThinFnPtr())
@@ -491,10 +491,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
             retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
             if (ReturnCarriesRawArrayCount(retTV))
-                paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
+                paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
             auto* retTy   = GetFunctionReturnABIType(retTV);
             auto* cFnTy   = llvm::FunctionType::get(retTy, paramTypes, false);
-            auto* fnPtr   = builder->CreateBitCast(funcPtr, cFnTy->getPointerTo(), "cfn_ptr");
+            auto* fnPtr   = builder->CreateBitCast(funcPtr, cflat_llvm::PointerTo(cFnTy), "cfn_ptr");
             std::vector<llvm::Value*> abiArgs;
             size_t typeIndex = 0;
             for (size_t i = 0; i < args.size() && i < funcPtrType.FuncPtrParams.size(); i++)
@@ -559,10 +559,10 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
         retTV.IsMove   = funcPtrType.FuncPtrReturnOwned;
         retTV.IsAlias  = funcPtrType.FuncPtrReturnAlias;
         if (ReturnCarriesRawArrayCount(retTV))
-            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
+            paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
         auto* retTy     = GetFunctionReturnABIType(retTV);
         auto* invokerTy = llvm::FunctionType::get(retTy, paramTypes, false);
-        auto* fnPtr     = builder->CreateBitCast(fnPtrI8, invokerTy->getPointerTo(), "fn_ptr");
+        auto* fnPtr     = builder->CreateBitCast(fnPtrI8, cflat_llvm::PointerTo(invokerTy), "fn_ptr");
 
         // Upconvert user args to match declared param types (the trailing slot is env, skip it).
         // String literals arrive as i8* - wrap them into %string{ptr,len} when the
@@ -627,7 +627,7 @@ llvm::Function* LLVMBackend::GetOrDeclareStrcmp()
         if (auto* fn = module->getFunction("strcmp"))
             return fn;
         auto* i32Ty = builder->getInt32Ty();
-        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* fnTy = llvm::FunctionType::get(i32Ty, { ptrTy, ptrTy }, false);
         return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strcmp", module.get());
     }
@@ -667,7 +667,7 @@ std::string LLVMBackend::DescribeConditionType(llvm::Type* t) const
         return "value";
     }
 
-llvm::BranchInst* LLVMBackend::CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
+llvm::CondBrInst* LLVMBackend::CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock)
 {
         cond = CoerceToBoolCondition(cond);
 
@@ -686,7 +686,7 @@ llvm::Value* LLVMBackend::CreateSelect(llvm::Value* cond, llvm::Value* falseValu
         return builder->CreateSelect(cond, trueValue, falseValue);
     }
 
-llvm::BranchInst* LLVMBackend::CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlockStack)
+llvm::UncondBrInst* LLVMBackend::CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlockStack)
 {
         if (exitBlockStack)
         {
@@ -980,7 +980,7 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
         {
             loweredRet = builder->getVoidTy();
             // Hidden sret pointer goes first.
-            ptypes.push_back(recipe.retSlot.structTy->getPointerTo());
+            ptypes.push_back(cflat_llvm::PointerTo(recipe.retSlot.structTy));
         }
         else if (recipe.retSlot.kind == AbiSlot::CoerceToInt)
             loweredRet = recipe.retSlot.coerceTy;
@@ -1000,7 +1000,7 @@ llvm::FunctionType* LLVMBackend::BuildExternFunctionType(const TypeAndValue& ret
                 ptypes.push_back(s.coerceTy2);
             }
             else if (s.kind == AbiSlot::ByVal)
-                ptypes.push_back(s.structTy->getPointerTo());
+                ptypes.push_back(cflat_llvm::PointerTo(s.structTy));
             else
                 ptypes.push_back(GetCCompatibleType(params[i]));
         }
@@ -1300,8 +1300,8 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
         retTV.IsMove   = tv.FuncPtrReturnOwned;
         retTV.IsAlias  = tv.FuncPtrReturnAlias;
         if (ReturnCarriesRawArrayCount(retTV))
-            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
-        return llvm::FunctionType::get(GetFunctionReturnABIType(retTV), paramTypes, false)->getPointerTo();
+            paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
+        return cflat_llvm::PointerTo(llvm::FunctionType::get(GetFunctionReturnABIType(retTV), paramTypes, false));
     }
 
 bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
@@ -1383,7 +1383,7 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
         for (const LLVMBackend::TypeAndValue& arg : arguments)
         {
             if (!externC && ParameterIsAliasByPointer(arg))
-                types.emplace_back(GetType(arg)->getPointerTo());
+                types.emplace_back(cflat_llvm::PointerTo(GetType(arg)));
             else
                 types.emplace_back(sized(externC ? GetCCompatibleType(arg) : GetType(arg)));
             if (!externC && ParameterCarriesRawArrayCount(arg))
@@ -1391,7 +1391,7 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
         }
 
         if (!externC && ReturnCarriesRawArrayCount(returnType))
-            types.emplace_back(builder->getInt64Ty()->getPointerTo());
+            types.emplace_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
 
         auto* retTy = externC ? GetCCompatibleType(returnType) : GetFunctionReturnABIType(returnType);
         return llvm::FunctionType::get(retTy, types, varargs);
@@ -1402,7 +1402,7 @@ llvm::Type* LLVMBackend::GetFunctionReturnABIType(const TypeAndValue& returnType
         auto* valueType = GetType(returnType);
         if (valueType != nullptr && returnType.IsAlias && !returnType.Pointer
             && !returnType.IsArrayView)
-            return valueType->getPointerTo();
+            return cflat_llvm::PointerTo(valueType);
         return valueType;
 }
 

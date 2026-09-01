@@ -2,20 +2,26 @@
 // ============================================================
 // LLVMBackend.h - LLVM IR backend, type system, symbol tables
 // ============================================================
-// SECTION      LINE       DESCRIPTION               FUNCTION
-// ───────────────────────────────────────────────────────────
-// §1           235-845    Public enums/structs (Operation, TypeAndValue, ...)
-// §2           847-1161   Private member data
-// §3           1162-4806  Private methods
-// §4           4807+      Public methods (>230 methods)
-//   §4.1       4848       Debug info                InitDebugInfo, FinalizeDebugInfo
-//   §4.2       4894       Block control             AbortFunctionBlocks, SaveBuilderState
-//   §4.3       4932       Interface system          CreateInterfaceDefinition, IsInterfaceType, GetFatPtrType
-//   §4.4       5915       Variable management       CreateGlobalVariable, AllocaAtEntry, CreateLocalVariable
-//   §4.5       6128       IR emission               CreateInsertValue, CreateStructGEP, CreateAssignment
-//   §4.6       7308       Control flow              CreateBasicBlock, SwitchToBlock, CreateJump
-//   §4.7       7690       Function system           CreateFunctionDeclaration, CreateFunctionDefinition
-//   §4.8       7991       Lookup / name resolution  IsKnownTypeName, GetType
+// One class, ~8000 lines. NAVIGATE BY SEARCH, NOT BY LINE NUMBER - the index that used to
+// live here listed line numbers and was stale again within a few commits, which is worse
+// than no index. The anchors below are declarations; grep for one to land in its group.
+//
+// GROUP                     GREP FOR
+// Public enums / structs    enum class Operation, struct TypeAndValue, struct StructData
+// Member data               stackNamedVariable, globalNamedVariable, dataStructures
+// Debug info (-g)           InitDebugInfo, FinalizeDebugInfo
+// Block control             AbortFunctionBlocks, SaveBuilderState
+// Interface system          CreateInterfaceDefinition, IsInterfaceType, GetFatPtrType
+// Variable management       CreateGlobalVariable, AllocaAtEntry, CreateLocalVariable
+// IR emission               CreateInsertValue, CreateStructGEP, CreateAssignment
+// Control flow              CreateBasicBlock, SwitchToBlock, CreateJump
+// Function system           CreateFunctionDeclaration, CreateFunctionDefinition
+// Lookup / name resolution  IsKnownTypeName, GetType
+// Optimization info (LSP)   CollectOptimizationInfo, struct OptRemark
+//
+// Method BODIES are not here - they live in the LLVMBackend_*.cpp split: CInterop,
+// CodegenHelpers, ControlFlowAndFunctions, EmitAndLink, Interfaces, Lookup, MoveDataflow,
+// Overloads, OwnershipTemps, StateAndImports, VariablesAndIR, WinRT.
 // ============================================================
 
 #include <algorithm>
@@ -78,35 +84,6 @@
 #include <llvm/MC/MCSubtargetInfo.h>
 #include <llvm/TargetParser/Host.h>
 #pragma warning(pop)
-/*
- * Two small LLVM helpers. These are NOT version shims - cflat targets LLVM 23 only -
- * they exist because the raw LLVM spellings are easy to get wrong at a call site.
- */
-namespace cflat_llvm
-{
-
-// BasicBlock::getTerminator() asserts on a block that has none; this is the nullable
-// query, and it also tolerates a null block (IRBuilder::GetInsertBlock() can return one).
-inline llvm::Instruction* GetTerminatorOrNull(llvm::BasicBlock* block)
-{
-    return block == nullptr ? nullptr : block->getTerminatorOrNull();
-}
-
-inline const llvm::Instruction* GetTerminatorOrNull(const llvm::BasicBlock* block)
-{
-    return block == nullptr ? nullptr : block->getTerminatorOrNull();
-}
-
-// APInt rejects a value that does not fit the target bit width instead of truncating it
-// silently, so ConstantInt::get(iN, uint64) asserts. Bitfield masks and C macro constants
-// are built at 64 bits and narrowed ON PURPOSE, so truncate explicitly.
-inline llvm::ConstantInt* GetIntTruncated(llvm::Type* type, uint64_t value)
-{
-    const unsigned bits = type->getIntegerBitWidth();
-    return llvm::ConstantInt::get(type->getContext(), llvm::APInt(64, value).zextOrTrunc(bits));
-}
-
-} // namespace cflat_llvm
 #include "platform/GeneratedParser.h" // antlr runtime + generated parser/lexer/listener + kTokenEOF
 #include <fstream>
 #include "ArgParser.h"
@@ -124,6 +101,7 @@ inline llvm::ConstantInt* GetIntTruncated(llvm::Type* type, uint64_t value)
 #include "CFlatErrorStrategy.h"
 #include "VcpkgResolver.h"
 #include "NugetResolver.h"
+#include "LlvmHelpers.h"
 
 struct ExpectedErrorReceived {};
 
@@ -6220,7 +6198,7 @@ public:
 
     void SwitchToBlock(llvm::BasicBlock* block);
 
-    llvm::BranchInst* CreateJump(llvm::BasicBlock* block);
+    llvm::UncondBrInst* CreateJump(llvm::BasicBlock* block);
 
     /// Returns the LLVM return type for the first overload of a function, or nullptr if not found.
     llvm::Type* GetFunctionReturnType(const std::string& functionName) const;
@@ -6271,7 +6249,7 @@ public:
     // Short type name for a rejected condition operand.
     std::string DescribeConditionType(llvm::Type* t) const;
 
-    llvm::BranchInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock);
+    llvm::CondBrInst* CreateConditionJump(llvm::Value* cond, llvm::BasicBlock* trueBlock, llvm::BasicBlock* falseBlock);
 
     llvm::PHINode* CreatePHINode(std::string name, int reserve);
 
@@ -6280,7 +6258,7 @@ public:
     /// <summary>
     /// Exit the current BasicBlock and then jump to resumeBlock.
     /// </summary>
-    llvm::BranchInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlockStack);
+    llvm::UncondBrInst* CreateBlockBreak(llvm::BasicBlock* resumeBlock, bool exitBlockStack);
 
     void InitializeBlock(llvm::BasicBlock* block, bool enterBlockStack, llvm::BasicBlock* continueBlock = nullptr, llvm::BasicBlock* resumeBlock = nullptr, llvm::BasicBlock* elseBlock = nullptr);
 

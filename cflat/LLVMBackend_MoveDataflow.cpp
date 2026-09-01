@@ -1160,10 +1160,10 @@ llvm::Value* LLVMBackend::LoadCoerceAt(llvm::Value* structSlot, llvm::Type* coer
         llvm::Value* p = structSlot;
         if (byteOff != 0)
         {
-            auto* i8p = builder->CreateBitCast(structSlot, builder->getInt8Ty()->getPointerTo());
+            auto* i8p = builder->CreateBitCast(structSlot, cflat_llvm::PointerTo(builder->getInt8Ty()));
             p = builder->CreateInBoundsGEP(builder->getInt8Ty(), i8p, builder->getInt64(byteOff));
         }
-        auto* cp = builder->CreateBitCast(p, coerceTy->getPointerTo());
+        auto* cp = builder->CreateBitCast(p, cflat_llvm::PointerTo(coerceTy));
         return builder->CreateLoad(coerceTy, cp);
     }
 
@@ -1172,10 +1172,10 @@ void LLVMBackend::StoreCoerceAt(llvm::Value* structSlot, llvm::Value* val, uint6
         llvm::Value* p = structSlot;
         if (byteOff != 0)
         {
-            auto* i8p = builder->CreateBitCast(structSlot, builder->getInt8Ty()->getPointerTo());
+            auto* i8p = builder->CreateBitCast(structSlot, cflat_llvm::PointerTo(builder->getInt8Ty()));
             p = builder->CreateInBoundsGEP(builder->getInt8Ty(), i8p, builder->getInt64(byteOff));
         }
-        auto* cp = builder->CreateBitCast(p, val->getType()->getPointerTo());
+        auto* cp = builder->CreateBitCast(p, cflat_llvm::PointerTo(val->getType()));
         builder->CreateStore(val, cp);
     }
 
@@ -1487,7 +1487,7 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                 ? currentFunctionAbiRecipe.retSlot.structTy : nullptr;
             if (strTy && (retTy == strTy || abiRetStructTy == strTy) && value->getType() != strTy)
             {
-                auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+                auto* ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
                 if (value->getType() == ptrTy)
                 {
                     if (auto* c = llvm::dyn_cast<llvm::Constant>(value); c && IsStringLiteralConstant(c))

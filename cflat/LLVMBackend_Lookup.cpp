@@ -222,11 +222,11 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             {
                 auto* fatTy = GetFatPtrType();
                 if (typeAndValue.ElemPointer)
-                    type = fatTy->getPointerTo()->getPointerTo(); // {i8*,i8*}** (T* where T=IFace*)
+                    type = cflat_llvm::PointerTo(cflat_llvm::PointerTo(fatTy)); // {i8*,i8*}** (T* where T=IFace*)
                 // An `IFace[]` array view is a thin pointer to a run of fat structs, so it lowers
                 // like `IFace*`; without this it would lower to the bare struct and every GEP fails.
                 else if (allowPointer && (typeAndValue.IsInterfacePointer || typeAndValue.IsArrayView))
-                    type = fatTy->getPointerTo();                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
+                    type = cflat_llvm::PointerTo(fatTy);                 // {i8*,i8*}* (T* where T=IFace, or T=IFace*)
                 else
                     type = fatTy;                                 // {i8*,i8*}  (bare fat ptr)
                 // The arms above already encode every pointer level an interface can have, so the
@@ -328,11 +328,11 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         {
             // Note: LLVM doesn't have void ptr, instead use i8 ptr.
             if (type->isVoidTy())
-                type = builder->getInt8Ty()->getPointerTo();
+                type = cflat_llvm::PointerTo(builder->getInt8Ty());
             else
-                type = type->getPointerTo();
+                type = cflat_llvm::PointerTo(type);
             if (wantElemPointer)
-                type = type->getPointerTo();
+                type = cflat_llvm::PointerTo(type);
         }
 
         // Prefer the explicit ConstArraySize set by the declaration handler; fall back to an

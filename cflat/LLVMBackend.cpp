@@ -702,7 +702,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
     std::vector<std::pair<llvm::CallBase*, llvm::Function*>> realCalls;
     auto headerFor = [&](llvm::IRBuilder<>& b, llvm::Value* user) {
         auto* bytes = b.CreateConstInBoundsGEP1_64(i8, user, -16);
-        return b.CreateBitCast(bytes, headerType->getPointerTo());
+        return b.CreateBitCast(bytes, cflat_llvm::PointerTo(headerType));
     };
     auto headerSize = [&](llvm::IRBuilder<>& b, llvm::Value* header) {
         return b.CreateStructGEP(headerType, header, 0);
@@ -743,7 +743,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCall(heapRelease, {size});
         b.CreateRet(llvm::ConstantPointerNull::get(ptr));
         b.SetInsertPoint(store);
-        auto* header = b.CreateBitCast(raw, headerType->getPointerTo());
+        auto* header = b.CreateBitCast(raw, cflat_llvm::PointerTo(headerType));
         b.CreateStore(size, headerSize(b, header));
         b.CreateStore(raw, headerRaw(b, header));
         b.CreateRet(addUserPointer(b, raw));
@@ -808,7 +808,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         b.CreateCall(heapRelease, {productValue});
         b.CreateRet(llvm::ConstantPointerNull::get(ptr));
         b.SetInsertPoint(store);
-        auto* header = b.CreateBitCast(raw, headerType->getPointerTo());
+        auto* header = b.CreateBitCast(raw, cflat_llvm::PointerTo(headerType));
         b.CreateStore(productValue, headerSize(b, header));
         b.CreateStore(raw, headerRaw(b, header));
         b.CreateRet(addUserPointer(b, raw));
@@ -881,7 +881,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* resizedRaw = b.CreatePHI(ptr, 2, "resized_raw");
         resizedRaw->addIncoming(grownRaw, callGrow);
         resizedRaw->addIncoming(shrunkRaw, callShrink);
-        auto* resizedHeader = b.CreateBitCast(resizedRaw, headerType->getPointerTo());
+        auto* resizedHeader = b.CreateBitCast(resizedRaw, cflat_llvm::PointerTo(headerType));
         b.CreateStore(newSize, headerSize(b, resizedHeader));
         b.CreateStore(resizedRaw, headerRaw(b, resizedHeader));
         b.CreateCondBr(b.CreateICmpUGT(oldSize, newSize),
@@ -952,7 +952,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
                                        b.CreateNot(b.CreateSub(alignment, b.getInt64(1))));
         auto* user = b.CreateIntToPtr(alignedInt, ptr);
         auto* header = b.CreateBitCast(b.CreateConstInBoundsGEP1_64(i8, user, -16),
-                                       headerType->getPointerTo());
+                                       cflat_llvm::PointerTo(headerType));
         b.CreateStore(total, headerSize(b, header));
         b.CreateStore(raw, headerRaw(b, header));
         b.CreateStore(user, wrapper->getArg(0));
@@ -979,7 +979,7 @@ bool LLVMBackend::InstrumentIsolatedResources()
         auto* release = makeSubtractRelease("__cflat_isolated_thread_release", available);
         auto* packetType = llvm::StructType::create(ctx, {ptr, ptr},
                                                     "__cflat_isolated_thread_start");
-        auto* packetPtr = packetType->getPointerTo();
+        auto* packetPtr = cflat_llvm::PointerTo(packetType);
         llvm::Function* threadAlloc = heapMalloc ? heapMalloc : realMalloc;
         llvm::Function* threadFree = heapFree ? heapFree : realFree;
         auto* realCreate = getExternal("pthread_create");

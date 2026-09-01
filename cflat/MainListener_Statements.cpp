@@ -2015,7 +2015,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             return;
                         }
 
-                        auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                        auto* i8PtrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
                         auto* i8Ty    = compiler->builder->getInt8Ty();
                         auto* nullPtr = llvm::ConstantPointerNull::get(i8PtrTy);
 
@@ -2487,10 +2487,10 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 {
                     // Type switch: dispatch on the concrete type behind an interface fat pointer
                     auto fatTy = compiler->GetFatPtrType();
-                    auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                    auto ptrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
 
                     // Validate: switch expression must be an interface-typed value (fat pointer)
-                    if (condVal->getType() != fatTy && condVal->getType() != fatTy->getPointerTo())
+                    if (condVal->getType() != fatTy && condVal->getType() != cflat_llvm::PointerTo(fatTy))
                         LogErrorContext(expression, "type switch expression must be interface-typed (fat pointer)");
 
                     // Extract dataPtr (field 1 of fat pointer)

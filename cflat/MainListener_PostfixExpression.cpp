@@ -1287,7 +1287,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Storage with the vtable pointer, so the call can inject it.
                                     pendingThinComReceiver = structVar.Storage;
                                     auto* vtblPtr = compiler->builder->CreateLoad(
-                                        vtblData.StructType->getPointerTo(),
+                                        cflat_llvm::PointerTo(vtblData.StructType),
                                         compiler->CreateStructGEP(structVar.BaseType, structVar.Storage, 0));
                                     structVar.Storage      = vtblPtr;
                                     structVar.Primary      = nullptr;
@@ -4178,7 +4178,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Fat {vtable,data} receiver: test the DATA slot (index 1), not
                                     // ifacePtr itself (always a live alloca address, never null).
                                     auto* fatTy = compiler->GetFatPtrType();
-                                    auto* ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+                                    auto* ptrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
                                     auto* dataField = compiler->CreateStructGEP(fatTy, ncIfacePtr, 1);
                                     auto* dataPtr = compiler->CreateLoad(ptrTy, dataField);
                                     ncEnterGuard(dataPtr);
@@ -5712,7 +5712,7 @@ llvm::Value* MainListener::ParseFormatString(CFlatParser::PrimaryExpressionConte
 
         int count = (int)segments.size();
         auto* i32ArrTy = llvm::ArrayType::get(i32Ty, count);
-        auto* ptrArrTy = llvm::ArrayType::get(i8Ty->getPointerTo(), count);
+        auto* ptrArrTy = llvm::ArrayType::get(cflat_llvm::PointerTo(i8Ty), count);
 
         auto* ptrArr = compiler->builder->CreateAlloca(ptrArrTy, nullptr, "fmtptrs");
         auto* lenArr = compiler->builder->CreateAlloca(i32ArrTy, nullptr, "fmtlens");
@@ -5953,7 +5953,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         llvm::AllocaInst* closureAlloca = nullptr;
         llvm::StructType* closureStructTy = nullptr;
         llvm::Value* envForFatTagged = nullptr;   // tagged i8* env stored in the fat struct (Option A)
-        auto* i8PtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
 
         if (!captures.empty())
         {
@@ -5962,7 +5962,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
             for (const auto& cap : captures)
             {
                 if (cap.ByReference)
-                    closureFields.push_back(compiler->GetDataStructure(cap.TV.TypeName).StructType->getPointerTo());
+                    closureFields.push_back(cflat_llvm::PointerTo(compiler->GetDataStructure(cap.TV.TypeName).StructType));
                 else
                     closureFields.push_back(compiler->GetType(cap.TV));
             }
@@ -6002,7 +6002,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                 auto* envInt  = compiler->builder->CreatePtrToInt(taggedEnv, compiler->builder->getInt64Ty());
                 auto* baseInt = compiler->builder->CreateAnd(envInt, compiler->builder->getInt64(~(uint64_t)1));
                 auto* baseI8  = compiler->builder->CreateIntToPtr(baseInt, i8PtrTy);
-                envCaptureBase = compiler->builder->CreateBitCast(baseI8, closureStructTy->getPointerTo(), "closure");
+                envCaptureBase = compiler->builder->CreateBitCast(baseI8, cflat_llvm::PointerTo(closureStructTy), "closure");
             }
             else
             {
@@ -6076,7 +6076,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
         {
             auto* envArg    = fn->getArg((unsigned)fn->arg_size() - 1);
             auto* closurePtr = compiler->builder->CreateBitCast(
-                envArg, closureStructTy->getPointerTo(), "closure");
+                envArg, cflat_llvm::PointerTo(closureStructTy), "closure");
 
             for (size_t i = 0; i < captures.size(); i++)
             {
@@ -6106,7 +6106,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                     // Load pointer to the outer struct (the address stored in the closure).
                     auto* structTy  = compiler->GetDataStructure(cap.TV.TypeName).StructType;
                     auto* outerPtr  = compiler->builder->CreateLoad(
-                        structTy->getPointerTo(), fieldGEP, cap.Name + "_ref");
+                        cflat_llvm::PointerTo(structTy), fieldGEP, cap.Name + "_ref");
 
                     if (cap.TV.ConstArraySize > 0)
                     {
@@ -6118,7 +6118,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
                         captureTV.ConstArraySize = 0;  // inside the lambda this is a T*, not a T[N]
                         captureNV.Primary      = outerPtr;
                         captureNV.TypeAndValue = captureTV;
-                        captureNV.BaseType     = structTy->getPointerTo();
+                        captureNV.BaseType     = cflat_llvm::PointerTo(structTy);
                     }
                     else
                     {
@@ -6546,7 +6546,7 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
             return nullptr;
         }
 
-        llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, elemType->getPointerTo(), "elemnew");
+        llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, cflat_llvm::PointerTo(elemType), "elemnew");
         if (compiler->GetFunction(typeName))
         {
             llvm::Value* structVal = compiler->CreateOverloadedFunctionCall(typeName, {});

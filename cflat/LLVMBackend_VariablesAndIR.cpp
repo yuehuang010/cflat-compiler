@@ -1568,7 +1568,7 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
         else if (typeName == "nullptr")
         {
             // create a i8 null pointer
-            value = llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo());
+            value = llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty()));
         }
         else
         {

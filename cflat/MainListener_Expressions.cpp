@@ -2037,7 +2037,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // other assignments are untouched.
             if (operatorText == "=" && right && NamedVarIsString(namedVar)
                 && !namedVar.TypeAndValue.Pointer
-                && right->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                && right->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
             {
                 auto* c = llvm::dyn_cast<llvm::Constant>(right);
                 if (c && compiler->IsStringLiteralConstant(c))
@@ -4252,8 +4252,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
 
         llvm::Value* trueValue  = nullptr;
         llvm::Value* falseValue = nullptr;
-        llvm::BranchInst* trueBr  = nullptr;
-        llvm::BranchInst* falseBr = nullptr;
+        llvm::UncondBrInst* trueBr  = nullptr;
+        llvm::UncondBrInst* falseBr = nullptr;
         llvm::BasicBlock* trueEnd = nullptr;
         llvm::BasicBlock* falseEnd = nullptr;
         bool trueOwnedString  = false;
@@ -4669,7 +4669,7 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             bool rhsTempField = false;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
             LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
-            llvm::BranchInst* rhsBr = nullptr;
+            llvm::UncondBrInst* rhsBr = nullptr;
             try
             {
                 {
@@ -5381,7 +5381,7 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
 
 llvm::Value* MainListener::LoadTypeDescFromInterface(llvm::Value* interfaceValue, antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
-        auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
 
         llvm::Value* vtablePtr;
         if (interfaceValue->getType()->isStructTy())
@@ -5655,7 +5655,7 @@ llvm::Value* MainListener::GenerateSafeCast(llvm::Value* interfaceValue, const s
                                   const LLVMBackend::NamedVariable* srcBinding,
                                   const std::string& srcTypeNameIn) {
         auto* compiler = Compiler(ctx);
-        auto ptrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
         // targetTypeName resolution is LOAD-BEARING (see the matching comment in
         // GenerateIsCheck); targetTypeNameIn (unresolved) is kept for every message below so a
         // rejected alias is reported by the name the user wrote. srcTypeName's resolution is
@@ -5943,7 +5943,7 @@ void MainListener::EmitProgramToStreamWire(const std::string& progName,
         llvm::Value* progStorage, llvm::Value* streamStorage,
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
-        auto* i8PtrTy  = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy  = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
 
         auto* writeBytesFn = FindStreamMethodFn(compiler, "write_bytes");
         if (!writeBytesFn)
@@ -5967,7 +5967,7 @@ void MainListener::EmitProgramToStreamWire(const std::string& progName,
             auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
             llvm::IRBuilder<> b(bb);
             auto* streamTy = compiler->GetDataStructure("stream").StructType;
-            auto* selfPtr  = b.CreateBitCast(shim->getArg(2), streamTy->getPointerTo(), "stream_self");
+            auto* selfPtr  = b.CreateBitCast(shim->getArg(2), cflat_llvm::PointerTo(streamTy), "stream_self");
             b.CreateCall(writeBytesFn->getFunctionType(), writeBytesFn,
                 {selfPtr, shim->getArg(0), shim->getArg(1)});
             b.CreateRetVoid();
@@ -5999,7 +5999,7 @@ void MainListener::EmitStreamToProgramWire(llvm::Value* streamStorage,
         const std::string& progName, llvm::Value* progStorage,
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
-        auto* i8PtrTy  = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy  = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
 
         auto* readFn = FindStreamMethodFn(compiler, "read");
         if (!readFn)
@@ -6019,7 +6019,7 @@ void MainListener::EmitStreamToProgramWire(llvm::Value* streamStorage,
             auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", shim);
             llvm::IRBuilder<> b(bb);
             auto* streamTy = compiler->GetDataStructure("stream").StructType;
-            auto* selfPtr  = b.CreateBitCast(shim->getArg(0), streamTy->getPointerTo(), "stream_self");
+            auto* selfPtr  = b.CreateBitCast(shim->getArg(0), cflat_llvm::PointerTo(streamTy), "stream_self");
             auto* result   = b.CreateCall(readFn->getFunctionType(), readFn, {selfPtr}, "line");
             b.CreateRet(result);
         }
@@ -6053,7 +6053,7 @@ void MainListener::EmitStreamToProgramWire(llvm::Value* streamStorage,
                 auto* bb = llvm::BasicBlock::Create(*compiler->context, "entry", returnShim);
                 llvm::IRBuilder<> b(bb);
                 auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                auto* selfPtr  = b.CreateBitCast(returnShim->getArg(1), streamTy->getPointerTo(), "stream_self");
+                auto* selfPtr  = b.CreateBitCast(returnShim->getArg(1), cflat_llvm::PointerTo(streamTy), "stream_self");
                 b.CreateCall(returnFn->getFunctionType(), returnFn, {selfPtr, returnShim->getArg(0)});
                 b.CreateRetVoid();
             }
@@ -6082,7 +6082,7 @@ llvm::Value* MainListener::EmitArenaChannelShellAlloc(LLVMBackend* compiler) {
         auto dsIt = compiler->dataStructures.find(kArenaChannelType);
         if (dsIt == compiler->dataStructures.end()) return nullptr;
         auto* arenaTy    = dsIt->second.StructType;
-        auto* arenaPtrTy = arenaTy->getPointerTo();
+        auto* arenaPtrTy = cflat_llvm::PointerTo(arenaTy);
         auto* ctorFn     = compiler->GetFunction(kArenaChannelType);
         auto* mallocFn   = compiler->GetFunction("malloc");
         if (!ctorFn || !mallocFn) return llvm::Constant::getNullValue(arenaPtrTy);
@@ -6118,7 +6118,7 @@ void MainListener::EmitProgramToProgramArenaWire(const std::string& producerName
             return;
         }
         auto* arenaTy    = dsIt->second.StructType;
-        auto* arenaPtrTy = arenaTy->getPointerTo();
+        auto* arenaPtrTy = cflat_llvm::PointerTo(arenaTy);
 
         // Select the no-arg init() overload (idempotent; init(int, i64) also exists).
         llvm::Function* initFn = nullptr;
@@ -8369,7 +8369,7 @@ bool MainListener::EmitOneFieldInit(
 
         // Coerce char* string literals to the string struct type
         if (fieldType.TypeName == "string" && !fieldType.Pointer
-            && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+            && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
         {
             auto* c = llvm::dyn_cast<llvm::Constant>(val);
             if (c && compiler->IsStringLiteralConstant(c))
@@ -9081,7 +9081,7 @@ void MainListener::CoerceElementToString(
         LLVMBackend::NamedVariable& nv,
         llvm::Value*& val,
         antlr4::ParserRuleContext* ctx) {
-        if (!val || val->getType() != compiler->builder->getInt8Ty()->getPointerTo())
+        if (!val || val->getType() != cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
             return;
 
         llvm::Value* strVal = nullptr;
@@ -9324,7 +9324,7 @@ void MainListener::EmitPositionalFixedArrayIntoSlot(
                 nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
-                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
             {
                 LLVMBackend::NamedVariable tmp = nv;
                 CoerceElementToString(compiler, tmp, val, fi);
@@ -9669,7 +9669,7 @@ void MainListener::EmitGlobalFixedArrayInit(
                 // A `string` element written as a literal is a borrowed {ptr,len} pair: fold it
                 // exactly as a scalar `string g = "x";` global does instead of rejecting it.
                 if (val != nullptr && elemTy == llvm::StructType::getTypeByName(*compiler->context, "string")
-                    && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                    && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
                 {
                     auto* lit = llvm::dyn_cast<llvm::Constant>(val);
                     if (lit != nullptr && compiler->IsStringLiteralConstant(lit))
@@ -9968,7 +9968,7 @@ void MainListener::EmitArrayViewInferredInit(
                 nv, std::format("element {} of array '{}'", i, name), fi);
 
             if (tv.TypeName == "string"
-                && val->getType() == compiler->builder->getInt8Ty()->getPointerTo())
+                && val->getType() == cflat_llvm::PointerTo(compiler->builder->getInt8Ty()))
             {
                 LLVMBackend::NamedVariable tmp = nv;
                 CoerceElementToString(compiler, tmp, val, fi);
@@ -10222,7 +10222,7 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             return {};
         }
 
-        llvm::Type* ptrTy = elemType->getPointerTo();
+        llvm::Type* ptrTy = cflat_llvm::PointerTo(elemType);
         llvm::Value* typedPtr = compiler->builder->CreateBitCast(rawPtr, ptrTy, "newptr");
 
         // Assume-aligned: tell the optimizer the buffer is aligned so LoopVectorize
@@ -10918,7 +10918,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         }
 
         // 2. Convert free base to void*
-        auto* voidPtrTy = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* voidPtrTy = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
         llvm::Value* voidPtr = compiler->builder->CreateBitCast(freeBase, voidPtrTy, "freeptr");
 
         // 3. Call operator delete: class-specific -> global. When the static

@@ -471,7 +471,7 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
 
 void LLVMBackend::RegisterBuiltinString()
 {
-        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* i32Ty = builder->getInt32Ty();
 
         auto* strTy = llvm::StructType::getTypeByName(*context, "string");
@@ -516,10 +516,10 @@ void LLVMBackend::RegisterBuiltinString()
 void LLVMBackend::RegisterBuiltinStrConcat()
 {
         auto* i8Ty     = builder->getInt8Ty();
-        auto* ptrTy    = i8Ty->getPointerTo();
-        auto* ptrPtrTy = ptrTy->getPointerTo();
+        auto* ptrTy    = cflat_llvm::PointerTo(i8Ty);
+        auto* ptrPtrTy = cflat_llvm::PointerTo(ptrTy);
         auto* i32Ty    = builder->getInt32Ty();
-        auto* i32PtrTy = i32Ty->getPointerTo();
+        auto* i32PtrTy = cflat_llvm::PointerTo(i32Ty);
         auto* i64Ty    = builder->getInt64Ty();
         auto* strTy    = llvm::StructType::getTypeByName(*context, "string");
 
@@ -689,7 +689,7 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
         closureLifetimeRegistered = true;
 
         auto* closureTy = GetClosureFatPtrType();
-        auto* i8PtrTy   = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy   = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* voidTy    = llvm::Type::getVoidTy(*context);
         auto* i64Ty     = builder->getInt64Ty();
         auto* i32Ty     = builder->getInt32Ty();
@@ -702,8 +702,8 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
             auto* envInt  = b.CreatePtrToInt(env, i64Ty);
             auto* capAddr = b.CreateAnd(envInt, b.getInt64(~(uint64_t)1));
             auto* slotAddr = b.CreateSub(capAddr, b.getInt64(8));
-            auto* slotPtr = b.CreateIntToPtr(slotAddr, cleanupFnTy->getPointerTo()->getPointerTo());
-            return b.CreateLoad(cleanupFnTy->getPointerTo(), slotPtr, "cleanupfn");
+            auto* slotPtr = b.CreateIntToPtr(slotAddr, cflat_llvm::PointerTo(cflat_llvm::PointerTo(cleanupFnTy)));
+            return b.CreateLoad(cflat_llvm::PointerTo(cleanupFnTy), slotPtr, "cleanupfn");
         };
         auto envIsOwned = [&](llvm::IRBuilder<>& b, llvm::Value* env) -> llvm::Value* {
             auto* envInt = b.CreatePtrToInt(env, i64Ty);
@@ -718,7 +718,7 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
         // Destructor: destruct owning captures (via the header cleanup fn), free the heap env
         // (no-op if borrowed/null), and null the field.
         {
-            auto* dtorTy = llvm::FunctionType::get(voidTy, { closureTy->getPointerTo() }, false);
+            auto* dtorTy = llvm::FunctionType::get(voidTy, { cflat_llvm::PointerTo(closureTy) }, false);
             auto* dtorFn = llvm::Function::Create(dtorTy, llvm::Function::InternalLinkage,
                                                   "__closure_fat_ptr.dtor", *module);
             dtorFn->arg_begin()->setName("self");
@@ -735,7 +735,7 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
             b.SetInsertPoint(ownBB);
             auto* cleanup = loadCleanup(b, env);
             b.CreateCondBr(b.CreateICmpNE(cleanup,
-                llvm::ConstantPointerNull::get(cleanupFnTy->getPointerTo())), callBB, freeBB);
+                llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(cleanupFnTy))), callBB, freeBB);
 
             b.SetInsertPoint(callBB);
             b.CreateCall(cleanupFnTy, cleanup,
@@ -771,7 +771,7 @@ void LLVMBackend::EnsureClosureLifetimeRegistered()
             b.SetInsertPoint(ownBB);
             auto* cleanup = loadCleanup(b, newEnv);
             b.CreateCondBr(b.CreateICmpNE(cleanup,
-                llvm::ConstantPointerNull::get(cleanupFnTy->getPointerTo())), callBB, doneBB);
+                llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(cleanupFnTy))), callBB, doneBB);
 
             b.SetInsertPoint(callBB);
             b.CreateCall(cleanupFnTy, cleanup, { capPtrOf(b, newEnv), capPtrOf(b, env), b.getInt32(1) });
@@ -868,8 +868,8 @@ void LLVMBackend::EnsureStringDtorRegistered()
         if (!freeFn) return;   // neither available yet; destructor cannot be created
 
         auto* voidTy   = llvm::Type::getVoidTy(*context);
-        auto* ptrTy    = builder->getInt8Ty()->getPointerTo();
-        auto* strPtrTy = strTy->getPointerTo();
+        auto* ptrTy    = cflat_llvm::PointerTo(builder->getInt8Ty());
+        auto* strPtrTy = cflat_llvm::PointerTo(strTy);
 
         auto* dtorFnTy = llvm::FunctionType::get(voidTy, { strPtrTy }, false);
         auto* dtorFn   = llvm::Function::Create(dtorFnTy, llvm::Function::InternalLinkage, "string.dtor", *module);
@@ -1234,7 +1234,7 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
         // before member teardown), then each member's full destructor.
         auto* structTy = dsIt->second.StructType;
         auto* voidTy   = llvm::Type::getVoidTy(*context);
-        auto* selfPtrTy = structTy->getPointerTo();
+        auto* selfPtrTy = cflat_llvm::PointerTo(structTy);
         auto* fnTy = llvm::FunctionType::get(voidTy, { selfPtrTy }, false);
         auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
                                           typeName + ".dtorfull", *module);
@@ -1761,7 +1761,7 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
         const std::vector<std::pair<unsigned, std::string>>& owningFields)
 {
         if (owningFields.empty()) return nullptr;
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* i32Ty   = builder->getInt32Ty();
         auto* voidTy  = llvm::Type::getVoidTy(*context);
         auto* fnTy = llvm::FunctionType::get(voidTy, { i8PtrTy, i8PtrTy, i32Ty }, false);
@@ -1772,14 +1772,14 @@ llvm::Function* LLVMBackend::GenerateClosureCaptureCleanup(const std::string& na
         auto* cloneBB = llvm::BasicBlock::Create(*context, "clone", fn);
         auto* freeBB  = llvm::BasicBlock::Create(*context, "free", fn);
         builder->SetInsertPoint(entry);
-        auto* dstCaps = builder->CreateBitCast(fn->getArg(0), capTy->getPointerTo(), "dstcaps");
+        auto* dstCaps = builder->CreateBitCast(fn->getArg(0), cflat_llvm::PointerTo(capTy), "dstcaps");
         auto* isClone = builder->CreateICmpEQ(fn->getArg(2), builder->getInt32(1));
         builder->CreateCondBr(isClone, cloneBB, freeBB);
 
         // CLONE: dst currently aliases src's owning handles (byte copy); replace each with a
         // deep copy so dst owns independent buffers.
         builder->SetInsertPoint(cloneBB);
-        auto* srcCaps = builder->CreateBitCast(fn->getArg(1), capTy->getPointerTo(), "srccaps");
+        auto* srcCaps = builder->CreateBitCast(fn->getArg(1), cflat_llvm::PointerTo(capTy), "srccaps");
         for (const auto& [idx, tn] : owningFields)
         {
             NamedVariable argNV;

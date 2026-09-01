@@ -273,11 +273,11 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
 
         std::vector<llvm::Value*> callArgs = argVals;
         if (nonVoidIface)
-            callArgs.push_back(builder->CreateBitCast(retvalAlloca, builder->getInt8Ty()->getPointerTo()));
+            callArgs.push_back(builder->CreateBitCast(retvalAlloca, cflat_llvm::PointerTo(builder->getInt8Ty())));
 
-        auto* objPtr = builder->CreateBitCast(argVals[0], objTy->getPointerTo());
+        auto* objPtr = builder->CreateBitCast(argVals[0], cflat_llvm::PointerTo(objTy));
         auto* vtblFieldPtr = builder->CreateStructGEP(objTy, objPtr, 0);
-        auto* vtblPtr = builder->CreateLoad(vtblTy->getPointerTo(), vtblFieldPtr);
+        auto* vtblPtr = builder->CreateLoad(cflat_llvm::PointerTo(vtblTy), vtblFieldPtr);
         auto* slotPtr = builder->CreateStructGEP(vtblTy, vtblPtr, slotIdx);
         auto* fnPtr = builder->CreateLoad(BuildThinFnPtrType(*slot), slotPtr);
         llvm::Value* callRes = CreateIndirectCall(*slot, fnPtr, callArgs);
@@ -306,7 +306,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
 {
         auto* objTy = dataStructures[className].StructType;
         auto* vtblTy = dataStructures[vtblName].StructType;
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* i32Ty = builder->getInt32Ty();
 
         // GUID constants: IUnknown, IInspectable, IAgileObject (every free-threaded WinRT object
@@ -343,7 +343,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
             // Compare two 8-byte halves of the 16-byte GUID (unaligned loads are fine on x64).
             auto guidEq = [&](llvm::Value* a, llvm::GlobalVariable* g) -> llvm::Value* {
                 auto* i64Ty = b.getInt64Ty();
-                auto* i64PtrTy = i64Ty->getPointerTo();
+                auto* i64PtrTy = cflat_llvm::PointerTo(i64Ty);
                 auto* aLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(a, i64PtrTy), llvm::MaybeAlign(1));
                 auto* aHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), a, 8);
                 auto* aHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(aHiPtr, i64PtrTy), llvm::MaybeAlign(1));
@@ -360,16 +360,16 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
             b.CreateCondBr(match, matchBB, noBB);
 
             b.SetInsertPoint(matchBB);
-            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(self, cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
-            b.CreateStore(self, b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateStore(self, b.CreateBitCast(ppv, cflat_llvm::PointerTo(i8PtrTy)));
             b.CreateRet(b.getInt32(0));
 
             b.SetInsertPoint(noBB);
             b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
-                b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+                b.CreateBitCast(ppv, cflat_llvm::PointerTo(i8PtrTy)));
             b.CreateRet(b.getInt32((uint32_t)0x80004002));  // E_NOINTERFACE
         }
 
@@ -379,7 +379,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
         {
             auto* entry = llvm::BasicBlock::Create(*context, "entry", addRefFn);
             llvm::IRBuilder<> b(entry);
-            auto* objP = b.CreateBitCast(addRefFn->getArg(0), objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(addRefFn->getArg(0), cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
@@ -394,7 +394,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
             auto* doneBB = llvm::BasicBlock::Create(*context, "done", releaseFn);
             llvm::IRBuilder<> b(entry);
             auto* self = releaseFn->getArg(0);
-            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(self, cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
@@ -404,7 +404,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
             b.SetInsertPoint(freeBB);
             if (auto* dtor = GetOrCreateFullDestructor(className))
                 b.CreateCall(dtor->getFunctionType(), dtor,
-                    { b.CreateBitCast(self, objTy->getPointerTo()) });
+                    { b.CreateBitCast(self, cflat_llvm::PointerTo(objTy)) });
             if (auto* del = GetFunction("operator delete"))
                 b.CreateCall(del->getFunctionType(), del,
                     { b.CreateBitCast(self, del->getArg(0)->getType()) });
@@ -486,7 +486,7 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
                     llvm::Value* val;
                     if (implHResult) { hr = b.CreateExtractValue(call, { 0u }); val = b.CreateExtractValue(call, { 1u }); }
                     else             { hr = b.getInt32(0); val = call; }
-                    auto* retPtr = b.CreateBitCast(fn->getArg(static_cast<unsigned>(fn->arg_size() - 1)), val->getType()->getPointerTo());
+                    auto* retPtr = b.CreateBitCast(fn->getArg(static_cast<unsigned>(fn->arg_size() - 1)), cflat_llvm::PointerTo(val->getType()));
                     b.CreateStore(val, retPtr);
                     b.CreateRet(hr);
                 }
@@ -690,10 +690,10 @@ llvm::Value* LLVMBackend::EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::
             return nullptr;
         }
 
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
-        auto* typedObj = builder->CreateBitCast(objPtr, objTy->getPointerTo());
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+        auto* typedObj = builder->CreateBitCast(objPtr, cflat_llvm::PointerTo(objTy));
         auto* vtblFieldPtr = builder->CreateStructGEP(objTy, typedObj, 0);
-        auto* vtblPtr = builder->CreateLoad(vtblTy->getPointerTo(), vtblFieldPtr);
+        auto* vtblPtr = builder->CreateLoad(cflat_llvm::PointerTo(vtblTy), vtblFieldPtr);
         auto* slotPtr = builder->CreateStructGEP(vtblTy, vtblPtr, slotIdx);
         auto* fnPtr = builder->CreateLoad(BuildThinFnPtrType(*slot), slotPtr);
 
@@ -823,7 +823,7 @@ const cflat_winmd::Delegate* LLVMBackend::FindWinrtDelegate(const std::string& f
 
 std::vector<llvm::Type*> LLVMBackend::WinrtDelegateInvokeParamTypes(const cflat_winmd::Method& invoke)
 {
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         std::vector<llvm::Type*> out;
         for (const cflat_winmd::Param& p : invoke.params)
         {
@@ -840,7 +840,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
         const uint8_t iidBytes[16])
 {
         EnsureClosureLifetimeRegistered();
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* i32Ty = builder->getInt32Ty();
         auto* closureTy = GetClosureFatPtrType();
 
@@ -848,7 +848,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
         auto* vtblTy = llvm::StructType::create(*context,
             { i8PtrTy, i8PtrTy, i8PtrTy, i8PtrTy }, "winrtdel_" + mangled + "_vtbl");
         auto* objTy = llvm::StructType::create(*context,
-            { vtblTy->getPointerTo(), i32Ty, closureTy }, "winrtdel_" + mangled);
+            { cflat_llvm::PointerTo(vtblTy), i32Ty, closureTy }, "winrtdel_" + mangled);
 
         // GUID globals: IUnknown, IAgileObject, and this delegate's IID.
         uint8_t unkB[16], agileB[16];
@@ -876,7 +876,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
             auto* ppv = qiFn->getArg(2);
             auto guidEq = [&](llvm::Value* a, llvm::GlobalVariable* g) -> llvm::Value* {
                 auto* i64Ty = b.getInt64Ty();
-                auto* i64PtrTy = i64Ty->getPointerTo();
+                auto* i64PtrTy = cflat_llvm::PointerTo(i64Ty);
                 auto* aLo = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(a, i64PtrTy), llvm::MaybeAlign(1));
                 auto* aHiPtr = b.CreateConstInBoundsGEP1_64(b.getInt8Ty(), a, 8);
                 auto* aHi = b.CreateAlignedLoad(i64Ty, b.CreateBitCast(aHiPtr, i64PtrTy), llvm::MaybeAlign(1));
@@ -891,16 +891,16 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
             b.CreateCondBr(match, matchBB, noBB);
 
             b.SetInsertPoint(matchBB);
-            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(self, cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
-            b.CreateStore(self, b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+            b.CreateStore(self, b.CreateBitCast(ppv, cflat_llvm::PointerTo(i8PtrTy)));
             b.CreateRet(b.getInt32(0));
 
             b.SetInsertPoint(noBB);
             b.CreateStore(llvm::ConstantPointerNull::get(i8PtrTy),
-                b.CreateBitCast(ppv, i8PtrTy->getPointerTo()));
+                b.CreateBitCast(ppv, cflat_llvm::PointerTo(i8PtrTy)));
             b.CreateRet(b.getInt32((uint32_t)0x80004002));   // E_NOINTERFACE
         }
 
@@ -908,7 +908,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
         auto* addRefFn = makeFn("AddRef", llvm::FunctionType::get(i32Ty, { i8PtrTy }, false));
         {
             llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", addRefFn));
-            auto* objP = b.CreateBitCast(addRefFn->getArg(0), objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(addRefFn->getArg(0), cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Add, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
@@ -923,7 +923,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
             auto* doneBB = llvm::BasicBlock::Create(*context, "done", releaseFn);
             llvm::IRBuilder<> b(entry);
             auto* self = releaseFn->getArg(0);
-            auto* objP = b.CreateBitCast(self, objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(self, cflat_llvm::PointerTo(objTy));
             auto* rcP = b.CreateStructGEP(objTy, objP, 1);
             auto* old = b.CreateAtomicRMW(llvm::AtomicRMWInst::Sub, rcP, b.getInt32(1),
                 llvm::MaybeAlign(), llvm::AtomicOrdering::Monotonic);
@@ -948,7 +948,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
         auto* invokeFn = makeFn("Invoke", llvm::FunctionType::get(i32Ty, invokeSig, false));
         {
             llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", invokeFn));
-            auto* objP = b.CreateBitCast(invokeFn->getArg(0), objTy->getPointerTo());
+            auto* objP = b.CreateBitCast(invokeFn->getArg(0), cflat_llvm::PointerTo(objTy));
             auto* cloP = b.CreateStructGEP(objTy, objP, 2);
             auto* code = b.CreateLoad(i8PtrTy, b.CreateStructGEP(closureTy, cloP, 0), "clo_code");
             llvm::Value* env = b.CreateLoad(i8PtrTy, b.CreateStructGEP(closureTy, cloP, 1), "clo_env");
@@ -962,7 +962,7 @@ void LLVMBackend::BuildWinrtDelegateType(const std::string& mangled, const cflat
             std::vector<llvm::Type*> cloSig = paramTys;
             cloSig.push_back(i8PtrTy);   // trailing env
             auto* cloFnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(*context), cloSig, false);
-            auto* cloFn = b.CreateBitCast(code, cloFnTy->getPointerTo(), "clo_fn");
+            auto* cloFn = b.CreateBitCast(code, cflat_llvm::PointerTo(cloFnTy), "clo_fn");
             std::vector<llvm::Value*> cloArgs;
             for (size_t i = 0; i < paramTys.size(); i++) cloArgs.push_back(invokeFn->getArg(1 + (unsigned)i));
             cloArgs.push_back(env);
@@ -1051,7 +1051,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
             LogErrorMessage("winrtDelegate: 'operator new' unavailable (import a core library first)");
             return nullptr;
         }
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* closureTy = GetClosureFatPtrType();
 
         // Allocate the object.
@@ -1060,7 +1060,7 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         szArg.Primary = builder->getInt64(sz);
         szArg.BaseType = builder->getInt64Ty();
         auto* raw = CreateOverloadedFunctionCall("operator new", { szArg });
-        auto* objP = builder->CreateBitCast(raw, objTy->getPointerTo(), "winrtdel.obj");
+        auto* objP = builder->CreateBitCast(raw, cflat_llvm::PointerTo(objTy), "winrtdel.obj");
 
         // lpVtbl = &vtbl, refcount = 1.
         builder->CreateStore(builder->CreateBitCast(vtblGlobal, objTy->getStructElementType(0)),
@@ -1341,7 +1341,7 @@ llvm::Value* LLVMBackend::EmitInterfaceFieldAddress(llvm::Value* fatVal, const s
         if (const auto* methods = FindInterface(ifaceName))
             methodCount = methods->size();
 
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
         llvm::Value* dataPtr   = builder->CreateExtractValue(fatVal, { 1u }, "iface_data");
 
@@ -1358,7 +1358,7 @@ llvm::Value* LLVMBackend::EmitInterfaceFieldAddress(llvm::Value* fatVal, const s
 void LLVMBackend::DeleteInterfaceValue(llvm::Value* fatVal, const std::string& ifaceName, llvm::Value* fatStorage)
 {
         auto fatTy = GetFatPtrType();
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
         llvm::Value* vtablePtr = builder->CreateExtractValue(fatVal, { 0u }, "iface_vtable");
         llvm::Value* dataPtr   = builder->CreateExtractValue(fatVal, { 1u }, "iface_data");
@@ -1470,7 +1470,7 @@ llvm::Function* LLVMBackend::GetOrDeclareStrlen()
         if (auto* fn = module->getFunction("strlen"))
             return fn;
         auto* i64Ty = builder->getInt64Ty();
-        auto* ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto* ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* fnTy = llvm::FunctionType::get(i64Ty, { ptrTy }, false);
         return llvm::Function::Create(fnTy, llvm::Function::ExternalLinkage, "strlen", module.get());
     }
@@ -1493,7 +1493,7 @@ llvm::Value* LLVMBackend::EmitOwnedStringDeepCopy(llvm::Value* value)
         szArg.Primary  = allocSize;
         szArg.BaseType = builder->getInt64Ty();
         auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
-        auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "cpybuf");
+        auto* heapPtr = builder->CreateBitCast(rawPtr, cflat_llvm::PointerTo(builder->getInt8Ty()), "cpybuf");
         // Copy exactly _len bytes (0 is a safe no-op for an empty source), then NUL-terminate.
         builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), len64);
         auto* termPtr = builder->CreateInBoundsGEP(builder->getInt8Ty(), heapPtr, { len64 }, "cpyterm");
@@ -1729,7 +1729,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 {
                     auto* dataField = builder->CreateStructGEP(GetFatPtrType(), srcStorage, 1);
                     builder->CreateStore(
-                        llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo()), dataField);
+                        llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty())), dataField);
                     if (!args[i].CallerName.empty() && !isFieldAccess)
                         MarkVariableMoved(args[i].CallerName);
                 }
@@ -1766,7 +1766,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             else
                             {
                                 auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
-                                auto* i8ptrTy = builder->getInt8Ty()->getPointerTo();
+                                auto* i8ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
                                 builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
                             }
                         }
@@ -1987,7 +1987,7 @@ llvm::Value* LLVMBackend::LowerAliasByPointerArg(const NamedVariable& arg, const
         llvm::Value* value = arg.Primary != nullptr ? arg.Primary : LoadArgStorage(arg);
         value = LowerByValueArg(value, param, arg);
         if (value == nullptr)
-            return llvm::ConstantPointerNull::get(paramTy->getPointerTo());
+            return llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(paramTy));
         auto* temp = AllocaAtEntry(paramTy, nullptr, "aliasarg");
         CreateAssignment(value, temp, arg.TypeAndValue.IsUnsignedInteger() != -1);
         // The materialized slot holds an rvalue nothing owns; an `alias` param borrows and never
@@ -2041,7 +2041,7 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 CheckThinFnPtrArgProvenance(value, arg, param.VariableName);
         }
         if (param.TypeName == "string" && !param.Pointer
-            && value && value->getType() == builder->getInt8Ty()->getPointerTo())
+            && value && value->getType() == cflat_llvm::PointerTo(builder->getInt8Ty()))
         {
             // Implicit char* -> string coercion: string literal or char* passed to a string param.
             auto* c = llvm::dyn_cast<llvm::Constant>(value);
@@ -2087,7 +2087,7 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 // null buffer. Reachable without any global (`string s = default; sink(move s);`)
                 // and also as the re-initialized state q11 leaves in program-lifetime storage.
                 auto* srcIsNull = builder->CreateICmpEQ(
-                    srcPtr, llvm::ConstantPointerNull::get(builder->getInt8Ty()->getPointerTo()),
+                    srcPtr, llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty())),
                     "movearg.empty");
                 auto* skipCopy = builder->CreateOr(alreadyOwned, srcIsNull, "movearg.nocopy");
                 auto* transferBB = builder->GetInsertBlock();
@@ -2108,7 +2108,7 @@ llvm::Value* LLVMBackend::LowerByValueArg(llvm::Value* value, const TypeAndValue
                 szArg.Primary  = allocSize;
                 szArg.BaseType = builder->getInt64Ty();
                 auto* rawPtr  = CreateOverloadedFunctionCall("operator new", { szArg });
-                auto* heapPtr = builder->CreateBitCast(rawPtr, builder->getInt8Ty()->getPointerTo(), "litbuf");
+                auto* heapPtr = builder->CreateBitCast(rawPtr, cflat_llvm::PointerTo(builder->getInt8Ty()), "litbuf");
                 builder->CreateMemCpy(heapPtr, llvm::MaybeAlign(1), srcPtr, llvm::MaybeAlign(1), allocSize);
                 auto* ownedLen = builder->CreateOr(srcLen, builder->getInt32(0x80000000), "ownedlen");
                 llvm::Value* copyVal = llvm::UndefValue::get(strTy);
@@ -2416,7 +2416,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         const NullIfaceDispatchSite* site)
 {
         auto fatTy = GetFatPtrType();
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
         auto vtablePtrField = builder->CreateStructGEP(fatTy, ifacePtr, 0);
         auto vtablePtr = builder->CreateLoad(ptrTy, vtablePtrField);
@@ -2469,13 +2469,13 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         for (const auto& p : methodInfo->Parameters)
         {
             // Same alias-borrow param ABI the definition emitted (GetFunctionType).
-            paramTypes.push_back(ParameterIsAliasByPointer(p) ? GetType(p)->getPointerTo()
+            paramTypes.push_back(ParameterIsAliasByPointer(p) ? cflat_llvm::PointerTo(GetType(p))
                                                               : GetType(p));
             if (ParameterCarriesRawArrayCount(p))
                 paramTypes.push_back(builder->getInt64Ty());
         }
         if (ReturnCarriesRawArrayCount(methodInfo->ReturnType))
-            paramTypes.push_back(builder->getInt64Ty()->getPointerTo());
+            paramTypes.push_back(cflat_llvm::PointerTo(builder->getInt64Ty()));
         auto fnTy = llvm::FunctionType::get(retTy, paramTypes, false);
 
         // callArgNVs is arity-matched to Parameters by the resolver, so no clamp here: a

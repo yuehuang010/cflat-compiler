@@ -486,7 +486,7 @@ llvm::StructType* LLVMBackend::GetFatPtrType() const
         const char* fatPtrName = "__iface_fat_ptr";
         if (auto* existing = llvm::StructType::getTypeByName(*context, fatPtrName))
             return existing;
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         return llvm::StructType::create(*context, { ptrTy, ptrTy }, fatPtrName);
     }
 
@@ -494,7 +494,7 @@ llvm::StructType* LLVMBackend::GetClosureFatPtrType() const
 {
         const char* name = "__closure_fat_ptr";
         if (auto* existing = llvm::StructType::getTypeByName(*context, name)) return existing;
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         return llvm::StructType::create(*context, { ptrTy, ptrTy }, name);
     }
 
@@ -504,7 +504,7 @@ llvm::Function* LLVMBackend::GetOrCreateFunctionShim(llvm::Function* original)
         if (auto* existing = module->getFunction(shimName)) return existing;
 
         auto* origTy  = original->getFunctionType();
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
         std::vector<llvm::Type*> shimParamTypes;
         for (auto* paramTy : origTy->params())
@@ -549,7 +549,7 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
 
         if (auto* existing = module->getFunction(key)) return existing;
 
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         std::vector<llvm::Type*> thunkParams;
         for (auto* pt : cFnTy->params()) thunkParams.push_back(pt);
         thunkParams.push_back(i8PtrTy); // env (trailing) carries the real C fn ptr at runtime
@@ -559,7 +559,7 @@ llvm::Function* LLVMBackend::GetOrCreateCFuncPtrThunk(llvm::FunctionType* cFnTy)
 
         llvm::IRBuilder<> b(llvm::BasicBlock::Create(*context, "entry", thunk));
         auto* envArg = thunk->getArg((unsigned)thunk->arg_size() - 1);
-        auto* fnPtr  = b.CreateBitCast(envArg, cFnTy->getPointerTo(), "cfn");
+        auto* fnPtr  = b.CreateBitCast(envArg, cflat_llvm::PointerTo(cFnTy), "cfn");
         std::vector<llvm::Value*> callArgs;
         for (unsigned i = 0; i + 1 < thunk->arg_size(); ++i) callArgs.push_back(thunk->getArg(i));
         if (cFnTy->getReturnType()->isVoidTy())
@@ -632,7 +632,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
                 auto* pairTy = llvm::StructType::get(*context, { slot.coerceTy, slot.coerceTy2 });
                 auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
                 b.CreateStore(value, copy);
-                auto* pairPtr = b.CreateBitCast(copy, pairTy->getPointerTo());
+                auto* pairPtr = b.CreateBitCast(copy, cflat_llvm::PointerTo(pairTy));
                 auto* pair = b.CreateLoad(pairTy, pairPtr);
                 loweredArgs.push_back(b.CreateExtractValue(pair, { 0u }));
                 loweredArgs.push_back(b.CreateExtractValue(pair, { 1u }));
@@ -641,7 +641,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
             {
                 auto* copy = b.CreateAlloca(slot.structTy, nullptr, "abi.coerce");
                 b.CreateStore(value, copy);
-                auto* coercePtr = b.CreateBitCast(copy, slot.coerceTy->getPointerTo());
+                auto* coercePtr = b.CreateBitCast(copy, cflat_llvm::PointerTo(slot.coerceTy));
                 loweredArgs.push_back(b.CreateLoad(slot.coerceTy, coercePtr));
             }
         }
@@ -655,7 +655,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
         else
         {
             auto* resultSlot = b.CreateAlloca(recipe.retSlot.structTy, nullptr, "abi.ret");
-            auto* resultPtr = b.CreateBitCast(resultSlot, call->getType()->getPointerTo());
+            auto* resultPtr = b.CreateBitCast(resultSlot, cflat_llvm::PointerTo(call->getType()));
             b.CreateStore(call, resultPtr);
             b.CreateRet(b.CreateLoad(recipe.retSlot.structTy, resultSlot));
         }
@@ -664,7 +664,7 @@ llvm::Function* LLVMBackend::GetOrCreateCAbiFunctionThunk(const FunctionSymbol& 
 
 llvm::Value* LLVMBackend::WrapCFuncPtrAsFatStruct(llvm::Value* cFnPtrValue, const TypeAndValue& fpTV)
 {
-        auto* i8PtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         // Build the C-side LLVM FunctionType from the TypeAndValue (no env arg).
         std::vector<llvm::Type*> paramTypes;
         for (const auto& p : fpTV.FuncPtrParams)
@@ -733,7 +733,7 @@ llvm::Value* LLVMBackend::EmitFuncToFunctionLowering(llvm::Value* fatVal, const 
         auto* thinTy   = llvm::cast<llvm::PointerType>(BuildThinFnPtrType(thinTV));
         auto* codeThin = builder->CreateBitCast(code, thinTy, "thinfn");
         auto* nullThin = llvm::ConstantPointerNull::get(thinTy);
-        auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy  = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* envNull  = builder->CreateICmpEQ(env, llvm::ConstantPointerNull::get(i8PtrTy), "env_isnull");
         return builder->CreateSelect(envNull, codeThin, nullThin, "tofn");
     }
@@ -771,7 +771,7 @@ llvm::Value* LLVMBackend::CoerceToFuncPtrReturn(llvm::Value* val, const TypeAndV
 
 llvm::Value* LLVMBackend::WidenThinToFat(llvm::Value* thinPtr)
 {
-        auto* i8PtrTy   = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy   = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* codeI8    = builder->CreateBitCast(thinPtr, i8PtrTy, "thin_code_i8");
         auto* nullEnv   = llvm::ConstantPointerNull::get(i8PtrTy);
         auto* closureTy = GetClosureFatPtrType();
@@ -786,7 +786,7 @@ llvm::Value* LLVMBackend::WrapBareValueAsFatStruct(llvm::Function* original)
         if (const auto* symbol = FindSymbolForFunction(original);
             symbol != nullptr && symbol->External && symbol->Recipe.hasLowering)
             original = GetOrCreateCAbiFunctionThunk(*symbol, FuncPtrSigOfSymbol(*symbol));
-        auto* i8PtrTy  = builder->getInt8Ty()->getPointerTo();
+        auto* i8PtrTy  = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* shim     = GetOrCreateFunctionShim(original);
         auto* shimAsI8 = builder->CreateBitCast(shim, i8PtrTy, "shim_i8");
         auto* nullEnv  = llvm::ConstantPointerNull::get(i8PtrTy);
@@ -875,7 +875,7 @@ void LLVMBackend::AppendInterfaceFieldOffsetSlots(const std::string& structName,
         const auto* ifields = GetInterfaceFields(ifaceName);
         if (ifields == nullptr || ifields->empty()) return;
 
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         const llvm::StructLayout* layout = (structTy != nullptr && !structTy->isOpaque())
             ? module->getDataLayout().getStructLayout(structTy) : nullptr;
 
@@ -1164,7 +1164,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
             return nullptr;
         }
 
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         std::vector<llvm::Constant*> entries;
 
         if (pd.typeDescriptor == nullptr)
@@ -1229,7 +1229,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
             return nullptr;
         }
 
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         std::vector<llvm::Constant*> entries;
 
         // First entry: pointer to unique per-struct type descriptor global (for 'is'/'as' checks)
@@ -1285,7 +1285,7 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
 llvm::Value* LLVMBackend::BuildInterfaceFatValue(llvm::GlobalVariable* vtable, llvm::Value* dataPtr)
 {
         auto fatTy = GetFatPtrType();
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         llvm::Value* v = llvm::UndefValue::get(fatTy);
         v = builder->CreateInsertValue(v, builder->CreateBitCast(vtable, ptrTy), { 0u });
         v = builder->CreateInsertValue(v, builder->CreateBitCast(dataPtr, ptrTy), { 1u });
@@ -1752,7 +1752,7 @@ void LLVMBackend::EmitInterfaceReboxBody(DeferredInterfaceRebox site)
         const std::string& dstIface = site.DstInterface;
 
         auto fatTy = GetFatPtrType();
-        auto ptrTy = builder->getInt8Ty()->getPointerTo();
+        auto ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
         currentFunction = fn;
         SwitchToBlock(llvm::BasicBlock::Create(*context, "entry", fn));

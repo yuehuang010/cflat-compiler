@@ -802,7 +802,7 @@ void MainListener::EmitProgramSyntheticTeardown(const std::string& name, llvm::V
         auto* dtorFn      = compiler->builder->GetInsertBlock()->getParent();
         auto* progType    = compiler->dataStructures[name].StructType;
         auto* fatTy       = compiler->GetFatPtrType();   // {i8*, i8*}
-        auto* voidPtrType = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* voidPtrType = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
         auto* freeFn      = compiler->GetFunction("free");
         if (!progType || !freeFn) return;
 
@@ -870,7 +870,7 @@ void MainListener::EmitProgramSyntheticTeardown(const std::string& name, llvm::V
             auto* arenaDestroyFn = FindMethodOf("destroy", kArenaChannelType);
             if (arenaTy && arenaDestroyFn)
             {
-                auto* arenaPtrTy = arenaTy->getPointerTo();
+                auto* arenaPtrTy = cflat_llvm::PointerTo(arenaTy);
                 auto* inboxGEP = compiler->builder->CreateStructGEP(
                     progType, thisArg, inboxArenaIdx, "inbox_arena_gep");
                 auto* inboxPtr = compiler->builder->CreateLoad(arenaPtrTy, inboxGEP, "inbox_arena_ptr");
@@ -978,9 +978,9 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             return;
         }
 
-        auto* progPtrType    = progType->getPointerTo();
-        auto* defAllocPtrTy  = defAllocType->getPointerTo();
-        auto* voidPtrType    = compiler->builder->getInt8Ty()->getPointerTo();
+        auto* progPtrType    = cflat_llvm::PointerTo(progType);
+        auto* defAllocPtrTy  = cflat_llvm::PointerTo(defAllocType);
+        auto* voidPtrType    = cflat_llvm::PointerTo(compiler->builder->getInt8Ty());
         auto* i32Type        = llvm::Type::getInt32Ty(*compiler->context);
         auto* i64Type        = llvm::Type::getInt64Ty(*compiler->context);
 
@@ -1157,7 +1157,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
 
             // Cast void* ctx to __RunArgs_Name*
             auto* argsPacket = compiler->builder->CreateBitCast(
-                ctxArg, runArgsType->getPointerTo(), "args_packet");
+                ctxArg, cflat_llvm::PointerTo(runArgsType), "args_packet");
 
             // Load self (Name*) from field 0
             auto* selfGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 0, "self_gep");
@@ -1351,7 +1351,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
                     mallocFn->getFunctionType(), mallocFn, {argvBytes}, "argv_raw");
                 compiler->builder->CreateStore(argvRaw, argvHolderAlloca);
                 argvPtrVal = compiler->builder->CreateBitCast(
-                    argvRaw, voidPtrType->getPointerTo(), "argv_ptr");
+                    argvRaw, cflat_llvm::PointerTo(voidPtrType), "argv_ptr");
 
                 // Loop: argv[i] = data[i]._ptr  (string field 0 is i8* _ptr)
                 auto* iAlloca   = compiler->AllocaAtEntry(i32Type, nullptr, "argv_i");
@@ -1477,7 +1477,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
                 }
                 if (outIdx != (unsigned)-1 && streamTy && closeFn && autoCloseIdx != (unsigned)-1)
                 {
-                    auto* streamPtrTy = streamTy->getPointerTo();
+                    auto* streamPtrTy = cflat_llvm::PointerTo(streamTy);
                     auto* outGEP = compiler->builder->CreateStructGEP(progType, self, outIdx, "out_field_gep");
                     auto* outPtr = compiler->builder->CreateLoad(streamPtrTy, outGEP, "out_stream");
                     auto* outNotNull = compiler->builder->CreateICmpNE(
@@ -1627,7 +1627,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             auto* pkgSize = compiler->GetTypeSizeBytes(runArgsType);
             auto* pkgRaw  = compiler->builder->CreateCall(
                 mallocFn->getFunctionType(), mallocFn, {pkgSize}, "pkg_raw");
-            auto* pkg = compiler->builder->CreateBitCast(pkgRaw, runArgsType->getPointerTo(), "pkg");
+            auto* pkg = compiler->builder->CreateBitCast(pkgRaw, cflat_llvm::PointerTo(runArgsType), "pkg");
 
             // Store this -> pkg->self (field 0)
             auto* selfGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 0, "pkg_self_gep");
@@ -2170,7 +2170,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             if (outFieldIndex != (unsigned)-1)
             {
                 auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
+                auto* nullStream = llvm::Constant::getNullValue(cflat_llvm::PointerTo(streamTy));
                 structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
@@ -2181,7 +2181,7 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
                 llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
-                if (!shell) shell = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                if (!shell) shell = llvm::Constant::getNullValue(cflat_llvm::PointerTo(arenaTy));
                 structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, shell, outboxFieldIndex);
             }
@@ -2539,7 +2539,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             if (outFieldIndex != (unsigned)-1)
             {
                 auto* streamTy = compiler->GetDataStructure("stream").StructType;
-                auto* nullStream = llvm::Constant::getNullValue(streamTy->getPointerTo());
+                auto* nullStream = llvm::Constant::getNullValue(cflat_llvm::PointerTo(streamTy));
                 structVal = compiler->CreateInsertValue(structVal, nullStream, outFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, nullStream, inStreamFieldIndex);
             }
@@ -2550,7 +2550,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             {
                 auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
                 llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
-                if (!shell) shell = llvm::Constant::getNullValue(arenaTy->getPointerTo());
+                if (!shell) shell = llvm::Constant::getNullValue(cflat_llvm::PointerTo(arenaTy));
                 structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
                 structVal = compiler->CreateInsertValue(structVal, shell, outboxFieldIndex);
             }

@@ -1260,7 +1260,7 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // freed via __delete_aligned to match. Two sources: the element TYPE's own alignment
         // (`struct alignas(64) T`), recovered here from the static type just like the `delete`
         // path does, and any per-site `new T[n] alignas(N)` excess carried on the local.
-        auto* voidPtrTy = builder->getInt8Ty()->getPointerTo();
+        auto* voidPtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
         auto* voidPtr = builder->CreateBitCast(ptrVal, voidPtrTy);
         // The DECLARED clause counts too: a global has no mutable NamedVariable, so its tracked
         // AllocAlignment is never established and only 'alignas(0, N)' on the declaration records
@@ -3191,7 +3191,7 @@ void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& t
 
         // Over-aligned blocks come from the aligned allocator and must be freed through
         // __delete_aligned - the same rule as EmitOwningPtrCleanup and the `delete` site.
-        auto* voidPtr = builder->CreateBitCast(ptrVal, builder->getInt8Ty()->getPointerTo());
+        auto* voidPtr = builder->CreateBitCast(ptrVal, cflat_llvm::PointerTo(builder->getInt8Ty()));
         uint64_t effAlign = allocAlign;
         if (!typeName.empty())
         {
