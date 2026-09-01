@@ -64,7 +64,7 @@ if ! bash "$SCRIPT_DIR/test_lsp.sh" Release; then
 fi
 
 banner "BUILD: vscode-extension"
-if ! bash "$SCRIPT_DIR/vscode-extension/build.sh"; then
+if ! bash "$SCRIPT_DIR/vscode-extension/build.sh" ci; then
     echo "BUILD FAILED: vscode-extension"
     OVERALL_ERRORS=$((OVERALL_ERRORS + 1))
 fi

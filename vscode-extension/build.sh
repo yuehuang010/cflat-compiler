@@ -12,18 +12,22 @@ if ! command -v node >/dev/null 2>&1; then
     exit 1
 fi
 
-# Install deps if node_modules is missing OR out of sync with package.json.
-# A bare "node_modules exists" check misses partial installs (e.g. esbuild
-# absent), so also probe a known build-time dependency.
-if [ ! -d node_modules ] || [ ! -d node_modules/esbuild ]; then
-    echo "[1/3] Installing npm dependencies..."
-    if ! npm install; then
-        echo "ERROR: npm install failed."
-        exit 1
-    fi
+# Sync deps unconditionally - npm decides whether anything needs doing. A
+# hand-rolled "is node_modules current" probe only catches deps someone
+# remembered to add a line for, and silently skips newly added ones.
+# "build.sh ci" installs from the lockfile only: reproducible, fails on
+# lockfile drift, never rewrites package-lock.json. Costs a full reinstall,
+# so the dev loop gets the incremental npm install instead.
+if [ "$1" = "ci" ]; then
+    echo "[1/3] Installing npm dependencies from lockfile (npm ci)..."
+    NPM_INSTALL_CMD="ci"
 else
-    echo "[1/3] npm dependencies already installed. Skipping npm install."
-    echo "       Run \"npm install\" manually if you need to refresh packages."
+    echo "[1/3] Syncing npm dependencies..."
+    NPM_INSTALL_CMD="install"
+fi
+if ! npm "$NPM_INSTALL_CMD" --no-audit --no-fund; then
+    echo "ERROR: npm dependency install failed."
+    exit 1
 fi
 
 # Compile TypeScript

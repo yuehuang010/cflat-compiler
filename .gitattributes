@@ -7,6 +7,12 @@
 # (reading /mnt/c), and CRLF would break the shebang / `set` parsing there.
 *.sh text eol=lf
 
+# Generated l10n bundles: vscode-l10n-dev always writes LF and has no EOL
+# switch, so a CRLF checkout leaves them permanently dirty after every build.
+# Check them out as LF to match the generator.
+vscode-extension/l10n/*.json text eol=lf
+vscode-extension/package.nls*.json text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #

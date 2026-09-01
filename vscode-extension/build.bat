@@ -13,26 +13,22 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Install deps if node_modules is missing OR out of sync with package.json.
-REM A bare "exist node_modules" check misses partial installs (e.g. esbuild
-REM absent), so also probe a known build-time dependency.
-if not exist node_modules (
-    set NEED_INSTALL=1
-) else if not exist node_modules\esbuild (
-    set NEED_INSTALL=1
+REM Sync deps unconditionally - npm decides whether anything needs doing. A
+REM hand-rolled "is node_modules current" probe only catches deps someone
+REM remembered to add a line for, and silently skips newly added ones.
+REM "build.bat ci" installs from the lockfile only: reproducible, fails on
+REM lockfile drift, never rewrites package-lock.json. Costs a full reinstall,
+REM so the dev loop gets the incremental npm install instead.
+if /i "%~1"=="ci" (
+    echo [1/2] Installing npm dependencies from lockfile ^(npm ci^)...
+    call npm ci --no-audit --no-fund
 ) else (
-    set NEED_INSTALL=0
+    echo [1/2] Syncing npm dependencies...
+    call npm install --no-audit --no-fund
 )
-if "%NEED_INSTALL%"=="1" (
-    echo [1/2] Installing npm dependencies...
-    call npm install
-    if errorlevel 1 (
-        echo ERROR: npm install failed.
-        exit /b 1
-    )
-) else (
-    echo [1/2] npm dependencies already installed. Skipping npm install.
-    echo        Run "npm install" manually if you need to refresh packages.
+if errorlevel 1 (
+    echo ERROR: npm dependency install failed.
+    exit /b 1
 )
 
 REM Compile TypeScript

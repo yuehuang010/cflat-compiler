@@ -66,7 +66,7 @@ echo.
 echo =========================================================================
 echo BUILD: vscode-extension
 echo =========================================================================
-call "%~dp0vscode-extension\build.bat"
+call "%~dp0vscode-extension\build.bat" ci
 if errorlevel 1 (
     echo BUILD FAILED: vscode-extension
     set /a OVERALL_ERRORS+=1
