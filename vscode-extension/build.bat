@@ -36,7 +36,7 @@ if "%NEED_INSTALL%"=="1" (
 )
 
 REM Compile TypeScript
-echo [2/3] Compiling TypeScript...
+echo [2/3] Regenerating l10n bundles and compiling TypeScript...
 call npm run compile
 if errorlevel 1 (
     echo ERROR: TypeScript compilation failed.

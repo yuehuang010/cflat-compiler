@@ -1,7 +1,7 @@
 {
   "name": "cflat-language",
-  "displayName": "cflat Language Support",
-  "description": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
+  "displayName": "%extension.displayName%",
+  "description": "%extension.description%",
   "version": "0.12.0",
   "publisher": "cflat",
   "engines": {
@@ -57,12 +57,12 @@
             "properties": {
               "program": {
                 "type": "string",
-                "description": "Path to the .cb source file to compile and debug.",
+                "description": "%cflat.debug.program.description%",
                 "default": "${file}"
               },
               "args": {
                 "type": "array",
-                "description": "Command-line arguments passed to the compiled program.",
+                "description": "%cflat.debug.args.description%",
                 "items": {
                   "type": "string"
                 },
@@ -70,12 +70,12 @@
               },
               "cwd": {
                 "type": "string",
-                "description": "Working directory for the compiled program. Defaults to the directory of the output .exe.",
+                "description": "%cflat.debug.cwd.description%",
                 "default": "${fileDirname}"
               },
               "stopAtEntry": {
                 "type": "boolean",
-                "description": "Break on entry to main.",
+                "description": "%cflat.debug.stopAtEntry.description%",
                 "default": false
               },
               "console": {
@@ -85,7 +85,7 @@
                   "externalTerminal",
                   "internalConsole"
                 ],
-                "description": "Where to host the program's stdio.",
+                "description": "%cflat.debug.console.description%",
                 "default": "integratedTerminal"
               }
             }
@@ -103,8 +103,8 @@
         ],
         "configurationSnippets": [
           {
-            "label": "cflat: Run current file",
-            "description": "Compile and debug the active .cb file with cppvsdbg.",
+            "label": "%cflat.debug.snippet.label%",
+            "description": "%cflat.debug.snippet.description%",
             "body": {
               "type": "cflat",
               "request": "launch",
@@ -120,31 +120,31 @@
     "commands": [
       {
         "command": "cflat.runDiagnostics",
-        "title": "cflat: Run Diagnostics on Current File"
+        "title": "%cflat.runDiagnostics.title%"
       },
       {
         "command": "cflat.showLlvmIr",
-        "title": "CFlat: Show LLVM IR"
+        "title": "%cflat.showLlvmIr.title%"
       },
       {
         "command": "cflat.showAssembly",
-        "title": "CFlat: Show Assembly"
+        "title": "%cflat.showAssembly.title%"
       },
       {
         "command": "cflat.showOptimizationInfo",
-        "title": "CFlat: Refresh Optimization Info"
+        "title": "%cflat.showOptimizationInfo.title%"
       },
       {
         "command": "cflat.toggleOptimizationInfo",
-        "title": "CFlat: Toggle Optimization Info"
+        "title": "%cflat.toggleOptimizationInfo.title%"
       },
       {
         "command": "cflat.showOutput",
-        "title": "cflat: Show Language Server Output"
+        "title": "%cflat.showOutput.title%"
       },
       {
         "command": "cflat.restartServer",
-        "title": "cflat: Restart Language Server"
+        "title": "%cflat.restartServer.title%"
       }
     ],
     "configuration": {
@@ -154,27 +154,27 @@
         "cflat.executablePath": {
           "type": "string",
           "default": "",
-          "description": "Path to the cflat compiler executable (cflat.exe on Windows, cflat on macOS/Linux). Leave empty to auto-detect the path recorded by 'cflat --init' in ~/.cflat/compiler_path.txt. Set this to override auto-detection. Changes take effect immediately (no reload required)."
+          "description": "%cflat.executablePath.description%"
         },
         "cflat.enableDiagnostics": {
           "type": "boolean",
           "default": true,
-          "description": "Run the cflat compiler on save and show errors/warnings inline."
+          "description": "%cflat.enableDiagnostics.description%"
         },
         "cflat.diagnosticDelay": {
           "type": "number",
           "default": 500,
-          "description": "Milliseconds to wait after a change before re-running diagnostics."
+          "description": "%cflat.diagnosticDelay.description%"
         },
         "cflat.optimizationInfo.enable": {
           "type": "boolean",
           "default": false,
-          "description": "Show a CodeLens above each function with what the optimizer did to it (instruction count, size, stack frame, spills, inlining). Running the optimizer is not free, so this refreshes only on save and on 'CFlat: Refresh Optimization Info' - never while you type."
+          "description": "%cflat.optimizationInfo.enable.description%"
         },
         "cflat.optimizationInfo.inlineAnnotations": {
           "type": "boolean",
           "default": true,
-          "description": "Mark inlining in the code itself: a dim marker after each call the optimizer inlined, and after the definition of each function that was inlined somewhere. Hover a marker for the callee, the cost and the threshold. Requires cflat.optimizationInfo.enable, and refreshes on the same schedule as the CodeLens. Calls that were NOT inlined are left unmarked."
+          "description": "%cflat.optimizationInfo.inlineAnnotations.description%"
         },
         "cflat.optimizationInfo.optLevel": {
           "type": "number",
@@ -184,28 +184,35 @@
             2
           ],
           "default": 2,
-          "description": "Optimization level the CodeLens figures are measured at. This is independent of how your project is actually built; the level is shown in every lens."
+          "description": "%cflat.optimizationInfo.optLevel.description%"
         }
       }
     }
   },
   "scripts": {
-    "vscode:prepublish": "node esbuild.js --production",
-    "compile": "node esbuild.js",
+    "vscode:prepublish": "npm run l10n && node esbuild.js --production",
+    "compile": "npm run l10n && node esbuild.js",
     "typecheck": "tsc -p ./ --noEmit",
     "watch": "node esbuild.js --watch",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "l10n:export": "vscode-l10n-dev export --outDir ./l10n ./src",
+    "l10n:pseudo": "vscode-l10n-dev generate-pseudo --outDir ./l10n ./l10n/bundle.l10n.json ./package.nls.json",
+    "l10n:xlf": "vscode-l10n-dev generate-xlf --outFile ./l10n/cflat.xlf ./l10n/bundle.l10n.json ./package.nls.json",
+    "l10n": "npm run l10n:export && npm run l10n:pseudo"
   },
   "dependencies": {
+    "@vscode/l10n": "^0.0.18",
     "vscode-languageclient": "^10.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.91.0",
+    "@vscode/l10n-dev": "^0.0.35",
     "@vscode/vsce": "^3.9.1",
     "esbuild": "^0.25.12",
     "typescript": "^5.3.0",
     "vitest": "^4.1.4"
-  }
+  },
+  "l10n": "./l10n"
 }

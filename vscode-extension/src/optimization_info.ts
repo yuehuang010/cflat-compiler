@@ -1,6 +1,11 @@
 // Pure data model and aggregation for cflat/optimizationInfo. Deliberately free of any
 // `vscode` import so it can be unit tested directly: everything here is a function of the
 // server's response, and none of it needs an editor.
+//
+// `@vscode/l10n` is the standalone bundle loader, NOT the `vscode` module - it runs in plain
+// node, and with no bundle configured `t()` returns the source string, so the unit tests see
+// the English text unchanged. extension.ts hands it the editor's bundle at activation.
+import * as l10n from '@vscode/l10n';
 
 // One entry per source function, as returned by cflat/optimizationInfo. A zero counter
 // means "not available" rather than "measured as zero", so zeros are omitted from the lens.
@@ -48,8 +53,98 @@ export interface OptInfoCacheEntry {
     remarks: OptRemark[];
 }
 
-export function plural(count: number, noun: string): string {
-    return `${count} ${noun}${count === 1 ? '' : 's'}`;
+// Translator hints ride along in the `comment` attribute of each l10n.t call. Two rules,
+// both learned from the extractor silently dropping them: a plain // comment above the call
+// is never harvested, and every array entry must be a LITERAL string - a shared constant or
+// an 'a' + 'b' concatenation is discarded without warning. Hence the repetition below.
+//
+// vscode.l10n does plain {N} substitution with no ICU plural selection, so every counted
+// noun needs its singular and plural spelled out as separate localizable strings. Two forms
+// is what the platform affords; a language needing more cannot be expressed here.
+export function countCallSites(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 call site',
+            comment: ['A source location where a function is called, not a website.']
+        })
+        : l10n.t({
+            message: '{0} call sites',
+            args: [count],
+            comment: ['Source locations where a function is called, not websites.']
+        });
+}
+
+export function countSites(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 site',
+            comment: ['Short for "call site" - a place a function is called from.',
+                'Appears in a one-line CodeLens above the function, so keep it short.']
+        })
+        : l10n.t({
+            message: '{0} sites',
+            args: [count],
+            comment: ['Short for "call sites" - places a function is called from.',
+                'Appears in a one-line CodeLens above the function, so keep it short.']
+        });
+}
+
+export function countFunctions(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 function',
+            comment: ['Counts the functions a body was copied into by inlining.']
+        })
+        : l10n.t({
+            message: '{0} functions',
+            args: [count],
+            comment: ['Counts the functions a body was copied into by inlining.']
+        });
+}
+
+export function countInstructions(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 instr',
+            comment: ['Abbreviation of "machine instruction".',
+                'Keep the abbreviation short - it sits in a one-line CodeLens.']
+        })
+        : l10n.t({
+            message: '{0} instr',
+            args: [count],
+            comment: ['Abbreviation of "machine instructions".',
+                'Keep the abbreviation short - it sits in a one-line CodeLens.']
+        });
+}
+
+export function countSpills(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 spill',
+            comment: ['Register allocation term: a value the compiler had to write out to the stack because no CPU register was free.',
+                'Use the established term in your language, not "spill" as in a spilled liquid.']
+        })
+        : l10n.t({
+            message: '{0} spills',
+            args: [count],
+            comment: ['Register allocation term: values the compiler had to write out to the stack because no CPU register was free.',
+                'Use the established term in your language, not "spill" as in a spilled liquid.']
+        });
+}
+
+export function countReloads(count: number): string {
+    return count === 1
+        ? l10n.t({
+            message: '1 reload',
+            comment: ['Register allocation term: reading a spilled value back from the stack into a CPU register.',
+                'The counterpart of "spill".']
+        })
+        : l10n.t({
+            message: '{0} reloads',
+            args: [count],
+            comment: ['Register allocation term: reading spilled values back from the stack into CPU registers.',
+                'The counterpart of "spill".']
+        });
 }
 
 // Dim monochrome marker for inlining. Deliberately not a colored or emoji glyph: this is
@@ -79,11 +174,31 @@ export interface InlineAnnotation {
 // and knowing a call missed by 258 units tells the user nothing they can act on. The
 // outcome is the whole actionable content of a decision.
 export function describeInlineDecision(remark: OptRemark): string {
+    // `Reason` and `remark.name` come from LLVM in English and are passed through as data.
     switch (remark.name) {
-        case 'Inlined': return 'inlined';
-        case 'TooCostly': return 'not inlined - too costly';
-        case 'NeverInline': return `never inlined${remark.args?.Reason ? ` - ${remark.args.Reason}` : ''}`;
-        default: return `not inlined - ${remark.name.toLowerCase()}`;
+        case 'Inlined': return l10n.t({
+            message: 'inlined',
+            comment: ['The optimizer replaced a call with a copy of the called function\'s body.']
+        });
+        case 'TooCostly': return l10n.t({
+            message: 'not inlined - too costly',
+            comment: ['The optimizer judged the function too large to copy into the caller.']
+        });
+        case 'NeverInline': return remark.args?.Reason
+            ? l10n.t({
+                message: 'never inlined - {0}',
+                args: [remark.args.Reason],
+                comment: ['{0} is an English reason supplied by the LLVM optimizer and cannot be translated - leave the placeholder alone.']
+            })
+            : l10n.t({
+                message: 'never inlined',
+                comment: ['The function can never be inlined, whatever its size.']
+            });
+        default: return l10n.t({
+            message: 'not inlined - {0}',
+            args: [remark.name.toLowerCase()],
+            comment: ['{0} is an English reason supplied by the LLVM optimizer and cannot be translated - leave the placeholder alone.']
+        });
     }
 }
 
@@ -111,12 +226,21 @@ export function buildInlineAnnotations(entry: OptInfoCacheEntry): {
     for (const [line, remarks] of [...byLine.entries()].sort((a, b) => a[0] - b[0])) {
         const inlined = remarks.filter(remark => remark.name === 'Inlined');
         if (inlined.length === 0) continue;
-        const hover = [`**Inlined here** at -O${entry.optLevel}`, ''];
+        const hover = [l10n.t({
+            message: '**Inlined here** at -O{0}',
+            args: [entry.optLevel],
+            comment: ['Heading of the hover shown on a call the optimizer inlined.',
+                'Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.',
+                '-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.']
+        }), ''];
         for (const remark of inlined)
             hover.push(`- \`${remark.calleeName}\` ${describeInlineDecision(remark)}`);
         const skipped = remarks.filter(remark => remark.name !== 'Inlined');
         if (skipped.length > 0) {
-            hover.push('', 'Also on this line:');
+            hover.push('', l10n.t({
+                message: 'Also on this line:',
+                comment: ['Introduces the calls on the same source line that were NOT inlined.']
+            }));
             for (const remark of skipped)
                 hover.push(`- \`${remark.calleeName}\` ${describeInlineDecision(remark)}`);
         }
@@ -139,15 +263,43 @@ export function buildInlineAnnotations(entry: OptInfoCacheEntry): {
         if (inlined.length === 0) continue;
 
         const summary = inlined.length === remarks.length
-            ? `inlined at ${plural(inlined.length, 'call site')}`
-            : `inlined at ${inlined.length} of ${plural(remarks.length, 'call site')}`;
-        const hover = [`**${info.name}** - ${summary} (-O${entry.optLevel})`, ''];
+            ? l10n.t({
+                message: 'inlined at {0}',
+                args: [countCallSites(inlined.length)],
+                comment: ['{0} is an already-formatted count such as "3 call sites".']
+            })
+            : l10n.t({
+                message: 'inlined at {0} of {1}',
+                args: [inlined.length, countCallSites(remarks.length)],
+                comment: ['{0} is a bare number and {1} an already-formatted count such as "3 call sites".',
+                    'Reads as "inlined at 2 of 3 call sites".']
+            });
+        const hover = [l10n.t({
+            message: '**{0}** - {1} (-O{2})',
+            args: [info.name, summary, entry.optLevel],
+            comment: ['{0} is a function name (never translate it), {1} an inlining summary.',
+                'Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.',
+                '-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.']
+        }), ''];
         for (const remark of inlined)
-            hover.push(`- line ${remark.srcLine}: ${describeInlineDecision(remark)}`);
+            hover.push(l10n.t({
+                message: '- line {0}: {1}',
+                args: [remark.srcLine, describeInlineDecision(remark)],
+                comment: ['Markdown list item. {0} is a source line number, {1} an inlining decision.',
+                    'Keep the leading "- ", it is what makes the list render.']
+            }));
         for (const remark of remarks.filter(remark => remark.name !== 'Inlined'))
-            hover.push(`- line ${remark.srcLine}: ${describeInlineDecision(remark)}`);
+            hover.push(l10n.t({
+                message: '- line {0}: {1}',
+                args: [remark.srcLine, describeInlineDecision(remark)],
+                comment: ['Markdown list item. {0} is a source line number, {1} an inlining decision.',
+                    'Keep the leading "- ", it is what makes the list render.']
+            }));
         if (info.eliminated)
-            hover.push('', 'No standalone copy of this function survived optimization.');
+            hover.push('', l10n.t({
+                message: 'No standalone copy of this function survived optimization.',
+                comment: ['The optimizer copied the body into every caller and emitted no separate function.']
+            }));
         definitions.push({ line: info.startLine, hover });
     }
     definitions.sort((a, b) => a.line - b.line);
@@ -162,9 +314,18 @@ export function buildInlineAnnotations(entry: OptInfoCacheEntry): {
 // appends the IR and Assembly links, which need a document URI this module deliberately
 // knows nothing about.
 export function buildFunctionDetail(entry: OptInfoCacheEntry, info: OptFunctionInfo): string[] {
-    const lines = [`**${info.name}** at -O${entry.optLevel}`, ''];
+    const lines = [l10n.t({
+        message: '**{0}** at -O{1}',
+        args: [info.name, entry.optLevel],
+        comment: ['Heading of the function-detail hover. {0} is a function name.',
+            'Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.',
+            '-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.']
+    }), ''];
     if (info.eliminated) {
-        lines.push('No code emitted - the optimizer inlined or removed this function.');
+        lines.push(l10n.t({
+            message: 'No code emitted - the optimizer inlined or removed this function.',
+            comment: ['Replaces the size counters when nothing was emitted for the function.']
+        }));
     } else {
         // A zero counter means "not available", never "measured as zero", so a figure the
         // server could not produce is omitted rather than reported as 0.
@@ -182,11 +343,31 @@ export function buildFunctionDetail(entry: OptInfoCacheEntry, info: OptFunctionI
         // function and the hover is anchored to its definition, so it answers nothing the
         // user is asking; for a generic it would actively mislead, since `symbol` holds
         // only the FIRST instantiation while `bytes` sums them all.
-        if (info.bytes > 0) lines.push(`- Function size: ${info.bytes} bytes`);
+        if (info.bytes > 0) lines.push(l10n.t({
+            message: '- Function size: {0} bytes',
+            args: [info.bytes],
+            comment: ['Size of this function\'s machine code in the object file.',
+                'Markdown list item - keep the leading "- ", it is what makes the list render.']
+        }));
         if (info.machineInstructions > 0)
-            lines.push(`- Machine instructions: ${info.machineInstructions}`);
-        if (info.stackBytes > 0) lines.push(`- Stack frame: ${info.stackBytes} bytes`);
-        lines.push(`- Register: ${plural(info.spills, 'spill')}, ${plural(info.reloads, 'reload')}`);
+            lines.push(l10n.t({
+                message: '- Machine instructions: {0}',
+                args: [info.machineInstructions],
+                comment: ['Count of CPU instructions emitted for this function.',
+                    'Markdown list item - keep the leading "- ", it is what makes the list render.']
+            }));
+        if (info.stackBytes > 0) lines.push(l10n.t({
+            message: '- Stack frame: {0} bytes',
+            args: [info.stackBytes],
+            comment: ['Stack space this function reserves for its locals and spills.',
+                'Markdown list item - keep the leading "- ", it is what makes the list render.']
+        }));
+        lines.push(l10n.t({
+            message: '- Register: {0}, {1}',
+            args: [countSpills(info.spills), countReloads(info.reloads)],
+            comment: ['Register allocator counters; {0} and {1} arrive already formatted, e.g. "2 spills" and "1 reload".',
+                'Markdown list item - keep the leading "- ", it is what makes the list render.']
+        }));
     }
 
     // inlinedInto is derived from the module itself; the navigable call sites come from the
@@ -194,7 +375,11 @@ export function buildFunctionDetail(entry: OptInfoCacheEntry, info: OptFunctionI
     // can outlive its evidence. Say that plainly - otherwise the reader is told the body was
     // inlined somewhere and given no way to reach it, with nothing explaining the gap.
     if (info.inlinedInto > 0 && collectInlineCallSites(entry, info).length === 0)
-        lines.push('', '_The individual call sites are not available for this function._');
+        lines.push('', l10n.t({
+            message: '_The individual call sites are not available for this function._',
+            comment: ['Shown when the body was inlined somewhere but the call sites cannot be listed.',
+                'Rendered as Markdown: _ _ makes text italic - keep the markers attached to the text they wrap.']
+        }));
 
     return lines;
 }

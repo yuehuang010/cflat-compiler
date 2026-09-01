@@ -1,0 +1,134 @@
+{
+  "extension.displayName": {
+    "message": "cflat Language Support",
+    "comment": [
+      "Marketplace name of the extension. \"cflat\" is the product name - never translate it."
+    ]
+  },
+  "extension.description": {
+    "message": "Syntax highlighting, diagnostics, and completions for cflat C dialect",
+    "comment": [
+      "Marketplace summary. \"cflat\" is the product name; \"C dialect\" means a variant of the C programming language."
+    ]
+  },
+  "cflat.runDiagnostics.title": {
+    "message": "cflat: Run Diagnostics on Current File",
+    "comment": [
+      "Command palette entry. The \"cflat: \" prefix groups the command under the product name and must stay in place; translate only what follows."
+    ]
+  },
+  "cflat.showLlvmIr.title": {
+    "message": "CFlat: Show LLVM IR",
+    "comment": [
+      "Command palette entry. IR = LLVM Intermediate Representation; leave \"LLVM IR\" untranslated. Keep the \"CFlat: \" prefix."
+    ]
+  },
+  "cflat.showAssembly.title": {
+    "message": "CFlat: Show Assembly",
+    "comment": [
+      "Command palette entry. \"Assembly\" means the emitted machine-code listing. Keep the \"CFlat: \" prefix."
+    ]
+  },
+  "cflat.showOptimizationInfo.title": {
+    "message": "CFlat: Refresh Optimization Info",
+    "comment": [
+      "Command palette entry. Recomputes the optimizer figures for the open file. Keep the \"CFlat: \" prefix."
+    ]
+  },
+  "cflat.toggleOptimizationInfo.title": {
+    "message": "CFlat: Toggle Optimization Info",
+    "comment": [
+      "Command palette entry. Switches the optimizer figures on or off. Keep the \"CFlat: \" prefix."
+    ]
+  },
+  "cflat.showOutput.title": {
+    "message": "cflat: Show Language Server Output",
+    "comment": [
+      "Command palette entry. Opens the language server log panel. Keep the \"cflat: \" prefix."
+    ]
+  },
+  "cflat.restartServer.title": {
+    "message": "cflat: Restart Language Server",
+    "comment": [
+      "Command palette entry. Restarts the background language server process. Keep the \"cflat: \" prefix."
+    ]
+  },
+  "cflat.executablePath.description": {
+    "message": "Path to the cflat compiler executable (cflat.exe on Windows, cflat on macOS/Linux). Leave empty to auto-detect the path recorded by 'cflat --init' in ~/.cflat/compiler_path.txt. Set this to override auto-detection. Changes take effect immediately (no reload required).",
+    "comment": [
+      "Settings description. Do not translate the file names (cflat.exe, cflat), the setting id cflat.executablePath, the command \"cflat --init\", or the path ~/.cflat/compiler_path.txt."
+    ]
+  },
+  "cflat.enableDiagnostics.description": {
+    "message": "Run the cflat compiler on save and show errors/warnings inline.",
+    "comment": [
+      "Settings description. \"diagnostics\" here means compiler errors and warnings shown inline in the editor."
+    ]
+  },
+  "cflat.diagnosticDelay.description": {
+    "message": "Milliseconds to wait after a change before re-running diagnostics.",
+    "comment": [
+      "Settings description. A debounce interval in milliseconds."
+    ]
+  },
+  "cflat.optimizationInfo.enable.description": {
+    "message": "Show a CodeLens above each function with what the optimizer did to it (instruction count, size, stack frame, spills, inlining). Running the optimizer is not free, so this refreshes only on save and on 'CFlat: Refresh Optimization Info' - never while you type.",
+    "comment": [
+      "Settings description. CodeLens is a VS Code feature name - keep it untranslated. \"CFlat: Refresh Optimization Info\" is a command title; translate it the same way you translate cflat.showOptimizationInfo.title."
+    ]
+  },
+  "cflat.optimizationInfo.inlineAnnotations.description": {
+    "message": "Mark inlining in the code itself: a dim marker after each call the optimizer inlined, and after the definition of each function that was inlined somewhere. Hover a marker for the callee and what the optimizer decided. Requires cflat.optimizationInfo.enable, and refreshes on the same schedule as the CodeLens. Calls that were NOT inlined are left unmarked.",
+    "comment": [
+      "Settings description. \"inlining\" is the optimization that replaces a call with a copy of the called function. Do not translate the setting id cflat.optimizationInfo.enable or the feature name CodeLens."
+    ]
+  },
+  "cflat.optimizationInfo.optLevel.description": {
+    "message": "Optimization level the CodeLens figures are measured at. This is independent of how your project is actually built; the level is shown in every lens.",
+    "comment": [
+      "Settings description. \"Optimization level\" is the compiler -O0/-O1/-O2 setting. CodeLens is a VS Code feature name - keep it untranslated."
+    ]
+  },
+  "cflat.debug.program.description": {
+    "message": "Path to the .cb source file to compile and debug.",
+    "comment": [
+      "Debug launch attribute. .cb is the cflat source file extension - keep it as-is."
+    ]
+  },
+  "cflat.debug.args.description": {
+    "message": "Command-line arguments passed to the compiled program.",
+    "comment": [
+      "Debug launch attribute. Arguments handed to the program when it runs."
+    ]
+  },
+  "cflat.debug.cwd.description": {
+    "message": "Working directory for the compiled program. Defaults to the directory of the output .exe.",
+    "comment": [
+      "Debug launch attribute. \"Working directory\" is the process current directory. .exe is a Windows file extension - keep it as-is."
+    ]
+  },
+  "cflat.debug.stopAtEntry.description": {
+    "message": "Break on entry to main.",
+    "comment": [
+      "Debug launch attribute. \"main\" is the program entry function name - never translate it."
+    ]
+  },
+  "cflat.debug.console.description": {
+    "message": "Where to host the program's stdio.",
+    "comment": [
+      "Debug launch attribute. stdio = the program standard input and output streams."
+    ]
+  },
+  "cflat.debug.snippet.label": {
+    "message": "cflat: Run current file",
+    "comment": [
+      "Label of a launch.json snippet offered in the editor. Keep the \"cflat: \" prefix."
+    ]
+  },
+  "cflat.debug.snippet.description": {
+    "message": "Compile and debug the active .cb file with cppvsdbg.",
+    "comment": [
+      "Description of a launch.json snippet. .cb is the cflat source extension and cppvsdbg is a VS Code debugger id - never translate either."
+    ]
+  }
+}

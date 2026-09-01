@@ -259,6 +259,32 @@ on every error-test batch).
 key with no example, which is the missing-negative-test backlog. `--strict` exits
 non-zero when a call site cannot be extracted cleanly.
 
+### The VS Code extension is a separate catalog
+
+Compiler diagnostics and the extension's own UI text (the optimization CodeLens,
+its hover, notifications, command titles, settings descriptions) are localized by
+two independent systems, on purpose - they resolve the display language from
+different places, and their key schemes are incompatible.
+
+The extension uses the VS Code standard, `vscode.l10n` / `@vscode/l10n`:
+
+```bash
+cd vscode-extension
+npm run l10n        # export + generate-pseudo; also runs as part of "npm run compile"
+npm run l10n:xlf    # -> l10n/cflat.xlf, the handoff file for the localization team
+```
+
+`l10n/bundle.l10n.json` holds the runtime strings (the English text IS the key)
+and `package.nls.json` the `package.json` contributions. `generate-pseudo` writes
+`bundle.l10n.qps-ploc.json` and `package.nls.qps-ploc.json`, which the Pseudo
+Language Language Pack renders - the same coverage gate `en-pseudo.json` provides
+for the compiler: any string still reading as plain English was never wrapped in
+`l10n.t`.
+
+`vscode.l10n` does plain `{N}` substitution with no ICU plural selection, so
+counted nouns are spelled out as separate singular and plural strings in
+`src/optimization_info.ts`. Two forms is what the platform affords.
+
 ## Case study: the test_threadpool UAF
 
 These tools were built to crack an intermittent `test_threadpool` crash that

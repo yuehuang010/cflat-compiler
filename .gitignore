@@ -383,3 +383,6 @@ out-linux/
 /.scratch/
 /scratch/
 .claude/settings.local.json
+
+# Generated on demand for the localization team; regenerate with "npm run l10n:xlf".
+vscode-extension/l10n/*.xlf

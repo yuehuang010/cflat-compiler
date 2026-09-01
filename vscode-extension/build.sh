@@ -27,7 +27,7 @@ else
 fi
 
 # Compile TypeScript
-echo "[2/3] Compiling TypeScript..."
+echo "[2/3] Regenerating l10n bundles and compiling TypeScript..."
 if ! npm run compile; then
     echo "ERROR: TypeScript compilation failed."
     exit 1

@@ -2,9 +2,11 @@ import * as childProcess from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import * as l10n from '@vscode/l10n';
 import {
     INLINE_MARKER, OptFunctionInfo, OptInfoCacheEntry, OptInfoResult,
-    buildFunctionDetail, buildInlineAnnotations, collectInlineCallSites, plural
+    buildFunctionDetail, buildInlineAnnotations, collectInlineCallSites,
+    countCallSites, countFunctions, countInstructions, countReloads, countSites, countSpills
 } from './optimization_info';
 import {
     LanguageClient,
@@ -257,9 +259,19 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         // leaving the view where it opened.
         const nearest = this.nearestMappedLine(state, sourceLine);
         if (nearest === undefined || !this.revealInView(state, nearest, true)) return;
-        vscode.window.setStatusBarMessage(
-            `cflat: line ${sourceLine} produced no ${state.kind === 'ir' ? 'IR' : 'assembly'}`
-            + ` - showing the nearest emitted line ${nearest}`, 5000);
+        vscode.window.setStatusBarMessage(state.kind === 'ir'
+            ? l10n.t({
+                message: 'cflat: line {0} produced no IR - showing the nearest emitted line {1}',
+                args: [sourceLine, nearest],
+                comment: ['Status bar message. IR = LLVM Intermediate Representation; keep "IR" as-is.',
+                    '{0} and {1} are source line numbers.']
+            })
+            : l10n.t({
+                message: 'cflat: line {0} produced no assembly - showing the nearest emitted line {1}',
+                args: [sourceLine, nearest],
+                comment: ['Status bar message. "assembly" means the emitted machine-code listing.',
+                    '{0} and {1} are source line numbers.']
+            }), 5000);
     }
 
     // Closest emitted line to the cursor, preferring the one below when two are equidistant:
@@ -353,16 +365,39 @@ class CflatViewContentProvider implements vscode.TextDocumentContentProvider {
         cached: boolean): void {
         const label = `${state.kind === 'ir' ? 'IR' : 'asm'}${state.optimized ? ' -O2' : ''}`;
         if (cached || !timings) {
-            this.statusBar.text = `$(watch) ${label} view: cached`;
-            this.statusBar.tooltip = 'cflat view served from the response cache';
+            this.statusBar.text = l10n.t({
+                message: '$(watch) {0} view: cached',
+                args: [label],
+                comment: ['$(watch) is a VS Code icon token, not text. Leave it exactly as written, including the parentheses.',
+                    '{0} is a view label such as "IR" or "asm -O2", produced by the extension and not translated.']
+            });
+            this.statusBar.tooltip = l10n.t({
+                message: 'cflat view served from the response cache',
+                comment: ['Status bar tooltip: the shown output was reused, not recomputed.']
+            });
         } else {
             const analyze = timings.analyzeMs ?? 0;
             const emit = timings.emitMs ?? 0;
             const total = timings.totalMs ?? analyze + emit;
-            this.statusBar.text = `$(watch) ${label} view: ${total}ms`;
-            this.statusBar.tooltip =
-                `cflat view refresh: analyze ${analyze}ms + emit ${emit}ms` +
-                (analyze === 0 ? ' (analysis reused)' : '');
+            this.statusBar.text = l10n.t({
+                message: '$(watch) {0} view: {1}ms',
+                args: [label, total],
+                comment: ['$(watch) is a VS Code icon token, not text. Leave it exactly as written, including the parentheses.',
+                    '{0} is a view label such as "IR" or "asm -O2", produced by the extension and not translated.',
+                    'ms = milliseconds.']
+            });
+            this.statusBar.tooltip = analyze === 0
+                ? l10n.t({
+                    message: 'cflat view refresh: analyze {0}ms + emit {1}ms (analysis reused)',
+                    args: [analyze, emit],
+                    comment: ['Status bar tooltip. ms = milliseconds.',
+                        '"analysis reused" means the previous parse was still valid.']
+                })
+                : l10n.t({
+                    message: 'cflat view refresh: analyze {0}ms + emit {1}ms',
+                    args: [analyze, emit],
+                    comment: ['Status bar tooltip. ms = milliseconds.']
+                });
         }
         this.statusBar.show();
     }
@@ -409,11 +444,11 @@ async function startClient(): Promise<void> {
     if (!exePath) {
         outputChannel.appendLine('ERROR: could not locate the cflat compiler.');
         outputChannel.show(true);
-        vscode.window.showWarningMessage(
+        vscode.window.showWarningMessage(l10n.t(
             'cflat: could not locate the cflat compiler (cflat.exe on Windows, cflat on macOS/Linux). ' +
             'Run "cflat --init" to record the compiler path, ' +
             'or set cflat.executablePath in Settings to enable the language server.'
-        );
+        ));
         return;
     }
 
@@ -499,18 +534,20 @@ class CflatDebugConfigurationProvider implements vscode.DebugConfigurationProvid
             }
         }
         if (!source) {
-            vscode.window.showErrorMessage(
+            vscode.window.showErrorMessage(l10n.t(
                 'cflat: no .cb / .c source file to debug. ' +
                 'Open the source file in the active editor, or set "program" in launch.json to a .cb path.'
-            );
+            ));
             return undefined;
         }
 
         const cflatExe = findCompilerExecutable();
         if (!cflatExe) {
-            vscode.window.showErrorMessage(
-                'cflat: cflat.executablePath is not set. Set it in Settings to enable debugging.'
-            );
+            vscode.window.showErrorMessage(l10n.t({
+                message: 'cflat: cflat.executablePath is not set. Set it in Settings to enable debugging.',
+                comment: ['cflat.executablePath is a settings identifier - never translate it.',
+                    '"Settings" is the VS Code settings editor; use its localized name.']
+            }));
             return undefined;
         }
 
@@ -575,7 +612,14 @@ function runInTerminal(exePath: string, args: string[], cwd: string): void {
 
 function compileForDebug(cflatExe: string, source: string, outExe: string): Thenable<boolean> {
     return vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Window, title: `cflat: compiling ${path.basename(source)}...` },
+        {
+            location: vscode.ProgressLocation.Window,
+            title: l10n.t({
+                message: 'cflat: compiling {0}...',
+                args: [path.basename(source)],
+                comment: ['Progress message. {0} is a source file name.']
+            })
+        },
         () => new Promise<boolean>(resolve => {
             outputChannel.appendLine(`Compiling: ${cflatExe} "${source}" -o "${outExe}" -g`);
             const proc = childProcess.spawn(
@@ -588,7 +632,12 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
             proc.on('error', err => {
                 outputChannel.appendLine(`Compile error: ${err.message}`);
                 outputChannel.show(true);
-                vscode.window.showErrorMessage(`cflat: failed to launch compiler (${err.message}).`);
+                vscode.window.showErrorMessage(
+                    l10n.t({
+                        message: 'cflat: failed to launch compiler ({0}).',
+                        args: [err.message],
+                        comment: ['{0} is an operating-system error message, already in English.']
+                    }));
                 resolve(false);
             });
             proc.on('close', code => {
@@ -598,7 +647,10 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
                 } else {
                     outputChannel.appendLine(`Compile failed (exit ${code}).`);
                     outputChannel.show(true);
-                    vscode.window.showErrorMessage('cflat: compile failed. See "cflat Language Server" output for details.');
+                    vscode.window.showErrorMessage(l10n.t({
+                        message: 'cflat: compile failed. See "cflat Language Server" output for details.',
+                        comment: ['"cflat Language Server" is the name of an output panel - translate it the same way everywhere or leave it as-is.']
+                    }));
                     resolve(false);
                 }
             });
@@ -639,8 +691,12 @@ class CflatOptimizationHoverProvider implements vscode.HoverProvider {
         const sites = collectInlineCallSites(entry, info);
         if (sites.length > 0) {
             const siteArgs = encodeURIComponent(JSON.stringify([uri, info.startLine]));
-            links.push(`[Show ${plural(sites.length, 'call site')}]`
-                + `(command:cflat.showInlineCallSites?${siteArgs})`);
+            links.push(`[${l10n.t({
+                message: 'Show {0}',
+                args: [countCallSites(sites.length)],
+                comment: ['Link label in a hover. {0} arrives already formatted, e.g. "3 call sites".',
+                    'Clicking the link lists those call sites.']
+            })}]` + `(command:cflat.showInlineCallSites?${siteArgs})`);
         }
         // Both output forms are offered here, not just IR. They are the two things the
         // counters above are measured from - bytes and machine instructions come from the
@@ -648,8 +704,14 @@ class CflatOptimizationHoverProvider implements vscode.HoverProvider {
         // palette made the shorter path to it invisible.
         const viewArgs = (kind: ViewKind) => encodeURIComponent(
             JSON.stringify([uri, info.startLine, entry.optLevel > 0, kind]));
-        links.push(`[Show IR](command:cflat.showViewForFunction?${viewArgs('ir')})`);
-        links.push(`[Show assembly](command:cflat.showViewForFunction?${viewArgs('asm')})`);
+        links.push(`[${l10n.t({
+            message: 'Show IR',
+            comment: ['Link label. IR = LLVM Intermediate Representation; keep "IR" as-is.']
+        })}](command:cflat.showViewForFunction?${viewArgs('ir')})`);
+        links.push(`[${l10n.t({
+            message: 'Show assembly',
+            comment: ['Link label. "assembly" means the emitted machine-code listing.']
+        })}](command:cflat.showViewForFunction?${viewArgs('asm')})`);
         markdown.appendMarkdown(`\n\n${links.join(' \u00b7 ')}`);
         return new vscode.Hover(markdown, document.lineAt(position.line).range);
     }
@@ -759,42 +821,98 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
     private lensTitle(info: OptFunctionInfo, optLevel: number): string {
         const prefix = `O${optLevel}: `;
         if (info.eliminated) {
-            return info.inlinedInto > 0
-                ? `${prefix}optimized away - inlined into ${plural(info.inlinedInto, 'site')}`
-                : `${prefix}optimized away`;
+            return prefix + (info.inlinedInto > 0
+                ? l10n.t({
+                    message: 'optimized away - inlined into {0}',
+                    args: [countSites(info.inlinedInto)],
+                    comment: ['No standalone copy of the function was emitted; its body was copied into its callers.',
+                        '{0} arrives already formatted, e.g. "3 sites".',
+                        'Appears in a one-line CodeLens above a function, so keep it short.']
+                })
+                : l10n.t({
+                    message: 'optimized away',
+                    comment: ['The optimizer emitted no code for this function.',
+                        'Appears in a one-line CodeLens above a function, so keep it short.']
+                }));
         }
 
         // Emitted bytes leads: it is the figure that means something outside the compiler.
         // The IR instruction count is not shown at all - see buildFunctionDetail.
         const parts: string[] = [];
         if (info.bytes > 0) parts.push(`${info.bytes} B`);
-        if (info.machineInstructions > 0) parts.push(plural(info.machineInstructions, 'instr'));
-        if (info.stackBytes > 0) parts.push(`${info.stackBytes} B stack`);
+        if (info.machineInstructions > 0) parts.push(countInstructions(info.machineInstructions));
+        if (info.stackBytes > 0) parts.push(l10n.t({
+            message: '{0} B stack',
+            args: [info.stackBytes],
+            comment: ['B = bytes. Stack space reserved by the function.',
+                'Appears in a one-line CodeLens above a function, so keep it short.']
+        }));
         if (info.spills > 0) {
             parts.push(info.reloads > 0
-                ? `${plural(info.spills, 'spill')}/${plural(info.reloads, 'reload')}`
-                : plural(info.spills, 'spill'));
+                ? `${countSpills(info.spills)}/${countReloads(info.reloads)}`
+                : countSpills(info.spills));
         }
-        if (info.inlinedInto > 0) parts.push(`inlined into ${plural(info.inlinedInto, 'site')}`);
+        if (info.inlinedInto > 0)
+            parts.push(l10n.t({
+                message: 'inlined into {0}',
+                args: [countSites(info.inlinedInto)],
+                comment: ['{0} arrives already formatted, e.g. "3 sites".',
+                    'Appears in a one-line CodeLens above a function, so keep it short.']
+            }));
         // The IR count used to guarantee a part; without it every counter can be
         // unavailable at once, and a lens reading just "O2: " would look broken.
-        if (parts.length === 0) parts.push('no size information');
+        if (parts.length === 0) parts.push(l10n.t({
+            message: 'no size information',
+            comment: ['Shown when the server reported no counters at all.',
+                'Appears in a one-line CodeLens above a function, so keep it short.']
+        }));
         return prefix + parts.join(' - ');
     }
 
     private lensTooltip(info: OptFunctionInfo, optLevel: number): string {
-        const lines = [`${info.name} at -O${optLevel}`];
-        if (info.eliminated) lines.push('No code emitted (inlined or removed)');
+        const lines = [l10n.t({
+            message: '{0} at -O{1}',
+            args: [info.name, optLevel],
+            comment: ['{0} is a function name (never translate it).',
+                '-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.']
+        })];
+        if (info.eliminated) lines.push(l10n.t({
+            message: 'No code emitted (inlined or removed)',
+            comment: ['CodeLens tooltip line for a function the optimizer did not emit.']
+        }));
         else {
-            if (info.bytes > 0) lines.push(`Function size: ${info.bytes} bytes`);
+            if (info.bytes > 0) lines.push(l10n.t({
+                message: 'Function size: {0} bytes',
+                args: [info.bytes],
+                comment: ['Size of this function\'s machine code in the object file.']
+            }));
             if (info.machineInstructions > 0)
-                lines.push(`Machine instructions: ${info.machineInstructions}`);
-            if (info.stackBytes > 0) lines.push(`Stack frame: ${info.stackBytes} bytes`);
-            lines.push(`Register: ${plural(info.spills, 'spill')}, ${plural(info.reloads, 'reload')}`);
+                lines.push(l10n.t({
+                    message: 'Machine instructions: {0}',
+                    args: [info.machineInstructions],
+                    comment: ['Count of CPU instructions emitted for this function.']
+                }));
+            if (info.stackBytes > 0) lines.push(l10n.t({
+                message: 'Stack frame: {0} bytes',
+                args: [info.stackBytes],
+                comment: ['Stack space this function reserves for its locals and spills.']
+            }));
+            lines.push(l10n.t({
+                message: 'Register: {0}, {1}',
+                args: [countSpills(info.spills), countReloads(info.reloads)],
+                comment: ['Register allocator counters; both arrive already formatted, e.g. "2 spills" and "1 reload".']
+            }));
         }
         if (info.inlinedInto > 0)
-            lines.push(`Body inlined into ${plural(info.inlinedInto, 'function')}`);
-        lines.push('Click for the full detail, including every inline decision');
+            lines.push(l10n.t({
+                message: 'Body inlined into {0}',
+                args: [countFunctions(info.inlinedInto)],
+                comment: ['{0} arrives formatted, e.g. "3 functions".']
+            }));
+        lines.push(l10n.t({
+            message: 'Click for the full detail, including every inline decision',
+            comment: ['Last line of the CodeLens tooltip; clicking opens a fuller hover.']
+        }));
         return lines.join('\n');
     }
 
@@ -834,14 +952,22 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
             this.changeEmitter.fire();
             if (!silent) {
                 vscode.window.setStatusBarMessage(
-                    `cflat: optimization info updated at -O${result.optLevel}`, 4000);
+                    l10n.t({
+                        message: 'cflat: optimization info updated at -O{0}',
+                        args: [result.optLevel],
+                        comment: ['-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.']
+                    }), 4000);
             }
         } catch (error) {
             this.cache.delete(uri);
             this.changeEmitter.fire();
             if (!silent) {
                 vscode.window.showWarningMessage(
-                    `cflat: could not collect optimization info - ${error}`);
+                    l10n.t({
+                        message: 'cflat: could not collect optimization info - {0}',
+                        args: [String(error)],
+                        comment: ['{0} is an error message from the language server, already in English.']
+                    }));
             }
         } finally {
             this.inFlight.delete(uri);
@@ -909,6 +1035,11 @@ async function openCompilerView(provider: CflatViewContentProvider, kind: ViewKi
 export function activate(context: vscode.ExtensionContext): void {
     // Must be a log channel: vscode-languageclient 10 types clientOptions.outputChannel
     // as LogOutputChannel, which extends OutputChannel.
+    // optimization_info.ts localizes through the standalone @vscode/l10n loader so it stays
+    // unit-testable outside the extension host. Point it at the bundle VS Code already
+    // resolved for the display language; undefined means English, which needs no bundle.
+    if (vscode.l10n.bundle) l10n.config({ contents: vscode.l10n.bundle });
+
     outputChannel = vscode.window.createOutputChannel('cflat Language Server', { log: true });
     context.subscriptions.push(outputChannel);
 
@@ -1057,8 +1188,10 @@ export function activate(context: vscode.ExtensionContext): void {
             const editor = vscode.window.activeTextEditor;
             if (!editor || editor.document.languageId !== 'cflat') return;
             if (!vscode.workspace.getConfiguration('cflat').get<boolean>('optimizationInfo.enable', false)) {
-                void vscode.window.showInformationMessage(
-                    'cflat: optimization info is disabled. Enable cflat.optimizationInfo.enable first.');
+                void vscode.window.showInformationMessage(l10n.t({
+                    message: 'cflat: optimization info is disabled. Enable cflat.optimizationInfo.enable first.',
+                    comment: ['cflat.optimizationInfo.enable is a settings identifier - never translate it.']
+                }));
                 return;
             }
             void lensProvider.refresh(editor.document);
@@ -1129,7 +1262,10 @@ export function activate(context: vscode.ExtensionContext): void {
     );
 
     context.subscriptions.push(
-        vscode.window.setStatusBarMessage('cflat Language Server started', 3000)
+        vscode.window.setStatusBarMessage(l10n.t({
+            message: 'cflat Language Server started',
+            comment: ['Status bar message. "cflat" is the product name - never translate it.']
+        }), 3000)
     );
 }
 

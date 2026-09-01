@@ -40,6 +40,11 @@ function describeFailure(interpreter: string, result: ReturnType<typeof spawnSyn
 const SMOKE_CHILD_TIMEOUT_MS = 60_000;
 const FIXTURE_CHILD_TIMEOUT_MS = 120_000;
 
+// The fixtures assert the English SOURCE templates of each diagnostic, so the server must not
+// localize: en.json deliberately words several of them differently ("is never called" for
+// "is never used"). test_lsp.sh exports the same variable for the same reason.
+const CHILD_ENV = { ...process.env, CFLAT_LOCALE: 'pseudo' };
+
 describe('LSP integration', () => {
     it('smoke tests pass', () => {
         if (!python) {
@@ -49,6 +54,7 @@ describe('LSP integration', () => {
         const result = spawnSync(python, [script], {
             encoding: 'utf8',
             timeout: SMOKE_CHILD_TIMEOUT_MS,
+            env: CHILD_ENV,
         });
         if (result.status !== 0) {
             expect.fail(`LSP smoke tests failed:\n${describeFailure(python, result)}`);
@@ -63,6 +69,7 @@ describe('LSP integration', () => {
         const result = spawnSync(python, [script], {
             encoding: 'utf8',
             timeout: FIXTURE_CHILD_TIMEOUT_MS,
+            env: CHILD_ENV,
         });
         if (result.status !== 0) {
             expect.fail(`LSP fixture tests failed:\n${describeFailure(python, result)}`);
