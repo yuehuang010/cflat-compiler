@@ -17,7 +17,7 @@ The whole surface is one LSP request, `cflat/optimizationInfo`
   costs:          [{ kind, detail, srcLine, bytes, count }],          // Tier 2
   instantiations: [{ base, count, bytes, symbols }],                  // Tier 2
   remarks:        [{ pass, name, kind, message, function, file,       // Tier 3
-                     srcLine, srcColumn, args }],
+                     srcLine, srcColumn, calleeName, calleeLine, args }],
   remarksTruncated }
 ```
 
@@ -104,7 +104,9 @@ The workaround is a two-factor filter, and both factors are load-bearing:
 1. `lineInUserRange(line)` - the line must fall inside one of the file's own function
    ranges, taken from `LspSymbolIndex::FunctionsIn(file)`.
 2. `entryBySymbol.count(symbol)` - the enclosing symbol must be one of this file's own
-   functions.
+   functions. Widened 2026-08-31 to `entryBySymbol || preoptEntryBySymbol`, so a caller the
+   optimizer erased still counts as this file's code; it is the same set of user functions
+   either way, just indexed before optimization as well as after.
 
 Factor 1 alone admits core code whose line numbers happen to collide with a user function's
 range. Factor 2 alone admits nothing useful for inlined code, where the enclosing symbol is
@@ -334,9 +336,103 @@ editor unusable.
 
 ## Later phases (recorded, not scheduled)
 
-- **Phase 2 - per-line data.** Server side DONE (see above). Remaining work is client-only:
-  render `lines` as `after` decorations, inlay hints, or gutter/overview-ruler heat,
-  filtered to lines that are hot, large, or eliminated.
+- **Phase 2 - per-line data.** Server side DONE (see above). INLINE MARKERS DONE
+  (2026-08-31, see below). Remaining client work: render `lines` as heat (gutter /
+  overview ruler), filtered to lines that are hot, large, or eliminated.
+
+## Inline markers in the editor (DONE 2026-08-31)
+
+The first visualization of the optimization data. A dim `\u21A6` sits after each call the
+optimizer inlined, and after the definition of each function that was inlined somewhere;
+hovering gives the callee, the decision and LLVM's cost/threshold numbers. Setting
+`cflat.optimizationInfo.inlineAnnotations` (default true, gated behind
+`optimizationInfo.enable`); repaints on the CodeLens cache signal, so one -O2 run feeds
+both surfaces.
+
+Four decisions worth not relitigating:
+
+- **The glyph is call-sites-only.** The definition line already carries a CodeLens saying
+  the same thing; a glyph beside it repeated one fact twice. The per-function inline story
+  moved into that lens instead - see the hover note below.
+- **Only inlining is marked.** A call the optimizer left alone gets NO glyph. An
+  annotation on every call is wallpaper; the value is in the lines that are marked, and
+  an unmarked line reading as "nothing happened here" is the whole point. The
+  not-inlined remarks are still shown, but only inside the hover of a function that WAS
+  inlined somewhere ("inlined at 1 of 2 call sites"), where they carry the actionable
+  cost-vs-threshold gap.
+- **Glyph choice is constrained, not cosmetic.** A solid triangle reads as a run/debug
+  button and an arrowhead reads as navigation; both were rejected on sight. Colored or
+  emoji glyphs compete with diagnostics for attention. `\u21A6` in
+  `editorCodeLens.foreground` is the result. It is one constant, `INLINE_GLYPH`.
+- **The server resolves the mangled callee, not the client.** `args.Callee` is a mangled
+  symbol (`_small_helper_i32_i32_`). `OptRemark` therefore carries `calleeName` and
+  `calleeLine`, resolved against a NEW pre-optimization symbol index
+  (`preoptEntryBySymbol`) - the view-side index cannot name a function the optimizer
+  erased, which is exactly the function an "inlined away" marker is about. The same index
+  now also fills `symbol` for eliminated functions, and widens the remark caller filter so
+  decisions made inside a caller that itself got inlined are no longer dropped.
+- **`inlinedInto` is NOT the "was this inlined" signal.** It counts functions that still
+  hold absorbed code, so a helper that was inlined and then constant-folded reports
+  `inlinedInto: 0` while the remark correctly says `Inlined`. The remarks are
+  authoritative for the decision; `inlinedInto` is authoritative for surviving code.
+
+Known limitation: LLVM reports `srcColumn` as 0 for inline remarks, so a marker anchors to
+the END of the call-site line and several calls on one line share one marker (the hover
+lists them all). Nothing in the response supports finer placement today.
+
+`bytes` is rendered as "Function size", not "emitted size": it IS the function's
+machine-code size, taken from its symbol in an in-memory object emission. One caveat the
+label hides - for a generic it is the SUM over every instantiation, because
+`entryBySymbol` maps every mangled instantiation back to the one source function and the
+byte walk uses `+=`. The Tier 2 `instantiations` array is the surface that breaks that
+down properly.
+
+Neither the IR instruction count nor the mangled symbol is EVER shown to the user, in
+the lens or the hover. It is a
+fact about a representation they never see, and it invites comparisons against the machine
+code that do not hold. Emitted BYTES leads instead; machine instructions follow when
+available. `irInstructions` stays on the wire and in the client interface - the server
+still reports it - it is simply not rendered. Because the IR count used to be the one
+figure guaranteed to exist, the lens now needs an explicit "no size information" fallback
+for the case where every counter is unavailable at once. The symbol went for the same
+reason plus one of its own: `symbol` holds only the FIRST matching definition while
+`bytes` sums them all, so on a generic it names one instantiation beside a size covering
+every one of them.
+
+The hover does not list call sites AT ALL. It shows one row per DISTINCT decision, and a
+`[Show N call sites]` link hands the locations to VS Code's own References peek
+(`editor.action.showReferences`) - a navigable, previewable list is that widget's job, and
+a hover is the wrong container for one of unbounded length. LLVM reports every inline
+remark at column 0, so `callRange` recovers the column by searching the line text for the
+callee name, falling back to the whole line; without that the peek highlights column 0 on
+every hit.
+
+Rows carry a site count only when the outcomes DIFFER - a single outcome covering
+everything needs none, because the summary line above already gave the total. Measured before
+building it: 10 call sites spread over plain, if-guarded and loop-nested calls all reported
+the identical `(TooCostly, cost 595, threshold 337)` - cost is mostly a property of the
+CALLEE, so a function called from 200 places collapses to a handful of rows, usually one.
+The grouping key is the rendered description string itself, so there is no parallel key to
+drift from the text.
+
+`remarksTruncated` is now plumbed to the client for this: past the server's 400-remark cap
+the per-function counts are lower bounds, and "inlined at 3 of 5 call sites" would be a
+lie. The hover says so instead.
+
+Clicking the CodeLens opens a HOVER, not the IR view. A CodeLens `tooltip` is a plain
+string - no markdown, no links - so the lens command
+(`cflat.showOptimizationDetail`) puts the cursor on the function and runs
+`editor.action.showHover`; a `HoverProvider` then returns `buildFunctionDetail` as a
+MarkdownString carrying a `[Show IR](command:cflat.showIrForFunction?...)` link. Command
+links require `markdown.isTrusted = true`; without it VS Code renders the link dead, with
+no error. Jumping straight to the IR view on click was the old behaviour and was wrong:
+the numbers are the answer most of the time, and the IR is the follow-up.
+
+Client layout: the pure aggregation lives in `vscode-extension/src/optimization_info.ts`
+with no `vscode` import, so it is unit-testable directly (`buildInlineAnnotations` cases in
+`src/lsp_integration.test.ts`); `extension.ts` keeps only the decoration painting. Do not
+move it back - importing `extension.ts` from vitest drags in `vscode-languageclient`, whose
+CommonJS `require('vscode')` no alias can intercept.
 - **Phase 3 - remarks (Tier 3) and Tier 2 cflat facts.** Widen the diagnostic handler;
   surface actionable misses as Hint diagnostics in a dedicated collection, with the full
   remark text on hover.

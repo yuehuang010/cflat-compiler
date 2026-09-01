@@ -2166,6 +2166,16 @@ private:
 
             // Last-known-good cache - kept global for now. Edits land sequentially in
             // practice (debounce + single editor); bulk sweeps don't use this index.
+            //
+            // A VIEW request (IR / assembly / optinfo) is excluded on purpose. It analyses
+            // whatever document it was asked about, which is not necessarily the one being
+            // edited - the IDE fires optinfo when the active editor changes, and it can
+            // land on an imported or core file. Publishing that index here replaced the
+            // editing document's symbols wholesale, and hover and go-to-definition went
+            // dead for the file the user was actually in. Worse, a second optinfo on the
+            // original file did NOT repair it: that request is served from the view cache,
+            // so no analysis runs and nothing republishes. Only a real edit brought it back.
+            if (!job.irRequest)
             {
                 std::lock_guard<std::mutex> lock(indexMutex_);
                 bool hasErrors    = !diagnostics.empty();
@@ -2452,6 +2462,8 @@ private:
                 {"file", remark.file},
                 {"srcLine", remark.srcLine},
                 {"srcColumn", remark.srcColumn},
+                {"calleeName", remark.calleeName},
+                {"calleeLine", remark.calleeLine},
                 {"args", std::move(args)}
             });
         }

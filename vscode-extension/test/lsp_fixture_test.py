@@ -521,6 +521,7 @@ def test_optimization_info(client: LspClient) -> str | None:
         "    return opt_info_helper(argc);\n"
         "}\n"
     )
+    helper_call_line = 6
     uri = _uri_for("optimization_info")
     _open_doc(client, uri, source)
     diagnostics = wait_diagnostics_for(client, uri)
@@ -541,6 +542,9 @@ def test_optimization_info(client: LspClient) -> str | None:
         functions = result.get("functions")
         if not isinstance(functions, list) or not functions:
             return None, f"optimizationInfo O{opt_level}: no functions: {result}"
+        remarks = result.get("remarks")
+        if not isinstance(remarks, list):
+            return None, f"optimizationInfo O{opt_level}: remarks not a list: {result}"
         by_name = {}
         for entry in functions:
             for field in ("name", "startLine", "endLine", "eliminated"):
@@ -571,11 +575,12 @@ def test_optimization_info(client: LspClient) -> str | None:
                     return None, (f"optimizationInfo O{opt_level}: empty line entry "
                                   f"in {entry['name']}: {line}")
             by_name[entry["name"]] = entry
-        return by_name, None
+        return (by_name, remarks), None
 
-    optimized, err = collect(2)
+    collected, err = collect(2)
     if err:
         return err
+    optimized, remarks = collected
     for name in ("opt_info_helper", "main"):
         if name not in optimized:
             return f"optimizationInfo O2: missing function {name}: {sorted(optimized)}"
@@ -597,9 +602,41 @@ def test_optimization_info(client: LspClient) -> str | None:
         if helper["machineInstructions"] <= 0 and helper["irInstructions"] <= 0:
             return f"optimizationInfo O2: helper survived with no instructions: {helper}"
 
-    unoptimized, err = collect(0)
+    # The inline markers in the editor ride on these two fields. args.Callee is the MANGLED
+    # symbol, so the server must resolve it - a client that parsed mangled names would be
+    # guessing. calleeLine is what anchors the marker to the callee's own definition.
+    inline_remarks = [r for r in remarks if r.get("pass") == "inline"]
+    for remark in inline_remarks:
+        for field, kind in (("calleeName", str), ("calleeLine", int),
+                            ("srcLine", int), ("name", str), ("kind", str)):
+            if not isinstance(remark.get(field), kind) or isinstance(remark.get(field), bool):
+                return f"optimizationInfo O2: remark {field} missing or wrong type: {remark}"
+        if remark["calleeName"] == "":
+            return f"optimizationInfo O2: remark has no resolved callee: {remark}"
+        # A callee defined in this file must point at a function we also reported.
+        if remark["calleeLine"] != 0:
+            owner = [e for e in optimized.values() if e["startLine"] == remark["calleeLine"]]
+            if not owner or owner[0]["name"] != remark["calleeName"]:
+                return (f"optimizationInfo O2: calleeLine does not match a reported "
+                        f"function: {remark}")
+
+    # Inlining is a heuristic, but if the helper WAS inlined the remark has to name it at
+    # the call site - that pairing is the whole contract behind the call-site marker.
+    inlined_helper = [r for r in inline_remarks
+                      if r["name"] == "Inlined" and r["calleeName"] == "opt_info_helper"]
+    if helper["eliminated"] and not inlined_helper:
+        return f"optimizationInfo O2: helper eliminated but no Inlined remark: {inline_remarks}"
+    for remark in inlined_helper:
+        if remark["srcLine"] != helper_call_line:
+            return (f"optimizationInfo O2: Inlined remark not at the call site "
+                    f"(expected line {helper_call_line}): {remark}")
+        if remark["calleeLine"] != 1:
+            return f"optimizationInfo O2: Inlined remark calleeLine should be 1: {remark}"
+
+    collected0, err = collect(0)
     if err:
         return err
+    unoptimized, _ = collected0
     helper0 = unoptimized.get("opt_info_helper")
     if helper0 is None or helper0["eliminated"]:
         return f"optimizationInfo O0: helper should survive: {helper0}"

@@ -567,6 +567,12 @@ public:
         std::string file;       // basename the remark's location points at
         int srcLine = 0;
         int srcColumn = 0;
+        // Source-level identity of the remark's Callee, resolved here because the args
+        // carry the MANGLED symbol and mangled names must never be parsed by a client.
+        // calleeName falls back to the raw symbol for a non-user callee (printf); a
+        // calleeLine of 0 means "not a function defined in this file".
+        std::string calleeName;
+        int calleeLine = 0;
         std::vector<std::pair<std::string, std::string>> args;
     };
 

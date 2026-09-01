@@ -171,9 +171,18 @@
           "default": false,
           "description": "Show a CodeLens above each function with what the optimizer did to it (instruction count, size, stack frame, spills, inlining). Running the optimizer is not free, so this refreshes only on save and on 'CFlat: Refresh Optimization Info' - never while you type."
         },
+        "cflat.optimizationInfo.inlineAnnotations": {
+          "type": "boolean",
+          "default": true,
+          "description": "Mark inlining in the code itself: a dim marker after each call the optimizer inlined, and after the definition of each function that was inlined somewhere. Hover a marker for the callee, the cost and the threshold. Requires cflat.optimizationInfo.enable, and refreshes on the same schedule as the CodeLens. Calls that were NOT inlined are left unmarked."
+        },
         "cflat.optimizationInfo.optLevel": {
           "type": "number",
-          "enum": [0, 1, 2],
+          "enum": [
+            0,
+            1,
+            2
+          ],
           "default": 2,
           "description": "Optimization level the CodeLens figures are measured at. This is independent of how your project is actually built; the level is shown in every lens."
         }

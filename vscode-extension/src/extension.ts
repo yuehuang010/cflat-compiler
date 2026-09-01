@@ -3,6 +3,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+    INLINE_MARKER, OptFunctionInfo, OptInfoCacheEntry, OptInfoResult,
+    buildFunctionDetail, buildInlineAnnotations, collectInlineCallSites, plural
+} from './optimization_info';
+import {
     LanguageClient,
     LanguageClientOptions,
     ServerOptions,
@@ -602,36 +606,100 @@ function compileForDebug(cflatExe: string, source: string, outExe: string): Then
     );
 }
 
-// One entry per source function, as returned by cflat/optimizationInfo. A zero counter
-// means "not available" rather than "measured as zero", so zeros are omitted from the lens.
-interface OptFunctionInfo {
-    name: string;
-    symbol: string;
-    startLine: number;
-    endLine: number;
-    irInstructions: number;
-    machineInstructions: number;
-    bytes: number;
-    stackBytes: number;
-    spills: number;
-    reloads: number;
-    inlinedInto: number;
-    eliminated: boolean;
+// Range covering the call itself, so the References peek highlights the call rather than
+// column 0. LLVM reports every inline remark at column 0, so the column has to be
+// recovered from the text; when the name is not on the line (a macro-ish expansion, or an
+// edit since the measurement) the whole line is a truthful fallback.
+function callRange(document: vscode.TextDocument, srcLine: number, calleeName: string): vscode.Range {
+    const line = document.lineAt(srcLine - 1);
+    const column = line.text.indexOf(calleeName);
+    if (column < 0) return line.range;
+    return new vscode.Range(srcLine - 1, column, srcLine - 1, column + calleeName.length);
 }
 
-interface OptInfoResult {
-    optLevel: number;
-    functions: OptFunctionInfo[];
+// The detail behind the CodeLens. A CodeLens tooltip is a plain string - no markdown, no
+// links - so the lens click opens a real hover here instead, where a trusted MarkdownString
+// can carry the "Show IR" command link.
+class CflatOptimizationHoverProvider implements vscode.HoverProvider {
+    constructor(private readonly provider: CflatOptimizationLensProvider) {}
+
+    provideHover(document: vscode.TextDocument, position: vscode.Position): vscode.Hover | undefined {
+        const entry = this.provider.annotationSource(document);
+        if (!entry) return undefined;
+        const info = entry.functions.find(candidate => candidate.startLine === position.line + 1);
+        if (!info) return undefined;
+
+        const markdown = new vscode.MarkdownString(
+            buildFunctionDetail(entry, info).join('\n'));
+        // Required for command: links to be clickable. The content is built from our own
+        // server's response, never from anything the user typed.
+        markdown.isTrusted = true;
+        const uri = document.uri.toString();
+        const links = [];
+        const sites = collectInlineCallSites(entry, info);
+        if (sites.length > 0) {
+            const siteArgs = encodeURIComponent(JSON.stringify([uri, info.startLine]));
+            links.push(`[Show ${plural(sites.length, 'call site')}]`
+                + `(command:cflat.showInlineCallSites?${siteArgs})`);
+        }
+        // Both output forms are offered here, not just IR. They are the two things the
+        // counters above are measured from - bytes and machine instructions come from the
+        // assembly, the inline decisions from the IR - so hiding one behind the command
+        // palette made the shorter path to it invisible.
+        const viewArgs = (kind: ViewKind) => encodeURIComponent(
+            JSON.stringify([uri, info.startLine, entry.optLevel > 0, kind]));
+        links.push(`[Show IR](command:cflat.showViewForFunction?${viewArgs('ir')})`);
+        links.push(`[Show assembly](command:cflat.showViewForFunction?${viewArgs('asm')})`);
+        markdown.appendMarkdown(`\n\n${links.join(' \u00b7 ')}`);
+        return new vscode.Hover(markdown, document.lineAt(position.line).range);
+    }
 }
 
-interface OptInfoCacheEntry {
-    key: string;
-    optLevel: number;
-    functions: OptFunctionInfo[];
-}
+// Paints the inline markers into the visible editors. Reads the CodeLens provider's cache
+// rather than issuing its own request - both surfaces describe the same optimizer run, and
+// running the -O2 pipeline twice for one refresh would be pure waste.
+class CflatInlineDecorations {
+    private readonly glyph = vscode.window.createTextEditorDecorationType({
+        after: {
+            contentText: ` ${INLINE_MARKER}`,
+            color: new vscode.ThemeColor('editorCodeLens.foreground'),
+            margin: '0 0 0 0.5ch'
+        },
+        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed
+    });
 
-function plural(count: number, noun: string): string {
-    return `${count} ${noun}${count === 1 ? '' : 's'}`;
+    constructor(private readonly provider: CflatOptimizationLensProvider) {}
+
+    apply(editor: vscode.TextEditor): void {
+        const entry = this.provider.annotationSource(editor.document);
+        if (!entry) {
+            editor.setDecorations(this.glyph, []);
+            return;
+        }
+        // Call sites only. The definition line already carries a CodeLens saying the same
+        // thing, and two markers for one fact is noise.
+        const { callSites } = buildInlineAnnotations(entry);
+        const options: vscode.DecorationOptions[] = [];
+        for (const annotation of callSites) {
+            const line = annotation.line - 1;
+            if (line < 0 || line >= editor.document.lineCount) continue;
+            const end = editor.document.lineAt(line).range.end;
+            options.push({
+                range: new vscode.Range(end, end),
+                hoverMessage: new vscode.MarkdownString(annotation.hover.join('\n'))
+            });
+        }
+        editor.setDecorations(this.glyph, options);
+    }
+
+    applyToVisible(): void {
+        for (const editor of vscode.window.visibleTextEditors)
+            if (editor.document.languageId === 'cflat') this.apply(editor);
+    }
+
+    dispose(): void {
+        this.glyph.dispose();
+    }
 }
 
 // Optimization facts above each function. The optimizer only runs on an explicit refresh
@@ -657,6 +725,17 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
         return `${CflatOptimizationLensProvider.optLevel()}|${document.version}`;
     }
 
+    // Cached facts for a document, or undefined when there are none for its CURRENT
+    // version - an edited document's old measurements describe code that no longer exists.
+    annotationSource(document: vscode.TextDocument): OptInfoCacheEntry | undefined {
+        if (!CflatOptimizationLensProvider.enabled()) return undefined;
+        if (!vscode.workspace.getConfiguration('cflat')
+                .get<boolean>('optimizationInfo.inlineAnnotations', true)) return undefined;
+        const entry = this.cache.get(document.uri.toString());
+        if (!entry || entry.key !== CflatOptimizationLensProvider.cacheKey(document)) return undefined;
+        return entry;
+    }
+
     provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
         if (!CflatOptimizationLensProvider.enabled()) return [];
         const entry = this.cache.get(document.uri.toString());
@@ -670,8 +749,8 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
             lenses.push(new vscode.CodeLens(range, {
                 title: this.lensTitle(info, entry.optLevel),
                 tooltip: this.lensTooltip(info, entry.optLevel),
-                command: 'cflat.showIrForFunction',
-                arguments: [document.uri.toString(), info.startLine, entry.optLevel > 0]
+                command: 'cflat.showOptimizationDetail',
+                arguments: [document.uri.toString(), info.startLine]
             }));
         }
         return lenses;
@@ -685,11 +764,11 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
                 : `${prefix}optimized away`;
         }
 
+        // Emitted bytes leads: it is the figure that means something outside the compiler.
+        // The IR instruction count is not shown at all - see buildFunctionDetail.
         const parts: string[] = [];
-        parts.push(info.machineInstructions > 0
-            ? `${plural(info.machineInstructions, 'instr')}`
-            : `${info.irInstructions} IR instr`);
         if (info.bytes > 0) parts.push(`${info.bytes} B`);
+        if (info.machineInstructions > 0) parts.push(plural(info.machineInstructions, 'instr'));
         if (info.stackBytes > 0) parts.push(`${info.stackBytes} B stack`);
         if (info.spills > 0) {
             parts.push(info.reloads > 0
@@ -697,6 +776,9 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
                 : plural(info.spills, 'spill'));
         }
         if (info.inlinedInto > 0) parts.push(`inlined into ${plural(info.inlinedInto, 'site')}`);
+        // The IR count used to guarantee a part; without it every counter can be
+        // unavailable at once, and a lens reading just "O2: " would look broken.
+        if (parts.length === 0) parts.push('no size information');
         return prefix + parts.join(' - ');
     }
 
@@ -704,17 +786,31 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
         const lines = [`${info.name} at -O${optLevel}`];
         if (info.eliminated) lines.push('No code emitted (inlined or removed)');
         else {
-            lines.push(`Machine instructions: ${info.machineInstructions}`);
-            lines.push(`LLVM IR instructions: ${info.irInstructions}`);
-            if (info.bytes > 0) lines.push(`Emitted size: ${info.bytes} bytes`);
+            if (info.bytes > 0) lines.push(`Function size: ${info.bytes} bytes`);
+            if (info.machineInstructions > 0)
+                lines.push(`Machine instructions: ${info.machineInstructions}`);
             if (info.stackBytes > 0) lines.push(`Stack frame: ${info.stackBytes} bytes`);
-            lines.push(`Spills / reloads: ${info.spills} / ${info.reloads}`);
-            if (info.symbol) lines.push(`Symbol: ${info.symbol}`);
+            lines.push(`Register: ${plural(info.spills, 'spill')}, ${plural(info.reloads, 'reload')}`);
         }
         if (info.inlinedInto > 0)
             lines.push(`Body inlined into ${plural(info.inlinedInto, 'function')}`);
-        lines.push('Click to open the LLVM IR for this function');
+        lines.push('Click for the full detail, including every inline decision');
         return lines.join('\n');
+    }
+
+    // True when the cache already holds measurements for this document's CURRENT version
+    // and opt level, i.e. a round trip would return what we have.
+    private isFresh(document: vscode.TextDocument): boolean {
+        const entry = this.cache.get(document.uri.toString());
+        return entry !== undefined && entry.key === CflatOptimizationLensProvider.cacheKey(document);
+    }
+
+    // The editor-switch path. Collecting optimization info runs the whole -O2 pipeline, so
+    // unlike refresh() this is a no-op when the cache is already current - otherwise tabbing
+    // back and forth between two files would re-optimize both on every switch.
+    async refreshIfStale(document: vscode.TextDocument): Promise<void> {
+        if (this.isFresh(document)) return;
+        await this.refresh(document, true);
     }
 
     async refresh(document: vscode.TextDocument, silent = false): Promise<void> {
@@ -729,8 +825,12 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
         const key = CflatOptimizationLensProvider.cacheKey(document);
         try {
             const result = await client.sendRequest<OptInfoResult>('cflat/optimizationInfo',
-                { uri, optLevel });
-            this.cache.set(uri, { key, optLevel: result.optLevel, functions: result.functions ?? [] });
+                { uri, optLevel, remarks: true });
+            this.cache.set(uri, {
+                key, optLevel: result.optLevel,
+                functions: result.functions ?? [],
+                remarks: result.remarks ?? []
+            });
             this.changeEmitter.fire();
             if (!silent) {
                 vscode.window.setStatusBarMessage(
@@ -828,7 +928,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     logFilePath = path.join(context.logUri.fsPath, 'lsp.log');
 
-    void startClient();
+    const clientReady = startClient().catch(() => undefined);
 
     const viewProvider = new CflatViewContentProvider(() => client);
     const editRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -897,17 +997,61 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Optimization info: CodeLens above each function, refreshed on demand and on save.
     const lensProvider = new CflatOptimizationLensProvider(() => client);
+    const inlineDecorations = new CflatInlineDecorations(lensProvider);
     context.subscriptions.push(
         lensProvider,
+        inlineDecorations,
         vscode.languages.registerCodeLensProvider({ scheme: 'file', language: 'cflat' }, lensProvider),
-        // Invoked by the lens itself, so it is deliberately not in the command palette.
-        vscode.commands.registerCommand('cflat.showIrForFunction',
-            async (sourceUri: string, line: number, optimized: boolean) => {
+        vscode.languages.registerHoverProvider({ scheme: 'file', language: 'cflat' },
+            new CflatOptimizationHoverProvider(lensProvider)),
+        // The lenses and the inline markers render the same cached measurements, so one
+        // signal repaints both: a refresh, an invalidation and a settings change all land here.
+        lensProvider.onDidChangeCodeLenses(() => inlineDecorations.applyToVisible()),
+        vscode.window.onDidChangeVisibleTextEditors(() => inlineDecorations.applyToVisible()),
+        // Measurements describe the saved text. Once the document version moves the cache
+        // no longer matches, and annotationSource returns nothing - repaint to clear them.
+        vscode.workspace.onDidChangeTextDocument(event => {
+            if (event.document.languageId === 'cflat' && event.contentChanges.length > 0)
+                inlineDecorations.applyToVisible();
+        }),
+        // Invoked from the optimization hover only, so deliberately not in the palette.
+        vscode.commands.registerCommand('cflat.showViewForFunction',
+            async (sourceUri: string, line: number, optimized: boolean, kind: ViewKind = 'ir') => {
                 const choice = viewChoices.find(candidate =>
                     candidate.optimized === optimized && !candidate.wholeModule)
                     ?? viewChoices[0];
                 const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(sourceUri));
-                await openCompilerView(viewProvider, 'ir', choice, document, line);
+                await openCompilerView(viewProvider, kind, choice, document, line);
+            }),
+        // Target of the CodeLens click. A lens can only run a command, and VS Code has no
+        // "show my tooltip" API, so put the cursor on the function and open the hover -
+        // which is where the detail and the IR / Assembly links live.
+        vscode.commands.registerCommand('cflat.showOptimizationDetail',
+            async (sourceUri: string, line: number) => {
+                const document = await vscode.workspace.openTextDocument(vscode.Uri.parse(sourceUri));
+                const editor = await vscode.window.showTextDocument(document, { preserveFocus: false });
+                const target = new vscode.Position(Math.max(0, line - 1), 0);
+                editor.selection = new vscode.Selection(target, target);
+                editor.revealRange(new vscode.Range(target, target));
+                await vscode.commands.executeCommand('editor.action.showHover');
+            }),
+        // Hands the call sites to VS Code's own References peek rather than listing them
+        // in the hover: a function called from 200 places needs a navigable, previewable
+        // list, which is exactly what that widget already is.
+        vscode.commands.registerCommand('cflat.showInlineCallSites',
+            async (sourceUri: string, line: number) => {
+                const uri = vscode.Uri.parse(sourceUri);
+                const document = await vscode.workspace.openTextDocument(uri);
+                const entry = lensProvider.annotationSource(document);
+                const info = entry?.functions.find(candidate => candidate.startLine === line);
+                if (!entry || !info) return;
+                const locations = collectInlineCallSites(entry, info)
+                    .filter(site => site.srcLine >= 1 && site.srcLine <= document.lineCount)
+                    .map(site => new vscode.Location(uri, callRange(document, site.srcLine, info.name)));
+                if (locations.length === 0) return;
+                await vscode.window.showTextDocument(document, { preserveFocus: false });
+                await vscode.commands.executeCommand('editor.action.showReferences',
+                    uri, new vscode.Position(Math.max(0, line - 1), 0), locations);
             }),
         vscode.commands.registerCommand('cflat.showOptimizationInfo', () => {
             const editor = vscode.window.activeTextEditor;
@@ -930,6 +1074,13 @@ export function activate(context: vscode.ExtensionContext): void {
         vscode.workspace.onDidSaveTextDocument((document: vscode.TextDocument) => {
             if (document.languageId === 'cflat') void lensProvider.refresh(document, true);
         }),
+        // Opening or switching to a file must collect its measurements. provideCodeLenses
+        // cannot do this - it fires on every edit, and running -O2 per keystroke is not
+        // affordable - so the editor-switch event is the trigger, guarded by the cache.
+        vscode.window.onDidChangeActiveTextEditor(editor => {
+            if (editor?.document.languageId === 'cflat')
+                void lensProvider.refreshIfStale(editor.document);
+        }),
         vscode.workspace.onDidCloseTextDocument((document: vscode.TextDocument) => {
             lensProvider.invalidate(document.uri.toString());
         }),
@@ -941,6 +1092,14 @@ export function activate(context: vscode.ExtensionContext): void {
                 void lensProvider.refresh(editor.document, true);
         })
     );
+
+    // The editor open at activation never raises onDidChangeActiveTextEditor, and the
+    // client is still starting at this point, so prime it once the server is up.
+    void clientReady.then(() => {
+        const editor = vscode.window.activeTextEditor;
+        if (editor?.document.languageId === 'cflat')
+            void lensProvider.refreshIfStale(editor.document);
+    });
 
     // Command: show compiler output channel
     context.subscriptions.push(

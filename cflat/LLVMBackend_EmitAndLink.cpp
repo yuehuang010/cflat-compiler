@@ -1098,9 +1098,14 @@ bool IsReportedRemarkPass(llvm::StringRef passName)
         || passName == "prologepilog" || passName == "regalloc";
 }
 
-// Upper bound on collected remarks. A whole-module O2 run over the core libraries can
-// emit thousands; the caller is told when this clamps.
-constexpr size_t kMaxCollectedRemarks = 400;
+// Upper bound on collected remarks, applied PER PASS and counted AFTER the root-file
+// filter. Per pass, not overall, because the passes are wildly unequal talkers: a single
+// large source emits ~12000 gvn remarks against ~2600 inline ones, so one shared budget is
+// spent by gvn long before the inline remarks that the IDE actually reads are collected.
+// That was a real defect - past the cut-off every function still reported an inlinedInto
+// count with no remarks behind it, and the editor offered "inlined into 2 sites" with no
+// sites to navigate to. The caller is told when this clamps.
+constexpr size_t kMaxCollectedRemarksPerPass = 5000;
 
 // Collects Tier 3 remarks, and doubles as the Tier 1 source for exact frame size and
 // spill counts (prologepilog / regalloc) - scraping the prologue text would be guesswork.
@@ -1110,6 +1115,7 @@ struct RemarkCollector : public llvm::DiagnosticHandler
     std::vector<LLVMBackend::OptRemark>* remarks;   // null when only frames are wanted
     std::function<bool(const llvm::DiagnosticLocation&)> isRootLocation;
     bool& truncated;   // a reference: the context destroys this handler on restore
+    std::map<std::string, size_t> collectedPerPass;
 
     RemarkCollector(std::map<std::string, LLVMBackend::FrameRemark>& frameOut,
                     std::vector<LLVMBackend::OptRemark>* remarkOut,
@@ -1167,11 +1173,13 @@ struct RemarkCollector : public llvm::DiagnosticHandler
         const llvm::DiagnosticLocation location = opt->getLocation();
         if (!location.isValid() || !isRootLocation(location))
             return true;   // a remark about the core libraries is not the user's business
-        if (remarks->size() >= kMaxCollectedRemarks)
+        size_t& collected = collectedPerPass[opt->getPassName().str()];
+        if (collected >= kMaxCollectedRemarksPerPass)
         {
             truncated = true;
             return true;
         }
+        ++collected;
 
         LLVMBackend::OptRemark entry;
         entry.pass = opt->getPassName().str();
@@ -2091,6 +2099,26 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
         view->setDataLayout(targetMachine->createDataLayout());
     }
 
+    // Definitions of one source function in a module. Name matching alone cannot separate
+    // overloads, which share a source name and differ only in mangling, so prefer the
+    // definitions whose debug info places them in this file at this function's own lines.
+    auto locateDefinitions = [&rootName](llvm::Module& searched, const std::string& name,
+                                         int startLine, int endLine) {
+        auto matches = MatchingFunctions(searched, name);
+        std::vector<llvm::Function*> located;
+        for (auto* function : matches)
+        {
+            auto* subprogram = function->getSubprogram();
+            if (!subprogram) continue;
+            const int line = static_cast<int>(subprogram->getLine());
+            if (line < startLine || line > endLine) continue;
+            if (!rootName.empty() && DebugFileName(subprogram->getFile()) != rootName) continue;
+            located.push_back(function);
+        }
+        if (!located.empty()) matches = std::move(located);
+        return matches;
+    };
+
     // Seed one entry per source function and index every surviving symbol back to it,
     // so generic instantiations aggregate into the function the user wrote.
     std::map<std::string, size_t> entryBySymbol;
@@ -2102,21 +2130,7 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
         info.startLine = source.second.first;
         info.endLine = source.second.second;
 
-        auto matches = MatchingFunctions(*view, info.name);
-        // Name matching alone cannot separate overloads, which share a source name and
-        // differ only in mangling. Prefer the definitions whose debug info places them
-        // in this file at this function's own lines.
-        std::vector<llvm::Function*> located;
-        for (auto* function : matches)
-        {
-            auto* subprogram = function->getSubprogram();
-            if (!subprogram) continue;
-            const int line = static_cast<int>(subprogram->getLine());
-            if (line < info.startLine || line > info.endLine) continue;
-            if (!rootName.empty() && DebugFileName(subprogram->getFile()) != rootName) continue;
-            located.push_back(function);
-        }
-        if (!located.empty()) matches = std::move(located);
+        auto matches = locateDefinitions(*view, info.name, info.startLine, info.endLine);
 
         info.eliminated = matches.empty();
         for (auto* function : matches)
@@ -2126,6 +2140,22 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
             entryBySymbol[function->getName().str()] = out.size();
         }
         out.push_back(std::move(info));
+    }
+
+    // The same index over the PRE-OPTIMIZATION module. A function the optimizer erased has
+    // no symbol left in the view, so the view-side index cannot name it - yet that is
+    // exactly the function an "inlined away" annotation is about. Kept separate from
+    // entryBySymbol so the line-attribution walk below keeps using the view's own view of
+    // which symbols are user code.
+    std::map<std::string, size_t> preoptEntryBySymbol;
+    for (size_t index = 0; index < out.size(); ++index)
+    {
+        FunctionOptInfo& info = out[index];
+        for (auto* function : locateDefinitions(*module, info.name, info.startLine, info.endLine))
+        {
+            preoptEntryBySymbol.emplace(function->getName().str(), index);
+            if (info.symbol.empty()) info.symbol = function->getName().str();
+        }
     }
 
     // One walk serves two purposes: which functions absorbed an inlined body, and how
@@ -2183,9 +2213,32 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
         {
             std::vector<OptRemark> kept;
             for (auto& remark : info.remarks)
-                if (entryBySymbol.count(remark.function)
-                    && lineInUserRange(remark.srcLine))
-                    kept.push_back(std::move(remark));
+            {
+                // A caller the optimizer erased is still a user function that made real
+                // decisions at real user lines, so the pre-opt index has to count too.
+                if (!entryBySymbol.count(remark.function)
+                    && !preoptEntryBySymbol.count(remark.function))
+                    continue;
+                if (!lineInUserRange(remark.srcLine)) continue;
+                for (const auto& arg : remark.args)
+                {
+                    if (arg.first != "Callee") continue;
+                    auto callee = preoptEntryBySymbol.find(arg.second);
+                    if (callee != preoptEntryBySymbol.end())
+                    {
+                        remark.calleeName = out[callee->second].name;
+                        remark.calleeLine = out[callee->second].startLine;
+                    }
+                    else
+                    {
+                        // Not defined in this file (printf, a core-library routine): the
+                        // symbol IS the best name available, and there is no line to point at.
+                        remark.calleeName = arg.second;
+                    }
+                    break;
+                }
+                kept.push_back(std::move(remark));
+            }
             info.remarks = std::move(kept);
         }
     }
