@@ -20,7 +20,7 @@ Landed since the original draft:
 - **Catalogs moved from `locales/` to `cflat/locales/`** and are deployed next to the compiler by
   CMake and by both release packaging scripts. `test.sh`, `test.bat`, and `test_err.bat` point at
   the new path.
-- **All ten catalogs cover the full 147-key inventory**: `de`, `en-simple`, `es`, `fr`, `it`,
+- **All ten catalogs cover the full 147-key inventory**: `de`, `en`, `es`, `fr`, `it`,
   `ja`, `ko`, `ru`, `zh-Hans`, `zh-Hant`, plus the generated `en-pseudo`.
 - **The LSP honors the editor UI language.** `initialize.params.locale` (or
   `initializationOptions.locale`) is resolved by `DiagnosticLocalization::ResolveClientLocale` and
@@ -49,7 +49,7 @@ calling that path. Parser diagnostics and several progress/debug messages have s
 paths.
 
 The source language is not the default display language. The default locale is the external
-English catalog `en-simple`. The source template is only the canonical fallback and the text
+English catalog `en`. The source template is only the canonical fallback and the text
 shown by the migration-only `pseudo` pseudo-locale.
 
 Every user-facing compiler print must eventually use a localized message API, including errors,
@@ -168,7 +168,7 @@ become a practical problem, the validator should reject them rather than silentl
 Locale files live under:
 
 ```text
-cflat/locales/en-simple.json
+cflat/locales/en.json
 cflat/locales/en-pseudo.json
 cflat/locales/ja-JP.json
 cflat/locales/zh-CN.json
@@ -186,7 +186,7 @@ Example:
 ```
 
 The English source template remains the canonical source text, but it is not the default display
-catalog. `en-simple.json` is the required default English localization and must contain every
+catalog. `en.json` is the required default English localization and must contain every
 inventoried key before the migration is complete. If an entry is missing at runtime, the
 compiler may fall back to the source template, but the missing entry must be reportable by the
 diagnostic coverage mode and by catalog validation.
@@ -201,10 +201,10 @@ Use this precedence:
 
 1. Explicit `--locale <locale>`.
 2. `CFLAT_LOCALE`.
-3. `en-simple`.
+3. `en`.
 
 Do not silently select the operating-system locale in this first design. The default must be
-deterministic and must always mean the checked-in `en-simple` catalog.
+deterministic and must always mean the checked-in `en` catalog.
 
 Add `--locale-dir <directory>` for development and installed-layout overrides. Otherwise search
 for catalogs relative to the compiler executable, not the current working directory.
@@ -219,7 +219,7 @@ The generated `en-pseudo.json` also contains `argumentExamples`, keyed by diagno
 array is ordered by placeholder number (`{0}`, `{1}`, ...) and contains a representative value
 observed during discovery, so translators can understand how each argument is used.
 
-The default catalog remains `en-simple`. The pseudo-locale discovery output is written
+The default catalog remains `en`. The pseudo-locale discovery output is written
 to `en-pseudo`, for example:
 
 ```text
@@ -245,8 +245,8 @@ while the compiler rewrite drops the extractor's `argumentNames` and `sites` fie
 catalog. For every localized message it prints the canonical source-template text, including
 the normal argument substitution, so tests can prove which source message was emitted.
 
-While `pseudo` is active, the localizer also checks the corresponding key in `en-simple.json` and
-prints a clear warning stating whether the `en-simple` entry is present and non-empty. This
+While `pseudo` is active, the localizer also checks the corresponding key in `en.json` and
+prints a clear warning stating whether the `en` entry is present and non-empty. This
 allows the test suite to exercise every diagnostic path while simultaneously reporting missing
 default-English coverage. The warning is test/migration metadata and must not be treated as the
 compiler diagnostic itself.
@@ -261,7 +261,7 @@ Add:
 
 - `cflat/DiagnosticLocalization.h`
 - `cflat/DiagnosticLocalization.cpp`
-- `cflat/locales/en-simple.json`
+- `cflat/locales/en.json`
 - `utilities/extract_diagnostics.py` - static call-site inventory; writes `en-pseudo.json`.
 
 Update:
@@ -280,7 +280,7 @@ Update:
 - `doc/CLI.md` - document locale options, the catalog workflow, and LSP locale selection.
 - `doc/DIAGNOSTIC.md` - document authoring and translation rules.
 - the test harness - run diagnostic coverage with `--locale pseudo` and fail or report according
-  to the agreed missing-`en-simple` policy.
+  to the agreed missing-`en` policy.
 
 The existing `DiagnosticSink` signature can continue to receive final display text initially.
 Adding a stable internal key to the sink can be considered later, but it is not required for
@@ -291,10 +291,10 @@ the first localization pass.
 ### Phase 1: localizer and one diagnostic
 
 - Implement JSON loading, locale selection, key normalization, placeholder validation, and
-  `en-simple` default loading.
+  `en` default loading.
 - Add `LogErrorMessage` to the backend.
 - Add runtime template collection driven by the error-test suite.
-- Add `--locale pseudo` source-text output and missing-`en-simple` warnings.
+- Add `--locale pseudo` source-text output and missing-`en` warnings.
 - Add `--update-locale <locale>` and deterministic source-template stub generation.
 - Keep the legacy `LogError(std::string)` stub during migration so it remains available while
   call sites are converted; after the migration inventory is clear, change it to `= delete` and
@@ -320,7 +320,7 @@ the first localization pass.
 
 ### Phase 3: catalogs and deployment
 
-- DONE: keep `en-simple` updated from the extractor plus the error-test pass, with English source
+- DONE: keep `en` updated from the extractor plus the error-test pass, with English source
   templates as initial translation values; refine wording where needed.
 - DONE: nine non-English catalogs (`de`, `es`, `fr`, `it`, `ja`, `ko`, `ru`, `zh-Hans`,
   `zh-Hant`), verified end-to-end through the LSP.
@@ -333,9 +333,9 @@ the first localization pass.
 Extend existing test files rather than creating new compiler integration test files. Verify:
 
 - Default diagnostics remain English.
-- Default output comes from `en-simple`, not directly from source literals.
+- Default output comes from `en`, not directly from source literals.
 - A selected locale translates a migrated diagnostic.
-- `--locale pseudo` prints canonical source text and reports whether each `en-simple` key exists
+- `--locale pseudo` prints canonical source text and reports whether each `en` key exists
   and is non-empty.
 - The extractor enumerates every `LogErrorMessage` call site, and the error-test run records real
   argument values for the subset it exercises.
@@ -363,12 +363,12 @@ is reused across `--check` and LSP analyses.
 - **Translation changes placeholder order:** use numbered placeholders in locale values and
   validate indexes.
 - **Existing tests depend on English wording:** match `expect_error` before localization and
-  keep the source template as the fallback even though `en-simple` is the default catalog.
+  keep the source template as the fallback even though `en` is the default catalog.
 - **Messages are missed by the migration:** run the complete error-test suite with `--locale
   pseudo`, require every exercised diagnostic to be collected, and require direct-print
   exemptions to be explicit.
 - **Default English coverage drifts:** run the error-test pass with `--locale pseudo`, warn for
-  every missing `en-simple` entry, regenerate with `--update-locale`, then run the extractor to
+  every missing `en` entry, regenerate with `--update-locale`, then run the extractor to
   re-add the templates no test reaches.
 - **Locale file is unavailable in an installed build:** locate catalogs beside the executable
   and fall back silently to English with optional verbose reporting.

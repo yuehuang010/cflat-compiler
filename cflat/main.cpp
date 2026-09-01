@@ -156,7 +156,7 @@ int main(int argc, char* argv[])
     args.addOption("platform", 'p', "Target platform: linux (native default), win64, win32, or macos (arm64 Mach-O cross-compile)", "linux");
 #endif
     args.addFlag("verbose", 'v', "Print detailed diagnostic messages during compilation");
-    args.addOption("locale", 0, "Diagnostic locale (default: en-simple; CFLAT_LOCALE is used when omitted; pseudo prints source templates)");
+    args.addOption("locale", 0, "Diagnostic locale (default: en; CFLAT_LOCALE is used when omitted; pseudo prints source templates)");
     args.addOption("locale-dir", 0, "Directory containing diagnostic locale JSON files (default: <compiler>/locales)");
     args.addOption("update-locale", 0, "Collect localized templates during compilation and update <locale>.json under --locale-dir");
     args.addFlag("O0", '0', "No optimization (default)");
@@ -246,15 +246,50 @@ int main(int argc, char* argv[])
     // Locate runtime.cb next to this executable (needed for lld-link discovery too).
     std::string runtimeDir = GetExeDir();
     std::string diagnosticLocale = args.getOption("locale").value_or("");
+    std::string diagnosticLocaleSource = "--locale";
     if (diagnosticLocale.empty())
     {
         if (const char* envLocale = std::getenv("CFLAT_LOCALE"); envLocale && *envLocale)
+        {
             diagnosticLocale = envLocale;
+            diagnosticLocaleSource = "CFLAT_LOCALE";
+        }
     }
+    const bool diagnosticLocaleRequested = !diagnosticLocale.empty();
     if (diagnosticLocale.empty())
-        diagnosticLocale = "en-simple";
+        diagnosticLocale = "en";
     std::string diagnosticLocaleDir = args.getOption("locale-dir").value_or(
         (std::filesystem::path(runtimeDir) / "locales").string());
+
+    // A locale the user ASKED for must exist. Loading an absent catalog leaves the message
+    // map empty and every diagnostic falls back to its English source template - silently,
+    // so the flag looks ignored rather than wrong. Only an explicit request is checked; the
+    // "en" default and the LSP's client-locale resolution already pick an existing catalog.
+    // 'pseudo' is a mode rather than a catalog, so it needs no file.
+    if (diagnosticLocaleRequested && diagnosticLocale != "pseudo")
+    {
+        std::error_code localeEc;
+        const auto catalogPath =
+            std::filesystem::path(diagnosticLocaleDir) / (diagnosticLocale + ".json");
+        if (!std::filesystem::exists(catalogPath, localeEc))
+        {
+            std::vector<std::string> available{"pseudo"};
+            for (const auto& entry : std::filesystem::directory_iterator(diagnosticLocaleDir, localeEc))
+                if (entry.path().extension() == ".json")
+                    available.push_back(entry.path().stem().string());
+            std::sort(available.begin(), available.end());
+            std::string joined;
+            for (size_t i = 0; i < available.size(); ++i)
+            {
+                if (i) joined += ", ";
+                joined += available[i];
+            }
+            std::cout << std::format(
+                "Error: {} '{}' has no catalog at '{}'. Available: {}\n",
+                diagnosticLocaleSource, diagnosticLocale, catalogPath.string(), joined);
+            return 1;
+        }
+    }
     auto updateLocale = args.getOption("update-locale");
 
     // --init / --init-local / --init-clear / --init-clear-local are mutually exclusive;

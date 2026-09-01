@@ -233,7 +233,7 @@ int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProg
     compiler.SetVerbose(args.hasFlag("verbose"));
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
-        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
+        symbolLocale && *symbolLocale ? symbolLocale : "en"));
     compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
         (std::filesystem::path(runtimeDir) / "locales").string()));
     compiler.LoadLocale(args.hasFlag("verbose"));
@@ -1075,7 +1075,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
     compiler.SetVerbose(args.hasFlag("verbose"));
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
-        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
+        symbolLocale && *symbolLocale ? symbolLocale : "en"));
     compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
         (std::filesystem::path(runtimeDir) / "locales").string()));
     compiler.LoadLocale(args.hasFlag("verbose"));
@@ -1202,7 +1202,7 @@ int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
     compiler.SetBatchMode(true);
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
-        symbolLocale && *symbolLocale ? symbolLocale : "en-simple"));
+        symbolLocale && *symbolLocale ? symbolLocale : "en"));
     compiler.SetLocaleDirectory(args.getOption("locale-dir").value_or(
         (std::filesystem::path(runtimeDir) / "locales").string()));
     compiler.LoadLocale(args.hasFlag("verbose"));

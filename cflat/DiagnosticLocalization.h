@@ -31,7 +31,7 @@ public:
     static std::string NormalizeKey(std::string_view englishTemplate);
 
     // Map an LSP/BCP-47 client tag ("ja", "zh-cn", "fr-CA") to a catalog name in
-    // localeDirectory. Returns "en-simple" when no catalog matches; never selects
+    // localeDirectory. Returns "en" when no catalog matches; never selects
     // the migration-only "pseudo" locale.
     static std::string ResolveClientLocale(std::string_view clientTag,
                                            const std::filesystem::path& localeDirectory);
@@ -42,10 +42,10 @@ private:
                      bool verbose,
                      std::unordered_map<std::string, std::vector<std::string>>* argumentExamples = nullptr) const;
 
-    std::string locale_ = "en-simple";
+    std::string locale_ = "en";
     std::filesystem::path localeDirectory_;
     std::unordered_map<std::string, std::string> messages_;
-    std::unordered_map<std::string, std::string> enSimpleMessages_;
+    std::unordered_map<std::string, std::string> enMessages_;
     mutable std::unordered_map<std::string, std::string> collectedTemplates_;
     mutable std::unordered_map<std::string, std::vector<std::string>> collectedArgumentExamples_;
     bool collectTemplates_ = false;

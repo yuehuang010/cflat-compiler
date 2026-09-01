@@ -244,25 +244,25 @@ bool DiagnosticLocalization::LoadCatalog(
 bool DiagnosticLocalization::Load(bool verbose)
 {
     messages_.clear();
-    enSimpleMessages_.clear();
+    enMessages_.clear();
     pseudoReportedKeys_.clear();
     collectedTemplates_.clear();
     collectedArgumentExamples_.clear();
 
-    bool enSimpleLoaded = LoadCatalog(localeDirectory_ / "en-simple.json",
-                                      enSimpleMessages_, verbose);
+    bool enLoaded = LoadCatalog(localeDirectory_ / "en.json",
+                                      enMessages_, verbose);
 
     if (locale_ == "pseudo")
         return true;
 
-    if (locale_ == "en-simple")
+    if (locale_ == "en")
     {
-        messages_ = enSimpleMessages_;
-        return enSimpleLoaded;
+        messages_ = enMessages_;
+        return enLoaded;
     }
 
     bool selectedLoaded = LoadCatalog(localeDirectory_ / (locale_ + ".json"), messages_, verbose);
-    return enSimpleLoaded && selectedLoaded;
+    return enLoaded && selectedLoaded;
 }
 
 std::string DiagnosticLocalization::NormalizeKey(std::string_view englishTemplate)
@@ -277,7 +277,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
     for (char c : clientTag)
         tag += static_cast<char>(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c);
     if (tag.empty() || tag == "pseudo")
-        return "en-simple";
+        return "en";
 
     auto catalogExists = [&localeDirectory](const std::string& name)
     {
@@ -287,7 +287,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
 
     const std::string primary = tag.substr(0, tag.find('-'));
     if (primary == "en")
-        return "en-simple";
+        return "en";
 
     // Chinese needs script, not region: the catalogs are zh-Hans / zh-Hant.
     if (primary == "zh")
@@ -299,7 +299,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
         const std::string candidate = traditional ? "zh-Hant" : "zh-Hans";
         if (catalogExists(candidate))
             return candidate;
-        return "en-simple";
+        return "en";
     }
 
     // Exact tag first (fr-ca.json if someone ships one), then the primary subtag.
@@ -307,7 +307,7 @@ std::string DiagnosticLocalization::ResolveClientLocale(std::string_view clientT
         return tag;
     if (catalogExists(primary))
         return primary;
-    return "en-simple";
+    return "en";
 }
 
 std::string DiagnosticLocalization::FormatSourceTemplate(
@@ -332,11 +332,11 @@ std::string DiagnosticLocalization::Localize(
     {
         if (pseudoReportedKeys_.insert(key).second)
         {
-            auto it = enSimpleMessages_.find(key);
-            if (it == enSimpleMessages_.end() && fullKey != key)
-                it = enSimpleMessages_.find(fullKey);
-            bool present = it != enSimpleMessages_.end() && !it->second.empty();
-            std::cerr << std::format("[pseudo] warning: en-simple entry {}: {}\n",
+            auto it = enMessages_.find(key);
+            if (it == enMessages_.end() && fullKey != key)
+                it = enMessages_.find(fullKey);
+            bool present = it != enMessages_.end() && !it->second.empty();
+            std::cerr << std::format("[pseudo] warning: en.json entry {}: {}\n",
                                      present ? "present" : "missing", key);
         }
         return FormatSourceTemplate(englishTemplate, arguments);

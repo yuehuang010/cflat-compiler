@@ -217,13 +217,13 @@ translations - expected, and reported by the extractor as a stale entry.
 ### Catalogs
 
 `cflat/locales/<name>.json` holds `locale` plus a `messages` map of key to
-translated template. `en-simple.json` is the default display catalog and must
+translated template. `en.json` is the default display catalog and must
 cover every key; the source template is only the fallback. `en-pseudo.json` is
 the migration catalog: it carries the English source templates plus
 `argumentExamples` (real values observed at runtime), and the extractor also
 writes `argumentNames` and `sites` there as translator context.
 
-To add a language, copy `en-simple.json`, set `locale` to the file's basename,
+To add a language, copy `en.json`, set `locale` to the file's basename,
 and translate the values. Name the file by BCP-47 tag: a plain primary subtag
 where that suffices (`de`, `fr`, `it`, `ja`, `ko`, `ru`), and by script for
 Chinese (`zh-Hans`, `zh-Hant`) because the client sends regions (`zh-CN`,

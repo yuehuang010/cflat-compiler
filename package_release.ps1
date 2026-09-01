@@ -33,7 +33,7 @@ Copy-Item "$releaseDir\lld-link.exe" "$publishDir\"
 Copy-Item "$releaseDir\clang-cl.exe" "$publishDir\"
 Copy-Item "$releaseDir\core"         "$publishDir\core" -Recurse
 # Diagnostic catalogs: without them every message falls back to the source
-# template and the default en-simple catalog never loads.
+# template and the default en catalog never loads.
 if (-not (Test-Path "$releaseDir\locales")) {
     Write-Error "locales/ not found at $releaseDir - run a Release build first."
     exit 1

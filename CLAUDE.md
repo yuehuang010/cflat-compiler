@@ -113,7 +113,7 @@ leave `std::cout`.
 ## Localization
 
 **Never edit `cflat/locales/` directly** - not by hand, not by sed/script, not from an agent.
-Covers every file there (de/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, en-simple, en-pseudo). They are
+Covers every file there (de/en/es/fr/it/ja/ko/ru/zh-Hans/zh-Hant, en-pseudo). They are
 GENERATED: `en-pseudo.json` comes from the `LogError*` format strings in code via build/test
 tooling; translations are maintained externally from it. New/changed diagnostic -> write ONLY the
 `LogError*` format string in code, let scripts/tests regenerate, commit regenerated result as-is.

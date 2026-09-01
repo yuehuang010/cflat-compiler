@@ -35,11 +35,6 @@
       "auto",
       "auto f<T>(T x)"
     ],
-    "calltoarg0arg1adoptp...rfacecannotbeadopted3c6285968c7bf0a5": [
-      "IAdoptErrorSink",
-      "add",
-      "child"
-    ],
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
       "IAdoptErrorSink",
       "add",
@@ -474,7 +469,6 @@
       "bool",
       "Foo"
     ],
-    "structscannotimpleme...facesuseclassinstead717a4040b2a990a4": [],
     "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
@@ -513,7 +507,7 @@
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",
-    "calltoarg0arg1adoptp...rfacecannotbeadopted3c6285968c7bf0a5": "call to '{0}.{1}': adopt parameter '{2}' requires an owning plain interface local; a unique local or borrowed interface cannot be adopted",
+    "calltoarg0adoptparam...rfacecannotbeadopted40dd336a21320a8f": "call to '{0}': adopt parameter '{1}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": "call to '{0}.{1}': adopt parameter '{2}' requires an owned interface local or a move-returning interface result; a unique local or borrowed interface cannot be adopted",
     "calltoarg0arg1cannot...retheparameterasarg67031961b50e1c046": "call to '{0}.{1}': cannot pass a pointer to by-value parameter '{2}' of type '{3}' - an address is not of type '{4}'. Dereference it with '{5}' at the call site, or declare the parameter as '{6}'.",
     "calltoarg0arg1cannot...retheparameterasarg6ee426562302ed0bf": "call to '{0}.{1}': cannot pass a '{2}' to by-value parameter '{3}' of type '{4}' - there is no implicit dereference. Write '{5}' at the call site to pass the pointee, or declare the parameter as '{6}'.",
@@ -539,6 +533,8 @@
     "cannotcopyarg0itsfie...ipinsteadofcopyingit932eb09febf31c17": "cannot copy '{0}': its field '{1}.{2}' is '{3}', so it owns a raw pointer that has no generic deep-clone. A memberwise copy would share the pointer between two owners and double-free at teardown. Write a '{4}' method for '{5}' that clones the pointee itself, or '{6}' the value to transfer ownership instead of copying it.",
     "cannotlocatecflatbui...timedirectoryisunsetd6eb6b14f48bb579": "cannot locate cflat_builtins.c: runtime directory is unset.",
     "cannotlocatecrashhan...timedirectoryisunsetef91181cafe6b040": "cannot locate crash handler source: runtime directory is unset.",
+    "cannotlowerexternret...rtheactivecabirecipe7d08233bdb7fb8eb": "cannot lower extern return value for the active C ABI recipe",
+    "cannotlowerexternsre...singhiddenreturnslot205bdd697f2b57c7": "cannot lower extern sret return: missing hidden return slot",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "cannot move the over-aligned buffer '{0}' ('{1}') into the '{2}' parameter of '{3}': that alignment is a property of the allocation, not of the type, so the callee cannot recover it. Declare the parameter '{4}' so the block alignment is recorded, or over-align the ELEMENT TYPE instead.",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "cannot pass an owning value to the variadic '{0}' slot of '{1}'; bind the value to an owner first",
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": "cannot pass a raw pointer '{0}' as array-view parameter '{1}' ('{2}') - a view must span a whole allocation (it comes only from '{3}' or another '{4}'); the '{5} -> {6}' decay is one-way",
@@ -553,8 +549,10 @@
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunction7fc3eb38b29ed908": "cannot pass to C function-pointer parameter '{0}': this lambda captured {1} {2} [{3}, ... (and {4} more)]. A C callback is a bare code pointer and cannot carry captured state - pass a non-capturing lambda or a named function.",
     "cannotpasstocfunctio...mbdaoranamedfunctionf611c7976a8f6c79": "cannot pass to C function-pointer parameter '{0}': this 'function<>' value may store captured state. A C callback is a bare code pointer - pass a non-capturing lambda or a named function.",
+    "cannotrepairtheexter...arationisalreadyused97e1fff5ca82f8ac": "cannot repair the extern '{0}' declaration after ABI lowering was selected: the old declaration is already used",
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
+    "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",
     "checkparameterlistmissingtypeorclosing": "check parameter list - missing type or closing ')'?",
     "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": "check the function signature - missing return type or parameter type?",
@@ -568,6 +566,7 @@
     "classarg0fieldarg1is...oparg9fromclassarg1031a6c739ed8c752e": "class '{0}' field '{1}' is declared '{2}' but interface '{3}' does not declare it '{4}' - a store through the interface's field slot would neither free the old pointee (it leaks) nor reject a borrow, which the class's synthesized destructor then frees. Declare the field '{5} {6} {7}' on interface '{8}', or drop '{9}' from class '{10}'.",
     "classarg0methodarg1p...arg9oninterfacearg10ec4b10b44959142b": "class '{0}' method '{1}': parameter '{2}' is declared '{3}' but interface '{4}' does not declare it '{5}' - a call through the interface does not transfer ownership, so the caller still frees the argument that class '{6}' has already taken over (a double free). Drop '{7}' from class '{8}', or declare the parameter '{9}' on interface '{10}'.",
     "classarg0methodarg1p...g9frominterfacearg109b5bbab5ec4e2cc0": "class '{0}' method '{1}': parameter '{2}' is not declared '{3}' but interface '{4}' declares it '{5}' - a call through the interface transfers ownership of the argument, so the caller stops freeing it while class '{6}' never takes it over (the argument leaks). Declare the parameter '{7}' on class '{8}', or drop '{9}' from interface '{10}'.",
+    "classarg0methodarg1p...twodeclarationsagree6bf9e4623207b28b": "class '{0}' method '{1}': parameter '{2}' is declared '{3}' but interface '{4}' declares it '{5}' - '{6}' is part of the method's contract. Make the two declarations agree.",
     "classarg0methodarg1p...twodeclarationsagreeb2b3fc055988d232": "class '{0}' method '{1}': parameter '{2}' is declared '{3}' but interface '{4}' declares it '{5}' - '{6}' is part of the method's contract, and a call through the interface reads the contract from the interface, so the borrow the two disagree about would go untracked. Make the two declarations agree.",
     "classarg0methodarg1p...twodeclarationsagreec4f2b930e72f8da1": "class '{0}' method '{1}': parameter '{2}' is declared '{3}' but interface '{4}' declares it '{5}' - '{6}' makes the parameter a borrow whose destructor is suppressed, and a call through the interface reads the contract from the interface, so the borrow the two disagree about would go untracked. Make the two declarations agree.",
     "classarg0methodarg1t...narg8oninterfacearg9186992c085ab2c1b": "class '{0}' method '{1}': the return type is declared '{2}' but interface '{3}' declares it '{4}' - a call through the interface destroys the result at scope exit, while class '{5}' returns a borrow of storage it still owns (a double free). Drop '{6}' from class '{7}', or declare the return '{8}' on interface '{9}'.",

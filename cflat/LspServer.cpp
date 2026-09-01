@@ -493,7 +493,7 @@ public:
         }
 
         // CFLAT_LOCALE outranks the client's UI language; without it the pool starts
-        // on en-simple and switches in ApplyClientLocale when initialize arrives.
+        // on en and switches in ApplyClientLocale when initialize arrives.
         if (const char* envLocale = std::getenv("CFLAT_LOCALE"); envLocale && *envLocale)
         {
             diagnosticLocale_ = envLocale;
@@ -2759,7 +2759,7 @@ private:
     }
 
     std::string runtimeDir_;
-    std::string diagnosticLocale_ = "en-simple";
+    std::string diagnosticLocale_ = "en";
     bool localeFromEnvironment_ = false;
     std::vector<std::string> importSearchDirs_;
 
