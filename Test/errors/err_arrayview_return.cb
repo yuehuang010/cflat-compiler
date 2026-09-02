@@ -2,3 +2,27 @@
 expect_error("cannot return a raw pointer 'T*' as an array-view 'T[]'") {
     int[] forge(int* p) { return p; }
 }
+
+// A fresh heap array handed back through a bare `T*` / `T[]` return loses its element count at
+// the boundary; only `move T*` carries one, and `array<T>` owns it outright.
+import "array.cb";
+expect_error("cannot return heap array the 'new' result as 'double[]'") {
+    double[] freshView(int n) { return new double[n]; }
+}
+expect_error("cannot return heap array 'p' as 'int*'") {
+    int* freshPtr(int n) { int* p = new int[n]; return p; }
+}
+// The sanctioned spellings stay legal: `move T[]` carries the count with the whole-allocation
+// view, `move T*` carries it on a pointer, `array<T>` owns it outright.
+move int[] countedViewReturn(int n) { return new int[n]; }
+move int* countedReturn(int n) { return new int[n]; }
+array<int> ownedReturn(int n) { return new int[n]; }
+
+// `new T[n]` into `array<T>`: a per-site alignas cannot be honored by the array's plain
+// deallocator, and the element type must match.
+expect_error("'alignas' is not supported on a 'new T[n]' stored into 'array<T>'") {
+    void alignedIntoArray() { array<int> a = new int[4] alignas(64); }
+}
+expect_error("cannot store 'new double[n]' into 'array<int>': the element types differ") {
+    void mismatchedIntoArray() { array<int> a = new double[4]; }
+}

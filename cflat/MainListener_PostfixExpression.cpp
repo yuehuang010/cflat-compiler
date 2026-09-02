@@ -7461,6 +7461,27 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                 if (static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
                     continue;
                 break;
+            case CFlatParser::RuleDeclaration:
+                {
+                    // `auto x = new T[n];` deduces array<T> (see ArmArrayNewDesugar), which names
+                    // no generic type in source - queue the instantiation here so its methods
+                    // exist before the body is emitted. Children are still walked below.
+                    auto* decl = static_cast<CFlatParser::DeclarationContext*>(ruleCtx);
+                    auto* specs = decl->declarationSpecifiers();
+                    auto* initList = decl->initDeclaratorList();
+                    if (specs != nullptr && initList != nullptr && specs->getText() == "auto")
+                    {
+                        for (auto* initDecl : initList->initDeclarator())
+                        {
+                            auto* init = initDecl->initializer();
+                            auto* ne = init != nullptr ? AsDirectNew(init->assignmentExpression()) : nullptr;
+                            if (ne == nullptr || ne->assignmentExpression() == nullptr) continue;
+                            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier());
+                            QueueGenericInstantiation("array", { elem }, MangledGenericName("array", { elem }));
+                        }
+                    }
+                }
+                break;
             case CFlatParser::RuleTypeSpecifier:
                 {
                     // typeSpecifier with generic params: e.g. the "Box<MyInt>" in "Box<MyInt> b"

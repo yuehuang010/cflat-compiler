@@ -521,6 +521,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         std::optional<DeclExpectedTypeScope> returnExpectedScope;
         returnExpectedScope.emplace(&declExpectedType, compiler->currentFunctionReturnTV);
         if (assignExpr != nullptr)
+            ArmArrayNewDesugar(assignExpr, compiler->currentFunctionReturnTV);
+        if (assignExpr != nullptr)
             returnNV = ParseAssignmentExpressionNamed(assignExpr, ResultUse::ReturnOperand);
         else if (defaultValue)
         {
@@ -532,6 +534,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             returnNV.Primary = GenerateDefaultValue(dtv);
         }
         returnExpectedScope.reset();
+        arrayNewDesugarCtx = nullptr;
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
@@ -559,6 +562,30 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 sourceName,
                 compiler->DisplayNameOfCoreUniqueType(compiler->currentFunctionReturnTV.TypeName),
                 shownPointee));
+        }
+
+        // A raw heap array handed back through a bare `T*` / `T[]` return loses its element count
+        // at the boundary (only `move T*` carries one), so the caller can never free it correctly.
+        // `alias T*` is the documented hand-managed spelling and stays legal.
+        if (returnNV.TypeAndValue.Pointer
+            && compiler->currentFunctionReturnTV.Pointer
+            && !compiler->currentFunctionReturnTV.IsAlias
+            && !compiler->ReturnCarriesRawArrayCount(compiler->currentFunctionReturnTV)
+            && (compiler->HasRawNewArrayProvenance(returnNV)
+                || compiler->FindRawArrayResult(returnNV.Primary) != nullptr))
+        {
+            std::string sourceName = returnNV.CallerName.empty()
+                ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
+            if (sourceName.empty()) sourceName = "the 'new' result";
+            else sourceName = "'" + sourceName + "'";
+            bool writable = true;
+            std::string elemShown = compiler->DisplayNameOfMangledType(
+                compiler->currentFunctionReturnTypeName, &writable);
+            if (!writable) elemShown = compiler->currentFunctionReturnTypeName;
+            LogErrorContext(errCtx, compiler->LocalizeMessage(
+                "cannot return heap array {} as '{}': the element count is lost at the return - "
+                "return 'array<{}>' or 'move {}[]' (which carries the count) instead",
+                { sourceName, CurrentReturnTypeSpelling(compiler), elemShown, elemShown }));
         }
 
         if (returnNV.ContainsBondedClosure)

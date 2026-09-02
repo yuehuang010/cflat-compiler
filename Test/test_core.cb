@@ -126,6 +126,63 @@ int testMemberDtor()
     return passed;
 }
 
+// `new T[n]` whose destination is `array<T>` desugars to `array<T>.init(n)`: decl-init,
+// direct assignment and return. Every element reads as `default` (primitives zero-filled).
+struct ArrElem { int v = 5; };
+array<int> makeIntArray(int n) { return new int[n]; }
+move Tracked* makeTrackedCounted(int n) { return new Tracked[n]; }
+array<ArrElem> makeElemArray(int n) { return new ArrElem[n]; }
+int testArrayNewDesugar()
+{
+    int passed = 0;
+    array<int> a = new int[16];
+    int nonZero = 0;
+    for (int i = 0; i < 16; i++) if (a[i] != 0) nonZero++;
+    passed += Test("new int[n] into array<int> count", a.count(), 16);
+    passed += Test("new int[n] into array<int> zero-filled", nonZero, 0);
+    a.set(3, 42);
+    passed += Test("new int[n] into array<int> writable", a[3], 42);
+
+    array<double> d = default;
+    d = new double[4];
+    passed += Test("assign new double[n] to array<double>", d.count(), 4);
+    passed += Test("assign new double[n] zero-filled", d[3] == 0.0, true);
+
+    array<int> r = makeIntArray(6);
+    passed += Test("return new int[n] as array<int>", r.count(), 6);
+    array<ArrElem> e = makeElemArray(3);
+    passed += Test("return new T[n] as array<T> runs ctor", e[2].v, 5);
+
+    // A counted `move T*` result binds to a `T[]` view; the view keeps the count, so every
+    // element is destructed at scope exit.
+    g_dtor_count = 0;
+    {
+        Tracked[] tv = makeTrackedCounted(3);
+        passed += Test("T[] view from move T* return reads elements", tv[2]._val, 0);
+    }
+    passed += Test("T[] view from move T* return destructs by count", g_dtor_count, 3);
+
+    auto ap = new int[5];
+    passed += Test("auto from new int[n] deduces array<int>", ap.count(), 5);
+    int* raw = new int[5];
+    raw[4] = 9;
+    passed += Test("T* from new int[n] stays a raw pointer", raw[4], 9);
+    delete[_] raw;
+
+    array<int> u = default;
+    u.init_uninit(4);
+    for (int i = 0; i < 4; i++) u.set(i, i * 2);
+    passed += Test("init_uninit then overwrite", u[3], 6);
+
+    // operator[] is an alias borrow of the live slot, so `a[i] = v` writes in place like a
+    // raw T[n] subscript; the auto-deduced array<int> gets the same lvalue.
+    ap[1] = 5;
+    u[0] = u[3] + ap[1];
+    passed += Test("array<T> subscript is an assignable lvalue", u[0], 11);
+    passed += Test("auto array<T> subscript write", ap[1], 5);
+    return passed;
+}
+
 int testArray()
 {
     int passed = 0;
@@ -3217,6 +3274,7 @@ extern int main()
     int r;
 
     r = testArray();            passed += r; total += 22;
+    r = testArrayNewDesugar();  passed += r; total += 14;
     r = testMemberDtor();       passed += r; total += 8;
     r = testList();             passed += r; total += 15;
     r = testListCopy();         passed += r; total += 19;

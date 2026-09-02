@@ -2596,7 +2596,7 @@ class GOuter<T> where T : IMessage
 {
     GInner<T>* make()
     {
-        GInner<T>* a = new GInner<T>[1];
+        GInner<T>* a = new GInner<T>;
         a.bump();
         a.bump();
         return a;
@@ -2609,7 +2609,7 @@ bool testNestedGenericInnerMethod()
     GOuter<IMessage> o = default;
     GInner<IMessage>* a = o.make();
     result &= Test("nested generic inner-method call", (int)a._v, 2);
-    delete[1] a;
+    delete a;
     return result;
 }
 

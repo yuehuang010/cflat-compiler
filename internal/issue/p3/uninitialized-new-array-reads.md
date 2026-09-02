@@ -124,3 +124,25 @@ Prior art checked: Rust `Vec::with_capacity` + `extend` keeps `len` at the initi
 an uninitialized read is unrepresentable; `vec![0; n]` is `alloc_zeroed`; `MaybeUninit`,
 `spare_capacity_mut`/`set_len`, `Box::new_uninit_slice`, `ndarray::Array::uninit` are the
 explicit unsafe opt-outs used by BLAS/FFT bindings.
+
+## Landed (2026-09-02): array<T>.init contract and the new T[n] desugar
+
+- `array<T>.init(n)` now honors the contract: primitive elements are memset to zero after the
+  `new T[n]`; struct / pointer / interface elements were already `default`. The opt-out is
+  `init_uninit(n)` (name chosen for the `_uninit` Rust precedent; not yet ruled on).
+- `new T[n]` whose destination is `array<T>` desugars to `array<T>.init(n)`: decl-init, direct
+  assignment, and `return` from a function declared to return `array<T>`. Per-site `alignas`
+  on that `new` is rejected (the array frees through the plain deallocator).
+- Returning a fresh heap array through a bare `T*` / `T[]` return is an error (the count is
+  lost at the boundary). `move T*` and `array<T>` returns stay legal; `alias T*` is exempt as
+  the documented hand-managed spelling. Six sites moved: core `regex._newStamp` (move),
+  `arena_channel.acquire_arena` (`new page_arena<T>` single), `function.__closure_env_alloc`
+  (alias); tests `makeAlignedFlat` (move), `ifaceViewFresh` (array<IShape>), `GOuter.make`.
+
+Still open (this issue stays):
+- `T* p = new T[n]` into a raw pointer is unchanged: primitives stay uninitialized. About 800
+  such sites (core 174, Test 526, example 119) remain; the migration to `array<T>` is the
+  vec follow-up in [[raw-array-count-desugar-direction]].
+- The zero-fill is an unconditional memset, not the `alloc_zeroed` allocator entry sketched
+  above; that optimization is worth doing only once the recycled-block allocators are measured.
+- Debug poison fill for `init_uninit` (option 1) not started.

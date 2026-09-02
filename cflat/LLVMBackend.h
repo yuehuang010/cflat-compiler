@@ -5270,6 +5270,8 @@ public:
      */
     std::string DisplayNameOfMangledType(const std::string& mangled, bool* writable = nullptr) const;
     bool IsCoreUniqueType(const std::string& typeName) const;
+    // True for a mangled instantiation of the core `array<T>` (array__<T>).
+    bool IsCoreArrayType(const std::string& typeName) const;
     // Answers whether this parameter/return consumes ownership: explicit move, or a by-value core unique<T>.
     bool IsMoveOrCoreUniqueValue(const TypeAndValue& t) const;
     bool IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeAndValue& param) const;

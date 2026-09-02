@@ -15,8 +15,22 @@ struct array<T>
     T*  _ptr = nullptr;
     int _len = 0;
 
-    // Allocate the backing buffer of `size` elements.
+    // Allocate the backing buffer of `size` elements. Every element reads as `default`:
+    // struct elements are constructed, pointer / interface slots are null, and primitive
+    // slots are zeroed here (`new T[]` leaves primitives uninitialized).
     void init(int size)
+    {
+        _ptr = new T[size];
+        _len = size;
+        if const (is_primitive(T))
+        {
+            if (size > 0) memset((void*)_ptr, 0, (i64)size * (i64)sizeof(T));
+        }
+    }
+
+    // init() without the primitive zero-fill, for a buffer the caller overwrites in full
+    // before reading (HPC hot paths). Element values are unspecified until written.
+    void init_uninit(int size)
     {
         _ptr = new T[size];
         _len = size;
@@ -108,6 +122,7 @@ struct array<T>
         }
     }
 
-    // a[index] - same semantics as get(index).
-    T operator[](int index) { return _ptr[index]; }
+    // a[index] - same semantics as get(index): an alias borrow of the live slot, so it is
+    // also an assignable lvalue (a[i] = v stores into the slot, like a raw T[n]).
+    alias T operator[](int index) { return _ptr[index]; }
 };

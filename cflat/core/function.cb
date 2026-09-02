@@ -5,8 +5,9 @@
 
 import "memory.cb";
 
-// Allocate `n` raw bytes through operator new.
-i8* __closure_env_alloc(i64 n)
+// Allocate `n` raw bytes through operator new. The block is hand-managed by the env
+// primitives below (`alias`: no count travels with it, and none is needed for bytes).
+alias i8* __closure_env_alloc(i64 n)
 {
     i8* base = new i8[n];
     return base;

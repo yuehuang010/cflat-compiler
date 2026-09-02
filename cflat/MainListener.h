@@ -3105,6 +3105,13 @@ private:
     // alloc-align channel: alignment is inherited only when the context provably reaches the `new`.
     CFlatParser::NewExpressionContext* AsDirectNew(antlr4::tree::ParseTree* node);
 
+    // `new T[n]` desugar into the core `array<T>`: a decl-init, direct assignment or return
+    // whose destination is `array<T>` and whose RHS is a DIRECT array `new` arms this one-shot
+    // slot; ParseNewExpression consumes it for that exact node and yields the array value.
+    CFlatParser::NewExpressionContext* arrayNewDesugarCtx = nullptr;
+    LLVMBackend::TypeAndValue arrayNewDesugarTarget;
+    void ArmArrayNewDesugar(antlr4::tree::ParseTree* rhs, const LLVMBackend::TypeAndValue& target);
+
     LLVMBackend::DeclTypeAndValue getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx);
 
     // Returns the default value for a type:
@@ -4487,7 +4494,7 @@ public:
     // assignment/parameter/return slot; `rhs` is the value being bound into it.
     bool RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
-                                     const LLVMBackend::TypeAndValue& rhs);
+                                     const LLVMBackend::NamedVariable& rhs);
 
     llvm::Value* ParseAssignmentExpression(CFlatParser::AssignmentExpressionContext* ctx);
 

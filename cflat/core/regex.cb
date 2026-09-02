@@ -856,12 +856,12 @@ class Regex
     }
 
     // Allocate and -1-initialize a per-state dedup stamp array; caller frees it.
-    int* _newStamp()
+    move int[] _newStamp()
     {
-        int* stamp = new int[_nstates];
+        int[] stamp = new int[_nstates];
         int i = 0;
         while (i < _nstates) { stamp[i] = -1; i++; }
-        return stamp;
+        return move stamp;
     }
 
     // Leftmost match. Returns a Match; .success is false if no match.
@@ -872,7 +872,7 @@ class Regex
         i8* s = input.data();
         int n = input.length();
 
-        int*  stamp = _newStamp();
+        int[] stamp = _newStamp();
         int*  ccaps = new int[_nstates * 20];
         int*  ncaps = new int[_nstates * 20];
         list<int> cstates;
@@ -916,7 +916,7 @@ class Regex
         i8* s = input.data();
         int n = input.length();
 
-        int*  stamp = _newStamp();
+        int[] stamp = _newStamp();
         int*  ccaps = new int[_nstates * 20];
         int*  ncaps = new int[_nstates * 20];
         list<int> cstates;

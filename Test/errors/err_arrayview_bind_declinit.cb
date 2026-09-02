@@ -59,10 +59,14 @@ expect_error("cannot delete array-view 'v' - it was bound from 'gDeclInitFieldHo
     void declInitGlobalFieldSource() { int[] v = gDeclInitFieldHolder.a; delete[_] v; }
 }
 
-// Legal: a view from 'new T[n]' (explicit or 'auto'-deduced) is a genuine heap allocation -
-// 'delete[_]' is exactly right and must keep compiling.
+// Legal: a view from 'new T[n]' is a genuine heap allocation - 'delete[_]' is exactly right
+// and must keep compiling.
 void declInitHeapOk() { int[] v = new int[3]; delete[_] v; }
-void declInitHeapAutoOk() { auto v = new int[3]; delete[_] v; }
+
+// 'auto' from 'new T[n]' deduces the owning array<T> (array.cb is part of the runtime); the
+// raw-pointer escape hatch is the explicit 'int* v' spelling.
+void declInitHeapAutoOk() { auto v = new int[3]; v.set(0, 1); }
+void declInitHeapRawOk() { int* v = new int[3]; delete[_] v; }
 
 // Legal: the view's origin cannot be proven here (it comes from a 'move' parameter, so the
 // caller's original binding is out of view) - the guard must not reject what it cannot prove.

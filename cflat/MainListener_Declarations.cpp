@@ -4133,6 +4133,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && AsDirectNew(assignmentExpression) != nullptr)
                         compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
                     if (assignmentExpression != nullptr)
+                        ArmArrayNewDesugar(assignmentExpression, typeAndValue);
+                    if (assignmentExpression != nullptr)
                     {
                         std::optional<DeclExpectedTypeScope> coreUniqueExpectedScope;
                         if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
@@ -4792,7 +4794,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 RejectLambdaReferenceCaptureEscape(
                                     isStaticLocal, rightNV, assignmentExpression);
                                 // int[] v = rawIntPtr; is the laundering door - reject it.
-                                RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV.TypeAndValue);
+                                RejectRawPointerToArrayView(assignmentExpression, typeAndValue, rightNV);
                                 // Declarator-init leg of the code-value store gate: `Rec* r = w;`
                                 // stored a code address in a data pointer and wrote through it.
                                 if (compiler->CodeValueIntoDataDestination(rightNV, typeAndValue))
@@ -6141,10 +6143,15 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
 
                         // Record `new T[n]` provenance on a raw `T*` local: a DIRECT new-array
-                        // initializer, or a plain copy of an already-tagged pointer local.
+                        // initializer, or a plain copy of an already-tagged pointer local. A `T[]`
+                        // view bound from a counted `move T*` CALL result records it too, so the
+                        // count that crossed the return drives its scope-exit / delete path.
                         auto* initNewArr = initializer && initializer->assignmentExpression()
                             ? AsDirectNew(initializer->assignmentExpression()) : nullptr;
-                        if (typeAndValue.Pointer && !typeAndValue.IsArrayView)
+                        const bool viewFromCountedCall = typeAndValue.IsArrayView
+                            && initNewArr == nullptr && srcPtrCopyIsRawNewArray
+                            && srcRawArrayLength != nullptr;
+                        if (typeAndValue.Pointer && (!typeAndValue.IsArrayView || viewFromCountedCall))
                         {
                             bool isRawArray = (initNewArr != nullptr
                                 && initNewArr->assignmentExpression() != nullptr)

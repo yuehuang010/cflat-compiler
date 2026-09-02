@@ -451,9 +451,12 @@ char[4] c = {72, 73, 0, 0}; // 'H', 'I'
 supplies the backing storage and infers its length. An empty `{}` is an error (nothing to infer
 from); use an explicit `T[N]` for a zero-length-but-sized array. Note: `T[]*` and `T[N]*`
 (pointer-to-array-view / pointer-to-fixed-array) are not valid types - to return several
-results, return one `T[]` and pass extra arrays as `T[]` out-parameters and scalars as `T*`
+results, return one `array<T>` and pass extra arrays as `T[]` out-parameters and scalars as `T*`
 (see [Returning Multiple Results](#returning-multiple-results) for the pattern and the noalias
-guarantee):
+guarantee). A fresh `new T[n]` cannot be returned as a bare `T[]` or `T*`: the element count
+would be lost at the boundary. Return `array<T>`, or `move T[]`, which carries the count with
+the view (`move T*` does the same on a pointer). The caller binds the result to a `T[]` view
+(`double[] v = makeBuffer(n);`); the view keeps the count for its scope-exit cleanup.
 
 ```c
 int[]    v = {11, 22, 33};  // backing [3 x int]; v points at element 0
@@ -464,7 +467,6 @@ string[] s = {"x", "y"};    // char* literals coerced to string
 
 ```c
 import "list.cb";
-import "array.cb";
 import "dictionary.cb";
 
 list<int>            li = {10, 20, 30};          // -> add() per element
@@ -519,8 +521,9 @@ int c = sum(x: 1, y: 2, 3);            // mixed with positional
 ### Returning Multiple Results
 
 A function returns a single value, so to hand back several results, return one and pass the
-rest as **out-parameters**. The sanctioned pattern: return one `T[]`, pass any extra arrays as
-`T[]` out-parameters, and pass scalar outputs as `T*` out-parameters.
+rest as **out-parameters**. The sanctioned pattern: return one array (an `array<T>` for a fresh
+heap array, or a `T[]` view the caller already owns), pass any extra arrays as `T[]`
+out-parameters, and pass scalar outputs as `T*` out-parameters.
 
 ```c
 // Returns the summed array; also reports how many elements it touched via an int* out-param.
@@ -2616,14 +2619,40 @@ for (int x in buf)
 `array<T>` (heap-allocated, fixed-size) also works:
 
 ```c
-import "array.cb";
-
-array<int> arr;
+array<int> arr;                 // array.cb is part of the runtime; no import needed
 arr.init(3);
 arr.set(0, 100); arr.set(1, 200); arr.set(2, 300);
 
 for (int v in arr)
     printf("%d\n", v);
+```
+
+`array<T>.init(n)` gives every element the value `default`: struct elements are constructed,
+pointer and interface slots are null, and primitive slots are zero-filled. `init_uninit(n)`
+skips the primitive zero-fill for a buffer that is overwritten in full before it is read.
+
+`new T[n]` whose destination is an `array<T>` desugars to `init(n)` - a declaration, a direct
+assignment, or a `return` from a function declared to return `array<T>`:
+
+```c
+array<double> d = new double[1024];          // zero-filled, count() == 1024
+array<Node> make(int n) { return new Node[n]; }
+auto a = new int[64];                        // deduces array<int>
+int* raw = new int[64];                      // escape hatch: raw pointer, you manage the count
+```
+
+`auto x = new T[n]` deduces `array<T>`. To keep a raw heap array and manage its size
+yourself, spell the pointer type: `T* p = new T[n]`.
+
+`a[i]` is an `alias` borrow of the live slot, the same contract as `get(i)`, so it is also an
+assignable lvalue: `a[i] = v` stores into the slot exactly like a raw `T[n]` subscript. The
+write goes through the borrow, so an owning element already in the slot is destructed first,
+the same release `set(i, v)` performs.
+
+```c
+auto a = new int[4];
+a[1] = 5;                    // in-place write, no set() needed
+a[2] = a[1] + 1;
 ```
 
 ---
@@ -3185,7 +3214,7 @@ table is a file index of what each library is for.
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
 | `string.cb` | `string` - owned/borrowed UTF-8 value type; `IString` implementation |
 | `wstring.cb` | `wstring` - owned UTF-16 string for Win32 `...W` / WinRT APIs |
-| `array.cb` | `array<T>` - owning fixed-size heap array with destructor support |
+| `array.cb` | `array<T>` - owning fixed-size heap array with destructor support - **auto-imported** via `runtime.cb` |
 | `list.cb` | `list<T>` - growable array |
 | `span.cb` | `span<T>` - non-owning **noalias** window (`T[]` + len); for vectorization. See [HPC.md](HPC.md) |
 | `view.cb` | `view<T>` - non-owning **may-alias** window (`T*` + len); sibling of `span<T>` |

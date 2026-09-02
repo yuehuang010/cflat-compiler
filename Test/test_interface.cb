@@ -1,5 +1,6 @@
 import "test_helper.cb";
 import "list.cb";
+import "array.cb";
 import "channel.cb";
 import "library/iface_rebox_lib.cb";
 import "library/gi_collide_iface.cb";
@@ -2507,7 +2508,16 @@ struct IfaceViewHolder
     int sum() { int s = 0; for (int i = 0; i < n; i++) s += items[i].area(); return s; }
 };
 
-IShape[] ifaceViewFresh(int n)
+// A fresh heap array crosses a call boundary as `array<IShape>`: `new IShape[n]` desugars to
+// the owning array (a bare `IShape[]` return would drop the element count).
+array<IShape> ifaceViewFresh(int n)
+{
+    return new IShape[n];
+}
+
+// The view spelling of the same return: `move IShape[]` carries the element count with the
+// whole-allocation view, so the caller's `IShape[]` local frees (and null-checks) by count.
+move IShape[] ifaceViewFreshCounted(int n)
 {
     return new IShape[n];
 }
@@ -2561,10 +2571,18 @@ bool testInterfaceArrayViewOfInterfaces()
     // NOTE: this pins the SEMANTICS, not the buffer-zeroing that implements them - macOS's
     // allocator scrubs freed blocks, so no .cb-level heap pollution can tell a missing memset
     // from a present one here. The memset itself is guarded by reading the emitted IR.
-    IShape[] fresh = ifaceViewFresh(3);
+    IShape[] fresh = ifaceViewFreshCounted(3);
     int nonNull = 0;
     for (int i = 0; i < 3; i++) if (fresh[i] != nullptr) nonNull++;
     result &= Test("iface_view_new_zeroed", nonNull, 0);
+
+    array<IShape> freshArr = ifaceViewFresh(3);
+    int arrNonNull = 0;
+    for (int i = 0; i < 3; i++) if (freshArr[i] != nullptr) arrNonNull++;
+    result &= Test("iface_array_returned_zeroed", arrNonNull, 0);
+    result &= Test("iface_array_returned_count", freshArr.count(), 3);
+    freshArr.set(1, sqs[2]);
+    result &= Test("iface_array_returned_write", freshArr[1].area(), 9);
 
     fresh[1] = sqs[2];
     result &= Test("iface_view_returned_write", fresh[1].area(), 9);

@@ -1,5 +1,6 @@
 {
   "argumentExamples": {
+    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -290,6 +291,16 @@
       "function<>",
       "(function<...>)value"
     ],
+    "cannotreturnheaparra...rriesthecountinstead43fbc7218e7c0530": [
+      "the 'new' result",
+      "double[]",
+      "double",
+      "double"
+    ],
+    "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": [
+      "double",
+      "array<int>"
+    ],
     "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
       "Untitled",
       "ITitled",
@@ -461,6 +472,9 @@
     ],
     "hintarg0": [
       "structs cannot implement interfaces; use 'class' instead"
+    ],
+    "importarg0winrtmetad...ifconstwindowsimport89defcf988c01580": [
+      "Windows.Foundation.winmd"
     ],
     "importpackagenugetar...mdimportonitsownlinece2e623666d2dd94": [
       "Bar.winmd"
@@ -824,6 +838,10 @@
       "guard",
       "nest"
     ],
+    "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": [
+      "displayType",
+      "displayType"
+    ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitc211031fc62a57d2": [
       "displayType",
       "displayType",
@@ -964,6 +982,16 @@
       "DescribeNonFunctionArgument(returnNV)",
       "function<>",
       "(function<...>)value"
+    ],
+    "cannotreturnheaparra...rriesthecountinstead43fbc7218e7c0530": [
+      "sourceName",
+      "CurrentReturnTypeSpelling(compiler)",
+      "elemShown",
+      "elemShown"
+    ],
+    "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": [
+      "elemSpelling",
+      "compiler->DisplayNameOfMangledType(arrayNewDesugarTarget.TypeName)"
     ],
     "clangclexenotfoundca...otcompilecsourcearg0a024a70aad3d9a4c": [
       "cSourcePath"
@@ -1347,6 +1375,7 @@
   },
   "locale": "en-pseudo",
   "messages": {
+    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
@@ -1433,7 +1462,9 @@
     "cannotrepairtheexter...arationisalreadyused97e1fff5ca82f8ac": "cannot repair the extern '{0}' declaration after ABI lowering was selected: the old declaration is already used",
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
+    "cannotreturnheaparra...rriesthecountinstead43fbc7218e7c0530": "cannot return heap array {0} as '{1}': the element count is lost at the return - return 'array<{2}>' or 'move {3}[]' (which carries the count) instead",
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
+    "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",
     "checkparameterlistmissingtypeorclosing": "check parameter list - missing type or closing ')'?",
     "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": "check the function signature - missing return type or parameter type?",
@@ -1537,6 +1568,9 @@
     "winrtdelegateoperato...ortacorelibraryfirsta2491578d800681c": "winrtDelegate: 'operator new' unavailable (import a core library first)"
   },
   "sites": {
+    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [
+      "MainListener_Expressions.cpp:11352"
+    ],
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
       "LLVMBackend_WinRT.cpp:1694"
     ],
@@ -1616,8 +1650,8 @@
       "LLVMBackend_StateAndImports.cpp:150"
     ],
     "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": [
-      "ForwardRefScanner.cpp:503",
-      "MainListener_Declarations.cpp:2518"
+      "ForwardRefScanner.cpp:515",
+      "MainListener_Declarations.cpp:2529"
     ],
     "arg0staticinitializerexecutionfailedarg1": [
       "LLVMBackend_EmitAndLink.cpp:3586"
@@ -1632,7 +1666,7 @@
       "LLVMBackend_ControlFlowAndFunctions.cpp:445"
     ],
     "calltoarg0adoptparam...rfacecannotbeadopted40dd336a21320a8f": [
-      "LLVMBackend_Overloads.cpp:1666"
+      "LLVMBackend_Overloads.cpp:1671"
     ],
     "calltoarg0arg1adoptp...rfacecannotbeadoptedc8edc9a7350dcd11": [
       "LLVMBackend_WinRT.cpp:2638"
@@ -1653,21 +1687,21 @@
       "LLVMBackend_WinRT.cpp:2260"
     ],
     "calltoarg0arg1stillo...ainerselementuniquet46a6c947c30c8662": [
-      "LLVMBackend_Overloads.cpp:2556",
-      "LLVMBackend_OwnershipTemps.cpp:2762"
+      "LLVMBackend_Overloads.cpp:2568",
+      "LLVMBackend_OwnershipTemps.cpp:2767"
     ],
     "calltoarg0arg1stillo...sothecontainerownsit3a125e8aa8e103e7": [
-      "LLVMBackend_Overloads.cpp:2528"
+      "LLVMBackend_Overloads.cpp:2540"
     ],
     "calltoarg0argumentar...rg2hasnoresolvedtype1b9c663e45646797": [
-      "LLVMBackend_Overloads.cpp:1196"
+      "LLVMBackend_Overloads.cpp:1208"
     ],
     "calltoarg0cannotpass...evaluenotastackvalueade9718dd6fc01f3": [
-      "LLVMBackend_Overloads.cpp:1126",
-      "LLVMBackend_Overloads.cpp:1151"
+      "LLVMBackend_Overloads.cpp:1138",
+      "LLVMBackend_Overloads.cpp:1163"
     ],
     "calltoarg0cannotpass...thecalleeonlyborrows7fecc6bc7d235122": [
-      "LLVMBackend_Overloads.cpp:1277"
+      "LLVMBackend_Overloads.cpp:1289"
     ],
     "calltoarg0moveargume...eclearedafterthemovecb9e409370205fa4": [
       "LLVMBackend_WinRT.cpp:1806"
@@ -1679,16 +1713,16 @@
       "LLVMBackend_WinRT.cpp:1648"
     ],
     "cannotarg0arg1arg2fr...oramovereturningcall24368f2be24c7fe1": [
-      "LLVMBackend_Overloads.cpp:1525"
+      "LLVMBackend_Overloads.cpp:1537"
     ],
     "cannotarg0arg1arg2fr...oramovereturningcall3006f824415239a3": [
-      "LLVMBackend_Overloads.cpp:1535"
+      "LLVMBackend_Overloads.cpp:1547"
     ],
     "cannotarg0arg1fromab...oramovereturningcall540141ea59f3ddd7": [
-      "LLVMBackend_Overloads.cpp:1520"
+      "LLVMBackend_Overloads.cpp:1532"
     ],
     "cannotarg0arg1frombo...oramovereturningcall00c40fbac047ce38": [
-      "LLVMBackend_Overloads.cpp:1530"
+      "LLVMBackend_Overloads.cpp:1542"
     ],
     "cannotarg0onlyanamed...thanexplicitcastarg28d664510c1990514": [
       "LLVMBackend_WinRT.cpp:1868"
@@ -1717,11 +1751,14 @@
     "cannotconverttointer...thernestedinsidearg46fae2dfad80b2d3d": [
       "LLVMBackend_Interfaces.cpp:1938"
     ],
+    "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": [
+      "LLVMBackend_Overloads.cpp:678"
+    ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitc211031fc62a57d2": [
-      "LLVMBackend_Overloads.cpp:699"
+      "LLVMBackend_Overloads.cpp:706"
     ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitcc0e5e860001f897": [
-      "LLVMBackend_Overloads.cpp:691"
+      "LLVMBackend_Overloads.cpp:698"
     ],
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": [
       "LLVMBackend_Overloads.cpp:671"
@@ -1740,16 +1777,16 @@
       "LLVMBackend_MoveDataflow.cpp:1518"
     ],
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": [
-      "LLVMBackend_Overloads.cpp:2293"
+      "LLVMBackend_Overloads.cpp:2305"
     ],
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
       "LLVMBackend_WinRT.cpp:1685"
     ],
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": [
-      "LLVMBackend_Overloads.cpp:1097"
+      "LLVMBackend_Overloads.cpp:1109"
     ],
     "cannotpassarawpointe...rg5arg6decayisoneway9309c0c4984312aa": [
-      "LLVMBackend_Overloads.cpp:1110"
+      "LLVMBackend_Overloads.cpp:1122"
     ],
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": [
       "LLVMBackend_Interfaces.cpp:1340"
@@ -1764,19 +1801,19 @@
       "LLVMBackend_Overloads.cpp:624"
     ],
     "cannotpassarg0tothea...binditfirstarg9arg1069e931e3bcfc1bb6": [
-      "LLVMBackend_Overloads.cpp:1231"
+      "LLVMBackend_Overloads.cpp:1243"
     ],
     "cannotpassarg0tothea...erexplicitlywitharg685f9bb80ecf24438": [
       "LLVMBackend_ControlFlowAndFunctions.cpp:430"
     ],
     "cannotpassarg0tothev...icitlywitharg6egarg797ac9bd8fa8f5479": [
-      "LLVMBackend_Overloads.cpp:1448"
+      "LLVMBackend_Overloads.cpp:1460"
     ],
     "cannotpassbondedvalu...toftheirsourcesscope560cc5e8605342a2": [
       "LLVMBackend_WinRT.cpp:2477"
     ],
     "cannotpassowningheap...quetdoesnotownarrays57d0d857da621597": [
-      "LLVMBackend_Overloads.cpp:1568"
+      "LLVMBackend_Overloads.cpp:1573"
     ],
     "cannotpasstocfunctio...mbdaoranamedfunction48dd5fe854279d60": [
       "LLVMBackend_WinRT.cpp:1985"
@@ -1796,8 +1833,14 @@
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": [
       "LLVMBackend_WinRT.cpp:1891"
     ],
+    "cannotreturnheaparra...rriesthecountinstead43fbc7218e7c0530": [
+      "MainListener_Statements.cpp:585"
+    ],
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": [
       "LLVMBackend_MoveDataflow.cpp:1514"
+    ],
+    "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": [
+      "MainListener_Expressions.cpp:11345"
     ],
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": [
       "LLVMBackend_CInterop.cpp:892"
@@ -1821,7 +1864,7 @@
       "LLVMBackend_Interfaces.cpp:932"
     ],
     "classarg0doesnotimplementarg1arg2": [
-      "LLVMBackend_WinRT.cpp:2875"
+      "LLVMBackend_WinRT.cpp:2876"
     ],
     "classarg0fieldarg1ha...arg3declaresitasarg48a734db922a905ed": [
       "LLVMBackend_Interfaces.cpp:960"
@@ -1900,10 +1943,10 @@
       "LLVMBackend_EmitAndLink.cpp:3763"
     ],
     "functionarg0cannotbe...rg3insteadordroparg4a38c64f3d4498882": [
-      "LLVMBackend_Overloads.cpp:1889"
+      "LLVMBackend_Overloads.cpp:1894"
     ],
     "functionarg0hasnoove...efunctionpointertype8d562b0f9fbd458d": [
-      "LLVMBackend_Overloads.cpp:1322"
+      "LLVMBackend_Overloads.cpp:1334"
     ],
     "functionarg0isneverused": [
       "LspServer.cpp:2606"
@@ -1921,10 +1964,10 @@
       "LLVMBackend_Interfaces.cpp:1254"
     ],
     "gettypealignbytesnulltypepointer": [
-      "LLVMBackend_WinRT.cpp:2724"
+      "LLVMBackend_WinRT.cpp:2725"
     ],
     "gettypesizebytesnulltypepointer": [
-      "LLVMBackend_WinRT.cpp:2712"
+      "LLVMBackend_WinRT.cpp:2713"
     ],
     "heapauditheapauditen...cannotinstrumentmainfc56369fd43948ec": [
       "LLVMBackend_EmitAndLink.cpp:3337"
@@ -2009,8 +2052,8 @@
       "CFlatErrorStrategy.h:100"
     ],
     "parameterarg0cannotp...toftheirsourcesscope0c92f2fcfe931fdb": [
-      "LLVMBackend_Overloads.cpp:1543",
-      "LLVMBackend_Overloads.cpp:1548"
+      "LLVMBackend_Overloads.cpp:1555",
+      "LLVMBackend_Overloads.cpp:1560"
     ],
     "programdefinitionsrequireatrailing": [
       "CFlatErrorListener.h:298"
@@ -2019,19 +2062,19 @@
       "LLVMBackend_ControlFlowAndFunctions.cpp:1456"
     ],
     "reflectfailedtocreatefunctionforarg0": [
-      "LLVMBackend_WinRT.cpp:2949"
+      "LLVMBackend_WinRT.cpp:2950"
     ],
     "reflectfailedtoretrievevisitoralloca": [
-      "LLVMBackend_WinRT.cpp:2969"
+      "LLVMBackend_WinRT.cpp:2970"
     ],
     "reflectisnotsupportedonuniontypearg0": [
-      "LLVMBackend_WinRT.cpp:2920"
+      "LLVMBackend_WinRT.cpp:2921"
     ],
     "reflectstructarg0hasnollvmtype": [
-      "LLVMBackend_WinRT.cpp:2915"
+      "LLVMBackend_WinRT.cpp:2916"
     ],
     "reflectunknownstructarg0": [
-      "LLVMBackend_WinRT.cpp:2909"
+      "LLVMBackend_WinRT.cpp:2910"
     ],
     "runcflatinitforthefi...imetofinishsettingup781292498c2143fa": [
       "LLVMBackend_EmitAndLink.cpp:3124"
@@ -2055,16 +2098,16 @@
       "CFlatErrorListener.h:70"
     ],
     "unknownfunctionarg0": [
-      "LLVMBackend_Overloads.cpp:794"
+      "LLVMBackend_Overloads.cpp:806"
     ],
     "unknowngenericfunctionarg0": [
-      "LLVMBackend_Overloads.cpp:796"
+      "LLVMBackend_Overloads.cpp:808"
     ],
     "unknowninterfacearg0": [
       "LLVMBackend_WinRT.cpp:2459"
     ],
     "unknowninterfacearg0arg1": [
-      "LLVMBackend_WinRT.cpp:2822"
+      "LLVMBackend_WinRT.cpp:2823"
     ],
     "unknownoperationarg0": [
       "LLVMBackend_EmitAndLink.cpp:3805"

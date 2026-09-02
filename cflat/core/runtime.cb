@@ -6,3 +6,4 @@ import "program.cb";
 import "string.cb";
 import "tuple.cb";
 import "unique.cb";
+import "array.cb";

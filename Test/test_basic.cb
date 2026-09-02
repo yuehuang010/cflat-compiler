@@ -4973,7 +4973,7 @@ struct WideHolder { unique WideRes* w = nullptr; };
 // RETURN escape: a function whose RETURN TYPE declares `alignas(0, 64)` hands back a 64-aligned
 // heap block. A bare `new` in the return inherits the alignment (inbound channel); the caller's
 // receiving local is stamped so `delete[_]` routes to __delete_aligned.
-alignas(0, 64) double[] makeAlignedFlat(int n)
+alignas(0, 64) move double[] makeAlignedFlat(int n)
 {
     return new double[n];
 }

@@ -1353,7 +1353,14 @@ bool MainListener::IsAllNullPhi(llvm::Value* value) const {
 
 bool MainListener::RejectRawPointerToArrayView(antlr4::ParserRuleContext* ctx,
                                      const LLVMBackend::TypeAndValue& target,
-                                     const LLVMBackend::TypeAndValue& rhs) {
+                                     const LLVMBackend::NamedVariable& rhsNV) {
+        const auto& rhs = rhsNV.TypeAndValue;
+        // A counted `move T*` call result (or a direct `new T[n]`) is a fresh WHOLE allocation,
+        // exactly what the noalias contract of `T[]` asks for - it binds; the count travels
+        // with the ledgered result. A named raw pointer stays rejected (decay is one-way).
+        if (target.IsArrayView && rhs.Pointer && !rhs.IsArrayView
+            && Compiler()->FindRawArrayResult(rhsNV.Primary) != nullptr)
+            return false;
         // A fixed `T*[N]` decays to its first POINTER ELEMENT, so it carries Pointer even
         // though it is a real bounded array source. Its matching `T*[]` view preserves that
         // element star in ElemPointer and is safe to bind; a raw `T*` remains rejected.
@@ -1768,8 +1775,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && targetAllocAlign > LLVMBackend::kDefaultNewAlign
                 && AsDirectNew(assignCtx) != nullptr)
                 compiler->pendingInitAllocAlign = targetAllocAlign;
+            if (operatorText == "=")
+                ArmArrayNewDesugar(assignCtx, namedVar.TypeAndValue);
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            arrayNewDesugarCtx = nullptr;
             // The observer conversion below unwraps an alias result whose element type is the
             // core unique wrapper. Preserve that source fact for the pointer-local ledger; the
             // conversion necessarily replaces the wrapper TypeName with its raw pointee.
@@ -1815,7 +1825,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // would launder a raw pointer into the noalias contract - reject (decay is one-way).
             if (operatorText == "=")
             {
-                RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV.TypeAndValue);
+                RejectRawPointerToArrayView(ctx, namedVar.TypeAndValue, rightNV);
                 // Permanently clear the declaration-time provenance flag on ANY reassignment,
                 // regardless of what this RHS is. Recomputing it from THIS RHS would be
                 // WALK-ORDER over the AST, not control flow: a reassignment inside one branch
@@ -11279,8 +11289,34 @@ bool MainListener::TryEmitContainerInitializer(
         return true;
     }
 
+void MainListener::ArmArrayNewDesugar(antlr4::tree::ParseTree* rhs, const LLVMBackend::TypeAndValue& target) {
+        arrayNewDesugarCtx = nullptr;
+        if (rhs == nullptr || target.Pointer || target.IsArrayView) return;
+        auto* ne = AsDirectNew(rhs);
+        if (ne == nullptr || ne->assignmentExpression() == nullptr) return;
+        auto* compiler = Compiler();
+        // `auto p = new T[n];` deduces the owning `array<T>`, not a raw `T*`: a raw pointer with
+        // a hidden count is the escape hatch and has to be spelled `T* p = new T[n];`.
+        if (target.TypeName == "auto")
+        {
+            std::string elem = ParseTypeSpecifierName(ne->typeSpecifier());
+            std::string mangled = MangledGenericName("array", { elem });
+            QueueGenericInstantiation("array", { elem }, mangled);
+            arrayNewDesugarCtx = ne;
+            arrayNewDesugarTarget = {};
+            arrayNewDesugarTarget.TypeName = mangled;
+            return;
+        }
+        if (!compiler->IsCoreArrayType(target.TypeName)) return;
+        arrayNewDesugarCtx = ne;
+        arrayNewDesugarTarget = target;
+        arrayNewDesugarTarget.VariableName.clear();
+    }
+
 LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
+        const bool desugarToArray = ctx == arrayNewDesugarCtx;
+        arrayNewDesugarCtx = nullptr;  // one-shot
         // The destination of `new T` is the allocated pointer, not its array count or
         // constructor arguments. Those child expressions have their own types and must not
         // inherit an enclosing initializer/return destination.
@@ -11295,6 +11331,53 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
         {
             typeName.pop_back();
             typeIsPtr = true;
+        }
+
+        // `array<T> a = new T[n];` (and the assignment / return forms): the element count lives in
+        // the array, so the value is built as `array<T> tmp; tmp.init(n);` - zero-filled, with
+        // per-element construction done by init's own `new T[n]`.
+        if (desugarToArray && isArray)
+        {
+            std::string elemSpelling = typeName + (typeIsPtr ? "*" : "");
+            std::string wantName = MangledGenericName("array", { elemSpelling });
+            if (wantName != arrayNewDesugarTarget.TypeName)
+            {
+                LogErrorContext(ctx, compiler->LocalizeMessage(
+                    "cannot store 'new {}[n]' into '{}': the element types differ",
+                    { elemSpelling, compiler->DisplayNameOfMangledType(arrayNewDesugarTarget.TypeName) }));
+                return {};
+            }
+            if (ctx->alignmentSpecifier() != nullptr)
+            {
+                LogErrorContext(ctx, compiler->LocalizeMessage(
+                    "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': "
+                    "the array frees its buffer through the plain deallocator"));
+                return {};
+            }
+            compiler->pendingInitAllocAlign = 0;
+            llvm::Value* countVal = ParseAssignmentExpression(ctx->assignmentExpression());
+            if (countVal == nullptr) return {};
+            llvm::Value* ctorVal = compiler->CreateOverloadedFunctionCall(arrayNewDesugarTarget.TypeName, {});
+            if (ctorVal == nullptr) return {};
+            auto* arrTy = ctorVal->getType();
+            auto* tempAlloca = compiler->AllocaAtEntry(arrTy, nullptr, "newarr");
+            compiler->builder->CreateStore(ctorVal, tempAlloca);
+            LLVMBackend::NamedVariable selfArg;
+            selfArg.TypeAndValue = arrayNewDesugarTarget;
+            selfArg.Storage = tempAlloca;
+            selfArg.Primary = ctorVal;
+            selfArg.BaseType = arrTy;
+            LLVMBackend::NamedVariable countArg;
+            countArg.Primary = compiler->Upconvert(countVal, compiler->builder->getInt32Ty());
+            countArg.BaseType = countArg.Primary->getType();
+            countArg.TypeAndValue.TypeName = "int";
+            compiler->CreateOverloadedFunctionCall("init", { selfArg, countArg });
+            LLVMBackend::NamedVariable result;
+            result.TypeAndValue = arrayNewDesugarTarget;
+            result.Primary = compiler->builder->CreateLoad(arrTy, tempAlloca, "newarr.val");
+            result.BaseType = arrTy;
+            compiler->lastOwningResult = true;
+            return result;
         }
 
         LLVMBackend::TypeAndValue typeInfo{ .TypeName = typeName, .Pointer = typeIsPtr };

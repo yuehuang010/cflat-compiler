@@ -2182,6 +2182,13 @@ bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
         return gts.coreGenericTemplates.count("unique") != 0;
 }
 
+bool LLVMBackend::IsCoreArrayType(const std::string& typeName) const
+{
+        constexpr std::string_view prefix = "array__";
+        if (!typeName.starts_with(prefix) || typeName.size() == prefix.size()) return false;
+        return gts.coreGenericTemplates.count("array") != 0;
+}
+
 bool LLVMBackend::IsMoveOrCoreUniqueValue(const TypeAndValue& t) const
 {
         return t.IsMove || (!t.Pointer && IsCoreUniqueType(t.TypeName));

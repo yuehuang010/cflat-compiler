@@ -140,7 +140,7 @@ class block_pool<T> where T : IMessage
         page_arena<T>* pa = _pop();
         if (pa == nullptr)
         {
-            pa = new page_arena<T>[1];
+            pa = new page_arena<T>;
         }
         pa->_chunkSize = _chunkSize;
         pa->reset();

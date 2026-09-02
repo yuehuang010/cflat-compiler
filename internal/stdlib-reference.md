@@ -19,7 +19,7 @@ Method-level API discovery is via the LSP (hover / completion / `--symbol`); thi
 | `interfaces.cb` | `IString`, `IEnumerable<T>`, `IComparable<T>`, `IReflector`, `ITuple<T...>` |
 | `string.cb` | `string` - owned/borrowed UTF-8 value type; `IString` implementation; `string_view` - borrowed `{ptr,len}` slice, built by `s.view()` / `s.span(a,b)` or directly as `string_view(ptr, len)`, with `.toString()` for an owning copy |
 | `wstring.cb` | `wstring` - owned UTF-16 string for Win32 `...W` / WinRT APIs |
-| `array.cb` | `array<T>` - owning fixed-size heap array with destructor support |
+| `array.cb` | `array<T>` - owning fixed-size heap array with destructor support - **auto-imported** via `runtime.cb` |
 | `list.cb` | `list<T>` - growable array. Element ownership keys off `is_unique(T)`: bare `list<T*>` / `list<IShape>` is a borrowed view (never frees elements); `list<unique T*>` / `list<unique IShape>` owns them (destructor/`removeAt`/`clear`/`set` free; `[]`/`get` return a borrow; `take()` moves an element out and removes the slot; `insert(i, value)` shifts the tail up and stores (`i == count()` appends); `.copy()` on a unique-element list is a compile error). See doc/LANGUAGE.md's "`unique` Ownership" section. |
 | `span.cb` | `span<T>` - non-owning NOALIAS window (`T[]` + len); `as_view()` decays to `view<T>`. See `doc/HPC.md` |
 | `view.cb` | `view<T>` - non-owning MAY-ALIAS window (`T*` + len); `slice(start,end)`; sibling of `span<T>` |

@@ -1,5 +1,6 @@
 import "test_helper.cb";
 import "list.cb";
+import "array.cb";
 import "json.cb";
 import "xml.cb";
 import "diagnostic/heap_audit.cb";
@@ -491,13 +492,17 @@ extern int main()
     total++; passed += Test("typeof_auto_from_string", typeof(fromStr), "string");
 
     // -- pointers ----------------------------------------------------------------
-    auto autoIntPtr = new int[2];
-    total++; passed += Test("typeof_auto_int_ptr", typeof(autoIntPtr), "int*");
-    delete autoIntPtr;
+    // 'auto' from 'new T[n]' deduces the owning array<T>; the explicit 'T*' spelling is the
+    // raw-pointer escape hatch and still reflects as a pointer.
+    auto autoIntArr = new int[2];
+    total++; passed += Test("typeof_auto_int_array", typeof(autoIntArr), "array__i32");
 
-    auto autoDblPtr = new double[2];
-    total++; passed += Test("typeof_auto_double_ptr", typeof(autoDblPtr), "double*");
-    delete autoDblPtr;
+    auto autoDblArr = new double[2];
+    total++; passed += Test("typeof_auto_double_array", typeof(autoDblArr), "array__double");
+
+    int* rawIntPtr = new int[2];
+    total++; passed += Test("typeof_raw_int_ptr", typeof(rawIntPtr), "int*");
+    delete rawIntPtr;
 
     auto autoPointPtr = new Point();
     total++; passed += Test("typeof_auto_struct_ptr", typeof(autoPointPtr), "Point*");
