@@ -169,6 +169,10 @@
       "the else path of an 'if const (__MACOS__ || __WINDOWS__ || __LINUX__)'",
       "the else arm of an 'if const (__WINDOWS__ && __MACOS__)'"
     ],
+    "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": [
+      "Handle",
+      "Handle"
+    ],
     "cannotcopyarg0itsfie...ipinsteadofcopyingitcc0e5e860001f897": [
       "Holder",
       "Holder",
@@ -1402,6 +1406,7 @@
     "cannotconverttointer...snottakeninthisbuild2453b841846c740d": "cannot convert to interface '{0}' - the only class implementing it, '{1}', is declared inside {2} that is not taken in this build",
     "cannotconverttointer...thernestedinsidearg3506794770e818c8b": "cannot convert to interface '{0}' - the only class implementing it, '{1}', is declared inside {2} that is not taken in this build, further nested inside {3}",
     "cannotconverttointer...thernestedinsidearg46fae2dfad80b2d3d": "cannot convert to interface '{0}' - all {1} classes implementing it are declared inside 'if const' arms that are not taken in this build (for example '{2}', declared inside {3}, further nested inside {4})",
+    "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": "cannot copy '{0}': it is declared '[unique]' (move-only). Write a 'copy()' method for '{1}' or 'move' the value instead.",
     "cannotcopyarg0itsfie...ipinsteadofcopyingitc211031fc62a57d2": "cannot copy '{0}': its field '{1}.{2}' is 'unique', so it owns a raw pointer that has no generic deep-clone. A memberwise copy would share the pointer between two owners and double-free at teardown. Write a '{3}' method for '{4}' that clones the pointee itself, or '{5}' the value to transfer ownership instead of copying it.",
     "cannotcopyarg0itsfie...ipinsteadofcopyingitcc0e5e860001f897": "cannot copy '{0}': its field '{1}.{2}' is 'unique' (a unique<T> wrapper), so it owns a raw pointer that has no generic deep-clone. A memberwise copy would share the pointer between two owners and double-free at teardown. Write a '{3}' method for '{4}' that clones the pointee itself, or '{5}' the value to transfer ownership instead of copying it.",
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": "cannot copy '{0}': unique<T> owns its pointee and has no deep-clone - 'move' it to transfer ownership, or clone the pointee yourself",

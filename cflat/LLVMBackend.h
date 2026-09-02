@@ -2800,6 +2800,7 @@ private:
     void SetTypeAnnotations(const std::string& name, std::vector<AnnotationValue> anns);
     // Find a single named annotation on a type/interface, or nullptr if absent.
     const AnnotationValue* FindTypeAnnotation(const std::string& name, const std::string& annName) const;
+    bool HasTypeAnnotation(const std::string& name, const std::string& annName) const;
     // The raw argument of a named type/interface annotation (e.g. the GUID of [uuid]); empty if absent.
     std::string GetTypeAnnotationArg(const std::string& name, const std::string& annName) const;
 

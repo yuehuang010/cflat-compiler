@@ -4,6 +4,40 @@
 // synthesis site instead. `Holder b = a;` still works - that MOVES, leaving one owner.
 struct Node { int v = 0; };
 
+[unique] struct Handle
+{
+    int fd = 0;
+    ~Handle() { }
+};
+
+expect_error("cannot copy 'Handle': it is declared '[unique]' (move-only). Write a 'copy()' method for 'Handle' or 'move' the value instead.") {
+    int copyUniqueHandle()
+    {
+        Handle a = default;
+        Handle b = a.copy();
+        return b.fd;
+    }
+}
+
+expect_error("use of moved variable 'a'") {
+    int readAfterImplicitMove()
+    {
+        Handle a = default;
+        Handle b = a;
+        return a.fd;
+    }
+}
+
+expect_error("cannot copy 'Handle': it is declared '[unique]' (move-only). Write a 'copy()' method for 'Handle' or 'move' the value instead.") {
+    int rangeCopiesUniqueHandle()
+    {
+        Handle[1] values;
+        int result = 0;
+        for (Handle value in values) result = result + value.fd;
+        return result;
+    }
+}
+
 interface IShape { int area(); };
 class Square : IShape { int area() { return 1; } ~Square() {} };
 

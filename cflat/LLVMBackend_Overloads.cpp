@@ -673,6 +673,13 @@ void LLVMBackend::LogUniqueCopyError(const std::string& typeName,
                 "to transfer ownership, or clone the pointee yourself", { displayType });
             return;
         }
+        if (HasTypeAnnotation(typeName, "unique"))
+        {
+            LogErrorMessage(
+                "cannot copy '{}': it is declared '[unique]' (move-only). Write a 'copy()' method "
+                "for '{}' or 'move' the value instead.", { displayType, displayType });
+            return;
+        }
         auto pathIsCoreUnique = [&](const auto& self, const std::string& owner,
                                     const std::string& path) -> bool {
             auto ownerIt = dataStructures.find(owner);
@@ -729,6 +736,11 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 EnsureClosureLifetimeRegistered();
             else
             {
+                if (HasTypeAnnotation(copyType, "unique"))
+                {
+                    LogUniqueCopyError(copyType);
+                    return nullptr;
+                }
                 // A synthesized destructor is the ownership boundary now that unique fields
                 // desugar to the real unique<T> wrapper. Keep the old unique diagnostic for the
                 // unsafe ownership cases, but key memberwise-copy suppression on the destructor.

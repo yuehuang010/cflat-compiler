@@ -1,5 +1,8 @@
 // unique<T>: single-owner smart pointer over a heap-allocated T, C++ unique_ptr style.
 // T is the POINTEE type: unique<Resource> owns a Resource*.
+annotation unique { };
+
+[unique]
 struct unique<T>
 {
     if const (is_interface(T))

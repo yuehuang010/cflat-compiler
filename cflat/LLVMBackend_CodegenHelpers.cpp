@@ -1473,18 +1473,15 @@ bool LLVMBackend::HasNonTrivialDestructor(const std::string& typeName)
 
 bool LLVMBackend::IsOwningValueType(const std::string& typeName)
 {
-        return HasNonTrivialDestructor(typeName);
+        return HasTypeAnnotation(typeName, "unique") || HasNonTrivialDestructor(typeName);
     }
 
 bool LLVMBackend::TypeOwnsUniquePointer(const std::string& typeName, std::string* outPath,
                                std::unordered_set<std::string>* seen) const
 {
-        // The core wrapper itself is a single owning handle. Treat it as non-copyable even
-        // though its implementation stores the handle in an ordinary raw-pointer field.
-        if (IsCoreUniqueType(typeName))
+        if (HasTypeAnnotation(typeName, "unique"))
         {
-            if (outPath)
-                *outPath = IsInterfaceType(typeName.substr(8)) ? "_v" : "_p";
+            if (outPath) outPath->clear();
             return true;
         }
         std::unordered_set<std::string> localSeen;

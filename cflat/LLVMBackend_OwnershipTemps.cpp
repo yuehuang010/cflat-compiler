@@ -921,6 +921,11 @@ const LLVMBackend::AnnotationValue* LLVMBackend::FindTypeAnnotation(const std::s
         return nullptr;
     }
 
+bool LLVMBackend::HasTypeAnnotation(const std::string& name, const std::string& annName) const
+{
+        return FindTypeAnnotation(name, annName) != nullptr;
+    }
+
 std::string LLVMBackend::GetTypeAnnotationArg(const std::string& name, const std::string& annName) const
 {
         auto* a = FindTypeAnnotation(name, annName);
@@ -3735,6 +3740,9 @@ void LLVMBackend::DropValue(const NamedVariable& namedVar)
             // Non-string struct local: run the full destructor (user dtor + members).
             // Skip an `alias`-bound local - it borrows storage it does not own (double-free).
             if (namedVar.IsAliasBorrow) return;
+            // A [unique] value is move-only. Its source is consumed completely, so do not run
+            // the user destructor a second time after an explicit or inferred whole-value move.
+            if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique")) return;
             // Skip the struct value being moved out via `return` - the caller now owns it.
             if (namedVar.Storage == returnedStructDtorSkipAlloca) return;
             // A fixed-array local (`T[N] a;`) owns every element - destruct all N.
@@ -3810,6 +3818,8 @@ void LLVMBackend::EmitDestructorsForScope(const StackState& frame)
             // Clean up move struct parameters
             if (namedVar.IsOwningStruct && namedVar.Storage != nullptr)
             {
+                if (namedVar.IsMoved && HasTypeAnnotation(namedVar.TypeAndValue.TypeName, "unique"))
+                    continue;
                 if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                     builder->CreateCall(dtor->getFunctionType(), dtor, { namedVar.Storage });
             }

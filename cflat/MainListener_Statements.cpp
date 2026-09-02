@@ -2133,6 +2133,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     // A by-value loop var bit-copies the element; an owning raw pointer has no
                     // owned bit to clear, so the once-only dtor at forRangeResume double-frees.
                     const bool elemIsCoreUnique = compiler->IsCoreUniqueType(elemType.TypeName);
+                    const bool elemIsUniqueAttribute =
+                        compiler->HasTypeAnnotation(elemType.TypeName, "unique");
                     const std::string shownElemType = elemIsCoreUnique
                         ? compiler->DisplayNameOfCoreUniqueType(elemType.TypeName)
                         : elemType.TypeName;
@@ -2141,7 +2143,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         && !compiler->IsInterfaceType(elemType.TypeName)
                         && compiler->TypeOwnsUniquePointer(elemType.TypeName, &ownedFieldPath))
                     {
-                        if (elemIsCoreUnique)
+                        if (elemIsCoreUnique || elemIsUniqueAttribute)
                         {
                             compiler->LogUniqueCopyError(elemType.TypeName);
                             return;

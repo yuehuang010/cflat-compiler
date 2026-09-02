@@ -25,11 +25,14 @@ one-off binaries. Not system temp, not session scratchpad. Gitignored; never pic
 
 ## Agent Delegation
 
-**Codex Luna = default implementation agent for ALL delegated work.** No tier choice - mechanical
-work and hard compiler work alike. Main session plans, coordinates, reviews.
+| Tier | Relative cost | Right for |
+|------|---------------|-----------|
+| Codex Luna (`gpt-5.6-luna`, High effort) | Low | **Default for everything.** High intelligence at low cost.  Mechanical work (renames, builds/tests, doc updates, regression tests). For hard compiler work alike (multi-file changes across grammar + ForwardRefScanner + codegen, debugging with unclear root cause, ownership/lifetime work) luna might need guidance.  Prepare to advise and add conditions if stuck. |
+| `opus` (`opus-general-purpose`) | High | Fallback only: Codex unavailable, or the task genuinely needs the Claude toolchain (skills, worktree tooling) |
+| `sonnet` (`general-purpose-sonnet`) | Low | Fallback for trival task.  Codex Luna covers this range at comparable cost and higher intelligence. |
 
 Applies to MAIN SESSION only. A spawned agent does the work itself; it must NEVER re-delegate.
-Wrong task for it -> say so in the report, do not spawn a sub-agent.
+Wrong task for it -> say so in the report, do not spawn a sub-agent.  Spawning cost should be considered for trivial task.
 
 Codex Luna is not an Agent-tool subagent. It is the `codex` CLI (`~/.local/bin/codex`), run from
 Bash. `~/.codex/config.toml` already pins `model = "gpt-5.6-luna"` + `model_reasoning_effort =

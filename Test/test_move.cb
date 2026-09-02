@@ -25,6 +25,52 @@ struct Resource
     int readId(int v) { return v; }
 };
 
+int uniqueAttributeDtorCount = 0;
+
+[unique] struct Handle
+{
+    int fd = 0;
+    ~Handle() { uniqueAttributeDtorCount = uniqueAttributeDtorCount + 1; }
+};
+
+[unique] struct CopyHandle
+{
+    int fd = 0;
+    ~CopyHandle() { uniqueAttributeDtorCount = uniqueAttributeDtorCount + 1; }
+    CopyHandle copy()
+    {
+        CopyHandle result = default;
+        result.fd = fd;
+        return move result;
+    }
+};
+
+struct UniqueAttributeTraits<T>
+{
+    int copyable()
+    {
+        if const (is_copyable(T)) return 1;
+        else return 0;
+    }
+    int unique()
+    {
+        if const (is_unique(T)) return 1;
+        else return 0;
+    }
+};
+
+Handle makeUniqueAttributeHandle(int fd)
+{
+    Handle result = default;
+    result.fd = fd;
+    return result;
+}
+
+void consumeUniqueAttributeHandle(Handle value)
+{
+    Handle local = value;
+}
+
 struct Container
 {
     Resource* item = nullptr;
@@ -11397,6 +11443,48 @@ int testAdoptInterfaceParam()
     return passed;
 }
 
+int testUniqueAttribute()
+{
+    int passed = 0;
+
+    uniqueAttributeDtorCount = 0;
+    {
+        Handle a = default;
+        a.fd = 7;
+        Handle b = move a;
+        passed += Test("unique_attribute_move_value", b.fd, 7);
+    }
+    passed += Test("unique_attribute_move_dtor_once", uniqueAttributeDtorCount, 1);
+
+    uniqueAttributeDtorCount = 0;
+    {
+        Handle value = makeUniqueAttributeHandle(9);
+        passed += Test("unique_attribute_return_value", value.fd, 9);
+    }
+    passed += Test("unique_attribute_return_dtor_once", uniqueAttributeDtorCount, 1);
+
+    uniqueAttributeDtorCount = 0;
+    {
+        Handle value = makeUniqueAttributeHandle(10);
+        consumeUniqueAttributeHandle(value);
+    }
+    passed += Test("unique_attribute_sink_dtor_once", uniqueAttributeDtorCount, 1);
+
+    uniqueAttributeDtorCount = 0;
+    {
+        CopyHandle a = default;
+        a.fd = 8;
+        CopyHandle b = a.copy();
+        passed += Test("unique_attribute_explicit_copy_value", b.fd, 8);
+    }
+    passed += Test("unique_attribute_explicit_copy_dtor_twice", uniqueAttributeDtorCount, 2);
+
+    UniqueAttributeTraits<Handle> traits = default;
+    passed += Test("unique_attribute_is_copyable", traits.copyable(), 0);
+    passed += Test("unique_attribute_is_unique", traits.unique(), 0);
+    return passed;
+}
+
 // Library unique<T> helpers. Unlike the builtin `unique T*` qualifier above, this owns its
 // pointee behind a generic value and exposes explicit release/reset operations.
 interface ILibraryUnique
@@ -12243,6 +12331,9 @@ extern int main()
 
     passed += testAdoptInterfaceParam();
     total += 4;
+
+    passed += testUniqueAttribute();
+    total += 9;
 
     passed += testLibraryUnique();
     total += 48;

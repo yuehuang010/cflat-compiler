@@ -105,3 +105,22 @@ the defect, and it is a library-level change behind `__active_allocator`.
 Option 2 is the one to avoid: it taxes every allocation including `hpc/`, and
 it silently blesses read-before-write instead of reporting it, which is the
 opposite of what both C++ and Rust concluded.
+
+## Direction (maintainer, 2026-09-02): safety first on the common path
+
+Supersedes the recommendation above. `new T[n]` is to become `array<T>.init(n)` (part of the
+"hidden raw-array count desugars to a core owning array type" follow-up), and `init(n)` gets a
+CONTRACT: every element reads as `default` afterwards. Primitives are zero-filled; struct
+elements already run their constructor; pointer/interface elements are already memset.
+
+Cost control, Rust/calloc style: route the fill through an `alloc_zeroed`-style entry on the
+allocator so a fresh page or freshly mapped arena block (already zero) pays nothing and only a
+RECYCLED block pays a memset - the recycled block is the only source of the flake. A second
+entry, `init_capacity(n)`, skips the fill for kernels that overwrite the
+whole buffer; that is `MaybeUninit` / C++20 `make_unique_for_overwrite`, spelled by name since
+cflat has no `unsafe`. Option 1 (Debug poison fill) then applies to that path only.
+
+Prior art checked: Rust `Vec::with_capacity` + `extend` keeps `len` at the initialized prefix so
+an uninitialized read is unrepresentable; `vec![0; n]` is `alloc_zeroed`; `MaybeUninit`,
+`spare_capacity_mut`/`set_len`, `Box::new_uninit_slice`, `ndarray::Array::uninit` are the
+explicit unsafe opt-outs used by BLAS/FFT bindings.
