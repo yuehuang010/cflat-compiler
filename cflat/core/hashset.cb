@@ -108,9 +108,13 @@ struct hashset<T>
     // deep-COPIED (the caller's value is left intact); a pointer element is BORROWED.
     bool add(alias T value)
     {
+        // A `unique` element is key-like and cannot be borrowed for hashing; poison the body so
+        // the defensive copy below is never instantiated for it (that copy of an owning element
+        // is its own error, and it would preempt this diagnostic).
+        if const (is_unique(T)) compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
         // Poison the copying overload for a non-copyable T so the class still instantiates and
         // `add(move x)` stays usable; the dead arm emits no call to the poisoned _placeAt.
-        if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
+        else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
         else
         {
             if (_capacity == 0) _init(8);
@@ -144,7 +148,7 @@ struct hashset<T>
     // strand it (nothing ever frees it). is_pointer(T) covers bare, `unique`, `alias` and
     // interface elements alike (a `unique` element is separately rejected by _slot). Declared
     // AFTER the plain add() so an interface contract check matches the plain overload first.
-    if const (!is_pointer(T))
+    if const (!is_pointer(T) && !is_unique(T))
     {
         bool add(move T value)
         {
@@ -179,6 +183,9 @@ struct hashset<T>
     {
         if const (is_primitive(T))      _keys[index] = value;
         else if const (is_pointer(T))   _keys[index] = value;
+        // An owning element is policy-rejected on the hash path; keep its .copy() out of the
+        // instantiation so that tailored diagnostic is the one reported.
+        else if const (is_unique(T))    compile_error("hashset elements cannot be 'unique'; set elements are key-like and a lookup reads the element for hashing/equality, which would move it out. Use 'hashset<T*>' to hold borrowed elements and manage their lifetime separately.");
         else if const (!is_copyable(T)) compile_error("this hashset element type owns a 'unique' pointer and has no 'copy()'; write 'move' at the call site (s.add(move x)) to transfer ownership instead, or give the type a 'copy()' method");
         else                            _keys[index] = value.copy();
     }

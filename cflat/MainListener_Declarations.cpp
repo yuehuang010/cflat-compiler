@@ -6,6 +6,36 @@ LLVMBackend* MainListener::Compiler(antlr4::ParserRuleContext* ctx) {
         return compilerLLVM;
     }
 
+static bool IsFunctionBodyDeclaration(
+    CFlatParser::DeclarationSpecifiersContext* declSpecs)
+{
+        bool insideFunction = false;
+        for (auto* parent = declSpecs->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr)
+                return false;
+            if (dynamic_cast<CFlatParser::ParameterDeclarationContext*>(parent) != nullptr)
+                return false;
+            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+                insideFunction = true;
+        }
+        return insideFunction
+            && dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) == nullptr;
+    }
+
+static bool IsCoreUniqueArrayViewInstantiation(
+    const LLVMBackend* compiler,
+    const std::string& mangledName,
+    const std::vector<std::string>& typeArgs) {
+        return compiler != nullptr && compiler->IsCoreUniqueType(mangledName)
+            && typeArgs.size() == 1 && typeArgs[0].ends_with("[]");
+    }
+
+static std::string CoreUniqueArrayViewMessage(const std::vector<std::string>& typeArgs) {
+        return std::format(
+            "'unique<{}>': array views are not supported - a view does not own its buffer",
+            typeArgs.empty() ? std::string() : typeArgs[0]);
+    }
 
 bool MainListener::InGenericInstantiation() const {
         return !activeTypeSubstitutions.empty() || !activeValueSubstitutions.empty()
@@ -78,6 +108,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(innerEntry));
             resolved = MangledGenericName(innerBase, innerArgs);
+            if (IsCoreUniqueArrayViewInstantiation(Compiler(), resolved, innerArgs))
+                LogErrorContext(entry, CoreUniqueArrayViewMessage(innerArgs));
             // A generic used as a type argument to another generic (e.g. list<int>
             // inside list<list<int>>) must itself be instantiated; otherwise the
             // outer instantiation's element type resolves to nothing and codegen
@@ -119,14 +151,11 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             if (substIt != activeTypeSubstitutions.end())
             {
                 // A substituted arg may itself carry "*"/"[]" (e.g. a pack param bound to "int[]")
-                // or a "unique " prefix (T bound to "unique Circle*"); peel those onto flags so
-                // they re-encode once below.
-                bool substUnique = false;
+                // or an "alias " prefix; peel it onto flags so it re-encodes once below.
                 bool substAlias = false;
                 resolved = substIt->second;
-                PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substUnique, &substAlias);
+                PeelTypeArgSuffix(resolved, pointerDepth, hasArrayView, &substAlias);
                 hasPointer = pointerDepth > 0;
-                isUnique = isUnique || substUnique;
                 isAlias = isAlias || substAlias;
             }
             else if (entry->pointer() == nullptr && entry->arrayTypeSuffix() == nullptr
@@ -179,8 +208,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             RejectFatEncodedClosurePointerArg(entry, uniqueBase);
             resolved += std::string(pointerDepth, '*');
         }
-        // D1: unique is only meaningful on a pointer or interface type; carry it as a leading
-        // prefix (D10) so this instantiation mangles distinctly and is_unique(T) can see it.
+        // D1: unique is only meaningful on a pointer or interface type. Valid unique arguments
+        // have already become a real unique<X> instantiation above; invalid forms have thrown.
         if (isUnique)
         {
             if (hasArrayView)
@@ -188,7 +217,17 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             if (!hasPointer && !Compiler(entry)->IsInterfaceType(uniqueBase))
                 LogErrorContext(entry, std::format("unique requires a pointer or interface type; "
                     "'{}' is neither", uniqueBase));
-            resolved = std::string(kUniqueQualifierPrefix) + resolved;
+            // The pointer/interface spelling of a `unique` type ARGUMENT names the core
+            // `unique<X>` value; unsupported or unresolved forms are rejected here.
+            if (CanDesugarUniqueTypeArg(Compiler(entry), uniqueBase, hasPointer, pointerDepth,
+                                        hasArrayView))
+            {
+                std::string uniqueType = MangledGenericName("unique", { uniqueBase });
+                QueueGenericInstantiation("unique", { uniqueBase }, uniqueType);
+                return uniqueType;
+            }
+            LogErrorContext(entry, std::format(
+                "'unique' on generic type argument '{}' cannot be desugared", entry->getText()));
         }
         // alias mirrors D1: only meaningful on a pointer or interface element (a pure borrow),
         // and is carried as a leading prefix so this instantiation mangles distinctly.
@@ -205,6 +244,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
 void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
                                    const std::string& mangledName) {
+        if (IsCoreUniqueArrayViewInstantiation(Compiler(), mangledName, typeArgs))
+            Compiler()->LogError(CoreUniqueArrayViewMessage(typeArgs));
         if (instantiatedGenerics.count(mangledName))
             return;
         bool isStructOrClass = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
@@ -381,6 +422,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             return {};
         }
         LLVMBackend::DeclTypeAndValue declType;
+        bool hasUniqueSpecifier = false;
         std::string typeName;
         auto declSpecList = declSpecs->declarationSpecifier();
         // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
@@ -448,7 +490,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     // `unique` is now legal on a field (validated by ValidateUniqueField) and on a
                     // local/param (an owning location, validated at the end of this function once the
                     // pointer/interface shape is known - D1/D5). Return-type unique stays unsupported.
-                    declType.IsUnique = true;
+                    hasUniqueSpecifier = true;
                     continue;  // not a type; look for the actual type in next specifier
                 }
                 if (typeSpec->getText() == "manifest")
@@ -562,6 +604,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 p.Pointer  = pPtr;
                                 p.IsMove   = param->Move() != nullptr;
                                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                CanonicalizeUniqueSigComponent(Compiler(declSpecs), p.TypeName,
+                                                               p.Pointer, p.PointerDepth);
                                 p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                                 declType.FuncPtrParams.push_back(p);
                             }
@@ -646,6 +690,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         typeArgs.push_back(ResolveTypeArgEntry(entry));
                     }
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
+                    if (IsCoreUniqueArrayViewInstantiation(Compiler(declSpecs), mangledName, typeArgs))
+                        LogErrorContext(genParams, CoreUniqueArrayViewMessage(typeArgs));
                     std::string displayName = baseName + "<";
                     for (size_t i = 0; i < genParams->typeParameterList()->typeParameterEntry().size(); i++)
                     {
@@ -742,30 +788,18 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     bool wasSubstituted = substIt != activeTypeSubstitutions.end();
                     if (substIt != activeTypeSubstitutions.end())
                     {
-                        // A substituted type may carry a "*" (pointer) or "[]" (noalias array-view)
-                        // suffix - e.g. a tuple pack param bound to "int[]". A leading "unique "
-                        // qualifier is stripped here: unique-as-a-storage-location semantics apply to
-                        // the direct `unique` spelling only (post-substitution container ownership is a
-                        // later stage), so the resolved type is the bare pointee.
+                        // A substituted type may carry a "*" (pointer), "[]" (noalias array-view),
+                        // or "alias " suffix - e.g. a tuple pack param bound to "int[]". Strip only
+                        // the alias marker here; a desugared unique type is already a core value.
                         typeName = substIt->second;
-                        bool substUniqueArg = false;
                         bool substAliasArg = false;
-                        PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView, &substUniqueArg, &substAliasArg);
-                        // A `unique` type argument is an OWNING location: a plain by-value parameter
-                        // of that type is a move sink, so the caller's source must be nulled.
-                        // An `alias`-declared parameter is an explicit borrow and stays one.
-                        if (substUniqueArg && !declType.IsAlias) declType.IsUniqueTypeArg = true;
-                        // An `alias` borrow of a `unique` element (list's `alias T get` with
-                        // T = `unique X*`): the CONTAINER owns the pointee and frees it, so a later
-                        // `delete` of a local bound to this return double-frees. Record it here (the
-                        // move-sink flag above is suppressed on an alias borrow) for the delete check.
-                        if (substUniqueArg && declType.IsAlias) declType.IsBorrowOfUniqueElement = true;
+                        PeelTypeArgSuffix(typeName, substPointerDepth, substArrayView, &substAliasArg);
                         // An `alias` element (list<alias X*>) is a pure borrow whose owner lives
                         // elsewhere, so ANY value of that element type is a borrow - not only the
                         // `alias T get` return but also `take()`'s plain-T return (take removes the
                         // slot but never transfers ownership the container never held). Tag every
                         // such value so a later `delete` of a bound local is rejected as a
-                        // double-free. Never a move sink (IsUniqueTypeArg stays clear).
+                        // double-free. Never a move sink.
                         if (substAliasArg) declType.IsBorrowOfAliasElement = true;
                     }
                     // Resolve namespace-qualified type names (alias expansion + parent namespace search).
@@ -806,15 +840,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 }
                 bool hasExplicitPointer = declSpec->pointer() != nullptr;
                 bool hasDblPointer = hasExplicitPointer && declSpec->pointer()->Star().size() >= 2;
-                // An explicit declarator star over a `unique` type ARGUMENT (`V* out`) declares a
-                // POINTER TO the owning location, not the owning location - it is an out-param, not
-                // a sink. Left set, the call site nulls the caller's variable and it dangles.
-                // A buffer of `unique` elements (`T* _data`, T = `unique X*`/`unique IFace`): the
-                // explicit star makes this a pointer-TO the owning location, so IsUniqueTypeArg is
-                // cleared (a slot read is a borrow), but remember the element ownership so a
-                // `move _data[i]` out of the slot can re-derive it (ApplyMovedSlotOwnership).
-                if (hasExplicitPointer && declType.IsUniqueTypeArg) declType.ElementOwningUnique = true;
-                if (hasExplicitPointer) declType.IsUniqueTypeArg = false;
                 bool substPointer = declType.Pointer; // T was already a pointer (e.g. T=IMessage*)
                 if (aliasPtrDepth > 0)
                 {
@@ -902,6 +927,60 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (declType.IsInterfacePointer)
                         declType.Pointer = true;
                 }
+                // Pointer-form and interface-form `unique` spell the core `unique<T>` value in
+                // locals, params, fields, and function/interface return types. `unique void*`
+                // stays on the builtin path permanently.
+                const bool isParameterDecl = dynamic_cast<CFlatParser::ParameterDeclarationContext*>(
+                    declSpecs->parent) != nullptr;
+                const bool isReturnDecl =
+                    dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) != nullptr
+                    || dynamic_cast<CFlatParser::InterfaceMethodContext*>(declSpecs->parent) != nullptr;
+                bool hasExternSpecifier = false;
+                for (auto candidate : declSpecList)
+                    if (candidate->storageClassSpecifier() != nullptr
+                        && candidate->storageClassSpecifier()->Extern() != nullptr)
+                        hasExternSpecifier = true;
+                const bool uniqueFatInterface = declType.IsFatInterfaceValue();
+                // A FIELD's `[N]` sits on the declarator, not on these specifiers. Local and field
+                // declarators may still desugar to fixed arrays of unique<T>.
+                const bool uniqueArrayOk = inLocalDecl_ || inStructFieldDecl_;
+                if (hasUniqueSpecifier
+                    && (inLocalDecl_ || isParameterDecl || inStructFieldDecl_ || isReturnDecl)
+                    && (!isReturnDecl || !hasExternSpecifier)
+                    && declType.TypeName != "void"
+                    && !inUnionFieldDecl_
+                    && !inInterfaceFieldDecl_
+                    && (!inStructFieldDecl_ || declType.TypeName != "void")
+                    && (uniqueFatInterface
+                        || (!declType.IsInterface && declType.Pointer && !declType.ElemPointer))
+                    && !declType.IsArrayView
+                    && (declType.ArraySize == nullptr || uniqueArrayOk)
+                    && declType.AliasArraySize == 0
+                    && declType.ExtraArrayDims.empty() && declType.AllocAlignValue == 0
+                    && (declSpecs->parent == nullptr
+                        || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
+                {
+                    std::string elementType = declType.TypeName;
+                    std::string uniqueType = MangledGenericName("unique", { elementType });
+                    QueueGenericInstantiation("unique", { elementType }, uniqueType);
+                    declType.TypeName = uniqueType;
+                    declType.Pointer = false;
+                    declType.ElemPointer = false;
+                    declType.PointerDepth = 0;
+                    hasUniqueSpecifier = false;
+                    // The declared type is now the wrapper STRUCT, not the interface it stores.
+                    declType.IsInterface = false;
+                    declType.IsInterfacePointer = false;
+                    if (isParameterDecl)
+                        declType.IsMove = true;
+                }
+                // R2: an allocation-alignment clause keeps the legacy pointer representation,
+                // whose cleanup carries the per-allocation deallocator metadata.
+                if (hasUniqueSpecifier
+                    && declType.AllocAlignValue != 0
+                    && declType.Pointer && !declType.ElemPointer
+                    && !declType.IsArrayView && !declType.IsFunctionPointer)
+                    declType.IsUnique = true;
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -914,7 +993,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 }
                 // Direct `unique` on a local/param (D4/D5): it qualifies a single-indirection pointer
                 // or an interface only (D1). A field is validated separately by ValidateUniqueField.
-                if (declType.IsUnique && !inStructFieldDecl_)
+                if (hasUniqueSpecifier
+                    && !inStructFieldDecl_)
                 {
                     // A view never owns its buffer, so it can never be the thing a scope-exit
                     // teardown deletes. Same rule (and wording) as the field form.
@@ -1521,6 +1601,7 @@ bool MainListener::RejectVariadicInterfaceMethod(const std::string& ifaceName,
 
 std::vector<LLVMBackend::TypeAndValue> MainListener::ParseInterfaceFields(CFlatParser::InterfaceDefinitionContext* ctx) {
         StructFieldDeclGuard fieldCtx(inStructFieldDecl_);
+        InterfaceFieldDeclGuard interfaceFieldCtx(inInterfaceFieldDecl_);
         // An interface body is never a union body - disarmed explicitly because a generic
         // interface can be instantiated from inside one (a union member typed `IFoo<int>`).
         UnionFieldDeclGuard notUnion(inUnionFieldDecl_, false);
@@ -1530,6 +1611,10 @@ std::vector<LLVMBackend::TypeAndValue> MainListener::ParseInterfaceFields(CFlatP
         {
             LLVMBackend::DeclTypeAndValue tv = ParseDeclarationSpecifiers(f->declarationSpecifiers());
             tv.VariableName = f->directDeclarator()->getText();
+            // Interface fields retain the contract marker: unlike class fields, they cannot
+            // desugar to a wrapper without losing the ABI-level ownership agreement.
+            if (HasSoftDeclarationSpecifier(f->declarationSpecifiers(), "unique"))
+                tv.IsUnique = true;
             if (tv.IsUnique)
                 ValidateUniqueField(tv, f);
             else
@@ -1856,6 +1941,11 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                 catch (const ExpectedErrorReceived&)
                 {
                     errorReceived = true;
+                    // ForwardRefScanner may have queued generic work for this failed declaration
+                    // before the scoped expectation ran. Let later source uses queue it again.
+                    for (const auto& pending : pendingInstantiations)
+                        instantiatedGenerics.erase(pending.mangledName);
+                    pendingInstantiations.clear();
                     // The declaration that failed inside the expectation is not a usable type.
                     // Roll back shells created by this block so they cannot shadow outer names.
                     for (auto it = compilerLLVM->dataStructures.begin(); it != compilerLLVM->dataStructures.end(); )
@@ -1865,6 +1955,23 @@ void MainListener::ParseExternalDeclaration(CFlatParser::ExternalDeclarationCont
                             it = compilerLLVM->dataStructures.erase(it);
                         else
                             ++it;
+                    }
+                    auto sizeFailedAggregateShell = [&](const std::string& baseName) {
+                        std::string typeName = namespaceName.empty() ? baseName : namespaceName + "." + baseName;
+                        auto it = compilerLLVM->dataStructures.find(typeName);
+                        if (it != compilerLLVM->dataStructures.end() && it->second.StructType != nullptr
+                            && it->second.StructType->isOpaque())
+                        {
+                            it->second.StructFields.clear();
+                            it->second.StructType->setBody(llvm::ArrayRef<llvm::Type*>());
+                        }
+                    };
+                    for (auto* extDecl : expectErrDecl->externalDeclaration())
+                    {
+                        if (auto* failedStruct = extDecl->structDefinition())
+                            sizeFailedAggregateShell(failedStruct->directDeclarator()->getText());
+                        if (auto* failedClass = extDecl->classDefinition())
+                            sizeFailedAggregateShell(failedClass->directDeclarator()->getText());
                     }
                     // A global whose type is the shell just rolled back keeps an unsized
                     // initializer, which the LLVM verifier rejects. Roll those back too - the
@@ -2465,6 +2572,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // At this point no basic block is active, so it is safe to emit new functions.
         // Parameter types must be scanned so that e.g. list<string>* params instantiate
         // list__string before the body references its methods.
+        ScanAndQueueGenericTypeUses(func->declarationSpecifiers());
         if (auto* paramTypeList = func->parameterTypeList())
             ScanAndQueueGenericTypeUses(paramTypeList);
         if (auto* blockItemList = func->compoundStatement()->blockItemList())
@@ -2701,6 +2809,7 @@ std::vector<LLVMBackend::AnnotationValue> MainListener::ParseAnnotationList(CFla
 
 std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(std::vector<CFlatParser::DeclarationContext*> ctx) {
         std::vector<LLVMBackend::DeclTypeAndValue> result;
+        auto* compiler = Compiler(ctx.empty() ? nullptr : ctx.front());
 
         // Parse a fixed-array dimension expression to a compile-time constant.
         // Returns nullopt (and logs) when the expression is not a ConstantInt.
@@ -2730,7 +2839,6 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     StructFieldDeclGuard fieldCtx(inStructFieldDecl_);
                     typeAndValue = ParseDeclarationSpecifiers(direct);
                 }
-
                 auto annotations = ParseAnnotationList(decl->annotationList());
 
                 auto initDeclList = decl->initDeclaratorList()->initDeclarator();
@@ -2780,6 +2888,13 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     // A field's `alignas(_, N)` allocation-alignment clause now rides in
                     // declarationSpecifiers (prefix), so ParseDeclarationSpecifiers already set
                     // typeAndValue.AllocAlignValue; it distributes to every declarator in this group.
+                    // Preserve the raw ownership carrier for the aligned-field remnant: the
+                    // wrapper cannot carry the allocation alignment needed by its destructor.
+                    if (HasSoftDeclarationSpecifier(direct, "unique")
+                        && typeAndValue.AllocAlignValue != 0)
+                    {
+                        typeAndValue.IsUnique = true;
+                    }
 
                     // Bitfield: `int flags : 3 = 0;` - the constantExpression after ':'
                     // is the declared width in bits. Set IsBitfield + BitWidth here;
@@ -2804,12 +2919,38 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                         }
                     }
 
-                    if (typeAndValue.IsUnique)
+                    bool spelledUnique = HasSoftDeclarationSpecifier(direct, "unique");
+                    bool isCoreUniqueField = !typeAndValue.Pointer
+                        && (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                            || typeAndValue.TypeName.starts_with("unique__"));
+                    // Keep error recovery for a unique union member on the builtin pointer
+                    // representation; an unresolved core wrapper is not a sized union member.
+                    if (inUnionFieldDecl_ && isCoreUniqueField)
+                    {
+                        typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                        typeAndValue.Pointer = true;
+                        typeAndValue.PointerDepth = 1;
+                        typeAndValue.IsUnique = true;
+                    }
+                    else if (inUnionFieldDecl_ && spelledUnique && typeAndValue.Pointer
+                             && !typeAndValue.ElemPointer)
+                    {
+                        typeAndValue.IsUnique = true;
+                    }
+                    if (typeAndValue.IsUnique || isCoreUniqueField || spelledUnique)
                         ValidateUniqueField(typeAndValue, declarator);
                     else
                         ValidateAllocAlignField(typeAndValue, declarator);
 
                     result.push_back(typeAndValue);  // Copy
+                    if (!inUnionFieldDecl_ && !structScopeStack.empty())
+                    {
+                        std::string cycleField;
+                        if (compiler->HasUniqueDestructionCycle(structScopeStack.back(), result, &cycleField))
+                            LogErrorContext(declarator, std::format(
+                                "'unique' on field '{}.{}' forms a destruction cycle back to '{}': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.",
+                                structScopeStack.back(), cycleField, structScopeStack.back()));
+                    }
                 }
             }
         }
@@ -2824,6 +2965,12 @@ void MainListener::ValidateUniqueField(const LLVMBackend::DeclTypeAndValue& f, a
         // so a shape complaint would only steer the user to fix the shape and land back here.
         if (inUnionFieldDecl_)
             LogErrorContext(ctx, "'unique' on " + field + ": a union member cannot be 'unique' - the synthesized destructor cannot know which member is active, so it would free whichever bits the union currently holds. Drop 'unique' and free the pointer from code that knows the active member.");
+        // The core wrapper enforces its single-pointer shape; old shape checks are builtin-only.
+        bool pendingCoreUnique = !f.Pointer && f.TypeName.starts_with("unique__")
+            && Compiler(ctx)->gts.coreGenericTemplates.count("unique") != 0;
+        if ((Compiler(ctx)->IsCoreUniqueType(f.TypeName) || pendingCoreUnique)
+            && !f.Pointer)
+            return;
         // `unique T* f[N]` is allowed since 2026-07-20: the synthesized destructor walks the array
         // and releases each slot (EmitOwningUniqueArrayCleanup, shared with the array-LOCAL path).
         if (f.IsArrayView)
@@ -3109,6 +3256,8 @@ void MainListener::ReleaseOwningLocalNow(antlr4::ParserRuleContext* ctx, LLVMBac
         nv->IsOwning = false;
         nv->RefCountStorage = nullptr;
         compiler->MarkVariableMoved(name);
+        if (compiler->IsCoreUniqueType(nv->TypeAndValue.TypeName))
+            compiler->MarkVariableExplicitlyMovedNull(name);
     }
 
 void MainListener::ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const std::string& name) {
@@ -3126,17 +3275,14 @@ void MainListener::ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const 
 
 void MainListener::ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
                                         const LLVMBackend::TypeAndValue& elemOwnershipType) {
-        bool unique = elemOwnershipType.IsUniqueTypeArg || elemOwnershipType.IsUnique
-            || elemOwnershipType.ElementOwningUnique;
+        bool unique = elemOwnershipType.IsUnique
+            || elemOwnershipType.TypeName.starts_with("unique__");
         bool thinPtr = elemOwnershipType.Pointer && !elemOwnershipType.ElemPointer
             && !elemOwnershipType.IsInterface;
         bool uniqueIface = elemOwnershipType.IsFatInterfaceValue();
         if (unique && (thinPtr || uniqueIface))
         {
             nv.IsOwning = true;
-            // DropValue/OwnsDroppableResource gate the interface arm on IsUnique/IsUniqueTypeArg;
-            // ensure it fires for an element recovered purely via ElementOwningUnique.
-            if (uniqueIface) nv.TypeAndValue.IsUniqueTypeArg = true;
         }
         else if ((thinPtr || uniqueIface) && !unique)
         {
@@ -3151,8 +3297,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
 
         size_t line = declSpec->getStart()->getLine();
         const bool isManifest = HasSoftDeclarationSpecifier(declSpec, "manifest");
-        auto typeAndValue = ParseDeclarationSpecifiers(declSpec);
-
+        const bool spelledBuiltinUnique = HasSoftDeclarationSpecifier(declSpec, "unique");
+        auto typeAndValue = [&]() {
+            LocalDeclGuard localDecl(inLocalDecl_,
+                !global_scope && IsFunctionBodyDeclaration(declSpec));
+            return ParseDeclarationSpecifiers(declSpec);
+        }();
+        // A generic parameter can itself be bound to a core unique wrapper. It is already a
+        // concrete value type, but its ordinary copy-shaped helper bodies must not be mistaken
+        // for a direct `unique` declaration diagnostic.
+        const bool genericCoreUniqueTypeArg = !spelledBuiltinUnique
+            && activeTypeSubstitutions.count(declSpec->getText()) != 0
+            && !typeAndValue.Pointer
+            && compiler->IsCoreUniqueType(typeAndValue.TypeName);
         if (isManifest)
         {
             if (!global_scope)
@@ -3185,8 +3342,316 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         // Queue any pending generic instantiation for this declaration's type.
         // Actual instantiation happens later in ProcessPendingInstantiations() at top-level scope.
         QueueInstantiateGenericType(declSpec);
+        // The desugared local calls unique<T>'s constructor immediately, so its deferred body and
+        // overload set must be available before this declaration evaluates its initializer.
+        if (compiler->IsCoreUniqueType(typeAndValue.TypeName))
+        {
+            auto savedState = compiler->SaveBuilderState();
+            auto savedStack = std::move(compiler->stackNamedVariable);
+            auto savedExpectedError = compiler->expectedError;
+            auto savedExpectedErrorScopeDepth = compiler->expectedErrorScopeDepth;
+            compiler->stackNamedVariable.clear();
+            compiler->expectedError.clear();
+            compiler->expectedErrorScopeDepth = SIZE_MAX;
+            try
+            {
+                ProcessPendingInstantiations();
+            }
+            catch (...)
+            {
+                compiler->stackNamedVariable = std::move(savedStack);
+                compiler->expectedError = std::move(savedExpectedError);
+                compiler->expectedErrorScopeDepth = savedExpectedErrorScopeDepth;
+                compiler->RestoreBuilderState(savedState);
+                throw;
+            }
+            compiler->stackNamedVariable = std::move(savedStack);
+            compiler->expectedError = std::move(savedExpectedError);
+            compiler->expectedErrorScopeDepth = savedExpectedErrorScopeDepth;
+            compiler->RestoreBuilderState(savedState);
+        }
 
         auto initDeclarVec = initDecl->initDeclarator();
+        auto* enclosingFunction = [&]() -> CFlatParser::FunctionDefinitionContext* {
+            for (auto* parent = declSpec->parent; parent != nullptr; parent = parent->parent)
+                if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
+                    return fn;
+            return nullptr;
+        }();
+        // Keep the raw-array decision on the value-producing side of the initializer. In
+        // particular, do not find a `new T[n]` buried in a call argument or in a condition.
+        auto hasRawNewArrayValue = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+            if (node == nullptr) return false;
+            if (auto* newExpr = dynamic_cast<CFlatParser::NewExpressionContext*>(node))
+                return newExpr->assignmentExpression() != nullptr;
+            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+            {
+                if (conditional->Question() != nullptr)
+                    return self(self, conditional->expression())
+                        || self(self, conditional->conditionalExpression());
+                if (conditional->QuestionQuestion() != nullptr)
+                    return self(self, conditional->logicalOrExpression())
+                        || self(self, conditional->conditionalExpression());
+                return self(self, conditional->logicalOrExpression());
+            }
+            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+            {
+                if (assignment->assignmentOperator() != nullptr)
+                    return self(self, assignment->assignmentExpression());
+                return self(self, assignment->conditionalExpression());
+            }
+            if (auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node))
+                return self(self, expression->assignmentExpression());
+            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
+                return self(self, primary->expression());
+            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
+            {
+                if (!postfix->argumentExpressionList().empty()
+                    || !postfix->LeftBracket().empty()
+                    || !postfix->Dot().empty() || !postfix->Arrow().empty()
+                    || !postfix->QuestionDot().empty())
+                    return false;
+                return self(self, postfix->primaryExpression());
+            }
+            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
+            {
+                if (unary->newExpression() != nullptr)
+                    return self(self, unary->newExpression());
+                if (unary->postfixExpression() != nullptr)
+                    return self(self, unary->postfixExpression());
+                return false;
+            }
+            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
+            {
+                if (cast->typeName() != nullptr) return false;
+                return self(self, cast->unaryExpression());
+            }
+            if (node->children.size() != 1) return false;
+            return self(self, node->children[0]);
+        };
+        auto hasAlignedMoveSource = [&](antlr4::tree::ParseTree* node) {
+            auto* move = TopLevelMoveExpression(node);
+            if (move == nullptr || move->unaryExpression() == nullptr)
+                return false;
+            const std::string sourceName = move->unaryExpression()->getText();
+            if (!IsBareIdentifierText(sourceName)) return false;
+            auto declarationHasAllocAlign = [&](CFlatParser::DeclarationSpecifiersContext* specs) {
+                if (specs == nullptr) return false;
+                for (auto* spec : specs->declarationSpecifier())
+                    if (auto* alignSpec = spec->alignmentSpecifier(); alignSpec != nullptr
+                        && ParseAllocAlignArg(alignSpec) != 0)
+                        return true;
+                return false;
+            };
+            const size_t assignmentStart = node->getSourceInterval().a;
+            auto declarationHasSource = [&](CFlatParser::DeclarationContext* declaration,
+                                             bool requireBefore)
+                -> std::optional<bool> {
+                if (declaration == nullptr || declaration->initDeclaratorList() == nullptr)
+                    return std::nullopt;
+                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                {
+                    auto* declarator = init->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && getDirectDeclName(direct) == sourceName
+                        && init->getStop() != nullptr
+                        && (!requireBefore
+                            || (size_t)init->getStop()->getTokenIndex() < assignmentStart))
+                        return declarationHasAllocAlign(declaration->declarationSpecifiers());
+                }
+                return std::nullopt;
+            };
+            for (auto* parent = node; parent != nullptr; parent = parent->parent)
+            {
+                if (parent != enclosingFunction
+                    && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr
+                        || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr))
+                    return false;
+                if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent))
+                {
+                    bool found = false;
+                    bool aligned = false;
+                    auto* list = compound->blockItemList();
+                    if (list != nullptr)
+                        for (auto* item : list->blockItem())
+                            if (auto* declaration = item->declaration())
+                            {
+                                auto result = declarationHasSource(declaration, true);
+                                if (result.has_value())
+                                {
+                                    found = true;
+                                    aligned = *result;
+                                }
+                            }
+                    if (found) return aligned;
+                }
+                if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
+                {
+                    auto* condition = iteration->forCondition();
+                    auto* forDecl = condition != nullptr ? condition->forDeclaration() : nullptr;
+                    if (forDecl != nullptr && forDecl->initDeclaratorList() != nullptr)
+                        for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
+                        {
+                            auto* declarator = init->declarator();
+                            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                            if (direct != nullptr && getDirectDeclName(direct) == sourceName
+                                && init->getStop() != nullptr
+                                && (size_t)init->getStop()->getTokenIndex() < assignmentStart)
+                                return declarationHasAllocAlign(forDecl->declarationSpecifiers());
+                        }
+                }
+                if (parent == enclosingFunction) break;
+            }
+            if (enclosingFunction->parameterTypeList() != nullptr
+                && enclosingFunction->parameterTypeList()->parameterList() != nullptr)
+                for (auto* parameter : enclosingFunction->parameterTypeList()->parameterList()->parameterDeclaration())
+                {
+                    auto* declarator = parameter->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && getDirectDeclName(direct) == sourceName)
+                        return declarationHasAllocAlign(parameter->declarationSpecifiers());
+                }
+            auto namespaceOf = [](antlr4::tree::ParseTree* node) {
+                std::string result;
+                for (auto* parent = node != nullptr ? node->parent : nullptr;
+                     parent != nullptr; parent = parent->parent)
+                    if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(parent))
+                    {
+                        std::string part;
+                        for (auto* id : ns->Identifier())
+                            part += (part.empty() ? "" : ".") + id->getText();
+                        result = part + (result.empty() ? "" : "." + result);
+                    }
+                return result;
+            };
+            const std::string functionNamespace = namespaceOf(enclosingFunction);
+            std::optional<bool> globalResult;
+            auto visitGlobals = [&](auto&& self, antlr4::tree::ParseTree* current) -> void {
+                if (current == nullptr || globalResult.has_value()) return;
+                if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(current) != nullptr
+                    || dynamic_cast<CFlatParser::StructDefinitionContext*>(current) != nullptr
+                    || dynamic_cast<CFlatParser::ClassDefinitionContext*>(current) != nullptr
+                    || dynamic_cast<CFlatParser::InterfaceDefinitionContext*>(current) != nullptr
+                    || dynamic_cast<CFlatParser::ProgramDefinitionContext*>(current) != nullptr)
+                    return;
+                if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(current);
+                    declaration != nullptr
+                    && dynamic_cast<CFlatParser::ExternalDeclarationContext*>(declaration->parent) != nullptr
+                    && namespaceOf(declaration) == functionNamespace)
+                {
+                    globalResult = declarationHasSource(declaration, false);
+                    if (globalResult.has_value()) return;
+                }
+                for (auto* child : current->children)
+                    self(self, child);
+            };
+            auto* root = static_cast<antlr4::tree::ParseTree*>(enclosingFunction);
+            while (root->parent != nullptr) root = root->parent;
+            visitGlobals(visitGlobals, root);
+            if (globalResult.has_value()) return *globalResult;
+            return false;
+        };
+        auto hasLaterBuiltinUniqueAssignment = [&](CFlatParser::InitDeclaratorContext* candidate,
+                                                    const std::string& name) {
+            if (enclosingFunction == nullptr || name.empty() || candidate == nullptr
+                || candidate->getStop() == nullptr)
+                return false;
+            const size_t declarationEnd = (size_t)candidate->getStop()->getTokenIndex();
+            CFlatParser::CompoundStatementContext* candidateBlock = nullptr;
+            CFlatParser::ForDeclarationContext* candidateFor = nullptr;
+            CFlatParser::IterationStatementContext* candidateIteration = nullptr;
+            for (auto* parent = candidate->parent; parent != nullptr; parent = parent->parent)
+            {
+                if (candidateBlock == nullptr)
+                    candidateBlock = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
+                if (candidateFor == nullptr)
+                    candidateFor = dynamic_cast<CFlatParser::ForDeclarationContext*>(parent);
+                if (candidateIteration == nullptr)
+                    candidateIteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
+                if (parent == enclosingFunction)
+                    break;
+            }
+            antlr4::tree::ParseTree* scanRoot = enclosingFunction->compoundStatement();
+            if (candidateBlock != nullptr)
+                scanRoot = candidateBlock;
+            else if (candidateFor != nullptr && candidateIteration != nullptr)
+                scanRoot = candidateIteration;
+            auto declarationRedeclares = [&](CFlatParser::DeclarationContext* declaration) {
+                if (declaration == nullptr || declaration->initDeclaratorList() == nullptr)
+                    return false;
+                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
+                {
+                    auto* declarator = init->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && getDirectDeclName(direct) == name)
+                        return true;
+                }
+                return false;
+            };
+            auto forRedeclares = [&](CFlatParser::ForDeclarationContext* forDecl) {
+                if (forDecl == nullptr || forDecl->initDeclaratorList() == nullptr)
+                    return false;
+                for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
+                {
+                    auto* declarator = init->declarator();
+                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
+                    if (direct != nullptr && getDirectDeclName(direct) == name)
+                        return true;
+                }
+                return false;
+            };
+            bool found = false;
+            auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
+                if (node == nullptr || found) return;
+                if (node != enclosingFunction
+                    && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
+                        || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr))
+                    return;
+                if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(node);
+                    compound != nullptr && compound != scanRoot
+                    && compound->blockItemList() != nullptr)
+                {
+                    for (auto* item : compound->blockItemList()->blockItem())
+                        if (declarationRedeclares(item->declaration()))
+                            return;
+                }
+                if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(node);
+                    iteration != nullptr)
+                {
+                    auto* condition = iteration->forCondition();
+                    auto* forDecl = condition != nullptr ? condition->forDeclaration() : nullptr;
+                    if (forDecl != candidateFor && forRedeclares(forDecl))
+                        return;
+                }
+                if (auto* statement = dynamic_cast<CFlatParser::ExpressionStatementContext*>(node))
+                {
+                    auto* expression = statement->expression();
+                    auto* assignment = expression != nullptr ? expression->assignmentExpression() : nullptr;
+                    if (assignment != nullptr && assignment->assignmentOperator() != nullptr
+                        && assignment->assignmentOperator()->getText() == "="
+                        && assignment->unaryExpression() != nullptr
+                        && assignment->unaryExpression()->getText() == name
+                        && assignment->getStart()->getTokenIndex() > declarationEnd
+                        && (hasRawNewArrayValue(hasRawNewArrayValue, assignment->assignmentExpression())
+                            || hasAlignedMoveSource(assignment->assignmentExpression())))
+                        found = true;
+                    return;
+                }
+                for (auto* child : node->children)
+                    self(self, child);
+            };
+            visit(visit, scanRoot);
+            return found;
+        };
+        auto preservesBuiltinUnique = [&](CFlatParser::InitDeclaratorContext* candidate,
+                                          const std::string& name) {
+            auto* initializer = candidate != nullptr ? candidate->initializer() : nullptr;
+            auto* assignment = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
+            if (hasRawNewArrayValue(hasRawNewArrayValue, assignment)
+                || hasLaterBuiltinUniqueAssignment(candidate, name))
+                return true;
+            return hasAlignedMoveSource(assignment);
+        };
 
         if (typeAndValue.TypeName.empty() && !typeAndValue.IsFunctionPointer)
         {
@@ -3222,9 +3687,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         // no brackets of its own. The sizes were folded at registration (see ParseDeclarationSpecifiers).
         if (typeAndValue.ConstInnerDimensions.empty() && !typeAndValue.AliasInnerDims.empty())
             typeAndValue.ConstInnerDimensions = typeAndValue.AliasInnerDims;
+        const auto parsedTypeAndValue = typeAndValue;
 
         for (auto initDecl : initDeclarVec)
         {
+            typeAndValue = parsedTypeAndValue;
             /*
             declarator
             : directDeclarator
@@ -3238,6 +3705,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             */
             auto declarator = initDecl->declarator();
             auto direct = declarator->directDeclarator();
+            std::string declaratorName = direct != nullptr ? getDirectDeclName(direct) : std::string();
+            if (!global_scope && spelledBuiltinUnique
+                && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                && preservesBuiltinUnique(initDecl, declaratorName))
+            {
+                typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                // The interface spelling has no star: restore the fat interface VALUE, not a pointer.
+                bool ifaceSpelling = compiler->IsInterfaceType(typeAndValue.TypeName);
+                typeAndValue.Pointer = !ifaceSpelling;
+                typeAndValue.ElemPointer = false;
+                typeAndValue.PointerDepth = ifaceSpelling ? 0 : 1;
+                typeAndValue.IsInterface = ifaceSpelling;
+                typeAndValue.IsInterfacePointer = false;
+                typeAndValue.IsUnique = true;
+            }
             auto paramTypeList = declarator->parameterTypeList();
             // A declarator with parens but no paramTypeList is a zero-parameter function:
             // matches grammar alternative `directDeclarator '(' identifierList? ')'`
@@ -3326,6 +3808,24 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             }
             else if (direct != nullptr)
             {
+                auto braceInitializer = initDecl->initializer();
+                auto braceInitializerList = initDecl->initializerList();
+                if (braceInitializerList == nullptr && braceInitializer != nullptr)
+                    braceInitializerList = braceInitializer->initializerList();
+                // Pointer-form unique brace initializers stay on the builtin diagnostic path;
+                // core unique<T> has a struct initializer syntax with different semantics.
+                bool hasBraceInitializer = braceInitializerList != nullptr
+                    || (braceInitializer != nullptr && braceInitializer->LeftBrace() != nullptr)
+                    || initDecl->LeftBrace() != nullptr;
+                if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                    && (hasBraceInitializer || direct->assignmentExpression() != nullptr))
+                {
+                    typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                    typeAndValue.Pointer = true;
+                    typeAndValue.ElemPointer = false;
+                    typeAndValue.PointerDepth = 1;
+                    typeAndValue.IsUnique = true;
+                }
                 auto identList = declarator->identifierList();
                 std::string name = getDirectDeclName(direct);
                 // `_` is the reserved discard target (`_ = expr`), never a binding. Rejecting the
@@ -3441,6 +3941,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // adoption is answered from this by value identity, never from a sticky flag.
                 llvm::Value* srcPrimary = nullptr;
                 bool srcIsMove = false;
+                bool coreUniqueImplicitDefault = false;
                 bool srcMovedFromSlot = false;
                 std::string srcCallerName;
                 std::vector<std::string> rhsLambdaCaptureNames;
@@ -3472,6 +3973,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // True when the initializer borrows an element the owning container frees
                 // (`B* g = l.get(0)` on a `list<unique B*>`). A later `delete g` double-frees.
                 bool srcBorrowsOwnedElement = false;
+                bool srcCoreUniqueElementBorrow = false;
                 std::string srcOwnedElementContainer;
                 // True when the borrowed element's owner lives outside the container (list<alias X*>);
                 // selects the alias delete message instead of the unique-element one.
@@ -3632,6 +4134,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         compiler->pendingInitAllocAlign = typeAndValue.AllocAlignValue;
                     if (assignmentExpression != nullptr)
                     {
+                        std::optional<DeclExpectedTypeScope> coreUniqueExpectedScope;
+                        if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                            && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8)))
+                            coreUniqueExpectedScope.emplace(&declExpectedType, typeAndValue);
                         if (typeAndValue.IsFatInterfaceValue())
                         {
                             // An interface declaration is a destination too: an immediately-
@@ -3641,6 +4147,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // For interface declarations, preserve NamedVariable type info
                             // so we can do the class->interface fat-struct upcast when needed.
                             auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                            ApplyCallResultBorrowProvenance(compiler, rightNV);
                             interfaceSourceNV = rightNV;
                             haveInterfaceSourceNV = true;
                             if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
@@ -3656,6 +4163,66 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     rightNV, "an interface local", assignmentExpression);
                             right = LoadNamedVariable(rightNV);
                             srcPrimary = rightNV.Primary;
+                            // A core unique<T> local is an owner wrapper, not an implementor
+                            // object. A plain interface destination borrows its pointee, so expose
+                            // the wrapper's _p slot before the normal concrete-to-interface box.
+                            if (right != nullptr && !rightNV.TypeAndValue.Pointer
+                                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName))
+                            {
+                                bool coreFieldBorrow =
+                                    IsUniqueFieldRead(rightNV) || rightNV.IsUniqueFieldAlias;
+                                std::string coreFieldOwner = coreFieldBorrow
+                                    ? DescribeUniqueFieldAccess(rightNV) : std::string();
+                                auto* uniqueStorage = rightNV.Storage;
+                                if (uniqueStorage == nullptr)
+                                {
+                                    uniqueStorage = compiler->CreateAlloca(right->getType());
+                                    compiler->builder->CreateStore(right, uniqueStorage);
+                                }
+                                const auto& uniqueData = compiler->GetDataStructure(
+                                    rightNV.TypeAndValue.TypeName);
+                                // The interface arm stores the fat value in `_v`; unwrapping it
+                                // yields the interface directly, and a MOVED source hands the
+                                // boxed object over rather than lending it.
+                                bool interfaceArm = false;
+                                LLVMBackend::TypeAndValue armField;
+                                for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                                    if (uniqueData.StructFields[i].VariableName == "_p"
+                                        || uniqueData.StructFields[i].VariableName == "_v")
+                                    {
+                                        interfaceArm = uniqueData.StructFields[i].VariableName == "_v";
+                                        armField = uniqueData.StructFields[i];
+                                        right = compiler->CreateLoad(compiler->CreateStructGEP(
+                                            right->getType(), uniqueStorage, (uint32_t)i));
+                                        break;
+                                    }
+                                bool transfersOwnership = rightNV.TypeAndValue.IsMove
+                                    || rightNV.IsExplicitMove;
+                                if (interfaceArm)
+                                {
+                                    armField.VariableName.clear();
+                                    rightNV.TypeAndValue = armField;
+                                }
+                                else
+                                {
+                                    rightNV.TypeAndValue.TypeName =
+                                        rightNV.TypeAndValue.TypeName.substr(8);
+                                    rightNV.TypeAndValue.Pointer = true;
+                                }
+                                rightNV.TypeAndValue.IsMove = interfaceArm && transfersOwnership;
+                                rightNV.IsOwning = interfaceArm && transfersOwnership;
+                                rightNV.IsBorrowed = !rightNV.IsOwning;
+                                if (!rightNV.IsOwning)
+                                {
+                                    rightNV.BorrowedOrigin = rightNV.CallerName;
+                                    if (coreFieldBorrow)
+                                        rightNV.BorrowedUniqueField = coreFieldOwner;
+                                }
+                                rightNV.Primary = right;
+                                rightNV.Storage = nullptr;
+                                rightNV.BaseType = right->getType();
+                                interfaceSourceNV = rightNV;
+                            }
                             // Derived-interface -> parent-interface: re-box (a derived vtable is not
                             // layout-compatible with the parent's once field slots exist). A '?:'
                             // result has no NamedVariable TypeName, so fall back to its join ledger.
@@ -3760,6 +4327,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // rightNV scope so the fat->thin narrowing gate below can name them.
                             {
                                 auto rightNV = ParseAssignmentExpressionNamed(assignmentExpression);
+                                ApplyCallResultBorrowProvenance(compiler, rightNV);
                                 initializerSourceNV = rightNV;
                                 haveInitializerSourceNV = true;
                                 if (!global_scope && typeAndValue.IsAlias && !typeAndValue.Pointer
@@ -3769,6 +4337,187 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     bindAliasReference = true;
                                 }
                                 right = LoadNamedVariable(rightNV);
+                                // A moved core unique interface wrapper can be reboxed into a
+                                // different core unique interface wrapper; do not bitcast structs.
+                                if (right != nullptr && !typeAndValue.Pointer
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                                    && typeAndValue.TypeName.size() > 8
+                                    && rightNV.TypeAndValue.TypeName.size() > 8
+                                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8))
+                                    && compiler->IsInterfaceType(rightNV.TypeAndValue.TypeName.substr(8)))
+                                {
+                                    const std::string sourceInterface =
+                                        rightNV.TypeAndValue.TypeName.substr(8);
+                                    const std::string destinationInterface =
+                                        typeAndValue.TypeName.substr(8);
+                                    if (sourceInterface != destinationInterface)
+                                    {
+                                        auto* wrapperStorage = rightNV.Storage;
+                                        if (wrapperStorage == nullptr)
+                                        {
+                                            wrapperStorage = compiler->CreateAlloca(right->getType());
+                                            compiler->builder->CreateStore(right, wrapperStorage);
+                                        }
+                                        llvm::Value* interfaceValue = nullptr;
+                                        const auto& sourceData = compiler->GetDataStructure(
+                                            rightNV.TypeAndValue.TypeName);
+                                        for (size_t i = 0; i < sourceData.StructFields.size(); i++)
+                                            if (sourceData.StructFields[i].VariableName == "_v")
+                                            {
+                                                interfaceValue = compiler->CreateLoad(
+                                                    compiler->CreateStructGEP(
+                                                        right->getType(), wrapperStorage,
+                                                        (uint32_t)i));
+                                                break;
+                                            }
+                                        auto* reboxed = compiler->ReboxInterfaceIfNeeded(
+                                            interfaceValue, sourceInterface, destinationInterface);
+                                        if (reboxed == interfaceValue)
+                                            right = GenerateDefaultValue(typeAndValue);
+                                        else
+                                            right = reboxed;
+                                    }
+                                }
+                                if (right != nullptr && !typeAndValue.Pointer
+                                    && !InGenericInstantiation()
+                                    && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                    && rightNV.TypeAndValue.TypeName == typeAndValue.TypeName
+                                    && !rightNV.TypeAndValue.IsMove
+                                    && !rightNV.IsExplicitMove
+                                    && !compiler->lastCallReturnsOwned)
+                                {
+                                    const std::string sourceName =
+                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                    if (sourceName.empty())
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from a borrowed value - the source still "
+                                            "owns it; use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                    else
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from borrowed value '{}' - the source still "
+                                            "owns it; use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            sourceName));
+                                }
+                                if (right != nullptr
+                                    && !typeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                    && typeAndValue.TypeName.size() > 8
+                                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8))
+                                    && right->getType()->isStructTy()
+                                    && compiler->StructImplementsInterface(
+                                        rightNV.TypeAndValue.TypeName,
+                                        typeAndValue.TypeName.substr(8)))
+                                {
+                                    const std::string sourceName =
+                                        LLVMBackend::BorrowedSourceName(rightNV);
+                                    if (sourceName.empty())
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from a borrowed value - the source is a stack value; "
+                                            "use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                    else
+                                        LogErrorContext(assignmentExpression, std::format(
+                                            "cannot initialize {} '{}' from borrowed value '{}' - the source is a stack value; "
+                                            "use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            sourceName));
+                                }
+                                // A core unique value is an observer when it initializes a plain
+                                // raw pointer local. Extract `_p` directly so legacy pointer locals
+                                // keep their borrow semantics without copying the wrapper.
+                                // A `unique X*` destination the desugar deliberately left on the
+                                // builtin spelling still takes a core unique<X> source: unwrap `_p`
+                                // and let the move/borrow classification below decide ownership.
+                                if (right != nullptr && typeAndValue.Pointer
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName))
+                                {
+                                    srcCoreUniqueElementBorrow = rightNV.TypeAndValue.IsAlias
+                                        && !rightNV.TypeAndValue.IsMove;
+                                    // Judge a JOINED escape on the WRAPPER: extracting `_p` below
+                                    // severs the ledger the join is the only carrier of. A direct
+                                    // field read keeps its own provenance and its own diagnostic.
+                                    if (!global_scope && compiler != nullptr
+                                        && !compiler->IsLedgeredOwningTempUniqueField(rightNV.Primary)
+                                        && compiler->JoinCarriesOwningTempUniqueField(rightNV.Primary))
+                                        GuardOwningTempUniqueFieldEscape(
+                                            rightNV, "a local", assignmentExpression);
+                                    bool movingUnique = rightNV.TypeAndValue.IsMove
+                                        || rightNV.IsExplicitMove;
+                                bool coreFieldBorrow = !movingUnique
+                                    && (IsUniqueFieldRead(rightNV) || rightNV.IsUniqueFieldAlias
+                                        || rightNV.BorrowedUniqueFieldViaCall);
+                                std::string coreFieldOwner = coreFieldBorrow
+                                    ? (rightNV.BorrowedUniqueField.empty()
+                                        ? DescribeUniqueFieldAccess(rightNV)
+                                        : rightNV.BorrowedUniqueField)
+                                    : std::string();
+                                    auto* uniqueStorage = rightNV.Storage;
+                                    if (uniqueStorage == nullptr)
+                                    {
+                                        uniqueStorage = compiler->CreateAlloca(right->getType());
+                                        compiler->builder->CreateStore(right, uniqueStorage);
+                                    }
+                                    const auto& uniqueData = compiler->GetDataStructure(
+                                        rightNV.TypeAndValue.TypeName);
+                                    for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                                        if (uniqueData.StructFields[i].VariableName == "_p")
+                                        {
+                                            right = compiler->CreateLoad(compiler->CreateStructGEP(
+                                                right->getType(), uniqueStorage, (uint32_t)i));
+                                            break;
+                                        }
+                                    auto pointeeName = rightNV.TypeAndValue.TypeName.substr(8);
+                                    rightNV.TypeAndValue.TypeName = pointeeName;
+                                    rightNV.TypeAndValue.Pointer = true;
+                                    rightNV.TypeAndValue.IsMove = movingUnique;
+                                    rightNV.IsOwning = movingUnique;
+                                    rightNV.IsBorrowed = !movingUnique;
+                                    rightNV.BorrowedOrigin = movingUnique ? std::string() : rightNV.CallerName;
+                                    if (coreFieldBorrow)
+                                        rightNV.BorrowedUniqueField = coreFieldOwner;
+                                    rightNV.Primary = right;
+                                    rightNV.Storage = nullptr;
+                                    rightNV.BaseType = right->getType();
+                                    initializerSourceNV = rightNV;
+                                }
+                                // The same observer conversion feeds a plain interface local:
+                                // box the pointee, never the unique<T> wrapper itself.
+                                if (right != nullptr && typeAndValue.IsInterface
+                                    && !typeAndValue.IsUnique
+                                    && !rightNV.TypeAndValue.Pointer
+                                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName))
+                                {
+                                    auto* uniqueStorage = rightNV.Storage;
+                                    if (uniqueStorage == nullptr)
+                                    {
+                                        uniqueStorage = compiler->CreateAlloca(right->getType());
+                                        compiler->builder->CreateStore(right, uniqueStorage);
+                                    }
+                                    const auto& uniqueData = compiler->GetDataStructure(
+                                        rightNV.TypeAndValue.TypeName);
+                                    for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                                        if (uniqueData.StructFields[i].VariableName == "_p")
+                                        {
+                                            right = compiler->CreateLoad(compiler->CreateStructGEP(
+                                                right->getType(), uniqueStorage, (uint32_t)i));
+                                            break;
+                                        }
+                                    rightNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName.substr(8);
+                                    rightNV.TypeAndValue.Pointer = true;
+                                    rightNV.TypeAndValue.IsMove = false;
+                                    rightNV.IsOwning = false;
+                                    rightNV.IsBorrowed = true;
+                                    rightNV.BorrowedOrigin = rightNV.CallerName;
+                                    rightNV.Primary = right;
+                                    rightNV.Storage = nullptr;
+                                    rightNV.BaseType = right->getType();
+                                    initializerSourceNV = rightNV;
+                                }
                                 if (right && rightNV.TypeAndValue.IsAlias
                                     && !rightNV.TypeAndValue.Pointer
                                     && rightNV.Primary != nullptr
@@ -3898,7 +4647,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || rightNV.IsUniqueFieldAlias))
                                 {
                                     srcIsBorrowed = true;
-                                    srcBorrowedUniqueField = DescribeUniqueFieldOwner(rightNV);
+                                    srcBorrowedUniqueField = DescribeUniqueFieldAccess(rightNV);
                                     srcBorrowedOrigin = DescribeUniqueFieldAccess(rightNV);
                                 }
                                 // Trap B through a CALL: the callee provably returns a live `unique`
@@ -3981,8 +4730,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 srcIsMove = rightNV.TypeAndValue.IsMove;
                                 // Borrow of an element the owning container frees (list<unique X*>
                                 // .get). Capture it so the local is tagged for the delete check.
-                                srcBorrowsOwnedElement = rightNV.TypeAndValue.IsBorrowOfUniqueElement
-                                    || rightNV.TypeAndValue.IsBorrowOfAliasElement;
+                                bool coreUniqueElementBorrow = srcCoreUniqueElementBorrow
+                                    || (rightNV.TypeAndValue.IsAlias
+                                        && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                                        && !rightNV.TypeAndValue.IsMove);
+                                srcBorrowsOwnedElement = rightNV.TypeAndValue.IsBorrowOfAliasElement
+                                    || coreUniqueElementBorrow;
                                 srcElementExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement;
                                 srcOwnedElementContainer = rightNV.TypeAndValue.ParentVariableName.empty()
                                     ? rightNV.CallerName : rightNV.TypeAndValue.ParentVariableName;
@@ -4222,6 +4975,151 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                             }
 
+                            // The pointer spelling of a local `unique X*` was rewritten to the
+                            // core value `unique<X>`. Adopt a pointer-producing initializer through
+                            // its move constructor; nullptr is the value's default construction.
+                            const bool coreUniqueIfaceArm =
+                                compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
+                            if (right && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                && !typeAndValue.Pointer && !typeAndValue.IsArrayView
+                                && (right->getType()->isPointerTy()
+                                    || (coreUniqueIfaceArm
+                                        && right->getType() == compiler->GetFatPtrType())))
+                            {
+                                auto movedArmOwns = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+                                    if (node == nullptr) return false;
+                                    std::string text = node->getText();
+                                    size_t movedText = text.find("move");
+                                    size_t colonText = movedText == std::string::npos
+                                        ? std::string::npos : text.find(':', movedText);
+                                    if (movedText != std::string::npos && colonText != std::string::npos)
+                                    {
+                                        std::string sourceName = text.substr(movedText + 4,
+                                            colonText - movedText - 4);
+                                        if (auto* source = compiler->FindLiveNamedVariable(sourceName))
+                                            if (source->IsOwning
+                                                || source->TypeAndValue.IsUnique
+                                                || compiler->IsCoreUniqueType(source->TypeAndValue.TypeName)
+                                                || compiler->IsVariableOwning(sourceName))
+                                                return true;
+                                    }
+                                    if (auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+                                    {
+                                        std::string sourceName = move->unaryExpression() != nullptr
+                                            ? move->unaryExpression()->getText() : std::string();
+                                        if (auto* source = compiler->FindLiveNamedVariable(sourceName))
+                                            if (source->IsOwning
+                                                || source->TypeAndValue.IsUnique
+                                                || compiler->IsCoreUniqueType(source->TypeAndValue.TypeName)
+                                                || compiler->IsVariableOwning(sourceName))
+                                                return true;
+                                    }
+                                    for (auto* child : node->children)
+                                        if (self(self, child)) return true;
+                                    return false;
+                                };
+                                bool initializerIsBorrowed = initializerSourceNV.IsBorrowed
+                                    || initializerSourceNV.IsAliasBorrow
+                                    || initializerSourceNV.TypeAndValue.IsAlias
+                                    || initializerSourceNV.BorrowsOwnedElement
+                                    || initializerSourceNV.BorrowsOwningLocal;
+                                bool initializerOwns = compiler->lastOwningResult
+                                    || compiler->lastCallReturnsOwned
+                                    || initializerSourceNV.IsOwning
+                                    || initializerSourceNV.IsOwningStruct
+                                    || initializerSourceNV.TypeAndValue.IsMove
+                                    || initializerSourceNV.IsExplicitMove
+                                    || compiler->IsOwnedNewTemp(right)
+                                    || compiler->IsOwningPtrTempValue(right)
+                                    || compiler->IsMovedOutPtrValue(right)
+                                    || movedArmOwns(movedArmOwns, initializer)
+                                    || (initializer != nullptr
+                                        && initializer->getText().find("move") != std::string::npos
+                                        && compiler->IsMovedOutPtrValue(right));
+                                initializerIsBorrowed = initializerIsBorrowed || !initializerOwns;
+                                // A raw pointer binding can retain its original borrow bit after
+                                // an owning rebind. The move dataflow ledger is authoritative for
+                                // that case, so do not make the core constructor reject a fresh owner.
+                                if (initializerIsBorrowed && initializerOwns
+                                    && !initializerSourceNV.CallerName.empty()
+                                    && (compiler->IsVariableOwning(initializerSourceNV.CallerName)
+                                        || compiler->BorrowProofRetiredByRebind(initializerSourceNV)))
+                                    initializerIsBorrowed = false;
+                                bool initializerIsNull = llvm::isa<llvm::ConstantPointerNull>(right)
+                                    || IsAllNullPhi(right);
+                                if (initializerIsBorrowed && !initializerIsNull
+                                    && !genericCoreUniqueTypeArg)
+                                {
+                                    const std::string sourceName =
+                                        LLVMBackend::BorrowedSourceName(initializerSourceNV);
+                                    if (sourceName.empty())
+                                        LogErrorContext(initDecl, std::format(
+                                            "cannot initialize {} '{}' from a borrowed value - the source still owns it; "
+                                            "use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                    else
+                                        LogErrorContext(initDecl, std::format(
+                                            "cannot initialize {} '{}' from borrowed value '{}' - the source still owns it; "
+                                            "use 'new', a 'move' expression, or a move-returning call",
+                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            sourceName));
+                                    right = GenerateDefaultValue(typeAndValue);
+                                }
+                                if (initializerIsNull)
+                                    right = GenerateDefaultValue(typeAndValue);
+                                else
+                                {
+                                    // A '?:' / '??' join carries no TypeName: box each arm into the
+                                    // interface here, so the ctor sees one owning fat value.
+                                    if (coreUniqueIfaceArm && right->getType()->isPointerTy()
+                                        && initializerSourceNV.TypeAndValue.TypeName.empty())
+                                    {
+                                        std::string armFailure;
+                                        std::string joinSpelling = "?:";
+                                        std::string iface = typeAndValue.TypeName.substr(8);
+                                        if (auto* fat = UpcastPointerJoinToInterface(
+                                                right, iface, &armFailure, &joinSpelling, true))
+                                            right = fat;
+                                        else if (!armFailure.empty())
+                                            LogErrorContext(assignmentExpression, std::format(
+                                                "cannot convert '{}' arm to interface '{}': {}",
+                                                joinSpelling, iface, armFailure));
+                                    }
+                                    LLVMBackend::NamedVariable ctorArg;
+                                    ctorArg.Primary = right;
+                                    ctorArg.BaseType = right->getType();
+                                    ctorArg.Storage = initializerSourceNV.Storage;
+                                    ctorArg.CallerName = initializerSourceNV.CallerName;
+                                    ctorArg.FieldName = initializerSourceNV.FieldName;
+                                    ctorArg.OwningStructName = initializerSourceNV.OwningStructName;
+                                    bool movedContainerSlot = compiler->lastMovedFromContainerSlot;
+                                    ctorArg.IsExplicitMove = initializerSourceNV.IsExplicitMove;
+                                    ctorArg.TypeAndValue.IsMove = initializerSourceNV.TypeAndValue.IsMove
+                                        || movedContainerSlot;
+                                    ctorArg.IsBorrowed = movedContainerSlot
+                                        ? false : initializerIsBorrowed;
+                                    ctorArg.BorrowedOrigin = movedContainerSlot
+                                        ? std::string() : initializerSourceNV.BorrowedOrigin;
+                                    ctorArg.IsOwning = initializerSourceNV.IsOwning
+                                        || movedContainerSlot
+                                        || (initializerOwns && !initializerIsBorrowed);
+                                    ctorArg.IsOwningStruct = initializerSourceNV.IsOwningStruct;
+                                    // A moved container slot can retain the slot's pointer depth
+                                    // witness even though its loaded LLVM value is one raw T*.
+                                    // The unique constructor consumes that actual value, so present
+                                    // its canonical pointee shape to overload resolution.
+                                    ctorArg.TypeAndValue.TypeName =
+                                        initializerSourceNV.TypeAndValue.TypeName;
+                                    ShapeCoreUniqueCtorArg(compiler, ctorArg,
+                                                           typeAndValue.TypeName, right);
+                                    right = compiler->CreateOverloadedFunctionCall(
+                                        typeAndValue.TypeName, { ctorArg }, true);
+                                    compiler->lastOwningResult = false;
+                                    compiler->lastCallReturnsOwned = false;
+                                }
+                            }
+
                             // A string LITERAL is a 'const char*', never a 'T*': catch it here or
                             // the slot points at character data and the first member access faults.
                             if (RejectStringLiteralIntoStructPointer(
@@ -4374,6 +5272,10 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
                     }
                 }
+                coreUniqueImplicitDefault = !global_scope && initializer == nullptr && !barebraceInit
+                    && !typeAndValue.Pointer && typeAndValue.TypeName.size() > 8
+                    && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
 
                 /*
                  * `auto x = <fixed array>` deduces the ARRAY VIEW `T[]`, i.e. a borrow. CFlat is
@@ -4665,6 +5567,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             "redeclaration of '{}' in the same scope; use a different name or assign to the existing variable", name));
                     auto alloc = compiler->CreateLocalVariable(typeAndValue, right ? right->getType() : nullptr, arraySize, line, typeAndValue.UserAlignValue);
                     allocList.push_back(std::pair(name, llvm::dyn_cast<llvm::AllocaInst>(alloc)));
+                    if (!typeAndValue.Pointer && compiler->IsCoreUniqueType(typeAndValue.TypeName))
+                        compiler->GetOrCreateStackVariable(name).IsOwning = true;
                     if (typeAndValue.IsFunctionPointer)
                     {
                         auto& local = compiler->GetOrCreateStackVariable(name);
@@ -4737,7 +5641,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && interfaceSourceNV.FieldName.empty()
                             && !typeAndValue.Pointer
                             && !typeAndValue.IsUnique
-                            && !typeAndValue.IsUniqueTypeArg
                             && !typeAndValue.IsAlias;
                         if (adoptsSourceBox)
                         {
@@ -4783,8 +5686,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                      * must not be re-zeroed per call, and a run-time-sized allocation has no
                      * constant whole-slot zero.
                      */
-                    if (right == nullptr && typeAndValue.IsUnique && !isStaticLocal
-                        && (typeAndValue.Pointer || typeAndValue.IsFatInterfaceValue())
+                    bool coreUniqueValue = !typeAndValue.Pointer
+                        && compiler->IsCoreUniqueType(typeAndValue.TypeName);
+                    bool coreUniqueInterface = coreUniqueValue
+                        && typeAndValue.TypeName.size() > 8
+                        && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
+                    if (right == nullptr
+                        && (typeAndValue.IsUnique || coreUniqueValue)
+                        && !isStaticLocal
+                        && (typeAndValue.Pointer || typeAndValue.IsFatInterfaceValue()
+                            || coreUniqueInterface)
                         && !needsArrayDefaultInit
                         && (arraySize == nullptr || typeAndValue.ConstArraySize > 0))
                     {
@@ -4941,6 +5852,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 {
                                     compiler->builder->CreateStore(
                                         llvm::ConstantAggregateZero::get(right->getType()), srcStorage);
+                                    if (compiler->IsCoreUniqueType(srcInferredTypeName)
+                                        && !srcCallerName.empty())
+                                        compiler->RecordNullSet(srcCallerName);
                                     // Only a named slot has a spelling to report a later use of; an
                                     // indirect lvalue is consumed silently, as `move w.b` already is.
                                     if (srcIsNamedSlot)
@@ -5101,7 +6015,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         }
                         else if (!bindAliasReference)
                         {
-                            compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                            auto* initStore = compiler->CreateAssignment(right, alloc, srcIsUnsigned);
+                            if (coreUniqueImplicitDefault && initStore != nullptr)
+                                initStore->setMetadata(
+                                    LLVMBackend::kIfaceDeclSplatMD,
+                                    llvm::MDNode::get(*compiler->context, {}));
                         }
 
                         // Implied move of a `move`-temp's owning field: the local now owns the buffer, so
@@ -5240,6 +6158,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             local.PointsToBorrowedByValueParam = srcPointsToBorrowedByValueParam;
                         }
 
+                        // A core unique wrapper can own a counted raw `new T[n]` result even though
+                        // its value representation has no raw-pointer count slot. Preserve the
+                        // existing count metadata so release and scope cleanup use delete[].
+                        if (!typeAndValue.Pointer
+                            && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                            && srcPtrCopyIsRawNewArray)
+                        {
+                            auto& local = compiler->GetOrCreateStackVariable(name);
+                            local.AllocatedByRawNewArray = true;
+                            local.RawArrayLengthStorage = compiler->AllocaAtEntry(
+                                compiler->builder->getInt64Ty(), nullptr,
+                                name + ".raw_array_count");
+                            compiler->builder->CreateStore(
+                                srcRawArrayLength != nullptr
+                                    ? compiler->Upconvert(srcRawArrayLength, compiler->builder->getInt64Ty())
+                                    : compiler->builder->getInt64(-1),
+                                local.RawArrayLengthStorage);
+                        }
+
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
                         if (typeAndValue.Pointer && compiler->lastCallReturnsOwned)
@@ -5256,7 +6193,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && compiler->IsInterfaceType(typeAndValue.TypeName);
                         bool plainInterfaceMoveResult = interfaceMoveResult
                             && !typeAndValue.IsUnique
-                            && !typeAndValue.IsUniqueTypeArg
                             && compiler->lastCallReturnType.IsMove
                             && !srcRhsExprText.empty()
                             // The RHS must BE a call; lastCallReturnType.IsMove above already
@@ -5308,15 +6244,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                          * (`move n->values[i]`) nulls the one real slot even through a borrowed base,
                          * so it does transfer; ownership is re-derived below.
                          */
+                        bool destUniqueLoc = (typeAndValue.IsUnique
+                                && ((typeAndValue.Pointer && !typeAndValue.ElemPointer)
+                                    || typeAndValue.IsInterface))
+                            || (!genericCoreUniqueTypeArg && !typeAndValue.Pointer
+                                && compiler->IsCoreUniqueType(typeAndValue.TypeName));
                         bool borrowMoveKeepsBorrow = srcIsBorrowed && !srcMovedFromSlot
                             && typeAndValue.Pointer && !typeAndValue.ElemPointer
-                            && !typeAndValue.IsUnique;
+                            && !typeAndValue.IsUnique && !destUniqueLoc;
                         if (initResultOwns)
                         {
                             // ParseMoveExpression sets lastOwningResult unconditionally and records the
                             // true provenance in IsBorrowed, so consult that; the `=` path has the same gate.
-                            if (srcIsBorrowed && !srcMovedFromSlot && typeAndValue.IsUnique
-                                && typeAndValue.Pointer && !typeAndValue.ElemPointer)
+                            if (srcIsBorrowed && !srcMovedFromSlot && destUniqueLoc)
                             {
                                 bool srcIsField = !srcBorrowedField.empty();
                                 std::string srcDesc = srcIsField
@@ -5350,7 +6290,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // borrow), so the ownership channels above cannot tell an owning element from a
                         // borrowed one - they mark EVERY moved pointer local owning. Re-derive the
                         // dropped local's ownership from the DESTINATION type, which DOES carry the
-                        // element's ownership via generic substitution (IsUniqueTypeArg). This is keyed
+                        // element's ownership via its desugared core unique type. This is keyed
                         // strictly to element-slot sources (lastMovedFromContainerSlot), so a move of a named
                         // local / param / field stays source-keyed. Value struct / string destinations
                         // are left untouched (their drop is already correct via the struct/runtime-bit
@@ -5507,7 +6447,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // Without this, both the source's scope-exit cleanup and any 'delete'
                         // on this local would free the same pointer (double-free).
                         // Move params are treated like new-allocated for this purpose.
-                        if (srcIsOwningMove && typeAndValue.Pointer && !compiler->lastOwningResult)
+                        if (srcIsOwningMove && typeAndValue.Pointer && !compiler->lastOwningResult
+                            && !compiler->IsCoreUniqueType(srcInferredTypeName))
                         {
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning)
@@ -5537,17 +6478,25 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             && ((llvm::isa<llvm::Constant>(right)
                                     && llvm::cast<llvm::Constant>(right)->isNullValue())
                                 || IsAllNullPhi(right));
-                        bool destUniqueLoc = (typeAndValue.Pointer && !typeAndValue.ElemPointer)
-                            || typeAndValue.IsInterface;
-                        if (initializer && typeAndValue.IsUnique && destUniqueLoc
+                        if (initializer && destUniqueLoc
                             && !srcIsMove && !srcIsNullLiteral)
                         {
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             if (!nv.IsOwning && !nv.IsNewAllocated)
-                                LogErrorContext(initDecl, std::format(
-                                    "cannot initialize unique '{}' from a borrowed value - the source still "
-                                    "owns it; use 'new', a 'move' expression, or a move-returning call, or "
-                                    "drop 'unique'", name));
+                            {
+                                const std::string sourceName =
+                                    LLVMBackend::BorrowedSourceName(initializerSourceNV);
+                                if (sourceName.empty())
+                                    LogErrorContext(initDecl, std::format(
+                                        "cannot initialize unique '{}' from a borrowed value - the source still "
+                                        "owns it; use 'new', a 'move' expression, or a move-returning call, or "
+                                        "drop 'unique'", name));
+                                else
+                                    LogErrorContext(initDecl, std::format(
+                                        "cannot initialize unique '{}' from borrowed value '{}' - the source still "
+                                        "owns it; use 'new', a 'move' expression, or a move-returning call, or "
+                                        "drop 'unique'", name, sourceName));
+                            }
                         }
 
                     }
@@ -5665,7 +6614,8 @@ bool MainListener::IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv) {
             return true;
         // Ownership gate only - the GEP-shape test below is deliberately NOT widened (it
         // over-matches borrows through casts; see the IsUniqueFieldAlias carve-out above).
-        bool ownsPointee = IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
+        bool ownsPointee = (IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer)
+            || (IsOwningUniqueField(nv.TypeAndValue));
         if (!ownsPointee && !IsOwningUniqueInterfaceField(nv.TypeAndValue)) return false;
         if (nv.IsInterfaceField) return true;
         auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(nv.Storage);
@@ -5676,7 +6626,8 @@ bool MainListener::IsUniqueFieldRead(const LLVMBackend::NamedVariable& nv) {
 bool MainListener::IsUniqueTempFieldRead(const LLVMBackend::NamedVariable& nv) {
         if (!nv.MovableTempField && !nv.FromOwningTempField) return false;
         if (nv.TypeAndValue.IsMove) return false;
-        return IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer;
+        return (IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer)
+            || IsOwningUniqueField(nv.TypeAndValue);
     }
 
 bool MainListener::IsImplicitCopyableStringTemp(const LLVMBackend::NamedVariable& nv) {
@@ -5732,6 +6683,9 @@ bool MainListener::AdoptImplicitStringTempCopy(LLVMBackend::NamedVariable& nv, l
 bool MainListener::IsOwningTempUniqueFieldEscape(const LLVMBackend::NamedVariable& nv) {
         if (nv.TypeAndValue.IsMove) return false;
         if (nv.IsAliasBorrow && !nv.RootIsAliasBorrowLocal) return false;
+        if (nv.IsUniqueFieldAlias && nv.FromOwningTempField && nv.OwningTempParent
+            && nv.TypeAndValue.Pointer)
+            return true;
         if (DeclaredOwningTempUniqueFieldRead(nv)) return true;
         return compilerLLVM != nullptr
             && compilerLLVM->JoinCarriesOwningTempUniqueField(nv.Primary);
@@ -5741,6 +6695,7 @@ bool MainListener::DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVar
         if (!nv.FromOwningTempField || !nv.OwningTempParent) return false;
         if (nv.TypeAndValue.IsMove) return false;
         return (IsOwningUniquePointerField(nv.TypeAndValue) && nv.TypeAndValue.Pointer)
+            || IsOwningUniqueField(nv.TypeAndValue)
             || IsOwningUniqueInterfaceField(nv.TypeAndValue);
     }
 
@@ -5794,14 +6749,35 @@ void MainListener::GuardOwningTempUniqueFieldEscape(const LLVMBackend::NamedVari
 
 bool MainListener::IsOwningUniquePointerField(const LLVMBackend::TypeAndValue& tv) {
         if (tv.IsUnique) return true;
-        return tv.IsUniqueTypeArg && !tv.IsAlias && !tv.IsBorrowOfUniqueElement
-            && tv.Pointer && !tv.ElemPointer && !tv.IsArrayView && !tv.IsSimd
+        return false;
+    }
+
+bool MainListener::IsOwningUniqueField(const LLVMBackend::TypeAndValue& tv) const {
+        if (IsOwningUniquePointerField(tv)) return true;
+        return compilerLLVM != nullptr && compilerLLVM->IsCoreUniqueType(tv.TypeName)
+            && !tv.Pointer && !tv.ElemPointer && !tv.IsAlias
+            && !tv.IsArrayView && !tv.IsSimd
             && tv.ConstArraySize == 0;
+}
+
+void MainListener::RejectRawHeapArrayIntoUniqueField(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& fieldType,
+        const std::string& fieldName,
+        antlr4::ParserRuleContext* ctx) {
+        if (!compilerLLVM->HasRawNewArrayProvenance(source)
+            || fieldType.ConstArraySize != 0 || !IsOwningUniqueField(fieldType))
+            return;
+        const std::string name = fieldName.empty() ? fieldType.VariableName : fieldName;
+        LogErrorContext(ctx, std::format(
+            "cannot store a heap array in unique field '{}': a unique field frees a single object - "
+            "hold the array in a local or a container", name));
     }
 
 bool MainListener::IsOwningUniqueInterfaceField(const LLVMBackend::TypeAndValue& tv) {
-        return (tv.IsUnique || tv.IsUniqueTypeArg) && tv.IsInterface && !tv.Pointer
-            && !tv.IsAlias && !tv.IsBorrowOfUniqueElement && !tv.IsArrayView
+        return tv.IsUnique
+            && tv.IsInterface && !tv.Pointer
+            && !tv.IsAlias && !tv.IsArrayView
             && !tv.IsSimd && tv.ConstArraySize == 0;
     }
 
@@ -5809,7 +6785,9 @@ void MainListener::RejectBorrowIntoUniqueField(const LLVMBackend::NamedVariable&
                                      const std::string& fieldDesc,
                                      antlr4::ParserRuleContext* ctx) {
         std::string src = rightNV.CallerName.empty() ? rightNV.BorrowedOrigin : rightNV.CallerName;
-        std::string origin = rightNV.BorrowedOrigin.empty() ? src : rightNV.BorrowedOrigin;
+        std::string origin = !rightNV.BorrowedUniqueField.empty()
+            ? rightNV.BorrowedUniqueField
+            : (rightNV.BorrowedOrigin.empty() ? src : rightNV.BorrowedOrigin);
         // The borrow aliases another `unique` field, so the source field's synthesized
         // destructor owns the pointee - storing it here would make two owners of one pointer.
         if (!rightNV.BorrowedUniqueField.empty() && rightNV.BorrowedUniqueFieldViaCall)
@@ -5995,7 +6973,8 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         // clause cannot disagree there and `new T alignas(...)` has no syntax. `fieldHasClause`
         // leads so the type lookup is skipped on the (overwhelmingly common) clause-free field.
         bool rhsIndirectPtr = fieldHasClause && rhsNonNullPtr
-            && fieldTV.IsUnique && fieldTV.Pointer && !fieldTV.IsArrayView
+            && fieldTV.IsUnique
+            && fieldTV.Pointer && !fieldTV.IsArrayView
             && !ElementTypeIsOverAligned(fieldTV);
         if (!(rhsOverAligned || (fieldHasClause && (rhsFreshBuffer || rhsIndirectPtr)))
             || fieldAlign == rightNV.AllocAlignment)
@@ -6246,7 +7225,9 @@ bool MainListener::SourceIsDanglingAliasBorrow(LLVMBackend* compiler,
 void MainListener::ApplyCallResultBorrowProvenance(LLVMBackend* compiler,
         LLVMBackend::NamedVariable& nv) {
         if (compiler == nullptr || nv.IsBorrowed || nv.TypeAndValue.IsMove) return;
-        if (!nv.TypeAndValue.Pointer || nv.Primary == nullptr) return;
+        bool coreUniqueValue = !nv.TypeAndValue.Pointer
+            && compiler->IsCoreUniqueType(nv.TypeAndValue.TypeName);
+        if ((!nv.TypeAndValue.Pointer && !coreUniqueValue) || nv.Primary == nullptr) return;
         const auto* fieldBorrow = compiler->FindUniqueFieldBorrowResult(nv.Primary);
         if (fieldBorrow == nullptr) return;
         nv.IsBorrowed = true;
@@ -6400,6 +7381,13 @@ bool MainListener::RejectOwningValueCopyIntoField(
         antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
         outCopied = false;
+        // A desugared unique field uses the ordinary value representation, but a plain field
+        // assignment is still the language's implicit ownership move, not a memberwise copy.
+        bool coreUniqueFieldRead = compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+            && !rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.IsMove
+            && (!rightNV.FieldName.empty() || !rightNV.OwningStructName.empty()
+                || llvm::isa_and_nonnull<llvm::GetElementPtrInst>(rightNV.Storage));
+        if (coreUniqueFieldRead) return false;
         if (!(right && right->getType()->isStructTy()
             && !rightNV.TypeAndValue.Pointer
             && !rightNV.TypeAndValue.IsArrayView
@@ -6632,6 +7620,11 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
         if (nv.FieldName.empty() && !nv.CallerName.empty() && NamedVarIsString(nv)
             && compilerLLVM->IsVariableBorrowingOwnedString(nv.CallerName))
             nv.BorrowsOwnedString = true;
-        compilerLLVM->lastCallReturnsOwned = exprOwned ? true : savedOwned;
+        // A produced call/join is the result of THIS expression. If its call was borrowing,
+        // do not restore an owned-return bit left by an outer receiver call (for example,
+        // `makeHolder()->borrowKid()`); that stale bit would make a plain pointer local own the
+        // borrowed field. Preserve the saved channel only for a non-produced binding read.
+        compilerLLVM->lastCallReturnsOwned = exprOwned
+            ? true : (compilerLLVM->IsProducedTempValue(nv.Primary) ? false : savedOwned);
         return nv;
     }

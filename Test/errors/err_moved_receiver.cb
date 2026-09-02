@@ -1,0 +1,35 @@
+struct MovedReceiverResource
+{
+    int id = 0;
+    ~MovedReceiverResource() { }
+};
+
+struct MovedReceiverBox<T>
+{
+    T* _p = nullptr;
+    MovedReceiverBox() { }
+    MovedReceiverBox(move T* p) { _p = p; }
+    ~MovedReceiverBox() { if (_p != nullptr) delete _p; }
+    T* operator->() { return _p; }
+    bool valid() { return _p != nullptr; }
+};
+
+expect_error("use of moved variable 'methodSource'") {
+    int movedMethodReceiver()
+    {
+        MovedReceiverBox<MovedReceiverResource> methodSource =
+            MovedReceiverBox<MovedReceiverResource>(new MovedReceiverResource());
+        MovedReceiverBox<MovedReceiverResource> methodDest = move methodSource;
+        return methodSource.valid() ? 1 : 0;
+    }
+}
+
+expect_error("use of moved variable 'operatorSource'") {
+    int movedOperatorReceiver()
+    {
+        MovedReceiverBox<MovedReceiverResource> operatorSource =
+            MovedReceiverBox<MovedReceiverResource>(new MovedReceiverResource());
+        MovedReceiverBox<MovedReceiverResource> operatorDest = operatorSource;
+        return operatorSource->id;
+    }
+}

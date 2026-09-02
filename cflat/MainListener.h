@@ -667,15 +667,21 @@ static std::string getDirectDeclName(CFlatParser::DirectDeclaratorContext* d)
     return d->getText();
 }
 
+// A parameter's C-style array suffix hangs on its declarator rather than its specifiers.
+// Keep this structural check available to both declaration-specifier parsers.
+static bool HasParameterArrayDeclarator(CFlatParser::DeclarationSpecifiersContext* specs)
+{
+    auto* param = specs != nullptr
+        ? dynamic_cast<CFlatParser::ParameterDeclarationContext*>(specs->parent) : nullptr;
+    if (param == nullptr || param->declarator() == nullptr) return false;
+    auto* direct = param->declarator()->directDeclarator();
+    return direct != nullptr && direct->assignmentExpression() != nullptr;
+}
+
 // Normalize a generic type argument for use in mangled names (e.g. "Employee*" -> "Employeeptr",
 // "int[]" -> "intview"). A type-arg string carries its reference kind as a suffix: "*" for a
 // pointer, "[]" for a noalias array-view (see PeelTypeArgSuffix). Both must fold to symbol-safe
 // text so the mangled name stays a valid identifier.
-// The `unique` ownership qualifier is carried as a leading "unique " prefix on a resolved
-// type-argument string (decision D10: single space, star attached, e.g. "unique Circle*").
-static const char kUniqueQualifierPrefix[] = "unique ";
-static const size_t kUniqueQualifierPrefixLen = sizeof(kUniqueQualifierPrefix) - 1;
-
 // True if a type-parameter entry carries the `unique` qualifier: a leading Identifier
 // (grammar: `Identifier? typeSpecifier ...`) whose text is exactly "unique".
 static bool TypeArgHasUnique(CFlatParser::TypeParameterEntryContext* entry)
@@ -684,17 +690,79 @@ static bool TypeArgHasUnique(CFlatParser::TypeParameterEntryContext* entry)
         && entry->Identifier()->getText() == "unique";
 }
 
-// Strip a leading "unique " qualifier off a resolved type-arg string, returning whether it
-// was present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type
-// as the unqualified spelling; is_unique consults the un-stripped substitution string.
-static bool StripUniqueQualifier(std::string& name)
+// A blessed core `unique<X>` substitution answers `is_copyable` as its former raw-pointer
+// spelling. The wrapper is transparent to this generic predicate; the interface arm stays a bare
+// interface name. Sole remaining caller is is_copyable; is_unique answers IsCoreUniqueType.
+static std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
+                                                    const std::string& resolved)
 {
-    if (name.compare(0, kUniqueQualifierPrefixLen, kUniqueQualifierPrefix) == 0)
+    if (compiler == nullptr || !compiler->IsCoreUniqueType(resolved)) return resolved;
+    std::string pointee = resolved.substr(8);
+    if (compiler->IsInterfaceType(pointee))
+        return pointee;
+    return pointee + "*";
+}
+
+// Shape the argument handed to unique<T>'s constructor: the pointer arm hands over the pointee
+// pointer, the interface arm hands over the interface VALUE (or an implementor pointer to box).
+static void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
+                                   LLVMBackend::NamedVariable& ctorArg,
+                                   const std::string& uniqueTypeName, llvm::Value* value)
+{
+    const std::string pointee = uniqueTypeName.substr(8);
+    if (compiler != nullptr && compiler->IsInterfaceType(pointee))
     {
-        name.erase(0, kUniqueQualifierPrefixLen);
-        return true;
+        bool fat = value != nullptr && value->getType()->isStructTy();
+        std::string argType = fat ? pointee : ctorArg.TypeAndValue.TypeName;
+        if (argType.empty()) argType = pointee;
+        ctorArg.TypeAndValue.TypeName = argType;
+        ctorArg.TypeAndValue.Pointer = !fat;
+        ctorArg.TypeAndValue.IsInterface = compiler->IsInterfaceType(argType);
+        ctorArg.TypeAndValue.IsInterfacePointer = false;
     }
-    return false;
+    else
+    {
+        ctorArg.TypeAndValue.TypeName = pointee;
+        ctorArg.TypeAndValue.Pointer = true;
+    }
+    ctorArg.TypeAndValue.ElemPointer = false;
+    ctorArg.TypeAndValue.PointerDepth = 0;
+}
+
+// A function-pointer SIGNATURE keeps the raw pointee spelling a desugared `unique X*` element
+// had before the desugar, so a user lambda stays spelled `X*` and the indirect-call adaptation
+// borrows the wrapper into it. The interface arm has no pointer spelling and is left alone.
+static void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::string& typeName,
+                                           bool& pointer, int& pointerDepth)
+{
+    if (compiler == nullptr || pointer || !compiler->IsCoreUniqueType(typeName)) return;
+    std::string pointee = typeName.substr(8);
+    if (compiler->IsInterfaceType(pointee)) return;
+    typeName = pointee;
+    pointer = true;
+    pointerDepth = 1;
+}
+
+// True when `unique X*` / `unique IFace` in GENERIC-ARGUMENT position spells the core
+// `unique<X>` value. Unsupported forms are rejected before a type-argument spelling is mangled.
+static bool CanDesugarUniqueTypeArg(const LLVMBackend* compiler, const std::string& base,
+                                    bool hasPointer, int pointerDepth, bool hasArrayView,
+                                    bool baseIsGenericInstantiation = false)
+{
+    if (compiler == nullptr || hasArrayView || base.empty() || base == "void") return false;
+    if (base.find('*') != std::string::npos || base.find('[') != std::string::npos) return false;
+    // The interface answer must be the SAME in both passes: interfaceTable is still empty during
+    // the forward scan, so the scan's own interface-definition set stands in for it there.
+    if (compiler->IsInterfaceTypeArgKey(base)) return !hasPointer;
+    if (!hasPointer || pointerDepth != 1) return false;
+    // IsTypeArgTypeKey also answers for a name the FORWARD SCAN has only seen, so the scanner's
+    // opaque shell is named the same as the instantiation the codegen pass builds. An unbound
+    // template parameter is in neither set and keeps the qualifier prefix.
+    // baseIsGenericInstantiation: the caller MANGLED this base itself from a nested generic spec,
+    // so no registry holds it yet - the other pass registers it before it asks. Without it the two
+    // passes disagreed on `unique dictionary<string, double>*`.
+    return compiler->IsKnownTypeName(base) || compiler->IsTypeArgTypeKey(base)
+        || baseIsGenericInstantiation;
 }
 
 // The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
@@ -758,12 +826,10 @@ static bool StripAliasQualifier(std::string& name)
     return false;
 }
 
-// Strip both leading ownership qualifiers (`unique `, `alias `) off a resolved type-arg string.
-// Neither is a signature/LLVM type - they resolve to the same underlying type - so callers that
-// only want the bare base drop both. Order is irrelevant (the two are mutually exclusive).
+// Strip the leading `alias ` qualifier off a resolved type-arg string. It is a generic
+// instantiation marker, not part of the underlying LLVM type.
 static void StripOwnershipQualifiers(std::string& name)
 {
-    StripUniqueQualifier(name);
     StripAliasQualifier(name);
 }
 
@@ -782,16 +848,9 @@ static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string&
     }
     std::string result;
     size_t start = 0;
-    // The `unique` qualifier (D10) mangles to a "unique_" token so list<unique Circle*>
-    // monomorphizes distinctly from list<Circle*>.
-    if (typeName.compare(0, kUniqueQualifierPrefixLen, kUniqueQualifierPrefix) == 0)
-    {
-        result += "unique_";
-        start = kUniqueQualifierPrefixLen;
-    }
     // The `alias` qualifier mangles to an "alias_" token so list<alias Circle*>
     // monomorphizes distinctly from list<Circle*> (mutually exclusive with unique).
-    else if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
+    if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
     {
         result += "alias_";
         start = kAliasQualifierPrefixLen;
@@ -924,6 +983,7 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
 }
 
 
+
 // Peel the reference-kind suffixes off a (possibly substituted) type-arg string: a trailing "[]"
 // is a noalias array-view (which is also a pointer repr), a trailing "*" is a plain pointer. They
 // never combine ("T[]*" is rejected at the grammar/listener). Suffixes were appended in source
@@ -931,13 +991,10 @@ static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isT
 // `pointerDepth` is ACCUMULATED (one per star), not a flag: `C**` must stay distinguishable from
 // `C*` all the way to MangleTypeArg, which is what makes Box<C**> its own instantiation.
 static void PeelTypeArgSuffix(std::string& name, int& pointerDepth, bool& arrayView,
-    bool* unique = nullptr, bool* aliasOut = nullptr)
+    bool* aliasOut = nullptr)
 {
-    // A `unique` or `alias` qualifier is a leading prefix; peel it first so the suffix loop and
-    // any re-mangling see the bare type. Callers resolving to an LLVM type discard it; callers
-    // that re-mangle a nested arg re-prepend it from *unique / *aliasOut. The two are exclusive.
-    bool hadUnique = StripUniqueQualifier(name);
-    if (unique != nullptr) *unique = hadUnique;
+    // The `alias` qualifier is a leading prefix; peel it before the suffix loop so the underlying
+    // type remains available to the resolver. It is re-added by callers that mangle alias args.
     bool hadAlias = StripAliasQualifier(name);
     if (aliasOut != nullptr) *aliasOut = hadAlias;
     for (;;)
@@ -2050,8 +2107,9 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
     if (p.IsThinFnPtr() || p.TypeName.rfind("__thinfn", 0) == 0) return false;
     if (p.IsArrayView || p.IsSimd) return false;
     if (p.ConstArraySize > 0) return false;
-    if (p.IsMove || p.IsUniqueTypeArg || p.IsAlias) return false;
-    if (p.IsBorrowOfUniqueElement || p.IsBorrowOfAliasElement) return false;
+    if (p.IsMove || p.TypeName.starts_with("unique__")
+        || p.IsAlias) return false;
+    if (p.IsBorrowOfAliasElement) return false;
     return true;
 }
 
@@ -2165,6 +2223,10 @@ class ForwardRefScanner
 private:
     LLVMBackend* compilerLLVM;
     antlr4::BufferedTokenStream* tokens_ = nullptr;
+
+    // Kept in sync with the codegen parser: only a declaration nested in a function body is a
+    // local; return types, parameters, fields, and generic arguments keep their builtin shape.
+    bool IsLocalDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs) const;
 
     LLVMBackend* Compiler(antlr4::ParserRuleContext* ctx);
 
@@ -2712,9 +2774,21 @@ private:
     // unqualified nested type names (e.g. "Inner") resolve to "Outer.Inner".
     std::vector<std::string> structScopeStack;
 
-    // Set only while ParseDeclarationList parses a field's declarationSpecifiers. The
-    // 'unique' soft keyword is field-only; every other position must reject it.
+    // Set only while ParseDeclarationList parses a field's declarationSpecifiers. Pointer-form
+    // `unique` fields desugar to core unique<T>; unique void* remains builtin.
     bool inStructFieldDecl_ = false;
+    // Interface fields retain their builtin ownership contract for vtable layout.
+    bool inInterfaceFieldDecl_ = false;
+    // Set only while a declaration parser is handling a function-body local. Pointer-form
+    // `unique X*` is rewritten to the core `unique<X>` value; interface locals remain builtin.
+    bool inLocalDecl_ = false;
+    struct LocalDeclGuard
+    {
+        bool& flag;
+        bool saved;
+        LocalDeclGuard(bool& f, bool active) : flag(f), saved(f) { flag = active; }
+        ~LocalDeclGuard() { flag = saved; }
+    };
     // Saves and restores rather than clearing: if a specifier parse ever nests (a generic
     // instantiation parsing its own fields), clearing would spuriously reject the outer field.
     struct StructFieldDeclGuard
@@ -2723,6 +2797,13 @@ private:
         bool  prev;
         explicit StructFieldDeclGuard(bool& f) : flag(f), prev(f) { flag = true; }
         ~StructFieldDeclGuard() { flag = prev; }
+    };
+    struct InterfaceFieldDeclGuard
+    {
+        bool& flag;
+        bool prev;
+        explicit InterfaceFieldDeclGuard(bool& f) : flag(f), prev(f) { flag = true; }
+        ~InterfaceFieldDeclGuard() { flag = prev; }
     };
 
     // Set while ParseStructDefinition parses the members of a UNION body. `unique` is rejected
@@ -2998,8 +3079,7 @@ private:
 
     // Encode + register a closure type from an already-resolved signature (used when a function-type
     // alias `using IntFn = Lambda<int(int)>` appears as a generic arg, so it unifies with the direct
-    // spelling). Produces the same name BuildEncodedClosureName gives for the direct form.
-    std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig);
+    // spelling). Declared public below - the forward scan calls it too.
 
     LLVMBackend::DeclTypeAndValue ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs);
 
@@ -3040,6 +3120,11 @@ private:
     llvm::Constant* SplatConstantOverFixedArray(llvm::Constant* elemConst, llvm::Type* arrType);
 
 public:
+    // Encode + register a closure type from an already-resolved signature (a function-type alias
+    // `using IntFn = Lambda<int(int)>` as a generic arg). BOTH passes call this, so an aliased
+    // closure gets one name; produces what BuildEncodedClosureName gives for the direct form.
+    static std::string EncodeClosureFromSig(LLVMBackend* compiler, const LLVMBackend::TypeAndValue& sig);
+
     MainListener(CFlatParser* parser, LLVMBackend* compilerLLVM, const std::string& filename);
 
     // Retry global default folds after all declarations and deferred instantiations are emitted.
@@ -3495,8 +3580,7 @@ public:
     // Recover ownership of a local/temp that was `move`d out of a container element slot. The slot
     // read demoted the element's `unique`-ness (a plain read hands out a borrow), so its TRUE
     // ownership is taken from `elemOwnershipType`: the DECLARED destination type for
-    // `T tmp = move _data[i]` (its IsUniqueTypeArg), or the moved element value's ElementOwningUnique
-    // for the `_ = move _data[i]` discard form (which has no destination type). An owning thin
+    // `T tmp = move _data[i]`. An owning thin
     // `unique T*` / `unique <iface>` element is marked owning so DropValue frees it exactly once; a
     // bare borrow element clears ownership so DropValue frees nothing.
     static void ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
@@ -3638,7 +3722,7 @@ public:
 
     // The DECLARED half of the predicate above, read straight off the NamedVariable the
     // member-access branch built. Also the condition under which the read is ledgered.
-    static bool DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVariable& nv);
+    bool DeclaredOwningTempUniqueFieldRead(const LLVMBackend::NamedVariable& nv);
 
     /*
      * The diagnostic for the predicate above. `move <temp>.<field>` is not a remedy (a temporary
@@ -3666,10 +3750,19 @@ public:
      * The type-arg arm mirrors the `uniqueAutoSink` ownership rule (LLVMBackend.h ~3581) and is
      * further restricted to the exact scalar-pointer shape whose free is synthesized, so it can
      * only reject a slot that is provably freed. Everything else is let through: an `alias` type
-     * argument and a borrow-of-unique-element never set IsUniqueTypeArg in the first place, and a
+     * argument and a borrow-of-alias-element never set IsUnique in the first place, and a
      * container's own `T* _data` buffer has it cleared by the explicit-star rule (~3974).
      */
     static bool IsOwningUniquePointerField(const LLVMBackend::TypeAndValue& tv);
+    bool IsOwningUniqueField(const LLVMBackend::TypeAndValue& tv) const;
+
+    // A raw `new T[n]` carries delete[] provenance, but a unique field's destructor frees one T.
+    // Reject the store before the field adopts the pointer, for both wrapper and builtin spellings.
+    void RejectRawHeapArrayIntoUniqueField(
+        const LLVMBackend::NamedVariable& source,
+        const LLVMBackend::TypeAndValue& fieldType,
+        const std::string& fieldName,
+        antlr4::ParserRuleContext* ctx);
 
     /*
      * The fat-interface counterpart of IsOwningUniquePointerField: a field that PROVABLY owns a
@@ -4487,8 +4580,8 @@ public:
     LLVMBackend::TypedValue ParseAndExpression(CFlatParser::AndExpressionContext* ctx,
                                                 ResultUse use = ResultUse::Value);
 
-    // `ifaceVal == nullptr` / `!= nullptr`: rewrite the fat-ptr operand to its data pointer so the
-    // comparison is a plain pointer compare. Only fires when the other operand is a null constant.
+    // Interface comparisons use the data pointer: against nullptr, or between two fat values.
+    // This keeps aggregate interface values out of LLVM icmp while preserving object identity.
     void LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
                                    LLVMBackend::TypedValue& lv, LLVMBackend::TypedValue& rv);
 
@@ -4678,6 +4771,9 @@ public:
     // (UnifyTernaryArmTypes) has no other way to learn which interface a `move` of an
     // interface-typed local produced.
     llvm::Value* LoadNamedVariable(LLVMBackend::NamedVariable& namedVar);
+
+    // Check a receiver use at call sites that do not load the receiver first.
+    void CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver);
 
     llvm::Value* LoadNamedVariableImpl(LLVMBackend::NamedVariable& namedVar);
 

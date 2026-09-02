@@ -16,7 +16,7 @@ void releaseString()
 
 extern int main()
 {
-    expect_error("use of moved variable 'p'");
+    expect_error("dereference of moved variable 'p' (it is null after the move)");
     unique Payload* p = new Payload();
     _ = move p;
     int k = p->k;

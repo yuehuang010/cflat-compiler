@@ -75,7 +75,6 @@ int LLVMBackend::ArrayViewBufferFieldIndex(const std::string& typeName)
 bool LLVMBackend::ArrayViewElementOwnsNothing(const TypeAndValue& elemField)
 {
         if (elemField.IsInterface) return false;
-        if (elemField.Pointer && elemField.IsUnique) return false;
         return !IsOwningValueOrClosureType(elemField.TypeName);
     }
 
@@ -1028,6 +1027,13 @@ void LLVMBackend::StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value
         builder->CreateStore(count, namedVar.RawArrayLengthStorage);
     }
 
+bool LLVMBackend::HasRawNewArrayProvenance(const NamedVariable& namedVar) const
+{
+        return namedVar.AllocatedByRawNewArray
+            && (namedVar.RawArrayLength != nullptr || namedVar.RawArrayLengthStorage != nullptr)
+            && !namedVar.TypeAndValue.IsMove;
+    }
+
 void LLVMBackend::SetVariableOwning(const std::string& varName, bool value)
 {
         for (auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1321,7 +1327,8 @@ void LLVMBackend::EmitCountedArrayDestruction(llvm::Value* ptrVal,
 bool LLVMBackend::IsOwningInterfaceValue(const NamedVariable& namedVar) const
 {
         return namedVar.IsOwning && namedVar.Storage != nullptr
-            && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg
+            && (namedVar.TypeAndValue.IsUnique
+                || IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
                 || namedVar.OwnsInterfaceBox)
             && namedVar.TypeAndValue.IsFatInterfaceValue();
 }
@@ -1334,21 +1341,52 @@ void LLVMBackend::EmitOwningInterfaceCleanup(const NamedVariable& namedVar)
 
 bool LLVMBackend::IsOwningUniqueArray(const NamedVariable& namedVar) const
 {
+        // A core unique wrapper can also own a counted raw `new T[n]` result. Its `_p` field
+        // uses the same counted destruction path as a raw pointer; the wrapper has no array
+        // syntax, so only explicit raw-array provenance enables this arm.
+        if (namedVar.Storage != nullptr && namedVar.BaseType != nullptr
+            && namedVar.IsOwning && namedVar.AllocatedByRawNewArray
+            && !namedVar.TypeAndValue.Pointer
+            && IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+            return namedVar.BaseType->isStructTy();
         // IsOwning is deliberately NOT required: it is set from a scalar's single `new` source and
         // an array has none. `unique` on the declaration is itself the ownership statement here.
         if (namedVar.Storage == nullptr || namedVar.BaseType == nullptr) return false;
         if (namedVar.IsAliasBorrow || namedVar.TypeAndValue.IsAlias) return false;
-        if (!namedVar.TypeAndValue.IsUnique && !namedVar.TypeAndValue.IsUniqueTypeArg) return false;
+        if (!namedVar.TypeAndValue.IsUnique
+            && !IsCoreUniqueType(namedVar.TypeAndValue.TypeName)) return false;
         if (namedVar.TypeAndValue.ConstArraySize == 0) return false;
         return namedVar.BaseType->isArrayTy();
     }
 
 void LLVMBackend::EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
 {
+        if (!namedVar.TypeAndValue.Pointer && IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+            && namedVar.AllocatedByRawNewArray)
+        {
+            const auto& uniqueData = GetDataStructure(namedVar.TypeAndValue.TypeName);
+            for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+            {
+                if (uniqueData.StructFields[i].VariableName != "_p") continue;
+                auto* pointerField = CreateStructGEP(
+                    namedVar.BaseType, namedVar.Storage, (unsigned)i);
+                NamedVariable raw = namedVar;
+                raw.Storage = pointerField;
+                raw.BaseType = GetType(TypeAndValue{
+                    .TypeName = namedVar.TypeAndValue.TypeName.substr(8), .Pointer = true});
+                raw.TypeAndValue.TypeName = namedVar.TypeAndValue.TypeName.substr(8);
+                raw.TypeAndValue.Pointer = true;
+                raw.TypeAndValue.ConstArraySize = 0;
+                EmitOwningPtrCleanup(raw);
+                return;
+            }
+        }
         auto* arrTy = llvm::cast<llvm::ArrayType>(namedVar.BaseType);
         auto* elemTy = arrTy->getElementType();
         uint64_t count = arrTy->getNumElements();
         bool isIface = namedVar.TypeAndValue.IsFatInterfaceValue();
+        bool isCoreUniqueValue = !namedVar.TypeAndValue.Pointer
+            && IsCoreUniqueType(namedVar.TypeAndValue.TypeName);
         for (uint64_t i = 0; i < count; i++)
         {
             auto* elemPtr = builder->CreateConstInBoundsGEP2_64(arrTy, namedVar.Storage, 0, i, "uniq.elem");
@@ -1358,6 +1396,11 @@ void LLVMBackend::EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
             elem.TypeAndValue.ConstArraySize = 0;
             if (isIface)
                 EmitOwningInterfaceCleanup(elem);
+            else if (isCoreUniqueValue && elemTy->isStructTy())
+            {
+                if (auto* dtor = GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
+                    builder->CreateCall(dtor->getFunctionType(), dtor, { elemPtr });
+            }
             else if (elemTy->isPointerTy())
                 EmitOwningPtrCleanup(elem);
         }
@@ -1542,6 +1585,9 @@ void LLVMBackend::ForgetFunctionEscapeMemo(const llvm::Function* fn)
         std::erase_if(paramRetainsPastCallMemo_, [&](const auto& kv) { return kv.first.first == fn; });
         std::erase_if(paramRetainsPastCallInProgress_, [&](const auto& k) { return k.first == fn; });
         std::erase_if(provableRetainsInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase_if(borrowingSinkInProgress_, [&](const auto& k) { return k.first == fn; });
+        std::erase_if(owningLocalBorrowingHelperArgs_,
+                      [&](const auto& e) { return e.Callee == fn; });
         // The record ledger holds this raw Function*, which LLVM may hand back to a later
         // Function::Create; an entry outliving its callee would be resolved against a stranger.
         std::erase_if(tempUniqueFieldArgs_, [&](const TempUniqueFieldArg& e) { return e.Callee == fn; });
@@ -1573,7 +1619,10 @@ void LLVMBackend::DropModuleEscapeMemo()
         paramRetainsPastCallMemo_.clear();
         paramRetainsPastCallInProgress_.clear();
         provableRetainsInProgress_.clear();
+        borrowingSinkInProgress_.clear();
         tempUniqueFieldArgs_.clear();
+        coreUniqueGetterSource_.clear();
+        owningLocalBorrowingHelperArgs_.clear();
         deferredTempUniqueFieldEscapes_.clear();
         pendingLaunderTempUniqueFields_.clear();
         // Both borrow-provenance ledgers are Function*/CallInst*-keyed, so a module rebuild
@@ -2177,6 +2226,101 @@ bool LLVMBackend::ParameterMayReachReturn(const llvm::Function* fn, unsigned arg
         return reaches;
     }
 
+std::optional<unsigned> LLVMBackend::CFlatParameterLLVMIndex(const FunctionSymbol& sym,
+                                                              unsigned paramIndex) const
+{
+        if (sym.Function == nullptr || paramIndex >= sym.Parameters.size()) return std::nullopt;
+        size_t expanded = 0;
+        for (const auto& param : sym.Parameters)
+            expanded += ParameterCarriesRawArrayCount(param) ? 2u : 1u;
+        unsigned llvmIndex = sym.IsMethod && sym.Function->arg_size() == expanded + 1 ? 1u : 0u;
+        for (unsigned i = 0; i < paramIndex; ++i)
+            llvmIndex += ParameterCarriesRawArrayCount(sym.Parameters[i]) ? 2u : 1u;
+        if (llvmIndex >= sym.Function->arg_size()) return std::nullopt;
+        return llvmIndex;
+    }
+
+bool LLVMBackend::ParameterMayReachBorrowingContainerSink(const llvm::Function* fn,
+                                                           unsigned argIndex, int depth)
+{
+        if (fn == nullptr || argIndex >= fn->arg_size() || depth > kMaxRetainDepth) return false;
+        if (!FunctionBodyIsReadable(fn)) return false;
+        auto key = std::make_pair(fn, argIndex);
+        if (!borrowingSinkInProgress_.insert(key).second) return false;
+        bool reaches = ValueMayReachBorrowingContainerSink(fn->getArg(argIndex), depth);
+        borrowingSinkInProgress_.erase(key);
+        return reaches;
+    }
+
+bool LLVMBackend::ValueMayReachBorrowingContainerSink(const llvm::Value* root, int depth)
+{
+        if (root == nullptr || depth > kMaxRetainDepth) return false;
+        llvm::SmallPtrSet<const llvm::Value*, 16> visited;
+        llvm::SmallVector<const llvm::Value*, 16> work;
+        visited.insert(root);
+        work.push_back(root);
+        while (!work.empty())
+        {
+            if (visited.size() > kMaxRetainUses) return false;
+            const llvm::Value* v = work.pop_back_val();
+            for (const llvm::User* u : v->users())
+            {
+                const auto* inst = llvm::dyn_cast<llvm::Instruction>(u);
+                if (inst == nullptr) continue;
+                if (const auto* call = llvm::dyn_cast<llvm::CallBase>(inst))
+                {
+                    const FunctionSymbol* sym = FindSymbolForFunction(call->getCalledFunction());
+                    if (sym != nullptr && sym->IsMethod && !sym->Parameters.empty())
+                    {
+                        const unsigned sinkParam = (unsigned)sym->Parameters.size() - 1;
+                        auto sinkArg = CFlatParameterLLVMIndex(*sym, sinkParam);
+                        if (sinkArg.has_value()
+                            && IsBorrowingContainerElementSink(sym->SourceName, sym->Parameters,
+                                                               sinkParam, sym->IsMethod)
+                            && *sinkArg < call->arg_size()
+                            && call->getArgOperand(*sinkArg) == v
+                            && call->arg_size() > 0)
+                        {
+                            std::string destKind;
+                            if (MemoryOutlivesCall(call->getArgOperand(0), destKind, 0))
+                                return true;
+                        }
+                    }
+                    // This is deliberately depth-1: a helper called by this function is not
+                    // summarized recursively, so two-level forwarding remains accepted.
+                    continue;
+                }
+                if (const auto* st = llvm::dyn_cast<llvm::StoreInst>(inst))
+                {
+                    if (st->getValueOperand() != v) continue;
+                    if (llvm::isa<llvm::AllocaInst>(st->getPointerOperand())
+                        && visited.insert(st->getPointerOperand()).second)
+                        work.push_back(st->getPointerOperand());
+                    continue;
+                }
+                if (const auto* ld = llvm::dyn_cast<llvm::LoadInst>(inst))
+                {
+                    const auto* slot = llvm::dyn_cast<llvm::AllocaInst>(v);
+                    if (slot == nullptr) continue;
+                    bool onlyTracked = true;
+                    for (const llvm::User* su : slot->users())
+                        if (const auto* s2 = llvm::dyn_cast<llvm::StoreInst>(su);
+                            s2 != nullptr && s2->getPointerOperand() == slot
+                            && !visited.contains(s2->getValueOperand())) onlyTracked = false;
+                    if (onlyTracked && visited.insert(ld).second) work.push_back(ld);
+                    continue;
+                }
+                if (llvm::isa<llvm::GetElementPtrInst>(inst) || llvm::isa<llvm::BitCastInst>(inst)
+                    || llvm::isa<llvm::AddrSpaceCastInst>(inst) || llvm::isa<llvm::PHINode>(inst)
+                    || llvm::isa<llvm::SelectInst>(inst))
+                {
+                    if (visited.insert(inst).second) work.push_back(inst);
+                }
+            }
+        }
+        return false;
+    }
+
 bool LLVMBackend::ValueMayReachReturn(const llvm::Value* root, int depth)
 {
         llvm::SmallPtrSet<const llvm::Value*, 16> visited;
@@ -2373,7 +2517,7 @@ void LLVMBackend::RegisterUniqueFieldBorrowResult(llvm::Value* callResult,
 {
         if (callResult == nullptr) return;
         uniqueFieldBorrowResults_[callResult] = info;
-    }
+}
 
 const LLVMBackend::UniqueFieldBorrowReturn* LLVMBackend::FindUniqueFieldBorrowResult(
     const llvm::Value* callResult) const
@@ -2389,6 +2533,13 @@ std::string LLVMBackend::DescribeUniqueFieldAccess(const NamedVariable& nv)
         if (field.empty()) return nv.CallerName;
         if (nv.FieldName.empty() || nv.CallerName.empty()) return field;
         return nv.CallerName + "." + field;
+    }
+
+std::string LLVMBackend::BorrowedSourceName(const NamedVariable& nv)
+{
+        if (!nv.BorrowedOrigin.empty()) return nv.BorrowedOrigin;
+        if (!nv.CallerName.empty()) return nv.CallerName;
+        return nv.TypeAndValue.VariableName;
     }
 
 void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::string& functionName,
@@ -2408,8 +2559,14 @@ void LLVMBackend::RecordTempUniqueFieldArgs(llvm::Value* callResult, const std::
                 carries ? nullptr : FindPendingLaunderTempUniqueField(argVal);
             if (!carries && pendingArg == nullptr) continue;
             std::string access;
+            // A blessed unique<X> argument arrived through get()/release(), so match its SOURCE.
+            const llvm::Value* matchVal = argVal;
+            if (auto srcIt = coreUniqueGetterSource_.find(argVal);
+                srcIt != coreUniqueGetterSource_.end())
+                matchVal = srcIt->second;
             for (const auto& nv : args)
-                if (nv.Primary == argVal) { access = DescribeUniqueFieldAccess(nv); break; }
+                if (nv.Primary == argVal || nv.Primary == matchVal)
+                { access = DescribeUniqueFieldAccess(nv); break; }
             TempUniqueFieldArg entry{ callee, i, functionName, access, sourceFileName,
                                       currentLine, currentColumn,
                                       carries && !IsLedgeredOwningTempUniqueField(argVal) };
@@ -2527,13 +2684,19 @@ void LLVMBackend::RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult,
             const TypeAndValue& param = method.Parameters[i];
             // A sink parameter states the ownership claim at the call site and is answered by the
             // sink path, exactly as in the direct call; only a PLAIN pointer reaches here.
-            if (param.IsMove || param.IsUnique || !param.Pointer) continue;
+            if (param.IsMove || !param.Pointer) continue;
             if (i + 1 >= call->arg_size()) break;
             llvm::Value* argVal = call->getArgOperand((unsigned)(i + 1));
             if (!JoinCarriesOwningTempUniqueField(argVal)) continue;
             std::string access;
+            // A blessed unique<X> argument arrived through get()/release(), so match its SOURCE.
+            const llvm::Value* matchVal = argVal;
+            if (auto srcIt = coreUniqueGetterSource_.find(argVal);
+                srcIt != coreUniqueGetterSource_.end())
+                matchVal = srcIt->second;
             for (const auto& nv : args)
-                if (nv.Primary == argVal) { access = DescribeUniqueFieldAccess(nv); break; }
+                if (nv.Primary == argVal || nv.Primary == matchVal)
+                { access = DescribeUniqueFieldAccess(nv); break; }
             TempUniqueFieldArg entry{ nullptr, (unsigned)i, ifaceName + "." + method.Name, access,
                                       sourceFileName, currentLine, currentColumn,
                                       !IsLedgeredOwningTempUniqueField(argVal),
@@ -2585,6 +2748,24 @@ void LLVMBackend::ResolveTempUniqueFieldArgEscapes()
             // THROWS, so the restore has to be RAII or it never runs.
             ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
             RejectTempUniqueFieldArgEscape(entry, destKind);
+        }
+    }
+
+void LLVMBackend::ResolveOwningLocalBorrowingHelperArgs()
+{
+        std::vector<OwningLocalBorrowingHelperArg> pending;
+        pending.swap(owningLocalBorrowingHelperArgs_);
+        for (const auto& entry : pending)
+        {
+            if (!ParameterMayReachBorrowingContainerSink(entry.Callee, entry.ParamIndex)) continue;
+            ReportingFileScope fileScope(this, entry.File, entry.Line, entry.Column);
+            LogErrorMessage(
+                "call to '{}': '{}' still owns the object it was given, and the helper parameter "
+                "'{}' stores it into a container that only BORROWS its elements and never frees "
+                "them, so the stored element would dangle. Declare parameter '{}' as 'move' and "
+                "call '{}(move {})', or declare the container's element 'unique T*'.",
+                { entry.FunctionName, entry.ArgumentName, entry.ParameterName,
+                  entry.ParameterName, entry.FunctionName, entry.ArgumentName });
         }
     }
 

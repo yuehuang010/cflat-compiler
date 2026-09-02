@@ -268,8 +268,8 @@ LLVMBackend::NamedVariable MainListener::ParseAssignmentExpressionNamed(CFlatPar
                                                         // return-block call reaches the inliner, so forward
                                                         // the use unchanged. Any operator/value context
                                                         // takes the fallback below with ResultUse::Value.
-                                                        return FinishAssignmentExpressionNamed(
-                                                            ParseCastExpression(muls[0], false, use), savedOwned);
+                                                        auto passthrough = ParseCastExpression(muls[0], false, use);
+                                                        return FinishAssignmentExpressionNamed(passthrough, savedOwned);
                                                     }
                                                 }
                                             }
@@ -533,10 +533,15 @@ llvm::Value* MainListener::BoxConcreteIntoInterface(antlr4::ParserRuleContext* e
     }
 
 bool MainListener::BindingKeepsOwnershipOfBoxedObject(const LLVMBackend::NamedVariable* nv) const {
-        if (nv == nullptr || nv->Storage == nullptr) return false;
+        if (nv == nullptr) return false;
+        if (!nv->BorrowedUniqueField.empty()) return true;
+        if (nv->Storage == nullptr) return false;
+        bool isCoreUniqueValue = compilerLLVM->IsCoreUniqueType(nv->TypeAndValue.TypeName)
+            && !nv->TypeAndValue.Pointer;
         // A `unique` field's synthesized destructor frees it. Field-specific and proven by the
         // field itself, so it is asked before the direct-binding gate below excludes field reads.
-        if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique) return true;
+        if (nv->IsUniqueFieldAlias
+            || nv->TypeAndValue.IsUnique || isCoreUniqueValue) return true;
         // A call RESULT proven to read a live `unique` field: the field frees it, so the box would
         // be a second owner. Value-keyed, so it answers for a temporary with no binding at all.
         if (nv->Primary != nullptr
@@ -601,7 +606,10 @@ std::string MainListener::DescribeBoxedSourceOwner(llvm::Value* dataPtr,
                 : std::format("'{}.{}'", nv->OwningStructName, nv->FieldName);
         // A bare self-field read (`u` inside the struct's own method) comes from GetMemberVariable,
         // which leaves FieldName and OwningStructName empty; the enclosing method names the owner.
-        if (nv->IsUniqueFieldAlias || nv->TypeAndValue.IsUnique)
+        bool isCoreUniqueValue = compilerLLVM->IsCoreUniqueType(nv->TypeAndValue.TypeName)
+            && !nv->TypeAndValue.Pointer;
+        if (nv->IsUniqueFieldAlias
+            || nv->TypeAndValue.IsUnique || isCoreUniqueValue)
         {
             std::string field = nv->TypeAndValue.VariableName.empty()
                 ? nv->CallerName : nv->TypeAndValue.VariableName;
@@ -1374,7 +1382,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
         {
             auto operatorText = ctx->assignmentOperator()->getText();
             auto assignCtx = ctx->assignmentExpression();
-
             // `_ = expr` is an explicit discard: evaluate the RHS for its side effects, drop the
             // result, and - like a bare-statement temp - destruct an owning-struct rvalue at the
             // end of the full expression. `_` is never an lvalue, so only the plain `=` form is
@@ -1416,9 +1423,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
 
                 // `_ = move <container element slot>;` (e.g. `_ = move _data[i]`): the slot read
                 // demoted an owning element to a borrow and there is no destination type to
-                // re-derive from, so recover the element's true ownership from ElementOwningUnique
-                // (stamped on the buffer field at instantiation, carried onto the element by the
-                // subscript). ParseMoveExpression detached the value (Storage null) and already
+                // re-derive from, so recover the element's true ownership from its desugared type
+                // (carried onto the element by the subscript). ParseMoveExpression detached the
+                // value (Storage null) and already
                 // zeroed the slot, so materialize the value into a temp and run the SAME DropValue
                 // teardown the `T tmp = move _data[i]` form gets: an owning ptr/iface/value/string
                 // element frees exactly once, a bare borrow element frees nothing. This branch fully
@@ -1763,6 +1770,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->pendingInitAllocAlign = targetAllocAlign;
 
             auto rightNV = ParseAssignmentExpressionNamed(assignCtx);
+            // The observer conversion below unwraps an alias result whose element type is the
+            // core unique wrapper. Preserve that source fact for the pointer-local ledger; the
+            // conversion necessarily replaces the wrapper TypeName with its raw pointee.
+            const bool rhsCoreUniqueAliasElement = !rightNV.TypeAndValue.Pointer
+                && rightNV.TypeAndValue.IsAlias
+                && !rightNV.TypeAndValue.IsMove
+                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName);
             bool rightStringImplicitCopied = false;
             RejectLambdaReferenceCaptureEscape(
                 IsProgramLifetimeStorage(namedVar), rightNV, ctx);
@@ -1911,7 +1925,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     // Trap B: a plain copy of a `unique` field borrows the field - its synthesized
                     // destructor is still the owner. `move b.p` extracts instead and carries IsMove.
                     if (!storeSrcIsBorrow && !rightNV.TypeAndValue.IsMove
-                        && ((rightNV.TypeAndValue.IsUnique && rightNV.TypeAndValue.Pointer
+                        && ((rightNV.TypeAndValue.IsUnique
+                                && rightNV.TypeAndValue.Pointer
                                 && rightNV.Storage != nullptr)
                             || rightNV.IsUniqueFieldAlias))
                     {
@@ -1973,6 +1988,35 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 || compiler->lastCallReturnsOwned
                 || compiler->IsOwnedNewTemp(rightNV.Primary)
                 || rightNV.TypeAndValue.IsMove;
+            bool topLevelMoveOwnsSource = false;
+            if (auto* move = TopLevelMoveExpression(assignCtx))
+            {
+                std::string sourceName = move->unaryExpression() != nullptr
+                    ? move->unaryExpression()->getText() : std::string();
+                if (auto* source = compiler->FindLiveNamedVariable(sourceName))
+                    topLevelMoveOwnsSource = source->IsOwning
+                        || source->TypeAndValue.IsUnique;
+            }
+            bool copiedOwnerWasRebound = false;
+            if (rightNV.BorrowsOwningLocal && rightNV.OwningLocalStorage != nullptr)
+            {
+                auto* source = compiler->FindVariableByStorage(rightNV.OwningLocalStorage);
+                copiedOwnerWasRebound = rightNV.PointerRebound
+                    || (source != nullptr && source->PointerRebound);
+            }
+            bool srcIsOwnedForCoreUnique =
+                (compiler->lastOwningResult
+                    && (AsDirectNew(assignCtx) != nullptr || TopLevelMoveExpression(assignCtx) != nullptr))
+                || compiler->lastCallReturnsOwned
+                || compiler->IsOwnedNewTemp(rightNV.Primary)
+                || compiler->IsOwningPtrTempValue(rightNV.Primary)
+                || rightNV.IsOwning || (rightNV.IsExplicitMove && !rightNV.IsBorrowed)
+                || topLevelMoveOwnsSource
+                || (TopLevelMoveExpression(assignCtx) != nullptr && !rightNV.IsBorrowed)
+                || compiler->IsMovedOutPtrValue(rightNV.Primary)
+                || compiler->BorrowProofRetiredByRebind(rightNV)
+                || copiedOwnerWasRebound
+                || rightNV.TypeAndValue.IsMove;
             // Same question for a `unique T*` LOCAL reassignment, but answered ONLY from
             // properties of THIS RHS. lastOwningResult is deliberately excluded: it is a sticky
             // global that a `new` anywhere in the RHS sets - including as a call ARGUMENT - so
@@ -1994,6 +2038,400 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
             auto right = LoadNamedVariable(rightNV);
+            srcIsOwnedForCoreUnique = srcIsOwnedForCoreUnique
+                || compiler->IsMovedOutPtrValue(right);
+
+            // A desugared unique<IFace> destination resets from an interface VALUE. Convert the
+            // pointer-shaped assignment forms here, before the shared reset path below, so the
+            // destination gets the same ownership-taking box as declaration initialization.
+            bool coreUniqueInterfaceResetValue = false;
+            if (operatorText == "=" && right != nullptr
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsInterfaceType(namedVar.TypeAndValue.TypeName.substr(8)))
+            {
+                const std::string interfaceName = namedVar.TypeAndValue.TypeName.substr(8);
+                bool sourceOwnsInterface = srcIsOwnedForCoreUnique;
+                if (right->getType()->isPointerTy())
+                {
+                    if (auto* constant = llvm::dyn_cast<llvm::Constant>(right);
+                        constant != nullptr && constant->isNullValue())
+                        right = llvm::Constant::getNullValue(compiler->GetFatPtrType());
+                    else if (sourceOwnsInterface)
+                    {
+                        std::string armFailure;
+                        std::string joinSpelling = "?:";
+                        if (rightNV.TypeAndValue.TypeName.empty())
+                            right = UpcastPointerJoinToInterface(
+                                right, interfaceName, &armFailure, &joinSpelling,
+                                /*transferArmOwnership*/ true);
+                        else if (compiler->StructImplementsInterface(
+                                     rightNV.TypeAndValue.TypeName, interfaceName))
+                            right = BoxConcreteIntoInterface(
+                                ctx, right, rightNV.TypeAndValue.Pointer,
+                                rightNV.TypeAndValue.TypeName, interfaceName, &rightNV,
+                                /*adoptsOwnership*/ true);
+                        if (right == nullptr && !armFailure.empty())
+                            LogErrorContext(ctx, std::format(
+                                "cannot convert '{}' arm to interface '{}': {}",
+                                joinSpelling, interfaceName, armFailure));
+                    }
+                }
+                else if (right->getType() == compiler->GetFatPtrType())
+                {
+                    sourceOwnsInterface = rightNV.IsOwning
+                        || rightNV.IsExplicitMove
+                        || rightNV.TypeAndValue.IsMove
+                        || compiler->lastCallReturnsOwned
+                        || compiler->FindOwnedReturnEntry(rightNV.Primary) != nullptr;
+                    if (sourceOwnsInterface)
+                    {
+                        std::string sourceInterface = compiler->ResolveFatInterfaceSrcName(
+                            right, rightNV.TypeAndValue.IsInterface
+                                ? rightNV.TypeAndValue.TypeName : std::string());
+                        right = compiler->ReboxInterfaceIfNeeded(
+                            right, sourceInterface, interfaceName);
+                    }
+                }
+                if (right != nullptr && right->getType() == compiler->GetFatPtrType()
+                    && sourceOwnsInterface)
+                {
+                    rightNV.Primary = right;
+                    rightNV.Storage = nullptr;
+                    rightNV.BaseType = right->getType();
+                    rightNV.TypeAndValue = {};
+                    rightNV.TypeAndValue.TypeName = interfaceName;
+                    rightNV.TypeAndValue.IsInterface = true;
+                    rightNV.TypeAndValue.IsMove = true;
+                    rightNV.IsOwning = true;
+                    rightNV.IsBorrowed = false;
+                    coreUniqueInterfaceResetValue = true;
+                    srcIsOwnedForCoreUnique = true;
+                }
+            }
+            // A core unique value assigned to a builtin unique pointer field transfers its
+            // pointee, so expose the wrapper's _p slot to the existing field ownership path.
+            if (operatorText == "=" && right != nullptr
+                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                && !rightNV.TypeAndValue.Pointer && namedVar.TypeAndValue.Pointer
+                && namedVar.TypeAndValue.IsUnique)
+            {
+                // A moved wrapper field has already been nulled by ParseMoveExpression. Preserve
+                // that ownership transfer when lowering it to the builtin pointer field path.
+                bool movedCoreUnique = namedVar.FieldName.empty()
+                    || rightNV.TypeAndValue.IsMove || rightNV.IsExplicitMove;
+                auto* uniqueStorage = rightNV.Storage;
+                if (uniqueStorage == nullptr)
+                {
+                    uniqueStorage = compiler->CreateAlloca(right->getType());
+                    compiler->builder->CreateStore(right, uniqueStorage);
+                }
+                const auto& uniqueData = compiler->GetDataStructure(rightNV.TypeAndValue.TypeName);
+                for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                    if (uniqueData.StructFields[i].VariableName == "_p")
+                    {
+                        auto* pointerField = compiler->CreateStructGEP(
+                            right->getType(), uniqueStorage, (uint32_t)i);
+                        right = compiler->CreateLoad(pointerField);
+                        rightNV.Storage = pointerField;
+                        rightNV.BaseType = right->getType();
+                        break;
+                    }
+                if (right != nullptr)
+                {
+                    if (movedCoreUnique && rightNV.Storage != nullptr)
+                    {
+                        compiler->builder->CreateStore(
+                            llvm::Constant::getNullValue(rightNV.BaseType), rightNV.Storage);
+                        if (!rightNV.CallerName.empty())
+                            compiler->MarkVariableExplicitlyMovedNull(rightNV.CallerName);
+                    }
+                    rightNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName.substr(8);
+                    rightNV.TypeAndValue.Pointer = true;
+                    rightNV.TypeAndValue.IsUnique = false;
+                    rightNV.TypeAndValue.IsMove = movedCoreUnique;
+                    rightNV.IsOwning = true;
+                    rightNV.IsExplicitMove = false;
+                    rightNV.Primary = right;
+                }
+            }
+
+            // A core unique value borrows its pointee when assigned to an ordinary raw pointer.
+            // Keep this implicit conversion at the store site so fields and locals receive the
+            // same observer semantics as plain call arguments.
+            if (operatorText == "=" && right != nullptr
+                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                && !rightNV.TypeAndValue.Pointer && namedVar.TypeAndValue.Pointer
+                && !namedVar.TypeAndValue.IsUnique)
+            {
+                // Read the wrapper's pointer field directly. The ordinary `get()` overload is
+                // equivalent, but its generated helper can be re-entered while pending generic
+                // instantiations are being drained for interface-bearing pointee types.
+                auto* uniqueStorage = rightNV.Storage;
+                if (uniqueStorage == nullptr)
+                {
+                    uniqueStorage = compiler->CreateAlloca(right->getType());
+                    compiler->builder->CreateStore(right, uniqueStorage);
+                }
+                const auto& uniqueData = compiler->GetDataStructure(rightNV.TypeAndValue.TypeName);
+                for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                    if (uniqueData.StructFields[i].VariableName == "_p")
+                    {
+                        auto* pointerField = compiler->CreateStructGEP(
+                            right->getType(), uniqueStorage, (uint32_t)i);
+                        right = compiler->CreateLoad(pointerField);
+                        break;
+                    }
+                if (right != nullptr)
+                {
+                    auto pointeeName = rightNV.TypeAndValue.TypeName.substr(8);
+                    rightNV.TypeAndValue.TypeName = pointeeName;
+                    rightNV.TypeAndValue.Pointer = true;
+                    rightNV.TypeAndValue.IsUnique = false;
+                    rightNV.TypeAndValue.IsMove = false;
+                    rightNV.IsOwning = false;
+                    rightNV.IsExplicitMove = false;
+                    rightNV.IsBorrowed = true;
+                    rightNV.BorrowedOrigin = rightNV.CallerName;
+                    rightNV.Primary = right;
+                    rightNV.BaseType = right->getType();
+                }
+            }
+
+            // A core unique value assigned from a raw owning expression is reset in place. The
+            // value-to-value case remains on the normal owning-struct move path below.
+            if (operatorText == "=" && right != nullptr
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && (right->getType()->isPointerTy() || coreUniqueInterfaceResetValue))
+            {
+                const bool destinationIsField = !namedVar.FieldName.empty()
+                    || llvm::isa_and_nonnull<llvm::GetElementPtrInst>(namedVar.Storage);
+                if (destinationIsField)
+                {
+                    const std::string fieldName = namedVar.FieldName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
+                    RejectRawHeapArrayIntoUniqueField(
+                        rightNV, namedVar.TypeAndValue, fieldName, ctx);
+                }
+                const bool sourceIsUniqueField = IsUniqueFieldRead(rightNV);
+                if (sourceIsUniqueField)
+                {
+                    if (RejectConsumeOfBorrowedByValueParamField(compiler, rightNV, ctx))
+                        return finishStore(right);
+                    EmitImplicitUniqueFieldMove(rightNV, right, nullptr, {});
+                    rightNV.IsOwning = true;
+                    rightNV.IsBorrowed = false;
+                    rightNV.BorrowedOrigin.clear();
+                }
+                if (LLVMBackend::IsProvableNonHeapAddress(right))
+                {
+                    // A slot of a desugared `unique T* f[N]` keeps the ARRAY wording the builtin
+                    // array leg gives, so the element is still named as an element.
+                    std::string slot = namedVar.FieldName.empty() && !namedVar.CallerName.empty()
+                        ? namedVar.CallerName : DescribeUniqueFieldOwner(namedVar);
+                    RejectNonHeapAddressIntoUnique(
+                        namedVar.IsElementAccess
+                            ? std::format("an element of unique array '{}'", slot)
+                            : destinationIsField
+                                ? std::format("unique field '{}'", DescribeUniqueFieldOwner(namedVar))
+                                : std::format("unique local '{}'", namedVar.CallerName), ctx);
+                    return finishStore(right);
+                }
+                if (destinationIsField)
+                {
+                    std::string field = DescribeUniqueFieldOwner(namedVar);
+                    std::string movedBorrowOrigin;
+                    if (compiler->IsMovedBorrowedPtrValue(rightNV.Primary, &movedBorrowOrigin))
+                    {
+                        if (movedBorrowOrigin.empty()) movedBorrowOrigin = rightNV.CallerName;
+                        LogErrorContext(ctx, std::format(
+                            "cannot store borrowed parameter '{}' into unique field '{}'",
+                            movedBorrowOrigin, field));
+                        return finishStore(right);
+                    }
+                    if (rightNV.BorrowsOwningLocal
+                        && compiler->OwningLocalCopyStillAliases(rightNV))
+                    {
+                        LogErrorContext(ctx, std::format(
+                            "cannot store '{}' into unique field '{}' - '{}' copies '{}', which still owns "
+                            "the object and frees it at scope exit, so the field's synthesized destructor "
+                            "double-frees it.",
+                            rightNV.CallerName, field, rightNV.CallerName, rightNV.OwningLocalOrigin));
+                        return finishStore(right);
+                    }
+                    if (llvm::isa_and_nonnull<llvm::AllocaInst>(rightNV.Storage))
+                    {
+                        const auto* source = compiler->FindVariableByStorage(rightNV.Storage);
+                        std::string sourceName = rightNV.CallerName.empty()
+                            ? rightNV.TypeAndValue.VariableName : rightNV.CallerName;
+                        if (source != nullptr && !source->IsOwning
+                            && JoinArmsStillKeepOwner(*source)
+                            && !source->JoinKeepsOwnerSource.empty())
+                        {
+                            LogErrorContext(ctx, std::format(
+                                "cannot store '{}' into unique field '{}' - every arm of the join "
+                                "was bound from holds an object {} already frees, so the field's "
+                                "synthesized destructor double-frees it. Store an object this frame owns instead.",
+                                sourceName, field, source->JoinKeepsOwnerSource));
+                            return finishStore(right);
+                        }
+                    }
+                }
+                bool nullSource = llvm::isa<llvm::ConstantPointerNull>(right);
+                auto containsMoveOfBorrowedParam = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
+                    if (node == nullptr) return false;
+                    if (auto* move = dynamic_cast<CFlatParser::MoveExpressionContext*>(node))
+                        if (move->unaryExpression() != nullptr
+                            && compiler->IsFunctionParameter(move->unaryExpression()->getText()))
+                            return true;
+                    for (auto* child : node->children)
+                        if (self(self, child)) return true;
+                    return false;
+                };
+                bool joinMovesBorrowedParam = containsMoveOfBorrowedParam(
+                    containsMoveOfBorrowedParam, assignCtx)
+                    && compiler->IsMovedBorrowedPtrValue(rightNV.Primary);
+                bool unprovenRawValue = !srcIsOwnedForCoreUnique
+                    && !sourceIsUniqueField
+                    && rightNV.BorrowedUniqueField.empty()
+                    && !joinMovesBorrowedParam
+                    && (!rightNV.IsBorrowed
+                        || (rightNV.BorrowedOrigin.empty()
+                            && !compiler->IsFunctionParameter(rightNV.CallerName)));
+                if (srcIsOwnedForCoreUnique || sourceIsUniqueField || nullSource || unprovenRawValue)
+                {
+                    LLVMBackend::NamedVariable resetArg = rightNV;
+                    if (unprovenRawValue)
+                    {
+                        // A plain alias-returning call is the legacy exception: the raw local remains
+                        // a borrow, so keep the wrapper out of scope-exit destruction after reset.
+                        resetArg.IsBorrowed = false;
+                        resetArg.BorrowedOrigin.clear();
+                        resetArg.IsOwning = true;
+                        resetArg.IsAliasBorrow = false;
+                        resetArg.TypeAndValue.IsAlias = false;
+                    }
+                    if (resetArg.TypeAndValue.TypeName.empty())
+                    {
+                        resetArg.TypeAndValue.TypeName = namedVar.TypeAndValue.TypeName.substr(8);
+                        resetArg.TypeAndValue.Pointer = true;
+                        resetArg.TypeAndValue.PointerDepth = 0;
+                    }
+                    resetArg.TypeAndValue.VariableName.clear();
+                    auto resetReceiver = namedVar;
+                    auto* wrapperTy = compiler->GetType(namedVar.TypeAndValue);
+                    if (resetReceiver.Storage != nullptr)
+                    {
+                        resetReceiver.Primary = resetReceiver.Storage;
+                        resetReceiver.Storage = nullptr;
+                    }
+                    else if (resetReceiver.Primary != nullptr && wrapperTy != nullptr
+                             && resetReceiver.Primary->getType() == wrapperTy)
+                    {
+                        auto* wrapperStorage = compiler->AllocaAtEntry(wrapperTy, nullptr,
+                                                                        "unique.reset.receiver");
+                        compiler->builder->CreateStore(resetReceiver.Primary, wrapperStorage);
+                        resetReceiver.Primary = wrapperStorage;
+                    }
+                    resetReceiver.BaseType = wrapperTy == nullptr ? resetReceiver.BaseType
+                        : cflat_llvm::PointerTo(wrapperTy);
+                    resetReceiver.TypeAndValue.Pointer = true;
+                    resetReceiver.TypeAndValue.VariableName.clear();
+                    compiler->CreateOverloadedFunctionCall("reset", { resetReceiver, resetArg });
+                    if (!destinationIsField && !namedVar.CallerName.empty())
+                        compiler->RecordNullClear(namedVar.CallerName);
+                    if (coreUniqueInterfaceResetValue && !destinationIsField
+                        && !namedVar.CallerName.empty())
+                    {
+                        compiler->MarkVariableUnmoved(namedVar.CallerName);
+                        compiler->MarkVariableNotExplicitlyMovedNull(namedVar.CallerName);
+                        compiler->SetVariableOwning(namedVar.CallerName, true);
+                    }
+                    if (unprovenRawValue && !destinationIsField && !namedVar.CallerName.empty())
+                    {
+                        auto& local = compiler->GetOrCreateStackVariable(namedVar.CallerName);
+                        local.IsAliasBorrow = true;
+                        local.IsOwning = false;
+                    }
+                }
+                else
+                {
+                    std::string name = namedVar.CallerName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                    if (name.empty() && unaryCtx != nullptr)
+                        name = unaryCtx->getText();
+                    if (destinationIsField)
+                    {
+                        std::string field = DescribeUniqueFieldOwner(namedVar);
+                        std::string movedBorrowOrigin;
+                        bool movedBorrow = compiler->IsMovedBorrowedPtrValue(
+                            rightNV.Primary, &movedBorrowOrigin);
+                        if (movedBorrow)
+                        {
+                            if (movedBorrowOrigin.empty())
+                                movedBorrowOrigin = rightNV.CallerName;
+                            LogErrorContext(ctx, std::format(
+                                "cannot store borrowed parameter '{}' into unique field '{}'",
+                                movedBorrowOrigin, field));
+                        }
+                        else if (rightNV.BorrowsOwningLocal
+                                 && compiler->OwningLocalCopyStillAliases(rightNV))
+                        {
+                            LogErrorContext(ctx, std::format(
+                                "cannot store '{}' into unique field '{}' - '{}' copies '{}'",
+                                rightNV.CallerName, field, rightNV.CallerName,
+                                rightNV.OwningLocalOrigin));
+                        }
+                        else if (!rightNV.BorrowedUniqueField.empty())
+                            RejectBorrowIntoUniqueField(
+                                rightNV, std::format("unique field '{}'", field), ctx);
+                        else if (rightNV.IsBorrowed && !rightNV.BorrowedOrigin.empty())
+                            LogErrorContext(ctx, std::format(
+                                "cannot store borrowed parameter '{}' into unique field '{}'",
+                                rightNV.BorrowedOrigin, field));
+                        else if (!rightNV.CallerName.empty()
+                                 && compiler->IsFunctionParameter(rightNV.CallerName))
+                            LogErrorContext(ctx, std::format(
+                                "cannot store borrowed parameter '{}' into unique field '{}'",
+                                rightNV.CallerName, field));
+                        else
+                            LogErrorContext(ctx, std::format(
+                                "cannot store a borrowed value into unique field '{}' - the source "
+                                "still owns it; use 'new', a 'move' expression, or a move-returning call",
+                                field));
+                        compiler->lastOwningResult = false;
+                        compiler->lastCallReturnsOwned = false;
+                        return finishStore(LoadNamedVariable(namedVar));
+                    }
+                    if (!rightNV.BorrowedUniqueField.empty())
+                        LogErrorContext(ctx, std::format(
+                            "cannot reset {} '{}' from a borrow of unique field '{}' - the field's "
+                            "synthesized destructor still owns it; use 'new', a 'move' expression, "
+                            "or a move-returning call",
+                            compiler->DisplayNameOfCoreUniqueType(namedVar.TypeAndValue.TypeName),
+                            name, rightNV.BorrowedUniqueField));
+                    else
+                    {
+                        const std::string sourceName =
+                            LLVMBackend::BorrowedSourceName(rightNV);
+                        if (sourceName.empty())
+                            LogErrorContext(ctx, std::format(
+                                "cannot reset {} '{}' from a borrowed value - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                compiler->DisplayNameOfCoreUniqueType(namedVar.TypeAndValue.TypeName), name));
+                        else
+                            LogErrorContext(ctx, std::format(
+                                "cannot reset {} '{}' from borrowed value '{}' - the source still owns it; "
+                                "use 'new', a 'move' expression, or a move-returning call",
+                                compiler->DisplayNameOfCoreUniqueType(namedVar.TypeAndValue.TypeName), name,
+                                sourceName));
+                    }
+                }
+                compiler->lastOwningResult = false;
+                compiler->lastCallReturnsOwned = false;
+                return finishStore(LoadNamedVariable(namedVar));
+            }
 
             // A plain assignment moves the RHS value into the named lvalue; if it was an
             // owned-string temporary (e.g. `s = a + b + c;`) the lvalue now holds it, so
@@ -2374,8 +2812,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // heap `new`, a `move`, a move-returning call, or nullptr is legal - mirror decl-init
             // (ParseDeclaration). A null value (raw null or the null fat-ptr from the nullptr upcast
             // above) owns nothing and is allowed.
-            bool destUniqueIface = namedVar.TypeAndValue.IsUnique
+            bool destLegacyUniqueIface = namedVar.TypeAndValue.IsUnique
                 && namedVar.TypeAndValue.IsFatInterfaceValue();
+            bool destUniqueIface = destLegacyUniqueIface
+                || (!namedVar.TypeAndValue.Pointer
+                    && !InGenericInstantiation()
+                    && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                    && namedVar.TypeAndValue.TypeName.size() > 8
+                    && compiler->IsInterfaceType(namedVar.TypeAndValue.TypeName.substr(8))
+                    && (llvm::isa<llvm::AllocaInst>(destination)
+                        || llvm::isa<llvm::GlobalVariable>(destination)));
             bool srcIsNullForUniqueIface = right != nullptr
                 && ((llvm::isa<llvm::Constant>(right)
                         && llvm::cast<llvm::Constant>(right)->isNullValue())
@@ -2401,7 +2847,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // (its scope-exit teardown only sees the final value), then adopts ownership of the new
             // one. `s = nullptr` frees the old and stores null (release-early). Self-assign cannot
             // occur - the reject above only admits new / move / move-call / null.
-            if (operatorText == "=" && destUniqueIface
+            if (operatorText == "=" && destLegacyUniqueIface && !coreUniqueInterfaceResetValue
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination)))
             {
                 auto* oldFat = compiler->builder->CreateLoad(compiler->GetFatPtrType(), destination);
@@ -2572,6 +3018,15 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !namedVar.IsInterfaceField && !namedVar.BitfieldStorage
                 && !namedVar.UnionFieldType)
                 || destIsViewElem;
+            // A desugared unique field reached through an array element is still a field even
+            // though its GEP source type is the containing array, not the holder struct.
+            bool destIsUniqueFieldSlot = !namedVar.FieldName.empty()
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer;
+            if (!destIsUniqueFieldSlot && destIsStructField
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer)
+                destIsUniqueFieldSlot = true;
 
             // A field of an alias-borrow local can arrive through the generic owning-local
             // reassignment path rather than the specialized field-read arm. Ask the shared source
@@ -2678,6 +3133,28 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // Store-side twin, for the one helper below that COPIES as well as rejects.
             bool selfUniqueFieldStore = selfUniqueFieldAssign || sameFieldStore;
 
+            // A desugared unique local/parameter is a move-only wrapper. Assigning it to a
+            // desugared unique field transfers the wrapper and zeros the source slot.
+            bool coreUniqueFieldMove = operatorText == "=" && destIsStructField
+                && destIsUniqueFieldSlot && right != nullptr && right->getType()->isStructTy()
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
+                && !rightNV.TypeAndValue.Pointer && rightNV.Storage != nullptr
+                && rightNV.Storage != destination && !IsUniqueFieldRead(rightNV);
+            if (coreUniqueFieldMove)
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(
+                        namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                compiler->builder->CreateStore(right, destination);
+                compiler->builder->CreateStore(
+                    llvm::ConstantAggregateZero::get(right->getType()), rightNV.Storage);
+                if (!rightNV.CallerName.empty())
+                    compiler->MarkVariableMoved(rightNV.CallerName);
+                return finishStore(right);
+            }
+
             // A suppressed (mixed) '?:' join of an owning-value struct: neither an existing owning
             // local nor a field can carry the suppression, so reject before any store path runs.
             if (operatorText == "="
@@ -2711,6 +3188,40 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             const bool destIsAliasBorrowLocal = operatorText == "="
                 && !destIsStructField && namedVar.FieldName.empty()
                 && DestinationIsAliasBorrowLocal(compiler, destination);
+
+            /*
+             * A blessed unique<X> ELEMENT read WITHOUT `move` is a borrow-copy ALIAS, never a
+             * consume: the container keeps the object and frees it at its own teardown (the
+             * btree lookup() contract - "found is a copy... Do not free through it"). Store the
+             * wrapper bits shallowly, leave the source slot intact, and rebind the destination
+             * local as a non-owning alias so nothing frees through it either. An explicit `move`
+             * is the only consuming spelling and falls through to the transfer arms below.
+             */
+            if (operatorText == "=" && right && destination != nullptr
+                && right->getType()->isStructTy()
+                && rightNV.IsElementAccess
+                && !rightNV.TypeAndValue.IsMove && !rightNV.IsExplicitMove
+                && !rightNV.TypeAndValue.Pointer && !namedVar.TypeAndValue.Pointer
+                && !destIsStructField && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && destination != rightNV.Storage
+                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName)
+            {
+                compiler->builder->CreateStore(right, destination);
+                // Mutate the LIVE binding, not a fresh entry in this inner block scope: the
+                // declaration's frame is the one the scope-exit destructor consults.
+                if (auto* local = namedVar.CallerName.empty()
+                        ? nullptr : compiler->FindLiveNamedVariable(namedVar.CallerName))
+                {
+                    local->IsAliasBorrow = true;
+                    local->IsOwning = false;
+                    local->IsOwningString = false;
+                    RecordAliasBorrowDeclBlock(compiler, *local);
+                }
+                return finishStore(right);
+            }
 
             // A direct read from a unique field is an implicit move when adopted by a unique local.
             // The field must be nulled before the old local value is released, matching the field-to-
@@ -2754,7 +3265,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // A PROVABLE stack address into a scalar `unique` field: the shape gate keeps the
             // pointer-worded message off whole-array and interface fields, where it would be untrue.
             if (operatorText == "=" && right && destIsStructField
-                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
+                && (namedVar.TypeAndValue.IsUnique
+                    || compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
                 && namedVar.TypeAndValue.Pointer
                 && namedVar.TypeAndValue.ConstArraySize == 0
                 && !namedVar.TypeAndValue.IsInterface
@@ -2850,11 +3362,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && IsOwningUniquePointerField(namedVar.TypeAndValue);
             bool destOwnsUniqueInterface = right && right->getType()->isStructTy()
                 && IsOwningUniqueInterfaceField(namedVar.TypeAndValue);
+            bool destOwnsUniqueValue = right && right->getType()->isStructTy()
+                && IsOwningUniqueField(namedVar.TypeAndValue)
+                && !namedVar.TypeAndValue.Pointer && !namedVar.TypeAndValue.IsInterface;
+            bool sourceIsCoreUniqueField = compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                && !rightNV.TypeAndValue.Pointer && !rightNV.TypeAndValue.IsMove
+                && (srcIsStructField || !rightNV.FieldName.empty()
+                    || !rightNV.OwningStructName.empty() || rightNV.IsInterfaceField);
 
             // A TEMPORARY's `unique` field is not an addressable source (no `move` spelling
             // either), so the implicit move below has no slot to null. Kept as a reject.
             if (operatorText == "=" && destIsStructField
-                && (destOwnsUniquePointee || destOwnsUniqueInterface)
+                && (destOwnsUniquePointee || destOwnsUniqueInterface || destOwnsUniqueValue)
                 && IsUniqueTempFieldRead(rightNV))
             {
                 RejectUniqueTempFieldToField(
@@ -2871,8 +3390,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
              * frees nothing, exactly as the `move` spelling already did.
              */
             if (operatorText == "=" && destIsStructField
-                && (destOwnsUniquePointee || destOwnsUniqueInterface)
-                && IsUniqueFieldRead(rightNV))
+                && (destOwnsUniquePointee || destOwnsUniqueInterface || destOwnsUniqueValue)
+                && (IsUniqueFieldRead(rightNV) || sourceIsCoreUniqueField))
             {
                 // Nulling a borrowed by-value parameter's field nulls only the callee's copy, so
                 // the caller frees the pointee twice. Same reject the `move` spelling raises.
@@ -2880,6 +3399,22 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     return finishStore(right);
                 EmitImplicitUniqueFieldMove(rightNV, right, destination,
                     destOwnsUniqueInterface ? namedVar.TypeAndValue.TypeName : std::string());
+            }
+
+            // A desugared field is non-copyable; move its loaded wrapper after dropping the target.
+            bool destIsCoreUniqueFieldValue = destIsUniqueFieldSlot
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer;
+            if (operatorText == "=" && right && right->getType()->isStructTy()
+                && destIsCoreUniqueFieldValue
+                && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
+                && rightNV.TypeAndValue.IsMove)
+            {
+                if (auto* dtor = compiler->GetOrCreateFullDestructor(
+                        namedVar.TypeAndValue.TypeName))
+                    compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
+                auto* stored = derefAssign(right, rhsUnsigned);
+                return finishStore(stored);
             }
 
             // A plain (non-move) by-value `string` PARAMETER stored into a struct field: deep-copy it.
@@ -2920,6 +3455,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // so free dest's old value, store the field, and zero the source so the temp dtor skips it.
             // POINTER fields are excluded: this branch was written for owning VALUE types, and on a
             // `unique Item*` field it destructs the destination SLOT's address (crashes codegen).
+            // A temp's core unique<T> field never implicitly moves into a destination of a
+            // DIFFERENT type: the wrapper bits would be reinterpreted and its pointee stranded.
+            if (operatorText == "=" && right && rightNV.MovableTempField
+                && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                && namedVar.TypeAndValue.TypeName != rightNV.TypeAndValue.TypeName)
+                GuardOwningTempUniqueFieldEscape(rightNV, "a longer-lived location", ctx);
             if (operatorText == "=" && right && rightNV.MovableTempField
                 && !rightNV.TypeAndValue.Pointer
                 && compiler->IsOwningValueType(rightNV.TypeAndValue.TypeName))
@@ -3040,7 +3581,8 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && !sameFieldStore
                 && !rightNV.TypeAndValue.IsMove
                 && rightNV.TypeAndValue.TypeName == namedVar.TypeAndValue.TypeName
-                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName))
+                && compiler->IsOwningValueType(namedVar.TypeAndValue.TypeName)
+                && !(destOwnsUniqueValue && IsUniqueFieldRead(rightNV)))
             {
                 if (compiler->IsCopyableType(namedVar.TypeAndValue.TypeName))
                 {
@@ -3400,7 +3942,7 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             {
                 // NOTE: closes the reassignment LEAK but does NOT fix aliasing of an owning-value RHS -
                 // ownership is a runtime property (_len owned bit), so auto copy/move is unsafe for string.
-                if (!destIsAliasBorrowLocal)
+                if (!destIsAliasBorrowLocal && !coreUniqueInterfaceResetValue)
                     if (auto* dtor = compiler->GetOrCreateFullDestructor(namedVar.TypeAndValue.TypeName))
                         compiler->builder->CreateCall(dtor->getFunctionType(), dtor, { destination });
                 RetireAliasBorrowOnRebind(compiler, destination);
@@ -3416,13 +3958,21 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             // synthesized destructor already trusts it: every construction path (stack local,
             // `new T()`, `new T[n]`, user-ctor entry) runs a default constructor that
             // zero-initializes the fields.
-            // IsUniqueTypeArg rides along: a `Box<unique Node*>::t` field owns and is released at
-            // teardown exactly as a written `unique` is, so its reassignment must release too.
+            // A builtin unique field owns and is released at teardown, so reassignment releases it too.
             bool consumedUniqueFieldSource = false;
             if (operatorText == "=" && right && right->getType()->isPointerTy()
-                && destIsStructField
-                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg))
+                && (destIsStructField || destIsUniqueFieldSlot)
+                && (namedVar.TypeAndValue.IsUnique
+                    || (compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                        && !namedVar.TypeAndValue.Pointer)))
             {
+                if (destIsStructField || destIsUniqueFieldSlot)
+                {
+                    const std::string fieldName = namedVar.FieldName.empty()
+                        ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
+                    RejectRawHeapArrayIntoUniqueField(
+                        rightNV, namedVar.TypeAndValue, fieldName, ctx);
+                }
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, destination,
                     compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
@@ -3477,8 +4027,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 && namedVar.IsElementAccess
                 && destArrGep && destArrGep->getNumIndices() == 2
                 && destArrGep->getSourceElementType()->isArrayTy()
-                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
-                && namedVar.TypeAndValue.Pointer
+                && (namedVar.TypeAndValue.IsUnique
+                    || (!namedVar.TypeAndValue.Pointer
+                        && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
+                && (namedVar.TypeAndValue.Pointer
+                    || !namedVar.TypeAndValue.IsInterface)
                 && !namedVar.TypeAndValue.IsInterface
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
@@ -3498,8 +4051,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && right && right->getType()->isPointerTy()
                 && !destIsStructField
                 && (llvm::isa<llvm::AllocaInst>(destination) || llvm::isa<llvm::GlobalVariable>(destination))
-                && (namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg)
-                && namedVar.TypeAndValue.Pointer
+                && (namedVar.TypeAndValue.IsUnique
+                    || (!namedVar.TypeAndValue.Pointer
+                        && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)))
+                && (namedVar.TypeAndValue.Pointer
+                    || !namedVar.TypeAndValue.IsInterface)
                 && !namedVar.TypeAndValue.IsInterface
                 && !namedVar.TypeAndValue.IsInterfacePointer
                 && !namedVar.TypeAndValue.IsFunctionPointer
@@ -3766,7 +4322,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(right);
             }
 
-            if (destIsElemSlot && namedVar.TypeAndValue.IsUnique && namedVar.TypeAndValue.Pointer
+            if (destIsElemSlot
+                && namedVar.TypeAndValue.IsUnique
+                && namedVar.TypeAndValue.Pointer
                 && right->getType()->isPointerTy())
             {
                 // unique T* element: store the new pointer, then null + mark-moved a NAMED owning
@@ -3789,7 +4347,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
 
             if (destIsElemSlot && right->getType()->isStructTy()
                 && rightNV.TypeAndValue.IsFatInterfaceValue()
-                && (rightNV.TypeAndValue.IsUnique || rightNV.TypeAndValue.IsUniqueTypeArg))
+                && (rightNV.TypeAndValue.IsUnique
+                    || (compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                        && !rightNV.TypeAndValue.Pointer)))
             {
                 // unique <interface> element: store the fat value, then zero + mark-moved a NAMED
                 // owning source so exactly one owner frees (mirrors the unique-pointer arm for the
@@ -3894,9 +4454,12 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && !namedVar.CallerName.empty() && namedVar.FieldName.empty()
                 && namedVar.TypeAndValue.Pointer)
             {
-                bool rhsBorrowsElem = (rightNV.TypeAndValue.IsBorrowOfUniqueElement
-                    || rightNV.TypeAndValue.IsBorrowOfAliasElement)
-                    && !compiler->lastOwningResult;
+                bool coreUniqueElementBorrow = rhsCoreUniqueAliasElement
+                    || (rightNV.TypeAndValue.IsAlias
+                    && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
+                    && !rightNV.TypeAndValue.IsMove);
+                bool rhsBorrowsElem = (rightNV.TypeAndValue.IsBorrowOfAliasElement
+                    || coreUniqueElementBorrow) && !compiler->lastOwningResult;
                 bool rhsExternallyOwned = rightNV.TypeAndValue.IsBorrowOfAliasElement
                     && !compiler->lastOwningResult;
                 std::string container = rightNV.TypeAndValue.ParentVariableName.empty()
@@ -4086,6 +4649,11 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
         auto* ft = falseValue->getType();
         auto* tt = trueValue->getType();
         auto* strTy = llvm::StructType::getTypeByName(*compiler->context, "string");
+        auto isCoreUniqueStruct = [&](llvm::Type* type) -> bool {
+            auto* structTy = llvm::dyn_cast<llvm::StructType>(type);
+            return structTy != nullptr && structTy->hasName()
+                && compiler->IsCoreUniqueType(structTy->getName().str());
+        };
         if (ft->isIntegerTy() && tt->isIntegerTy())
         {
             unsigned fb = ft->getIntegerBitWidth();
@@ -4127,6 +4695,112 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
             if (RejectCodeValueTernaryStringArm(ctx, trueValue, trueOccurrence)) return false;
             atTrue();
             trueValue = compiler->WrapStringLiteralAsString(trueValue);
+        }
+        else if (auto* fatTy = compiler->GetFatPtrType();
+                 (tt == fatTy && isCoreUniqueStruct(ft)) || (ft == fatTy && isCoreUniqueStruct(tt)))
+        {
+            // A core unique interface wrapper joins with a plain interface value by borrowing
+            // its `_v` field. Keep the wrapper arm non-owning so the mixed-join receiver check runs.
+            bool trueIsWrapper = isCoreUniqueStruct(tt);
+            llvm::Value*& wrapperValue = trueIsWrapper ? trueValue : falseValue;
+            llvm::Value*& fatValue = trueIsWrapper ? falseValue : trueValue;
+            auto* wrapperTy = llvm::cast<llvm::StructType>(wrapperValue->getType());
+            const auto& data = compiler->GetDataStructure(wrapperTy->getName().str());
+            size_t valueIndex = data.StructFields.size();
+            for (size_t i = 0; i < data.StructFields.size(); ++i)
+            {
+                if (data.StructFields[i].VariableName == "_v")
+                {
+                    valueIndex = i;
+                    break;
+                }
+            }
+            if (valueIndex == data.StructFields.size())
+            {
+                LogErrorContext(ctx,
+                    "internal compiler error: conditional interface value is missing its stored interface field");
+                return false;
+            }
+            (trueIsWrapper ? atTrue : atFalse)();
+            wrapperValue = compiler->builder->CreateExtractValue(
+                wrapperValue, {(unsigned)valueIndex}, "unique_interface_value");
+            std::string interfaceName = wrapperTy->getName().str().substr(8);
+            compiler->RegisterFatInterfaceValueTypeName(wrapperValue, interfaceName);
+            (trueIsWrapper ? atFalse : atTrue)();
+            fatValue = compiler->ReboxInterfaceIfNeeded(
+                fatValue, compiler->FindFatInterfaceValueTypeName(fatValue), interfaceName);
+            if (fatValue == nullptr) return false;
+        }
+        else if (((tt->isStructTy() && ft->isPointerTy())
+                  || (ft->isStructTy() && tt->isPointerTy()))
+                 && ((trueValue->getType() == tt && isCoreUniqueStruct(tt))
+                     || (falseValue->getType() == ft && isCoreUniqueStruct(ft))))
+        {
+            // A desugared `unique T*` local is a core unique<T> value. A ternary that mixes
+            // its borrow (`uniqueValue`) with a raw T* must join as T*, so lower the unique arm
+            // through its library observer before the ordinary pointer join diagnostics run.
+            bool trueIsUnique = trueValue->getType() == tt && isCoreUniqueStruct(tt);
+            bool falseIsUnique = falseValue->getType() == ft && isCoreUniqueStruct(ft);
+            if (trueIsUnique == falseIsUnique) return true;
+            auto lowerUnique = [&](llvm::Value*& value, llvm::Type* type) {
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = value;
+                receiver.BaseType = type;
+                receiver.TypeAndValue.TypeName = llvm::cast<llvm::StructType>(type)->getName().str();
+                receiver.TypeAndValue.VariableName.clear();
+                receiver.Storage = compiler->CreateAlloca(type);
+                compiler->builder->CreateStore(value, receiver.Storage);
+                const auto& data = compiler->GetDataStructure(receiver.TypeAndValue.TypeName);
+                llvm::Value* wrapper = value;
+                for (size_t i = 0; i < data.StructFields.size(); i++)
+                {
+                    if (data.StructFields[i].VariableName == "_p")
+                    {
+                        auto* field = compiler->CreateStructGEP(type, receiver.Storage, (uint32_t)i);
+                        value = compiler->CreateLoad(field);
+                        compiler->RegisterValueElementTypeName(value,
+                            llvm::cast<llvm::StructType>(type)->getName().str().substr(8));
+                        // The wrapper carried the owning-temp-field provenance; the raw pointer
+                        // this join actually stores has to carry it on.
+                        if (compiler->IsLedgeredOwningTempUniqueField(wrapper))
+                            compiler->RegisterOwningTempUniqueField(value);
+                        if (compiler->IsMovedOutPtrValue(wrapper))
+                            compiler->RegisterMovedOutPtrValue(value);
+                        return;
+                    }
+                    if (data.StructFields[i].VariableName == "_v")
+                    {
+                        value = compiler->builder->CreateExtractValue(
+                            value, {(unsigned)i}, "unique_interface_value");
+                        compiler->RegisterFatInterfaceValueTypeName(
+                            value, llvm::cast<llvm::StructType>(type)->getName().str().substr(8));
+                        if (compiler->IsMovedOutPtrValue(wrapper))
+                            compiler->RegisterMovedOutPtrValue(value);
+                        return;
+                    }
+                }
+                value = nullptr;
+            };
+            if (trueIsUnique) { atTrue(); lowerUnique(trueValue, tt); }
+            else             { atFalse(); lowerUnique(falseValue, ft); }
+            if (auto* fatTy = compiler->GetFatPtrType(); fatTy != nullptr
+                && trueValue != nullptr && falseValue != nullptr)
+            {
+                bool trueIsFat = trueValue->getType() == fatTy;
+                bool falseIsFat = falseValue->getType() == fatTy;
+                if (trueIsFat != falseIsFat)
+                {
+                    llvm::Value*& thinValue = trueIsFat ? falseValue : trueValue;
+                    (trueIsFat ? atFalse : atTrue)();
+                    std::string armFailure;
+                    thinValue = BoxTernaryThinArmToInterface(
+                        thinValue, llvm::cast<llvm::StructType>(trueIsFat ? tt : ft)
+                            ->getName().str().substr(8), armFailure);
+                    if (thinValue == nullptr)
+                        LogErrorContext(ctx, std::format(
+                            "cannot convert '?:' arm to interface: {}", armFailure));
+                }
+            }
         }
         else if (auto* fatTy = compiler->GetFatPtrType();
                  (ft == fatTy && tt->isPointerTy()) || (tt == fatTy && ft->isPointerTy()))
@@ -4227,6 +4901,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         CFlatParser::ConditionalExpressionContext* expressionFalseCtx, ResultUse use,
         const LLVMBackend::TypeAndValue& outerExpected) {
         auto* compiler = Compiler(ctx);
+        const bool moveInterfaceReturn = compiler->currentFunctionReturnsOwned
+            && compiler->currentFunctionReturnTV.IsInterface;
         if (condTv.value == nullptr) return {};
 
         struct TernaryCallArgumentDepthScope
@@ -4462,6 +5138,145 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             return {};
         }
 
+        // A conditional of desugared unique fields must remain a raw pointer join so the selected
+        // field slot can be nulled by the implicit move at the destination.
+        auto lowerCoreUniqueField = [&](llvm::Value*& value, llvm::Value* storage,
+                                        llvm::BasicBlock* block) {
+            auto* structTy = llvm::dyn_cast<llvm::StructType>(value->getType());
+            if (structTy == nullptr || !structTy->hasName()
+                || !compiler->IsCoreUniqueType(structTy->getName().str())
+                || !compiler->IsUniqueFieldReadValue(value) || storage == nullptr)
+                return false;
+            compiler->builder->SetInsertPoint(block);
+            LLVMBackend::NamedVariable receiver;
+            receiver.Primary = value;
+            receiver.Storage = storage;
+            receiver.BaseType = storage->getType();
+            receiver.TypeAndValue.TypeName = structTy->getName().str();
+            LLVMBackend::TypeAndValue rawType;
+            rawType.TypeName = receiver.TypeAndValue.TypeName.substr(8);
+            rawType.Pointer = true;
+            value = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
+            if (value != nullptr)
+                compiler->RegisterUniqueFieldRead(value, storage);
+            return value != nullptr;
+        };
+        auto isCoreUniqueStructValue = [&](llvm::Value* value) {
+            auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(
+                value == nullptr ? nullptr : value->getType());
+            return structTy != nullptr && structTy->hasName()
+                && compiler->IsCoreUniqueType(structTy->getName().str());
+        };
+        const bool expectedUniqueInterface = compiler->IsCoreUniqueType(outerExpected.TypeName)
+            && compiler->IsInterfaceType(outerExpected.TypeName.substr(8));
+        const bool expectedInterfaceDestination = outerExpected.IsInterface || expectedUniqueInterface;
+        // A move-returning interface function consumes each selected unique<T> arm. Lower the
+        // wrapper through release in its own arm so the selected source is empty at scope exit;
+        // the returned pointer/fat value then goes through the ordinary interface boxing path.
+        auto lowerUniqueMoveReturnArm = [&](llvm::Value*& value, llvm::Value*& storage,
+                                            llvm::BasicBlock* block, bool explicitMove) {
+            auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(
+                value == nullptr ? nullptr : value->getType());
+            // Explicit `move` expressions already detach their wrapper in ParseMoveExpression.
+            // Extract those detached values without releasing them again. An implicit unique<T>
+            // arm in a move-interface return needs the release below to detach the selected arm.
+            bool consumeMovedWrapper = moveInterfaceReturn && !explicitMove;
+            bool extractDetachedWrapper = expectedInterfaceDestination && explicitMove;
+            if ((!consumeMovedWrapper && !extractDetachedWrapper)
+                || structTy == nullptr || !structTy->hasName()
+                || !compiler->IsCoreUniqueType(structTy->getName().str()))
+                return false;
+            const auto& data = compiler->GetDataStructure(structTy->getName().str());
+            std::string fieldName;
+            size_t fieldIndex = 0;
+            LLVMBackend::TypeAndValue releasedType;
+            for (size_t i = 0; i < data.StructFields.size(); ++i)
+            {
+                const auto& field = data.StructFields[i];
+                if (field.VariableName == "_p" || field.VariableName == "_v")
+                {
+                    fieldName = field.VariableName;
+                    fieldIndex = i;
+                    releasedType = field;
+                    break;
+                }
+            }
+            if (fieldName.empty())
+            {
+                return false;
+            }
+
+            compiler->builder->SetInsertPoint(block);
+            if (extractDetachedWrapper)
+            {
+                value = compiler->CreateExtractValue(value, (unsigned)fieldIndex);
+            }
+            else
+            {
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = value;
+                receiver.Storage = storage;
+                receiver.BaseType = structTy;
+                receiver.TypeAndValue.TypeName = structTy->getName().str();
+                receiver.TypeAndValue.IsMove = true;
+                receiver.IsExplicitMove = true;
+                receiver.IsOwning = true;
+                receiver.IsBorrowed = false;
+                receiver.CallerName.clear();
+                releasedType.IsMove = true;
+                releasedType.Pointer = fieldName == "_p";
+                releasedType.IsInterface = fieldName == "_v";
+                releasedType.IsInterfacePointer = false;
+                value = compiler->CreateCoreUniqueRawPointerCall(receiver, releasedType);
+            }
+            if (value == nullptr) return false;
+            if (fieldName == "_p")
+                compiler->RegisterValueElementTypeName(value, releasedType.TypeName);
+            else
+                compiler->RegisterFatInterfaceValueTypeName(value, releasedType.TypeName);
+            compiler->RegisterMovedOutPtrValue(value);
+            if (expectedInterfaceDestination)
+            {
+                std::string target = expectedUniqueInterface
+                    ? outerExpected.TypeName.substr(8) : outerExpected.TypeName;
+                if (fieldName == "_p")
+                {
+                    std::string armFailure;
+                    value = BoxTernaryThinArmToInterface(value, target, armFailure);
+                    if (value == nullptr)
+                        LogErrorContext(ctx, std::format(
+                            "cannot convert '?:' arm to interface '{}': {}", target, armFailure));
+                }
+                else
+                {
+                    bool moved = compiler->IsMovedOutPtrValue(value);
+                    value = compiler->ReboxInterfaceIfNeeded(
+                        value, compiler->FindFatInterfaceValueTypeName(value), target);
+                    compiler->RegisterFatInterfaceValueTypeName(value, target);
+                    if (moved) compiler->RegisterMovedOutPtrValue(value);
+                }
+            }
+            compiler->lastOwningResult = true;
+            storage = nullptr;
+            return true;
+        };
+        const bool trueExplicitMove = expressionTrueCtx != nullptr
+            && TopLevelMoveExpression(expressionTrueCtx->assignmentExpression()) != nullptr;
+        const bool falseExplicitMove = expressionFalseCtx != nullptr
+            && TopLevelMoveExpression(expressionFalseCtx) != nullptr;
+        lowerUniqueMoveReturnArm(trueValue, trueStorage, trueEnd, trueExplicitMove);
+        lowerUniqueMoveReturnArm(falseValue, falseStorage, falseEnd, falseExplicitMove);
+        bool lowerUniqueFieldJoin = isCoreUniqueStructValue(trueValue)
+            && isCoreUniqueStructValue(falseValue)
+            && compiler->IsUniqueFieldReadValue(trueValue)
+            && compiler->IsUniqueFieldReadValue(falseValue);
+        if (lowerUniqueFieldJoin)
+        {
+            lowerCoreUniqueField(trueValue, trueStorage, trueEnd);
+            lowerCoreUniqueField(falseValue, falseStorage, falseEnd);
+            compiler->SwitchToBlock(resumeBlock);
+            if (trueValue == nullptr || falseValue == nullptr) return {};
+        }
         // Do arm-local conversions before adding their jumps. In particular, a runtime char*
         // converted to string emits a call to operator string and cannot be inserted after a
         // terminator.
@@ -4478,7 +5293,22 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->SwitchToBlock(resumeBlock);
             return {};
         }
-
+        // The fat interface LLVM type is shared by every interface. Rebox each moved arm against
+        // the declared return interface after unification, using the per-value source-interface
+        // ledger; this also handles parent/derived arms whose LLVM types are identical.
+        if ((outerExpected.IsInterface || expectedUniqueInterface)
+            && trueValue->getType() == compiler->GetFatPtrType()
+            && falseValue->getType() == compiler->GetFatPtrType())
+        {
+            std::string target = outerExpected.TypeName;
+            if (compiler->IsCoreUniqueType(target)) target = target.substr(8);
+            atTrue();
+            trueValue = compiler->ReboxInterfaceIfNeeded(
+                trueValue, compiler->FindFatInterfaceValueTypeName(trueValue), target);
+            atFalse();
+            falseValue = compiler->ReboxInterfaceIfNeeded(
+                falseValue, compiler->FindFatInterfaceValueTypeName(falseValue), target);
+        }
         if (trueValue->getType()->isVoidTy())
         {
             atTrue(); compiler->CreateJump(resumeBlock);
@@ -4498,7 +5328,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             if (!falseOwnedString) { atFalse(); falseValue = AdoptTernaryStringArm(compiler, falseValue, falseOwnedString); }
             ownedString = trueOwnedString && falseOwnedString;
         }
-
         bool trueRawArray = compiler->IsRawArrayResult(trueValue);
         bool falseRawArray = compiler->IsRawArrayResult(falseValue);
         bool rawArrayJoin = (trueRawArray || falseRawArray)
@@ -4518,7 +5347,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 ? compiler->Upconvert(compiler->RawArrayCountOf(falseValue), i64Ty)
                 : compiler->builder->getInt64(-1);
         }
-
         llvm::AllocaInst* trueAliasTemp = nullptr;
         llvm::AllocaInst* falseAliasTemp = nullptr;
         if (compiler->currentFunctionReturnTV.IsAlias || trueAlias || falseAlias)
@@ -4541,7 +5369,6 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 compiler->builder->CreateStore(falseValue, falseAliasTemp);
             }
         }
-
         atTrue();
         trueBr = compiler->CreateJump(resumeBlock);
         atFalse();
@@ -4636,24 +5463,104 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
             // Null-coalescing: lhs ?? rhs  ->  (lhs != null) ? lhs : rhs
             // Per-arm cast occurrence, exactly as ParseTernaryBranches scopes its two arms.
             llvm::Value* lhs = nullptr;
+            LLVMBackend::TypedValue lhsTv;
             size_t lhsOcc = compiler->CurrentCastOccurrence();
             {
                 LLVMBackend::CastOccurrenceScope armScope(compiler);
                 lhsOcc = armScope.Id;
-                lhs = ParseLogicalOrExpression(logicCtx, ResultUse::Value);
+                lhsTv = ParseLogicalOrExpression(logicCtx, ResultUse::Value);
+                lhs = lhsTv.value;
             }
             if (!lhs) return {};
+            llvm::Value* lhsStorage = lhsTv.receiverStorage;
+            const bool lhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(lhs);
+            auto clearUniqueFieldRead = [&](llvm::Value* value, llvm::Value* storage) {
+                if (value == nullptr || storage == nullptr) return;
+                if (value->getType()->isPointerTy())
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(value->getType())),
+                        storage);
+                else if (value->getType()->isStructTy())
+                    compiler->builder->CreateStore(
+                        llvm::ConstantAggregateZero::get(value->getType()), storage);
+            };
 
-            auto* resultAlloca = compiler->CreateAlloca(lhs->getType());
+            llvm::Value* conditionValue = lhs;
+            auto lhsType = InferTernaryArmType(lhs);
+            if (!outerExpected.Pointer && compiler->IsCoreUniqueType(lhsType.TypeName))
+            {
+                LLVMBackend::NamedVariable uniqueValue;
+                uniqueValue.Primary = lhs;
+                uniqueValue.BaseType = lhs->getType();
+                uniqueValue.TypeAndValue.TypeName = lhsType.TypeName;
+                uniqueValue.TypeAndValue.VariableName.clear();
+                if (auto* valid = compiler->CreateOverloadedFunctionCall("valid", { uniqueValue }))
+                    conditionValue = valid;
+            }
+
+            // A move-interface return must release each unique<T> arm before the join is
+            // materialized. Otherwise the wrapper dtors run at function exit and leave the
+            // returned interface pointing at freed storage. Keep the join raw while the two
+            // branch-local releases are emitted; the return path boxes it afterward.
+            bool moveUniquePointerJoin = compiler->currentFunctionReturnsOwned
+                && compiler->currentFunctionReturnTV.IsInterface;
+            if (moveUniquePointerJoin)
+            {
+                auto* lhsStruct = llvm::dyn_cast<llvm::StructType>(lhs->getType());
+                moveUniquePointerJoin = lhsStruct != nullptr && lhsStruct->hasName()
+                    && compiler->IsCoreUniqueType(lhsStruct->getName().str());
+                if (moveUniquePointerJoin)
+                {
+                    const auto& uniqueData = compiler->GetDataStructure(lhsStruct->getName().str());
+                    moveUniquePointerJoin = std::ranges::any_of(uniqueData.StructFields,
+                        [](const auto& field) { return field.VariableName == "_p"; });
+                }
+            }
+            llvm::Type* resultType = lhs->getType();
+            if (moveUniquePointerJoin)
+            {
+                auto* lhsStruct = llvm::cast<llvm::StructType>(lhs->getType());
+                const auto& uniqueData = compiler->GetDataStructure(lhsStruct->getName().str());
+                for (const auto& field : uniqueData.StructFields)
+                    if (field.VariableName == "_p")
+                    {
+                        if (auto* rawType = compiler->GetType(field)) resultType = rawType;
+                        break;
+                    }
+            }
+            auto* resultAlloca = compiler->CreateAlloca(resultType);
             auto* rawCountAlloca = compiler->CreateAlloca(compiler->builder->getInt64Ty());
 
             auto* nullBlock = compiler->CreateBasicBlock("nullcoal_null");
             auto* notNullBlock = compiler->CreateBasicBlock("nullcoal_notnull");
             auto* resumeBlock = compiler->CreateBasicBlock("nullcoal_resume");
 
-            compiler->CreateConditionJump(lhs, notNullBlock, nullBlock);
+            compiler->CreateConditionJump(conditionValue, notNullBlock, nullBlock);
             // insert point is now notNullBlock (lhs is not null)
+            if (moveUniquePointerJoin)
+            {
+                auto* lhsStruct = llvm::dyn_cast<llvm::StructType>(lhs->getType());
+                if (lhsStruct != nullptr && lhsStruct->hasName())
+                {
+                    LLVMBackend::NamedVariable receiver;
+                    receiver.Primary = lhs;
+                    receiver.Storage = lhsStorage;
+                    receiver.BaseType = lhsStruct;
+                    receiver.TypeAndValue.TypeName = lhsStruct->getName().str();
+                    receiver.TypeAndValue.IsMove = true;
+                    receiver.IsExplicitMove = true;
+                    receiver.IsOwning = true;
+                    LLVMBackend::TypeAndValue rawType;
+                    rawType.TypeName = receiver.TypeAndValue.TypeName.substr(8);
+                    rawType.Pointer = true;
+                    rawType.IsMove = true;
+                    lhs = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
+                    lhsStorage = nullptr;
+                }
+            }
             compiler->CreateAssignment(lhs, resultAlloca);
+            if (lhsUniqueFieldRead)
+                clearUniqueFieldRead(lhs, lhsStorage);
             compiler->builder->CreateStore(
                 compiler->IsRawArrayResult(lhs)
                     ? compiler->Upconvert(compiler->RawArrayCountOf(lhs), compiler->builder->getInt64Ty())
@@ -4663,10 +5570,12 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
 
             compiler->SwitchToBlock(nullBlock);
             llvm::Value* rhs = nullptr;
+            llvm::Value* rhsStorage = nullptr;
             bool lhsAlias = compiler->IsAliasValue(lhs);
             bool rhsAlias = false;
             bool lhsTempField = compiler->IsTempFieldValue(lhs);
             bool rhsTempField = false;
+            bool rhsUniqueFieldRead = false;
             size_t rhsOcc = compiler->CurrentCastOccurrence();
             LLVMBackend::OwnedTempMark rhsMark = compiler->MarkOwnedTemps();
             llvm::UncondBrInst* rhsBr = nullptr;
@@ -4685,15 +5594,44 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                         if (!rhsExpected.TypeName.empty())
                             expectedScope.emplace(&declExpectedType, rhsExpected);
                     }
-                    rhs = ParseConditionalExpression(ctx->conditionalExpression(), use);
+                    auto rhsTv = ParseConditionalExpression(ctx->conditionalExpression(), use);
+                    rhs = rhsTv.value;
+                    rhsStorage = rhsTv.receiverStorage;
+                    rhsUniqueFieldRead = compiler->IsUniqueFieldReadValue(rhs);
                     rhsAlias = compiler->IsAliasValue(rhs);
                     rhsTempField = compiler->IsTempFieldValue(rhs);
+                }
+                // A raw-pointer coalesce result observes a desugared unique field on its RHS.
+                if (rhs != nullptr && resultAlloca->getAllocatedType()->isPointerTy())
+                {
+                    auto* rhsStruct = llvm::dyn_cast<llvm::StructType>(rhs->getType());
+                    if (rhsStruct != nullptr && rhsStruct->hasName()
+                        && compiler->IsCoreUniqueType(rhsStruct->getName().str()))
+                    {
+                        LLVMBackend::NamedVariable receiver;
+                        receiver.Primary = rhs;
+                        receiver.Storage = rhsStorage;
+                        receiver.BaseType = rhs->getType();
+                        receiver.TypeAndValue.TypeName = rhsStruct->getName().str();
+                        receiver.TypeAndValue.IsMove = moveUniquePointerJoin;
+                        receiver.IsExplicitMove = moveUniquePointerJoin;
+                        receiver.IsOwning = moveUniquePointerJoin;
+                        LLVMBackend::TypeAndValue rawType;
+                        rawType.TypeName = receiver.TypeAndValue.TypeName.substr(8);
+                        rawType.Pointer = true;
+                        rawType.IsMove = moveUniquePointerJoin;
+                        rhs = compiler->CreateCoreUniqueRawPointerCall(receiver, rawType);
+                        if (rhsTempField)
+                            compiler->RegisterOwningTempUniqueField(rhs);
+                    }
                 }
                 // `nullcoal_null` does not dominate the resume block, so the end-of-statement flush
                 // would skip its temps; mirror FinishTernaryArm and keep the yielded value. The
                 // branch block does dominate the resume, so struct temps hoist there instead.
                 compiler->FlushOwnedTempsSince(rhsMark, rhs, nullBlock->getSinglePredecessor());
                 compiler->CreateAssignment(rhs, resultAlloca);
+                if (rhsUniqueFieldRead)
+                    clearUniqueFieldRead(rhs, rhsStorage);
                 compiler->builder->CreateStore(
                     compiler->IsRawArrayResult(rhs)
                         ? compiler->Upconvert(compiler->RawArrayCountOf(rhs), compiler->builder->getInt64Ty())
@@ -4762,6 +5700,22 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                             "raw_array_count_join"),
                         lhsIsNull ? rhsAlign : lhsAlign);
                     compiler->PropagateTernaryOwnership(lhs, rhs, joined);
+                }
+            }
+            // A blessed unique<X> join is a one-slot STRUCT, so the pointer-shaped ledgering
+            // above skips it. Its arms are just as unrecoverable from the IR, and the
+            // owning-temp-field escape guards read this ledger.
+            else if (joined != nullptr && lhs != nullptr && rhs != nullptr
+                     && lhsBr != nullptr && rhsBr != nullptr
+                     && joined->getType() == lhs->getType())
+            {
+                auto* st = llvm::dyn_cast<llvm::StructType>(joined->getType());
+                if (st != nullptr && st->hasName()
+                    && compiler->IsCoreUniqueType(st->getName().str()))
+                {
+                    compiler->RegisterNullCoalesceJoin(
+                        joined, { { lhs, lhsBr->getParent() }, { rhs, rhsBr->getParent() } });
+                    compiler->PropagateUniqueFieldRead(lhs, rhs, joined);
                 }
             }
             LLVMBackend::TypedValue result{ joined, false };
@@ -5209,7 +6163,12 @@ void MainListener::LowerInterfaceNullCompare(antlr4::ParserRuleContext* ctx,
         auto isNull = [&](const LLVMBackend::TypedValue& v)
             { return llvm::isa_and_nonnull<llvm::ConstantPointerNull>(v.value); };
 
-        if (isFat(lv) && isNull(rv))
+        if (isFat(lv) && isFat(rv))
+        {
+            lv.value = compiler->builder->CreateExtractValue(lv.value, { 1u }, "iface_data");
+            rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
+        }
+        else if (isFat(lv) && isNull(rv))
             lv.value = compiler->builder->CreateExtractValue(lv.value, { 1u }, "iface_data");
         else if (isFat(rv) && isNull(lv))
             rv.value = compiler->builder->CreateExtractValue(rv.value, { 1u }, "iface_data");
@@ -5240,10 +6199,60 @@ LLVMBackend::TypedValue MainListener::ParseEqualityExpression(CFlatParser::Equal
             Compiler(ctx)->RegisterOwnedPtrTemp(rv.value);
             std::string op = ctx->children[1]->getText();
 
-            // An interface value compared against nullptr tests its DATA pointer (fat-ptr field 1):
-            // a failed `as <Interface>` yields a zeroed fat pointer, so `f != nullptr` is the
-            // hit/miss test. Reduce the fat operand to its data pointer and compare pointers.
+            // Interface comparisons use the DATA pointer (fat-ptr field 1): a failed `as <Interface>`
+            // yields a zeroed fat pointer, while fat-vs-fat compares test object identity.
+            // Reduce each fat operand to its data pointer before comparing pointers.
             LowerInterfaceNullCompare(ctx, lv, rv);
+
+            // A core unique value compares null through its validity method, avoiding a struct
+            // versus pointer LLVM comparison and keeping the spelling independent of its origin.
+            auto coreUniqueType = [](llvm::Value* value) -> std::string {
+                auto* structTy = llvm::dyn_cast_or_null<llvm::StructType>(
+                    value != nullptr ? value->getType() : nullptr);
+                if (structTy == nullptr || !structTy->hasName()) return {};
+                std::string name = structTy->getName().str();
+                return name.starts_with("unique__") ? name : std::string();
+            };
+            auto lowerCoreUniqueNullCompare = [&](LLVMBackend::TypedValue& uniqueValue,
+                                                   bool isEqual) -> llvm::Value* {
+                std::string typeName = coreUniqueType(uniqueValue.value);
+                if (typeName.empty() || !Compiler(ctx)->IsCoreUniqueType(typeName)) return nullptr;
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = uniqueValue.value;
+                receiver.Storage = uniqueValue.receiverStorage;
+                receiver.BaseType = uniqueValue.value->getType();
+                receiver.TypeAndValue.TypeName = typeName;
+                auto* valid = Compiler(ctx)->CreateOverloadedFunctionCall("valid", { receiver });
+                return isEqual ? Compiler(ctx)->builder->CreateNot(valid, "unique_isnull") : valid;
+            };
+            if (llvm::isa_and_nonnull<llvm::ConstantPointerNull>(rv.value))
+                if (auto* result = lowerCoreUniqueNullCompare(lv, op == "=="))
+                    return { result, false };
+            if (llvm::isa_and_nonnull<llvm::ConstantPointerNull>(lv.value))
+                if (auto* result = lowerCoreUniqueNullCompare(rv, op == "=="))
+                    return { result, false };
+
+            auto lowerCoreUniqueValue = [&](LLVMBackend::TypedValue& uniqueValue) {
+                std::string typeName = coreUniqueType(uniqueValue.value);
+                if (typeName.empty() || !Compiler(ctx)->IsCoreUniqueType(typeName)) return;
+                LLVMBackend::NamedVariable receiver;
+                receiver.Primary = uniqueValue.value;
+                receiver.Storage = uniqueValue.receiverStorage;
+                receiver.BaseType = uniqueValue.value->getType();
+                receiver.TypeAndValue.TypeName = typeName;
+                LLVMBackend::TypeAndValue rawType;
+                rawType.TypeName = typeName.substr(8);
+                rawType.Pointer = true;
+                uniqueValue.value = Compiler(ctx)->CreateCoreUniqueRawPointerCall(receiver, rawType);
+                auto elemType = rawType;
+                elemType.Pointer = false;
+                uniqueValue.elemType = Compiler(ctx)->GetType(elemType);
+                uniqueValue.pointerDepth = 0;
+                uniqueValue.elemPointer = false;
+                uniqueValue.receiverStorage = nullptr;
+            };
+            lowerCoreUniqueValue(lv);
+            lowerCoreUniqueValue(rv);
 
             auto* overload = TryBinaryOperatorOverload(lv, op, rv, ctx, lv.elemType,
                                                        rv.pointerDepth, rv.elemPointer);
@@ -5276,6 +6285,7 @@ LLVMBackend::TypedValue MainListener::TypedValueOfNamedOperand(LLVMBackend::Name
         LLVMBackend::TypedValue result{ LoadNamedVariable(namedVar), isUnsigned };
         result.isAlias = namedVar.TypeAndValue.IsAlias || namedVar.IsAliasBorrow;
         result.storage = result.isAlias ? namedVar.Storage : nullptr;
+        result.receiverStorage = namedVar.Storage;
         if (result.isAlias) Compiler(ctx)->RegisterAliasValue(result.value);
         if (namedVar.FromOwningTempField && !namedVar.OwningTempParent)
             Compiler(ctx)->RegisterTempFieldValue(result.value);
@@ -5323,6 +6333,27 @@ LLVMBackend::TypedValue MainListener::ParseTypeCheckExpression(CFlatParser::Type
         {
             srcNV = ParseCastExpression(castOperand);
             tv = TypedValueOfNamedOperand(srcNV, castOperand);
+            // `owner is/as X` on a blessed unique<I> probes the BORROWED interface value; the
+            // wrapper keeps its scope-exit release.
+            auto* castCompiler = Compiler(ctx);
+            if (!srcNV.TypeAndValue.Pointer
+                && castCompiler->IsCoreUniqueType(srcNV.TypeAndValue.TypeName)
+                && castCompiler->IsInterfaceType(srcNV.TypeAndValue.TypeName.substr(8)))
+            {
+                auto coreUnique = srcNV;
+                coreUnique.TypeAndValue.VariableName.clear();
+                auto* borrowed = castCompiler->CreateOverloadedFunctionCall("get", { coreUnique });
+                std::string ifaceName = srcNV.TypeAndValue.TypeName.substr(8);
+                srcNV.TypeAndValue = {};
+                srcNV.TypeAndValue.TypeName = ifaceName;
+                srcNV.TypeAndValue.IsInterface = true;
+                srcNV.Storage = nullptr;
+                srcNV.Primary = borrowed;
+                srcNV.BaseType = borrowed != nullptr ? borrowed->getType() : nullptr;
+                srcNV.IsOwning = false;
+                tv.value = borrowed;
+                tv.elemType = nullptr;
+            }
             srcBinding = &srcNV;
         }
         else
@@ -6557,6 +7588,21 @@ LLVMBackend::NamedVariable MainListener::LowerSpanElementAccess(
         return elem;
     }
 
+void MainListener::CheckMovedReceiver(const LLVMBackend::NamedVariable& receiver)
+{
+        if (receiver.IdentifierLine > 0 && !receiver.IsElementAccess)
+        {
+            Compiler()->RecordMoveUse(receiver.CallerName, receiver.FieldName,
+                                      receiver.IdentifierLine, receiver.IdentifierColumn);
+            if (auto moved = Compiler()->MovedUseSubject(receiver); !moved.empty())
+            {
+                Compiler()->currentLine = receiver.IdentifierLine;
+                Compiler()->currentColumn = receiver.IdentifierColumn;
+                Compiler()->LogError(std::format("use of moved variable '{}'", moved));
+            }
+        }
+    }
+
 llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVar) {
         auto* compiler = Compiler();
         llvm::Value* result = LoadNamedVariableImpl(namedVar);
@@ -6584,18 +7630,7 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
         // Every value read of a named local. A dereference site records its Deref event BEFORE
         // calling this, so the read below cannot swallow its own check (see RecordNullRead).
         compiler->RecordNullRead(namedVar.CallerName);
-        if (namedVar.IdentifierLine > 0)
-        {
-            if (!namedVar.IsElementAccess)
-                compiler->RecordMoveUse(namedVar.CallerName, namedVar.FieldName,
-                                        namedVar.IdentifierLine, namedVar.IdentifierColumn);
-            if (auto moved = compiler->MovedUseSubject(namedVar); !moved.empty())
-            {
-                compiler->currentLine = namedVar.IdentifierLine;
-                compiler->currentColumn = namedVar.IdentifierColumn;
-                compiler->LogError(std::format("use of moved variable '{}'", moved));
-            }
-        }
+        CheckMovedReceiver(namedVar);
         if (namedVar.TypeAndValue.Pointer)
         {
             if (namedVar.Primary != nullptr)
@@ -7252,6 +8287,21 @@ LLVMBackend::NamedVariable MainListener::ParseCastExpression(CFlatParser::CastEx
                 return namedVar;
             }
 
+            // A core unique value used in a type-changing cast is observed through its raw
+            // pointee, preserving the old `unique T*` cast behavior without copying the owner.
+            if (!destTypeName.IsArrayView && namedVar.Primary != nullptr
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && !namedVar.TypeAndValue.Pointer
+                && !compiler->IsCoreUniqueType(destTypeName.TypeName))
+            {
+                LLVMBackend::TypeAndValue rawType;
+                rawType.TypeName = namedVar.TypeAndValue.TypeName.substr(8);
+                rawType.Pointer = true;
+                namedVar.Primary = compiler->CreateCoreUniqueRawPointerCall(namedVar, rawType);
+                namedVar.Storage = nullptr;
+                namedVar.TypeAndValue = rawType;
+            }
+
             // Explicit `(T[])p` escape: re-establish the noalias array-view from a raw
             // pointer. `T*` and `T[]` share an identical representation, so this is a pure
             // reinterpret (no bit manipulation) - the sanctioned inverse of the implicit
@@ -7681,15 +8731,36 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     if (IsBorrowedByValueParamBinding(compiler, probe))
                         namedVar.PointsToBorrowedByValueParam = true;
                 }
-                namedVar.Primary = namedVar.Storage;
-                namedVar.Storage = nullptr;
+                if (compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                    && !namedVar.TypeAndValue.Pointer && namedVar.Storage != nullptr)
+                {
+                    const auto& uniqueData = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                    for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                        if (uniqueData.StructFields[i].VariableName == "_p")
+                        {
+                            namedVar.Primary = compiler->CreateStructGEP(
+                                namedVar.BaseType, namedVar.Storage, (uint32_t)i);
+                            namedVar.TypeAndValue.TypeName = namedVar.TypeAndValue.TypeName.substr(8);
+                            namedVar.TypeAndValue.Pointer = true;
+                            namedVar.TypeAndValue.PointerDepth = 1;
+                            namedVar.BaseType = namedVar.Primary->getType();
+                            namedVar.Storage = nullptr;
+                            break;
+                        }
+                }
+                else
+                {
+                    namedVar.Primary = namedVar.Storage;
+                    namedVar.Storage = nullptr;
+                }
                 // `&` over an alias lvalue yields a PLAIN borrowed pointer - the same value the
                 // accessor spelling (`c.eqPtr()`) hands back, so it stores like any other pointer.
                 // The provenance moves to PointsToAliasBorrow, which the return/delete boundary
                 // gates below read; the alias markers themselves are dropped here.
                 // A non-pointer `alias` PARAMETER is a borrow of the CALLER's object, so its
                 // address is the caller's - not frame-local, and legitimate to return or store.
-                const bool addrOfAliasParam = llvm::isa<llvm::Argument>(namedVar.Primary)
+                const bool addrOfAliasParam = namedVar.Primary != nullptr
+                    && llvm::isa<llvm::Argument>(namedVar.Primary)
                     && compiler->ParameterIsAliasByPointer(namedVar.TypeAndValue);
                 if (namedVar.IsAliasBorrow || namedVar.TypeAndValue.IsAlias)
                 {
@@ -7739,6 +8810,30 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
             }
             else if (opText == "*")
             {
+                if (!namedVar.TypeAndValue.Pointer
+                    && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                {
+                    auto coreUnique = namedVar;
+                    coreUnique.TypeAndValue.VariableName.clear();
+                    if (compiler->IsExplicitlyMovedNullHere(coreUnique))
+                        LogErrorContext(ctx, std::format(
+                            "dereference of moved variable '{}' (it is null after the move)",
+                            coreUnique.CallerName));
+                    auto raw = compiler->CreateOverloadedFunctionCall("get", { coreUnique });
+                    compiler->RecordNullDerefFor(coreUnique,
+                        ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                    auto pointeeName = coreUnique.TypeAndValue.TypeName.substr(8);
+                    namedVar.TypeAndValue = {};
+                    namedVar.TypeAndValue.TypeName = pointeeName;
+                    namedVar.Storage = raw;
+                    namedVar.Primary = nullptr;
+                    namedVar.BaseType = compiler->GetType(namedVar.TypeAndValue);
+                    compiler->EmitOwnDerefGuard(
+                        coreUnique.Storage, raw,
+                        ctx->getStart()->getLine(),
+                        ctx->getStart()->getCharPositionInLine());
+                    return namedVar;
+                }
                 if (!namedVar.Storage)
                 {
                     LogErrorContext(ctx, "cannot dereference a value without addressable storage; "
@@ -8175,6 +9270,8 @@ bool MainListener::EmitOneFieldInit(
             return false;
         }
 
+        RejectRawHeapArrayIntoUniqueField(rightNV, fieldType, fieldName, errCtx);
+
         // Brace leg of the code-value store gate. This is a SEPARATE lowering path from the `=`
         // assignment site, so `h.p = w` being rejected says nothing about `Holder h = { p = w }`.
         RejectCodeValueIntoDataSlot(errCtx, rightNV, fieldType, "brace-initialize",
@@ -8241,7 +9338,7 @@ bool MainListener::EmitOneFieldInit(
         // is needed - both callers construct a fresh slot, so there is no old pointee to release.
         // The two borrow legs use the same owning-slot predicate as the `=` path, so a field made
         // owning by generic substitution (`Box<unique Item*>::t`) is seen by both store paths.
-        if (IsOwningUniquePointerField(fieldType))
+        if (IsOwningUniqueField(fieldType))
         {
             std::string fieldDesc = std::format("unique field '{}.{}'", typeName, fieldName);
             if (rightNV.IsBorrowed && !rightNV.TypeAndValue.IsMove)
@@ -8264,18 +9361,22 @@ bool MainListener::EmitOneFieldInit(
         // `fieldType.Pointer` stands in for the `=` path's isPointerTy() test on the stored value:
         // IsOwningUniquePointerField answers TRUE for any written `unique`, fat interface included.
         bool braceDestOwnsPointee = IsOwningUniquePointerField(fieldType) && fieldType.Pointer;
+        bool braceDestOwnsValue = IsOwningUniqueField(fieldType)
+            && !fieldType.Pointer && !fieldType.IsInterface;
         // A TEMPORARY's `unique` field has no addressable slot to null, so it stays a reject here
         // too; a real field source takes the implicit move applied just after the load below.
-        if (braceDestOwnsPointee && IsUniqueTempFieldRead(rightNV))
+        if ((braceDestOwnsPointee || braceDestOwnsValue) && IsUniqueTempFieldRead(rightNV))
             RejectUniqueTempFieldToField(
                 rightNV, std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
         // Belt-and-braces: the source gates above all throw, so this leg runs only for the
         // cast/join spellings that reach an owning destination with every declared fact stripped.
         bool braceSrcGateFired = braceSrcIsUniqueFieldRead
-            && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType));
+            && (braceDestOwnsPointee || braceDestOwnsValue
+                || IsOwningUniqueInterfaceField(fieldType));
         if (!braceSrcGateFired)
         {
-            bool braceDestOwns = braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType);
+            bool braceDestOwns = braceDestOwnsPointee || braceDestOwnsValue
+                || IsOwningUniqueInterfaceField(fieldType);
             GuardOwningTempUniqueFieldEscape(
                 rightNV, std::format("{}field '{}.{}'", braceDestOwns ? "unique " : "",
                                      typeName, fieldName), errCtx);
@@ -8297,6 +9398,26 @@ bool MainListener::EmitOneFieldInit(
 
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
+
+        if ((val->getType()->isPointerTy()
+                || (val->getType() == compiler->GetFatPtrType()
+                    && compiler->IsCoreUniqueType(fieldType.TypeName)
+                    && compiler->IsInterfaceType(fieldType.TypeName.substr(8))))
+            && !fieldType.Pointer
+            && compiler->IsCoreUniqueType(fieldType.TypeName))
+        {
+            auto ctorArg = rightNV;
+            ctorArg.Primary = val;
+            ctorArg.BaseType = val->getType();
+            ShapeCoreUniqueCtorArg(compiler, ctorArg, fieldType.TypeName, val);
+            ctorArg.IsOwning = ctorArg.IsOwning || compiler->lastOwningResult
+                || compiler->lastCallReturnsOwned || compiler->IsOwnedNewTemp(val)
+                || compiler->IsOwningPtrTempValue(val) || compiler->IsMovedOutPtrValue(val);
+            val = compiler->CreateCoreUniqueFromRawPointerCall(ctorArg, fieldType);
+            compiler->ConsumeOwnedNewTemp(rightNV.Primary);
+            compiler->lastOwningResult = false;
+            compiler->lastCallReturnsOwned = false;
+        }
 
         // A string LITERAL is a 'const char*', never a 'T*' - the brace leg of the same gate the
         // declarator and `=` paths apply, so no spelling can seed a struct pointer with characters.
@@ -8323,7 +9444,8 @@ bool MainListener::EmitOneFieldInit(
         // The brace-init leg of the 2026-08-10 implicit-move ruling, kept in lockstep with the `=`
         // path. The destination slot is freshly constructed here, so only the source is nulled.
         if (braceSrcIsUniqueFieldRead && !IsUniqueTempFieldRead(rightNV)
-            && (braceDestOwnsPointee || IsOwningUniqueInterfaceField(fieldType)))
+            && (braceDestOwnsPointee || braceDestOwnsValue
+                || IsOwningUniqueInterfaceField(fieldType)))
         {
             // Same borrowed-by-value-parameter reject the `=` path applies: nulling the callee's
             // copy leaves the caller's struct still freeing the pointee (double free).
@@ -8334,8 +9456,9 @@ bool MainListener::EmitOneFieldInit(
 
         // Same provable stack-address reject the `=` path applies, with the same scalar-pointer
         // shape gate; `&local` carries no borrow provenance for the legs above to see.
-        if ((fieldType.IsUnique || fieldType.IsUniqueTypeArg)
-            && fieldType.Pointer && fieldType.ConstArraySize == 0 && !fieldType.IsInterface
+        if (IsOwningUniqueField(fieldType)
+            && ((fieldType.Pointer && fieldType.ConstArraySize == 0 && !fieldType.IsInterface)
+                || braceDestOwnsValue)
             && LLVMBackend::IsProvableNonHeapAddress(val))
             RejectNonHeapAddressIntoUnique(
                 std::format("unique field '{}.{}'", typeName, fieldName), errCtx);
@@ -8475,12 +9598,14 @@ bool MainListener::EmitOneFieldInit(
             auto* gep = compiler->builder->CreateStructGEP(sd.StructType, structPtr, (unsigned)fieldIdx, fieldName + "_init");
             // The aggregate seed already constructed this field. Release that value before the
             // named override replaces it, matching the ordinary assignment drop-old path.
-            if (fieldType.IsUnique && fieldType.Pointer)
+            if (fieldType.IsUnique
+                && fieldType.Pointer)
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, gep,
                     compiler->GetFullDestructorForDelete(fieldType.TypeName),
                     fieldType.TypeName, fieldType.AllocAlignValue, val);
-            else if (fieldType.IsFatInterfaceValue() && fieldType.IsUnique)
+            else if (fieldType.IsFatInterfaceValue()
+                && fieldType.IsUnique)
             {
                 auto* oldFat = compiler->builder->CreateLoad(compiler->GetFatPtrType(), gep);
                 compiler->DeleteInterfaceValue(oldFat, fieldType.TypeName, nullptr);
@@ -8589,6 +9714,25 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         auto* compiler = Compiler(ae);
         auto nv = ParseAssignmentExpressionNamed(ae);
         llvm::Value* val = LoadNamedVariable(nv);
+        RejectRawHeapArrayIntoUniqueField(nv, field, field.VariableName, ae);
+        if (val != nullptr && !field.Pointer
+            && compiler->IsCoreUniqueType(field.TypeName)
+            && (val->getType()->isPointerTy()
+                || (val->getType() == compiler->GetFatPtrType()
+                    && compiler->IsInterfaceType(field.TypeName.substr(8)))))
+        {
+            auto ctorArg = nv;
+            ctorArg.Primary = val;
+            ctorArg.BaseType = val->getType();
+            ShapeCoreUniqueCtorArg(compiler, ctorArg, field.TypeName, val);
+            ctorArg.IsOwning = ctorArg.IsOwning || compiler->lastOwningResult
+                || compiler->lastCallReturnsOwned || compiler->IsOwnedNewTemp(val)
+                || compiler->IsOwningPtrTempValue(val) || compiler->IsMovedOutPtrValue(val);
+            val = compiler->CreateCoreUniqueFromRawPointerCall(ctorArg, field);
+            compiler->ConsumeOwnedNewTemp(nv.Primary);
+            compiler->lastOwningResult = false;
+            compiler->lastCallReturnsOwned = false;
+        }
         if (srcIsUnsigned != nullptr)
             *srcIsUnsigned = nv.TypeAndValue.IsUnsignedInteger() != -1;
         RejectCodeValueIntoDataSlot(ae, nv, field, "default-initialize",
@@ -8606,7 +9750,8 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
             && compiler->StructImplementsInterface(nv.TypeAndValue.TypeName, field.TypeName))
         {
             val = BoxConcreteIntoInterface(ae, val, true, nv.TypeAndValue.TypeName,
-                                           field.TypeName, &nv, field.IsUnique);
+                                           field.TypeName, &nv,
+                                           field.IsUnique);
             // The aggregate now carries the pointer (as a box), so an owning `new` temporary
             // must not also be released by end-of-expression cleanup. A non-unique interface
             // field intentionally remains a non-owning reference; its object is not field-owned.
@@ -8712,6 +9857,21 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         if (field.ConstArraySize > 0)
             return EmitFieldDefaultFixedArrayBrace(structName, field, list);
 
+        bool isCoreUniqueField = compiler->IsCoreUniqueType(field.TypeName)
+            && !field.Pointer;
+        if (isCoreUniqueField)
+        {
+            std::string pointee = field.TypeName.substr(8);
+            // The interface spelling carries no star; keep the advice text matching what was written.
+            std::string spelling = compiler->IsInterfaceType(pointee)
+                ? std::format("unique {}", pointee) : std::format("unique {}*", pointee);
+            LogPointerBraceInitReject(list,
+                std::format("field '{}.{}'", structName, field.VariableName),
+                pointee, spelling,
+                CanSuggestAllocation(list, field), true);
+            return nullptr;
+        }
+
         bool isContainer = field.TypeName.rfind("list__", 0) == 0
             || field.TypeName.rfind("array__", 0) == 0
             || field.TypeName.rfind("dictionary__", 0) == 0;
@@ -8725,7 +9885,8 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
             LogPointerBraceInitReject(list,
                 std::format("field '{}.{}'", structName, field.VariableName),
                 field.TypeName, DescribePointerDeclType(field),
-                CanSuggestAllocation(list, field), field.IsUnique);
+                CanSuggestAllocation(list, field),
+                field.IsUnique);
         if (fieldType == nullptr) return nullptr;
 
         llvm::Value* slot = compiler->CreateAlloca(fieldType);
@@ -8781,7 +9942,8 @@ llvm::Value* MainListener::EmitFieldDefaultFixedArrayBrace(
             // field values would become the element addresses.
             LogPointerBraceInitReject(list, std::format("array element of field '{}'", path),
                 field.TypeName, DescribePointerDeclType(field),
-                CanSuggestAllocation(list, field), field.IsUnique);
+                CanSuggestAllocation(list, field),
+                field.IsUnique);
         }
         else if (!emptyList && structData.StructType == nullptr)
         {
@@ -10281,16 +11443,21 @@ LLVMBackend::NamedVariable MainListener::ParseNewExpression(CFlatParser::NewExpr
             {
                 for (auto* namedArg : argList->argumentNamedExpression())
                 {
-                    // Occurrence-scope this ONE constructor argument (see codeValueDataCasts_),
-                    // same as the direct-call argument loop.
+                    // Preserve legacy value loading while retaining metadata for core unique args.
                     size_t savedCastOcc = compiler->BeginCastOccurrence();
                     size_t thisCastOcc = compiler->CurrentCastOccurrence();
-                    llvm::Value* argVal = ParseAssignmentExpression(namedArg->assignmentExpression());
+                    auto argNV = ParseAssignmentExpressionNamed(namedArg->assignmentExpression());
+                    llvm::Value* argVal = argNV.Primary != nullptr
+                        ? argNV.Primary : LoadNamedVariable(argNV);
                     compiler->EndCastOccurrence(savedCastOcc);
                     if (!argVal) break;
                     LLVMBackend::NamedVariable argVar;
-                    argVar.Primary = argVal;
+                    if (compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName)
+                        && !argNV.TypeAndValue.Pointer)
+                        argVar = argNV;
                     argVar.BaseType = argVal->getType();
+                    argVar.Primary = argVal;
+                    argVar.TypeAndValue.VariableName.clear();
                     argVar.CastOccurrenceId = thisCastOcc;
                     ctorArgs.push_back(argVar);
                 }
@@ -10456,8 +11623,40 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             // types are auto-destructed at scope exit, so this is always a user error; without
             // this check the operand flows into icmp/call/bitcast instructions that require a
             // pointer and LLVM's module verifier fails with no source location.
-            if (!namedVar.TypeAndValue.Pointer && !isInterfaceOperand)
+            // An `alias` DIRECT call result of blessed unique<X> (list's `alias T get`) is a
+            // borrow, not a local; it belongs to the alias-result gate further below.
+            bool aliasCoreUniqueResult = (namedVar.TypeAndValue.IsAlias || namedVar.PointsToAliasBorrow)
+                && (namedVar.Storage == nullptr || namedVar.CallerName.empty())
+                && !namedVar.TypeAndValue.Pointer && compiler->IsCoreUniqueType(typeName);
+            if (!namedVar.TypeAndValue.Pointer && !isInterfaceOperand && !aliasCoreUniqueResult)
             {
+                if (compiler->IsCoreUniqueType(typeName))
+                {
+                    bool isField = !namedVar.FieldName.empty()
+                        || llvm::isa_and_nonnull<llvm::GetElementPtrInst>(namedVar.Storage);
+                    if (isField)
+                    {
+                        std::string fieldName = namedVar.FieldName.empty()
+                            ? namedVar.TypeAndValue.VariableName : namedVar.FieldName;
+                        std::string owner = namedVar.OwningStructName.empty()
+                            ? SplitEnclosingStruct(compiler->GetCurrentFunctionName(), compiler)
+                            : namedVar.OwningStructName;
+                        std::string fieldDesc = owner.empty()
+                            ? std::format("'{}'", fieldName)
+                            : std::format("'{}.{}'", owner, fieldName);
+                        LogErrorContext(ctx, std::format(
+                            "cannot delete unique field {} - the synthesized destructor already deletes it, "
+                            "so this is a double-free. Assign '{} = nullptr;' to release it instead.",
+                            fieldDesc, fieldName));
+                        return {};
+                    }
+                    LogErrorContext(ctx, std::format(
+                        "cannot delete unique local '{}' - a unique local is freed automatically at "
+                        "scope exit (and reassigning it frees the current object first), so an explicit "
+                        "delete is unnecessary. Let it go out of scope to release it.",
+                        namedVar.CallerName.empty() ? "<expr>" : namedVar.CallerName));
+                    return {};
+                }
                 std::string displayType = typeName;
                 if (size_t d = displayType.find("__"); d != std::string::npos)
                 {
@@ -10767,12 +11966,19 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                     }
                 }
             }
-            if (namedVar.TypeAndValue.IsUnique && !isRawUnionMember)
+            // The blessed unique<X> is always a VALUE: a `unique<X>*` names a heap ARRAY of
+            // wrappers (a container's element buffer), which its owner does delete by hand.
+            if ((namedVar.TypeAndValue.IsUnique
+                    || (compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                        && !namedVar.TypeAndValue.Pointer))
+                && !isRawUnionMember)
             {
                 // A `unique` LOCAL (alloca storage, no field name) is freed automatically at scope
                 // exit, and reassignment frees the current pointee first. Distinguish it from the
                 // field case (whose storage is a GEP off `this`) so the advice fits.
-                bool isLocal = namedVar.Storage != nullptr
+                bool isField = !namedVar.FieldName.empty()
+                    || llvm::isa_and_nonnull<llvm::GetElementPtrInst>(namedVar.Storage);
+                bool isLocal = !isField && namedVar.Storage != nullptr
                     && llvm::isa<llvm::AllocaInst>(namedVar.Storage)
                     && namedVar.FieldName.empty();
                 if (isLocal)
@@ -11312,7 +12518,6 @@ CFlatParser::TypeCheckExpressionContext* MainListener::SoleTypeCheckExpressionOf
 LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveExpressionContext* ctx) {
         auto* compiler = Compiler(ctx);
         auto argNV = ParseUnaryExpression(ctx->unaryExpression());
-
         if (argNV.ContainsBondedClosure)
             LogErrorContext(ctx,
                 "cannot move a holder containing a bonded closure - the closure would outlive its captured local");
@@ -11540,7 +12745,8 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // would mark the whole array moved), and an interface is not a dataStructures entry, so the
         // slot below never zeroes. Zero the {i8*,i8*} here or the array teardown double-frees it.
         if (!argNV.TypeAndValue.Pointer && argNV.IsElementAccess && argNV.Storage
-            && argNV.TypeAndValue.IsFatInterfaceValue())
+            && argNV.TypeAndValue.IsFatInterfaceValue()
+            && !compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName))
         {
             compiler->builder->CreateStore(
                 llvm::ConstantAggregateZero::get(compiler->GetFatPtrType()), argNV.Storage);
@@ -11566,6 +12772,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // auto-freed at scope exit, so consuming it here leaks nothing.
         if (!argNV.TypeAndValue.Pointer && argNV.Storage
             && argNV.TypeAndValue.IsFatInterfaceValue()
+            && !compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName)
             && !IsDirectCallArgument(ctx)
             && !argNV.CallerName.empty() && compiler->IsVariableOwning(argNV.CallerName))
         {
@@ -11611,6 +12818,16 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
                 if (structType)
                     compiler->builder->CreateStore(
                         llvm::ConstantAggregateZero::get(structType), argNV.Storage);
+                // Only a WHOLE-variable move nulls the variable. An element or field move
+                // (`move n->values[k]`) leaves the base live, so it must not enter the ledger.
+                if (compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName)
+                    && !argNV.IsElementAccess && argNV.FieldName.empty())
+                    compiler->RecordNullSet(argNV.CallerName);
+                if (!argNV.IsElementAccess && argNV.FieldName.empty() && !argNV.CallerName.empty())
+                    compiler->MarkVariableExplicitlyMovedNull(argNV.CallerName);
+                if (!argNV.IsElementAccess && argNV.FieldName.empty() && !argNV.IsBorrowed
+                    && !compiler->IsCoreUniqueType(argNV.TypeAndValue.TypeName))
+                    compiler->MarkVariableMoved(argNV.CallerName);
                 // Signal ownership transfer exactly as the POINTER branch below does. Without it
                 // `return move r` is classified as a BORROW and its owned bits are stripped (leak).
                 compiler->lastOwningResult = true;
@@ -12325,7 +13542,8 @@ bool MainListener::ResolveTransparentAnonField(
         out.OwningStructName = structVar.TypeAndValue.TypeName;
         out.FieldName = fieldName;
         // Preserve unique-field provenance across a later cast (see the sibling named-field read).
-        if (leafField.IsUnique && leafField.Pointer)
+        if (leafField.IsUnique
+            && leafField.Pointer)
             out.IsUniqueFieldAlias = true;
         out.IsBorrowed = structVar.IsBorrowed;
         out.BorrowedOrigin = structVar.BorrowedOrigin;

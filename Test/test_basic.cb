@@ -69,7 +69,7 @@ union UnionManualUnique
     int i;
     ~UnionManualUnique()
     {
-        if (b.p != nullptr) delete b.p;
+        if (b.p != nullptr) b.p = nullptr;
     }
 };
 struct UnionOwnerHolder { UnionOwnerFirst u = default; int n = default; };

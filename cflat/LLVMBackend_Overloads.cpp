@@ -162,7 +162,26 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     tmpArg.TypeName = resolveName(tmpArg.TypeName);
                     tmpParam.TypeName = resolveName(tmpParam.TypeName);
 
-                    if (tmpArg.IsTypeMatch(tmpParam))
+                    bool coreUniqueValueReceiver = !tmpArg.Pointer && tmpParam.Pointer
+                        && tmpArg.TypeName == tmpParam.TypeName;
+                    // A raw owning pointer binds by constructing the core value at the call site.
+                    // The constructor is the ownership boundary and rejects borrowed pointers.
+                    bool rawPointerToCoreUnique = IsRawPointerToCoreUnique(arg, tmpParam);
+                    // A blessed core unique value is implicitly convertible to its raw pointee.
+                    bool coreUniqueToRawPointer = !tmpArg.Pointer
+                        && IsCoreUniqueToRawPointer(arg, tmpParam);
+                    // A `unique<X>*` OUT-parameter accepts a pointer to X: the wrapper is a
+                    // single-slot value of the same layout, so the callee's copy-out lands in
+                    // the caller's slot as the borrow the builtin spelling handed back.
+                    bool coreUniqueOutParam = tmpParam.Pointer && !tmpParam.ElemPointer
+                        && tmpArg.Pointer && IsCoreUniqueType(tmpParam.TypeName)
+                        && tmpParam.TypeName.size() > 8
+                        && tmpParam.TypeName.substr(8) == tmpArg.TypeName;
+                    if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
+                        || coreUniqueOutParam
+                        || IsStackValueToCoreUniqueInterface(arg, tmpParam))
+                        result = 0;
+                    else if (tmpArg.IsTypeMatch(tmpParam))
                         result = 0;
                     else if (tmpArg.IsTypePromotion(tmpParam))
                     {
@@ -230,6 +249,8 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                 {
                     auto candidateParam = GetType(*candidateParamItr);
                     result = CompareUpconvert(arg.BaseType, candidateParam);
+                    if (IsRawPointerToCoreUnique(arg, *candidateParamItr))
+                        result = 0;
 
                     /*
                      * A function pointer or closure VALUE does not implicitly convert to a DATA
@@ -637,11 +658,59 @@ bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const T
         return true;
     }
 
+void LLVMBackend::LogUniqueCopyError(const std::string& typeName,
+                                     const std::string& uniquePath) const
+{
+        bool writable = true;
+        const std::string shownType = IsCoreUniqueType(typeName)
+            ? DisplayNameOfCoreUniqueType(typeName)
+            : DisplayNameOfMangledType(typeName, &writable);
+        const std::string displayType = writable ? shownType : typeName;
+        if (IsCoreUniqueType(typeName))
+        {
+            LogErrorMessage(
+                "cannot copy '{}': unique<T> owns its pointee and has no deep-clone - 'move' it "
+                "to transfer ownership, or clone the pointee yourself", { displayType });
+            return;
+        }
+        auto pathIsCoreUnique = [&](const auto& self, const std::string& owner,
+                                    const std::string& path) -> bool {
+            auto ownerIt = dataStructures.find(owner);
+            if (ownerIt == dataStructures.end()) return false;
+            size_t dot = path.find('.');
+            std::string fieldName = dot == std::string::npos ? path : path.substr(0, dot);
+            for (const auto& field : ownerIt->second.StructFields)
+            {
+                if (field.VariableName != fieldName) continue;
+                if (dot == std::string::npos) return IsCoreUniqueType(field.TypeName);
+                return self(self, field.TypeName, path.substr(dot + 1));
+            }
+            return false;
+        };
+        if (pathIsCoreUnique(pathIsCoreUnique, typeName, uniquePath))
+            LogErrorMessage(
+                "cannot copy '{}': its field '{}.{}' is 'unique' (a unique<T> wrapper), so it "
+                "owns a raw pointer that has no generic deep-clone. A memberwise copy would share "
+                "the pointer between two owners and double-free at teardown. Write a '{}' method "
+                "for '{}' that clones the pointee itself, or '{}' the value to transfer ownership "
+                "instead of copying it.",
+                { displayType, displayType, uniquePath, "copy()", displayType, "move" });
+        else
+            LogErrorMessage(
+                "cannot copy '{}': its field '{}.{}' is 'unique', so it owns a raw pointer that has "
+                "no generic deep-clone. A memberwise copy would share the pointer between two owners "
+                "and double-free at teardown. Write a '{}' method for '{}' that clones the pointee "
+                "itself, or '{}' the value to transfer ownership instead of copying it.",
+                { displayType, displayType, uniquePath, "copy()", displayType, "move" });
+}
+
 llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functionNameIn, const std::vector<LLVMBackend::NamedVariable>& arguments, bool forceRoot,
         const std::string& displayName)
 {
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
-        const std::string& shownFunctionName = displayName.empty() ? functionName : displayName;
+        std::string shownFunctionName = displayName.empty() ? functionName : displayName;
+        if (displayName.empty() && IsCoreUniqueType(functionName))
+            shownFunctionName = DisplayNameOfCoreUniqueType(functionName);
 
         // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
         // one generated on demand (the "every value type has an implicit copy() if undefined"
@@ -656,26 +725,32 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             // The closure fat type gets an env-cloning copy (not a memberwise one - both its
             // fields are pointers, which a memberwise copy would shallow-share and double-free).
             const std::string& copyType = arguments[0].TypeAndValue.TypeName;
-            std::string uniquePath;
             if (copyType == "__closure_fat_ptr")
                 EnsureClosureLifetimeRegistered();
-            else if (TypeOwnsUniquePointer(copyType, &uniquePath))
+            else
             {
-                // The single choke point for "someone wants a copy of this type and it has no
-                // copy() of its own" - covers a user `.copy()`, a containing type's field copy,
-                // and a by-value closure capture alike.
-                LogErrorMessage(
-                    "cannot copy '{}': its field '{}.{}' is '{}', so it owns a raw pointer that has "
-                    "no generic deep-clone. A memberwise copy would share the pointer between two owners "
-                    "and double-free at teardown. Write a '{}' method for '{}' that clones the pointee "
-                    "itself, or '{}' the value to transfer ownership instead of copying it.",
-                    { copyType, copyType, uniquePath, "unique", "copy()", copyType, "move" });
-                return nullptr;
+                // A synthesized destructor is the ownership boundary now that unique fields
+                // desugar to the real unique<T> wrapper. Keep the old unique diagnostic for the
+                // unsafe ownership cases, but key memberwise-copy suppression on the destructor.
+                if (HasNonTrivialDestructor(copyType))
+                {
+                    std::string uniquePath;
+                    bool uniqueOwner = TypeOwnsUniquePointer(copyType, &uniquePath);
+                    if (uniqueOwner || StructSynthCopyUnsafe(copyType))
+                    {
+                        if (uniqueOwner)
+                            LogUniqueCopyError(copyType, uniquePath);
+                        else
+                            LogError(std::format(
+                                "cannot copy '{}': it has a non-trivial destructor and a shallow-copied "
+                                "pointer/view field but no 'copy()' method. Write a 'copy()' method that "
+                                "defines independent state, or 'move' the value instead of copying it.", copyType));
+                        return nullptr;
+                    }
+                    GetOrCreateMemberwiseCopy(copyType);
+                }
+                // A POD struct has no destructor and uses the bitwise fallback below.
             }
-            else if (IsOwningValueType(copyType))
-                // Only an owning value type needs the deep memberwise synth; a POD struct is
-                // handled by the bitwise fallback below, so synthesizing one would be dead.
-                GetOrCreateMemberwiseCopy(copyType);
         }
 
         // Bitwise-copy fallback. The copy is deep only for an OWNING value type (string, a struct
@@ -794,6 +869,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
             // Call arguments
             msg += std::format("  Call arguments ({}):\n", arguments.size());
+            auto displayDiagnosticType = [&](const std::string& typeName) {
+                if (typeName.empty()) return typeName;
+                return IsCoreUniqueType(typeName)
+                    ? DisplayNameOfCoreUniqueType(typeName)
+                    : DisplayNameOfMangledType(typeName);
+            };
             for (size_t i = 0; i < arguments.size(); i++)
             {
                 const auto& arg = arguments[i];
@@ -805,6 +886,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     arg.BaseType->print(rso);
                     typeName = typeStr;
                 }
+                typeName = displayDiagnosticType(typeName);
                 std::string name;
                 if (arg.TypeAndValue.VariableName.empty())
                 {
@@ -829,7 +911,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     if (i > 0) paramList += ", ";
                     const auto& p = c.Parameters[i];
-                    paramList += std::format("{}{} {}", p.TypeName, PointerStars(p), p.VariableName);
+                    paramList += std::format("{}{} {}", displayDiagnosticType(p.TypeName),
+                                             PointerStars(p), p.VariableName);
                 }
                 msg += std::format("    {}({})\n", displayName.empty() ? c.UniqueName : shownFunctionName, paramList);
             }
@@ -851,8 +934,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         resolvedArgs[i].BaseType->print(rso);
                         argDesc = typeStr;
                     }
+                    argDesc = displayDiagnosticType(argDesc);
                     std::string argPtr = i < resolvedArgs.size() ? PointerStars(resolvedArgs[i].TypeAndValue) : "";
-                    std::string paramDesc = i < resolvedSym.Parameters.size() ? resolvedSym.Parameters[i].TypeName : "<missing>";
+                    std::string paramDesc = i < resolvedSym.Parameters.size()
+                        ? displayDiagnosticType(resolvedSym.Parameters[i].TypeName) : "<missing>";
                     std::string paramPtr = i < resolvedSym.Parameters.size() ? PointerStars(resolvedSym.Parameters[i]) : "";
                     msg += std::format("    [{}] arg={}{}  param={}{}\n", i, argDesc, argPtr, paramDesc, paramPtr);
                 }
@@ -976,6 +1061,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
+        const std::string diagnosticFunctionName = displayName.empty()
+            ? DisplayNameOfCoreUniqueType(functionName) : displayName;
+
         // convert parameter to vector of llvm::value*
         std::vector<llvm::Value*> argList;
         auto candParamItr = candidate.Parameters.begin();
@@ -1031,7 +1119,26 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && RejectFuncPtrShapeMismatch(arg, *candParamItr))
                 return nullptr;
 
-            if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
+            // Desugared spelling of the same rule as the builtin `unique IFace` parameter below:
+            // an owning wrapper would free a STACK address at scope exit.
+            if (!inVariadicRange && IsStackValueToCoreUniqueInterface(arg, *candParamItr))
+            {
+                LogErrorMessage(
+                    "call to '{}': cannot pass a stack value to {} interface parameter '{}' - "
+                    "it takes ownership and frees the object at scope exit, so the source must be "
+                    "a heap '{}' (or a '{}' of an owned interface value), not a stack value",
+                    { diagnosticFunctionName, "unique", candParamItr->VariableName, "new", "move" });
+                return nullptr;
+            }
+
+            // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it
+            // holds through get() rather than boxing the wrapper struct itself.
+            if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface
+                && IsCoreUniqueToRawPointer(arg, *candParamItr))
+            {
+                argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr));
+            }
+            else if (!inVariadicRange && candParamItr->IsInterface && !arg.TypeAndValue.IsInterface)
             {
                 // A `unique` interface param takes ownership and frees its boxed object at scope
                 // exit. A struct VALUE source would box a STACK address as the data pointer, so
@@ -1045,7 +1152,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         "call to '{}': cannot pass a stack value to {} interface parameter '{}' - "
                         "it takes ownership and frees the object at scope exit, so the source must be "
                         "a heap '{}' (or a '{}' of an owned interface value), not a stack value",
-                        { functionName, "unique", candParamItr->VariableName, "new", "move" });
+                        { diagnosticFunctionName, "unique", candParamItr->VariableName, "new", "move" });
                     return nullptr;
                 }
                 // A pointer-shaped source (`T**`, `T[]`, `T[N]`, simd) is not an instance of its
@@ -1088,7 +1195,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     {
                         LogErrorMessage(
                             "call to '{}': argument {} (interface parameter '{}') has no resolved type",
-                            { functionName, std::to_string(argIndex), candParamItr->VariableName });
+                            { diagnosticFunctionName, std::to_string(argIndex), candParamItr->VariableName });
                         return nullptr;
                     }
                     auto tempAlloca = AllocaAtEntry(structTy, nullptr);
@@ -1105,6 +1212,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             }
             else if (!inVariadicRange && candParamItr->Pointer)
             {
+                bool coreUniqueToRawPointer = IsCoreUniqueToRawPointer(arg, *candParamItr);
+                if (coreUniqueToRawPointer)
+                {
+                    argList.push_back(CreateCoreUniqueRawPointerCall(arg, *candParamItr));
+                }
+                else
+                {
                 // A 'string' is a {ptr,len} value, not a char*: the lowering below would hand the
                 // callee the PAIR's address. Only a variadic candidate reaches here with one (a
                 // non-variadic candidate is rejected by overload scoring first).
@@ -1119,7 +1233,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         "{} value, not a '{}' - the callee would read the pair itself. Pass "
                         "the buffer explicitly with '{}'. An interpolated string literal is a "
                         "'{}': bind it first ({}; {}).",
-                        { "string", "char*", candParamItr->VariableName, functionName, "string",
+                        { "string", "char*", candParamItr->VariableName, diagnosticFunctionName, "string",
                           "{ptr,len}", "char*", ".data()", "string", "string s = \"{{x}}\"",
                           "printf(\"%s\", s.data())" });
                     return nullptr;
@@ -1154,12 +1268,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         argList.push_back(arg.GetValue());
                 }
 
-                // Mirrors the 'uniqueAutoSink' entry rule (~3581/3608): both spellings bind the
-                // param owning, and only HERE is the argument's origin still visible.
+                // A `move` parameter is checked while the argument's origin is still visible.
                 llvm::Value* loweredArg = argList.back();
-                bool paramIsUniqueAutoSink = candParamItr->IsUniqueTypeArg
-                    && !candParamItr->IsAlias && !candParamItr->IsBorrowOfUniqueElement;
-                if ((candParamItr->IsMove || paramIsUniqueAutoSink)
+                if (candParamItr->IsMove
                     && IsProvableNonHeapAddress(loweredArg))
                 {
                     const std::string qualifier = candParamItr->IsMove ? "'move'" : "unique";
@@ -1168,8 +1279,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         "parameter '{}' - it takes ownership and frees the pointee at scope exit, "
                         "but neither is heap-allocated and freeing it is undefined. Use '{}' to "
                         "allocate on the heap, or drop '{}' if the callee only borrows.",
-                        { functionName, qualifier, candParamItr->VariableName, "new", "new" });
+                        { diagnosticFunctionName, qualifier, candParamItr->VariableName, "new", "new" });
                     return nullptr;
+                }
                 }
             }
             else if (!inVariadicRange && candParamItr->IsFunctionPointer)
@@ -1251,6 +1363,17 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 }
                 argList.push_back(val);
             }
+            else if (!inVariadicRange && ParameterIsAliasByPointer(*candParamItr)
+                     && IsRawPointerToCoreUnique(arg, *candParamItr))
+            {
+                // A raw pointer names no wrapper to borrow, so build one into a temporary and
+                // borrow that - the same construction the by-value arm performs.
+                llvm::Value* wrapped = CreateCoreUniqueFromRawPointerCall(arg, *candParamItr);
+                auto* wrapperTy = GetType(*candParamItr);
+                auto* tmp = AllocaAtEntry(wrapperTy, nullptr, "unique.aliasarg");
+                builder->CreateStore(wrapped, tmp);
+                argList.push_back(tmp);
+            }
             else if (!inVariadicRange && ParameterIsAliasByPointer(*candParamItr))
             {
                 argList.push_back(LowerAliasByPointerArg(arg, *candParamItr));
@@ -1269,9 +1392,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
 
                 if (!inVariadicRange)
                 {
-                    // Canonical by-value arg lowering (string coercion + move heap-copy);
-                    // shared with virtual dispatch via CallInterfaceMethod.
-                    value = LowerByValueArg(value, *candParamItr, arg);
+                    if (IsRawPointerToCoreUnique(arg, *candParamItr))
+                        value = CreateCoreUniqueFromRawPointerCall(arg, *candParamItr);
+                    else
+                    {
+                        // Canonical by-value arg lowering (string coercion + move heap-copy);
+                        // shared with virtual dispatch via CallInterfaceMethod.
+                        value = LowerByValueArg(value, *candParamItr, arg);
+                    }
 
                     // An owning-struct RVALUE temp passed to a by-value BORROW param has no named
                     // owner and the callee will not free it; register it for end-of-full-expression
@@ -1321,7 +1449,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         "cannot pass '{}' to the variadic '{}' of '{}': a variadic slot is "
                         "untyped and a '{}' is a {} value, not a '{}' - the length "
                         "field would be read as the next argument. Pass the buffer explicitly with "
-                        "'{}' (e.g. {}).", { "string", "...", functionName, "string", "{ptr,len}",
+                        "'{}' (e.g. {}).", { "string", "...", diagnosticFunctionName, "string", "{ptr,len}",
                                               "char*", ".data()", "printf(\"%s\", s.data())" });
                 }
 
@@ -1349,6 +1477,68 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // Check: bonded value must not be passed to a move parameter (would transfer ownership out of scope).
         for (size_t i = 0; i < candidate.Parameters.size() && i < matched.size(); i++)
         {
+            bool isCoreUniqueConstructor = i == 0 && IsCoreUniqueType(functionName);
+            bool isCoreUniqueReset = candidate.IsMethod && functionName == "reset" && i > 0
+                && !candidate.Parameters.empty() && IsCoreUniqueType(candidate.Parameters[0].TypeName);
+            if (candidate.Parameters[i].IsMove && candidate.Parameters[i].Pointer
+                && (isCoreUniqueConstructor || isCoreUniqueReset))
+            {
+                const auto& arg = matched[i];
+                bool isNull = arg.Primary != nullptr
+                    && llvm::isa<llvm::ConstantPointerNull>(arg.Primary);
+                bool owningLocalCopyWasRebound = false;
+                if (arg.BorrowsOwningLocal && arg.OwningLocalStorage != nullptr)
+                {
+                    auto* owner = FindVariableByStorage(arg.OwningLocalStorage);
+                    owningLocalCopyWasRebound = arg.PointerRebound
+                        || (owner != nullptr && owner->PointerRebound);
+                }
+                bool isBorrowed = arg.IsBorrowed || arg.IsAliasBorrow
+                    || arg.TypeAndValue.IsAlias || arg.BorrowsOwnedElement
+                    || (arg.BorrowsOwningLocal && !owningLocalCopyWasRebound);
+                bool isOwned = !isBorrowed && (arg.IsOwning || arg.IsOwningString
+                    || arg.IsOwningStruct || arg.TypeAndValue.IsMove
+                    || IsOwningPtrTempValue(arg.Primary)
+                    || IsMovedOutPtrValue(arg.Primary)
+                    || owningLocalCopyWasRebound
+                    || (arg.FieldName.empty() && !arg.CallerName.empty()
+                        && IsVariableOwning(arg.CallerName)));
+                // Temporary blessing until the deferred general move-sink borrow rule lands.
+                bool tempUniqueFieldSource = JoinCarriesOwningTempUniqueField(arg.Primary)
+                    || (arg.FromOwningTempField && arg.OwningTempParent);
+                if (!isNull && !isOwned && !tempUniqueFieldSource)
+                {
+                    const std::string sourceName = BorrowedSourceName(arg);
+                    std::string uniqueType = isCoreUniqueConstructor
+                        ? DisplayNameOfCoreUniqueType(functionName)
+                        : DisplayNameOfCoreUniqueType(candidate.Parameters[0].TypeName);
+                    std::string destinationName;
+                    if (isCoreUniqueReset && !matched.empty())
+                        destinationName = matched[0].CallerName.empty()
+                            ? matched[0].TypeAndValue.VariableName : matched[0].CallerName;
+                    if (sourceName.empty() && destinationName.empty())
+                        LogErrorMessage(
+                            "cannot {} {} from a borrowed value - the source still owns it; use 'new', "
+                            "a 'move' expression, or a move-returning call",
+                            { isCoreUniqueReset ? "reset" : "initialize", uniqueType });
+                    else if (sourceName.empty())
+                        LogErrorMessage(
+                            "cannot {} {} '{}' from a borrowed value - the source still owns it; use 'new', "
+                            "a 'move' expression, or a move-returning call",
+                            { isCoreUniqueReset ? "reset" : "initialize", uniqueType, destinationName });
+                    else if (destinationName.empty())
+                        LogErrorMessage(
+                            "cannot {} {} from borrowed value '{}' - the source still owns it; use 'new', "
+                            "a 'move' expression, or a move-returning call",
+                            { isCoreUniqueReset ? "reset" : "initialize", uniqueType, sourceName });
+                    else
+                        LogErrorMessage(
+                            "cannot {} {} '{}' from borrowed value '{}' - the source still owns it; use 'new', "
+                            "a 'move' expression, or a move-returning call",
+                            { isCoreUniqueReset ? "reset" : "initialize", uniqueType, destinationName,
+                              sourceName });
+                }
+            }
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });
@@ -1357,6 +1547,22 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "consuming" });
+            // A core unique<T> wrapper owns one T, never a raw new T[n] allocation. The source
+            // provenance is visible here before move transfer; unknown sources fail open.
+            const auto& arg = matched[i];
+            if (!candidate.Parameters[i].Pointer
+                && IsCoreUniqueType(candidate.Parameters[i].TypeName)
+                && HasRawNewArrayProvenance(arg))
+            {
+                const std::string sourceName = arg.CallerName.empty()
+                    ? (arg.TypeAndValue.VariableName.empty() ? std::string("<expression>")
+                                                              : arg.TypeAndValue.VariableName)
+                    : arg.CallerName;
+                LogErrorMessage(
+                    "cannot pass owning heap array '{}' to parameter '{}' of '{}': "
+                    "unique<T> does not own arrays",
+                    { sourceName, candidate.Parameters[i].VariableName, functionName });
+            }
             // The element slot of a borrowing container is a legal `move` destination: the
             // container keeps the ONLY handle afterwards (manual-free idiom), so the generic
             // "move into a borrow parameter transfers nothing" diagnostic is wrong there.
@@ -1365,6 +1571,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 DiagnoseExplicitMoveToBorrowParam(functionName, candidate.Parameters[i], matched[i]);
             RejectOwningLocalIntoBorrowingContainer(functionName, candidate.Parameters, i,
                                                     candidate.IsMethod, matched[i]);
+            RejectOwningLocalIntoBorrowingHelper(functionName, candidate, i, matched[i]);
             // A string LITERAL is a 'const char*', never a 'T*' - the ARGUMENT leg of the same
             // gate the declarator, `=`, brace-init, field-default and return sites apply.
             if (IsStringLiteralIntoStructPointer(candidate.Parameters[i], matched[i].Primary))
@@ -1446,7 +1653,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             bool ownedInterfaceLocal = arg.OwnsInterfaceBox
                 || arg.IsAdoptable
                 || (arg.TypeAndValue.IsFatInterfaceValue() && arg.IsOwning && arg.TypeAndValue.IsMove);
-            if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg
+            if (arg.TypeAndValue.IsUnique
                 || (!ownedInterfaceLocal && !ownedMoveInterface)
                 || (!arg.CallerName.empty() && !arg.FieldName.empty()))
                 LogErrorMessage(
@@ -1466,9 +1673,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         AdoptLaunderedOwningTempResult(result);
         // The REJECT-side twin: a callee whose every return reads a live `unique` field hands back
         // an object that field still owns, so this result is a borrow, not something to adopt.
-        if (result != nullptr && candidate.ReturnType.Pointer && !candidate.ReturnsOwned)
-            if (const auto* borrow = FindUniqueFieldBorrowReturn(candidate.Function))
-                RegisterUniqueFieldBorrowResult(result, *borrow);
+        const auto* uniqueFieldBorrow = !candidate.ReturnsOwned
+            ? FindUniqueFieldBorrowReturn(candidate.Function) : nullptr;
+        if (result != nullptr && uniqueFieldBorrow != nullptr)
+            RegisterUniqueFieldBorrowResult(result, *uniqueFieldBorrow);
 
         // Extern C function returning a function pointer: the LLVM-level return type is a
         // bare ptr but CFlat function<T> variables hold the {fn, env} closure fat struct.
@@ -1490,13 +1698,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // the ARGUMENT list describes a different value: retire its sticky channels here.
         lastOwningResult = false;
         lastAllocAlignment = 0;
-        // A substituted `unique X*` type-arg return owns like `move` (Pointer-gated: a struct
-        // VALUE return e.g. list<T>.copy() may carry IsUniqueTypeArg but is not owned here).
-        lastCallReturnsOwned = candidate.ReturnsOwned
-            || (candidate.ReturnType.IsUniqueTypeArg && candidate.ReturnType.Pointer);
+        // A core unique return owns like `move`.
+        lastCallReturnsOwned = uniqueFieldBorrow == nullptr
+            && (candidate.ReturnsOwned
+                || (!candidate.ReturnsAlias && !candidate.ReturnType.Pointer
+                    && IsCoreUniqueType(candidate.ReturnType.TypeName)));
         // Ledger the owning-return result by value for the no-discard check: string / pointer /
         // interface via lastCallReturnsOwned, plus a by-value owning-value STRUCT return (move S).
-        bool ownedValueStructReturn = !candidate.ReturnType.Pointer
+        bool ownedValueStructReturn = uniqueFieldBorrow == nullptr && !candidate.ReturnsAlias
+            && !candidate.ReturnType.Pointer
             && candidate.ReturnType.TypeName != "string"
             && IsOwningValueType(candidate.ReturnType.TypeName);
         if (lastCallReturnsOwned || ownedValueStructReturn)
@@ -1862,8 +2072,13 @@ LLVMBackend::NamedVariable LLVMBackend::GetMemberVariable(const std::string& nam
                             namedVar.TypeAndValue = structField;
                             // Preserve unique-field provenance across a later cast so a bare
                             // self-field read (`(Res*)p` inside a method) stays a tracked alias.
-                            if (structField.IsUnique && structField.Pointer)
+                            bool isUniqueField = (structField.IsUnique && structField.Pointer)
+                                || (IsCoreUniqueType(structField.TypeName) && !structField.Pointer);
+                            if (isUniqueField)
+                            {
                                 namedVar.IsUniqueFieldAlias = true;
+                                RegisterUniqueFieldRead(namedVar.Primary, namedVar.Storage);
+                            }
                             // Field declared `alignas(_, N)`: stamp the block alignment so a bare
                             // `delete field` inside a member (e.g. the destructor) frees via
                             // __delete_aligned. GetMemberVariable purposely omits OwningStructName.
@@ -1944,6 +2159,199 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
             return thisVar;
         }
         return {};
+    }
+
+bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
+{
+        constexpr std::string_view prefix = "unique__";
+        if (!typeName.starts_with(prefix) || typeName.size() == prefix.size()) return false;
+        // The parser and generic-instantiation queue ask this before the wrapper struct is
+        // materialized. The reserved mangling plus the imported core template is sufficient.
+        return gts.coreGenericTemplates.count("unique") != 0;
+}
+
+bool LLVMBackend::IsMoveOrCoreUniqueValue(const TypeAndValue& t) const
+{
+        return t.IsMove || (!t.Pointer && IsCoreUniqueType(t.TypeName));
+}
+
+bool LLVMBackend::IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeAndValue& param) const
+{
+        if (arg.TypeAndValue.Pointer || !IsCoreUniqueType(arg.TypeAndValue.TypeName)
+            || arg.TypeAndValue.TypeName.size() <= 8)
+            return false;
+        // Interface arm: unique<IShape> borrows to a plain IShape parameter through get().
+        if (!param.Pointer)
+            return param.IsFatInterfaceValue()
+                && arg.TypeAndValue.TypeName.substr(8) == param.TypeName;
+        TypeAndValue uniquePointee;
+        uniquePointee.TypeName = arg.TypeAndValue.TypeName.substr(8);
+        uniquePointee.Pointer = true;
+        if (param.ElemPointer) return false;
+        if (uniquePointee.TypeName == param.TypeName) return true;
+
+        // Generic substitutions may spell the same C-equivalent pointee as `i32` in
+        // unique<T> and `int` in the instantiated method parameter. Compare their value
+        // identities through the normal integer-width rules before applying the pointer
+        // adaptation, so all generic methods share this borrow path.
+        TypeAndValue uniquePointeeValue;
+        uniquePointeeValue.TypeName = uniquePointee.TypeName;
+        TypeAndValue paramPointee = param;
+        paramPointee.Pointer = false;
+        paramPointee.ElemPointer = false;
+        return uniquePointeeValue.IsTypeMatch(paramPointee);
+}
+
+bool LLVMBackend::IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeAndValue& param) const
+{
+        if (param.Pointer || !IsCoreUniqueType(param.TypeName) || param.TypeName.size() <= 8)
+            return false;
+        bool nullPointer = arg.Primary != nullptr && llvm::isa<llvm::ConstantPointerNull>(arg.Primary);
+        if (!nullPointer && arg.Primary == nullptr && arg.TypeAndValue.TypeName.empty()
+            && arg.Storage != nullptr && arg.BaseType != nullptr && arg.BaseType->isPointerTy())
+            nullPointer = true;
+        if (nullPointer)
+            return true;
+        // Interface arm: unique<IShape> is constructed from any implementor pointer or from an
+        // IShape value, exactly as the explicit `unique<IShape>(new Sq())` spelling resolves.
+        if (IsInterfaceType(param.TypeName.substr(8)))
+        {
+            const std::string ifaceName = param.TypeName.substr(8);
+            if (arg.TypeAndValue.TypeName == ifaceName) return true;
+            if (arg.TypeAndValue.Pointer
+                && StructImplementsInterface(arg.TypeAndValue.TypeName, ifaceName))
+                return true;
+            std::string elemName = FindValueElementTypeName(arg.Primary);
+            if (!elemName.empty()
+                && (elemName == ifaceName || StructImplementsInterface(elemName, ifaceName)))
+                return true;
+            if (const auto* owned = FindOwnedNewTemp(arg.Primary);
+                owned != nullptr && StructImplementsInterface(owned->TypeName, ifaceName))
+                return true;
+            return false;
+        }
+        const TypeAndValue uniquePointee = [&]() {
+            TypeAndValue value;
+            value.TypeName = param.TypeName.substr(8);
+            value.Pointer = true;
+            return value;
+        }();
+        auto matchesRawPointer = [&](llvm::Value* value) {
+            if (value == nullptr) return false;
+            if (FindValueElementTypeName(value) == uniquePointee.TypeName) return true;
+            if (const auto* owned = FindOwnedNewTemp(value);
+                owned != nullptr && owned->TypeName == uniquePointee.TypeName)
+                return true;
+            auto* expectedType = GetType(uniquePointee);
+            return expectedType != nullptr && value->getType() == expectedType;
+        };
+        const auto* nullJoin = FindNullCoalesceJoin(arg.Primary);
+        if (!arg.TypeAndValue.Pointer && nullJoin == nullptr)
+            return false;
+        if (!arg.TypeAndValue.Pointer)
+        {
+            for (const auto& arm : nullJoin->Arms)
+                if (!llvm::isa_and_nonnull<llvm::ConstantPointerNull>(arm.Value)
+                    && matchesRawPointer(arm.Value))
+                    return true;
+            return false;
+        }
+        if (uniquePointee.IsTypeMatch(arg.TypeAndValue)) return true;
+        if (matchesRawPointer(arg.Primary)) return true;
+        // Fresh `new T()` expressions have no source spelling on their NamedVariable. Their LLVM
+        // pointer type still proves the same pointee shape for this ownership constructor.
+        auto* expectedType = GetType(uniquePointee);
+        return expectedType != nullptr
+            && ((arg.BaseType != nullptr && arg.BaseType == expectedType)
+                || (arg.Primary != nullptr && arg.Primary->getType() == expectedType));
+}
+
+bool LLVMBackend::IsStackValueToCoreUniqueInterface(const NamedVariable& arg,
+                                                    const TypeAndValue& param) const
+{
+        if (param.Pointer || arg.TypeAndValue.Pointer || arg.TypeAndValue.IsInterface)
+            return false;
+        if (!IsCoreUniqueType(param.TypeName) || param.TypeName.size() <= 8)
+            return false;
+        const std::string ifaceName = param.TypeName.substr(8);
+        if (!IsInterfaceType(ifaceName) || arg.TypeAndValue.TypeName.empty())
+            return false;
+        return StructImplementsInterface(arg.TypeAndValue.TypeName, ifaceName);
+}
+
+llvm::Value* LLVMBackend::CreateCoreUniqueFromRawPointerCall(
+    const NamedVariable& arg, const TypeAndValue& param)
+{
+        if (arg.IsExplicitMove && !arg.BorrowedUniqueField.empty())
+            LogErrorMessage(
+                "cannot 'move' '{}' - it was returned as a borrow of unique field '{}', and moving "
+                "the alias does not null the field, so the field's synthesized destructor still "
+                "frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or "
+                "pass a value the receiver can own.",
+                { arg.CallerName.empty() ? arg.BorrowedOrigin : arg.CallerName,
+                  arg.BorrowedUniqueField });
+        auto receiver = arg;
+        // A plain factory result has no owner marker; treat it as the ownership handoff while
+        // still rejecting named or explicitly borrowed pointers.
+        if (receiver.Storage == nullptr && !receiver.IsBorrowed && !receiver.IsAliasBorrow
+            && !receiver.TypeAndValue.IsAlias)
+            receiver.IsOwning = true;
+        receiver.TypeAndValue.VariableName.clear();
+        receiver.IsExplicitMove = false;
+        return CreateOverloadedFunctionCall(param.TypeName, { receiver }, true);
+}
+
+llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
+    const NamedVariable& arg, const TypeAndValue& param)
+{
+        bool consumesCoreUnique = arg.IsExplicitMove && IsMoveOrCoreUniqueValue(param);
+        bool carriesTempUniqueField = JoinCarriesOwningTempUniqueField(arg.Primary)
+            || (arg.FromOwningTempField && arg.OwningTempParent);
+        if (consumesCoreUnique && !arg.CallerName.empty())
+        {
+            RecordNullSet(arg.CallerName);
+            MarkVariableExplicitlyMovedNull(arg.CallerName);
+        }
+        auto receiver = arg;
+        // Resolve the wrapper observer/release method through a pointer receiver so a pointee
+        // method named `get` cannot win overload scoring.
+        auto* wrapperTy = GetType(arg.TypeAndValue);
+        if (receiver.Storage != nullptr)
+        {
+            receiver.Primary = receiver.Storage;
+            receiver.Storage = nullptr;
+        }
+        else if (receiver.Primary != nullptr && wrapperTy != nullptr
+                 && receiver.Primary->getType() == wrapperTy)
+        {
+            auto* wrapperStorage = AllocaAtEntry(wrapperTy, nullptr, "unique.receiver");
+            builder->CreateStore(receiver.Primary, wrapperStorage);
+            receiver.Primary = wrapperStorage;
+        }
+        receiver.BaseType = wrapperTy == nullptr ? receiver.BaseType
+            : cflat_llvm::PointerTo(wrapperTy);
+        receiver.TypeAndValue.Pointer = true;
+        receiver.TypeAndValue.VariableName.clear();
+        receiver.IsExplicitMove = false;
+        auto* result = CreateOverloadedFunctionCall(consumesCoreUnique ? "release" : "get", { receiver });
+        // The getter is an ABI adapter, not a new ownership boundary. Preserve the temporary
+        // field ledger across it so a later call/return still rejects the escaping raw pointer.
+        if (carriesTempUniqueField)
+            RegisterOwningTempUniqueField(result);
+        // Keep the provenance link so a diagnostic can still name the source field.
+        if (result != nullptr && arg.Primary != nullptr)
+            coreUniqueGetterSource_[result] = arg.Primary;
+        return result;
+}
+
+std::string LLVMBackend::DisplayNameOfCoreUniqueType(const std::string& typeName) const
+{
+        if (!IsCoreUniqueType(typeName)) return typeName;
+        std::string arg = typeName.substr(std::string("unique__").size());
+        bool writable = true;
+        std::string shownArg = DisplayNameOfMangledType(arg, &writable);
+        if (!writable) return typeName;
+        return std::format("unique<{}>", shownArg);
     }
 
 LLVMBackend::NamedVariable LLVMBackend::GetFunctionArgument(std::string name)
@@ -2060,22 +2468,16 @@ bool LLVMBackend::IsBorrowingContainerElementSink(const std::string& functionNam
         if (!elem.Pointer || elem.IsArrayView) return false;
         if (elem.IsInterfacePointer || elem.IsFatInterfaceValue() || elem.IsFunctionPointer)
             return false;
-        if (elem.IsMove || elem.IsAlias || elem.IsUnique || elem.IsUniqueTypeArg) return false;
-        if (elem.IsBorrowOfUniqueElement || elem.IsBorrowOfAliasElement) return false;
+        if (elem.IsMove || elem.IsAlias || elem.IsUnique) return false;
+        if (elem.IsBorrowOfAliasElement) return false;
         return true;
     }
 
-bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& functionName,
-        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod,
-        const NamedVariable& arg)
+bool LLVMBackend::IsProvenOwningNamedLocal(const NamedVariable& arg) const
 {
-        if (!IsBorrowingContainerElementSink(functionName, params, paramIndex, isMethod))
-            return false;
-        // `add(move p)` IS the remedy - it must reach the transfer, not this reject.
         if (arg.IsExplicitMove || arg.TypeAndValue.IsMove) return false;
-        // Prove an owning POINTER binding. Everything unproven accepts.
         if (!arg.TypeAndValue.Pointer || arg.TypeAndValue.IsArrayView) return false;
-        if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg) return false;
+        if (arg.TypeAndValue.IsUnique) return false;
         if (arg.IsBorrowed || arg.IsAliasBorrow || arg.BorrowsOwnedElement) return false;
         if (!arg.IsOwning) return false;
         // Not live any more: already transferred, or handed to an interface box.
@@ -2093,7 +2495,28 @@ bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& fun
         // from one is the sanctioned borrow-collection shape and stays legal. The written
         // qualifier lives on the DECLARATION - a read hands out a plain pointer value.
         if (const NamedVariable* decl = FindVariableByStorage(arg.Storage))
-            if (decl->TypeAndValue.IsUnique || decl->TypeAndValue.IsUniqueTypeArg) return false;
+            if (decl->TypeAndValue.IsUnique) return false;
+
+        return true;
+    }
+
+bool LLVMBackend::IsBarePointerParameter(const TypeAndValue& param) const
+{
+        if (!param.Pointer || param.IsArrayView) return false;
+        if (param.IsInterfacePointer || param.IsFatInterfaceValue() || param.IsFunctionPointer)
+            return false;
+        if (param.IsMove || param.IsAlias || param.IsUnique) return false;
+        if (param.IsBorrowOfAliasElement) return false;
+        return true;
+    }
+
+bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& functionName,
+        const std::vector<TypeAndValue>& params, size_t paramIndex, bool isMethod,
+        const NamedVariable& arg)
+{
+        if (!IsBorrowingContainerElementSink(functionName, params, paramIndex, isMethod))
+            return false;
+        if (!IsProvenOwningNamedLocal(arg)) return false;
 
         LogErrorMessage(
             "call to '{}': '{}' still owns the object it was given, and frees it when it goes out "
@@ -2103,6 +2526,33 @@ bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& fun
             { functionName, arg.CallerName,
               std::format("{}({} {})", functionName, "move", arg.CallerName), "unique T*" });
         return true;
+    }
+
+void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functionName,
+        const FunctionSymbol& callee, size_t paramIndex, const NamedVariable& arg)
+{
+        if (callee.Function == nullptr || paramIndex >= callee.Parameters.size()) return;
+        if (callee.IsMethod && paramIndex == 0) return;
+        if (!IsBarePointerParameter(callee.Parameters[paramIndex])
+            || !IsProvenOwningNamedLocal(arg)) return;
+        auto llvmIndex = CFlatParameterLLVMIndex(callee, (unsigned)paramIndex);
+        if (!llvmIndex.has_value()) return;
+        if (!FunctionBodyIsComplete(callee.Function))
+        {
+            owningLocalBorrowingHelperArgs_.push_back({
+                callee.Function, *llvmIndex, functionName,
+                callee.Parameters[paramIndex].VariableName, arg.CallerName,
+                sourceFileName, currentLine, currentColumn });
+            return;
+        }
+        if (!ParameterMayReachBorrowingContainerSink(callee.Function, *llvmIndex)) return;
+        LogErrorMessage(
+            "call to '{}': '{}' still owns the object it was given, and the helper parameter '{}' "
+            "stores it into a container that only BORROWS its elements and never frees them, so "
+            "the stored element would dangle. Declare parameter '{}' as 'move' and call '{}(move "
+            "{})', or declare the container's element 'unique T*'.",
+            { functionName, arg.CallerName, callee.Parameters[paramIndex].VariableName,
+              callee.Parameters[paramIndex].VariableName, functionName, arg.CallerName });
     }
 
 void LLVMBackend::MarkVariableMoved(const std::string& name)
@@ -2406,8 +2856,9 @@ bool LLVMBackend::IsExplicitlyMovedNullHere(const NamedVariable& nv) const
 void LLVMBackend::RecordNullDerefFor(const NamedVariable& nv, int line, int col)
 {
         if (nv.CallerName.empty() || !nv.FieldName.empty() || nv.AddressEscaped) return;
-        if (!(nv.ExplicitlyMovedNull || nv.IsOwning || nv.TypeAndValue.IsUnique
-              || nv.TypeAndValue.IsUniqueTypeArg))
+        if (!(nv.ExplicitlyMovedNull || nv.IsOwning
+              || nv.TypeAndValue.IsUnique
+              || IsCoreUniqueType(nv.TypeAndValue.TypeName)))
             return;
         RecordNullDeref(nv.CallerName, line, col);
     }
@@ -2443,5 +2894,22 @@ std::string LLVMBackend::MovedUseSubject(const NamedVariable& nv) const
         if (nv.IsMoved) return nv.CallerName;
         if (!nv.FieldName.empty() && nv.MovedFields.count(nv.FieldName))
             return nv.CallerName + "." + nv.FieldName;
+        if (!nv.CallerName.empty())
+        {
+            for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
+            {
+                const NamedVariable* binding = nullptr;
+                if (auto it = frame.namedVariable.find(nv.CallerName); it != frame.namedVariable.end())
+                    binding = &it->second;
+                else if (auto it = frame.functionArgument.find(nv.CallerName);
+                         it != frame.functionArgument.end())
+                    binding = &it->second;
+                if (binding == nullptr) continue;
+                if (binding->IsMoved) return nv.CallerName;
+                if (!nv.FieldName.empty() && binding->MovedFields.count(nv.FieldName))
+                    return nv.CallerName + "." + nv.FieldName;
+                break;
+            }
+        }
         return "";
-    }
+}

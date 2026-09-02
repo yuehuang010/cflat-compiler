@@ -763,9 +763,8 @@ namespace os
 
     // Takes the slot by address and nulls it after releasing, matching
     // mutex_destroy/cond_destroy/rwlock_destroy. Load-bearing for semaphore's
-    // `unique void* _handle`: a plain `_handle = nullptr;` assignment at the
-    // call site would be treated as a unique-field reassignment and trigger a
-    // synthesized delete of the OLD (already-freed) handle - a double free.
+    // The slot is borrowed by this helper: a plain `_handle = nullptr;`
+    // assignment at the call site is safe after the owner has released it.
     // Nulling here, through the pointer, is a plain store the compiler does
     // not intercept.
     void sem_destroy(void** slot) {
@@ -817,9 +816,8 @@ namespace os
 
     // Takes the slot by address and nulls it after releasing, matching
     // mutex_destroy/cond_destroy/rwlock_destroy. Load-bearing for event's
-    // `unique void* _h`: a plain `_h = nullptr;` assignment at the call site
-    // would be treated as a unique-field reassignment and trigger a
-    // synthesized delete of the OLD (already-freed) handle - a double free.
+    // The slot is borrowed by this helper: a plain `_h = nullptr;` assignment
+    // at the call site is safe after the owner has released it.
     // Nulling here, through the pointer, is a plain store the compiler does
     // not intercept.
     void event_destroy(void** slot) {

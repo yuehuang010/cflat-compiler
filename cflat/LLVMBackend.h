@@ -206,6 +206,11 @@ struct GenericTemplateState
     // the two scannedGeneric*Names sets it is deliberately NOT cached - a warm cache restores
     // dataStructures + interfaceTable, which is what a cached core type needs.
     std::unordered_set<std::string>                                             scannedTypeNames;
+    // The INTERFACE subset of scannedTypeNames, same keys and same certain/keyable gating. Answers
+    // "is this type-arg base an interface?" while interfaceTable is still empty, so the forward
+    // scan desugars `list<unique IShape>` to the same unique<IShape> name the codegen pass builds.
+    // Not cached, for the same reason scannedTypeNames is not: a warm cache restores interfaceTable.
+    std::unordered_set<std::string>                                             scannedInterfaceNames;
     // Template key -> the NAMESPACE it was declared in, recorded at registration. It CANNOT be
     // derived from the key: struct nesting and namespace nesting share one dotted key space, so a
     // template nested in `struct Outer` is keyed "Outer.Box" exactly like one in `namespace Outer`.
@@ -707,31 +712,6 @@ public:
         bool IsMove = false;     // parameter declared with 'move' - function takes ownership
         bool IsAdopt = false;    // parameter declared with 'adopt' - retires an owned interface box at the call site
         bool IsAlias = false;    // return/decl declared with 'alias' - borrowed reference; caller must not free the interior
-        // This type came from a generic type argument qualified with `unique`. It records only
-        // that provenance - it is set on ANY declaration whose type substitutes to `unique X*`
-        // (locals and fields included), not just parameters, because the substitution branch has
-        // no parameter-context signal. The move-sink meaning lives in the CONSUMERS, which
-        // iterate parameters only (ApplyMoveParamTransfer, DiagnoseExplicitMoveToBorrowParam).
-        // A new consumer must therefore check it is looking at a parameter before treating it as
-        // a sink; reading it off a local and nulling that source would free what nobody owns.
-        // Distinct from IsUnique (the written field/local qualifier), which drives destructor
-        // synthesis and must not be set from a substitution.
-        bool IsUniqueTypeArg = false;
-        // A buffer pointer (`T* _data`, substituted with T = `unique X*` / `unique IFace`) whose
-        // indexed ELEMENT is an owning `unique` value. The pointer model strips the element's
-        // `unique`-ness on a slot read (a read hands out a borrow, so IsUniqueTypeArg is cleared
-        // by the explicit-pointer rule), so this out-of-band flag remembers the element ownership.
-        // Read ONLY by the container-slot move-out recovery (ApplyMovedSlotOwnership): it lets
-        // `_ = move _data[i]` (which has no destination type to re-derive from) release the element
-        // exactly as `T tmp = move _data[i]` does. Plain reads ignore it, so a slot read still
-        // demotes to a borrow. Propagated onto the element value by the subscript path.
-        bool ElementOwningUnique = false;
-        // An `alias` borrow (accessor return such as list's `alias T get`) whose type argument
-        // substituted to a `unique X*` element - i.e. the CONTAINER owns the pointee and its
-        // destructor frees it. Distinct from IsUniqueTypeArg (suppressed on alias borrows): this
-        // records "borrow of an element the owner will free", so a later `delete` of a local bound
-        // to it can be rejected as a double-free. Read ONLY by the delete-of-owned-element check.
-        bool IsBorrowOfUniqueElement = false;
         // Set by the ForwardRefScanner body-scan on a plain by-value parameter the callee body
         // UNCONDITIONALLY moves (top-level `move <param>`): a synthesized move-sink whose caller
         // source is nulled at the call site. Consumers still gate on the concrete type owning a
@@ -1117,11 +1097,8 @@ public:
         bool IsMove = false;
         bool IsAdopt = false;
         bool IsAlias = false;
-        bool IsUniqueTypeArg = false;
-        bool ElementOwningUnique = false;
         bool IsOwningSink = false;
         bool IsConsumeInferredSink = false;
-        bool IsBorrowOfUniqueElement = false;
         bool IsBorrowOfAliasElement = false;
         bool IsBond = false;
         bool IsUnique = false;
@@ -1169,11 +1146,8 @@ public:
             s.IsMove = t.IsMove;
             s.IsAdopt = t.IsAdopt;
             s.IsAlias = t.IsAlias;
-            s.IsUniqueTypeArg = t.IsUniqueTypeArg;
-            s.ElementOwningUnique = t.ElementOwningUnique;
             s.IsOwningSink = t.IsOwningSink;
             s.IsConsumeInferredSink = t.IsConsumeInferredSink;
-            s.IsBorrowOfUniqueElement = t.IsBorrowOfUniqueElement;
             s.IsBorrowOfAliasElement = t.IsBorrowOfAliasElement;
             s.IsBond = t.IsBond;
             s.IsUnique = t.IsUnique;
@@ -1224,11 +1198,8 @@ public:
             t.IsMove = IsMove;
             t.IsAdopt = IsAdopt;
             t.IsAlias = IsAlias;
-            t.IsUniqueTypeArg = IsUniqueTypeArg;
-            t.ElementOwningUnique = ElementOwningUnique;
             t.IsOwningSink = IsOwningSink;
             t.IsConsumeInferredSink = IsConsumeInferredSink;
-            t.IsBorrowOfUniqueElement = IsBorrowOfUniqueElement;
             t.IsBorrowOfAliasElement = IsBorrowOfAliasElement;
             t.IsBond = IsBond;
             t.IsUnique = IsUnique;
@@ -1596,6 +1567,7 @@ public:
         bool         isArrayView = false;   // value came from a thin `int[]` view (pointer arithmetic is banned on it)
         bool         isAlias    = false;    // value is a borrow from an alias result or join
         llvm::Value* storage    = nullptr;  // lvalue storage for an addressable alias result/join
+        llvm::Value* receiverStorage = nullptr; // lvalue storage retained for synthesized method calls
         // Pointer DEPTH of the operand, carried so an operator's right operand can be judged:
         // the operator path reduces it to a raw llvm::Value and 0 means "not recorded".
         int          pointerDepth = 0;
@@ -1874,6 +1846,9 @@ public:
     // Third cycle guard, for ParameterMayReachReturn. Same reason: a key left by either escape
     // walk must never terminate the return walk, which asks a different question again.
     std::set<std::pair<const llvm::Function*, unsigned>> mayReachReturnInProgress_;
+    // Cycle guard for the depth-1 borrowing-container sink walk. A recursive call is not
+    // followed, but this also protects a parameter value that loops through a local slot.
+    std::set<std::pair<const llvm::Function*, unsigned>> borrowingSinkInProgress_;
     // Cycle guard for the select/phi arm walk in MemoryOutlivesCall: a loop-carried phi reaches
     // itself, and re-entering it must not be read as an arm that names local memory.
     mutable std::set<const llvm::Instruction*> joinAddressInProgress_;
@@ -2601,6 +2576,25 @@ private:
         std::vector<std::pair<const llvm::Function*, unsigned>> LaunderConds;
     };
     std::vector<TempUniqueFieldArg> tempUniqueFieldArgs_;
+    // A blessed unique<X> argument reaches a raw-pointer parameter through get()/release(), so the
+    // value the callee receives is not the argument NamedVariable's Primary. Map it back so the
+    // temp-field diagnostics keep naming the source field.
+    std::unordered_map<const llvm::Value*, const llvm::Value*> coreUniqueGetterSource_;
+
+    // A direct call whose owning-local argument must wait for a callee body emitted below it.
+    // The answer is resolved after all direct bodies are complete.
+    struct OwningLocalBorrowingHelperArg
+    {
+        const llvm::Function* Callee = nullptr;
+        unsigned ParamIndex = 0;
+        std::string FunctionName;
+        std::string ParameterName;
+        std::string ArgumentName;
+        std::string File;
+        size_t Line = 0;
+        size_t Column = 0;
+    };
+    std::vector<OwningLocalBorrowingHelperArg> owningLocalBorrowingHelperArgs_;
 
     // Depth counter, not a bool: '?:' arms can nest (a ? (b ? c : d) : e), so a plain flag would
     // clear early on the inner ternary's exit. Non-zero while lowering either arm of a '?:' in the
@@ -3319,6 +3313,10 @@ private:
     llvm::Value* LoadRawArrayLength(const NamedVariable& namedVar);
     void StoreRawArrayLength(const NamedVariable& namedVar, llvm::Value* rawArrayLength);
 
+    // Positive proof that a pointer carries a raw `new T[n]` allocation. Unknown sources and
+    // move-parameter sources stay outside this gate so callers fail open.
+    bool HasRawNewArrayProvenance(const NamedVariable& namedVar) const;
+
     // True when the named variable currently owns its value (freed on scope exit). Used to decide
     // whether consuming it (into a move interface param) must disown the source.
     bool IsVariableOwning(const std::string& name) const;
@@ -3365,9 +3363,6 @@ private:
     // only a genuinely `unique` interface value does. Its Storage is a fat-ptr {i8*,i8*} slot, so
     // EmitOwningPtrCleanup (single pointer) must not run on it - EmitOwningInterfaceCleanup handles
     // the fat-ptr teardown instead.
-    // IsUniqueTypeArg is checked alongside IsUnique: generic substitution records a `unique` type
-    // ARGUMENT there and never sets IsUnique, so `move V value` with V = `unique IFace` would
-    // otherwise read as a borrow and leak (the `unique C*` spelling is owning unconditionally).
     bool IsOwningInterfaceValue(const NamedVariable& namedVar) const;
 
     // Free a `unique`/`move` interface VALUE (local or param): load the fat value from its slot
@@ -3638,6 +3633,15 @@ private:
     bool JoinAddressOutlivesCall(const llvm::Instruction* join, std::string& destKind,
                                  int depth) const;
 
+    // Exact local-owner predicate shared by the direct add-site and helper call-site rules.
+    bool IsProvenOwningNamedLocal(const NamedVariable& arg) const;
+    bool IsBarePointerParameter(const TypeAndValue& param) const;
+    std::optional<unsigned> CFlatParameterLLVMIndex(const FunctionSymbol& sym,
+                                                    unsigned paramIndex) const;
+
+    void RejectOwningLocalIntoBorrowingHelper(const std::string& functionName,
+        const FunctionSymbol& callee, size_t paramIndex, const NamedVariable& arg);
+
     /*
      * Record every argument of the just-emitted call that reads a temp's `unique` field and lands
      * on a PLAIN `T*` parameter, and reject immediately when the callee body already proves the
@@ -3694,6 +3698,12 @@ private:
      */
     bool ParameterMayReachReturn(const llvm::Function* fn, unsigned argIndex, int depth = 0);
 
+    // True only when a bare pointer parameter reaches a direct borrowing-container element sink
+    // whose receiver names memory that outlives the callee frame. Unknown answers are false.
+    bool ParameterMayReachBorrowingContainerSink(const llvm::Function* fn, unsigned argIndex,
+                                                 int depth = 0);
+    bool ValueMayReachBorrowingContainerSink(const llvm::Value* root, int depth);
+
     // Worklist half of ParameterMayReachReturn. Not memoized, for the same reason
     // OwningPtrProvablyEscapes is not: the query is rare and a body may still be growing.
     bool ValueMayReachReturn(const llvm::Value* root, int depth);
@@ -3741,6 +3751,7 @@ private:
     // Name a unique-field access for a diagnostic: "b.t", or the bare field / caller when a cast
     // or a join has already dropped half the provenance. MainListener delegates to this copy.
     static std::string DescribeUniqueFieldAccess(const NamedVariable& nv);
+    static std::string BorrowedSourceName(const NamedVariable& nv);
 
     /*
      * Parks `currentFunction` for the end-of-module resolves. FunctionBodyIsComplete refuses
@@ -3786,6 +3797,7 @@ private:
 
     // Re-ask the recorded questions now that every body is complete, and reject what is proven.
     void ResolveTempUniqueFieldArgEscapes();
+    void ResolveOwningLocalBorrowingHelperArgs();
 
     void RejectTempUniqueFieldArgEscape(const TempUniqueFieldArg& entry, const std::string& destKind);
 
@@ -4229,6 +4241,7 @@ private:
     // excluded. Used to gate move-sink transfer / borrow-laundering diagnostics.
     bool IsOwningValueOrClosureType(const std::string& typeName);
 
+    bool HasNonTrivialDestructor(const std::string& typeName);
     bool IsOwningValueType(const std::string& typeName);
 
     // True when the array-view element described by `elemField` owns nothing, so bit-copying it
@@ -4238,22 +4251,23 @@ private:
     bool ArrayViewElementOwnsNothing(const TypeAndValue& elemField);
 
     // True when `typeName` owns a raw pointer via `unique` - directly, or through a by-value
-    // member that does. Such a type has no memberwise copy: cloning a `unique` field would need a
-    // generic deep-clone of the pointee, which does not exist, and a shallow copy would hand the
-    // same pointer to two synthesized destructors. `outPath` receives the offending field path
-    // (e.g. "h.slot") for diagnostics. Value-member cycles are impossible (infinite size), but
-    // `seen` guards defensively so a malformed registry cannot recurse forever.
+    // member that does. `outPath` receives the offending field path for ownership classification
+    // and diagnostics.
+    // Value-member cycles are impossible (infinite size), but `seen` guards defensively so a
+    // malformed registry cannot recurse forever.
     bool TypeOwnsUniquePointer(const std::string& typeName, std::string* outPath = nullptr,
                                std::unordered_set<std::string>* seen = nullptr) const;
 
     bool HasCopyOverloadFor(const std::string& typeName) const;
 
     // True when a value of `typeName` can be COPIED (an independent duplicate) rather than
-    // requiring a move. Mirrors the is_copyable intrinsic exactly: strip ownership qualifiers,
-    // then a pointer or a non-struct type (string, primitives, closures) is copyable; a struct
-    // is copyable iff it has a copy() overload or does not transitively own a `unique` pointer.
+    // requiring a move. Destructor-backed raw pointer/view or unique ownership requires a real
+    // copy() overload; safe synthesized deep-copy fields and side-effect-only dtors remain copyable.
     // This is the predicate for the copy-on-assign flip (copyable owners copy, non-copyable move).
     bool IsCopyableType(const std::string& typeNameIn) const;
+
+    void LogUniqueCopyError(const std::string& typeName,
+                            const std::string& uniquePath = {}) const;
 
     // True when an owning-sink parameter actually CONSUMES its argument for the concrete
     // (monomorphized) type. An unconditional-`move` inferred sink consumes any owner (existing
@@ -4291,12 +4305,8 @@ private:
     // them -> double-free; such a type needs a hand-written copy() to be capturable).
     bool ClosureCaptureDeepCopyable(const std::string& typeName);
 
-    // True when a value struct owns a raw resource that its memberwise synth would shallow-share:
-    // the author wrote a destructor AND a field is a raw pointer/view. Copying such a type via the
-    // synth bit-copies the pointer while the dtor frees it on both instances (double-free), so it is
-    // NOT copyable without a hand-written copy(). `string`/closures have dedicated deep-copy/clone
-    // paths and are excluded. Narrower than ClosureCaptureDeepCopyable's raw-pointer test by the
-    // user-dtor gate: a raw pointer with NO destructor is a borrow the synth shallow-shares by design.
+    // True when a user destructor and a raw pointer/view make the memberwise synth unsafe. A raw
+    // pointer without a destructor is a borrow and remains safely shallow-copied by design.
     bool StructSynthCopyUnsafe(const std::string& typeName) const;
 
     // True when `typeName` defines `operator->` (its implicit `this` is the sole parameter).
@@ -4932,6 +4942,13 @@ public:
 
     bool IsInterfaceType(const std::string& name) const;
 
+    // True when the type-argument key names an interface in EITHER pass: interfaceTable once the
+    // main pass has registered it, or the forward scan's own interface-definition set before that.
+    bool IsInterfaceTypeArgKey(const std::string& name) const
+    {
+        return IsInterfaceType(name) || gts.scannedInterfaceNames.count(name) != 0;
+    }
+
     bool HasInterfaceMethod(const std::string& ifaceName, const std::string& methodName) const;
 
     /*
@@ -5244,13 +5261,25 @@ public:
      * write, so the rendered form is used when - and ONLY when - it is provably writable source
      * that binds the same instantiation ('Box<i32>*' and 'Box<int>*' mangle alike).
      *
-     * A NESTED instantiation cannot be rendered from the string: "Box__Box__i32" would come out
-     * "Box<Box, i32>", which is not what the user wrote and does not name any type. Those return
-     * the RAW mangled name with *writable = false, and every caller must then DROP its "declare the
-     * parameter as 'T*'" advice rather than hand back a spelling that will not compile. A name with
-     * no "__" comes back unchanged and is always writable.
+     * A NESTED instantiation generally cannot be rendered from the string: "Box__Box__i32" would
+     * come out "Box<Box, i32>", which is not what the user wrote. Core unique<T> is an exception
+     * because its reserved prefix identifies the nested boundary. Other ambiguous names return the
+     * RAW mangled name with *writable = false. A name with no "__" comes back unchanged and is always
+     * writable.
      */
     std::string DisplayNameOfMangledType(const std::string& mangled, bool* writable = nullptr) const;
+    bool IsCoreUniqueType(const std::string& typeName) const;
+    // Answers whether this parameter/return consumes ownership: explicit move, or a by-value core unique<T>.
+    bool IsMoveOrCoreUniqueValue(const TypeAndValue& t) const;
+    bool IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeAndValue& param) const;
+    bool IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeAndValue& param) const;
+    // A STACK implementor value bound to a blessed unique<IFace> parameter: it resolves so the
+    // owning-source rule can reject it by name instead of a no-overload report.
+    bool IsStackValueToCoreUniqueInterface(const NamedVariable& arg, const TypeAndValue& param) const;
+    llvm::Value* CreateCoreUniqueFromRawPointerCall(const NamedVariable& arg,
+                                                     const TypeAndValue& param);
+    llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param);
+    std::string DisplayNameOfCoreUniqueType(const std::string& typeName) const;
     void RegisterMangledTypeDisplayName(const std::string& mangled, const std::string& spelled)
     {
         if (!mangled.empty() && !spelled.empty())
@@ -6093,7 +6122,13 @@ public:
     // True when a chain of `unique` pointer fields starting at `from` reaches `target`.
     // Pointee types not yet registered are skipped: a cycle needs every member present, so
     // the last one registered is the one that closes the chain and reports.
-    bool UniqueChainReaches(const std::string& from, const std::string& target) const;
+    bool UniqueChainReaches(const std::string& from, const std::string& target,
+                            const std::string& currentName = {},
+                            const std::vector<DeclTypeAndValue>* currentFields = nullptr) const;
+
+    bool HasUniqueDestructionCycle(const std::string& name,
+                                   const std::vector<DeclTypeAndValue>& fields,
+                                   std::string* fieldName = nullptr) const;
 
     // D2: a `unique` field whose pointee transitively reaches a `unique` field of the same
     // type would synthesize a self-recursive destructor that overflows the stack on a long chain.
@@ -7580,6 +7615,14 @@ public:
     void SetIsolatedPolicy(const IsolatedPolicy& policy);
     std::optional<IsolatedPolicy> GetIsolatedPolicy() const;
     bool IsIsolated() const;
+    bool CurrentSourceIsCoreLibrary() const;
+    /*
+     * The directory of an analyzed ROOT that is itself a core library source (the LSP opening
+     * cflat/core/list.cb, or --check on it). That checkout is a second copy of the library, so
+     * its siblings are NOT under runtimeDir/core and would classify as user code - which drops
+     * the core-template origin marker `unique`/`list` need. Empty for a user root.
+     */
+    std::string rootCoreDir_;
     bool IsIsolatedCoreSource() const;
     void ReportIsolatedPolicyError(const std::string& message) const;
     void ValidateIsolatedExtern(CFlatParser::DeclarationContext* ctx);

@@ -1,0 +1,27 @@
+import "unique.cb";
+
+struct Resource { int id = 0; ~Resource() { } };
+
+void constructFromBorrow(Resource* borrowed)
+{
+    expect_error("cannot initialize unique<Resource> from borrowed value 'borrowed'") {
+        unique<Resource> value = unique<Resource>(borrowed);
+    }
+}
+
+void resetFromBorrow(Resource* borrowed)
+{
+    unique<Resource> value = unique<Resource>(new Resource());
+    expect_error("cannot reset unique<Resource> 'value' from borrowed value 'borrowed'") {
+        value.reset(borrowed);
+    }
+}
+
+extern int main()
+{
+    Resource* resource = new Resource();
+    constructFromBorrow(resource);
+    resetFromBorrow(resource);
+    delete resource;
+    return 0;
+}

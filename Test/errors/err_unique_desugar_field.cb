@@ -1,0 +1,31 @@
+import "unique.cb";
+
+struct DesugarFieldResource
+{
+    ~DesugarFieldResource() { }
+};
+
+struct DesugarFieldHolder
+{
+    unique DesugarFieldResource* slot = nullptr;
+};
+
+expect_error("cannot store borrowed parameter 'p' into unique field 'DesugarFieldHolder.slot'") {
+    void badStore(DesugarFieldResource* p)
+    {
+        DesugarFieldHolder h = default;
+        h.slot = p;
+    }
+}
+
+expect_error("cannot delete unique field 'DesugarFieldHolder.slot'") {
+    void badDelete(DesugarFieldHolder* h)
+    {
+        delete h->slot;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

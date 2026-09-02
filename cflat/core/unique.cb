@@ -1,0 +1,111 @@
+// unique<T>: single-owner smart pointer over a heap-allocated T, C++ unique_ptr style.
+// T is the POINTEE type: unique<Resource> owns a Resource*.
+struct unique<T>
+{
+    if const (is_interface(T))
+    {
+        T _v = default;
+    }
+    else
+    {
+        T* _p = nullptr;
+    }
+
+    unique() { }
+
+    // Keep these constructors arm-local: interface values are pointer-shaped during overload
+    // resolution, so an unconditionally declared pointer overload wins over the interface one.
+    if const (is_interface(T))
+    {
+        // Takes ownership of an interface value: unique<I> u = unique<I>(new Impl());
+        unique(move T v)
+        {
+            _v = move v;
+        }
+    }
+    else
+    {
+        // Takes ownership of a heap pointer: unique<Foo> u = unique<Foo>(new Foo());
+        unique(move T* p)
+        {
+            _p = p;
+        }
+    }
+
+    // The poison remains on the destructor so unique<Foo*> is rejected at instantiation.
+    ~unique()
+    {
+        if const (is_pointer(T) && !is_interface(T))
+            compile_error("unique<T> takes the pointee type: write unique<Foo>, not unique<Foo*>");
+        else if const (is_interface(T))
+        {
+            if (_v != nullptr) delete _v;
+        }
+        else
+        {
+            if (_p != nullptr) delete _p;
+        }
+    }
+
+    // Borrowing observers: the caller does not take ownership.
+    if const (is_interface(T))
+    {
+        T get() { return _v; }
+    }
+    else
+    {
+        T* get() { return _p; }
+        T* operator->() { return _p; }
+    }
+
+    bool valid()
+    {
+        if const (is_interface(T)) return _v != nullptr;
+        else return _p != nullptr;
+    }
+
+    bool operator!()
+    {
+        if const (is_interface(T)) return _v == nullptr;
+        else return _p == nullptr;
+    }
+
+    // Hands ownership back out; this unique<T> becomes empty.
+    if const (is_interface(T))
+    {
+        move T release()
+        {
+            T v = move _v;
+            _v = nullptr;
+            return move v;
+        }
+    }
+    else
+    {
+        move T* release()
+        {
+            T* p = _p;
+            _p = nullptr;
+            return move p;
+        }
+
+        // Frees the current pointee (if any) and takes ownership of the replacement.
+        void reset(move T* p)
+        {
+            T* old = _p;
+            _p = p;
+            if (old != nullptr && old != _p) delete old;
+        }
+    }
+
+    if const (is_interface(T))
+    {
+        // Frees the current value (if any) and takes ownership of the replacement.
+        void reset(move T v)
+        {
+            T old = _v;
+            _v = move v;
+            if (old != nullptr && old != _v) delete old;
+        }
+    }
+};

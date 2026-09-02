@@ -1,0 +1,12 @@
+import "unique.cb";
+
+struct Resource { int id = 0; ~Resource() { } };
+
+extern int main()
+{
+    Resource resource = default;
+    expect_error("call to 'unique<Resource>': cannot pass the address of a stack or global value") {
+        unique<Resource> value = unique<Resource>(&resource);
+    }
+    return 0;
+}

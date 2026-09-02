@@ -205,7 +205,7 @@ expect_error("use of moved variable 'root.left'") {
 // as the thin-pointer spelling is rejected (Test/errors/err_unique_borrow_into_unique.cb).
 move IUniqueThing makeUniqueIface() { return new UniqueIfaceThing(); }
 
-expect_error("cannot initialize unique 'mixedIface' from a borrowed value") {
+expect_error("cannot initialize unique<IUniqueThing> 'mixedIface' from a borrowed value") {
     int mixedIfaceJoinIntoUnique(bool c)
     {
         unique IUniqueThing ifaceOwner = new UniqueIfaceThing();
@@ -218,7 +218,7 @@ expect_error("cannot initialize unique 'mixedIface' from a borrowed value") {
 // Same mixed join, but the THIN arm goes through the new fat/thin harmonizer branch instead of
 // an already-fat owning call: a borrowed already-fat arm mixed with a thin `new` arm still owns
 // nothing a `unique` receiver may free.
-expect_error("cannot initialize unique 'fatBorrowVsNewUnique' from a borrowed value") {
+expect_error("cannot initialize unique<IUniqueThing> 'fatBorrowVsNewUnique' from a borrowed value") {
     int fatBorrowVsNewArmIntoUnique(bool c)
     {
         unique IUniqueThing thinOwner = new UniqueIfaceThing();
@@ -244,7 +244,7 @@ expect_error("cannot assign a borrowed value to unique interface 'mixedIfaceAssi
 // A BORROWED THIN-POINTER arm joined into an interface slot. A plain receiver only borrows the
 // mixed join (see test_move.cb's iface_ternary_thin_* legs), but a `unique` receiver must own
 // what it frees, so this spelling stays rejected exactly like the fat-pointer one above.
-expect_error("cannot initialize unique 'thinBorrowIntoUnique' from a borrowed value") {
+expect_error("cannot initialize unique<IUniqueThing> 'thinBorrowIntoUnique' from a borrowed value") {
     int thinBorrowArmIntoUnique(bool c)
     {
         unique UniqueIfaceThing* thinOwner = new UniqueIfaceThing();
@@ -632,7 +632,7 @@ expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
 }
 
 // No `alias` keyword anywhere: the provenance is computed from the callee's returns, not spelled.
-expect_error("it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+expect_error("cannot store 'k' into unique field 'JoinBox.item' - it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
     void fieldBorrowIntoUniqueField(FieldBorrowWrap* w)
     {
         UniqueThing* k = w->borrowPlain();
@@ -685,7 +685,7 @@ expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
     }
 }
 
-expect_error("it was returned as a borrow of unique field 'FieldBorrowWrap.item'") {
+expect_error("cannot store 'FieldBorrowWrap.item' into unique field 'JoinBox.item' - it was returned as a borrow") {
     void directBorrowIntoUniqueField(FieldBorrowWrap* w)
     {
         JoinBox s;
@@ -726,7 +726,7 @@ expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
  */
 auto autoBorrowAccessor<T>(T* w) { return w->item; }
 
-expect_error("from a borrow of unique field 'FieldBorrowWrap.item'") {
+expect_error("cannot reset unique<UniqueThing> 'o' from a borrow of unique field 'FieldBorrowWrap.item'") {
     void autoReturnBorrowIntoUniqueLocal(FieldBorrowWrap* w)
     {
         UniqueThing* k = autoBorrowAccessor<FieldBorrowWrap>(w);
@@ -1262,7 +1262,7 @@ extern int main()
     // the global still owns the value, so the new local would be a second owner. The sanctioned
     // spelling is `move`, which nulls the global; its accept legs are in Test/test_move.cb
     // (testUniqueGlobalStorage). This is the storage-duration case of the same rule.
-    expect_error("cannot initialize unique 'uqgBorrowed' from a borrowed value") {
+    expect_error("cannot initialize unique<UniqueThing> 'uqgBorrowed' from borrowed value 'uqgErrGlobal'") {
         unique UniqueThing* uqgBorrowed = uqgErrGlobal;
         printf("%d\n", uqgBorrowed->get());
     }

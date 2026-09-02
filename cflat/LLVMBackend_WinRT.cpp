@@ -1534,7 +1534,11 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
         // itself says the callee takes ownership, so an explicit `move` at the call site is fine.
         // An inferred owning-value sink (body unconditionally moves the param, owning concrete
         // type) is likewise a real sink, so `move` into it transfers rather than "nothing".
-        bool paramIsSink = param.IsMove || param.IsUniqueTypeArg
+        bool inferredSinkConsumes = param.IsConsumeInferredSink
+            && !IsCopyableType(param.TypeName);
+        bool paramIsSink = param.IsMove
+            || (!param.Pointer && !param.IsAlias && IsCoreUniqueType(param.TypeName))
+            || inferredSinkConsumes
             || (OwningSinkConsumesConcrete(param) && IsOwningValueOrClosureType(param.TypeName));
         DiagnoseExplicitMoveToBorrowParam(
             functionName, param.VariableName, param.TypeName, paramIsSink, arg);
@@ -1543,8 +1547,12 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
 void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& functionName,
         const TypeAndValue& param, const NamedVariable& arg)
 {
-        bool paramClaimsOwnership = param.Pointer && !param.IsAlias
-            && (param.IsMove || param.IsUnique || param.IsUniqueTypeArg);
+        bool coreUniqueValueParam = !param.Pointer
+            && (IsCoreUniqueType(param.TypeName) || param.TypeName.starts_with("unique__"));
+        bool paramClaimsOwnership = coreUniqueValueParam
+            || (param.Pointer && !param.IsAlias
+                && (param.IsMove
+                    || param.IsUnique));
         if (!paramClaimsOwnership) return;
         if (!JoinCarriesOwningTempUniqueField(arg.Primary))
         {
@@ -1577,7 +1585,8 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         const std::vector<TypeAndValue::FuncPtrParam>& params, const std::vector<NamedVariable>& args)
 {
         bool anySink = false;
-        for (const auto& p : params) anySink = anySink || p.IsOwningSink || p.IsMove;
+        for (const auto& p : params)
+            anySink = anySink || p.IsOwningSink || p.IsConsumeInferredSink || p.IsMove;
         if (!anySink) return;
         // A DECLARED `move` param takes the same ApplyMoveParamTransfer path a direct call takes
         // (FuncPtrParamAsTypeAndValue carries IsMove); an INFERRED sink keeps IsMove false.
@@ -1593,6 +1602,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
+            std::string sourceName = args[i].CallerName;
+            if (sourceName.empty() && args[i].FieldName.empty())
+                sourceName = args[i].TypeAndValue.VariableName;
             RejectOwningTempUniqueFieldIntoSinkParam(functionName, params[i], args[i]);
             // A plain by-value parameter the callee body unconditionally moves is a synthesized
             // move sink too - but only when the concrete type owns a resource AND the matched arg
@@ -1602,6 +1614,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // Admit __closure_fat_ptr and any encoded closure element type; a thin C fn ptr owns
             // nothing and never reaches here as a sink (ParamIsOwningSinkEligible rejects it).
             bool paramOwnsResource = IsOwningValueOrClosureType(params[i].TypeName);
+            bool inferredSinkConsumes = params[i].IsConsumeInferredSink
+                && !IsCopyableType(params[i].TypeName);
             // A borrow/alias arg has no ownership to transfer - nulling it would orphan a value
             // the caller still relies on.
             bool argIsBorrow = args[i].IsBorrowed || args[i].IsAliasBorrow
@@ -1614,24 +1628,28 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             // closure-temp set); consuming the temp transfers its env into the slot.
             bool argIsOwner = !argIsBorrow
                 && (args[i].IsOwning || args[i].IsOwningString || args[i].IsOwningStruct
-                    || IsVariableOwning(args[i].CallerName) || IsVariableOwningString(args[i].CallerName)
+                    || IsVariableOwning(sourceName) || IsVariableOwningString(sourceName)
                     || IsOwnedClosureTemp(args[i].Primary)
-                    || (!args[i].CallerName.empty() && paramOwnsResource));
-            bool isOwningSink = OwningSinkConsumesConcrete(params[i]) && argIsOwner && paramOwnsResource;
+                    || (!sourceName.empty() && paramOwnsResource));
+            bool isOwningSink = (OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes)
+                && argIsOwner && paramOwnsResource;
             // Ownership-laundering guard: the arg is a value this function only BORROWS (a plain
             // by-value owning-value param of the current function) but the callee's param CONSUMES
             // it (a sink / `move` / unique). Transferring would null this function's alias while the
             // TRUE owner (a caller further up) still frees the resource - a silent double-free.
             bool paramConsumesOwningValue = paramOwnsResource
-                && (params[i].IsMove || params[i].IsUniqueTypeArg || OwningSinkConsumesConcrete(params[i]));
+                && (params[i].IsMove
+                    || (!params[i].Pointer && !params[i].IsAlias
+                        && IsCoreUniqueType(params[i].TypeName))
+                    || OwningSinkConsumesConcrete(params[i]) || inferredSinkConsumes);
             if (paramConsumesOwningValue
-                && IsVariableBorrowedOwningValue(args[i].CallerName))
+                && IsVariableBorrowedOwningValue(sourceName))
             {
                 LogErrorMessage(
                     "call to '{}': parameter '{}' takes ownership of a value this function only "
                     "borrows ('{}' is a by-value parameter, so the caller keeps ownership). Accept "
                     "the parameter as a sink ({} it in the body), or pass a copy with '{}'.",
-                    { functionName, params[i].VariableName, args[i].CallerName, "move", "copy()" });
+                    { functionName, params[i].VariableName, sourceName, "move", "copy()" });
                 continue;
             }
             // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
@@ -1645,8 +1663,12 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
             bool movesIntoBorrowingElement = args[i].IsExplicitMove && !argIsBorrow
                 && args[i].TypeAndValue.Pointer
                 && IsBorrowingContainerElementSink(functionName, params, i, calleeIsMethod)
-                && (args[i].IsOwning || IsVariableOwning(args[i].CallerName));
-            if (params[i].IsMove || params[i].IsUniqueTypeArg || isOwningSink
+                && (args[i].IsOwning || IsVariableOwning(sourceName));
+            if (params[i].IsMove
+                || (!params[i].Pointer && !params[i].IsAlias
+                    && IsCoreUniqueType(params[i].TypeName))
+                || isOwningSink
+                || inferredSinkConsumes
                 || movesIntoBorrowingElement)
             {
                 // A `move` param takes ownership and frees the block itself. The allocation alignment
@@ -1665,7 +1687,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             "parameter of '{}': that alignment is a property of the allocation, not of the type, so "
                             "the callee cannot recover it. Declare the parameter '{}' so the block "
                             "alignment is recorded, or over-align the ELEMENT TYPE instead.",
-                            { args[i].CallerName.empty() ? args[i].TypeAndValue.TypeName : args[i].CallerName,
+                            { sourceName.empty() ? args[i].TypeAndValue.TypeName : sourceName,
                               std::format("new T[n] alignas(0, {})", args[i].AllocAlignment), "move", functionName,
                               std::format("alignas(0, {})", args[i].AllocAlignment) });
                     else
@@ -1711,9 +1733,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // The CallerName fallback resolves the BASE variable's storage; do NOT use it
                 // for a field access or it would null the base pointer instead of the field.
                 // A field access already carries its own (GEP) Storage.
-                if (srcStorage == nullptr && !isFieldAccess && !args[i].CallerName.empty())
+                if (srcStorage == nullptr && !isFieldAccess && !sourceName.empty())
                 {
-                    auto ref = FindVariableStorage(args[i].CallerName);
+                    auto ref = FindVariableStorage(sourceName);
                     srcStorage = ref.Storage;
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
@@ -1724,14 +1746,14 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // value reaches here; the owning check keeps a borrow source untouched.
                 if (params[i].IsFatInterfaceValue()
                     && args[i].TypeAndValue.IsFatInterfaceValue()
-                    && (args[i].IsOwning || IsVariableOwning(args[i].CallerName))
+                    && (args[i].IsOwning || IsVariableOwning(sourceName))
                     && srcStorage != nullptr)
                 {
                     auto* dataField = builder->CreateStructGEP(GetFatPtrType(), srcStorage, 1);
                     builder->CreateStore(
                         llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty())), dataField);
-                    if (!args[i].CallerName.empty() && !isFieldAccess)
-                        MarkVariableMoved(args[i].CallerName);
+                    if (!sourceName.empty() && !isFieldAccess)
+                        MarkVariableMoved(sourceName);
                 }
                 if (srcStorage != nullptr && !isInterfaceBorrow)
                 {
@@ -1789,7 +1811,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
                 // Moving a FIELD (`node->left`) marks only that field, not the whole base variable.
-                if (!args[i].CallerName.empty() && srcStorage != nullptr &&
+                if (!sourceName.empty() && srcStorage != nullptr &&
                     !isInterfaceBorrow && srcBaseTy != nullptr)
                 {
                     bool isPtr = llvm::isa<llvm::PointerType>(srcBaseTy);
@@ -1798,9 +1820,9 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     if (isPtr || isOwningStr || isStruct)
                     {
                         if (isFieldAccess)
-                            MarkVariableFieldMoved(args[i].CallerName, args[i].FieldName);
+                            MarkVariableFieldMoved(sourceName, args[i].FieldName);
                         else
-                            MarkVariableMoved(args[i].CallerName);
+                            MarkVariableMoved(sourceName);
                     }
                 }
             }
@@ -2159,7 +2181,8 @@ bool LLVMBackend::PointerArgIntoByValueParam(const NamedVariable& arg, const Typ
         return arg.TypeAndValue.Pointer && !param.Pointer && !param.IsInterface
             && !param.IsFunctionPointer && !param.TypeName.empty()
             && arg.TypeAndValue.TypeName == param.TypeName
-            && IsDataStructure(param.TypeName);
+            && IsDataStructure(param.TypeName)
+            && !IsRawPointerToCoreUnique(arg, param);
     }
 
 bool LLVMBackend::PointerArgIntoByValuePrimitiveParam(const NamedVariable& arg, const TypeAndValue& param) const
@@ -2495,7 +2518,14 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (RejectCodeValueIntoDataParam(nv, param, ifaceName, methodName))
                 return nullptr;
 
-            if (param.IsInterface && !nv.TypeAndValue.IsInterface)
+            // A blessed unique<IFace> wrapper is not an implementor: borrow the fat value it holds
+            // through get(), the same lowering the direct call path applies.
+            if (param.IsInterface && !nv.TypeAndValue.IsInterface
+                && IsCoreUniqueToRawPointer(nv, param))
+            {
+                callArgs.push_back(CreateCoreUniqueRawPointerCall(nv, param));
+            }
+            else if (param.IsInterface && !nv.TypeAndValue.IsInterface)
             {
                 // Concrete struct/pointer -> interface fat ptr upconversion.
                 // Reject a pointer-shaped source: it is not an instance of its element class.
@@ -2542,6 +2572,18 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 // Same alias-borrow ABI as the direct call path (CreateOverloadedFunctionCall).
                 callArgs.push_back(LowerAliasByPointerArg(nv, param));
             }
+            else if (!param.Pointer && IsRawPointerToCoreUnique(nv, param))
+            {
+                // Interface vtable slots use the same by-value unique<T> ABI as direct calls;
+                // construct the wrapper before passing the raw owning pointer to the slot.
+                callArgs.push_back(CreateCoreUniqueFromRawPointerCall(nv, param));
+            }
+            else if (param.Pointer && IsCoreUniqueToRawPointer(nv, param))
+            {
+                // The mirror direction: a blessed unique<X> argument borrows to a raw X* slot
+                // through get(), exactly as the direct call path lowers it.
+                callArgs.push_back(CreateCoreUniqueRawPointerCall(nv, param));
+            }
             else if (param.Pointer)
             {
                 // Storage may be a promoted-param alloca holding the pointer; load to get the value.
@@ -2562,6 +2604,11 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             if (ParameterCarriesRawArrayCount(param))
                 callArgs.push_back(RawArrayCountArgument(nv));
         }
+
+        // Restore the virtual method result side-channel after any nested core constructor call.
+        lastCallReturnType = methodInfo->ReturnType;
+        lastCallReturnsOwned = false;
+        lastCallReturnsAllocAlign = 0;
 
         llvm::Value* rawReturnCountSlot = nullptr;
         if (ReturnCarriesRawArrayCount(methodInfo->ReturnType))
@@ -2585,7 +2632,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             bool ownedInterfaceLocal = arg.OwnsInterfaceBox
                 || arg.IsAdoptable
                 || (arg.TypeAndValue.IsFatInterfaceValue() && arg.IsOwning && arg.TypeAndValue.IsMove);
-            if (arg.TypeAndValue.IsUnique || arg.TypeAndValue.IsUniqueTypeArg
+            if (arg.TypeAndValue.IsUnique
                 || (!ownedInterfaceLocal && !ownedMoveInterface)
                 || (!arg.CallerName.empty() && !arg.FieldName.empty()))
                 LogErrorMessage(
@@ -2624,9 +2671,11 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // than anything a `new`/`move` in the argument list produced.
         lastOwningResult = false;
         lastAllocAlignment = 0;
-        // A substituted `unique X*` type-arg return owns like `move` (see the direct-call path).
-        lastCallReturnsOwned = (rt.IsMove || rt.IsUniqueTypeArg)
-            && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface);
+        // A core unique return owns like `move` (see the direct-call path).
+        lastCallReturnsOwned = (rt.IsMove
+            || (!rt.IsAlias && IsCoreUniqueType(rt.TypeName)))
+            && (rt.TypeName == "string" || rt.Pointer || rt.IsInterface
+                || IsCoreUniqueType(rt.TypeName));
         if (lastCallReturnsOwned)
             RegisterOwnedReturnTemp(callResult, ifaceName + "." + methodName, rt);
         lastCallReturnsAllocAlign = rt.AllocAlignValue;

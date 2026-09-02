@@ -535,6 +535,32 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         compiler->pendingInitAllocAlign = 0;  // one-shot
         lambdaExpectedType = {};
 
+        if (compiler->HasRawNewArrayProvenance(returnNV)
+            && returnNV.TypeAndValue.Pointer
+            && !compiler->currentFunctionReturnTV.Pointer
+            && compiler->IsCoreUniqueType(compiler->currentFunctionReturnTV.TypeName))
+        {
+            std::string sourceName;
+            if (assignExpr != nullptr)
+                if (auto* move = TopLevelMoveExpression(assignExpr);
+                    move != nullptr && move->unaryExpression() != nullptr)
+                    sourceName = move->unaryExpression()->getText();
+            if (sourceName.empty())
+                sourceName = returnNV.CallerName.empty()
+                    ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
+            if (sourceName.empty()) sourceName = retText;
+            std::string pointee = compiler->currentFunctionReturnTV.TypeName.substr(8);
+            bool writable = true;
+            std::string shownPointee = compiler->DisplayNameOfMangledType(pointee, &writable);
+            if (!writable) shownPointee = pointee;
+            LogErrorContext(errCtx, std::format(
+                "cannot return owning heap array '{}' as '{}': unique<T> does not own arrays - "
+                "return 'move {}*' instead",
+                sourceName,
+                compiler->DisplayNameOfCoreUniqueType(compiler->currentFunctionReturnTV.TypeName),
+                shownPointee));
+        }
+
         if (returnNV.ContainsBondedClosure)
             LogErrorContext(errCtx,
                 "cannot return a holder containing a bonded closure - the closure would outlive its captured local");
@@ -631,7 +657,128 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, compiler->DescribeCodeValueIntoData(
                 CodeValueDestSpelling(retTV), "return", CodeValueCastAdvice(retTV)));
         }
-        auto right = aliasRefReturn ? returnNV.Storage : LoadNamedVariable(returnNV);
+        // A desugared unique<T> local returned through an owning interface return releases its
+        // raw pointee for the existing interface boxing path. The wrapper slot is nulled first,
+        // so its normal scope-exit destructor remains harmless.
+        if (compiler->currentFunctionReturnTV.IsInterface
+            && !returnNV.TypeAndValue.Pointer
+            && compiler->IsCoreUniqueType(returnNV.TypeAndValue.TypeName)
+            && returnNV.Storage != nullptr)
+        {
+            const auto& uniqueData = compiler->GetDataStructure(returnNV.TypeAndValue.TypeName);
+            for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                if (uniqueData.StructFields[i].VariableName == "_p")
+                {
+                    auto* pointerField = compiler->CreateStructGEP(
+                        returnNV.BaseType, returnNV.Storage, (uint32_t)i);
+                    auto* raw = compiler->CreateLoad(pointerField);
+                    compiler->builder->CreateStore(
+                        llvm::ConstantPointerNull::get(llvm::cast<llvm::PointerType>(raw->getType())),
+                        pointerField);
+                    compiler->RecordNullSet(returnNV.CallerName);
+                    compiler->lastOwningResult = true;
+                    returnNV.Primary = raw;
+                    returnNV.TypeAndValue.TypeName = returnNV.TypeAndValue.TypeName.substr(8);
+                    returnNV.TypeAndValue.Pointer = true;
+                    returnNV.TypeAndValue.IsMove = true;
+                    returnNV.IsOwning = true;
+                    break;
+                }
+        }
+        bool coreUniqueRawReturn = !aliasRefReturn
+            && compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
+        auto right = coreUniqueRawReturn
+            ? compiler->CreateCoreUniqueRawPointerCall(returnNV, compiler->currentFunctionReturnTV)
+            : (aliasRefReturn ? returnNV.Storage : LoadNamedVariable(returnNV));
+        if (coreUniqueRawReturn)
+            returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+
+        // A pointer-form `unique T*` return was desugared to a core unique<T> value by the
+        // declaration parser. Adopt a raw pointer only after proving that this expression owns
+        // it; CreateCoreUniqueFromRawPointerCall deliberately treats an unmarked rvalue call as
+        // an ownership handoff, which is wrong for a borrowed plain-pointer call result.
+        const bool coreUniqueValueReturn = !aliasRefReturn
+            && !compiler->currentFunctionReturnTV.Pointer
+            && compiler->IsCoreUniqueType(compiler->currentFunctionReturnTV.TypeName);
+        const bool rawPointerReturn = coreUniqueValueReturn
+            && right != nullptr && right->getType()->isPointerTy()
+            && (returnNV.TypeAndValue.Pointer
+                || llvm::isa<llvm::ConstantPointerNull>(right));
+        if (rawPointerReturn)
+        {
+            const bool returnedNull = llvm::isa<llvm::ConstantPointerNull>(right);
+            const bool sourceBorrowed = returnNV.IsBorrowed
+                || returnNV.IsAliasBorrow
+                || returnNV.TypeAndValue.IsAlias
+                || returnNV.BorrowsOwnedElement
+                || returnNV.BorrowsOwningLocal;
+            const bool sourceOwned = compiler->lastCallReturnsOwned
+                || compiler->lastOwningResult
+                || returnNV.IsOwning
+                || returnNV.IsExplicitMove
+                || returnNV.TypeAndValue.IsMove
+                || compiler->IsOwnedNewTemp(right)
+                || compiler->IsOwningPtrTempValue(right)
+                || compiler->IsMovedOutPtrValue(right)
+                || (!returnNV.CallerName.empty()
+                    && compiler->IsVariableOwning(returnNV.CallerName));
+            if (!returnedNull && (sourceBorrowed || !sourceOwned))
+            {
+                const std::string sourceName = LLVMBackend::BorrowedSourceName(returnNV).empty()
+                    ? retText : LLVMBackend::BorrowedSourceName(returnNV);
+                LogErrorContext(errCtx, std::format(
+                    "cannot return borrowed value '{}' as '{}'; the return type owns the "
+                    "pointee - use 'new', a move source, or a move-returning call",
+                    sourceName.empty() ? "this expression" : sourceName,
+                    compiler->DisplayNameOfCoreUniqueType(
+                        compiler->currentFunctionReturnTV.TypeName)));
+            }
+            if (returnedNull)
+            {
+                LLVMBackend::DeclTypeAndValue defaultType;
+                static_cast<LLVMBackend::TypeAndValue&>(defaultType) =
+                    compiler->currentFunctionReturnTV;
+                right = GenerateDefaultValue(defaultType);
+            }
+            else
+            {
+                auto ctorArg = returnNV;
+                ctorArg.Primary = right;
+                ctorArg.BaseType = right->getType();
+                ShapeCoreUniqueCtorArg(
+                    compiler, ctorArg, compiler->currentFunctionReturnTV.TypeName, right);
+                right = compiler->CreateCoreUniqueFromRawPointerCall(
+                    ctorArg, compiler->currentFunctionReturnTV);
+                compiler->ConsumeOwnedNewTemp(returnNV.Primary);
+            }
+            returnNV.TypeAndValue = compiler->currentFunctionReturnTV;
+            returnNV.Primary = right;
+            returnNV.Storage = nullptr;
+            returnNV.CallerName.clear();
+            returnNV.FieldName.clear();
+            returnNV.IsOwning = true;
+            returnNV.IsExplicitMove = false;
+        }
+        // A conditional of desugared unique<T> values yields the wrapper by value. Unwrap its
+        // selected pointee for the existing owning-interface return boxing path.
+        if (compiler->currentFunctionReturnTV.IsInterface
+            && right != nullptr && right->getType()->isStructTy()
+            && compiler->IsCoreUniqueType(returnNV.TypeAndValue.TypeName))
+        {
+            const auto& uniqueData = compiler->GetDataStructure(returnNV.TypeAndValue.TypeName);
+            for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
+                if (uniqueData.StructFields[i].VariableName == "_p")
+                {
+                    right = compiler->builder->CreateExtractValue(
+                        right, {(unsigned)i}, "unique_return_ptr");
+                    returnNV.TypeAndValue.TypeName = returnNV.TypeAndValue.TypeName.substr(8);
+                    returnNV.TypeAndValue.Pointer = true;
+                    returnNV.TypeAndValue.IsMove = true;
+                    returnNV.IsOwning = true;
+                    compiler->lastOwningResult = true;
+                    break;
+                }
+        }
         // A string LITERAL is a 'const char*', never a 'T*' - the RETURN leg of the same gate the
         // declarator, `=`, brace-init, field-default and argument sites apply.
         RejectStringLiteralIntoStructPointer(errCtx, compiler->currentFunctionReturnTV, right,
@@ -746,7 +893,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && compiler->currentFunction->getReturnType() == fatTy
             && right->getType()->isPointerTy()
             && !returnNV.TypeAndValue.IsInterface
-            && ReturnUpcastStructName(returnNV).empty())
+            && (ReturnUpcastStructName(returnNV).empty()
+                || compiler->FindNullCoalesceJoin(right) != nullptr
+                || llvm::isa<llvm::PHINode>(right)))
         {
             std::string ternaryArmFailure;
             std::string joinSpelling = "?:";
@@ -977,7 +1126,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         if (compiler->builder != nullptr && compiler->builder->GetInsertBlock() != nullptr
             && !(right != nullptr && llvm::isa<llvm::ConstantPointerNull>(right)))
         {
-            bool provesFieldBorrow = returnNV.TypeAndValue.Pointer && IsUniqueFieldRead(returnNV);
+            bool returnsCoreUniqueAsRawPointer =
+                compiler->IsCoreUniqueToRawPointer(returnNV, compiler->currentFunctionReturnTV);
+            bool returnsCoreUniqueValue = !returnNV.TypeAndValue.Pointer
+                && compiler->IsCoreUniqueType(returnNV.TypeAndValue.TypeName);
+            bool provesFieldBorrow = IsUniqueFieldRead(returnNV)
+                && (returnNV.TypeAndValue.Pointer || returnsCoreUniqueAsRawPointer
+                    || returnsCoreUniqueValue);
             compiler->RecordUniqueFieldBorrowReturn(
                 compiler->builder->GetInsertBlock()->getParent(), provesFieldBorrow,
                 provesFieldBorrow ? DescribeUniqueFieldOwner(returnNV) : std::string());
@@ -1977,19 +2132,28 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
 
                     // A by-value loop var bit-copies the element; an owning raw pointer has no
                     // owned bit to clear, so the once-only dtor at forRangeResume double-frees.
+                    const bool elemIsCoreUnique = compiler->IsCoreUniqueType(elemType.TypeName);
+                    const std::string shownElemType = elemIsCoreUnique
+                        ? compiler->DisplayNameOfCoreUniqueType(elemType.TypeName)
+                        : elemType.TypeName;
                     std::string ownedFieldPath;
                     if (!elemType.Pointer && !elemType.IsArrayView && !elemType.IsInterface
                         && !compiler->IsInterfaceType(elemType.TypeName)
                         && compiler->TypeOwnsUniquePointer(elemType.TypeName, &ownedFieldPath))
                     {
+                        if (elemIsCoreUnique)
+                        {
+                            compiler->LogUniqueCopyError(elemType.TypeName);
+                            return;
+                        }
                         LogErrorContext(iterationStatement, std::format(
                             "cannot bind loop variable '{}' of '{}' by value in a range 'for': field "
                             "'{}.{}' is 'unique', so '{}' owns a raw pointer that a by-value copy would "
                             "share. The loop variable is destructed once when the loop exits and would "
                             "free the pointee the collection still owns. Iterate by index and read the "
                             "element in place instead (for (int i = 0; i < N; i++) ... coll[i]).",
-                            varName, elemType.TypeName, elemType.TypeName, ownedFieldPath,
-                            elemType.TypeName));
+                            varName, shownElemType, shownElemType, ownedFieldPath,
+                            shownElemType));
                         return;
                     }
 

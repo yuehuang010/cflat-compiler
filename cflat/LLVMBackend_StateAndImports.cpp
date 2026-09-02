@@ -1072,11 +1072,8 @@ nlohmann::json LLVMBackend::TvToJson(const TypeAndValue& tv)
         if (s.IsMove)         j["mv"]  = true;
         if (s.IsAdopt)        j["ad"]  = true;
         if (s.IsAlias)        j["al"]  = true;
-        if (s.IsUniqueTypeArg) j["unt"] = true;
-        if (s.ElementOwningUnique) j["eou"] = true;
         if (s.IsOwningSink)   j["osk"] = true;
         if (s.IsConsumeInferredSink) j["cis"] = true;
-        if (s.IsBorrowOfUniqueElement) j["bue"] = true;
         if (s.IsBorrowOfAliasElement) j["bae"] = true;
         if (s.IsBond)          j["bd"] = true;
         if (s.IsUnique)        j["uq"] = true;
@@ -1131,11 +1128,8 @@ LLVMBackend::TypeAndValue LLVMBackend::TvFromJson(const SjVal& j)
         s.IsMove = j.value("mv", false);
         s.IsAdopt = j.value("ad", false);
         s.IsAlias = j.value("al", false);
-        s.IsUniqueTypeArg = j.value("unt", false);
-        s.ElementOwningUnique = j.value("eou", false);
         s.IsOwningSink = j.value("osk", false);
         s.IsConsumeInferredSink = j.value("cis", false);
-        s.IsBorrowOfUniqueElement = j.value("bue", false);
         s.IsBorrowOfAliasElement = j.value("bae", false);
         s.IsBond = j.value("bd", false);
         s.IsUnique = j.value("uq", false);

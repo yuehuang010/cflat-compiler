@@ -117,6 +117,409 @@ The goal this serves, in the maintainer's words: *"The more important goal is to
 ptr and fatptr."* Ownership reads off the type at the local declaration site, with nothing at
 the call sites - C#-like local readability, with the complexity paid once in the library.
 
+### DIRECTION CHANGE 2026-08-31: `unique` becomes a LIBRARY TYPE `struct unique<T>`
+
+Maintainer ruling: the builtin `unique` modifier is causing too many stabilization headaches.
+Convert it to a C++-style library type `struct unique<T>`, keeping the `unique` keyword as sugar
+for it. Constraint from the maintainer: **the helpful diagnostics of the builtin must survive
+the conversion** - there is a balance between library genericity and compiler-blessed errors.
+
+**Prototype results (2026-08-31, worktree unique-type-prototype-4ba544, probes in `scratch/`):**
+
+A hand-written `uptr<T>` (ctor `uptr(move T* p)`, dtor, `operator->`, `get/release/reset/valid`,
+`operator!`) works TODAY with zero compiler changes:
+
+- Scope-exit destruction, factory return, `move` param consume, `release()`/`reset()`,
+  move-between-locals: all correct dtor counts, no double frees (`scratch/uniq_proto.cb`).
+- `struct unique<T>` is LEGAL as a name despite the soft keyword, and COEXISTS with the builtin
+  `unique T*` qualifier in the same file (`scratch/coexist_probe.cb`) - incremental migration
+  is viable, no big-bang rename needed.
+- `list<uptr<Resource>>` works: `xs[1]->id` chains `operator[]` + `operator->`, elements
+  destroyed exactly once at teardown (`scratch/container_probe.cb`).
+- `b = a` on an owning value type is an implicit move that NULLS the source, and the move
+  dataflow tracks it for direct field reads (`a._p` after -> "use of moved variable 'a'").
+
+**The diagnostic gap, measured (this is the whole balance problem):**
+
+| Misuse | builtin `unique T*` | library `uptr<T>` |
+|---|---|---|
+| read after explicit move | compile error "use of moved variable 'p'" | compiles, SEGFAULT at runtime |
+| init from borrowed value | compile error "cannot initialize unique 'b' from a borrowed value..." | n/a (ctor takes `move T*`) |
+| direct field read after move | (same guard) | compile error - already works |
+| method/operator call on moved receiver | compile error | compiles, runs on zeroed shell |
+
+The gap is NARROW: move dataflow checks direct field reads on a moved owning-struct local but
+NOT a method/operator call where the moved local is the RECEIVER (`a->id` via `operator->`,
+`a.valid()`). Fixing that one dataflow hole gives library `unique<T>` the builtin's
+use-after-move story, and benefits EVERY owning value type (ComPtr, list, ...), not just
+unique<T>. Related existing issue: `p2/deref-of-moved-pointer-guard-inside-callee.md`.
+
+**Guiding balance rule (from the maintainer 2026-08-31): keep the builtin's helpful errors.**
+Operationalized as: compiler blessing of `unique<T>` is limited to DIAGNOSTIC WORDING and
+source locations. Semantics (destruction, move-by-default, consume rules) must fall out of
+the struct definition plus the GENERAL owning-value-type rules, so every rule that makes
+`unique<T>` safe also makes `ComPtr<T>` and user RAII types safe. If a stage needs a
+semantic special case keyed on the name `unique`, that stage is designed wrong - stop and
+re-derive it as a general rule.
+
+### MIGRATION PLAN - `unique` qualifier -> library `struct unique<T>` (2026-08-31)
+
+Ordering principle: each stage lands green on the full suite and is independently useful;
+the builtin keeps working unchanged until Stage 5. No stage breaks user code before Stage 4.
+
+**WHERE THINGS STAND (2026-09-01, end of overnight session).** Stages 1-3 are DONE and live
+as THREE single-parent commits on branch `claude/unique-type-prototype-4ba544` (worktree of
+the same name): `7139375` receiver-gap fix, `6cc6537` core unique<T> (cherry-picked from
+the retired stage2 branch), `3530fdd` diagnostic blessing. The branch fast-forwards onto
+master; maintainer wants to INSPECT before it goes to master - do not merge without them.
+The stage2 worktree/branch (`unique-stage2` / `claude/unique-stage2-core-type`) is
+superseded by the cherry-pick and can be deleted at inspection time. Maintainer rulings
+this session: `unique<int>` stays ALLOWED (possible path to atomics - do not poison
+primitives); helpful builtin errors must survive the conversion (the balance rule above).
+Suite baseline on the branch: 756/0/8, examples 45/0, LSP green.
+TIMEBOX CLOSE-OUT (2026-09-01 ~05:30, end of the maintainer's 5h box). On the branch, all
+suites green (762/0/8, examples 45/0, LSP green): Stage 4a (interface arm, d2e93e6), Stage
+4b LOCALS desugar incl. indirect-call adaptation (d5b247b + 495c0f4), the dbnl helper-gap
+issue fix (a128abd), Stage 3 partial recorded on the move-sink issue. NOT done: 4b params /
+fields / generic-args / interface-locals slices (a ready-to-run brief for params+fields is
+in scratch/codex_stage4b2_brief.md), Stage 5 removal slices (ordered map below). Next
+session: run 4b2 brief, then generic-args + interface slice, then Stage 5 order 1-7.
+RULING 2026-09-01 (maintainer): Stage 4 starts now. The interface sub-question is decided:
+`unique<IShape>` gets an `if const (is_interface(T))` arm inside `core/unique.cb` holding
+the fat pointer and releasing through the vtable dtor slot - full parity, one type. The
+partial-desugar and reject-interfaces alternatives were declined.
+
+TIMEBOX CLOSE-OUT (2026-09-01 ~18:30, end of the maintainer's 12h box). STAGE 4 IS DONE:
+every user-facing `unique` spelling desugars to library `unique<X>`. Commits this box, all
+single-parent on `claude/unique-type-prototype-4ba544`, all verified green (test.sh Release
+764/0/8, test_example.sh 45/0, test_lsp.sh 180/0): `d119b11` 4b params+fields, `24335ed`
+4b generic-args, `1d8239c` 4b interface spelling, `1d32664` Stage 5 slice 2 (is_unique
+re-point to IsCoreUniqueType), `e7b81ca` Stage 4 scanner residues (interface type-args,
+using-alias closure bases, fixed-array unique fields), `7198859` Stage 5 slices 4-5 (dtor
+arms, TypeOwnsUniquePointer re-key to HasNonTrivialDestructor, six void* slots dropped -
+see scratch/unique_void_resolution.md), `f8fde6d` Stage 5 slice 3 (kUniqueQualifierPrefix +
+`unique_` mangling token retired; reject paths now diagnose in the main pass only).
+Ruling made this box: reading a blessed unique<X> ELEMENT into a local is a BORROW-COPY
+ALIAS (non-owning, no dtor); explicit `move` is the only consuming spelling
+(MainListener_Expressions.cpp ~3078).
+STAGE 5 REMAINDER = slices 6/7/1, MEASURED AND BLOCKED, not attempted-and-failed: the
+`preserveBuiltinUnique` paths are still LIVE (cold-trace counts: 97 interface, 7 raw-array,
+5 aligned-field consumer hits; main-qualifier producer 742). A trial full removal broke
+unique__IShape reset overload resolution, borrowed-value rejection on an all-null
+conditional, and crashed generic instantiation (unique__Sq/unique__Ci) - rolled back.
+So: IsUnique (cache key "uq") STAYS, the ParseDeclarationSpecifiers text-match plumbing
+STAYS (the desugar rewrite itself is permanent regardless), IsUniqueFieldAlias stays as the
+desugared-path carrier (1184 carrier hits vs 8 builtin hits, all aligned fields).
+Definitive builtin remnants: (1) alignas'd unique fields (permanent until unique<T,ALIGN> -
+plain delete on aligned block = heap corruption), (2) four reject-path scanner spellings
+(unique int / unique array-view / two closure forms in err_lambda_array_view.cb), (3) the
+IsUnique flag + "uq" serializer key serving (1)+(2) and the still-live preservation paths,
+(4) IsUniqueFieldAlias carrier. NEXT SESSION: root-cause WHY the preservation paths still
+fire 97/7/742 times on a fully-desugared tree (suspect: generic instantiation re-parses
+carry the builtin spelling internally) - that is the key that unlocks slices 6/7; the
+batch-3 brief (scratch/codex_stage5_batch3_brief.md) and run log
+(scratch/codex_s5b3_run.log) carry the measurement detail. Never merge to master -
+maintainer inspects first.
+
+STAGE 5 BATCH 4 (2026-09-01, session after the 12h box). ROOT CAUSE of the "still-live
+preservation paths": the generic re-parse suspect above was WRONG. Nothing carried the
+builtin spelling internally. The 200 `preserveBuiltinUnique` rollbacks came from six
+textual heuristics in ParseDeclaration, each standing in for a desugar adaptation the
+library type or compiler lacked (per-tag cold-trace taxonomy with disable probes:
+scratch/stage5_preserve_taxonomy.md). Commit `704c510`: seven heuristics measured dead
+deleted; the broad move-name fallback (83 hits) hid a compiler SEGFAULT (core-unique
+wrapper values reaching the raw cast path unboxed) - fixed, not masked; dictionary set
+now shares the p.get() borrow adaptation (43); interface pointer/conditional assignment
+boxes before reset (63); `?:`/`??` in move-return position release the selected
+unique<T> arm and leave the untaken arm for one scope-exit destruction (4); a wrapper
+owning a counted `new T[n]` result frees with delete[] (probe: 3 dtors, no double free).
+Verified independently: test.sh Release 764/0/8, examples 45/0, LSP 180/0. Final trace:
+every tag 0 except the two RULED REMNANTS: (1) alignas allocation moved into a local
+(4 sites, test_core.cb:2943/3089/3108/3146) - permanent until unique<T, ALIGN>;
+(2) owning heap array through a unique pointer (`unique T* v = new T[n]; v[i]`, 6 sites,
+test_core.cb runRawCount*) - NEEDS MAINTAINER RULING on the surface (unique<T[]>? a
+separate owning-array type? keep builtin?) before any code. Retarget:
+err_discard_move_use_after "use of moved variable 'p'" -> "dereference of moved variable
+'p' (it is null after the move)". Slices 6/7 (IsUnique flag + "uq" key, qualifier
+plumbing) are now unblocked EXCEPT for what the two remnants, the alignas'd unique
+fields, and the four reject-path scanner spellings still need - re-measure IsUnique
+consumers before touching them. Never merge to master - maintainer inspects first.
+
+STAGE 5 BATCH 5 (2026-09-02, slices 6/7). Commit `aae5ca5`: per-site cold trace over ~90
+IsUnique/IsUniqueTypeArg reads (scratch/codex_stage5_batch5_report.md has the table).
+70 zero-hit consumer arms deleted; 40 arms re-keyed on IsCoreUniqueType / IsMove /
+pointer-interface shape; IsUniqueTypeArg, ElementOwningUnique, IsBorrowOfUniqueElement
+deleted with serializer keys unt/eou/bue. IsUnique + "uq" STAY, now serving only: R1
+alignas'd unique fields, R2 alignas allocation moved into a local, R3 owning heap array
+through a unique local (ruling still open), R4 four reject-path spellings, R5 union-member
+recovery, R6 pointer-form brace/assignment diagnostics, plus the interface unique-field
+ABI contract. Retargets: borrowed-value rejections now spell the desugared type and say
+"reset" for assignment (err_move, err_move_borrowed_ptr_into_unique_field,
+err_unique_borrow_into_unique, err_unique_iface_borrow_no_move, err_unique_iface_stack_box).
+Verified independently: test.sh Release 764/0/8, examples 45/0, LSP 180/0. Review debt
+before master: the predicate `IsMove || (!Pointer && IsCoreUniqueType(name))` was copied
+nine times - folded into IsMoveOrCoreUniqueValue in `ba752a2`. Process lesson (4h25m run, 1147 turns, 114 builds):
+never brief "delete + retarget" in one run; zero-hit deletions first, then one run per
+retarget cluster, with a 3-attempt stop rule and the lldb path mandatory. STAGE 5 IS
+NOW COMPLETE except the R3 ruling. Never merge to master - maintainer inspects first.
+
+STAGE 5 R3 RULING (2026-09-02). Maintainer: "Block unique<T[]> for now" - narrow block, keep
+the raw-count tests. unique never owns a heap array via the library type: `unique<T[]>` is
+rejected at all three instantiation sites (ParseDeclarationSpecifiers, ResolveTypeArgEntry,
+QueueGenericInstantiation) with the existing array-view wording; a builtin-preserved
+`unique T* r = new T[n]` returned as `unique<T>` is a LogError (was an LLVM verifier
+failure); `new T[n]` stored into a `unique T*` FIELD is a LogError (was delete of 1 of n).
+Builtin `unique T* v = new T[n]` with per-local count metadata is a PERMANENT remnant, so
+the arrayRebind heuristic and IsUnique/"uq" stay; Test/test_core.cb runRawCount* (38
+assertions) unchanged. Legs in Test/errors/err_unique_array_view.cb; both p2 issues deleted.
+Generic `T[]` args in general are NOT blocked (list<int[]> fails only because the body
+forms `int[]*`; follow-up internal/issue/p3/generic-array-view-arg-diagnostic-points-into-core.md).
+Verified: test.sh Release 764/0/8, examples 45/0, LSP green, warm-cache legs fire.
+
+STAGE 5 OPUS REVIEW ROUND 1 (2026-09-02, after the R3 ruling). Read-only Opus pass over
+`git diff master...HEAD` (brief scratch/opus_review_brief.md): 8 CONFIRMED, 4 PLAUSIBLE, all
+applied in three Codex runs split by outcome class. `3bf443e` heuristics: the R2/R3 remnant
+decision is now parse-tree based (new-array expression on the declarator's own initializer or
+a later `=` to that exact name; move source itself carries AllocAlignValue); the `find("align")`
+/ `find("new")+find("[")` / `body.find(name+"=")` probes are gone from both passes. `d3ec811`
+memory safety: unique<IFace>.copy() double free (fat `_v` field escaped both copy gates),
+reset() self-safe, dead "unique " prefix strip removed. `5b167a4` diagnostics: borrowed source
+named again via one BorrowedSourceName helper (agnostic wording when unknown - an IR-walking
+name recovery Codex tried was rejected), overload listings and the wrapper copy() rejection
+show unique<T> spellings. Verified per commit: test.sh Release 764/0/8, examples 45/0, LSP
+green, warm-cache legs. Round 2 review scoped to 7ee554c..HEAD follows.
+
+STAGE 5 OPUS REVIEW ROUND 2 (2026-09-02, scope 7ee554c..HEAD). 8 CONFIRMED, 1 PLAUSIBLE.
+`0b48e3e` remnant decision: scanner vetoes desugar on ANY alignment specifier (its folder only
+read literals); later-assignment walk skips blocks/for-inits that re-declare the name; aligned
+move source resolved from the parse tree in scope order, not the live symbol table; return
+diagnostic takes the name from the move expression. `2aa0c07` provenance: one
+HasRawNewArrayProvenance gate for return / field store / argument boundary, args carry array
+provenance; the `move T*`-parameter-into-unique-field leg stays OPEN (needs a per-parameter
+"stored into unique field" fact) - internal/issue/p2/unique-field-heap-array-through-move-param.md.
+Clean per review: reset() interface arm makes no second owner; fat-vs-fat interface compare is
+identity; multi-declarator reset; new-array discrimination structural; UFCS copy unaffected.
+`7109771` diagnostics: StructSynthCopyUnsafe dead arm and the discarded _v/_p path dropped; DisplayNameOfMangledType takes the core-unique arm only for arity-1 outer templates (Pair__unique__Node__i32 now returns raw, not writable); range-for over unique<T> elements and alias/array unique<T> fields no longer print unique__X or ._p. Round 3 review scoped to 5b167a4..HEAD follows.
+
+STAGE 5 OPUS REVIEW ROUND 3 (2026-09-02, scope 5b167a4..HEAD). 5 CONFIRMED, 2 PLAUSIBLE, one
+Codex run, `6048c16`: the round-2 presence-based alignas veto in the scanner had diverged from
+the main pass for single-arg `alignas(N)` on a unique parameter/return (undefined symbol at
+link) - both passes now fold the allocation argument with FoldCompileTimeInt; the heap-array
+argument rejection fires only on an actual transfer (borrowing an array local into a unique<T>
+parameter compiles again); copy() diagnostic back under LogErrorMessage as two templates and
+shows Box<unique<N>>; DisplayNameOfMangledType returns raw/non-writable when the outer template
+is unregistered. Plausible, unfixed: hasAlignedMoveSource gives up across lambda boundaries and
+on namespace mismatch (no reproducer reaching a bad free). Per the review-loop rule a Fable
+advisor pass replaces a 4th Opus round; its verdict is recorded below.
+
+FABLE ADVISOR VERDICT (2026-09-02, after round 3): NOT converged. (1) Round 3's `transfers`
+gate re-opened a hole: a by-value unique<T> parameter CONSUMES, so `peek(a)` with an array
+local (no `move`) compiled and freed 1 of 3 (scratch/rev4/g1.cb); the Opus finding's "borrow"
+premise was wrong and the test leg it added exercised a raw `Resource*`, not a unique<T>
+parameter. Corrected in the follow-up commit (unconditional rejection restored, implicit-form
+leg in err_unique_array_view.cb). (2) STRUCTURAL CAUSE, maintainer decision needed: the R2/R3
+remnant decision in MainListener::ParseDeclaration (~3362-3644, ~280 lines of name/token-index
+parse-tree lookahead, plus a third copy of the rule in ForwardRefScanner ~365-395) is a second
+syntactic ownership analysis that runs ahead of the real one and does not share its provenance
+flags; every round found a shape it misses. Recommendation: REPLACE - (a) `new T[n]` into a
+unique LOCAL becomes a hard error like the other legs (drops hasRawNewArrayValue and
+hasLaterBuiltinUniqueAssignment), (b) builtin stays only when the DECLARED type carries
+`alignas(_, N>0)`, which both passes now fold identically (drops hasAlignedMoveSource: an
+aligned pointer can only move into a declared-aligned slot). ~200 of ~280 lines go; the decision
+becomes a pure function of the declaration specifiers shared by both passes. If (a) must stay
+legal, minimum: decide from the direct initializer + declared alignas only and LogError the
+later-assignment forms. (3) OPEN DIVERGENCE found while probing: `unique T*` on a function
+RETURN type is NOT desugared (`unique R* mk()` -> `define ptr @_mk_RPtr__`; `unique<R> mk()` ->
+`%unique__R`), so `unique R* m = mk();` reports "from borrowed value 'mk'" while the `unique<R>`
+spelling runs; only Test/test_move.cb ~9367 pins the raw reading. Needs a ruling: desugar
+return types too, or document the raw-pointer reading. (4) Highest merge risk: unique<T>'s
+destructor does scalar delete, so any unpinned path from `new T[n]` to a unique<T> value is a
+silent wrong-deallocator, not a diagnostic; the `move T*`-parameter leg is still open
+(internal/issue/p2/unique-field-heap-array-through-move-param.md). Do not merge before the
+structural decision.
+MAINTAINER RULINGS (2026-09-02): (2) filed, not a merge blocker -
+internal/issue/p2/unique-builtin-remnant-decision-is-parse-tree-lookahead.md. (3) fixed: return
+types desugar in both passes (FunctionDefinition + InterfaceMethod parent, extern excluded), raw
+owning returns adopt through the unique<T> ctor, borrowed sources LogError; test_move.cb ~9367
+helper is now `move Resource*`; verified 764/0/8 + examples 45/0. Generic-signature gap filed as
+internal/issue/p3/unique-pointer-spelling-with-unbound-type-parameter.md. (4) measured: `move T*`
+already carries a hidden raw-array count; findings + a runtime-check recommendation recorded in
+the p2 issue, plus a new p2 for `delete p` on a counted parameter.
+
+**Stage 1 - close the moved-receiver dataflow gap. DONE 2026-08-31, uncommitted in worktree
+unique-type-prototype-4ba544.** Shared `MainListener::CheckMovedReceiver` helper (factored
+from the duplicated check in `LoadNamedVariableImpl`, `MainListener_Expressions.cpp` ~6560)
+now also fires for `operator->` (`MainListener_PostfixExpression.cpp` ~809), `operator[]`
+(~2236), and method-call receivers (~4635). All three scratch misuse probes are compile
+errors ("use of moved variable 'x'" at the receiver use), all controls still pass, new
+`Test/errors/err_moved_receiver.cb` covers method-call and operator receivers.
+Independently verified: `bash test.sh Release` 750/0/8, `bash test_example.sh` 45/0.
+(NOTE: suite baseline grew since the 2026-07-20 numbers above; 750/45 is the current bar.)
+Original scope statement follows.
+Extend the existing use-after-move check (RecordMoveUse / MovedUseSubject, precedent: the
+closure-call check at `MainListener_PostfixExpression.cpp` ~3848) to method/operator calls
+whose RECEIVER is a moved-from owning-struct local. Scope: ALL owning value types, not
+blessed names - this is the balance rule's first test. New `Test/errors/err_moved_receiver.cb`.
+Exit criteria: the three scratch misuse probes become compile errors; suite stays at baseline.
+
+**Stage 2 - land `core/unique.cb`. DONE 2026-08-31, uncommitted in worktree unique-stage2
+(branch claude/unique-stage2-core-type, off master - does NOT contain Stage 1).**
+Landed exactly as designed: `cflat/core/unique.cb` (new), +123 lines of positive legs in
+`Test/test_move.cb`, new `Test/errors/err_unique_type_pointer.cb`. Zero compiler changes.
+Rulings made in-flight: `unique<int>` (primitive pointee) is ALLOWED - `new int` works and
+the dtor path is sound, matching C++ unique_ptr<int>. Poison caveat: the dtor
+`compile_error` fires only when a function instantiating the type is EMITTED, so the error
+test calls the misuse function from main; a declared-but-never-called misuse compiles clean
+(consistent with core's dead-if-const convention, but weaker than a true instantiation-time
+poison - revisit in Stage 3 if blessing should harden it).
+Independently verified: err test PASS, native test_move 2114/2114, `bash test.sh Release`
+750/0/8, examples 45/0. Original scope statement follows.
+`struct unique<T>` where T is the POINTEE type; `_p` is `T*` (C++ unique_ptr shape, matches
+the validated prototype). API: `unique()`, `unique(move T* p)`, dtor, `operator->`, `get()`,
+`release()` (move-returns `T*`), `reset(move T* p)` (frees old), `valid()`, `operator!`.
+Poison bad instantiations with `if const` + `compile_error`: T itself a pointer ("unique<T*>
+- T is the pointee; write unique<T>"), T a primitive. Positive legs extend an existing
+`Test/test_*.cb` (no new test files); negative legs -> `Test/errors/err_unique_type_*.cb`.
+OPEN SUB-QUESTION (needs ruling before this stage builds): `unique<IShape>` for interface
+values. An interface value is a fat pointer, not a `T*`, so the struct needs an
+`if const (is_interface(T))` arm holding the fat pointer and releasing through the vtable
+dtor slot - or interface ownership stays on the builtin qualifier until Stage 4 and migrates
+with the sugar. RECOMMENDATION: defer to Stage 4; do not block the scalar case on it.
+
+**Stage 3 - diagnostic blessing. DONE 2026-09-01 (commit 3530fdd on the branch below).**
+Landed: `IsCoreUniqueType` / `DisplayNameOfCoreUniqueType` on LLVMBackend (blessed = mangled
+`unique__*` instantiation registered in dataStructures with core's `unique` generic template
+present); call-arg diagnostics in `LLVMBackend_Overloads.cpp` render `unique<Resource>`
+instead of `unique__Resource`; and ONE narrow semantic guard - a borrowed pointer bound to
+the `move T*` parameter of blessed unique<T>'s CONSTRUCTOR or reset() errors with
+"cannot initialize/reset unique<Resource> from a borrowed value - the source still owns it;
+use 'new', a 'move' expression, or a move-returning call". The guard is explicitly
+TEMPORARY: the general move-sink borrow rule stays DEFERRED per the 2026-08-10 ruling in
+`internal/issue/p1/move-of-borrow-into-move-sink-parameter.md`; when that lands, this
+blessing collapses into it. Guard polarity: indeterminate ownership REJECTS (safe direction
+for an owning sink); non-firing sources (`new`, `move owned`, move-returning call incl.
+release(), nullptr) pinned by positive legs in Test/test_move.cb. New twin tests:
+`Test/errors/err_unique_type_borrow_init.cb`, `err_unique_type_stack_addr.cb`.
+Independently verified: suites 756/0/8, examples 45/0, LSP all pass.
+NOT done in this stage (still open for a later pass): the remaining ~30 semantic-message
+twins from the audit below - only the borrowed-init/reset and callee-name families landed;
+the poison-is-emission-time caveat from Stage 2 was left as is. Original scope follows.
+The compiler learns to recognize core's `unique<T>` by name for ERROR TEXT: use-after-move
+on a `unique<T>` local says "unique variable 'x' was moved ..." style wording matching
+today's messages; init/assign paths that today say "cannot initialize unique 'b' from a
+borrowed value..." get equivalent wording when the target is `unique<T>` (the ctor signature
+already REJECTS the borrowed init - this stage only upgrades the resulting
+no-matching-overload error to the helpful sentence). Mechanism: a small predicate
+(IsCoreUniqueType: struct named `unique`, defined in core) consulted ONLY at LogError sites.
+Audit the existing `err_unique_*` error tests as the checklist of messages worth preserving;
+each preserved message gets a twin error test against `unique<T>`.
+
+AUDIT DONE 2026-08-31: 31 `err_unique*.cb` files + ~20 more mentioning unique/move/owner.
+Split: ~14 distinct PARSE-POSITION messages (illegal-position family in
+`MainListener_Declarations.cpp:50-52,187-189,645,2826-2841`, explicit-generic-arg rejection
+`MainListener_PostfixExpression.cpp:1824`, interface/impl field agreement
+`LLVMBackend_Interfaces.cpp:958-967`) keep firing verbatim from the Stage 4 sugar. ~30+
+SEMANTIC messages (borrow-into-unique `MainListener_Declarations.cpp:5548,5869-5881`,
+alias/temp-escape families `:5766-5907` + `LLVMBackend_OwnershipTemps.cpp:456-507,2625-2660`,
+use-after-move `MainListener_PostfixExpression.cpp:3862` + loop variant
+`LLVMBackend_MoveDataflow.cpp:790`, delete rules `MainListener_Expressions.cpp:10666-10798`,
+destruction cycle `LLVMBackend_VariablesAndIR.cpp:1229`) must be re-derived; their wording is
+pinned by the tests and is the Stage 3 work list.
+
+**Stage 4b design note (2026-09-01, written before implementation).** The desugar is NOT a
+pure type rewrite; the builtin qualifier grants pointer-flavoured expression forms that the
+struct type must be adapted to at each site. Adaptation-point table (builtin spelling ->
+desugared emission):
+
+| Site | Builtin `unique X* p` | Desugared `unique<X> p` |
+|---|---|---|
+| init from owning rvalue | `= new X()` / move-returning call | ctor call `unique<X>(<expr>)` |
+| init nullptr/none | `= nullptr` | `= default` |
+| reassign | `p = <owning expr>` (frees old) | `p.reset(<expr>)` |
+| null test | `p == nullptr` / `!= nullptr` | `!p.valid()` / `p.valid()` |
+| deref | `p->f` | already works (`operator->`) |
+| borrow as plain arg | pass `p` to `X*` param | pass `p.get()` |
+| explicit move to raw sink | `take(move p)` with `move X*` param | `take(p.release())` |
+| move to unique<X> sink | n/a (new) | `move p` (owning struct move, Stage 1 guards) |
+| delete p | rejected (err_unique_*) | struct local delete already rejected; wording via blessing |
+| generic arg | `list<unique X*>` | `list<unique<X>>` (element now an owning VALUE) |
+| interface | `unique IShape` | `unique<IShape>` (4a arm) |
+
+The desugar lives in BOTH ParseDeclarationSpecifiers copies for the TYPE, and the
+adaptation points live in the declaration/assignment/argument emission paths, keyed on the
+destination being blessed unique<T> (Stage 3 predicate) - NOT on the keyword, so
+hand-written unique<X> gets identical treatment; the keyword is pure spelling.
+Phasing (each slice suite-green): (1) locals + the expression adaptations; (2) params;
+(3) fields; (4) generic args + container spellings in core; (5) interface spelling; then
+retarget err_unique_* expectations per slice as they flip.
+
+**Stage 4 - keyword desugar (`unique T*` -> `unique<T>`). THE BREAKING CHANGE.**
+In BOTH ParseDeclarationSpecifiers copies (ForwardRefScanner + MainListener), rewrite the
+soft-keyword qualifier to the generic type before any IsUnique flag is set: `unique T*`
+field/local/param/generic-arg positions all produce `unique<T>`; `unique IShape` produces
+the interface arm decided in Stage 2's sub-question. The keyword remains the SUGARED
+spelling users write; the parse-position rules (illegal on value types, return position,
+tuple element - `doc/LANGUAGE.md` table) keep firing at parse time with today's messages,
+which is exactly the "helpful errors" the sugar preserves. Consequences to handle in the
+SAME change: mangling (`unique_` token -> `unique__T` instantiation names; whole-program
+compiler, no ABI concern, but `--symbol-dump` output and LSP hover text change - update
+LSP tests); `list<unique T*>` -> `list<unique<T>>` meaning containers now hold an owning
+VALUE element, which the container migration of 2026-07-20 already made the semantics for;
+re-point the `err_unique_*` suite at the desugared form. `--init` serializer rule applies to
+any flag that changes meaning here.
+
+**Stage 5 removal map (surveyed 2026-09-01, read-only inventory).** Removal order, least
+hazard first: (1) IsUniqueFieldAlias (12 sites, NOT serialized); (2) re-point `is_unique(T)`
+to answer true for blessed `unique<...>` instantiations BEFORE any mangling change (14
+if const arms in core depend on it; it currently reads the un-stripped substitution
+string); (3) kUniqueQualifierPrefix + `unique_` mangling token (+ --symbol-dump/LSP sweep);
+(4) IsUniqueTypeArg + ElementOwningUnique + IsBorrowOfUniqueElement (cache keys
+"unt"/"eou"/"bue" out in the same commit); (5) synthesized-dtor unique arms, re-keying
+TypeOwnsUniquePointer off "has non-trivial dtor" (it also gates memberwise copy() - deleting
+it naively re-enables shallow copies = double free); (6) IsUnique last (~86 sites, cache key
+"uq"); (7) the five qualifier text-match sites in both ParseDeclarationSpecifiers copies,
+both together, last of all. NEVER remove: IsOwningSink (cache "osk" x2) and the general
+IsOwning/MoveDataflow machinery - unique<T> rides them.
+MAP CORRECTIONS (2026-09-01 afternoon, removal-readiness audit with instrumentation):
+(1) IsUniqueFieldAlias is NOT removable - 1d8239c made it the carrier for the DESUGARED
+field-alias path too (MainListener_PostfixExpression.cpp:1674-1677); at most rename it once
+the builtin legs die. (2) DONE as 1d32664 (is_unique answers IsCoreUniqueType directly;
+LegacyUniqueSubstitutionSpelling survives only for is_copyable's pointer/interface split).
+(3) blocked until the residual builtin spellings desugar: ForwardRefScanner interface
+type-args (scan-time IsInterfaceType false -> one-sided FR/ML disagreement; the codegen
+prefix producer fires zero times), using-alias bases, fixed-array `unique T* f[N]` fields,
+alignas'd unique fields. Sweep already done clean: nothing in --symbol-dump/LSP/doc depends
+on the prefix or token. There are SIX builtin void* handle fields, not five: the map missed
+barrier.cb:47.
+unique void* RESOLVED (probed; scratch/unique_void_resolution.md): the six handle fields
+never migrate to unique<void> - they are mutable slots released via os.*_destroy(&field),
+and `unique` only buys copy suppression; all owners have hand-written dtors. In slice 5,
+re-key copy suppression to has-non-trivial-dtor FIRST, then drop the fields to plain
+`void*` in the SAME slice - never before the re-key. Core generic-arg migrations: ui_test.cb:409,
+ui_native/cocoa.cb:2626,5168, ui_native/win32.cb:4460,7264.
+
+**Stage 5 - retire the builtin plumbing.**
+With all spellings desugared, `IsUnique` / `IsUniqueTypeArg` / `IsUniqueFieldAlias` /
+`kUniqueQualifierPrefix` mangling and the unique-specific arms of the synthesized destructor
+become dead: `unique<T>` has a REAL dtor, so the ordinary owning-field destruction path
+(Rule of Zero) covers what the special arms did. Remove in dependency order, suite-green at
+every step; any TypeAndValue/StructData field removed must come out of the LLVMBackend.cpp
+cache round-trip in the same change. The ~1600-site inventory concentrates in
+MainListener_Expressions.cpp (334), MainListener_Declarations.cpp (284), LLVMBackend.h (209),
+LLVMBackend_OwnershipTemps.cpp (173) - expect this stage to be several sessions and to
+shrink, not grow, each file it touches.
+
+**Risks / watch list.**
+- Stage 4 changes monomorphization names; anything keyed on the mangled string (symbol
+  index, caches, `--symbol-dump` selectors) needs a sweep.
+- The p1/p2 open issues in this area (temp-unique-field-escapes, move-of-borrow-into-move-
+  sink, deref-of-moved-pointer-guard-inside-callee) should be re-triaged after Stage 4 -
+  some may become library-level non-issues, others may need re-filing against `unique<T>`.
+- `dictionary<K, unique V*>` etc. in core migrate spelling in Stage 4; behaviour must not
+  change (the 2026-07-20 container rule already defines it).
+- Keep the builtin fully working through Stages 1-3; never ship a state where neither
+  spelling has the guardrails.
+
 ### NEXT - in priority order
 
 1. **Core FIELD migration - CANCELLED 2026-07-20. There are ZERO migratable fields, and

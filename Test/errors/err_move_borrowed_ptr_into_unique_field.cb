@@ -18,7 +18,7 @@ void goodStash(move Payload* b) { stash.p = b; }
 // local's scope-exit teardown frees the pointee the caller still owns, so the caller frees
 // it a second time. Reassignment through plain '=' is the only way in - decl-init has its
 // own D5 reject - and it must not silently adopt a borrow either.
-expect_error("cannot assign borrowed parameter 'b' to unique local 'k'") {
+expect_error("cannot reset unique<Payload> 'k' from borrowed value 'b'") {
     void badLocal(Payload* b) { unique Payload* k = nullptr; k = move b; }
 }
 
@@ -28,7 +28,7 @@ void goodLocal(move Payload* b) { unique Payload* k = nullptr; k = move b; }
 // Same laundering at DECL-INIT. The plain `unique Payload* k = b;` form is caught by D5, but
 // the 'move' spelling signalled ownership unconditionally, so the local adopted the borrow and
 // freed it at scope exit while the caller still owned it (double free, exit 134).
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'b'") {
     void badInit(Payload* b) { unique Payload* k = move b; }
 }
 
@@ -45,36 +45,36 @@ void goodInit(move Payload* b) { unique Payload* k = move b; }
 
 // Rebound to ANOTHER BORROW: still nobody's to give away. The '=' now RECORDS the borrow it
 // stored, so the origin named is the current source 'c', not the declaration-time 'b'.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'c'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'c'") {
     void reboundToBorrow(Payload* b, Payload* c) { Payload* t = b; t = c; unique Payload* k = move t; }
 }
 
 // Rebound via `move` OF A BORROW. The `move` token is SYNTAX, not a proof of ownership: the moved
 // value owns nothing (the real owner still frees it), so the binding is still a borrow afterwards.
 // Reading the token alone is how a store that transfers nothing retired the proof.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'b'") {
     void reboundToMovedBorrow(Payload* b) { Payload* t = b; t = move b; unique Payload* k = move t; }
 }
 
 // SELF-assignment is a store like any other, and proves nothing at all.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'b'") {
     void reboundSelf(Payload* b) { Payload* t = b; t = t; unique Payload* k = move t; }
 }
 
 // The PARAMETER's own binding rebound to another borrow. The store records the borrow it stored,
 // so the origin named is the current source 'c'.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'c'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'c'") {
     void reboundParam(Payload* b, Payload* c) { b = c; unique Payload* k = move b; }
 }
 
 // '??=' keeps the OLD referent when the arm is not taken, so no store through it can prove an owner.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'b'") {
     void reboundCoalesce(Payload* b, Payload* c) { Payload* t = b; t ??= c; unique Payload* k = move t; }
 }
 
 // The rebind IS to a fresh owner, but sits in a branch that never runs. The walk is not
 // control-flow-aware, so a same-block test is what separates this from the accepted form below.
-expect_error("cannot initialize unique local 'k' from borrowed parameter 'b'") {
+expect_error("cannot initialize unique<Payload> 'k' from borrowed value 'b'") {
     void reboundDeadBranch(Payload* b) {
         Payload* t = b;
         if (t == nullptr) { t = new Payload(); }

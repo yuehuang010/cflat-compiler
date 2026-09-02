@@ -136,6 +136,25 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
         ResolvedInterfaceMembersScope memberScope(resolvedInterfaceMembers_, (const void*)ctx);
 
         std::vector<LLVMBackend::InterfaceMethod> methods;
+        auto implementationUsesCoreUnique = [&](const std::string& methodName, size_t paramIndex) {
+            auto functionIt = compilerLLVM->functionTable.find(methodName);
+            if (functionIt == compilerLLVM->functionTable.end()) return false;
+            for (const auto& [implName, data] : compilerLLVM->dataStructures)
+            {
+                if (std::find(data.Interfaces.begin(), data.Interfaces.end(), mangledName)
+                    == data.Interfaces.end())
+                    continue;
+                for (const auto& symbol : functionIt->second)
+                {
+                    if (symbol.Parameters.size() <= paramIndex + 1
+                        || symbol.Parameters[0].TypeName != implName)
+                        continue;
+                    if (compilerLLVM->IsCoreUniqueType(symbol.Parameters[paramIndex + 1].TypeName))
+                        return true;
+                }
+            }
+            return false;
+        };
         for (auto method : InterfaceMethods(ctx))
         {
             if (RejectVariadicInterfaceMethod(mangledName, method)) continue;
@@ -145,7 +164,19 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
             auto declParams = ParseParameterTypeList(method->parameterTypeList());
             for (const auto& p : declParams)
             {
-                LLVMBackend::TypeAndValue tv = p;
+                auto tv = p;
+                if (compilerLLVM->IsCoreUniqueType(tv.TypeName)
+                    && tv.Pointer && !tv.ElemPointer && !tv.IsInterface
+                    && implementationUsesCoreUnique(m.Name, m.Parameters.size()))
+                {
+                    std::string uniqueType = MangledGenericName("unique", { tv.TypeName });
+                    QueueGenericInstantiation("unique", { tv.TypeName }, uniqueType);
+                    tv.TypeName = uniqueType;
+                    tv.Pointer = false;
+                    tv.ElemPointer = false;
+                    tv.PointerDepth = 0;
+                    tv.IsMove = true;
+                }
                 m.Parameters.push_back(tv);
             }
             methods.push_back(std::move(m));
@@ -429,6 +460,8 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
                     p.Pointer  = pPtr;
                     p.IsMove   = param->Move() != nullptr;
                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                    CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName, p.Pointer,
+                                                   p.PointerDepth);
                     p.ResolvedTypeKey = SigComponentResolvedKey(p.TypeName);
                     tv.FuncPtrParams.push_back(p);
                 }

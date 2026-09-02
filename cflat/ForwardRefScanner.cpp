@@ -12,6 +12,24 @@ std::vector<CFlatParser::InterfaceMemberContext*> ForwardRefScanner::ResolveInte
         return out;
     }
 
+bool ForwardRefScanner::IsLocalDeclarationSpecifiers(
+    CFlatParser::DeclarationSpecifiersContext* declSpecs) const
+{
+        bool insideFunction = false;
+        for (auto* parent = declSpecs->parent; parent != nullptr; parent = parent->parent)
+        {
+            if (dynamic_cast<CFlatParser::AggregateMemberContext*>(parent) != nullptr)
+                return false;
+            if (dynamic_cast<CFlatParser::ParameterDeclarationContext*>(parent) != nullptr)
+                return false;
+            if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr)
+                insideFunction = true;
+        }
+        // The function's own return declarationSpecifiers is a direct child, not a local.
+        return insideFunction
+            && dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) == nullptr;
+    }
+
 LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFlatParser::DeclarationSpecifiersContext* declSpecs) {
         // A null context here means a caller tried to scan a declaration with no return-type
         // specifier as an ordinary member function. Diagnose rather than dereference it.
@@ -22,6 +40,19 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
         }
         auto* compiler = Compiler(declSpecs);
         LLVMBackend::DeclTypeAndValue declType;
+        bool hasUniqueSpecifier = false;
+        bool hasAllocAlignmentSpecifier = false;
+        for (auto declSpec : declSpecs->declarationSpecifier())
+        {
+            auto* alignSpec = declSpec->alignmentSpecifier();
+            if (alignSpec == nullptr) continue;
+            auto cexprs = alignSpec->constantExpression();
+            size_t idx = (alignSpec->typeName() != nullptr) ? 0 : 1;
+            if (cexprs.size() <= idx) continue;
+            auto folded = FoldCompileTimeInt(compiler, cexprs[idx]->conditionalExpression());
+            if (folded && *folded > 0)
+                hasAllocAlignmentSpecifier = true;
+        }
         // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
         // branch below drops the empty pairs and would silently parse a narrower type.
         for (auto declSpec : declSpecs->declarationSpecifier())
@@ -66,7 +97,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     // whose diagnostics expect_error observes.
                     if (typeSpec->getText() == "unique")
                     {
-                        declType.IsUnique = true;
+                        hasUniqueSpecifier = true;
                         continue;  // not a type; look for the actual type in next specifier
                     }
                     if (typeSpec->getText() == "manifest")
@@ -119,6 +150,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                                     p.Pointer = pPtr;
                                     p.IsMove = param->Move() != nullptr;
                                     p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
+                                    CanonicalizeUniqueSigComponent(compilerLLVM, p.TypeName,
+                                                                   p.Pointer, p.PointerDepth);
                                     p.ResolvedTypeKey = SigComponentResolvedKeyScanner(p.TypeName);
                                     declType.FuncPtrParams.push_back(p);
                                 }
@@ -177,8 +210,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
                     {
                         // Closure type args (gap a) encode to a symbol-safe name; a `unique`-qualified
-                        // arg routes through ResolveForwardTypeArg so its canonical "unique T*" text
-                        // (D10) matches the queueing path; others keep the raw getText() spelling.
+                        // arg routes through ResolveForwardTypeArg so its canonical core unique name
+                        // matches the queueing path; others keep the raw getText() spelling.
                         // A NESTED generic arg must mangle the same way the main pass mangles it
                         // ("Inner__int"), or the shell is registered under the raw "Inner<int>"
                         // spelling and stays opaque.
@@ -319,6 +352,59 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     if (declType.IsInterfacePointer)
                         declType.Pointer = true;
                 }
+                // Keep this mirror of the MainListener rewrite for parameters and return types.
+                // Struct fields are parsed in the main pass.
+                bool isParameterDecl = dynamic_cast<CFlatParser::ParameterDeclarationContext*>(
+                    declSpecs->parent) != nullptr;
+                const bool isReturnDecl =
+                    dynamic_cast<CFlatParser::FunctionDefinitionContext*>(declSpecs->parent) != nullptr
+                    || dynamic_cast<CFlatParser::InterfaceMethodContext*>(declSpecs->parent) != nullptr;
+                bool hasExternSpecifier = false;
+                for (auto candidate : declSpecs->declarationSpecifier())
+                    if (candidate->storageClassSpecifier() != nullptr
+                        && candidate->storageClassSpecifier()->Extern() != nullptr)
+                        hasExternSpecifier = true;
+                const bool uniqueArrayOk = IsLocalDeclarationSpecifiers(declSpecs);
+                if (hasUniqueSpecifier
+                    && (isParameterDecl
+                        || IsLocalDeclarationSpecifiers(declSpecs)
+                        || isReturnDecl)
+                    && (!isReturnDecl || !hasExternSpecifier)
+                    && declType.TypeName != "void"
+                    && (declType.IsFatInterfaceValue()
+                        || (!declType.IsInterface && declType.Pointer && !declType.ElemPointer))
+                    && !declType.IsArrayView
+                    && (declType.ArraySize == nullptr || uniqueArrayOk)
+                    && declType.AliasArraySize == 0 && declType.ExtraArrayDims.empty()
+                    && !hasAllocAlignmentSpecifier
+                    && (declSpecs->parent == nullptr
+                        || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
+                {
+                    declType.TypeName = "unique__" + MangleTypeArg(compiler, declType.TypeName);
+                    if ((isParameterDecl || isReturnDecl)
+                        && compiler->AnyGenericTypeTemplateNamed("unique"))
+                    {
+                        compiler->CreateStructType(declType.TypeName, {});
+                        LLVMBackend::TypeAndValue returnType{ .TypeName = declType.TypeName };
+                        compiler->CreateFunctionDeclaration(declType.TypeName, returnType, {});
+                    }
+                    declType.Pointer = false;
+                    declType.ElemPointer = false;
+                    declType.PointerDepth = 0;
+                    hasUniqueSpecifier = false;
+                    // The declared type is now the wrapper STRUCT, not the interface it stores.
+                    declType.IsInterface = false;
+                    declType.IsInterfacePointer = false;
+                    if (isParameterDecl)
+                        declType.IsMove = true;
+                }
+                // R2: an allocation-alignment clause keeps the legacy pointer representation,
+                // whose cleanup carries the per-allocation deallocator metadata.
+                if (hasUniqueSpecifier
+                    && hasAllocAlignmentSpecifier
+                    && declType.Pointer && !declType.ElemPointer
+                    && !declType.IsArrayView && !declType.IsFunctionPointer)
+                    declType.IsUnique = true;
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -349,19 +435,16 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             {
                 // ForwardRefScanner: the SLOT alignment (arg1) doesn't affect forward declarations,
                 // but arg2 (allocation alignment) must be recorded onto the registered signature so
-                // a return-type/param clause survives into the call-site checks. This pre-pass lacks
-                // the constant folder, so it best-effort parses an integer literal; the codegen pass
-                // does the full validation and error reporting.
+                // a return-type/param clause survives into the call-site checks. The shared folder
+                // keeps this pass consistent with the codegen pass for constant expressions.
                 auto cexprs = alignSpec->constantExpression();
                 size_t idx = (alignSpec->typeName() != nullptr) ? 0 : 1;
                 if (cexprs.size() > idx)
                 {
-                    std::string txt = cexprs[idx]->getText();
-                    uint64_t v = 0;
-                    auto res = std::from_chars(txt.data(), txt.data() + txt.size(), v);
-                    if (res.ec == std::errc() && res.ptr == txt.data() + txt.size()
-                        && v > 0 && v <= 4096 && (v & (v - 1)) == 0)
-                        declType.AllocAlignValue = v;
+                    auto folded = FoldCompileTimeInt(compiler, cexprs[idx]->conditionalExpression());
+                    if (folded && *folded > 0 && *folded <= 4096
+                        && ((*folded & (*folded - 1)) == 0))
+                        declType.AllocAlignValue = static_cast<uint64_t>(*folded);
                 }
             }
         }
@@ -928,8 +1011,12 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         auto* typeSpec = entry->typeSpecifier();
         std::string resolved;
         std::string innerBase;
+        // The scan mangles a nested generic base itself, so its name is not yet in any type
+        // registry - but the main pass HAS registered it by the time it resolves the same arg.
+        bool baseIsGenericInstantiation = false;
         if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
+            baseIsGenericInstantiation = true;
             resolved = Compiler(entry)->ResolveGenericBaseAlias(innerBase);
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
                 resolved += "__" + MangleTypeArg(compilerLLVM, ResolveForwardTypeArg(innerEntry));
@@ -957,19 +1044,49 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
                 else if (auto folded = FoldCompileTimeInt(Compiler(entry), typeSpec->genericIdentifier()))
                     return std::to_string(*folded);
             }
+            // A function-type alias resolves to the SAME encoded closure name as the direct
+            // spelling, exactly as the main pass does. A unique-qualified closure is left in its
+            // ordinary encoded form; the main pass owns the diagnostic and never sees a legacy
+            // qualifier spelling.
+            if (!IsArrayViewArg(entry))
+                if (auto* fit = Compiler(entry)->FindFunctionTypeAlias(resolved); fit != nullptr)
+                {
+                    return entry->pointer() != nullptr
+                        ? MainListener::EncodeClosureFromSig(Compiler(entry), *fit) + "*"
+                        : MainListener::EncodeClosureFromSig(Compiler(entry), *fit);
+                }
         }
         // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
         // bracket forms are rejected in the main pass, so the forward scan just names them.
         // Stars are COUNTED here, exactly as the main pass counts them: a shell named Box__Cptr
         // for a Box<C**> use would not match the instantiation the codegen pass builds.
+        std::string uniqueArgBase = resolved;
+        int uniqueArgStars = 0;
+        bool uniqueArgView = false;
         if (entry->pointer() != nullptr)
-            resolved += std::string(PointerDepthOf(entry->pointer()), '*');
+        {
+            uniqueArgStars = PointerDepthOf(entry->pointer());
+            resolved += std::string(uniqueArgStars, '*');
+        }
         else if (IsArrayViewArg(entry))
+        {
+            uniqueArgView = true;
             resolved += "[]";
-        // Carry the `unique` / `alias` qualifier into the mangled/instantiation string; the main
-        // pass validates position/type and emits diagnostics. The two are mutually exclusive.
+        }
+        // Carry the `alias` qualifier into the mangled/instantiation string. Valid `unique`
+        // arguments become a real unique<X> instantiation; reject the remaining forms in the
+        // main pass before any legacy marker is produced.
         if (isUnique)
-            resolved = std::string(kUniqueQualifierPrefix) + resolved;
+        {
+            // Mirror of the MainListener rewrite: a `unique` type ARGUMENT names core unique<X>.
+            if (CanDesugarUniqueTypeArg(compilerLLVM, uniqueArgBase, uniqueArgStars > 0,
+                                        uniqueArgStars, uniqueArgView, baseIsGenericInstantiation))
+                return "unique__" + MangleTypeArg(compilerLLVM, uniqueArgBase);
+            // The forward scan must not emit a diagnostic here: expect_error matching and
+            // localization are owned by the codegen pass. Returning the ordinary resolved
+            // spelling keeps this reject path out of the retired prefix/token scheme.
+            return resolved;
+        }
         else if (isAlias)
             resolved = std::string(kAliasQualifierPrefix) + resolved;
         return resolved;
@@ -1098,6 +1215,12 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
             if (certain && !unkeyable && !name.empty())
                 compiler->gts.scannedTypeNames.insert(QualifyName(QualifyName(ns, typePath), name));
         };
+        // The interface subset, gated identically - keys must match scannedTypeNames exactly.
+        auto recordInterfaceName = [&](const std::string& name)
+        {
+            if (certain && !unkeyable && !name.empty())
+                compiler->gts.scannedInterfaceNames.insert(QualifyName(QualifyName(ns, typePath), name));
+        };
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
@@ -1158,7 +1281,10 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
             {
                 auto* nameGid = static_cast<CFlatParser::InterfaceDefinitionContext*>(ruleCtx)->genericIdentifier();
                 if (nameGid && nameGid->Identifier())
+                {
                     recordTypeName(nameGid->Identifier()->getText());
+                    recordInterfaceName(nameGid->Identifier()->getText());
+                }
                 if (nameGid && nameGid->Identifier() && nameGid->genericTypeParameters() != nullptr)
                 {
                     std::string key = QualifyName(ns, nameGid->Identifier()->getText());

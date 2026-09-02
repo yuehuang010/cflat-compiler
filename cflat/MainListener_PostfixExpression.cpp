@@ -755,6 +755,21 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             LogErrorContext(ctx, "a void call result cannot be used as a chain receiver");
                         prevToken = tokenType;
                         nullConditionalPending = (tokenType == CFlatParser::QuestionDot);
+                        if (!namedVar.TypeAndValue.Pointer
+                            && Compiler(ctx)->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                            && namedVar.CallerName != "this")
+                        {
+                            if (!namedVar.FieldName.empty())
+                                CheckMovedReceiver(namedVar);
+                            if (!nullConditionalPending)
+                                Compiler(ctx)->RecordNullDerefFor(namedVar,
+                                    ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                            if (!nullConditionalPending
+                                && Compiler(ctx)->IsExplicitlyMovedNullHere(namedVar))
+                                LogErrorContext(ctx, std::format(
+                                    "dereference of moved variable '{}' (it is null after the move)",
+                                    namedVar.CallerName));
+                        }
                         // [PFX-1b] Unadopted owning-POINTER receiver (`makePtr()->v = 1;`): free it
                         // at end-of-expression. SCALAR member only - see MemberIsScalarField.
                         if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow)
@@ -765,6 +780,57 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 && Compiler(ctx)->MemberIsScalarField(
                                        namedVar.TypeAndValue.TypeName, scalarMember))
                                 Compiler(ctx)->RegisterOwnedPtrTemp(namedVar.Primary);
+                        }
+                        // [PFX-1c] blessed core unique<IFace> : forward-on-miss to the owned fat
+                        // value. The pointer arm reaches its pointee through operator->; the
+                        // interface arm has no pointer to hand out, so unwrap the value in place
+                        // and let the normal virtual-dispatch path below run on it.
+                        if ((tokenType == CFlatParser::Dot || tokenType == CFlatParser::Arrow
+                             || tokenType == CFlatParser::QuestionDot)
+                            && !namedVar.TypeAndValue.Pointer
+                            && !namedVar.TypeAndValue.IsInterface
+                            && Compiler(ctx)->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                        {
+                            auto* compiler = Compiler(ctx);
+                            std::string memberName = NextMemberName(ctx, parseTree);
+                            auto sd = compiler->GetDataStructure(namedVar.TypeAndValue.TypeName);
+                            bool coreUniqueInterfaceMember = !memberName.empty()
+                                && sd.StructType != nullptr && sd.StructFields.size() == 1
+                                && sd.StructFields[0].IsFatInterfaceValue()
+                                && compiler->HasInterfaceMethod(
+                                    sd.StructFields[0].TypeName, memberName);
+                            if (!memberName.empty() && sd.StructType != nullptr
+                                && sd.StructFields.size() == 1
+                                && sd.StructFields[0].IsFatInterfaceValue()
+                                && (coreUniqueInterfaceMember
+                                    || !compiler->TypeHasMember(namedVar.TypeAndValue.TypeName, memberName)))
+                            {
+                                if (memberName == "copy" && !coreUniqueInterfaceMember)
+                                    compiler->LogUniqueCopyError(namedVar.TypeAndValue.TypeName);
+                                llvm::Value* storage = namedVar.Storage;
+                                if (storage == nullptr && namedVar.Primary != nullptr)
+                                {
+                                    storage = compiler->CreateAlloca(sd.StructType);
+                                    compiler->CreateAssignment(namedVar.Primary, storage);
+                                }
+                                if (storage != nullptr)
+                                {
+                                    auto fieldType = sd.StructFields[0];
+                                    fieldType.VariableName.clear();
+                                    auto* fieldPtr = compiler->CreateStructGEP(sd.StructType, storage, 0);
+                                    LLVMBackend::NamedVariable ifaceNV;
+                                    ifaceNV.Storage = fieldPtr;
+                                    ifaceNV.Primary = compiler->CreateLoad(fieldPtr);
+                                    ifaceNV.BaseType = ifaceNV.Primary->getType();
+                                    ifaceNV.TypeAndValue = fieldType;
+                                    ifaceNV.TypeAndValue.VariableName = namedVar.TypeAndValue.VariableName;
+                                    ifaceNV.CallerName = namedVar.CallerName;
+                                    ifaceNV.IsBorrowed = true;
+                                    namedVar = ifaceNV;
+                                    interfaceVar = namedVar;
+                                    structVar = {};
+                                }
+                            }
                         }
                         // [PFX-1a] user operator-> : forward-on-miss. CFlat's `.` and `->` are flexible
                         // (either token works on a value or a pointer). When the member that follows is
@@ -806,13 +872,27 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     thisNV.Storage = temp;
                                 }
 
+                                if (!compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName))
+                                    CheckMovedReceiver(namedVar);
                                 auto* arrowResult = compiler->CreateOverloadedFunctionCall("operator->", { thisNV });
                                 if (arrowResult == nullptr) break;
 
+                                // operator-> is an ABI adapter, not an ownership boundary: keep the
+                                // owning-temp-field ledger on the pointer it hands back.
+                                if (compiler->IsLedgeredOwningTempUniqueField(namedVar.Primary))
+                                    compiler->RegisterOwningTempUniqueField(arrowResult);
+                                bool throughCoreUniqueField =
+                                    compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                                    && (!namedVar.FieldName.empty() || namedVar.IsUniqueFieldAlias);
+                                bool throughPointer = namedVar.FieldPathThroughPointer
+                                    || throughCoreUniqueField;
+                                std::string pathRoot = namedVar.FieldPathRoot;
                                 namedVar = {};
                                 namedVar.Primary      = arrowResult;
                                 namedVar.BaseType     = arrowResult->getType();
                                 namedVar.TypeAndValue = compiler->lastCallReturnType;
+                                namedVar.FieldPathThroughPointer = throughPointer;
+                                namedVar.FieldPathRoot = pathRoot;
                                 PrepareAliasCallResult(ctx, namedVar);
 
                                 if (++arrowGuard > 32)
@@ -833,8 +913,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             && (namedVar.TypeAndValue.Pointer
                                 || Compiler(ctx)->IsThinEncodedClosureType(namedVar.TypeAndValue.TypeName))
                             && !namedVar.TypeAndValue.IsInterface
-                            && !(namedVar.TypeAndValue.IsUnique || namedVar.TypeAndValue.IsUniqueTypeArg
-                                 || namedVar.IsOwning || namedVar.TypeAndValue.ElementOwningUnique)
+                            && !(namedVar.TypeAndValue.IsUnique
+                                 || namedVar.IsOwning)
                             && NextMemberName(ctx, parseTree) == "copy")
                         {
                             // Capture the pointer VALUE now: the auto-deref below leaves namedVar in a
@@ -880,6 +960,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // can detect that the parent pointer is a borrowed parameter.
                                 structVar.IsBorrowed      = namedVar.IsBorrowed;
                                 structVar.BorrowedOrigin  = namedVar.BorrowedOrigin;
+                                structVar.FieldPathThroughPointer = namedVar.FieldPathThroughPointer;
+                                structVar.FieldPathRoot = namedVar.FieldPathRoot;
                                 structVar.ContainsBondedClosure = namedVar.ContainsBondedClosure;
                                 structVar.BondedSources = namedVar.BondedSources;
                             }
@@ -1511,6 +1593,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             namedVar.FromOwningTempField = true;
                                             if (namedVar.Primary != nullptr && !namedVar.OwningTempParent)
                                                 Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
+                                            // A blessed unique<X> field VALUE is owning by its type.
+                                            // Ledger the read so a later '?:' / '??' join still
+                                            // carries provenance the joined value cannot.
+                                            if (namedVar.Primary != nullptr && !fieldType.Pointer
+                                                && Compiler(ctx)->IsCoreUniqueType(fieldType.TypeName))
+                                            {
+                                                Compiler(ctx)->RegisterOwningTempUniqueField(namedVar.Primary);
+                                                Compiler(ctx)->RegisterTempFieldValue(namedVar.Primary);
+                                            }
                                         }
                                     }
                                     namedVar.TypeAndValue = fieldType;
@@ -1589,7 +1680,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // A cast off this read (`(Res*)b.p`, `free((void*)b.p)`) severs
                                     // Storage and rewrites the type; carry the unique provenance so
                                     // the borrow rules still fire (see IsUniqueFieldRead / Trap B).
-                                    if (fieldType.IsUnique && fieldType.Pointer)
+                                    if ((fieldType.IsUnique
+                                            && fieldType.Pointer)
+                                        || (Compiler(ctx)->IsCoreUniqueType(fieldType.TypeName)
+                                            && !fieldType.Pointer))
                                         namedVar.IsUniqueFieldAlias = true;
                                     // Ledger the read by VALUE so a cast or a join, which drop every
                                     // flag above, still answer the persist-site guard.
@@ -1941,7 +2035,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // A `unique` destination is an owning LOCATION; the return
                                     // spelling that fills it is `move`, so both map to Owned.
                                     ctxTv.FuncPtrReturnOwned    = declExpectedType.IsMove
-                                                               || declExpectedType.IsUnique;
+                                                               || declExpectedType.IsUnique
+                                                               || (!declExpectedType.Pointer
+                                                                   && Compiler(ctx)->IsCoreUniqueType(
+                                                                       declExpectedType.TypeName));
                                     ctxTv.FuncPtrReturnAlias    = declExpectedType.IsAlias;
                                     lambdaExpectedType = ctxTv;
                                 }
@@ -2232,6 +2329,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             idxNV.Primary  = rvalue;
                             idxNV.BaseType = rvalue->getType();
 
+                            CheckMovedReceiver(structVar);
                             auto* result = Compiler(ctx)->CreateOverloadedFunctionCall("operator[]", { thisNV, idxNV });
                             if (result)
                             {
@@ -3527,9 +3625,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto substIt = activeTypeSubstitutions.find(argText);
                                     if (substIt != activeTypeSubstitutions.end())
                                     {
+                                        // A blessed core `unique<X>` substitution is the owning
+                                        // spelling; the old qualifier marker no longer exists.
                                         const std::string& resolved = substIt->second;
-                                        isUniq = resolved.compare(0, kUniqueQualifierPrefixLen,
-                                            kUniqueQualifierPrefix) == 0;
+                                        isUniq = Compiler(ctx)->IsCoreUniqueType(resolved);
                                     }
                                 }
                             }
@@ -3586,9 +3685,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto substIt = activeTypeSubstitutions.find(argText);
                                     if (substIt != activeTypeSubstitutions.end())
                                     {
-                                        std::string base = substIt->second;
-                                        StripOwnershipQualifiers(base);
                                         auto* be = Compiler(ctx);
+                                        std::string base = LegacyUniqueSubstitutionSpelling(
+                                            be, substIt->second);
+                                        StripOwnershipQualifiers(base);
                                         // Shared predicate: a pointer (bare/unique/alias) or a
                                         // non-struct type is copyable; a struct is refused only by
                                         // the unique-owner rule (drives the copy-on-assign flip too).
@@ -3899,10 +3999,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     for (const auto& namedArgument : namedArgCtx)
                                     {
                                         size_t argParamIndex = argNVs.size();
+                                        LLVMBackend::TypeAndValue argExpectedDest;
                                         std::optional<DeclExpectedTypeScope> argExpectedScope;
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size())
                                         {
-                                            auto argExpectedDest = LLVMBackend::FuncPtrParamAsTypeAndValue(
+                                            argExpectedDest = LLVMBackend::FuncPtrParamAsTypeAndValue(
                                                 funcPtrTV.FuncPtrParams[argParamIndex], argParamIndex);
                                             argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                         }
@@ -3913,6 +4014,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                             Compiler(ctx)->LogError(
                                                 "cannot pass a holder containing a bonded closure to a function - the callee could stash it beyond the captured local's lifetime");
                                         auto argValue = argNV.Primary ? argNV.Primary : LoadNamedVariable(argNV);
+                                        if (Compiler(ctx)->IsCoreUniqueToRawPointer(argNV, argExpectedDest))
+                                            argValue = Compiler(ctx)->CreateCoreUniqueRawPointerCall(
+                                                argNV, argExpectedDest);
                                         if (argNV.TypeAndValue.IsAlias && !argNV.TypeAndValue.Pointer
                                             && argNV.Primary != nullptr
                                             && (argNV.TypeAndValue.IsFunctionPointer
@@ -4244,7 +4348,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
-                                    if (argNV.IdentifierLine > 0)
+                                    bool coreUniqueRawBorrow = !ifaceArgExpectedDest.IsMove
+                                        && !ifaceArgExpectedDest.IsUnique
+                                        && ifaceArgExpectedDest.Pointer
+                                        && !argNV.TypeAndValue.Pointer
+                                        && Compiler(ctx)->IsCoreUniqueType(argNV.TypeAndValue.TypeName);
+                                    if (argNV.IdentifierLine > 0 && !coreUniqueRawBorrow)
                                     {
                                         if (!argNV.IsElementAccess)
                                             Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
@@ -4298,7 +4407,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
                                     argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
-                                    argVar.TypeAndValue.IsUniqueTypeArg = argNV.TypeAndValue.IsUniqueTypeArg;
+                                    argVar.TypeAndValue.IsBorrowOfAliasElement =
+                                        argNV.TypeAndValue.IsBorrowOfAliasElement;
                                     // Propagate the pointer SHAPE flags: without them a `T**` or a
                                     // `T[]` looks like a thin `T*` and gets boxed into an interface param.
                                     argVar.TypeAndValue.ElemPointer = argNV.TypeAndValue.ElemPointer;
@@ -4419,6 +4529,31 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     auto fatTy = Compiler(ctx)->GetFatPtrType();
                                     ifacePtr = Compiler(ctx)->CreateAlloca(fatTy);
                                     Compiler(ctx)->CreateAssignment(interfaceVar.Primary, ifacePtr);
+                                }
+                                // A core unique interface stores its fat value in a wrapper field.
+                                // Add a whole-wrapper witness for the uninitialized check; the normal
+                                // field-path witness cannot distinguish a hidden declaration splat
+                                // from a genuinely initialized wrapper.
+                                if (!interfaceVar.CallerName.empty()
+                                    && interfaceVar.Storage != nullptr
+                                    && interfaceVar.TypeAndValue.IsInterface)
+                                {
+                                    auto owner = Compiler(ctx)->GetScopedLocalOrArgument(
+                                        interfaceVar.CallerName);
+                                    if (!owner.TypeAndValue.Pointer
+                                        && Compiler(ctx)->IsCoreUniqueType(owner.TypeAndValue.TypeName)
+                                        && owner.Storage != nullptr
+                                        && owner.Storage != interfaceVar.Storage)
+                                    {
+                                        LLVMBackend::NullIfaceDispatchSite wrapperSite;
+                                        wrapperSite.VarName = interfaceVar.CallerName;
+                                        wrapperSite.MemberName = primaryIdentifier;
+                                        wrapperSite.Line = (int)ctx->getStart()->getLine();
+                                        wrapperSite.Col = (int)ctx->getStart()->getCharPositionInLine();
+                                        Compiler(ctx)->RecordPendingNullIfaceDispatch(
+                                            wrapperSite, owner.Storage, interfaceVar.Primary,
+                                            interfaceVar.TypeAndValue.TypeName);
+                                    }
                                 }
                                 bool cleanupInlineOwnedReceiver = interfaceVar.Primary != nullptr
                                     && interfaceVar.Storage == nullptr
@@ -4629,20 +4764,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             std::vector<LLVMBackend::NamedVariable> arguments;
                             if (structVar.BaseType)
                             {
-                                // Use-after-move check for the method receiver.
                                 // LoadNamedVariable is not called for receivers, so check here.
-                                if (structVar.IdentifierLine > 0)
-                                {
-                                    if (!structVar.IsElementAccess)
-                                        Compiler(ctx)->RecordMoveUse(structVar.CallerName, structVar.FieldName,
-                                                                     structVar.IdentifierLine, structVar.IdentifierColumn);
-                                    if (auto moved = Compiler(ctx)->MovedUseSubject(structVar); !moved.empty())
-                                    {
-                                        Compiler(ctx)->currentLine = structVar.IdentifierLine;
-                                        Compiler(ctx)->currentColumn = structVar.IdentifierColumn;
-                                        Compiler(ctx)->LogError(std::format("use of moved variable '{}'", moved));
-                                    }
-                                }
+                                CheckMovedReceiver(structVar);
                                 LLVMBackend::NamedVariable argumentNamedVar = structVar; // Copy;
                                 argumentNamedVar.TypeAndValue.VariableName = "";
                                 // An owning-value rvalue temp receiver is dropped after the call - destruct it.
@@ -4848,7 +4971,12 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // Use-after-move check: a field access carries a populated Primary, so the
                                     // LoadNamedVariable check below is skipped for it - check explicitly here so
                                     // re-moving a field (or any moved variable) is rejected uniformly.
-                                    if (argNV.IdentifierLine > 0)
+                                    bool coreUniqueRawBorrow = !argExpectedDest.IsMove
+                                        && !argExpectedDest.IsUnique
+                                        && argExpectedDest.Pointer
+                                        && !argNV.TypeAndValue.Pointer
+                                        && Compiler(ctx)->IsCoreUniqueType(argNV.TypeAndValue.TypeName);
+                                    if (argNV.IdentifierLine > 0 && !coreUniqueRawBorrow)
                                     {
                                         if (!argNV.IsElementAccess)
                                             Compiler(ctx)->RecordMoveUse(argNV.CallerName, argNV.FieldName,
@@ -4892,6 +5020,9 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.IsAdoptable = argNV.IsAdoptable;
                                     argVar.IsOwningString = argNV.IsOwningString;
                                     argVar.IsOwningStruct = argNV.IsOwningStruct;
+                                    argVar.AllocatedByRawNewArray = argNV.AllocatedByRawNewArray;
+                                    argVar.RawArrayLength = argNV.RawArrayLength;
+                                    argVar.RawArrayLengthStorage = argNV.RawArrayLengthStorage;
                                     // Explicit 'move' at the call site: drives move-overload selection
                                     // and the borrow-param diagnostic after overload resolution.
                                     argVar.IsExplicitMove = argNV.IsExplicitMove;
@@ -4901,7 +5032,6 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     argVar.TypeAndValue.Pointer = argNV.TypeAndValue.Pointer;
                                     argVar.TypeAndValue.IsMove = argNV.TypeAndValue.IsMove;
                                     argVar.TypeAndValue.IsUnique = argNV.TypeAndValue.IsUnique;
-                                    argVar.TypeAndValue.IsUniqueTypeArg = argNV.TypeAndValue.IsUniqueTypeArg;
                                     // Propagate the array-view flag so a `T[]` argument is still seen
                                     // as a view at the call site (otherwise the noalias gate would
                                     // false-reject a legitimate view passed to a `T[]` parameter).
@@ -4944,6 +5074,13 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         argVar.TypeAndValue.IsInterface = true;
                                         argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
                                     }
+
+                                    // Preserve a desugared unique<T> source for the common call
+                                    // adapter. Overload matching uses this identity to apply the
+                                    // existing unique<T> -> T* borrow through get(), including
+                                    // generic methods such as dictionary.set().
+                                    if (Compiler(ctx)->IsCoreUniqueType(argNV.TypeAndValue.TypeName))
+                                        argVar.TypeAndValue.TypeName = argNV.TypeAndValue.TypeName;
 
                                     // Extract struct name if this is a struct type
                                     if (argVar.TypeAndValue.TypeName.empty())

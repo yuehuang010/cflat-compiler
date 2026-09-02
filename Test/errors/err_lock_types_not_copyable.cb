@@ -1,8 +1,6 @@
-// All six lock/sync primitives own their OS handle through a `unique void*`
-// slot, which suppresses memberwise copy (see mutex.cb/rwlock.cb/event.cb/
-// semaphore.cb/barrier.cb). Copying would hand the same OS handle to two
-// synthesized destructors and double-destroy it. `mutex b = a;` still works -
-// that MOVES, leaving one owner - only an explicit `.copy()` is refused.
+// All six lock/sync primitives own OS state through a mutable `void*` slot and
+// release it from a hand-written destructor. The non-trivial destructor suppresses
+// memberwise copy, while `mutex b = a;` still MOVES and leaves one owner.
 
 import "mutex.cb";
 import "rwlock.cb";
@@ -10,42 +8,42 @@ import "event.cb";
 import "semaphore.cb";
 import "barrier.cb";
 
-expect_error("cannot copy 'mutex': its field 'mutex._srw' is 'unique'") {
+expect_error("cannot copy 'mutex': it has a non-trivial destructor") {
     void testMutexCopy() {
         mutex a;
         mutex b = a.copy();
     }
 }
 
-expect_error("cannot copy 'condvar': its field 'condvar._slot' is 'unique'") {
+expect_error("cannot copy 'condvar': it has a non-trivial destructor") {
     void testCondvarCopy() {
         condvar a;
         condvar b = a.copy();
     }
 }
 
-expect_error("cannot copy 'rwlock': its field 'rwlock._lock' is 'unique'") {
+expect_error("cannot copy 'rwlock': it has a non-trivial destructor") {
     void testRwlockCopy() {
         rwlock a;
         rwlock b = a.copy();
     }
 }
 
-expect_error("cannot copy 'event': its field 'event._h' is 'unique'") {
+expect_error("cannot copy 'event': it has a non-trivial destructor") {
     void testEventCopy() {
         event a;
         event b = a.copy();
     }
 }
 
-expect_error("cannot copy 'semaphore': its field 'semaphore._handle' is 'unique'") {
+expect_error("cannot copy 'semaphore': it has a non-trivial destructor") {
     void testSemaphoreCopy() {
         semaphore a;
         semaphore b = a.copy();
     }
 }
 
-expect_error("cannot copy 'barrier': its field 'barrier._mtx._srw' is 'unique'") {
+expect_error("cannot copy 'barrier': it has a non-trivial destructor") {
     void testBarrierCopy() {
         barrier a;
         barrier b = a.copy();

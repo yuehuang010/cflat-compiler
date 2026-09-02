@@ -25,10 +25,9 @@ import "interfaces.cb";
 // Reader-writer lock (shared reads, exclusive writes).
 [Capability(ISharedLockable)]
 struct rwlock {
-    // unique: copy suppression only. os.rwlock_destroy nulls the slot after releasing
-    // it, so the synthesized null-checked delete never fires. Removing that null
-    // turns this into a delete on non-`new` memory.
-    unique void* _lock = nullptr;
+    // OS-owned mutable slot; os.rwlock_destroy releases and nulls it.
+    // ~rwlock is the only CFlat lifecycle hook for the slot.
+    void* _lock = nullptr;
 
     // Acquire a shared (read) lock - many readers can hold this simultaneously.
     void acquire_read() {
@@ -67,8 +66,7 @@ struct rwlock {
         os.rwlock_destroy(&_lock);
     }
 
-    // RAII teardown. `unique` on _lock suppresses copy, so a rwlock cannot be
-    // duplicated into two owners that would both try to destroy one OS lock.
+    // RAII teardown. The non-trivial destructor makes rwlock non-copyable.
     ~rwlock() {
         os.rwlock_destroy(&_lock);
     }

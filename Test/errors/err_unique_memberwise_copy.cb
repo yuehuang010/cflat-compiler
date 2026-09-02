@@ -4,6 +4,19 @@
 // synthesis site instead. `Holder b = a;` still works - that MOVES, leaving one owner.
 struct Node { int v = 0; };
 
+interface IShape { int area(); };
+class Square : IShape { int area() { return 1; } ~Square() {} };
+
+// The interface arm must not forward an unknown `.copy()` to the borrowed fat value. That would
+// copy the box bits and let two unique<IShape> destructors release the same object.
+expect_error("cannot copy 'unique<IShape>': unique<T> owns its pointee and has no deep-clone") {
+    unique<IShape> duplicate(unique<IShape> value)
+    {
+        unique<IShape> copy = value.copy();
+        return move copy;
+    }
+}
+
 struct Holder { unique Node* slot = nullptr; };
 
 // `.copy()` on a Holder VALUE dispatches its memberwise copy, which is refused at the synthesis

@@ -1,0 +1,31 @@
+import "unique.cb";
+
+struct Thing { int v = 0; };
+struct R { int v = 0; };
+
+R* borrowedFn() { return nullptr; }
+
+expect_error("cannot initialize unique") {
+    void rejectBorrowedCall() { unique R* m = borrowedFn(); }
+}
+
+expect_error("cannot return borrowed value") {
+    unique R* rejectBorrowedReturn()
+    {
+        R* borrowed = borrowedFn();
+        return borrowed;
+    }
+}
+
+// The destructor poison is deferred until the function is emitted, so call misuse() below.
+expect_error("unique<T> takes the pointee type");
+void misuse()
+{
+    unique<Thing*> u = default;
+}
+
+extern int main()
+{
+    misuse();
+    return 0;
+}

@@ -41,10 +41,9 @@ import "intrinsic.cb";   // pause() - spin-loop hint (x86; compiles away elsewhe
 // ---------------------------------------------------------------------------
 struct barrier {
     mutex _mtx        = default;
-    // unique: copy suppression only. cv_destroy (os.cond_destroy) nulls the slot
-    // after releasing it, so the synthesized null-checked delete never fires.
-    // Removing that null turns this into a delete on non-`new` memory.
-    unique void* _cv  = nullptr;   // condvar slot: Win32 CONDITION_VARIABLE inline / POSIX heap pthread_cond_t*
+    // OS-owned mutable slot; cv_destroy releases and nulls it.
+    // ~barrier is the only CFlat lifecycle hook for the slot.
+    void* _cv  = nullptr;   // condvar slot: Win32 CONDITION_VARIABLE inline / POSIX heap pthread_cond_t*
     int   _total      = 0;         // participants expected each phase (N)
     int   _count      = 0;         // arrivals still pending in the current phase
     u64   _generation = 0;         // phase id; bumped when a phase completes
@@ -104,9 +103,7 @@ struct barrier {
         _mtx.destroy();     // POSIX: free the heap mutex. Windows: SRW no-op.
     }
 
-    // RAII teardown. `unique` on _cv (and transitively via _mtx) suppresses copy,
-    // so a barrier cannot be duplicated into two owners that would both destroy
-    // one OS condvar/mutex.
+    // RAII teardown. The non-trivial destructor makes barrier non-copyable.
     ~barrier() {
         destroy();
     }

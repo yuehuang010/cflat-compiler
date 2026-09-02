@@ -9,7 +9,7 @@ struct Box { unique Res* p = nullptr; };
 
 extern int main()
 {
-    expect_error("cannot delete 'alias' - it aliases unique field 'Box.p'") {
+    expect_error("cannot delete 'alias' - it aliases unique field 'b.p'") {
         Box b = default;
         b.p = new Res();
         Res* alias = b.p;

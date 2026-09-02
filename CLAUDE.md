@@ -33,7 +33,7 @@ Wrong task for it -> say so in the report, do not spawn a sub-agent.
 
 Codex Luna is not an Agent-tool subagent. It is the `codex` CLI (`~/.local/bin/codex`), run from
 Bash. `~/.codex/config.toml` already pins `model = "gpt-5.6-luna"` + `model_reasoning_effort =
-"high"` - no flags needed:
+"xhigh"` - no flags needed:
 
 ```bash
 codex exec --sandbox workspace-write -C /Users/felixhuang/source/cflat-compiler "<self-contained prompt>"

@@ -125,7 +125,10 @@ struct dictionary<K, V>
     // caller's soon-freed argument, leaving the stored key dangling once that buffer is freed.
     void _placeKeyAt(int index, alias K key)
     {
-        _keys[index] = key.copy();
+        // A `unique` key is policy-rejected on the hash path; keep its .copy() (itself an error on
+        // an owning key) out of the instantiation so that tailored diagnostic is the one reported.
+        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+        else _keys[index] = key.copy();
     }
 
     // Release the value in a live slot by moving it into the discard sink and letting that drop:
@@ -173,19 +176,27 @@ struct dictionary<K, V>
     // by-value copy is a no-op drop and the caller keeps its original either way.
     bool add(alias K key, V value)
     {
-        if (_capacity == 0) _init(8);
-        // `key` BORROWS the caller's object, and that object may BE a slot of this dictionary's
-        // own key array (`d.add(d.keyAt(0), v)`). _maybeRehash frees that array, so take the
-        // independent copy FIRST and read only the copy afterwards.
-        K k = key.copy();
-        _maybeRehash();
-        int insertSlot = _insertSlotFor(k);
-        if (insertSlot == -1) return false;
-        _placeKeyAt(insertSlot, k);
-        _values[insertSlot] = value;
-        _status[insertSlot] = 1;
-        _count++;
-        return true;
+        // A `unique` key cannot be borrowed for hashing; poison the whole body so the defensive
+        // copy below is never instantiated for it (that copy of an owning key is its own error,
+        // and it would preempt this diagnostic).
+        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
+        else
+        {
+            if (_capacity == 0) _init(8);
+            // `key` BORROWS the caller's object, and that object may BE a slot of this dictionary's
+            // own key array (`d.add(d.keyAt(0), v)`). _maybeRehash frees that array, so take the
+            // independent copy FIRST and read only the copy afterwards.
+            K k = key.copy();
+            _maybeRehash();
+            int insertSlot = _insertSlotFor(k);
+            if (insertSlot == -1) return false;
+            _placeKeyAt(insertSlot, k);
+            _values[insertSlot] = value;
+            _status[insertSlot] = 1;
+            _count++;
+            return true;
+        }
+        return false;
     }
 
     // Insert or overwrite the value for key. Store semantics DEFER to V exactly as in add(): a
@@ -197,24 +208,29 @@ struct dictionary<K, V>
     // add() - there is no duplicate-refusal path.
     void set(alias K key, V value)
     {
-        if (_capacity == 0) _init(8);
-        // Self-aliasing guard, exactly as in add(): copy before the rehash frees _keys.
-        K k = key.copy();
-        _maybeRehash();
-
-        int updateSlot = _insertSlotFor(k);
-        if (updateSlot == -1)
-        {
-            updateSlot = _findSlot(k);
-            _releaseValueAt(updateSlot);
-        }
+        // See add(): the key copy below is its own error on an owning key, so poison the body.
+        if const (is_unique(K)) compile_error("dictionary keys cannot be 'unique'; a lookup reads the key for hashing/equality and would move it out. Use 'dictionary<K*, V>' for a borrowed key, or a primitive/owning-value key, and manage the key lifetime separately.");
         else
         {
-            _placeKeyAt(updateSlot, k);
-            _status[updateSlot] = 1;
-            _count++;
+            if (_capacity == 0) _init(8);
+            // Self-aliasing guard, exactly as in add(): copy before the rehash frees _keys.
+            K k = key.copy();
+            _maybeRehash();
+
+            int updateSlot = _insertSlotFor(k);
+            if (updateSlot == -1)
+            {
+                updateSlot = _findSlot(k);
+                _releaseValueAt(updateSlot);
+            }
+            else
+            {
+                _placeKeyAt(updateSlot, k);
+                _status[updateSlot] = 1;
+                _count++;
+            }
+            _values[updateSlot] = value;
         }
-        _values[updateSlot] = value;
     }
 
     // Transfer overloads - the caller writes `move` to give up ownership instead of paying for
@@ -224,7 +240,9 @@ struct dictionary<K, V>
     // already a synthesized move sink. is_pointer(V) covers bare, `unique`, `alias` and
     // interface values alike. Declared AFTER the plain overloads so the IDictionary contract
     // check matches the plain ones first.
-    if const (!is_pointer(V))
+    // `!is_unique(K)`: a unique key is policy-rejected on the hash path, and these bodies copy
+    // the key, which is its own error on an owning key - keep them out of that instantiation.
+    if const (!is_pointer(V) && !is_unique(K))
     {
         bool add(alias K key, move V value)
         {

@@ -315,7 +315,8 @@ bool LLVMBackend::InterfaceSlotIsFrameLocal(const llvm::Value* slot) const
                 if (const auto* call = llvm::dyn_cast<llvm::CallBase>(u))
                     if (const llvm::Function* f = call->getCalledFunction(); f != nullptr
                         && (f->getName().starts_with("llvm.dbg.")
-                            || f->getName().starts_with("llvm.lifetime."))) continue;
+                            || f->getName().starts_with("llvm.lifetime.")
+                            || f->getName().starts_with("_~"))) continue;
                 return false;
             }
         }

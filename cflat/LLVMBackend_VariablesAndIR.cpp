@@ -1201,7 +1201,9 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PadFieldsForAlignment(
         return out;
     }
 
-bool LLVMBackend::UniqueChainReaches(const std::string& from, const std::string& target) const
+bool LLVMBackend::UniqueChainReaches(const std::string& from, const std::string& target,
+                                     const std::string& currentName,
+                                     const std::vector<DeclTypeAndValue>* currentFields) const
 {
         std::unordered_set<std::string> seen;
         std::vector<std::string> pending{ from };
@@ -1211,24 +1213,53 @@ bool LLVMBackend::UniqueChainReaches(const std::string& from, const std::string&
             pending.pop_back();
             if (t == target) return true;
             if (!seen.insert(t).second) continue;
-            auto it = dataStructures.find(t);
-            if (it == dataStructures.end()) continue;
-            for (const auto& f : it->second.StructFields)
-                if (f.IsUnique && f.Pointer && !f.ElemPointer)
-                    pending.push_back(f.TypeName);
+            const std::vector<DeclTypeAndValue>* fields = nullptr;
+            if (t == currentName && currentFields != nullptr)
+                fields = currentFields;
+            else
+            {
+                auto it = dataStructures.find(t);
+                if (it == dataStructures.end()) continue;
+                fields = &it->second.StructFields;
+            }
+            for (const auto& f : *fields)
+            {
+                bool coreUnique = !f.Pointer
+                    && (IsCoreUniqueType(f.TypeName)
+                        || f.TypeName.starts_with("unique__"));
+                if ((f.IsUnique
+                        && f.Pointer && !f.ElemPointer) || coreUnique)
+                    pending.push_back(coreUnique ? f.TypeName.substr(8) : f.TypeName);
+            }
+        }
+        return false;
+    }
+
+bool LLVMBackend::HasUniqueDestructionCycle(const std::string& name,
+                                             const std::vector<LLVMBackend::DeclTypeAndValue>& fields,
+                                             std::string* fieldName) const
+{
+        for (const auto& f : fields)
+        {
+            bool coreUnique = !f.Pointer
+                && (IsCoreUniqueType(f.TypeName)
+                    || f.TypeName.starts_with("unique__"));
+            if ((!f.IsUnique
+                    || !f.Pointer || f.ElemPointer) && !coreUnique) continue;
+            std::string pointee = coreUnique ? f.TypeName.substr(8) : f.TypeName;
+            if (!UniqueChainReaches(pointee, name, name, &fields)) continue;
+            if (fieldName != nullptr) *fieldName = f.VariableName;
+            return true;
         }
         return false;
     }
 
 void LLVMBackend::RejectUniqueDestructionCycles(const std::string& name, const std::vector<LLVMBackend::DeclTypeAndValue>& fields)
 {
-        for (const auto& f : fields)
-        {
-            if (!f.IsUnique || !f.Pointer || f.ElemPointer) continue;
-            if (!UniqueChainReaches(f.TypeName, name)) continue;
-            LogError("'unique' on field '" + name + "." + f.VariableName + "' forms a destruction cycle back to '"
-                     + name + "': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.");
-        }
+        std::string fieldName;
+        if (!HasUniqueDestructionCycle(name, fields, &fieldName)) return;
+        LogError("'unique' on field '" + name + "." + fieldName + "' forms a destruction cycle back to '"
+                 + name + "': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.");
     }
 
 void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
@@ -1285,6 +1316,10 @@ llvm::StructType* LLVMBackend::CreateStructType(std::string name, std::vector<LL
 
         if (typeAndValues.size() > 0)
         {
+            // Check before asking LLVM for the core unique<T> value layout. A rejected cycle must
+            // not instantiate an unsized recursive wrapper, or expect_error recovery would leave
+            // an invalid module behind before it can finish the file.
+            RejectUniqueDestructionCycles(name, typeAndValues);
             RejectByValueContainmentCycles(name, typeAndValues);
             std::vector<llvm::Type*> types;
 

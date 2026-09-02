@@ -3,7 +3,7 @@
 // create two owners of one pointer - a compile error.
 struct N { int v = 0; ~N() {} };
 
-expect_error("cannot initialize unique 'u' from a borrowed value") {
+expect_error("cannot initialize unique<N> 'u' from borrowed value 'borrowed'") {
     void takes(N* borrowed) { unique N* u = borrowed; }
 }
 
@@ -12,7 +12,7 @@ expect_error("cannot initialize unique 'u' from a borrowed value") {
 // (abort at scope exit). The join owns nothing, so the `unique` initialization is rejected.
 move N* makeN() { return new N; }
 
-expect_error("cannot initialize unique 'u2' from a borrowed value") {
+expect_error("cannot initialize unique<N> 'u2' from a borrowed value") {
     void mixedJoin(bool a, bool b)
     {
         unique N* owned = new N;
@@ -24,7 +24,7 @@ expect_error("cannot initialize unique 'u2' from a borrowed value") {
 // only the callee's copy, so the caller remains sole owner and the join owns nothing - adopting it
 // destroyed the caller's live object inside the callee. Rejecting it here matches the direct
 // `unique N* u = move borrowed;` spelling, which was already an error.
-expect_error("cannot initialize unique 'u3' from a borrowed value") {
+expect_error("cannot initialize unique<N> 'u3' from a borrowed value") {
     void borrowedMoveJoin(N* borrowed, bool c)
     {
         unique N* u3 = c ? move borrowed : nullptr;
@@ -35,7 +35,7 @@ expect_error("cannot initialize unique 'u3' from a borrowed value") {
 // already rejected, but routing it through a '?:' join whose arms are all borrowed moves or null
 // silently borrowed into the owning slot. Every path owns nothing, so reject it like the direct
 // form and like the declaration above.
-expect_error("cannot assign borrowed parameter 'borrowed' to unique local 'b4'") {
+expect_error("cannot reset unique<N> 'b4' from a borrowed value") {
     void borrowedMoveJoinReassign(N* borrowed, bool c)
     {
         unique N* b4 = nullptr;
@@ -45,7 +45,7 @@ expect_error("cannot assign borrowed parameter 'borrowed' to unique local 'b4'")
 
 // Same through a NESTED join - the provenance survives the outer join, so the laundering depth
 // does not change the answer.
-expect_error("cannot assign borrowed parameter 'borrowed' to unique local 'b5'") {
+expect_error("cannot reset unique<N> 'b5' from a borrowed value") {
     void borrowedMoveNestedJoinReassign(N* borrowed, bool c)
     {
         unique N* b5 = nullptr;

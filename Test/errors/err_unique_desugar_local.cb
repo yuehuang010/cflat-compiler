@@ -1,0 +1,19 @@
+// Pointer-form unique locals are library unique<T> values, but their ownership checks remain.
+struct DesugarResource { int id = 0; ~DesugarResource() {} };
+
+void rejectBorrowedInit(DesugarResource* borrowed)
+{
+    expect_error("cannot initialize unique<DesugarResource> 'u' from borrowed value 'borrowed'") {
+        unique<DesugarResource> u = borrowed;
+    }
+}
+
+void rejectDelete()
+{
+    unique DesugarResource* u = nullptr;
+    expect_error("cannot delete unique local 'u'") {
+        delete u;
+    }
+}
+
+int main() { return 0; }

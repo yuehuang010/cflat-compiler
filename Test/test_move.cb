@@ -1,5 +1,6 @@
 import "function.cb";
 import "list.cb";
+import "unique.cb";
 import "stack.cb";
 import "queue.cb";
 import "dictionary.cb";
@@ -9363,7 +9364,7 @@ PodPair makePodPair()
 // call-site reject deliberately leaves alone; the two sinks state the ownership claim it reads.
 int readResourceId(Resource* r) { return r->id; }
 // An OWNING call result for the '??' fallback arm: the arm flush must keep the value it yields.
-unique Resource* makeArmOwnedResource() { Resource* r = new Resource(); r->id = 52; return r; }
+move Resource* makeArmOwnedResource() { Resource* r = new Resource(); r->id = 52; return r; }
 void sinkResourceUnique(unique Resource* r) { }
 void sinkResourceMove(move Resource* r) { delete r; }
 
@@ -11396,6 +11397,486 @@ int testAdoptInterfaceParam()
     return passed;
 }
 
+// Library unique<T> helpers. Unlike the builtin `unique T*` qualifier above, this owns its
+// pointee behind a generic value and exposes explicit release/reset operations.
+interface ILibraryUnique
+{
+    int value();
+};
+
+int libraryUniqueADtor = 0;
+int libraryUniqueBDtor = 0;
+
+class LibraryUniqueA : ILibraryUnique
+{
+    int value() { return 41; }
+    ~LibraryUniqueA() { libraryUniqueADtor = libraryUniqueADtor + 1; }
+};
+
+class LibraryUniqueB : ILibraryUnique
+{
+    int value() { return 42; }
+    ~LibraryUniqueB() { libraryUniqueBDtor = libraryUniqueBDtor + 1; }
+};
+
+void consumeLibraryUniqueIface(move unique<ILibraryUnique> value)
+{
+    int id = value.get().value();
+}
+
+move unique<Resource> makeLibraryUnique(int id)
+{
+    Resource* p = new Resource();
+    p->id = id;
+    return unique<Resource>(p);
+}
+
+void consumeLibraryUnique(move unique<Resource> value)
+{
+    int id = value->id;
+}
+
+void borrowLibraryUnique(Resource* value)
+{
+    int id = value->id;
+}
+
+int testLibraryUnique()
+{
+    int passed = 0;
+
+    // Scope exit destroys the pointee exactly once, after the owner leaves scope.
+    dtorCount = 0;
+    {
+        unique<Resource> value = unique<Resource>(new Resource());
+        value->id = 11;
+        passed += Test("library_unique_scope_value", value.get()->id, 11);
+        passed += Test("library_unique_scope_live", dtorCount, 0);
+    }
+    passed += Test("library_unique_scope_dtor", dtorCount, 1);
+
+    // An indirect raw-pointer call borrows the unique pointee and leaves its owner intact.
+    dtorCount = 0;
+    {
+        unique<Resource> value = unique<Resource>(new Resource());
+        value->id = 18;
+        function<void(Resource*)> callback = borrowLibraryUnique;
+        callback(value);
+        passed += Test("library_unique_indirect_borrow_value", value->id, 18);
+        passed += Test("library_unique_indirect_borrow_live", dtorCount, 0);
+    }
+    passed += Test("library_unique_indirect_borrow_dtor", dtorCount, 1);
+
+    // A move-returning factory transfers the unique value to the caller.
+    dtorCount = 0;
+    {
+        unique<Resource> value = makeLibraryUnique(12);
+        passed += Test("library_unique_factory_value", value->id, 12);
+    }
+    passed += Test("library_unique_factory_dtor", dtorCount, 1);
+
+    // A move unique<T> parameter consumes the owner and destroys it at callee exit.
+    dtorCount = 0;
+    {
+        unique<Resource> value = unique<Resource>(new Resource());
+        value->id = 13;
+        consumeLibraryUnique(move value);
+    }
+    passed += Test("library_unique_consume_dtor", dtorCount, 1);
+
+    // release() empties the owner and hands the raw ownership to the caller.
+    dtorCount = 0;
+    {
+        unique<Resource> value = unique<Resource>(new Resource());
+        value->id = 14;
+        Resource* raw = value.release();
+        passed += Test("library_unique_release_empty", value.valid(), false);
+        passed += Test("library_unique_release_value", raw->id, 14);
+        delete raw;
+    }
+    passed += Test("library_unique_release_dtor", dtorCount, 1);
+
+    // reset() destroys the old pointee immediately and owns the replacement until scope exit.
+    dtorCount = 0;
+    {
+        unique<Resource> value = unique<Resource>(new Resource());
+        value->id = 15;
+        Resource* replacement = new Resource();
+        replacement->id = 16;
+        value.reset(replacement);
+        passed += Test("library_unique_reset_value", value->id, 16);
+        passed += Test("library_unique_reset_old_dtor", dtorCount, 1);
+    }
+    passed += Test("library_unique_reset_total_dtor", dtorCount, 2);
+
+    // The library type accepts only ownership-producing pointer expressions at its sinks.
+    dtorCount = 0;
+    {
+        unique<Resource> fromNew = unique<Resource>(new Resource());
+        Resource* ownedLocal = new Resource();
+        unique<Resource> fromMove = unique<Resource>(move ownedLocal);
+        unique<Resource> target = unique<Resource>(new Resource());
+        unique<Resource> u2 = unique<Resource>(new Resource());
+        target.reset(u2.release());
+    }
+    passed += Test("library_unique_blessed_accepts_owned_sources", dtorCount, 4);
+
+    // list<unique<T>> delegates ownership to unique<T> for add, removal, overwrite, take,
+    // and clear. Each block observes both immediate and scope-exit destruction.
+    dtorCount = 0;
+    {
+        list<unique<Resource>> items;
+        items.add(unique<Resource>(new Resource()));
+        items.add(unique<Resource>(new Resource()));
+        items.removeAt(0);
+        passed += Test("library_unique_list_removeAt_dtor", dtorCount, 1);
+    }
+    passed += Test("library_unique_list_removeAt_total", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        list<unique<Resource>> items;
+        items.add(unique<Resource>(new Resource()));
+        items.set(0, unique<Resource>(new Resource()));
+        passed += Test("library_unique_list_set_old_dtor", dtorCount, 1);
+    }
+    passed += Test("library_unique_list_set_total", dtorCount, 2);
+
+    dtorCount = 0;
+    {
+        list<unique<Resource>> items;
+        Resource* p = new Resource();
+        p->id = 17;
+        items.add(unique<Resource>(p));
+        unique<Resource> taken = items.take(0);
+        passed += Test("library_unique_list_take_empty", items.count(), 0);
+        passed += Test("library_unique_list_take_value", taken->id, 17);
+        passed += Test("library_unique_list_take_live", dtorCount, 0);
+    }
+    passed += Test("library_unique_list_take_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        list<unique<Resource>> items;
+        items.add(unique<Resource>(new Resource()));
+        items.add(unique<Resource>(new Resource()));
+        items.add(unique<Resource>(new Resource()));
+        items.clear();
+        passed += Test("library_unique_list_clear_dtor", dtorCount, 3);
+        passed += Test("library_unique_list_clear_empty", items.count(), 0);
+    }
+    passed += Test("library_unique_list_clear_total", dtorCount, 3);
+
+    // Interface unique<T> stores the fat value and releases through its vtable destructor.
+    libraryUniqueADtor = 0;
+    libraryUniqueBDtor = 0;
+    {
+        unique<ILibraryUnique> value = unique<ILibraryUnique>(new LibraryUniqueA());
+        passed += Test("library_unique_iface_virtual_get", value.get().value(), 41);
+        passed += Test("library_unique_iface_operator_not_live", !value, false);
+        passed += Test("library_unique_iface_scope_a_live", libraryUniqueADtor, 0);
+    }
+    passed += Test("library_unique_iface_scope_a_dtor", libraryUniqueADtor, 1);
+    passed += Test("library_unique_iface_scope_b_dtor", libraryUniqueBDtor, 0);
+
+    // reset() of an interface unique must not delete and then re-adopt the same fat value.
+    libraryUniqueADtor = 0;
+    {
+        unique<ILibraryUnique> value = unique<ILibraryUnique>(new LibraryUniqueA());
+        value.reset(value.get());
+        passed += Test("library_unique_iface_reset_same_live", libraryUniqueADtor, 0);
+    }
+    passed += Test("library_unique_iface_reset_same_dtor", libraryUniqueADtor, 1);
+
+    libraryUniqueADtor = 0;
+    libraryUniqueBDtor = 0;
+    {
+        unique<ILibraryUnique> value = unique<ILibraryUnique>(new LibraryUniqueA());
+        consumeLibraryUniqueIface(move value);
+        passed += Test("library_unique_iface_move_param_source", libraryUniqueADtor, 1);
+    }
+    passed += Test("library_unique_iface_move_param_b_dtor", libraryUniqueBDtor, 0);
+
+    libraryUniqueADtor = 0;
+    libraryUniqueBDtor = 0;
+    {
+        unique<ILibraryUnique> value = unique<ILibraryUnique>(new LibraryUniqueA());
+        ILibraryUnique raw = value.release();
+        passed += Test("library_unique_iface_release_empty", value.valid(), false);
+        passed += Test("library_unique_iface_release_operator_not", !value, true);
+        passed += Test("library_unique_iface_release_value", raw.value(), 41);
+        delete raw;
+        passed += Test("library_unique_iface_release_a_dtor", libraryUniqueADtor, 1);
+        value.reset(new LibraryUniqueB());
+        passed += Test("library_unique_iface_reset_value", value.get().value(), 42);
+        passed += Test("library_unique_iface_reset_a_dtor", libraryUniqueADtor, 1);
+    }
+    passed += Test("library_unique_iface_reset_b_dtor", libraryUniqueBDtor, 1);
+
+    libraryUniqueADtor = 0;
+    libraryUniqueBDtor = 0;
+    {
+        list<unique<ILibraryUnique>> items;
+        items.add(unique<ILibraryUnique>(new LibraryUniqueA()));
+        items.add(unique<ILibraryUnique>(new LibraryUniqueB()));
+        items.add(unique<ILibraryUnique>(new LibraryUniqueA()));
+        items.removeAt(0);
+        passed += Test("library_unique_iface_list_remove_a_dtor", libraryUniqueADtor, 1);
+        items.clear();
+        passed += Test("library_unique_iface_list_clear_a_dtor", libraryUniqueADtor, 2);
+        passed += Test("library_unique_iface_list_clear_b_dtor", libraryUniqueBDtor, 1);
+    }
+    passed += Test("library_unique_iface_list_final_a_dtor", libraryUniqueADtor, 2);
+    passed += Test("library_unique_iface_list_final_b_dtor", libraryUniqueBDtor, 1);
+
+    return passed;
+}
+
+int desugaredFieldUserDtorCount = 0;
+
+struct DesugaredUniqueFieldHolder
+{
+    unique Resource* item = nullptr;
+};
+
+struct DesugaredUniqueFieldWithDtor
+{
+    unique Resource* item = nullptr;
+
+    ~DesugaredUniqueFieldWithDtor()
+    {
+        desugaredFieldUserDtorCount = desugaredFieldUserDtorCount + 1;
+        item = nullptr;
+    }
+};
+
+int exerciseDesugaredUniqueParam(unique Resource* p)
+{
+    int oldId = p == nullptr ? -1 : p->id;
+    p = new Resource();
+    p->id = oldId + 1;
+    return p->id;
+}
+
+struct DesugaredUniqueCtorResource
+{
+    int id = 0;
+    DesugaredUniqueCtorResource(int value) { id = value; }
+    ~DesugaredUniqueCtorResource() { dtorCount = dtorCount + 1; }
+};
+
+unique<Resource> makeDesugaredUniqueP5()
+{
+    int[] tmp = new int[4];
+    tmp[0] = 1;
+    unique Resource* p = new Resource();
+    p->id = 5;
+    return move p;
+}
+
+unique<DesugaredUniqueCtorResource> makeDesugaredUniqueP6(int[] arr)
+{
+    unique DesugaredUniqueCtorResource* p = new DesugaredUniqueCtorResource(arr[0]);
+    return move p;
+}
+
+unique<Resource> makeDesugaredUniqueP7()
+{
+    alignas(64) int[16] buf;
+    buf[0] = 1;
+    unique Resource* p = new Resource();
+    unique Resource* q = move p;
+    q->id = 7;
+    return move q;
+}
+
+move Resource* desugaredUniqueAlignedNew()
+{
+    return new Resource();
+}
+
+unique<Resource> makeDesugaredUniqueP8()
+{
+    unique Resource* p = desugaredUniqueAlignedNew();
+    p->id = 8;
+    return move p;
+}
+
+unique Resource* makeDesugaredUniquePointerReturn()
+{
+    Resource* r = new Resource();
+    r->id = 11;
+    return r;
+}
+
+struct DesugaredUniqueReturnStruct
+{
+    unique Resource* make()
+    {
+        Resource* r = new Resource();
+        r->id = 12;
+        return r;
+    }
+};
+
+interface IDesugaredUniqueReturn { unique Resource* make(); };
+class DesugaredUniqueReturnImpl : IDesugaredUniqueReturn
+{
+    unique Resource* make()
+    {
+        Resource* r = new Resource();
+        r->id = 13;
+        return r;
+    }
+};
+
+int desugaredUniqueAlignedConst(move alignas(0, 32 + 32) unique Resource* p)
+{
+    return p->id;
+}
+
+int desugaredUniqueShadowedAssignment()
+{
+    unique Resource* p = new Resource();
+    p->id = 9;
+    {
+        int* p = nullptr;
+        p = new int[4];
+        p[0] = 10;
+        delete[] p;
+    }
+    return p->id;
+}
+
+int desugaredUniqueAlignedOrder()
+{
+    unique Resource* q = nullptr;
+    alignas(0, 64) unique Resource* a = new Resource();
+    a->id = 10;
+    q = move a;
+    return q->id;
+}
+
+int testDesugaredUniquePointerForms()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    passed += Test("desugared_unique_param_raw_value", exerciseDesugaredUniqueParam(new Resource()), 1);
+    passed += Test("desugared_unique_param_raw_dtor", dtorCount, 2);
+
+    dtorCount = 0;
+    passed += Test("desugared_unique_param_null_value", exerciseDesugaredUniqueParam(nullptr), 0);
+    passed += Test("desugared_unique_param_null_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        DesugaredUniqueFieldHolder source = default;
+        source.item = new Resource();
+        source.item->id = 41;
+        DesugaredUniqueFieldHolder target = default;
+        target.item = source.item;
+        passed += Test("desugared_unique_field_move_source_empty", source.item == nullptr, true);
+        passed += Test("desugared_unique_field_move_target_value", target.item->id, 41);
+    }
+    passed += Test("desugared_unique_field_move_dtor", dtorCount, 1);
+    passed += Test("desugared_unique_field_sizeof", (int)sizeof(DesugaredUniqueFieldHolder), 8);
+
+    dtorCount = 0;
+    desugaredFieldUserDtorCount = 0;
+    {
+        DesugaredUniqueFieldWithDtor holder = default;
+        holder.item = new Resource();
+    }
+    passed += Test("desugared_unique_field_user_dtor_first_resource", dtorCount, 1);
+    passed += Test("desugared_unique_field_user_dtor_count", desugaredFieldUserDtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique<Resource> value = makeDesugaredUniqueP5();
+        passed += Test("desugared_unique_p5_value", value->id, 5);
+        passed += Test("desugared_unique_p5_live", dtorCount, 0);
+    }
+    passed += Test("desugared_unique_p5_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        int[] args = new int[1];
+        args[0] = 6;
+        unique<DesugaredUniqueCtorResource> value = makeDesugaredUniqueP6(args);
+        passed += Test("desugared_unique_p6_value", value->id, 6);
+        passed += Test("desugared_unique_p6_live", dtorCount, 0);
+    }
+    passed += Test("desugared_unique_p6_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique<Resource> value = makeDesugaredUniqueP7();
+        passed += Test("desugared_unique_p7_value", value->id, 7);
+        passed += Test("desugared_unique_p7_live", dtorCount, 0);
+    }
+    passed += Test("desugared_unique_p7_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique<Resource> value = makeDesugaredUniqueP8();
+        passed += Test("desugared_unique_p8_value", value->id, 8);
+        passed += Test("desugared_unique_p8_live", dtorCount, 0);
+    }
+    passed += Test("desugared_unique_p8_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        alignas(0, 32 + 32) unique Resource* value = new Resource();
+        value->id = 9;
+        passed += Test("desugared_unique_align_const_value",
+            desugaredUniqueAlignedConst(move value), 9);
+    }
+    passed += Test("desugared_unique_align_const_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("desugared_unique_shadowed_assignment_value",
+        desugaredUniqueShadowedAssignment(), 9);
+    passed += Test("desugared_unique_shadowed_assignment_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("desugared_unique_align_order_value", desugaredUniqueAlignedOrder(), 10);
+    passed += Test("desugared_unique_align_order_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* m = makeDesugaredUniquePointerReturn();
+        passed += Test("desugared_unique_return_pointer_value", m->id, 11);
+    }
+    passed += Test("desugared_unique_return_pointer_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique<Resource> m = makeDesugaredUniquePointerReturn();
+        passed += Test("desugared_unique_return_value_value", m->id, 11);
+    }
+    passed += Test("desugared_unique_return_value_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        DesugaredUniqueReturnStruct s = default;
+        unique Resource* m = s.make();
+        passed += Test("desugared_unique_return_struct_method_value", m->id, 12);
+    }
+    passed += Test("desugared_unique_return_struct_method_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        DesugaredUniqueReturnImpl impl = default;
+        IDesugaredUniqueReturn iface = impl;
+        unique<Resource> m = iface.make();
+        passed += Test("desugared_unique_return_iface_method_value", m->id, 13);
+    }
+    passed += Test("desugared_unique_return_iface_method_dtor", dtorCount, 1);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -11762,6 +12243,12 @@ extern int main()
 
     passed += testAdoptInterfaceParam();
     total += 4;
+
+    passed += testLibraryUnique();
+    total += 48;
+
+    passed += testDesugaredUniquePointerForms();
+    total += 36;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -61,8 +61,11 @@ class FileStream : IReader, IWriter
     void write(string text) { gLastWriteLen = text.length(); }
 };
 
-// Destructor side-effect counter for delete-through-interface (Test 15).
+// Destructor side-effect counter for delete-through-interface (Test 15). The order stamp is
+// read by the `unique <interface>` FIELD teardown-ordering leg further down.
 int gDelIfaceDtorCount = 0;
+int gUniqIfaceFieldOrder = 0;
+int gUniqIfaceBoxDtorAt = 0;
 
 interface ICounted { int value(); };
 
@@ -70,7 +73,12 @@ class Counted : ICounted
 {
     int v = 0;
     int value() { return v; }
-    ~Counted() { gDelIfaceDtorCount = gDelIfaceDtorCount + 1; }
+    ~Counted()
+    {
+        gDelIfaceDtorCount = gDelIfaceDtorCount + 1;
+        gUniqIfaceFieldOrder = gUniqIfaceFieldOrder + 1;
+        gUniqIfaceBoxDtorAt = gUniqIfaceFieldOrder;
+    }
 };
 
 move ICounted makeCounted()
@@ -777,6 +785,25 @@ bool testMoveInterfaceParam()
 // scope-exit teardown a no-op) and the destination owns it - exactly one
 // destruction per object, zero leaks. Non-move borrowing stays rejected (see
 // Test/errors/err_unique_iface_borrow_no_move.cb).
+// A `unique <interface>` FIELD declared on both an interface and its implementor must AGREE
+// without a spurious shape mismatch, and the class destructor must run before the field release.
+int gUniqIfaceHolderDtorAt = 0;
+interface IUniqIfaceField
+{
+    unique ICounted slot;
+    int slotValue();
+};
+class UniqIfaceHolder : IUniqIfaceField
+{
+    unique ICounted slot = default;
+    int slotValue() { return slot != nullptr ? slot.value() : -1; }
+    ~UniqIfaceHolder()
+    {
+        gUniqIfaceFieldOrder = gUniqIfaceFieldOrder + 1;
+        gUniqIfaceHolderDtorAt = gUniqIfaceFieldOrder;
+    }
+};
+
 bool testMoveUniqueInterfaceLocal()
 {
     bool result = true;
@@ -801,6 +828,23 @@ bool testMoveUniqueInterfaceLocal()
         result &= Test("uniq_iface_reassign_value", y.value(), 7);
     }
     result &= Test("uniq_iface_reassign_total_dtor", gDelIfaceDtorCount, 2);
+
+    // FIELD leg: the interface and the class agree on `unique ICounted slot`, dispatch reads the
+    // owned box, and teardown runs the class destructor BEFORE the field release (UniqueFreesItself).
+    gDelIfaceDtorCount = 0;
+    gUniqIfaceFieldOrder = 0;
+    gUniqIfaceHolderDtorAt = 0;
+    gUniqIfaceBoxDtorAt = 0;
+    {
+        UniqIfaceHolder h;
+        h.slot = new Counted();
+        IUniqIfaceField iface = h;
+        result &= Test("uniq_iface_field_dispatch", iface.slotValue(), 0);
+        result &= Test("uniq_iface_field_no_early_free", gDelIfaceDtorCount, 0);
+    }
+    result &= Test("uniq_iface_field_freed_once", gDelIfaceDtorCount, 1);
+    result &= Test("uniq_iface_field_user_dtor_first", gUniqIfaceHolderDtorAt, 1);
+    result &= Test("uniq_iface_field_release_second", gUniqIfaceBoxDtorAt, 2);
 
     return result;
 }

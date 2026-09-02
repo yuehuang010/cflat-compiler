@@ -148,14 +148,6 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
             if (rawArrayCountArg != nullptr)
                 rawArrayCountArg->setName(itr_nameArg->VariableName + ".raw_array_count");
 
-            // 8a (thin unique): a plain (non-move) `unique`-type-arg pointer / interface param is a
-            // synthesized sink - ApplyMoveParamTransfer nulls the caller on IsUniqueTypeArg - but
-            // unlike an explicit `move` param it was never routed through scope-exit cleanup, so a
-            // path that does not move it out leaked. Mark it owning so EmitOwningPtrCleanup /
-            // EmitOwningInterfaceCleanup release it on the not-moved path (a no-op on a nulled slot).
-            bool uniqueAutoSink = itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
-                && !itr_nameArg->IsBorrowOfUniqueElement;
-
             // A non-pointer `alias T` param arrives as a POINTER to the caller's object: bind
             // Storage to it directly so reads, writes and `&param` all reach the caller's slot.
             if (ParameterIsAliasByPointer(*itr_nameArg))
@@ -187,12 +179,11 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                     .Storage = tmp,
                     // A `move` interface param takes ownership: mark it owning so 'delete x' is
                     // permitted (not a borrow) and scope exit destructs it if not deleted. A plain
-                    // `unique <iface>` sink (uniqueAutoSink) is likewise owning at entry (8a).
-                    .IsOwning = itr_nameArg->IsMove || uniqueAutoSink,
+                    .IsOwning = itr_nameArg->IsMove,
                 };
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
-            else if ((itr_nameArg->IsMove || uniqueAutoSink) && itr_nameArg->Pointer)
+            else if (itr_nameArg->IsMove && itr_nameArg->Pointer)
             {
                 // move parameter: alloca a slot so we can null it out on scope exit
                 auto* ptrTy = GetType(*itr_nameArg, nullptr, true);
@@ -277,15 +268,21 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 // downstream consuming call (a sink/`move`/unique param) is rejected, not laundered.
                 // A consume-inferred sink of a COPYABLE type does NOT consume (store is a copy), so
                 // it is still a borrow here - OwningSinkConsumesConcrete makes that call per T.
+                // A by-value core unique<X> param is a synthesized sink, exactly as the
+                // `unique X*` spelling it desugars from: the callee owns it on entry.
+                bool coreUniqueValueParam = !itr_nameArg->Pointer
+                    && IsCoreUniqueType(itr_nameArg->TypeName);
                 if (!OwningSinkConsumesConcrete(*itr_nameArg) && !itr_nameArg->IsMove
-                    && !itr_nameArg->IsUniqueTypeArg && !itr_nameArg->IsAlias
+                    && !itr_nameArg->IsAlias
+                    && !coreUniqueValueParam
                     && IsOwningValueOrClosureType(itr_nameArg->TypeName))
                     namedVar.IsBorrowedOwningValue = true;
                 // 8a: an owning sink that CONSUMES for this concrete type (a non-copyable owner) OWNS
                 // the value on entry. A path that does not move it out must release it at scope exit,
                 // or the poisoned caller's value leaks. Marking it owning routes it through the
                 // scope-exit full destructor (a no-op on a moved-out/nulled slot, same as a local).
-                if (OwningSinkConsumesConcrete(*itr_nameArg) && IsOwningValueType(itr_nameArg->TypeName)
+                if ((OwningSinkConsumesConcrete(*itr_nameArg) || coreUniqueValueParam)
+                    && IsOwningValueType(itr_nameArg->TypeName)
                     && !IsCopyableType(itr_nameArg->TypeName))
                     namedVar.IsOwningStruct = true;
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
@@ -1170,31 +1167,30 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             // never participate in the containing value's synthesized destruction.
             if (f.IsAlias)
                 continue;
-            // `unique T* field`: the struct owns the pointee. Unlike a value member this is
-            // pushed even when the pointee is trivially destructible - the block still needs freeing.
-            // IsUniqueTypeArg matches the array arm below: a scalar field made `unique` by generic
-            // substitution (`struct Holder<T> { T _v; }` as `Holder<unique C*>`) was released by
-            // nothing and leaked silently.
-            if ((f.IsUnique || f.IsUniqueTypeArg) && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
+            // A remaining builtin `unique T* field` owns the pointee. Aligned fields stay on this
+            // path so their allocation alignment reaches the matching deallocator.
+            if (f.IsUnique
+                && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
                 && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
             {
                 work.push_back({ i, GetFullDestructorForDelete(f.TypeName), true, f.TypeName, f.AllocAlignValue });
                 continue;
             }
-            // Scalar `unique IFace field`: a boxed interface value is a {i8*,i8*} fat pointer, so
+            // A remaining builtin scalar `unique IFace field` is a {i8*,i8*} fat pointer, so
             // f.Pointer is false above. Route it to the fat-pointer-aware emitter (vtable dtor
-            // slot + operator delete), the same release the array arm gives each element.
-            if ((f.IsUnique || f.IsUniqueTypeArg) && f.IsFatInterfaceValue()
+            // slot + operator delete).
+            if (f.IsUnique
+                && f.IsFatInterfaceValue()
                 && !f.ElemPointer && !f.IsSimd && !f.IsBitfield && !f.IsPadding
                 && f.ConstArraySize == 0)
             {
                 work.push_back({ i, nullptr, false, f.TypeName, 0, false, true, true });
                 continue;
             }
-            // `unique T* f[N]` / `unique IFace f[N]`, written or reached through a `unique` generic
-            // type argument: the struct owns every slot, so release element by element. Null slots
-            // are skipped by the scalar emitters, so a partially-filled array frees only live entries.
-            if ((f.IsUnique || f.IsUniqueTypeArg) && f.ConstArraySize > 0
+            // A remaining builtin aligned `unique T* f[N]` / `unique IFace f[N]` owns every slot,
+            // so release element by element. Null slots are skipped by the scalar emitters.
+            if (f.IsUnique
+                && f.ConstArraySize > 0
                 && !f.ElemPointer && !f.IsArrayView && !f.IsSimd && !f.IsBitfield && !f.IsPadding
                 && f.ConstInnerDimensions.empty()
                 && (f.Pointer || f.IsFatInterfaceValue()))
@@ -1468,18 +1464,29 @@ std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndVal
         destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName);
 }
 
-bool LLVMBackend::IsOwningValueType(const std::string& typeName)
+bool LLVMBackend::HasNonTrivialDestructor(const std::string& typeName)
 {
         if (typeName.empty())
             return false;
-        if (dataStructures.find(typeName) == dataStructures.end())
-            return false;
         return GetOrCreateFullDestructor(typeName) != nullptr;
+    }
+
+bool LLVMBackend::IsOwningValueType(const std::string& typeName)
+{
+        return HasNonTrivialDestructor(typeName);
     }
 
 bool LLVMBackend::TypeOwnsUniquePointer(const std::string& typeName, std::string* outPath,
                                std::unordered_set<std::string>* seen) const
 {
+        // The core wrapper itself is a single owning handle. Treat it as non-copyable even
+        // though its implementation stores the handle in an ordinary raw-pointer field.
+        if (IsCoreUniqueType(typeName))
+        {
+            if (outPath)
+                *outPath = IsInterfaceType(typeName.substr(8)) ? "_v" : "_p";
+            return true;
+        }
         std::unordered_set<std::string> localSeen;
         if (seen == nullptr) seen = &localSeen;
         if (!seen->insert(typeName).second) return false;
@@ -1489,11 +1496,15 @@ bool LLVMBackend::TypeOwnsUniquePointer(const std::string& typeName, std::string
         {
             // A unique interface field is a fat owning value rather than a thin pointer, but it
             // has the same non-copyable ownership contract and must block memberwise bit copies.
-            bool ownsUniqueField = (f.IsUnique || f.IsUniqueTypeArg)
-                && !f.IsAlias && !f.IsBorrowOfUniqueElement
+            bool ownsCoreUniqueField = IsCoreUniqueType(f.TypeName)
+                && !f.Pointer && !f.ElemPointer
+                && !f.IsArrayView && !f.IsSimd && !f.IsBitfield;
+            bool ownsUniqueField = ownsCoreUniqueField
+                || (f.IsUnique
+                    && !f.IsAlias
                 && !f.IsArrayView && !f.IsSimd && !f.IsBitfield
                 && ((f.Pointer && !f.ElemPointer && f.ConstArraySize == 0)
-                    || (f.IsInterface && !f.Pointer && f.ConstArraySize == 0));
+                    || (f.IsInterface && !f.Pointer && f.ConstArraySize == 0)));
             if (ownsUniqueField)
             {
                 if (outPath) *outPath = f.VariableName;
@@ -1526,16 +1537,12 @@ bool LLVMBackend::HasCopyOverloadFor(const std::string& typeName) const
 bool LLVMBackend::IsCopyableType(const std::string& typeNameIn) const
 {
         std::string base = typeNameIn;
-        // Strip a leading ownership qualifier ("unique " / "alias "); they are mutually exclusive.
-        if (base.rfind("unique ", 0) == 0) base = base.substr(7);
-        else if (base.rfind("alias ", 0) == 0) base = base.substr(6);
+        if (base.rfind("alias ", 0) == 0) base = base.substr(6);
         if (base.empty()) return false;
         if (base.back() == '*') return true;
         if (dataStructures.count(base) == 0) return true;
-        // A struct with a user destructor over a raw pointer/view field, but no HAND-WRITTEN copy(),
-        // is NOT copyable: the memberwise synth would shallow-share the raw pointer while the dtor
-        // frees it on both instances (double-free). Checked before the generic copy()-overload test
-        // so an on-demand-registered synth cannot mask it.
+        // A raw pointer/view plus a non-trivial destructor needs an author-defined copy policy.
+        // Safe destructor-backed value types may still use the memberwise synth.
         if (!HasRealCopyOverloadFor(base) && StructSynthCopyUnsafe(base))
             return false;
         if (HasCopyOverloadFor(base)) return true;

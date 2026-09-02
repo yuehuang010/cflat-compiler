@@ -617,8 +617,7 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrSigOfSymbol(const FunctionSymbol& 
         sig.TypeName = "__c_fn_ptr";
         sig.FuncPtrReturnTypeName = sym.ReturnType.TypeName;
         sig.FuncPtrReturnPointer = sym.ReturnType.Pointer;
-        sig.FuncPtrReturnOwned = sym.ReturnType.IsMove
-            || (sym.ReturnType.IsUniqueTypeArg && sym.ReturnType.Pointer);
+        sig.FuncPtrReturnOwned = sym.ReturnType.IsMove;
         sig.FuncPtrReturnAlias = sym.ReturnType.IsAlias;
         sig.FuncPtrReturnPointerDepth = sym.ReturnType.ValuePointerDepth();
         for (const auto& p : sym.Parameters)

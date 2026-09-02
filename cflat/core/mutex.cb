@@ -27,10 +27,9 @@ import "interfaces.cb";
 // Mutual-exclusion lock (non-recursive).
 [Capability(ILockable, ICvWaitable)]
 struct mutex {
-    // unique: copy suppression only. os.mutex_destroy nulls the slot after releasing
-    // it, so the synthesized null-checked delete never fires. Removing that null
-    // turns this into a delete on non-`new` memory.
-    unique void* _srw = nullptr;
+    // OS-owned mutable slot; os.mutex_destroy releases and nulls it.
+    // ~mutex is the only CFlat lifecycle hook for the slot.
+    void* _srw = nullptr;
 
     // Acquire the lock exclusively, blocking until it is available.
     void acquire() {
@@ -56,8 +55,7 @@ struct mutex {
         os.mutex_destroy(&_srw);
     }
 
-    // RAII teardown. `unique` on _srw suppresses copy, so a mutex cannot be
-    // duplicated into two owners that would both try to destroy one OS lock.
+    // RAII teardown. The non-trivial destructor makes mutex non-copyable.
     ~mutex() {
         os.mutex_destroy(&_srw);
     }
@@ -89,10 +87,9 @@ void cv_destroy(void** slot) {
 
 // First-class condition variable. Owns its own slot and pairs with a mutex.
 struct condvar {
-    // unique: copy suppression only. os.cond_destroy nulls the slot after releasing
-    // it, so the synthesized null-checked delete never fires. Removing that null
-    // turns this into a delete on non-`new` memory.
-    unique void* _slot = nullptr;
+    // OS-owned mutable slot; os.cond_destroy releases and nulls it.
+    // ~condvar is the only CFlat lifecycle hook for the slot.
+    void* _slot = nullptr;
 
     // Prepare the condvar for use.
     void init() {
@@ -120,8 +117,7 @@ struct condvar {
         os.cond_destroy(&_slot);
     }
 
-    // RAII teardown. `unique` on _slot suppresses copy, so a condvar cannot be
-    // duplicated into two owners that would both try to destroy one OS condvar.
+    // RAII teardown. The non-trivial destructor makes condvar non-copyable.
     ~condvar() {
         os.cond_destroy(&_slot);
     }

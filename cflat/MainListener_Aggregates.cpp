@@ -54,7 +54,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
             // for the core container.
-            if (Compiler()->currentSourceIsCore_)
+            if (Compiler()->CurrentSourceIsCoreLibrary())
                 Compiler()->gts.coreGenericTemplates.insert(structName);
             else
                 Compiler()->gts.coreGenericTemplates.erase(structName);
@@ -2680,7 +2680,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
             // for the core container.
-            if (Compiler()->currentSourceIsCore_)
+            if (Compiler()->CurrentSourceIsCoreLibrary())
                 Compiler()->gts.coreGenericTemplates.insert(structName);
             else
                 Compiler()->gts.coreGenericTemplates.erase(structName);

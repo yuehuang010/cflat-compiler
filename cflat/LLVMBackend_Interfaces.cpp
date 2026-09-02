@@ -934,8 +934,28 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
                     { implName, ifaceName, f.VariableName, InterfaceFieldTypeText(f) });
                 continue;
             }
-            if (impl->TypeName != f.TypeName || impl->Pointer != f.Pointer
-                || impl->IsInterface != f.IsInterface)
+            auto interfaceComparableType = [this](const TypeAndValue& tv) {
+                if (!tv.Pointer && IsCoreUniqueType(tv.TypeName))
+                    return tv.TypeName.substr(8);
+                return tv.TypeName;
+            };
+            bool sameComparableType = interfaceComparableType(*impl) == interfaceComparableType(f);
+            // A blessed unique<T> is judged by the spelling it desugars from: the interface arm
+            // is a fat VALUE, every other arm a pointer.
+            auto interfaceUniqueIfaceArm = [this](const TypeAndValue& tv) {
+                return !tv.Pointer && IsCoreUniqueType(tv.TypeName)
+                    && IsInterfaceType(tv.TypeName.substr(8));
+            };
+            auto interfacePointerShape = [&](const TypeAndValue& tv) {
+                if (interfaceUniqueIfaceArm(tv)) return false;
+                return tv.Pointer || IsCoreUniqueType(tv.TypeName);
+            };
+            auto interfaceValueShape = [&](const TypeAndValue& tv) {
+                return interfaceUniqueIfaceArm(tv) || tv.IsInterface;
+            };
+            bool samePointerShape = interfacePointerShape(*impl) == interfacePointerShape(f);
+            if (!sameComparableType || !samePointerShape
+                || interfaceValueShape(*impl) != interfaceValueShape(f))
             {
                 LogErrorMessage(
                     "class '{}' field '{}' has type '{}' but interface '{}' declares it as '{}'",
@@ -946,9 +966,15 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
             // interface's byte-offset slot reads ownership from the INTERFACE, because dynamic
             // dispatch leaves the concrete type unknown. Both directions of disagreement are heap
             // bugs, so both are rejected - the same uniformity 'push(move T item)' already imposes.
-            if (impl->IsUnique != f.IsUnique)
+            bool implUnique = impl->IsUnique
+                || (!impl->Pointer
+                    && IsCoreUniqueType(impl->TypeName));
+            bool interfaceUnique = f.IsUnique
+                || (!f.Pointer
+                    && IsCoreUniqueType(f.TypeName));
+            if (implUnique != interfaceUnique)
             {
-                if (impl->IsUnique)
+                if (implUnique)
                     LogErrorMessage(
                         "class '{}' field '{}' is declared '{}' but interface '{}' does not declare "
                         "it '{}' - a store through the interface's field slot would neither free the "
@@ -975,8 +1001,8 @@ bool LLVMBackend::InterfaceMethodContractConforms(const InterfaceMethod& method,
         {
             const auto& ip = method.Parameters[i];
             const auto& cp = sym.Parameters[i + 1];   // Parameters[0] is the implicit 'this'
-            bool cpMove = cp.IsMove || cp.IsUniqueTypeArg;
-            bool ipMove = ip.IsMove || ip.IsUniqueTypeArg;
+            bool cpMove = IsMoveOrCoreUniqueValue(cp);
+            bool ipMove = IsMoveOrCoreUniqueValue(ip);
             if (cpMove != ipMove) return false;
             if (cp.IsAdopt != ip.IsAdopt) return false;
             if (cp.IsBond != ip.IsBond) return false;
@@ -984,8 +1010,8 @@ bool LLVMBackend::InterfaceMethodContractConforms(const InterfaceMethod& method,
         }
         const auto& ir = method.ReturnType;
         const auto& cr = sym.ReturnType;
-        bool crMove = cr.IsMove || cr.IsUniqueTypeArg;
-        bool irMove = ir.IsMove || ir.IsUniqueTypeArg;
+        bool crMove = IsMoveOrCoreUniqueValue(cr);
+        bool irMove = IsMoveOrCoreUniqueValue(ir);
         if (crMove != irMove) return false;
         if (cr.IsAlias != ir.IsAlias) return false;
         if (cr.IsBond != ir.IsBond) return false;
@@ -1004,8 +1030,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                                                           : std::format("#{}", i + 1));
             // Compare sink-ness: a `unique` type argument makes a by-value parameter a move sink
             // just like `move` (ApplyMoveParamTransfer), so the two spellings must agree.
-            bool cpMove = cp.IsMove || cp.IsUniqueTypeArg;
-            bool ipMove = ip.IsMove || ip.IsUniqueTypeArg;
+            bool cpMove = IsMoveOrCoreUniqueValue(cp);
+            bool ipMove = IsMoveOrCoreUniqueValue(ip);
             if (cpMove != ipMove)
             {
                 if (ipMove)
@@ -1063,8 +1089,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
         const auto& ir = method.ReturnType;
         const auto& cr = sym.ReturnType;
         // Sink-ness, matching the parameter check: a `unique` type-argument return owns like `move`.
-        bool crMove = cr.IsMove || cr.IsUniqueTypeArg;
-        bool irMove = ir.IsMove || ir.IsUniqueTypeArg;
+        bool crMove = IsMoveOrCoreUniqueValue(cr);
+        bool irMove = IsMoveOrCoreUniqueValue(ir);
         if (crMove != irMove)
         {
             if (irMove)
@@ -1614,12 +1640,55 @@ std::string LLVMBackend::DisplayNameOfMangledType(const std::string& mangled, bo
 {
         if (writable) *writable = true;
 
-        if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
-            return it->second;
-
         size_t d = mangled.find("__");
         if (d == std::string::npos)
+        {
+            if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
+                return it->second;
             return mangled;
+        }
+
+        std::string args = mangled.substr(d + 2);
+        size_t outerArity = 0;
+        bool hasOuterTemplate = false;
+        const std::string outerName = mangled.substr(0, d);
+        if (auto it = gts.genericStructTypeParams.find(outerName);
+            it != gts.genericStructTypeParams.end())
+        {
+            outerArity = it->second.size();
+            hasOuterTemplate = true;
+        }
+        if (!hasOuterTemplate)
+        {
+            if (auto it = gts.genericInterfaceTypeParams.find(outerName);
+                it != gts.genericInterfaceTypeParams.end())
+            {
+                outerArity = it->second.size();
+                hasOuterTemplate = true;
+            }
+        }
+        if (args.starts_with("unique__") && IsCoreUniqueType(args) && !hasOuterTemplate)
+        {
+            if (writable) *writable = false;
+            return mangled;
+        }
+        // Core unique<T> is unambiguous only when it is the outer template's single argument.
+        if (args.starts_with("unique__") && IsCoreUniqueType(args)
+            && hasOuterTemplate && outerArity == 1)
+        {
+            std::string shownUnique = DisplayNameOfCoreUniqueType(args);
+            if (shownUnique != args)
+                return mangled.substr(0, d) + "<" + shownUnique + ">";
+        }
+        if (args.starts_with("unique__") && IsCoreUniqueType(args)
+            && MangledGenericNameIsAmbiguous(mangled))
+        {
+            if (writable) *writable = false;
+            return mangled;
+        }
+
+        if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
+            return it->second;
 
         if (MangledGenericNameIsAmbiguous(mangled))
         {
@@ -1627,7 +1696,6 @@ std::string LLVMBackend::DisplayNameOfMangledType(const std::string& mangled, bo
             return mangled;
         }
 
-        std::string args = mangled.substr(d + 2);
         std::string joined;
         for (size_t pos = 0; pos <= args.size(); )
         {

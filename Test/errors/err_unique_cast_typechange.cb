@@ -7,14 +7,14 @@ struct Box { unique Res* p = nullptr; };
 
 extern int main()
 {
-    expect_error("cannot delete 'r' - it aliases unique field 'Box.p'") {
+    expect_error("cannot delete 'r' - it aliases unique field 'b.p'") {
         Box b = default;
         b.p = new Res();
         void* v = (void*)b.p;
         Res* r = (Res*)v;
         delete r;
     }
-    expect_error("cannot delete 'c2' - it aliases unique field 'Box.p'") {
+    expect_error("cannot delete 'c2' - it aliases unique field 'b.p'") {
         Box b = default;
         b.p = new Res();
         char* c = (char*)b.p;

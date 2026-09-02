@@ -24,10 +24,9 @@ import "interfaces.cb";
 // [Capability(ILockable)]: acquire()/release() make `lock (s) { }` legal on a semaphore.
 [Capability(ILockable)]
 struct semaphore {
-    // unique: copy suppression only. os.sem_destroy nulls the slot after
-    // releasing it, so the synthesized null-checked delete never fires. Removing
-    // that null turns this into a delete on non-`new` memory.
-    unique void* _handle = nullptr;
+    // OS-owned mutable slot; os.sem_destroy releases and nulls it.
+    // ~semaphore is the only CFlat lifecycle hook for the slot.
+    void* _handle = nullptr;
 
     // Create the semaphore.  Must be called before acquire/release.
     //   initial   - starting signal count (0 = fully blocked)
@@ -61,8 +60,7 @@ struct semaphore {
         os.sem_destroy(&_handle);
     }
 
-    // RAII teardown. `unique` on _handle suppresses copy, so a semaphore cannot be
-    // duplicated into two owners that would both try to destroy one OS semaphore.
+    // RAII teardown. The non-trivial destructor makes semaphore non-copyable.
     ~semaphore() {
         destroy();
     }

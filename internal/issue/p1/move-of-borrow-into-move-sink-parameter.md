@@ -114,6 +114,14 @@ has NO remedy available: `_rebalanceFrom` cannot declare `node` a `move` paramet
 conditionally hands the node off and rebinds it (`node = parent;`) each turn of the loop. A blanket
 rejection here therefore breaks `core/` for every program that imports btree.
 
+## PARTIAL 2026-09-01: the core unique<T> slice is closed
+
+Stage 3 of the library-type conversion (commit 3530fdd, `internal/plan/unique-ownership.md`)
+added a NARROW blessed guard: a borrowed pointer bound to the `move T*` parameter of core
+unique<T>'s CONSTRUCTOR or reset() is rejected ("cannot initialize unique<X> from a borrowed
+value..."). Only those two callees; the general sink rule below stays deferred exactly as
+ruled, and the blessed guard collapses into it whenever it lands.
+
 ## Fix direction
 
 Not a guard. Either an opt-in check (a `--sanitize=ownership` site, which already records move
@@ -137,3 +145,8 @@ remained of it. Two things it carried that are not already above:
 - **Standing constraint for the whole family.** Explicit `move x` nulls the source and leaves it
   READABLE AS NULL, by design. Do not "fix" anything here by importing Rust move semantics - that
   has been tried and breaks the suite.
+
+2026-09-01 (Stage 4b4 finding): the INTERFACE twin of this gap is also unpinned - a
+borrowed interface VALUE binds silently to a `unique IShape` (now unique<IShape>) param;
+LLVMBackend_Overloads.cpp:1066 gates the owning-source check on `!arg.IsInterface`. No err
+test covers it. Fold into the general move-sink borrow rule when it lands.

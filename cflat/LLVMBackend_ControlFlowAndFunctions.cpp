@@ -400,8 +400,7 @@ LLVMBackend::TypeAndValue LLVMBackend::MakeFuncPtrTypeAndValue(const std::string
         tv.IsFunctionPointer = true;
         tv.FuncPtrReturnTypeName = chosen->ReturnType.TypeName;
         tv.FuncPtrReturnPointer = chosen->ReturnType.Pointer;
-        tv.FuncPtrReturnOwned = chosen->ReturnType.IsMove
-            || (chosen->ReturnType.IsUniqueTypeArg && chosen->ReturnType.Pointer);
+        tv.FuncPtrReturnOwned = chosen->ReturnType.IsMove;
         tv.FuncPtrReturnAlias = chosen->ReturnType.IsAlias;
         tv.FuncPtrReturnPointerDepth = chosen->ReturnType.ValuePointerDepth();
         for (const auto& p : chosen->Parameters)
@@ -648,6 +647,13 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
 
         if (cond->getType()->isIntegerTy())
             return builder->CreateICmpNE(cond, llvm::ConstantInt::get(cond->getType(), 0), "tobool");
+
+        // A blessed core unique<X> pointer arm is a one-slot wrapper over the raw pointer, so it
+        // tests exactly as the `unique X*` spelling it desugars from.
+        if (auto* st = llvm::dyn_cast<llvm::StructType>(cond->getType());
+            st != nullptr && st->hasName() && st->getNumElements() == 1
+            && st->getElementType(0)->isPointerTy() && IsCoreUniqueType(st->getName().str()))
+            return builder->CreateIsNotNull(builder->CreateExtractValue(cond, 0));
 
         // An aggregate (a `string`, any struct) has no truth value. Diagnose it here rather than
         // handing it to CreateCondBr / CreateSelect, which fails module verification opaquely.
@@ -1306,12 +1312,12 @@ llvm::Type* LLVMBackend::BuildThinFnPtrType(const TypeAndValue& tv) const
 
 bool LLVMBackend::ParameterCarriesRawArrayCount(const TypeAndValue& param) const
 {
-        return param.Pointer && (param.IsMove || param.IsUniqueTypeArg);
+        return param.Pointer && param.IsMove;
     }
 
 bool LLVMBackend::ReturnCarriesRawArrayCount(const TypeAndValue& returnType) const
 {
-        return returnType.Pointer && (returnType.IsMove || returnType.IsUniqueTypeArg);
+        return returnType.Pointer && returnType.IsMove;
     }
 
 llvm::Value* LLVMBackend::RawArrayCountArgument(const NamedVariable& arg)
@@ -1683,16 +1689,25 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
 
             symList.push_back(funcSym);
         }
-        else if (isMethod)
+        else
         {
-            // ForwardRefScanner registered this symbol; propagate IsMethod in case it wasn't set there.
+            // ForwardRefScanner registered this symbol. Refresh the complete semantic signature
+            // from the main pass: generic substitution can add return provenance (for example,
+            // `alias T` instantiated with a core unique wrapper), which the forward pass cannot
+            // derive before the body is materialized.
             auto it = functionTable.find(functionName);
             if (it != functionTable.end())
             {
                 for (auto& sym : it->second)
-                {
-                    if (sym.Function == fn) { sym.IsMethod = true; break; }
-                }
+                    if (sym.Function == fn)
+                    {
+                        sym.ReturnType = returnType;
+                        sym.ReturnsOwned = returnsOwned;
+                        sym.ReturnsAlias = returnType.IsAlias;
+                        sym.Parameters = arguments;
+                        if (isMethod) sym.IsMethod = true;
+                        break;
+                    }
             }
         }
         return fn;

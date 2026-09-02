@@ -1,0 +1,23 @@
+// A helper can hide the borrowing-container add from the caller, but the caller's owning local
+// still dies before the container. The summary rejects both a field-backed and global-backed sink.
+import "list.cb";
+
+class B { int v = 0; };
+class Bag { list<B*> items; void put(B* p) { items.add(p); } };
+list<B*> g_items;
+void putGlobal(B* p) { g_items.add(p); }
+
+extern int main()
+{
+    expect_error("call to 'put': 'n' still owns the object it was given") {
+        Bag bag;
+        B* n = new B();
+        bag.put(n);
+    }
+
+    expect_error("call to 'putGlobal': 'n' still owns the object it was given") {
+        B* n = new B();
+        putGlobal(n);
+    }
+    return 0;
+}

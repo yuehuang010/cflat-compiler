@@ -516,6 +516,16 @@ bool LLVMBackend::IsIsolated() const
     return isolatedPolicy_.has_value();
 }
 
+bool LLVMBackend::CurrentSourceIsCoreLibrary() const
+{
+    // The core-template ORIGIN marker must not depend on which file the caller happened to make
+    // the root: an LSP re-analysis of `core/unique.cb` itself analyzes it as user code, which
+    // would otherwise erase `unique` from the core-template set for every later analysis.
+    if (currentSourceIsCore_) return true;
+    return !runtimeDir.empty()
+        && IsPathUnderDirectory(currentSourceFilePath_, std::filesystem::path(runtimeDir) / "core");
+}
+
 bool LLVMBackend::IsIsolatedCoreSource() const
 {
     return isolatedPolicy_.has_value() && !currentSourceIsCore_ && !runtimeDir.empty()
@@ -1621,6 +1631,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     currentSourceFilePath_ = rootCanonical;
     analyzedRootPath_ = rootCanonical;
     currentSourceIsCore_ = false;
+    // See rootCoreDir_: a core library source compiled directly imports its siblings from ITS
+    // checkout, which is not runtimeDir/core.
+    rootCoreDir_ = RootFileNameIsCore(sourceFileName)
+        ? std::filesystem::path(rootCanonical).parent_path().string() : std::string();
     importedFiles.insert(rootCanonical);
     importStack.push_back(rootCanonical);
     struct RootGuard {
@@ -2281,6 +2295,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // define - and FunctionBodyIsComplete refuses it, which would exempt exactly that callee.
         {
             NoCurrentFunctionScope noCurrent(this);
+            ResolveOwningLocalBorrowingHelperArgs();
             ResolveTempUniqueFieldArgEscapes();
 
             // The RETURN half of the same deferral: the escape SITE, not the callee question.
@@ -3132,6 +3147,10 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         if (!cec)
             isCoreImport = IsPathUnderDirectory(canonicalStr, coreDir);
     }
+    // Same library, different checkout: an analyzed core root imports its siblings from ITS
+    // directory, not from runtimeDir/core, and they are core all the same.
+    if (!isCoreImport && !rootCoreDir_.empty())
+        isCoreImport = IsPathUnderDirectory(canonicalStr, rootCoreDir_);
 
     // All imported trees are mtime-and-size validated and retained for the process lifetime.
     // Generic-template ctx pointers therefore remain valid across re-analysis.
@@ -3948,6 +3967,16 @@ bool LLVMBackend::Analyze(const std::string& filePath,
     // not load the cache: the cache already contains this file's own definitions, and
     // re-walking the root over them reports spurious redeclarations.
     bool rootIsCoreFile = RootFileNameIsCore(sourceFileName);
+    // The LSP analyzes a TEMP copy, so the root's real directory is sourceFileDir_ - the temp
+    // dir is never the library checkout and would make rootCoreDir_ useless.
+    rootCoreDir_.clear();
+    if (rootIsCoreFile)
+    {
+        std::filesystem::path rootDir = sourceFileDir_.empty()
+            ? std::filesystem::path(rootCanonical).parent_path()
+            : std::filesystem::path(sourceFileDir_);
+        rootCoreDir_ = std::filesystem::weakly_canonical(rootDir).string();
+    }
 
     bool bitcodeLoaded = false;
     if (!noCache_ && !runtimeDir.empty() && !skipRuntimeImport && !rootIsCoreFile)
@@ -4441,6 +4470,7 @@ void LLVMBackend::ResetForReanalysis()
     firstCallLocation_.clear();
     // Holds llvm::Function* into a module a rebuild invalidates.
     tempUniqueFieldArgs_.clear();
+    coreUniqueGetterSource_.clear();
     deferredTempUniqueFieldEscapes_.clear();
     lastAllocAlignment = 0;
     pendingInitAllocAlign = 0;
@@ -6190,11 +6220,8 @@ static llvm::json::Object SerializeTav(const TAV& t)
     if (s.IsMove)                 o["mv"]  = true;
     if (s.IsAdopt)                o["ad"]  = true;
     if (s.IsAlias)                o["al"]  = true;
-    if (s.IsUniqueTypeArg)        o["unt"] = true;
-    if (s.ElementOwningUnique)    o["eou"] = true;
     if (s.IsOwningSink)           o["osk"] = true;
     if (s.IsConsumeInferredSink)  o["cis"] = true;
-    if (s.IsBorrowOfUniqueElement) o["bue"] = true;
     if (s.IsBorrowOfAliasElement) o["bae"] = true;
     if (s.IsBond)                 o["bd"]  = true;
     if (s.IsUnique)               o["uq"]  = true;
@@ -6262,11 +6289,8 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     if (auto v = o.getBoolean("mv")) s.IsMove = *v;
     if (auto v = o.getBoolean("ad")) s.IsAdopt = *v;
     if (auto v = o.getBoolean("al")) s.IsAlias = *v;
-    if (auto v = o.getBoolean("unt")) s.IsUniqueTypeArg = *v;
-    if (auto v = o.getBoolean("eou")) s.ElementOwningUnique = *v;
     if (auto v = o.getBoolean("osk")) s.IsOwningSink = *v;
     if (auto v = o.getBoolean("cis")) s.IsConsumeInferredSink = *v;
-    if (auto v = o.getBoolean("bue")) s.IsBorrowOfUniqueElement = *v;
     if (auto v = o.getBoolean("bae")) s.IsBorrowOfAliasElement = *v;
     if (auto v = o.getBoolean("bd")) s.IsBond = *v;
     if (auto v = o.getBoolean("uq")) s.IsUnique = *v;

@@ -1,5 +1,17 @@
 # Borrowing container fed an owning local THROUGH a helper: still a silent use-after-free
 
+## NARROWED 2026-09-01: the depth-1 helper shape is CLOSED (commit 1406cec, branch claude/dbnl-helper-gap)
+
+The filed repro (Bag.put) is now rejected at the call site via a depth-1 callee summary
+reusing the temp-unique-field family's MemoryOutlivesCall walk: a bare-pointer parameter
+provably reaching a borrowing-container element sink whose receiver outlives the helper
+frame rejects a PROVEN owning named local argument (same predicate as the add-site rule),
+unknown-accepts, end-of-module resolve for late-emitted callees. Regression:
+Test/errors/err_owning_local_via_helper.cb; accept-set in Test/test_list_ownership.cb.
+REMAINING OPEN (this file now covers only these): depth-2 forwarding (put -> put2 -> add)
+and indirect calls through function<T> - both accept, both need more than a direct-callee
+walk. The approach-B and same-function-check prohibitions below still stand for THOSE.
+
 Residual of the add-site rule that landed on `fix/add-owning-local-needs-move`. The direct
 spelling (`l.add(p)` with `p` a live owning named local) is now a hard error naming
 `add(move p)`; this file holds the one shape the rule deliberately does not reach, and it is

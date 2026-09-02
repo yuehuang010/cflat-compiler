@@ -14,6 +14,7 @@ import "list.cb";
 import "dictionary.cb";
 import "queue.cb";
 import "stack.cb";
+import "hashset.cb";
 import "diagnostic/heap_audit.cb";
 import "test_helper.cb";
 
@@ -1329,6 +1330,132 @@ void addBorrowedParam(list<Res*>* l, Res* borrowed)
     l->add(borrowed);
 }
 
+class HelperOwnedBag
+{
+    list<unique Res*> items;
+    void put(move Res* p) { items.add(move p); }
+    int first() { return items.get(0).id; }
+};
+
+class HelperFieldHolder
+{
+    unique Res* value = nullptr;
+};
+
+int helperReads(Res* p) { return p.id; }
+void helperStoresLocal(Res* p) { list<Res*> local; local.add(p); }
+void helperStores(list<Res*>* l, Res* p) { l->add(p); }
+int helperStoresFromBorrowed(Res* p)
+{
+    list<Res*> l;
+    helperStores(&l, p);
+    return l.get(0).id;
+}
+void helperStoresHash(hashset<Res*>* h, Res* p) { h->add(p); }
+void helperStoresMove(list<Res*>* l, move Res* p) { l->add(move p); }
+void helperDepth2(list<Res*>* l, Res* p) { l->add(p); }
+void helperDepth1(list<Res*>* l, Res* p) { helperDepth2(l, p); }
+alias Res* helperBorrow(Res* p) { return p; }
+
+int testHelperShapeAcceptSet()
+{
+    int passed = 0;
+
+    g_dtor = 0;
+    {
+        HelperOwnedBag bag;
+        Res* p = new Res(20);
+        bag.put(move p);
+        passed += Test("helper owning container stores", bag.first(), 20);
+    }
+    passed += Test("helper owning container frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(21);
+        passed += Test("helper read keeps owner", helperReads(p), 21);
+        delete p;
+    }
+    passed += Test("helper read frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(22);
+        helperStoresLocal(p);
+        passed += Test("helper local borrowing list keeps owner", p.id, 22);
+        delete p;
+    }
+    passed += Test("helper local borrowing list frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        unique Res* owner = new Res(23);
+        passed += Test("helper borrowed parameter stored", helperStoresFromBorrowed(owner), 23);
+    }
+    passed += Test("helper borrowed parameter owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        HelperFieldHolder holder;
+        holder.value = new Res(24);
+        list<Res*> l;
+        helperStores(&l, holder.value);
+        passed += Test("helper field argument stored", l.get(0).id, 24);
+    }
+    passed += Test("helper field argument owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        unique Res* owner = new Res(25);
+        list<Res*> l;
+        helperStores(&l, helperBorrow(owner));
+        passed += Test("helper call result stored", l.get(0).id, 25);
+    }
+    passed += Test("helper call result owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        unique Res* owner = new Res(26);
+        list<Res*> l;
+        function<void(list<Res*>*, Res*)> indirect = helperStores;
+        indirect(&l, owner);
+        passed += Test("indirect helper stores", l.get(0).id, 26);
+    }
+    passed += Test("indirect helper owner frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(27);
+        list<Res*> l;
+        helperDepth1(&l, p);
+        passed += Test("two-level helper stores", l.get(0).id, 27);
+        delete p;
+    }
+    passed += Test("two-level helper frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(28);
+        hashset<Res*> h;
+        helperStoresHash(&h, p);
+        passed += Test("hashset helper stores", p.id, 28);
+        delete p;
+    }
+    passed += Test("hashset helper frees once", g_dtor, 1);
+
+    g_dtor = 0;
+    {
+        Res* p = new Res(29);
+        list<Res*> l;
+        helperStoresMove(&l, move p);
+        passed += Test("move helper stores", l.get(0).id, 29);
+        delete l.take(0);
+    }
+    passed += Test("move helper frees once", g_dtor, 1);
+
+    return passed;
+}
+
 extern int main()
 {
     HeapAudit.enable();
@@ -1372,6 +1499,7 @@ extern int main()
     total += 11; passed += testInsert();
     total += 14; passed += testAddSiteAcceptSet();
     total += 4;  passed += testUserDefinedContainersAccept();
+    total += 20; passed += testHelperShapeAcceptSet();
 
     // Every ownership rule above is only meaningful if nothing leaked.
     int leaks = (int)HeapAudit.reportLeaks();

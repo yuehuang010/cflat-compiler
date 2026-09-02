@@ -40,9 +40,11 @@ struct array<T>
     // type is destructed, a bare pointer or interface is left to its real owner.
     void _releaseAt(int index)
     {
+        // An owning element is released by moving it into the discard sink: the element is the
+        // library unique<T> wrapper, whose drop frees the pointee exactly once (null is a no-op).
         if const (is_unique(T))
         {
-            if (_ptr[index] != nullptr) delete _ptr[index];
+            _ = move _ptr[index];
         }
         else if const (is_pointer(T))   { }
         else if const (is_primitive(T)) { }
@@ -60,7 +62,7 @@ struct array<T>
                 int i = 0;
                 while (i < _len)
                 {
-                    if (_ptr[i] != nullptr) delete _ptr[i];
+                    _ = move _ptr[i];
                     i++;
                 }
             }

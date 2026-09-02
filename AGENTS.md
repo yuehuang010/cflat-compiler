@@ -63,6 +63,10 @@ the same answer for fewer tokens - not a worse answer.
 - **Bisect, do not brute-force.** When narrowing a failure, binary-search the input rather than
   reading everything; verify the probe is actually reproducing the failure before trusting a
   run of "passes" (a probe that fails for an unrelated reason makes the search vacuous).
+- **Read caps.** <= 60 lines per read; logs by tail. Turn count is the cost, not build time.
+- **Stop rule.** Same test failing after 3 fix attempts -> stop, report evidence. No revert.
+- **One outcome class per run.** Measured deletions first, verify, report. Retargets/rekeys
+  are a separate run - never both in one pass.
 
 ## Skills
 
@@ -485,6 +489,7 @@ Quick reference: `doc/LANGUAGE.md` is the user-facing language reference.
 - Rerun with `-v` to see detailed diagnostics
 - Check `.ll` output (`--out-lli`) to inspect LLVM IR
 - LLVM assertion `"Ptr must have pointer type"` usually means `GetType()` was called without `allowPointer=true` for a pointer parameter
+- Segfault/wrong value -> Debug build (assertions-on LLVM) + `lldb --batch -o run -o bt -- x64/Debug/cflat <args>`. Never print-and-rebuild.
 
 ### Standard Library
 

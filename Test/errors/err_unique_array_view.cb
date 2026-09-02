@@ -16,6 +16,44 @@ expect_error("array views are not supported - a view does not own its buffer") {
     int takesIface() { unique IOwned[] v = new IOwned[2]; return 0; }
 }
 
+expect_error("'unique<int[]>': array views are not supported - a view does not own its buffer") {
+    unique<int[]> u = default;
+}
+
+expect_error("cannot return owning heap array 'r' as 'unique<X>': unique<T> does not own arrays - return 'move X*' instead") {
+    struct X { int v = 0; };
+    move unique<X> makeArray(int n) {
+        unique X* r = new X[n];
+        return move r;
+    }
+}
+
+expect_error("cannot store a heap array in unique field 'arr': a unique field frees a single object - hold the array in a local or a container") {
+    struct Y { int v = 0; };
+    struct Holder { unique Y* arr = default; };
+    int storeArray() {
+        Holder h = default;
+        h.arr = new Y[3];
+        return 0;
+    }
+}
+
+expect_error("cannot pass owning heap array 'a' to parameter 'p' of 'take': unique<T> does not own arrays") {
+    struct R { int v = 0; };
+    int take(unique R* p) { return p->v; }
+    int useArray() {
+        unique R* a = new R[3];
+        return take(move a);
+    }
+}
+
+expect_error("cannot pass owning heap array 'a' to parameter 'p' of 'take': unique<T> does not own arrays") {
+    int useArrayImplicit() {
+        unique R* a = new R[3];
+        return take(a);
+    }
+}
+
 extern int main()
 {
     return 0;

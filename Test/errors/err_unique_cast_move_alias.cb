@@ -9,7 +9,7 @@ void consume(move Res* n) { delete n; }
 
 extern int main()
 {
-    expect_error("cannot 'move' 'alias' - it aliases unique field 'Box.p'") {
+    expect_error("cannot 'move' 'alias' - it aliases unique field 'b.p'") {
         Box b = default;
         b.p = new Res();
         Res* alias = (Res*)b.p;

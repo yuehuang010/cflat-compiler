@@ -12,7 +12,7 @@ class Thing : IThing
     int get() { return v; }
 };
 
-expect_error("cannot initialize unique 'b' from a borrowed value") {
+expect_error("cannot initialize unique<IThing> 'b' from borrowed value 'a'") {
     void borrowNoMove()
     {
         unique IThing a = new Thing();

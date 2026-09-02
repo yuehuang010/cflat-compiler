@@ -113,7 +113,8 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
                     LogErrorContext(paramDecl, std::format(
                         "parameter '{}' declared 'adopt' must be a plain interface value",
                         paramType.VariableName));
-                if (paramType.IsMove || paramType.IsBond || paramType.IsAlias || paramType.IsUnique)
+                if (paramType.IsMove || paramType.IsBond || paramType.IsAlias
+                    || paramType.IsUnique)
                     LogErrorContext(paramDecl, std::format(
                         "parameter '{}': 'adopt' cannot be combined with another ownership qualifier",
                         paramType.VariableName));

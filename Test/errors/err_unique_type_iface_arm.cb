@@ -1,0 +1,19 @@
+import "unique.cb";
+
+interface IThing { int get(); };
+
+struct Other { int value = 0; };
+
+// A pointer to an unrelated type cannot use the interface constructor.
+expect_error("no overload of 'unique<IThing>' matches");
+void misuse()
+{
+    Other* value = new Other();
+    unique<IThing> owner = unique<IThing>(move value);
+}
+
+extern int main()
+{
+    misuse();
+    return 0;
+}
