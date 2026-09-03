@@ -77,6 +77,7 @@
 - [C Interop](#c-interop) ([full reference](C_INTEROP.md))
 - [WinMD / COM](#winmd--com) ([full reference](WINMD.md))
 - [Windows Application Manifest](#windows-application-manifest-manifest-declaration) (`manifest`)
+- [Application Metadata](#application-metadata-application-declaration) (`application`)
 - [JSON](#json-libjsoncb)
 - [Debug Info](#debug-info)
 - [Compiler CLI](#compiler-cli) ([full reference](CLI.md))
@@ -2527,6 +2528,39 @@ On a name collision the type meaning wins, matching C. The result is typed
 
 ---
 
+### `embed("path")`
+
+Folds a file's bytes into the program at compile time, the way C23 `#embed` and
+Rust `include_bytes!` do. It is an expression, not a declaration specifier, and
+takes exactly one string literal.
+
+```c
+const string shader = embed("shaders/blit.glsl");   // string, byte-exact length
+const u8[] payload  = embed("data/payload.bin");    // u8[N], N = the file size
+u32 n = (u32)sizeof(payload);                       // the asset's byte count
+```
+
+- The path resolves against the directory of the **source file that writes the
+  call** - not the working directory and not the import path. An absolute path,
+  a missing file, or a path that climbs out of that directory with `..` is a
+  compile error at the expression, as is a zero-byte file (`u8[0]` is not an
+  array, and C23 `#embed` rejects the empty case for the same reason).
+- The result type comes from the destination: `string` when the destination is a
+  string, `u8[N]` otherwise, with `N` taken from the file - so `sizeof` measures
+  the asset. Any other destination type is an error naming both spellings.
+- The bytes live in one private read-only constant global (`.rdata` / `.rodata` /
+  `__TEXT,__const`) on every target, so `embed` also works under `--run`. A
+  file-scope declaration binds that constant directly; a local declaration copies
+  it into the frame, so declare large assets at file scope.
+- Text needs no NUL suffix: `string` carries its own length, and `0x00` bytes in a
+  binary asset survive intact.
+- Embedded assets are listed in `<out>.cflat-dep.json`, so editing an asset
+  invalidates the up-to-date check and relinks.
+
+v1 takes one literal path: no globs, no directories, no length limit.
+
+---
+
 ## Annotations
 
 Annotations are user-defined metadata attached to struct fields, classes, or interfaces. Define an annotation struct with `annotation`, then apply it with `[Name]` or `[Name(args)]`. An annotation must be declared (in the current file or an import) before use; an undeclared annotation is an "Unknown annotation" error. The COM/WinRT `[winrt]` and `[uuid(...)]` markers are ordinary annotations declared in `com.cb`.
@@ -2994,8 +3028,8 @@ Note: `program` remains required at the start of a managed-entry-point definitio
 
 **Reserved compiler intrinsics** (built-in pseudo-functions - cannot be redefined):
 
-`annotationof`, `expect_error`, `is_pointer`, `json_const`, `nameof`, `reflect`,
-`reflect_set`, `sizeof`, `typeof`, `xml_const`
+`annotationof`, `embed`, `expect_error`, `is_pointer`, `json_const`, `nameof`,
+`reflect`, `reflect_set`, `sizeof`, `typeof`, `xml_const`
 
 **Compiler-recognized methods** (not reserved - you define them on a type, the
 compiler auto-invokes them by name):
@@ -3217,6 +3251,95 @@ A `dependentAssembly` identity is **not** checked this way - it names a foreign 
 
 ```bash
 cflat app.cb --check --dump-manifest -
+```
+
+---
+
+## Application Metadata (`application` declaration)
+
+A **file-scope `application` declaration** carries the OS-facing identity of the program - name,
+version, identifier, copyright, icon - once, and the compiler routes it per target: a Windows
+`RT_VERSION` + `RT_ICON` / `RT_GROUP_ICON` resource, a macOS `__TEXT,__info_plist` section, or a
+full `.app` bundle. There is at most one per program.
+
+```c
+import "application.cb";
+
+application AppInfo app = {
+    name        = "MemPress Monitor",
+    identifier  = "com.example.mempress",
+    description = "Memory pressure monitor",
+    company     = "Example Inc",
+    copyright   = "(c) 2026 Example Inc",
+    version     = { file = "0.11.0" },
+    icon        = { { image = embed("icon-16.png") }, { image = embed("icon-32.png") } },
+};
+```
+
+### Rules
+
+The type is `AppInfo` from `core/application.cb`; that struct tree *is* the schema. The
+initializer must be a compile-time literal, so every rule below is decided at the declaration on
+any host and `--check` reports it:
+
+- Exactly **one** `application` per program. A second names both locations. Libraries never
+  declare one.
+- `name` is required; every other field is optional and an empty field is omitted, not emitted
+  empty.
+- `version.file` / `version.product` are one to four dotted decimals, each below 65536. Missing
+  trailing components are zero. `version.product` defaults to `version.file`.
+- `icon` is either a list of PNGs - each square, each a distinct size out of
+  16/32/48/64/128/256/512/1024 - or a single `.ico` / `.icns` file used as-is. An `.ico` on a
+  macOS build, or an `.icns` on a Windows build, is an error.
+- PNG set to `.ico` / `.icns` conversion is done by the compiler; no external tool is involved.
+
+### Per-target output
+
+| Target | Metadata | Icon |
+|--------|----------|------|
+| Windows | `RT_VERSION` in the same `.res` as the `manifest` | `RT_GROUP_ICON` id 1 + `RT_ICON` 1..N |
+| macOS, `-o app` | `__TEXT,__info_plist` section (`otool -P` shows it) | not representable; `-v` prints a note |
+| macOS, `-o App.app` | `Contents/Info.plist` + `Contents/PkgInfo` | `Contents/Resources/App.icns` |
+| Linux | compile-time constants only | embedded PNG data only |
+
+### Reading the values back
+
+`core/application.cb` exposes the declared strings as compile-time constants on every target, so
+an About box and the shell metadata cannot disagree:
+
+```c
+printf("%s %s\n", Application.name().data(), Application.version().data());
+```
+
+`Application.version()` reports `version.product` when it is set, else `version.file`. With no
+`application` declaration all four accessors return the empty string, and
+`Application.declared()` - the flag a library uses to skip application-only work - is `false`.
+
+`Application.icon()` returns the platform's application-icon handle as a `void*`:
+
+| Target | Handle | With no declaration |
+|--------|--------|---------------------|
+| Windows | `HICON` for the emitted `RT_GROUP_ICON` id 1, via `LoadIcon(GetModuleHandle(nullptr), 1)` | `nullptr` |
+| macOS | `NSImage*` from `[[NSApplication sharedApplication] applicationIconImage]` | never `nullptr` - AppKit substitutes a generic image; a bare Mach-O gets it too, since only an `-o App.app` bundle carries the real icon |
+| other | `nullptr` | `nullptr` |
+
+A Windows program that calls `Application.icon()` must link `user32.lib`; importing
+`ui_native/win32.cb` already does.
+
+Both `ui_native` backends install the icon automatically when `Application.declared()` is true:
+the Win32 host sets `WNDCLASSEX.hIcon`/`hIconSm` and sends `WM_SETICON` (`ICON_BIG` +
+`ICON_SMALL`) to each top-level window it creates, so the title bar, taskbar and alt-tab all
+show it. The Cocoa host does nothing: AppKit already reads the icon out of a bundle's plist,
+and a bare Mach-O has no icon to install.
+
+### Inspecting the generated metadata
+
+`--dump-app-info` writes the folded fields plus the serialization for the target - the Win32
+VERSIONINFO string table, or the macOS `Info.plist` XML - to a file or to stdout with `-`. It
+works with `--check`, and on any host:
+
+```bash
+cflat app.cb --check --dump-app-info -
 ```
 
 ---

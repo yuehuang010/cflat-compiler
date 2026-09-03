@@ -103,6 +103,7 @@
 #include "VcpkgResolver.h"
 #include "NugetResolver.h"
 #include "LlvmHelpers.h"
+#include "AppResources.h"
 
 struct ExpectedErrorReceived {};
 
@@ -2919,6 +2920,12 @@ private:
     std::vector<std::string> dependencyFiles_;
     std::unordered_map<std::string, std::string> dependencyPathMemo_;
     std::unordered_set<std::string> dependencyFileSet_;
+    // Assets folded in by `embed("...")`, in first-seen order. Cleared per compile and per
+    // re-analysis alongside the dependency lists.
+    std::vector<std::string> embeddedAssets_;
+    // Bytes of each embedded asset, keyed on the resolved path, so an asset named by several
+    // sites is read once. Cleared with embeddedAssets_.
+    std::unordered_map<std::string, std::vector<uint8_t>> embedFileCache_;
     void RecordDependency(const std::string& path);
     // A positional `.c` input, noted at arg-parse time because clang is only invoked for it
     // AFTER the module-end analyses run. Read by RunNullIfaceGlobalCheck.
@@ -3219,6 +3226,11 @@ private:
     std::string sourceFileName;
     std::string currentSourceFilePath_;
     std::vector<ManifestFragment> manifestFragments_;
+    // The single `application` declaration, with the file/line that declared it. Never written
+    // by a core file, so it deliberately stays out of the --init cache round-trip.
+    std::optional<cflat::appres::AppInfoData> applicationInfo_;
+    std::string applicationSourceFile_;
+    size_t applicationLine_ = 0;
     std::unordered_map<std::string, std::string> compileTimeStringConstants_;
     // True while the file being scanned/walked lives under runtimeDir/core (set by CompileImportedFile).
     bool currentSourceIsCore_ = false;
@@ -4609,6 +4621,15 @@ private:
     // insert, preserving first-seen order. On a non-macOS target this is an error,
     // except in LSP analyze mode (symbolSink_ set) where it is recorded silently.
     bool AddFrameworkImport(const std::string& name);
+
+    // Routes a macOS build by OUTPUT SHAPE: a bare Mach-O carrying a __TEXT,__info_plist
+    // section, or a .app bundle whose Contents/ the compiler writes around the same executable.
+    bool EmitMacApplication(const std::string& outputPath, bool debugInfo,
+                            const std::optional<std::string>& lliPath);
+    // Adds the Info.plist XML as a __TEXT,__info_plist constant kept alive by llvm.used.
+    void EmitMacInfoPlistSection(const std::string& executableName, bool bundleIcon);
+    // Writes Contents/Info.plist, Contents/PkgInfo and Contents/Resources/<stem>.icns.
+    bool WriteMacBundleMetadata(const std::string& bundlePath, const std::string& stem);
 
     bool EmitExecutableMachO(const std::string& exePath, bool debugInfo,
                              const std::optional<std::string>& lliPath);
@@ -7480,6 +7501,18 @@ public:
     // Runs at declaration time so --check and expect_error see it on any platform.
     bool ValidateManifestIdentity(const std::string& xml, const std::string& sourceFile,
                                   size_t line) const;
+    // Records the one `application` declaration. Returns false (and reports) on a second one.
+    bool RecordApplicationInfo(const std::string& sourceFile, size_t line,
+                               cflat::appres::AppInfoData info);
+    const std::optional<cflat::appres::AppInfoData>& GetApplicationInfo() const { return applicationInfo_; }
+    const std::string& GetApplicationSourceFile() const { return applicationSourceFile_; }
+    size_t GetApplicationLine() const { return applicationLine_; }
+    // Defines __cflat_app_name / _version / _identifier / _copyright when application.cb
+    // declared them. Runs once per compile, after the walk and before optimization.
+    void MaterializeApplicationConstants();
+    // Rejects an icon container the target OS cannot consume (.ico on macOS, .icns on Windows).
+    bool ValidateApplicationForTarget(bool windowsTarget) const;
+
     void RecordCompileTimeStringConstant(const std::string& name, const std::string& value);
     std::optional<std::string> GetCompileTimeStringConstant(const std::string& name) const;
 
@@ -7606,11 +7639,30 @@ public:
     void SetWindowsSubsystem(const std::string& v);
 
     const std::vector<std::string>& GetDependencyFiles() const { return dependencyFiles_; }
+
+    /*
+     * Read an asset named by an `embed("...")` literal. The path resolves against the DIRECTORY
+     * of the source file holding the expression - never the cwd and never the import path - and
+     * may not escape that directory with '..'. Returns the bytes, or nullopt with `error` set to
+     * a finished, user-facing sentence. Free of expression state so the `application` declaration
+     * can reuse it.
+     */
+    std::optional<std::vector<uint8_t>> LoadEmbedFile(const std::string& literalPath,
+                                                      const std::string& sourceFile,
+                                                      std::string& resolvedPath,
+                                                      std::string& error);
+    // Lists an embedded asset in <out>.cflat-dep.json beside the source inputs, so the
+    // up-to-date check re-links when the asset changes.
+    void RecordEmbedDependency(const std::string& resolvedPath);
+    const std::vector<std::string>& GetEmbeddedAssets() const { return embeddedAssets_; }
     static bool IsOutputUpToDate(const std::string& outputPath,
                                  const std::vector<std::string>& normalizedArgs);
+    // `assets` are also listed among the inputs; the separate key makes them visible in the
+    // manifest as embedded resources.
     static bool WriteDependencyManifest(const std::string& outputPath,
                                         const std::vector<std::string>& normalizedArgs,
-                                        const std::vector<std::string>& dependencyFiles);
+                                        const std::vector<std::string>& dependencyFiles,
+                                        const std::vector<std::string>& assets = {});
 
     void SetXthreadScanLevel(int n);
     int  GetXthreadScanLevel() const;

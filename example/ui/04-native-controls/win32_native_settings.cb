@@ -15,6 +15,22 @@
 //   out\nsettings.exe --selftest
 import "ui_native/win32.cb";
 import "ui_test.cb";
+import "application.cb";
+
+// OS-facing metadata for this example (internal/plan/resource-embedding.md). The two PNGs
+// become RT_GROUP_ICON/RT_ICON on Windows and the .icns of an `-o Foo.app` bundle on macOS;
+// Application.name()/version()/icon() below read the SAME declaration, so an About box and
+// the shell can never disagree.
+application AppInfo settingsApp = {
+    name        = "Native Settings",
+    identifier  = "com.cflat.example.nativesettings",
+    description = "cflat ui_native settings panel example",
+    company     = "CFlat",
+    copyright   = "(c) 2026 CFlat",
+    version     = { file = "1.0.0" },
+    icon        = { { image = embed("icon_16.png") },
+                    { image = embed("icon_32.png") } },
+};
 
 class NativeSettings : IComponent
 {
@@ -127,6 +143,19 @@ int nativeSelfTest(int argc, char** argv)
 
         t.sliderSet("root/vol", 70);
         t.expectInt("progress mirrors slider", 70, t.progressValue("root/pb"));
+    });
+
+    // The `application` declaration is visible at runtime and LoadIcon resolves the
+    // RT_GROUP_ICON id 1 the compiler emitted into the .res.
+    s.test("application metadata + icon", (IUiTest t) =>
+    {
+        t.launch(new NativeSettings(), 44, 26);
+        t.expectTrue("application declared", Application.declared());
+        t.expectTrue("app name", Application.name() == "Native Settings");
+        t.expectTrue("app version", Application.version() == "1.0.0");
+        t.expectTrue("app identifier",
+            Application.identifier() == "com.cflat.example.nativesettings");
+        t.expectTrue("app icon handle", Application.icon() != nullptr);
     });
 
     // The Save button declared a `tooltip`, so the window's tooltip control exists

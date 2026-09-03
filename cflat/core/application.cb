@@ -1,0 +1,113 @@
+// OS-facing application metadata (internal/plan/resource-embedding.md, section 3.2).
+//
+// One `application AppInfo <name> = { ... };` declaration per program, at file scope, with a
+// compile-time literal initializer. The compiler routes the same leaves per target: a Windows
+// .res (RT_VERSION + RT_ICON/RT_GROUP_ICON), a macOS __TEXT,__info_plist section, or a full
+// .app bundle when the output path ends in ".app".
+//
+//   import "application.cb";
+//
+//   application AppInfo app = {
+//       name       = "MemPress Monitor",
+//       identifier = "com.example.mempress",
+//       version    = { file = "0.11.0" },
+//       icon       = { { image = embed("icon-16.png") }, { image = embed("icon-32.png") } },
+//   };
+
+// Application.icon() reaches NSApplication through the objc bridge on macOS. Gated so the
+// file stays importable on every target; it never imports ui_native.
+if const (__MACOS__) {
+    import "cocoa.cb";
+}
+
+// Application.icon() on Windows: MAKEINTRESOURCE(1) is the RT_GROUP_ICON id the backend
+// emits. LoadIconA lives in user32.dll, and a `lib` clause only takes effect on a header or
+// .winmd import - a .cb import drops it - so this file cannot request user32.lib on its own
+// without pulling in windows.h. A program calling icon() must link it itself, e.g. with
+// `import "windows.h" lib "user32.lib";` (ui_native/win32.cb already does exactly that).
+if const (__WINDOWS__) {
+    extern stdcall void* GetModuleHandleA(char* name);
+    extern stdcall void* LoadIconA(void* inst, char* name);
+}
+
+enum FileType : int { application, dll, driver };
+
+struct AppIcon {
+    u8[] image = default;        // one embed("x.png"); or a single .ico / .icns escape hatch
+};
+
+struct AppVersion {
+    string file = default;       // "0.11.0": FileVersion string + VS_FIXEDFILEINFO dwFileVersion
+    string product = default;    // ProductVersion; defaults to file
+    bool prerelease = default;   // VS_FF_PRERELEASE
+    bool debug = default;        // VS_FF_DEBUG
+};
+
+struct AppInfo {
+    string name = default;         // ProductName            / CFBundleName
+    string identifier = default;   // InternalName           / CFBundleIdentifier
+    string description = default;  // FileDescription        / (none)
+    string company = default;      // CompanyName            / (none)
+    string copyright = default;    // LegalCopyright         / NSHumanReadableCopyright
+    AppVersion version = default;  // RT_VERSION             / CFBundleShortVersionString
+    FileType type = default;       // dwFileType             / CFBundlePackageType
+    list<AppIcon> icon = default;  // RT_GROUP_ICON+RT_ICON  / .icns + CFBundleIconFile
+    int language = 1033;           // LanguageId on every .res entry + VarFileInfo Translation
+};
+
+// Compiler-provided constants. The backend defines these four globals at the end of codegen
+// from the `application` declaration, and to the empty string when there is none.
+extern i8* __cflat_app_name;
+extern i8* __cflat_app_version;
+extern i8* __cflat_app_identifier;
+extern i8* __cflat_app_copyright;
+// 1 when the program carries an `application` declaration, 0 otherwise.
+extern int __cflat_app_declared;
+
+namespace Application
+{
+    // The declared name, or "" when the program has no `application` declaration.
+    string name()
+    {
+        return __cflat_app_name;
+    }
+
+    // version.product when set, else version.file; "" when neither is declared.
+    string version()
+    {
+        return __cflat_app_version;
+    }
+
+    string identifier()
+    {
+        return __cflat_app_identifier;
+    }
+
+    string copyright()
+    {
+        return __cflat_app_copyright;
+    }
+
+    // True when the program has an `application` declaration. Libraries use this to skip
+    // application-only work (ui_native's window icon) instead of guessing from a value.
+    bool declared()
+    {
+        return __cflat_app_declared != 0;
+    }
+
+    // The platform's application-icon handle, or nullptr when the target has no such notion.
+    // Windows: HICON for the emitted RT_GROUP_ICON id 1 - nullptr when none was declared.
+    // macOS: the NSImage AppKit resolves from the .app bundle plist; a BARE binary still
+    // gets a non-null generic application image, never nullptr.
+    void* icon()
+    {
+        if const (__WINDOWS__) {
+            return LoadIconA(GetModuleHandleA(nullptr), (char*)1);
+        }
+        if const (__MACOS__) {
+            if (!cocoaInit()) return nullptr;
+            return msg0(msg0(cls("NSApplication"), "sharedApplication"), "applicationIconImage");
+        }
+        return nullptr;
+    }
+}

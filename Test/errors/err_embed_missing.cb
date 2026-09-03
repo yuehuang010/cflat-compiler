@@ -1,0 +1,33 @@
+// embed("path") negative cases: an asset that is not there, a destination type that
+// cannot hold bytes, and a path that climbs out of the source file's own directory.
+
+extern int main()
+{
+    // The path resolves against this file's directory (Test/errors/), which holds no assets.
+    expect_error("cannot be read: no such file") {
+        const u8[] missing = embed("library/no_such_asset.bin");
+    }
+
+    // Bytes have exactly two destination spellings; 'int' is neither.
+    expect_error("must be spelled 'u8[]' or 'string'") {
+        int wrongTarget = embed("err_embed_missing.cb");
+    }
+
+    // An explicit extent must equal the asset's byte count; only 'u8[]' sizes itself.
+    expect_error("but the destination declares 8 elements") {
+        const u8[8] tooSmall = embed("err_embed_missing.cb");
+    }
+
+    // '..' may not walk above the directory of the file that writes the call.
+    expect_error("escapes the directory of the source file") {
+        const u8[] escaped = embed("../test_core.cb");
+    }
+
+    return 0;
+}
+
+// Global counterpart of the extent-mismatch leg above; a global initializer takes the same
+// path through the embed fold.
+expect_error("but the destination declares 4 elements") {
+    const u8[4] globalTooSmall = embed("err_embed_missing.cb");
+}

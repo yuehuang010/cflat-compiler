@@ -26,6 +26,7 @@ import "ui_native.cb";
 import "manifest.cb";
 import "graphic/bitmap.cb";   // 24bpp BMP writer for nativeSaveWindowBmp (the shot() backend)
 import "wstring.cb";
+import "application.cb";   // Application.declared()/icon() - the auto window icon
 
 manifest ManifestDoc uiNativeManifest = { assembly = {
     dependency = { { dependentAssembly = { assemblyIdentity = {
@@ -238,6 +239,9 @@ const int TTM_GETTOOLCOUNT   = 1037;   // WM_USER+13
 const int TTF_IDISHWND       = 0x0001;
 const int TTF_SUBCLASS       = 0x0010;
 const int TTS_ALWAYSTIP      = 0x0001;
+
+// Sets a window's large (wParam 1) / small (wParam 0) title-bar + taskbar icon.
+const int WM_SETICON = 0x0080;
 
 // Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
 const int WM_APP_CALL = 0x8001;
@@ -7138,6 +7142,14 @@ void ensureWindowClass()
     wc.hInstance     = _hInst;
     wc.hCursor       = LoadCursorA(nullptr, (char*)IDC_ARROW);
     wc.hbrBackground = (void*)((i64)COLOR_BTNFACE + 1);
+    // An `application` declaration emits RT_GROUP_ICON id 1; class-level icons are what
+    // Explorer, the taskbar and alt-tab read. A null icon just leaves the Win32 default.
+    if (Application.declared())
+    {
+        void* classIcon = Application.icon();
+        wc.hIcon   = classIcon;
+        wc.hIconSm = classIcon;
+    }
     wc.lpszClassName = "CFlatNativeWindow";
     RegisterClassExA(&wc);
     _classReg = true;
@@ -7167,6 +7179,18 @@ int createAppWindow(IComponent app, const char* title, bool show)
         CW_USEDEFAULT, CW_USEDEFAULT, 760, 560,
         nullptr, nullptr, _hInst, nullptr);
     wnd.hwnd = hwnd;               // findWindowIdx now resolves this window's messages
+
+    // Per-window icon, so an already-registered class does not decide this frame's icon.
+    // Safe headless (the window exists, it is only hidden) and when nothing was declared.
+    if (Application.declared())
+    {
+        void* appIcon = Application.icon();
+        if (appIcon != nullptr)
+        {
+            SendMessageA(hwnd, (u32)WM_SETICON, (u64)1, (i64)appIcon);   // ICON_BIG
+            SendMessageA(hwnd, (u32)WM_SETICON, (u64)0, (i64)appIcon);   // ICON_SMALL
+        }
+    }
     wnd.dpi = GetDpiForWindow(hwnd);
     if (wnd.dpi < 96u) wnd.dpi = 96u;
     wnd.font = createUiFontDpi(wnd.dpi);

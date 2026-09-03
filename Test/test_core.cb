@@ -11,6 +11,7 @@ import "interfaces.cb";
 import "array.cb";
 import "bucket_allocator.cb";
 import "cruntime.cb";
+import "application.cb";
 
 // ── array<T> ─────────────────────────────────────────────────────────────────
 
@@ -3304,6 +3305,67 @@ int testRawArrayRuntimeCount()
     return passed;
 }
 
+// embed("path") - compile-time file embedding. The path resolves against THIS file's
+// directory, so both assets live in Test/library/. The text asset goes to a `string`
+// (byte-exact length, no NUL games); the binary asset goes to a u8[N] whose N is the
+// file size, so sizeof() measures the asset and 0x00 / 0xFF bytes survive intact.
+int testEmbed()
+{
+    int passed = 0;
+
+    const string text = embed("library/embed_payload.txt");
+    passed += Test("embed string length", (int)text.length(), 40);
+    passed += Test("embed string content",
+        text == "cflat embed fixture\nline two\nline three\n", true);
+
+    const u8[] bytes = embed("library/embed_bytes.bin");
+    passed += Test("embed u8[] sizeof",   (int)sizeof(bytes), 16);
+    passed += Test("embed u8[] first",    (int)bytes[0],      0);
+    passed += Test("embed u8[] ascii",    (int)bytes[4],      64);
+    passed += Test("embed u8[] high bit", (int)bytes[14],     255);
+    passed += Test("embed u8[] last",     (int)bytes[15],     10);
+
+    // Explicit extent is the same value; the count is not inferred away.
+    u8[16] sized = embed("library/embed_bytes.bin");
+    passed += Test("embed u8[16] sizeof", (int)sizeof(sized), 16);
+    passed += Test("embed u8[16] last",   (int)sized[15],     10);
+
+    return passed;
+}
+
+// The `application` declaration: OS metadata typed by core/application.cb, folded at compile
+// time. The icon PNGs resolve against THIS file's directory, like every embed above. On this
+// portable path only the compile-time constants are observable; the .res / Info.plist / .icns
+// serializations are exercised by the per-target link.
+application AppInfo cflatTestApp = {
+    name        = "CFlat Core Test",
+    identifier  = "com.cflat.coretest",
+    description = "cflat core regression suite",
+    company     = "CFlat",
+    copyright   = "(c) 2026 CFlat",
+    version     = { file = "0.11.0", product = "0.11.1" },
+    icon        = { { image = embed("library/app_icon_16.png") },
+                    { image = embed("library/app_icon_32.png") } },
+};
+
+int testApplication()
+{
+    int passed = 0;
+
+    passed += Test("application name", Application.name() == "CFlat Core Test", true);
+    // version() reports version.product when it is set, not version.file.
+    passed += Test("application version", Application.version() == "0.11.1", true);
+    passed += Test("application identifier",
+        Application.identifier() == "com.cflat.coretest", true);
+    passed += Test("application copyright", Application.copyright() == "(c) 2026 CFlat", true);
+    passed += Test("application name length", (int)Application.name().length(), 15);
+    // declared() is what a library gates application-only work on; it is true here and
+    // false in a program with no `application` declaration.
+    passed += Test("application declared", Application.declared(), true);
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -3351,6 +3413,8 @@ extern int main()
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;
+    r = testEmbed();            passed += r; total += 9;
+    r = testApplication();      passed += r; total += 6;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

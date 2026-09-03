@@ -14,6 +14,22 @@
 //   x64/Release/cflat example/ui/04-native-controls/cocoa_native_settings.cb -i example/ui -i example/macos --heap-audit -o out/nsettings_mac
 //   ./out/nsettings_mac --selftest
 import "ui_native/cocoa.cb";
+import "application.cb";
+
+// OS-facing metadata for this example (internal/plan/resource-embedding.md). The two PNGs
+// become RT_GROUP_ICON/RT_ICON on Windows and the .icns of an `-o Foo.app` bundle on macOS;
+// Application.name()/version()/icon() below read the SAME declaration, so an About box and
+// the shell can never disagree.
+application AppInfo settingsApp = {
+    name        = "Native Settings",
+    identifier  = "com.cflat.example.nativesettings",
+    description = "cflat ui_native settings panel example",
+    company     = "CFlat",
+    copyright   = "(c) 2026 CFlat",
+    version     = { file = "1.0.0" },
+    icon        = { { image = embed("icon_16.png") },
+                    { image = embed("icon_32.png") } },
+};
 
 class NativeSettings : IComponent
 {
@@ -111,6 +127,16 @@ int nativeSelfTest()
     void* hStat = u2h(activeCtx().nativeHandle("root/status"));
 
     int pass = 0; int total = 0;
+
+    // 0. The `application` declaration is visible at runtime, and AppKit hands back an
+    //    application icon even for this BARE binary (the generic image, never nullptr).
+    total++;
+    bool appMeta = Application.declared()
+        && Application.name() == "Native Settings"
+        && Application.version() == "1.0.0"
+        && Application.identifier() == "com.cflat.example.nativesettings"
+        && Application.icon() != nullptr;
+    if (appMeta) pass++; else printf("  FAIL: application metadata / icon\n");
 
     // 1. Every widget became a real control.
     total++;

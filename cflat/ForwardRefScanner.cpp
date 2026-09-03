@@ -102,6 +102,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     }
                     if (typeSpec->getText() == "manifest")
                         continue;  // collected by the main pass; not a runtime type
+                    if (typeSpec->getText() == "application")
+                        continue;  // collected by the main pass; not a runtime type
                     // tuple type sugar: (T1, T2) -> tuple<T1, T2>
                     if (typeSpec->tupleTypeSpecifier() != nullptr)
                     {

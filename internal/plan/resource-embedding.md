@@ -1,11 +1,25 @@
-# Resource embedding (DRAFT SPEC - not ratified)
+# Resource embedding (IMPLEMENTED 2026-09-03; Windows paths unverified)
 
-Ruling 2026-08-28 (maintainer): this needs a FULL SPEC, not a small-issue fix. Moved to plan
-status; replaces `internal/issue/p3/no-resource-embedding-or-resource-compiler.md` (deleted).
-Do not implement any piece of it until the spec below is ratified.
+Ratified and implemented 2026-09-03 on macOS: steps 1-4 of section 5 landed (`embed(...)`,
+`application` declaration, `--dump-app-info`, Windows `.res` writer, macOS `__TEXT,__info_plist`
+and `-o App.app` bundle, `Application.*` API, ui_native auto icon). Byte serializers live in
+`cflat/AppResources.{h,cpp}`. Windows-only paths (lld-link `.res` consumption, `LoadIconA`,
+`WM_SETICON`, `Test/test_windows.cb`, `win32_native_settings.cb`) were written but not executed:
+verify on the Windows host. Step 5 (Linux `.desktop`) remains a separate plan.
 
-Draft written 2026-09-02. Maintainer constraints recorded: cross-platform solution, not a
-Windows RC port; no additional file extensions (no `.rc`, no `.qrc`-style manifest file).
+**Open on the Windows box: user32.lib without the SDK.** `Application.icon()` calls
+`LoadIconA` (user32), and `ui_native/win32.cb` needs user32/gdi32/comctl32/shell32/ole32/
+comdlg32/dwmapi/uxtheme. Today those resolve only through the Windows SDK `um` fallback
+dir; `--init` synthesizes import libs from System32 DLLs for kernel32/ws2_32/ntdll/dbghelp/
+advapi32/ucrtbase only (`SynthesizeSystemImportLibs`, `cflat/LLVMBackend.cpp`). Investigate:
+(a) add the GUI DLLs to that table (cheapest, host-only); (b) Zig's route - ship mingw-w64
+`.def` files and synthesize from them, SDK-free and cross-compile-capable (check the
+mingw-w64 runtime license before vendoring); (c) a declaration-side `dll "user32.dll"`
+clause on `extern stdcall` so a core `.cb` can request the import lib without importing
+`windows.h` (grammar + both ParseDeclarationSpecifiers copies; needs a `p4/` ruling).
+Zig requires the SDK for its msvc target and is SDK-free only for windows-gnu. Maintainer
+constraints recorded: cross-platform solution, not a Windows RC port; no additional file
+extensions (no `.rc`, no `.qrc`-style manifest file).
 
 ## Motivation (from the closed issue)
 
@@ -289,7 +303,7 @@ section `__TEXT,__info_plist`, added to `llvm.used` (dead-strip keeps it). This 
 documented route for single-file tools: `codesign` reads the identifier from it,
 LaunchServices reads the version, `otool -P` shows it. No linker flag, no `-sectcreate`,
 works from the bundled `ld64.lld`. The icon is NOT representable here: Finder shows the
-generic executable icon; `--check` emits a note, not an error.
+generic executable icon; `-v` prints a note, not an error.
 
 **Bundle, `-o App.app`.** The compiler writes the layout Apple expects and links the
 executable into it. `.app` is Apple's extension, not a new one; it is the one
@@ -333,7 +347,7 @@ localization and nibs (`ui_native` / localization concerns).
 | Target | `name` / `version` / `identifier` / `copyright` | `icon` |
 |--------|-----------------------------------------------|--------|
 | Windows | RT_VERSION as above | RT_GROUP_ICON id 1 + RT_ICON 1..N |
-| macOS, `-o app` | `__TEXT,__info_plist` section | not representable; `--check` note |
+| macOS, `-o app` | `__TEXT,__info_plist` section | not representable; `-v` note |
 | macOS, `-o App.app` | `Contents/Info.plist` | `Contents/Resources/App.icns` |
 | Linux | kept only as embedded data (readable via API below) | embedded PNG data only; `.desktop` + icon-theme emission deferred to a later `--bundle` plan |
 

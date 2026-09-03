@@ -194,6 +194,7 @@ int main(int argc, char* argv[])
     args.addMultiOption("symbol-dump-ir", 0, "Dump unoptimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
     args.addMultiOption("symbol-dump-opt", 0, "Dump optimized LLVM IR for a selector, then exit (repeatable). Selector: module, line:<n>, or function:<name>. Requires a positional source file");
     args.addOption("dump-manifest", 0, "Write the merged Win32 manifest XML (exactly what is embedded as the RT_MANIFEST resource) to the given file, or to stdout with '-'. Works with --check");
+    args.addOption("dump-app-info", 0, "Write the `application` declaration's fields, plus the Win32 VERSIONINFO string table or the macOS Info.plist for the target, to the given file, or to stdout with '-'. Works with --check");
     args.addOption("dump-winmd", 0, "Read a WinRT metadata file (.winmd) into the projection model and dump it (diagnostic), then exit");
     args.addOption("emit-winmd", 0, "After compiling, write this program's [winrt] interfaces and classes to the given .winmd file");
     args.addFlag("winmd-sig-selftest", 0, "Validate the WinRT parameterized-type signature encoder and PIID derivation against reference IIDs, then exit");
@@ -688,7 +689,8 @@ int main(int argc, char* argv[])
         // The build already succeeded; a manifest that cannot be written only costs the
         // next run its up-to-date short-circuit, so it is reported and not treated as failure.
         if (!LLVMBackend::WriteDependencyManifest(effectiveOutput, args.normalizedArguments(),
-                                                  compiler.GetDependencyFiles()))
+                                                  compiler.GetDependencyFiles(),
+                                                  compiler.GetEmbeddedAssets()))
             std::cout << std::format("note: could not write dependency manifest for '{}'; the next build will not be skipped.\n",
                                      effectiveOutput);
     }

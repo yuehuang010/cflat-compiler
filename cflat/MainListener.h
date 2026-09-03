@@ -3133,6 +3133,10 @@ private:
     // yields a multi-child node and returns nullptr. This is the safety gate for the inbound
     // alloc-align channel: alignment is inherited only when the context provably reaches the `new`.
     CFlatParser::NewExpressionContext* AsDirectNew(antlr4::tree::ParseTree* node);
+    // Byte count of a `= embed("path")` initializer, read from the initializer's SYNTAX so a
+    // declaration can size its storage before the expression is walked. nullopt when the
+    // initializer is not a direct embed, or the asset cannot be read (the walk reports that).
+    std::optional<uint64_t> DirectEmbedByteCount(CFlatParser::AssignmentExpressionContext* expr);
 
     // `new T[n]` desugar into the core `array<T>`: a decl-init, direct assignment or return
     // whose destination is `array<T>` and whose RHS is a DIRECT array `new` arms this one-shot
@@ -3676,6 +3680,16 @@ public:
         antlr4::ParserRuleContext* ctx, const std::string& intrinsicName,
         const std::string& typeName, CFlatParser::InitializerListContext* init,
         std::vector<LLVMBackend::ManifestFragment::Leaf>* manifestLeaves = nullptr);
+
+    // Walks the compile-time literal of an `application AppInfo x = { ... };` declaration into
+    // the plain data the .res / Info.plist writers consume. Reports and returns false on the
+    // first shape or validation failure; host-independent, so --check sees every rule.
+    bool FoldApplicationLiteral(antlr4::ParserRuleContext* ctx, const std::string& typeName,
+        CFlatParser::InitializerListContext* init, cflat::appres::AppInfoData& out);
+
+    // Classifies the icon list into a PNG set or a single .ico / .icns container, filling
+    // IconKind and each image's pixel size. Reports the offending entry index on failure.
+    bool ValidateApplicationIcons(antlr4::ParserRuleContext* ctx, cflat::appres::AppInfoData& out);
 
     void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx);
 

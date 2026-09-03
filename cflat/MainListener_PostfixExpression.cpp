@@ -3841,6 +3841,91 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             break;
                         }
 
+                        /*
+                         * Compile-time intrinsic: embed("path") - folds a file's bytes into a
+                         * private read-only constant global. The path resolves against the
+                         * directory of the source file that WRITES the call, imports included.
+                         * The result shape comes from the destination type: `string` when the
+                         * destination is a string, `u8[N]` (N = the file size) otherwise.
+                         */
+                        if (functionName == "embed")
+                        {
+                            auto* compiler = Compiler(ctx);
+                            auto namedArgCtx = argumentList.empty()
+                                ? std::vector<CFlatParser::ArgumentNamedExpressionContext*>()
+                                : argumentList[functionArgCounter]->argumentNamedExpression();
+                            if (namedArgCtx.size() != 1)
+                            {
+                                LogErrorContext(ctx, "embed takes exactly one argument: a string "
+                                    "literal path, as in 'embed(\"data/payload.bin\")'");
+                                break;
+                            }
+                            std::string argText = namedArgCtx[0]->assignmentExpression()->getText();
+                            if (argText.size() < 2 || argText.front() != '"' || argText.back() != '"')
+                            {
+                                LogErrorContext(ctx, "embed requires a string literal path, as in "
+                                    "'embed(\"data/payload.bin\")'");
+                                break;
+                            }
+                            std::string literalPath = ProcessRawText(argText, false);
+                            std::string resolvedPath;
+                            std::string embedError;
+                            auto bytes = compiler->LoadEmbedFile(
+                                literalPath, compiler->GetSourceFilePath(), resolvedPath, embedError);
+                            if (!bytes.has_value())
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "embed(\"{}\") cannot be read: {}", literalPath, embedError));
+                                break;
+                            }
+                            compiler->RecordEmbedDependency(resolvedPath);
+
+                            // `string` destination: byte-exact length, no NUL needed.
+                            const auto& embedDest = declExpectedType;
+                            if (embedDest.TypeName == "string" && !embedDest.Pointer
+                                && embedDest.ConstArraySize == 0 && !embedDest.IsArrayView)
+                            {
+                                namedVar = compiler->MakeStringLiteralNV(
+                                    std::string(bytes->begin(), bytes->end()));
+                                break;
+                            }
+                            if (!embedDest.TypeName.empty() && embedDest.TypeName != "u8")
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "embed(\"{}\") produces bytes; its destination must be spelled "
+                                    "'u8[]' or 'string', not '{}'", literalPath,
+                                    SpellType(*compiler, embedDest)));
+                                break;
+                            }
+
+                            // An EXPLICIT extent must match the asset; only 'u8[]' sizes itself.
+                            if (embedDest.TypeName == "u8" && !embedDest.Pointer
+                                && !embedDest.IsArrayView && embedDest.ConstArraySize != 0
+                                && embedDest.ConstArraySize != bytes->size())
+                            {
+                                LogErrorContext(ctx, std::format(
+                                    "embed(\"{}\") holds {} bytes but the destination declares "
+                                    "{} elements; write 'u8[]' to take the asset's own size",
+                                    literalPath, bytes->size(), embedDest.ConstArraySize));
+                                break;
+                            }
+
+                            auto* byteTy = llvm::Type::getInt8Ty(*compiler->context);
+                            auto* arrTy = llvm::ArrayType::get(byteTy, bytes->size());
+                            auto* init = llvm::ConstantDataArray::get(
+                                *compiler->context, llvm::ArrayRef<uint8_t>(*bytes));
+                            auto* gv = new llvm::GlobalVariable(
+                                *compiler->module, arrTy, true, llvm::GlobalValue::PrivateLinkage,
+                                init, "embed");
+                            gv->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+                            namedVar = LLVMBackend::NamedVariable();
+                            namedVar.Storage = gv;
+                            namedVar.BaseType = arrTy;
+                            namedVar.TypeAndValue.TypeName = "u8";
+                            namedVar.TypeAndValue.ConstArraySize = bytes->size();
+                            break;
+                        }
+
                         // Hardware intrinsic: __rdtscp() - serializing read of the x86 CPU
                         // timestamp counter (RDTSCP). Returns an i64 raw cycle count. x86/Intel
                         // target only; callers should guard with `if const (__X86__)`. Wrapped
@@ -7231,7 +7316,7 @@ LLVMBackend::NamedVariable MainListener::ParseIdentifier(antlr4::tree::TerminalN
         // Compiler intrinsics handled at the call site - not in the function table.
         static const std::unordered_set<std::string> kIntrinsics = {
             "va_start", "va_end", "is_pointer", "is_unique", "is_interface", "is_copyable", "is_primitive", "is_string", "annotationof",
-            "compile_error",
+            "compile_error", "embed",
             "reflect", "reflect_set", "json_const", "xml_const", "__rdtscp", "__readcyclecounter", "__lfence", "__pause",
             "__popcount", "__ctz", "__clz", "__prefetch", "__fma", "__likely", "__unlikely",
             "__atomic_acquire_fence",

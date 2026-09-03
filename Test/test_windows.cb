@@ -27,6 +27,7 @@
 //      knowledge of windows.h - the dependency is expressed entirely in this source.
 import "test_helper.cb";
 import "manifest.cb";
+import "application.cb";
 import "filesystem.cb";
 import "wstring.cb";
 // A standalone `import "windows.h";` BEFORE the group must not strip windows.h from the
@@ -52,10 +53,30 @@ manifest ManifestDoc appManifest = { assembly = {
     } }
 } };
 
+// The `application` declaration is the RT_VERSION / RT_ICON half of the same .res the manifest
+// above lands in: one temp .res carries all three resource types. The icon PNGs resolve against
+// this file's directory, like every embed.
+application AppInfo appInfo = {
+    name        = "CFlat Windows Test",
+    identifier  = "com.cflat.windowstest",
+    description = "cflat Win32 regression suite",
+    company     = "CFlat",
+    copyright   = "(c) 2026 CFlat",
+    version     = { file = "0.11.0" },
+    icon        = { { image = embed("library/app_icon_16.png") },
+                    { image = embed("library/app_icon_32.png") } },
+};
+
 extern int main(int argc, char** argv)
 {
     int passed = 0;
     int total = 0;
+
+    total++; passed += Test("application name", Application.name() == "CFlat Windows Test", true);
+    // version.product is unset, so version() reports version.file.
+    total++; passed += Test("application version", Application.version() == "0.11.0", true);
+    total++; passed += Test("application identifier",
+        Application.identifier() == "com.cflat.windowstest", true);
 
     string image = File.readAllText("" + argv[0]);
     total++; passed += Test("embedded manifest dependency", image.contains("Microsoft.Windows.Common-Controls"), true);

@@ -161,6 +161,7 @@ set(CFLAT_SOURCES
   ${CFLAT_DIR}/LLVMBackend_OwnershipTemps.cpp
   ${CFLAT_DIR}/LLVMBackend_CodegenHelpers.cpp
   ${CFLAT_DIR}/LLVMBackend_CInterop.cpp
+  ${CFLAT_DIR}/AppResources.cpp
   ${CFLAT_DIR}/LLVMBackend_EmitAndLink.cpp
   ${CFLAT_DIR}/LLVMBackend_Interfaces.cpp
   ${CFLAT_DIR}/LLVMBackend_WinRT.cpp

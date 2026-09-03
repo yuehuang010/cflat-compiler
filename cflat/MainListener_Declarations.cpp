@@ -506,6 +506,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 }
                 if (typeSpec->getText() == "manifest")
                     continue;  // collected by ParseDeclaration at file scope
+                if (typeSpec->getText() == "application")
+                    continue;  // collected by ParseDeclaration at file scope
                 // tuple type sugar: (T1, T2) -> tuple<T1, T2>
                 if (typeSpec->tupleTypeSpecifier() != nullptr)
                 {
@@ -1146,6 +1148,24 @@ CFlatParser::NewExpressionContext* MainListener::AsDirectNew(antlr4::tree::Parse
             node = node->children[0];
         }
         return nullptr;
+    }
+
+std::optional<uint64_t> MainListener::DirectEmbedByteCount(
+        CFlatParser::AssignmentExpressionContext* expr) {
+        if (expr == nullptr) return std::nullopt;
+        std::string text = expr->getText();
+        if (text.size() < 9 || text.rfind("embed(\"", 0) != 0 || text.back() != ')')
+            return std::nullopt;
+        std::string quoted = text.substr(6, text.size() - 7);
+        if (quoted.size() < 2 || quoted.front() != '"' || quoted.back() != '"')
+            return std::nullopt;
+        auto* compiler = Compiler();
+        std::string resolvedPath;
+        std::string embedError;
+        auto bytes = compiler->LoadEmbedFile(ProcessRawText(quoted, false),
+                                             compiler->GetSourceFilePath(), resolvedPath, embedError);
+        if (!bytes.has_value()) return std::nullopt;
+        return (uint64_t)bytes->size();
     }
 
 LLVMBackend::DeclTypeAndValue MainListener::getFunctionReturnType(CFlatParser::FunctionDefinitionContext* ctx) {
@@ -2472,6 +2492,11 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             LogErrorContext(func, "manifest is only valid on file-scope variable declarations");
             return;
         }
+        if (HasSoftDeclarationSpecifier(func->declarationSpecifiers(), "application"))
+        {
+            LogErrorContext(func, "application is only valid on file-scope variable declarations");
+            return;
+        }
         // Create Function Definition
         auto name = nameOverride.empty() ? ::getFunctionName(func) : nameOverride;
         if (!namespaceName.empty())
@@ -2892,6 +2917,11 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                 if (HasSoftDeclarationSpecifier(direct, "manifest"))
                 {
                     LogErrorContext(direct, "manifest declarations are only allowed at file scope");
+                    continue;
+                }
+                if (HasSoftDeclarationSpecifier(direct, "application"))
+                {
+                    LogErrorContext(direct, "application declarations are only allowed at file scope");
                     continue;
                 }
                 LLVMBackend::DeclTypeAndValue typeAndValue;
@@ -3352,12 +3382,332 @@ void MainListener::ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
         }
     }
 
+
+bool MainListener::ValidateApplicationIcons(antlr4::ParserRuleContext* ctx,
+    cflat::appres::AppInfoData& out)
+{
+    using namespace cflat::appres;
+    if (out.Icons.empty())
+    {
+        out.IconKind = AppIconKind::None;
+        return true;
+    }
+
+    // A single-entry list may be a whole .ico / .icns container; every other shape is a PNG set.
+    if (out.Icons.size() == 1)
+    {
+        if (LooksLikeIco(out.Icons[0].Bytes))
+        {
+            // Split now so the .res writer emits one RT_ICON per contained image.
+            std::vector<AppIconImage> split;
+            std::string splitError;
+            if (!SplitIco(out.Icons[0].Bytes, split, splitError))
+            {
+                LogErrorContext(ctx, std::format("application icon: {}", splitError));
+                return false;
+            }
+            out.Icons = std::move(split);
+            out.IconKind = AppIconKind::Ico;
+            return true;
+        }
+        if (LooksLikeIcns(out.Icons[0].Bytes)) { out.IconKind = AppIconKind::Icns; return true; }
+    }
+
+    static const std::set<uint32_t> allowed = { 16, 32, 48, 64, 128, 256, 512, 1024 };
+    std::set<uint32_t> seen;
+    for (size_t i = 0; i < out.Icons.size(); ++i)
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        if (!ProbePng(out.Icons[i].Bytes, width, height))
+        {
+            LogErrorContext(ctx, std::format(
+                "application icon entry {} is not a PNG; an icon list holds PNG images, or a "
+                "single .ico / .icns file", i));
+            return false;
+        }
+        if (width != height)
+        {
+            LogErrorContext(ctx, std::format(
+                "application icon entry {} is {}x{}; icon images must be square", i, width, height));
+            return false;
+        }
+        if (allowed.count(width) == 0)
+        {
+            LogErrorContext(ctx, std::format(
+                "application icon entry {} is {}x{}; the size must be one of "
+                "16, 32, 48, 64, 128, 256, 512, 1024", i, width, height));
+            return false;
+        }
+        if (!seen.insert(width).second)
+        {
+            LogErrorContext(ctx, std::format(
+                "application icon entry {} repeats the {}x{} size; every icon size must be distinct",
+                i, width, height));
+            return false;
+        }
+        out.Icons[i].Width = width;
+        out.Icons[i].Height = height;
+    }
+    out.IconKind = AppIconKind::PngSet;
+    return true;
+}
+
+/*
+ * The `application` literal walk. Deliberately its own walker rather than a third mode of
+ * FoldConstLiteral: the leaves here are typed data (byte spans from embed, a parsed version
+ * quad, an icon list) instead of the JSON/XML text those two modes produce.
+ */
+bool MainListener::FoldApplicationLiteral(antlr4::ParserRuleContext* ctx, const std::string& typeName,
+    CFlatParser::InitializerListContext* init, cflat::appres::AppInfoData& out)
+{
+    auto* compiler = Compiler(ctx);
+    if (typeName != "AppInfo")
+    {
+        LogErrorContext(ctx, std::format(
+            "an application declaration must be typed 'AppInfo' from core/application.cb, not '{}'",
+            typeName));
+        return false;
+    }
+    if (init == nullptr)
+    {
+        LogErrorContext(ctx, "an application declaration requires a brace initializer");
+        return false;
+    }
+
+    // One named field's single expression; nullptr when the field is a brace list instead.
+    auto soleExpression = [&](CFlatParser::FieldInitContext* field)
+        -> CFlatParser::AssignmentExpressionContext* {
+        if (field->Colon() != nullptr || field->assignmentExpression().size() != 1) return nullptr;
+        return field->assignmentExpression(0);
+    };
+    auto stringField = [&](CFlatParser::FieldInitContext* field, const std::string& name,
+                           std::string& value) {
+        auto* expression = soleExpression(field);
+        std::string raw = expression == nullptr ? std::string() : expression->getText();
+        if (raw.size() < 2 || raw.front() != '"' || raw.back() != '"')
+        {
+            LogErrorContext(field, std::format(
+                "application field '{}' must be a string literal", name));
+            return false;
+        }
+        value = ProcessRawText(raw);
+        // The VS_VERSIONINFO block length is a u16, so an over-long field would silently truncate.
+        static const size_t kMaxAppStringBytes = 32000;
+        if (value.size() > kMaxAppStringBytes)
+        {
+            LogErrorContext(field, std::format(
+                "application field '{}' is {} bytes; the limit is {} bytes", name, value.size(),
+                kMaxAppStringBytes));
+            return false;
+        }
+        return true;
+    };
+    auto boolField = [&](CFlatParser::FieldInitContext* field, const std::string& name, bool& value) {
+        auto* expression = soleExpression(field);
+        std::string raw = expression == nullptr ? std::string() : expression->getText();
+        if (raw != "true" && raw != "false")
+        {
+            LogErrorContext(field, std::format(
+                "application field '{}' must be 'true' or 'false'", name));
+            return false;
+        }
+        value = raw == "true";
+        return true;
+    };
+
+    bool sawName = false;
+    for (auto* field : init->fieldInit())
+    {
+        if (field->Identifier() == nullptr)
+        {
+            LogErrorContext(field, "an application initializer requires named fields");
+            return false;
+        }
+        const std::string name = field->Identifier()->getText();
+        if (name == "name")
+        {
+            if (!stringField(field, name, out.Name)) return false;
+            sawName = !out.Name.empty();
+        }
+        else if (name == "identifier") { if (!stringField(field, name, out.Identifier)) return false; }
+        else if (name == "description") { if (!stringField(field, name, out.Description)) return false; }
+        else if (name == "company") { if (!stringField(field, name, out.Company)) return false; }
+        else if (name == "copyright") { if (!stringField(field, name, out.Copyright)) return false; }
+        else if (name == "language")
+        {
+            auto* expression = soleExpression(field);
+            std::string raw = expression == nullptr ? std::string() : expression->getText();
+            long parsed = 0;
+            size_t consumed = 0;
+            try { parsed = std::stol(raw, &consumed); } catch (...) { consumed = 0; }
+            if (consumed != raw.size() || parsed < 0 || parsed > 0xFFFF)
+            {
+                LogErrorContext(field,
+                    "application field 'language' must be a decimal LanguageId between 0 and 65535");
+                return false;
+            }
+            out.Language = static_cast<int>(parsed);
+        }
+        else if (name == "type")
+        {
+            auto* expression = soleExpression(field);
+            std::string raw = expression == nullptr ? std::string() : expression->getText();
+            if (raw == "FileType.application") out.Type = cflat::appres::AppFileType::Application;
+            else if (raw == "FileType.dll") out.Type = cflat::appres::AppFileType::Dll;
+            else if (raw == "FileType.driver") out.Type = cflat::appres::AppFileType::Driver;
+            else
+            {
+                LogErrorContext(field, std::format(
+                    "application field 'type' must name a FileType member "
+                    "(FileType.application, FileType.dll, FileType.driver), got '{}'", raw));
+                return false;
+            }
+        }
+        else if (name == "version")
+        {
+            auto* nested = field->initializerList();
+            if (nested == nullptr)
+            {
+                LogErrorContext(field, "application field 'version' must be a brace initializer");
+                return false;
+            }
+            for (auto* versionField : nested->fieldInit())
+            {
+                if (versionField->Identifier() == nullptr)
+                {
+                    LogErrorContext(versionField, "an application initializer requires named fields");
+                    return false;
+                }
+                const std::string versionName = versionField->Identifier()->getText();
+                if (versionName == "file")
+                { if (!stringField(versionField, "version.file", out.Version.File)) return false; }
+                else if (versionName == "product")
+                { if (!stringField(versionField, "version.product", out.Version.Product)) return false; }
+                else if (versionName == "prerelease")
+                { if (!boolField(versionField, "version.prerelease", out.Version.Prerelease)) return false; }
+                else if (versionName == "debug")
+                { if (!boolField(versionField, "version.debug", out.Version.Debug)) return false; }
+                else
+                {
+                    LogErrorContext(versionField, std::format(
+                        "no field named '{}' in AppVersion", versionName));
+                    return false;
+                }
+            }
+        }
+        else if (name == "icon")
+        {
+            auto* nested = field->initializerList();
+            if (nested == nullptr)
+            {
+                LogErrorContext(field, "application field 'icon' must be a brace list of AppIcon entries");
+                return false;
+            }
+            size_t index = 0;
+            for (auto* entry : nested->fieldInit())
+            {
+                auto* entryInit = entry->initializerList();
+                if (entry->Identifier() != nullptr || entryInit == nullptr)
+                {
+                    LogErrorContext(entry, std::format(
+                        "application icon entry {} must be a brace initializer "
+                        "of the form '{{ image = embed(\"icon.png\") }}'", index));
+                    return false;
+                }
+                cflat::appres::AppIconImage image;
+                bool sawImage = false;
+                for (auto* iconField : entryInit->fieldInit())
+                {
+                    if (iconField->Identifier() == nullptr
+                        || iconField->Identifier()->getText() != "image")
+                    {
+                        LogErrorContext(iconField, std::format(
+                            "application icon entry {} accepts only the field 'image'", index));
+                        return false;
+                    }
+                    auto* expression = soleExpression(iconField);
+                    std::string raw = expression == nullptr ? std::string() : expression->getText();
+                    if (!raw.starts_with("embed(") || !raw.ends_with(")"))
+                    {
+                        LogErrorContext(iconField, std::format(
+                            "application icon entry {} must be 'image = embed(\"icon.png\")'", index));
+                        return false;
+                    }
+                    std::string pathLiteral = raw.substr(6, raw.size() - 7);
+                    if (pathLiteral.size() < 2 || pathLiteral.front() != '"'
+                        || pathLiteral.back() != '"')
+                    {
+                        LogErrorContext(iconField, std::format(
+                            "application icon entry {} must embed a string literal path", index));
+                        return false;
+                    }
+                    std::string literalPath = ProcessRawText(pathLiteral, false);
+                    std::string resolvedPath;
+                    std::string embedError;
+                    auto bytes = compiler->LoadEmbedFile(literalPath,
+                        compiler->GetSourceFilePath(), resolvedPath, embedError);
+                    if (!bytes.has_value())
+                    {
+                        LogErrorContext(iconField, std::format(
+                            "embed(\"{}\") cannot be read: {}", literalPath, embedError));
+                        return false;
+                    }
+                    compiler->RecordEmbedDependency(resolvedPath);
+                    image.Bytes = std::move(*bytes);
+                    sawImage = true;
+                }
+                if (!sawImage)
+                {
+                    LogErrorContext(entry, std::format(
+                        "application icon entry {} has no 'image'", index));
+                    return false;
+                }
+                out.Icons.push_back(std::move(image));
+                ++index;
+            }
+        }
+        else
+        {
+            LogErrorContext(field, std::format("no field named '{}' in AppInfo", name));
+            return false;
+        }
+    }
+
+    if (!sawName)
+    {
+        LogErrorContext(ctx, "an application declaration requires a non-empty 'name'");
+        return false;
+    }
+
+    uint16_t quad[4] = { 0, 0, 0, 0 };
+    std::string versionError;
+    if (!out.Version.File.empty()
+        && !cflat::appres::ParseVersionQuad(out.Version.File, quad, versionError))
+    {
+        LogErrorContext(ctx, std::format("application version.file '{}' is not valid: {}",
+            out.Version.File, versionError));
+        return false;
+    }
+    if (!out.Version.Product.empty()
+        && !cflat::appres::ParseVersionQuad(out.Version.Product, quad, versionError))
+    {
+        LogErrorContext(ctx, std::format("application version.product '{}' is not valid: {}",
+            out.Version.Product, versionError));
+        return false;
+    }
+
+    if (!ValidateApplicationIcons(ctx, out)) return false;
+    return true;
+}
+
 std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclaration(CFlatParser::DeclarationSpecifiersContext* declSpec, CFlatParser::InitDeclaratorListContext* initDecl, const std::string& namespaceName) {
         auto* compiler = Compiler(declSpec);
         std::vector<std::pair<std::string, llvm::AllocaInst*>> allocList;
 
         size_t line = declSpec->getStart()->getLine();
         const bool isManifest = HasSoftDeclarationSpecifier(declSpec, "manifest");
+        const bool isApplication = HasSoftDeclarationSpecifier(declSpec, "application");
         const bool spelledBuiltinUnique = HasSoftDeclarationSpecifier(declSpec, "unique");
         auto typeAndValue = [&]() {
             LocalDeclGuard localDecl(inLocalDecl_,
@@ -3396,6 +3746,42 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 if (folded)
                     compiler->RecordManifestFragment(compiler->GetSourceFilePath(),
                         manifestDecl->getStart()->getLine(), *folded, std::move(manifestLeaves));
+            }
+            return allocList;
+        }
+        if (isApplication)
+        {
+            if (!global_scope)
+            {
+                LogErrorContext(declSpec, "application declarations are only allowed at file scope");
+                return allocList;
+            }
+            for (auto* appDecl : initDecl->initDeclarator())
+            {
+                auto* initializer = appDecl->initializer();
+                auto* initList = appDecl->initializerList();
+                if (initList == nullptr && initializer != nullptr)
+                    initList = initializer->initializerList();
+                if (appDecl->declarator()->parameterTypeList() != nullptr || initList == nullptr)
+                {
+                    LogErrorContext(appDecl,
+                        "application initializer must be a compile-time literal");
+                    continue;
+                }
+                // The one-declaration rule is checked BEFORE the walk so a second declaration
+                // names both locations rather than failing on whatever it embeds.
+                if (compiler->GetApplicationInfo().has_value())
+                {
+                    LogErrorContext(appDecl, std::format(
+                        "a program may declare only one application; already declared at {}:{}",
+                        compiler->GetApplicationSourceFile(), compiler->GetApplicationLine()));
+                    continue;
+                }
+                cflat::appres::AppInfoData info;
+                if (!FoldApplicationLiteral(appDecl, typeAndValue.TypeName, initList, info))
+                    continue;
+                compiler->RecordApplicationInfo(compiler->GetSourceFilePath(),
+                    appDecl->getStart()->getLine(), std::move(info));
             }
             return allocList;
         }
@@ -3775,6 +4161,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // Equivalent to T[N] arr = {} / T[N] arr = {field=v,...}.
                 bool barebraceInit = initDecl->LeftBrace() != nullptr;
                 CFlatParser::InitializerListContext* barebraceList = barebraceInit ? initDecl->initializerList() : nullptr;
+
+                /*
+                 * `u8[] a = embed("...")` sizes its own destination: the asset's byte count IS the
+                 * extent, so the declaration is a fixed 'u8[N]', not a length-inferred view. The
+                 * size must be known BEFORE storage is created, so the path is read here from the
+                 * initializer's syntax; the expression itself re-reads it and folds the bytes.
+                 */
+                if (typeAndValue.IsArrayView && typeAndValue.ConstArraySize == 0
+                    && initializer != nullptr)
+                {
+                    if (auto embedSize = DirectEmbedByteCount(initializer->assignmentExpression()))
+                    {
+                        typeAndValue.IsArrayView = false;
+                        typeAndValue.Pointer = false;
+                        typeAndValue.ConstArraySize = *embedSize;
+                    }
+                }
 
                 // Empty '{}' on a POINTER target: rejected as AMBIGUOUS (null pointer vs pointer
                 // to an empty object) in every spelling. A NON-pointer '{}' has ONE reading, so
@@ -5284,6 +5687,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && right != nullptr && right->getType()->isPointerTy()
                         && llvm::isa_and_nonnull<llvm::ArrayType>(compiler->GetType(typeAndValue)))
                     {
+                        // `embed("...")` folds to a private constant [N x i8] global; a global
+                        // destination of the same shape adopts those bytes directly.
+                        auto* embedGlobal = constant == nullptr ? nullptr
+                            : llvm::dyn_cast<llvm::GlobalVariable>(constant->stripPointerCasts());
+                        auto* embedBytes = (embedGlobal == nullptr || !embedGlobal->isConstant()
+                                            || !embedGlobal->hasInitializer())
+                            ? nullptr
+                            : llvm::dyn_cast<llvm::ConstantDataArray>(embedGlobal->getInitializer());
+                        if (embedBytes != nullptr
+                            && embedBytes->getType() == compiler->GetType(typeAndValue)
+                            && DirectEmbedByteCount(initializer == nullptr ? nullptr
+                                                    : initializer->assignmentExpression()).has_value())
+                        {
+                            constant = embedBytes;
+                        }
+                        else
+                        {
                         bool fromStringLiteral = constant != nullptr
                             && compiler->IsStringLiteralConstant(constant);
                         if (fromStringLiteral)
@@ -5319,6 +5739,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 "own shape. Use a brace list ('{{...}}'), '= default' to zero it, or "
                                 "fill '{}' element by element at the start of main.",
                                 DescribeArrayShape(typeAndValue), name, name));
+                        }
                     }
 
                     auto* global = compiler->CreateGlobalVariable(typeAndValue, constant,

@@ -1,0 +1,39 @@
+// `application` declaration rules, all decided AT THE DECLARATION on any host so --check
+// catches them without a Windows or macOS link. The duplicate-declaration leg comes LAST,
+// because it is the only one that leaves a recorded declaration behind: the failing legs
+// above it are rejected before anything is recorded.
+
+import "application.cb";
+
+expect_error("requires a non-empty 'name'") {
+    application AppInfo noName = { identifier = "com.example.noname" };
+}
+
+expect_error("must be a compile-time literal") {
+    application AppInfo notALiteral = default;
+}
+
+expect_error("version.file '1.2.3.4.5' is not valid") {
+    application AppInfo badVersion = { name = "Bad Version", version = { file = "1.2.3.4.5" } };
+}
+
+expect_error("version.file '1.70000' is not valid") {
+    application AppInfo hugeComponent = { name = "Huge", version = { file = "1.70000" } };
+}
+
+// The icon bytes are this very source file, which is not a PNG and not an .ico / .icns.
+expect_error("icon entry 0 is not a PNG") {
+    application AppInfo badIcon = { name = "Bad Icon",
+        icon = { { image = embed("err_application_rules.cb") } } };
+}
+
+expect_error("no field named 'nickname' in AppInfo") {
+    application AppInfo unknownField = { name = "Unknown", nickname = "nope" };
+}
+
+// From here on a declaration IS recorded, so every later one is the duplicate case.
+application AppInfo theOne = { name = "The One", version = { file = "1.0.0" } };
+
+expect_error("may declare only one application") {
+    application AppInfo second = { name = "The Second" };
+}

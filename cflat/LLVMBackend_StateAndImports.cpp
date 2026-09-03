@@ -362,6 +362,122 @@ std::string LLVMBackend::GetSourceFilePath() const
 { return currentSourceFilePath_; }
 
 /*
+ * Resolve and read an `embed("...")` asset. Containment is decided on the LEXICALLY normalized
+ * path (so '..' is rejected as written) and again on the weakly-canonical one (so a symlink
+ * cannot smuggle the read outside the source file's directory).
+ */
+std::optional<std::vector<uint8_t>> LLVMBackend::LoadEmbedFile(const std::string& literalPath,
+                                                               const std::string& sourceFile,
+                                                               std::string& resolvedPath,
+                                                               std::string& error)
+{
+    resolvedPath.clear();
+    error.clear();
+    if (literalPath.empty())
+    {
+        error = "the path is empty";
+        return std::nullopt;
+    }
+
+    std::filesystem::path relative(literalPath);
+    // is_absolute() is false for "/abs/x" on Windows; the root tests catch it on every host.
+    if (relative.is_absolute() || relative.has_root_directory() || relative.has_root_name())
+    {
+        error = "an absolute path is not allowed; embed resolves relative to the source file";
+        return std::nullopt;
+    }
+
+    std::error_code ec;
+    std::filesystem::path base = std::filesystem::path(sourceFile).parent_path();
+    // The LSP analyzes a TEMP copy of the root document; its real directory is sourceFileDir_.
+    if (!sourceFileDir_.empty() && sourceFile == analyzedRootPath_)
+        base = sourceFileDir_;
+    if (base.empty()) base = std::filesystem::current_path(ec);
+
+    auto contains = [](const std::filesystem::path& directory,
+                       const std::filesystem::path& candidate) {
+        auto directoryText = directory.generic_string();
+        auto candidateText = candidate.generic_string();
+        if (!directoryText.empty() && directoryText.back() == '/') directoryText.pop_back();
+        if (directoryText.empty() || candidateText.size() <= directoryText.size()) return false;
+        return candidateText.compare(0, directoryText.size(), directoryText) == 0
+            && candidateText[directoryText.size()] == '/';
+    };
+
+    auto lexicalBase = base.lexically_normal();
+    auto lexicalFull = (base / relative).lexically_normal();
+    if (!contains(lexicalBase, lexicalFull))
+    {
+        error = "the path escapes the directory of the source file that names it";
+        return std::nullopt;
+    }
+
+    auto canonicalBase = std::filesystem::weakly_canonical(lexicalBase, ec);
+    if (ec) canonicalBase = lexicalBase;
+    auto canonicalFull = std::filesystem::weakly_canonical(lexicalFull, ec);
+    if (ec) canonicalFull = lexicalFull;
+    if (!contains(canonicalBase, canonicalFull))
+    {
+        error = "the path escapes the directory of the source file that names it";
+        return std::nullopt;
+    }
+
+    if (!std::filesystem::exists(canonicalFull, ec) || ec)
+    {
+        error = "no such file";
+        return std::nullopt;
+    }
+    if (!std::filesystem::is_regular_file(canonicalFull, ec) || ec)
+    {
+        error = "not a regular file";
+        return std::nullopt;
+    }
+
+    // The same asset is read by the extent check, the initializer and the global-init arm;
+    // serve the later reads from the cache keyed on the resolved path.
+    const std::string cacheKey = canonicalFull.string();
+    auto cached = embedFileCache_.find(cacheKey);
+    if (cached != embedFileCache_.end())
+    {
+        resolvedPath = cacheKey;
+        return cached->second;
+    }
+
+    std::ifstream input(canonicalFull, std::ios::binary);
+    if (!input)
+    {
+        error = "the file could not be opened for reading";
+        return std::nullopt;
+    }
+    std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+    if (input.bad())
+    {
+        error = "the file could not be read";
+        return std::nullopt;
+    }
+    // A zero-byte asset has no 'u8[N]' spelling (N = 0 is not an array), and C23 '#embed'
+    // rejects the empty case for the same reason. Reject it once, here, for both shapes.
+    if (bytes.empty())
+    {
+        error = "the file is empty";
+        return std::nullopt;
+    }
+    resolvedPath = cacheKey;
+    embedFileCache_.emplace(cacheKey, bytes);
+    return bytes;
+}
+
+void LLVMBackend::RecordEmbedDependency(const std::string& resolvedPath)
+{
+    if (resolvedPath.empty()) return;
+    if (std::find(embeddedAssets_.begin(), embeddedAssets_.end(), resolvedPath)
+        == embeddedAssets_.end())
+        embeddedAssets_.push_back(resolvedPath);
+    RecordDependency(resolvedPath);
+}
+
+/*
  * The ROOT <assemblyIdentity> of a manifest is the one Windows uses to build the process
  * activation context, and a malformed one fails at PROCESS LAUNCH with Win32 error 14001
  * (ERROR_SXS_CANT_GEN_ACTCTX) - outside the compiler, naming no field. These checks are pure
@@ -594,6 +710,80 @@ std::optional<std::string> LLVMBackend::MergeManifestFragments() const
         }
 
     return "<assembly" + rootAttributes + ">" + children + "</assembly>";
+}
+
+bool LLVMBackend::RecordApplicationInfo(const std::string& sourceFile, size_t line,
+                                        cflat::appres::AppInfoData info)
+{
+    if (applicationInfo_.has_value()) return false;
+    applicationInfo_ = std::move(info);
+    applicationSourceFile_ = sourceFile;
+    applicationLine_ = line;
+    return true;
+}
+
+/*
+ * Define the constants core/application.cb declares `extern`: four `i8*` strings plus the
+ * `__cflat_app_declared` int flag. They are always defined when the file is imported, so a
+ * program without an `application` declaration links and reads back empty strings / 0 rather
+ * than failing at link time.
+ */
+void LLVMBackend::MaterializeApplicationConstants()
+{
+    if (module == nullptr) return;
+    const auto& info = applicationInfo_;
+    const std::string product = !info ? std::string()
+        : (info->Version.Product.empty() ? info->Version.File : info->Version.Product);
+    const std::pair<const char*, std::string> constants[] = {
+        { "__cflat_app_name",       info ? info->Name : std::string() },
+        { "__cflat_app_version",    product },
+        { "__cflat_app_identifier", info ? info->Identifier : std::string() },
+        { "__cflat_app_copyright",  info ? info->Copyright : std::string() },
+    };
+    for (const auto& [symbol, text] : constants)
+    {
+        auto* slot = module->getNamedGlobal(symbol);
+        if (slot == nullptr || slot->hasInitializer()) continue;
+        auto* bytes = new llvm::GlobalVariable(*module,
+            llvm::ArrayType::get(llvm::Type::getInt8Ty(*context), text.size() + 1), true,
+            llvm::GlobalValue::PrivateLinkage,
+            llvm::ConstantDataArray::getString(*context, text, true),
+            std::string(symbol) + ".text");
+        bytes->setUnnamedAddr(llvm::GlobalValue::UnnamedAddr::Global);
+        slot->setInitializer(bytes);
+        slot->setConstant(true);
+        slot->setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+
+    // Application.declared(): lets a library (ui_native) skip application-only work when the
+    // program carries no declaration, without inspecting the string constants.
+    auto* flag = module->getNamedGlobal("__cflat_app_declared");
+    if (flag != nullptr && !flag->hasInitializer() && flag->getValueType()->isIntegerTy())
+    {
+        flag->setInitializer(llvm::ConstantInt::get(flag->getValueType(), info ? 1 : 0));
+        flag->setConstant(true);
+        flag->setLinkage(llvm::GlobalValue::InternalLinkage);
+    }
+}
+
+/*
+ * An .ico is a Windows container and an .icns a macOS one; each is an error on the other
+ * target. Keyed on the TARGET, not the host, so a cross-compile is judged the same way.
+ */
+bool LLVMBackend::ValidateApplicationForTarget(bool windowsTarget) const
+{
+    if (!applicationInfo_) return true;
+    const char* container = nullptr;
+    if (windowsTarget && applicationInfo_->IconKind == cflat::appres::AppIconKind::Icns)
+        container = "icns";
+    else if (!windowsTarget && applicationInfo_->IconKind == cflat::appres::AppIconKind::Ico)
+        container = "ico";
+    if (container == nullptr) return true;
+    LogError(std::format(
+        "application declared at {}:{} uses an .{} icon, which the {} target cannot consume; "
+        "supply a PNG set instead", applicationSourceFile_, applicationLine_, container,
+        windowsTarget ? "Windows" : "macOS"));
+    return false;
 }
 
 void LLVMBackend::RecordCompileTimeStringConstant(const std::string& name, const std::string& value)

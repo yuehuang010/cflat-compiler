@@ -5071,6 +5071,10 @@ int createAppWindow(IComponent app, const char* title, bool show)
         msg1(nsapp, "setDelegate:", _appDelegate);
     }
 
+    // Window-icon hook (counterpart of the Win32 WM_SETICON path) is a no-op on macOS: a
+    // .app already gets its plist icon, and a bare Mach-O carries no icon to install.
+
+
     CocoaHost* fresh = new CocoaHost();
     fresh.app = app;
     _windows.add(fresh);            // moves the window into the owning registry

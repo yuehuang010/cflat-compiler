@@ -156,6 +156,16 @@ std::filesystem::path ExistingAbsolutePath(const std::filesystem::path& path,
     return result;
 }
 
+// The file whose timestamp stands for the output. A `-o App.app` bundle is a DIRECTORY, so
+// stamp the Mach-O the linker actually rewrote inside it.
+std::filesystem::path OutputStampPath(const std::filesystem::path& output)
+{
+    std::error_code ec;
+    if (output.extension() == ".app" && std::filesystem::is_directory(output, ec))
+        return output / "Contents" / "MacOS" / output.stem();
+    return output;
+}
+
 bool ReadFileStamp(const std::filesystem::path& path, int64_t& mtime, int64_t& size)
 {
     std::error_code ec;
@@ -232,7 +242,7 @@ bool LLVMBackend::IsOutputUpToDate(const std::string& outputPath,
             return false;
 
         int64_t outputMtime = 0, outputSize = 0;
-        if (!ReadFileStamp(output, outputMtime, outputSize)
+        if (!ReadFileStamp(OutputStampPath(output), outputMtime, outputSize)
             || outputMtime < manifest.at("output").at("mtime").get<int64_t>())
             return false;
 
@@ -252,7 +262,8 @@ bool LLVMBackend::IsOutputUpToDate(const std::string& outputPath,
 
 bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
                                           const std::vector<std::string>& normalizedArgs,
-                                          const std::vector<std::string>& dependencyFiles)
+                                          const std::vector<std::string>& dependencyFiles,
+                                          const std::vector<std::string>& assets)
 {
     std::error_code ec;
     auto output = ExistingAbsolutePath(outputPath, ec);
@@ -261,7 +272,7 @@ bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
     if (ec) return false;
     int64_t outputMtime = 0, outputSize = 0;
     int64_t compilerMtime = 0, compilerSize = 0;
-    if (!ReadFileStamp(output, outputMtime, outputSize)
+    if (!ReadFileStamp(OutputStampPath(output), outputMtime, outputSize)
         || !ReadFileStamp(compiler, compilerMtime, compilerSize))
         return false;
 
@@ -282,6 +293,10 @@ bool LLVMBackend::WriteDependencyManifest(const std::string& outputPath,
         manifest["inputs"].push_back({ {"path", path.string()},
                                        {"mtime", mtime}, {"size", size} });
     }
+
+    manifest["assets"] = nlohmann::json::array();
+    for (const auto& asset : assets)
+        manifest["assets"].push_back(asset);
 
     auto manifestPath = DependencyManifestPath(outputPath);
     std::ofstream file(manifestPath, std::ios::binary | std::ios::trunc);
@@ -1618,6 +1633,8 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
     dependencyFiles_.clear();
     dependencyPathMemo_.clear();
     dependencyFileSet_.clear();
+    embeddedAssets_.clear();
+    embedFileCache_.clear();
     if (inputOverride.empty())
     {
         for (size_t i = 0; i < args.positionalCount(); ++i)
@@ -2328,6 +2345,10 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         }
     }
 
+    // Define the `application` constants before optimization so a folded Application.name()
+    // reads the declared value on every output shape, --run included.
+    MaterializeApplicationConstants();
+
     {
         llvm::TimeTraceScope debugScope("FinalizeDebugInfo");
         if (verbose) std::cout << "[verbose] finalizing debug info\n";
@@ -2596,6 +2617,52 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
                     LogError(std::format("could not write manifest dump '{}'", *dumpPath));
                     return false;
                 }
+            }
+        }
+    }
+
+    // A bare Mach-O can carry the plist but never an icon. Not an error (the program is
+    // well-formed), and only under -v so a suite build stays quiet.
+    if (verbose && targetMacOS_ && applicationInfo_
+        && applicationInfo_->IconKind != cflat::appres::AppIconKind::None
+        && (!exePath || std::filesystem::path(*exePath).extension() != ".app"))
+        std::cout << "[verbose] the application icon is not representable in a bare executable; "
+                     "build with -o <name>.app for a bundle that carries it.\n";
+
+    // --dump-app-info: the `application` leaves plus the per-target serialization that would be
+    // embedded. Runs under --check on any host, so a Windows version block is inspectable here.
+    if (auto dumpPath = args.getOption("dump-app-info"))
+    {
+        std::string document;
+        if (!applicationInfo_)
+            document = "No application declaration in this program.\n";
+        else
+        {
+            std::string outputName = exePath
+                ? std::filesystem::path(*exePath).filename().string()
+                : std::filesystem::path(sourceFileName).stem().string();
+            document = cflat::appres::DescribeAppInfo(*applicationInfo_);
+            if (targetWindows_)
+                document += cflat::appres::DescribeVersionBlock(*applicationInfo_, outputName);
+            else if (targetMacOS_)
+            {
+                const bool bundle = exePath && std::filesystem::path(*exePath).extension() == ".app";
+                std::string stem = std::filesystem::path(outputName).stem().string();
+                document += cflat::appres::BuildInfoPlist(*applicationInfo_,
+                    bundle ? stem : outputName, cflat::appres::kMacMinimumSystemVersion,
+                    bundle && !cflat::appres::BuildIcns(*applicationInfo_).empty());
+            }
+        }
+        if (dumpPath->empty() || *dumpPath == "-")
+            std::cout << document;
+        else
+        {
+            std::ofstream out(*dumpPath, std::ios::binary | std::ios::trunc);
+            out.write(document.data(), static_cast<std::streamsize>(document.size()));
+            if (!out)
+            {
+                LogError(std::format("could not write application info dump '{}'", *dumpPath));
+                return false;
             }
         }
     }
@@ -4230,7 +4297,12 @@ void LLVMBackend::ResetForReanalysis()
     if (!batchMode_) coreHashCache_.clear();
     dependencyPathMemo_.clear();
     dependencyFileSet_.clear();
+    embeddedAssets_.clear();
+    embedFileCache_.clear();
     manifestFragments_.clear();
+    applicationInfo_.reset();
+    applicationSourceFile_.clear();
+    applicationLine_ = 0;
     compileTimeStringConstants_.clear();
     // Reset the LLVM context so named struct types from a previous analysis do
     // not survive into the next one.  Without this, two fixtures that define a
@@ -7149,6 +7221,9 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     globalDeclSite.clear();
     coreSymbolIndex_.Clear();
     manifestFragments_.clear();
+    applicationInfo_.reset();
+    applicationSourceFile_.clear();
+    applicationLine_ = 0;
     namespaceTable.clear();
     typeAliases.clear();
     manglingAliases_.clear();

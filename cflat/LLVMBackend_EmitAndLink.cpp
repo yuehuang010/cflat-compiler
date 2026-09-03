@@ -18,6 +18,7 @@
 #include <llvm/Analysis/TargetLibraryInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 #include <llvm/Transforms/Scalar/SROA.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/SimplifyCFG.h>
@@ -393,46 +394,6 @@ void ConsolidateLineMappings(std::vector<LLVMBackend::LineMapping>& mappings)
 #include <cstring>
 #include <sys/sysctl.h>
 #endif
-
-static void AppendManifestResU16(std::vector<uint8_t>& bytes, uint16_t value)
-{
-    bytes.push_back(static_cast<uint8_t>(value));
-    bytes.push_back(static_cast<uint8_t>(value >> 8));
-}
-
-static void AppendManifestResU32(std::vector<uint8_t>& bytes, uint32_t value)
-{
-    for (int i = 0; i < 4; ++i)
-        bytes.push_back(static_cast<uint8_t>(value >> (i * 8)));
-}
-
-static bool WriteManifestResource(const std::string& path, const std::string& xml)
-{
-    std::vector<uint8_t> bytes;
-    auto appendHeader = [&](uint32_t dataSize, uint16_t type, uint16_t id) {
-        AppendManifestResU32(bytes, dataSize);
-        AppendManifestResU32(bytes, 32);
-        AppendManifestResU16(bytes, 0xffff);
-        AppendManifestResU16(bytes, type);
-        AppendManifestResU16(bytes, 0xffff);
-        AppendManifestResU16(bytes, id);
-        AppendManifestResU32(bytes, 0);
-        AppendManifestResU16(bytes, 0x0030);
-        AppendManifestResU16(bytes, 1033);
-        AppendManifestResU32(bytes, 0);
-        AppendManifestResU32(bytes, 0);
-    };
-
-    appendHeader(0, 0, 0);
-    appendHeader(static_cast<uint32_t>(xml.size()), 24, 1);
-    bytes.insert(bytes.end(), xml.begin(), xml.end());
-    while ((bytes.size() & 3u) != 0) bytes.push_back(0);
-
-    std::ofstream out(path, std::ios::binary);
-    if (!out) return false;
-    out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-    return static_cast<bool>(out);
-}
 
 #if defined(_WIN32)
 struct CflatActCtxW
@@ -2623,6 +2584,97 @@ bool LLVMBackend::AddFrameworkImport(const std::string& name)
         return true;
     }
 
+void LLVMBackend::EmitMacInfoPlistSection(const std::string& executableName, bool bundleIcon)
+{
+    if (!applicationInfo_ || module == nullptr) return;
+    const std::string xml = cflat::appres::BuildInfoPlist(*applicationInfo_, executableName,
+        cflat::appres::kMacMinimumSystemVersion, bundleIcon);
+    auto* bytes = llvm::ConstantDataArray::getString(*context, xml, false);
+    auto* global = new llvm::GlobalVariable(*module, bytes->getType(), true,
+        llvm::GlobalValue::PrivateLinkage, bytes, "__cflat_info_plist");
+    global->setSection("__TEXT,__info_plist");
+    global->setAlignment(llvm::Align(1));
+    // Dead-strip would drop a private constant nothing references; llvm.used pins it.
+    llvm::appendToUsed(*module, { global });
+}
+
+bool LLVMBackend::WriteMacBundleMetadata(const std::string& bundlePath, const std::string& stem)
+{
+    namespace fs = std::filesystem;
+    const fs::path contents = fs::path(bundlePath) / "Contents";
+
+    cflat::appres::AppInfoData info;
+    if (applicationInfo_) info = *applicationInfo_;
+    // Build the icns first: CFBundleIconFile may only be claimed when a file is actually written.
+    const std::vector<uint8_t> icns = applicationInfo_
+        ? cflat::appres::BuildIcns(*applicationInfo_) : std::vector<uint8_t>();
+    const bool hasIcon = !icns.empty();
+    const std::string plist = cflat::appres::BuildInfoPlist(info, stem,
+        cflat::appres::kMacMinimumSystemVersion, hasIcon);
+
+    auto writeFile = [&](const fs::path& path, const char* data, size_t size) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (out) out.write(data, static_cast<std::streamsize>(size));
+        if (out) return true;
+        LogError(std::format("could not write bundle file '{}'", path.string()));
+        return false;
+    };
+
+    if (!writeFile(contents / "Info.plist", plist.data(), plist.size())) return false;
+    static const char kPkgInfo[] = "APPL????";
+    if (!writeFile(contents / "PkgInfo", kPkgInfo, sizeof(kPkgInfo) - 1)) return false;
+    const fs::path icnsPath = contents / "Resources" / (stem + ".icns");
+    if (hasIcon)
+    {
+        if (!writeFile(icnsPath, reinterpret_cast<const char*>(icns.data()), icns.size()))
+            return false;
+    }
+    else
+    {
+        // A rebuild that drops the icon must not leave the previous bundle's icns behind.
+        std::error_code removeError;
+        fs::remove(icnsPath, removeError);
+    }
+    return true;
+}
+
+/*
+ * `-o App.app` is the one bundle-emitting spelling: the executable lands in
+ * Contents/MacOS/<stem> and the compiler writes the rest of the layout around it. Any other
+ * output path is a bare Mach-O, which can carry the plist but never an icon.
+ */
+bool LLVMBackend::EmitMacApplication(const std::string& outputPath, bool debugInfo,
+                                     const std::optional<std::string>& lliPath)
+{
+    namespace fs = std::filesystem;
+    if (!ValidateApplicationForTarget(false)) return false;
+
+    const bool bundle = fs::path(outputPath).extension() == ".app";
+    if (!bundle)
+    {
+        EmitMacInfoPlistSection(fs::path(outputPath).filename().string(), false);
+        return EmitExecutableMachO(outputPath, debugInfo, lliPath);
+    }
+
+    const std::string stem = fs::path(outputPath).stem().string();
+    std::error_code ec;
+    fs::create_directories(fs::path(outputPath) / "Contents" / "MacOS", ec);
+    if (!ec) fs::create_directories(fs::path(outputPath) / "Contents" / "Resources", ec);
+    if (ec)
+    {
+        LogError(std::format("could not create application bundle '{}': {}",
+            outputPath, ec.message()));
+        return false;
+    }
+
+    // Same rule as the on-disk plist: claim the icon only when an icns actually results.
+    EmitMacInfoPlistSection(stem, applicationInfo_
+        && !cflat::appres::BuildIcns(*applicationInfo_).empty());
+    const std::string innerPath = (fs::path(outputPath) / "Contents" / "MacOS" / stem).string();
+    if (!EmitExecutableMachO(innerPath, debugInfo, lliPath)) return false;
+    return WriteMacBundleMetadata(outputPath, stem);
+}
+
 bool LLVMBackend::EmitExecutableMachO(const std::string& exePath, bool debugInfo,
                              const std::optional<std::string>& lliPath)
 {
@@ -2938,7 +2990,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
         // macOS arm64 cross-target: Mach-O object emission, independent of host OS
         // (handled before the host-specific COFF/ELF split below).
         if (targetMacOS_)
-            return EmitExecutableMachO(exePath, debugInfo, lliPath);
+            return EmitMacApplication(exePath, debugInfo, lliPath);
 #if !defined(_WIN32)
         // Linux/Unix host: emit a native ELF executable. The Windows/COFF path
         // below is unreachable here (but still compiles).
@@ -3226,16 +3278,30 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             linkArgStrs.push_back(std::filesystem::path(lib).filename().string());
         }
 
-        std::vector<std::string> manifestTempFiles;
-        auto cleanupManifestFiles = [&]() {
-            for (const auto& path : manifestTempFiles)
+        // ONE .res carries every Win32 resource: the merged manifest, the version block and the
+        // icon group. Either declaration alone still produces it; neither produces none.
+        std::vector<std::string> resourceTempFiles;
+        auto cleanupResourceFiles = [&]() {
+            for (const auto& path : resourceTempFiles)
                 llvm::sys::fs::remove(path);
-            manifestTempFiles.clear();
+            resourceTempFiles.clear();
         };
-        if (!manifestFragments_.empty())
+        if (!manifestFragments_.empty() || applicationInfo_)
         {
-            auto merged = MergeManifestFragments();
-            if (!merged || !ValidateManifestActivationContext(*merged))
+            std::string mergedManifestXml;
+            if (!manifestFragments_.empty())
+            {
+                auto merged = MergeManifestFragments();
+                if (!merged || !ValidateManifestActivationContext(*merged))
+                {
+                    llvm::sys::fs::remove(objPath);
+                    for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                    return false;
+                }
+                mergedManifestXml =
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n" + *merged;
+            }
+            if (!ValidateApplicationForTarget(true))
             {
                 llvm::sys::fs::remove(objPath);
                 for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
@@ -3243,25 +3309,47 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             }
 
             llvm::SmallString<256> resourcePath;
-            if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_manifest", "res", resourcePath))
+            if (auto ec = llvm::sys::fs::createTemporaryFile("cflat_resource", "res", resourcePath))
             {
-                LogError(std::format("could not create temporary manifest resource: {}", ec.message()));
+                LogError(std::format("could not create temporary resource file: {}", ec.message()));
                 llvm::sys::fs::remove(objPath);
                 for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
                 return false;
             }
             std::string path = resourcePath.str().str();
-            std::string document = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n"
-                + *merged;
-            if (!WriteManifestResource(path, document))
+            cflat::appres::AppInfoData info;
+            if (applicationInfo_) info = *applicationInfo_;
+            bool resOverflow = false;
+            auto resBytes = cflat::appres::BuildWindowsRes(info,
+                std::filesystem::path(exePath).filename().string(), mergedManifestXml, resOverflow);
+            if (resOverflow)
             {
                 llvm::sys::fs::remove(path);
-                LogError(std::format("could not write temporary manifest resource '{}'", path));
+                LogError("the application version resource is too large to encode; "
+                    "shorten the application text fields");
                 llvm::sys::fs::remove(objPath);
                 for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
                 return false;
             }
-            manifestTempFiles.push_back(path);
+            bool written = false;
+            {
+                std::ofstream out(path, std::ios::binary | std::ios::trunc);
+                if (out)
+                {
+                    out.write(reinterpret_cast<const char*>(resBytes.data()),
+                        static_cast<std::streamsize>(resBytes.size()));
+                    written = static_cast<bool>(out);
+                }
+            }
+            if (!written)
+            {
+                llvm::sys::fs::remove(path);
+                LogError(std::format("could not write temporary resource file '{}'", path));
+                llvm::sys::fs::remove(objPath);
+                for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
+                return false;
+            }
+            resourceTempFiles.push_back(path);
             linkArgStrs.push_back(path);
         }
 
@@ -3276,7 +3364,7 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
             int rc = llvm::sys::ExecuteAndWait(lldLinkPath, linkArgs, std::nullopt, {}, 0, 0, &linkErr);
             llvm::sys::fs::remove(objPath);
             for (auto& cObj : cObjectFiles_) llvm::sys::fs::remove(cObj);
-            cleanupManifestFiles();
+            cleanupResourceFiles();
 
             if (rc != 0)
             {
