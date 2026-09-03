@@ -4,9 +4,9 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import * as l10n from '@vscode/l10n';
 import {
-    INLINE_MARKER, OptFunctionInfo, OptInfoCacheEntry, OptInfoResult,
-    buildFunctionDetail, buildInlineAnnotations, collectInlineCallSites,
-    countCallSites, countFunctions, countInstructions, countReloads, countSites, countSpills
+    OptFunctionInfo, OptInfoCacheEntry, OptInfoResult,
+    buildCallSiteHover, buildFunctionDetail, collectInlineCallSites,
+    countCallSites, countFunctions, countInstructions, countReloads, countSpills
 } from './optimization_info';
 import {
     LanguageClient,
@@ -679,7 +679,15 @@ class CflatOptimizationHoverProvider implements vscode.HoverProvider {
         const entry = this.provider.annotationSource(document);
         if (!entry) return undefined;
         const info = entry.functions.find(candidate => candidate.startLine === position.line + 1);
-        if (!info) return undefined;
+        if (!info) {
+            // Not a definition line: a call, if the cursor sits on a callee the optimizer
+            // decided about. VS Code merges this with the server's signature hover.
+            const word = document.getWordRangeAtPosition(position);
+            if (!word) return undefined;
+            const lines = buildCallSiteHover(entry, position.line + 1, document.getText(word));
+            if (lines.length === 0) return undefined;
+            return new vscode.Hover(new vscode.MarkdownString(lines.join('\n')), word);
+        }
 
         const markdown = new vscode.MarkdownString(
             buildFunctionDetail(entry, info).join('\n'));
@@ -714,53 +722,6 @@ class CflatOptimizationHoverProvider implements vscode.HoverProvider {
         })}](command:cflat.showViewForFunction?${viewArgs('asm')})`);
         markdown.appendMarkdown(`\n\n${links.join(' \u00b7 ')}`);
         return new vscode.Hover(markdown, document.lineAt(position.line).range);
-    }
-}
-
-// Paints the inline markers into the visible editors. Reads the CodeLens provider's cache
-// rather than issuing its own request - both surfaces describe the same optimizer run, and
-// running the -O2 pipeline twice for one refresh would be pure waste.
-class CflatInlineDecorations {
-    private readonly glyph = vscode.window.createTextEditorDecorationType({
-        after: {
-            contentText: ` ${INLINE_MARKER}`,
-            color: new vscode.ThemeColor('editorCodeLens.foreground'),
-            margin: '0 0 0 0.5ch'
-        },
-        rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed
-    });
-
-    constructor(private readonly provider: CflatOptimizationLensProvider) {}
-
-    apply(editor: vscode.TextEditor): void {
-        const entry = this.provider.annotationSource(editor.document);
-        if (!entry) {
-            editor.setDecorations(this.glyph, []);
-            return;
-        }
-        // Call sites only. The definition line already carries a CodeLens saying the same
-        // thing, and two markers for one fact is noise.
-        const { callSites } = buildInlineAnnotations(entry);
-        const options: vscode.DecorationOptions[] = [];
-        for (const annotation of callSites) {
-            const line = annotation.line - 1;
-            if (line < 0 || line >= editor.document.lineCount) continue;
-            const end = editor.document.lineAt(line).range.end;
-            options.push({
-                range: new vscode.Range(end, end),
-                hoverMessage: new vscode.MarkdownString(annotation.hover.join('\n'))
-            });
-        }
-        editor.setDecorations(this.glyph, options);
-    }
-
-    applyToVisible(): void {
-        for (const editor of vscode.window.visibleTextEditors)
-            if (editor.document.languageId === 'cflat') this.apply(editor);
-    }
-
-    dispose(): void {
-        this.glyph.dispose();
     }
 }
 
@@ -824,9 +785,9 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
             return prefix + (info.inlinedInto > 0
                 ? l10n.t({
                     message: 'optimized away - inlined into {0}',
-                    args: [countSites(info.inlinedInto)],
+                    args: [countFunctions(info.inlinedInto)],
                     comment: ['No standalone copy of the function was emitted; its body was copied into its callers.',
-                        '{0} arrives already formatted, e.g. "3 sites".',
+                        '{0} arrives already formatted, e.g. "3 functions".',
                         'Appears in a one-line CodeLens above a function, so keep it short.']
                 })
                 : l10n.t({
@@ -855,8 +816,8 @@ class CflatOptimizationLensProvider implements vscode.CodeLensProvider {
         if (info.inlinedInto > 0)
             parts.push(l10n.t({
                 message: 'inlined into {0}',
-                args: [countSites(info.inlinedInto)],
-                comment: ['{0} arrives already formatted, e.g. "3 sites".',
+                args: [countFunctions(info.inlinedInto)],
+                comment: ['{0} arrives already formatted, e.g. "3 functions".',
                     'Appears in a one-line CodeLens above a function, so keep it short.']
             }));
         // The IR count used to guarantee a part; without it every counter can be
@@ -1128,23 +1089,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Optimization info: CodeLens above each function, refreshed on demand and on save.
     const lensProvider = new CflatOptimizationLensProvider(() => client);
-    const inlineDecorations = new CflatInlineDecorations(lensProvider);
     context.subscriptions.push(
         lensProvider,
-        inlineDecorations,
         vscode.languages.registerCodeLensProvider({ scheme: 'file', language: 'cflat' }, lensProvider),
         vscode.languages.registerHoverProvider({ scheme: 'file', language: 'cflat' },
             new CflatOptimizationHoverProvider(lensProvider)),
-        // The lenses and the inline markers render the same cached measurements, so one
-        // signal repaints both: a refresh, an invalidation and a settings change all land here.
-        lensProvider.onDidChangeCodeLenses(() => inlineDecorations.applyToVisible()),
-        vscode.window.onDidChangeVisibleTextEditors(() => inlineDecorations.applyToVisible()),
-        // Measurements describe the saved text. Once the document version moves the cache
-        // no longer matches, and annotationSource returns nothing - repaint to clear them.
-        vscode.workspace.onDidChangeTextDocument(event => {
-            if (event.document.languageId === 'cflat' && event.contentChanges.length > 0)
-                inlineDecorations.applyToVisible();
-        }),
         // Invoked from the optimization hover only, so deliberately not in the palette.
         vscode.commands.registerCommand('cflat.showViewForFunction',
             async (sourceUri: string, line: number, optimized: boolean, kind: ViewKind = 'ir') => {

@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
-    OptFunctionInfo, OptInfoCacheEntry, OptRemark, buildFunctionDetail, buildInlineAnnotations,
-    collectInlineCallSites
+    OptFunctionInfo, OptInfoCacheEntry, OptRemark, buildCallSiteHover, buildFunctionDetail,
+    collectInlineCallSites, describeInlineCostBreakdown, describeInlineDecision
 } from './optimization_info';
 import { spawnSync } from 'child_process';
 import { join } from 'path';
@@ -102,66 +102,173 @@ function helperFunction(overrides: Partial<OptFunctionInfo> = {}): OptFunctionIn
     };
 }
 
-describe('buildInlineAnnotations', () => {
-    it('marks a call site that was inlined', () => {
-        const { callSites } = buildInlineAnnotations(entry([remark({ srcLine: 10 })]));
-        expect(callSites.map(site => site.line)).toEqual([10]);
-        expect(callSites[0].hover.join('\n')).toContain('`helper` inlined');
-        // Cost and threshold are unitless inline-model internals with no action attached.
-        expect(callSites[0].hover.join('\n')).not.toContain('cost');
+describe('buildCallSiteHover', () => {
+    it('describes the decision for the callee under the cursor', () => {
+        expect(buildCallSiteHover(entry([remark({ srcLine: 10 })]), 10, 'helper'))
+            .toEqual(['**Inlined** at -O2']);
     });
 
-    it('leaves a call site that was not inlined unmarked', () => {
-        const notInlined = remark({ name: 'TooCostly', kind: 'missed', args: { Cost: '3250', Threshold: '337' } });
-        const { callSites, definitions } = buildInlineAnnotations(
-            entry([notInlined], [helperFunction({ eliminated: false, inlinedInto: 0 })]));
-        expect(callSites).toEqual([]);
-        expect(definitions).toEqual([]);
+    it('shows an inlined call with its weight, which may be negative', () => {
+        const lines = buildCallSiteHover(entry([
+            remark({ srcLine: 10, args: { Cost: '-35', Threshold: '337', unsimplified_common_instructions: '10', callsite_cost: '-45' } })
+        ]), 10, 'helper');
+        expect(lines).toEqual(['**Inlined** at -O2 (weight -35, threshold 337)']);
+        const bonus = buildCallSiteHover(entry([
+            remark({ srcLine: 10, args: { Cost: '-15025', Threshold: '337', last_call_to_static_bonus: '1' } })
+        ]), 10, 'helper');
+        expect(bonus).toEqual(['**Inlined** at -O2 (weight -15025, threshold 337)', '',
+            'Includes the last-call-to-static bonus: the function is deleted after inlining.']);
     });
 
-    it('ignores calls to functions defined outside this file', () => {
-        const external = remark({ name: 'NeverInline', kind: 'missed', calleeName: 'printf', calleeLine: 0 });
-        expect(buildInlineAnnotations(entry([external])).callSites).toEqual([]);
+    it('explains a rejected call with one contributor per line', () => {
+        const lines = buildCallSiteHover(entry([
+            remark({ srcLine: 11, name: 'TooCostly', kind: 'missed',
+                     args: { Cost: '320', Threshold: '250', unsimplified_common_instructions: '330',
+                             callsite_cost: '-10', sroa_losses: '60' } })
+        ]), 11, 'helper');
+        expect(lines).toEqual([
+            '**Not inlined** at -O2: too costly (weight 320, threshold 250)',
+            '- Instructions: 330 (~66 instructions)',
+            '- Call overhead removed: -10',
+            '',
+            'Missed reduction: 60 (argument address escapes)'
+        ]);
     });
 
-    it('collapses several inlined calls on one line into a single marker', () => {
-        const { callSites } = buildInlineAnnotations(entry([
-            remark({ srcLine: 10 }),
-            remark({ srcLine: 10, calleeName: 'other', calleeLine: 5 })
-        ]));
-        expect(callSites).toHaveLength(1);
-        expect(callSites[0].hover.join('\n')).toContain('other');
+    it('collapses identical verdicts from repeated calls and re-inlined copies', () => {
+        const args = { Cost: '1730', Threshold: '225', unsimplified_common_instructions: '1690' };
+        const lines = buildCallSiteHover(entry([
+            remark({ srcLine: 114, name: 'TooCostly', kind: 'missed', args }),
+            remark({ srcLine: 114, name: 'TooCostly', kind: 'missed', args }),
+            remark({ srcLine: 114, name: 'TooCostly', kind: 'missed', args, function: 'main' }),
+            remark({ srcLine: 114, name: 'TooCostly', kind: 'missed', args, function: 'main' })
+        ]), 114, 'helper');
+        expect(lines).toEqual([
+            '**Not inlined** at -O2: too costly (weight 1730, threshold 225)',
+            '- Instructions: 1690 (~338 instructions)'
+        ]);
     });
 
-    it('reports partial inlining on the definition as N of M', () => {
-        const { definitions } = buildInlineAnnotations(entry([
-            remark({ srcLine: 10 }),
-            remark({ srcLine: 11, name: 'TooCostly', kind: 'missed' })
-        ], [helperFunction()]));
-        expect(definitions.map(site => site.line)).toEqual([1]);
-        const hover = definitions[0].hover.join('\n');
-        expect(hover).toContain('inlined at 1 of 2 call sites');
-        expect(hover).toContain('too costly');
+    it('lists genuinely different decisions on one line as separate blocks', () => {
+        const lines = buildCallSiteHover(entry([
+            remark({ srcLine: 20 }),
+            remark({ srcLine: 20, name: 'TooCostly', kind: 'missed', args: { Cost: '3250', Threshold: '337' } })
+        ]), 20, 'helper');
+        expect(lines).toEqual([
+            '**Inlined** at -O2',
+            '',
+            '**Not inlined** at -O2: too costly'
+        ]);
     });
 
-    it('reports full inlining on the definition without a ratio', () => {
-        const { definitions } = buildInlineAnnotations(entry([
-            remark({ srcLine: 10 }), remark({ srcLine: 11 })
-        ], [helperFunction()]));
-        expect(definitions[0].hover.join('\n')).toContain('inlined at 2 call sites');
+    it('ignores other callees on the line and other lines', () => {
+        const remarks = [remark({ srcLine: 10 }), remark({ srcLine: 10, calleeName: 'other', calleeLine: 5 })];
+        expect(buildCallSiteHover(entry(remarks), 10, 'other')).toEqual(['**Inlined** at -O2']);
+        expect(buildCallSiteHover(entry(remarks), 11, 'helper')).toEqual([]);
+        expect(buildCallSiteHover(entry(remarks), 10, 'nothing')).toEqual([]);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Inline cost breakdown rendering (pure; no server, no editor)
+// ---------------------------------------------------------------------------
+
+describe('describeInlineDecision cost breakdown', () => {
+    it('renders outcome only when the server sent no breakdown', () => {
+        // An older server sends Cost/Threshold and nothing else; that must look as it did.
+        expect(describeInlineDecision(remark({ name: 'Inlined', args: { Cost: '25', Threshold: '337' } })))
+            .toBe('inlined');
+        expect(describeInlineDecision(remark({
+            name: 'TooCostly', kind: 'missed', args: { Cost: '3250', Threshold: '337' }
+        }))).toBe('not inlined - too costly');
+        expect(describeInlineCostBreakdown({ Cost: '3250', Threshold: '337' }, false)).toBeUndefined();
+        expect(describeInlineCostBreakdown(undefined, true)).toBeUndefined();
     });
 
-    it('does not attribute a remark to a different function sharing its start line', () => {
-        const { definitions } = buildInlineAnnotations(
-            entry([remark()], [helperFunction({ name: 'not_helper' })]));
-        expect(definitions).toEqual([]);
+    it('explains a too-costly call with its contributors, biggest cost to biggest credit', () => {
+        expect(describeInlineDecision(remark({
+            name: 'TooCostly', kind: 'missed',
+            args: {
+                Cost: '320', Threshold: '250',
+                unsimplified_common_instructions: '240',
+                call_penalty: '50',
+                switch_penalty: '25', jump_table_penalty: '15',
+                call_argument_setup: '10', lowered_call_arg_setup: '4',
+                sroa_savings: '10', callsite_cost: '-14',
+                sroa_losses: '60',
+                num_loops: '2', dead_blocks: '1', threshold: '250'
+            }
+        }))).toBe('not inlined - too costly (weight 320, threshold 250): '
+            + 'Instructions: 240 (~48 instructions), Calls inside callee: 50, Switch lowering: 40, Argument setup: 14, '
+            + 'Stack promotion savings: -10, Call overhead removed: -14. '
+            + 'Missed reduction: 60 (argument address escapes)');
+    });
+
+    it('caps the list at six contributors and counts the rest', () => {
+        expect(describeInlineDecision(remark({
+            name: 'TooCostly', kind: 'missed',
+            args: {
+                Cost: '2800', Threshold: '250',
+                unsimplified_common_instructions: '700', call_penalty: '600',
+                switch_penalty: '500', call_argument_setup: '400',
+                indirect_call_penalty: '300', cold_cc_penalty: '200',
+                load_relative_intrinsic: '100',
+                sroa_savings: '5', load_elimination: '4', callsite_cost: '-3'
+            }
+        }))).toBe('not inlined - too costly (weight 2800, threshold 250): '
+            + 'Instructions: 700 (~140 instructions), Calls inside callee: 600, Switch lowering: 500, Argument setup: 400, '
+            + 'Indirect calls: 300, Cold calling convention: 200 +4 more.');
+    });
+
+    it('sums the features that describe one user-visible cost', () => {
+        expect(describeInlineDecision(remark({
+            name: 'TooCostly', kind: 'missed',
+            args: {
+                Cost: '20', Threshold: '100',
+                switch_penalty: '1', jump_table_penalty: '2',
+                case_cluster_penalty: '3', switch_default_dest_penalty: '4',
+                call_argument_setup: '3', lowered_call_arg_setup: '4'
+            }
+        }))).toBe('not inlined - too costly (weight 20, threshold 100): '
+            + 'Switch lowering: 10, Argument setup: 7.');
+    });
+
+    it('reports the threshold bonus as its own sentence', () => {
+        expect(describeInlineDecision(remark({
+            name: 'TooCostly', kind: 'missed',
+            args: {
+                Cost: '400', Threshold: '250',
+                unsimplified_common_instructions: '400', last_call_to_static_bonus: '90'
+            }
+        }))).toBe('not inlined - too costly (weight 400, threshold 250): Instructions: 400 (~80 instructions). '
+            + 'Includes the last-call-to-static bonus: the function is deleted after inlining.');
+    });
+
+    it('gives an inlined call its weight and no contributor list', () => {
+        expect(describeInlineDecision(remark({
+            name: 'Inlined',
+            args: {
+                Cost: '35', Threshold: '250',
+                unsimplified_common_instructions: '45', callsite_cost: '-10'
+            }
+        }))).toBe('inlined (weight 35, threshold 250)');
+    });
+
+    it('keeps the reason-carrying branches untouched', () => {
+        expect(describeInlineDecision(remark({
+            name: 'NeverInline', kind: 'missed', args: { Reason: 'noinline attribute' }
+        }))).toBe('never inlined - noinline attribute');
+        expect(describeInlineDecision(remark({
+            name: 'IndirectCall', kind: 'missed',
+            args: { Cost: '10', Threshold: '250', call_penalty: '25' }
+        }))).toBe('not inlined - indirectcall (weight 10, threshold 250): Calls inside callee: 25.');
     });
 });
 
 describe('buildFunctionDetail', () => {
     it('reports the counters without any inline summary', () => {
         // The "Show N call sites" link the caller appends carries both the count and the
-        // navigation, so restating it in prose here would be redundant.
+        // navigation; the decisions themselves live on the call-site hover.
         const detail = buildFunctionDetail(entry([
             remark({ srcLine: 43 }),
             remark({ srcLine: 44, name: 'TooCostly', kind: 'missed', args: { Cost: '3250', Threshold: '337' } })
@@ -171,9 +278,23 @@ describe('buildFunctionDetail', () => {
         expect(detail).toContain('Function size: 96 bytes');
         expect(detail).not.toContain('call site');
         expect(detail).not.toContain('inlined');
-        expect(detail).not.toContain('cost');
-        expect(detail).not.toContain('threshold');
+        expect(detail).not.toContain('saving');
         expect(detail).not.toContain('line 43');
+    });
+
+    it('reports the inline cost seen at the call sites, as a range when it varies', () => {
+        const detail = buildFunctionDetail(entry([
+            remark({ srcLine: 43, args: { Cost: '35', Threshold: '250' } }),
+            remark({ srcLine: 44, name: 'TooCostly', kind: 'missed',
+                     args: { Cost: '1730', Threshold: '225', unsimplified_common_instructions: '1690' } }),
+            remark({ srcLine: 45, args: { Cost: '-15025', Threshold: '337', last_call_to_static_bonus: '1' } })
+        ], [helperFunction()]), helperFunction({ eliminated: false, bytes: 96 })).join('\n');
+        expect(detail).toContain('- Inline weight: 35 to 1730 (~338 instructions)');
+        expect(detail).not.toContain('15025');
+        const single = buildFunctionDetail(entry([remark({ srcLine: 43, args: { Cost: '35', Threshold: '250' } })],
+            [helperFunction()]), helperFunction()).join('\n');
+        expect(single).toContain('- Inline weight: 35');
+        expect(buildFunctionDetail(entry([], []), helperFunction()).join('\n')).not.toContain('Inline weight');
     });
 
     it('says nothing about inlining even when a function was never inlined', () => {

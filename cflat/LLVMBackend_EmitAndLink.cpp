@@ -16,6 +16,11 @@
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
 #include <llvm/Analysis/TargetLibraryInfo.h>
+#include <llvm/Analysis/AssumptionCache.h>
+#include <llvm/Analysis/InlineAdvisor.h>
+#include <llvm/Analysis/InlineCost.h>
+#include <llvm/Analysis/InlineModelFeatureMaps.h>
+#include <llvm/Analysis/TargetTransformInfo.h>
 #include <llvm/Transforms/Utils/Mem2Reg.h>
 #include <llvm/Transforms/Utils/Cloning.h>
 #include <llvm/Transforms/Utils/ModuleUtils.h>
@@ -485,10 +490,122 @@ std::unique_ptr<llvm::Module> LLVMBackend::CloneModuleForView(const std::string&
     return llvm::CloneModule(*module);
 }
 
+// ---- Inline cost breakdown (IDE view only) ----
+// The inline remarks LLVM emits carry Cost and Threshold but nothing about WHERE the cost
+// came from. The call analyzer can be re-run per call site to get the per-summand
+// features, but only mid-pipeline state reconciles with the remark, so it is captured from
+// an InlineAdvisor that wraps - and never overrides - the default decision.
+
+// Feature names come straight from the LLVM macro so the table can never drift.
+static const char* const kInlineCostFeatureNames[] = {
+#define CFLAT_INLINE_COST_FEATURE_NAME(DTYPE, SHAPE, NAME, DOC) #NAME,
+    INLINE_COST_FEATURE_ITERATOR(CFLAT_INLINE_COST_FEATURE_NAME)
+#undef CFLAT_INLINE_COST_FEATURE_NAME
+};
+
+struct InlineCostBreakdownRecord
+{
+    std::string caller;   // mangled symbol of the function holding the call
+    std::string callee;   // mangled symbol of the callee
+    int line = 0;
+    int column = 0;
+    llvm::InlineCostFeatures features{};
+};
+
+struct InlineCostBreakdownSink
+{
+    std::vector<InlineCostBreakdownRecord> records;
+    bool truncated = false;
+};
+
+// The plugin advisor factory is a plain function pointer with no captures, and the LSP
+// analysis pool runs pipelines on several threads, so the sink travels thread-locally.
+static thread_local InlineCostBreakdownSink* tlsInlineCostSink = nullptr;
+
+struct InlineCostSinkGuard
+{
+    explicit InlineCostSinkGuard(InlineCostBreakdownSink* sink) { tlsInlineCostSink = sink; }
+    ~InlineCostSinkGuard() { tlsInlineCostSink = nullptr; }
+};
+
+class BreakdownInlineAdvisor : public llvm::InlineAdvisor
+{
+public:
+    BreakdownInlineAdvisor(llvm::Module& m, llvm::FunctionAnalysisManager& fam,
+                           llvm::InlineParams params, llvm::InlineContext ic,
+                           InlineCostBreakdownSink* sink)
+        : llvm::InlineAdvisor(m, fam, ic), inner_(m, fam, params, ic), fam_(fam), sink_(sink) {}
+
+    void onPassEntry(llvm::LazyCallGraph::SCC* scc = nullptr) override { inner_.onPassEntry(scc); }
+    void onPassExit(llvm::LazyCallGraph::SCC* scc = nullptr) override { inner_.onPassExit(scc); }
+
+private:
+    std::unique_ptr<llvm::InlineAdvice> getAdviceImpl(llvm::CallBase& cb) override
+    {
+        Record(cb);
+        // The decision itself is the stock one, unchanged: getAdvice with MandatoryOnly
+        // false forwards straight to DefaultInlineAdvisor::getAdviceImpl.
+        return inner_.getAdvice(cb, /*MandatoryOnly=*/false);
+    }
+
+    void Record(llvm::CallBase& cb)
+    {
+        if (!sink_ || sink_->records.size() >= kMaxInlineCostRecords)
+        {
+            if (sink_) sink_->truncated = true;
+            return;
+        }
+        llvm::Function* callee = cb.getCalledFunction();
+        const llvm::Function* caller = cb.getCaller();
+        if (!callee || !caller || callee->isDeclaration()) return;
+        const llvm::DebugLoc& loc = cb.getDebugLoc();
+        if (!loc) return;
+
+        auto getAssumptionCache = [this](llvm::Function& f) -> llvm::AssumptionCache& {
+            return fam_.getResult<llvm::AssumptionAnalysis>(f);
+        };
+        auto getTLI = [this](llvm::Function& f) -> const llvm::TargetLibraryInfo& {
+            return fam_.getResult<llvm::TargetLibraryAnalysis>(f);
+        };
+        llvm::TargetTransformInfo& calleeTTI = fam_.getResult<llvm::TargetIRAnalysis>(*callee);
+        // No ORE: this analysis must not add remarks of its own. No BFI/PSI either - the
+        // view pipeline has no profile, matching what the default heuristic sees.
+        std::optional<llvm::InlineCostFeatures> features = llvm::getInliningCostFeatures(
+            cb, calleeTTI, getAssumptionCache, /*GetBFI=*/nullptr, getTLI,
+            /*PSI=*/nullptr, /*ORE=*/nullptr);
+        if (!features) return;
+
+        InlineCostBreakdownRecord record;
+        record.caller = caller->getName().str();
+        record.callee = callee->getName().str();
+        record.line = static_cast<int>(loc.getLine());
+        record.column = static_cast<int>(loc.getCol());
+        record.features = *features;
+        sink_->records.push_back(std::move(record));
+    }
+
+    // Mirrors kMaxCollectedRemarksPerPass: a huge source must not leak records for
+    // remarks that were clamped away anyway.
+    static constexpr size_t kMaxInlineCostRecords = 5000;
+
+    llvm::DefaultInlineAdvisor inner_;
+    llvm::FunctionAnalysisManager& fam_;
+    InlineCostBreakdownSink* sink_ = nullptr;
+};
+
+static llvm::InlineAdvisor* MakeBreakdownInlineAdvisor(llvm::Module& m,
+                                                       llvm::FunctionAnalysisManager& fam,
+                                                       llvm::InlineParams params,
+                                                       llvm::InlineContext ic)
+{
+    return new BreakdownInlineAdvisor(m, fam, params, ic, tlsInlineCostSink);
+}
+
 // Point the clone at the target machine and run the O<optLevel> pipeline on it. The
 // machine is only created when the caller needs one; codegen always does.
 bool LLVMBackend::OptimizeViewModule(llvm::Module& view, int optLevel, bool needTargetMachine,
-                                     std::unique_ptr<llvm::TargetMachine>& outMachine)
+                                     std::unique_ptr<llvm::TargetMachine>& outMachine,
+                                     InlineCostBreakdownSink* breakdownSink)
 {
     if (needTargetMachine)
     {
@@ -526,6 +643,12 @@ bool LLVMBackend::OptimizeViewModule(llvm::Module& view, int optLevel, bool need
         passBuilder.registerLoopAnalyses(loopAnalysis);
         passBuilder.crossRegisterProxies(loopAnalysis, functionAnalysis, cgsccAnalysis, moduleAnalysis);
         instrumentation.registerCallbacks(instrumentationCallbacks, &moduleAnalysis);
+        // Registered ONLY when a sink was supplied: InlineAdvisorAnalysis prefers a
+        // registered plugin advisor, and the wrapper must never enter a normal compile.
+        if (breakdownSink)
+            moduleAnalysis.registerPass(
+                [] { return llvm::PluginInlineAdvisorAnalysis(MakeBreakdownInlineAdvisor); });
+        InlineCostSinkGuard sinkGuard(breakdownSink);
         auto pipelineLevel = optLevel == 1 ? llvm::OptimizationLevel::O1
                                            : llvm::OptimizationLevel::O2;
         auto passes = passBuilder.buildPerModuleDefaultPipeline(pipelineLevel);
@@ -1192,6 +1315,53 @@ struct RemarkCollector : public llvm::DiagnosticHandler
     }
 };
 
+// Attach the decision-time inline cost features to the inline remarks they belong to.
+// LLVM's inline remarks report column 0, so the key is (caller symbol, callee symbol,
+// line); several calls to one callee on one line are paired in encounter order.
+static void MergeInlineCostBreakdown(std::vector<LLVMBackend::OptRemark>& remarks,
+                                     const InlineCostBreakdownSink& sink)
+{
+    if (sink.records.empty() || remarks.empty()) return;
+    using Key = std::tuple<std::string, std::string, int>;
+    std::map<Key, std::vector<size_t>> byKey;
+    for (size_t i = 0; i < sink.records.size(); ++i)
+    {
+        const InlineCostBreakdownRecord& record = sink.records[i];
+        byKey[Key{record.caller, record.callee, record.line}].push_back(i);
+    }
+
+    std::map<Key, size_t> consumed;
+    for (LLVMBackend::OptRemark& remark : remarks)
+    {
+        if (remark.pass != "inline") continue;
+        std::string callee;
+        bool hasThreshold = false;
+        for (const auto& arg : remark.args)
+        {
+            if (arg.first == "Callee") callee = arg.second;
+            else if (arg.first == "Threshold" || arg.first == "threshold") hasThreshold = true;
+        }
+        if (callee.empty()) continue;
+
+        const Key key{remark.function, callee, remark.srcLine};
+        auto found = byKey.find(key);
+        if (found == byKey.end()) continue;
+        size_t& next = consumed[key];
+        if (next >= found->second.size()) continue;
+        const InlineCostBreakdownRecord& record = sink.records[found->second[next++]];
+
+        for (size_t feature = 0; feature < record.features.size(); ++feature)
+        {
+            const int value = record.features[feature];
+            if (value == 0) continue;
+            const char* name = kInlineCostFeatureNames[feature];
+            // The remark already states its threshold; do not report it twice.
+            if (hasThreshold && std::string(name) == "threshold") continue;
+            remark.args.push_back({name, std::to_string(value)});
+        }
+    }
+}
+
 // Tier 2: classify a surviving call as a cflat-level cost and merge it into totals keyed
 // by (line, kind, detail). Only costs the optimizer did NOT remove are recorded.
 void RecordOptCost(const llvm::Instruction& instruction, int rootLine,
@@ -1486,8 +1656,11 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
             std::unique_ptr<llvm::TargetMachine> targetMachine;
             llvm::TimeTraceScope pipelineScope("OptViewCachePipeline",
                                                "O" + std::to_string(optLevel));
-            if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine))
+            InlineCostBreakdownSink breakdown;
+            if (!OptimizeViewModule(*view, optLevel, /*needTargetMachine=*/true, targetMachine,
+                                    &breakdown))
                 return nullptr;
+            MergeInlineCostBreakdown(next.remarks, breakdown);
         }
 
         next.rootPathAliases = {analyzedRootPath_};
@@ -1881,8 +2054,11 @@ std::unique_ptr<llvm::Module> LLVMBackend::GetOrBuildOptimizedView(int optLevel)
         std::unique_ptr<llvm::TargetMachine> targetMachine;
         llvm::TimeTraceScope pipelineScope("ViewIncrementalPipeline",
                                            "O" + std::to_string(optLevel));
-        if (!OptimizeViewModule(*work, optLevel, /*needTargetMachine=*/true, targetMachine))
+        InlineCostBreakdownSink breakdown;
+        if (!OptimizeViewModule(*work, optLevel, /*needTargetMachine=*/true, targetMachine,
+                                &breakdown))
             return nullptr;
+        MergeInlineCostBreakdown(next.remarks, breakdown);
     }
 
     for (const std::string& name : protectedNames)

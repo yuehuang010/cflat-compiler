@@ -1,6 +1,6 @@
 # Inline cost breakdown for the IDE optimization view
 
-Status: PROPOSED (2026-08-31). Child of `optimization-info-ide.md` (Tier 3 extension).
+Status: STEP 1 DONE (2026-09-03), client rendering pending. Proposed 2026-08-31. Child of `optimization-info-ide.md` (Tier 3 extension).
 
 ## Problem
 
@@ -31,6 +31,14 @@ breakdown is what makes them actionable.
   pipeline runs; `InlineAdvisorAnalysis::Result::tryCreate` prefers it automatically.
   cflat owns the pipeline setup (`RunViewPipeline`, `LLVMBackend_EmitAndLink.cpp`
   ~524-541), so this is a direct `moduleAnalysis.registerPass` - no dynamic plugin lib.
+- `sroa_losses` is a SEPARATE feature from `sroa_savings`: savings the analyzer promised
+  for an alloca argument and then forfeited when that alloca turned out to escape. It is a
+  diagnostic counter, not a summand of the cost - do not add or subtract it when
+  presenting contributors.
+- Inline remarks carry NO usable column (LLVM reports `Column: 0` / `srcColumn 0` on every
+  inline remark), so the record-to-remark merge keys on (callee mangled symbol, caller
+  symbol, line). Several calls to one callee on one line are paired in encounter order.
+
 - Rejected alternatives:
   - Post-hoc `getInliningCostFeatures` at LSP query time on the pre-inline module:
     cheap and on-demand, but module state differs from decision-time state, numbers
@@ -88,6 +96,11 @@ On the inline decision detail, render top contributors, largest first, credits s
 1. Server: advisor + registration + merge into remark args. Extend the existing
    `optimizationInfo` LSP fixture scenario to assert a known call site carries at least
    one breakdown arg at -O2. No new test files.
+   DONE 2026-09-03 (`LLVMBackend_EmitAndLink.cpp` BreakdownInlineAdvisor +
+   MergeInlineCostBreakdown, `LLVMBackend.h` OptimizeViewModule sink parameter,
+   `lsp_fixture_test.py` breakdown assertion). Measured cost: cold optimizationInfo on
+   `Test/test_move.cb` 4.64s -> 4.68s, on `example/tools/interp.cb` 0.467s -> 0.475s
+   (~1%); -O2 view IR byte-identical before/after.
 2. Extension: render contributors in the inline decision UI; `build.bat` +
    `test_lsp.bat` + extension test suite.
 3. (Recorded, not scheduled) callee line-level drill-down via

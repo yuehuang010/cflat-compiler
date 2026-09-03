@@ -11,20 +11,6 @@
       "Source locations where a function is called, not websites."
     ]
   },
-  "1 site/Short for \"call site\" - a place a function is called from.Appears in a one-line CodeLens above the function, so keep it short.": {
-    "message": "1 site",
-    "comment": [
-      "Short for \"call site\" - a place a function is called from.",
-      "Appears in a one-line CodeLens above the function, so keep it short."
-    ]
-  },
-  "{0} sites/Short for \"call sites\" - places a function is called from.Appears in a one-line CodeLens above the function, so keep it short.": {
-    "message": "{0} sites",
-    "comment": [
-      "Short for \"call sites\" - places a function is called from.",
-      "Appears in a one-line CodeLens above the function, so keep it short."
-    ]
-  },
   "1 function/Counts the functions a body was copied into by inlining.": {
     "message": "1 function",
     "comment": [
@@ -79,6 +65,171 @@
       "The counterpart of \"spill\"."
     ]
   },
+  "Instructions/Machine/IR instructions in the called function that the optimizer could not fold away.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Instructions",
+    "comment": [
+      "Machine/IR instructions in the called function that the optimizer could not fold away.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Calls inside callee/Cost charged for the calls the called function itself makes.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Calls inside callee",
+    "comment": [
+      "Cost charged for the calls the called function itself makes.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Switch lowering/Cost of turning a switch statement into jump tables and comparison chains.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Switch lowering",
+    "comment": [
+      "Cost of turning a switch statement into jump tables and comparison chains.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Argument setup/Cost of preparing the arguments passed to a call.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Argument setup",
+    "comment": [
+      "Cost of preparing the arguments passed to a call.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Indirect calls/Cost charged for calls through a function pointer, whose target is not known.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Indirect calls",
+    "comment": [
+      "Cost charged for calls through a function pointer, whose target is not known.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Cold calling convention/Cost charged because the called function uses the calling convention for rarely executed code.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Cold calling convention",
+    "comment": [
+      "Cost charged because the called function uses the calling convention for rarely executed code.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Relative loads/Cost of loads made through a relative offset, as used by virtual call tables.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Relative loads",
+    "comment": [
+      "Cost of loads made through a relative offset, as used by virtual call tables.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Stack promotion savings/A saving, shown as a negative number: inlining would let the optimizer keep a stack variable in registers.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Stack promotion savings",
+    "comment": [
+      "A saving, shown as a negative number: inlining would let the optimizer keep a stack variable in registers.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Eliminated loads/A saving, shown as a negative number: inlining would remove loads from memory.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Eliminated loads",
+    "comment": [
+      "A saving, shown as a negative number: inlining would remove loads from memory.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "Call overhead removed/A saving, shown as a negative number: inlining removes the cost of performing the call itself.Appears in a comma-separated list of what made a call expensive to inline.": {
+    "message": "Call overhead removed",
+    "comment": [
+      "A saving, shown as a negative number: inlining removes the cost of performing the call itself.",
+      "Appears in a comma-separated list of what made a call expensive to inline."
+    ]
+  },
+  "~{0} instructions/An approximate instruction count derived from an inline cost. Keep the leading ~ (about).": {
+    "message": "~{0} instructions",
+    "comment": [
+      "An approximate instruction count derived from an inline cost. Keep the leading ~ (about)."
+    ]
+  },
+  "Includes the last-call-to-static bonus: the function is deleted after inlining./Explains a very large saving: this was the only remaining call to a function private to the file.": {
+    "message": "Includes the last-call-to-static bonus: the function is deleted after inlining.",
+    "comment": [
+      "Explains a very large saving: this was the only remaining call to a function private to the file."
+    ]
+  },
+  "(weight {0}, threshold {1})/Follows \"inlined\" or \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call (can be negative) and {1} the budget it had to stay under.Both are plain integers with no unit.": {
+    "message": "(weight {0}, threshold {1})",
+    "comment": [
+      "Follows \"inlined\" or \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call (can be negative) and {1} the budget it had to stay under.",
+      "Both are plain integers with no unit."
+    ]
+  },
+  "{0}: {1}/One cost contributor: {0} is its label, e.g. \"Switch lowering\", {1} a plain integer.": {
+    "message": "{0}: {1}",
+    "comment": [
+      "One cost contributor: {0} is its label, e.g. \"Switch lowering\", {1} a plain integer."
+    ]
+  },
+  "{0}: {1} ({2})/The instruction contributor: {0} is its label, {1} a plain integer, {2} a reading such as \"~338 instructions\".": {
+    "message": "{0}: {1} ({2})",
+    "comment": [
+      "The instruction contributor: {0} is its label, {1} a plain integer, {2} a reading such as \"~338 instructions\"."
+    ]
+  },
+  "+{0} more/Ends a truncated list of cost contributors. {0} is how many were left out.": {
+    "message": "+{0} more",
+    "comment": [
+      "Ends a truncated list of cost contributors. {0} is how many were left out."
+    ]
+  },
+  "Missed reduction: {0} (argument address escapes)/{0} is a weight reduction the optimizer could not take because the address of an argument was used, so the value could not be kept in registers.A plain integer with no unit.": {
+    "message": "Missed reduction: {0} (argument address escapes)",
+    "comment": [
+      "{0} is a weight reduction the optimizer could not take because the address of an argument was used, so the value could not be kept in registers.",
+      "A plain integer with no unit."
+    ]
+  },
+  "{0}, {1}/Joins two entries of a comma-separated list.": {
+    "message": "{0}, {1}",
+    "comment": [
+      "Joins two entries of a comma-separated list."
+    ]
+  },
+  "{0} {1}/Appends a \"+n more\" tail to a list.": {
+    "message": "{0} {1}",
+    "comment": [
+      "Appends a \"+n more\" tail to a list."
+    ]
+  },
+  "(weight {0}, threshold {1}): {2}./Follows \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call and {1} the budget it had to stay under.{2} is an already-formatted list such as \"Instructions: 240, Argument setup: 14\".Both numbers are plain integers with no unit.": {
+    "message": "(weight {0}, threshold {1}): {2}.",
+    "comment": [
+      "Follows \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call and {1} the budget it had to stay under.",
+      "{2} is an already-formatted list such as \"Instructions: 240, Argument setup: 14\".",
+      "Both numbers are plain integers with no unit."
+    ]
+  },
+  "(weight {0}, threshold {1})./Follows \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call and {1} the budget it had to stay under.Both are plain integers with no unit.": {
+    "message": "(weight {0}, threshold {1}).",
+    "comment": [
+      "Follows \"not inlined - too costly\". {0} is the inline weight LLVM computed for the call and {1} the budget it had to stay under.",
+      "Both are plain integers with no unit."
+    ]
+  },
+  "{0} {1}/{0} is a verdict such as \"inlined\", {1} its detail such as \"(weight 35, threshold 250)\".": {
+    "message": "{0} {1}",
+    "comment": [
+      "{0} is a verdict such as \"inlined\", {1} its detail such as \"(weight 35, threshold 250)\"."
+    ]
+  },
+  "too costly/The optimizer judged the function too large to copy into the caller.": {
+    "message": "too costly",
+    "comment": [
+      "The optimizer judged the function too large to copy into the caller."
+    ]
+  },
+  "never - {0}/{0} is an English reason supplied by the LLVM optimizer and cannot be translated - leave the placeholder alone.": {
+    "message": "never - {0}",
+    "comment": [
+      "{0} is an English reason supplied by the LLVM optimizer and cannot be translated - leave the placeholder alone."
+    ]
+  },
+  "never/The function can never be inlined, whatever its size.": {
+    "message": "never",
+    "comment": [
+      "The function can never be inlined, whatever its size."
+    ]
+  },
   "inlined/The optimizer replaced a call with a copy of the called function's body.": {
     "message": "inlined",
     "comment": [
@@ -109,52 +260,42 @@
       "{0} is an English reason supplied by the LLVM optimizer and cannot be translated - leave the placeholder alone."
     ]
   },
-  "**Inlined here** at -O{0}/Heading of the hover shown on a call the optimizer inlined.Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
-    "message": "**Inlined here** at -O{0}",
+  "**Inlined** at -O{0}/Heading of the hover shown on a call the optimizer inlined.Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
+    "message": "**Inlined** at -O{0}",
     "comment": [
       "Heading of the hover shown on a call the optimizer inlined.",
       "Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.",
       "-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit."
     ]
   },
-  "Also on this line:/Introduces the calls on the same source line that were NOT inlined.": {
-    "message": "Also on this line:",
+  "**Inlined** at -O{0} {1}/Heading of the hover shown on a call the optimizer inlined. {1} is a detail such as \"(weight -35, threshold 337)\".Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
+    "message": "**Inlined** at -O{0} {1}",
     "comment": [
-      "Introduces the calls on the same source line that were NOT inlined."
-    ]
-  },
-  "inlined at {0}/{0} is an already-formatted count such as \"3 call sites\".": {
-    "message": "inlined at {0}",
-    "comment": [
-      "{0} is an already-formatted count such as \"3 call sites\"."
-    ]
-  },
-  "inlined at {0} of {1}/{0} is a bare number and {1} an already-formatted count such as \"3 call sites\".Reads as \"inlined at 2 of 3 call sites\".": {
-    "message": "inlined at {0} of {1}",
-    "comment": [
-      "{0} is a bare number and {1} an already-formatted count such as \"3 call sites\".",
-      "Reads as \"inlined at 2 of 3 call sites\"."
-    ]
-  },
-  "**{0}** - {1} (-O{2})/{0} is a function name (never translate it), {1} an inlining summary.Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
-    "message": "**{0}** - {1} (-O{2})",
-    "comment": [
-      "{0} is a function name (never translate it), {1} an inlining summary.",
+      "Heading of the hover shown on a call the optimizer inlined. {1} is a detail such as \"(weight -35, threshold 337)\".",
       "Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.",
       "-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit."
     ]
   },
-  "- line {0}: {1}/Markdown list item. {0} is a source line number, {1} an inlining decision.Keep the leading \"- \", it is what makes the list render.": {
-    "message": "- line {0}: {1}",
+  "**Not inlined** at -O{0}: {1}/Heading of the hover shown on a call the optimizer rejected. {1} is the reason, e.g. \"too costly\".Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
+    "message": "**Not inlined** at -O{0}: {1}",
     "comment": [
-      "Markdown list item. {0} is a source line number, {1} an inlining decision.",
-      "Keep the leading \"- \", it is what makes the list render."
+      "Heading of the hover shown on a call the optimizer rejected. {1} is the reason, e.g. \"too costly\".",
+      "Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.",
+      "-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit."
     ]
   },
-  "No standalone copy of this function survived optimization./The optimizer copied the body into every caller and emitted no separate function.": {
-    "message": "No standalone copy of this function survived optimization.",
+  "**Not inlined** at -O{0}: {1} {2}/Heading of the hover shown on a call the optimizer rejected. {1} is the reason, e.g. \"too costly\"; {2} a detail such as \"(weight 1730, threshold 225)\".Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
+    "message": "**Not inlined** at -O{0}: {1} {2}",
     "comment": [
-      "The optimizer copied the body into every caller and emitted no separate function."
+      "Heading of the hover shown on a call the optimizer rejected. {1} is the reason, e.g. \"too costly\"; {2} a detail such as \"(weight 1730, threshold 225)\".",
+      "Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.",
+      "-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit."
+    ]
+  },
+  "- {0}/Markdown list item - keep the leading \"- \", it is what makes the list render.": {
+    "message": "- {0}",
+    "comment": [
+      "Markdown list item - keep the leading \"- \", it is what makes the list render."
     ]
   },
   "**{0}** at -O{1}/Heading of the function-detail hover. {0} is a function name.Rendered as Markdown: ** ** makes text bold - keep the markers attached to the text they wrap.-O0 / -O1 / -O2 is a compiler optimization-level flag. Never translate it and never separate the O from its digit.": {
@@ -204,6 +345,26 @@
     "comment": [
       "Shown when the body was inlined somewhere but the call sites cannot be listed.",
       "Rendered as Markdown: _ _ makes text italic - keep the markers attached to the text they wrap."
+    ]
+  },
+  "{0} ({1})/{0} is an inline weight (plain integer), {1} a reading such as \"~338 instructions\".": {
+    "message": "{0} ({1})",
+    "comment": [
+      "{0} is an inline weight (plain integer), {1} a reading such as \"~338 instructions\"."
+    ]
+  },
+  "- Inline weight: {0}/What the optimizer estimates copying this function into a caller costs. {0} arrives formatted, e.g. \"1730 (~338 instructions)\".Markdown list item - keep the leading \"- \", it is what makes the list render.": {
+    "message": "- Inline weight: {0}",
+    "comment": [
+      "What the optimizer estimates copying this function into a caller costs. {0} arrives formatted, e.g. \"1730 (~338 instructions)\".",
+      "Markdown list item - keep the leading \"- \", it is what makes the list render."
+    ]
+  },
+  "- Inline weight: {0} to {1}/A range of inline cost estimates across call sites; both arrive formatted, e.g. \"1690 (~338 instructions)\".Markdown list item - keep the leading \"- \", it is what makes the list render.": {
+    "message": "- Inline weight: {0} to {1}",
+    "comment": [
+      "A range of inline cost estimates across call sites; both arrive formatted, e.g. \"1690 (~338 instructions)\".",
+      "Markdown list item - keep the leading \"- \", it is what makes the list render."
     ]
   },
   "cflat: line {0} produced no IR - showing the nearest emitted line {1}/Status bar message. IR = LLVM Intermediate Representation; keep \"IR\" as-is.{0} and {1} are source line numbers.": {
@@ -298,11 +459,11 @@
       "Link label. \"assembly\" means the emitted machine-code listing."
     ]
   },
-  "optimized away - inlined into {0}/No standalone copy of the function was emitted; its body was copied into its callers.{0} arrives already formatted, e.g. \"3 sites\".Appears in a one-line CodeLens above a function, so keep it short.": {
+  "optimized away - inlined into {0}/No standalone copy of the function was emitted; its body was copied into its callers.{0} arrives already formatted, e.g. \"3 functions\".Appears in a one-line CodeLens above a function, so keep it short.": {
     "message": "optimized away - inlined into {0}",
     "comment": [
       "No standalone copy of the function was emitted; its body was copied into its callers.",
-      "{0} arrives already formatted, e.g. \"3 sites\".",
+      "{0} arrives already formatted, e.g. \"3 functions\".",
       "Appears in a one-line CodeLens above a function, so keep it short."
     ]
   },
@@ -320,10 +481,10 @@
       "Appears in a one-line CodeLens above a function, so keep it short."
     ]
   },
-  "inlined into {0}/{0} arrives already formatted, e.g. \"3 sites\".Appears in a one-line CodeLens above a function, so keep it short.": {
+  "inlined into {0}/{0} arrives already formatted, e.g. \"3 functions\".Appears in a one-line CodeLens above a function, so keep it short.": {
     "message": "inlined into {0}",
     "comment": [
-      "{0} arrives already formatted, e.g. \"3 sites\".",
+      "{0} arrives already formatted, e.g. \"3 functions\".",
       "Appears in a one-line CodeLens above a function, so keep it short."
     ]
   },

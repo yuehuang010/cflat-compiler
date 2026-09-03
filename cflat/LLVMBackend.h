@@ -485,6 +485,10 @@ enum class LockMode
 struct TypeSpelling;
 struct TypeManglingAccess;
 
+// Per-call-site inline cost features captured at inline decision time. Defined in
+// LLVMBackend_EmitAndLink.cpp; only the IDE view pipeline ever supplies one.
+struct InlineCostBreakdownSink;
+
 class LLVMBackend
 {
 public:
@@ -4599,8 +4603,11 @@ private:
     // path: the core materialization below is load-bearing on a warm cache.
     std::unique_ptr<llvm::Module> CloneModuleForView(const std::string& purpose);
     std::unique_ptr<llvm::Module> GetOrBuildOptimizedView(int optLevel);
+    // `breakdownSink` (optional) makes the view pipeline record inline cost features per
+    // call site; the normal compile path passes null and pays nothing.
     bool OptimizeViewModule(llvm::Module& view, int optLevel, bool needTargetMachine,
-                            std::unique_ptr<llvm::TargetMachine>& outMachine);
+                            std::unique_ptr<llvm::TargetMachine>& outMachine,
+                            InlineCostBreakdownSink* breakdownSink = nullptr);
 
     // Native ELF code emission + link for Linux (and other ELF/Unix hosts).
     // Emits an x86-64 ELF object for the host triple and links it with the

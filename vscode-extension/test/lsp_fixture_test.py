@@ -633,6 +633,41 @@ def test_optimization_info(client: LspClient) -> str | None:
         if remark["calleeLine"] != 1:
             return f"optimizationInfo O2: Inlined remark calleeLine should be 1: {remark}"
 
+    # The inline cost breakdown: every inline decision is re-analyzed at decision time and
+    # the nonzero LLVM cost features ride along in args. Without it the UI can only show
+    # "cost 320 vs threshold 250" with no way to say where the 320 came from. The feature
+    # keys come from INLINE_COST_FEATURE_ITERATOR, so this list must stay a subset of it.
+    breakdown_keys = {
+        "sroa_savings", "sroa_losses", "load_elimination", "call_penalty",
+        "call_argument_setup", "load_relative_intrinsic", "lowered_call_arg_setup",
+        "indirect_call_penalty", "jump_table_penalty", "case_cluster_penalty",
+        "switch_default_dest_penalty", "switch_penalty",
+        "unsimplified_common_instructions", "num_loops", "dead_blocks",
+        "simplified_instructions", "constant_args", "constant_offset_ptr_args",
+        "callsite_cost", "cold_cc_penalty", "last_call_to_static_bonus",
+        "is_multiple_blocks", "nested_inlines", "nested_inline_cost_estimate", "threshold",
+    }
+    if not inline_remarks:
+        return "optimizationInfo O2: no inline remarks at all, breakdown cannot be checked"
+    with_breakdown = []
+    for remark in inline_remarks:
+        present = breakdown_keys & set(remark.get("args", {}))
+        if not present:
+            continue
+        for key in present:
+            value = remark["args"][key]
+            try:
+                int(value)
+            except (TypeError, ValueError):
+                return (f"optimizationInfo O2: breakdown arg {key} is not an integer: "
+                        f"{value!r} in {remark}")
+            if int(value) == 0:
+                return f"optimizationInfo O2: zero-valued breakdown arg {key}: {remark}"
+        with_breakdown.append(remark)
+    if not with_breakdown:
+        return (f"optimizationInfo O2: no inline remark carries a cost breakdown: "
+                f"{inline_remarks}")
+
     collected0, err = collect(0)
     if err:
         return err
