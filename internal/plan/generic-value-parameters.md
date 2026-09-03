@@ -1,11 +1,30 @@
 # Value (non-type) generic parameters: `struct Buf<T, int N>`
 
-Status: **Design ratified 2026-08-26. Stages 0-5 IMPLEMENTED 2026-08-27** (`./test.sh Release`
+Status: **Design ratified 2026-08-26. Stages 0-5 IMPLEMENTED 2026-08-27; trailing-parameter DEFAULTS added 2026-09-03 (see as-built note below)** (`./test.sh Release`
 720 passed / 0 failed / 8 skipped). Written after a review of C++ / C# / Rust prior art against
 what CFlat already has; the "measured" claims below describe the state BEFORE implementation and
 are kept as the record of why each decision was made.
 
 **As-built notes, where the implementation refined the design:**
+
+- **Stage 6 (2026-09-03): defaults on trailing value parameters.** `struct S<T, int N = <const-expr>>`
+  parses (`valueParameterDeclaration : valueParameterType Identifier ('=' shiftExpression)?`, still
+  100% rules - the default sits at SHIFT level for the same reason a use-site value argument does,
+  so a `>` can never be read as an operator inside it). The folded default is stored per template in
+  `gts.genericStruct/Interface/FunctionValueDefaults`, parallel to the existing `...ValueParams`
+  vectors, filled by `ParseGenericTypeParameters` (both passes) and round-tripped through the
+  `--init` cache as `value_param_defaults`. Two directions meet in the middle: instantiation FILLS
+  omitted trailing arguments from the defaults (`FillGenericValueDefaults`), and
+  `MangleGenericInstance` STRIPS a trailing argument spelled exactly as its default. Stripping
+  rather than appending is what keeps `unique<T>`'s existing mangled name byte-identical while
+  making `unique<T, 0>` name the same instantiation. Diagnostics: a default on a non-trailing
+  parameter, a default that does not fold, and (only for templates that declare a default) a use
+  site that omits an undefaulted parameter. Coverage: `Test/test_generics.cb::testGenericValueDefaults`,
+  `Test/errors/err_generic_value_default.cb`. Known gap: the ForwardRefScanner does not register
+  generic STRUCT templates at all, so it learns a struct's defaults only once the main pass (or the
+  warm core cache) has registered them - a user struct whose default is spelled explicitly at a use
+  site in the same file could mangle differently in the two passes. `unique` is a core template and
+  is always registered first, so the shipped user of this feature is unaffected.
 
 - The use-site value-argument alternative is `shiftExpression`, NOT `assignmentExpression`.
   Decision #5 said only that a comparison must be parenthesized; admitting a full

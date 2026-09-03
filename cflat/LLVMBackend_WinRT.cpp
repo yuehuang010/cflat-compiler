@@ -1711,7 +1711,13 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // it only when the PARAMETER declares the same `alignas(_, N)` clause. A matching clause
                 // is allowed; a missing/mismatched one would free the block wrong and corrupt the heap.
                 // Alignment carried by the TYPE is not tagged and passes through freely.
+                // A `unique<T, N>` parameter carries its allocation alignment in the TYPE, so
+                // type identity already enforces agreement and the wrapper VALUE has no tracked
+                // block alignment to compare against.
+                const bool coreUniqueWrapperParam = !params[i].Pointer
+                    && IsCoreUniqueType(params[i].TypeName);
                 if (paramsCarryAllocAlign
+                    && !coreUniqueWrapperParam
                     && args[i].AllocAlignment != params[i].AllocAlignValue
                     && (args[i].AllocAlignment > kDefaultNewAlign
                         || params[i].AllocAlignValue > kDefaultNewAlign))

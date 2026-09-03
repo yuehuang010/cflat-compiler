@@ -142,6 +142,9 @@ struct GenericTemplateState
     // Parallel to the type-parameter vectors: empty means a TYPE parameter; otherwise this is
     // the primitive spelling of a compile-time VALUE parameter.
     std::unordered_map<std::string, std::vector<std::string>>                   genericStructValueParams;
+    // Parallel again: the DEFAULT of a trailing value parameter, already folded to its decimal
+    // spelling. Empty means "no default". Only trailing value parameters may carry one.
+    std::unordered_map<std::string, std::vector<std::string>>                   genericStructValueDefaults;
     std::unordered_set<std::string>                                             instantiatedGenerics;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericStructConstraints;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericClassConstraints;
@@ -152,6 +155,7 @@ struct GenericTemplateState
     std::unordered_map<std::string, CFlatParser::InterfaceDefinitionContext*>   genericInterfaceTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceValueParams;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericInterfaceValueDefaults;
     std::unordered_set<std::string>                                             instantiatedInterfaces;
     // Mangled names known to name a generic INTERFACE instantiation (Container__int). Recorded
     // wherever such a use is seen so it lowers to a fat pointer before interfaceTable has it.
@@ -221,6 +225,7 @@ struct GenericTemplateState
     std::unordered_map<std::string, CFlatParser::FunctionDefinitionContext*>    genericFunctionTemplates;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionTypeParams;
     std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionValueParams;
+    std::unordered_map<std::string, std::vector<std::string>>                   genericFunctionValueDefaults;
     std::unordered_set<std::string>                                             instantiatedGenericFunctions;
     std::unordered_map<std::string, std::unordered_map<std::string, std::vector<std::string>>> genericFunctionConstraints;
     std::vector<PendingInstantiation>                                           pendingInstantiations;

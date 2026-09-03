@@ -41,7 +41,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
         auto* compiler = Compiler(declSpecs);
         LLVMBackend::DeclTypeAndValue declType;
         bool hasUniqueSpecifier = false;
-        bool hasAllocAlignmentSpecifier = false;
+        uint64_t allocAlignSpecifierValue = 0;
         for (auto declSpec : declSpecs->declarationSpecifier())
         {
             auto* alignSpec = declSpec->alignmentSpecifier();
@@ -50,8 +50,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
             size_t idx = (alignSpec->typeName() != nullptr) ? 0 : 1;
             if (cexprs.size() <= idx) continue;
             auto folded = FoldCompileTimeInt(compiler, cexprs[idx]->conditionalExpression());
-            if (folded && *folded > 0)
-                hasAllocAlignmentSpecifier = true;
+            if (folded && *folded > 0 && *folded <= 4096 && ((*folded & (*folded - 1)) == 0))
+                allocAlignSpecifierValue = static_cast<uint64_t>(*folded);
         }
         // Reject `T[][]` / `T[][M]` / `T[N][]` before any branch consumes the brackets - every
         // branch below drops the empty pairs and would silently parse a narrower type.
@@ -389,11 +389,15 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     && !declType.IsArrayView
                     && (declType.ArraySize == nullptr || uniqueArrayOk)
                     && declType.AliasArraySize == 0 && declType.ExtraArrayDims.empty()
-                    && !hasAllocAlignmentSpecifier
                     && (declSpecs->parent == nullptr
                         || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
                 {
-                    declType.TypeName = MangleGenericInstance(*compiler, "unique", { declType.TypeName });
+                    // Mirror of the codegen copy: the declared allocation alignment travels in
+                    // the type, so `alignas(0, N) unique T*` names `unique<T, N>`.
+                    std::vector<std::string> uniqueArgs{ declType.TypeName };
+                    if (allocAlignSpecifierValue != 0)
+                        uniqueArgs.push_back(std::to_string(allocAlignSpecifierValue));
+                    declType.TypeName = MangleGenericInstance(*compiler, "unique", uniqueArgs);
                     if ((isParameterDecl || isReturnDecl)
                         && compiler->AnyGenericTypeTemplateNamed("unique"))
                     {
@@ -411,13 +415,6 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     if (isParameterDecl)
                         declType.IsMove = true;
                 }
-                // R2: an allocation-alignment clause keeps the legacy pointer representation,
-                // whose cleanup carries the per-allocation deallocator metadata.
-                if (hasUniqueSpecifier
-                    && hasAllocAlignmentSpecifier
-                    && declType.Pointer && !declType.ElemPointer
-                    && !declType.IsArrayView && !declType.IsFunctionPointer)
-                    declType.IsUnique = true;
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -1346,6 +1343,7 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                         compiler->gts.genericTemplateNamespace[key] = ns;
                         std::vector<std::string> params;
                         std::vector<std::string> valueParams;
+                        std::vector<std::string> valueDefaults;
                         for (auto* entry : gp->typeParameterList()->typeParameterEntry())
                         {
                             if (IsValueParameterDeclaration(entry))
@@ -1355,16 +1353,23 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
                                 if (ValueParameterTypeSpelling(entry).empty()) continue;
                                 params.push_back(entry->valueParameterDeclaration()->Identifier()->getText());
                                 valueParams.push_back(ValueParameterTypeSpelling(entry));
+                                std::string defaultSpelling;
+                                if (auto* defExpr = entry->valueParameterDeclaration()->shiftExpression())
+                                    if (auto folded = FoldCompileTimeInt(compiler, defExpr))
+                                        defaultSpelling = std::to_string(*folded);
+                                valueDefaults.push_back(defaultSpelling);
                             }
                             else
                             {
                                 params.push_back(entry->typeSpecifier() != nullptr
                                     ? entry->typeSpecifier()->getText() : entry->getText());
                                 valueParams.push_back("");
+                                valueDefaults.push_back("");
                             }
                         }
                         compiler->gts.genericFunctionTypeParams[key] = params;
                         compiler->gts.genericFunctionValueParams[key] = valueParams;
+                        compiler->gts.genericFunctionValueDefaults[key] = valueDefaults;
                         std::unordered_map<std::string, std::vector<std::string>> constraints;
                         if (auto* where = fd->whereClause(); where != nullptr)
                         {

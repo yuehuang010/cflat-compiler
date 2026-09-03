@@ -974,13 +974,23 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     && !declType.IsArrayView
                     && (declType.ArraySize == nullptr || uniqueArrayOk)
                     && declType.AliasArraySize == 0
-                    && declType.ExtraArrayDims.empty() && declType.AllocAlignValue == 0
+                    && declType.ExtraArrayDims.empty()
+                    // A FIELD with an allocation-alignment clause keeps the builtin pointer
+                    // representation: its synthesized teardown reads the alignment off the
+                    // field's own declared type, a path this change does not touch.
+                    && (declType.AllocAlignValue == 0 || !inStructFieldDecl_)
                     && (declSpecs->parent == nullptr
                         || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
                 {
                     std::string elementType = declType.TypeName;
-                    std::string uniqueType = MangledGenericName("unique", { elementType });
-                    QueueGenericInstantiation("unique", { elementType }, uniqueType);
+                    // The declared allocation alignment travels in the TYPE: `alignas(0, N) unique
+                    // T*` is `unique<T, N>`, so the deallocator that matches the allocation is
+                    // part of the type rather than a side flag on the local.
+                    std::vector<std::string> uniqueArgs{ elementType };
+                    if (declType.AllocAlignValue != 0)
+                        uniqueArgs.push_back(std::to_string(declType.AllocAlignValue));
+                    std::string uniqueType = MangledGenericName("unique", uniqueArgs);
+                    QueueGenericInstantiation("unique", uniqueArgs, uniqueType);
                     declType.TypeName = uniqueType;
                     declType.Pointer = false;
                     declType.ElemPointer = false;
@@ -992,8 +1002,10 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (isParameterDecl)
                         declType.IsMove = true;
                 }
-                // R2: an allocation-alignment clause keeps the legacy pointer representation,
-                // whose cleanup carries the per-allocation deallocator metadata.
+                // A `unique` FIELD or GLOBAL with an allocation-alignment clause stays on the
+                // builtin pointer representation, whose cleanup carries the per-allocation
+                // deallocator. Locals, parameters and return types were claimed by the desugar
+                // above (which cleared hasUniqueSpecifier), so only those two reach here.
                 if (hasUniqueSpecifier
                     && declType.AllocAlignValue != 0
                     && declType.Pointer && !declType.ElemPointer
@@ -1566,11 +1578,14 @@ void MainListener::ParseInterfaceDefinition(CFlatParser::InterfaceDefinitionCont
             // Keyed on the namespace-QUALIFIED name, like a generic struct or class. The use site
             // resolves its spelled base to this key via LLVMBackend::ResolveGenericTemplateBase.
             std::vector<std::string> valueParams;
-            auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters(), &valueParams);
+            std::vector<std::string> valueDefaults;
+            auto typeParams = ParseGenericTypeParameters(nameGid->genericTypeParameters(), &valueParams,
+                                                         &valueDefaults);
             genericInterfaceTemplates[name] = ctx;
             Compiler()->gts.genericTemplateNamespace[name] = Compiler()->GetCurrentNamespace();
             genericInterfaceTypeParams[name] = typeParams;
             compilerLLVM->gts.genericInterfaceValueParams[name] = valueParams;
+            compilerLLVM->gts.genericInterfaceValueDefaults[name] = valueDefaults;
             {
                 auto entries = nameGid->genericTypeParameters()->typeParameterList()->typeParameterEntry();
                 bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
@@ -2471,13 +2486,16 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         if (nameOverride.empty() && func->genericTypeParameters() != nullptr)
         {
             std::vector<std::string> valueParams;
-            auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
+            std::vector<std::string> valueDefaults;
+            auto typeParams = ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
+                                                         &valueDefaults);
             genericFunctionTemplates[name] = func;
             // Record the declaring namespace, never re-derive it from the key: a call site's bare
             // spelling resolves through it (ResolveGenericFunctionBase) and the body is lowered in it.
             Compiler()->gts.genericTemplateNamespace[name] = namespaceName;
             genericFunctionTypeParams[name] = typeParams;
             compilerLLVM->gts.genericFunctionValueParams[name] = valueParams;
+            compilerLLVM->gts.genericFunctionValueDefaults[name] = valueDefaults;
             genericFunctionConstraints[name] = ParseWhereClause(func->whereClause());
             auto entries = func->genericTypeParameters()->typeParameterList()->typeParameterEntry();
             bool hasPack = !entries.empty() && entries.back()->Ellipsis() != nullptr;
@@ -3415,286 +3433,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         }
 
         auto initDeclarVec = initDecl->initDeclarator();
-        auto* enclosingFunction = [&]() -> CFlatParser::FunctionDefinitionContext* {
-            for (auto* parent = declSpec->parent; parent != nullptr; parent = parent->parent)
-                if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent))
-                    return fn;
-            return nullptr;
-        }();
-        // Keep the raw-array decision on the value-producing side of the initializer. In
-        // particular, do not find a `new T[n]` buried in a call argument or in a condition.
-        auto hasRawNewArrayValue = [&](auto&& self, antlr4::tree::ParseTree* node) -> bool {
-            if (node == nullptr) return false;
-            if (auto* newExpr = dynamic_cast<CFlatParser::NewExpressionContext*>(node))
-                return newExpr->assignmentExpression() != nullptr;
-            if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
-            {
-                if (conditional->Question() != nullptr)
-                    return self(self, conditional->expression())
-                        || self(self, conditional->conditionalExpression());
-                if (conditional->QuestionQuestion() != nullptr)
-                    return self(self, conditional->logicalOrExpression())
-                        || self(self, conditional->conditionalExpression());
-                return self(self, conditional->logicalOrExpression());
-            }
-            if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
-            {
-                if (assignment->assignmentOperator() != nullptr)
-                    return self(self, assignment->assignmentExpression());
-                return self(self, assignment->conditionalExpression());
-            }
-            if (auto* expression = dynamic_cast<CFlatParser::ExpressionContext*>(node))
-                return self(self, expression->assignmentExpression());
-            if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
-                return self(self, primary->expression());
-            if (auto* postfix = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
-            {
-                if (!postfix->argumentExpressionList().empty()
-                    || !postfix->LeftBracket().empty()
-                    || !postfix->Dot().empty() || !postfix->Arrow().empty()
-                    || !postfix->QuestionDot().empty())
-                    return false;
-                return self(self, postfix->primaryExpression());
-            }
-            if (auto* unary = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
-            {
-                if (unary->newExpression() != nullptr)
-                    return self(self, unary->newExpression());
-                if (unary->postfixExpression() != nullptr)
-                    return self(self, unary->postfixExpression());
-                return false;
-            }
-            if (auto* cast = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
-            {
-                if (cast->typeName() != nullptr) return false;
-                return self(self, cast->unaryExpression());
-            }
-            if (node->children.size() != 1) return false;
-            return self(self, node->children[0]);
-        };
-        auto hasAlignedMoveSource = [&](antlr4::tree::ParseTree* node) {
-            auto* move = TopLevelMoveExpression(node);
-            if (move == nullptr || move->unaryExpression() == nullptr)
-                return false;
-            const std::string sourceName = move->unaryExpression()->getText();
-            if (!IsBareIdentifierText(sourceName)) return false;
-            auto declarationHasAllocAlign = [&](CFlatParser::DeclarationSpecifiersContext* specs) {
-                if (specs == nullptr) return false;
-                for (auto* spec : specs->declarationSpecifier())
-                    if (auto* alignSpec = spec->alignmentSpecifier(); alignSpec != nullptr
-                        && ParseAllocAlignArg(alignSpec) != 0)
-                        return true;
-                return false;
-            };
-            const size_t assignmentStart = node->getSourceInterval().a;
-            auto declarationHasSource = [&](CFlatParser::DeclarationContext* declaration,
-                                             bool requireBefore)
-                -> std::optional<bool> {
-                if (declaration == nullptr || declaration->initDeclaratorList() == nullptr)
-                    return std::nullopt;
-                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
-                {
-                    auto* declarator = init->declarator();
-                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                    if (direct != nullptr && getDirectDeclName(direct) == sourceName
-                        && init->getStop() != nullptr
-                        && (!requireBefore
-                            || (size_t)init->getStop()->getTokenIndex() < assignmentStart))
-                        return declarationHasAllocAlign(declaration->declarationSpecifiers());
-                }
-                return std::nullopt;
-            };
-            for (auto* parent = node; parent != nullptr; parent = parent->parent)
-            {
-                if (parent != enclosingFunction
-                    && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(parent) != nullptr
-                        || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(parent) != nullptr))
-                    return false;
-                if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent))
-                {
-                    bool found = false;
-                    bool aligned = false;
-                    auto* list = compound->blockItemList();
-                    if (list != nullptr)
-                        for (auto* item : list->blockItem())
-                            if (auto* declaration = item->declaration())
-                            {
-                                auto result = declarationHasSource(declaration, true);
-                                if (result.has_value())
-                                {
-                                    found = true;
-                                    aligned = *result;
-                                }
-                            }
-                    if (found) return aligned;
-                }
-                if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent))
-                {
-                    auto* condition = iteration->forCondition();
-                    auto* forDecl = condition != nullptr ? condition->forDeclaration() : nullptr;
-                    if (forDecl != nullptr && forDecl->initDeclaratorList() != nullptr)
-                        for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
-                        {
-                            auto* declarator = init->declarator();
-                            auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                            if (direct != nullptr && getDirectDeclName(direct) == sourceName
-                                && init->getStop() != nullptr
-                                && (size_t)init->getStop()->getTokenIndex() < assignmentStart)
-                                return declarationHasAllocAlign(forDecl->declarationSpecifiers());
-                        }
-                }
-                if (parent == enclosingFunction) break;
-            }
-            if (enclosingFunction->parameterTypeList() != nullptr
-                && enclosingFunction->parameterTypeList()->parameterList() != nullptr)
-                for (auto* parameter : enclosingFunction->parameterTypeList()->parameterList()->parameterDeclaration())
-                {
-                    auto* declarator = parameter->declarator();
-                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                    if (direct != nullptr && getDirectDeclName(direct) == sourceName)
-                        return declarationHasAllocAlign(parameter->declarationSpecifiers());
-                }
-            auto namespaceOf = [](antlr4::tree::ParseTree* node) {
-                std::string result;
-                for (auto* parent = node != nullptr ? node->parent : nullptr;
-                     parent != nullptr; parent = parent->parent)
-                    if (auto* ns = dynamic_cast<CFlatParser::NamespaceDefinitionContext*>(parent))
-                    {
-                        std::string part;
-                        for (auto* id : ns->Identifier())
-                            part += (part.empty() ? "" : ".") + id->getText();
-                        result = part + (result.empty() ? "" : "." + result);
-                    }
-                return result;
-            };
-            const std::string functionNamespace = namespaceOf(enclosingFunction);
-            std::optional<bool> globalResult;
-            auto visitGlobals = [&](auto&& self, antlr4::tree::ParseTree* current) -> void {
-                if (current == nullptr || globalResult.has_value()) return;
-                if (dynamic_cast<CFlatParser::FunctionDefinitionContext*>(current) != nullptr
-                    || dynamic_cast<CFlatParser::StructDefinitionContext*>(current) != nullptr
-                    || dynamic_cast<CFlatParser::ClassDefinitionContext*>(current) != nullptr
-                    || dynamic_cast<CFlatParser::InterfaceDefinitionContext*>(current) != nullptr
-                    || dynamic_cast<CFlatParser::ProgramDefinitionContext*>(current) != nullptr)
-                    return;
-                if (auto* declaration = dynamic_cast<CFlatParser::DeclarationContext*>(current);
-                    declaration != nullptr
-                    && dynamic_cast<CFlatParser::ExternalDeclarationContext*>(declaration->parent) != nullptr
-                    && namespaceOf(declaration) == functionNamespace)
-                {
-                    globalResult = declarationHasSource(declaration, false);
-                    if (globalResult.has_value()) return;
-                }
-                for (auto* child : current->children)
-                    self(self, child);
-            };
-            auto* root = static_cast<antlr4::tree::ParseTree*>(enclosingFunction);
-            while (root->parent != nullptr) root = root->parent;
-            visitGlobals(visitGlobals, root);
-            if (globalResult.has_value()) return *globalResult;
-            return false;
-        };
-        auto hasLaterBuiltinUniqueAssignment = [&](CFlatParser::InitDeclaratorContext* candidate,
-                                                    const std::string& name) {
-            if (enclosingFunction == nullptr || name.empty() || candidate == nullptr
-                || candidate->getStop() == nullptr)
-                return false;
-            const size_t declarationEnd = (size_t)candidate->getStop()->getTokenIndex();
-            CFlatParser::CompoundStatementContext* candidateBlock = nullptr;
-            CFlatParser::ForDeclarationContext* candidateFor = nullptr;
-            CFlatParser::IterationStatementContext* candidateIteration = nullptr;
-            for (auto* parent = candidate->parent; parent != nullptr; parent = parent->parent)
-            {
-                if (candidateBlock == nullptr)
-                    candidateBlock = dynamic_cast<CFlatParser::CompoundStatementContext*>(parent);
-                if (candidateFor == nullptr)
-                    candidateFor = dynamic_cast<CFlatParser::ForDeclarationContext*>(parent);
-                if (candidateIteration == nullptr)
-                    candidateIteration = dynamic_cast<CFlatParser::IterationStatementContext*>(parent);
-                if (parent == enclosingFunction)
-                    break;
-            }
-            antlr4::tree::ParseTree* scanRoot = enclosingFunction->compoundStatement();
-            if (candidateBlock != nullptr)
-                scanRoot = candidateBlock;
-            else if (candidateFor != nullptr && candidateIteration != nullptr)
-                scanRoot = candidateIteration;
-            auto declarationRedeclares = [&](CFlatParser::DeclarationContext* declaration) {
-                if (declaration == nullptr || declaration->initDeclaratorList() == nullptr)
-                    return false;
-                for (auto* init : declaration->initDeclaratorList()->initDeclarator())
-                {
-                    auto* declarator = init->declarator();
-                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                    if (direct != nullptr && getDirectDeclName(direct) == name)
-                        return true;
-                }
-                return false;
-            };
-            auto forRedeclares = [&](CFlatParser::ForDeclarationContext* forDecl) {
-                if (forDecl == nullptr || forDecl->initDeclaratorList() == nullptr)
-                    return false;
-                for (auto* init : forDecl->initDeclaratorList()->initDeclarator())
-                {
-                    auto* declarator = init->declarator();
-                    auto* direct = declarator != nullptr ? declarator->directDeclarator() : nullptr;
-                    if (direct != nullptr && getDirectDeclName(direct) == name)
-                        return true;
-                }
-                return false;
-            };
-            bool found = false;
-            auto visit = [&](auto&& self, antlr4::tree::ParseTree* node) -> void {
-                if (node == nullptr || found) return;
-                if (node != enclosingFunction
-                    && (dynamic_cast<CFlatParser::LambdaExpressionContext*>(node) != nullptr
-                        || dynamic_cast<CFlatParser::FunctionDefinitionContext*>(node) != nullptr))
-                    return;
-                if (auto* compound = dynamic_cast<CFlatParser::CompoundStatementContext*>(node);
-                    compound != nullptr && compound != scanRoot
-                    && compound->blockItemList() != nullptr)
-                {
-                    for (auto* item : compound->blockItemList()->blockItem())
-                        if (declarationRedeclares(item->declaration()))
-                            return;
-                }
-                if (auto* iteration = dynamic_cast<CFlatParser::IterationStatementContext*>(node);
-                    iteration != nullptr)
-                {
-                    auto* condition = iteration->forCondition();
-                    auto* forDecl = condition != nullptr ? condition->forDeclaration() : nullptr;
-                    if (forDecl != candidateFor && forRedeclares(forDecl))
-                        return;
-                }
-                if (auto* statement = dynamic_cast<CFlatParser::ExpressionStatementContext*>(node))
-                {
-                    auto* expression = statement->expression();
-                    auto* assignment = expression != nullptr ? expression->assignmentExpression() : nullptr;
-                    if (assignment != nullptr && assignment->assignmentOperator() != nullptr
-                        && assignment->assignmentOperator()->getText() == "="
-                        && assignment->unaryExpression() != nullptr
-                        && assignment->unaryExpression()->getText() == name
-                        && assignment->getStart()->getTokenIndex() > declarationEnd
-                        && (hasRawNewArrayValue(hasRawNewArrayValue, assignment->assignmentExpression())
-                            || hasAlignedMoveSource(assignment->assignmentExpression())))
-                        found = true;
-                    return;
-                }
-                for (auto* child : node->children)
-                    self(self, child);
-            };
-            visit(visit, scanRoot);
-            return found;
-        };
-        auto preservesBuiltinUnique = [&](CFlatParser::InitDeclaratorContext* candidate,
-                                          const std::string& name) {
-            auto* initializer = candidate != nullptr ? candidate->initializer() : nullptr;
-            auto* assignment = initializer != nullptr ? initializer->assignmentExpression() : nullptr;
-            if (hasRawNewArrayValue(hasRawNewArrayValue, assignment)
-                || hasLaterBuiltinUniqueAssignment(candidate, name))
-                return true;
-            return hasAlignedMoveSource(assignment);
-        };
 
         if (typeAndValue.TypeName.empty() && !typeAndValue.IsFunctionPointer)
         {
@@ -3749,20 +3487,18 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
             auto declarator = initDecl->declarator();
             auto direct = declarator->directDeclarator();
             std::string declaratorName = direct != nullptr ? getDirectDeclName(direct) : std::string();
-            if (!global_scope && spelledBuiltinUnique
-                && compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                && preservesBuiltinUnique(initDecl, declaratorName))
+            // unique<T> owns exactly ONE object - it has no element count to free an array with.
+            // Catch the direct `new T[n]` initializer here, before the wrapper's constructor
+            // overload resolution reports the mismatch in wrapper terms.
+            if (!global_scope && compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                && !typeAndValue.Pointer)
             {
-                typeAndValue.TypeName = MangledGenericArgument(
-                    *compiler, typeAndValue.TypeName);
-                // The interface spelling has no star: restore the fat interface VALUE, not a pointer.
-                bool ifaceSpelling = compiler->IsInterfaceType(typeAndValue.TypeName);
-                typeAndValue.Pointer = !ifaceSpelling;
-                typeAndValue.ElemPointer = false;
-                typeAndValue.PointerDepth = ifaceSpelling ? 0 : 1;
-                typeAndValue.IsInterface = ifaceSpelling;
-                typeAndValue.IsInterfacePointer = false;
-                typeAndValue.IsUnique = true;
+                auto* initAssign = initDecl->initializer() != nullptr
+                    ? initDecl->initializer()->assignmentExpression() : nullptr;
+                if (RawNewArrayValueOf(initAssign) != nullptr)
+                    LogErrorContext(initAssign, std::format(
+                        "cannot store a heap array in unique local '{}': unique<T> does not own "
+                        "arrays - use 'array<T>'", declaratorName));
             }
             auto paramTypeList = declarator->parameterTypeList();
             // A declarator with parens but no paramTypeList is a zero-parameter function:
@@ -6236,24 +5972,6 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             local.PointsToBorrowedByValueParam = srcPointsToBorrowedByValueParam;
                         }
 
-                        // A core unique wrapper can own a counted raw `new T[n]` result even though
-                        // its value representation has no raw-pointer count slot. Preserve the
-                        // existing count metadata so release and scope cleanup use delete[].
-                        if (!typeAndValue.Pointer
-                            && compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                            && srcPtrCopyIsRawNewArray)
-                        {
-                            auto& local = compiler->GetOrCreateStackVariable(name);
-                            local.AllocatedByRawNewArray = true;
-                            local.RawArrayLengthStorage = compiler->AllocaAtEntry(
-                                compiler->builder->getInt64Ty(), nullptr,
-                                name + ".raw_array_count");
-                            compiler->builder->CreateStore(
-                                srcRawArrayLength != nullptr
-                                    ? compiler->Upconvert(srcRawArrayLength, compiler->builder->getInt64Ty())
-                                    : compiler->builder->getInt64(-1),
-                                local.RawArrayLengthStorage);
-                        }
 
                         // Propagate pointer ownership: if the RHS was a move-returning pointer call,
                         // mark this local as owning so it is freed on scope exit.
@@ -6405,6 +6123,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             auto& nv = compiler->GetOrCreateStackVariable(name);
                             nv.TypeAndValue.AllocAlignValue = typeAndValue.AllocAlignValue;
                             auto* initAssignExpr = initializer ? initializer->assignmentExpression() : nullptr;
+                            // A `unique<T, N>` local carries the alignment in its TYPE: the wrapper's
+                            // destructor picks the matching deallocator off N, and the direct `new`
+                            // above already inherited N. There is no separate block-alignment field
+                            // on the wrapper VALUE to cross-check, so this raw-pointer guard does
+                            // not apply.
+                            if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
+                                && !typeAndValue.Pointer)
+                                initAssignExpr = nullptr;
                             if (initAssignExpr != nullptr
                                 && nv.AllocAlignment != typeAndValue.AllocAlignValue)
                             {

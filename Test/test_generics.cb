@@ -4482,6 +4482,28 @@ struct IShape2 { int value = default; };
 class Circle { int value = default; };
 struct Buf<T, int N> { int value = default; int cap() { return N; } };
 
+// A TRAILING value parameter may carry a default. Omitting the argument and spelling the
+// default explicitly must name the SAME instantiation - the mangled name canonicalizes by
+// dropping a trailing argument equal to its default.
+struct DefBuf<T, int N = 4> { T[N] items = default; int cap() { return N; } };
+
+int testGenericValueDefaults()
+{
+    int result = 1;
+    DefBuf<int> omitted = default;
+    DefBuf<int, 4> spelled = default;
+    DefBuf<int, 8> wider = default;
+    omitted.items[0] = 7;
+    // Assignable only because both spellings are one type.
+    spelled = omitted;
+    result &= Test("generic_value_default_omitted", omitted.cap(), 4);
+    result &= Test("generic_value_default_spelled_same_type", spelled.items[0], 7);
+    result &= Test("generic_value_default_overridden", wider.cap(), 8);
+    result &= Test("generic_value_default_typeof", typeof(omitted), "DefBuf<int>");
+    result &= Test("generic_value_default_typeof_spelled", typeof(spelled), "DefBuf<int>");
+    return result;
+}
+
 int prefixManglingArrayParam(array<int>* value)
 {
     return value == nullptr ? 0 : 1;
@@ -4519,6 +4541,7 @@ extern int main()
     int total  = 0;
     total++; passed += testGenericAlias()                ? 1 : 0;
     total++; passed += testGenericStructs();
+    total++; passed += testGenericValueDefaults();
     total++; passed += testInterface()                   ? 1 : 0;
     total++; passed += testGenericInterface()            ? 1 : 0;
     total++; passed += testReturnListFreeFunc()          ? 1 : 0;

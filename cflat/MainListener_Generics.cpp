@@ -222,8 +222,12 @@ bool MainListener::IsFollowedByDot(CFlatParser::PostfixExpressionContext* ctx, a
         return false;
     }
 
-std::string MainListener::InstantiateGenericFunction(const std::string& baseName, const std::vector<std::string>& typeArgs) {
+std::string MainListener::InstantiateGenericFunction(const std::string& baseName,
+                                                    const std::vector<std::string>& spelledArgs) {
+        std::vector<std::string> typeArgs = spelledArgs;
         std::string mangledName = MangledGenericName(baseName, typeArgs);
+        FillGenericValueDefaults(*Compiler(), baseName,
+                                 genericFunctionTypeParams[baseName].size(), typeArgs);
         if (instantiatedGenericFunctions.count(mangledName)) return mangledName;
         instantiatedGenericFunctions.insert(mangledName);
 
@@ -581,6 +585,19 @@ void MainListener::ProcessPendingInstantiations() {
 
             const auto& typeParams = genericStructTypeParams[pending.templateName];
             const auto& valueParams = genericStructValueParams[pending.templateName];
+            // Omitted TRAILING value arguments come from the declared defaults. The mangled name
+            // was canonicalized the same way (a spelled default is stripped), so the filled list
+            // and the name always describe the same instantiation.
+            if (!FillGenericValueDefaults(*Compiler(), pending.templateName,
+                                          typeParams.size(), pending.typeArgs)
+                && TemplateHasGenericDefaults(*Compiler(), pending.templateName))
+            {
+                Compiler()->LogError(std::format(
+                    "generic '{}' expects {} type argument(s), but {} were provided and the "
+                    "remaining parameter(s) have no default",
+                    pending.templateName, typeParams.size(), pending.typeArgs.size()));
+                continue;
+            }
 
             // Materialize the template context (lazy-parses cached source on first use),
             // then verify where-clause constraints before instantiating.

@@ -49,7 +49,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     "generic struct '{}' conflicts with a generic interface of the same name",
                     SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
             std::vector<std::string> valueParams;
-            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
+            std::vector<std::string> valueDefaults;
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
+                                                         &valueDefaults);
             genericStructTemplates[structName] = ctx;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
@@ -62,6 +64,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericStructValueParams[structName] = valueParams;
+            Compiler()->gts.genericStructValueDefaults[structName] = valueDefaults;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
             ValidateGenericAggregateAliasNames(ctx, structName);
             // Record which param (if any) is variadic - always the last one
@@ -539,9 +542,12 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     // separates the owner, not a namespace, so only this tells the two apart.
                     Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
                     std::vector<std::string> valueParams;
+                    std::vector<std::string> valueDefaults;
                     genericFunctionTypeParams[qualifiedName] =
-                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
+                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
+                                                   &valueDefaults);
                     genericFunctionValueParams[qualifiedName] = valueParams;
+                    Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
@@ -2692,7 +2698,9 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     "generic class '{}' conflicts with a generic interface of the same name",
                     SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
             std::vector<std::string> valueParams;
-            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
+            std::vector<std::string> valueDefaults;
+            auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams,
+                                                         &valueDefaults);
             genericClassTemplates[structName] = ctx;
             // Origin marker: a template DECLARED in a core library file. Read by
             // IsBorrowingContainerElementSink so a user type of the same name is not mistaken
@@ -2705,6 +2713,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             Compiler()->RevokeGenericInterfaceInstances(structName);
             genericStructTypeParams[structName] = typeParams;
             genericStructValueParams[structName] = valueParams;
+            Compiler()->gts.genericStructValueDefaults[structName] = valueDefaults;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
             ValidateGenericAggregateAliasNames(ctx, structName);
             return;
@@ -3218,9 +3227,12 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     // separates the owner, not a namespace, so only this tells the two apart.
                     Compiler()->gts.genericTemplateNamespace[qualifiedName] = Compiler()->GetCurrentNamespace();
                     std::vector<std::string> valueParams;
+                    std::vector<std::string> valueDefaults;
                     genericFunctionTypeParams[qualifiedName] =
-                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams);
+                        ParseGenericTypeParameters(func->genericTypeParameters(), &valueParams,
+                                                   &valueDefaults);
                     genericFunctionValueParams[qualifiedName] = valueParams;
+                    Compiler()->gts.genericFunctionValueDefaults[qualifiedName] = valueDefaults;
                     genericFunctionConstraints[qualifiedName] = ParseWhereClause(func->whereClause());
                 }
                 else if (funcName == "operator new" || funcName == "operator delete" || isFunctionStatic(func))
@@ -3327,9 +3339,11 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
     }
 
 std::vector<std::string> MainListener::ParseGenericTypeParameters(
-    CFlatParser::GenericTypeParametersContext* genericParams, std::vector<std::string>* valueTypes) {
+    CFlatParser::GenericTypeParametersContext* genericParams, std::vector<std::string>* valueTypes,
+    std::vector<std::string>* valueDefaults) {
         std::vector<std::string> typeParams;
         if (valueTypes != nullptr) valueTypes->clear();
+        if (valueDefaults != nullptr) valueDefaults->clear();
         if (!genericParams)
             return typeParams;
 
@@ -3354,6 +3368,21 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(
                 }
                 typeParams.push_back(entry->valueParameterDeclaration()->Identifier()->getText());
                 if (valueTypes != nullptr) valueTypes->push_back(ValueParameterTypeSpelling(entry));
+                if (valueDefaults != nullptr)
+                {
+                    std::string defaultSpelling;
+                    if (auto* defExpr = entry->valueParameterDeclaration()->shiftExpression())
+                    {
+                        auto folded = FoldCompileTimeInt(Compiler(entry), defExpr);
+                        if (!folded)
+                            LogErrorContext(entry, std::format(
+                                "default for value parameter '{}' must be a compile-time constant "
+                                "(got '{}')", typeParams.back(), defExpr->getText()));
+                        else
+                            defaultSpelling = std::to_string(*folded);
+                    }
+                    valueDefaults->push_back(defaultSpelling);
+                }
                 continue;
             }
             auto* typeSpec = entry->typeSpecifier();
@@ -3370,6 +3399,7 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(
             }
             typeParams.push_back(typeSpec->genericIdentifier()->Identifier()->getText());
             if (valueTypes != nullptr) valueTypes->push_back("");
+            if (valueDefaults != nullptr) valueDefaults->push_back("");
             if (entry->Ellipsis() != nullptr)
             {
                 seenPack = true;
@@ -3384,6 +3414,26 @@ std::vector<std::string> MainListener::ParseGenericTypeParameters(
                                 "combined with a parameter pack (T...) in the same generic");
                             break;
                         }
+            }
+        }
+
+        // A default is only meaningful on a TRAILING parameter: a use site fills omitted
+        // arguments from the right, so a defaulted parameter followed by a non-defaulted one
+        // could never be omitted.
+        if (valueDefaults != nullptr)
+        {
+            bool seenDefault = false;
+            for (size_t i = 0; i < valueDefaults->size(); i++)
+            {
+                if (!(*valueDefaults)[i].empty()) { seenDefault = true; continue; }
+                if (seenDefault)
+                {
+                    LogErrorContext(genericParams, std::format(
+                        "generic parameter '{}' has no default but follows a parameter that does; "
+                        "only trailing parameters may carry a default", typeParams[i]));
+                    valueDefaults->assign(valueDefaults->size(), std::string{});
+                    break;
+                }
             }
         }
 

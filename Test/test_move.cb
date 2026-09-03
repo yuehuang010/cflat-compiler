@@ -11836,9 +11836,11 @@ int desugaredUniqueShadowedAssignment()
     return p->id;
 }
 
+// The allocation alignment is part of the TYPE (`unique<Resource, 64>`), so the destination of
+// the move must carry the same clause - a plain `unique Resource*` is a different type.
 int desugaredUniqueAlignedOrder()
 {
-    unique Resource* q = nullptr;
+    alignas(0, 64) unique Resource* q = nullptr;
     alignas(0, 64) unique Resource* a = new Resource();
     a->id = 10;
     q = move a;

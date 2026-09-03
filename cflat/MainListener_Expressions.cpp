@@ -1782,6 +1782,18 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             if (operatorText == "=" && targetAllocAlign > LLVMBackend::kDefaultNewAlign
                 && AsDirectNew(assignCtx) != nullptr)
                 compiler->pendingInitAllocAlign = targetAllocAlign;
+            // unique<T> frees a SINGLE object - it has no element count. A `new T[n]` reaching a
+            // unique local is rejected here for the same reason the field, parameter and return
+            // legs already reject it.
+            if (operatorText == "=" && !namedVar.TypeAndValue.Pointer
+                && namedVar.FieldName.empty()
+                && (llvm::isa<llvm::AllocaInst>(destination)
+                    || llvm::isa<llvm::GlobalVariable>(destination))
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && RawNewArrayValueOf(assignCtx) != nullptr)
+                LogErrorContext(ctx, std::format(
+                    "cannot store a heap array in unique local '{}': unique<T> does not own "
+                    "arrays - use 'array<T>'", namedVar.CallerName));
             if (operatorText == "=")
                 ArmArrayNewDesugar(assignCtx, namedVar.TypeAndValue);
 
@@ -11819,7 +11831,11 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
             ApplyCallResultBorrowProvenance(compiler, namedVar);
             typeName  = namedVar.TypeAndValue.TypeName;
             elemIsPtr = namedVar.TypeAndValue.ElemPointer;
-            operandAllocAlign = namedVar.AllocAlignment;
+            // A DECLARED 'alignas(0, N)' clause counts as well as a tracked block alignment: the
+            // scope-exit path (EmitOwningPtrCleanup) already frees on the max of the two, so an
+            // explicit 'delete' of the same local must reach the same deallocator.
+            operandAllocAlign = std::max(namedVar.AllocAlignment,
+                                         namedVar.TypeAndValue.AllocAlignValue);
             // An interface value is a {vtable, data} fat struct, not a raw pointer; flag it so
             // the free path below extracts the data pointer and dispatches the dtor virtually.
             isInterfaceOperand = namedVar.TypeAndValue.IsFatInterfaceValue() && !sawCast;

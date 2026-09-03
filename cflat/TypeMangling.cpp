@@ -26,6 +26,21 @@ struct TypeManglingAccess
         compiler.gts.mangledArityHints[std::string(mangled)] = arity;
     }
 
+    static const std::vector<std::string>* ValueDefaults(const LLVMBackend& compiler,
+                                                        std::string_view base)
+    {
+        std::string key(base);
+        const auto& g = compiler.gts;
+        for (const auto* map : { &g.genericStructValueDefaults,
+                                 &g.genericInterfaceValueDefaults,
+                                 &g.genericFunctionValueDefaults })
+        {
+            auto it = map->find(key);
+            if (it != map->end()) return &it->second;
+        }
+        return nullptr;
+    }
+
     static std::optional<size_t> KnownMangledArity(const LLVMBackend& compiler,
                                                    std::string_view text, size_t position)
     {
@@ -573,9 +588,32 @@ static std::string MangleGenericInstanceUnchecked(const LLVMBackend& compiler,
     return result;
 }
 
-std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view base,
-                                  const std::vector<std::string>& args)
+// Canonical form of a generic instance name: a TRAILING value argument that is spelled
+// exactly as its declared default is dropped, so `unique<T>` and `unique<T, 0>` are one
+// instantiation with one mangled name. Only value parameters carry defaults, and only
+// trailing ones, so this never touches a type argument.
+const std::vector<std::string>* GenericValueDefaultsFor(const LLVMBackend& compiler,
+                                                        std::string_view base)
 {
+    return TypeManglingAccess::ValueDefaults(compiler, base);
+}
+
+static void StripDefaultedTrailingArgs(const LLVMBackend& compiler, std::string_view base,
+                                       std::vector<std::string>& args)
+{
+    const auto* defaults = GenericValueDefaultsFor(compiler, base);
+    if (defaults == nullptr) return;
+    while (!args.empty() && args.size() <= defaults->size()
+           && !(*defaults)[args.size() - 1].empty()
+           && args.back() == (*defaults)[args.size() - 1])
+        args.pop_back();
+}
+
+std::string MangleGenericInstance(const LLVMBackend& compiler, std::string_view base,
+                                  const std::vector<std::string>& spelledArgs)
+{
+    std::vector<std::string> args = spelledArgs;
+    StripDefaultedTrailingArgs(compiler, base, args);
     std::string result = MangleGenericInstanceUnchecked(compiler, base, args);
     TypeManglingAccess::RememberArity(compiler, result, args.size());
 #ifndef NDEBUG

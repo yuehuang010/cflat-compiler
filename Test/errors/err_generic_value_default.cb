@@ -1,0 +1,25 @@
+// Defaults on generic VALUE parameters: only a trailing parameter may carry one, the default
+// must fold at compile time, and a parameter with no default still has to be supplied.
+
+// A default on a non-trailing parameter could never be used: a use site fills omitted
+// arguments from the right.
+expect_error("generic parameter 'M' has no default but follows a parameter that does; only trailing parameters may carry a default") {
+    struct BadOrder<T, int N = 4, int M> { int n() { return N + M; } };
+}
+
+// The default is a constant expression, folded at declaration time.
+expect_error("default for value parameter 'N' must be a compile-time constant") {
+    int notConst = 3;
+    struct BadFold<T, int N = notConst> { int n() { return N; } };
+}
+
+// A parameter without a default is still required.
+expect_error("generic 'Pair' expects 3 type argument(s), but 1 were provided and the remaining parameter(s) have no default") {
+    struct Pair<T, U, int N = 4> { T a = default; U b = default; int n() { return N; } };
+    int usePair() { Pair<int> p = default; return p.n(); }
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -935,10 +935,11 @@ extern int main()
         UniqueThing star = *ut5;
     }
 
-    // Index dereference ('[]') of an explicitly-moved thin `unique` pointer local.
+    // Index dereference ('[]') of an explicitly-moved owning pointer local. `unique<T>` owns a
+    // single object and has no `operator[]`, so the counted heap-array form lives on a raw `T*`.
     expect_error("dereference of moved variable 'ut7'") {
-        unique int* ut7 = new int[4];
-        unique int* ut8 = move ut7;
+        int* ut7 = new int[4];
+        int* ut8 = move ut7;
         int idx = ut7[0];
     }
 

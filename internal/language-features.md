@@ -44,7 +44,7 @@ For the full user-facing language reference see `doc/LANGUAGE.md`.
 
 ## Ownership / Lifetime (`move` keyword)
 
-CFlat uses **context-based ownership**: local variables own the pointers they allocate; function parameters borrow by default; struct fields own nothing unless marked `unique`. `unique` is also legal on locals, parameters, and generic type arguments (`list<unique T*>`) - see `doc/LANGUAGE.md`'s "`unique` Ownership" section for the full rules.
+CFlat uses **context-based ownership**: local variables own the pointers they allocate; function parameters borrow by default; struct fields own nothing unless marked `unique`. `unique` is also legal on locals, parameters, and generic type arguments (`list<unique T*>`) - see `doc/LANGUAGE.md`'s "`unique` Ownership" section for the full rules. On a local, parameter or return type `unique T*` is SUGAR for the core library type `unique<T, int ALIGN = 0>` (`cflat/core/unique.cb`); `alignas(0, N) unique T*` names `unique<T, N>` and frees through the aligned deallocator, and `unique<T, 64>` is a distinct type from `unique<T>`. There is no builtin pointer representation for a unique local any more, so a heap ARRAY cannot live in one - `unique T* p = new T[n]` is an error; use a raw `T*` (which carries the count), `array<T>`, or a container. A `unique` FIELD still uses the in-place pointer representation.
 
 The `move` keyword on a **parameter definition** transfers ownership into the callee:
 

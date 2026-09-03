@@ -418,9 +418,12 @@ typeParameterEntry
 // A compile-time VALUE generic parameter: `struct Buf<T, int N>`. The primitive type token
 // decides the branch on the FIRST token, so it can never collide with the `unique`/`alias`
 // leading Identifier of a type argument. No `const` marker - const is implied by the position.
+// A trailing value parameter may carry a DEFAULT: `struct unique<T, int ALIGN = 0>`. The
+// default is a constant expression at shift level, the same level a use-site value argument
+// uses, so a '>' can never be mistaken for an operator inside it.
 valueParameterDeclaration
-    : valueParameterType Identifier
-    | nonIntegralValueParameterType Identifier
+    : valueParameterType Identifier ('=' shiftExpression)?
+    | nonIntegralValueParameterType Identifier ('=' shiftExpression)?
     ;
 
 valueParameterType

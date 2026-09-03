@@ -13,6 +13,7 @@
       "T",
       "AliasParameterNameReuse"
     ],
+    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -464,6 +465,7 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
+    "endoffile": [],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"
@@ -498,6 +500,7 @@
       "')'",
       "'{'"
     ],
+    "missingatendofstatement": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
     ],
@@ -532,6 +535,7 @@
       "bool",
       "Foo"
     ],
+    "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
     ]

@@ -815,6 +815,70 @@ static int64_t ParseValueArg(const std::string& text)
     return start == 1 ? -out : out;
 }
 
+// The value-producing side of an initializer/assignment, when it is a heap ARRAY allocation
+// (`new T[n]`). Recurses through parens, the assignment/conditional chain and the `?:`/`??`
+// arms so a joined allocation is found too; never descends into a call argument or a
+// condition, which are not the value. Pure DIAGNOSTIC: nothing about the representation is
+// decided here.
+static CFlatParser::NewExpressionContext* RawNewArrayValueOf(antlr4::tree::ParseTree* node)
+{
+    if (node == nullptr) return nullptr;
+    if (auto* newExpr = dynamic_cast<CFlatParser::NewExpressionContext*>(node))
+        return newExpr->assignmentExpression() != nullptr ? newExpr : nullptr;
+    if (auto* conditional = dynamic_cast<CFlatParser::ConditionalExpressionContext*>(node))
+    {
+        if (conditional->Question() != nullptr)
+        {
+            if (auto* v = RawNewArrayValueOf(conditional->expression())) return v;
+            return RawNewArrayValueOf(conditional->conditionalExpression());
+        }
+        if (conditional->QuestionQuestion() != nullptr)
+        {
+            if (auto* v = RawNewArrayValueOf(conditional->logicalOrExpression())) return v;
+            return RawNewArrayValueOf(conditional->conditionalExpression());
+        }
+        return RawNewArrayValueOf(conditional->logicalOrExpression());
+    }
+    if (auto* assignment = dynamic_cast<CFlatParser::AssignmentExpressionContext*>(node))
+        return RawNewArrayValueOf(assignment->conditionalExpression());
+    if (auto* ctx = dynamic_cast<antlr4::ParserRuleContext*>(node))
+    {
+        // A single-child pass-through link in the expression chain (or a parenthesized
+        // expression) carries the same value; anything wider is not the value side.
+        if (ctx->children.size() == 1)
+            return RawNewArrayValueOf(ctx->children[0]);
+        if (auto* primary = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(ctx);
+            primary != nullptr && primary->expression() != nullptr)
+            return RawNewArrayValueOf(primary->expression());
+    }
+    return nullptr;
+}
+
+// Fill omitted TRAILING generic arguments from the template's declared defaults. Returns true
+// when every parameter now has an argument. Shared by the struct/class and function
+// instantiation paths so both agree with the canonical mangled name.
+static bool FillGenericValueDefaults(const LLVMBackend& compiler, const std::string& templateName,
+                                     size_t paramCount, std::vector<std::string>& typeArgs)
+{
+    const auto* defaults = GenericValueDefaultsFor(compiler, templateName);
+    if (defaults == nullptr) return typeArgs.size() >= paramCount;
+    while (typeArgs.size() < paramCount && typeArgs.size() < defaults->size()
+           && !(*defaults)[typeArgs.size()].empty())
+        typeArgs.push_back((*defaults)[typeArgs.size()]);
+    return typeArgs.size() >= paramCount;
+}
+
+// True when the template declares at least one defaulted parameter, i.e. it opted into the
+// arity check that a template without defaults has never had.
+static bool TemplateHasGenericDefaults(const LLVMBackend& compiler, const std::string& templateName)
+{
+    const auto* defaults = GenericValueDefaultsFor(compiler, templateName);
+    if (defaults == nullptr) return false;
+    for (const auto& d : *defaults)
+        if (!d.empty()) return true;
+    return false;
+}
+
 // Strip a leading "alias " qualifier off a resolved type-arg string, returning whether it was
 // present. The bare base (e.g. "Circle*") remains so it resolves to the same LLVM type as the
 // unqualified spelling; the alias prefix only drives distinct monomorphization + borrow tagging.
@@ -5782,7 +5846,8 @@ public:
     void ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx, const std::string& nameOverride = {}, const std::string& namespaceName = {});
 
     std::vector<std::string> ParseGenericTypeParameters(CFlatParser::GenericTypeParametersContext* genericParams,
-                                                        std::vector<std::string>* valueTypes = nullptr);
+                                                        std::vector<std::string>* valueTypes = nullptr,
+                                                        std::vector<std::string>* valueDefaults = nullptr);
 
     // Returns { typeParamName -> [requiredInterface, ...] } from a whereClause context.
     std::unordered_map<std::string, std::vector<std::string>>

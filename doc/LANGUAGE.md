@@ -793,6 +793,27 @@ a `namespace` does not fold in a value argument - only file-scope ones do.
 Specialization uses `if const` in the generic body, including at member scope; CFlat does not use
 C++-style partial specialization.
 
+A **trailing** value parameter may carry a default, written after `=` as a constant expression:
+
+```c
+struct DefBuf<T, int N = 4>
+{
+    T[N] items = default;
+    int cap() { return N; }
+};
+
+DefBuf<int>    omitted = default;   // N = 4
+DefBuf<int, 4> spelled = default;   // the SAME type as DefBuf<int>
+DefBuf<int, 8> wider   = default;
+```
+
+Omitted trailing arguments are filled from the declared defaults, and the instantiation identity
+canonicalizes the other way: a trailing argument spelled exactly as its default is dropped from
+the mangled name, so `DefBuf<int>` and `DefBuf<int, 4>` are one instantiation and both print as
+`DefBuf<int>`. Only VALUE parameters may carry a default, only trailing ones may, and the default
+must fold at compile time - a default on a parameter followed by an undefaulted one is rejected at
+the declaration, and a use site that omits an undefaulted parameter is rejected at the use.
+
 Two limits are worth stating. A value parameter cannot be combined with a parameter pack
 (`struct Bag<int N, T...>` is rejected at the declaration), and a value predicate in a `where`
 clause works on generic structs, classes and functions but not on interfaces, which have no
@@ -1534,9 +1555,22 @@ value type (`unique int`, `unique Circle` where `Circle` is not a pointer) - err
 in return position, as a tuple element type, or as an explicit generic-function type
 argument (`identity<unique N*>(n)`); transfer out of a return is `move`.
 
-At runtime `unique` is free - it is still just a pointer or a fat interface pointer, no
-wrapper and no extra field. It only changes what the compiler statically requires and
-enforces at the declaration site that carries it.
+At runtime `unique` costs nothing beyond the pointer it holds: on a LOCAL, PARAMETER or
+RETURN type `unique T*` is sugar for the core library type `unique<T>`, a one-field wrapper
+whose `sizeof` is exactly a pointer's. A `unique` FIELD keeps the original in-place pointer
+representation.
+
+**A `unique` local, parameter or return owns exactly ONE object.** It carries no element
+count, so a heap ARRAY may not be stored in one: `unique T* p = new T[n];` (and a later
+`p = new T[n];`) is rejected with *cannot store a heap array in unique local 'p':
+unique<T> does not own arrays - use 'array<T>'*. Hold a counted heap array in a raw `T*` (which
+carries the count and can be handed to a `move T*` sink), in `array<T>`, or in a container.
+
+**Allocation alignment travels in the type.** `alignas(0, N) unique T*` names `unique<T, N>`:
+the wrapper frees the block through the aligned deallocator that matches the aligned `new`,
+and a `unique<T, 64>` value is a different type from a `unique<T>` - it will not bind to a
+plain `unique T*` parameter. The declared clause is still inherited by a direct `new` on the
+right-hand side, so the allocation does not have to repeat it.
 
 #### Field ownership (original form)
 

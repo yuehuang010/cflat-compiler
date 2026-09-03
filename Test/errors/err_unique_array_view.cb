@@ -23,8 +23,38 @@ expect_error("'unique<int[]>': array views are not supported - a view does not o
 expect_error("cannot return owning heap array 'r' as 'unique<X>': unique<T> does not own arrays - return 'move X*' instead") {
     struct X { int v = 0; };
     move unique<X> makeArray(int n) {
-        unique X* r = new X[n];
+        X* r = new X[n];
         return move r;
+    }
+}
+
+// A LOCAL is the same rule as the field, parameter and return legs: `unique<T>` frees one
+// object and carries no element count, so a `new T[n]` cannot be stored in one. Both the
+// declaration initializer and a later assignment are rejected, joined arms included.
+expect_error("cannot store a heap array in unique local 'p': unique<T> does not own arrays - use 'array<T>'") {
+    struct L1 { int v = 0; };
+    int declInit(int n) { unique L1* p = new L1[n]; return p->v; }
+}
+
+expect_error("cannot store a heap array in unique local 'p': unique<T> does not own arrays - use 'array<T>'") {
+    struct L2 { int v = 0; };
+    int laterAssign(int n) { unique L2* p = nullptr; p = new L2[n]; return 0; }
+}
+
+expect_error("cannot store a heap array in unique local 'p': unique<T> does not own arrays - use 'array<T>'") {
+    struct L3 { int v = 0; };
+    int joinedArms(int n) {
+        unique L3* p = n > 1 ? new L3[n] : new L3[2];
+        return p->v;
+    }
+}
+
+// The aligned spelling reaches the same door: an over-aligned heap ARRAY is still an array.
+expect_error("cannot store a heap array in unique local 'p': unique<T> does not own arrays - use 'array<T>'") {
+    struct L4 { int v = 0; };
+    int alignedArray(int n) {
+        alignas(0, 64) unique L4* p = new L4[n] alignas(0, 64);
+        return p->v;
     }
 }
 
@@ -42,14 +72,14 @@ expect_error("cannot pass owning heap array 'a' to parameter 'p' of 'take': uniq
     struct R { int v = 0; };
     int take(unique R* p) { return p->v; }
     int useArray() {
-        unique R* a = new R[3];
+        R* a = new R[3];
         return take(move a);
     }
 }
 
 expect_error("cannot pass owning heap array 'a' to parameter 'p' of 'take': unique<T> does not own arrays") {
     int useArrayImplicit() {
-        unique R* a = new R[3];
+        R* a = new R[3];
         return take(a);
     }
 }

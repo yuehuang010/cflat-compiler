@@ -2688,9 +2688,12 @@ void resetRawCountState()
     g_raw_count_sum = 0;
 }
 
+// `unique<T>` owns a single object, so the counted heap-array shapes below live on a raw `T*`
+// local and are released through a `move T*` sink - the count still travels with the pointer,
+// which is exactly what these tests pin.
 void runRawCountIfElse(int choose)
 {
-    unique RawCountElem* values = nullptr;
+    RawCountElem* values = nullptr;
     int a = 2;
     int b = 4;
     if (choose != 0)
@@ -2704,18 +2707,20 @@ void runRawCountIfElse(int choose)
         values[0].id = 1; values[1].id = 2;
         values[2].id = 3; values[3].id = 4;
     }
+    rawCountSink(move values);
 }
 
 void runRawCountConditionalMove(int choose)
 {
-    unique RawCountElem* source = nullptr;
+    RawCountElem* source = nullptr;
     int n = 3;
     if (choose != 0)
     {
         source = new RawCountElem[n];
         source[0].id = 4; source[1].id = 5; source[2].id = 6;
     }
-    unique RawCountElem* destination = move source;
+    RawCountElem* destination = move source;
+    rawCountSink(move destination);
 }
 
 int runRawCountStaticView(int choose)
@@ -2736,11 +2741,12 @@ int runRawCountJoinDecl(int choose)
     {
         int a = 2;
         int b = 4;
-        unique RawCountElem* values = choose != 0
+        RawCountElem* values = choose != 0
             ? new RawCountElem[a] : new RawCountElem[b];
         int i = 0;
         int n = choose != 0 ? a : b;
         while (i < n) { values[i].id = i + 1; i++; }
+        rawCountSink(move values);
     }
     return g_raw_count_dtors * 100 + g_raw_count_sum;
 }
@@ -2749,9 +2755,10 @@ int runRawCountJoinAssign(int choose)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = nullptr;
+        RawCountElem* values = nullptr;
         values = choose != 0
             ? new RawCountElem[2] : new RawCountElem[4];
+        rawCountSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2760,9 +2767,10 @@ int runRawCountJoinNested(int mode)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = mode == 0
+        RawCountElem* values = mode == 0
             ? new RawCountElem[2]
             : (mode == 1 ? new RawCountElem[3] : new RawCountElem[4]);
+        rawCountSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2771,9 +2779,10 @@ int runRawCountJoinNullScalar(int mode)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = mode == 0
+        RawCountElem* values = mode == 0
             ? new RawCountElem[2]
             : (mode == 1 ? nullptr : new RawCountElem());
+        rawCountSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2782,8 +2791,9 @@ int runRawCountJoinCoalesce(int choose)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values =
+        RawCountElem* values =
             ((choose != 0 ? new RawCountElem[2] : nullptr) ?? new RawCountElem[4]);
+        rawCountSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2792,8 +2802,9 @@ int runRawCountJoinZero(int choose)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = choose != 0
+        RawCountElem* values = choose != 0
             ? new RawCountElem[0] : new RawCountElem[2];
+        rawCountSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2803,8 +2814,9 @@ int runRawCountJoinResources(int choose)
     resetRawCountState();
     g_raw_count_resource_dtors = 0;
     {
-        unique RawCountOwnerElem* values = choose != 0
+        RawCountOwnerElem* values = choose != 0
             ? new RawCountOwnerElem[2] : new RawCountOwnerElem[4];
+        rawCountOwnerSink(move values);
     }
     return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
 }
@@ -2813,10 +2825,11 @@ int runRawCountJoinAligned(int choose)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = nullptr;
+        alignas(0, 64) RawCountElem* values;
         values = choose != 0
             ? new RawCountElem[2] alignas(0, 64)
             : new RawCountElem[4] alignas(0, 64);
+        rawCountAlignedSink(move values);
     }
     return g_raw_count_dtors;
 }
@@ -2852,7 +2865,7 @@ class RawCountSinkImpl : RawCountSinkInterface
 int runRawCountMoveDirect(int n)
 {
     resetRawCountState();
-    { unique RawCountElem* values = new RawCountElem[n]; rawCountSink(move values); }
+    { RawCountElem* values = new RawCountElem[n]; rawCountSink(move values); }
     return g_raw_count_dtors;
 }
 
@@ -2860,7 +2873,7 @@ int runRawCountMoveScalarNull(int scalar)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = scalar != 0 ? new RawCountElem() : nullptr;
+        RawCountElem* values = scalar != 0 ? new RawCountElem() : nullptr;
         rawCountSink(move values);
     }
     return g_raw_count_dtors;
@@ -2871,7 +2884,7 @@ int runRawCountMoveIndirect(int n)
     resetRawCountState();
     {
         function<void(move RawCountElem*)> sink = rawCountSink;
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         sink(move values);
     }
     return g_raw_count_dtors;
@@ -2881,7 +2894,7 @@ int runRawCountMoveGeneric(int n)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         rawCountGenericSink<RawCountElem>(move values);
     }
     return g_raw_count_dtors;
@@ -2892,7 +2905,7 @@ int runRawCountMoveInterface(int n)
     resetRawCountState();
     {
         RawCountSinkInterface sink = new RawCountSinkImpl();
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         sink.sink(move values);
         delete sink;
     }
@@ -2903,10 +2916,11 @@ int runRawCountMoveForwardReturn(int n, int returnIt)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         if (returnIt != 0)
         {
-            unique RawCountElem* result = rawCountReturn(move values);
+            RawCountElem* result = rawCountReturn(move values);
+            rawCountSink(move result);
         }
         else
         {
@@ -2920,17 +2934,19 @@ int runRawCountMoveReturnDispatch(int n, int interfaceCall)
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         if (interfaceCall != 0)
         {
             RawCountSinkInterface sink = new RawCountSinkImpl();
-            unique RawCountElem* result = sink.pass(move values);
+            RawCountElem* result = sink.pass(move values);
             delete sink;
+            rawCountSink(move result);
         }
         else
         {
             function<move RawCountElem*(move RawCountElem*)> pass = rawCountReturn;
-            unique RawCountElem* result = pass(move values);
+            RawCountElem* result = pass(move values);
+            rawCountSink(move result);
         }
     }
     return g_raw_count_dtors;
@@ -2941,7 +2957,7 @@ int runRawCountMoveResources(int n)
     resetRawCountState();
     g_raw_count_resource_dtors = 0;
     {
-        unique RawCountOwnerElem* values = new RawCountOwnerElem[n];
+        RawCountOwnerElem* values = new RawCountOwnerElem[n];
         rawCountOwnerSink(move values);
     }
     return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
@@ -2951,7 +2967,7 @@ int runRawCountMoveAligned(int n)
 {
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* values =
+        alignas(0, 64) RawCountElem* values =
             new RawCountElem[n] alignas(0, 64);
         rawCountAlignedSink(move values);
     }
@@ -2962,7 +2978,8 @@ int runRawCountMoveReassign()
 {
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[2];
+        RawCountElem* values = new RawCountElem[2];
+        rawCountSink(move values);
         values = new RawCountElem[4];
         rawCountSink(move values);
     }
@@ -2974,17 +2991,20 @@ int runLocalAlignAcceptSet()
 {
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* wide;
-        unique alignas(0, 64) RawCountElem* source = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* wide;
+        alignas(0, 64) RawCountElem* source = new RawCountElem[2] alignas(0, 64);
         wide = move source;
+        rawCountAlignedSink(move wide);
     }
     {
         // A plain `new` on the reassignment door inherits the local's declared clause.
-        unique alignas(0, 64) RawCountElem* values;
+        alignas(0, 64) RawCountElem* values;
         values = new RawCountElem[3];
+        rawCountAlignedSink(move values);
     }
     {
-        unique alignas(0, 64) RawCountElem* values = new RawCountElem[1] alignas(0, 64);
+        alignas(0, 64) RawCountElem* values = new RawCountElem[1] alignas(0, 64);
+        rawCountAlignedSink(move values);
         values = nullptr;
     }
     return g_raw_count_dtors;
@@ -2996,9 +3016,10 @@ int runLocalAlignPlainDestAccept()
 {
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
-        unique RawCountElem* plain = nullptr;
+        alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* plain;
         plain = move owner;
+        rawCountAlignedSink(move plain);
     }
     return g_raw_count_dtors;
 }
@@ -3018,8 +3039,9 @@ int runLocalAlignParamAccept()
 {
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
         runLocalAlignParamSink(owner);
+        rawCountAlignedSink(move owner);
     }
     return g_raw_count_dtors;
 }
@@ -3041,10 +3063,12 @@ int runLocalAlignTernaryAccept(int choose)
 {
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* a = new RawCountElem[2] alignas(0, 64);
-        unique alignas(0, 64) RawCountElem* b = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* a = new RawCountElem[2] alignas(0, 64);
+        alignas(0, 64) RawCountElem* b = new RawCountElem[2] alignas(0, 64);
         alignas(0, 64) RawCountElem* p;
         p = choose != 0 ? a : b;
+        rawCountAlignedSink(move a);
+        rawCountAlignedSink(move b);
     }
     return g_raw_count_dtors;
 }
@@ -3056,29 +3080,32 @@ int testRawArrayRuntimeCount()
     resetRawCountState();
     {
         int n = 3;
-        unique RawCountElem* values = new RawCountElem[n];
+        RawCountElem* values = new RawCountElem[n];
         values[0].id = 1; values[1].id = 2; values[2].id = 3;
+        rawCountSink(move values);
     }
     passed += Test("raw count declaration init order", g_raw_count_order, 321);
 
     resetRawCountState();
     {
-        unique RawCountElem* values = nullptr;
+        RawCountElem* values = nullptr;
         int n = 3;
         values = new RawCountElem[n];
         values[0].id = 1; values[1].id = 2; values[2].id = 3;
+        rawCountSink(move values);
     }
     passed += Test("raw count later assignment order", g_raw_count_order, 321);
 
     resetRawCountState();
     {
-        unique RawCountElem* values = nullptr;
+        RawCountElem* values = nullptr;
         int n = 3;
         if (n > 0)
         {
             values = new RawCountElem[n];
             values[0].id = 1; values[1].id = 2; values[2].id = 3;
         }
+        rawCountSink(move values);
     }
     passed += Test("raw count if-only cleanup", g_raw_count_order, 321);
 
@@ -3091,17 +3118,19 @@ int testRawArrayRuntimeCount()
 
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[1];
+        RawCountElem* values = new RawCountElem[1];
         values[0].id = 1;
         int i = 0;
         while (i < 2)
         {
             int n = i + 2;
+            rawCountSink(move values);
             values = new RawCountElem[n];
             int j = 0;
             while (j < n) { values[j].id = 10 * n + j; j++; }
             i++;
         }
+        rawCountSink(move values);
     }
     passed += Test("raw count loop reassignment", g_raw_count_dtors * 1000 + g_raw_count_sum, 6135);
 
@@ -3115,13 +3144,16 @@ int testRawArrayRuntimeCount()
     resetRawCountState();
     int nullMarker = 0;
     {
-        unique RawCountElem* values = new RawCountElem[2];
+        RawCountElem* values = new RawCountElem[2];
         values[0].id = 1; values[1].id = 2;
-        values = nullptr;
-        nullMarker = values == nullptr ? g_raw_count_order : -1;
+        // Releasing the array through the sink runs the counted destruction in order. The
+        // moved-from local being null is pinned separately by "raw count direct move source
+        // null" - a variable consumed by a `move` PARAMETER may not be read again.
+        rawCountSink(move values);
+        nullMarker = g_raw_count_order;
     }
-    passed += Test("raw count null assignment releases old", nullMarker, 21);
-    passed += Test("raw count null assignment clears state", g_raw_count_order, 21);
+    passed += Test("raw count release order", nullMarker, 21);
+    passed += Test("raw count release clears state", g_raw_count_order, 21);
 
     resetRawCountState();
     RawCountElem* nullValues = nullptr;
@@ -3131,38 +3163,43 @@ int testRawArrayRuntimeCount()
 
     resetRawCountState();
     {
-        unique alignas(0, 64) RawCountElem* values;
+        alignas(0, 64) RawCountElem* values;
         int n = 2;
         if (n > 0)
             values = new RawCountElem[n] alignas(0, 64);
+        rawCountAlignedSink(move values);
     }
     passed += Test("raw count aligned conditional cleanup", g_raw_count_dtors, 2);
 
     resetRawCountState();
     int moveSourceNull = 0;
     {
-        unique RawCountElem* source = new RawCountElem[3];
+        RawCountElem* source = new RawCountElem[3];
         source[0].id = 1; source[1].id = 2; source[2].id = 3;
-        unique RawCountElem* destination = move source;
+        RawCountElem* destination = move source;
         moveSourceNull = source == nullptr ? 1 : 0;
+        rawCountSink(move destination);
     }
     passed += Test("raw count direct move source null", moveSourceNull, 1);
     passed += Test("raw count direct move destination order", g_raw_count_order, 321);
 
     resetRawCountState();
     {
-        unique RawCountElem* values = new RawCountElem[2];
+        RawCountElem* values = new RawCountElem[2];
         values[0].id = 1; values[1].id = 2;
+        rawCountSink(move values);
         values = new RawCountElem[3];
         values[0].id = 3; values[1].id = 4; values[2].id = 5;
+        rawCountSink(move values);
     }
     passed += Test("raw count array reassignment order", g_raw_count_order, 21543);
 
     resetRawCountState();
     g_raw_count_resource_dtors = 0;
     {
-        unique RawCountOwnerElem* source = new RawCountOwnerElem[3];
-        unique RawCountOwnerElem* destination = move source;
+        RawCountOwnerElem* source = new RawCountOwnerElem[3];
+        RawCountOwnerElem* destination = move source;
+        rawCountOwnerSink(move destination);
     }
     passed += Test("raw count move element resources", g_raw_count_dtors * 10 + g_raw_count_resource_dtors, 33);
 
@@ -3199,9 +3236,10 @@ int testRawArrayRuntimeCount()
     int zeroMoveSourceNull = 0;
     {
         int n = 0;
-        unique RawCountElem* source = new RawCountElem[n];
-        unique RawCountElem* destination = move source;
+        RawCountElem* source = new RawCountElem[n];
+        RawCountElem* destination = move source;
         zeroMoveSourceNull = source == nullptr ? 1 : 0;
+        rawCountSink(move destination);
     }
     passed += Test("raw count zero move source null", zeroMoveSourceNull, 1);
     passed += Test("raw count zero move cleanup", g_raw_count_dtors, 0);

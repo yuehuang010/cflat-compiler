@@ -22,8 +22,8 @@ struct AlignElem { int id = default; };
 expect_error("alignment mismatch assigning to 'values'") {
     void runLocalAlignFromOrdinary()
     {
-        unique alignas(0, 64) AlignElem* values;
-        unique AlignElem* other = new AlignElem[2];
+        alignas(0, 64) AlignElem* values;
+        AlignElem* other = new AlignElem[2];
         values = move other;
     }
 }
@@ -31,8 +31,8 @@ expect_error("alignment mismatch assigning to 'values'") {
 expect_error("alignment mismatch assigning to 'wide'") {
     void runLocalAlignDisagree()
     {
-        unique alignas(0, 64) AlignElem* wide;
-        unique alignas(0, 32) AlignElem* narrow = new AlignElem[2] alignas(0, 32);
+        alignas(0, 64) AlignElem* wide;
+        alignas(0, 32) AlignElem* narrow = new AlignElem[2] alignas(0, 32);
         wide = move narrow;
     }
 }

@@ -2,8 +2,11 @@
 // T is the POINTEE type: unique<Resource> owns a Resource*.
 annotation unique { };
 
+// ALIGN carries the OVER-alignment of the owned block, so `alignas(0, N) unique T*` is
+// `unique<T, N>`: the deallocator that matches the allocation is part of the type. 0 (and any
+// value up to the default `new` alignment) means an ordinary block freed with plain `delete`.
 [unique]
-struct unique<T>
+struct unique<T, int ALIGN = 0>
 {
     if const (is_interface(T)) { using P = T; }
     else { using P = T*; }
@@ -25,6 +28,18 @@ struct unique<T>
         else if const (is_interface(T))
         {
             if (_p != nullptr) delete _p;
+        }
+        else if const (ALIGN > 16)
+        {
+            // The block came from the aligned allocator, so it must go back through the aligned
+            // deallocator. The declared clause on `q` is what routes the free.
+            if (_p != nullptr)
+            {
+                alignas(0, ALIGN) P q;
+                q = _p;
+                _p = nullptr;
+                delete q;
+            }
         }
         else
         {
@@ -63,6 +78,18 @@ struct unique<T>
     {
         P old = move _p;
         _p = move p;
-        if (old != nullptr && old != _p) delete old;
+        if (old != nullptr && old != _p)
+        {
+            if const (ALIGN > 16)
+            {
+                alignas(0, ALIGN) P q;
+                q = old;
+                delete q;
+            }
+            else
+            {
+                delete old;
+            }
+        }
     }
 };

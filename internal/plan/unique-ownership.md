@@ -346,6 +346,45 @@ internal/issue/p3/unique-pointer-spelling-with-unbound-type-parameter.md. (4) me
 already carries a hidden raw-array count; findings + a runtime-check recommendation recorded in
 the p2 issue, plus a new p2 for `delete p` on a counted parameter.
 
+BUILTIN REMNANT REMOVED (2026-09-03, worktree unique-type-prototype-4ba544). The R2/R3
+parse-tree-lookahead remnant decision is GONE, and with it
+internal/issue/p2/unique-builtin-remnant-decision-is-parse-tree-lookahead.md (deleted).
+What landed, in order:
+
+- **Generic value-parameter DEFAULTS** (`struct S<T, int N = <const-expr>>`), a prerequisite -
+  see the Stage 6 as-built note in internal/plan/generic-value-parameters.md. Only trailing
+  value parameters; a spelled default is stripped from the mangled name, so `unique<T>` keeps
+  its exact old symbol.
+- **`unique<T, int ALIGN = 0>`** in `cflat/core/unique.cb`. The destructor and `reset()` take
+  an `if const (ALIGN > 16)` arm that frees through `__delete_aligned` (routed by declaring the
+  local that holds the pointer `alignas(0, ALIGN)`; `ParseDeleteExpression` now reads the
+  operand's DECLARED clause as well as its tracked block alignment, mirroring what
+  `EmitOwningPtrCleanup` has always done). `sizeof(unique<T>)` is still 8.
+- **Desugar** in BOTH `ParseDeclarationSpecifiers` copies: plain `unique T*` -> `unique<T>`,
+  `alignas(0, N) unique T*` -> `unique<T, N>`. FIELDS and GLOBALS with an allocation-alignment
+  clause deliberately stay on the builtin pointer representation (their synthesized teardown
+  reads the alignment off the field's own type) - that path is untouched.
+- **Deleted** from `MainListener_Declarations.cpp`: `hasRawNewArrayValue`,
+  `hasAlignedMoveSource`, `hasLaterBuiltinUniqueAssignment`, `preservesBuiltinUnique`, the
+  `enclosingFunction` lookup they shared, and the un-desugar application block (~295 lines);
+  plus the locals-only "core unique wrapper owns a counted `new T[n]`" block. From
+  `ForwardRefScanner.cpp`: the presence-only alignas veto and the R2 copy.
+- **New diagnostic** (locals join the field/param/return legs): *cannot store a heap array in
+  unique local 'p': unique<T> does not own arrays - use 'array<T>'*, fired from the
+  declaration initializer and from a later `=`. Both use `RawNewArrayValueOf`, a ~30-line
+  DIAGNOSTIC-only walk of the value side (`?:` / `??` arms included) - it decides nothing about
+  representation, which is what the advisor objected to.
+- **Tests**: `Test/test_core.cb` `runRawCount*` and the local-alignas accept set now hold their
+  counted arrays in raw `T*` locals released through the existing `move T*` sinks, so every
+  dtor-count/order assertion is unchanged in value and in intent (one leg lost its
+  `values == nullptr` observation, which "raw count direct move source null" already pins).
+  `Test/test_move.cb::desugaredUniqueAlignedOrder` now moves into a same-clause destination,
+  because `unique<Resource, 64>` and `unique<Resource>` are different types.
+  `Test/errors/err_unique_array_view.cb` gained the local decl-init, later-assignment, joined-arm
+  and aligned-array legs; `err_align_alloc_mismatch.cb` / `err_move.cb` moved their array legs
+  onto raw pointers. New `Test/errors/err_generic_value_default.cb`.
+- Verified on macOS: `bash test.sh Release` 768/0/8, `./test_example.sh` 45/0.
+
 **Stage 1 - close the moved-receiver dataflow gap. DONE 2026-08-31, uncommitted in worktree
 unique-type-prototype-4ba544.** Shared `MainListener::CheckMovedReceiver` helper (factored
 from the duplicated check in `LoadNamedVariableImpl`, `MainListener_Expressions.cpp` ~6560)

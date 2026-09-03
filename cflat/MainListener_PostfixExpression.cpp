@@ -1951,6 +1951,11 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 auto packIt = Compiler(ctx)->gts.genericFunctionPackIndex.find(gfKey);
                                 size_t packIdx = packIt != Compiler(ctx)->gts.genericFunctionPackIndex.end()
                                     ? packIt->second : std::string::npos;
+                                // Omitted TRAILING value arguments come from the declared defaults
+                                // before the arity is judged.
+                                if (packIdx == std::string::npos)
+                                    FillGenericValueDefaults(*Compiler(ctx), gfKey,
+                                                             typeParams.size(), typeArgs);
                                 bool wrongArity = packIdx == std::string::npos
                                     ? typeParams.size() != typeArgs.size()
                                     : typeArgs.size() < packIdx;
