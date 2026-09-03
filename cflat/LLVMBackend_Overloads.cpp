@@ -1721,6 +1721,9 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             argList = std::move(abiArgs);
         }
 
+        // Null move sources before the callee can observe or reseat an aliased slot.
+        ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
+                               candidate.IsMethod, true);
         llvm::Value* result = candidate.Recipe.hasLowering
             ? EmitAbiLoweredCall(candidate, argList)
             : CreateFunctionCall(candidate.Function, argList);
@@ -1902,7 +1905,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             candidate.Parameters[i].VariableName, diagnosticFunctionName)));
         }
 
-        // Null out caller's storage for move parameters; mark the source moved (shared helper).
+        // Retire move temporaries and mark the source moved after the call.
         ApplyMoveParamTransfer(functionName, candidate.Parameters, matched, true,
                                candidate.IsMethod);
 

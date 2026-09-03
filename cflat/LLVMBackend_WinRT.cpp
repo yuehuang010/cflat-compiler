@@ -1598,12 +1598,13 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p,
-        size_t index)
+        size_t index) const
 {
         TypeAndValue tv;
         tv.TypeName = p.TypeName;
         tv.Pointer  = p.Pointer;
         tv.PointerDepth = p.PointerDepth;
+        tv.IsInterface = IsInterfaceType(p.TypeName);
         tv.AllocAlignValue = p.AllocAlignValue;
         tv.IsOwningSink = p.IsOwningSink;
         tv.IsConsumeInferredSink = p.IsConsumeInferredSink;
@@ -1616,7 +1617,8 @@ LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndV
 }
 
 void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
-        const std::vector<TypeAndValue::FuncPtrParam>& params, const std::vector<NamedVariable>& args)
+        const std::vector<TypeAndValue::FuncPtrParam>& params,
+        const std::vector<NamedVariable>& args, bool beforeCall)
 {
         bool anySink = false;
         for (const auto& p : params)
@@ -1627,19 +1629,21 @@ void LLVMBackend::ApplyFuncPtrSinkTransfer(const std::string& functionName,
         std::vector<TypeAndValue> synth;
         for (size_t i = 0; i < params.size(); i++)
             synth.push_back(FuncPtrParamAsTypeAndValue(params[i], i));
-        ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ true);
+        ApplyMoveParamTransfer(functionName, synth, args, /*paramsCarryAllocAlign*/ true,
+            /*calleeIsMethod*/ false, beforeCall);
 }
 
 void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign, bool calleeIsMethod)
+        bool paramsCarryAllocAlign, bool calleeIsMethod, bool beforeCall)
 {
         for (size_t i = 0; i < params.size() && i < args.size(); i++)
         {
             std::string sourceName = args[i].CallerName;
             if (sourceName.empty() && args[i].FieldName.empty())
                 sourceName = args[i].TypeAndValue.VariableName;
-            RejectOwningTempUniqueFieldIntoSinkParam(functionName, params[i], args[i]);
+            if (!beforeCall)
+                RejectOwningTempUniqueFieldIntoSinkParam(functionName, params[i], args[i]);
             // A plain by-value parameter the callee body unconditionally moves is a synthesized
             // move sink too - but only when the concrete type owns a resource AND the matched arg
             // is itself an OWNER (not a borrow/alias). A borrow arg has nothing to transfer, so
@@ -1716,7 +1720,7 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // block alignment to compare against.
                 const bool coreUniqueWrapperParam = !params[i].Pointer
                     && IsCoreUniqueType(params[i].TypeName);
-                if (paramsCarryAllocAlign
+                if (!beforeCall && paramsCarryAllocAlign
                     && !coreUniqueWrapperParam
                     && args[i].AllocAlignment != params[i].AllocAlignValue
                     && (args[i].AllocAlignment > kDefaultNewAlign
@@ -1741,22 +1745,25 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                               std::to_string(args[i].AllocAlignment) });
                 }
 
-                // A `move string` argument transfers ownership to the callee, which frees
-                // it on return. If the argument is an unnamed owned-string temporary (e.g.
-                // a chained-concat result passed directly), drop it from the end-of-
-                // expression cleanup list so it is not also freed by the caller.
-                if (params[i].TypeName == "string")
-                    UnregisterOwnedStringTemp(args[i].Primary);
-                // A `move` closure argument (fat Lambda<T> or an encoded closure element type, gap a)
-                // transfers env ownership to the callee. Drop the unnamed lambda temp from the end-
-                // of-expression closure cleanup so it is not also freed by the caller (double-free).
-                else if (params[i].TypeName == "__closure_fat_ptr"
-                         || IsEncodedClosureType(params[i].TypeName))
-                    UnregisterOwnedClosureTemp(args[i].Primary);
+                if (!beforeCall)
+                {
+                    // A `move string` argument transfers ownership to the callee, which frees
+                    // it on return. If the argument is an unnamed owned-string temporary (e.g.
+                    // a chained-concat result passed directly), drop it from the end-of-
+                    // expression cleanup list so it is not also freed by the caller.
+                    if (params[i].TypeName == "string")
+                        UnregisterOwnedStringTemp(args[i].Primary);
+                    // A `move` closure argument (fat Lambda<T> or an encoded closure element type, gap a)
+                    // transfers env ownership to the callee. Drop the unnamed lambda temp from the end-
+                    // of-expression closure cleanup so it is not also freed by the caller (double-free).
+                    else if (params[i].TypeName == "__closure_fat_ptr"
+                             || IsEncodedClosureType(params[i].TypeName))
+                        UnregisterOwnedClosureTemp(args[i].Primary);
 
-                // Invariant guard: a sink parameter owns its argument, so no caller-side
-                // end-of-expression free may remain registered for it.
-                UnregisterOwnedPtrTemp(args[i].Primary);
+                    // Invariant guard: a sink parameter owns its argument, so no caller-side
+                    // end-of-expression free may remain registered for it.
+                    UnregisterOwnedPtrTemp(args[i].Primary);
+                }
 
                 // An interface fat-ptr param built from a caller STRUCT VALUE points AT the caller's
                 // alloca, so zeroing that alloca would corrupt the data the callee sees - keep it a
@@ -1781,6 +1788,58 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     srcStorage = ref.Storage;
                     if (srcBaseTy == nullptr) srcBaseTy = ref.BaseType;
                 }
+
+                if (beforeCall)
+                {
+                    // Clear the source before the callee can observe or reseat an aliased slot.
+                    if (params[i].IsFatInterfaceValue()
+                        && args[i].TypeAndValue.IsFatInterfaceValue()
+                        && (args[i].IsOwning || IsVariableOwning(sourceName))
+                        && srcStorage != nullptr)
+                    {
+                        auto* dataField = builder->CreateStructGEP(GetFatPtrType(), srcStorage, 1);
+                        builder->CreateStore(
+                            llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty())), dataField);
+                    }
+                    if (srcStorage != nullptr && !isInterfaceBorrow)
+                    {
+                        if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
+                        {
+                            builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
+                            StoreRawArrayLength(args[i], nullptr);
+                            if (!isFieldAccess)
+                                SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);
+                        }
+                        else if (params[i].TypeName == "string" && args[i].IsOwningString)
+                        {
+                            auto* strTy = llvm::StructType::getTypeByName(*context, "string");
+                            if (strTy)
+                            {
+                                if (llvm::isa<llvm::GlobalVariable>(srcStorage))
+                                    builder->CreateStore(llvm::ConstantAggregateZero::get(strTy), srcStorage);
+                                else
+                                {
+                                    auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
+                                    auto* i8ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
+                                    builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
+                                }
+                            }
+                        }
+                        else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
+                        {
+                            builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
+                        }
+                        else if (srcBaseTy == nullptr && params[i].TypeName != "string")
+                        {
+                            LogErrorMessage(
+                                "call to '{}': 'move' argument {} has no resolved type, so its source "
+                                "storage cannot be cleared",
+                                { SpellFunctionSymbol(*this, functionName), std::to_string(i) });
+                        }
+                    }
+                    continue;
+                }
+
                 // An OWNING interface VALUE arg (an owning `unique IShape` local) moved into a
                 // move interface param transfers ownership: null the source fat-ptr's data field so
                 // its scope-exit teardown sees null and no-ops, else callee and source double-free.
@@ -1791,65 +1850,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     && (args[i].IsOwning || IsVariableOwning(sourceName))
                     && srcStorage != nullptr)
                 {
-                    auto* dataField = builder->CreateStructGEP(GetFatPtrType(), srcStorage, 1);
-                    builder->CreateStore(
-                        llvm::ConstantPointerNull::get(cflat_llvm::PointerTo(builder->getInt8Ty())), dataField);
                     if (!sourceName.empty() && !isFieldAccess)
                         MarkVariableMoved(sourceName);
-                }
-                if (srcStorage != nullptr && !isInterfaceBorrow)
-                {
-                    // dyn_cast_or_null: a hand-built NamedVariable may carry storage but a null
-                    // BaseType. A bare dyn_cast on a null type dereferences null and segfaults
-                    // the compiler (the pre-existing list<string>-json crash); _or_null treats a
-                    // missing type as "no match" and falls through to the diagnostic below.
-                    if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
-                    {
-                        // Pointer move param: null the caller's storage.
-                        builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                        StoreRawArrayLength(args[i], nullptr);
-                        // --sanitize=ownership (M1): record this move site for a tracked pointer local.
-                        if (!isFieldAccess)
-                            SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);
-                    }
-                    else if (params[i].TypeName == "string" && args[i].IsOwningString)
-                    {
-                        // String move param: zero out _ptr in the caller's alloca so its destructor is a no-op.
-                        // (Does not need srcBaseTy - the string layout is looked up by name.)
-                        auto* strTy = llvm::StructType::getTypeByName(*context, "string");
-                        if (strTy)
-                        {
-                            // q11 ruling point 3: a move out of PROGRAM-LIFETIME storage re-initializes
-                            // it, so the next entry reads a defined value. Nulling _ptr alone leaves
-                            // _len stale, and `string` is { i8* _ptr, i32 _len } - the next run then
-                            // reads a stale length off a null pointer and segfaults. A frame local
-                            // cannot observe this (its declaration re-runs, and reads after the move
-                            // are rejected), so only the outliving storage class is widened here.
-                            if (llvm::isa<llvm::GlobalVariable>(srcStorage))
-                                builder->CreateStore(llvm::ConstantAggregateZero::get(strTy), srcStorage);
-                            else
-                            {
-                                auto* ptrField = builder->CreateStructGEP(strTy, srcStorage, 0);
-                                auto* i8ptrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
-                                builder->CreateStore(llvm::ConstantPointerNull::get(i8ptrTy), ptrField);
-                            }
-                        }
-                    }
-                    else if (auto* stTy = llvm::dyn_cast_or_null<llvm::StructType>(srcBaseTy))
-                    {
-                        // Struct move param: zero the caller's entire struct so its destructor is a no-op.
-                        builder->CreateStore(llvm::ConstantAggregateZero::get(stTy), srcStorage);
-                    }
-                    else if (srcBaseTy == nullptr && params[i].TypeName != "string")
-                    {
-                        // We have caller storage to clear but no type telling us how. This can only
-                        // arise from a malformed (hand-built) argument; emit a clear diagnostic
-                        // rather than leaving a stale value that a later destructor would double-free.
-                        LogErrorMessage(
-                            "call to '{}': 'move' argument {} has no resolved type, so its source "
-                            "storage cannot be cleared after the move",
-                            { SpellFunctionSymbol(*this, functionName), std::to_string(i) });
-                    }
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
                 // Covers pointer, owning-string, and struct move params - all cases where caller storage was zeroed.
@@ -2664,6 +2666,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             callArgs.push_back(rawReturnCountSlot);
         }
 
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
+            true, false, true);
         auto* callResult = builder->CreateCall(fnTy, fnPtr, callArgs);
         RegisterRawArrayCallResult(callResult, rawReturnCountSlot,
                                    methodInfo->ReturnType.AllocAlignValue);
@@ -2702,7 +2706,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
             DiagnoseExplicitMoveToBorrowParam(SpellType(*this, TypeAndValue{ .TypeName = ifaceName })
                 + "." + methodName,
                 methodInfo->Parameters[i], callArgNVs[i]);
-        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs);
+        ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs,
+            true, false, false);
 
         // A temp's `unique` field handed to a PLAIN `T*` parameter of a VIRTUAL slot. Same point
         // in the sequence as the direct path's RecordTempUniqueFieldArgs, for the same reason.

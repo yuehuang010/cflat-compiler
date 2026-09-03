@@ -7093,6 +7093,63 @@ struct LmsCopyVal { string s = ""; };
 void lmsDerefMove(move LmsCopyVal p, LmsCopyVal* out) { *out = p; }
 Lambda<int(move OaiBox)> lmsGet() { return (move OaiBox p) => { OaiBox[2] d = { p }; return d[0].item->id; }; }
 
+interface Rev3Shape { int area(); };
+class Rev3Square : Rev3Shape
+{
+    int value = 0;
+    int area() { return value; }
+};
+interface Rev3Caller { int take(move Rev3Shape shape); };
+class Rev3CallerImpl : Rev3Caller
+{
+    int take(move Rev3Shape shape) { return shape.area(); }
+};
+int rev3Direct(move Rev3Shape shape) { return shape.area(); }
+
+int testFuncPtrInterfaceMove()
+{
+    int passed = 0;
+    Rev3Square direct = default;
+    direct.value = 42;
+    passed += Test("rev3_iface_direct", rev3Direct(move direct), 42);
+
+    Rev3Square virtualArg = default;
+    virtualArg.value = 43;
+    Rev3Caller caller = new Rev3CallerImpl();
+    passed += Test("rev3_iface_virtual", caller.take(move virtualArg), 43);
+    delete caller;
+
+    Rev3Square indirectArg = default;
+    indirectArg.value = 44;
+    function<int(move Rev3Shape)> indirect =
+        (move Rev3Shape shape) => { return shape.area(); };
+    passed += Test("rev3_iface_indirect", indirect(move indirectArg), 44);
+    return passed;
+}
+
+int testFuncPtrOwningInterfaceMove()
+{
+    int passed = 0;
+    dtorCount = 0;
+    {
+        unique IShapeMove directOwner = new CiMove();
+        consumeShapeMove(move directOwner);
+        passed += Test("rev3_iface_owning_direct_dtor", dtorCount, 1);
+    }
+    passed += Test("rev3_iface_owning_direct_once", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique IShapeMove indirectOwner = new CiMove();
+        function<void(move IShapeMove)> consume =
+            (move IShapeMove shape) => { delete shape; };
+        consume(move indirectOwner);
+        passed += Test("rev3_iface_owning_indirect_dtor", dtorCount, 1);
+    }
+    passed += Test("rev3_iface_owning_indirect_once", dtorCount, 1);
+    return passed;
+}
+
 int testDeclaredMoveFuncPtrParam()
 {
     int passed = 0;
@@ -12047,10 +12104,17 @@ struct SlotTree
 {
     Resource* _root = nullptr;
     ~SlotTree() { }
-    // `move _root` from a method. The slot is nulled when the CALL RETURNS, so a caller that has
-    // to re-seat the slot must assign after the call (see cflat/core/hpc/btree.cb).
+    // `move _root` from a method. The slot is nulled before the call, so a callee can re-seat it.
     void releaseRoot() { slotSink(move _root); }
+    void reseatRoot(move Resource* old) { delete old; _root = new Resource(); }
 };
+
+int slotTreeRootPresent(SlotTree* tree) { return tree->_root != nullptr ? 1 : 0; }
+void slotTreeReleaseRoot(move SlotTree* tree)
+{
+    Resource* root = move tree->_root;
+    delete root;
+}
 
 struct SlotNode
 {
@@ -12092,6 +12156,17 @@ int testSlotMoveIntoSink()
         passed += Test("slot_move_root_nulled", t->_root == nullptr, true);
         delete t;
     }
+
+    dtorCount = 0;
+    {
+        SlotTree* t = new SlotTree();
+        t->_root = new Resource();
+        t->reseatRoot(move t->_root);
+        passed += Test("slot_move_reseat_root_survives", slotTreeRootPresent(t), 1);
+        passed += Test("slot_move_reseat_old_dtor", dtorCount, 1);
+        slotTreeReleaseRoot(move t);
+    }
+    passed += Test("slot_move_reseat_all_freed_once", dtorCount, 2);
 
     slotNodeDtors = 0;
     {
@@ -12443,6 +12518,10 @@ extern int main()
     total += 60;
     passed += testDeclaredMoveFuncPtrParam();
     total += 80;
+    passed += testFuncPtrInterfaceMove();
+    total += 3;
+    passed += testFuncPtrOwningInterfaceMove();
+    total += 4;
 
     passed += testConsumeOfBorrowedByValueParamField();
     total += 37;
@@ -12483,7 +12562,7 @@ extern int main()
     total += 36;
 
     passed += testSlotMoveIntoSink();
-    total += 5;
+    total += 8;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

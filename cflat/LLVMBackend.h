@@ -5735,20 +5735,22 @@ public:
     // alignment (for example C interop). Named function-pointer signatures carry the fact.
     // calleeIsMethod enables the borrowing-container element leg (an explicit `move` into a
     // bare-pointer element slot transfers), and is passed only by the direct-call path.
+    // beforeCall clears the caller's source storage; the second call keeps post-call temp cleanup
+    // and compile-time moved marking in their existing order.
     void ApplyMoveParamTransfer(const std::string& functionName,
         const std::vector<TypeAndValue>& params, const std::vector<NamedVariable>& args,
-        bool paramsCarryAllocAlign = true, bool calleeIsMethod = false);
+        bool paramsCarryAllocAlign = true, bool calleeIsMethod = false, bool beforeCall = false);
 
     // Indirect-call twin: a lambda literal's inferred owning sinks ride the funcptr TYPE
     // (FuncPtrParam::IsOwningSink), so the caller's source must be transferred exactly as a direct
     // call does. A no-op unless some parameter carries the inferred flag.
     void ApplyFuncPtrSinkTransfer(const std::string& functionName,
         const std::vector<TypeAndValue::FuncPtrParam>& params,
-        const std::vector<NamedVariable>& args);
+        const std::vector<NamedVariable>& args, bool beforeCall = false);
 
-    // The synthesized TypeAndValue a funcptr parameter's per-param facts stand for. Only the
-    // fields the sink/ownership machinery reads are filled.
-    static TypeAndValue FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p, size_t index);
+    // The synthesized TypeAndValue a funcptr parameter's per-param facts stand for. Interface
+    // classification is recovered from the backend because FuncPtrParam stores only its spelling.
+    TypeAndValue FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p, size_t index) const;
 
     // Is this argument PROVABLY a data pointer being passed to a closure parameter? Deliberately
     // one-sided: it answers yes only when the frontend positively recorded a pointer that is not
@@ -6268,7 +6270,8 @@ public:
     // Emits an indirect call through a closure fat struct {i8* fnptr, i8* envptr}.
     llvm::Value* CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                     std::vector<llvm::Value*> args,
-                                    const std::vector<NamedVariable>* argNVs = nullptr);
+                                    const std::vector<NamedVariable>* argNVs = nullptr,
+                                    const std::vector<llvm::Value*>* rawArrayCounts = nullptr);
 
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases);
 

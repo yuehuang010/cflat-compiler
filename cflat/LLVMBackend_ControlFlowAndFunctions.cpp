@@ -487,7 +487,8 @@ static bool IndirectArgIsUnsigned(const std::vector<LLVMBackend::NamedVariable>*
 
 llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, llvm::Value* funcPtr,
                                              std::vector<llvm::Value*> args,
-                                             const std::vector<NamedVariable>* argNVs)
+                                             const std::vector<NamedVariable>* argNVs,
+                                             const std::vector<llvm::Value*>* rawArrayCounts)
 {
         auto* i8PtrTy = cflat_llvm::PointerTo(builder->getInt8Ty());
 
@@ -530,8 +531,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
                 pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
                 if (ParameterCarriesRawArrayCount(pTV))
                 {
-                    abiArgs.push_back(argNVs != nullptr && i < argNVs->size()
-                        ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1));
+                    llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                        ? (*rawArrayCounts)[i] : nullptr;
+                    if (count == nullptr)
+                        count = argNVs != nullptr && i < argNVs->size()
+                            ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1);
+                    abiArgs.push_back(count);
                     typeIndex++;
                 }
             }
@@ -602,8 +607,12 @@ llvm::Value* LLVMBackend::CreateIndirectCall(const TypeAndValue& funcPtrType, ll
             pTV.IsMove = funcPtrType.FuncPtrParams[i].IsMove;
             if (ParameterCarriesRawArrayCount(pTV))
             {
-                userArgs.push_back(argNVs != nullptr && i < argNVs->size()
-                    ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1));
+                llvm::Value* count = rawArrayCounts != nullptr && i < rawArrayCounts->size()
+                    ? (*rawArrayCounts)[i] : nullptr;
+                if (count == nullptr)
+                    count = argNVs != nullptr && i < argNVs->size()
+                        ? RawArrayCountArgument((*argNVs)[i]) : builder->getInt64(-1);
+                userArgs.push_back(count);
                 typeIndex++;
             }
         }

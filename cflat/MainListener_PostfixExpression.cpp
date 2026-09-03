@@ -4129,7 +4129,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         std::optional<DeclExpectedTypeScope> argExpectedScope;
                                         if (argParamIndex < funcPtrTV.FuncPtrParams.size())
                                         {
-                                            argExpectedDest = LLVMBackend::FuncPtrParamAsTypeAndValue(
+                                            argExpectedDest = Compiler(ctx)->FuncPtrParamAsTypeAndValue(
                                                 funcPtrTV.FuncPtrParams[argParamIndex], argParamIndex);
                                             argExpectedScope.emplace(&declExpectedType, argExpectedDest);
                                         }
@@ -4197,8 +4197,18 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         std::format("function pointer '{}'",
                                             SpellFunctionSymbol(*Compiler(ctx), functionName)));
                                 }
+                                std::vector<llvm::Value*> rawArrayCounts(argNVs.size(), nullptr);
+                                for (size_t i = 0; i < argNVs.size()
+                                    && i < funcPtrTV.FuncPtrParams.size(); i++)
+                                {
+                                    const auto& fp = funcPtrTV.FuncPtrParams[i];
+                                    if (fp.Pointer && fp.IsMove)
+                                        rawArrayCounts[i] = Compiler(ctx)->RawArrayCountArgument(argNVs[i]);
+                                }
+                                Compiler(ctx)->ApplyFuncPtrSinkTransfer(
+                                    functionName, funcPtrTV.FuncPtrParams, argNVs, true);
                                 auto result = Compiler(ctx)->CreateIndirectCall(
-                                    funcPtrTV, funcPtr, callArgs, &argNVs);
+                                    funcPtrTV, funcPtr, callArgs, &argNVs, &rawArrayCounts);
                                 Compiler(ctx)->lastCallReturnsOwned = funcPtrTV.FuncPtrReturnOwned;
                                 if (result != nullptr && funcPtrTV.FuncPtrReturnOwned)
                                 {
@@ -4209,7 +4219,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // A lambda literal's INFERRED owning sinks ride the funcptr type;
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
-                                    functionName, funcPtrTV.FuncPtrParams, argNVs);
+                                    functionName, funcPtrTV.FuncPtrParams, argNVs, false);
                                 // Diagnose explicit move-to-borrow here; ownership transfer is
                                 // centralized in ApplyFuncPtrSinkTransfer below.
                                 for (size_t i = 0; i < pcount; i++)

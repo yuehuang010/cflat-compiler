@@ -928,9 +928,8 @@ struct btree<K, V>
                 // childless internal node collapses to its only child; an empty leaf
                 // collapses the tree to nullptr). Otherwise node stays the root untouched.
                 // node IS the root here, so hand off the OWNING SLOT (_root), not the
-                // borrowed local. The move out of a slot nulls it when the call RETURNS, so
-                // the helper cannot re-seat _root itself - it hands back the replacement and
-                // the assignment happens here, after the call.
+                // borrowed local. The move out of a slot nulls it before the call; this helper
+                // still hands back the replacement and the assignment happens here.
                 if (node->count == 0)
                 {
                     btree_node<K, V>* newRoot = _collapseEmptyRoot(node->isLeaf, move _root);
@@ -1090,8 +1089,7 @@ struct btree<K, V>
     // Free an empty root node (node->count == 0, already verified by the caller) and hand back
     // the node that must replace it: an internal node collapses to its only remaining child; a
     // leaf collapses to an empty tree. Always frees node, so it is taken by move out of the
-    // tree's owning `_root` slot; the CALLER stores the returned replacement into `_root`,
-    // because moving out of a slot nulls that slot when the call returns.
+    // tree's owning `_root` slot; the CALLER stores the returned replacement into `_root`.
     btree_node<K, V>* _collapseEmptyRoot(bool wasLeaf, move btree_node<K, V>* node)
     {
         btree_node<K, V>* onlyChild = wasLeaf ? nullptr : node->children[0];

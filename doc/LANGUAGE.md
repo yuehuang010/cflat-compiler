@@ -1387,9 +1387,8 @@ accepted as well - that is the usual "null the fields, then free them" teardown 
 
 Two details worth knowing:
 
-- **The slot is nulled when the call RETURNS**, not before it. A callee handed `move obj->slot`
-  must not try to re-seat `obj->slot` itself: return the replacement and let the caller store it
-  after the call.
+- **The slot is nulled before the callee runs**, so the callee sees null and any replacement it
+  stores into the slot survives the call.
 - If the function really does own the pointer, say so in its signature (`void f(move Node* n)`);
   then `sink(move n)` is a genuine transfer and is accepted.
 
