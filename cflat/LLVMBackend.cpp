@@ -4373,6 +4373,8 @@ void LLVMBackend::ResetForReanalysis()
     programTable.clear();
     enumBackingTypes.clear();
     typeAliases.clear();
+    aliasScopeStack_.clear();
+    aggregateAliasScopes_.clear();
     manglingAliases_.clear();
     genericBaseAliases_.clear();
     functionTypeAliases.clear();

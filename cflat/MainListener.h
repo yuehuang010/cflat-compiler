@@ -2355,6 +2355,9 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         LLVMBackend::TypeAndValue returnType{ .TypeName = typeName };
         compiler->CreateFunctionDeclaration(typeName, returnType, {});
 
+        LLVMBackend::AliasScopeGuard aliasScope(compiler);
+        ScanAggregateAliases(ctx->aggregateMember());
+
         // Pre-declare member functions (and detect constructor overloads).
         // Ctor signatures seen so far in this body, keyed by mangled name -> declaring line.
         std::map<std::string, size_t> seenCtorSignatures;
@@ -2459,6 +2462,7 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
     // is the authoritative ParseUsingDeclaration's call, and an alias to a non-type still mangles
     // to a name that fails the same way its target does.
     void RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx);
+    void ScanAggregateAliases(const std::vector<CFlatParser::AggregateMemberContext*>& members);
 
 public:
     ForwardRefScanner(LLVMBackend* compiler);
@@ -3307,6 +3311,98 @@ public:
 
     void AppendResolvedMembers(const std::vector<CFlatParser::AggregateMemberContext*>& members,
                                std::vector<CFlatParser::AggregateMemberContext*>& out);
+
+    template <typename TCtx>
+    void CollectAggregateAliases(TCtx* ctx, const std::string& aggregateName)
+    {
+        auto* compiler = Compiler(ctx);
+        const auto& members = ResolveAggregateMembers(ctx);
+        std::unordered_set<std::string> typeParams;
+        if (auto* generic = ctx->genericTypeParameters())
+            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                if (entry->valueParameterDeclaration() == nullptr && entry->typeSpecifier() != nullptr)
+                    if (auto* gid = entry->typeSpecifier()->genericIdentifier(); gid != nullptr)
+                        if (gid->Identifier() != nullptr && gid->genericTypeParameters() == nullptr)
+                            typeParams.insert(gid->Identifier()->getText());
+
+        std::unordered_set<std::string> membersByName;
+        for (auto* member : members)
+        {
+            if (auto* decl = member->declaration())
+            {
+                if (auto* list = decl->initDeclaratorList())
+                    for (auto* init : list->initDeclarator())
+                        if (auto* declarator = init->declarator())
+                            membersByName.insert(getDirectDeclName(declarator->directDeclarator()));
+            }
+            else if (auto* func = member->functionDefinition())
+                membersByName.insert(getFunctionName(func));
+            else if (auto* nested = member->structDefinition())
+                membersByName.insert(nested->directDeclarator()->getText());
+            else if (auto* nested = member->classDefinition())
+                membersByName.insert(nested->directDeclarator()->getText());
+        }
+
+        for (auto* member : members)
+        {
+            auto* usingDecl = member->usingDeclaration();
+            if (usingDecl == nullptr) continue;
+            std::string alias = usingDecl->String() != nullptr
+                ? usingDecl->String()->getText()
+                : usingDecl->Identifier()->getText();
+            if (typeParams.count(alias) != 0)
+                LogErrorContext(usingDecl, compiler->LocalizeMessage(
+                    "alias '{}' reuses the name of type parameter '{}' of '{}'",
+                    { alias, alias, aggregateName }));
+            if (membersByName.count(alias) != 0)
+                LogErrorContext(usingDecl, compiler->LocalizeMessage(
+                    "alias '{}' collides with member '{}' of '{}'",
+                    { alias, alias, aggregateName }));
+            ParseUsingDeclaration(usingDecl);
+        }
+    }
+
+    template <typename TCtx>
+    void ValidateGenericAggregateAliasNames(TCtx* ctx, const std::string& aggregateName)
+    {
+        auto* compiler = Compiler(ctx);
+        std::unordered_set<std::string> typeParams;
+        if (auto* generic = ctx->genericTypeParameters())
+            for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+                if (entry->valueParameterDeclaration() == nullptr && entry->typeSpecifier() != nullptr)
+                    if (auto* gid = entry->typeSpecifier()->genericIdentifier(); gid != nullptr)
+                        if (gid->Identifier() != nullptr && gid->genericTypeParameters() == nullptr)
+                            typeParams.insert(gid->Identifier()->getText());
+
+        std::function<void(const std::vector<CFlatParser::AggregateMemberContext*>&)> visit;
+        std::function<void(CFlatParser::IfConstMemberContext*)> visitIfConst;
+        visitIfConst = [&](CFlatParser::IfConstMemberContext* ifConst) {
+            for (auto* block : ifConst->ifConstMemberBlock())
+                visit(block->aggregateMember());
+            if (auto* elseIf = ifConst->ifConstMember())
+                visitIfConst(elseIf);
+        };
+        visit = [&](const std::vector<CFlatParser::AggregateMemberContext*>& members) -> void
+        {
+            for (auto* member : members)
+            {
+                if (auto* usingDecl = member->usingDeclaration())
+                {
+                    std::string alias = usingDecl->String() != nullptr
+                        ? usingDecl->String()->getText()
+                        : usingDecl->Identifier()->getText();
+                    if (typeParams.count(alias) != 0)
+                        compiler->LogError(compiler->LocalizeMessage(
+                            "alias '{}' reuses the name of type parameter '{}' of '{}'",
+                            { alias, alias, aggregateName }));
+                    continue;
+                }
+                if (auto* ifConst = member->ifConstMember())
+                    visitIfConst(ifConst);
+            }
+        };
+        visit(ctx->aggregateMember());
+    }
 
     // Member-scope `if const`: same semantics as the file-scope ParseIfConstDeclaration, but the
     // selected branch's members are spliced into the enclosing aggregate's member list.

@@ -2079,6 +2079,21 @@ A structured RHS (generic, pointer, or array) must resolve to a known type or th
 errors. A bare-identifier RHS that does not name a known type is treated as a namespace alias
 (as in the first example) - so a namespace can be aliased before it is defined.
 
+Aliases can also be declared in a struct or class body. They are visible throughout that body,
+including fields and methods, and are resolved separately for each generic instantiation:
+
+```c
+struct Box<T>
+{
+    if const (is_interface(T)) { using P = T; }
+    else { using P = T*; }
+    P value = default;
+    P get() { return value; }
+};
+```
+
+Function-scope aliases end at the closing brace of the function.
+
 ### Module Imports
 
 Split code across multiple files with `import`:

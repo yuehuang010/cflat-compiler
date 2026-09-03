@@ -193,12 +193,33 @@ bool LLVMBackend::IsPrimitiveTypeName(const std::string& name)
 
 void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string& target)
 {
+        if (!aliasScopeStack_.empty())
+        {
+            aliasScopeStack_.back().typeAliases[alias] = target;
+            return;
+        }
         const auto candidates = ScopedNameCandidates(alias);
         typeAliases[candidates.empty() ? alias : candidates.front()] = target;
     }
 
+void LLVMBackend::RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target)
+{
+        if (!aliasScopeStack_.empty())
+        {
+            aliasScopeStack_.back().functionTypeAliases[alias] = target;
+            return;
+        }
+        const auto candidates = ScopedNameCandidates(alias);
+        functionTypeAliases[candidates.empty() ? alias : candidates.front()] = target;
+    }
+
 std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
 {
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+        {
+            auto it = frame.typeAliases.find(name);
+            if (it != frame.typeAliases.end()) return it->second;
+        }
         for (const auto& candidate : ScopedNameCandidates(name))
         {
             auto it = typeAliases.find(candidate);
@@ -209,12 +230,52 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
 
 const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::string& name) const
 {
+        for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+        {
+            auto it = frame.functionTypeAliases.find(name);
+            if (it != frame.functionTypeAliases.end()) return &it->second;
+        }
         for (const auto& candidate : ScopedNameCandidates(name))
         {
             auto it = functionTypeAliases.find(candidate);
             if (it != functionTypeAliases.end()) return &it->second;
         }
         return nullptr;
+    }
+
+void LLVMBackend::PushAliasScope()
+{
+        aliasScopeStack_.emplace_back();
+    }
+
+LLVMBackend::AliasScopeFrame LLVMBackend::PopAliasScope()
+{
+        if (aliasScopeStack_.empty()) return {};
+        AliasScopeFrame frame = std::move(aliasScopeStack_.back());
+        aliasScopeStack_.pop_back();
+        return frame;
+    }
+
+void LLVMBackend::PushAggregateAliasScope(const std::string& aggregateName)
+{
+        auto it = aggregateAliasScopes_.find(aggregateName);
+        if (it == aggregateAliasScopes_.end())
+            PushAliasScope();
+        else
+            aliasScopeStack_.push_back(it->second);
+    }
+
+void LLVMBackend::SaveAggregateAliasScope(const std::string& aggregateName)
+{
+        if (!aliasScopeStack_.empty())
+            aggregateAliasScopes_[aggregateName] = aliasScopeStack_.back();
+    }
+
+bool LLVMBackend::AliasInCurrentScope(const std::string& alias) const
+{
+        if (aliasScopeStack_.empty()) return false;
+        const auto& frame = aliasScopeStack_.back();
+        return frame.typeAliases.count(alias) != 0 || frame.functionTypeAliases.count(alias) != 0;
     }
 
 void LLVMBackend::RegisterManglingAlias(const std::string& alias, const std::string& target)

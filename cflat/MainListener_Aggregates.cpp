@@ -63,6 +63,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             genericStructTypeParams[structName] = typeParams;
             genericStructValueParams[structName] = valueParams;
             genericStructConstraints[structName] = ParseWhereClause(ctx->whereClause());
+            ValidateGenericAggregateAliasNames(ctx, structName);
             // Record which param (if any) is variadic - always the last one
             {
                 auto entries = ctx->genericTypeParameters()->typeParameterList()->typeParameterEntry();
@@ -95,6 +96,10 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
+
+        LLVMBackend::AliasScopeGuard aliasScope(compiler);
+        CollectAggregateAliases(ctx, structName);
+        compiler->SaveAggregateAliasScope(structName);
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
@@ -2689,6 +2694,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             genericStructTypeParams[structName] = typeParams;
             genericStructValueParams[structName] = valueParams;
             genericClassConstraints[structName] = ParseWhereClause(ctx->whereClause());
+            ValidateGenericAggregateAliasNames(ctx, structName);
             return;
         }
 
@@ -2758,6 +2764,10 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
 
         if (compiler->IsVerbose())
             std::cout << "[verbose]     parse decl list: " << structName << "\n";
+
+        LLVMBackend::AliasScopeGuard aliasScope(compiler);
+        CollectAggregateAliases(ctx, structName);
+        compiler->SaveAggregateAliasScope(structName);
 
         // Process nested struct/class definitions before fields so their types are available
         for (auto* nestedStruct : MemberStructDefinitions(ctx))
@@ -3562,6 +3572,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
             return;
 
         compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -3728,6 +3739,7 @@ void MainListener::ParseDestructorDefinition(CFlatParser::DestructorDefinitionCo
         compiler->RegisterDestructor(structName, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -3774,6 +3786,7 @@ void MainListener::ParseProgramDestructorDefinition(CFlatParser::DestructorDefin
         compiler->RegisterDestructor(name, fn);
 
         compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);

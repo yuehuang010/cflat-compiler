@@ -1639,6 +1639,10 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         else if (ctx->Identifier() != nullptr)
             alias = ctx->Identifier()->getText();
 
+        if (compiler->AliasInCurrentScope(alias))
+            LogErrorContext(ctx, compiler->LocalizeMessage(
+                "alias '{}' is already defined in this scope", { alias }));
+
         auto* typeSpec = ctx->typeSpecifier();
 
         // Function-type alias (using Cb = function<R(Args)>): a closure type carries a call
@@ -1647,8 +1651,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         // type/namespace dispatch below, which only recognizes named types.
         if (auto* fpSpec = typeSpec->functionPointerSpecifier())
         {
-            auto aliasKeys = compiler->ScopedNameCandidates(alias);
-            compiler->functionTypeAliases[aliasKeys.empty() ? alias : aliasKeys.front()] = BuildFuncPtrAliasType(fpSpec);
+            compiler->RegisterFunctionTypeAlias(alias, BuildFuncPtrAliasType(fpSpec));
             if (auto* s = compiler->GetSymbolSink())
                 s->Register(SymbolKind::TypeAlias, alias, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
@@ -1658,6 +1661,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
         }
 
         std::string target = typeSpec->getText();
+        if (auto subst = activeTypeSubstitutions.find(target); subst != activeTypeSubstitutions.end())
+            target = subst->second;
         // A pointer alias (using Handle = void*) stores its trailing stars in the alias string;
         // the stars are peeled back onto the pointer flags at the resolution site (GetType /
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
@@ -2616,6 +2621,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             return;
 
         compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         // Fresh straight-line for this function/lambda body; restore the enclosing walk's flag on
         // exit so a nested lambda's return does not leak into the surrounding expression.
         ReturnFlagGuard functionReturnFlagGuard(&straightLineReturned_);
@@ -4183,16 +4189,17 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                                 const auto& uniqueData = compiler->GetDataStructure(
                                     rightNV.TypeAndValue.TypeName);
-                                // The interface arm stores the fat value in `_v`; unwrapping it
-                                // yields the interface directly, and a MOVED source hands the
-                                // boxed object over rather than lending it.
+                                // The interface arm stores the fat value in its interface-typed
+                                // field; unwrapping it yields the interface directly, and a MOVED
+                                // source hands the boxed object over rather than lending it.
                                 bool interfaceArm = false;
                                 LLVMBackend::TypeAndValue armField;
                                 for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
                                     if (uniqueData.StructFields[i].VariableName == "_p"
                                         || uniqueData.StructFields[i].VariableName == "_v")
                                     {
-                                        interfaceArm = uniqueData.StructFields[i].VariableName == "_v";
+                                        interfaceArm = uniqueData.StructFields[i].IsInterface
+                                            || uniqueData.StructFields[i].VariableName == "_v";
                                         armField = uniqueData.StructFields[i];
                                         right = compiler->CreateLoad(compiler->CreateStructGEP(
                                             right->getType(), uniqueStorage, (uint32_t)i));
@@ -4366,7 +4373,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         const auto& sourceData = compiler->GetDataStructure(
                                             rightNV.TypeAndValue.TypeName);
                                         for (size_t i = 0; i < sourceData.StructFields.size(); i++)
-                                            if (sourceData.StructFields[i].VariableName == "_v")
+                                            if (sourceData.StructFields[i].IsInterface
+                                                || sourceData.StructFields[i].VariableName == "_v")
                                             {
                                                 interfaceValue = compiler->CreateLoad(
                                                     compiler->CreateStructGEP(

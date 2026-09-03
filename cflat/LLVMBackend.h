@@ -1073,6 +1073,12 @@ public:
 
     };
 
+    struct AliasScopeFrame
+    {
+        std::unordered_map<std::string, std::string> typeAliases;
+        std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
+    };
+
     struct AnnotationValue
     {
         std::string Name;   // e.g. "JsonName"
@@ -2735,6 +2741,8 @@ private:
     // Closure type aliases (`using Cb = function<R(Args)>;`). Cannot live in string-shaped
     // typeAliases because a closure type carries a full call signature, not a plain type name.
     std::unordered_map<std::string, TypeAndValue> functionTypeAliases;
+    std::vector<AliasScopeFrame> aliasScopeStack_;
+    std::unordered_map<std::string, AliasScopeFrame> aggregateAliasScopes_;
     // Source spellings for instantiated generic types used only by diagnostics. The mangled key
     // remains the identity; this side map keeps user-facing text independent of MangleTypeArg.
     std::unordered_map<std::string, std::string> mangledTypeDisplayNames;
@@ -4807,6 +4815,7 @@ public:
     static bool IsPrimitiveTypeName(const std::string& name);
 
     void RegisterTypeAlias(const std::string& alias, const std::string& target);
+    void RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target);
 
     std::string ResolveTypeAlias(const std::string& name) const;
 
@@ -4832,6 +4841,25 @@ public:
     bool IsGenericBaseAlias(const std::string& name) const;
 
     std::string ResolveGenericBaseAlias(const std::string& base) const;
+
+    void PushAliasScope();
+    AliasScopeFrame PopAliasScope();
+    void PushAggregateAliasScope(const std::string& aggregateName);
+    void SaveAggregateAliasScope(const std::string& aggregateName);
+    bool AliasInCurrentScope(const std::string& alias) const;
+
+    class AliasScopeGuard
+    {
+    public:
+        explicit AliasScopeGuard(LLVMBackend* compiler) : compiler_(compiler) { compiler_->PushAliasScope(); }
+        AliasScopeGuard(LLVMBackend* compiler, const std::string& aggregateName)
+            : compiler_(compiler) { compiler_->PushAggregateAliasScope(aggregateName); }
+        ~AliasScopeGuard() { compiler_->PopAliasScope(); }
+        AliasScopeGuard(const AliasScopeGuard&) = delete;
+        AliasScopeGuard& operator=(const AliasScopeGuard&) = delete;
+    private:
+        LLVMBackend* compiler_;
+    };
 
     // Canonical interface lookup. Callers must not choose between a bare key and a qualified key
     // themselves: a namespace-local interface shadows a global interface of the same tail name.

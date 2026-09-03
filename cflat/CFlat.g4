@@ -852,6 +852,7 @@ baseSpecifier
 // with `declarationSpecifiers`; the named rule resolves it.
 aggregateMember
     : declaration
+    | usingDeclaration
     | functionDefinition
     | destructorDefinition
     | structDefinition

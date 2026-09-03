@@ -1,0 +1,63 @@
+// Scoped aliases reject same-scope redefinition but allow separate if-const arm scopes.
+void duplicateFunctionAlias()
+{
+    expect_error("alias 'M' is already defined in this scope") {
+        using M = int;
+        using M = i32;
+    }
+}
+
+expect_error("alias 'P' is already defined in this scope") {
+    struct DuplicateStructAlias
+    {
+        using P = int;
+        using P = i32;
+    };
+}
+
+expect_error("alias 'T' reuses the name of type parameter 'T' of 'AliasParameterNameReuse'") {
+    struct AliasParameterNameReuse<T>
+    {
+        using T = int;
+    };
+}
+
+expect_error("alias 'value' collides with member 'value' of 'AliasFieldNameCollision'") {
+    struct AliasFieldNameCollision
+    {
+        int value = 0;
+        using value = int;
+    };
+}
+
+expect_error("alias 'run' collides with member 'run' of 'AliasMethodNameCollision'") {
+    struct AliasMethodNameCollision
+    {
+        int run() { return 0; }
+        using run = int;
+    };
+}
+
+expect_error("alias 'Inner' collides with member 'Inner' of 'AliasNestedTypeNameCollision'") {
+    struct AliasNestedTypeNameCollision
+    {
+        struct Inner { int value = 0; };
+        using Inner = int;
+    };
+}
+
+void defineFunctionAlias()
+{
+    using M = int;
+}
+
+void useLeakedFunctionAlias()
+{
+    expect_error("unknown type 'M'");
+    M value = default;
+}
+
+extern int main()
+{
+    return 0;
+}

@@ -1,6 +1,18 @@
 {
   "argumentExamples": {
-    "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [],
+    "aliasarg0collideswithmemberarg1ofarg2": [
+      "value",
+      "value",
+      "AliasFieldNameCollision"
+    ],
+    "aliasarg0isalreadydefinedinthisscope": [
+      "M"
+    ],
+    "aliasarg0reusesthena...eparameterarg1ofarg20a53fdefc23ddef2": [
+      "T",
+      "T",
+      "AliasParameterNameReuse"
+    ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -452,7 +464,6 @@
     "duplicatenamedargumentarg0": [
       "a"
     ],
-    "endoffile": [],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"
@@ -487,7 +498,6 @@
       "')'",
       "'{'"
     ],
-    "missingatendofstatement": [],
     "namedargumentarg0doe...notmatchanyparameter54ee4c123914315f": [
       "z"
     ],
@@ -522,12 +532,24 @@
       "bool",
       "Foo"
     ],
-    "switchexpressionmustbeanintegertype": [],
     "unknowntypearg0": [
       "GiDeadOnly__i32"
     ]
   },
   "argumentNames": {
+    "aliasarg0collideswithmemberarg1ofarg2": [
+      "alias",
+      "alias",
+      "aggregateName"
+    ],
+    "aliasarg0isalreadydefinedinthisscope": [
+      "alias"
+    ],
+    "aliasarg0reusesthena...eparameterarg1ofarg20a53fdefc23ddef2": [
+      "alias",
+      "alias",
+      "aggregateName"
+    ],
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
       "functionName",
       "std::to_string(params[i].AllocAlignValue)",
@@ -1375,6 +1397,9 @@
   },
   "locale": "en-pseudo",
   "messages": {
+    "aliasarg0collideswithmemberarg1ofarg2": "alias '{0}' collides with member '{1}' of '{2}'",
+    "aliasarg0isalreadydefinedinthisscope": "alias '{0}' is already defined in this scope",
+    "aliasarg0reusesthena...eparameterarg1ofarg20a53fdefc23ddef2": "alias '{0}' reuses the name of type parameter '{1}' of '{2}'",
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
@@ -1568,8 +1593,19 @@
     "winrtdelegateoperato...ortacorelibraryfirsta2491578d800681c": "winrtDelegate: 'operator new' unavailable (import a core library first)"
   },
   "sites": {
+    "aliasarg0collideswithmemberarg1ofarg2": [
+      "MainListener.h:3358"
+    ],
+    "aliasarg0isalreadydefinedinthisscope": [
+      "ForwardRefScanner.cpp:1530",
+      "MainListener_Declarations.cpp:1643"
+    ],
+    "aliasarg0reusesthena...eparameterarg1ofarg20a53fdefc23ddef2": [
+      "MainListener.h:3354",
+      "MainListener.h:3395"
+    ],
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [
-      "MainListener_Expressions.cpp:11352"
+      "MainListener_Expressions.cpp:11354"
     ],
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": [
       "LLVMBackend_WinRT.cpp:1694"
@@ -1651,13 +1687,13 @@
     ],
     "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": [
       "ForwardRefScanner.cpp:515",
-      "MainListener_Declarations.cpp:2529"
+      "MainListener_Declarations.cpp:2534"
     ],
     "arg0staticinitializerexecutionfailedarg1": [
       "LLVMBackend_EmitAndLink.cpp:3586"
     ],
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": [
-      "LLVMBackend_Interfaces.cpp:1357"
+      "LLVMBackend_Interfaces.cpp:1418"
     ],
     "builtinssourcenotfoundarg0": [
       "LLVMBackend_CInterop.cpp:420"
@@ -1734,22 +1770,22 @@
       "LLVMBackend_WinRT.cpp:1936"
     ],
     "cannotconvertinterfa...ngarg2implementsarg3275f532c2c4f1baa": [
-      "LLVMBackend_Interfaces.cpp:1738"
+      "LLVMBackend_Interfaces.cpp:1799"
     ],
     "cannotconverttointer...0noclassimplementsit1e8c0aedb2889c6b": [
-      "LLVMBackend_Interfaces.cpp:1946"
+      "LLVMBackend_Interfaces.cpp:2007"
     ],
     "cannotconverttointer...g2declaredinsidearg380f17f1b4261ff04": [
-      "LLVMBackend_Interfaces.cpp:1932"
+      "LLVMBackend_Interfaces.cpp:1993"
     ],
     "cannotconverttointer...snottakeninthisbuild2453b841846c740d": [
-      "LLVMBackend_Interfaces.cpp:1919"
+      "LLVMBackend_Interfaces.cpp:1980"
     ],
     "cannotconverttointer...thernestedinsidearg3506794770e818c8b": [
-      "LLVMBackend_Interfaces.cpp:1924"
+      "LLVMBackend_Interfaces.cpp:1985"
     ],
     "cannotconverttointer...thernestedinsidearg46fae2dfad80b2d3d": [
-      "LLVMBackend_Interfaces.cpp:1938"
+      "LLVMBackend_Interfaces.cpp:1999"
     ],
     "cannotcopyarg0itisde...rmovethevalueinstead3793b495c6a49924": [
       "LLVMBackend_Overloads.cpp:678"
@@ -1789,7 +1825,7 @@
       "LLVMBackend_Overloads.cpp:1122"
     ],
     "cannotpassarg0asinte...doesnotimplementarg3abf6e4ddf846baae": [
-      "LLVMBackend_Interfaces.cpp:1340"
+      "LLVMBackend_Interfaces.cpp:1401"
     ],
     "cannotpassarg0toarg1...thanexplicitcastarg44f72ac88eeb8cb84": [
       "LLVMBackend_WinRT.cpp:1906"
@@ -1840,7 +1876,7 @@
       "LLVMBackend_MoveDataflow.cpp:1514"
     ],
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": [
-      "MainListener_Expressions.cpp:11345"
+      "MainListener_Expressions.cpp:11347"
     ],
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": [
       "LLVMBackend_CInterop.cpp:892"
@@ -1861,49 +1897,49 @@
       "LLVMBackend_CInterop.cpp:357"
     ],
     "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
-      "LLVMBackend_Interfaces.cpp:932"
+      "LLVMBackend_Interfaces.cpp:993"
     ],
     "classarg0doesnotimplementarg1arg2": [
       "LLVMBackend_WinRT.cpp:2876"
     ],
     "classarg0fieldarg1ha...arg3declaresitasarg48a734db922a905ed": [
-      "LLVMBackend_Interfaces.cpp:960"
+      "LLVMBackend_Interfaces.cpp:1021"
     ],
     "classarg0fieldarg1is...10frominterfacearg115f0bea281623e0f5": [
-      "LLVMBackend_Interfaces.cpp:987"
+      "LLVMBackend_Interfaces.cpp:1048"
     ],
     "classarg0fieldarg1is...oparg9fromclassarg1031a6c739ed8c752e": [
-      "LLVMBackend_Interfaces.cpp:978"
+      "LLVMBackend_Interfaces.cpp:1039"
     ],
     "classarg0methodarg1p...arg9oninterfacearg10ec4b10b44959142b": [
-      "LLVMBackend_Interfaces.cpp:1047"
+      "LLVMBackend_Interfaces.cpp:1108"
     ],
     "classarg0methodarg1p...g9frominterfacearg109b5bbab5ec4e2cc0": [
-      "LLVMBackend_Interfaces.cpp:1038"
+      "LLVMBackend_Interfaces.cpp:1099"
     ],
     "classarg0methodarg1p...twodeclarationsagree6bf9e4623207b28b": [
-      "LLVMBackend_Interfaces.cpp:1058"
+      "LLVMBackend_Interfaces.cpp:1119"
     ],
     "classarg0methodarg1p...twodeclarationsagreeb2b3fc055988d232": [
-      "LLVMBackend_Interfaces.cpp:1068"
+      "LLVMBackend_Interfaces.cpp:1129"
     ],
     "classarg0methodarg1p...twodeclarationsagreec4f2b930e72f8da1": [
-      "LLVMBackend_Interfaces.cpp:1078"
+      "LLVMBackend_Interfaces.cpp:1139"
     ],
     "classarg0methodarg1t...narg8oninterfacearg9186992c085ab2c1b": [
-      "LLVMBackend_Interfaces.cpp:1125"
+      "LLVMBackend_Interfaces.cpp:1186"
     ],
     "classarg0methodarg1t...narg8oninterfacearg9c14b5c6a79fc450b": [
-      "LLVMBackend_Interfaces.cpp:1105"
+      "LLVMBackend_Interfaces.cpp:1166"
     ],
     "classarg0methodarg1t...rg8frominterfacearg96e84ec7e43b58386": [
-      "LLVMBackend_Interfaces.cpp:1097"
+      "LLVMBackend_Interfaces.cpp:1158"
     ],
     "classarg0methodarg1t...rg8frominterfacearg9a2c5150ebb3cca45": [
-      "LLVMBackend_Interfaces.cpp:1116"
+      "LLVMBackend_Interfaces.cpp:1177"
     ],
     "classarg0methodarg1t...twodeclarationsagree1cbfbd8143256040": [
-      "LLVMBackend_Interfaces.cpp:1136"
+      "LLVMBackend_Interfaces.cpp:1197"
     ],
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
       "LLVMBackend_ControlFlowAndFunctions.cpp:660"
@@ -1952,16 +1988,16 @@
       "LspServer.cpp:2606"
     ],
     "getorcreateprogramvt...notimplementarg1arg27eb70aa4fbb83de6": [
-      "LLVMBackend_Interfaces.cpp:1210"
+      "LLVMBackend_Interfaces.cpp:1271"
     ],
     "getorcreateprogramvt...unknowninterfacearg0e4dc00542011e2b1": [
-      "LLVMBackend_Interfaces.cpp:1189"
+      "LLVMBackend_Interfaces.cpp:1250"
     ],
     "getorcreatevtablearg...notimplementarg1arg280f8d3de313016d6": [
-      "LLVMBackend_Interfaces.cpp:1277"
+      "LLVMBackend_Interfaces.cpp:1338"
     ],
     "getorcreatevtableunknowninterfacearg0": [
-      "LLVMBackend_Interfaces.cpp:1254"
+      "LLVMBackend_Interfaces.cpp:1315"
     ],
     "gettypealignbytesnulltypepointer": [
       "LLVMBackend_WinRT.cpp:2725"

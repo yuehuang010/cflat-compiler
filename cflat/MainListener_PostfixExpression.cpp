@@ -6190,6 +6190,7 @@ LLVMBackend::NamedVariable MainListener::ParseLambdaExpression(CFlatParser::Lamb
 
         auto* fn = compiler->CreateFunctionDefinition(lambdaName, returnType, allParams);
         compiler->InitializeBlock(&fn->front(), false);
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         struct LambdaDeferredCheckGuard
         {
             LLVMBackend* Compiler;

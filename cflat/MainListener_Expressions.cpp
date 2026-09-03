@@ -4710,7 +4710,7 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                  (tt == fatTy && isCoreUniqueStruct(ft)) || (ft == fatTy && isCoreUniqueStruct(tt)))
         {
             // A core unique interface wrapper joins with a plain interface value by borrowing
-            // its `_v` field. Keep the wrapper arm non-owning so the mixed-join receiver check runs.
+            // its `_p` field. Keep the wrapper arm non-owning so the mixed-join receiver check runs.
             bool trueIsWrapper = isCoreUniqueStruct(tt);
             llvm::Value*& wrapperValue = trueIsWrapper ? trueValue : falseValue;
             llvm::Value*& fatValue = trueIsWrapper ? falseValue : trueValue;
@@ -4719,7 +4719,7 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
             size_t valueIndex = data.StructFields.size();
             for (size_t i = 0; i < data.StructFields.size(); ++i)
             {
-                if (data.StructFields[i].VariableName == "_v")
+                if (data.StructFields[i].VariableName == "_p")
                 {
                     valueIndex = i;
                     break;
@@ -4778,7 +4778,7 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                             compiler->RegisterMovedOutPtrValue(value);
                         return;
                     }
-                    if (data.StructFields[i].VariableName == "_v")
+                    if (data.StructFields[i].VariableName == "_p")
                     {
                         value = compiler->builder->CreateExtractValue(
                             value, {(unsigned)i}, "unique_interface_value");
@@ -5200,6 +5200,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             std::string fieldName;
             size_t fieldIndex = 0;
             LLVMBackend::TypeAndValue releasedType;
+            bool interfaceField = false;
             for (size_t i = 0; i < data.StructFields.size(); ++i)
             {
                 const auto& field = data.StructFields[i];
@@ -5208,6 +5209,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                     fieldName = field.VariableName;
                     fieldIndex = i;
                     releasedType = field;
+                    interfaceField = field.IsInterface || fieldName == "_v";
                     break;
                 }
             }
@@ -5234,13 +5236,13 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
                 receiver.IsBorrowed = false;
                 receiver.CallerName.clear();
                 releasedType.IsMove = true;
-                releasedType.Pointer = fieldName == "_p";
-                releasedType.IsInterface = fieldName == "_v";
+                releasedType.Pointer = !interfaceField;
+                releasedType.IsInterface = interfaceField;
                 releasedType.IsInterfacePointer = false;
                 value = compiler->CreateCoreUniqueRawPointerCall(receiver, releasedType);
             }
             if (value == nullptr) return false;
-            if (fieldName == "_p")
+            if (!interfaceField)
                 compiler->RegisterValueElementTypeName(value, releasedType.TypeName);
             else
                 compiler->RegisterFatInterfaceValueTypeName(value, releasedType.TypeName);
@@ -5249,7 +5251,7 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             {
                 std::string target = expectedUniqueInterface
                     ? outerExpected.TypeName.substr(8) : outerExpected.TypeName;
-                if (fieldName == "_p")
+                if (!interfaceField)
                 {
                     std::string armFailure;
                     value = BoxTernaryThinArmToInterface(value, target, armFailure);

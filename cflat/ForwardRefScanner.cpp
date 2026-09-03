@@ -540,6 +540,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
 
         std::vector<LLVMBackend::TypeAndValue> allParams(params.begin(), params.end());
 
+        LLVMBackend::AliasScopeGuard functionAliasScope(compiler);
         ApplyOwningSinkInference(compiler, func, allParams);
 
         bool returnsOwned = ComputeReturnsOwned(returnType, name, allParams);
@@ -1525,6 +1526,10 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         else if (ctx->Identifier() != nullptr)
             alias = ctx->Identifier()->getText();
 
+        if (compiler->AliasInCurrentScope(alias))
+            compiler->LogError(compiler->LocalizeMessage(
+                "alias '{}' is already defined in this scope", { alias }));
+
         auto* typeSpec = ctx->typeSpecifier();
 
         // Function-type alias (using Cb = function<R(Args)>): store the resolved signature so the
@@ -1532,8 +1537,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         // forward reference in a function signature resolves during the scan pass).
         if (auto* fpSpec = typeSpec->functionPointerSpecifier())
         {
-            auto aliasKeys = compiler->ScopedNameCandidates(alias);
-            compiler->functionTypeAliases[aliasKeys.empty() ? alias : aliasKeys.front()] = BuildFuncPtrAliasType(fpSpec);
+            compiler->RegisterFunctionTypeAlias(alias, BuildFuncPtrAliasType(fpSpec));
             return;
         }
         std::string target = typeSpec->getText();
@@ -1603,6 +1607,37 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
             || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
             compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+    }
+
+void ForwardRefScanner::ScanAggregateAliases(
+    const std::vector<CFlatParser::AggregateMemberContext*>& members)
+{
+        auto scanIfConst = [&](auto&& self, CFlatParser::IfConstMemberContext* ifConst) -> void
+        {
+            int decision = ScannerDecideIfConst(ifConst->expression());
+            auto blocks = ifConst->ifConstMemberBlock();
+            if (decision > 0 && !blocks.empty())
+                ScanAggregateAliases(blocks[0]->aggregateMember());
+            else if (decision == 0)
+            {
+                if (auto* elseIf = ifConst->ifConstMember())
+                    self(self, elseIf);
+                else if (blocks.size() > 1)
+                    ScanAggregateAliases(blocks[1]->aggregateMember());
+            }
+        };
+        for (auto* member : members)
+        {
+            if (auto* usingDecl = member->usingDeclaration())
+            {
+                ScanUsingDeclaration(usingDecl);
+                continue;
+            }
+
+            auto* ifConst = member->ifConstMember();
+            if (ifConst == nullptr) continue;
+            scanIfConst(scanIfConst, ifConst);
+        }
     }
 
 void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionContext* ctx) {

@@ -2747,6 +2747,87 @@ bool testGenericAlias()
     return result;
 }
 
+// Struct/class-scope aliases are resolved for each generic instantiation. The interface arm
+// keeps a fat interface value while the concrete arm keeps a pointer to the concrete type.
+interface ScopedAliasReadable { int Read(); };
+
+class ScopedAliasReader : ScopedAliasReadable
+{
+    int value = default;
+    int Read() { return value; }
+};
+
+struct ScopedAliasBox<T>
+{
+    using P = T*;
+    P value = default;
+    P get() { return value; }
+};
+
+struct SelectedScopedAliasBox<T>
+{
+    if const (is_interface(T)) { using P = T; }
+    else { using P = T*; }
+    P value = default;
+    P get() { return value; }
+};
+
+struct AliasDeclaredBelow<T>
+{
+    P value = default;
+    using P = T;
+    P get() { return value; }
+};
+
+struct ShadowedScopedAlias<T>
+{
+    using P = T*;
+    P outer = default;
+    struct Inner
+    {
+        using P = int;
+        P value = 0;
+        P get() { return value; }
+    };
+    Inner inner = default;
+};
+
+bool testStructScopeUsingAliases()
+{
+    bool result = true;
+
+    ScopedAliasBox<ScopedAliasReader> rawBox = default;
+    ScopedAliasReader* raw = new ScopedAliasReader();
+    raw->value = 7;
+    rawBox.value = raw;
+    result &= Test("struct_scope_alias_pointer", rawBox.get()->Read(), 7);
+    delete raw;
+
+    SelectedScopedAliasBox<ScopedAliasReadable> ifaceBox = default;
+    ScopedAliasReader impl = default;
+    impl.value = 11;
+    ScopedAliasReadable iface = impl;
+    ifaceBox.value = iface;
+    result &= Test("struct_scope_alias_interface", ifaceBox.get().Read(), 11);
+
+    SelectedScopedAliasBox<ScopedAliasReader> structBox = default;
+    ScopedAliasReader* structRaw = new ScopedAliasReader();
+    structRaw->value = 13;
+    structBox.value = structRaw;
+    result &= Test("struct_scope_alias_struct", structBox.get()->Read(), 13);
+    delete structRaw;
+
+    AliasDeclaredBelow<int> below = default;
+    below.value = 17;
+    result &= Test("struct_scope_alias_field_before_using", below.get(), 17);
+
+    ShadowedScopedAlias<ScopedAliasReader> shadow = default;
+    shadow.inner.value = 19;
+    result &= Test("struct_scope_alias_nested_shadow", shadow.inner.get(), 19);
+
+    return result;
+}
+
 // --- member-scope `if const`: per-instantiation member dispatch ---
 
 class IfConstRes
@@ -4525,6 +4606,7 @@ extern int main()
     total++; passed += testGenericFunctions()                      ? 1 : 0;
     total++; passed += testGenericSizeof()                          ? 1 : 0;
     total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
+    total++; passed += testStructScopeUsingAliases()                ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

@@ -303,7 +303,13 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         // and "Instruction does not dominate all uses" verifier error).
         auto savedStack = std::move(instCompiler->stackNamedVariable);
         instCompiler->stackNamedVariable.clear();
-        ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+        if (!ownerStruct.empty())
+        {
+            LLVMBackend::AliasScopeGuard aggregateAliasScope(instCompiler, ownerStruct);
+            ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
+        }
+        else
+            ParseFunctionDefinition(tmplCtx, ownerStruct, {}, mangledName, DeclaringNamespaceOf(compilerLLVM, baseName));
         instCompiler->stackNamedVariable = std::move(savedStack);
         savedState.restore();
 
