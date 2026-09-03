@@ -11967,6 +11967,87 @@ int testDesugaredUniquePointerForms()
     return passed;
 }
 
+// --- SLOT-MOVE rule (2026-09-03). `sink(move borrowedParam)` is rejected (negative legs in
+// Test/errors/err_move_borrow_into_sink.cb); moving out of the OWNING SLOT reached THROUGH the
+// borrow stays legal and is the prescribed fix. These legs pin that the slot move runs exactly
+// one destructor and nulls the slot.
+int slotNodeDtors = 0;
+
+struct SlotParent
+{
+    Resource* kids[4] = default;
+    ~SlotParent() { }
+};
+
+void slotSink(move Resource* r) { delete r; }
+
+// `parent` is a BORROWED parameter, but `parent->kids[0]` is an owning SLOT: the move nulls the
+// slot, so the sink is the one release path.
+void slotMoveThroughBorrowedParent(SlotParent* parent) { slotSink(move parent->kids[0]); }
+
+struct SlotTree
+{
+    Resource* _root = nullptr;
+    ~SlotTree() { }
+    // `move _root` from a method. The slot is nulled when the CALL RETURNS, so a caller that has
+    // to re-seat the slot must assign after the call (see cflat/core/hpc/btree.cb).
+    void releaseRoot() { slotSink(move _root); }
+};
+
+struct SlotNode
+{
+    int id = 0;
+    SlotNode* children[2] = default;
+    ~SlotNode() { slotNodeDtors = slotNodeDtors + 1; }
+};
+
+// The `_freeSubtree` shape: the bare `n->children[i]` argument is an IMPLICIT move out of an
+// owning element slot, which is a slot move and stays legal.
+void slotFreeSubtree(move SlotNode* n)
+{
+    if (n == nullptr) return;
+    int i = 0;
+    while (i < 2) { slotFreeSubtree(n->children[i]); i = i + 1; }
+    delete n;
+}
+
+int testSlotMoveIntoSink()
+{
+    int passed = 0;
+
+    dtorCount = 0;
+    {
+        SlotParent* parent = new SlotParent();
+        parent->kids[0] = new Resource();
+        slotMoveThroughBorrowedParent(parent);
+        passed += Test("slot_move_parent_dtor", dtorCount, 1);
+        passed += Test("slot_move_parent_slot_nulled", parent->kids[0] == nullptr, true);
+        delete parent;
+    }
+
+    dtorCount = 0;
+    {
+        SlotTree* t = new SlotTree();
+        t->_root = new Resource();
+        t->releaseRoot();
+        passed += Test("slot_move_root_dtor", dtorCount, 1);
+        passed += Test("slot_move_root_nulled", t->_root == nullptr, true);
+        delete t;
+    }
+
+    slotNodeDtors = 0;
+    {
+        SlotNode* root = new SlotNode();
+        root->children[0] = new SlotNode();
+        root->children[1] = new SlotNode();
+        root->children[0]->children[0] = new SlotNode();
+        slotFreeSubtree(root);
+        passed += Test("slot_move_free_subtree_dtors", slotNodeDtors, 4);
+    }
+
+    return passed;
+}
+
 extern int main()
 {
     int passed = 0;
@@ -12342,6 +12423,9 @@ extern int main()
 
     passed += testDesugaredUniquePointerForms();
     total += 36;
+
+    passed += testSlotMoveIntoSink();
+    total += 5;
 
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

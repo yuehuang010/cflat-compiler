@@ -198,6 +198,13 @@
     "cannotcopyarg0unique...nethepointeeyourselfb6e9ff574f9a1595": [
       "unique<IShape>"
     ],
+    "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": [
+      "borrowed parameter 'p'",
+      "q",
+      "sink",
+      "p",
+      "p"
+    ],
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": [
       "b",
       "new T[n] alignas(0, 64)",
@@ -1472,6 +1479,7 @@
     "cannotlocatecrashhan...timedirectoryisunsetef91181cafe6b040": "cannot locate crash handler source: runtime directory is unset.",
     "cannotlowerexternret...rtheactivecabirecipe7d08233bdb7fb8eb": "cannot lower extern return value for the active C ABI recipe",
     "cannotlowerexternsre...singhiddenreturnslot205bdd697f2b57c7": "cannot lower extern sret return: missing hidden return slot",
+    "cannotmovearg0intomo...ifthisfunctionownsite3725c6c36e14caf": "cannot move {0} into move parameter '{1}' of '{2}' - the caller may still own this pointer and will free it on scope exit. Move it out of the owning slot instead (e.g. 'move parent->children[i]'), or declare '{3}' as 'move {4}' if this function owns it.",
     "cannotmovearg0itwasr...luethereceivercanownecd0567bd50b057c": "cannot 'move' '{0}' - it was returned as a borrow of unique field '{1}', and moving the alias does not null the field, so the field's synthesized destructor still frees the pointee. Pass it to a plain (non-'move') parameter, which borrows, or pass a value the receiver can own.",
     "cannotmovetheoverali...heelementtypeinstead37678af4b62532f7": "cannot move the over-aligned buffer '{0}' ('{1}') into the '{2}' parameter of '{3}': that alignment is a property of the allocation, not of the type, so the callee cannot recover it. Declare the parameter '{4}' so the block alignment is recorded, or over-align the ELEMENT TYPE instead.",
     "cannotpassanowningva...evaluetoanownerfirste67cc584259d5eee": "cannot pass an owning value to the variadic '{0}' slot of '{1}'; bind the value to an owner first",

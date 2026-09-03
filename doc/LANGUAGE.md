@@ -1340,6 +1340,61 @@ the borrow you asked for, so `alias string a = bars.get(0).date;` is still rejec
 and a named `alias` string local is still rejected at a field store - copying either one silently
 would make a second owner.
 
+### Moving into a `move` parameter: the slot rule
+
+A `move T*` parameter is a **sink** - the callee takes ownership and is free to `delete` it. The
+argument therefore has to be something this function actually owns. Handing a sink a pointer
+PARAMETER that was only borrowed is rejected, whether or not `move` is spelled:
+
+```cflat
+void sink(move Node* q) { delete q; }
+
+void f(Node* n)
+{
+    sink(move n);   // ERROR: cannot move borrowed parameter 'n' into move parameter 'q' of 'sink'
+    sink(n);        // ERROR: same transfer, no keyword
+    Node* p = n;
+    sink(move p);   // ERROR: 'p' is a borrowed pointer copied from parameter 'n'
+}
+```
+
+The caller may still own that pointer and will free it at its own scope exit, so the callee's
+`delete` is a double free.
+
+**The fix is to move out of the owning SLOT**, not out of the borrow. A field, an array element or
+a container slot reached THROUGH a borrowed pointer is a real owner, and the move nulls it, so
+exactly one release happens:
+
+```cflat
+void detach(Parent* parent, int i) { sink(move parent->children[i]); }  // OK - slot is nulled
+
+struct Tree
+{
+    Node* _root = nullptr;
+    void clear() { sink(move _root); }        // OK - `_root` is this object's owning slot
+};
+
+void freeSubtree(move Node* n)
+{
+    for (int i = 0; i < n->count; i = i + 1) freeSubtree(n->children[i]);  // OK - implicit slot move
+    delete n;
+}
+```
+
+A local copied out of a field (`int* p = t->buffer;`) copies the SLOT, not the parameter, so it is
+accepted as well - that is the usual "null the fields, then free them" teardown shape.
+
+Two details worth knowing:
+
+- **The slot is nulled when the call RETURNS**, not before it. A callee handed `move obj->slot`
+  must not try to re-seat `obj->slot` itself: return the replacement and let the caller store it
+  after the call.
+- If the function really does own the pointer, say so in its signature (`void f(move Node* n)`);
+  then `sink(move n)` is a genuine transfer and is accepted.
+
+Provenance the compiler cannot prove is accepted, as everywhere else in the ownership checks -
+the rule rejects only what it can show is a borrow.
+
 ### `move` Return Type
 
 `move T*` on a function's return type declares that the caller receives ownership of the returned pointer - the caller is responsible for freeing it (or passing it along).

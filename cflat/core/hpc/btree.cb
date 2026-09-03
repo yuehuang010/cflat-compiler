@@ -903,7 +903,8 @@ struct btree<K, V>
         // height if the root collapses. `leaf` is only ever borrowed here - remove() does
         // not own it (it is already linked into the tree); ownership only moves at the
         // point a helper actually frees a node (see _mergeWithLeft/_mergeWithRight/
-        // _collapseEmptyRoot, all of which take their doomed node by `move`).
+        // _collapseEmptyRoot, each of which is handed its doomed node by a `move` out of
+        // that node's OWNING SLOT - `_root` or `parent->children[i]`).
         _rebalanceFrom(path, pathIdx, depth, leaf);
 
         return true;
@@ -914,8 +915,8 @@ struct btree<K, V>
     // merge only ever touch node's immediate parent's separator (a borrow moves one entry
     // across a single sibling boundary; a merge deletes the separator between the two
     // nodes it joins), so no fixup above the immediate parent is ever required. `node` is
-    // borrowed - it is already part of the tree, and this function only sometimes hands
-    // it off (via `move`) to a helper that frees it.
+    // borrowed - it is already part of the tree. A helper that frees a node is handed the
+    // node's OWNING SLOT (`_root` / `parent->children[i]`), never this borrowed local.
     void _rebalanceFrom(btree_node<K, V>** path, int* pathIdx, int depth, btree_node<K, V>* node)
     {
         int d = depth;
@@ -926,7 +927,15 @@ struct btree<K, V>
                 // node is the root: shrink the tree's height if it is now empty (a
                 // childless internal node collapses to its only child; an empty leaf
                 // collapses the tree to nullptr). Otherwise node stays the root untouched.
-                if (node->count == 0) _collapseEmptyRoot(node->isLeaf, move node);
+                // node IS the root here, so hand off the OWNING SLOT (_root), not the
+                // borrowed local. The move out of a slot nulls it when the call RETURNS, so
+                // the helper cannot re-seat _root itself - it hands back the replacement and
+                // the assignment happens here, after the call.
+                if (node->count == 0)
+                {
+                    btree_node<K, V>* newRoot = _collapseEmptyRoot(node->isLeaf, move _root);
+                    _root = newRoot;
+                }
                 break;
             }
             if (node->count >= _minKeys()) break;
@@ -949,9 +958,9 @@ struct btree<K, V>
             }
 
             if (leftSib != nullptr)
-                _mergeWithLeft(parent, idx, move node, leftSib);
+                _mergeWithLeft(parent, idx, move parent->children[idx], leftSib);
             else
-                _mergeWithRight(parent, idx, node, move rightSib);
+                _mergeWithRight(parent, idx, node, move parent->children[idx + 1]);
 
             node = parent;
             d--;
@@ -959,16 +968,19 @@ struct btree<K, V>
     }
 
     // Merge node into leftSib (node is parent->children[idx], leftSib is its left sibling);
-    // node disappears. Frees node, so it is taken by move.
+    // node disappears. Frees node, so it is taken by move OUT OF ITS OWNING SLOT
+    // (`move parent->children[idx]`): the caller's move nulls that slot, and the separator
+    // fixup below overwrites it before anything reads it.
     void _mergeWithLeft(btree_node<K, V>* parent, int idx, move btree_node<K, V>* node, btree_node<K, V>* leftSib)
     {
         bool leafMerge = node->isLeaf;
         int k = 0;
         if (node->isLeaf)
         {
-            // `node` is a `move` parameter, so `move node->keys[k]` is legal: it transfers the
-            // owning key/value into leftSib and clears node's slot, so `delete node` (whose
-            // destructor now frees all slots) sees them empty - no double free.
+            // `move node->keys[k]` is an ELEMENT-SLOT move, legal through any borrow: it
+            // transfers the owning key/value into leftSib and clears node's slot, so
+            // `delete node` (whose destructor frees all slots) sees them empty - no double
+            // free. `move` on the PARAMETER is what makes the `delete` below legal.
             while (k < node->count)
             {
                 leftSib->keys[leftSib->count] = move node->keys[k];
@@ -982,7 +994,7 @@ struct btree<K, V>
         {
             // Internal merge pulls the parent separator DOWN into leftSib by shallow copy (parent
             // is borrowed - no `move`); the fixup below overwrites that parent slot without freeing,
-            // so leftSib keeps the buffer. node's keys transfer by move (move parameter).
+            // so leftSib keeps the buffer. node's keys transfer by element-slot move.
             leftSib->keys[leftSib->count] = parent->keys[idx - 1];
             leftSib->count++;
             while (k < node->count)
@@ -1017,15 +1029,18 @@ struct btree<K, V>
     }
 
     // Merge rightSib into node (node is parent->children[idx], rightSib is its right
-    // sibling); rightSib disappears. Frees rightSib, so it is taken by move.
+    // sibling); rightSib disappears. Frees rightSib, so it is taken by move OUT OF ITS
+    // OWNING SLOT (`move parent->children[idx + 1]`): the caller's move nulls that slot,
+    // and the separator fixup below overwrites it before anything reads it.
     void _mergeWithRight(btree_node<K, V>* parent, int idx, btree_node<K, V>* node, move btree_node<K, V>* rightSib)
     {
         bool leafMerge = node->isLeaf;
         int k = 0;
         if (node->isLeaf)
         {
-            // `rightSib` is a `move` parameter, so `move rightSib->keys[k]` transfers the owning
-            // key/value into node and clears rightSib's slot; `delete rightSib` then frees empties.
+            // `move rightSib->keys[k]` is an element-slot move (legal through any borrow): it
+            // transfers the owning key/value into node and clears rightSib's slot, so
+            // `delete rightSib` then frees empties. `move` on the PARAMETER makes that delete legal.
             while (k < rightSib->count)
             {
                 node->keys[node->count] = move rightSib->keys[k];
@@ -1072,22 +1087,16 @@ struct btree<K, V>
         parent->count--;
     }
 
-    // Free an empty root node (node->count == 0, already verified by the caller) and shrink
-    // the tree: an internal node collapses to its only remaining child; a leaf collapses to
-    // an empty tree. Always frees node, so it is taken by move.
-    void _collapseEmptyRoot(bool wasLeaf, move btree_node<K, V>* node)
+    // Free an empty root node (node->count == 0, already verified by the caller) and hand back
+    // the node that must replace it: an internal node collapses to its only remaining child; a
+    // leaf collapses to an empty tree. Always frees node, so it is taken by move out of the
+    // tree's owning `_root` slot; the CALLER stores the returned replacement into `_root`,
+    // because moving out of a slot nulls that slot when the call returns.
+    btree_node<K, V>* _collapseEmptyRoot(bool wasLeaf, move btree_node<K, V>* node)
     {
-        if (!wasLeaf)
-        {
-            btree_node<K, V>* onlyChild = node->children[0];
-            delete node;
-            _root = onlyChild;
-        }
-        else
-        {
-            delete node;
-            _root = nullptr;
-        }
+        btree_node<K, V>* onlyChild = wasLeaf ? nullptr : node->children[0];
+        delete node;
+        return onlyChild;
     }
 
     // Borrow the last entry of leftSib into node (node is parent->children[idx]).

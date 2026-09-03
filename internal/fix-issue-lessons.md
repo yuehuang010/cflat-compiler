@@ -3052,3 +3052,35 @@ See also the governing rule for the guard family (unknown ACCEPTS; a false rejec
 a missed dangle is today's behaviour), recorded above.
 
 2026-09-03: Stage 1 changed type and function mangling from double-underscore separators to `$`.
+
+## Landed 2026-09-03: the SLOT-MOVE rule (move-sink fed by a borrow)
+
+Rule: binding an argument to a `move` SINK parameter is REJECTED when the argument is a borrowed
+pointer/interface PARAMETER of the enclosing function, or a local that copied one directly. Covers
+explicit `move x` and the implicit move of a bare argument. Guard lives in
+`LLVMBackend_Overloads.cpp` in the parameter loop, right after the core-`unique<T>` blessed guard
+(which is left ahead of it so its existing error tests keep their wording). Polarity is the guard
+family's: unknown provenance ACCEPTS - the argument must have direct alloca storage, no FieldName,
+no owning bit, and a proven parameter origin.
+
+`BorrowedThroughField` is the load-bearing exclusion: `int* p = t->permutation;` is a copy of an
+OWNING SLOT, not of the parameter, so it must not be reached (`core/sci/spatial.cb::kdtree_free`
+is the witness - it was the only false rejection in the whole tree).
+
+Moving out of an owning SLOT reached through a borrow stays legal and is the prescribed fix:
+`sink(move parent->children[i])`, `sink(move _root)`, `_freeSubtree(n->children[i])`.
+
+**A move out of a slot nulls the slot when the CALL RETURNS, not before.** This cost a bisect:
+`_collapseEmptyRoot(node->isLeaf, move _root)` in `core/hpc/btree.cb` was silently zeroing `_root`
+on top of the callee's own `_root = onlyChild`, so every `remove()` after the first root collapse
+returned false (500-key ascending removal stalled at key 372). A callee handed a slot move can
+never re-seat that slot itself - it must return the replacement and let the caller assign after
+the call. btree was rewritten that way plus `move parent->children[idx]` /
+`move parent->children[idx + 1]` at the two merge sites; the stale comments claiming `move` on the
+PARAMETER is what makes `move node->keys[k]` legal were corrected (element-slot moves are legal
+through any borrow; the `move` param only ever bought the `delete`).
+
+Tried and rejected earlier by the issue file, do not retry: a destination-agnostic rejection at the
+`move` expression (measured and disproved); splitting `move` into a separate gut-permission
+modifier (there is no second meaning to split); a new opt-out spelling or forwarder modifier (both
+offered to the maintainer 2026-09-03 and declined); exempting btree.

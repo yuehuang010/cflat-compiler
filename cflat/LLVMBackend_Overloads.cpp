@@ -1575,6 +1575,78 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                               sourceName });
                 }
             }
+
+            /*
+             * The general SLOT-MOVE rule. Binding a BORROWED PARAMETER of the enclosing function
+             * (or a local that copied one) to a `move` sink parameter hands the callee a pointer
+             * the caller still owns and will free again at its own scope exit - a double free,
+             * whether the `move` is spelled or implicit. Moving out of the owning SLOT reached
+             * THROUGH the borrow (`move parent->children[i]`, `move _root`) stays legal and is the
+             * recommended fix: the slot is the one owner and the move nulls it. Storage must be a
+             * direct alloca, so every field / element access is exempt by construction. Unknown
+             * provenance ACCEPTS.
+             */
+            if (!isCoreUniqueConstructor && !isCoreUniqueReset)
+            {
+                const auto& sinkParam = candidate.Parameters[i];
+                bool paramIsSink = !sinkParam.IsAlias
+                    && ((sinkParam.IsMove
+                         && (sinkParam.Pointer || sinkParam.IsInterfacePointer
+                             || sinkParam.IsFatInterfaceValue()))
+                        // A `unique<T>` BY-VALUE parameter is a sink without the keyword: the
+                        // type says the callee takes ownership.
+                        || (!sinkParam.Pointer && IsCoreUniqueType(sinkParam.TypeName)));
+                const auto& arg = matched[i];
+                bool storageIsLocalSlot = arg.Storage != nullptr
+                    && llvm::isa<llvm::AllocaInst>(arg.Storage);
+                // The argument NV is rebuilt by the expression walk, so the borrow bits live on
+                // the binding itself - ask the live variable, not the copy.
+                const NamedVariable* live = storageIsLocalSlot
+                    ? FindVariableByStorage(arg.Storage) : nullptr;
+                bool argOwns = arg.IsOwning || arg.IsOwningStruct || arg.IsOwningString
+                    || arg.OwnsInterfaceBox
+                    || (live != nullptr && (live->IsOwning || live->IsOwningStruct
+                                            || live->IsOwningString || live->IsNewAllocated))
+                    || (!arg.CallerName.empty() && IsVariableOwning(arg.CallerName));
+                if (paramIsSink && storageIsLocalSlot && !argOwns && arg.FieldName.empty()
+                    && !BorrowProofRetiredByRebind(arg)
+                    && (live == nullptr || !BorrowProofRetiredByRebind(*live)))
+                {
+                    bool directBorrowParam = !arg.CallerName.empty()
+                        && IsFunctionParameter(arg.CallerName);
+                    // A local read out of a FIELD of the borrowed parameter copies an OWNING
+                    // SLOT, not the parameter - that is exactly the legal idiom, so it is not
+                    // reached by this rule.
+                    bool throughField = arg.BorrowedThroughField
+                        || (live != nullptr && live->BorrowedThroughField);
+                    std::string borrowOrigin = throughField ? std::string()
+                        : (!arg.BorrowedOrigin.empty()
+                           ? arg.BorrowedOrigin
+                           : (live != nullptr && live->IsBorrowed ? live->BorrowedOrigin
+                                                                  : std::string()));
+                    bool copiedFromBorrowParam = !directBorrowParam
+                        && !borrowOrigin.empty() && IsFunctionParameter(borrowOrigin);
+                    if (directBorrowParam || copiedFromBorrowParam)
+                    {
+                        std::string sourceName = directBorrowParam
+                            ? std::format("borrowed parameter '{}'", arg.CallerName)
+                            : std::format("borrowed pointer '{}' (copied from parameter '{}')",
+                                          arg.CallerName.empty() ? borrowOrigin
+                                                                 : arg.CallerName,
+                                          borrowOrigin);
+                        std::string declName = directBorrowParam ? arg.CallerName : borrowOrigin;
+                        LogErrorMessage(
+                            "cannot move {} into move parameter '{}' of '{}' - the caller may still "
+                            "own this pointer and will free it on scope exit. Move it out of the "
+                            "owning slot instead (e.g. 'move parent->children[i]'), or declare "
+                            "'{}' as 'move {}' if this function owns it.",
+                            { sourceName, sinkParam.VariableName,
+                              SpellFunctionSymbol(*this, diagnosticFunctionName),
+                              declName, declName });
+                    }
+                }
+            }
+
             if (candidate.Parameters[i].IsMove && matched[i].IsBonded)
                 LogErrorMessage("parameter '{}': cannot pass bonded value to '{}' parameter - bonded values cannot be transferred out of their source's scope",
                     { candidate.Parameters[i].VariableName, "move" });

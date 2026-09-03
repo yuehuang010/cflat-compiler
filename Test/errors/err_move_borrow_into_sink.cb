@@ -1,0 +1,48 @@
+// The SLOT-MOVE rule: binding a BORROWED PARAMETER of the enclosing function (or a local that
+// copied one) to a `move` SINK parameter hands the callee a pointer the caller still owns and
+// will free again on scope exit - a double free, whether the `move` is spelled or implicit.
+// Moving out of the owning SLOT reached through the borrow (`move parent->children[i]`,
+// `move _root`) stays legal; the positive legs live in Test/test_move.cb.
+import "unique.cb";
+
+class Ci { int r = 7; ~Ci() { } };
+void sink(move Ci* q) { delete q; }
+
+// 1. The explicit form: `move p` nulls only the callee's copy, so the caller stays sole owner.
+expect_error("cannot move borrowed parameter 'p' into move parameter 'q' of 'sink'") {
+    void explicitMove(Ci* p) { sink(move p); }
+}
+
+// 2. The IMPLICIT form: a bare pointer argument bound to a `move T*` parameter is the same
+// transfer with no keyword, so it is rejected identically.
+expect_error("cannot move borrowed parameter 'p' into move parameter 'q' of 'sink'") {
+    void implicitMove(Ci* p) { sink(p); }
+}
+
+// 3. Laundered through a local copy of the borrowed parameter. The provenance flags still prove
+// the origin, so the rejection names both the local and the parameter it copied.
+expect_error("cannot move borrowed pointer 'p' (copied from parameter 'n') into move parameter 'q' of 'sink'") {
+    void copiedFromBorrow(Ci* n) { Ci* p = n; sink(move p); }
+}
+
+// 4. The INTERFACE twin: a borrowed interface VALUE bound to a `move` interface parameter used
+// to bind silently, so the callee released a box the caller still owned.
+interface IShape { int area(); };
+class Box : IShape { int a = 3; int area() { return a; } ~Box() { } };
+void sinkIface(move IShape s) { }
+
+expect_error("cannot move borrowed parameter 'borrowed' into move parameter 's' of 'sinkIface'") {
+    void ifaceMove(IShape borrowed) { sinkIface(move borrowed); }
+}
+
+// 5. The same through a `unique<T>` BY-VALUE parameter, which is a sink without the keyword.
+void sinkUnique(unique<IShape> s) { }
+
+expect_error("cannot move borrowed parameter 'borrowed' into move parameter 's' of 'sinkUnique'") {
+    void uniqueParamMove(IShape borrowed) { sinkUnique(move borrowed); }
+}
+
+extern int main()
+{
+    return 0;
+}
