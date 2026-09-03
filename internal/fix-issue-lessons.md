@@ -3084,3 +3084,31 @@ Tried and rejected earlier by the issue file, do not retry: a destination-agnost
 `move` expression (measured and disproved); splitting `move` into a separate gut-permission
 modifier (there is no second meaning to split); a new opt-out spelling or forwarder modifier (both
 offered to the maintainer 2026-09-03 and declined); exempting btree.
+
+## Temp-unique-field escapes: the guard family is closed, and what it deliberately ACCEPTS (2026-09-03)
+
+`p1/temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return.md` is retired.
+The last two closable residues landed today: a generic interface INSTANCE now has a closed world of
+its own (every implementor registers under the mangled instance name, so the instance overrides the
+template's uncertainty once instantiation is drained - the template itself never can), and an
+interface call whose ARGUMENT is a candidate launder now carries that launder's conditions onto the
+recorded entry exactly as the direct-call recorder does. Reject legs:
+`Test/errors/err_temp_unique_field_iface_generic.cb`, `..._iface_launder_arg.cb`.
+
+What remains is ratified ACCEPT, not unfixed bugs - the family's polarity is unknown-ACCEPTS:
+
+- **`function<T>` dispatch has no closed world.** `f(makeBox().t)` through a function-pointer value
+  dangles and compiles. Closing it needs a points-to analysis; do not re-open it.
+- **The parameter returned back out of a local FIELD** (`Slot s; s.q = n; return s.q;`) stays
+  accepted. Relaxing `ParameterMayReachReturn` to follow a load through a GEP was BUILT and MEASURED
+  TWICE and false-rejects `int readResourceId(Resource* r) { return r->id; }` in `Test/test_move.cb`;
+  the type-based refinement (pointer loads only) false-rejects `Node* getNext(Node* n)`. **Do not
+  retry either.** Closing it needs field/offset awareness the walk does not have.
+- **`kMaxRetainDepth` / `kMaxRetainUses` budget escapes** answer accept (12 nested passthru callees
+  measured dangling). Deliberate.
+- **Slot rule vs select-join polarity disagree by design.** `SlotHoldsOutlivingPointer` proves on
+  ANY store into the address slot, while the join rule is ALL-of-arms, so the same program written
+  as a slot and as a select gets different verdicts. Both directions are safe; reconciling them is
+  unfiled work, not a regression.
+- **Do not consolidate this into a "root provenance" rework.** These were separate mechanisms
+  sharing one guard, and every one of them was fixed alone.

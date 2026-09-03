@@ -2631,10 +2631,13 @@ bool LLVMBackend::EveryImplementorRetainsInterfaceArg(const std::string& ifaceNa
         }
         if (firstKind.empty()) return false;
         destKind = firstKind;
+        // A generic implementor is registered under its MANGLED name; the diagnostic must spell
+        // it back as source, like every other user-facing surface.
+        std::string implSpelling = SpellType(*this, TypeAndValue{ .TypeName = firstImpl });
         implDetail = impls.size() == 1
-            ? std::format("'{}.{}' stores it into {}", firstImpl, methodName, firstKind)
+            ? std::format("'{}.{}' stores it into {}", implSpelling, methodName, firstKind)
             : std::format("all {} implementors store it, e.g. '{}.{}' into {}",
-                          impls.size(), firstImpl, methodName, firstKind);
+                          impls.size(), implSpelling, methodName, firstKind);
         return true;
 }
 
@@ -2694,7 +2697,13 @@ void LLVMBackend::RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult,
             if (param.IsMove || !param.Pointer) continue;
             if (i + 1 >= call->arg_size()) break;
             llvm::Value* argVal = call->getArgOperand((unsigned)(i + 1));
-            if (!JoinCarriesOwningTempUniqueField(argVal)) continue;
+            bool carries = JoinCarriesOwningTempUniqueField(argVal);
+            // A chain hop: the argument is itself a call whose callee is still below, so it is
+            // only the temp's field if that hop proves. Carry its conditions forward, exactly as
+            // the direct path does.
+            const PendingLaunderTempUniqueField* pendingArg =
+                carries ? nullptr : FindPendingLaunderTempUniqueField(argVal);
+            if (!carries && pendingArg == nullptr) continue;
             std::string access;
             // A blessed unique<X> argument arrived through get()/release(), so match its SOURCE.
             const llvm::Value* matchVal = argVal;
@@ -2704,25 +2713,40 @@ void LLVMBackend::RecordTempUniqueFieldInterfaceArgs(llvm::Value* callResult,
             for (const auto& nv : args)
                 if (nv.Primary == argVal || nv.Primary == matchVal)
                 { access = DescribeUniqueFieldAccess(nv); break; }
+            if (access.empty() && pendingArg != nullptr) access = pendingArg->Access;
             TempUniqueFieldArg entry{ nullptr, (unsigned)i, ifaceName + "." + method.Name, access,
                                       sourceFileName, currentLine, currentColumn,
-                                      !IsLedgeredOwningTempUniqueField(argVal),
+                                      carries && !IsLedgeredOwningTempUniqueField(argVal),
                                       ifaceName, method.Name, param.VariableName,
                                       method.Parameters.size() };
+            if (pendingArg != nullptr) entry.LaunderConds = pendingArg->Conds;
+            const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
+            std::string innerAccess = inner != nullptr ? inner->Access
+                : (pendingArg != nullptr ? pendingArg->Access : access);
             // Return-side laundering, ALL polarity: re-ledgering feeds a REJECTION, so it may only
             // fire when the result IS the temp's field on every implementor that can be dispatched.
             if (EveryImplementorMayReturnInterfaceArg(ifaceName, method.Name,
                                                       method.Parameters.size(), (unsigned)i))
             {
-                RegisterOwningTempUniqueField(call);
-                const LaunderedTempUniqueField* inner = FindLaunderedTempUniqueField(argVal);
-                RegisterLaunderedTempUniqueField(call, entry.CalleeName,
-                    inner != nullptr ? inner->Access : access);
+                if (entry.LaunderConds.empty())
+                {
+                    RegisterOwningTempUniqueField(call);
+                    RegisterLaunderedTempUniqueField(call, entry.CalleeName, innerAccess);
+                }
+                else
+                {
+                    // The incoming hop is still unproven, so the result is only a CANDIDATE
+                    // launder: the destination sites defer their own answer on the same conds.
+                    RegisterPendingLaunderTempUniqueField(call, entry.LaunderConds,
+                                                         entry.CalleeName, innerAccess);
+                }
             }
             std::string destKind, implDetail;
-            // Answer now when every implementor is already emitted, so the diagnostic lands inside
-            // any enclosing statement scope; otherwise defer to the end-of-module resolve.
-            if (EveryImplementorRetainsInterfaceArg(ifaceName, method.Name,
+            // Answer now when every implementor is already emitted AND the argument is already
+            // known to be the field, so the diagnostic lands inside any enclosing statement scope;
+            // otherwise defer to the end-of-module resolve.
+            if (entry.LaunderConds.empty()
+                && EveryImplementorRetainsInterfaceArg(ifaceName, method.Name,
                     method.Parameters.size(), (unsigned)i, destKind, implDetail))
                 RejectTempUniqueFieldInterfaceArgEscape(entry, destKind, implDetail);
             tempUniqueFieldArgs_.push_back(entry);
@@ -2853,6 +2877,10 @@ void LLVMBackend::RejectTempUniqueFieldInterfaceArgEscape(const TempUniqueFieldA
         std::string param = entry.ParamName.empty()
             ? std::format("parameter #{}", entry.ArgIndex + 1)
             : std::format("parameter '{}'", entry.ParamName);
+        // A generic interface INSTANCE is keyed by its mangled name - spell it back as source.
+        std::string spelledMethod = entry.IfaceName.empty()
+            ? entry.CalleeName
+            : SpellType(*this, TypeAndValue{ .TypeName = entry.IfaceName }) + "." + entry.MethodName;
         LogError(std::format(
             "call to interface method '{}': cannot pass {} to plain pointer {} - every "
             "implementor of this method stores that pointer into memory that outlives the call "
@@ -2860,7 +2888,7 @@ void LLVMBackend::RejectTempUniqueFieldInterfaceArgEscape(const TempUniqueFieldA
             "statement. Bind the whole call result to a local first and pass the field off that "
             "local, so the pointee outlives the statement - or declare the interface parameter "
             "'move' and pass 'move <local>.<field>' to hand ownership over.",
-            entry.CalleeName, what, param, implDetail));
+            spelledMethod, what, param, implDetail));
     }
 
 bool LLVMBackend::StoredValueMayBeCallerOwned(const llvm::Value* val, int depth) const

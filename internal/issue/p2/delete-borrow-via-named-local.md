@@ -42,8 +42,9 @@ owning named local of THIS frame? Inside `Bag.put` the argument is `p`, a borrow
 parameter, so the rule accepts - correctly, since `put` cannot know whether its caller kept an
 owner. The caller's `n` dies one line later and nothing at either site can see both facts.
 
-This is the container-element flavour of the general provenance gap; the field flavour is
-[[temp-unique-field-escapes-through-an-indirect-callee-or-an-unfollowable-return]].
+This is the container-element flavour of the general provenance gap; the field flavour was
+closed out on 2026-09-03 - see the temp-unique-field digest entry in
+`internal/fix-issue-lessons.md`.
 
 ## Fix direction
 

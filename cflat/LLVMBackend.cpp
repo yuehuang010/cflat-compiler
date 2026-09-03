@@ -2295,6 +2295,9 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
         // define - and FunctionBodyIsComplete refuses it, which would exempt exactly that callee.
         {
             NoCurrentFunctionScope noCurrent(this);
+            // Every generic instantiation is drained here, so an instantiated generic interface's
+            // implementor set is final and may finally be enumerated.
+            SettledInterfaceInstancesScope settled(this);
             ResolveOwningLocalBorrowingHelperArgs();
             ResolveTempUniqueFieldArgEscapes();
 
@@ -4391,6 +4394,7 @@ void LLVMBackend::ResetForReanalysis()
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    certainInstantiatedInterfaces_.clear();
     ifConstGuardedImpls_.clear();
     analyzedRootPath_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
@@ -7129,6 +7133,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     coreInterfaceDefs_.clear();
     scannedInterfaceImpls.clear();
     uncertainInterfaceImpls.clear();
+    certainInstantiatedInterfaces_.clear();
     ifConstGuardedImpls_.clear();
     importCompileDepth_ = 0;   // a throw out of an import walk can leave the RAII depth stranded
     // Every Function* here died with the old module. Re-adopt any bodyless rebox thunk baked

@@ -1,0 +1,40 @@
+/*
+ * The LAUNDERED-ARGUMENT leg of the temp-unique-field guard's interface half. The argument of the
+ * virtual call is not the temp's field directly - it is the result of `passLater`, a callee
+ * defined BELOW the call site, so at the call the return walk cannot answer and the value is only
+ * a CANDIDATE launder. The interface recorder used to key on the eager ledger alone and accepted.
+ *
+ * It now carries the candidate's conditions onto the recorded entry, exactly as the direct-call
+ * recorder does, and the end-of-module resolve fires only when every hop proves. The wording is
+ * the shared interface formatter's - the user cannot tell which pass caught it.
+ *
+ * Bare file-scope `expect_error` for the usual reason: the answer only exists at the end-of-module
+ * resolve, after any scoped block would have closed. One leg per file.
+ *
+ * Measured on the pre-guard binary (--check): compiled clean, `gLaunderKept` dangled.
+ */
+expect_error("call to interface method 'ILaunderKeep.take': cannot pass unique field 'passLater' of a temporary to plain pointer parameter 'n' - every implementor of this method stores that pointer into memory that outlives the call ('LaunderKeeper.take' stores it into a global)");
+
+struct LaunderNode { int v = 0; };
+struct LaunderBox<T> { T t = default; };
+LaunderBox<unique LaunderNode*> makeLaunderBox()
+{
+    LaunderBox<unique LaunderNode*> b = default;
+    b.t = new LaunderNode();
+    return b;
+}
+
+LaunderNode* gLaunderKept = nullptr;
+interface ILaunderKeep { void take(LaunderNode* n); };
+class LaunderKeeper : ILaunderKeep { void take(LaunderNode* n) { gLaunderKept = n; } };
+
+extern int main()
+{
+    LaunderKeeper k = default;
+    ILaunderKeep it = k;
+    it.take(passLater(makeLaunderBox().t));
+    return 0;
+}
+
+// Defined BELOW the call site on purpose: the launder is unanswerable while the call is emitted.
+LaunderNode* passLater(LaunderNode* p) { return p; }

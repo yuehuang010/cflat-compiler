@@ -9492,6 +9492,26 @@ class MixedReadC : IResourceMixed { int ifaceLookMixed(Resource* r) { return r->
 interface IResourceRet { Resource* ifacePick(Resource* r); };
 class RetGlobalC : IResourceRet { Resource* ifacePick(Resource* r) { return gKeptResource; } };
 
+// GENERIC interface dispatch. A monomorphized interface HAS a closed world of its own - every
+// implementor registers under the INSTANCE name - so the instance is judged at the end-of-module
+// resolve while its template stays uncertain. The reject cell is
+// Test/errors/err_temp_unique_field_iface_generic.cb; these are the ACCEPT cells of that same
+// proof, and they are what fails if the instance-level judgement ever loses its polarity.
+interface IGenMix<T> { int genLook(T* r); };
+class GenMixStoreC : IGenMix<Resource> { Resource* p = nullptr; int genLook(Resource* r) { this.p = r; return r->id; } };
+class GenMixReadC : IGenMix<Resource> { int genLook(Resource* r) { return r->id; } };
+interface IGenRead<T> { int genRead(T* r); };
+class GenReadOnlyC : IGenRead<Resource> { int genRead(Resource* r) { return r->id; } };
+
+// The interface half of the DEFERRED launder: the argument of the virtual call is the result of
+// a callee defined below main, so the entry carries that callee's conditions. `LateStoreC` is
+// the sole implementor and DOES store, so only the launder proof keeps this accepting - the
+// storing twin with a real passthru is the reject leg in
+// Test/errors/err_temp_unique_field_iface_launder_arg.cb.
+Resource* gLateStored = nullptr;
+interface ILateStore { void lateStore(Resource* r); };
+class LateStoreC : ILateStore { void lateStore(Resource* r) { gLateStored = r; } };
+
 // The RECEIVER shape: `makeSelfBox().t->m()`. A method whose body only READS `this` must keep
 // working off a temp's unique field, and a method that DOES store `this` must keep working off
 // a BORROWED container element, where nothing is freed at end of statement. The storing
@@ -9654,6 +9674,44 @@ int testTempUniqueFieldBorrowAccepts()
     Resource* ifacePicked = ifaceRetI.ifacePick(makeMoveBox().t);
     passed += Test("temp_uniq_accept_iface_return_other", ifacePicked == nullptr ? 1 : 0, 1);
     passed += Test("temp_uniq_accept_iface_return_other_freed_once", dtorCount, 1);
+
+    // GENERIC interface, MIXED implementors: one stores and one only reads, so "every implementor
+    // stores it" is false on the instance too and the site stays accepted - freed once.
+    dtorCount = 0;
+    GenMixReadC genMx = default;
+    IGenMix<Resource> genMxI = genMx;
+    passed += Test("temp_uniq_accept_generic_iface_mixed",
+                   genMxI.genLook(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_generic_iface_mixed_freed_once", dtorCount, 1);
+
+    // GENERIC interface whose sole implementor only READS: nothing outlives the call.
+    dtorCount = 0;
+    GenReadOnlyC genRd = default;
+    IGenRead<Resource> genRdI = genRd;
+    passed += Test("temp_uniq_accept_generic_iface_read",
+                   genRdI.genRead(makeMoveBox().t), 44);
+    passed += Test("temp_uniq_accept_generic_iface_read_freed_once", dtorCount, 1);
+
+    // The interface call whose ARGUMENT is a candidate launder, with a sole implementor that only
+    // READS. The launder proves (latePassthruResource does hand its parameter back), so the entry
+    // is judged - and the read-only implementor answers ACCEPT.
+    dtorCount = 0;
+    passed += Test("temp_uniq_accept_iface_launder_arg_read",
+                   ifaceRdI.ifaceLookRead(latePassthruResource(makeMoveBox().t)), 44);
+    passed += Test("temp_uniq_accept_iface_launder_arg_read_freed_once", dtorCount, 1);
+
+    // The other side of the same gate: the sole implementor DOES store, but the below-defined
+    // callee returns something OTHER than its parameter, so the stored pointer is not the temp's
+    // field and the site must stay accepted.
+    dtorCount = 0;
+    {
+        LateStoreC lateSt = default;
+        ILateStore lateStI = lateSt;
+        lateStI.lateStore(lateRetGlobalResource(makeMoveBox().t));
+        passed += Test("temp_uniq_accept_iface_launder_arg_other",
+                       gLateStored == nullptr ? 1 : 0, 1);
+    }
+    passed += Test("temp_uniq_accept_iface_launder_arg_other_freed_once", dtorCount, 1);
 
     // FLIPPED by the '??' fallback-arm fix. The old pair here pinned `dtors == 0` on
     // `nul ?? makeMoveBox().t` - a deliberate tripwire on a LEAK: that arm got no per-arm
@@ -12343,7 +12401,7 @@ extern int main()
     total += 29;
 
     passed += testTempUniqueFieldBorrowAccepts();
-    total += 127;
+    total += 135;
 
     passed += testUniqueArrayElementFieldStore();
     total += 24;

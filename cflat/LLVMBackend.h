@@ -2724,6 +2724,14 @@ private:
     // Interfaces whose real implementor set is a main-pass fact: named in a generic class's base
     // clause, or spelled generically. Never prove a conversion impossible against one of these.
     std::unordered_set<std::string> uncertainInterfaceImpls;
+    // Concrete INSTANCES of a generic interface (the mangled name) that have actually been
+    // instantiated. Every implementor of such an instance registers under that mangled name, so
+    // the instance HAS a closed world of its own even though its template never can. Only trusted
+    // once instantiation is drained - see interfaceInstancesSettled_.
+    std::unordered_set<std::string> certainInstantiatedInterfaces_;
+    // True only inside the end-of-module resolves, where every generic instantiation has been
+    // drained and an instantiated interface's implementor set can no longer grow.
+    bool interfaceInstancesSettled_ = false;
     // A class declared inside an `if const` arm that MainListener did NOT take, with a phrase
     // describing that arm. The scanner records every arm; the entries for the arm MainListener
     // takes are retracted as it takes them, so only genuinely absent classes are left. DIAGNOSTIC
@@ -3721,6 +3729,23 @@ private:
         ~NoCurrentFunctionScope() { backend_->currentFunction = saved_; }
         NoCurrentFunctionScope(const NoCurrentFunctionScope&) = delete;
         NoCurrentFunctionScope& operator=(const NoCurrentFunctionScope&) = delete;
+    };
+
+    /*
+     * Declares that every generic instantiation is drained, so an instantiated interface's
+     * implementor set is final. RAII for the same reason as above - LogError THROWS out of the
+     * resolves this wraps.
+     */
+    struct SettledInterfaceInstancesScope
+    {
+        LLVMBackend* backend_;
+        bool saved_;
+        explicit SettledInterfaceInstancesScope(LLVMBackend* backend)
+            : backend_(backend), saved_(backend->interfaceInstancesSettled_)
+        { backend_->interfaceInstancesSettled_ = true; }
+        ~SettledInterfaceInstancesScope() { backend_->interfaceInstancesSettled_ = saved_; }
+        SettledInterfaceInstancesScope(const SettledInterfaceInstancesScope&) = delete;
+        SettledInterfaceInstancesScope& operator=(const SettledInterfaceInstancesScope&) = delete;
     };
 
     // Point diagnostics at a file/line recorded earlier, and put the compiler's own reporting
@@ -5114,6 +5139,9 @@ public:
     // Mark an interface whose implementor set cannot be settled before codegen (a generic class
     // names it, or it is itself spelled generically), so the check never proves anything about it.
     void RecordUncertainInterfaceImpl(const std::string& ifaceName);
+
+    // Remember that a generic interface INSTANCE was materialized under this mangled name.
+    void RecordCertainInstantiatedInterface(const std::string& mangledName);
 
     // Remember a class the scanner found inside an `if const` arm, with the full chain of arms it
     // sits under. Read by the zero-implementor diagnostic only - it must never gate acceptance.

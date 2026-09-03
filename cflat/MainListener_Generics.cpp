@@ -53,6 +53,10 @@ void MainListener::InstantiateGenericInterface(const std::string& baseName, cons
                                      const std::unordered_map<std::string, std::string>& substitutions,
                                      const std::unordered_map<std::string, std::vector<std::string>>& packSubstitutions,
                                      const std::unordered_map<std::string, std::string>& valueSubstitutions) {
+        // The INSTANCE exists from here on, so its implementor set is enumerable even though the
+        // template's never is. Recorded before the dedupe return - a repeat call is still an
+        // instantiation of the same concrete name.
+        compilerLLVM->RecordCertainInstantiatedInterface(mangledName);
         if (instantiatedInterfaces.count(mangledName)) return;
         instantiatedInterfaces.insert(mangledName);
 

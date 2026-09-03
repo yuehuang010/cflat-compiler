@@ -1457,6 +1457,11 @@ void LLVMBackend::RecordUncertainInterfaceImpl(const std::string& ifaceName)
         if (!ifaceName.empty()) uncertainInterfaceImpls.insert(ifaceName);
     }
 
+void LLVMBackend::RecordCertainInstantiatedInterface(const std::string& mangledName)
+{
+        if (!mangledName.empty()) certainInstantiatedInterfaces_.insert(mangledName);
+    }
+
 void LLVMBackend::RecordIfConstGuardedInterfaceImpl(const std::string& className,
                                            std::vector<std::string> guardChain, const void* node,
                                            std::vector<std::vector<std::string>> ifaceCandidates)
@@ -1521,10 +1526,18 @@ bool LLVMBackend::InterfaceImplementorSetIsUncertain(const std::string& ifaceNam
 {
         if (importCompileDepth_ > 0) return true;
         if (uncertainInterfaceImpls.count(ifaceName) > 0) return true;
-        // A monomorphized name (IFoo__int) inherits its template's uncertainty.
+        // A monomorphized name inherits its template's uncertainty. The INSTANCE is the exception:
+        // every implementor registers under the mangled name, so once instantiation is drained
+        // the instance has a closed world of its own even though the template never can. A call
+        // spelled on the bare TEMPLATE name inside generic code is not an instance and stays
+        // uncertain, which is what keeps the accepting polarity where it belongs.
         std::string_view base = MangledBase(ifaceName);
         if (base != ifaceName)
+        {
+            if (interfaceInstancesSettled_ && certainInstantiatedInterfaces_.count(ifaceName) > 0)
+                return false;
             return uncertainInterfaceImpls.count(std::string(base)) > 0;
+        }
         return false;
     }
 

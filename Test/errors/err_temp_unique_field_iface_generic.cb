@@ -1,0 +1,40 @@
+/*
+ * The GENERIC-INTERFACE leg of the temp-unique-field guard's interface half. A generic class or
+ * a generic base clause records the TEMPLATE as uncertain, because the instance name is not
+ * known before substitution - and a monomorphized name used to inherit that uncertainty, so a
+ * call through `IGenKeep<GenKeepNode>` could never be judged and always accepted.
+ *
+ * The INSTANCE is the exception the template can never be: every implementor of it registers
+ * under the mangled instance name, so once every generic instantiation is drained the instance
+ * HAS a closed world. That is only true at the end-of-module resolve, which is where this leg
+ * is answered - a call spelled on the bare template name inside generic code still has no single
+ * implementor set and stays accepting.
+ *
+ * This leg lives in its own file for the same structural reason as
+ * err_temp_unique_field_iface_deferred.cb: a scoped `expect_error(...) { }` block closes before
+ * end-of-module resolution runs and would report "expected error ... did not occur", the
+ * opposite of the truth. Only the bare file-scope form stays armed to the end of the compile.
+ *
+ * The interface name must be spelled back as SOURCE ('IGenKeep<GenKeepNode>'), never as the
+ * mangled vtable key - that is what the substring below pins.
+ *
+ * Measured on the pre-guard binary (--check): the call compiled clean and `gGenKept` was left
+ * pointing at a block the temporary's synthesized destructor had already freed.
+ */
+expect_error("call to interface method 'IGenKeep<GenKeepNode>.gkeep': cannot pass unique field 'makeGenBox.t' of a temporary to plain pointer parameter 'n' - every implementor of this method stores that pointer into memory that outlives the call ('GenKeeper.gkeep' stores it into a global)");
+
+struct GenKeepNode { int v = 0; };
+struct GenBox<T> { T t = default; };
+GenBox<unique GenKeepNode*> makeGenBox() { GenBox<unique GenKeepNode*> b = default; b.t = new GenKeepNode(); return b; }
+
+GenKeepNode* gGenKept = nullptr;
+interface IGenKeep<T> { void gkeep(T* n); };
+class GenKeeper : IGenKeep<GenKeepNode> { void gkeep(GenKeepNode* n) { gGenKept = n; } };
+
+extern int main()
+{
+    GenKeeper k = default;
+    IGenKeep<GenKeepNode> it = k;
+    it.gkeep(makeGenBox().t);
+    return 0;
+}
