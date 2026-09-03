@@ -240,9 +240,6 @@ const int TTF_IDISHWND       = 0x0001;
 const int TTF_SUBCLASS       = 0x0010;
 const int TTS_ALWAYSTIP      = 0x0001;
 
-// Sets a window's large (wParam 1) / small (wParam 0) title-bar + taskbar icon.
-const int WM_SETICON = 0x0080;
-
 // Marshaled UI-thread call (ctx.post): WM_APP+1, lParam = the boxed closure pointer.
 const int WM_APP_CALL = 0x8001;
 // Posted on show: re-open each dark ListView's theme once the window is visible. A theme

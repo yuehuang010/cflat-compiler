@@ -5515,7 +5515,7 @@ bool LLVMBackend::ResolveCpuName(const std::string& requested, const std::string
 // ---- Import-library synthesis (SDK-free system libs) ----
 //
 // Read a system DLL's export table and emit a name-only import library via
-// `lld-link /lib /def`. Lets cflat output link against kernel32/ws2_32/ntdll/dbghelp/ucrt
+// `lld-link /lib /def`. Lets cflat output link against kernel32/ws2_32/ntdll/dbghelp/user32/ucrt
 // without the Windows SDK's .lib files: the DLLs are OS-resident, so --init can read their
 // exports on any Win10+ machine and rebuild the import libs locally. The link line keeps
 // the same lib NAMES (ucrt.lib, kernel32.lib, ...), so only the /libpath flips (Phase C).
@@ -5665,9 +5665,10 @@ std::string LLVMBackend::GetSyntheticLibDir(const std::string& arch)
     return base + "/lib/" + arch;
 }
 
-// Generate kernel32/ws2_32/ntdll/dbghelp/ucrt import libs for <arch> into the synthetic lib
-// dir. ucrt.lib is built from ucrtbase.dll (the OS-resident UCRT; the api-ms-win-crt-* apisets
-// all forward to it). Best-effort: logs each lib, returns true if all were written.
+// Generate kernel32/ws2_32/ntdll/dbghelp/advapi32/user32/ucrt import libs for <arch> into the
+// synthetic lib dir. ucrt.lib is built from ucrtbase.dll (the OS-resident UCRT; the
+// api-ms-win-crt-* apisets all forward to it). Best-effort: logs each lib, returns true
+// if all were written.
 bool LLVMBackend::SynthesizeSystemImportLibs(const std::string& arch, const std::string& lldLink)
 {
     if (arch != "x64")
@@ -5700,6 +5701,7 @@ bool LLVMBackend::SynthesizeSystemImportLibs(const std::string& arch, const std:
         { "ntdll.dll",    "ntdll.dll",    "ntdll.lib"    },
         { "dbghelp.dll",  "dbghelp.dll",  "dbghelp.lib"  },
         { "advapi32.dll", "advapi32.dll", "advapi32.lib" },
+        { "user32.dll",   "user32.dll",   "user32.lib"   },
         { "ucrtbase.dll", "ucrtbase.dll", "ucrt.lib"     },
     };
 
@@ -5748,6 +5750,7 @@ bool LLVMBackend::SynthesizeX86SystemImportLibs(const LinkerPaths& paths)
         { paths.umLib   + "\\ntdll.lib",    "ntdll.dll",    "ntdll.lib"    },
         { paths.umLib   + "\\dbghelp.lib",  "dbghelp.dll",  "dbghelp.lib"  },
         { paths.umLib   + "\\advapi32.lib", "advapi32.dll", "advapi32.lib" },
+        { paths.umLib   + "\\user32.lib",   "user32.dll",   "user32.lib"   },
         { paths.ucrtLib + "\\ucrt.lib",     "ucrtbase.dll", "ucrt.lib"     },
     };
 

@@ -156,6 +156,13 @@ int nativeSelfTest(int argc, char** argv)
         t.expectTrue("app identifier",
             Application.identifier() == "com.cflat.example.nativesettings");
         t.expectTrue("app icon handle", Application.icon() != nullptr);
+
+        // The host also PUSHED that icon onto the frame (WM_SETICON at window creation),
+        // so the window reports the same handle back.
+        void* frame = FindWindowA("CFlatNativeWindow", nullptr);
+        t.expectTrue("native frame found", frame != nullptr);
+        t.expectTrue("frame icon matches app icon",
+            (void*)SendMessageA(frame, (u32)WM_GETICON, (u64)1, (i64)0) == Application.icon());
     });
 
     // The Save button declared a `tooltip`, so the window's tooltip control exists

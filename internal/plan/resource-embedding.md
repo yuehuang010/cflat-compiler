@@ -1,11 +1,34 @@
-# Resource embedding (IMPLEMENTED 2026-09-03; Windows paths unverified)
+# Resource embedding (IMPLEMENTED 2026-09-03; Windows paths VERIFIED 2026-09-03)
 
 Ratified and implemented 2026-09-03 on macOS: steps 1-4 of section 5 landed (`embed(...)`,
 `application` declaration, `--dump-app-info`, Windows `.res` writer, macOS `__TEXT,__info_plist`
 and `-o App.app` bundle, `Application.*` API, ui_native auto icon). Byte serializers live in
-`cflat/AppResources.{h,cpp}`. Windows-only paths (lld-link `.res` consumption, `LoadIconA`,
-`WM_SETICON`, `Test/test_windows.cb`, `win32_native_settings.cb`) were written but not executed:
-verify on the Windows host. Step 5 (Linux `.desktop`) remains a separate plan.
+`cflat/AppResources.{h,cpp}`. Step 5 (Linux `.desktop`) remains a separate plan.
+
+## Windows verification (2026-09-03, Windows host)
+
+Every Windows-only path in this plan now executes and is asserted:
+
+- **lld-link `.res` consumption.** `Test/test_windows.cb` linked to an exe carries exactly the
+  planned directory: RT_ICON (3) ids 1 and 2 at 411 / 523 bytes (the two PNG files verbatim),
+  RT_GROUP_ICON (14) id 1 at 34 bytes (`GRPICONDIR` + 2 x `GRPICONDIRENTRY`), RT_VERSION (16),
+  RT_MANIFEST (24) - all four resource types from ONE temp `.res`, no rc.exe.
+- **RT_VERSION.** Read back through the OS (`FileVersionInfo`): ProductName, FileDescription,
+  CompanyName, LegalCopyright, FileVersion, ProductVersion, InternalName and OriginalFilename
+  all match the declaration, so the block layout and the UTF-16 string blocks are correct.
+- **RT_GROUP_ICON.** `ExtractAssociatedIcon` (what Explorer does) returns a 32x32 icon, and
+  `LoadImage(hInst, 1, IMAGE_ICON, 16|32, ...)` selects each entry - proving the width/height
+  fields of `GRPICONDIRENTRY` and the icon-id numbering.
+- **`LoadIconA` / `Application.icon()`.** `win32_native_settings.cb`'s self-test asserts a
+  non-null handle from cflat itself; `LoadIconA(hInst, MAKEINTRESOURCE(1))` also resolves
+  from outside the process.
+- **`WM_SETICON`.** The same self-test now round-trips it: after `t.launch()` the frame is
+  found by class name and `WM_GETICON`/`ICON_BIG` returns the same handle `Application.icon()`
+  does, so the host really pushed the icon onto the window.
+
+One defect found and fixed in the process: `ui_native/win32.cb` declared its own
+`const int WM_SETICON`, which collides with the `windows.h` binding it already imports
+(`redeclaration of global`). The header binding supplies the constant; the local const is gone.
 
 **Open on the Windows box: user32.lib without the SDK.** `Application.icon()` calls
 `LoadIconA` (user32), and `ui_native/win32.cb` needs user32/gdi32/comctl32/shell32/ole32/
@@ -20,6 +43,20 @@ clause on `extern stdcall` so a core `.cb` can request the import lib without im
 Zig requires the SDK for its msvc target and is SDK-free only for windows-gnu. Maintainer
 constraints recorded: cross-platform solution, not a Windows RC port; no additional file
 extensions (no `.rc`, no `.qrc`-style manifest file).
+
+Narrowed 2026-09-03 on the Windows host, still awaiting a ruling:
+
+- Option (a) does NOT help `ui_native/win32.cb`. That file reaches user32/gdi32/... through
+  `import "windows.h"`, so it needs SDK HEADERS regardless of where the import libs come
+  from; synthesizing the libs changes nothing for it.
+- The only caller option (a) would unblock is `application.cb`, which hand-writes its
+  `extern stdcall GetModuleHandleA/LoadIconA` and imports no header. So the question is
+  really "how does a core `.cb` request an import lib without a header import".
+- Option (a) also has a linking problem, not just a synthesis one: synthesized libs reach
+  the link only because `kernel32.lib` / `ws2_32.lib` are pushed unconditionally onto the
+  lld-link line (`LLVMBackend_EmitAndLink.cpp`). Adding user32 there would link user32 into
+  every console program. A per-declaration request (option (c)) is what the shape actually
+  calls for; option (a) is only the synthesis half of it.
 
 ## Motivation (from the closed issue)
 

@@ -258,7 +258,8 @@ if(ANTLR4_IS_STATIC)
   target_compile_definitions(cflat PRIVATE ANTLR4CPP_STATIC)
 endif()
 if(WIN32)
-  target_compile_definitions(cflat PRIVATE _CONSOLE)
+  # NOMINMAX: windows.h otherwise defines min/max macros that break std::min/std::max.
+  target_compile_definitions(cflat PRIVATE _CONSOLE NOMINMAX)
 endif()
 
 # Precompiled header of the heavy third-party headers (LLVM/antlr/json/simdjson).

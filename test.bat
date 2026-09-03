@@ -330,7 +330,9 @@ if errorlevel 1 (
     goto DefinesDone
 )
 set DEFINES_IR_COUNT=0
-for /f %%c in ('findstr /r /c:"^%%.Buf\$int\$.8. = type" "%DEFINES_IR%" ^| find /c /v ""') do set DEFINES_IR_COUNT=%%c
+REM Count with a for /f loop, not `| find /c /v ""` - a Git-for-Windows PATH puts GNU find.exe
+REM ahead of the Windows one, which reads /c and /v as paths and scans the whole drive.
+for /f "delims=" %%c in ('findstr /r /c:"^%%.Buf\$int\$.8. = type" "%DEFINES_IR%"') do set /a DEFINES_IR_COUNT+=1
 if not "%DEFINES_IR_COUNT%"=="1" (
     echo FAILED: equivalent folded values did not share one generic instantiation >"%DEFINES_RESULT%"
     goto DefinesDone

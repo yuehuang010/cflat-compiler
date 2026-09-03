@@ -3177,11 +3177,11 @@ bool LLVMBackend::EmitExecutable(const std::string& exePath, const std::string& 
 
         if (useSyntheticLibs)
         {
-            // Synthetic dir first: ucrt/kernel32/ws2_32/ntdll/dbghelp resolve here (first match
-            // wins), so basic code links with no Windows SDK present. The SDK dirs are added
-            // after as a fallback chain for advanced cases that genuinely still need the SDK:
-            //   - 'um':       long-tail system import libs we do not synthesize (user32/gdi32/
-            //                 uuid/... pulled by system-header `#pragma comment(lib,...)`).
+            // Synthetic dir first: ucrt/kernel32/ws2_32/ntdll/dbghelp/advapi32/user32 resolve
+            // here (first match wins), so basic code links with no Windows SDK present. The SDK
+            // dirs are added after as a fallback chain for advanced cases that still need the SDK:
+            //   - 'um':       long-tail system import libs we do not synthesize (gdi32/uuid/...
+            //                 pulled by system-header `#pragma comment(lib,...)`).
             //   - 'msvc-lib': libcmt/msvcrt - reached only by a prebuilt user lib built /MT, a
             //                 user .c using /GS (__security_cookie/check), or a CRT header-inline
             //                 we have not shimmed. A basic build requests none of these, so it
@@ -3452,8 +3452,8 @@ void LLVMBackend::InjectHeapAuditIntoMain()
         if (!mainFn || mainFn->isDeclaration())
             return;
 
-        llvm::Function* enableFn = module->getFunction("_HeapAudit.enable_void__");
-        llvm::Function* reportFn = module->getFunction("_HeapAudit.reportLeaks_u64__");
+        llvm::Function* enableFn = module->getFunction("_HeapAudit.enable$void$.0");
+        llvm::Function* reportFn = module->getFunction("_HeapAudit.reportLeaks$u64$.0");
         if (!enableFn || !reportFn)
         {
             LogErrorMessage("--heap-audit: HeapAudit.enable/reportLeaks were not linked - "

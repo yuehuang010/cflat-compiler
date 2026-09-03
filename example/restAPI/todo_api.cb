@@ -56,9 +56,9 @@ stop_source g_stop   = default;   // flipped by POST /shutdown
 // Construct an owned Todo. The title is deep-copied so the Todo owns it regardless of
 // the caller's string lifetime. Assigning the owned `.copy()` temporary straight to the
 // field transfers ownership to it (the containing Todo's destructor frees the buffer).
-Todo* _makeTodo(int id, string title, bool done)
+unique Todo* _makeTodo(int id, string title, bool done)
 {
-    Todo* t = new Todo;
+    unique Todo* t = new Todo;
     t->id = id;
     t->title = title.copy();
     t->done = done;
@@ -133,9 +133,9 @@ HttpResponse* createTodo(HttpRequest* req)
     string j = default;
     lock (g_lock)
     {
-        Todo* t = _makeTodo(g_nextId, input.title, input.done);
+        unique Todo* t = _makeTodo(g_nextId, input.title, input.done);
         g_nextId++;
-        g_todos.add(t);
+        g_todos.add(move t);
         string jj = _todoJson(g_todos.get(g_todos.count() - 1));
         j = move jj;
     }

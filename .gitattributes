@@ -13,6 +13,10 @@
 vscode-extension/l10n/*.json text eol=lf
 vscode-extension/package.nls*.json text eol=lf
 
+# embed() copies a fixture into the binary byte-for-byte, and Test/test_core.cb
+# asserts its exact length - a CRLF checkout would change it.
+Test/library/embed_payload.txt text eol=lf
+
 ###############################################################################
 # Set default behavior for command prompt diff.
 #
