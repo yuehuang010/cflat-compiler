@@ -1351,6 +1351,11 @@ bool LLVMBackend::ReturnCarriesRawArrayCount(const TypeAndValue& returnType) con
 
 llvm::Value* LLVMBackend::RawArrayCountArgument(const NamedVariable& arg)
 {
+        if (!arg.FieldName.empty() || !arg.OwningStructName.empty() || arg.IsElementAccess)
+            return builder->getInt64(-1);
+        if (arg.Storage != nullptr && !llvm::isa<llvm::AllocaInst>(arg.Storage)
+            && !llvm::isa<llvm::GlobalVariable>(arg.Storage))
+            return builder->getInt64(-1);
         llvm::Value* count = LoadRawArrayLength(arg);
         return count != nullptr ? Upconvert(count, builder->getInt64Ty()) : builder->getInt64(-1);
     }

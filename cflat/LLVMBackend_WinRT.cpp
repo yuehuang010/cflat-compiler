@@ -1806,7 +1806,10 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         if (auto* ptrTy = llvm::dyn_cast_or_null<llvm::PointerType>(srcBaseTy))
                         {
                             builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                            StoreRawArrayLength(args[i], nullptr);
+                            // A field or element slot holds one scalar; only a whole binding owns a count.
+                            if (args[i].FieldName.empty() && args[i].OwningStructName.empty()
+                                && !args[i].IsElementAccess)
+                                StoreRawArrayLength(args[i], nullptr);
                             if (!isFieldAccess)
                                 SetOwnMoveOrigin(srcStorage, currentLine, currentColumn);
                         }

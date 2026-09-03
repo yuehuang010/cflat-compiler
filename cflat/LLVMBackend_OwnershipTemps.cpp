@@ -993,6 +993,13 @@ void LLVMBackend::SetVariableRawNewArray(const std::string& varName, bool value,
                 StoreRawArrayLength(it->second, rawArrayLength);
                 return;
             }
+            auto argIt = frame.functionArgument.find(varName);
+            if (argIt != frame.functionArgument.end())
+            {
+                argIt->second.AllocatedByRawNewArray = value;
+                StoreRawArrayLength(argIt->second, rawArrayLength);
+                return;
+            }
         }
     }
 
@@ -1220,6 +1227,38 @@ void LLVMBackend::EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar,
         builder->SetInsertPoint(skipBB);
     }
 
+void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::Value* ptrVal,
+                                          const std::string& typeName)
+{
+        auto* dtor = GetFullDestructorForDelete(typeName);
+        if (dtor == nullptr) return;
+
+        if (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr)
+        {
+            auto* count = LoadRawArrayLength(namedVar);
+            if (count != nullptr)
+            {
+                auto* arrayBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_array", builder->GetInsertBlock()->getParent());
+                auto* scalarBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_scalar", builder->GetInsertBlock()->getParent());
+                auto* doneBB = llvm::BasicBlock::Create(
+                    *context, "raw_array_dtor_done", builder->GetInsertBlock()->getParent());
+                builder->CreateCondBr(
+                    builder->CreateICmpSGE(count, builder->getInt64(0)), arrayBB, scalarBB);
+                builder->SetInsertPoint(arrayBB);
+                EmitCountedArrayDestruction(ptrVal, typeName, count);
+                builder->CreateBr(doneBB);
+                builder->SetInsertPoint(scalarBB);
+                builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+                builder->CreateBr(doneBB);
+                builder->SetInsertPoint(doneBB);
+                return;
+            }
+        }
+        builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+    }
+
 void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement)
 {
         // Load the current pointer value from the alloca
@@ -1241,31 +1280,7 @@ void LLVMBackend::EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Valu
         // Call the full destructor (user dtor + member fields) if the type needs one. Resolve
         // through the delete-site resolver: a pointee still incomplete here (self-referential
         // element) binds the deferred stub instead of silently dropping the call.
-        if (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr)
-        {
-            auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName);
-            if (dtor != nullptr)
-            {
-                auto* count = LoadRawArrayLength(namedVar);
-                auto* arrayBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_array", builder->GetInsertBlock()->getParent());
-                auto* scalarBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_scalar", builder->GetInsertBlock()->getParent());
-                auto* doneBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_done", builder->GetInsertBlock()->getParent());
-                builder->CreateCondBr(
-                    builder->CreateICmpSGE(count, builder->getInt64(0)), arrayBB, scalarBB);
-                builder->SetInsertPoint(arrayBB);
-                EmitCountedArrayDestruction(ptrVal, namedVar.TypeAndValue.TypeName, count);
-                builder->CreateBr(doneBB);
-                builder->SetInsertPoint(scalarBB);
-                builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
-                builder->CreateBr(doneBB);
-                builder->SetInsertPoint(doneBB);
-            }
-        }
-        else if (auto* dtor = GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName))
-            builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+        EmitOwningPtrDestructor(namedVar, ptrVal, namedVar.TypeAndValue.TypeName);
 
         // Free the pointer. An over-aligned block came from the aligned allocator, so it must be
         // freed via __delete_aligned to match. Two sources: the element TYPE's own alignment

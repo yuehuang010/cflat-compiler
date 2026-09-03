@@ -3327,6 +3327,11 @@ private:
 
     void EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* refCount);
 
+    // Destruct an owning pointer by its raw-array count when available, or as a scalar otherwise.
+    // The caller supplies a non-null-guarded pointer and handles deallocation separately.
+    void EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::Value* ptrVal,
+                                 const std::string& typeName);
+
     void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr);
 
     // Null-safe reverse-order element destruction shared by scope cleanup and `delete[n]`.

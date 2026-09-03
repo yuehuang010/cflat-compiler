@@ -4974,14 +4974,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     IsOwningArrayStringElementRead(rightNV, right);
                                 srcIsRawHeapStringElem =
                                     IsRawHeapStringElementRead(rightNV, right);
-                                // Plain pointer copy from an already-tagged local (`string* q = p;`)
-                                // carries the `new T[n]` provenance across.
-                                srcPtrCopyIsRawNewArray = rightNV.AllocatedByRawNewArray;
+                                // Plain pointer copy from an already-tagged whole binding (`T* q = p`)
+                                // carries the `new T[n]` provenance across, but a field/element is one slot.
+                                const bool rhsIsWholeRawArrayBinding = rightNV.FieldName.empty()
+                                    && rightNV.OwningStructName.empty() && !rightNV.IsElementAccess
+                                    && (rightNV.Storage == nullptr
+                                        || llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
+                                srcPtrCopyIsRawNewArray = rhsIsWholeRawArrayBinding
+                                    && rightNV.AllocatedByRawNewArray;
                                 // Both the `&w` producer and a plain copy of an already-tainted
                                 // pointer local carry the fact forward.
                                 srcPointsToBorrowedByValueParam =
                                     rightNV.PointsToBorrowedByValueParam;
-                                srcRawArrayLength = compiler->LoadRawArrayLength(rightNV);
+                                srcRawArrayLength = rhsIsWholeRawArrayBinding
+                                    ? compiler->LoadRawArrayLength(rightNV) : nullptr;
                                 rhsIsFuncPtr = rightNV.TypeAndValue.IsFunctionPointer;
                                 rhsFuncPtrReturnOwned = rightNV.TypeAndValue.FuncPtrReturnOwned;
                                 rhsFuncPtrReturnAlias = rightNV.TypeAndValue.FuncPtrReturnAlias;
@@ -7360,7 +7367,12 @@ void MainListener::TransferPointerOwnershipOnStore(
                 {
                     compiler->builder->CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy), srcStorage);
-                    compiler->StoreRawArrayLength(rightNV, nullptr);
+                    const bool sourceIsWholeRawArrayBinding = !rightNV.IsElementAccess
+                        && rightNV.FieldName.empty() && rightNV.OwningStructName.empty()
+                        && (llvm::isa<llvm::AllocaInst>(srcStorage)
+                            || llvm::isa<llvm::GlobalVariable>(srcStorage));
+                    if (sourceIsWholeRawArrayBinding)
+                        compiler->StoreRawArrayLength(rightNV, nullptr);
                     // Moving a field (`x = node->left`) marks only that field, not the base.
                     if (!rightNV.FieldName.empty())
                         compiler->MarkVariableFieldMoved(rightNV.CallerName, rightNV.FieldName);

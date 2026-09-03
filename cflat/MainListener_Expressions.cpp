@@ -4285,10 +4285,16 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 // is the same check for the reassignment door, before the re-derive below.
                 RejectLocalAllocAlignMismatch(namedVar, rightNV, right, ctx);
                 auto* asgNewArr = assignCtx ? AsDirectNew(assignCtx) : nullptr;
-                bool rhsIsRawArray = (asgNewArr != nullptr
-                    && asgNewArr->assignmentExpression() != nullptr)
-                    || rightNV.AllocatedByRawNewArray;
-                llvm::Value* rhsCount = compiler->LoadRawArrayLength(rightNV);
+                const bool rhsIsWholeRawArrayBinding = rightNV.FieldName.empty()
+                    && rightNV.OwningStructName.empty() && !rightNV.IsElementAccess
+                    && (rightNV.Storage == nullptr
+                        || llvm::isa<llvm::AllocaInst>(rightNV.Storage)
+                        || llvm::isa<llvm::GlobalVariable>(rightNV.Storage));
+                bool rhsIsRawArray = rhsIsWholeRawArrayBinding
+                    && ((asgNewArr != nullptr && asgNewArr->assignmentExpression() != nullptr)
+                        || rightNV.AllocatedByRawNewArray);
+                llvm::Value* rhsCount = rhsIsWholeRawArrayBinding
+                    ? compiler->LoadRawArrayLength(rightNV) : nullptr;
                 if (namedVar.TypeAndValue.IsArrayView
                     && rightNV.TypeAndValue.ConstArraySize > 0
                     && !rightNV.TypeAndValue.IsArrayView)
@@ -7682,7 +7688,11 @@ llvm::Value* MainListener::LoadNamedVariable(LLVMBackend::NamedVariable& namedVa
         // values PROVEN to be data must not widen into a fat closure's code slot (see dataValues_).
         if (result != nullptr && compiler->ArgumentIsDataValue(namedVar))
             compiler->RegisterDataValue(result);
-        if (result != nullptr && namedVar.AllocatedByRawNewArray)
+        const bool rawArrayBinding = namedVar.Storage != nullptr
+            && (llvm::isa<llvm::AllocaInst>(namedVar.Storage)
+                || llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+            && namedVar.FieldName.empty() && !namedVar.IsElementAccess;
+        if (result != nullptr && namedVar.AllocatedByRawNewArray && rawArrayBinding)
         {
             if (auto* count = compiler->LoadRawArrayLength(namedVar))
                 compiler->RegisterRawArrayResult(result, count, namedVar.AllocAlignment, false);
@@ -12303,7 +12313,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
         // would crash on the first null child.
         if (!isArray && !typeName.empty())
         {
-            if (auto* dtor = compiler->GetFullDestructorForDelete(typeName))
+            if (compiler->GetFullDestructorForDelete(typeName) != nullptr)
             {
                 auto* nullPtr = llvm::ConstantPointerNull::get(
                     llvm::cast<llvm::PointerType>(ptrVal->getType()));
@@ -12312,7 +12322,7 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 auto* contBB  = compiler->CreateBasicBlock("del_dtor_cont");
                 compiler->builder->CreateCondBr(isNull, contBB, dtorBB);
                 compiler->builder->SetInsertPoint(dtorBB);
-                compiler->builder->CreateCall(dtor, { ptrVal });
+                compiler->EmitOwningPtrDestructor(operandNamedVar, ptrVal, typeName);
                 compiler->builder->CreateBr(contBB);
                 compiler->builder->SetInsertPoint(contBB);
             }
@@ -13091,13 +13101,25 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
             return argNV;
         }
 
-        llvm::Value* movedRawArrayLength = compiler->LoadRawArrayLength(argNV);
-        bool movedRawNewArray = argNV.AllocatedByRawNewArray;
+        const bool moveSourceIsWholeBinding = !argNV.IsElementAccess
+            && argNV.FieldName.empty() && argNV.OwningStructName.empty()
+            && (llvm::isa<llvm::AllocaInst>(argNV.Storage)
+                || llvm::isa<llvm::GlobalVariable>(argNV.Storage));
+        // A field or element-field owns one scalar pointee, never the base array.
+        if (!moveSourceIsWholeBinding)
+        {
+            argNV.AllocatedByRawNewArray = false;
+            argNV.RawArrayLength = nullptr;
+        }
+        llvm::Value* movedRawArrayLength = moveSourceIsWholeBinding
+            ? compiler->LoadRawArrayLength(argNV) : nullptr;
+        bool movedRawNewArray = moveSourceIsWholeBinding && argNV.AllocatedByRawNewArray;
 
         // Null the source (field GEP or local alloca) to transfer ownership.
         if (auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType()))
             compiler->builder->CreateStore(llvm::ConstantPointerNull::get(ptrTy), argNV.Storage);
-        compiler->StoreRawArrayLength(argNV, nullptr);
+        if (moveSourceIsWholeBinding)
+            compiler->StoreRawArrayLength(argNV, nullptr);
 
         // Explicit 'move a' of a whole thin pointer local: nulled but plain-readable (only a later
         // SAME-BLOCK deref errors - see MarkVariableExplicitlyMovedNull). Excludes a field-path move.
@@ -13144,7 +13166,7 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         // so let the decl site re-key ownership off the DEST type - a bare `T*` element must NOT own
         // (no spurious delete -> double-free), a `unique T*` element must own. A named local / param
         // / field source stays source-keyed (IsElementAccess false leaves lastOwningResult in force).
-        if (argNV.IsElementAccess)
+        if (argNV.IsElementAccess && argNV.FieldName.empty())
             compiler->lastMovedFromContainerSlot = true;
 
         LLVMBackend::NamedVariable result;

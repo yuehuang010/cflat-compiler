@@ -2658,6 +2658,7 @@ int g_raw_count_dtors = 0;
 int g_raw_count_order = 0;
 int g_raw_count_sum = 0;
 int g_raw_count_resource_dtors = 0;
+int g_raw_count_slot_dtors = 0;
 
 class RawCountElem
 {
@@ -2682,11 +2683,24 @@ class RawCountOwnerElem
     ~RawCountOwnerElem() { g_raw_count_dtors++; }
 };
 
+class RawCountNestedElem
+{
+    RawCountResource* resource = new RawCountResource();
+    ~RawCountNestedElem() { delete resource; g_raw_count_dtors++; }
+};
+
+struct RawCountFieldSlot
+{
+    RawCountElem* p = nullptr;
+    ~RawCountFieldSlot() { g_raw_count_slot_dtors++; }
+};
+
 void resetRawCountState()
 {
     g_raw_count_dtors = 0;
     g_raw_count_order = 0;
     g_raw_count_sum = 0;
+    g_raw_count_slot_dtors = 0;
 }
 
 // `unique<T>` owns a single object, so the counted heap-array shapes below live on a raw `T*`
@@ -2850,6 +2864,63 @@ void rawCountGenericSink<T>(move T* values) {}
 void rawCountAlignedSink(move alignas(0, 64) RawCountElem* values) {}
 void rawCountOwnerSink(move RawCountOwnerElem* values) {}
 move RawCountElem* rawCountReturn(move RawCountElem* values) { return move values; }
+void rawCountDeleteSink(move RawCountElem* values) { delete values; }
+void rawCountDeleteBranch(move RawCountElem* values, int choose)
+{
+    if (choose != 0) { delete values; }
+}
+void rawCountDeleteGenericSink<T>(move T* values) { delete values; }
+class RawCountDeleteMethod
+{
+    void sink(move RawCountElem* values) { delete values; }
+};
+move RawCountElem* rawCountDeleteReturn() { return new RawCountElem[3]; }
+void rawCountDeleteNestedSink(move RawCountNestedElem* values) { delete values; }
+
+int runRawCountMoveDelete()
+{
+    resetRawCountState();
+    rawCountDeleteSink(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveDeleteBranch()
+{
+    resetRawCountState();
+    rawCountDeleteBranch(new RawCountElem[3], 1);
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveDeleteReturn()
+{
+    resetRawCountState();
+    RawCountElem* values = rawCountDeleteReturn();
+    delete values;
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveDeleteMethod()
+{
+    resetRawCountState();
+    RawCountDeleteMethod method;
+    method.sink(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveDeleteGeneric()
+{
+    resetRawCountState();
+    rawCountDeleteGenericSink<RawCountElem>(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveDeleteNested()
+{
+    resetRawCountState();
+    g_raw_count_resource_dtors = 0;
+    rawCountDeleteNestedSink(new RawCountNestedElem[3]);
+    return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
+}
 
 interface RawCountSinkInterface
 {
@@ -2984,6 +3055,194 @@ int runRawCountMoveReassign()
         values = new RawCountElem[4];
         rawCountSink(move values);
     }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveFieldDelete()
+{
+    resetRawCountState();
+    {
+        RawCountFieldSlot* slots = new RawCountFieldSlot[3];
+        slots[0].p = new RawCountElem();
+        slots[1].p = new RawCountElem();
+        slots[2].p = new RawCountElem();
+        RawCountElem* h = move slots[0].p;
+        delete h;
+        RawCountElem* a = move slots[1].p;
+        RawCountElem* b = move slots[2].p;
+        delete[_] a;
+        delete[_] b;
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMoveFieldScope()
+{
+    resetRawCountState();
+    {
+        RawCountFieldSlot* slots = new RawCountFieldSlot[3];
+        slots[0].p = new RawCountElem();
+        slots[1].p = new RawCountElem();
+        slots[2].p = new RawCountElem();
+        RawCountElem* h = move slots[0].p;
+        RawCountElem* a = move slots[1].p;
+        RawCountElem* b = move slots[2].p;
+        delete[_] a;
+        delete[_] b;
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMoveFieldAssign()
+{
+    resetRawCountState();
+    {
+        RawCountFieldSlot* slots = new RawCountFieldSlot[3];
+        slots[0].p = new RawCountElem();
+        slots[1].p = new RawCountElem();
+        slots[2].p = new RawCountElem();
+        RawCountElem* h = nullptr;
+        h = move slots[0].p;
+        delete h;
+        RawCountElem* a = move slots[1].p;
+        RawCountElem* b = move slots[2].p;
+        delete[_] a;
+        delete[_] b;
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMoveFieldDynamicBase()
+{
+    resetRawCountState();
+    {
+        int slotCount = 3;
+        RawCountFieldSlot* slots = new RawCountFieldSlot[slotCount];
+        slots[0].p = new RawCountElem();
+        slots[1].p = new RawCountElem();
+        slots[2].p = new RawCountElem();
+        RawCountElem* h = move slots[0].p;
+        delete h;
+        RawCountElem* a = move slots[1].p;
+        RawCountElem* b = move slots[2].p;
+        delete[_] a;
+        delete[_] b;
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMoveFieldObjectPointer()
+{
+    resetRawCountState();
+    RawCountFieldSlot* obj = new RawCountFieldSlot();
+    obj->p = new RawCountElem();
+    RawCountElem* h = move obj->p;
+    delete h;
+    delete obj;
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMoveFieldObjectValue()
+{
+    resetRawCountState();
+    {
+        RawCountFieldSlot obj = default;
+        obj.p = new RawCountElem();
+        RawCountElem* h = move obj.p;
+        delete h;
+    }
+    return g_raw_count_dtors * 10 + g_raw_count_slot_dtors;
+}
+
+int runRawCountMovePureElement()
+{
+    resetRawCountState();
+    RawCountElem*[3] values = default;
+    values[0] = new RawCountElem();
+    values[1] = new RawCountElem();
+    values[2] = new RawCountElem();
+    RawCountElem* h = move values[0];
+    delete h;
+    delete values[1];
+    delete values[2];
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamLocal(move RawCountElem* p)
+{
+    RawCountElem* q = move p;
+    rawCountSink(move q);
+}
+
+int runRawCountMoveParamLocal()
+{
+    resetRawCountState();
+    RawCountElem* values = new RawCountElem[3];
+    rawCountMoveParamLocal(move values);
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignDelete(move RawCountElem* p)
+{
+    p = new RawCountElem();
+    delete p;
+}
+
+int runRawCountMoveParamReassignDelete()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignDelete(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignScope(move RawCountElem* p)
+{
+    p = new RawCountElem();
+}
+
+int runRawCountMoveParamReassignScope()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignScope(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignArrayDelete(move RawCountElem* p)
+{
+    p = new RawCountElem[4];
+    delete p;
+}
+
+int runRawCountMoveParamReassignArrayDelete()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignArrayDelete(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignArrayScope(move RawCountElem* p)
+{
+    p = new RawCountElem[4];
+}
+
+int runRawCountMoveParamReassignArrayScope()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignArrayScope(new RawCountElem[3]);
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignMoveLocal(move RawCountElem* p)
+{
+    RawCountElem* q = new RawCountElem[2];
+    p = move q;
+    delete p;
+}
+
+int runRawCountMoveParamReassignMoveLocal()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignMoveLocal(new RawCountElem[3]);
     return g_raw_count_dtors;
 }
 
@@ -3291,6 +3550,46 @@ int testRawArrayRuntimeCount()
         runRawCountMoveAligned(2) * 10 + runRawCountMoveAligned(4), 24);
     passed += Test("raw count move parameter after reassignment",
         runRawCountMoveReassign(), 6);
+    passed += Test("raw count move element-field explicit delete",
+        runRawCountMoveFieldDelete(), 13);
+    passed += Test("raw count move element-field scope cleanup",
+        runRawCountMoveFieldScope(), 13);
+    passed += Test("raw count move element-field assignment",
+        runRawCountMoveFieldAssign(), 13);
+    passed += Test("raw count move element-field keeps dynamic base count",
+        runRawCountMoveFieldDynamicBase(), 13);
+    passed += Test("raw count move object pointer field",
+        runRawCountMoveFieldObjectPointer(), 11);
+    passed += Test("raw count move object value field",
+        runRawCountMoveFieldObjectValue(), 11);
+    passed += Test("raw count move pure pointer element",
+        runRawCountMovePureElement(), 3);
+    passed += Test("raw count move counted parameter into local",
+        runRawCountMoveParamLocal(), 3);
+    passed += Test("raw count move parameter scalar reassignment delete",
+        runRawCountMoveParamReassignDelete(), 1);
+    passed += Test("raw count move parameter scalar reassignment scope cleanup",
+        runRawCountMoveParamReassignScope(), 1);
+    passed += Test("raw count move parameter array reassignment delete",
+        runRawCountMoveParamReassignArrayDelete(), 4);
+    passed += Test("raw count move parameter array reassignment scope cleanup",
+        runRawCountMoveParamReassignArrayScope(), 4);
+    passed += Test("raw count move parameter reassignment from counted local",
+        runRawCountMoveParamReassignMoveLocal(), 2);
+    // Plain delete must use the move-pointer raw count; old code returns 1 instead of 3.
+    // The nested resource leg similarly returns 11 instead of 33 on the pre-fix compiler.
+    passed += Test("raw count explicit move delete array",
+        runRawCountMoveDelete(), 3);
+    passed += Test("raw count explicit move delete branch",
+        runRawCountMoveDeleteBranch(), 3);
+    passed += Test("raw count explicit move delete return local",
+        runRawCountMoveDeleteReturn(), 3);
+    passed += Test("raw count explicit move delete method",
+        runRawCountMoveDeleteMethod(), 3);
+    passed += Test("raw count explicit move delete generic",
+        runRawCountMoveDeleteGeneric(), 3);
+    passed += Test("raw count explicit move delete nested resource",
+        runRawCountMoveDeleteNested(), 33);
     passed += Test("local alignas reassignment accept-set",
         runLocalAlignAcceptSet(), 6);
     passed += Test("local alignas clause-free destination accepted",
@@ -3409,7 +3708,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 44;
+    r = testRawArrayRuntimeCount(); passed += r; total += 63;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;
