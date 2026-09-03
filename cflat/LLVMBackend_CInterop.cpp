@@ -832,14 +832,13 @@ void LLVMBackend::RegisterCSignatures(const std::vector<CSigEntry>& sigs, const 
             if (auto* s = GetSymbolSink())
             {
                 s->RemoveFunctionAliases(e.name);
-                std::string sig = e.ret.TypeName + (e.ret.Pointer ? "*" : "") + " " + e.name + "(";
+                std::string sig = SpellType(*this, e.ret) + " " + e.name + "(";
                 bool first = true;
                 for (const auto& p : e.params)
                 {
                     if (!first) sig += ", ";
                     first = false;
-                    sig += p.TypeName;
-                    if (p.Pointer) sig += "*";
+                    sig += SpellType(*this, p);
                     if (!p.VariableName.empty()) sig += " " + p.VariableName;
                 }
                 sig += ")";
@@ -1778,9 +1777,7 @@ void LLVMBackend::RegisterCRecords(const std::vector<CRecordEntry>& records, con
                         annSig += "[" + std::to_string(d) + "] ";
                     if (f.ConstArraySize > 0)
                         annSig = "[" + std::to_string(f.ConstArraySize) + "] " + annSig;
-                    std::string typeSig = f.TypeName;
-                    if (f.Pointer) typeSig += "*";
-                    if (f.ElemPointer) typeSig += "*";
+                    std::string typeSig = SpellType(*this, f);
                     std::string fieldSig = annSig + typeSig + " " + f.VariableName;
                     if (f.IsBitfield && f.BitWidth > 0)
                         fieldSig += ":" + std::to_string(f.BitWidth);

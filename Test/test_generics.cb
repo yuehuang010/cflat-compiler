@@ -2702,7 +2702,7 @@ bool testDictOfListPtr()
 
 // =============================================================
 // Generic type aliases (using IntList = list<int>) - Tier 1
-// The alias value is just the mangled name (list__int), a plain string; the
+// The alias value is just the mangled name (list$int), a plain string; the
 // instantiation is enqueued by the using itself (see ParseUsingDeclaration).
 // =============================================================
 
@@ -4171,7 +4171,7 @@ using CanonAliasS2 = CanonAliasS;       // alias of a struct, not a primitive
 int canonAliasTakesIntList(list<int>* p)          { return (int)p->count(); }
 int canonAliasTakesStructList(list<CanonAliasS>* p) { return (int)p->count(); }
 int canonAliasTakesBox(CanonBox<int> b)           { return b.v; }
-// Closure encoder leg: Lambda<int(CanonAliasInt)> must encode as __fatfn_1_3_i32_3_i32.
+// Closure encoder leg: Lambda<int(CanonAliasInt)> must encode as fatfn$.1$int$int.
 int canonAliasTakesFnList(list<Lambda<int(int)>>* p) { return (int)p->count(); }
 
 bool testGnCanonicalPrimitiveTypeArg()
@@ -4323,15 +4323,15 @@ bool testGnUnresolvedGenericShellGate()
 // Pointer-depth gate vs generic substitution
 // ---------------------------------------------------------------
 // PeelTypeArgSuffix carries a type argument's stars as a real DEPTH, so PdgBox<PdgC**> mangles
-// PdgBox__PdgCptrptr and its substituted `T x` parameter is a proven PdgC** - a distinct
+// PdgBox$.p$.p$PdgC and its substituted `T x` parameter is a proven PdgC** - a distinct
 // instantiation from PdgBox<PdgC*>, and one the overload depth gate can judge.
 class PdgC { int r = 0; };
 int pdgPick(PdgC* c) { return 1; }
 int pdgPick(PdgC** c) { return 2; }
 class PdgBox<T> { T v = default; int put(T x) { v = x; return 1; } T get() { return v; }
                   int which() { return pdgPick(v); } };
-// Overloaded on the two INSTANTIATIONS: while both mangled to PdgBox__PdgCptr this pair was a
-// redefinition, so the fact that it compiles at all is the distinctness proof.
+// Overloaded on the two INSTANTIATIONS: the new keys PdgBox$.p$PdgC and PdgBox$.p$.p$PdgC are
+// distinct, so the fact that this pair compiles is the distinctness proof.
 int pdgWhichBox(PdgBox<PdgC*> b) { return 1; }
 int pdgWhichBox(PdgBox<PdgC**> b) { return 2; }
 int pdgId<T>(T x) { return 7; }
@@ -4454,6 +4454,62 @@ bool testNsgNamespacedGenericSpellings()
     a.v = 41;
     result &= Test("nsg_using_alias_from_file_scope", a.v + 1, 42) != 0;
 
+    return result;
+}
+
+struct B { int value = default; };
+struct A__B { int x = default; };
+struct A<T> { T v = default; };
+
+bool testGenericAndDunderNameCollision()
+{
+    bool result = true;
+    A__B named = default;
+    named.x = 7;
+    A<B> generic = default;
+    generic.v.value = 9;
+
+    result &= Test("collision_named_field", named.x, 7);
+    result &= Test("collision_generic_field", generic.v.value, 9);
+    result &= Test("collision_named_sizeof", (int)sizeof(A__B), 4);
+    result &= Test("collision_generic_sizeof", (int)sizeof(A<B>), 4);
+    result &= Test("collision_named_typeof", typeof(named), "A__B");
+    result &= Test("collision_generic_typeof", typeof(generic), "A<B>");
+    return result;
+}
+
+struct IShape2 { int value = default; };
+class Circle { int value = default; };
+struct Buf<T, int N> { int value = default; int cap() { return N; } };
+
+int prefixManglingArrayParam(array<int>* value)
+{
+    return value == nullptr ? 0 : 1;
+}
+
+int prefixManglingOverload(list<string*>* value) { return 1; }
+int prefixManglingOverload(list<string**> value) { return 2; }
+
+bool testPrefixManglingAndPointerCollision()
+{
+    bool result = true;
+    array<IShape2*> shapes = default;
+    array<int> ints = default;
+    list<string*> l = default;
+    list<string**> m = default;
+    list<alias Circle*> aliases = default;
+    Buf<int, 8> positive = default;
+    Buf<int, -8> negative = default;
+
+    result &= Test("prefix_array_pointer_element", typeof(shapes), "array<IShape2*>");
+    result &= Test("prefix_array_pointer_parameter", prefixManglingArrayParam(&ints), 1);
+    result &= Test("prefix_list_pointer_overload", prefixManglingOverload(&l)
+                   + prefixManglingOverload(m), 3);
+    result &= Test("prefix_list_pointer_typeof", typeof(&l), "list<string*>*");
+    result &= Test("prefix_list_double_pointer_typeof", typeof(m), "list<string**>");
+    result &= Test("prefix_alias_typeof", typeof(aliases), "list<alias Circle*>");
+    result &= Test("prefix_value_positive", positive.cap(), 8);
+    result &= Test("prefix_value_negative", negative.cap(), -8);
     return result;
 }
 
@@ -4607,6 +4663,8 @@ extern int main()
     total++; passed += testGenericSizeof()                          ? 1 : 0;
     total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
     total++; passed += testStructScopeUsingAliases()                ? 1 : 0;
+    total++; passed += testGenericAndDunderNameCollision()           ? 1 : 0;
+    total++; passed += testPrefixManglingAndPointerCollision()       ? 1 : 0;
 
     printf("%d/%d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;

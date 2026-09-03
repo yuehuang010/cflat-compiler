@@ -33,9 +33,11 @@
 #include <cctype>
 #include <cmath>
 #include <charconv>
+#include <cassert>
 
 #include "platform/GeneratedParser.h"
 #include "LLVMBackend.h"
+#include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
 static bool HasSoftDeclarationSpecifier(CFlatParser::DeclarationSpecifiersContext* specs,
@@ -697,7 +699,7 @@ static std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
                                                     const std::string& resolved)
 {
     if (compiler == nullptr || !compiler->IsCoreUniqueType(resolved)) return resolved;
-    std::string pointee = resolved.substr(8);
+    std::string pointee = MangledGenericArgument(*compiler, resolved);
     if (compiler->IsInterfaceType(pointee))
         return pointee;
     return pointee + "*";
@@ -709,7 +711,7 @@ static void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
                                    LLVMBackend::NamedVariable& ctorArg,
                                    const std::string& uniqueTypeName, llvm::Value* value)
 {
-    const std::string pointee = uniqueTypeName.substr(8);
+    const std::string pointee = MangledGenericArgument(*compiler, uniqueTypeName);
     if (compiler != nullptr && compiler->IsInterfaceType(pointee))
     {
         bool fat = value != nullptr && value->getType()->isStructTy();
@@ -736,7 +738,7 @@ static void CanonicalizeUniqueSigComponent(const LLVMBackend* compiler, std::str
                                            bool& pointer, int& pointerDepth)
 {
     if (compiler == nullptr || pointer || !compiler->IsCoreUniqueType(typeName)) return;
-    std::string pointee = typeName.substr(8);
+    std::string pointee = MangledGenericArgument(*compiler, typeName);
     if (compiler->IsInterfaceType(pointee)) return;
     typeName = pointee;
     pointer = true;
@@ -833,53 +835,17 @@ static void StripOwnershipQualifiers(std::string& name)
     StripAliasQualifier(name);
 }
 
-// CanonicalPrimitiveSpelling lives in LLVMBackend.h - the SAME map has to serve both type
-// identities (generic instantiation here, overload symbol names in ToUniqueString) or one
-// spelling of a type monomorphizes differently from how it overloads.
+// The type-mangling funnel owns primitive canonicalization for both generic identities and
+// overload symbol names, so one spelling cannot monomorphize differently from how it overloads.
 // `compiler` is REQUIRED (no default): it supplies the pure-rename `using` alias fold, and a site
 // that silently skipped it would mangle a name the other pass spells differently. Every current
 // call site reaches one; a nullptr is only correct where the string cannot name a source alias.
 static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string& typeName)
 {
-    if (IsDecimalIntegerSpelling(typeName))
-    {
-        // Reserve __s<length>_<text> for a future string value parameter; do not implement it here.
-        return typeName[0] == '-' ? "n" + typeName.substr(1) : typeName;
-    }
-    std::string result;
-    size_t start = 0;
-    // The `alias` qualifier mangles to an "alias_" token so list<alias Circle*>
-    // monomorphizes distinctly from list<Circle*> (mutually exclusive with unique).
-    if (typeName.compare(0, kAliasQualifierPrefixLen, kAliasQualifierPrefix) == 0)
-    {
-        result += "alias_";
-        start = kAliasQualifierPrefixLen;
-    }
-    // Canonicalize the BASE only - everything before the first reference-kind suffix - and by
-    // exact match, so a struct named `Int` or a type named `integer` is never rewritten. A
-    // nested generic arrives already mangled (list<int> -> "list__i32"), since the inner name
-    // was built through this same funnel.
-    size_t baseEnd = start;
-    while (baseEnd < typeName.size() && typeName[baseEnd] != '*' && typeName[baseEnd] != '[')
-        baseEnd++;
-    // A pure-rename `using` alias is transparent, so fold it BEFORE canonicalizing: MyInt -> int
-    // -> i32, which is what makes list<MyInt> and list<int> one instantiation. Only the BASE is
-    // folded; the suffix walk below owns the reference-kind decoration either way.
-    std::string base = typeName.substr(start, baseEnd - start);
-    if (compiler != nullptr) base = compiler->ResolveManglingAlias(base);
-    result += CanonicalPrimitiveSpelling(base);
-
-    for (size_t i = baseEnd; i < typeName.size(); i++)
-    {
-        if (typeName[i] == '*') result += "ptr";
-        else if (typeName[i] == '[' && i + 1 < typeName.size() && typeName[i + 1] == ']')
-        {
-            result += "view";
-            i++;  // consume the matching ']'
-        }
-        else result += typeName[i];
-    }
-    return result;
+    if (compiler == nullptr) return typeName;
+    LLVMBackend::TypeAndValue type;
+    type.TypeName = typeName;
+    return MangleType(*compiler, type);
 }
 
 // A `using` target that is nothing but a (possibly dotted) identifier - the only shape that is a
@@ -961,25 +927,18 @@ static int ReconcilePointerDepth(bool pointer, int stars)
     return stars > 0 ? stars : 1;
 }
 
-// Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> "intptr", "int**" ->
-// "intptrptr"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
-// "__fatfn_1_3_i32_3_i32"; function<void(UiTest*)> -> "__thinfn_1_4_void_9_UiTestptr";
-// Lambda<list<string>()> -> "__fatfn_0_12_list__string". Both compiler passes MUST call this
+// Each component folds its pointer DEPTH in via MangleTypeArg ("int*" -> ".p$int", "int**" ->
+// ".p$.p$int"); isThin selects the thin/fat prefix. Examples: Lambda<int(int)> ->
+// "fatfn$.1$int$int"; function<void(UiTest*)> -> "cfn$.1$void$.p$UiTest";
+// Lambda<list<string>()> -> "fatfn$.1$list$string". Both compiler passes MUST call this
 // identically. Depths are ints, so a caller that only knows "is a pointer" passes 0 or 1 and gets
 // the string this produced before depth existed.
 static std::string BuildEncodedClosureName(const LLVMBackend* compiler, bool isThin,
     const std::string& ret, int retDepth,
     const std::vector<std::pair<std::string, int>>& params)
 {
-    auto comp = [compiler](const std::string& name, int depth) {
-        std::string c = MangleTypeArg(compiler, name + std::string(depth < 0 ? 0 : depth, '*'));
-        return std::to_string(c.size()) + "_" + c;
-    };
-    std::string s = isThin ? "__thinfn" : "__fatfn";
-    s += "_" + std::to_string(params.size());
-    s += "_" + comp(ret, retDepth);
-    for (const auto& p : params) s += "_" + comp(p.first, p.second);
-    return s;
+    if (compiler == nullptr) return ret;
+    return MangleClosureType(*compiler, isThin, ret, retDepth, params);
 }
 
 
@@ -1694,17 +1653,15 @@ inline std::string CanonicalWrapperTypeName(const LLVMBackend* compiler, const s
         std::string base = compiler->ResolveTypeAlias(
             compiler->ResolveQualifiedName(spelled.substr(0, lt)));
         base = compiler->ResolveGenericBaseAlias(base);
-        std::string mangled = base;
+        std::vector<std::string> args;
         for (const auto& arg : SplitTopLevelTypeArgs(spelled.substr(lt + 1, spelled.size() - lt - 2)))
         {
-            // A NESTED instantiation goes through this same funnel: MangleTypeArg does not recurse,
-            // so "GBox<Inner<int>>" would meet the declared "GBox__Inner__i32" as "GBox__Inner<int>".
             if (!arg.empty() && arg.back() == '>' && arg.find('<') != std::string::npos)
-                mangled += "__" + CanonicalWrapperTypeName(compiler, arg);
+                args.push_back(CanonicalWrapperTypeName(compiler, arg));
             else
-                mangled += "__" + MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, arg));
+                args.push_back(MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, arg)));
         }
-        return mangled;
+        return MangleGenericInstance(*compiler, base, args);
     }
     return compiler->ResolveManglingAlias(
         compiler->ResolveTypeAlias(compiler->ResolveQualifiedName(spelled)));
@@ -2099,15 +2056,15 @@ inline bool ParamIsOwningSinkEligible(const LLVMBackend::TypeAndValue& p)
 {
     if (p.Pointer || p.ElemPointer) return false;
     if (p.IsInterface || p.IsInterfacePointer) return false;
-    // A THIN C function pointer (function<...> / __c_fn_ptr, or an encoded __thinfn) owns NOTHING,
+    // A THIN C function pointer (function<...> / __c_fn_ptr, or an encoded cfn$...) owns NOTHING,
     // so it can never be an owning sink. A FAT closure (Lambda<...> / __closure_fat_ptr, or an
-    // encoded __fatfn) is an OWNING VALUE like string - it owns its captured env - so it IS
+    // encoded fatfn$...) is an OWNING VALUE like string - it owns its captured env - so it IS
     // sink-eligible: moved into the slot on insert, freed on teardown. The concrete
     // owns-a-resource gate still runs at the call site on the monomorphized type.
-    if (p.IsThinFnPtr() || p.TypeName.rfind("__thinfn", 0) == 0) return false;
+    if (p.IsThinFnPtr() || IsThinMangledClosure(p.TypeName)) return false;
     if (p.IsArrayView || p.IsSimd) return false;
     if (p.ConstArraySize > 0) return false;
-    if (p.IsMove || p.TypeName.starts_with("unique__")
+    if (p.IsMove || MangledBase(p.TypeName) == "unique"
         || p.IsAlias) return false;
     if (p.IsBorrowOfAliasElement) return false;
     return true;
@@ -2275,11 +2232,14 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                 std::string typeName = genBaseTypeName;
                 if (!namespaceName.empty())
                     typeName = namespaceName + "." + typeName;
+                LLVMBackend::TypeAndValue displayType;
+                displayType.TypeName = typeName;
+                const std::string displayTypeName = SpellType(*compiler, displayType);
                 std::string keyword = ctx->getStart()->getText();
                 std::string doc = ExtractLeadingDoc(tokens_, ctx->getStart());
                 s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            keyword + " " + typeName, {}, doc);
+                            keyword + " " + displayTypeName, {}, doc, displayTypeName);
                 for (auto* func : MemberFunctionDefinitions(ctx))
                 {
                     std::string funcName = getFunctionName(func);
@@ -2290,7 +2250,8 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
                     s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
                                 (int)func->getStart()->getLine(),
                                 (int)func->getStart()->getCharPositionInLine(),
-                                getFunctionSignatureText(func), {}, fdoc);
+                                getFunctionSignatureText(func), {}, fdoc,
+                                displayTypeName + "." + funcName);
                 }
             }
             // A generic class's real base clause needs main-pass type-arg substitution, and its
@@ -2340,15 +2301,18 @@ void ScanInterfaceDefinition(CFlatParser::InterfaceDefinitionContext* ctx,
         {
             std::string keyword = ctx->getStart()->getText();
             std::string doc = ExtractLeadingDoc(tokens_, ctx->getStart());
+            LLVMBackend::TypeAndValue displayType;
+            displayType.TypeName = typeName;
+            const std::string displayTypeName = SpellType(*compiler, displayType);
             s->Register(SymbolKind::Struct, typeName, compiler->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        keyword + " " + typeName, {}, doc);
+                        keyword + " " + displayTypeName, {}, doc, displayTypeName);
             // Also register under the unqualified name so Lookup("Point") finds "Geometry.Point".
             size_t dot = typeName.rfind('.');
             if (dot != std::string::npos)
                 s->Register(SymbolKind::Struct, typeName.substr(dot + 1), compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                            keyword + " " + typeName, {}, doc);
+                            keyword + " " + displayTypeName, {}, doc, displayTypeName);
         }
 
         // Pre-declare default constructor
@@ -2477,7 +2441,7 @@ public:
      * MangleTypeArg folds the same alias set in both. It cannot be left to the walk: ScanGenericTypeUses
      * mangles every generic use in the file BEFORE ScanExternalDeclaration reaches the first `using`,
      * while codegen sees the alias already registered - the two would build a struct shell under
-     * `list__MyInt` and look it up as `list__i32`.
+     * `list$MyInt` and look it up as `list$int`.
      *
      * Only a bare-name target is a pure rename (IsBareTypeName); `using Handle = void*;` and
      * `using Vec3 = float[3];` keep their suffix in the alias string and stay opaque here.
@@ -2494,7 +2458,7 @@ public:
     // Resolve a type-argument entry to the same string MainListener::ResolveTypeArgEntry
     // would produce at the top level (no active substitutions during the forward scan),
     // recursing into nested generics so list<int> inside list<list<int>> mangles to
-    // "list__int" rather than the literal "list<int>". A trailing pointer becomes "*"
+    // "list$int" rather than the literal "list<int>". A trailing pointer becomes "*"
     // (MangleTypeArg later turns it into "ptr"), keeping shell names consistent with
     // the main pass.
     std::string ResolveForwardTypeArg(CFlatParser::TypeParameterEntryContext* entry);
@@ -3065,10 +3029,7 @@ private:
      * Rebuild a readable source spelling ("Lambda<int(int)>") from a registered encoded closure
      * name, so a diagnostic raised on the substitution path can name the closure the way it was
      * written rather than the mangled symbol. A signature component that is itself a generic
-     * instantiation arrives mangled ("list__i32"), so each one goes through
-     * DisplayNameOfMangledType - and if ANY component is not provably writable source, the whole
-     * spelling falls back to the raw encoded name rather than emitting a half-demangled hybrid
-     * ("Lambda<int(list__list__i32*)>") that names no type the user can write.
+     * instantiation arrives mangled ("list$int"), so each one goes through SpellType.
      */
     static std::string ClosureArgSpelling(LLVMBackend* compiler, const std::string& encodedName);
 
@@ -5037,14 +4998,14 @@ public:
      * never synthesized from the bare pointee name. A type ALIAS ('using PS = S*') is already
      * resolved away by ParseDeclarationSpecifiers, so this names the resolved type, not 'PS'.
      */
-    static std::string DescribePointerDeclType(const LLVMBackend::TypeAndValue& tv);
+    std::string DescribePointerDeclType(const LLVMBackend::TypeAndValue& tv) const;
 
     /*
      * Spell a code-value store DESTINATION the way the source wrote it: 'Rec*', 'Rec**', 'int[]',
      * 'Rec*[2]', 'string'. DescribePointerDeclType renders an array VIEW as 'int*', which is not
      * what the declaration says, so views are spelled here instead.
      */
-    static std::string CodeValueDestSpelling(const LLVMBackend::TypeAndValue& dest);
+    std::string CodeValueDestSpelling(const LLVMBackend::TypeAndValue& dest) const;
 
     /*
      * The cast escape is advised only where one actually COMPILES - verified per spelling, not
@@ -5053,7 +5014,7 @@ public:
      * '(int[])w' is refused outright, so advising either would send the user into a second error.
      * `string` is reached by the char* coercion and '(string)' of a raw value is itself rejected.
      */
-    static std::string CodeValueCastAdvice(const LLVMBackend::TypeAndValue& dest);
+    std::string CodeValueCastAdvice(const LLVMBackend::TypeAndValue& dest) const;
 
     /*
      * Parse a struct/class field DEFAULT initializer and gate it. `struct H { Rec* p = ro; };` is a
@@ -5248,7 +5209,7 @@ public:
     static int FixedArrayElementStars(const LLVMBackend::TypeAndValue& tv);
 
     // Render a fixed-array type for a diagnostic: "int[3]", "int*[2]", "Foo**[2][4]".
-    static std::string DescribeArrayShape(const LLVMBackend::TypeAndValue& tv);
+    std::string DescribeArrayShape(const LLVMBackend::TypeAndValue& tv) const;
 
     // Same, for the initializer side, whose extents arrive as loose values.
     static std::string DescribeArrayShape(const std::string& typeName, int stars, uint64_t n,
@@ -5697,7 +5658,7 @@ public:
     // Instantiation is deferred to avoid interrupting code generation in the current context.
     void QueueInstantiateGenericType(CFlatParser::DeclarationSpecifiersContext* declSpec);
 
-    // Compute the mangled name for a generic instantiation, e.g. Box<int, float> -> "Box__int__float".
+    // Compute the mangled name for a generic instantiation, e.g. Box<int, float> -> "Box$int$float".
     std::string MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs);
 
     // Process all pending generic instantiations that were queued during parsing.
@@ -5719,10 +5680,11 @@ public:
         const std::string& structName,
         const LLVMBackend::TypeAndValue& returnType);
 
-    // The program-owned inbox/outbox channel is always arena_channel<IMessage>:
-    // the seam is untyped (consumers downcast pa->_root), so IMessage is the
-    // single, fixed payload interface. Mangled name of that instantiation.
-    static constexpr const char* kArenaChannelType = "arena_channel__IMessage";
+    // The program-owned inbox/outbox channel is always arena_channel<IMessage>.
+    static std::string ArenaChannelTypeName(const LLVMBackend& compiler)
+    {
+        return MangleGenericInstance(compiler, "arena_channel", { "IMessage" });
+    }
 
     // Ensure arena_channel<IMessage> (and its transitive block_pool<IMessage> /
     // page_arena<IMessage>) is fully instantiated so the synthetic program

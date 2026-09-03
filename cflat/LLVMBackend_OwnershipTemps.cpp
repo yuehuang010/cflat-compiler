@@ -1378,8 +1378,10 @@ void LLVMBackend::EmitOwningUniqueArrayCleanup(const NamedVariable& namedVar)
                 NamedVariable raw = namedVar;
                 raw.Storage = pointerField;
                 raw.BaseType = GetType(TypeAndValue{
-                    .TypeName = namedVar.TypeAndValue.TypeName.substr(8), .Pointer = true});
-                raw.TypeAndValue.TypeName = namedVar.TypeAndValue.TypeName.substr(8);
+                    .TypeName = MangledGenericArgument(*this, namedVar.TypeAndValue.TypeName),
+                    .Pointer = true});
+                raw.TypeAndValue.TypeName = MangledGenericArgument(
+                    *this, namedVar.TypeAndValue.TypeName);
                 raw.TypeAndValue.Pointer = true;
                 raw.TypeAndValue.ConstArraySize = 0;
                 EmitOwningPtrCleanup(raw);
@@ -2769,8 +2771,9 @@ void LLVMBackend::ResolveOwningLocalBorrowingHelperArgs()
                 "'{}' stores it into a container that only BORROWS its elements and never frees "
                 "them, so the stored element would dangle. Declare parameter '{}' as 'move' and "
                 "call '{}(move {})', or declare the container's element 'unique T*'.",
-                { entry.FunctionName, entry.ArgumentName, entry.ParameterName,
-                  entry.ParameterName, entry.FunctionName, entry.ArgumentName });
+                { SpellFunctionSymbol(*this, entry.FunctionName), entry.ArgumentName,
+                  entry.ParameterName, entry.ParameterName,
+                  SpellFunctionSymbol(*this, entry.FunctionName), entry.ArgumentName });
         }
     }
 

@@ -82,7 +82,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             LogErrorContext(entry, std::format("unknown type qualifier '{}'; only 'unique' or 'alias' "
                 "is allowed on a generic type argument", entry->Identifier()->getText()));
         // Written stars are COUNTED, not flagged: Box<C**> must reach MangleTypeArg as "C**" so it
-        // mangles Box__Cptrptr and becomes its own instantiation.
+        // mangles Box$.p$.p$C and becomes its own instantiation.
         int pointerDepth = PointerDepthOf(entry->pointer());
         bool hasPointer = pointerDepth > 0;
         // Now that the stars are COUNTED here, this spelling joins the others that count them: a
@@ -244,6 +244,17 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
 void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
                                    const std::string& mangledName) {
+#ifndef NDEBUG
+        TypeSpelling spelling;
+        if (DemangleType(*Compiler(), mangledName, spelling))
+        {
+            std::vector<std::string> args;
+            args.reserve(spelling.args.size());
+            for (const auto& arg : spelling.args)
+                args.push_back(MangleType(*Compiler(), arg));
+            assert(MangleGenericInstance(*Compiler(), spelling.base, args) == mangledName);
+        }
+#endif
         if (IsCoreUniqueArrayViewInstantiation(Compiler(), mangledName, typeArgs))
             Compiler()->LogError(CoreUniqueArrayViewMessage(typeArgs));
         if (instantiatedGenerics.count(mangledName))
@@ -321,12 +332,12 @@ void MainListener::RejectFatClosurePointerArg(antlr4::ParserRuleContext* ctx, bo
 std::string MainListener::ClosureArgSpelling(LLVMBackend* compiler, const std::string& encodedName) {
         const auto* sig = compiler->GetEncodedClosureType(encodedName);
         if (sig == nullptr) return encodedName;
-        bool allWritable = true;
         auto comp = [&](const std::string& n, bool ptr, int depth) {
-            bool writable = true;
-            std::string shown = compiler->DisplayNameOfMangledType(n, &writable);
-            if (!writable) allWritable = false;
-            return shown + std::string(ptr ? (depth > 0 ? depth : 1) : 0, '*');
+            LLVMBackend::TypeAndValue tv;
+            tv.TypeName = n;
+            tv.Pointer = ptr;
+            tv.PointerDepth = depth;
+            return SpellType(*compiler, tv);
         };
         std::string s = sig->IsThinFnPtr() ? "function<" : "Lambda<";
         s += comp(sig->FuncPtrReturnTypeName, sig->FuncPtrReturnPointer, sig->FuncPtrReturnPointerDepth);
@@ -338,7 +349,7 @@ std::string MainListener::ClosureArgSpelling(LLVMBackend* compiler, const std::s
                       sig->FuncPtrParams[i].PointerDepth);
         }
         s += ")>";
-        return allWritable ? s : encodedName;
+        return s;
     }
 
 void MainListener::RejectFatEncodedClosurePointerArg(antlr4::ParserRuleContext* ctx, const std::string& baseName) {
@@ -571,7 +582,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     {
                         // Resolve return/param types the same way ordinary type positions resolve:
                         // substitution + generic mangling/queueing (gap b), so a generic inside the
-                        // signature (e.g. Lambda<list<string>()>) stores the mangled "list__string".
+                        // signature (e.g. Lambda<list<string>()>) stores the mangled "list$string".
                         bool retPtr = fpSpec->pointer() != nullptr;
                         int retStars = PointerDepthOf(fpSpec->pointer());
                         declType.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
@@ -584,9 +595,11 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             declType.FuncPtrReturnAlias = text == "alias";
                         }
                         // Over the cap here too: no declarable function can supply this signature.
-                        if (retStars > PointerDepthCap)
-                            LogErrorContext(fpSpec, PointerDepthCapMessage(
-                                std::format("function type return '{}'", declType.FuncPtrReturnTypeName), retStars));
+                                if (retStars > PointerDepthCap)
+                                    LogErrorContext(fpSpec, PointerDepthCapMessage(
+                                        std::format("function type return '{}'",
+                                            SpellType(*Compiler(declSpecs), LLVMBackend::TypeAndValue{
+                                                .TypeName = declType.FuncPtrReturnTypeName })), retStars));
                         declType.FuncPtrReturnPointer  = retPtr;
                         declType.FuncPtrReturnPointerDepth = ReconcilePointerDepth(retPtr, retStars);
                         declType.FuncPtrReturnResolvedKey = SigComponentResolvedKey(declType.FuncPtrReturnTypeName);
@@ -598,9 +611,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                                 bool pPtr = param->pointer() != nullptr;
                                 int pStars = PointerDepthOf(param->pointer());
                                 p.TypeName = ResolveSigComponentCodegen(param->typeSpecifier(), pPtr);
+                                LLVMBackend::TypeAndValue pType;
+                                pType.TypeName = p.TypeName;
+                                pType.Pointer = pPtr;
+                                pType.PointerDepth = pStars;
                                 if (pStars > PointerDepthCap)
                                     LogErrorContext(param, PointerDepthCapMessage(
-                                        std::format("function type parameter '{}'", p.TypeName), pStars));
+                                        std::format("function type parameter '{}'",
+                                            SpellType(*Compiler(declSpecs), pType)), pStars));
                                 p.Pointer  = pPtr;
                                 p.IsMove   = param->Move() != nullptr;
                                 p.PointerDepth = ReconcilePointerDepth(pPtr, pStars);
@@ -678,7 +696,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 auto* genParams = GenericSpecOf(typeSpec, baseName);
                 if (genParams != nullptr)
                 {
-                    // Generic type instantiation: Box<MyType> -> Box__MyType
+                    // Generic type instantiation: Box<MyType> -> Box$MyType
                     baseName = Compiler(declSpecs)->ResolveGenericBaseAlias(baseName);
                     std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
@@ -692,14 +710,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     std::string mangledName = MangledGenericName(baseName, typeArgs);
                     if (IsCoreUniqueArrayViewInstantiation(Compiler(declSpecs), mangledName, typeArgs))
                         LogErrorContext(genParams, CoreUniqueArrayViewMessage(typeArgs));
-                    std::string displayName = baseName + "<";
-                    for (size_t i = 0; i < genParams->typeParameterList()->typeParameterEntry().size(); i++)
-                    {
-                        if (i > 0) displayName += ", ";
-                        displayName += genParams->typeParameterList()->typeParameterEntry()[i]->getText();
-                    }
-                    displayName += ">";
-                    Compiler(declSpecs)->RegisterMangledTypeDisplayName(mangledName, displayName);
                     declType.TypeName = mangledName;
                     // A generic INTERFACE instantiation is a fat pointer, not a struct. interfaceTable
                     // only gains it at the next drain, so mark it from the template name here. The
@@ -854,7 +864,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     int writtenPtr = aliasPtrDepth + declStars + (substArgPtrDepth > 0 ? 1 : 0);
                     if (writtenPtr > PointerDepthCap)
                         LogErrorContext(declSpec, PointerDepthCapMessage(
-                            std::format("pointer alias resolving to '{}'", declType.TypeName), writtenPtr));
+                            std::format("pointer alias resolving to '{}'",
+                                SpellType(*Compiler(declSpecs), declType)), writtenPtr));
                     declType.Pointer = totalPtr >= 1;
                     declType.ElemPointer = totalPtr >= 2;
                     declType.PointerDepth = totalPtr > 2 ? 0 : totalPtr;
@@ -890,6 +901,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.ElemPointer = elementPointer || declType.ElemPointer;
                     }
                 }
+                LLVMBackend::TypeAndValue baseType = declType;
+                baseType.Pointer = false;
+                baseType.ElemPointer = false;
+                baseType.PointerDepth = 0;
+                baseType.IsArrayView = false;
+                const std::string baseSpelling = SpellType(*Compiler(declSpecs), baseType);
                 if (ArrayPtrOf(declSpec))
                 {
                     if (declType.IsArrayView)
@@ -897,12 +914,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                             "pointer to array-view '{}[]*' is not a valid type. "
                             "To return several results, return one 'T[]' and pass the rest as out-parameters: "
                             "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.",
-                            declType.TypeName));
+                            baseSpelling));
                     else
                         LogErrorContext(declSpec, std::format(
                             "pointer to fixed array '{}[N]*' is not a valid type; "
                             "pass '{}*' (a fixed array decays to a pointer to its first element).",
-                            declType.TypeName, declType.TypeName));
+                            baseSpelling, baseSpelling));
                 }
                 // A pointer to an aliased fixed array (Vec3* where Vec3 = float[3]) is the same
                 // T[N]* ban, but the dimension lives on the alias, not the declarator - so the
@@ -911,11 +928,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     LogErrorContext(declSpec, std::format(
                         "pointer to fixed array '{}[N]*' is not a valid type; "
                         "pass '{}*' (a fixed array decays to a pointer to its first element).",
-                        declType.TypeName, declType.TypeName));
+                        baseSpelling, baseSpelling));
                 declType.IsInterface = genericSpecIsInterface
                                     || Compiler(declSpecs)->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && hasExplicitPointer && activeTypeSubstitutions.empty())
-                    LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
+                    LogErrorContext(declSpec, std::format("pointer '*' is not allowed on interface type '{}'",
+                        SpellType(*Compiler(declSpecs), baseType)));
                 // Past the throwing checks: this spec really does name a generic interface.
                 if (genericSpecIsInterface)
                     Compiler(declSpecs)->gts.genericInterfaceInstances.insert(declType.TypeName);
@@ -984,7 +1002,8 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
-                        LogErrorContext(declSpec, std::format("nullable '?' is not allowed on primitive type '{}'", declType.TypeName));
+                        LogErrorContext(declSpec, std::format("nullable '?' is not allowed on primitive type '{}'",
+                            SpellType(*Compiler(declSpecs), declType)));
                     else
                     {
                         declType.IsNullable = true;
@@ -1001,12 +1020,13 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (declType.IsArrayView)
                         LogErrorContext(declSpec, std::format(
                             "'unique' on '{}[]': array views are not supported - a view does not "
-                            "own its buffer", declType.TypeName));
+                            "own its buffer", SpellType(*Compiler(declSpecs), declType)));
                     bool uniqueSingleIndirect = (declType.Pointer && !declType.ElemPointer
                         && !declType.IsArrayView) || declType.IsFatInterfaceValue();
                     if (!uniqueSingleIndirect && !declType.IsArrayView)
                         LogErrorContext(declSpec, std::format(
-                            "unique requires a pointer or interface type; '{}' is neither", declType.TypeName));
+                            "unique requires a pointer or interface type; '{}' is neither",
+                            SpellType(*Compiler(declSpecs), declType)));
                 }
                 break;
             }
@@ -1067,7 +1087,8 @@ uint64_t MainListener::ParseAlignmentSpecifier(CFlatParser::AlignmentSpecifierCo
             llvm::Type* t = compilerLLVM->GetType(dt);
             if (t == nullptr || !t->isSized())
             {
-                LogErrorContext(alignSpec, std::format("alignas: cannot resolve type '{}'", dt.TypeName));
+                LogErrorContext(alignSpec, std::format("alignas: cannot resolve type '{}'",
+                    SpellType(*compilerLLVM, dt)));
                 return 0;
             }
             uint64_t alignVal = compilerLLVM->module->getDataLayout().getABITypeAlign(t).value();
@@ -1383,7 +1404,7 @@ void MainListener::ResolvePendingGlobalDefaultConstructions()
             }
             LogWarningContext(item.Context, std::format(
                 "({}) global is zero-initialized: its default construction could not be reduced to a compile-time constant here.",
-                item.TypeValue.TypeName));
+                SpellType(*compilerLLVM, item.TypeValue)));
         }
     }
 
@@ -1685,7 +1706,8 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             // `using M = int[][3];` would otherwise fold to "int[3]" - the empty pair is dropped.
             if (DimSpecIsUnsizedMultiDim(dimSpec))
                 compiler->LogError(std::format("using alias '{}': {}", alias,
-                    UnsizedMultiDimMessage(target)));
+                    UnsizedMultiDimMessage(SpellType(*compiler,
+                        LLVMBackend::TypeAndValue{ .TypeName = target }))));
             auto dims = dimSpec->assignmentExpression();
             if (dims.empty())
                 compiler->LogError(std::format(
@@ -1728,7 +1750,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                 || genericInterfaceTemplates.count(n) != 0 || compiler->IsWinrtGenericBase(n);
         };
 
-        // Generic RHS (using IL = list<int>): mangle to list__int and pre-declare the shell +
+        // Generic RHS (using IL = list<int>): mangle to list$int and pre-declare the shell +
         // default ctor to enqueue the instantiation, then alias to the mangled name. The base
         // must name a generic template, else the RHS is malformed - LogError rather than
         // silently degrading to a namespace alias (the historical bug).
@@ -1755,7 +1777,10 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             else if (!compiler->InstantiateWinrtGenericInterface(baseName, typeArgs, mangledName))
             {
                 compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a generic type",
-                                               alias, target, baseName));
+                                               alias, SpellType(*compiler,
+                                                   LLVMBackend::TypeAndValue{ .TypeName = target }),
+                                               SpellType(*compiler,
+                                                   LLVMBackend::TypeAndValue{ .TypeName = baseName })));
                 return;
             }
             compiler->RegisterTypeAlias(alias, mangledName + suffix);
@@ -1811,7 +1836,10 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             // A pointer alias whose base is neither a type nor (a namespace can't take a '*')
             // is malformed - the RHS looks like a type but resolves to nothing.
             compiler->LogError(std::format("using alias '{}' = '{}': '{}' is not a known type",
-                                           alias, targetDecorated + suffix, targetBase));
+                                           alias, SpellType(*compiler,
+                                               LLVMBackend::TypeAndValue{ .TypeName = targetDecorated + suffix }),
+                                           SpellType(*compiler,
+                                               LLVMBackend::TypeAndValue{ .TypeName = targetBase })));
         }
         else if (global_scope)
             compiler->RegisterNamespaceAlias(alias, targetBase);
@@ -2467,7 +2495,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             if (!structName.empty() && compiler->TypeHasCapability(structName, wantIface)) continue;
             LogErrorContext(func, std::format(
                 "lock: type '{}' does not support '{}' mode (missing [Capability({})]).",
-                structName.empty() ? "<free function>" : structName, modeText, wantIface));
+                structName.empty() ? "<free function>" : SpellType(*compiler,
+                    LLVMBackend::TypeAndValue{ .TypeName = structName }), modeText, wantIface));
         }
 
         if (!structName.empty())
@@ -2554,6 +2583,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         if (compiler->TypeOwnsUniquePointer(returnType.TypeName))
         {
             std::string borrowedParam;
+            const std::string returnTypeSpelling = SpellType(*compiler, returnType);
             auto returnKind = ClassifyValueStructReturns(Compiler(), func, returnType, allParams, &borrowedParam);
             if (returnKind == ValueStructReturnKind::Mixed)
             {
@@ -2562,8 +2592,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
                     "so the caller cannot know whether to free the result. Make all returns borrowed "
                     "(declare 'alias {}'), or all returns owned (declare 'move {}' and take ownership in "
                     "with a 'move {} {}' parameter).",
-                    borrowedParam, returnType.TypeName, returnType.TypeName,
-                    returnType.TypeName, borrowedParam));
+                    borrowedParam, returnTypeSpelling, returnTypeSpelling,
+                    returnTypeSpelling, borrowedParam));
                 return;
             }
             if (returnKind == ValueStructReturnKind::AllBorrowedParam)
@@ -2576,7 +2606,7 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         // generic struct instantiations before the function's IR block is opened.
         // At this point no basic block is active, so it is safe to emit new functions.
         // Parameter types must be scanned so that e.g. list<string>* params instantiate
-        // list__string before the body references its methods.
+        // list$string before the body references its methods.
         ScanAndQueueGenericTypeUses(func->declarationSpecifiers());
         if (auto* paramTypeList = func->parameterTypeList())
             ScanAndQueueGenericTypeUses(paramTypeList);
@@ -2596,9 +2626,14 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
         {
             // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out; the
             // dimension carried here is the ARRAY's, not the lane count.
+            LLVMBackend::TypeAndValue elementType = returnType;
+            elementType.Pointer = false;
+            elementType.ElemPointer = false;
+            elementType.PointerDepth = 0;
+            elementType.IsArrayView = false;
             std::string elem = returnType.IsSimd
-                ? std::format("simd<{},{}>", returnType.TypeName, returnType.SimdLanes)
-                : returnType.TypeName;
+                ? std::format("simd<{},{}>", SpellType(*compiler, elementType), returnType.SimdLanes)
+                : SpellType(*compiler, elementType);
             LogErrorContext(func, std::format(
                 "function '{}' cannot return the fixed array '{}[N]' by value - CFlat has no "
                 "by-value array return, and the size was being dropped silently (the function "
@@ -2718,7 +2753,8 @@ void MainListener::ParseFunctionDefinition(CFlatParser::FunctionDefinitionContex
             if (!blockUnreachable && currentBlock == expectErrorRecoveryBlock_ && currentBlock->empty())
                 blockUnreachable = true;
             if (returnType.TypeName != "void" && !compiler->IsBlockTerminated() && !blockUnreachable)
-                LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.", name));
+                LogErrorContext(func, std::format("Function '{}' with non-void return type is missing a return statement.",
+                    SpellFunctionSymbol(*compiler, name)));
 
             // if return is void, then this might need a implicit return;
             if (returnType.TypeName == "void")
@@ -2928,12 +2964,13 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     bool spelledUnique = HasSoftDeclarationSpecifier(direct, "unique");
                     bool isCoreUniqueField = !typeAndValue.Pointer
                         && (compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                            || typeAndValue.TypeName.starts_with("unique__"));
+                            || MangledBase(typeAndValue.TypeName) == "unique");
                     // Keep error recovery for a unique union member on the builtin pointer
                     // representation; an unresolved core wrapper is not a sized union member.
                     if (inUnionFieldDecl_ && isCoreUniqueField)
                     {
-                        typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                        typeAndValue.TypeName = MangledGenericArgument(
+                            *compiler, typeAndValue.TypeName);
                         typeAndValue.Pointer = true;
                         typeAndValue.PointerDepth = 1;
                         typeAndValue.IsUnique = true;
@@ -2972,7 +3009,7 @@ void MainListener::ValidateUniqueField(const LLVMBackend::DeclTypeAndValue& f, a
         if (inUnionFieldDecl_)
             LogErrorContext(ctx, "'unique' on " + field + ": a union member cannot be 'unique' - the synthesized destructor cannot know which member is active, so it would free whichever bits the union currently holds. Drop 'unique' and free the pointer from code that knows the active member.");
         // The core wrapper enforces its single-pointer shape; old shape checks are builtin-only.
-        bool pendingCoreUnique = !f.Pointer && f.TypeName.starts_with("unique__")
+        bool pendingCoreUnique = !f.Pointer && MangledBase(f.TypeName) == "unique"
             && Compiler(ctx)->gts.coreGenericTemplates.count("unique") != 0;
         if ((Compiler(ctx)->IsCoreUniqueType(f.TypeName) || pendingCoreUnique)
             && !f.Pointer)
@@ -3282,7 +3319,7 @@ void MainListener::ReleaseOwningGlobalNow(antlr4::ParserRuleContext* ctx, const 
 void MainListener::ApplyMovedSlotOwnership(LLVMBackend::NamedVariable& nv,
                                         const LLVMBackend::TypeAndValue& elemOwnershipType) {
         bool unique = elemOwnershipType.IsUnique
-            || elemOwnershipType.TypeName.starts_with("unique__");
+            || MangledBase(elemOwnershipType.TypeName) == "unique";
         bool thinPtr = elemOwnershipType.Pointer && !elemOwnershipType.ElemPointer
             && !elemOwnershipType.IsInterface;
         bool uniqueIface = elemOwnershipType.IsFatInterfaceValue();
@@ -3716,7 +3753,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 && compiler->IsCoreUniqueType(typeAndValue.TypeName)
                 && preservesBuiltinUnique(initDecl, declaratorName))
             {
-                typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                typeAndValue.TypeName = MangledGenericArgument(
+                    *compiler, typeAndValue.TypeName);
                 // The interface spelling has no star: restore the fat interface VALUE, not a pointer.
                 bool ifaceSpelling = compiler->IsInterfaceType(typeAndValue.TypeName);
                 typeAndValue.Pointer = !ifaceSpelling;
@@ -3761,9 +3799,14 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 {
                     // A simd type's TypeName is its ELEMENT ('float'), so spell the vector back out;
                     // the dimension carried here is the ARRAY's, not the lane count.
+                    LLVMBackend::TypeAndValue elementType = typeAndValue;
+                    elementType.Pointer = false;
+                    elementType.ElemPointer = false;
+                    elementType.PointerDepth = 0;
+                    elementType.IsArrayView = false;
                     std::string elem = typeAndValue.IsSimd
-                        ? std::format("simd<{},{}>", typeAndValue.TypeName, typeAndValue.SimdLanes)
-                        : typeAndValue.TypeName;
+                        ? std::format("simd<{},{}>", SpellType(*compiler, elementType), typeAndValue.SimdLanes)
+                        : SpellType(*compiler, elementType);
                     LogErrorContext(direct, std::format(
                         "function '{}' cannot return the fixed array '{}[N]' by value - CFlat has no "
                         "by-value array return, and the size was being dropped silently (the function "
@@ -3782,14 +3825,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 // dedupes instead of listing as a phantom overload.
                 if (auto* s = compiler->GetSymbolSink())
                 {
-                    std::string sig = typeAndValue.TypeName + " " + declName + "(";
+                    std::string sig = SpellType(*compiler, typeAndValue) + " " + declName + "(";
                     bool first = true;
                     for (const auto& p : declParams)
                     {
                         if (!first) sig += ", ";
                         first = false;
-                        sig += p.TypeName;
-                        if (p.Pointer) sig += "*";
+                        sig += SpellType(*compiler, p);
                         if (!p.VariableName.empty()) sig += " " + p.VariableName;
                     }
                     if (ellipsis) sig += first ? "..." : ", ...";
@@ -3826,7 +3868,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                 if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
                     && (hasBraceInitializer || direct->assignmentExpression() != nullptr))
                 {
-                    typeAndValue.TypeName = typeAndValue.TypeName.substr(8);
+                    typeAndValue.TypeName = MangledGenericArgument(
+                        *compiler, typeAndValue.TypeName);
                     typeAndValue.Pointer = true;
                     typeAndValue.ElemPointer = false;
                     typeAndValue.PointerDepth = 1;
@@ -4055,15 +4098,21 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         auto structData = compiler->GetDataStructure(typeAndValue.TypeName);
                         if (typeAndValue.Pointer)
                         {
+                            LLVMBackend::TypeAndValue baseType = typeAndValue;
+                            baseType.Pointer = false;
+                            baseType.ElemPointer = false;
+                            baseType.PointerDepth = 0;
+                            baseType.IsArrayView = false;
                             // 'S*[N] a = {field=v}' - the seed built below is an 'S', memcpy'd over
                             // each POINTER slot, so the field values become the element addresses.
                             LogPointerBraceInitReject(initDecl, std::format("array element of '{}'", name),
-                                typeAndValue.TypeName, DescribePointerDeclType(typeAndValue),
+                                SpellType(*compiler, baseType), DescribePointerDeclType(typeAndValue),
                                 CanSuggestAllocation(initDecl, typeAndValue));
                         }
                         else if (structData.StructType == nullptr)
                         {
-                            LogErrorContext(initDecl, std::format("array value-initializer '= {{}}' requires a struct element type, '{}' is not a struct", typeAndValue.TypeName));
+                            LogErrorContext(initDecl, std::format("array value-initializer '= {{}}' requires a struct element type, '{}' is not a struct",
+                                SpellType(*compiler, typeAndValue)));
                         }
                         else
                         {
@@ -4103,7 +4152,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             "a 'static' array view cannot be initialized from a brace list - its "
                             "backing storage is the stack frame of the first call, so '{}' would "
                             "dangle afterwards. Declare it with an explicit size ('{}[N] {}') so the "
-                            "static owns the elements.", name, typeAndValue.TypeName, name));
+                            "static owns the elements.", name, SpellType(*compiler, typeAndValue), name));
                     else
                         EmitArrayViewInferredInit(name, typeAndValue, arrInitList, line, allocList);
                     continue;
@@ -4144,7 +4193,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     {
                         std::optional<DeclExpectedTypeScope> coreUniqueExpectedScope;
                         if (compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                            && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8)))
+                            && compiler->IsInterfaceType(MangledGenericArgument(
+                                *compiler, typeAndValue.TypeName)))
                             coreUniqueExpectedScope.emplace(&declExpectedType, typeAndValue);
                         if (typeAndValue.IsFatInterfaceValue())
                         {
@@ -4195,11 +4245,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 bool interfaceArm = false;
                                 LLVMBackend::TypeAndValue armField;
                                 for (size_t i = 0; i < uniqueData.StructFields.size(); i++)
-                                    if (uniqueData.StructFields[i].VariableName == "_p"
-                                        || uniqueData.StructFields[i].VariableName == "_v")
+                                    if (uniqueData.StructFields[i].VariableName == "_p")
                                     {
-                                        interfaceArm = uniqueData.StructFields[i].IsInterface
-                                            || uniqueData.StructFields[i].VariableName == "_v";
+                                        interfaceArm = uniqueData.StructFields[i].IsInterface;
                                         armField = uniqueData.StructFields[i];
                                         right = compiler->CreateLoad(compiler->CreateStructGEP(
                                             right->getType(), uniqueStorage, (uint32_t)i));
@@ -4214,8 +4262,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 }
                                 else
                                 {
-                                    rightNV.TypeAndValue.TypeName =
-                                        rightNV.TypeAndValue.TypeName.substr(8);
+                                    rightNV.TypeAndValue.TypeName = MangledGenericArgument(
+                                        *compiler, rightNV.TypeAndValue.TypeName);
                                     rightNV.TypeAndValue.Pointer = true;
                                 }
                                 rightNV.TypeAndValue.IsMove = interfaceArm && transfersOwnership;
@@ -4261,11 +4309,13 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 else if (!ternaryArmFailure.empty())
                                     LogErrorContext(assignmentExpression, std::format(
                                         "cannot convert '{}' arm to interface '{}': {}",
-                                        joinSpelling, typeAndValue.TypeName, ternaryArmFailure));
+                                        joinSpelling, SpellType(*compiler, typeAndValue), ternaryArmFailure));
                                 else if (rhsIsKnownType && !compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
                                 {
                                     LogErrorContext(assignmentExpression,
-                                        std::format("'{}' does not implement interface '{}'", structName, typeAndValue.TypeName));
+                                        std::format("'{}' does not implement interface '{}'",
+                                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName }),
+                                            SpellType(*compiler, typeAndValue)));
                                 }
                                 else if (!structName.empty()
                                          && compiler->StructImplementsInterface(structName, typeAndValue.TypeName))
@@ -4352,15 +4402,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     && !rightNV.TypeAndValue.Pointer
                                     && compiler->IsCoreUniqueType(typeAndValue.TypeName)
                                     && compiler->IsCoreUniqueType(rightNV.TypeAndValue.TypeName)
-                                    && typeAndValue.TypeName.size() > 8
-                                    && rightNV.TypeAndValue.TypeName.size() > 8
-                                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8))
-                                    && compiler->IsInterfaceType(rightNV.TypeAndValue.TypeName.substr(8)))
+                                    && compiler->IsInterfaceType(MangledGenericArgument(
+                                        *compiler, typeAndValue.TypeName))
+                                    && compiler->IsInterfaceType(MangledGenericArgument(
+                                        *compiler, rightNV.TypeAndValue.TypeName)))
                                 {
                                     const std::string sourceInterface =
-                                        rightNV.TypeAndValue.TypeName.substr(8);
+                                        MangledGenericArgument(
+                                            *compiler, rightNV.TypeAndValue.TypeName);
                                     const std::string destinationInterface =
-                                        typeAndValue.TypeName.substr(8);
+                                        MangledGenericArgument(*compiler, typeAndValue.TypeName);
                                     if (sourceInterface != destinationInterface)
                                     {
                                         auto* wrapperStorage = rightNV.Storage;
@@ -4373,8 +4424,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         const auto& sourceData = compiler->GetDataStructure(
                                             rightNV.TypeAndValue.TypeName);
                                         for (size_t i = 0; i < sourceData.StructFields.size(); i++)
-                                            if (sourceData.StructFields[i].IsInterface
-                                                || sourceData.StructFields[i].VariableName == "_v")
+                                            if (sourceData.StructFields[i].IsInterface)
                                             {
                                                 interfaceValue = compiler->CreateLoad(
                                                     compiler->CreateStructGEP(
@@ -4404,23 +4454,23 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source still "
                                             "owns it; use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                            SpellType(*compiler, typeAndValue), name));
                                     else
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from borrowed value '{}' - the source still "
                                             "owns it; use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            SpellType(*compiler, typeAndValue), name,
                                             sourceName));
                                 }
                                 if (right != nullptr
                                     && !typeAndValue.Pointer
                                     && compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                                    && typeAndValue.TypeName.size() > 8
-                                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8))
+                                    && compiler->IsInterfaceType(MangledGenericArgument(
+                                        *compiler, typeAndValue.TypeName))
                                     && right->getType()->isStructTy()
                                     && compiler->StructImplementsInterface(
                                         rightNV.TypeAndValue.TypeName,
-                                        typeAndValue.TypeName.substr(8)))
+                                        MangledGenericArgument(*compiler, typeAndValue.TypeName)))
                                 {
                                     const std::string sourceName =
                                         LLVMBackend::BorrowedSourceName(rightNV);
@@ -4428,12 +4478,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source is a stack value; "
                                             "use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                            SpellType(*compiler, typeAndValue), name));
                                     else
                                         LogErrorContext(assignmentExpression, std::format(
                                             "cannot initialize {} '{}' from borrowed value '{}' - the source is a stack value; "
                                             "use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            SpellType(*compiler, typeAndValue), name,
                                             sourceName));
                                 }
                                 // A core unique value is an observer when it initializes a plain
@@ -4481,7 +4531,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                                 right->getType(), uniqueStorage, (uint32_t)i));
                                             break;
                                         }
-                                    auto pointeeName = rightNV.TypeAndValue.TypeName.substr(8);
+                                    auto pointeeName = MangledGenericArgument(
+                                        *compiler, rightNV.TypeAndValue.TypeName);
                                     rightNV.TypeAndValue.TypeName = pointeeName;
                                     rightNV.TypeAndValue.Pointer = true;
                                     rightNV.TypeAndValue.IsMove = movingUnique;
@@ -4517,7 +4568,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                                 right->getType(), uniqueStorage, (uint32_t)i));
                                             break;
                                         }
-                                    rightNV.TypeAndValue.TypeName = rightNV.TypeAndValue.TypeName.substr(8);
+                                    rightNV.TypeAndValue.TypeName = MangledGenericArgument(
+                                        *compiler, rightNV.TypeAndValue.TypeName);
                                     rightNV.TypeAndValue.Pointer = true;
                                     rightNV.TypeAndValue.IsMove = false;
                                     rightNV.IsOwning = false;
@@ -4990,7 +5042,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // its move constructor; nullptr is the value's default construction.
                             const bool coreUniqueIfaceArm =
                                 compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                                && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
+                                && compiler->IsInterfaceType(MangledGenericArgument(
+                                    *compiler, typeAndValue.TypeName));
                             if (right && compiler->IsCoreUniqueType(typeAndValue.TypeName)
                                 && !typeAndValue.Pointer && !typeAndValue.IsArrayView
                                 && (right->getType()->isPointerTy()
@@ -5067,12 +5120,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         LogErrorContext(initDecl, std::format(
                                             "cannot initialize {} '{}' from a borrowed value - the source still owns it; "
                                             "use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name));
+                                            SpellType(*compiler, typeAndValue), name));
                                     else
                                         LogErrorContext(initDecl, std::format(
                                             "cannot initialize {} '{}' from borrowed value '{}' - the source still owns it; "
                                             "use 'new', a 'move' expression, or a move-returning call",
-                                            compiler->DisplayNameOfCoreUniqueType(typeAndValue.TypeName), name,
+                                            SpellType(*compiler, typeAndValue), name,
                                             sourceName));
                                     right = GenerateDefaultValue(typeAndValue);
                                 }
@@ -5087,7 +5140,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     {
                                         std::string armFailure;
                                         std::string joinSpelling = "?:";
-                                        std::string iface = typeAndValue.TypeName.substr(8);
+                                        std::string iface = MangledGenericArgument(
+                                            *compiler, typeAndValue.TypeName);
                                         if (auto* fat = UpcastPointerJoinToInterface(
                                                 right, iface, &armFailure, &joinSpelling, true))
                                             right = fat;
@@ -5144,7 +5198,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             {
                                 LogErrorContext(assignmentExpression, std::format(
                                     "cannot initialize pointer '{}' with a value of type '{}' - the right-hand side must be a pointer (call getPtr() or use '&')",
-                                    name, typeAndValue.TypeName));
+                                    name, SpellType(*compiler, typeAndValue)));
                                 right = nullptr;
                             }
 
@@ -5163,7 +5217,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                 LogErrorContext(assignmentExpression, std::format(
                                     "cannot initialize value of type '{}' with a pointer of type '{}*'; "
                                     "declare it as '{}* {} = ...;' or drop the 'new'",
-                                    typeAndValue.TypeName, typeAndValue.TypeName, typeAndValue.TypeName, name));
+                                    SpellType(*compiler, typeAndValue), SpellType(*compiler, typeAndValue),
+                                    SpellType(*compiler, typeAndValue), name));
                                 right = nullptr;
                             }
 
@@ -5279,13 +5334,16 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             }
                         }
                         else
-                            LogWarningContext(direct, std::format("({}) struct and class is not initialized on the stack.", typeAndValue.TypeName));
+                            LogWarningContext(direct, std::format(
+                                "({}) struct and class is not initialized on the stack.",
+                                SpellType(*compiler, typeAndValue)));
                     }
                 }
                 coreUniqueImplicitDefault = !global_scope && initializer == nullptr && !barebraceInit
                     && !typeAndValue.Pointer && typeAndValue.TypeName.size() > 8
                     && compiler->IsCoreUniqueType(typeAndValue.TypeName)
-                    && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
+                    && compiler->IsInterfaceType(MangledGenericArgument(
+                        *compiler, typeAndValue.TypeName));
 
                 /*
                  * `auto x = <fixed array>` deduces the ARRAY VIEW `T[]`, i.e. a borrow. CFlat is
@@ -5315,17 +5373,19 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     std::string srcDims = std::format("[{}]", srcConstArraySize);
                     for (uint64_t d : srcConstInnerDimensions) srcDims += std::format("[{}]", d);
                     std::string srcPath = DescribeInitializerPath(srcCallerName, srcBorrowedField);
+                    const std::string srcTypeSpelling = SpellType(*compiler,
+                        LLVMBackend::TypeAndValue{ .TypeName = srcInferredTypeName });
                     // The row-bind remedy only reaches a `T[]` when the source is exactly 2-D;
                     // a row of a 3-D array is itself multi-dimensional and has no view either.
                     std::string rowRemedy = srcConstInnerDimensions.size() == 1
                         ? std::format("bind one row ('{}[] row = {}[i];'), or ",
-                                      srcInferredTypeName, srcPath)
+                                      srcTypeSpelling, srcPath)
                         : "or ";
                     LogErrorContext(direct, std::format(
                         "cannot deduce 'auto' from multi-dimensional fixed array '{0}{1}' - a "
                         "multi-dimensional array has no array-view type (a thin view carries no "
                         "row stride). Copy it ('{0}{1} b = {2};'), {3}index the array directly.",
-                        srcInferredTypeName, srcDims, srcPath, rowRemedy));
+                        srcTypeSpelling, srcDims, srcPath, rowRemedy));
                 }
 
                 if (typeAndValue.TypeName == "auto" && right != nullptr && !global_scope
@@ -5412,7 +5472,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                      * message is the least misleading; it can never flip accept vs. reject; a type
                      * whose prefix this misses still hits the struct/union/class branch below (any
                      * false positive would need a mangled name accidentally starting with
-                     * "list__"/"array__"/"dictionary__", which the mangler does not produce for
+                     * "list$"/"array$"/"dictionary$", which the mangler does not produce for
                      * anything else) and gets the (slightly less precise but still true) struct
                      * wording instead.
                      *
@@ -5426,9 +5486,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                     {
                         auto scalarElements = scalarInitList->fieldInit();
                         const std::string& scalarTypeName = typeAndValue.TypeName;
-                        bool isContainerType = scalarTypeName.rfind("list__", 0) == 0
-                            || scalarTypeName.rfind("array__", 0) == 0
-                            || scalarTypeName.rfind("dictionary__", 0) == 0;
+                        bool isContainerType = MangledBase(scalarTypeName) == "list"
+                            || MangledBase(scalarTypeName) == "array"
+                            || MangledBase(scalarTypeName) == "dictionary";
                         bool scalarIsAggregate =
                             compiler->GetDataStructure(scalarTypeName).StructType != nullptr;
                         if (!scalarElements.empty() && scalarIsAggregate)
@@ -5440,21 +5500,22 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             // looks up by name, not by pointer-ness - so say "pointer to struct" instead of
                             // "struct type" for one; the message would otherwise misdescribe the declaration.
                             const char* kindWord = typeAndValue.Pointer ? "pointer to struct type" : "struct type";
+                            const std::string scalarTypeSpelling = SpellType(*compiler, typeAndValue);
                             if (isContainerType)
                                 LogErrorContext(direct, std::format(
-                                    "brace initializers are not supported for '{}{}' at global scope - "
+                                    "brace initializers are not supported for '{}' at global scope - "
                                     "it requires runtime construction (add()/set() calls) that a "
                                     "global's compile-time constant cannot hold; declare it '= default' "
-                                    "and populate it in a function", scalarTypeName, typeAndValue.Pointer ? "*" : ""));
+                                    "and populate it in a function", scalarTypeSpelling));
                             else if (hasPositional)
                                 LogErrorContext(direct, std::format(
                                     "positional initializers are not supported for {} '{}'; use 'field = value'",
-                                    kindWord, scalarTypeName));
+                                    kindWord, scalarTypeSpelling));
                             else
                                 LogErrorContext(direct, std::format(
                                     "field initializers ('{{field = value}}') are not supported for {} '{}' "
                                     "at global scope; assign fields individually after declaration, or use "
-                                    "'= default' to zero-initialize", kindWord, scalarTypeName));
+                                    "'= default' to zero-initialize", kindWord, scalarTypeSpelling));
                         }
                         else if (!scalarElements.empty() && !isContainerType)
                         {
@@ -5505,7 +5566,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (visible > typeAndValue.ConstArraySize)
                                 LogErrorContext(direct, std::format(
                                     "too many initializers for '{}[{}]': string literal has {} characters",
-                                    typeAndValue.TypeName, typeAndValue.ConstArraySize, visible));
+                                    SpellType(*compiler, typeAndValue), typeAndValue.ConstArraySize, visible));
                             std::vector<llvm::Constant*> elements;
                             elements.reserve((size_t)typeAndValue.ConstArraySize);
                             for (size_t i = 0; i < typeAndValue.ConstArraySize; ++i)
@@ -5551,7 +5612,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         s->RegisterVariable(name, typeAndValue.TypeName,
                                             compiler->GetSourceFilePath(),
                                             (int)direct->getStart()->getLine(),
-                                            (int)direct->getStart()->getCharPositionInLine());
+                                            (int)direct->getStart()->getCharPositionInLine(),
+                                            SpellType(*compiler, typeAndValue));
                         // Also register as a named symbol so globals (including
                         // namespace consts like Math.PI) show up in --symbol
                         // queries and in their namespace's member listing.
@@ -5559,8 +5621,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                     compiler->GetSourceFilePath(),
                                     (int)direct->getStart()->getLine(),
                                     (int)direct->getStart()->getCharPositionInLine(),
-                                    std::format("{}{} {}", typeAndValue.TypeName,
-                                                typeAndValue.Pointer ? "*" : "", name));
+                                    std::format("{} {}", SpellType(*compiler, typeAndValue), name),
+                                    {}, name);
                     }
                 }
                 else
@@ -5700,7 +5762,8 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         && compiler->IsCoreUniqueType(typeAndValue.TypeName);
                     bool coreUniqueInterface = coreUniqueValue
                         && typeAndValue.TypeName.size() > 8
-                        && compiler->IsInterfaceType(typeAndValue.TypeName.substr(8));
+                        && compiler->IsInterfaceType(MangledGenericArgument(
+                            *compiler, typeAndValue.TypeName));
                     if (right == nullptr
                         && (typeAndValue.IsUnique || coreUniqueValue)
                         && !isStaticLocal
@@ -5982,7 +6045,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             if (visible > typeAndValue.ConstArraySize)
                                 LogErrorContext(direct, std::format(
                                     "too many initializers for '{}[{}]': string literal has {} characters",
-                                    typeAndValue.TypeName, typeAndValue.ConstArraySize, visible));
+                                    SpellType(*compiler, typeAndValue), typeAndValue.ConstArraySize, visible));
                             std::vector<llvm::Constant*> elements;
                             elements.reserve((size_t)typeAndValue.ConstArraySize);
                             for (size_t i = 0; i < typeAndValue.ConstArraySize; ++i)
@@ -6102,9 +6165,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         auto* localInitList = (initializer != nullptr) ? initializer->initializerList() : barebraceList;
                         if (localInitList != nullptr)
                         {
-                            bool localIsContainer = typeAndValue.TypeName.rfind("list__", 0) == 0
-                                || typeAndValue.TypeName.rfind("array__", 0) == 0
-                                || typeAndValue.TypeName.rfind("dictionary__", 0) == 0;
+                            bool localIsContainer = MangledBase(typeAndValue.TypeName) == "list"
+                                || MangledBase(typeAndValue.TypeName) == "array"
+                                || MangledBase(typeAndValue.TypeName) == "dictionary";
                             if (!localIsContainer && compiler->GetDataStructure(typeAndValue.TypeName).StructType == nullptr)
                             {
                                 // A brace list with values on a non-struct, non-container declaration
@@ -6528,7 +6591,7 @@ std::string MainListener::DescribeUniqueFieldOwner(const LLVMBackend::NamedVaria
         if (owner.empty() && compilerLLVM)
             owner = SplitEnclosingStruct(compilerLLVM->GetCurrentFunctionName(), compilerLLVM);
         if (compilerLLVM && !owner.empty())
-            owner = compilerLLVM->DisplayNameOfMangledType(owner);
+            owner = SpellType(*compilerLLVM, LLVMBackend::TypeAndValue{ .TypeName = owner });
         if (field.empty()) return owner;
         return owner.empty() ? field : owner + "." + field;
     }
@@ -7322,7 +7385,7 @@ bool MainListener::RejectAliasBorrowAdoption(
         LogErrorContext(ctx, std::format(
             "cannot store an 'alias' value '{}' into {}; it borrows storage it does not own and "
             "would dangle. Use '.copy()' for an independent owned copy.",
-            rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName,
+            rightNV.CallerName.empty() ? SpellType(*compiler, rightNV.TypeAndValue) : rightNV.CallerName,
             destKind));
         return true;
     }
@@ -7369,7 +7432,7 @@ bool MainListener::RejectAliasStoreIntoField(
         LogErrorContext(ctx, std::format(
             "cannot store an 'alias' value '{}' into a field; it borrows storage it does not own "
             "and would dangle. Use '.copy()' for an independent owned copy.",
-            rightNV.CallerName.empty() ? rightNV.TypeAndValue.TypeName : rightNV.CallerName));
+            rightNV.CallerName.empty() ? SpellType(*compiler, rightNV.TypeAndValue) : rightNV.CallerName));
         return true;
     }
 
@@ -7379,12 +7442,14 @@ bool MainListener::RejectNonOwningStructJoinStore(llvm::Value* right, const std:
         if (right == nullptr || !right->getType()->isStructTy()) return false;
         if (!compiler->IsNonOwningStructJoin(right)) return false;
         if (destTypeName.empty() || !compiler->IsOwningValueType(destTypeName)) return false;
+        const std::string destTypeSpelling = SpellType(*compiler,
+            LLVMBackend::TypeAndValue{ .TypeName = destTypeName });
         LogErrorContext(ctx, std::format(
             "cannot store a '?:' result that mixes an owning and a borrowed '{}' arm into {}; its "
             "destructor would free a value another owner still frees. Assign each arm in its own "
             "branch, declare the function 'alias' to hand the borrow through, or write a 'copy()' "
             "method for '{}' and copy the arm into an independent owned value.",
-            destTypeName, destKind, destTypeName));
+            destTypeSpelling, destKind, destTypeSpelling));
         return true;
     }
 
@@ -7435,22 +7500,8 @@ bool MainListener::RejectOwningValueCopyIntoField(
         }
 
         // Render the mangled generic name back to source spelling for the message
-        // (e.g. "list__int" -> "list<int>", "dictionary__string__int" -> "dictionary<string, int>").
-        std::string displayType = rightNV.TypeAndValue.TypeName;
-        if (size_t d = displayType.find("__"); d != std::string::npos)
-        {
-            std::string base = displayType.substr(0, d);
-            std::string args = displayType.substr(d + 2);
-            std::string joined;
-            for (size_t pos = 0; pos <= args.size(); )
-            {
-                size_t sep = args.find("__", pos);
-                if (sep == std::string::npos) { joined += args.substr(pos); break; }
-                joined += args.substr(pos, sep - pos) + ", ";
-                pos = sep + 2;
-            }
-            displayType = base + "<" + joined + ">";
-        }
+        // (e.g. "list$int" -> "list<int>", "dictionary$string$int" -> "dictionary<string, int>").
+        std::string displayType = SpellType(*compiler, rightNV.TypeAndValue);
         LogErrorContext(ctx, std::format(
             "copying owning value '{}' by value into a struct field aliases its backing buffer "
             "and will double-free at teardown; use '.copy()' for an independent copy or 'move' "

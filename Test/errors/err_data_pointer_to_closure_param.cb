@@ -1379,7 +1379,7 @@ expect_error("cannot assign a function-pointer or closure VALUE into data type '
  * one candidate simply losing. The sibling set that CONTAINS a `function<>` candidate still binds
  * it, unchanged on both binaries; its accept leg is cvj_overload_set_binds_funcptr.
  */
-expect_error("[_joinOv_i32_U8Ptr_] parameter 0 is a data type ('void*') and the argument is a function-pointer or closure VALUE") {
+expect_error("[joinOv(void*)] parameter 0 is a data type ('void*') and the argument is a function-pointer or closure VALUE") {
     int joinOv(JoinRec* p) { return 1; }
     int joinOv(void* p) { return 2; }
 

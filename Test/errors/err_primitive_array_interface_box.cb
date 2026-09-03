@@ -80,7 +80,7 @@ expect_error("cannot convert 'int[3]' to interface 'IShape' - 'int' is a primiti
 
 // A simd vector through the same site. On the pre-fix compiler this LINKED AND RAN - a silent
 // miscompile storing a vector in a fat-pointer slot - so it is pinned here deliberately.
-expect_error("cannot convert 'int simd vector' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
+    expect_error("cannot convert 'simd<int,4> simd vector' to interface 'IShape' - 'int' is a primitive type and can never implement an interface") {
     void braceInitSimd() { simd<int,4> sv; Holder h = { s = sv }; }
 }
 

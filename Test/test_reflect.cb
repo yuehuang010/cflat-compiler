@@ -465,7 +465,7 @@ extern int main()
     auto litBool   = true;
     auto litChar   = 'A';                    // char literal -> i8
     total++; passed += Test("typeof_auto_lit_i8",      typeof(litI8),     "i8");
-    total++; passed += Test("typeof_auto_lit_i16",     typeof(litI16),    "i16");
+    total++; passed += Test("typeof_auto_lit_i16",     typeof(litI16),    "short");
     total++; passed += Test("typeof_auto_lit_int",     typeof(litInt),    "int");
     total++; passed += Test("typeof_auto_lit_i64",     typeof(litI64),    "i64");
     total++; passed += Test("typeof_auto_float",       typeof(litFloat),  "float");
@@ -483,7 +483,7 @@ extern int main()
     double srcD = 1;  auto fromD   = srcD;
     total++; passed += Test("typeof_auto_from_i8",     typeof(fromI8),  "i8");
     total++; passed += Test("typeof_auto_from_u8",     typeof(fromU8),  "u8");
-    total++; passed += Test("typeof_auto_from_i16",    typeof(fromI16), "i16");
+    total++; passed += Test("typeof_auto_from_i16",    typeof(fromI16), "short");
     total++; passed += Test("typeof_auto_from_u32",    typeof(fromU32), "u32");
     total++; passed += Test("typeof_auto_from_i64",    typeof(fromI64), "i64");
     total++; passed += Test("typeof_auto_from_double", typeof(fromD),   "double");
@@ -495,10 +495,17 @@ extern int main()
     // 'auto' from 'new T[n]' deduces the owning array<T>; the explicit 'T*' spelling is the
     // raw-pointer escape hatch and still reflects as a pointer.
     auto autoIntArr = new int[2];
-    total++; passed += Test("typeof_auto_int_array", typeof(autoIntArr), "array__i32");
+    total++; passed += Test("typeof_auto_int_array", typeof(autoIntArr), "array<int>");
 
     auto autoDblArr = new double[2];
-    total++; passed += Test("typeof_auto_double_array", typeof(autoDblArr), "array__double");
+    total++; passed += Test("typeof_auto_double_array", typeof(autoDblArr), "array<double>");
+
+    list<list<int>> nestedLists = default;
+    total++; passed += Test("typeof_nested_generic", typeof(nestedLists), "list<list<int>>");
+
+    array<int>* arrayInstancePtr = new array<int>;
+    total++; passed += Test("typeof_pointer_to_instance", typeof(arrayInstancePtr), "array<int>*");
+    delete arrayInstancePtr;
 
     int* rawIntPtr = new int[2];
     total++; passed += Test("typeof_raw_int_ptr", typeof(rawIntPtr), "int*");

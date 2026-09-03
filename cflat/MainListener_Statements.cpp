@@ -142,10 +142,11 @@ void MainListener::ParseDestructuringDeclaration(CFlatParser::DestructuringDecla
         auto rhsNV = ParseAssignmentExpressionNamed(ctx->assignmentExpression());
         std::string rhsType = rhsNV.TypeAndValue.TypeName;
 
-        // Verify the RHS is a tuple type (mangled name starts with "tuple__")
-        if (rhsType.substr(0, 7) != "tuple__")
+        // Verify the RHS is a tuple type through the shared mangling owner.
+        if (MangledBase(rhsType) != "tuple")
         {
-            LogErrorContext(ctx, std::format("Destructuring requires a tuple type, got '{}'", rhsType));
+            LogErrorContext(ctx, std::format("Destructuring requires a tuple type, got '{}'",
+                SpellType(*compiler, rhsNV.TypeAndValue)));
             return;
         }
 
@@ -158,7 +159,8 @@ void MainListener::ParseDestructuringDeclaration(CFlatParser::DestructuringDecla
         auto* structType = compiler->GetDataStructure(rhsType).StructType;
         if (!structType)
         {
-            LogErrorContext(ctx, std::format("Tuple type '{}' is not fully instantiated", rhsType));
+            LogErrorContext(ctx, std::format("Tuple type '{}' is not fully instantiated",
+                SpellType(*compiler, rhsNV.TypeAndValue)));
             return;
         }
 
@@ -255,7 +257,8 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 bool isStruct = compiler->dataStructures.count(resolvedTypeName) > 0;
                 bool isInterface = compiler->HasInterface(resolvedTypeName);
                 if (!isStruct && !isInterface)
-                    LogErrorContext(labeled, std::format("'{}' is not a known struct or interface type", typeName));
+                    LogErrorContext(labeled, std::format("'{}' is not a known struct or interface type",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
                 if (!ctx.isTypeSwitch && !ctx.caseMap.empty())
                     LogErrorContext(labeled, "cannot mix type cases with constant cases in a switch");
                 ctx.isTypeSwitch = true;
@@ -456,10 +459,18 @@ static std::string CurrentReturnTypeSpelling(const LLVMBackend* compiler)
         // ("__closure_fat_ptr"), which is not writable source - name the writable KIND instead,
         // the same elided spelling the lambda-inference diagnostic uses.
         if (tv.IsFunctionPointer) return tv.IsThinFnPtr() ? "function<...>" : "Lambda<...>";
-        std::string suffix = compiler->currentFunctionReturnIsArrayView ? "[]"
-            : tv.ElemPointer ? "**"
-            : tv.Pointer ? "*" : "";
-        return compiler->currentFunctionReturnTypeName + suffix;
+        return SpellType(*compiler, tv);
+    }
+
+static std::string CurrentReturnBaseTypeSpelling(const LLVMBackend* compiler)
+{
+        if (compiler->currentFunctionReturnTypeName.empty()) return "a value";
+        auto tv = compiler->currentFunctionReturnTV;
+        tv.Pointer = false;
+        tv.ElemPointer = false;
+        tv.PointerDepth = 0;
+        tv.IsArrayView = false;
+        return SpellType(*compiler, tv);
     }
 
 std::string MainListener::ReturnUpcastStructName(const LLVMBackend::NamedVariable& nv) {
@@ -474,12 +485,17 @@ void MainListener::LogInterfaceReturnDangle(antlr4::ParserRuleContext* ctx, cons
         {
             LogErrorContext(ctx, std::format("cannot return a local value as interface '{}' - "
                 "the interface fat pointer would dangle once this function returns; "
-                "allocate the object on the heap and return the pointer", ifaceName));
+                "allocate the object on the heap and return the pointer",
+                SpellType(*Compiler(ctx), LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
             return;
         }
+        LLVMBackend::TypeAndValue structType{ .TypeName = structName };
+        LLVMBackend::TypeAndValue interfaceType{ .TypeName = ifaceName };
         LogErrorContext(ctx, std::format("cannot return local value '{}' as interface '{}' - "
             "the interface fat pointer would dangle once this function returns; "
-            "allocate on the heap ('new {}') and return the pointer", structName, ifaceName, structName));
+            "allocate on the heap ('new {}') and return the pointer",
+            SpellType(*Compiler(ctx), structType), SpellType(*Compiler(ctx), interfaceType),
+            SpellType(*Compiler(ctx), structType)));
     }
 
 /*
@@ -552,15 +568,15 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 sourceName = returnNV.CallerName.empty()
                     ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
             if (sourceName.empty()) sourceName = retText;
-            std::string pointee = compiler->currentFunctionReturnTV.TypeName.substr(8);
-            bool writable = true;
-            std::string shownPointee = compiler->DisplayNameOfMangledType(pointee, &writable);
-            if (!writable) shownPointee = pointee;
+            std::string pointee = MangledGenericArgument(
+                *compiler, compiler->currentFunctionReturnTV.TypeName);
+            std::string shownPointee = SpellType(*compiler,
+                LLVMBackend::TypeAndValue{ .TypeName = pointee });
             LogErrorContext(errCtx, std::format(
                 "cannot return owning heap array '{}' as '{}': unique<T> does not own arrays - "
                 "return 'move {}*' instead",
                 sourceName,
-                compiler->DisplayNameOfCoreUniqueType(compiler->currentFunctionReturnTV.TypeName),
+                SpellType(*compiler, compiler->currentFunctionReturnTV),
                 shownPointee));
         }
 
@@ -578,10 +594,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
             if (sourceName.empty()) sourceName = "the 'new' result";
             else sourceName = "'" + sourceName + "'";
-            bool writable = true;
-            std::string elemShown = compiler->DisplayNameOfMangledType(
-                compiler->currentFunctionReturnTypeName, &writable);
-            if (!writable) elemShown = compiler->currentFunctionReturnTypeName;
+            std::string elemShown = SpellType(*compiler, compiler->currentFunctionReturnTV);
             LogErrorContext(errCtx, compiler->LocalizeMessage(
                 "cannot return heap array {} as '{}': the element count is lost at the return - "
                 "return 'array<{}>' or 'move {}[]' (which carries the count) instead",
@@ -705,7 +718,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     compiler->RecordNullSet(returnNV.CallerName);
                     compiler->lastOwningResult = true;
                     returnNV.Primary = raw;
-                    returnNV.TypeAndValue.TypeName = returnNV.TypeAndValue.TypeName.substr(8);
+                    returnNV.TypeAndValue.TypeName = MangledGenericArgument(
+                        *compiler, returnNV.TypeAndValue.TypeName);
                     returnNV.TypeAndValue.Pointer = true;
                     returnNV.TypeAndValue.IsMove = true;
                     returnNV.IsOwning = true;
@@ -757,8 +771,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "cannot return borrowed value '{}' as '{}'; the return type owns the "
                     "pointee - use 'new', a move source, or a move-returning call",
                     sourceName.empty() ? "this expression" : sourceName,
-                    compiler->DisplayNameOfCoreUniqueType(
-                        compiler->currentFunctionReturnTV.TypeName)));
+                    SpellType(*compiler, compiler->currentFunctionReturnTV)));
             }
             if (returnedNull)
             {
@@ -798,7 +811,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 {
                     right = compiler->builder->CreateExtractValue(
                         right, {(unsigned)i}, "unique_return_ptr");
-                    returnNV.TypeAndValue.TypeName = returnNV.TypeAndValue.TypeName.substr(8);
+                    returnNV.TypeAndValue.TypeName = MangledGenericArgument(
+                        *compiler, returnNV.TypeAndValue.TypeName);
                     returnNV.TypeAndValue.Pointer = true;
                     returnNV.TypeAndValue.IsMove = true;
                     returnNV.IsOwning = true;
@@ -899,7 +913,7 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 LogErrorContext(errCtx, std::format(
                     "cannot return a value of type '{}' from a function that returns '{}'",
                     returnNV.TypeAndValue.TypeName.empty() ? std::string("this expression")
-                                                             : returnNV.TypeAndValue.TypeName,
+                                                             : SpellType(*compiler, returnNV.TypeAndValue),
                     CurrentReturnTypeSpelling(compiler)));
         }
 
@@ -937,7 +951,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             else if (!ternaryArmFailure.empty())
                 LogErrorContext(errCtx, std::format(
                     "cannot convert '{}' arm to interface '{}': {}",
-                    joinSpelling, ifaceName, ternaryArmFailure));
+                    joinSpelling,
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName }),
+                    ternaryArmFailure));
         }
 
         // String ownership transfer (runtime-bit model). Classify the returned
@@ -1072,11 +1088,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             && returnNV.TypeAndValue.TypeName == compiler->currentFunctionReturnTypeName)
         {
             LogErrorContext(errCtx, std::format(
-                "cannot return pointer '{}*' from a function declared to return value type '{}' - "
+                "cannot return pointer '{}' from a function declared to return value type '{}' - "
                 "declare the return type '{}*' (or 'move {}*' to transfer ownership to the caller), "
                 "or dereference the pointer to return a copy.",
-                returnNV.TypeAndValue.TypeName, compiler->currentFunctionReturnTypeName,
-                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                SpellType(*compiler, returnNV.TypeAndValue),
+                CurrentReturnTypeSpelling(compiler),
+                CurrentReturnTypeSpelling(compiler),
+                CurrentReturnTypeSpelling(compiler)));
         }
 
         if (ReturnLeaksOwnershipIntoInterface(right, compiler))
@@ -1085,8 +1103,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 "returning a heap object boxed into interface '{}' from a non-'move' function "
                 "transfers ownership the caller cannot see - it will leak. Declare the return "
                 "type 'move {}' so the caller knows to 'delete' it.",
-                compiler->currentFunctionReturnTypeName,
-                compiler->currentFunctionReturnTypeName));
+                CurrentReturnTypeSpelling(compiler),
+                CurrentReturnTypeSpelling(compiler)));
         }
 
         // A FRESH ALLOCATION handed back through a BARE pointer return type gives the
@@ -1113,9 +1131,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "gives the caller no ownership signal - declare a named function with return type "
                     "'move {}*' and call it from the lambda, or use a named function with return type "
                     "'alias {}*' for manual ownership",
-                    compiler->currentFunctionReturnTypeName,
-                    compiler->currentFunctionReturnTypeName,
-                    compiler->currentFunctionReturnTypeName));
+                    CurrentReturnBaseTypeSpelling(compiler),
+                    CurrentReturnBaseTypeSpelling(compiler),
+                    CurrentReturnBaseTypeSpelling(compiler)));
             }
             else LogErrorContext(errCtx, std::format(
                 "returning a fresh allocation from a function whose return type is the bare "
@@ -1123,8 +1141,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 "'delete' is a silent leak. Declare the return type 'move {}*' to transfer "
                 "ownership to the caller (which adopts it with 'unique {}* x = f();'), or "
                 "'alias {}*' to opt out of ownership tracking and manage the lifetime by hand.",
-                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName,
-                compiler->currentFunctionReturnTypeName, compiler->currentFunctionReturnTypeName));
+                CurrentReturnBaseTypeSpelling(compiler), CurrentReturnBaseTypeSpelling(compiler),
+                CurrentReturnBaseTypeSpelling(compiler), CurrentReturnBaseTypeSpelling(compiler)));
         }
 
         // The mirror image: an INTERFACE VALUE returned from a function whose declared
@@ -1139,9 +1157,11 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, std::format(
                 "cannot return interface value '{}' from a function declared to return '{}' - "
                 "declare the return type as the interface (e.g. 'move {}')",
-                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName,
-                compiler->currentFunctionReturnTypeName,
-                returnNV.TypeAndValue.TypeName.empty() ? "<interface>" : returnNV.TypeAndValue.TypeName));
+                returnNV.TypeAndValue.TypeName.empty() ? "<interface>"
+                    : SpellType(*compiler, returnNV.TypeAndValue),
+                CurrentReturnTypeSpelling(compiler),
+                returnNV.TypeAndValue.TypeName.empty() ? "<interface>"
+                    : SpellType(*compiler, returnNV.TypeAndValue)));
         }
 
         /*
@@ -1261,7 +1281,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             LogErrorContext(errCtx, std::format(
                 "cannot return an 'alias' value '{}'; it borrows storage it does not own and "
                 "would dangle. Declare the function 'alias', or use '.copy()' for an owned copy.",
-                returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName));
+                returnNV.CallerName.empty() ? SpellType(*compiler, returnNV.TypeAndValue)
+                                            : returnNV.CallerName));
         }
 
         // Same hazard through a suppressed (mixed) '?:' join of an owning-value
@@ -1286,7 +1307,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                     "recover it from the return type and would free the block as an ordinary "
                     "allocation. Declare the return type 'alignas(0, {})' so the block alignment is "
                     "recorded, or over-align the ELEMENT TYPE instead.",
-                    returnNV.CallerName.empty() ? returnNV.TypeAndValue.TypeName : returnNV.CallerName,
+                    returnNV.CallerName.empty() ? SpellType(*compiler, returnNV.TypeAndValue)
+                                                : returnNV.CallerName,
                     returnNV.AllocAlignment, returnNV.AllocAlignment));
             else
                 LogErrorContext(errCtx, std::format(
@@ -1595,7 +1617,9 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
             }
             else if (!structName.empty() && !compiler->StructImplementsInterface(structName, ifaceName))
             {
-                LogErrorContext(errCtx, std::format("'{}' does not implement interface '{}'", structName, ifaceName));
+                LogErrorContext(errCtx, std::format("'{}' does not implement interface '{}'",
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName }),
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
             }
             else if (!structName.empty()
                      && RejectPointerShapedInterfaceUpcast(
@@ -1636,7 +1660,8 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
                 LogErrorContext(errCtx, std::format(
                     "cannot convert this expression to interface '{}': its concrete "
                     "class cannot be determined; bind it to a local variable of the "
-                    "class type first", ifaceName));
+                    "class type first", SpellType(*compiler,
+                        LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
             }
         }
 
@@ -2162,9 +2187,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     const bool elemIsCoreUnique = compiler->IsCoreUniqueType(elemType.TypeName);
                     const bool elemIsUniqueAttribute =
                         compiler->HasTypeAnnotation(elemType.TypeName, "unique");
-                    const std::string shownElemType = elemIsCoreUnique
-                        ? compiler->DisplayNameOfCoreUniqueType(elemType.TypeName)
-                        : elemType.TypeName;
+                    const std::string shownElemType = SpellType(*compiler, elemType);
                     std::string ownedFieldPath;
                     if (!elemType.Pointer && !elemType.IsArrayView && !elemType.IsInterface
                         && !compiler->IsInterfaceType(elemType.TypeName)
@@ -2294,15 +2317,15 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     bool isFaceType   = compiler->IsInterfaceType(collNV.TypeAndValue.TypeName);
                     bool isFixedArray = collNV.BaseType && llvm::isa<llvm::ArrayType>(collNV.BaseType);
                     bool isArrayView  = collNV.TypeAndValue.IsArrayView;
-                    bool isDirectContainer = collNV.TypeAndValue.TypeName.starts_with("list__")
-                        || collNV.TypeAndValue.TypeName.starts_with("array__");
+                    bool isDirectContainer = MangledBase(collNV.TypeAndValue.TypeName) == "list"
+                        || MangledBase(collNV.TypeAndValue.TypeName) == "array";
                     int dataFieldIndex = -1;
                     if (isDirectContainer && !isFaceType && !isFixedArray && !isArrayView && collNV.BaseType
                         && collNV.BaseType->isStructTy())
                     {
                         auto data = compiler->GetDataStructure(collNV.TypeAndValue.TypeName);
                         for (size_t i = 0; i < data.StructFields.size(); ++i)
-                            if ((collNV.TypeAndValue.TypeName.starts_with("list__")
+                            if ((MangledBase(collNV.TypeAndValue.TypeName) == "list"
                                     ? data.StructFields[i].VariableName == "_data"
                                     : data.StructFields[i].VariableName == "_ptr")
                                 && data.StructFields[i].Pointer)
@@ -2715,7 +2738,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             auto& sd = dsIt->second;
                             if (!sd.typeDescriptor)
                             {
-                                LogErrorContext(expression, std::format("struct '{}' has no type descriptor", entry.typeCaseName));
+                                LogErrorContext(expression, std::format("struct '{}' has no type descriptor",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = entry.typeCaseName })));
                                 continue;
                             }
                             auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, sd.typeDescriptor);
@@ -2727,7 +2751,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                             auto& pd = compiler->programTable[entry.typeCaseName];
                             if (!pd.typeDescriptor)
                             {
-                                LogErrorContext(expression, std::format("program '{}' has no type descriptor", entry.typeCaseName));
+                                LogErrorContext(expression, std::format("program '{}' has no type descriptor",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = entry.typeCaseName })));
                                 continue;
                             }
                             auto* cmp = compiler->builder->CreateICmpEQ(loadedDesc, pd.typeDescriptor);
@@ -2781,7 +2806,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                         }
                         else
                         {
-                            LogErrorContext(expression, std::format("'{}' is not a known struct or interface type", entry.typeCaseName));
+                            LogErrorContext(expression, std::format("'{}' is not a known struct or interface type",
+                                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = entry.typeCaseName })));
                         }
 
                         compiler->SwitchToBlock(nextCheck);
@@ -3016,7 +3042,7 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 {
                     LogErrorContext(lockStmt, std::format(
                         "lock: '{}' is an interface value of type '{}'; lock() requires a concrete lock type.",
-                        canonical, mutexTypeName));
+                        canonical, SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = mutexTypeName })));
                     return;
                 }
 
@@ -3030,11 +3056,11 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                     if (wantMode.empty())
                         LogErrorContext(lockStmt, std::format(
                             "lock: type '{}' is not a lock type (missing [Capability(ILockable)]).",
-                            mutexTypeName));
+                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = mutexTypeName })));
                     else
                         LogErrorContext(lockStmt, std::format(
                             "lock: type '{}' does not support '{}' mode (missing [Capability({})]).",
-                            mutexTypeName, wantMode, wantIface));
+                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = mutexTypeName }), wantMode, wantIface));
                     return;
                 }
 
@@ -3073,7 +3099,8 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 if (!unlockFn)
                 {
                     LogErrorContext(lockStmt, std::format(
-                        "lock: type '{}' has no '{}' method.", mutexTypeName, releaseMethod));
+                        "lock: type '{}' has no '{}' method.",
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = mutexTypeName }), releaseMethod));
                     return;
                 }
 
@@ -3257,19 +3284,25 @@ void MainListener::GenerateDefaultParamOverloads(
                      * non-empty form - which the declarator supports by building backing storage,
                      * and which a parameter default cannot - says so rather than borrowing the
                      * pointer wording. Both LogErrorContext calls throw, so neither falls through.
-                     */
+                    */
                     if (params[i].IsArrayView)
                     {
+                        LLVMBackend::TypeAndValue parameterBase = params[i];
+                        parameterBase.Pointer = false;
+                        parameterBase.ElemPointer = false;
+                        parameterBase.PointerDepth = 0;
+                        parameterBase.IsArrayView = false;
+                        const std::string parameterBaseSpelling = SpellType(*compiler, parameterBase);
                         if (initList == nullptr)
                             LogErrorContext(initCtx, std::format(
                                 "cannot infer the length of '{}[]' from an empty initializer list; "
                                 "use an explicit size '{}[N]'",
-                                params[i].TypeName, params[i].TypeName));
+                                parameterBaseSpelling, parameterBaseSpelling));
                         LogErrorContext(initCtx, std::format(
                             "a brace list is not supported as the default for the array-view "
                             "parameter '{}' of type '{}[]' - it would need backing storage the "
                             "default cannot own; use '= default' and fill it in the body",
-                            params[i].VariableName, params[i].TypeName));
+                            params[i].VariableName, parameterBaseSpelling));
                     }
 
                     if (params[i].Pointer)
@@ -3301,7 +3334,7 @@ void MainListener::GenerateDefaultParamOverloads(
                     LogErrorContext(initCtx, std::format(
                         "cannot build the default value for parameter '{}' of type '{}' - this default "
                         "initializer form is not supported; use '= default' or an explicit expression",
-                        params[i].VariableName, params[i].TypeName));
+                        params[i].VariableName, SpellType(*compiler, params[i])));
 
                 LLVMBackend::NamedVariable namedVar;
                 namedVar.Primary = defaultVal;

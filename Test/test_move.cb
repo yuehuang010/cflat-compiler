@@ -7615,7 +7615,7 @@ int wcpCopyParen(OaiCopyBox p)    { OaiCopyBox o = (p); return o.item->id; }
  * every leg below ABORTED on the pre-fix binary (measured rc 133 as a native exe, from macOS
  * malloc's double-free guard; rc 134 under `--run`). Four spelling families reach it - a `using`
  * alias, a namespace-relative name inside its own namespace, a generic instantiation (`Box<int>`
- * against the mangled `Box__int`), and a NESTED one whose argument must mangle through the same
+ * against the mangled `Box$int`), and a NESTED one whose argument must mangle through the same
  * funnel.
  */
 using OaiAlias  = OaiBox;
@@ -7637,7 +7637,7 @@ WcpGBox<int> wcpGMake(int id) { WcpGBox<int> b; b.item = new Resource(); b.item-
 int wcpGenericCast(WcpGBox<int> p)      { WcpGBox<int> o = (WcpGBox<int>)p; return o.item->id; }
 int wcpGenericAliasCast(WcpGBox<int> p) { WcpGBox<int> o = (WcpGAlias)p;    return o.item->id; }
 // A NESTED instantiation: the argument itself must be mangled through the same funnel, or the
-// spelling meets the declared `WcpGBox__WcpInner__i32` as `WcpGBox__WcpInner<int>` and misses.
+// spelling meets the declared `WcpGBox$WcpInner$int` as `WcpGBox$WcpInner<int>` and misses.
 struct WcpInner<T> { T tag = default; };
 WcpGBox<WcpInner<int>> wcpGMakeNested(int id)
 { WcpGBox<WcpInner<int>> b; b.item = new Resource(); b.item->id = id; return b; }
@@ -7899,7 +7899,7 @@ int testWrapperConsumeProvenance()
     }
     passed += Test("wcp_alias_ret_freed_once", dtorCount, 1);
 
-    // A GENERIC instantiation: the parameter's TypeName is the MANGLED `WcpGBox__i32`, so even the
+    // A GENERIC instantiation: the parameter's TypeName is the MANGLED `WcpGBox$int`, so even the
     // bare `(WcpGBox<int>)` spelling missed - this leg carries no alias at all.
     dtorCount = 0;
     {

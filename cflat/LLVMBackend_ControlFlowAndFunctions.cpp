@@ -58,7 +58,11 @@ void LLVMBackend::DumpState() const
         std::cout << std::format("  Location: {}:{}\n", currentLine, currentColumn);
 
         if (currentFunction)
-            std::cout << std::format("  Function: {}\n", currentFunction->getName().str());
+        {
+            const std::string rawFunction = currentFunction->getName().str();
+            std::cout << std::format("  Function: {} ({})\n",
+                                     SpellFunctionSymbol(*this, rawFunction), rawFunction);
+        }
         else
             std::cout << "  Function: <none>\n";
 
@@ -73,7 +77,21 @@ void LLVMBackend::DumpState() const
         }
 
         std::cout << std::format("  Structs registered: {}\n", dataStructures.size());
+        for (const auto& [name, _] : dataStructures)
+        {
+            TypeAndValue type;
+            type.TypeName = name;
+            std::cout << std::format("    {} ({})\n", SpellType(*this, type), name);
+        }
         std::cout << std::format("  Functions registered: {}\n", functionTable.size());
+        for (const auto& [name, overloads] : functionTable)
+            for (const auto& overload : overloads)
+            {
+                const std::string rawFunction = overload.UniqueName.empty()
+                    ? name : overload.UniqueName;
+                std::cout << std::format("    {} ({})\n",
+                                         SpellFunctionSymbol(*this, rawFunction), rawFunction);
+            }
     }
 
 void LLVMBackend::InitDebugInfo(const std::string& filename, const std::string& directory)
@@ -438,8 +456,8 @@ void LLVMBackend::CheckIndirectCallArgShape(llvm::Value* arg, llvm::Type* destTy
 
         // An unnamed slot gets the shorter message: naming a type it does not have, or advising a
         // '*' spelling of it, would be advice the caller cannot follow.
-        bool writable = true;
-        std::string shown = DisplayNameOfMangledType(paramTypeName, &writable);
+        std::string shown = SpellType(*this, TypeAndValue{ .TypeName = paramTypeName });
+        const bool writable = !shown.empty();
         if (shown.empty())
         {
             LogErrorMessage(
@@ -1101,7 +1119,7 @@ void LLVMBackend::FlushPendingFunctionDeclarations()
                 LogError(std::format(
                     "'{}' was used before the by-value type in its signature was complete, so its "
                     "calling convention cannot be repaired. Define that type before the signature.",
-                    d.FunctionName));
+                    SpellFunctionSymbol(*this, d.FunctionName)));
                 continue;
             }
 
@@ -1141,8 +1159,10 @@ void LLVMBackend::ReportUnresolvedProvisionalDeclarations()
             LogError(std::format(
                 "type '{}' is never completed, so '{}' cannot take it by value. "
                 "Define the type's body, or pass it by pointer.",
-                incomplete != nullptr ? incomplete->getName().str() : std::string("<unknown>"),
-                d.FunctionName));
+                incomplete != nullptr
+                    ? SpellType(*this, TypeAndValue{ .TypeName = incomplete->getName().str() })
+                    : std::string("<unknown>"),
+                SpellFunctionSymbol(*this, d.FunctionName)));
         }
     }
 
@@ -1208,7 +1228,7 @@ void LLVMBackend::CreateFunctionDeclaration(const std::string& functionName, con
                     "name already exists with a different signature (e.g. in a core library "
                     "such as os.windows). Rename your extern, or call the existing one "
                     "(for file I/O use os.windows.fopen/fread/fwrite/fclose).",
-                    { functionName });
+                    { SpellFunctionSymbol(*this, functionName) });
                 return;
             }
         }
@@ -1379,7 +1399,7 @@ llvm::FunctionType* LLVMBackend::GetFunctionType(const LLVMBackend::TypeAndValue
             LogError(std::format(
                 "type '{}' is incomplete here, so it cannot be passed by value. "
                 "Define its body before this signature, or pass it by pointer.",
-                incomplete->getName().str()));
+                SpellType(*this, TypeAndValue{ .TypeName = incomplete->getName().str() })));
 
         std::vector<llvm::Type*> types;
         types.reserve(arguments.size());
@@ -1425,19 +1445,15 @@ bool LLVMBackend::ParameterIsAliasByPointer(const TypeAndValue& param) const
 
 std::string LLVMBackend::ComputeMangledName(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType, const std::vector<LLVMBackend::TypeAndValue>& arguments, bool varargs)
 {
-        std::string argumentString = {};
-
-        for (const auto& argument : arguments)
-        {
-            argumentString += argument.ToUniqueString();
-            if (argument.IsMove)
-                argumentString += "M";
-        }
-
-        std::string uniqueName = std::format("_{}_{}_{}_", functionName, returnType.ToUniqueString(), argumentString);
-
+        std::string uniqueName = MangleFunctionSymbol(*this, functionName, returnType,
+                                                      arguments, varargs);
+#ifndef NDEBUG
+        FunctionSymbolSpelling spelling;
+        assert(DemangleFunctionSymbol(*this, uniqueName, spelling));
+        assert(MangleFunctionSymbol(*this, spelling) == uniqueName);
+#endif
         return uniqueName;
-    }
+}
 
 std::string LLVMBackend::SourceFileLeaf(const std::string& path)
 {
@@ -1456,7 +1472,7 @@ void LLVMBackend::DiagnoseDuplicateFunctionBody(const std::string& functionName,
         LogErrorMessage("redefinition of '{}' - the same overload is already defined at "
             "{}({}). Two parameter lists that differ only in a SPELLING of one type ('int' and "
             "'i32' name the same type) are one overload, not two.",
-            { functionName, firstFile, std::to_string(firstLine) });
+            { SpellFunctionSymbol(*this, functionName), firstFile, std::to_string(firstLine) });
     }
 
 bool LLVMBackend::OverloadSlotIsDefined(const std::string& functionName, const LLVMBackend::TypeAndValue& returnType,
@@ -1525,7 +1541,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
                 LogErrorMessage(
                     "cannot repair the extern '{}' declaration after ABI lowering was selected: "
                     "the old declaration is already used",
-                    { functionName });
+                    { SpellFunctionSymbol(*this, functionName) });
                 return fn;
             }
         }

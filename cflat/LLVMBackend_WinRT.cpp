@@ -203,7 +203,7 @@ const LLVMBackend::FunctionSymbol* LLVMBackend::FindWinrtMethod(const std::strin
 
 bool LLVMBackend::IsHResultType(const std::string& typeName)
 {
-        return typeName.rfind("HResult__", 0) == 0;
+        return MangledBase(typeName) != typeName && MangledBase(typeName) == "HResult";
     }
 
 void LLVMBackend::WireWinrtObject(llvm::Value* objPtr, const std::string& className)
@@ -244,7 +244,8 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
             if (vtblSD.StructFields[i].VariableName == slotName) { slotIdx = i; slot = &vtblSD.StructFields[i]; break; }
         if (!slot || argVals.empty())
         {
-            LogErrorMessage("EmitWinrtSlotCall: bad slot '{}' on '{}'", { slotName, className });
+            LogErrorMessage("EmitWinrtSlotCall: bad slot '{}' on '{}'",
+                { slotName, SpellType(*this, TypeAndValue{ .TypeName = className }) });
             return nullptr;
         }
 
@@ -263,7 +264,8 @@ llvm::Value* LLVMBackend::EmitWinrtSlotCall(const std::string& className, const 
             if (rt == winrtSlotHResultType_.end() || !dataStructures.count(rt->second))
             {
                 LogErrorMessage("[winrt] '{}::{}' sugar needs HResult<{}> instantiated "
-                    "(import \"com.cb\")", { className, slotName, im->ReturnType.TypeName });
+                    "(import \"com.cb\")", { SpellType(*this, TypeAndValue{ .TypeName = className }),
+                    slotName, SpellType(*this, im->ReturnType) });
                 return nullptr;
             }
             hresultTypeName = rt->second;
@@ -439,7 +441,8 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
                 if (!implSym)
                 {
                     LogErrorMessage("[winrt] class '{}' does not implement '{}::{}'",
-                        { className, ifaceName, m.Name });
+                        { SpellType(*this, TypeAndValue{ .TypeName = className }),
+                          SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), m.Name });
                     thunks.push_back(nullptr);
                     continue;
                 }
@@ -453,7 +456,8 @@ void LLVMBackend::EmitWinrtRuntime(const std::string& className, const std::stri
                 if (impl->hasStructRetAttr())
                 {
                     LogErrorMessage("[winrt] '{}::{}' returns a struct via the sret ABI, "
-                        "which the WinRT thunk does not support yet", { className, m.Name });
+                        "which the WinRT thunk does not support yet",
+                        { SpellType(*this, TypeAndValue{ .TypeName = className }), m.Name });
                     thunks.push_back(nullptr);
                     continue;
                 }
@@ -635,7 +639,11 @@ bool LLVMBackend::BuildWinrtInterfaceStructs(const std::string& thinName,
         winrtThinInterfaces_.insert(thinName);
         if (auto* s = GetSymbolSink())
         {
-            s->Register(SymbolKind::Struct, thinName, fileForLsp, 0, 0, lspDesc);
+            TypeAndValue thinType;
+            thinType.TypeName = thinName;
+            const std::string displayThinName = SpellType(*this, thinType);
+            s->Register(SymbolKind::Struct, thinName, fileForLsp, 0, 0, lspDesc,
+                        {}, {}, displayThinName);
             // Register each real interface method as a "<Interface>.<Method>" member so --symbol
             // and dot-completion expose the WinRT call surface. `methods` is already the flattened
             // vtable-order list with the synthetic IUnknown/IInspectable base slots excluded, so
@@ -654,7 +662,8 @@ bool LLVMBackend::BuildWinrtInterfaceStructs(const std::string& thinName,
                     if (!p.name.empty()) sig += " " + p.name;
                 }
                 sig += ")";
-                s->Register(SymbolKind::Function, thinName + "." + m.name, fileForLsp, 0, 0, sig);
+                s->Register(SymbolKind::Function, thinName + "." + m.name, fileForLsp, 0, 0, sig,
+                            {}, {}, displayThinName + "." + m.name);
             }
         }
         return true;
@@ -673,7 +682,8 @@ llvm::Value* LLVMBackend::EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::
         auto vtblIt = dataStructures.find(vtblName);
         if (dsIt == dataStructures.end() || vtblIt == dataStructures.end())
         {
-            LogErrorMessage("EmitWinrtThinSlotCall: '{}' is not a built WinRT interface", { thinName });
+            LogErrorMessage("EmitWinrtThinSlotCall: '{}' is not a built WinRT interface",
+                { SpellType(*this, TypeAndValue{ .TypeName = thinName }) });
             return nullptr;
         }
         auto* objTy = dsIt->second.StructType;     // { <vtbl>* }
@@ -686,7 +696,8 @@ llvm::Value* LLVMBackend::EmitWinrtThinSlotCall(llvm::Value* objPtr, const std::
             if (slots[i].VariableName == slotName) { slotIdx = i; slot = &slots[i]; break; }
         if (!slot)
         {
-            LogErrorMessage("EmitWinrtThinSlotCall: no slot '{}' on '{}'", { slotName, thinName });
+            LogErrorMessage("EmitWinrtThinSlotCall: no slot '{}' on '{}'", { slotName,
+                SpellType(*this, TypeAndValue{ .TypeName = thinName }) });
             return nullptr;
         }
 
@@ -772,7 +783,8 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
         if (cflatArgs.size() != tpl.genericParams.size())
         {
             LogErrorMessage("'{}<...>' expects {} type argument(s), got {}",
-                { base, std::to_string(tpl.genericParams.size()), std::to_string(cflatArgs.size()) });
+                { SpellType(*this, TypeAndValue{ .TypeName = base }),
+                  std::to_string(tpl.genericParams.size()), std::to_string(cflatArgs.size()) });
             return true;   // handled (it IS a winmd generic), just mis-arity
         }
 
@@ -781,7 +793,11 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
         {
             cflat_winmd::TypeRef r;
             std::string err;
-            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogRawError(base + "<...>: " + err); return true; }
+            if (!CFlatArgToWinrtTypeRef(a, r, err))
+            {
+                LogRawError(SpellType(*this, TypeAndValue{ .TypeName = base }) + "<...>: " + err);
+                return true;
+            }
             argRefs.push_back(r);
         }
 
@@ -809,7 +825,8 @@ bool LLVMBackend::InstantiateWinrtGenericInterface(const std::string& base,
         }
         else
         {
-            LogRawError("PIID derivation for '" + mangledName + "': " + err);
+            LogRawError("PIID derivation for '" + SpellType(*this,
+                TypeAndValue{ .TypeName = mangledName }) + "': " + err);
         }
         return true;
     }
@@ -990,31 +1007,38 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         if (!tpl)
         {
             LogErrorMessage("winrtDelegate: '{}' is not an imported WinRT delegate type "
-                     "(import the .winmd that declares it)", { base });
+                     "(import the .winmd that declares it)",
+                { SpellType(*this, TypeAndValue{ .TypeName = base }) });
             return nullptr;
         }
         if (cflatArgs.size() != tpl->genericParams.size())
         {
             LogErrorMessage("winrtDelegate: '{}' expects {} type argument(s), got {}",
-                { base, std::to_string(tpl->genericParams.size()), std::to_string(cflatArgs.size()) });
+                { SpellType(*this, TypeAndValue{ .TypeName = base }),
+                  std::to_string(tpl->genericParams.size()), std::to_string(cflatArgs.size()) });
             return nullptr;
         }
         if (!(tpl->invoke.returnType.fullName == "Void" && tpl->invoke.returnType.pointerDepth == 0))
         {
             LogErrorMessage("winrtDelegate: '{}' has a non-void Invoke return, which the "
-                     "projection does not support yet (only void-returning handlers)", { base });
+                     "projection does not support yet (only void-returning handlers)",
+                { SpellType(*this, TypeAndValue{ .TypeName = base }) });
             return nullptr;
         }
 
-        std::string mangled = base;
-        for (const auto& a : cflatArgs) mangled += "__" + a;
+        std::string mangled = MangleGenericInstance(*this, base, cflatArgs);
 
         // Substitute the generic Invoke signature with the concrete type arguments.
         std::vector<cflat_winmd::TypeRef> argRefs;
         for (const auto& a : cflatArgs)
         {
             cflat_winmd::TypeRef r; std::string err;
-            if (!CFlatArgToWinrtTypeRef(a, r, err)) { LogRawError("winrtDelegate " + base + "<...>: " + err); return nullptr; }
+            if (!CFlatArgToWinrtTypeRef(a, r, err))
+            {
+                LogRawError("winrtDelegate " + SpellType(*this,
+                    TypeAndValue{ .TypeName = base }) + "<...>: " + err);
+                return nullptr;
+            }
             argRefs.push_back(r);
         }
         cflat_winmd::Method invoke = tpl->invoke;
@@ -1026,7 +1050,8 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
         {
             if (!ParseUuidToBytes(tpl->iid, iidBytes))
             {
-                LogErrorMessage("winrtDelegate: delegate '{}' has no IID in metadata", { base });
+                LogErrorMessage("winrtDelegate: delegate '{}' has no IID in metadata",
+                    { SpellType(*this, TypeAndValue{ .TypeName = base }) });
                 return nullptr;
             }
         }
@@ -1036,7 +1061,8 @@ llvm::Value* LLVMBackend::EmitWinrtDelegateObject(const std::string& base,
             std::string err;
             if (!cflat_winmd::DerivePiid(inst, winrtConsumedModel_, iidBytes, err))
             {
-                LogRawError("winrtDelegate PIID for '" + mangled + "': " + err);
+                LogRawError("winrtDelegate PIID for '" + SpellType(*this,
+                    TypeAndValue{ .TypeName = mangled }) + "': " + err);
                 return nullptr;
             }
         }
@@ -1111,7 +1137,8 @@ void LLVMBackend::RegisterWinrtModel(const cflat_winmd::Model& model, const std:
                     : (llvm::Constant*)builder->getInt32((uint32_t)(int32_t)m.value);
                 CreateGlobalVariable(tv, c);
                 if (auto* s = GetSymbolSink())
-                    s->Register(SymbolKind::Variable, name, fileForLsp, 0, 0, tv.TypeName + " " + name);
+                    s->Register(SymbolKind::Variable, name, fileForLsp, 0, 0,
+                                SpellType(*this, tv) + " " + name, {}, {}, name);
             }
         }
 
@@ -1135,7 +1162,13 @@ void LLVMBackend::RegisterWinrtModel(const cflat_winmd::Model& model, const std:
             }
             CreateStructType(st.fullName, fields);   // fills the shell created above
             if (auto* s = GetSymbolSink())
-                s->Register(SymbolKind::Struct, st.fullName, fileForLsp, 0, 0, "struct " + st.fullName);
+            {
+                TypeAndValue structType;
+                structType.TypeName = st.fullName;
+                const std::string displayStructName = SpellType(*this, structType);
+                s->Register(SymbolKind::Struct, st.fullName, fileForLsp, 0, 0,
+                            "struct " + displayStructName, {}, {}, displayStructName);
+            }
         }
 
         // Pass C: interfaces -> COM vtable struct (flat IInspectable layout) + thin pointer struct.
@@ -1218,8 +1251,7 @@ bool LLVMBackend::WinmdInstantiateSelfTest(const std::string& path, std::string&
         for (const auto& c : cases)
         {
             if (!winrtGenericTemplates_.count(c.base)) { report += std::string("[skip] ") + c.base + " (not in winmd)\n"; continue; }
-            std::string mangled = c.base;
-            for (const auto& a : c.args) mangled += "__" + a;
+            std::string mangled = MangleGenericInstance(*this, c.base, c.args);
             InstantiateWinrtGenericInterface(c.base, c.args, mangled);
 
             auto iidIt = winrtInstanceIid_.find(mangled);
@@ -1523,8 +1555,9 @@ void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionN
             "call to '{}': parameter '{}' BORROWS its argument, so '{} {}' transfers nothing - "
             "the callee never takes ownership and the value would be orphaned. Drop the '{}', "
             "or declare the parameter '{} {}'.",
-            { functionName, paramName,
-              "move", arg.CallerName.empty() ? arg.TypeAndValue.TypeName : arg.CallerName, "move", "move", paramType });
+            { SpellFunctionSymbol(*this, functionName), paramName,
+              "move", arg.CallerName.empty() ? SpellType(*this, arg.TypeAndValue) : arg.CallerName,
+              "move", "move", SpellType(*this, TypeAndValue{ .TypeName = paramType }) });
     }
 
 void LLVMBackend::DiagnoseExplicitMoveToBorrowParam(const std::string& functionName,
@@ -1548,7 +1581,7 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
         const TypeAndValue& param, const NamedVariable& arg)
 {
         bool coreUniqueValueParam = !param.Pointer
-            && (IsCoreUniqueType(param.TypeName) || param.TypeName.starts_with("unique__"));
+            && (IsCoreUniqueType(param.TypeName) || MangledBase(param.TypeName) == "unique");
         bool paramClaimsOwnership = coreUniqueValueParam
             || (param.Pointer && !param.IsAlias
                 && (param.IsMove
@@ -1560,7 +1593,8 @@ void LLVMBackend::RejectOwningTempUniqueFieldIntoSinkParam(const std::string& fu
             RecordDeferredTempUniqueFieldSinkEscape(arg.Primary, functionName, param.VariableName);
             return;
         }
-        LogRawError(DescribeTempUniqueFieldSinkEscape(functionName, param.VariableName));
+        LogRawError(DescribeTempUniqueFieldSinkEscape(SpellFunctionSymbol(*this, functionName),
+                                                     param.VariableName));
     }
 
 LLVMBackend::TypeAndValue LLVMBackend::FuncPtrParamAsTypeAndValue(const TypeAndValue::FuncPtrParam& p,
@@ -1649,7 +1683,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                     "call to '{}': parameter '{}' takes ownership of a value this function only "
                     "borrows ('{}' is a by-value parameter, so the caller keeps ownership). Accept "
                     "the parameter as a sink ({} it in the body), or pass a copy with '{}'.",
-                    { functionName, params[i].VariableName, sourceName, "move", "copy()" });
+                    { SpellFunctionSymbol(*this, functionName), params[i].VariableName, sourceName,
+                      "move", "copy()" });
                 continue;
             }
             // A `unique`-typed parameter is a synthesized move sink: the callee owns and frees it,
@@ -1687,15 +1722,16 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                             "parameter of '{}': that alignment is a property of the allocation, not of the type, so "
                             "the callee cannot recover it. Declare the parameter '{}' so the block "
                             "alignment is recorded, or over-align the ELEMENT TYPE instead.",
-                            { sourceName.empty() ? args[i].TypeAndValue.TypeName : sourceName,
-                              std::format("new T[n] alignas(0, {})", args[i].AllocAlignment), "move", functionName,
+                            { sourceName.empty() ? SpellType(*this, args[i].TypeAndValue) : sourceName,
+                              std::format("new T[n] alignas(0, {})", args[i].AllocAlignment), "move",
+                              SpellFunctionSymbol(*this, functionName),
                               std::format("alignas(0, {})", args[i].AllocAlignment) });
                     else
                         LogErrorMessage(
                             "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
                             "'alignas(0, {})' but the argument was allocated 'alignas(0, {})'. The two must agree "
                             "so the callee frees with the correct alignment.",
-                            { functionName, std::to_string(params[i].AllocAlignValue),
+                            { SpellFunctionSymbol(*this, functionName), std::to_string(params[i].AllocAlignValue),
                               std::to_string(args[i].AllocAlignment) });
                 }
 
@@ -1805,7 +1841,8 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                         // rather than leaving a stale value that a later destructor would double-free.
                         LogErrorMessage(
                             "call to '{}': 'move' argument {} has no resolved type, so its source "
-                            "storage cannot be cleared after the move", { functionName, std::to_string(i) });
+                            "storage cannot be cleared after the move",
+                            { SpellFunctionSymbol(*this, functionName), std::to_string(i) });
                     }
                 }
                 // Compile-time: mark the caller's storage as moved so subsequent reads are rejected.
@@ -2212,57 +2249,59 @@ std::string LLVMBackend::FuncPtrArgDepthMismatch(const NamedVariable& arg,
         if (!arg.TypeAndValue.PointerDepthRefuses(param))
             return "";
 
-        bool writable = true;
-        std::string shown = DisplayNameOfMangledType(p.TypeName, &writable);
-        std::string argShown = DisplayNameOfMangledType(arg.TypeAndValue.TypeName);
+        TypeAndValue parameterBase;
+        parameterBase.TypeName = p.TypeName;
+        std::string shown = SpellType(*this, parameterBase);
+        std::string argShown = SpellType(*this, arg.TypeAndValue);
         // A primitive pointer argument carries no CFlat TypeName; report only the depth then.
         if (p.PointerDepth >= 2)
             return std::format("has type '{}**' and the argument has {} - there is no "
                 "implicit address-of. Take its address with '&' at the call site", shown,
                 argShown.empty() ? std::string("one fewer level of indirection")
-                                 : std::format("type '{}*'", argShown));
+                                 : std::format("type '{}'", argShown));
         return std::format("has type '{}*' and the argument has {} - there is no implicit "
             "dereference. Dereference it with '*' at the call site", shown,
             argShown.empty() ? std::string("one more level of indirection")
-                             : std::format("type '{}**'", argShown));
+                             : std::format("type '{}'", argShown));
     }
 
 bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceName,
         const std::string& methodName, const std::vector<NamedVariable>& args,
         const std::vector<TypeAndValue>& params)
 {
+        const std::string displayIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
         for (size_t i = 0; i < args.size() && i < params.size(); i++)
         {
             if (ArgumentProvablyMismatchesParameter(args[i], params[i]))
             {
                 std::string why = DescribeFuncPtrSignatureMismatch(args[i].TypeAndValue, params[i]);
                 LogErrorMessage("no method of '{}.{}' matches the given arguments{}",
-                    { ifaceName, methodName, why.empty() ? "" : " - " + why });
+                    { displayIface, methodName, why.empty() ? "" : " - " + why });
                 return true;
             }
             if (args[i].TypeAndValue.PointerDepthRefuses(params[i]))
             {
                 bool tooDeep = args[i].TypeAndValue.IsProvenDoublePointer()
                     || args[i].TypeAndValue.IsProvenDecayedDoublePointer();
-                std::string shown = DisplayNameOfMangledType(params[i].TypeName);
-                std::string argShown = DisplayNameOfMangledType(args[i].TypeAndValue.TypeName);
+                std::string shown = SpellType(*this, params[i]);
+                std::string argShown = SpellType(*this, args[i].TypeAndValue);
                 if (tooDeep)
                 {
                     LogErrorMessage(
                         "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has {} - "
                         "there is no implicit dereference. Dereference it with '{}' at the call site.",
-                        { ifaceName, methodName, std::to_string(i), params[i].VariableName,
-                          shown + "*", argShown.empty() ? std::string("one more level of indirection")
-                                           : std::format("type '{}**'", argShown), "*" });
+                        { displayIface, methodName, std::to_string(i), params[i].VariableName,
+                          shown, argShown.empty() ? std::string("one more level of indirection")
+                                           : std::format("type '{}'", argShown), "*" });
                 }
                 else
                 {
                     LogErrorMessage(
                         "call to '{}.{}': parameter {} '{}' has type '{}' and the argument has {} - "
                         "there is no implicit address-of. Take its address with '{}' at the call site.",
-                        { ifaceName, methodName, std::to_string(i), params[i].VariableName,
-                          shown + "**", argShown.empty() ? std::string("one fewer level of indirection")
-                                           : std::format("type '{}*'", argShown), "&" });
+                        { displayIface, methodName, std::to_string(i), params[i].VariableName,
+                          shown, argShown.empty() ? std::string("one fewer level of indirection")
+                                           : std::format("type '{}'", argShown), "&" });
                 }
                 return true;
             }
@@ -2270,15 +2309,14 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
             {
                 // Rendered when the rendering is provably writable source; a nested instantiation
                 // stays raw and loses the advice clause rather than naming a type that cannot exist.
-                bool writable = true;
-                std::string shown = DisplayNameOfMangledType(params[i].TypeName, &writable);
-                if (writable)
+                std::string shown = SpellType(*this, params[i]);
+                if (!shown.empty())
                 {
                     LogErrorMessage(
                         "call to '{}.{}': cannot pass a '{}' to by-value parameter '{}' of type '{}' - "
                         "there is no implicit dereference. Write '{}' at the call site to pass the "
                         "pointee, or declare the parameter as '{}'.",
-                        { ifaceName, methodName, std::format("{}*", shown), params[i].VariableName,
+                        { displayIface, methodName, std::format("{}*", shown), params[i].VariableName,
                           shown, "*", std::format("{}*", shown) });
                 }
                 else
@@ -2287,7 +2325,7 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
                         "call to '{}.{}': cannot pass a '{}' to by-value parameter '{}' of type '{}' - "
                         "there is no implicit dereference. Write '{}' at the call site to pass the "
                         "pointee.",
-                        { ifaceName, methodName, std::format("{}*", shown), params[i].VariableName,
+                        { displayIface, methodName, std::format("{}*", shown), params[i].VariableName,
                           shown, "*" });
                 }
                 return true;
@@ -2298,9 +2336,9 @@ bool LLVMBackend::DiagnoseProvableInterfaceArgMismatch(const std::string& ifaceN
                     "call to '{}.{}': cannot pass a pointer to by-value parameter '{}' of type '{}' - "
                     "an address is not of type '{}'. Dereference it with '{}' at the call site, or "
                     "declare the parameter as '{}'.",
-                    { ifaceName, methodName, params[i].VariableName, params[i].TypeName,
-                      std::format("{}*", params[i].TypeName), "*",
-                      std::format("{}*", params[i].TypeName) });
+                    { displayIface, methodName, params[i].VariableName, SpellType(*this, params[i]),
+                      std::format("{}*", SpellType(*this, params[i])), "*",
+                      std::format("{}*", SpellType(*this, params[i])) });
                 return true;
             }
         }
@@ -2312,6 +2350,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
         std::vector<NamedVariable>& matchedArgs)
 {
         matchedArgs = args;
+        const std::string displayIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
 
         std::vector<int> byName;
         for (int i = 0; i < (int)methods.size(); i++)
@@ -2319,7 +2358,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
 
         if (byName.empty())
         {
-            LogErrorMessage("interface '{}' has no method '{}'", { ifaceName, methodName });
+            LogErrorMessage("interface '{}' has no method '{}'", { displayIface, methodName });
             return -1;
         }
 
@@ -2346,7 +2385,7 @@ int LLVMBackend::ResolveInterfaceMethodSlot(const std::string& ifaceName, const 
             }
             LogErrorMessage(
                 "no overload of interface method '{}.{}' takes {} argument(s); expected {}",
-                { ifaceName, methodName, std::to_string(args.size()), expected });
+                { displayIface, methodName, std::to_string(args.size()), expected });
             return -1;
         }
 
@@ -2456,7 +2495,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogErrorMessage("unknown interface '{}'", { ifaceName });
+            LogErrorMessage("unknown interface '{}'",
+                { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }) });
             return nullptr;
         }
 
@@ -2476,7 +2516,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 continue;
             LogErrorMessage(
                 "cannot pass bonded value to interface method '{}.{}' parameter '{}' - bonded values cannot be transferred out of their source's scope",
-                { ifaceName, methodName, methodInfo->Parameters[i].VariableName });
+                { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), methodName,
+                  methodInfo->Parameters[i].VariableName });
         }
 
         // Method indices start at 1 (slot 0 is type ID)
@@ -2533,7 +2574,7 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                 if (!argShape.empty())
                 {
                     LogRawError(FormatPointerShapedInterfaceUpcastError(
-                        argShape, nv.TypeAndValue.TypeName, param.TypeName));
+                        argShape, SpellType(*this, nv.TypeAndValue), SpellType(*this, param)));
                     return nullptr;
                 }
                 std::string structName = nv.TypeAndValue.TypeName;
@@ -2639,7 +2680,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
                     "call to '{}.{}': adopt parameter '{}' requires an owned interface local or "
                     "a move-returning interface result; "
                     "a unique local or borrowed interface cannot be adopted",
-                    { ifaceName, methodName, methodInfo->Parameters[i].VariableName });
+                    { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), methodName,
+                      methodInfo->Parameters[i].VariableName });
             if (!arg.CallerName.empty())
             {
                 SetVariableOwning(arg.CallerName, false);
@@ -2651,7 +2693,8 @@ llvm::Value* LLVMBackend::CallInterfaceMethod(llvm::Value* ifacePtr, const std::
         // direct call, so the caller's source must be nulled/marked-moved here too. Without this
         // the source keeps its owning flag and scope exit frees what the callee now owns.
         for (size_t i = 0; i < methodInfo->Parameters.size() && i < callArgNVs.size(); i++)
-            DiagnoseExplicitMoveToBorrowParam(ifaceName + "." + methodName,
+            DiagnoseExplicitMoveToBorrowParam(SpellType(*this, TypeAndValue{ .TypeName = ifaceName })
+                + "." + methodName,
                 methodInfo->Parameters[i], callArgNVs[i]);
         ApplyMoveParamTransfer(ifaceName + "." + methodName, methodInfo->Parameters, callArgNVs);
 
@@ -2820,7 +2863,9 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
         const auto* ifaceMethods = FindInterface(interfaceName);
         if (ifaceMethods == nullptr)
         {
-            LogErrorMessage("unknown interface{} '{}'", { ":", interfaceName });
+            TypeAndValue displayInterface;
+            displayInterface.TypeName = interfaceName;
+            LogErrorMessage("unknown interface{} '{}'", { ":", SpellType(*this, displayInterface) });
             return;
         }
 
@@ -2874,7 +2919,8 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
             if (!found)
             {
                 LogErrorMessage("class '{}' does not implement '{}::{}'",
-                    { structName, interfaceName, method.Name });
+                    { SpellType(*this, TypeAndValue{ .TypeName = structName }),
+                      SpellType(*this, TypeAndValue{ .TypeName = interfaceName }), method.Name });
             }
             else if (!anyConforms)
             {
@@ -2892,6 +2938,8 @@ void LLVMBackend::VerifyInterfaceImplementation(const std::string& structName, c
 llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& structName)
 {
         auto compiler = this;
+        TypeAndValue displayStruct;
+        displayStruct.TypeName = structName;
 
         // Guard: if already synthesized, return existing function
         if (compiler->synthesizedReflectFunctions.count(structName))
@@ -2907,18 +2955,18 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         auto it = compiler->dataStructures.find(structName);
         if (it == compiler->dataStructures.end())
         {
-            LogErrorMessage("reflect: unknown struct '{}'", { structName });
+            LogErrorMessage("reflect: unknown struct '{}'", { SpellType(*compiler, displayStruct) });
             return nullptr;
         }
         auto& sd = it->second;
         if (!sd.StructType)
         {
-            LogErrorMessage("reflect: struct '{}' has no LLVM type", { structName });
+            LogErrorMessage("reflect: struct '{}' has no LLVM type", { SpellType(*compiler, displayStruct) });
             return nullptr;
         }
         if (sd.IsUnion)
         {
-            LogErrorMessage("reflect is not supported on union type '{}'", { structName });
+            LogErrorMessage("reflect is not supported on union type '{}'", { SpellType(*compiler, displayStruct) });
             return nullptr;
         }
 
@@ -2947,7 +2995,7 @@ llvm::Function* LLVMBackend::SynthesizeReflectFunction(const std::string& struct
         auto* fn = compiler->CreateFunctionDefinition(fnName, voidReturn, {objParam, visitorParam});
         if (!fn)
         {
-            LogErrorMessage("reflect: failed to create function for '{}'", { structName });
+            LogErrorMessage("reflect: failed to create function for '{}'", { SpellType(*compiler, displayStruct) });
             return nullptr;
         }
         fn->setLinkage(llvm::Function::InternalLinkage);

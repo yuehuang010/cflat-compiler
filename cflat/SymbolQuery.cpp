@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "LLVMBackend.h"
+#include "TypeMangling.h"
 #include "LspSymbolIndex.h"
 
 // ---- --symbol query mode -------------------------------------------------
@@ -44,6 +45,11 @@ static const char* SymbolKindName(SymbolKind k)
     return "symbol";
 }
 
+static std::string SymbolDisplayName(const SymbolDef& def)
+{
+    return def.displayName.empty() ? def.name : def.displayName;
+}
+
 // Case-insensitive Levenshtein edit distance.
 static int EditDistance(const std::string& a, const std::string& b)
 {
@@ -68,8 +74,9 @@ static int EditDistance(const std::string& a, const std::string& b)
 // fields are registered under "<Type>.<member>", so we scan the index for that prefix.
 static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
 {
-    std::cout << std::format("{}  ({})\n", def.name, SymbolKindName(def.kind));
-    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
+    const std::string displayName = SymbolDisplayName(def);
+    std::cout << std::format("{}  ({})\n", displayName, SymbolKindName(def.kind));
+    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != displayName)
         std::cout << std::format("  {}\n", def.signatureMarkdown);
     for (const auto& sig : def.overloadSignatures)
         std::cout << std::format("  {}\n", sig);
@@ -91,12 +98,12 @@ static void PrintSymbolDetail(const LspSymbolIndex& index, const SymbolDef& def)
         for (const auto* m : members)
         {
             std::string shortName = m->name.substr(prefix.size());
-            std::cout << "    " << m->name;
+            std::cout << "    " << SymbolDisplayName(*m);
             if (!m->signatureMarkdown.empty() && m->signatureMarkdown != shortName)
                 std::cout << "  :  " << m->signatureMarkdown;
             std::cout << "\n";
             for (const auto& sig : m->overloadSignatures)
-                std::cout << std::format("    {}  :  {}\n", m->name, sig);
+                std::cout << std::format("    {}  :  {}\n", SymbolDisplayName(*m), sig);
         }
     }
 }
@@ -142,7 +149,7 @@ static void PrintSymbolSuggestions(const LspSymbolIndex& index, const std::strin
     for (size_t i = 0; i < hits.size() && i < maxShow; ++i)
     {
         const SymbolDef* d = hits[i].def;
-        std::cout << std::format("    {}  ({})", d->name, SymbolKindName(d->kind));
+        std::cout << std::format("    {}  ({})", SymbolDisplayName(*d), SymbolKindName(d->kind));
         if (d->line > 0 && !d->file.empty())
             std::cout << std::format("  {}:{}", d->file, d->line);
         std::cout << "\n";
@@ -671,7 +678,7 @@ static bool TryNarrowSymbolOverloads(const LspSymbolIndex& index, const SymbolDe
         arguments.push_back(InferSymbolArgumentType(index, raw));
 
     std::vector<std::string> signatures;
-    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
+    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != SymbolDisplayName(def))
         signatures.push_back(def.signatureMarkdown);
     signatures.insert(signatures.end(), def.overloadSignatures.begin(), def.overloadSignatures.end());
     if (signatures.empty()) return false;
@@ -725,8 +732,9 @@ static bool IsSymbolLineKeyword(const std::string& name)
 static void PrintCompactSymbolDetail(const SymbolDef& def,
                                      const std::vector<std::string>* signatures = nullptr)
 {
-    std::cout << std::format("  {}  ({})\n", def.name, SymbolKindName(def.kind));
-    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != def.name)
+    const std::string displayName = SymbolDisplayName(def);
+    std::cout << std::format("  {}  ({})\n", displayName, SymbolKindName(def.kind));
+    if (!def.signatureMarkdown.empty() && def.signatureMarkdown != displayName)
     {
         if (!signatures) std::cout << std::format("    {}\n", def.signatureMarkdown);
     }
@@ -922,7 +930,8 @@ static bool ReadSourceLines(const std::string& path, std::vector<std::string>& l
 
 static void DumpSymbolLine(const LspSymbolIndex& index,
                            const std::vector<std::string>& sourceLines,
-                           size_t lineNumber, bool& firstLine)
+                           size_t lineNumber, bool& firstLine,
+                           const SymbolDef* preferredFunction = nullptr)
 {
     if (!firstLine) std::cout << "\n";
     firstLine = false;
@@ -939,6 +948,15 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
     for (const auto& token : ScanSymbolLine(sourceLine))
     {
         const SymbolDef* def = index.Lookup(token.path);
+        if (preferredFunction && lineNumber == (size_t)preferredFunction->line)
+        {
+            const std::string preferredName = SymbolDisplayName(*preferredFunction);
+            const size_t dot = preferredName.rfind('.');
+            const std::string preferredShort = dot == std::string::npos
+                ? preferredName : preferredName.substr(dot + 1);
+            if (token.path == preferredShort)
+                def = preferredFunction;
+        }
         if (def)
         {
             if (printed.insert(def->name).second)
@@ -957,12 +975,14 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
                 const std::string type = variable && !variable->typeName.empty()
                     ? variable->typeName : (typeName ? *typeName : "");
                 if (!printed.insert(token.path).second) continue;
-                std::cout << std::format("  {} (variable) : {}\n", token.path, type);
+                const std::string displayType = variable && !variable->displayTypeName.empty()
+                    ? variable->displayTypeName : type;
+                std::cout << std::format("  {} (variable) : {}\n", token.path, displayType);
                 if (variable && variable->line > 0 && !variable->file.empty())
                     std::cout << std::format("    defined: {}:{}\n", variable->file, variable->line);
                 const SymbolDef* typeDef = type.empty() ? nullptr : index.Lookup(SymbolTypeLookupName(type));
                 if (typeDef && !typeDef->signatureMarkdown.empty() &&
-                    typeDef->signatureMarkdown != typeDef->name)
+                    typeDef->signatureMarkdown != SymbolDisplayName(*typeDef))
                     std::cout << std::format("    {}\n", typeDef->signatureMarkdown);
             }
             continue;
@@ -972,9 +992,7 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
         if (!receiverType) continue;
         const std::string type = SymbolTypeLookupName(*receiverType);
         std::string typeBase = type;
-        const size_t genericSeparator = typeBase.find("__");
-        if (genericSeparator != std::string::npos)
-            typeBase.resize(genericSeparator);
+        typeBase = std::string(MangledBase(typeBase));
         def = index.Lookup(type + "." + token.member);
         if (!def && typeBase != type)
             def = index.Lookup(typeBase + "." + token.member);
@@ -983,15 +1001,109 @@ static void DumpSymbolLine(const LspSymbolIndex& index,
     }
 }
 
-static const SymbolDef* LookupFunction(const LspSymbolIndex& index, const std::string& name)
+static std::string StripGenericOwner(const std::string& name)
+{
+    const size_t open = name.find('<');
+    if (open == std::string::npos) return name;
+    int depth = 0;
+    for (size_t i = open; i < name.size(); i++)
+    {
+        if (name[i] == '<')
+            ++depth;
+        else if (name[i] == '>' && --depth == 0)
+        {
+            if (i + 1 < name.size() && name[i + 1] == '.')
+                return name.substr(0, open) + name.substr(i + 1);
+            return name;
+        }
+    }
+    return name;
+}
+
+static const SymbolDef* LookupFunction(const LspSymbolIndex& index,
+                                       const LLVMBackend& compiler,
+                                       const std::string& name)
 {
     if (const SymbolDef* def = index.Lookup(name); def && def->kind == SymbolKind::Function)
         return def;
+
+    const size_t selectorDot = name.rfind('.');
+    if (selectorDot != std::string::npos && selectorDot > 0 && selectorDot + 1 < name.size())
+    {
+        const std::string normalizedSelector = NormalizeSymbolTypeName(StripGenericOwner(name));
+        for (const auto& [symbolName, def] : index.Symbols())
+        {
+            if (def.kind != SymbolKind::Function) continue;
+            if (NormalizeSymbolTypeName(def.name) == normalizedSelector
+                || NormalizeSymbolTypeName(SymbolDisplayName(def)) == normalizedSelector)
+                return &def;
+        }
+    }
+
+    const std::string baseName = StripGenericOwner(name);
+    if (baseName != name)
+        if (const SymbolDef* def = index.Lookup(baseName); def && def->kind == SymbolKind::Function)
+            return def;
+
+    // A raw LLVM function symbol has no index entry of its own. Its source function name,
+    // and where possible its receiver type, identify the source definition to dump.
+    FunctionSymbolSpelling raw;
+    std::string rawFunctionName;
+    if (DemangleFunctionSymbol(compiler, name, raw))
+        rawFunctionName = raw.name;
+    else if (name.size() > 2 && name.front() == '_')
+    {
+        const size_t end = name.find('$', 1);
+        if (end != std::string::npos)
+            rawFunctionName = name.substr(1, end - 1);
+    }
+    if (!rawFunctionName.empty())
+    {
+        if (const SymbolDef* def = index.Lookup(rawFunctionName);
+            def && def->kind == SymbolKind::Function)
+            return def;
+
+        std::string receiver;
+        const std::string sourceSymbol = SpellFunctionSymbol(compiler, name);
+        const size_t openParen = sourceSymbol.find('(');
+        if (openParen != std::string::npos && !raw.parameters.empty())
+        {
+            const size_t firstEnd = sourceSymbol.find(',', openParen + 1);
+            receiver = sourceSymbol.substr(openParen + 1,
+                (firstEnd == std::string::npos ? sourceSymbol.find(')', openParen + 1) : firstEnd)
+                - openParen - 1);
+            while (receiver.starts_with("move ")) receiver.erase(0, 5);
+            while (receiver.ends_with("*")) receiver.pop_back();
+            if (receiver.ends_with("[]")) receiver.resize(receiver.size() - 2);
+            receiver = StripGenericOwner(receiver);
+        }
+        if (!receiver.empty())
+            if (const SymbolDef* def = index.Lookup(receiver + "." + rawFunctionName);
+                def && def->kind == SymbolKind::Function)
+                return def;
+
+        for (const auto& [symbolName, def] : index.Symbols())
+            if (def.kind == SymbolKind::Function
+                && (def.displayName == rawFunctionName
+                    || def.displayName.ends_with("." + rawFunctionName)))
+                return &def;
+    }
 
     const std::string lowerName = ToLower(name);
     for (const auto& [symbolName, def] : index.Symbols())
         if (def.kind == SymbolKind::Function && ToLower(symbolName) == lowerName)
             return &def;
+    const std::string lowerBaseName = ToLower(baseName);
+    if (baseName != name)
+        for (const auto& [symbolName, def] : index.Symbols())
+            if (def.kind == SymbolKind::Function && ToLower(symbolName) == lowerBaseName)
+                return &def;
+    if (name.find('.') == std::string::npos)
+        for (const auto& [symbolName, def] : index.Symbols())
+            if (def.kind == SymbolKind::Function
+                && (symbolName.ends_with("." + name)
+                    || def.displayName.ends_with("." + name)))
+                return &def;
     return nullptr;
 }
 
@@ -1119,7 +1231,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
             continue;
         }
 
-        const SymbolDef* def = LookupFunction(index, selector.functionName);
+        const SymbolDef* def = LookupFunction(index, compiler, selector.functionName);
         if (!def)
         {
             std::cout << std::format("'{}': no exact match.\n", selector.functionName);
@@ -1143,7 +1255,7 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
         }
         for (size_t lineNumber = startLine;; ++lineNumber)
         {
-            DumpSymbolLine(index, functionLines, lineNumber, firstLine);
+            DumpSymbolLine(index, functionLines, lineNumber, firstLine, def);
             if (lineNumber == endLine) break;
         }
     }

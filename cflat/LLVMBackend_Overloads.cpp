@@ -175,8 +175,7 @@ std::pair<std::vector<LLVMBackend::NamedVariable>, LLVMBackend::FunctionSymbol> 
                     // the caller's slot as the borrow the builtin spelling handed back.
                     bool coreUniqueOutParam = tmpParam.Pointer && !tmpParam.ElemPointer
                         && tmpArg.Pointer && IsCoreUniqueType(tmpParam.TypeName)
-                        && tmpParam.TypeName.size() > 8
-                        && tmpParam.TypeName.substr(8) == tmpArg.TypeName;
+                        && MangledGenericArgument(*this, tmpParam.TypeName) == tmpArg.TypeName;
                     if (coreUniqueValueReceiver || rawPointerToCoreUnique || coreUniqueToRawPointer
                         || coreUniqueOutParam
                         || IsStackValueToCoreUniqueInterface(arg, tmpParam))
@@ -639,17 +638,13 @@ bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const T
         if (!CodeValueIntoDataDestination(arg, param)) return false;
 
         // Spelled from the DECLARED parameter, the only type the vtable slot knows.
-        std::string spelling = param.IsArrayView
-            ? param.TypeName + std::string(param.ElemPointer ? 1 : 0, '*') + "[]"
-            : param.TypeName + std::string(param.Pointer ? 1 : 0, '*');
+        std::string spelling = SpellType(*this, param);
         // The cast escape is advised only where it compiles - a view rejects a raw 'T*' by its own
         // rule, and '(string)' of a raw value is itself refused.
         std::string advice = (param.Pointer && !param.IsArrayView && param.ConstArraySize == 0)
             ? spelling : std::string();
-        // Unmangle the callee only on the instantiation REGISTRY, never on a bare '__' in the name:
-        // DisplayNameOfMangledType splits unconditionally and would rewrite a plain 'I__x'.
-        std::string callee = gts.genericInterfaceInstances.count(ifaceName) > 0
-            ? DisplayNameOfMangledType(ifaceName) : ifaceName;
+        // Unmangle the callee only on the instantiation REGISTRY, never on a bare '__' in the name.
+        std::string callee = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
         callee += "." + methodName;
         std::string what = param.VariableName.empty()
             ? std::format("parameter of '{}'", callee)
@@ -661,11 +656,7 @@ bool LLVMBackend::RejectCodeValueIntoDataParam(const NamedVariable& arg, const T
 void LLVMBackend::LogUniqueCopyError(const std::string& typeName,
                                      const std::string& uniquePath) const
 {
-        bool writable = true;
-        const std::string shownType = IsCoreUniqueType(typeName)
-            ? DisplayNameOfCoreUniqueType(typeName)
-            : DisplayNameOfMangledType(typeName, &writable);
-        const std::string displayType = writable ? shownType : typeName;
+        const std::string displayType = SpellType(*this, TypeAndValue{ .TypeName = typeName });
         if (IsCoreUniqueType(typeName))
         {
             LogErrorMessage(
@@ -715,9 +706,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         const std::string& displayName)
 {
         std::string functionName = ResolveQualifiedName(functionNameIn, forceRoot);
-        std::string shownFunctionName = displayName.empty() ? functionName : displayName;
-        if (displayName.empty() && IsCoreUniqueType(functionName))
-            shownFunctionName = DisplayNameOfCoreUniqueType(functionName);
+        std::string shownFunctionName = displayName;
+        if (shownFunctionName.empty())
+        {
+            shownFunctionName = dataStructures.contains(functionName)
+                ? SpellType(*this, TypeAndValue{ .TypeName = functionName })
+                : SpellFunctionSymbol(*this, functionName);
+            if (IsCoreUniqueType(functionName))
+                shownFunctionName = SpellType(*this, TypeAndValue{ .TypeName = functionName });
+        }
 
         // Implicit `copy()` synthesis: a value type with no copy() of its own gets a memberwise
         // one generated on demand (the "every value type has an implicit copy() if undefined"
@@ -756,7 +753,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             LogError(std::format(
                                 "cannot copy '{}': it has a non-trivial destructor and a shallow-copied "
                                 "pointer/view field but no 'copy()' method. Write a 'copy()' method that "
-                                "defines independent state, or 'move' the value instead of copying it.", copyType));
+                                "defines independent state, or 'move' the value instead of copying it.",
+                                SpellType(*this, TypeAndValue{ .TypeName = copyType })));
                         return nullptr;
                     }
                     GetOrCreateMemberwiseCopy(copyType);
@@ -803,7 +801,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         if (funcSym == functionTable.end())
         {
             if (displayName.empty())
-                LogErrorMessage("unknown function '{}'", { functionName });
+                LogErrorMessage("unknown function '{}'", { shownFunctionName });
             else
                 LogErrorMessage("unknown generic function '{}'", { displayName });
             return nullptr;
@@ -883,9 +881,13 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             msg += std::format("  Call arguments ({}):\n", arguments.size());
             auto displayDiagnosticType = [&](const std::string& typeName) {
                 if (typeName.empty()) return typeName;
-                return IsCoreUniqueType(typeName)
-                    ? DisplayNameOfCoreUniqueType(typeName)
-                    : DisplayNameOfMangledType(typeName);
+                return SpellType(*this, TypeAndValue{ .TypeName = typeName });
+            };
+            auto displayParameterType = [&](const TypeAndValue& parameter) {
+                std::string result = SpellType(*this, parameter);
+                if (result.empty())
+                    result = displayDiagnosticType(parameter.TypeName) + PointerStars(parameter);
+                return result;
             };
             for (size_t i = 0; i < arguments.size(); i++)
             {
@@ -923,10 +925,12 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     if (i > 0) paramList += ", ";
                     const auto& p = c.Parameters[i];
-                    paramList += std::format("{}{} {}", displayDiagnosticType(p.TypeName),
-                                             PointerStars(p), p.VariableName);
+                    std::string parameterType = displayParameterType(p);
+                    if (p.IsMove) paramList += "move ";
+                    paramList += parameterType;
                 }
-                msg += std::format("    {}({})\n", displayName.empty() ? c.UniqueName : shownFunctionName, paramList);
+                const std::string candidateName = c.SourceName.empty() ? shownFunctionName : c.SourceName;
+                msg += std::format("    {}({})\n", candidateName, paramList);
             }
 
             // If exactly one resolved candidate passed MatchFunction, show per-argument type comparison
@@ -934,7 +938,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 const auto& [resolvedArgs, resolvedSym] = resolvedCandidate.front();
                 msg += std::format("  Argument mismatch detail (single resolved candidate: {}):\n",
-                    displayName.empty() ? resolvedSym.UniqueName : shownFunctionName);
+                    displayName.empty() ? SpellFunctionSymbol(*this, resolvedSym.UniqueName)
+                                         : shownFunctionName);
                 size_t count = std::max(resolvedArgs.size(), resolvedSym.Parameters.size());
                 for (size_t i = 0; i < count; i++)
                 {
@@ -965,7 +970,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!pi->IsFunctionPointer) continue;
                     std::string why = DescribeFuncPtrSignatureMismatch(arguments[i].TypeAndValue, *pi);
                     if (why.empty()) continue;
-                    msg += std::format("  [{}] {}\n", c.UniqueName, why);
+                    msg += std::format("  [{}] {}\n", SpellFunctionSymbol(*this, c.UniqueName), why);
                     break;
                 }
             }
@@ -997,13 +1002,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     // Per-shape wording: "data type" is false at the scalar cell the variadic arm
                     // also judges, and a rejection's message must be true where it fires.
                     if (ParameterStoresData(*pi))
-                        msg += std::format("  [{}] parameter {} is a data type ('{}{}') and the argument is "
+                        msg += std::format("  [{}] parameter {} is a data type ('{}') and the argument is "
                             "a function-pointer or closure VALUE - code does not convert to a data "
-                            "pointer.\n", c.UniqueName, i, pi->TypeName, pi->Pointer ? "*" : "");
+                            "pointer.\n", SpellFunctionSymbol(*this, c.UniqueName), i,
+                            displayParameterType(*pi));
                     else
                         msg += std::format("  [{}] parameter {} has type '{}' and the argument is a "
                             "function-pointer or closure VALUE - code does not convert to a "
-                            "non-pointer type.\n", c.UniqueName, i, pi->TypeName);
+                            "non-pointer type.\n", SpellFunctionSymbol(*this, c.UniqueName), i,
+                            displayParameterType(*pi));
                     break;
                 }
             }
@@ -1029,9 +1036,14 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     if (!tooDeep && !tooShallow) continue;
                     // A mangled instantiation name is not writable source, so the advice clause is
                     // dropped rather than naming a type the user cannot spell.
-                    bool writable = true;
-                    std::string shown = DisplayNameOfMangledType(pi->TypeName, &writable);
-                    std::string argShown = DisplayNameOfMangledType(arguments[i].TypeAndValue.TypeName);
+                    TypeAndValue parameterBase = *pi;
+                    parameterBase.Pointer = false;
+                    parameterBase.ElemPointer = false;
+                    parameterBase.PointerDepth = 0;
+                    parameterBase.IsArrayView = false;
+                    std::string shown = SpellType(*this, parameterBase);
+                    std::string argShown = SpellType(*this, arguments[i].TypeAndValue);
+                    const bool writable = !shown.empty();
                     // A PRIMITIVE pointer argument carries no CFlat TypeName at all, so the depth
                     // is all that is known about it - say only that, never "type '**'".
                     auto argType = [&](const char* stars, const char* unnamed) {
@@ -1044,16 +1056,19 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                             ? std::format(", or declare the parameter as '{}**'", shown) : std::string();
                         // A `T*[N]` argument decays to the element-0 ADDRESS, so the type the
                         // callee receives is `T**`; say so rather than naming the array.
+                        std::string arrayElementShown = argShown;
+                        if (arrayElementShown.ends_with("*"))
+                            arrayElementShown.pop_back();
                         std::string how = arguments[i].TypeAndValue.IsProvenDecayedDoublePointer()
-                            && !argShown.empty()
-                            ? std::format(" (a '{}*[{}]' array decays to '{}**')", argShown,
-                                arguments[i].TypeAndValue.ConstArraySize, argShown)
+                            && !arrayElementShown.empty()
+                            ? std::format(" (a '{}*[{}]' array decays to '{}**')", arrayElementShown,
+                                arguments[i].TypeAndValue.ConstArraySize, arrayElementShown)
                             : std::string();
                         msg += std::format("  [{}] parameter {} '{}' has type '{}*' and the argument has "
                             "{}{} - there is no implicit dereference. Dereference it with '*' at "
                             "the call site{}.\n",
-                            c.UniqueName, i, pi->VariableName, shown,
-                            argType("**", "one more level of indirection"), how, advice);
+                            SpellFunctionSymbol(*this, c.UniqueName), i, pi->VariableName, shown,
+                            argType("", "one more level of indirection"), how, advice);
                     }
                     else
                     {
@@ -1062,8 +1077,8 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                         msg += std::format("  [{}] parameter {} '{}' has type '{}**' and the argument has "
                             "{} - there is no implicit address-of. Take its address with '&' at "
                             "the call site{}.\n",
-                            c.UniqueName, i, pi->VariableName, shown,
-                            argType("*", "one fewer level of indirection"), advice);
+                            SpellFunctionSymbol(*this, c.UniqueName), i, pi->VariableName, shown,
+                            argType("", "one fewer level of indirection"), advice);
                     }
                     break;
                 }
@@ -1073,8 +1088,10 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             return nullptr;
         }
 
-        const std::string diagnosticFunctionName = displayName.empty()
-            ? DisplayNameOfCoreUniqueType(functionName) : displayName;
+        std::string diagnosticFunctionName = displayName.empty()
+            ? SpellFunctionSymbol(*this, functionName) : displayName;
+        if (displayName.empty() && diagnosticFunctionName == functionName)
+            diagnosticFunctionName = SpellType(*this, TypeAndValue{ .TypeName = functionName });
 
         // convert parameter to vector of llvm::value*
         std::vector<llvm::Value*> argList;
@@ -1108,7 +1125,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             {
                 LogErrorMessage(
                     "cannot pass an owning value to the variadic '{}' slot of '{}'; bind the "
-                    "value to an owner first", { "...", functionName });
+                    "value to an owner first", { "...", diagnosticFunctionName });
                 return nullptr;
             }
 
@@ -1173,7 +1190,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 if (!argShape.empty())
                 {
                     LogRawError(FormatPointerShapedInterfaceUpcastError(
-                        argShape, arg.TypeAndValue.TypeName, candParamItr->TypeName));
+                        argShape, SpellType(*this, arg.TypeAndValue), SpellType(*this, *candParamItr)));
                     return nullptr;
                 }
                 // Derive struct name from TypeName if available, else from BaseType
@@ -1522,8 +1539,15 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 {
                     const std::string sourceName = BorrowedSourceName(arg);
                     std::string uniqueType = isCoreUniqueConstructor
-                        ? DisplayNameOfCoreUniqueType(functionName)
-                        : DisplayNameOfCoreUniqueType(candidate.Parameters[0].TypeName);
+                        ? SpellType(*this, TypeAndValue{ .TypeName = functionName })
+                        : [&] {
+                            TypeAndValue base = candidate.Parameters[0];
+                            base.Pointer = false;
+                            base.ElemPointer = false;
+                            base.PointerDepth = 0;
+                            base.IsArrayView = false;
+                            return SpellType(*this, base);
+                        }();
                     std::string destinationName;
                     if (isCoreUniqueReset && !matched.empty())
                         destinationName = matched[0].CallerName.empty()
@@ -1573,7 +1597,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogErrorMessage(
                     "cannot pass owning heap array '{}' to parameter '{}' of '{}': "
                     "unique<T> does not own arrays",
-                    { sourceName, candidate.Parameters[i].VariableName, functionName });
+                    { sourceName, candidate.Parameters[i].VariableName, diagnosticFunctionName });
             }
             // The element slot of a borrowing container is a legal `move` destination: the
             // container keeps the ONLY handle afterwards (manual-free idiom), so the generic
@@ -1590,7 +1614,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                 LogError(DescribeStringLiteralIntoStructPointer(
                     candidate.Parameters[i],
                     std::format("parameter '{}' of '{}'",
-                                candidate.Parameters[i].VariableName, functionName)));
+                                candidate.Parameters[i].VariableName, diagnosticFunctionName)));
         }
 
         // C-extern ABI lowering: when the resolved candidate has struct-by-value params or
@@ -1641,7 +1665,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
         // tied to the core list receiver - a user-defined `add` method is not an ownership API.
         if (functionName == "add" && candidate.IsMethod && candidate.Parameters.size() >= 2
             && candidate.Parameters[0].Pointer
-            && candidate.Parameters[0].TypeName.starts_with("list__")
+            && MangledBase(candidate.Parameters[0].TypeName) == "list"
             && candidate.Parameters[1].IsFatInterfaceValue())
         {
             for (const auto& arg : matched)
@@ -1672,7 +1696,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
                     "call to '{}': adopt parameter '{}' requires an owned interface local or "
                     "a move-returning interface result; "
                     "a unique local or borrowed interface cannot be adopted",
-                    { functionName, candidate.Parameters[i].VariableName });
+                    { diagnosticFunctionName, candidate.Parameters[i].VariableName });
             if (!arg.CallerName.empty())
             {
                 SetVariableOwning(arg.CallerName, false);
@@ -1803,7 +1827,7 @@ llvm::Value* LLVMBackend::CreateOverloadedFunctionCall(const std::string& functi
             if (lostSink < 0) continue;
             LogRawError(DescribeLostClosureSink(candidate.Parameters[i], (size_t)lostSink,
                 std::format("parameter '{}' of '{}'",
-                            candidate.Parameters[i].VariableName, functionName)));
+                            candidate.Parameters[i].VariableName, diagnosticFunctionName)));
         }
 
         // Null out caller's storage for move parameters; mark the source moved (shared helper).
@@ -1895,7 +1919,8 @@ bool LLVMBackend::RejectAliasParamFuncPtrBind(const std::string& functionName,
                 "function '{}' cannot be used as a function pointer: its parameter '{}' is "
                 "'{}', which is passed as a reference to the caller's object and has no "
                 "function-pointer spelling. Declare the parameter '{}' instead, or drop '{}'",
-                { functionName, p.VariableName, "alias " + p.TypeName, p.TypeName + "*", "alias" });
+                { SpellFunctionSymbol(*this, functionName), p.VariableName,
+                  "alias " + SpellType(*this, p), SpellType(*this, p) + "*", "alias" });
             return true;
         }
         return false;
@@ -2175,8 +2200,9 @@ LLVMBackend::NamedVariable LLVMBackend::GetThisPointer()
 
 bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
 {
-        constexpr std::string_view prefix = "unique__";
-        if (!typeName.starts_with(prefix) || typeName.size() == prefix.size()) return false;
+        std::string_view base = MangledBase(typeName);
+        if (base == typeName || base != "unique" || typeName.size() <= base.size() + 1)
+            return false;
         // The parser and generic-instantiation queue ask this before the wrapper struct is
         // materialized. The reserved mangling plus the imported core template is sufficient.
         return gts.coreGenericTemplates.count("unique") != 0;
@@ -2184,8 +2210,9 @@ bool LLVMBackend::IsCoreUniqueType(const std::string& typeName) const
 
 bool LLVMBackend::IsCoreArrayType(const std::string& typeName) const
 {
-        constexpr std::string_view prefix = "array__";
-        if (!typeName.starts_with(prefix) || typeName.size() == prefix.size()) return false;
+        std::string_view base = MangledBase(typeName);
+        if (base == typeName || base != "array" || typeName.size() <= base.size() + 1)
+            return false;
         return gts.coreGenericTemplates.count("array") != 0;
 }
 
@@ -2197,14 +2224,15 @@ bool LLVMBackend::IsMoveOrCoreUniqueValue(const TypeAndValue& t) const
 bool LLVMBackend::IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeAndValue& param) const
 {
         if (arg.TypeAndValue.Pointer || !IsCoreUniqueType(arg.TypeAndValue.TypeName)
-            || arg.TypeAndValue.TypeName.size() <= 8)
+            || MangledGenericArgument(*this, arg.TypeAndValue.TypeName).empty())
             return false;
+        const std::string argPointee = MangledGenericArgument(*this, arg.TypeAndValue.TypeName);
         // Interface arm: unique<IShape> borrows to a plain IShape parameter through get().
         if (!param.Pointer)
             return param.IsFatInterfaceValue()
-                && arg.TypeAndValue.TypeName.substr(8) == param.TypeName;
+                && argPointee == param.TypeName;
         TypeAndValue uniquePointee;
-        uniquePointee.TypeName = arg.TypeAndValue.TypeName.substr(8);
+        uniquePointee.TypeName = argPointee;
         uniquePointee.Pointer = true;
         if (param.ElemPointer) return false;
         if (uniquePointee.TypeName == param.TypeName) return true;
@@ -2223,8 +2251,10 @@ bool LLVMBackend::IsCoreUniqueToRawPointer(const NamedVariable& arg, const TypeA
 
 bool LLVMBackend::IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeAndValue& param) const
 {
-        if (param.Pointer || !IsCoreUniqueType(param.TypeName) || param.TypeName.size() <= 8)
+        if (param.Pointer || !IsCoreUniqueType(param.TypeName)
+            || MangledGenericArgument(*this, param.TypeName).empty())
             return false;
+        const std::string paramPointee = MangledGenericArgument(*this, param.TypeName);
         bool nullPointer = arg.Primary != nullptr && llvm::isa<llvm::ConstantPointerNull>(arg.Primary);
         if (!nullPointer && arg.Primary == nullptr && arg.TypeAndValue.TypeName.empty()
             && arg.Storage != nullptr && arg.BaseType != nullptr && arg.BaseType->isPointerTy())
@@ -2233,9 +2263,9 @@ bool LLVMBackend::IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeA
             return true;
         // Interface arm: unique<IShape> is constructed from any implementor pointer or from an
         // IShape value, exactly as the explicit `unique<IShape>(new Sq())` spelling resolves.
-        if (IsInterfaceType(param.TypeName.substr(8)))
+        if (IsInterfaceType(paramPointee))
         {
-            const std::string ifaceName = param.TypeName.substr(8);
+            const std::string ifaceName = paramPointee;
             if (arg.TypeAndValue.TypeName == ifaceName) return true;
             if (arg.TypeAndValue.Pointer
                 && StructImplementsInterface(arg.TypeAndValue.TypeName, ifaceName))
@@ -2251,7 +2281,7 @@ bool LLVMBackend::IsRawPointerToCoreUnique(const NamedVariable& arg, const TypeA
         }
         const TypeAndValue uniquePointee = [&]() {
             TypeAndValue value;
-            value.TypeName = param.TypeName.substr(8);
+            value.TypeName = paramPointee;
             value.Pointer = true;
             return value;
         }();
@@ -2292,7 +2322,7 @@ bool LLVMBackend::IsStackValueToCoreUniqueInterface(const NamedVariable& arg,
             return false;
         if (!IsCoreUniqueType(param.TypeName) || param.TypeName.size() <= 8)
             return false;
-        const std::string ifaceName = param.TypeName.substr(8);
+        const std::string ifaceName = MangledGenericArgument(*this, param.TypeName);
         if (!IsInterfaceType(ifaceName) || arg.TypeAndValue.TypeName.empty())
             return false;
         return StructImplementsInterface(arg.TypeAndValue.TypeName, ifaceName);
@@ -2362,16 +2392,6 @@ llvm::Value* LLVMBackend::CreateCoreUniqueRawPointerCall(
             coreUniqueGetterSource_[result] = arg.Primary;
         return result;
 }
-
-std::string LLVMBackend::DisplayNameOfCoreUniqueType(const std::string& typeName) const
-{
-        if (!IsCoreUniqueType(typeName)) return typeName;
-        std::string arg = typeName.substr(std::string("unique__").size());
-        bool writable = true;
-        std::string shownArg = DisplayNameOfMangledType(arg, &writable);
-        if (!writable) return typeName;
-        return std::format("unique<{}>", shownArg);
-    }
 
 LLVMBackend::NamedVariable LLVMBackend::GetFunctionArgument(std::string name)
 {
@@ -2456,11 +2476,11 @@ bool LLVMBackend::IsBorrowingContainerElementSink(const std::string& functionNam
 
         std::string receiver = params[0].TypeName;
         if (!params[0].Pointer) return false;
-        size_t sep = receiver.find("__");
-        if (sep == std::string::npos) return false;   // not a generic instantiation
+        std::string_view qualifiedView = MangledBase(receiver);
+        if (qualifiedView == receiver) return false;   // not a generic instantiation
         // The template key keeps its namespace ("mylib.list"); the method table below is keyed
         // on the bare name.
-        std::string qualified = receiver.substr(0, sep);
+        std::string qualified(qualifiedView);
         std::string base = qualified;
         if (size_t dot = base.rfind('.'); dot != std::string::npos)
             base = base.substr(dot + 1);
@@ -2542,8 +2562,9 @@ bool LLVMBackend::RejectOwningLocalIntoBorrowingContainer(const std::string& fun
             "of scope - but this container only BORROWS its elements and never frees them, so the "
             "stored element would dangle. Transfer the object with '{}', or declare the container's "
             "element '{}' so the container owns it.",
-            { functionName, arg.CallerName,
-              std::format("{}({} {})", functionName, "move", arg.CallerName), "unique T*" });
+            { SpellFunctionSymbol(*this, functionName), arg.CallerName,
+              std::format("{}({} {})", SpellFunctionSymbol(*this, functionName), "move", arg.CallerName),
+              "unique T*" });
         return true;
     }
 
@@ -2570,8 +2591,9 @@ void LLVMBackend::RejectOwningLocalIntoBorrowingHelper(const std::string& functi
             "stores it into a container that only BORROWS its elements and never frees them, so "
             "the stored element would dangle. Declare parameter '{}' as 'move' and call '{}(move "
             "{})', or declare the container's element 'unique T*'.",
-            { functionName, arg.CallerName, callee.Parameters[paramIndex].VariableName,
-              callee.Parameters[paramIndex].VariableName, functionName, arg.CallerName });
+            { SpellFunctionSymbol(*this, functionName), arg.CallerName,
+              callee.Parameters[paramIndex].VariableName, callee.Parameters[paramIndex].VariableName,
+              SpellFunctionSymbol(*this, functionName), arg.CallerName });
     }
 
 void LLVMBackend::MarkVariableMoved(const std::string& name)

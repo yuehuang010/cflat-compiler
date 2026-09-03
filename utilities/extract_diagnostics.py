@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Static inventory of localizable compiler diagnostics.
 
+Diagnostic format arguments must spell types and function symbols; --report fails on a bare
+.TypeName argument or a variable whose name starts with ``mangled``.
+
 Scans the C++ sources for localizable diagnostic call sites and writes the complete
 set of English templates, their argument expressions, and their source
 locations directly into cflat/locales/en-pseudo.json. This is the
@@ -40,6 +43,9 @@ import sys
 
 CALL_NAMES = ("LogErrorMessage", "LocalizeMessage", "localizeMessage_")
 LEGACY_NAME = "LogError"
+GUARD_CALL_NAMES = CALL_NAMES + ("LogErrorContext", LEGACY_NAME)
+FORBIDDEN_FORMAT_ARGUMENT_RE = re.compile(
+    r"^(?:(?:[A-Za-z_][A-Za-z0-9_]*\.)+TypeName|mangled[A-Za-z0-9_]*)$")
 
 # (state machine) Walk C++ text once, yielding only positions that are real
 # code - not inside a comment, string, or character literal.
@@ -252,6 +258,36 @@ def looks_like_declaration(prev_token, argument_text):
     return "std::string englishTemplate" in argument_text
 
 
+def check_forbidden_format_arguments(argument_text, site, problems):
+    """Reject raw type names and mangled locals in extracted format arguments."""
+    code_positions = scan_code_positions(argument_text)
+    code_set = set(code_positions)
+    for start in find_call_starts(argument_text, code_positions, "std::format"):
+        paren = next_code_char(argument_text, start + len("std::format"), code_set)
+        if paren < 0 or argument_text[paren] != '(':
+            continue
+        nested = extract_call_arguments(argument_text, paren)
+        if nested is None:
+            continue
+        for item in split_top_level(nested)[1:]:
+            candidate = item.strip()
+            if FORBIDDEN_FORMAT_ARGUMENT_RE.fullmatch(candidate):
+                problems.append("%s: raw diagnostic format argument: %s" % (site, candidate))
+
+
+def check_direct_format_arguments(argument_text, site, problems):
+    parts = split_top_level(argument_text)
+    if len(parts) < 2:
+        return
+    candidate = parts[1].strip()
+    if not (candidate.startswith('{') and candidate.endswith('}')):
+        return
+    for item in split_top_level(candidate[1:-1]):
+        value = item.strip()
+        if FORBIDDEN_FORMAT_ARGUMENT_RE.fullmatch(value):
+            problems.append("%s: raw diagnostic format argument: %s" % (site, value))
+
+
 def scan_file(path, problems):
     with open(path, 'r', encoding='utf-8', errors='replace') as handle:
         text = handle.read()
@@ -277,6 +313,8 @@ def scan_file(path, problems):
                 continue
 
             site = "%s:%d" % (name, line_of(text, start))
+            check_direct_format_arguments(argument_text, site, problems)
+            check_forbidden_format_arguments(argument_text, site, problems)
             parts = split_top_level(argument_text)
             if not parts:
                 problems.append("%s: empty argument list" % site)
@@ -322,18 +360,22 @@ def scan_file(path, problems):
             })
 
     legacy = []
-    for start in find_call_starts(text, code_positions, LEGACY_NAME):
-        paren = next_code_char(text, start + len(LEGACY_NAME), code_set)
-        if paren < 0 or text[paren] != '(':
-            continue
-        argument_text = extract_call_arguments(text, paren)
-        if argument_text is None:
-            continue
-        if looks_like_declaration(prev_code_token(text, start), argument_text):
-            continue
-        if "std::string message" in argument_text:
-            continue
-        legacy.append("%s:%d" % (name, line_of(text, start)))
+    for call_name in ("LogErrorContext", LEGACY_NAME):
+        for start in find_call_starts(text, code_positions, call_name):
+            paren = next_code_char(text, start + len(call_name), code_set)
+            if paren < 0 or text[paren] != '(':
+                continue
+            argument_text = extract_call_arguments(text, paren)
+            if argument_text is None:
+                continue
+            if looks_like_declaration(prev_code_token(text, start), argument_text):
+                continue
+            if "std::string message" in argument_text:
+                continue
+            site = "%s:%d" % (name, line_of(text, start))
+            check_forbidden_format_arguments(argument_text, site, problems)
+            if call_name == LEGACY_NAME:
+                legacy.append(site)
 
     return entries, legacy
 
@@ -560,7 +602,9 @@ def main():
         for problem in problems:
             sys.stderr.write("  PROBLEM  %s\n" % problem)
 
-    if options.strict and problems:
+    guard_problems = [problem for problem in problems
+                      if ": raw diagnostic format argument: " in problem]
+    if (options.report and guard_problems) or (options.strict and problems):
         return 1
     return 0
 

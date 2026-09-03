@@ -3915,7 +3915,7 @@ bool testGiLiveInterfaceDeadStructMirror()
 
 // --- Legs 22/23: NESTED generic type arguments in a generic-interface signature -------------
 // The scanner once mangled the arg non-recursively (GiContainer__GiBox<int>) while the main
-// pass produced GiContainer__GiBox__int, so the pre-declared signature never matched the call.
+// pass produced GiContainer$GiBox$int, so the pre-declared signature never matched the call.
 class GiBoxCarrier : Getter<int> { int Get() { return 41; } };
 int takeGiNested_leg22(GiContainer<GiBox<int>> c) { GiBox<int> r = c.Get(); return r.tag; }
 int takeGiNested_leg23(GiContainer<Getter<int>> c) { Getter<int> inner = c.Get(); return inner.Get(); }
@@ -4028,7 +4028,7 @@ bool testGiUndecidableDeadStructDoesNotVeto()
 // 1) A GENERIC FUNCTION whose parameter is a generic interface - the mainstream shape. A check
 //    that treated "recorded as a generic-interface instance" as "must have been instantiated"
 //    hard-rejected this, because the recorded name for an uninstantiated template body is the
-//    unsubstituted placeholder 'GiContainer__T', which can never gain an interfaceTable entry.
+//    unsubstituted placeholder 'GiContainer$T', which can never gain an interfaceTable entry.
 int giTemplateGet<T>(GiContainer<T> c) { return (int)c.Get(); }
 // 2) The same with a CORE generic interface, and reached only through a template that is never
 //    instantiated - this is the form that broke a plain 'import "interfaces.cb";'.

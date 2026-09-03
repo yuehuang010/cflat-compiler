@@ -2391,6 +2391,9 @@ the null-safe `?.` operator above when a pointer may legitimately be null.
 
 Returns the type name of an expression or type as a `const char*` at compile time:
 
+The printed form uses the source spelling, with aliases folded to their canonical names. For
+example, `typeof(array<MyInt>)` prints `array<int>` when `MyInt` aliases `int`.
+
 ```c
 int  i = 0;
 bool b = false;

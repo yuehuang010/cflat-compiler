@@ -13,7 +13,7 @@ extern int main()
     // could not import)", which came from the opaque shell the forward-ref scan pre-declared for
     // every bare 'Name<Args>'. With that shell gated on the name actually naming a template, a
     // template that exists only in a dead arm names nothing and says so.
-    expect_error("unknown type 'GiDeadOnly__i32'");
+    expect_error("unknown type 'GiDeadOnly<int>'");
     GiDeadOnly<int> z = default;
     return 0;
 }

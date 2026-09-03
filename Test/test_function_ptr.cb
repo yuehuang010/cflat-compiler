@@ -1974,8 +1974,8 @@ bool testClosureListSpellingUnify()
 
     // `list<Lambda<i32(i32)>>` must be the SAME instantiation as `list<Lambda<int(int)>>`:
     // `int` and `i32` are one type, so the encoded element name must not fork on the spelling.
-    // They used to encode as __fatfn_1_3_int_3_int and __fatfn_1_3_i32_3_i32 - two container
-    // types of identical layout that did not interconvert.
+    // The new encoder gives both spellings the same key, fatfn$.1$int$int, so the container
+    // types have identical layout and interoperate.
     int cap = 5;
     list<Lambda<i32(i32)>> fns;
     fns.add((int x) => x + cap);
@@ -2543,7 +2543,7 @@ namespace SigNs
     int runNs(function<void(SigPt*)> f)      { SigPt q; f(&q); return q.a; }
 }
 
-// A GENERIC INSTANTIATION as a pointee. A signature records the MANGLED key (`Box__i32`), and
+// A GENERIC INSTANTIATION as a pointee. A signature records the MANGLED key (`Box$int`), and
 // monomorphization keeps signedness and the target-native widths, so `SigBox<i32>` and
 // `SigBox<u32>` are two instantiations - correct at the source level, since `u32` divides and
 // prints differently. Neither difference changes LAYOUT, though, so all three crossings below

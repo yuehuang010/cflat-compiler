@@ -8,6 +8,7 @@ enum class SymbolKind { Function, Struct, Interface, Namespace, TypeAlias, Field
 struct VariableInfo
 {
     std::string typeName;
+    std::string displayTypeName;
     std::string file;
     int line = 0;    // 1-based; 0 means no location recorded
     int column = 0;  // 0-based
@@ -16,6 +17,7 @@ struct VariableInfo
 struct SymbolDef
 {
     std::string name;
+    std::string displayName;
     SymbolKind kind;
     std::string file;
     int line;      // 1-based (ANTLR convention)
@@ -57,7 +59,8 @@ public:
     void Register(SymbolKind kind, const std::string& name, const std::string& file,
                   int line, int col, const std::string& sig,
                   const std::vector<std::string>& members = {},
-                  const std::string& docComment = {});
+                  const std::string& docComment = {},
+                  const std::string& displayName = {});
     void RemoveFunctionAliases(const std::string& name);
     void RegisterDefinition(const SymbolDef& def);
     void RegisterFunctionRange(const std::string& name, const std::string& file,
@@ -71,9 +74,12 @@ public:
     void RemapFile(const std::string& fromFile, const std::string& toFile);
 
     void RegisterVariable(const std::string& varName, const std::string& typeName);
+    void RegisterVariable(const std::string& varName, const std::string& typeName,
+                          const std::string& displayTypeName);
     // Overload: also records the variable's source location for go-to-definition.
     void RegisterVariable(const std::string& varName, const std::string& typeName,
-                          const std::string& file, int line, int column);
+                          const std::string& file, int line, int column,
+                          const std::string& displayTypeName = {});
     const std::string* LookupVariableType(const std::string& varName) const;
     const VariableInfo* LookupVariable(const std::string& varName) const;
 

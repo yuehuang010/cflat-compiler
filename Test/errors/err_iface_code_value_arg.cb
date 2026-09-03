@@ -143,7 +143,7 @@ expect_error("cannot pass a function-pointer or closure VALUE into parameter 's'
     }
 }
 
-// A GENERIC interface: its vtable key is the mangled 'IIcvG__i32'. The diagnostic must spell the
+// A GENERIC interface: its vtable key is the mangled 'IIcvG$int'. The diagnostic must spell the
 // interface back as source. The unmangling is gated on the instantiation REGISTRY - the leg below
 // proves the other side of that gate.
 interface IIcvG<T> { int take(T v, IcvRec* p); };

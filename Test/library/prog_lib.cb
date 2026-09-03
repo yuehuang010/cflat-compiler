@@ -1,7 +1,7 @@
 // Regression-test library: a `program` defined in an imported file.
 // Bug: CompileImportedFile did not run ScanGenericTypeUses before
-// ScanExternalDeclaration, so list__string had no opaque shell when
-// ScanProgramDefinition tried to pre-declare run(LibProgram*, list__string).
+// ScanExternalDeclaration, so list$string had no opaque shell when
+// ScanProgramDefinition tried to pre-declare run(LibProgram*, list$string).
 import "list.cb";
 
 program LibProgram {

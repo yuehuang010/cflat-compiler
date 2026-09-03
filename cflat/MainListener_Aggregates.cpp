@@ -47,7 +47,7 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(
                     "generic struct '{}' conflicts with a generic interface of the same name",
-                    structName));
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
             std::vector<std::string> valueParams;
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
             genericStructTemplates[structName] = ctx;
@@ -233,7 +233,8 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
             for (const auto& f : declList)
                 if (!f.VariableName.empty() && !seenFields.insert(f.VariableName).second)
                     LogErrorContext(ctx, std::format(
-                        "redeclaration of field '{}' in '{}'", f.VariableName, structName));
+                        "redeclaration of field '{}' in '{}'", f.VariableName,
+                        SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
         }
 
         // Bitfield packing: collapse runs of same-type bitfields into shared
@@ -434,11 +435,11 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                             else
                             {
                                 // Narrowing field initializer (e.g. u8 r = 255 has i32 literal).
-                                if (ShouldWarnImplicitFieldNarrowing(
+                if (ShouldWarnImplicitFieldNarrowing(
                                         rvalue, destType, declList[structIndex].TypeName))
                                     compiler->LogWarning(std::format(
                                         "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                        declList[structIndex].TypeName,
+                                        SpellType(*compiler, declList[structIndex]),
                                         declList[structIndex].VariableName));
                                 rvalue = compiler->CreateCast(rvalue, destType);
                             }
@@ -471,14 +472,15 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = field.TypeName;
-                if (field.Pointer) typeSig += "*";
-                if (field.ElemPointer) typeSig += "*";
+                std::string typeSig = SpellType(*compiler, field);
+                LLVMBackend::TypeAndValue ownerType;
+                ownerType.TypeName = structName;
+                const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
                 s->Register(SymbolKind::Field, structName + "." + field.VariableName,
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + structName + "." + field.VariableName);
+                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
             }
         }
 
@@ -593,7 +595,9 @@ void MainListener::ParseStructDefinition(CFlatParser::StructDefinitionContext* c
                     if (!compiler->HasInterface(ifaceName))
                     {
                         LogErrorContext(ctx, std::format(
-                            "[Capability] on '{}': unknown interface '{}'", structName, ifaceName));
+                            "[Capability] on '{}': unknown interface '{}'",
+                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName }),
+                            SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = ifaceName })));
                         continue;
                     }
                     capIfaces.push_back(compiler->ResolveInterfaceName(ifaceName));
@@ -643,7 +647,8 @@ void MainListener::EmitUnionDefaultConstructorBody(
                     "union '{}' gives field '{}' a default initializer, but field '{}' already has "
                     "one - members of a union share storage, so at most one may be initialized. "
                     "Write '= default' on all but one.",
-                    structName, tv.VariableName, declList[chosen].VariableName));
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName }),
+                    tv.VariableName, declList[chosen].VariableName));
             }
             sawExplicit = true;
             chosen = i;
@@ -804,6 +809,7 @@ llvm::Function* MainListener::FindMethodOf(const std::string& methodName, const 
 
 void MainListener::EmitProgramSyntheticTeardown(const std::string& name, llvm::Value* thisArg) {
         auto* compiler = compilerLLVM;
+        const std::string channelType = ArenaChannelTypeName(*compiler);
         auto* dtorFn      = compiler->builder->GetInsertBlock()->getParent();
         auto* progType    = compiler->dataStructures[name].StructType;
         auto* fatTy       = compiler->GetFatPtrType();   // {i8*, i8*}
@@ -870,9 +876,9 @@ void MainListener::EmitProgramSyntheticTeardown(const std::string& name, llvm::V
         // and is never freed. arena_channel::destroy() is safe on an uninitialized shell.
         if (inboxArenaIdx != (unsigned)-1)
         {
-            auto* arenaTy = compiler->dataStructures.count(kArenaChannelType)
-                            ? compiler->dataStructures[kArenaChannelType].StructType : nullptr;
-            auto* arenaDestroyFn = FindMethodOf("destroy", kArenaChannelType);
+            auto* arenaTy = compiler->dataStructures.count(channelType)
+                            ? compiler->dataStructures[channelType].StructType : nullptr;
+            auto* arenaDestroyFn = FindMethodOf("destroy", channelType);
             if (arenaTy && arenaDestroyFn)
             {
                 auto* arenaPtrTy = cflat_llvm::PointerTo(arenaTy);
@@ -906,8 +912,9 @@ void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinition
         const LLVMBackend::TypeAndValue& returnType,
         const std::vector<LLVMBackend::TypeAndValue>& params) {
         auto* compiler = compilerLLVM;
+        const std::string listStringTypeName = MangleGenericInstance(*compiler, "list", { "string" });
 
-        if (member == "run" && params.size() == 2 && params[1].TypeName == "list__string"
+        if (member == "run" && params.size() == 2 && params[1].TypeName == listStringTypeName
             && params[1].IsMove)
         {
             auto it = compiler->functionTable.find(member);
@@ -916,12 +923,12 @@ void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinition
                 for (const auto& sym : it->second)
                 {
                     if (sym.Parameters.size() != params.size()
-                        || sym.ReturnType.ToUniqueString() != returnType.ToUniqueString())
+                        || sym.ReturnType.ToUniqueString(*compiler) != returnType.ToUniqueString(*compiler))
                         continue;
                     bool sameExceptMove = true;
                     for (size_t i = 0; i < params.size(); i++)
                     {
-                        if (sym.Parameters[i].ToUniqueString() != params[i].ToUniqueString()
+                        if (sym.Parameters[i].ToUniqueString(*compiler) != params[i].ToUniqueString(*compiler)
                             || (i == params.size() - 1 && sym.Parameters[i].IsMove))
                         {
                             sameExceptMove = false;
@@ -959,6 +966,7 @@ void MainListener::RejectIfProgramMemberSlotTaken(CFlatParser::ProgramDefinition
 
 void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::ProgramDefinitionContext* ctx) {
         auto* compiler = compilerLLVM;
+        const std::string listStringTypeName = MangleGenericInstance(*compiler, "list", { "string" });
 
         // Resolve types - all must be concrete by this point (ProcessPendingInstantiations ran)
         auto* progType        = compiler->dataStructures[name].StructType;
@@ -967,7 +975,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             return it != compiler->dataStructures.end() ? it->second.StructType : nullptr;
         };
         auto* defAllocType    = findStructType("MallocAllocator");
-        auto* listStringType  = findStructType("list__string");
+        auto* listStringType  = findStructType(listStringTypeName);
         auto* stringStructType= findStructType("string");
         auto* threadType      = findStructType("Thread");
         auto* fatTy           = compiler->GetFatPtrType();   // {i8*, i8*}
@@ -975,9 +983,10 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
         if (!progType || !defAllocType || !listStringType || !threadType)
         {
             compiler->LogError(std::format(
-                "program '{}': missing required type (MallocAllocator={}, list__string={}, Thread={})",
+                "program '{}': missing required type (MallocAllocator={}, {}={}, Thread={})",
                 name,
                 defAllocType  ? "ok" : "missing",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = listStringTypeName }),
                 listStringType ? "ok" : "missing",
                 threadType    ? "ok" : "missing"));
             return;
@@ -989,7 +998,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
         auto* i32Type        = llvm::Type::getInt32Ty(*compiler->context);
         auto* i64Type        = llvm::Type::getInt64Ty(*compiler->context);
 
-        // __RunArgs_Name = { Name*, list__string }
+        // __RunArgs_Name = { Name*, list$string }
         auto* runArgsType = llvm::StructType::create(
             *compiler->context, {progPtrType, listStringType}, "__RunArgs_" + name);
         compiler->programTable[name].RunArgsType = runArgsType;
@@ -1168,7 +1177,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             auto* selfGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 0, "self_gep");
             auto* self     = compiler->builder->CreateLoad(progPtrType, selfGEP, "self");
 
-            // Pointer to list__string (field 1) - passed by value to main
+            // Pointer to list$string (field 1) - passed by value to main
             auto* argsGEP  = compiler->builder->CreateStructGEP(runArgsType, argsPacket, 1, "args_gep");
 
             // Load self->_allocator (IAllocator fat-ptr); user may have set it before run().
@@ -1308,7 +1317,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
 
             auto* cleanupBB = llvm::BasicBlock::Create(*compiler->context, "seh_cleanup", trampolineFn);
 
-            // Load list__string args by value from the packet
+            // Load list$string args by value from the packet
             llvm::Value* argsVal = compiler->builder->CreateLoad(listStringType, argsGEP, "args_val");
 
             // Re-home the args into the program allocator: the caller built them under the CRT
@@ -1593,11 +1602,11 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             // takes ownership (and frees it at scope exit); a no-arg or main(argc,argv) entry
             // never receives the list, so the packet's copy (_data buffer + owning string
             // elements) would otherwise leak. The active allocator is already nulled above, so
-            // ~list__string frees under the CRT allocator the caller built the args with; the
+            // ~list$string frees under the CRT allocator the caller built the args with; the
             // argv array (which only borrows each element's _ptr) was just freed above.
             if (!isListArgs)
             {
-                if (auto* argsDtor = compiler->GetOrCreateFullDestructor("list__string"))
+                if (auto* argsDtor = compiler->GetOrCreateFullDestructor(listStringTypeName))
                     compiler->builder->CreateCall(argsDtor->getFunctionType(), argsDtor, {argsGEP});
             }
 
@@ -1608,7 +1617,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
         }
 
         // ======================================================================
-        // EMIT run(): bool run(Name* this, list__string args)
+        // EMIT run(): bool run(Name* this, list$string args)
         // Allocates args packet, spawns thread into self->_thread, returns
         // whether the thread started. Does NOT join - caller uses WaitForExit().
         // ======================================================================
@@ -1617,7 +1626,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             LLVMBackend::DeclTypeAndValue thisParam;
             thisParam.TypeName = name;  thisParam.VariableName = name + "__";  thisParam.Pointer = true;
             LLVMBackend::DeclTypeAndValue argsParam;
-            argsParam.TypeName = "list__string";  argsParam.VariableName = "args";
+            argsParam.TypeName = listStringTypeName;  argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
 
             RejectIfProgramMemberSlotTaken(ctx, name, "run", "bool run(move list<string>)",
@@ -1626,7 +1635,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             compiler->programTable[name].RunFunction = runFn;
 
             auto* thisArg = runFn->getArg(0);   // Name*
-            auto* argsArg = runFn->getArg(1);   // list__string by value (move)
+            auto* argsArg = runFn->getArg(1);   // list$string by value (move)
 
             // Malloc the args packet (raw malloc - tracked alloc is per-thread)
             auto* pkgSize = compiler->GetTypeSizeBytes(runArgsType);
@@ -1642,7 +1651,7 @@ void MainListener::EmitProgramRunWrapper(const std::string& name, CFlatParser::P
             auto* argsGEP = compiler->builder->CreateStructGEP(runArgsType, pkg, 1, "pkg_args_gep");
             compiler->builder->CreateStore(argsArg, argsGEP);
 
-            // Zero run()'s args alloca so ~list__string is a no-op at scope exit.
+            // Zero run()'s args alloca so ~list$string is a no-op at scope exit.
             // Ownership of _data transfers to the packet; trampoline frees the packet on completion.
             {
                 auto& runArgNV = compiler->stackNamedVariable.back().functionArgument["args"];
@@ -2008,14 +2017,14 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             // (see ParseProgramDefinition for the full rationale). Both default null.
             if (hasArenaChannelType) {
                 LLVMBackend::DeclTypeAndValue inboxArenaField;
-                inboxArenaField.TypeName     = kArenaChannelType;
+                inboxArenaField.TypeName     = ArenaChannelTypeName(*compiler);
                 inboxArenaField.VariableName = "inbox";
                 inboxArenaField.Pointer      = true;
                 inboxArenaFieldIndex = (unsigned)declList.size();
                 declList.push_back(inboxArenaField);
 
                 LLVMBackend::DeclTypeAndValue outboxField;
-                outboxField.TypeName     = kArenaChannelType;
+                outboxField.TypeName     = ArenaChannelTypeName(*compiler);
                 outboxField.VariableName = "outbox";
                 outboxField.Pointer      = true;
                 outboxFieldIndex = (unsigned)declList.size();
@@ -2184,7 +2193,8 @@ void MainListener::ParseImportedProgramDefinition(const std::string& name) {
             // but a non-null `this` prevents crashes if recv/send is called before `>>` wires the channel.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
-                auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
+                auto* arenaTy = compiler->GetDataStructure(
+                    ArenaChannelTypeName(*compiler)).StructType;
                 llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
                 if (!shell) shell = llvm::Constant::getNullValue(cflat_llvm::PointerTo(arenaTy));
                 structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
@@ -2356,14 +2366,14 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             // that never message pay nothing.
             if (hasArenaChannelType) {
                 LLVMBackend::DeclTypeAndValue inboxArenaField;
-                inboxArenaField.TypeName     = kArenaChannelType;
+                inboxArenaField.TypeName     = ArenaChannelTypeName(*compiler);
                 inboxArenaField.VariableName = "inbox";
                 inboxArenaField.Pointer      = true;
                 inboxArenaFieldIndex = (unsigned)declList.size();
                 declList.push_back(inboxArenaField);
 
                 LLVMBackend::DeclTypeAndValue outboxField;
-                outboxField.TypeName     = kArenaChannelType;
+                outboxField.TypeName     = ArenaChannelTypeName(*compiler);
                 outboxField.VariableName = "outbox";
                 outboxField.Pointer      = true;
                 outboxFieldIndex = (unsigned)declList.size();
@@ -2458,7 +2468,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                             if (ShouldWarnImplicitFieldNarrowing(rvalue, destType, declList[idx].TypeName))
                                 compiler->LogWarning(std::format(
                                     "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    declList[idx].TypeName,
+                                    SpellType(*compiler, declList[idx]),
                                     declList[idx].VariableName));
                             rvalue = compiler->CreateCast(rvalue, destType);
                         }
@@ -2553,7 +2563,8 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             // but a non-null `this` prevents crashes if recv/send is called before `>>` wires the channel.
             if (inboxArenaFieldIndex != (unsigned)-1)
             {
-                auto* arenaTy = compiler->GetDataStructure(kArenaChannelType).StructType;
+                auto* arenaTy = compiler->GetDataStructure(
+                    ArenaChannelTypeName(*compiler)).StructType;
                 llvm::Value* shell = EmitArenaChannelShellAlloc(compiler);
                 if (!shell) shell = llvm::Constant::getNullValue(cflat_llvm::PointerTo(arenaTy));
                 structVal = compiler->CreateInsertValue(structVal, shell, inboxArenaFieldIndex);
@@ -2578,14 +2589,15 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = field.TypeName;
-                if (field.Pointer) typeSig += "*";
-                if (field.ElemPointer) typeSig += "*";
+                std::string typeSig = SpellType(*compiler, field);
+                LLVMBackend::TypeAndValue ownerType;
+                ownerType.TypeName = name;
+                const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
                 s->Register(SymbolKind::Field, name + "." + field.VariableName,
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + name + "." + field.VariableName);
+                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
             }
         }
 
@@ -2643,7 +2655,7 @@ void MainListener::ParseProgramDefinition(CFlatParser::ProgramDefinitionContext*
             }
         }
 
-        // Flush instantiations (e.g. list__string from main's params) before emitting run()
+        // Flush instantiations (e.g. list$string from main's params) before emitting run()
         ProcessPendingInstantiations();
 
         // Emit auto-generated run(), WaitForExit(), and __program_run_Name trampoline
@@ -2678,7 +2690,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                 || genericInterfaceTemplates.count(structName) != 0)
                 LogErrorContext(ctx, std::format(
                     "generic class '{}' conflicts with a generic interface of the same name",
-                    structName));
+                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })));
             std::vector<std::string> valueParams;
             auto typeParams = ParseGenericTypeParameters(ctx->genericTypeParameters(), &valueParams);
             genericClassTemplates[structName] = ctx;
@@ -2714,12 +2726,16 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
             auto ids = ctx->baseSpecifier();
             if (ids.empty() || BaseSpecifierName(ids[0]).empty())
             {
-                LogErrorContext(ctx, "[winrt] class '" + structName + "' must implement exactly one interface");
+                LogErrorContext(ctx, "[winrt] class '"
+                    + SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })
+                    + "' must implement exactly one interface");
                 return;
             }
             if (ids.size() > 1)
             {
-                LogErrorContext(ctx, "[winrt] class '" + structName + "' may implement only one interface in this milestone");
+                LogErrorContext(ctx, "[winrt] class '"
+                    + SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structName })
+                    + "' may implement only one interface in this milestone");
                 return;
             }
             // Passed through verbatim: a WinMD projected interface is registered under its own
@@ -3051,7 +3067,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                                     rvalue, destType, declList[structIndex].TypeName))
                                 compiler->LogWarning(std::format(
                                     "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    declList[structIndex].TypeName,
+                                    SpellType(*compiler, declList[structIndex]),
                                     declList[structIndex].VariableName));
                             rvalue = compiler->CreateCast(rvalue, destType);
                         }
@@ -3080,14 +3096,15 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     if (!ann.Value.empty()) annSig += "(" + ann.Value + ")";
                     annSig += "] ";
                 }
-                std::string typeSig = field.TypeName;
-                if (field.Pointer) typeSig += "*";
-                if (field.ElemPointer) typeSig += "*";
+                std::string typeSig = SpellType(*compiler, field);
+                LLVMBackend::TypeAndValue ownerType;
+                ownerType.TypeName = structName;
+                const std::string displayFieldName = SpellType(*compiler, ownerType) + "." + field.VariableName;
                 s->Register(SymbolKind::Field, structName + "." + field.VariableName,
                             compiler->GetSourceFilePath(),
                             (int)ctx->getStart()->getLine(),
                             (int)ctx->getStart()->getCharPositionInLine(),
-                            annSig + typeSig + " " + structName + "." + field.VariableName);
+                            annSig + typeSig + " " + displayFieldName, {}, displayFieldName);
             }
         }
 
@@ -3663,7 +3680,7 @@ void MainListener::ParseConstructorDefinition(CFlatParser::FunctionDefinitionCon
                             if (ShouldWarnImplicitFieldNarrowing(fieldVal, destType, field.TypeName))
                                 compiler->LogWarning(std::format(
                                     "implicit narrowing to '{}' in field '{}' - use an explicit cast",
-                                    field.TypeName, field.VariableName));
+                                    SpellType(*compiler, field), field.VariableName));
                             fieldVal = compiler->CreateCast(fieldVal, destType);
                         }
                     }

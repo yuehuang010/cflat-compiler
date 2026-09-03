@@ -15,7 +15,7 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot
 
 // The generic spelling of the same brace-init store: the field is made owning by
 // substitution (IsUniqueTypeArg), which this path's IsUnique-only gate could not see.
-// Prefix-pinned to keep the `Box__unique_Nodeptr` mangling out of the assertion.
+// Prefix-pinned to keep the `Box$unique$.p$Node` mangling out of the assertion.
 struct Box<T> { T t = default; };
 
 expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {

@@ -596,6 +596,12 @@ private:
             HandleDefinition(msg, id);
         else if (method == "textDocument/completion")
             HandleCompletion(msg, id);
+        else if (method == "textDocument/signatureHelp")
+            HandleSignatureHelp(msg, id);
+        else if (method == "textDocument/documentSymbol")
+            HandleDocumentSymbol(msg, id);
+        else if (method == "workspace/symbol")
+            HandleWorkspaceSymbol(msg, id);
         else if (method == "cflat/runDiagnostics")
             HandleRunDiagnostics(msg);
         else if (method == "cflat/viewAssembly")
@@ -684,7 +690,12 @@ private:
                 {"definitionProvider", true},
                 {"completionProvider", {
                     {"triggerCharacters", {".", ">", ":", "#"}}
-                }}
+                }},
+                {"signatureHelpProvider", {
+                    {"triggerCharacters", {"(", ","}}
+                }},
+                {"documentSymbolProvider", true},
+                {"workspaceSymbolProvider", true}
                 // Unused-code hints are pushed as diagnostics carrying the Unnecessary
                 // tag (see PublishDiagnostics); the client renders those faded with no
                 // extra server capability required.
@@ -898,8 +909,12 @@ private:
             // Lookup misses them; surface their type plus that type's description.
             if (const std::string* vt = index->LookupVariableType(word); vt && !vt->empty())
             {
-                value = CodeFence(*vt + " " + word);
-                AppendTypeDoc(value, *vt, index.get());
+                std::string displayType = *vt;
+                if (const VariableInfo* vi = index->LookupVariable(word);
+                    vi != nullptr && !vi->displayTypeName.empty())
+                    displayType = vi->displayTypeName;
+                value = CodeFence(displayType + " " + word);
+                AppendTypeDoc(value, displayType, index.get());
             }
             else
             {
@@ -954,12 +969,11 @@ private:
         });
     }
 
-    // For a generic instantiation mangled as "array__Explosion", returns "array".
-    // Returns the name unchanged if no "__" separator is present.
+    // For a generic instantiation mangled as "array$Explosion", returns "array".
+    // Returns the name unchanged if no "$" separator is present.
     static std::string StripGenericSuffix(const std::string& name)
     {
-        size_t dunder = name.find("__");
-        return dunder != std::string::npos ? name.substr(0, dunder) : name;
+        return std::string(MangledBase(name));
     }
 
     // Leading type-name path of a decorated type or a "Type name" signature, e.g.
@@ -1003,10 +1017,10 @@ private:
             if (base == "string")
             {
                 // The builtin string keeps its friendly spelling, while its generic
-                // member instantiation is indexed as list__string.
-                if (index->Lookup("list__string")
-                    || !index->LookupPrefix("list__string.").empty())
-                    base = "list__string";
+                // member instantiation is indexed as list$string.
+                if (index->Lookup("list$string")
+                    || !index->LookupPrefix("list$string.").empty())
+                    base = "list$string";
                 break;
             }
 
@@ -1023,7 +1037,7 @@ private:
     }
 
     // Element type of an indexed container/array/pointer type:
-    //   "array__Sphere" -> "Sphere", "Sphere[10]"/"Sphere[]" -> "Sphere",
+    //   "array$Sphere" -> "Sphere", "Sphere[10]"/"Sphere[]" -> "Sphere",
     //   "Sphere*" -> "Sphere". A fixed array stores its element type directly, so a
     // plain "Sphere" (no container wrapper) is returned unchanged.
     static std::string ElementType(const std::string& type)
@@ -1033,8 +1047,8 @@ private:
             t = t.substr(0, br);
         while (!t.empty() && t.back() == ' ') t.pop_back();
         if (!t.empty() && t.back() == '*') return StripPointer(t);
-        if (size_t u = t.find("__"); u != std::string::npos && u > 0)
-            return t.substr(u + 2);
+        if (std::string_view base = MangledBase(t); base != t && !base.empty())
+            return t.substr(base.size() + 1);
         return t;
     }
 
@@ -1301,7 +1315,7 @@ private:
             // LookupPrefix("TypeName.partial") returns matching fields and methods.
             auto members = index->LookupPrefix(typeName + "." + partial);
             // Generic instantiation: also try the template name (e.g. "array" from
-            // "array__Explosion") so methods defined on the template show up.
+            // "array$Explosion") so methods defined on the template show up.
             if (members.empty())
                 members = index->LookupPrefix(StripGenericSuffix(typeName) + "." + partial);
             for (const SymbolDef* def : members)
@@ -1330,7 +1344,7 @@ private:
             for (const SymbolDef* def : defs)
             {
                 nlohmann::json item = {
-                    {"label",  def->name},
+                    {"label",  def->displayName.empty() ? def->name : def->displayName},
                     {"detail", def->signatureMarkdown}
                 };
                 switch (def->kind)
@@ -1347,6 +1361,135 @@ private:
             }
         }
         SendResponse(id, { {"isIncomplete", false}, {"items", std::move(items)} });
+    }
+
+    static int LspSymbolKindValue(SymbolKind kind)
+    {
+        switch (kind)
+        {
+            case SymbolKind::Function:  return 12;
+            case SymbolKind::Struct:    return 23;
+            case SymbolKind::Interface: return 11;
+            case SymbolKind::Namespace: return 3;
+            case SymbolKind::TypeAlias: return 26;
+            case SymbolKind::Field:     return 8;
+            case SymbolKind::Variable:  return 13;
+        }
+        return 13;
+    }
+
+    static std::string DisplaySymbolName(const SymbolDef& def)
+    {
+        return def.displayName.empty() ? def.name : def.displayName;
+    }
+
+    static nlohmann::json SymbolRange(const SymbolDef& def)
+    {
+        const std::string name = DisplaySymbolName(def);
+        lsp::Position start{std::max(0, def.line - 1), std::max(0, def.column)};
+        lsp::Position end{start.line, start.character + static_cast<int>(name.size())};
+        return lsp::rangeToJson({start, end});
+    }
+
+    void HandleSignatureHelp(const nlohmann::json& msg,
+                             const std::optional<nlohmann::json>& id)
+    {
+        const auto* params = GetParams(msg);
+        if (!params) { SendResponse(id, nullptr); return; }
+
+        std::string uri;
+        int line = 0, character = 0;
+        ExtractTextDocPosition(*params, uri, line, character);
+        std::string text;
+        {
+            std::lock_guard<std::mutex> lock(docsMutex_);
+            if (auto it = docs_.find(uri); it != docs_.end())
+                text = it->second.text;
+        }
+
+        std::string word = extractWordAt(text, line, character);
+        auto index = GetCurrentIndex();
+        std::string receiver;
+        const SymbolDef* def = ResolveQualifiedSymbol(index.get(), text, line, character,
+                                                      word, receiver);
+        if (!def && !word.empty() && receiver.empty())
+            def = index->Lookup(word);
+        if (!def || def->kind != SymbolKind::Function)
+        {
+            SendResponse(id, nullptr);
+            return;
+        }
+
+        std::vector<std::string> signatures;
+        signatures.push_back(def->signatureMarkdown);
+        signatures.insert(signatures.end(), def->overloadSignatures.begin(),
+                          def->overloadSignatures.end());
+        nlohmann::json result = {
+            {"signatures", nlohmann::json::array()},
+            {"activeSignature", 0},
+            {"activeParameter", 0}
+        };
+        for (const std::string& signature : signatures)
+        {
+            nlohmann::json item = {{"label", signature}};
+            if (!def->docComment.empty())
+                item["documentation"] = def->docComment;
+            result["signatures"].push_back(std::move(item));
+        }
+        SendResponse(id, std::move(result));
+    }
+
+    void HandleDocumentSymbol(const nlohmann::json& msg,
+                              const std::optional<nlohmann::json>& id)
+    {
+        const auto* params = GetParams(msg);
+        if (!params) { SendResponse(id, nlohmann::json::array()); return; }
+        std::string uri = params->contains("textDocument") && (*params)["textDocument"].is_object()
+            ? (*params)["textDocument"].value("uri", "") : std::string{};
+        const std::string file = uriToFilePath(uri);
+        auto index = GetCurrentIndex();
+        nlohmann::json result = nlohmann::json::array();
+        for (const auto& [name, def] : index->Symbols())
+        {
+            if (!file.empty() && def.file != file)
+                continue;
+            const std::string displayName = DisplaySymbolName(def);
+            nlohmann::json item = {
+                {"name", displayName},
+                {"detail", def.signatureMarkdown},
+                {"kind", LspSymbolKindValue(def.kind)},
+                {"range", SymbolRange(def)},
+                {"selectionRange", SymbolRange(def)}
+            };
+            result.push_back(std::move(item));
+        }
+        SendResponse(id, std::move(result));
+    }
+
+    void HandleWorkspaceSymbol(const nlohmann::json& msg,
+                               const std::optional<nlohmann::json>& id)
+    {
+        const auto* params = GetParams(msg);
+        const std::string query = params ? params->value("query", "") : std::string{};
+        auto index = GetCurrentIndex();
+        nlohmann::json result = nlohmann::json::array();
+        for (const auto& [name, def] : index->Symbols())
+        {
+            const std::string displayName = DisplaySymbolName(def);
+            if (!query.empty() && displayName.find(query) == std::string::npos
+                && name.find(query) == std::string::npos)
+                continue;
+            result.push_back({
+                {"name", displayName},
+                {"detail", def.signatureMarkdown},
+                {"kind", LspSymbolKindValue(def.kind)},
+                {"location", {
+                    {"uri", filePathToUri(def.file)},
+                    {"range", SymbolRange(def)}
+                }}
+            });
+        }
+        SendResponse(id, std::move(result));
     }
 
     void HandleRunDiagnostics(const nlohmann::json& msg)
@@ -2247,7 +2390,7 @@ private:
             timings.emitMs = ElapsedMs(emitStart);
             timings.incremental = backend->LastOptimizedViewWasIncremental();
             finishTiming();
-            auto response = BuildOptimizationInfoResponse(job, collected, timings);
+            auto response = BuildOptimizationInfoResponse(job, *backend, collected, timings);
             InsertCachedView(MakeViewCacheKey(uri, text, *job.irRequest), response);
             SendOptimizationInfoResult(job, std::move(response), timings);
             return true;
@@ -2408,7 +2551,8 @@ private:
     }
 
     nlohmann::json BuildOptimizationInfoResponse(
-        const AnalysisJob& job, const LLVMBackend::OptimizationInfo& collected,
+        const AnalysisJob& job, const LLVMBackend& backend,
+        const LLVMBackend::OptimizationInfo& collected,
         const ViewTimings& timings)
     {
         nlohmann::json functions = nlohmann::json::array();
@@ -2424,7 +2568,7 @@ private:
                 });
             functions.push_back({
                 {"name", info.name},
-                {"symbol", info.symbol},
+                {"symbol", SpellFunctionSymbol(backend, info.symbol)},
                 {"startLine", info.startLine},
                 {"endLine", info.endLine},
                 {"irInstructions", info.irInstructions},
@@ -2458,11 +2602,11 @@ private:
                 {"name", remark.name},
                 {"kind", remark.kind},
                 {"message", remark.message},
-                {"function", remark.function},
+                {"function", SpellFunctionSymbol(backend, remark.function)},
                 {"file", remark.file},
                 {"srcLine", remark.srcLine},
                 {"srcColumn", remark.srcColumn},
-                {"calleeName", remark.calleeName},
+                {"calleeName", SpellFunctionSymbol(backend, remark.calleeName)},
                 {"calleeLine", remark.calleeLine},
                 {"args", std::move(args)}
             });
@@ -2470,12 +2614,21 @@ private:
 
         nlohmann::json instantiations = nlohmann::json::array();
         for (const auto& group : collected.instantiations)
+        {
+            nlohmann::json symbols = nlohmann::json::array();
+            for (const auto& raw : group.symbols)
+            {
+                LLVMBackend::TypeAndValue type;
+                type.TypeName = raw;
+                symbols.push_back(SpellType(backend, type));
+            }
             instantiations.push_back({
                 {"base", group.base},
                 {"count", group.count},
                 {"bytes", group.bytes},
-                {"symbols", group.symbols}
+                {"symbols", std::move(symbols)}
             });
+        }
 
         return {
             {"optLevel", job.irRequest->optLevel},

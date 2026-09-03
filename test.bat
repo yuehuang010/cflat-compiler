@@ -330,7 +330,7 @@ if errorlevel 1 (
     goto DefinesDone
 )
 set DEFINES_IR_COUNT=0
-for /f %%c in ('findstr /r /c:"^%%Buf__i32__8 = type" "%DEFINES_IR%" ^| find /c /v ""') do set DEFINES_IR_COUNT=%%c
+for /f %%c in ('findstr /r /c:"^%%.Buf\$int\$.8. = type" "%DEFINES_IR%" ^| find /c /v ""') do set DEFINES_IR_COUNT=%%c
 if not "%DEFINES_IR_COUNT%"=="1" (
     echo FAILED: equivalent folded values did not share one generic instantiation >"%DEFINES_RESULT%"
     goto DefinesDone

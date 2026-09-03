@@ -99,8 +99,8 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
 {
         if (sites.empty())
         {
-            LogErrorMessage("'{}' return: function '{}' has no return statement; explicit return required for type inference",
-                            { "auto", functionName });
+                            LogErrorMessage("'{}' return: function '{}' has no return statement; explicit return required for type inference",
+                            { "auto", SpellFunctionSymbol(*this, functionName) });
             return oldFn;
         }
 
@@ -117,7 +117,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             if (siteTy->isVoidTy() || unifiedTy->isVoidTy())
             {
                 LogErrorMessage("'{}' return: cannot mix '{}' and '{}' in function '{}'",
-                                { "auto", "return;", "return <expr>;", functionName });
+                                { "auto", "return;", "return <expr>;", SpellFunctionSymbol(*this, functionName) });
                 return oldFn;
             }
             int srcToCur = CompareUpconvert(siteTy, unifiedTy);   // widens to current?
@@ -127,7 +127,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             else
             {
                 LogErrorMessage("'{}' return: cannot unify return types in function '{}'",
-                                { "auto", functionName });
+                                { "auto", SpellFunctionSymbol(*this, functionName) });
                 return oldFn;
             }
         }
@@ -148,7 +148,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
             // Discard the placeholder; the existing definition wins.
             if (!oldFn->use_empty())
                 LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported",
-                                { "auto", functionName });
+                                { "auto", SpellFunctionSymbol(*this, functionName) });
             ForgetFunctionEscapeMemo(oldFn);
             oldFn->eraseFromParent();
             return existing;
@@ -230,7 +230,7 @@ llvm::Function* LLVMBackend::FinalizeAutoReturnFunction(
         // Diagnose explicitly rather than letting LLVM's verifier complain later.
         if (!oldFn->use_empty())
             LogErrorMessage("'{}' return: recursive call in function '{}' is not yet supported - declare the return type explicitly",
-                            { "auto", functionName });
+                            { "auto", SpellFunctionSymbol(*this, functionName) });
 
         MigrateUniqueFieldBorrowReturn(oldFn, newFn);
         ForgetFunctionEscapeMemo(oldFn);

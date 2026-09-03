@@ -112,8 +112,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         std::vector<std::string> typeArgs;
                         for (auto* entry : tts->tupleTypeEntry())
                             typeArgs.push_back(TupleEntryArgName(compiler, entry));
-                        std::string mangledName = "tuple";
-                        for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(compiler, arg);
+                        std::string mangledName = MangleGenericInstance(*compiler, "tuple", typeArgs);
                         compiler->CreateStructType(mangledName, {});
                         LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                         compiler->CreateFunctionDeclaration(mangledName, rt, {});
@@ -204,7 +203,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     auto* genParams = GenericSpecOf(typeSpec, baseName);
                     if (genParams != nullptr)
                     {
-                        // Generic type instantiation: Box<MyType> -> Box__MyType
+                        // Generic type instantiation: Box<MyType> -> Box$MyType
                         baseName = compiler->ResolveGenericBaseAlias(baseName);
                         std::vector<std::string> typeArgs;
                     for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
@@ -224,8 +223,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         else
                             typeArgs.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
                     }
-                    std::string mangledName = baseName;
-                    for (const auto& arg : typeArgs) mangledName += "__" + MangleTypeArg(compiler, arg);
+                    std::string mangledName = MangleGenericInstance(*compiler, baseName, typeArgs);
                     // A generic INTERFACE instantiation is a fat pointer, not a struct: no shell,
                     // no default ctor. Mark it now - interfaceTable only fills in the main pass.
                     // The genericInterfaceInstances insert is deferred to the common tail below,
@@ -234,10 +232,11 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     {
                         genericSpecIsInterface = true;
                         // Re-mangle through ResolveForwardTypeArg so a nested generic argument
-                        // (Container<Box<int>>) matches the main pass's Container__Box__int.
-                        mangledName = baseName;
+                        // (Container<Box<int>>) matches the main pass's Container$Box$int.
+                        std::vector<std::string> interfaceArgs;
                         for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
-                            mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
+                            interfaceArgs.push_back(ResolveForwardTypeArg(entry));
+                        mangledName = MangleGenericInstance(*compiler, baseName, interfaceArgs);
                     }
                     // No template anywhere by this name: skip the shell, which would suppress the
                     // `unknown type` this declaration is owed. Main pass gates alike (isKnownTemplate).
@@ -330,19 +329,33 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 }
                 if (ArrayPtrOf(declSpec))
                 {
+                    LLVMBackend::TypeAndValue baseType = declType;
+                    baseType.Pointer = false;
+                    baseType.ElemPointer = false;
+                    baseType.PointerDepth = 0;
+                    baseType.IsArrayView = false;
+                    const std::string baseSpelling = SpellType(*compiler, baseType);
                     if (declType.IsArrayView)
                         compiler->LogError(std::format("pointer to array-view '{}[]*' is not a valid type. "
                             "To return several results, return one 'T[]' and pass the rest as out-parameters: "
                             "a 'T[]' for arrays (each keeps its noalias contract) and a 'T*' for scalars.",
-                            declType.TypeName));
+                            baseSpelling));
                     else
                         compiler->LogError(std::format("pointer to fixed array '{}[N]*' is not a valid type; "
                             "pass '{}*' (a fixed array decays to a pointer to its first element).",
-                            declType.TypeName, declType.TypeName));
+                            baseSpelling, baseSpelling));
                 }
                 declType.IsInterface = genericSpecIsInterface || compiler->IsInterfaceType(declType.TypeName);
                 if (declType.IsInterface && declSpec->pointer() != nullptr)
-                    compiler->LogError(std::format("pointer '*' is not allowed on interface type '{}'", declType.TypeName));
+                {
+                    LLVMBackend::TypeAndValue interfaceBase = declType;
+                    interfaceBase.Pointer = false;
+                    interfaceBase.ElemPointer = false;
+                    interfaceBase.PointerDepth = 0;
+                    interfaceBase.IsArrayView = false;
+                    compiler->LogError(std::format("pointer '*' is not allowed on interface type '{}'",
+                        SpellType(*compiler, interfaceBase)));
+                }
                 // Past the throwing checks: this spec really does name a generic interface.
                 if (genericSpecIsInterface)
                     compiler->gts.genericInterfaceInstances.insert(declType.TypeName);
@@ -380,7 +393,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     && (declSpecs->parent == nullptr
                         || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
                 {
-                    declType.TypeName = "unique__" + MangleTypeArg(compiler, declType.TypeName);
+                    declType.TypeName = MangleGenericInstance(*compiler, "unique", { declType.TypeName });
                     if ((isParameterDecl || isReturnDecl)
                         && compiler->AnyGenericTypeTemplateNamed("unique"))
                     {
@@ -408,7 +421,8 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
-                        compiler->LogError(std::format("nullable '?' is not allowed on primitive type '{}'", declType.TypeName));
+                        compiler->LogError(std::format("nullable '?' is not allowed on primitive type '{}'",
+                            SpellType(*compiler, declType)));
                     else
                     {
                         declType.IsNullable = true;
@@ -578,8 +592,16 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
         {
             // Qualify member methods with their owning type ("double vec3.dot(...)"),
             // mirroring how namespace functions already carry their namespace in `name`.
-            std::string displayName = structName.empty() ? name : structName + "." + rawFuncName;
-            std::string sig = returnType.TypeName + (returnType.Pointer ? "*" : "") + " " + displayName + "(";
+            std::string displayTypeName = SpellType(*compiler, returnType);
+            std::string displayOwnerName;
+            if (!structName.empty())
+            {
+                LLVMBackend::TypeAndValue ownerType;
+                ownerType.TypeName = structName;
+                displayOwnerName = SpellType(*compiler, ownerType);
+            }
+            std::string displayName = structName.empty() ? name : displayOwnerName + "." + rawFuncName;
+            std::string sig = displayTypeName + " " + displayName + "(";
             bool first = true;
             for (const auto& p : params)
             {
@@ -588,15 +610,14 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                     continue;
                 if (!first) sig += ", ";
                 first = false;
-                sig += p.TypeName;
-                if (p.Pointer) sig += "*";
+                sig += SpellType(*compiler, p);
                 if (!p.VariableName.empty()) sig += " " + p.VariableName;
             }
             sig += ")";
             std::string doc = ExtractLeadingDoc(tokens_, func->getStart());
             s->Register(SymbolKind::Function, name, compiler->GetSourceFilePath(),
                         (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
-                        sig, {}, doc);
+                        sig, {}, doc, displayName);
             s->RegisterFunctionRange(name, compiler->GetSourceFilePath(),
                                      (int)func->getStart()->getLine(),
                                      (int)func->getStop()->getLine());
@@ -607,7 +628,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
             if (structName.empty() && !namespaceName.empty())
                 s->Register(SymbolKind::Function, rawFuncName, compiler->GetSourceFilePath(),
                             (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
-                            sig, {}, doc);
+                            sig, {}, doc, displayName);
 
             // Record an unused-function candidate. Only free functions: struct methods
             // can be re-emitted (and called) in another TU under monomorphization, so a
@@ -633,7 +654,7 @@ void ForwardRefScanner::ScanFunctionDefinition(CFlatParser::FunctionDefinitionCo
                 std::string qualName = structName + "." + rawFuncName;
                 s->Register(SymbolKind::Function, qualName, compiler->GetSourceFilePath(),
                             (int)func->getStart()->getLine(), (int)func->getStart()->getCharPositionInLine(),
-                            sig, {}, doc);
+                            sig, {}, doc, displayName);
             }
         }
 
@@ -702,14 +723,19 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
 
         if (auto* s = Compiler(ctx)->GetSymbolSink())
         {
-            std::string sig = "interface " + name;
+            LLVMBackend::TypeAndValue interfaceType;
+            interfaceType.TypeName = name;
+            const std::string displayName = SpellType(*Compiler(ctx), interfaceType);
+            std::string sig = "interface " + displayName;
             if (!parentNames.empty())
             {
                 sig += " : ";
                 for (size_t i = 0; i < parentNames.size(); ++i)
                 {
                     if (i > 0) sig += ", ";
-                    sig += parentNames[i];
+                    LLVMBackend::TypeAndValue parentType;
+                    parentType.TypeName = parentNames[i];
+                    sig += SpellType(*Compiler(ctx), parentType);
                 }
             }
             std::vector<std::string> memberNames;
@@ -719,7 +745,7 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
                 memberNames.push_back(f.VariableName);
             s->Register(SymbolKind::Interface, name, Compiler(ctx)->GetSourceFilePath(),
                         (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
-                        sig, memberNames, ExtractLeadingDoc(tokens_, ctx->getStart()));
+                        sig, memberNames, ExtractLeadingDoc(tokens_, ctx->getStart()), displayName);
 
             // Interface FIELDS are reached like struct fields (`b.title`), so they need the same
             // "Type.field" symbols that dot-completion, hover and go-to-definition resolve
@@ -735,15 +761,18 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
             for (const auto& f : allFields != nullptr ? *allFields : kNoFields)
             {
                 if (f.VariableName.empty()) continue;
-                std::string typeSig = f.TypeName + (f.Pointer ? "*" : "");
+                std::string typeSig = SpellType(*Compiler(ctx), f);
                 std::string key = name + "." + f.VariableName;
+                LLVMBackend::TypeAndValue ownerType;
+                ownerType.TypeName = name;
+                std::string displayKey = SpellType(*Compiler(ctx), ownerType) + "." + f.VariableName;
 
                 if (auto it = ownFields.find(f.VariableName); it != ownFields.end())
                 {
                     auto* fc = it->second;
                     s->Register(SymbolKind::Field, key, Compiler(ctx)->GetSourceFilePath(),
                                 (int)fc->getStart()->getLine(), (int)fc->getStart()->getCharPositionInLine(),
-                                typeSig + " " + key, {}, ExtractLeadingDoc(tokens_, fc->getStart()));
+                                typeSig + " " + displayKey, {}, ExtractLeadingDoc(tokens_, fc->getStart()), displayKey);
                     continue;
                 }
                 // Inherited: reuse the parent's recorded location and doc. Copy them out before
@@ -755,7 +784,7 @@ void ForwardRefScanner::ScanInterfaceDefinition(CFlatParser::InterfaceDefinition
                     std::string pFile = pd->file, pDoc = pd->docComment;
                     int pLine = pd->line, pCol = pd->column;
                     s->Register(SymbolKind::Field, key, pFile, pLine, pCol,
-                                typeSig + " " + parent + "." + f.VariableName, {}, pDoc);
+                                typeSig + " " + displayKey, {}, pDoc, displayKey);
                     break;
                 }
             }
@@ -1018,14 +1047,17 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         if (auto* innerParams = GenericSpecOf(typeSpec, innerBase))
         {
             baseIsGenericInstantiation = true;
-            resolved = Compiler(entry)->ResolveGenericBaseAlias(innerBase);
+            std::vector<std::string> innerArgs;
             for (auto* innerEntry : innerParams->typeParameterList()->typeParameterEntry())
-                resolved += "__" + MangleTypeArg(compilerLLVM, ResolveForwardTypeArg(innerEntry));
+                innerArgs.push_back(ResolveForwardTypeArg(innerEntry));
+            resolved = MangleGenericInstance(*Compiler(entry),
+                                             Compiler(entry)->ResolveGenericBaseAlias(innerBase),
+                                             innerArgs);
         }
         else if (typeSpec && typeSpec->functionPointerSpecifier())
         {
             // Closure type as a generic argument (gap a): encode to a symbol-safe name so the
-            // shell name (e.g. list____fatfn_1_3_int_3_int) matches the main pass.
+            // shell name (e.g. list$fatfn$.1$int$int) matches the main pass.
             resolved = EncodeClosureScanner(typeSpec->functionPointerSpecifier());
         }
         else
@@ -1059,7 +1091,7 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
         }
         // `T[]` array-view arg encodes as a "[]" suffix (mirrors "*" for a pointer); the bad
         // bracket forms are rejected in the main pass, so the forward scan just names them.
-        // Stars are COUNTED here, exactly as the main pass counts them: a shell named Box__Cptr
+        // Stars are COUNTED here, exactly as the main pass counts them: a shell named Box$.p$C
         // for a Box<C**> use would not match the instantiation the codegen pass builds.
         std::string uniqueArgBase = resolved;
         int uniqueArgStars = 0;
@@ -1082,7 +1114,7 @@ std::string ForwardRefScanner::ResolveForwardTypeArg(CFlatParser::TypeParameterE
             // Mirror of the MainListener rewrite: a `unique` type ARGUMENT names core unique<X>.
             if (CanDesugarUniqueTypeArg(compilerLLVM, uniqueArgBase, uniqueArgStars > 0,
                                         uniqueArgStars, uniqueArgView, baseIsGenericInstantiation))
-                return "unique__" + MangleTypeArg(compilerLLVM, uniqueArgBase);
+                return MangleGenericInstance(*compilerLLVM, "unique", { uniqueArgBase });
             // The forward scan must not emit a diagnostic here: expect_error matching and
             // localization are owned by the codegen pass. Returning the ordinary resolved
             // spelling keeps this reject path out of the retired prefix/token scheme.
@@ -1101,9 +1133,10 @@ std::string ForwardRefScanner::ResolveSigComponentScanner(CFlatParser::TypeSpeci
         if (ts->genericIdentifier() != nullptr && ts->genericIdentifier()->genericTypeParameters() != nullptr)
         {
             std::string mangled = ts->genericIdentifier()->Identifier()->getText();
+            std::vector<std::string> args;
             for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
-                mangled += "__" + MangleTypeArg(compilerLLVM, ResolveForwardTypeArg(entry));
-            return mangled;
+                args.push_back(ResolveForwardTypeArg(entry));
+            return MangleGenericInstance(*compilerLLVM, mangled, args);
         }
         return ts->getText();
     }
@@ -1205,7 +1238,7 @@ void ForwardRefScanner::CollectGenericTemplateDecls(antlr4::RuleContext* ctx, bo
          * source as dataStructures, which fills in textual order during the main pass, so one
          * spelling in one namespace got two answers depending on line order.
          * `unkeyable` covers a body whose nested types have NO fixed key: inside a GENERIC template
-         * the real key is per-instantiation (Box__int.Inner), not Box.Inner.
+         * the real key is per-instantiation (Box$int.Inner), not Box.Inner.
          * `certain` gates the whole thing: it is false inside an unfoldable `if const` arm (a dead
          * arm's type never becomes a real key) and inside an expect_error block (whose type may fail
          * to register while a claim here would redirect a later argument to a key that never
@@ -1393,11 +1426,12 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                 if (!compiler->AnyGenericTypeTemplateNamed(spelledBase))
                     return;
                 // Name the shell after the registered KEY, not the spelling: a bare use inside a
-                // namespace would otherwise leave an opaque 'Box__int' that 'NS.Box__int' never completes.
+                // namespace would otherwise leave an opaque 'Box$int' that 'NS.Box$int' never completes.
                 std::string baseName = compiler->ResolveGenericTemplateBase(spelledBase);
-                std::string mangledName = baseName;
+                std::vector<std::string> args;
                 for (auto* entry : genericParams->typeParameterList()->typeParameterEntry())
-                    mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
+                    args.push_back(ResolveForwardTypeArg(entry));
+                std::string mangledName = MangleGenericInstance(*compiler, baseName, args);
                 // A generic INTERFACE instantiation has no struct shell and no default ctor - the
                 // main pass builds it in interfaceTable. Pre-declaring one shadows it as opaque.
                 if (compiler->IsGenericInterfaceTemplateName(
@@ -1461,10 +1495,8 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                             std::vector<std::string> typeArgs;
                             for (auto* entry : tts->tupleTypeEntry())
                                 typeArgs.push_back(TupleEntryArgName(Compiler(tts), entry));
-                            std::string mangledName = "tuple";
-                            for (const auto& arg : typeArgs)
-                                mangledName += "__" + MangleTypeArg(Compiler(tts), arg);
                             auto* c = Compiler(tts);
+                            std::string mangledName = MangleGenericInstance(*c, "tuple", typeArgs);
                             c->CreateStructType(mangledName, {});
                             LLVMBackend::TypeAndValue rt{ .TypeName = mangledName };
                             c->CreateFunctionDeclaration(mangledName, rt, {});
@@ -1546,7 +1578,7 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         // ParseDeclarationSpecifiers). Storage stays string-shaped - no descriptor struct.
         std::string suffix(ctx->pointer() != nullptr ? ctx->pointer()->Star().size() : 0, '*');
 
-        // Generic RHS (using IL = list<int>): mangle to list__int, pre-declare the shell +
+        // Generic RHS (using IL = list<int>): mangle to list$int, pre-declare the shell +
         // default ctor to enqueue the instantiation (mirrors the use-site path at
         // ParseDeclarationSpecifiers), then alias to the mangled name - still a plain string.
         // The forward-ref pass is opportunistic: it never errors (templates may not be scanned
@@ -1554,7 +1586,8 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
         std::string baseName;
         if (auto* genParams = GenericSpecOf(typeSpec, baseName))
         {
-            std::string mangledName = compiler->ResolveGenericBaseAlias(baseName);
+            std::string resolvedBaseName = compiler->ResolveGenericBaseAlias(baseName);
+            std::vector<std::string> args;
             for (auto* entry : genParams->typeParameterList()->typeParameterEntry())
             {
                 // Closure and `unique`-qualified args encode via ResolveForwardTypeArg so the shell
@@ -1564,13 +1597,14 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
                     && GenericSpecOf(entry->typeSpecifier(), nestedBase) != nullptr;
                 if ((entry->typeSpecifier() && entry->typeSpecifier()->functionPointerSpecifier())
                     || TypeArgHasUnique(entry) || nestedGeneric)
-                    mangledName += "__" + MangleTypeArg(compiler, ResolveForwardTypeArg(entry));
+                    args.push_back(ResolveForwardTypeArg(entry));
                 else
-                    mangledName += "__" + MangleTypeArg(compiler, ResolveTypeArgSpelling(compiler, entry->getText()));
+                    args.push_back(ResolveTypeArgSpelling(compiler, entry->getText()));
             }
+            std::string mangledName = MangleGenericInstance(*compiler, resolvedBaseName, args);
             // A generic interface instantiation gets no struct shell / default ctor (see
             // tryPreDeclare); the alias still names the mangled interface.
-            if (compiler->IsGenericInterfaceTemplateName(compiler->ResolveGenericBaseAlias(baseName)))
+            if (compiler->IsGenericInterfaceTemplateName(resolvedBaseName))
                 compiler->gts.genericInterfaceInstances.insert(mangledName);
             else
             {
@@ -1662,7 +1696,7 @@ void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionCont
             compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false);
         }
 
-        // Pre-declare run(Name* this, list__string args) -> bool
+        // Pre-declare run(Name* this, list$string args) -> bool
         {
             LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
             LLVMBackend::DeclTypeAndValue thisParam;
@@ -1670,7 +1704,7 @@ void ForwardRefScanner::ScanProgramDefinition(CFlatParser::ProgramDefinitionCont
             thisParam.VariableName = name + "__";
             thisParam.Pointer = true;
             LLVMBackend::DeclTypeAndValue argsParam;
-            argsParam.TypeName = "list__string";
+            argsParam.TypeName = MangleGenericInstance(*compiler, "list", { "string" });
             argsParam.VariableName = "args";
             argsParam.IsMove = true;  // run() takes ownership; caller's list is zeroed after the call
             compiler->CreateFunctionDeclaration("run", boolReturn, { thisParam, argsParam });
@@ -1791,7 +1825,7 @@ void ForwardRefScanner::ScanImportedProgramDefinition(const std::string& name) {
             compiler->CreateFunctionDeclaration("__program_run_" + name, intReturn, { ctxParam }, false, false, false, false);
         }
 
-        // Pre-declare run(Name* this, list__string args) -> bool
+        // Pre-declare run(Name* this, list$string args) -> bool
         {
             LLVMBackend::TypeAndValue boolReturn{ .TypeName = "bool" };
             LLVMBackend::DeclTypeAndValue thisParam;
@@ -1799,7 +1833,7 @@ void ForwardRefScanner::ScanImportedProgramDefinition(const std::string& name) {
             thisParam.VariableName = name + "__";
             thisParam.Pointer = true;
             LLVMBackend::DeclTypeAndValue argsParam;
-            argsParam.TypeName = "list__string";
+            argsParam.TypeName = MangleGenericInstance(*compiler, "list", { "string" });
             argsParam.VariableName = "args";
             argsParam.IsMove = true;
             compiler->CreateFunctionDeclaration("run", boolReturn, { thisParam, argsParam });

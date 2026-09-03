@@ -239,20 +239,50 @@ std::map<int, std::string> BuildAsmFileTable(const std::string& assembly)
 
 // Definitions whose symbol corresponds to the given source-level function name, covering
 // plain, namespace-qualified and generic-mangled spellings. Empty name matches nothing.
-std::vector<llvm::Function*> MatchingFunctions(llvm::Module& m, const std::string& functionName)
+std::vector<llvm::Function*> MatchingFunctions(const LLVMBackend& compiler, llvm::Module& m,
+                                               const std::string& functionName)
 {
     std::vector<llvm::Function*> matches;
     if (functionName.empty()) return matches;
-    const std::string mangledPrefix = "_" + functionName + "_";
-    const std::string qualifiedPrefix = "." + functionName + "_";
+    const std::string mangledPrefix = "_" + functionName + "$";
+    const std::string qualifiedPrefix = "." + functionName + "$";
+    const size_t selectorDot = functionName.rfind('.');
+    const bool qualifiedSource = selectorDot != std::string::npos && selectorDot > 0
+        && selectorDot + 1 < functionName.size();
+    const std::string selectorReceiver = qualifiedSource
+        ? functionName.substr(0, selectorDot) : std::string();
+    const std::string selectorMethod = qualifiedSource
+        ? functionName.substr(selectorDot + 1) : std::string();
+    auto normalize = [](std::string text) {
+        std::erase_if(text, [](char c) { return std::isspace((unsigned char)c) != 0; });
+        return text;
+    };
     for (auto& function : m)
     {
         if (function.isDeclaration()) continue;
         llvm::StringRef name = function.getName();
+        const std::string sourceSymbol = SpellFunctionSymbol(compiler, name.str());
+        const size_t openParen = sourceSymbol.find('(');
+        const std::string sourceName = sourceSymbol.substr(0, openParen);
+        bool receiverMatch = false;
+        if (qualifiedSource && sourceName == selectorMethod && openParen != std::string::npos)
+        {
+            const size_t firstEnd = sourceSymbol.find(',', openParen + 1);
+            const size_t closeParen = sourceSymbol.find(')', openParen + 1);
+            const size_t end = firstEnd == std::string::npos ? closeParen : firstEnd;
+            if (end != std::string::npos)
+            {
+                const std::string firstParameter = normalize(
+                    sourceSymbol.substr(openParen + 1, end - openParen - 1));
+                const std::string receiver = normalize(selectorReceiver);
+                receiverMatch = firstParameter == receiver || firstParameter == receiver + "*";
+            }
+        }
         if (name == functionName
             || name.starts_with(mangledPrefix)
-            || name.starts_with(functionName + "__")
-            || name.contains(qualifiedPrefix))
+            || name.contains(qualifiedPrefix)
+            || sourceName == functionName
+            || receiverMatch)
             matches.push_back(&function);
     }
     return matches;
@@ -557,7 +587,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         return false;
 
     auto matchingFunctions = [&](llvm::Module& m) {
-        return MatchingFunctions(m, functionName);
+        return MatchingFunctions(*this, m, functionName);
     };
 
     struct PreOptimizationMatch
@@ -598,7 +628,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
         std::string banner;
         for (const auto& info : preOptimizationMatches)
         {
-            banner += "; function " + info.name
+            banner += "; function " + SpellFunctionSymbol(*this, info.name)
                 + " was optimized away at O" + std::to_string(optLevel)
                 + " (inlined or removed)\n";
             if (info.addressTaken)
@@ -620,7 +650,7 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             for (const auto& caller : survivingCallers)
             {
                 if (count++ != 0) banner += ", ";
-                banner += caller;
+                banner += SpellFunctionSymbol(*this, caller);
                 if (count == 5) break;
             }
             banner += " - view those functions instead\n";
@@ -794,7 +824,8 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                 mappingStream << rootViewBanner;
                 for (auto* function : rootFunctions)
                 {
-                    mappingStream << "; function: " << function->getName() << "\n";
+                    mappingStream << "; function: "
+                                  << SpellFunctionSymbol(*this, function->getName().str()) << "\n";
                     mappingStream.flush();
                     writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
                     function->print(mappingStream, &writer);
@@ -806,7 +837,8 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             else
                 for (auto* function : matchingFunctions(*view))
                 {
-                    mappingStream << "; function: " << function->getName() << "\n";
+                    mappingStream << "; function: "
+                                  << SpellFunctionSymbol(*this, function->getName().str()) << "\n";
                     mappingStream.flush();
                     writer.SetBaseLine((int)std::count(mappingText.begin(), mappingText.end(), '\n'));
                     function->print(mappingStream, &writer);
@@ -824,7 +856,8 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
                 stream << rootViewBanner;
                 for (auto* function : rootFunctions)
                 {
-                    stream << "; function: " << function->getName() << "\n";
+                    stream << "; function: "
+                           << SpellFunctionSymbol(*this, function->getName().str()) << "\n";
                     function->print(stream, nullptr);
                     stream << "\n";
                 }
@@ -834,7 +867,8 @@ bool LLVMBackend::PrintModuleView(std::string& out, const std::string& kind,
             else
                 for (auto* function : matches)
             {
-                stream << "; function: " << function->getName() << "\n";
+                stream << "; function: "
+                       << SpellFunctionSymbol(*this, function->getName().str()) << "\n";
                 function->print(stream, nullptr);
                 stream << "\n";
             }
@@ -2102,9 +2136,9 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     // Definitions of one source function in a module. Name matching alone cannot separate
     // overloads, which share a source name and differ only in mangling, so prefer the
     // definitions whose debug info places them in this file at this function's own lines.
-    auto locateDefinitions = [&rootName](llvm::Module& searched, const std::string& name,
+    auto locateDefinitions = [this, &rootName](llvm::Module& searched, const std::string& name,
                                          int startLine, int endLine) {
-        auto matches = MatchingFunctions(searched, name);
+        auto matches = MatchingFunctions(*this, searched, name);
         std::vector<llvm::Function*> located;
         for (auto* function : matches)
         {
@@ -2306,16 +2340,16 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
     }
 
     // Monomorphization bloat, taken from the compiler's own instantiation registry rather
-    // than guessed from mangled symbols. Each entry is a full instantiation name (list__i32);
+    // than guessed from mangled symbols. Each entry is a full instantiation name (list$int);
     // group them by the generic they came from and charge every function that mentions one.
     {
         std::map<std::string, OptInstantiation> byBase;
         for (const auto& instantiation : gts.instantiatedGenerics)
         {
-            const size_t marker = instantiation.find("__");
-            if (marker == std::string::npos || marker == 0) continue;
-            OptInstantiation& group = byBase[instantiation.substr(0, marker)];
-            group.base = instantiation.substr(0, marker);
+            std::string_view base = MangledBase(instantiation);
+            if (base == instantiation || base.empty()) continue;
+            OptInstantiation& group = byBase[std::string(base)];
+            group.base = std::string(base);
             group.count++;
             if (group.symbols.size() < 12) group.symbols.push_back(instantiation);
         }
@@ -2325,8 +2359,8 @@ bool LLVMBackend::CollectOptimizationInfo(int optLevel,
             const std::string symbol = function.getName().str();
             auto size = symbolBytes.find(symbol);
             if (size == symbolBytes.end()) continue;
-            // Charge the longest matching instantiation so list__list__i32 does not also
-            // count against list__i32.
+            // Charge the longest matching instantiation so list$list$int does not also
+            // count against list$int.
             const OptInstantiation* best = nullptr;
             size_t bestLength = 0;
             for (const auto& [base, group] : byBase)

@@ -7,7 +7,7 @@
 // See internal/issue/generic-template-namespace-key-space.md, "T1".
 //
 // RE-RATIFIED 2026-08-12 (q12, maintainer): the message moved from "Unknown identifier 'Width'."
-// to "unknown type 'IV__i32'". The old wording was a side effect of the last-segment shell
+// to "unknown type 'IV<int>'". The old wording was a side effect of the last-segment shell
 // fallback in AnyGenericTypeTemplateNamed, which accepted any bare name matching the last dotted
 // segment of some namespaced key; it made the diagnostic blame a phantom METHOD on a type the
 // user never declared. With the fallback removed, this bare spelling reports the same
@@ -15,7 +15,7 @@
 namespace NS { interface IV<T> { int Width(); }; }
 class C<T> : IV<T> { int Width() { return 7; } };
 
-expect_error("unknown type 'IV__i32'");
+expect_error("unknown type 'IV<int>'");
 int use(IV<int> v) { return v.Width(); }
 
 // The generic STRUCT/CLASS twin of the same hole, and the actual q12 bug: pre-fix these two
@@ -23,7 +23,7 @@ int use(IV<int> v) { return v.Width(); }
 // the last segment of the namespaced key. A name colliding with nothing (`Nope<int>`) always
 // reported "unknown type"; the collision was the whole difference.
 namespace NB { class Box<T> { T v = default; }; }
-expect_error("unknown type 'Box__i32'") {
+expect_error("unknown type 'Box<int>'") {
     int useBox(Box<int> b) { return 1; }
 }
 
@@ -31,7 +31,7 @@ expect_error("unknown type 'Box__i32'") {
 // the enclosing-namespace walk cannot reach it either.
 namespace TA { class Tag<T> { T v = default; }; }
 namespace TB {
-    expect_error("unknown type 'Tag__i32'") {
+    expect_error("unknown type 'Tag<int>'") {
         int useTag(Tag<int> t) { return 1; }
     }
 }

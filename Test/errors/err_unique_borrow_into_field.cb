@@ -16,7 +16,7 @@ expect_error("cannot store borrowed parameter 'n' into unique field 'Holder.slot
 // not IsUnique, and destructor synthesis ORs the two - so the field was freed identically
 // while this reject, keyed on IsUnique alone, never saw it (silent abort, exit 134, no
 // diagnostic at all). Pinned to the stable prefix only: the message names the INSTANTIATED
-// struct, so the full substring would embed the `Box__unique_Nodeptr` mangling.
+// struct, so the full substring would embed the `Box$unique$.p$Node` mangling.
 struct Box<T> { T t = default; };
 
 expect_error("cannot store borrowed parameter 'n' into unique field 'Box") {

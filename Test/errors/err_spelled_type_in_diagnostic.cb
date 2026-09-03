@@ -1,0 +1,18 @@
+// Customer-facing diagnostics spell generic instantiations and their function candidates.
+import "array.cb";
+import "list.cb";
+
+expect_error("cannot store 'new double[n]' into 'array<int>': the element types differ") {
+    void arrayElementMismatch() { array<int> values = new double[4]; }
+}
+
+interface IS { int value(); };
+
+expect_error("list<IS> <this>") {
+    void interfaceElementInstance() { list<IS> values = default; values.add(1); }
+}
+
+expect_error("set(array<IS>*, int, IS)") {
+    void interfaceArrayCandidate() { array<IS> values = default; values.set(0, 1); }
+}
+

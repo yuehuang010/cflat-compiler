@@ -510,6 +510,12 @@ bool LLVMBackend::SameBlockProvesNullIface(const PendingNullIfaceDispatch& rec) 
         return stored != nullptr && stored->isNullValue();
     }
 
+static std::string SpellPendingNullIfaceName(const LLVMBackend& compiler,
+                                             const std::string& name)
+{
+        return SpellType(compiler, LLVMBackend::TypeAndValue{ .TypeName = name });
+    }
+
 void LLVMBackend::ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec)
 {
         SetSourceLocation(static_cast<size_t>(rec.Line), static_cast<size_t>(rec.Col));
@@ -521,7 +527,8 @@ void LLVMBackend::ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec)
                 "implementation since it was last set to null, so '{}.{}' would resolve its "
                 "address through a null '{}' vtable; assign one before the access, or write "
                 "'{}?.{}' to skip it when null",
-                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName,
+                SpellPendingNullIfaceName(*this, rec.IfaceName),
                 rec.VarName, rec.MemberName));
         else
             LogError(std::format(
@@ -529,7 +536,8 @@ void LLVMBackend::ReportNullIfaceAccess(const PendingNullIfaceDispatch& rec)
                 "implementation since it was last set to null, so '{}.{}()' would dispatch "
                 "through a null '{}' vtable; assign one before the call, or write '{}?.{}()' "
                 "to skip it when null",
-                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName,
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName,
+                SpellPendingNullIfaceName(*this, rec.IfaceName),
                 rec.VarName, rec.MemberName));
     }
 
@@ -543,13 +551,15 @@ void LLVMBackend::ReportNullIfaceUninitAccess(const PendingNullIfaceDispatch& re
                 "member access on uninitialized interface value '{}' - '{}' is never assigned an "
                 "implementation before this access, so '{}.{}' would resolve its address through "
                 "an uninitialized '{}' vtable; assign one before the access",
-                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName));
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName,
+                SpellPendingNullIfaceName(*this, rec.IfaceName)));
         else
             LogError(std::format(
                 "method call on uninitialized interface value '{}' - '{}' is never assigned an "
                 "implementation before this call, so '{}.{}()' would dispatch through an "
                 "uninitialized '{}' vtable; assign one before the call",
-                rec.VarName, rec.VarName, rec.VarName, rec.MemberName, rec.IfaceName));
+                rec.VarName, rec.VarName, rec.VarName, rec.MemberName,
+                SpellPendingNullIfaceName(*this, rec.IfaceName)));
     }
 
 void LLVMBackend::RunNullIfaceDispatchCheck(llvm::Function* F)
@@ -1354,7 +1364,7 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                             {
                                 ownedStringReturnVar = &nv;
                                 builder->CreateStore(
-                                    llvm::ConstantAggregateZero::get(loadInst->getType()), srcAlloca);
+                                    llvm::Constant::getNullValue(loadInst->getType()), srcAlloca);
                                 return;
                             }
                             if (nv.Storage == srcAlloca && nv.IsOwning)

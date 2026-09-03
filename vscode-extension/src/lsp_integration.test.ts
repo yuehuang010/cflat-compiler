@@ -96,7 +96,7 @@ function entry(remarks: OptRemark[], functions: OptFunctionInfo[] = []): OptInfo
 
 function helperFunction(overrides: Partial<OptFunctionInfo> = {}): OptFunctionInfo {
     return {
-        name: 'helper', symbol: '_helper_i32_i32_', startLine: 1, endLine: 3,
+        name: 'helper', symbol: '_helper$int$.1$int', startLine: 1, endLine: 3,
         irInstructions: 0, machineInstructions: 0, bytes: 0, stackBytes: 0,
         spills: 0, reloads: 0, inlinedInto: 1, eliminated: true, ...overrides
     };
@@ -202,7 +202,7 @@ describe('buildFunctionDetail', () => {
         expect(detail).not.toContain('IR');
         expect(detail).not.toContain('62');
         expect(detail).not.toContain('Symbol');
-        expect(detail).not.toContain('_helper_i32_i32_');
+        expect(detail).not.toContain('_helper$int$.1$int');
         expect(detail).toContain('Function size: 96 bytes');
     });
 

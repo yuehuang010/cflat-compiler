@@ -123,12 +123,12 @@ expect_error("'dunder__name' is a function used as a value - did you mean 'dunde
 }
 
 // The other side of that gate: a REAL generic instantiation must still be spelled back as
-// source. Its functionTable key is the mangled 'bfvGid__i32'; quoting the key raw would print
-// a name no user wrote and advise 'bfvGid__i32()'. (The type argument is rendered canonically,
+// source. Its functionTable key is the mangled 'bfvGid$int'; quoting the key raw would print
+// a name no user wrote and advise 'bfvGid$int()'. (The type argument is rendered canonically,
 // so 'int' comes back as 'i32' - that spelling compiles and names the same instantiation.)
 T bfvGid<T>(T x) { return x; }
 
-expect_error("'bfvGid<i32>' is a function used as a value - did you mean 'bfvGid<i32>()'?") {
+expect_error("'bfvGid<int>' is a function used as a value - did you mean 'bfvGid<int>()'?") {
     int test_generic_instantiation_as_scalar()
     {
         long v = (long)bfvGid<int>;

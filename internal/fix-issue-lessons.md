@@ -3050,3 +3050,5 @@ shelf life: verify the commit and the file's existence before repeating it.
 
 See also the governing rule for the guard family (unknown ACCEPTS; a false rejection is a blocker,
 a missed dangle is today's behaviour), recorded above.
+
+2026-09-03: Stage 1 changed type and function mangling from double-underscore separators to `$`.

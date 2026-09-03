@@ -310,7 +310,8 @@ void LLVMBackend::createFunctionBlock(llvm::Function* fn, const std::string& fri
                 RegisterFunctionArgument(itr_nameArg->VariableName, namedVar);
             }
             if (symbolSink_ && !itr_nameArg->VariableName.empty())
-                symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName);
+                symbolSink_->RegisterVariable(itr_nameArg->VariableName, itr_nameArg->TypeName,
+                                              SpellType(*this, *itr_nameArg));
 
             RecordMoveGenBind(itr_nameArg->VariableName); // fresh parameter binding
 
@@ -418,7 +419,7 @@ llvm::DIType* LLVMBackend::GetDIType(const TypeAndValue& tv)
             return basic;
         }
 
-        // Struct (including generic instantiations like Box__int and the built-in `string`).
+        // Struct (including generic instantiations like Box$int and the built-in `string`).
         auto sdIt = dataStructures.find(tv.TypeName);
         if (sdIt != dataStructures.end() && sdIt->second.StructType != nullptr
             && !sdIt->second.StructType->isOpaque())
@@ -835,7 +836,7 @@ bool LLVMBackend::IsThinEncodedClosureType(const std::string& name) const
 
 std::string LLVMBackend::SpellEncodedClosureType(const TypeAndValue& enc) const
 {
-        return std::format("{}<{}>", enc.IsThinFnPtr() ? "function" : "Lambda", FuncPtrSpellingOf(enc));
+        return SpellType(*this, enc);
     }
 
 bool LLVMBackend::IsFatEncodedClosureType(const std::string& name) const
@@ -1376,13 +1377,16 @@ void LLVMBackend::ResolvePendingAliasReturnInference()
                         auto* oldFunction = sym.Function;
                         std::string oldName = oldFunction->getName().str();
                         oldFunction->setName(oldName + ".alias_old");
+                        std::string inferredName = ComputeMangledName(
+                            p.FunctionName, sym.ReturnType, sym.Parameters, sym.Variadic);
                         auto* newFunction = llvm::Function::Create(
-                            inferredType, oldFunction->getLinkage(), oldName, *module);
+                            inferredType, oldFunction->getLinkage(), inferredName, *module);
                         newFunction->setCallingConv(oldFunction->getCallingConv());
                         newFunction->setAttributes(oldFunction->getAttributes());
                         newFunction->addFnAttr(llvm::Attribute::NullPointerIsValid);
                         oldFunction->eraseFromParent();
                         sym.Function = newFunction;
+                        sym.UniqueName = inferredName;
                     }
                 }
             }
@@ -1453,6 +1457,12 @@ bool LLVMBackend::IsStringLiteralIntoStructPointer(const TypeAndValue& destTV, l
 std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndValue& destTV,
                                                    const std::string& destDesc) const
 {
+    TypeAndValue destBase = destTV;
+    destBase.Pointer = false;
+    destBase.ElemPointer = false;
+    destBase.PointerDepth = 0;
+    destBase.IsArrayView = false;
+    const std::string displayType = SpellType(*this, destBase);
     return std::format(
         "cannot store a string literal into {} of type '{}{}' - a string literal is a "
         "'const char*', not a pointer to a '{}', so reading a member through it would interpret "
@@ -1460,8 +1470,8 @@ std::string LLVMBackend::DescribeStringLiteralIntoStructPointer(const TypeAndVal
         "declare the slot 'const char*'. A cast on the literal itself is still rejected (the "
         "underlying pointer is unchanged); route it through a 'const char*' local first, e.g. "
         "'const char* r = \"...\"; {}* q = ({}*)r;', to assert the reinterpret explicitly.",
-        destDesc, destTV.TypeName, destTV.IsNullable ? "?" : "*",
-        destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName, destTV.TypeName);
+        destDesc, displayType, destTV.IsNullable ? "?" : "*",
+        displayType, displayType, displayType, displayType, displayType);
 }
 
 bool LLVMBackend::HasNonTrivialDestructor(const std::string& typeName)
@@ -1592,21 +1602,24 @@ std::string LLVMBackend::DescribeLostClosureSink(const TypeAndValue& dest, size_
 {
         // Rebuild the destination's own spelling with `move` added at the offending parameter.
         std::string family = dest.IsThinFnPtr() ? "function" : "Lambda";
-        std::string spelled = family + "<" + dest.FuncPtrReturnTypeName
-            + std::string(dest.FuncPtrReturnPointer ? "*" : "") + "(";
+        TypeAndValue returnType;
+        returnType.TypeName = dest.FuncPtrReturnTypeName;
+        returnType.Pointer = dest.FuncPtrReturnPointer;
+        returnType.PointerDepth = dest.FuncPtrReturnPointerDepth;
+        std::string spelled = family + "<" + SpellType(*this, returnType) + "(";
         for (size_t i = 0; i < dest.FuncPtrParams.size(); i++)
         {
             if (i > 0) spelled += ", ";
             if (i == index || dest.FuncPtrParams[i].IsMove) spelled += "move ";
-            spelled += dest.FuncPtrParams[i].TypeName;
-            if (dest.FuncPtrParams[i].Pointer) spelled += "*";
+            spelled += SpellType(*this, FuncPtrParamAsTypeAndValue(dest.FuncPtrParams[i], i));
         }
         spelled += ")>";
         return std::format(
             "this closure CONSUMES parameter {} ('{}'), but {} does not spell it - ownership cannot "
             "travel with a closure value, so the caller would free it again. Spell the sink in the "
             "type: '{}'",
-            index + 1, dest.FuncPtrParams[index].TypeName, destDescription, spelled);
+            index + 1, SpellType(*this, FuncPtrParamAsTypeAndValue(dest.FuncPtrParams[index], index)),
+            destDescription, spelled);
     }
 
 bool LLVMBackend::HasRealCopyOverloadFor(const std::string& typeName) const

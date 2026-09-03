@@ -60,7 +60,7 @@ bool testImportAs()
 
 // ---- program defined in an imported library file ----
 // Regression: CompileImportedFile must run ScanGenericTypeUses before
-// ScanExternalDeclaration so the opaque shell for list__string is present
+// ScanExternalDeclaration so the opaque shell for list$string is present
 // when ScanProgramDefinition pre-declares run().
 
 bool testProgramImport()

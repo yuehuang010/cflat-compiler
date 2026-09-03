@@ -122,17 +122,19 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
             && !initValue->getType()->isAggregateType() && !initValue->getType()->isVectorTy();
         if (destIsWideStorage && srcIsSingleValue && initValue->getType() != destinationType)
         {
+            const std::string elementTypeSpelling = SpellType(*this, typeValue);
             if (initValue->getType()->isPointerTy())
                 LogError(std::format(
                     "cannot initialize global {} '{}' from a pointer value or a string literal - "
                     "CFlat has no C-style character-array initializer. Use a brace list "
                     "('{{'a','b',...}}'), '= default' to zero it, or declare '{}' as a pointer or a "
                     "'string' to point at the literal.",
-                    DescribeAggregateStorageShape(destinationType, typeValue.TypeName),
+                    DescribeAggregateStorageShape(destinationType, elementTypeSpelling),
                     typeValue.VariableName, typeValue.VariableName));
             std::string declText = typeValue.IsSimd
-                ? std::format("simd<{},{}>", typeValue.TypeName, typeValue.SimdLanes)
-                : typeValue.TypeName;
+                ? std::format("simd<{},{}>",
+                    SpellType(*this, TypeAndValue{ .TypeName = typeValue.TypeName }), typeValue.SimdLanes)
+                : elementTypeSpelling;
             LogError(std::format(
                 "cannot initialize global '{} {}' from a single scalar value - it names {}, which "
                 "is not assignable from one value. Use a brace list ('{{...}}') to fill it, or "
@@ -141,7 +143,7 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
                 destinationType->isVectorTy()
                     ? std::format("simd vector storage with {} lanes",
                                   llvm::cast<llvm::FixedVectorType>(destinationType)->getNumElements())
-                    : DescribeAggregateStorageShape(destinationType, typeValue.TypeName)));
+                    : DescribeAggregateStorageShape(destinationType, elementTypeSpelling)));
         }
 
         // Extern globals link to the bare C symbol: a namespaced declaration like
@@ -196,7 +198,8 @@ llvm::GlobalVariable* LLVMBackend::CreateGlobalVariable(TypeAndValue typeValue, 
         // `move g` into a local, which re-initializes the storage and destructs at scope exit.
 
         if (symbolSink_ && !typeValue.VariableName.empty())
-            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
+                                          SpellType(*this, typeValue));
 
         if (diBuilder && diFile && !typeValue.VariableName.empty() && !externalDecl)
         {
@@ -378,7 +381,7 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
         {
             LogError(std::format(
                 "type '{}' is incomplete here (its layout is not available at this point); "
-                "it can only be used through a pointer", typeValue.TypeName));
+                "it can only be used through a pointer", SpellType(*this, typeValue)));
             type = builder->getInt8Ty();  // sized placeholder; the error already aborts the compile
         }
         // GetType returns [N x T] for fixed-size arrays; passing N again as element-count
@@ -425,7 +428,8 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
             RecordMoveGenBind(typeValue.VariableName);
             if (symbolSink_ && !typeValue.VariableName.empty())
                 symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
-                                              GetSourceFilePath(), (int)line, 0);
+                                              GetSourceFilePath(), (int)line, 0,
+                                              SpellType(*this, typeValue));
             CreateOwnOriginSlot(gv);
             if (diBuilder && diFile && !typeValue.VariableName.empty())
             {
@@ -464,7 +468,8 @@ llvm::Value* LLVMBackend::CreateLocalVariable(const TypeAndValue& typeValue, llv
 
         if (symbolSink_ && !typeValue.VariableName.empty())
             symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
-                                          GetSourceFilePath(), (int)line, 0);
+                                          GetSourceFilePath(), (int)line, 0,
+                                          SpellType(*this, typeValue));
 
         if (diBuilder && currentSubprogram && (unsigned)line > 0)
         {
@@ -490,7 +495,8 @@ void LLVMBackend::RegisterPrimaryVariable(const TypeAndValue& typeValue, llvm::V
         RecordMoveGenBind(typeValue.VariableName); // fresh inlined-param binding
 
         if (symbolSink_ && !typeValue.VariableName.empty())
-            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName);
+            symbolSink_->RegisterVariable(typeValue.VariableName, typeValue.TypeName,
+                                          SpellType(*this, typeValue));
     }
 
 llvm::AllocaInst* LLVMBackend::CreateAlloca(llvm::Type* type)
@@ -803,7 +809,12 @@ llvm::Type* LLVMBackend::GetTypeFromStorage(llvm::Value* value) const
 
         if (type == nullptr)
         {
-            LogError(std::format("GetTypeFromStorage could not resolve type for value '{}'", value->getName().str()));
+            const std::string rawValueName = value->getName().str();
+            std::string displayValueName = SpellFunctionSymbol(*this, rawValueName);
+            if (displayValueName == rawValueName)
+                displayValueName = SpellType(*this, TypeAndValue{ .TypeName = rawValueName });
+            LogError(std::format("GetTypeFromStorage could not resolve type for value '{}'",
+                                 displayValueName));
         }
 
         return type;
@@ -822,6 +833,8 @@ std::string LLVMBackend::DescribeAggregateStorageShape(llvm::Type* type,
         }
         // A simd element keeps its own spelling: the caller's name is only the LANE type, so
         // without this an array of vectors reads as 'float[2]' instead of 'simd<float,4>[2]'.
+        TypeAndValue elementType;
+        elementType.TypeName = elementTypeName;
         std::string elemName = elementTypeName;
         if (auto* vecTy = llvm::dyn_cast<llvm::FixedVectorType>(type); vecTy != nullptr && !elemName.empty())
             elemName = std::format("simd<{},{}>", elemName, vecTy->getNumElements());
@@ -1025,14 +1038,15 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
             unsigned storageBits = BitfieldStorageBits(cur.TypeName);
             if (storageBits == 0)
             {
-                LogError("bitfield '" + cur.VariableName + "' has unsupported underlying type '" + cur.TypeName + "' (must be an integer or bool type)");
+                LogError("bitfield '" + cur.VariableName + "' has unsupported underlying type '"
+                         + SpellType(*this, cur) + "' (must be an integer or bool type)");
                 i++;
                 continue;
             }
             if (cur.BitWidth > storageBits)
             {
                 LogError("bitfield '" + cur.VariableName + "' width " + std::to_string(cur.BitWidth)
-                       + " exceeds underlying type '" + cur.TypeName + "' width " + std::to_string(storageBits));
+                       + " exceeds underlying type '" + SpellType(*this, cur) + "' width " + std::to_string(storageBits));
                 i++;
                 continue;
             }
@@ -1076,7 +1090,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> LLVMBackend::PackBitfields(
                 if (bf.BitWidth > storageBits)
                 {
                     LogError("bitfield '" + bf.VariableName + "' width " + std::to_string(bf.BitWidth)
-                           + " exceeds underlying type '" + bf.TypeName + "' width " + std::to_string(storageBits));
+                           + " exceeds underlying type '" + SpellType(*this, bf) + "' width " + std::to_string(storageBits));
                     i++;
                     continue;
                 }
@@ -1226,10 +1240,11 @@ bool LLVMBackend::UniqueChainReaches(const std::string& from, const std::string&
             {
                 bool coreUnique = !f.Pointer
                     && (IsCoreUniqueType(f.TypeName)
-                        || f.TypeName.starts_with("unique__"));
+                        || MangledBase(f.TypeName) == "unique");
                 if ((f.IsUnique
                         && f.Pointer && !f.ElemPointer) || coreUnique)
-                    pending.push_back(coreUnique ? f.TypeName.substr(8) : f.TypeName);
+                    pending.push_back(coreUnique ? MangledGenericArgument(*this, f.TypeName)
+                                                 : f.TypeName);
             }
         }
         return false;
@@ -1243,10 +1258,11 @@ bool LLVMBackend::HasUniqueDestructionCycle(const std::string& name,
         {
             bool coreUnique = !f.Pointer
                 && (IsCoreUniqueType(f.TypeName)
-                    || f.TypeName.starts_with("unique__"));
+                    || MangledBase(f.TypeName) == "unique");
             if ((!f.IsUnique
                     || !f.Pointer || f.ElemPointer) && !coreUnique) continue;
-            std::string pointee = coreUnique ? f.TypeName.substr(8) : f.TypeName;
+            std::string pointee = coreUnique ? MangledGenericArgument(*this, f.TypeName)
+                                             : f.TypeName;
             if (!UniqueChainReaches(pointee, name, name, &fields)) continue;
             if (fieldName != nullptr) *fieldName = f.VariableName;
             return true;
@@ -1258,8 +1274,9 @@ void LLVMBackend::RejectUniqueDestructionCycles(const std::string& name, const s
 {
         std::string fieldName;
         if (!HasUniqueDestructionCycle(name, fields, &fieldName)) return;
-        LogError("'unique' on field '" + name + "." + fieldName + "' forms a destruction cycle back to '"
-                 + name + "': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.");
+        const std::string displayName = SpellType(*this, TypeAndValue{ .TypeName = name });
+        LogError("'unique' on field '" + displayName + "." + fieldName + "' forms a destruction cycle back to '"
+                 + displayName + "': the synthesized destructor would recurse without bound. Drop 'unique' and write a destructor with an iterative teardown.");
     }
 
 void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
@@ -1296,12 +1313,16 @@ void LLVMBackend::RejectByValueContainmentCycles(const std::string& name,
                     for (size_t i = 0; i < path.size(); i++)
                     {
                         if (i > 0) cycle += " -> ";
-                        cycle += path[i];
+                        cycle += SpellType(*this, TypeAndValue{ .TypeName = path[i] });
                     }
-                    LogError("field '" + typeName + "." + field.VariableName
+                    TypeAndValue displayType;
+                    displayType.TypeName = typeName;
+                    TypeAndValue displayTarget;
+                    displayTarget.TypeName = target;
+                    LogError("field '" + SpellType(*this, displayType) + "." + field.VariableName
                              + "' contains a by-value cycle (" + cycle
                              + "); recursive value types have no finite size. Make it a pointer ('"
-                             + target + "*') or break the cycle.");
+                             + SpellType(*this, displayTarget) + "*') or break the cycle.");
                 }
                 visit(target);
                 path.pop_back();
@@ -1607,7 +1628,9 @@ llvm::Constant* LLVMBackend::CreateConstant(std::string typeName, std::string in
         }
         else
         {
-            LogError(std::format("unknown type '{}'", typeName));
+            TypeAndValue displayType;
+            displayType.TypeName = typeName;
+            LogError(std::format("unknown type '{}'", SpellType(*this, displayType)));
             return nullptr;
         }
 
@@ -1697,7 +1720,12 @@ llvm::Value* LLVMBackend::SplatToSimd(llvm::Value* scalar, const TypeAndValue& t
         {
             // Spell the whole declared shape - pointer AND array - so the message is true of
             // every slot kind that can reach here, not just the pointer one. LogError throws.
-            std::string decl = std::format("simd<{},{}>", tv.TypeName, tv.SimdLanes);
+            TypeAndValue displayType = tv;
+            displayType.Pointer = false;
+            displayType.PointerDepth = 0;
+            displayType.ElemPointer = false;
+            std::string decl = std::format("simd<{},{}>",
+                SpellType(*this, displayType), tv.SimdLanes);
             if (tv.Pointer) decl += tv.ElemPointer ? "**" : "*";
             if (tv.ConstArraySize > 0) decl += std::format("[{}]", tv.ConstArraySize);
             LogError(std::format(
@@ -1731,20 +1759,13 @@ void LLVMBackend::RejectBareFunctionValue(llvm::Value* value) const
             return;
         if (auto* fn = llvm::dyn_cast<llvm::Function>(value))
         {
-            // Gated on the instantiation REGISTRY, never on a bare '__': DisplayNameOfMangledType
-            // splits on the first '__', so '__error' / 'foo__bar' would be rewritten into nothing.
-            std::string name = FindFunctionSourceName(fn);
-            bool writable = true;
-            if (gts.instantiatedGenericFunctions.count(name) != 0)
-                name = DisplayNameOfMangledType(name, &writable);
-            if (!writable)
-                LogError(std::format(
-                    "'{}' is a function used as a value - did you mean to call it? (a bare function name is only valid as a function<T> value)",
-                    name));
-            else
-                LogError(std::format(
-                    "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
-                    name, name));
+            const std::string sourceName = FindFunctionSourceName(fn);
+            std::string name = SpellFunctionSymbol(*this, sourceName);
+            if (name == sourceName)
+                name = SpellType(*this, TypeAndValue{ .TypeName = sourceName });
+            LogError(std::format(
+                "'{}' is a function used as a value - did you mean '{}()'? (a bare function name is only valid as a function<T> value)",
+                name, name));
         }
     }
 

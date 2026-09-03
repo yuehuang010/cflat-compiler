@@ -474,10 +474,9 @@ bool LLVMBackend::IsGenericInterfaceTemplateName(const std::string& name) const
 void LLVMBackend::RevokeGenericInterfaceInstances(const std::string& base)
 {
         if (gts.genericInterfaceInstances.empty()) return;
-        std::string prefix = base + "__";
         for (auto it = gts.genericInterfaceInstances.begin(); it != gts.genericInterfaceInstances.end(); )
         {
-            if (it->rfind(prefix, 0) == 0) it = gts.genericInterfaceInstances.erase(it);
+            if (MangledBase(*it) == base) it = gts.genericInterfaceInstances.erase(it);
             else ++it;
         }
     }
@@ -902,12 +901,17 @@ std::string LLVMBackend::DescribePointerShapedInterfaceSource(const TypeAndValue
         if (src.IsInterface || src.IsInterfacePointer) return "";
         // A simd element keeps its own spelling: TypeName is only the LANE type, so without this
         // a simd<float,4>[2] source reads as 'float[2]'. Wording only - the arms are unchanged.
-        std::string elem = src.IsSimd ? std::format("simd<{},{}>", src.TypeName, src.SimdLanes)
-                                      : src.TypeName;
+        TypeAndValue base = src;
+        base.Pointer = false;
+        base.ElemPointer = false;
+        base.PointerDepth = 0;
+        base.IsArrayView = false;
+        std::string elem = SpellType(*this, base);
+        if (src.IsSimd) elem = std::format("simd<{},{}>", elem, src.SimdLanes);
         if (src.ElemPointer) return elem + "**";
         if (src.IsArrayView) return elem + "[]";
         if (src.ConstArraySize != 0) return std::format("{}[{}]", elem, src.ConstArraySize);
-        if (src.IsSimd) return src.TypeName + " simd vector";
+        if (src.IsSimd) return elem + " simd vector";
         return "";
     }
 
@@ -917,15 +921,21 @@ std::string LLVMBackend::FormatPointerShapedInterfaceUpcastError(const std::stri
 {
         // A PRIMITIVE element gets its own wording: "index or dereference it first" is useless
         // advice when no value of that element type could ever implement the interface.
+        TypeAndValue type;
+        type.TypeName = typeName;
+        const std::string shownType = SpellType(*this, type);
+        TypeAndValue interfaceType;
+        interfaceType.TypeName = interfaceName;
+        const std::string shownInterface = SpellType(*this, interfaceType);
         if (IsPrimitiveTypeName(ResolveTypeAlias(typeName)))
             return std::format(
                 "cannot convert '{}' to interface '{}' - '{}' is a primitive type and can never "
                 "implement an interface",
-                shape, interfaceName, typeName);
+                shape, shownInterface, shownType);
         return std::format(
             "cannot convert '{}' to interface '{}' - only a single instance pointer '{}*' or a "
             "'{}' value can be boxed into an interface fat pointer; index or dereference it first",
-            shape, interfaceName, typeName, typeName);
+            shape, shownInterface, shownType, shownType);
     }
 
 void LLVMBackend::AppendInterfaceFieldOffsetSlots(const std::string& structName, const std::string& ifaceName,
@@ -957,14 +967,12 @@ void LLVMBackend::AppendInterfaceFieldOffsetSlots(const std::string& structName,
         }
     }
 
-std::string LLVMBackend::InterfaceFieldTypeText(const TypeAndValue& f)
+std::string LLVMBackend::InterfaceFieldTypeText(const TypeAndValue& f) const
 {
-        std::string s = f.TypeName;
-        if (f.Pointer) s += "*";
-        return s;
+        return SpellType(*this, f);
     }
 
-std::string LLVMBackend::InterfaceMethodTypeText(const TypeAndValue& tv, const std::string& name)
+std::string LLVMBackend::InterfaceMethodTypeText(const TypeAndValue& tv, const std::string& name) const
 {
         std::string s;
         if (tv.IsMove)  s += "move ";
@@ -979,6 +987,8 @@ std::string LLVMBackend::InterfaceMethodTypeText(const TypeAndValue& tv, const s
 void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::string& ifaceName,
                                const std::vector<DeclTypeAndValue>& implFields)
 {
+        const std::string shownImpl = SpellType(*this, TypeAndValue{ .TypeName = implName });
+        const std::string shownIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
         const auto* ifields = GetInterfaceFields(ifaceName);
         if (ifields == nullptr) return;
 
@@ -992,12 +1002,12 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
             {
                 LogErrorMessage(
                     "class '{}' does not implement interface field '{}::{}' (expected type '{}')",
-                    { implName, ifaceName, f.VariableName, InterfaceFieldTypeText(f) });
+                    { shownImpl, shownIface, f.VariableName, InterfaceFieldTypeText(f) });
                 continue;
             }
             auto interfaceComparableType = [this](const TypeAndValue& tv) {
                 if (!tv.Pointer && IsCoreUniqueType(tv.TypeName))
-                    return tv.TypeName.substr(8);
+                    return MangledGenericArgument(*this, tv.TypeName);
                 return tv.TypeName;
             };
             bool sameComparableType = interfaceComparableType(*impl) == interfaceComparableType(f);
@@ -1005,7 +1015,7 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
             // is a fat VALUE, every other arm a pointer.
             auto interfaceUniqueIfaceArm = [this](const TypeAndValue& tv) {
                 return !tv.Pointer && IsCoreUniqueType(tv.TypeName)
-                    && IsInterfaceType(tv.TypeName.substr(8));
+                    && IsInterfaceType(MangledGenericArgument(*this, tv.TypeName));
             };
             auto interfacePointerShape = [&](const TypeAndValue& tv) {
                 if (interfaceUniqueIfaceArm(tv)) return false;
@@ -1020,7 +1030,7 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
             {
                 LogErrorMessage(
                     "class '{}' field '{}' has type '{}' but interface '{}' declares it as '{}'",
-                    { implName, f.VariableName, InterfaceFieldTypeText(*impl), ifaceName,
+                    { shownImpl, f.VariableName, InterfaceFieldTypeText(*impl), shownIface,
                       InterfaceFieldTypeText(f) });
             }
             // 'unique' is part of the field contract, not of the field's type: a store through the
@@ -1042,16 +1052,16 @@ void LLVMBackend::VerifyInterfaceFields(const std::string& implName, const std::
                         "old pointee (it leaks) nor reject a borrow, which the class's synthesized "
                         "destructor then frees. Declare the field '{} {} {}' on interface '{}', or "
                         "drop '{}' from class '{}'.",
-                        { implName, f.VariableName, "unique", ifaceName, "unique", "unique",
-                          InterfaceFieldTypeText(f), f.VariableName, ifaceName, "unique", implName });
+                        { shownImpl, f.VariableName, "unique", shownIface, "unique", "unique",
+                          InterfaceFieldTypeText(f), f.VariableName, shownIface, "unique", shownImpl });
                 else
                     LogErrorMessage(
                         "class '{}' field '{}' is not declared '{}' but interface '{}' declares it "
                         "'{}' - a store through the interface's field slot would free the old pointee, "
                         "which class '{}' does not own. Declare the field '{} {} {}' on class '{}', or "
                         "drop '{}' from interface '{}'.",
-                        { implName, f.VariableName, "unique", ifaceName, "unique", implName, "unique",
-                          InterfaceFieldTypeText(f), f.VariableName, implName, "unique", ifaceName });
+                        { shownImpl, f.VariableName, "unique", shownIface, "unique", shownImpl, "unique",
+                          InterfaceFieldTypeText(f), f.VariableName, shownImpl, "unique", shownIface });
             }
         }
     }
@@ -1082,6 +1092,8 @@ bool LLVMBackend::InterfaceMethodContractConforms(const InterfaceMethod& method,
 void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, const std::string& ifaceName,
                                        const InterfaceMethod& method, const FunctionSymbol& sym)
 {
+        const std::string shownImpl = SpellType(*this, TypeAndValue{ .TypeName = implName });
+        const std::string shownIface = SpellType(*this, TypeAndValue{ .TypeName = ifaceName });
         for (size_t i = 0; i < method.Parameters.size(); i++)
         {
             const auto& ip = method.Parameters[i];
@@ -1102,8 +1114,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                         "the argument, so the caller stops freeing it while class '{}' never takes it "
                         "over (the argument leaks). Declare the parameter '{}' on class '{}', or drop "
                         "'{}' from interface '{}'.",
-                        { implName, method.Name, pname, "move", ifaceName, "move", implName,
-                          InterfaceMethodTypeText(ip, pname), implName, "move", ifaceName });
+                        { shownImpl, method.Name, pname, "move", shownIface, "move", shownImpl,
+                          InterfaceMethodTypeText(ip, pname), shownImpl, "move", shownIface });
                 else
                     LogErrorMessage(
                         "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
@@ -1111,8 +1123,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                         "ownership, so the caller still frees the argument that class '{}' has already "
                         "taken over (a double free). Drop '{}' from class '{}', or declare the "
                         "parameter '{}' on interface '{}'.",
-                        { implName, method.Name, pname, "move", ifaceName, "move", implName, "move",
-                          implName, InterfaceMethodTypeText(cp, pname), ifaceName });
+                        { shownImpl, method.Name, pname, "move", shownIface, "move", shownImpl, "move",
+                          shownImpl, InterfaceMethodTypeText(cp, pname), shownIface });
             }
             else if (cp.IsAdopt != ip.IsAdopt)
             {
@@ -1120,7 +1132,7 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "class '{}' method '{}': parameter '{}' is declared '{}' but interface '{}' "
                     "declares it '{}' - '{}' is part of the method's contract. Make the two "
                     "declarations agree.",
-                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                    { shownImpl, method.Name, pname, InterfaceMethodTypeText(cp), shownIface,
                       InterfaceMethodTypeText(ip), "adopt" });
             }
             // 'bond' and 'move' are mutually exclusive, so report only the more severe disagreement.
@@ -1131,7 +1143,7 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "declares it '{}' - '{}' is part of the method's contract, and a call through "
                     "the interface reads the contract from the interface, so the borrow the two "
                     "disagree about would go untracked. Make the two declarations agree.",
-                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                    { shownImpl, method.Name, pname, InterfaceMethodTypeText(cp), shownIface,
                       InterfaceMethodTypeText(ip), "bond" });
             }
             else if (cp.IsAlias != ip.IsAlias)
@@ -1142,7 +1154,7 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "suppressed, and a call through the interface reads the contract from the "
                     "interface, so the borrow the two disagree about would go untracked. Make the "
                     "two declarations agree.",
-                    { implName, method.Name, pname, InterfaceMethodTypeText(cp), ifaceName,
+                    { shownImpl, method.Name, pname, InterfaceMethodTypeText(cp), shownIface,
                       InterfaceMethodTypeText(ip), "alias" });
             }
         }
@@ -1160,16 +1172,16 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "'{}' declares it '{}' - a call through the interface hands the caller an owned "
                     "value to free, while class '{}' returns one it still owns (a double free). "
                     "Declare the return '{}' on class '{}', or drop '{}' from interface '{}'.",
-                    { implName, method.Name, "move", ifaceName, InterfaceMethodTypeText(ir), implName,
-                      InterfaceMethodTypeText(ir), implName, "move", ifaceName });
+                    { shownImpl, method.Name, "move", shownIface, InterfaceMethodTypeText(ir), shownImpl,
+                      InterfaceMethodTypeText(ir), shownImpl, "move", shownIface });
             else
                 LogErrorMessage(
                     "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
                     "declares it '{}' - a call through the interface treats the result as a borrow "
                     "and never frees it, while class '{}' hands over ownership (the result leaks). "
                     "Drop '{}' from class '{}', or declare the return '{}' on interface '{}'.",
-                    { implName, method.Name, "move", ifaceName, InterfaceMethodTypeText(ir), implName,
-                      "move", implName, InterfaceMethodTypeText(cr), ifaceName });
+                    { shownImpl, method.Name, "move", shownIface, InterfaceMethodTypeText(ir), shownImpl,
+                      "move", shownImpl, InterfaceMethodTypeText(cr), shownIface });
         }
         if (cr.IsAlias != ir.IsAlias)
         {
@@ -1180,8 +1192,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "borrow and suppresses its destructor, while class '{}' returns a value the "
                     "caller must destroy (the result leaks). Declare the return '{}' on class '{}', "
                     "or drop '{}' from interface '{}'.",
-                    { implName, method.Name, "alias", ifaceName, InterfaceMethodTypeText(ir), implName,
-                      InterfaceMethodTypeText(ir), implName, "alias", ifaceName });
+                    { shownImpl, method.Name, "alias", shownIface, InterfaceMethodTypeText(ir), shownImpl,
+                      InterfaceMethodTypeText(ir), shownImpl, "alias", shownIface });
             else
                 LogErrorMessage(
                     "class '{}' method '{}': the return type is declared '{}' but interface '{}' "
@@ -1189,8 +1201,8 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                     "exit, while class '{}' returns a borrow of storage it still owns (a double "
                         "free). Drop '{}' from class '{}', or declare the return '{}' on interface "
                     "'{}'.",
-                    { implName, method.Name, "alias", ifaceName, InterfaceMethodTypeText(ir), implName,
-                      "alias", implName, InterfaceMethodTypeText(cr), ifaceName });
+                    { shownImpl, method.Name, "alias", shownIface, InterfaceMethodTypeText(ir), shownImpl,
+                      "alias", shownImpl, InterfaceMethodTypeText(cr), shownIface });
         }
         if (cr.IsBond != ir.IsBond)
         {
@@ -1199,7 +1211,7 @@ void LLVMBackend::VerifyInterfaceMethodContract(const std::string& implName, con
                 "declares it '{}' - '{}' is part of the return contract, and a call through the "
                 "interface reads the contract from the interface, so the borrow the two disagree "
                 "about would go untracked. Make the two declarations agree.",
-                { implName, method.Name, InterfaceMethodTypeText(cr), ifaceName,
+                { shownImpl, method.Name, InterfaceMethodTypeText(cr), shownIface,
                   InterfaceMethodTypeText(ir), "bond" });
         }
     }
@@ -1247,7 +1259,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogErrorMessage("GetOrCreateProgramVTable: unknown interface '{}'", { ifaceName });
+            LogErrorMessage("GetOrCreateProgramVTable: unknown interface '{}'",
+                { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }) });
             return nullptr;
         }
 
@@ -1269,7 +1282,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateProgramVTable(ProgramData& pd, con
             if (fn == nullptr)
             {
                 LogErrorMessage("GetOrCreateProgramVTable: '{}' does not implement '{}::{}'",
-                                { structName, ifaceName, method.Name });
+                                { SpellType(*this, TypeAndValue{ .TypeName = structName }),
+                                  SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), method.Name });
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
             }
             else
@@ -1312,7 +1326,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
         const auto* ifaceMethods = FindInterface(ifaceName);
         if (ifaceMethods == nullptr)
         {
-            LogErrorMessage("GetOrCreateVTable: unknown interface '{}'", { ifaceName });
+            LogErrorMessage("GetOrCreateVTable: unknown interface '{}'",
+                { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }) });
             return nullptr;
         }
 
@@ -1336,7 +1351,8 @@ llvm::GlobalVariable* LLVMBackend::GetOrCreateVTable(const std::string& structNa
             if (fn == nullptr)
             {
                 LogErrorMessage("GetOrCreateVTable: '{}' does not implement '{}::{}'",
-                                { structName, ifaceName, method.Name });
+                                { SpellType(*this, TypeAndValue{ .TypeName = structName }),
+                                  SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), method.Name });
                 entries.push_back(llvm::ConstantPointerNull::get(ptrTy));
             }
             else
@@ -1400,7 +1416,10 @@ llvm::Value* LLVMBackend::CoerceArgToInterface(const NamedVariable& arg, llvm::V
         {
             LogErrorMessage(
                 "cannot pass '{}' as interface parameter '{}' of {} - it does not implement '{}'",
-                { structName.empty() ? "<unknown>" : structName, ifaceName, calleeDesc, ifaceName });
+                { structName.empty() ? "<unknown>" : SpellType(*this,
+                      TypeAndValue{ .TypeName = structName }),
+                  SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), calleeDesc,
+                  SpellType(*this, TypeAndValue{ .TypeName = ifaceName }) });
             return val;
         }
 
@@ -1417,7 +1436,7 @@ llvm::Value* LLVMBackend::CoerceArgToInterface(const NamedVariable& arg, llvm::V
             {
                 LogErrorMessage(
                     "argument for interface parameter '{}' of {} has no resolved storage",
-                    { ifaceName, calleeDesc });
+                    { SpellType(*this, TypeAndValue{ .TypeName = ifaceName }), calleeDesc });
                 return val;
             }
             auto* tempAlloca = AllocaAtEntry(structTy, nullptr);
@@ -1503,8 +1522,9 @@ bool LLVMBackend::InterfaceImplementorSetIsUncertain(const std::string& ifaceNam
         if (importCompileDepth_ > 0) return true;
         if (uncertainInterfaceImpls.count(ifaceName) > 0) return true;
         // A monomorphized name (IFoo__int) inherits its template's uncertainty.
-        if (size_t p = ifaceName.find("__"); p != std::string::npos)
-            return uncertainInterfaceImpls.count(ifaceName.substr(0, p)) > 0;
+        std::string_view base = MangledBase(ifaceName);
+        if (base != ifaceName)
+            return uncertainInterfaceImpls.count(std::string(base)) > 0;
         return false;
     }
 
@@ -1658,127 +1678,7 @@ void LLVMBackend::ResolveMaterializedInterfaceUses()
 
 std::string LLVMBackend::TemplateBaseOfMangledName(const std::string& mangled)
 {
-        size_t pos = mangled.find("__");
-        return pos == std::string::npos ? mangled : mangled.substr(0, pos);
-    }
-
-bool LLVMBackend::MangledGenericNameIsAmbiguous(const std::string& mangled) const
-{
-        size_t d = mangled.find("__");
-        if (d == std::string::npos) return false;
-
-        auto segmentNamesATemplate = [&](const std::string& seg)
-            {
-                if (seg.empty()) return false;
-                if (IsGenericTemplateKey(seg)) return true;
-                std::string tail = "." + seg;
-                for (const auto& kv : gts.genericStructTemplates)
-                    if (kv.first.ends_with(tail)) return true;
-                for (const auto& kv : gts.genericClassTemplates)
-                    if (kv.first.ends_with(tail)) return true;
-                for (const auto& kv : gts.genericInterfaceTemplates)
-                    if (kv.first.ends_with(tail)) return true;
-                for (const auto& n : gts.scannedGenericStructNames)
-                    if (n.ends_with(tail)) return true;
-                for (const auto& n : gts.scannedGenericInterfaceNames)
-                    if (n.ends_with(tail)) return true;
-                return false;
-            };
-
-        std::string args = mangled.substr(d + 2);
-        for (size_t pos = 0; pos <= args.size(); )
-        {
-            size_t sep = args.find("__", pos);
-            std::string seg = (sep == std::string::npos) ? args.substr(pos) : args.substr(pos, sep - pos);
-            if (segmentNamesATemplate(seg)) return true;
-            if (sep == std::string::npos) break;
-            pos = sep + 2;
-        }
-        return false;
-    }
-
-std::string LLVMBackend::DisplayNameOfMangledType(const std::string& mangled, bool* writable) const
-{
-        if (writable) *writable = true;
-
-        size_t d = mangled.find("__");
-        if (d == std::string::npos)
-        {
-            if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
-                return it->second;
-            return mangled;
-        }
-
-        std::string args = mangled.substr(d + 2);
-        size_t outerArity = 0;
-        bool hasOuterTemplate = false;
-        const std::string outerName = mangled.substr(0, d);
-        if (auto it = gts.genericStructTypeParams.find(outerName);
-            it != gts.genericStructTypeParams.end())
-        {
-            outerArity = it->second.size();
-            hasOuterTemplate = true;
-        }
-        if (!hasOuterTemplate)
-        {
-            if (auto it = gts.genericInterfaceTypeParams.find(outerName);
-                it != gts.genericInterfaceTypeParams.end())
-            {
-                outerArity = it->second.size();
-                hasOuterTemplate = true;
-            }
-        }
-        if (args.starts_with("unique__") && IsCoreUniqueType(args) && !hasOuterTemplate)
-        {
-            if (writable) *writable = false;
-            return mangled;
-        }
-        // Core unique<T> is unambiguous only when it is the outer template's single argument.
-        if (args.starts_with("unique__") && IsCoreUniqueType(args)
-            && hasOuterTemplate && outerArity == 1)
-        {
-            std::string shownUnique = DisplayNameOfCoreUniqueType(args);
-            if (shownUnique != args)
-                return mangled.substr(0, d) + "<" + shownUnique + ">";
-        }
-        if (args.starts_with("unique__") && IsCoreUniqueType(args)
-            && MangledGenericNameIsAmbiguous(mangled))
-        {
-            if (writable) *writable = false;
-            return mangled;
-        }
-
-        if (auto it = mangledTypeDisplayNames.find(mangled); it != mangledTypeDisplayNames.end())
-            return it->second;
-
-        if (MangledGenericNameIsAmbiguous(mangled))
-        {
-            if (writable) *writable = false;
-            return mangled;
-        }
-
-        std::string joined;
-        for (size_t pos = 0; pos <= args.size(); )
-        {
-            size_t sep = args.find("__", pos);
-            std::string seg = (sep == std::string::npos) ? args.substr(pos) : args.substr(pos, sep - pos);
-            // An EMPTY segment means the argument itself began with "__" - an encoded closure type
-            // ("Box____fatfn_1_3_i32_3_i32"). Splitting it gives "Box<, fatfn_...>", a hybrid that
-            // names no type. A SINGLE such argument can be spelled back exactly; anything else is
-            // not writable source and the raw mangled name is handed back.
-            if (seg.empty())
-            {
-                if (joined.empty())
-                    if (const TypeAndValue* enc = GetEncodedClosureType(args))
-                        return mangled.substr(0, d) + "<" + SpellEncodedClosureType(*enc) + ">";
-                if (writable) *writable = false;
-                return mangled;
-            }
-            if (sep == std::string::npos) { joined += seg; break; }
-            joined += seg + ", ";
-            pos = sep + 2;
-        }
-        return mangled.substr(0, d) + "<" + joined + ">";
+        return std::string(MangledBase(mangled));
     }
 
 llvm::Value* LLVMBackend::ReboxInterfaceIfNeeded(llvm::Value* fatVal, const std::string& srcIface,
@@ -1980,12 +1880,14 @@ void LLVMBackend::ReportInterfaceReboxHasNoImplementor(const DeferredInterfaceRe
                     LogErrorMessage(
                         "cannot convert to interface '{}' - the only class implementing it, '{}', is "
                         "declared inside {} that is not taken in this build",
-                        { site.DstInterface, guardedClass, guard });
+                        { SpellType(*this, TypeAndValue{ .TypeName = site.DstInterface }),
+                          SpellType(*this, TypeAndValue{ .TypeName = guardedClass }), guard });
                 else
                     LogErrorMessage(
                         "cannot convert to interface '{}' - the only class implementing it, '{}', is "
                         "declared inside {} that is not taken in this build, further nested inside {}",
-                        { site.DstInterface, guardedClass, guard, nest });
+                        { SpellType(*this, TypeAndValue{ .TypeName = site.DstInterface }),
+                          SpellType(*this, TypeAndValue{ .TypeName = guardedClass }), guard, nest });
             }
             else
             {
@@ -1994,17 +1896,21 @@ void LLVMBackend::ReportInterfaceReboxHasNoImplementor(const DeferredInterfaceRe
                         "cannot convert to interface '{}' - all {} classes implementing it are declared "
                         "inside 'if const' arms that are not taken in this build (for example '{}', "
                         "declared inside {})",
-                        { site.DstInterface, std::to_string(guardedCount), guardedClass, guard });
+                        { SpellType(*this, TypeAndValue{ .TypeName = site.DstInterface }),
+                          std::to_string(guardedCount),
+                          SpellType(*this, TypeAndValue{ .TypeName = guardedClass }), guard });
                 else
                     LogErrorMessage(
                         "cannot convert to interface '{}' - all {} classes implementing it are declared "
                         "inside 'if const' arms that are not taken in this build (for example '{}', "
                         "declared inside {}, further nested inside {})",
-                        { site.DstInterface, std::to_string(guardedCount), guardedClass, guard, nest });
+                        { SpellType(*this, TypeAndValue{ .TypeName = site.DstInterface }),
+                          std::to_string(guardedCount),
+                          SpellType(*this, TypeAndValue{ .TypeName = guardedClass }), guard, nest });
             }
             return;
         }
         LogErrorMessage(
             "cannot convert to interface '{}' - no class implements it",
-            { site.DstInterface });
+            { SpellType(*this, TypeAndValue{ .TypeName = site.DstInterface }) });
     }

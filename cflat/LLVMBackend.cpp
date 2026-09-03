@@ -2233,7 +2233,7 @@ bool LLVMBackend::Compile(const ArgParser& args, const std::string& inputOverrid
             scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
             // First pass: pre-declare opaque types and constructors for every
             // generic instantiation found anywhere in the file (including inside
-            // function bodies), so uses like Box<MyType> b = Box__MyType() resolve.
+            // function bodies), so uses like Box<MyType> b = Box$MyType() resolve.
             // Generic interface templates first: a use like Container<int> must not be
             // pre-declared as an opaque struct shell (it is a fat-pointer interface).
             if (auto* tu = computeUnit->translationUnit())
@@ -3275,8 +3275,8 @@ bool LLVMBackend::CompileImportedFile(const std::string& importingFilePath, cons
         scanner.ValidateIsolatedIntegralPointerCasts(computeUnit);
         // Pre-declare opaque types for all generic instantiations found in the file
         // (including inside function/program bodies) before scanning declarations.
-        // Without this pass, program definitions that pre-declare run(Name*, list__string)
-        // fail because the opaque shell for list__string hasn't been created yet.
+        // Without this pass, program definitions that pre-declare run(Name*, list$string)
+        // fail because the opaque shell for list$string hasn't been created yet.
         // Generic interface templates first (see the main-file scan for why).
         if (auto* tu = computeUnit->translationUnit())
         {
@@ -4322,7 +4322,7 @@ void LLVMBackend::ResetForReanalysis()
     // RegisterEncodedClosureType memoizes on this map but writes the encoded closure's backing
     // entries into dataStructures/functionTable, both just cleared. A survivor makes the next
     // file's registration early-return, leaving `Lambda<int(int)>` resolvable as an encoded name
-    // with no type behind it - it then reports as `unknown type '__fatfn_...'`.
+    // with no type behind it - it then reports as `unknown type 'fatfn$...'`.
     encodedClosureTypes_.clear();
     // Body origins describe definitions in the module just discarded; a survivor would make the
     // next analysis of the same file report its own definition as a redefinition of itself.
@@ -6618,7 +6618,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
     // than silently reused (v6 includes the LSP core-variable replay state; v8 is the non-pointer
     // `alias T` parameter reference ABI - such a parameter is now passed as a pointer to the
     // caller's object, so cached v7 core bitcode has the wrong calling convention for it).
-    root["version"]   = 9;
+    root["version"]   = 10;
     root["platform"]  = platform;
     root["core_hash"] = ComputeCoreHash(runtimeDir);
 
@@ -6818,6 +6818,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
         {
             llvm::json::Object so;
             so["name"] = def.name;
+            so["display_name"] = def.displayName;
             so["kind"] = static_cast<int64_t>(def.kind);
             so["file"] = relToRuntime(def.file);
             so["line"] = static_cast<int64_t>(def.line);
@@ -6842,6 +6843,7 @@ bool LLVMBackend::SaveCoreBitcode(const std::string& cacheDir, const std::string
             llvm::json::Object vo;
             vo["name"] = name;
             vo["type"] = info.typeName;
+            vo["display_type"] = info.displayTypeName;
             vo["file"] = relToRuntime(info.file);
             vo["line"] = static_cast<int64_t>(info.line);
             vo["column"] = static_cast<int64_t>(info.column);
@@ -7058,7 +7060,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     auto ver      = root->getInteger("version");
     auto storedPl = root->getString("platform");
     auto storedH  = root->getString("core_hash");
-    if (!ver || *ver != 9) return false;   // v8 predates the split LSP symbol sidecar (see writer)
+    if (!ver || *ver != 10) return false;  // v9 used the pre-dollar type and function mangling
     if (!storedPl || storedPl->str() != platform) return false;
     if (!storedH || storedH->str() != coreHash) return false;
     if (!std::filesystem::exists(symbolsPath)) return false;
@@ -7378,6 +7380,8 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                     continue;
                 SymbolDef def;
                 def.name = name->str();
+                if (auto displayName = so->getString("display_name"))
+                    def.displayName = displayName->str();
                 def.kind = static_cast<SymbolKind>(*kind);
                 def.file = rejoinRuntime(*file);
                 def.line = static_cast<int>(*line);
@@ -7402,12 +7406,14 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
                 if (!vo) continue;
                 auto name = vo->getString("name");
                 auto type = vo->getString("type");
+                auto displayType = vo->getString("display_type");
                 auto file = vo->getString("file");
                 auto line = vo->getInteger("line");
                 auto column = vo->getInteger("column");
                 if (!name || !type || !file || !line || !column) continue;
                 coreSymbolIndex_.RegisterVariable(name->str(), type->str(), rejoinRuntime(*file),
-                                                   static_cast<int>(*line), static_cast<int>(*column));
+                                                   static_cast<int>(*line), static_cast<int>(*column),
+                                                   displayType ? displayType->str() : std::string{});
             }
         } // end CoreDes:Variables
     }

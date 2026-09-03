@@ -37,8 +37,8 @@ expect_error("brace initializer with values is not supported on 'gi2' - 'I' is n
 expect_error("brace initializer with values is not supported on 'gi3' - 'I' is not a struct/union/class or a recognized container") {
     I gi3 = { 1 };
 }
-// Generic interface instantiation - the message names the mangled instantiation.
-expect_error("brace initializer with values is not supported on 'gb' - 'IB__i32' is not a struct/union/class or a recognized container") {
+// Generic interface instantiation - the message uses the source spelling.
+expect_error("brace initializer with values is not supported on 'gb' - 'IB<int>' is not a struct/union/class or a recognized container") {
     IB<int> gb = { b = 1 };
 }
 // Namespace scope: the global takes its qualified name into the diagnostic.

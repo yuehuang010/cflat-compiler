@@ -6,12 +6,12 @@
 // to add()/set() calls) - so "use 'field = value'" would be a false remedy here.
 // Containers get their own honest message instead.
 import "list.cb";
-expect_error("brace initializers are not supported for 'list__i32' at global scope") {
+expect_error("brace initializers are not supported for 'list<int>' at global scope") {
     list<int> gpiContainer = {1, 2, 3};
 }
 
 // Same construct without '=' ('list<int> g {1,2,3};') - barebraceList, not
 // initializer->initializerList(); must reach the same guard.
-expect_error("brace initializers are not supported for 'list__i32' at global scope") {
+expect_error("brace initializers are not supported for 'list<int>' at global scope") {
     list<int> gpiContainer2 {1, 2, 3};
 }

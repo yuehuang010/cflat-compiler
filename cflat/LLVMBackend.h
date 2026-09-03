@@ -25,6 +25,7 @@
 // ============================================================
 
 #include <algorithm>
+#include <string_view>
 #include <deque>
 #include <functional>
 #include <ranges>
@@ -227,6 +228,7 @@ struct GenericTemplateState
     // (including the forward-ref pre-scan) so a destructure can lazily instantiate the fields
     // when the tuple is reached only via a return type before its producer was code-generated.
     std::unordered_map<std::string, std::vector<std::string>>                   tupleTypeArgs;
+    mutable std::unordered_map<std::string, size_t>                             mangledArityHints;
 
     // Templates loaded from the core cache but not yet parsed: name -> source text. The
     // genericX Templates maps hold a null context placeholder until MaterializeGeneric* parses
@@ -474,32 +476,8 @@ enum class LockMode
     Optimistic,
 };
 
-/*
- * Fold an alias SPELLING of a primitive onto its canonical name. `int` and `i32` are one type
- * ("freely interchangeable", doc/LANGUAGE.md), so every place that builds a TYPE IDENTITY out of
- * a spelling must funnel through here or the two spellings become two types. Two such places
- * exist: MangleTypeArg (generic instantiation) and ToUniqueString (overload symbol names).
- *
- * This is SOURCE identity, not the ABI canon. Signedness is PRESERVED: `u32` is a distinct type
- * from `i32`, not a spelling of it, and it divides, compares and prints differently. The
- * function-pointer comparison wants the ABI canon instead (FuncPtrScalarCanon, which drops
- * signedness) - see internal/plan/funcptr-type-mangling.md for why the two must stay separate.
- *
- * Two deliberate absences. `long`/`ulong` are target-native, so folding them onto `i64`/`u64`
- * would make `Box<long>` and `Box<i64>` one type on LP64 and two on Windows - platform-varying
- * symbol names. `char` carries a distinct DWARF encoding (DW_ATE_signed_char) that `i8` does not,
- * so folding it would make a debugger print numbers instead of characters, and which of the two
- * spellings won would depend on registration order.
- */
-inline const std::string& CanonicalPrimitiveSpelling(const std::string& base)
-{
-    static const std::unordered_map<std::string, std::string> kCanonicalPrimitive = {
-        { "int",   "i32" },
-        { "short", "i16" },
-    };
-    auto it = kCanonicalPrimitive.find(base);
-    return it == kCanonicalPrimitive.end() ? base : it->second;
-}
+struct TypeSpelling;
+struct TypeManglingAccess;
 
 class LLVMBackend
 {
@@ -573,7 +551,7 @@ public:
     // Tier 2: one generic base and how much code its instantiations cost in total.
     struct OptInstantiation
     {
-        std::string base;   // "Box" for Box__i32 / Box__float
+        std::string base;   // "Box" for Box$int / Box$float
         int count = 0;
         int bytes = 0;
         std::vector<std::string> symbols;
@@ -1020,58 +998,20 @@ public:
 
         /*
          * The overload IDENTITY of this type: two parameters are the same overload slot exactly
-         * when this string matches. Every spelling goes through CanonicalPrimitiveSpelling, so
+         * when this string matches. Every spelling goes through the type-mangling funnel, so
          * `f(int)` and `f(i32)` are ONE overload rather than two - which is what the language
          * reference already promises and what monomorphization now does for `Box<int>`. Without
          * it the two coexisted and picked each other's arguments (`f(1)` reached the `i32` body
          * while an `i32` variable reached the `int` one).
          */
-        std::string ToUniqueString() const
-        {
-            if (IsFunctionPointer)
-            {
-                // The indirection marker rides the generated PREFIX, not the tail: a tail suffix
-                // would collide with a trailing pointer param (`function<int(int*)>` vs `function<int(int)>*`).
-                std::string kind = IsThinFnPtr() ? "cfuncptr" : "funcptr";
-                if (IsArrayView)   kind += "Arr";
-                else if (Pointer)  kind += (ElemPointer ? "PtrPtr" : "Ptr");
-                // One "Ptr" per level, so function<void(int*)> and function<void(int**)> are two
-                // overloads. An unrecorded depth still yields exactly one "Ptr", which is the
-                // string every producer emitted before depth existed.
-                auto ptrTail = [](bool ptr, int depth) {
-                    std::string t;
-                    for (int i = 0, n = ptr ? std::max(depth, 1) : 0; i < n; i++) t += "Ptr";
-                    return t;
-                };
-                std::string s = kind + "_"
-                              + CanonicalPrimitiveSpelling(FuncPtrReturnTypeName)
-                              + ptrTail(FuncPtrReturnPointer, FuncPtrReturnPointerDepth);
-                for (const auto& p : FuncPtrParams)
-                    s += "_" + CanonicalPrimitiveSpelling(p.TypeName)
-                       + ptrTail(p.Pointer, p.PointerDepth) + (p.IsMove ? "M" : "");
-                return s;
-            }
-
-            std::string type = CanonicalPrimitiveSpelling(TypeName);
-
-            if (IsArrayView)
-            {
-                // Distinct from a bare pointer so `f(int[])` and `f(int*)` are separate overloads.
-                return (TypeName == "void" ? std::string("U8") : type) + "Arr";
-            }
-
-            if (Pointer)
-            {
-                // Note: LLVM doesn't have void ptr, instead use i8 ptr.
-                if (TypeName == "void")
-                    return ElemPointer ? "U8PtrPtr" : "U8Ptr";
-                return ElemPointer ? type + "PtrPtr" : type + "Ptr";
-            }
-
-            return type;
-        }
+        std::string ToUniqueString(const LLVMBackend& compiler) const;
 
     };
+
+    friend std::string MangleType(const LLVMBackend&, const TypeAndValue&);
+    friend std::string MangleType(const LLVMBackend&, const TypeSpelling&);
+    friend bool DemangleType(const LLVMBackend&, std::string_view, TypeSpelling&);
+    friend struct TypeManglingAccess;
 
     struct AliasScopeFrame
     {
@@ -1628,7 +1568,7 @@ public:
         llvm::Function* MainFunction = nullptr;
         llvm::Function* RunFunction = nullptr;
         llvm::Function* TrampolineFunction = nullptr;  // __program_run_Name
-        llvm::StructType* RunArgsType = nullptr;       // { Name*, list__string }
+        llvm::StructType* RunArgsType = nullptr;       // { Name*, list$string }
         unsigned ExitCodeFieldIndex = 0;               // struct field index of exitCode
         unsigned ThreadFieldIndex = 0;                 // struct field index of _thread
         unsigned AllocatorFieldIndex = 0;              // struct field index of _allocator (IAllocator fat-ptr)
@@ -2745,7 +2685,6 @@ private:
     std::unordered_map<std::string, AliasScopeFrame> aggregateAliasScopes_;
     // Source spellings for instantiated generic types used only by diagnostics. The mangled key
     // remains the identity; this side map keeps user-facing text independent of MangleTypeArg.
-    std::unordered_map<std::string, std::string> mangledTypeDisplayNames;
     // Closure types used as generic arguments (e.g. list<Lambda<int(int)>>) are encoded into a
     // symbol-safe name (see BuildEncodedClosureName in MainListener.h) and registered here so the
     // call descriptor (signature + fat/thin) is recoverable at the invoke site. The encoded name
@@ -2835,7 +2774,7 @@ private:
     // (Windows.Foundation.Collections.IVector, ...). Kept so a qualified `IVector<int>` can be
     // instantiated on demand into a concrete COM vtable + thin pointer + derived PIID.
     std::unordered_map<std::string, cflat_winmd::Interface> winrtGenericTemplates_;
-    // Derived per-instantiation IID (PIID) keyed by mangled name (e.g. "IVector__int"), used for
+    // Derived per-instantiation IID (PIID) keyed by mangled name (e.g. "IVector$int"), used for
     // QueryInterface identity and the `iidof(...)` builtin.
     std::unordered_map<std::string, std::array<uint8_t, 16>> winrtInstanceIid_;
     // Thin COM interface pointer structs built by BuildWinrtInterfaceStructs (both non-generic
@@ -2843,7 +2782,7 @@ private:
     // through the IIterable<T>/IIterator<T> protocol instead of the count()/get() index path.
     std::unordered_set<std::string> winrtThinInterfaces_;
     // Projected delegate objects built by EmitWinrtDelegateObject, keyed by mangled instance name
-    // (e.g. "AsyncOperationCompletedHandler__string"). Caches the COM object struct type and the
+    // (e.g. "AsyncOperationCompletedHandler$string"). Caches the COM object struct type and the
     // static vtable so repeated winrtDelegate(...) sites reuse one type/vtable per instantiation.
     std::unordered_map<std::string, llvm::StructType*> winrtDelegateObjTy_;
     std::unordered_map<std::string, llvm::GlobalVariable*> winrtDelegateVtbl_;
@@ -4933,7 +4872,7 @@ public:
      * Resolve the SPELLED bare name of a generic type ARGUMENT to the key its type is registered
      * under - the argument-side counterpart of ResolveGenericTemplateBase. Without it `Box<Item>`
      * written at global scope and inside `namespace A` (which declares its own `Item`) both mangle
-     * to "Box__Item" and collapse onto ONE instantiation whose layout is decided by drain order.
+     * to "Box$Item" and collapse onto ONE instantiation whose layout is decided by drain order.
      * Enclosing-namespace chain, INNERMOST FIRST, accepting only a candidate that names a type.
      * Callers must not apply it to an already-substituted argument.
      *
@@ -5103,11 +5042,11 @@ public:
                                          std::vector<llvm::Constant*>& entries);
 
     // The declared type of an interface field / implementor field, for diagnostics.
-    static std::string InterfaceFieldTypeText(const TypeAndValue& f);
+    std::string InterfaceFieldTypeText(const TypeAndValue& f) const;
 
     // An interface method's parameter/return as declared, ownership qualifiers included, for
     // diagnostics - so a message can quote the exact spelling the fix needs.
-    static std::string InterfaceMethodTypeText(const TypeAndValue& tv, const std::string& name = "");
+    std::string InterfaceMethodTypeText(const TypeAndValue& tv, const std::string& name = "") const;
 
     // Every field an interface declares must exist on the implementor with the same name and
     // type - the vtable slot carries that field's byte offset. Runs EAGERLY, at the class or
@@ -5269,36 +5208,12 @@ public:
     // forward scan recorded as declared under a condition it could not fold.
     void ResolveMaterializedInterfaceUses();
 
-    // "Container__int" -> "Container". The bare template name a mangled instantiation came from,
+    // "Container$int" -> "Container". The bare template name a mangled instantiation came from,
     // used only to look up the if-const hint.
     static std::string TemplateBaseOfMangledName(const std::string& mangled);
 
-    /*
-     * True when a "__" segment of an instantiation name is itself a TEMPLATE name, which makes the
-     * flat rendering below AMBIGUOUS: the separator is the same for a nested argument and for a
-     * sibling one, so "Box__Box__i32" (Box<Box<int>>) and a hypothetical two-argument Box read
-     * identically. Deliberately over-broad - it also scans for a namespace-qualified key whose tail
-     * matches, since the declaring namespace is not knowable here - because a false "ambiguous"
-     * only costs the pretty rendering, while a false "unambiguous" prints a type that does not
-     * exist. IsGenericTemplateKey is the one definition of the template key space.
-     */
-    bool MangledGenericNameIsAmbiguous(const std::string& mangled) const;
-
-    /*
-     * "Box__i32" -> "Box<i32>", "dictionary__string__int" -> "dictionary<string, int>". DIAGNOSTICS
-     * ONLY - never a key. A message that quotes the raw mangled name gives advice the user cannot
-     * write, so the rendered form is used when - and ONLY when - it is provably writable source
-     * that binds the same instantiation ('Box<i32>*' and 'Box<int>*' mangle alike).
-     *
-     * A NESTED instantiation generally cannot be rendered from the string: "Box__Box__i32" would
-     * come out "Box<Box, i32>", which is not what the user wrote. Core unique<T> is an exception
-     * because its reserved prefix identifies the nested boundary. Other ambiguous names return the
-     * RAW mangled name with *writable = false. A name with no "__" comes back unchanged and is always
-     * writable.
-     */
-    std::string DisplayNameOfMangledType(const std::string& mangled, bool* writable = nullptr) const;
     bool IsCoreUniqueType(const std::string& typeName) const;
-    // True for a mangled instantiation of the core `array<T>` (array__<T>).
+    // True for a mangled instantiation of the core `array<T>` (array$<T>).
     bool IsCoreArrayType(const std::string& typeName) const;
     // Answers whether this parameter/return consumes ownership: explicit move, or a by-value core unique<T>.
     bool IsMoveOrCoreUniqueValue(const TypeAndValue& t) const;
@@ -5310,12 +5225,6 @@ public:
     llvm::Value* CreateCoreUniqueFromRawPointerCall(const NamedVariable& arg,
                                                      const TypeAndValue& param);
     llvm::Value* CreateCoreUniqueRawPointerCall(const NamedVariable& arg, const TypeAndValue& param);
-    std::string DisplayNameOfCoreUniqueType(const std::string& typeName) const;
-    void RegisterMangledTypeDisplayName(const std::string& mangled, const std::string& spelled)
-    {
-        if (!mangled.empty() && !spelled.empty())
-            mangledTypeDisplayNames.emplace(mangled, spelled);
-    }
 
     // Rebuild only when the source and destination interfaces actually differ (the common
     // same-interface case stays a plain by-value copy, with no if-chain emitted). The ambiguous
@@ -5446,7 +5355,7 @@ public:
     // Non-hex characters (dashes, braces) are skipped. Returns false if fewer than 32 nibbles.
     static bool ParseUuidToBytes(const std::string& text, uint8_t out[16]);
 
-    // Resolve `name` (a mangled generic instance like "Windows.Foundation.IReference__i32", a
+    // Resolve `name` (a mangled generic instance like "Windows.Foundation.IReference$i32", a
     // [uuid] interface, or an imported non-generic interface FULL name) to a 16-byte GUID/PIID for
     // `iidof(...)` builtin. Returns nullptr if no IID is known. The result is a REFIID-shaped
     // pointer suitable for QueryInterface.
@@ -5578,7 +5487,7 @@ public:
 
     // Instantiate an imported generic WinRT interface (`base` = the FULL name, e.g.
     // "Windows.Foundation.Collections.IVector", `cflatArgs` = the concrete CFlat type arguments,
-    // `mangledName` = base + "__" + args) into a concrete COM vtable + thin pointer struct and a
+    // `mangledName` = base + "$" + args) into a concrete COM vtable + thin pointer struct and a
     // derived PIID. Returns false if `base` is not a registered winmd generic template (so the
     // caller can fall through to other resolution).
     bool InstantiateWinrtGenericInterface(const std::string& base,
@@ -6610,8 +6519,8 @@ public:
     std::string FuncPtrScalarCanon(const std::string& resolved) const;
 
     /*
-     * ABI-canonical form of a registered struct key. Every `__`-separated token that names a
-     * scalar is folded onto its LOWERED token (`Box__u32` and `Box__i32` both -> `Box__i32`);
+     * ABI-canonical form of a registered struct key. Every `$`-separated token that names a
+     * scalar is folded onto its LOWERED token (`Box$u32` and `Box$i32` both -> `Box$i32`);
      * every other token is emitted verbatim, so a plain `Circle` is untouched.
      *
      * Monomorphization canonicalizes SOURCE identity and deliberately keeps signedness, because

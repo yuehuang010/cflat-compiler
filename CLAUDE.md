@@ -486,8 +486,8 @@ Source (.cb) -> CFlatLexer/CFlatParser (ANTLR4) -> Parse Tree
 ### Two-pass compilation
 
 1. **ForwardRefScanner** (`MainListener.h`): pre-registers struct shells, function signatures,
-   generic instantiations before codegen. Enables forward refs; monomorphizes generics (`Box<int>`
-   -> `Box__int`, double-underscore mangling). Also detects `move` params and `if const` blocks.
+   generic instantiations before codegen. Enables forward refs; monomorphizes generics. Also
+   detects `move` params and `if const` blocks.
 2. **MainListener** (`MainListener.h`): walks the AST, emits LLVM IR via `LLVMBackend`.
 
 Both share `ParseDeclarationSpecifiers()` - **any type-parsing change must be applied to BOTH

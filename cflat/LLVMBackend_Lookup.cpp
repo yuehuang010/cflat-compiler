@@ -39,6 +39,7 @@
 #include <cctype>
 #include <map>
 #include <set>
+#include <functional>
 
 #if defined(__APPLE__)
 // Step 3 (macOS self-contained link): harvest libSystem's exported symbols from
@@ -282,13 +283,20 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                         }
                         std::string count = std::format("{} type parameter{}", typeParams->size(),
                             typeParams->size() == 1 ? "" : "s");
+                        TypeAndValue displayType;
+                        displayType.TypeName = resolvedTypeName;
+                        const std::string displayName = SpellType(*this, displayType);
                         LogErrorMessage("'{}' is a generic type; type arguments are required "
                             "(expects {}: {}), e.g. {}",
-                            { resolvedTypeName, count, parameterNames,
-                              resolvedTypeName + "<" + exampleArgs + ">" });
+                            { displayName, count, parameterNames,
+                              displayName + "<" + exampleArgs + ">" });
                     }
                     else
-                        LogErrorMessage("unknown type '{}'", { resolvedTypeName });
+                    {
+                        TypeAndValue displayType;
+                        displayType.TypeName = resolvedTypeName;
+                        LogErrorMessage("unknown type '{}'", { SpellType(*this, displayType) });
+                    }
                     type = builder->getVoidTy();
                 }
             }
@@ -311,7 +319,8 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
             {
                 LogErrorMessage("simd element type must be a numeric scalar "
                     "({}, {}, {}, {}) or {} for a mask, got '{}'",
-                    { "i8..i64", "u8..u64", "float", "double", "bool", resolvedTypeName });
+                    { "i8..i64", "u8..u64", "float", "double", "bool",
+                      SpellType(*this, TypeAndValue{ .TypeName = resolvedTypeName }) });
                 return type;
             }
             type = llvm::FixedVectorType::get(type, static_cast<unsigned>(lanes));
@@ -465,34 +474,27 @@ std::string LLVMBackend::FuncPtrScalarCanon(const std::string& resolved) const
 
 std::string LLVMBackend::FuncPtrAbiCanonKey(const std::string& key) const
 {
-        std::string out;
-        size_t i = 0;
-        for (;;)
+        TypeSpelling spelling;
+        if (!DemangleType(*this, key, spelling)) return key;
+        std::function<std::string(const TypeSpelling&)> canon =
+            [&](const TypeSpelling& value) -> std::string
         {
-            size_t sep = key.find("__", i);
-            size_t end = (sep == std::string::npos) ? key.size() : sep;
-            std::string token = key.substr(i, end - i);
-
-            // Peel the reference-kind suffixes MangleTypeArg folded in ("int*" -> "intptr").
-            std::string suffix;
-            for (;;)
+            if (!value.args.empty())
             {
-                if (token.size() > 3 && token.compare(token.size() - 3, 3, "ptr") == 0)
-                { suffix = "ptr" + suffix; token.erase(token.size() - 3); continue; }
-                if (token.size() > 4 && token.compare(token.size() - 4, 4, "view") == 0)
-                { suffix = "view" + suffix; token.erase(token.size() - 4); continue; }
-                break;
+                std::vector<std::string> args;
+                args.reserve(value.args.size());
+                for (const auto& arg : value.args)
+                    args.push_back(canon(arg));
+                return MangleGenericInstance(*this, value.base, args);
             }
-            // Rewrite ONLY a token that is a known scalar; anything else round-trips verbatim.
-            std::string canon = FuncPtrScalarCanon(ResolveFuncPtrTypeSpelling(token));
-            out += (canon.empty() ? token : canon) + suffix;
-
-            if (sep == std::string::npos) break;
-            out += "__";
-            i = sep + 2;
-        }
-        return out;
-    }
+            TypeSpelling scalar = value;
+            std::string resolved = ResolveFuncPtrTypeSpelling(value.base);
+            if (std::string scalarName = FuncPtrScalarCanon(resolved); !scalarName.empty())
+                scalar.base = std::move(scalarName);
+            return MangleType(*this, scalar);
+        };
+        return canon(spelling);
+}
 
 std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string& spelling) const
 {
@@ -671,16 +673,19 @@ std::string LLVMBackend::FuncPtrSpellingOf(const LLVMBackend::TypeAndValue& tv) 
 {
         // One '*' per recorded level, so a depth mismatch is visible as `int**` vs `int*` rather
         // than as two identical-looking spellings.
-        auto stars = [](bool ptr, int depth) {
-            return std::string(ptr ? (depth > 0 ? (size_t)depth : 1) : 0, '*');
-        };
-        std::string s = DisplayNameOfMangledType(tv.FuncPtrReturnTypeName)
-                      + stars(tv.FuncPtrReturnPointer, tv.FuncPtrReturnPointerDepth) + "(";
+        TypeAndValue returnType;
+        returnType.TypeName = tv.FuncPtrReturnTypeName;
+        returnType.Pointer = tv.FuncPtrReturnPointer;
+        returnType.PointerDepth = tv.FuncPtrReturnPointerDepth;
+        std::string s = SpellType(*this, returnType) + "(";
         for (size_t i = 0; i < tv.FuncPtrParams.size(); i++)
         {
             if (i > 0) s += ", ";
-            s += DisplayNameOfMangledType(tv.FuncPtrParams[i].TypeName);
-            s += stars(tv.FuncPtrParams[i].Pointer, tv.FuncPtrParams[i].PointerDepth);
+            TypeAndValue parameterType;
+            parameterType.TypeName = tv.FuncPtrParams[i].TypeName;
+            parameterType.Pointer = tv.FuncPtrParams[i].Pointer;
+            parameterType.PointerDepth = tv.FuncPtrParams[i].PointerDepth;
+            s += SpellType(*this, parameterType);
         }
         return s + ")";
     }
@@ -727,7 +732,8 @@ std::string LLVMBackend::DescribeFuncPtrBindMismatch(const std::string& function
         return std::format("cannot bind function '{}' to function-pointer type '{}': '{}' is "
             "'{}' - {}. A function pointer is called with no conversion site, so the signature "
             "has to match.",
-            functionName, FuncPtrSpellingOf(dest), functionName, FuncPtrSpellingOf(fn), why);
+            SpellFunctionSymbol(*this, functionName), FuncPtrSpellingOf(dest),
+            SpellFunctionSymbol(*this, functionName), FuncPtrSpellingOf(fn), why);
     }
 
 bool LLVMBackend::ArgumentIsFunctionPointerish(const NamedVariable& arg) const

@@ -398,7 +398,7 @@ elif ! $TIMEOUT "$CFLAT" "$SRC/cli_defines_fixture.cb" -i "$LIB" --locale-dir "$
     -DCLI_DEF_ON=1 -DCLI_DEF_LEVEL=7 -DCLI_DEF_TAG=nightly -DCLI_SIMD_LANES=8 -DCAP=4 \
     --out-lli "$defines_ir" --nologo >>"$defines_log" 2>&1; then
   write_result "$defines_name" "FAIL: value-parameter IR probe did not compile" "$defines_t0"
-elif [ "$(grep -c '^%Buf__i32__8 = type' "$defines_ir")" -ne 1 ]; then
+elif [ "$(grep -c 'Buf\$int\$.8" = type' "$defines_ir")" -ne 1 ]; then
   write_result "$defines_name" "FAIL: equivalent folded values did not share one generic instantiation" "$defines_t0"
 elif ! grep -Fq "simd define=3 const=4" "$defines_off_log"; then
   write_result "$defines_name" "FAIL: -D or const global did not reach simd lane count" "$defines_t0"

@@ -10,13 +10,13 @@ expect_error("unknown type qualifier 'borrow'; only 'unique' or 'alias' is allow
 // struct shell for every bare `Name<Args>`, which suppressed this diagnostic entirely: the local
 // declaration reported the structural "is incomplete here (its layout is not available at
 // import)" instead, blaming C interop on a file with none.
-expect_error("unknown type 'ZzUnknown__i32'") {
+expect_error("unknown type 'ZzUnknown<int>'") {
     ZzUnknown<int> bad2 = default;
 }
 
 // The serious face of the same shell: a SIGNATURE naming a type that exists nowhere. The function
 // is never called, so nothing ever materialised a value of the shell - master compiled, linked and
 // ran this file clean. It must be a diagnostic, not silence.
-expect_error("unknown type 'ZzUnknown2__i32'") {
+expect_error("unknown type 'ZzUnknown2<int>'") {
     int zzUnused(ZzUnknown2<int> v) { return 1; }
 }

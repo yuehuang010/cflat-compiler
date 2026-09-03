@@ -47,24 +47,33 @@ files: MSVC, Swift and Java all emit `$` in symbols, so lld-link/COFF, ld64/Mach
 debuggers accept it. `<`, `>`, `,` are legal in LLVM quoted names but are an unexercised COFF risk
 and are NOT used.
 
-**Scheme.** A type name is `base` followed by exactly `arity(base)` argument types, each
-`$`-prefixed; reference kinds are `$`-prefixed single-letter codes after the type they decorate.
-Arity is a property of the template, so nesting needs no brackets: the demangler reads `base`,
-looks up its arity, recurses that many times.
+**Scheme (corrected 2026-09-03, see "Stage 1b").** A type is `base` followed by exactly
+`arity(base)` argument types, each `$`-prefixed. Reference kinds and qualifiers are CODE tokens
+placed BEFORE the type they decorate (Itanium `P` order), and every non-type token starts with a
+`.` so it can never be read as an identifier: `.p` pointer (one per level), `.v` array view,
+`.a` alias qualifier, `.m` move parameter, `.va` varargs, `.8` / `.n8` numeric value argument.
+Arity recursion then needs no brackets and no slot-kind knowledge.
 
-| Source | Today | New |
+| Source | Old (`__`) | New |
 |---|---|---|
 | `array<int>` | `array__i32` | `array$int` |
-| `array<IShape2*>` | `array__IShape2ptr` | `array$IShape2$p` |
-| `int[]` view arg | `i32view` | `int$v` |
+| `array<IShape2*>` | `array__IShape2ptr` | `array$.p$IShape2` |
+| `array<int>*` (as a parameter) | `array__i32Ptr` | `.p$array$int` |
+| `list<string*>*` vs `list<string**>` | `list__stringptrPtr` vs `list__stringptrptr` | `.p$list$.p$string` vs `list$.p$.p$string` |
+| `int[]` view arg | `i32view` | `.v$int` |
 | `GBox<Inner<int>>` | `GBox__Inner__i32` | `GBox$Inner$int` |
 | `Pair<int, string>` | `Pair__i32__string` | `Pair$int$string` |
-| `list<alias Circle*>` | `list__alias_Circleptr` | `list$a$Circle$p` (qualifier code BEFORE the type it qualifies) |
-| `unique<IS>` (core wrapper) | `unique__IS` | `unique$IS` - no special case left in the demangler |
-| `ns.Item` | (namespace dots survive today) | `ns.Item` unchanged; `.` is already reserved in identifiers |
-| struct `A__B` | `A__B` | `A__B` - collision gone, no `__` reservation needed |
-| value parameter `Buf<8>` | `Buf__8` | `Buf$8` (decimal, `n` prefix for negative, as today) |
-| closure arg `list<Lambda<int(int)>>` | `list____fatfn_1_3_i32_3_i32` | `list$fatfn$int$int` - one encoder, same arity rule (`function<R(A,B)>` = `fn` with a leading param COUNT, `$2$int$int$int`) |
+| `list<alias Circle*>` | `list__alias_Circleptr` | `list$.a$.p$Circle` |
+| `unique<IS>` | `unique__IS` | `unique$IS` |
+| `ns.Item` | `ns.Item` | `ns.Item` (a base never starts with `.`) |
+| struct `A__B` | `A__B` | `A__B` - collision gone |
+| `Buf<8>` / `Buf<-8>` | `Buf__8` / `Buf__n8` | `Buf$.8` / `Buf$.n8` |
+| `list<Lambda<int(int)>>` | `list____fatfn_1_3_i32_3_i32` | `list$fatfn$.1$int$int` (kind, param count, return, params) |
+| function `int f(list<string*>* a)` | `_f_i32_list__stringptrPtr_` | `_f$int$.1$.p$list$.p$string` |
+
+Why postfix codes were wrong (Stage 1 as first landed): `list$string$p$p` cannot say whether the
+second `$p` decorates `string` or `list<...>`; `f(list<string*>*)` and `f(list<string**>)`
+collided and reported a false redefinition (repro scratch/amb.cb).
 
 **Canonical spelling on the way out.** Aliases are folded on the way in (they already are:
 `ResolveManglingAlias`), primitives are canonical keywords on the way out (`i32` -> `int`, `f64` ->
@@ -111,6 +120,14 @@ Non-surfaces (stay mangled, by design): LLVM IR type/function symbols, `.ll` out
 files, the `--init` cache JSON.
 
 ## Staging - tree green at every step
+
+Status 2026-09-03: Stage 0 and Stage 1 LANDED in worktree unique-type-prototype-4ba544
+(uncommitted): `cflat/TypeMangling.{h,cpp}` owns the `$` scheme, function symbols are
+`_name$ret$argc$args`, cache metadata bumped 9 -> 10, the `A<B>` / `A__B` collision has a positive
+leg in Test/test_generics.cb. Stage 2 LANDED 2026-09-03: 120 diagnostic sites re-routed through SpellType /
+SpellFunctionSymbol, typeof / LSP / symbol-dump / crash dump spell source names, and
+utilities/extract_diagnostics.py fails the report on a bare `.TypeName` or `mangled*` format
+argument. Stage 1b (prefix `.x` codes) applied after the postfix-code collision above was found. The Windows link of `$` symbols (test.bat Release) is the remaining proof.
 
 **Stage 0 - funnel (behaviour-neutral, largest step).** Introduce the mangle/demangle pair with
 the CURRENT `__` scheme and prove it by round-tripping every instantiation the suite produces

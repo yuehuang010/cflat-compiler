@@ -344,38 +344,15 @@ std::string MainListener::InferAndInstantiateGenericFunction(const std::string& 
             if (!genId->Identifier()) continue;
 
             std::string baseName = genId->Identifier()->getText();
-            std::string prefix = baseName + "__";
-
-            if (receiverType.size() <= prefix.size() || receiverType.substr(0, prefix.size()) != prefix)
+            TypeSpelling receiverSpelling;
+            if (MangledBase(receiverType) != baseName
+                || !DemangleType(*Compiler(), receiverType, receiverSpelling)
+                || receiverSpelling.args.size() != typeParams.size())
                 continue;
-
-            std::string suffix = receiverType.substr(prefix.size());
-
-            // With a single type parameter the entire suffix is the type argument.
-            // With multiple type parameters split on "__" (works for simple non-generic args).
             std::vector<std::string> typeArgs;
-            if (typeParams.size() == 1)
-            {
-                typeArgs = { suffix };
-            }
-            else
-            {
-                size_t pos = 0;
-                while (pos < suffix.size())
-                {
-                    size_t next = suffix.find("__", pos);
-                    if (next == std::string::npos)
-                    {
-                        typeArgs.push_back(suffix.substr(pos));
-                        break;
-                    }
-                    typeArgs.push_back(suffix.substr(pos, next - pos));
-                    pos = next + 2;
-                }
-            }
-
-            if (typeArgs.size() == typeParams.size())
-                return InstantiateGenericFunction(funcName, typeArgs);
+            for (const auto& arg : receiverSpelling.args)
+                typeArgs.push_back(MangleType(*Compiler(), arg));
+            return InstantiateGenericFunction(funcName, typeArgs);
         }
         return {};
     }
@@ -441,7 +418,7 @@ LLVMBackend::TypeAndValue MainListener::BuildFuncPtrAliasType(CFlatParser::Funct
         if (fpSpec->typeSpecifier() != nullptr)
         {
             // Resolve generic signature types (gap b) so `using Cb = Lambda<list<string>()>` stores
-            // the mangled "list__string" and queues the instantiation.
+            // the mangled "list$string" and queues the instantiation.
             bool retPtr = fpSpec->pointer() != nullptr;
             int retStars = PointerDepthOf(fpSpec->pointer());
             tv.FuncPtrReturnTypeName = ResolveSigComponentCodegen(fpSpec->typeSpecifier(), retPtr);
@@ -529,10 +506,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
     }
 
 std::string MainListener::MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs) {
-        std::string name = baseName;
-        for (const auto& arg : typeArgs)
-            name += "__" + MangleTypeArg(Compiler(), arg);
-        return name;
+        return MangleGenericInstance(*Compiler(), baseName, typeArgs);
     }
 
 void MainListener::ProcessPendingInstantiations() {
@@ -750,14 +724,16 @@ bool MainListener::EnsureArenaChannelInstantiated(LLVMBackend* compiler) {
         // ForwardRefScanner may have registered an opaque shell (flagged in instantiatedGenerics) before
         // the full body is available; force re-queuing here so sizeof() is valid when the ctor needs it.
         auto isSized = [&]() {
-            auto it = compiler->dataStructures.find(kArenaChannelType);
+            const std::string channelType = ArenaChannelTypeName(*compiler);
+            auto it = compiler->dataStructures.find(channelType);
             return it != compiler->dataStructures.end() && it->second.StructType
                 && it->second.StructType->isSized();
         };
         if (isSized()) return true;
         if (!genericClassTemplates.count("arena_channel")) return false;
-        pendingInstantiations.push_back({"arena_channel", {"IMessage"}, kArenaChannelType});
-        instantiatedGenerics.insert(kArenaChannelType);
+        const std::string channelType = ArenaChannelTypeName(*compiler);
+        pendingInstantiations.push_back({"arena_channel", {"IMessage"}, channelType});
+        instantiatedGenerics.insert(channelType);
         ProcessPendingInstantiations();
         return isSized();
     }

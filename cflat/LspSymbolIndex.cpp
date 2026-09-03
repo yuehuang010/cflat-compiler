@@ -4,10 +4,12 @@
 void LspSymbolIndex::Register(SymbolKind kind, const std::string& name, const std::string& file,
                                int line, int col, const std::string& sig,
                                const std::vector<std::string>& members,
-                               const std::string& docComment)
+                               const std::string& docComment,
+                               const std::string& displayName)
 {
     SymbolDef def;
     def.name = name;
+    def.displayName = displayName;
     def.kind = kind;
     def.file = file;
     def.line = line;
@@ -89,7 +91,11 @@ void LspSymbolIndex::MergeFrom(const LspSymbolIndex& other)
 const SymbolDef* LspSymbolIndex::Lookup(const std::string& name) const
 {
     auto it = symbols_.find(name);
-    return (it != symbols_.end()) ? &it->second : nullptr;
+    if (it != symbols_.end()) return &it->second;
+    for (const auto& [key, def] : symbols_)
+        if (def.displayName == name)
+            return &def;
+    return nullptr;
 }
 
 std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& prefix) const
@@ -97,7 +103,7 @@ std::vector<const SymbolDef*> LspSymbolIndex::LookupPrefix(const std::string& pr
     std::vector<const SymbolDef*> results;
     for (const auto& [name, def] : symbols_)
     {
-        if (name.starts_with(prefix))
+        if (name.starts_with(prefix) || def.displayName.starts_with(prefix))
             results.push_back(&def);
     }
     return results;
@@ -142,18 +148,27 @@ void LspSymbolIndex::RegisterCandidate(const UnusedCandidate& cand)
 
 void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::string& typeName)
 {
+    RegisterVariable(varName, typeName, {});
+}
+
+void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::string& typeName,
+                                      const std::string& displayTypeName)
+{
     if (varName.empty() || typeName.empty()) return;
     // Preserve any previously-recorded location; only update the type.
     auto& info = variables_[varName];
     info.typeName = typeName;
+    if (!displayTypeName.empty()) info.displayTypeName = displayTypeName;
 }
 
 void LspSymbolIndex::RegisterVariable(const std::string& varName, const std::string& typeName,
-                                      const std::string& file, int line, int column)
+                                      const std::string& file, int line, int column,
+                                      const std::string& displayTypeName)
 {
     if (varName.empty()) return;
     auto& info = variables_[varName];
     if (!typeName.empty()) info.typeName = typeName;
+    if (!displayTypeName.empty()) info.displayTypeName = displayTypeName;
     info.file = file;
     info.line = line;
     info.column = column;

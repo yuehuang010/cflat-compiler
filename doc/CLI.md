@@ -476,6 +476,8 @@ Selectors are:
 - `line:<n>` dumps one 1-based source line, for example `--symbol-dump line:49`.
 - `line:<a>-<b>` dumps an inclusive line range, for example `--symbol-dump line:41-49`.
 - `function:<name>` dumps the definition's function body, for example `--symbol-dump function:main`.
+  The selector accepts either the source spelling (`function:set`, `function:array<int>.init`) or
+  the raw mangled symbol (`function:_set$void$.3$...`).
 
 IR dump selectors are `module`, `line:<n>`, and `function:<name>`. Line ranges are not supported
 for IR dumps. A line selector resolves to the function enclosing that 1-based source line.

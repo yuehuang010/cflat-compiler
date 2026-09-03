@@ -58,7 +58,7 @@ expect_error("declared type 'DpCircle' produces pointer depth 3, but the type mo
 expect_error("declared type 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
     DpCircle*** dpTripleRet() { return nullptr; }
 }
-expect_error("function type parameter 'DpCircle' produces pointer depth 3, but the type model caps at 2 levels") {
+    expect_error("function type parameter 'DpCircle**' produces pointer depth 3, but the type model caps at 2 levels") {
     int dpTakesFn(function<int(DpCircle***)> f) { return 0; }
 }
 // An ALIAS reaching the same depth was already refused at its USE site; it now shares the one

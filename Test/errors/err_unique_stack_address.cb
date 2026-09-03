@@ -33,7 +33,7 @@ expect_error("cannot store the address of a stack or global value into unique fi
 }
 
 // Pinned to the stable prefix only: the diagnostic names the INSTANTIATED struct, so the
-// full substring would embed the `Box__unique_Itemptr` mangling and break if it ever changes.
+// full substring would embed the `Box$unique$.p$Item` mangling and break if it ever changes.
 expect_error("cannot store the address of a stack or global value into unique field 'Box") {
     void storeGenericField() { Item i; Box<unique Item*> b = default; b.t = &i; }
 }

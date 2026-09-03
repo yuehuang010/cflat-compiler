@@ -113,18 +113,21 @@ std::optional<std::string> MainListener::FoldConstLiteral(
     std::vector<LLVMBackend::ManifestFragment::Leaf>* manifestLeaves)
 {
     auto* compiler = Compiler(ctx);
+    auto spellTypeName = [&](const std::string& name) {
+        return SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = name });
+    };
     const bool xmlConst = intrinsicName == "xml_const";
     auto rootData = compiler->GetDataStructure(typeName);
     if (!rootData.StructType)
     {
         LogErrorContext(ctx, std::format(
-            "{}(): unknown struct type '{}'", intrinsicName, typeName));
+            "{}(): unknown struct type '{}'", intrinsicName, spellTypeName(typeName)));
         return std::nullopt;
     }
     if (rootData.IsUnion)
     {
         LogErrorContext(ctx, std::format(
-            "{}() is not supported on union type '{}'", intrinsicName, typeName));
+            "{}() is not supported on union type '{}'", intrinsicName, spellTypeName(typeName)));
         return std::nullopt;
     }
     if (init == nullptr)
@@ -244,7 +247,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
         auto* nested = fieldInit->initializerList();
         if (nested == nullptr && values.empty() && isEmptyNestedBrace(fieldInit))
         {
-            if (fieldType.rfind("list__", 0) == 0) return xmlConst ? "" : "[]";
+            if (MangledBase(fieldType) == "list") return xmlConst ? "" : "[]";
             if (compiler->GetDataStructure(fieldType).StructType != nullptr)
                 return xmlConst ? emitXmlElement(elementName, fieldType, nullptr)
                                 : foldStruct(fieldType, nullptr, false);
@@ -253,9 +256,16 @@ std::optional<std::string> MainListener::FoldConstLiteral(
         }
         if (nested != nullptr)
         {
-            if (fieldType.rfind("list__", 0) == 0)
+            if (MangledBase(fieldType) == "list")
             {
-                std::string elementType = fieldType.substr(6);
+                TypeSpelling listSpelling;
+                if (!DemangleType(*compiler, fieldType, listSpelling)
+                    || listSpelling.args.size() != 1)
+                {
+                    literalError(fieldInit);
+                    return {};
+                }
+                std::string elementType = MangleType(*compiler, listSpelling.args[0]);
                 if (xmlConst && compiler->GetDataStructure(elementType).StructType == nullptr)
                 {
                     LogErrorContext(fieldInit, std::format(
@@ -328,7 +338,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
                     && !isEmptyNestedBrace(fieldInit)))
             {
                 LogErrorContext(fieldInit, std::format(
-                    "{} struct initializer for '{}' requires named fields", intrinsicName, structName));
+                    "{} struct initializer for '{}' requires named fields", intrinsicName, spellTypeName(structName)));
                 valid = false;
                 continue;
             }
@@ -389,7 +399,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
         {
             if (field.IsBitfieldStorage || field.IsPadding) continue;
             if (hasAnnotation(field, "Private")) continue;
-            const bool isList = !field.Pointer && field.TypeName.rfind("list__", 0) == 0;
+            const bool isList = !field.Pointer && MangledBase(field.TypeName) == "list";
             const bool isStruct = !field.Pointer && compiler->GetDataStructure(field.TypeName).StructType != nullptr;
             const bool isScalar = !field.Pointer && isScalarType(field.TypeName);
             const bool jsonText = hasAnnotation(field, "JsonText");
@@ -403,13 +413,19 @@ std::optional<std::string> MainListener::FoldConstLiteral(
                 valid = false;
                 continue;
             }
-            if (xmlConst && isList
-                && compiler->GetDataStructure(field.TypeName.substr(6)).StructType == nullptr)
+            if (xmlConst && isList)
             {
-                LogErrorContext(nestedInit, std::format(
-                    "xml_const list field '{}' must contain struct elements", field.VariableName));
-                valid = false;
-                continue;
+                TypeSpelling listSpelling;
+                if (!DemangleType(*compiler, field.TypeName, listSpelling)
+                    || listSpelling.args.size() != 1
+                    || compiler->GetDataStructure(
+                        MangleType(*compiler, listSpelling.args[0])).StructType == nullptr)
+                {
+                    LogErrorContext(nestedInit, std::format(
+                        "xml_const list field '{}' must contain struct elements", field.VariableName));
+                    valid = false;
+                    continue;
+                }
             }
             if (xmlConst && jsonText && (isStruct || isList))
             {
@@ -476,7 +492,7 @@ std::optional<std::string> MainListener::FoldConstLiteral(
             if (!found)
             {
                 LogErrorContext(fieldInit, std::format(
-                    "{}: no field named {} in {}", intrinsicName, fieldName, structName));
+                    "{}: no field named {} in {}", intrinsicName, fieldName, spellTypeName(structName)));
                 valid = false;
             }
         }
@@ -1900,7 +1916,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                         }
 
                         // If the primary is a generic instantiation (e.g. Box<MyInt>),
-                        // map it to its mangled constructor name (e.g. Box__MyInt).
+                        // map it to its mangled constructor name (e.g. Box$MyInt).
                         // Apply type substitutions for generic parameters.
                         if (prevPrimary->genericIdentifier() != nullptr && prevPrimary->genericIdentifier()->genericTypeParameters() != nullptr && prevPrimary->genericIdentifier()->Identifier() != nullptr)
                         {
@@ -1916,8 +1932,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 if (TypeArgHasUnique(entry))
                                     LogErrorContext(entry, "unique is not supported as an explicit generic function type argument");
                                 typeArgs.push_back(ResolveTypeArgEntry(entry));
-                                mangledName += "__" + MangleTypeArg(Compiler(), typeArgs.back());
                             }
+                            mangledName = MangleGenericInstance(*Compiler(), baseName, typeArgs);
                             bool isFollowedByCall = false;
                             for (size_t i = 0; i + 1 < ctx->children.size(); i++)
                             {
@@ -2875,7 +2891,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto sd = compiler->GetDataStructure(structTypeName);
                             if (!sd.StructType)
                             {
-                                LogErrorContext(ctx, std::format("reflect(): first argument must be a struct type, got '{}'", structTypeName));
+                                LogErrorContext(ctx, std::format("reflect(): first argument must be a struct type, got '{}'",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structTypeName })));
                                 break;
                             }
 
@@ -2905,12 +2922,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto structData = compiler->GetDataStructure(structTypeName);
                             if (!structData.StructType)
                             {
-                                LogErrorContext(ctx, std::format("reflect: cannot find struct '{}'", structTypeName));
+                                LogErrorContext(ctx, std::format("reflect: cannot find struct '{}'",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structTypeName })));
                                 break;
                             }
                             if (structData.IsUnion)
                             {
-                                LogErrorContext(ctx, std::format("reflect is not supported on union type '{}'", structTypeName));
+                                LogErrorContext(ctx, std::format("reflect is not supported on union type '{}'",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structTypeName })));
                                 break;
                             }
 
@@ -2920,7 +2939,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 if (sd.IsUnion)
                                 {
-                                    compiler->LogError(std::format("JSON serialization is not supported on union type '{}'", sd.StructType->getName().str()));
+                                    compiler->LogError(std::format(
+                                        "JSON serialization is not supported on union type '{}'",
+                                        SpellType(*compiler, LLVMBackend::TypeAndValue{
+                                            .TypeName = sd.StructType->getName().str() })));
                                     return;
                                 }
                                 LLVMBackend::NamedVariable intNV, boolNV, floatNV, strNV;
@@ -2990,9 +3012,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     }
                                     // ── list<T> field (value type, not pointer) ──────────────
                                     // Check BEFORE nested struct to avoid treating list as a struct
-                                    else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
+                                    else if (MangledBase(typeName) == "list" && !field.Pointer)
                                     {
-                                        std::string elemTypeName = typeName.substr(6); // strip "list__"
+                                        TypeSpelling listSpelling;
+                                        if (!DemangleType(*compiler, typeName, listSpelling)
+                                            || listSpelling.args.size() != 1)
+                                            continue;
+                                        std::string elemTypeName = MangleType(
+                                            *compiler, listSpelling.args[0]);
                                         auto nameNV = compiler->MakeStringLiteralNV(displayName);
                                         compiler->CallInterfaceMethod(visitorAlloca, "IReflector", "beginArray", {nameNV});
 
@@ -3282,7 +3309,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             auto sd = compiler->GetDataStructure(structTypeName);
                             if (!sd.StructType)
                             {
-                                LogErrorContext(ctx, std::format("reflect_set(): first argument must be a struct type, got '{}'", structTypeName));
+                                LogErrorContext(ctx, std::format("reflect_set(): first argument must be a struct type, got '{}'",
+                                    SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = structTypeName })));
                                 break;
                             }
 
@@ -3310,7 +3338,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             {
                                 if (sd.IsUnion)
                                 {
-                                    compiler->LogError(std::format("JSON deserialization is not supported on union type '{}'", sd.StructType->getName().str()));
+                                    compiler->LogError(std::format(
+                                        "JSON deserialization is not supported on union type '{}'",
+                                        SpellType(*compiler, LLVMBackend::TypeAndValue{
+                                            .TypeName = sd.StructType->getName().str() })));
                                     return;
                                 }
                                 auto* fatTy = compiler->GetFatPtrType();
@@ -3392,9 +3423,14 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                         compiler->builder->CreateStore(narrowed, gep);
                                     }
                                     // ── list<T> (value type) ──────────────────────────────────
-                                    else if (typeName.rfind("list__", 0) == 0 && !field.Pointer)
+                                    else if (MangledBase(typeName) == "list" && !field.Pointer)
                                     {
-                                        std::string elemTypeName = typeName.substr(6);
+                                        TypeSpelling listSpelling;
+                                        if (!DemangleType(*compiler, typeName, listSpelling)
+                                            || listSpelling.args.size() != 1)
+                                            continue;
+                                        std::string elemTypeName = MangleType(
+                                            *compiler, listSpelling.args[0]);
 
                                         // arr = src.getArray(name) -> alloca fat ptr
                                         auto* arrVal = compiler->CallInterfaceMethod(srcA, "IJSON", "getArray", {nameNV});
@@ -4051,7 +4087,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (!why.empty())
                                         Compiler(ctx)->LogError(std::format(
                                             "call through function pointer '{}': parameter {} {}.",
-                                            functionName, i, why));
+                                            SpellFunctionSymbol(*Compiler(ctx), functionName), i, why));
                                 }
                                 for (size_t i = 0; i < pcount; i++)
                                 {
@@ -4068,7 +4104,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     if (argNVs[i].Storage == nullptr && argNVs[i].Primary == nullptr) continue;
                                     callArgs[i] = Compiler(ctx)->CoerceArgToInterface(
                                         argNVs[i], callArgs[i], fp.TypeName,
-                                        std::format("function pointer '{}'", functionName));
+                                        std::format("function pointer '{}'",
+                                            SpellFunctionSymbol(*Compiler(ctx), functionName)));
                                 }
                                 auto result = Compiler(ctx)->CreateIndirectCall(
                                     funcPtrTV, funcPtr, callArgs, &argNVs);
@@ -4126,7 +4163,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     // primaryIdentifier still names the PRODUCER - drop it instead.
                                     std::string subject = functionArgCounter > 0
                                         ? std::string("the call result")
-                                        : std::format("function value '{}'", functionName);
+                                        : std::format("function value '{}'",
+                                            SpellFunctionSymbol(*Compiler(ctx), functionName));
                                     LogErrorContext(ctx, std::format(
                                         "call through {} returns 'void', so it produces "
                                         "no value to consume - call it as a statement", subject));
@@ -4149,7 +4187,7 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 LogErrorContext(ctx, std::format(
                                     "return-block function '{}' cannot be called in a value context (its "
                                     "'return' exits the caller, not the block) - call it as a bare statement",
-                                    functionName));
+                                    SpellFunctionSymbol(*Compiler(ctx), functionName)));
                                 // A '?.' earlier in this chain may have left the insert point mid-chain
                                 // (an "access" block with no terminator yet) - close it before bailing.
                                 if (!Compiler(ctx)->IsBlockTerminated())
@@ -4172,7 +4210,10 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     "return-block function '{}' returns '{}' but the calling function '{}' "
                                     "declares return type '{}' - the inlined 'return' would not match the "
                                     "caller's return type",
-                                    functionName, rb->ReturnType.TypeName, callerName, callerRetName));
+                                    SpellFunctionSymbol(*Compiler(ctx), functionName),
+                                    SpellType(*Compiler(ctx), rb->ReturnType),
+                                    SpellFunctionSymbol(*Compiler(ctx), callerName),
+                                    SpellType(*Compiler(ctx), Compiler(ctx)->currentFunctionReturnTV)));
                                 if (!Compiler(ctx)->IsBlockTerminated())
                                     Compiler(ctx)->builder->CreateUnreachable();
                                 return {};
@@ -5174,7 +5215,8 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                             if (receiverIsFixedArray && !receiverIsCharStringConversion)
                             {
                                 LogErrorContext(primaryCtx, std::format(
-                                    "no overload of '{}' matches the given arguments.", functionName));
+                                    "no overload of '{}' matches the given arguments.",
+                                    SpellFunctionSymbol(*Compiler(primaryCtx), functionName)));
                             }
 
                             // [PFX-7] call lowering, three ways: a [winrt] COM vtable dispatch
@@ -6643,7 +6685,8 @@ llvm::Value* MainListener::EmitHeapDefaultConstruct(LLVMBackend* compiler, const
         llvm::Type* elemType = compiler->GetType(typeInfo);
         if (!elemType || !elemType->isSized())
         {
-            LogErrorContext(errCtx, std::format("'<{}>': cannot construct unknown or unsized type", typeName));
+            LogErrorContext(errCtx, std::format("'<{}>': cannot construct unknown or unsized type",
+                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = typeName })));
             return nullptr;
         }
 
@@ -6855,20 +6898,26 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
         {
             // typeof(int), typeof(bool), typeof(MyStruct) - type specifier used directly
             if (auto* ts = ctx->typeSpecifier())
-                return compiler->CreateGlobalString("typeof", ts->getText());
+            {
+                LLVMBackend::TypeAndValue type;
+                type.TypeName = ParseTypeSpecifierName(ts);
+                return compiler->CreateGlobalString("typeof", SpellType(*compiler, type));
+            }
 
             // typeof(expr) - navigate down to unaryExpression to read TypeAndValue
-            std::string typeName;
+            LLVMBackend::TypeAndValue type;
 
             // ANTLR picks the expression alternative for user-defined type names (Identifier
             // matches both expression and typeSpecifier); catch them here before evaluating.
             if (compiler->GetDataStructure(expressionCtx->getText()).StructType != nullptr)
-                return compiler->CreateGlobalString("typeof", expressionCtx->getText());
+                type.TypeName = expressionCtx->getText();
 
-            if (auto* ue = tryGetUnaryExpression(expressionCtx))
+            if (type.TypeName.empty())
             {
-                auto namedVar = ParseUnaryExpression(ue);
-                typeName = namedVar.TypeAndValue.TypeName;
+                if (auto* ue = tryGetUnaryExpression(expressionCtx))
+                {
+                    auto namedVar = ParseUnaryExpression(ue);
+                    type = namedVar.TypeAndValue;
                 // 'auto' variables carry the literal text "auto" (or an empty
                 // string) as their declared TypeName even though the concrete
                 // type is known. Recover it from the resolved LLVM BaseType,
@@ -6876,13 +6925,14 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                 // Note: LLVM integer types are signless, so an 'auto' variable
                 // bound to an unsigned value reports the signed name (e.g. "int"
                 // for u32, "i8" for char) - the signedness is not recoverable here.
-                if ((typeName == "auto" || typeName.empty()) && namedVar.BaseType != nullptr)
-                    typeName = LLVMTypeToTypeName(namedVar.BaseType);
-                if (namedVar.TypeAndValue.Pointer && !typeName.empty() && typeName.back() != '*')
-                    typeName += "*";
+                    if ((type.TypeName == "auto" || type.TypeName.empty()) && namedVar.BaseType != nullptr)
+                        type.TypeName = LLVMTypeToTypeName(namedVar.BaseType);
+                }
             }
 
-            return compiler->CreateGlobalString("typeof", typeName.empty() ? "unknown" : typeName);
+            std::string spelling = type.TypeName.empty() || type.TypeName == "auto"
+                ? "unknown" : SpellType(*compiler, type);
+            return compiler->CreateGlobalString("typeof", spelling);
         }
         else if (ctx->NameOf())
         {
@@ -6917,7 +6967,7 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
             // A bare type-parameter (e.g. iidof(T) inside ComPtr<T>) must resolve to the
             // specialization's concrete type argument, the same way T*/T type positions do.
             // Route base through any `using` alias and the active generic substitution map so
-            // T -> the instantiated mangled interface (e.g. "IReference__int") reaches the PIID table.
+            // T -> the instantiated mangled interface (e.g. "IReference$int") reaches the PIID table.
             if (typeArgs.empty())
             {
                 base = compiler->ResolveTypeAlias(base);
@@ -6935,7 +6985,9 @@ llvm::Value* MainListener::ParsePrimaryExpression(CFlatParser::PrimaryExpression
                 compiler->InstantiateWinrtGenericInterface(base, typeArgs, mangled);
             if (auto* g = compiler->EmitIidGlobalFor(mangled))
                 return g;
-            compiler->LogError("iidof: no IID known for type '" + (typeArgs.empty() ? base : mangled) +
+            compiler->LogError("iidof: no IID known for type '" +
+                               SpellType(*compiler, LLVMBackend::TypeAndValue{
+                                   .TypeName = typeArgs.empty() ? base : mangled }) +
                                "' (only [winrt]/imported interfaces and parameterized WinRT interfaces have one)");
             return llvm::Constant::getNullValue(compiler->builder->getPtrTy());
         }
