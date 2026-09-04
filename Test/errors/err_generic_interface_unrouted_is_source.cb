@@ -28,7 +28,7 @@ class IsCWide : IsWide {
     int B0(){return 0;} int B1(){return 1;} int B2(){return 2;} int B3(){return 3;}
     int B4(){return 4;} int B5(){return 5;} int B6(){return 6;} int B7(){return 7;}
 };
-if const (sizeof(int) == 8) {
+if const (alignof(int) == 8) {
     interface GiIsSrc<T> { T Get(); };
 }
 

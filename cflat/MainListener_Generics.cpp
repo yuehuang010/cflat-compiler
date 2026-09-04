@@ -1,5 +1,21 @@
 #include "MainListener.h"
 
+namespace {
+// The drain body has early 'continue's, so the previous origin is restored by a scope guard.
+struct ActiveOriginScope
+{
+    GenericTemplateState::ActiveInstantiationOrigin* slot_;
+    GenericTemplateState::ActiveInstantiationOrigin saved_;
+    ActiveOriginScope(GenericTemplateState::ActiveInstantiationOrigin* slot,
+                      GenericTemplateState::ActiveInstantiationOrigin next)
+        : slot_(slot), saved_(std::move(*slot)) { *slot_ = std::move(next); }
+    ~ActiveOriginScope() { *slot_ = std::move(saved_); }
+    ActiveOriginScope(const ActiveOriginScope&) = delete;
+    ActiveOriginScope& operator=(const ActiveOriginScope&) = delete;
+};
+}
+
+
 
 bool MainListener::ValidateGenericArgumentKinds(const std::string& templateName,
     const std::vector<std::string>& typeParams, const std::vector<std::string>& valueParams,
@@ -239,6 +255,31 @@ std::string MainListener::InstantiateGenericFunction(const std::string& baseName
         if (templateIt == genericFunctionTemplates.end()) return {};
         auto* tmplCtx = compilerLLVM->MaterializeGenericFunction(baseName);
         if (!tmplCtx) return {};
+
+        // Generic FUNCTIONS do not go through pendingInstantiations, so publish the same origin
+        // here: a body type that fails on a substituted array view is reported at the call.
+        GenericTemplateState::ActiveInstantiationOrigin fnOrigin;
+        {
+            const auto& outer = compilerLLVM->gts.activeInstantiationOrigin;
+            fnOrigin.templateName = baseName;
+            if (outer.valid)
+            {
+                // Instantiated from inside another template body: keep the site the user wrote.
+                fnOrigin.file = outer.file;
+                fnOrigin.line = outer.line;
+                fnOrigin.column = outer.column;
+            }
+            else
+            {
+                fnOrigin.file = compilerLLVM->sourceFileName;
+                fnOrigin.line = compilerLLVM->currentLine;
+                fnOrigin.column = compilerLLVM->currentColumn;
+            }
+            fnOrigin.valid = !fnOrigin.file.empty();
+            for (const auto& arg : typeArgs)
+                if (arg.size() > 2 && arg.ends_with("[]")) fnOrigin.viewArgs.push_back(arg);
+        }
+        ActiveOriginScope fnOriginScope(&compilerLLVM->gts.activeInstantiationOrigin, std::move(fnOrigin));
 
         // The body is re-walked long after the declaring namespace's scope closed, so install it:
         // without this a sibling name inside the body resolves globally (or not at all).
@@ -539,21 +580,6 @@ void MainListener::QueuePendingInstantiation(const std::string& templateName,
         }
         pendingInstantiations.push_back(std::move(record));
     }
-
-namespace {
-// The drain body has early 'continue's, so the previous origin is restored by a scope guard.
-struct ActiveOriginScope
-{
-    GenericTemplateState::ActiveInstantiationOrigin* slot_;
-    GenericTemplateState::ActiveInstantiationOrigin saved_;
-    ActiveOriginScope(GenericTemplateState::ActiveInstantiationOrigin* slot,
-                      GenericTemplateState::ActiveInstantiationOrigin next)
-        : slot_(slot), saved_(std::move(*slot)) { *slot_ = std::move(next); }
-    ~ActiveOriginScope() { *slot_ = std::move(saved_); }
-    ActiveOriginScope(const ActiveOriginScope&) = delete;
-    ActiveOriginScope& operator=(const ActiveOriginScope&) = delete;
-};
-}
 
 void MainListener::ProcessPendingInstantiations() {
         while (!pendingInstantiations.empty())

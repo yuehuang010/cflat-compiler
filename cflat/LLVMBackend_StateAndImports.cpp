@@ -1129,6 +1129,64 @@ std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
         return {};
     }
 
+bool LLVMBackend::TryGetEnumMemberInt(const std::string& enumSpelling, const std::string& member,
+                                      int64_t& out) const
+{
+        std::string enumKey = ResolveEnumTypeName(enumSpelling);
+        if (enumKey.empty()) return false;
+        auto it = globalNamedVariable.find(enumKey + "." + member);
+        if (it == globalNamedVariable.end() || it->second == nullptr) return false;
+        auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(it->second->getInitializer());
+        if (ci == nullptr || ci->getBitWidth() > 64) return false;
+        out = ci->getSExtValue();
+        return true;
+    }
+
+bool LLVMBackend::TryGetScanTimeTypeSize(const std::string& typeName, int64_t& out) const
+{
+        if (typeName.empty()) return false;
+        std::string name = typeName;
+        // A pointer of any depth is one target pointer, so strip the suffix before the rest.
+        if (name.back() == '*')
+        {
+            if (module == nullptr) return false;
+            out = (int64_t)module->getDataLayout().getPointerSize();
+            return true;
+        }
+        name = ResolveTypeAlias(name);
+        if (std::string enumKey = ResolveEnumTypeName(name); !enumKey.empty())
+            name = GetEnumBackingType(enumKey);
+        TypeAndValue probe;
+        probe.TypeName = name;
+        if (int bits = probe.IsInteger(); bits > 0) { out = bits / 8; return true; }
+        if (int bits = probe.IsFloatingPoint(); bits > 0) { out = bits / 8; return true; }
+        if (name == "bool") { out = 1; return true; }
+        // Aggregates and anything else are left undecidable: the scan-time layout may not exist
+        // yet, and the main pass decides them for real.
+        return false;
+    }
+
+bool LLVMBackend::TryGetScanTimeIntegerCast(const std::string& typeName, int64_t value,
+                                            int64_t& out) const
+{
+        if (typeName.empty() || typeName.back() == '*') return false;
+        std::string name = ResolveTypeAlias(typeName);
+        if (std::string enumKey = ResolveEnumTypeName(name); !enumKey.empty())
+            name = GetEnumBackingType(enumKey);
+        if (name == "bool") { out = value != 0 ? 1 : 0; return true; }
+        TypeAndValue probe;
+        probe.TypeName = name;
+        const int bits = probe.IsInteger();
+        if (bits <= 0) return false;
+        if (bits >= 64) { out = value; return true; }
+        const uint64_t mask = (uint64_t(1) << bits) - 1;
+        const uint64_t truncated = (uint64_t)value & mask;
+        out = probe.IsUnsignedInteger() != -1
+            ? (int64_t)truncated
+            : llvm::APInt(bits, truncated).getSExtValue();
+        return true;
+    }
+
 bool LLVMBackend::IsNamespace(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))
@@ -1188,6 +1246,9 @@ std::vector<std::string> LLVMBackend::ScopedNameCandidatesIn(const std::string& 
             }
         }
 
+        // Verbatim spelling outranks the alias hop: a real namespace named like an alias wins,
+        // the same order struct lookup uses, so both pre-scans queue one canonical key.
+        add(name);
         if (opts.ResolveFirstComponentAlias && name.find('.') != std::string::npos)
         {
             auto dot = name.find('.');
@@ -1196,7 +1257,6 @@ std::vector<std::string> LLVMBackend::ScopedNameCandidatesIn(const std::string& 
             std::string resolvedFirst = ResolveNamespace(first);
             add(resolvedFirst + "." + rest);
         }
-        add(name);
         return candidates;
     }
 

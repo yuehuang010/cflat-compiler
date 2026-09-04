@@ -529,12 +529,33 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         }
         if (auto* n = dynamic_cast<CFlatParser::CastExpressionContext*>(node))
         {
-            if (n->typeName() != nullptr) return std::nullopt;  // a cast is not folded here
+            if (n->typeName() != nullptr)
+            {
+                // A C-cast to an integer (or enum) target folds as the main pass's truncation;
+                // every other target leaves the condition undecidable.
+                if (compiler == nullptr) return std::nullopt;
+                auto v = FoldCompileTimeIntLeaf(compiler, n->castExpression());
+                if (!v) return std::nullopt;
+                int64_t out = 0;
+                if (!compiler->TryGetScanTimeIntegerCast(n->typeName()->getText(), *v, out))
+                    return std::nullopt;
+                return InScannerInt32Range(out) ? std::optional<int64_t>(out) : std::nullopt;
+            }
             if (n->unaryExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->unaryExpression());
             return ParseScannerIntegerLiteral(n->getText());
         }
         if (auto* n = dynamic_cast<CFlatParser::UnaryExpressionContext*>(node))
         {
+            // `sizeof '(' typeName ')'` - exactly four children, so `sizeof alignof(T)` and the
+            // expression form are not mistaken for it. Aggregates answer undecidable.
+            if (n->typeName() != nullptr && n->children.size() == 4 && !n->Sizeof().empty())
+            {
+                int64_t bytes = 0;
+                if (compiler == nullptr
+                    || !compiler->TryGetScanTimeTypeSize(n->typeName()->getText(), bytes))
+                    return std::nullopt;
+                return InScannerInt32Range(bytes) ? std::optional<int64_t>(bytes) : std::nullopt;
+            }
             if (n->postfixExpression() != nullptr) return FoldCompileTimeIntLeaf(compiler, n->postfixExpression());
             if (n->unaryOperator() != nullptr && n->castExpression() != nullptr)
             {
@@ -553,9 +574,25 @@ static std::optional<int64_t> FoldCompileTimeIntLeaf(LLVMBackend* compiler, antl
         }
         if (auto* n = dynamic_cast<CFlatParser::PostfixExpressionContext*>(node))
         {
-            // Only a bare primary folds - a call, index or member access does not.
-            if (n->children.size() != 1) return std::nullopt;
-            return FoldCompileTimeIntLeaf(compiler, n->primaryExpression());
+            // Only a bare primary folds - a call, index or non-enum member access does not.
+            if (n->children.size() == 1) return FoldCompileTimeIntLeaf(compiler, n->primaryExpression());
+            // `Dir.Back`: an enum member is a compile-time constant, registered in both passes.
+            if (n->children.size() == 3 && n->Dot().size() == 1 && compiler != nullptr
+                && n->children[1] == n->Dot(0))
+            {
+                auto* prim = n->primaryExpression();
+                auto* member = dynamic_cast<antlr4::tree::TerminalNode*>(n->children[2]);
+                auto* gid = prim != nullptr ? prim->genericIdentifier() : nullptr;
+                if (member != nullptr && gid != nullptr && gid->genericTypeParameters() == nullptr
+                    && gid->Identifier() != nullptr)
+                {
+                    int64_t ev = 0;
+                    if (compiler->TryGetEnumMemberInt(gid->Identifier()->getText(),
+                                                      member->getText(), ev))
+                        return InScannerInt32Range(ev) ? std::optional<int64_t>(ev) : std::nullopt;
+                }
+            }
+            return std::nullopt;
         }
         if (auto* n = dynamic_cast<CFlatParser::PrimaryExpressionContext*>(node))
         {

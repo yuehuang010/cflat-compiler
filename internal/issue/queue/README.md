@@ -10,7 +10,8 @@ is down to two members and fold what it recorded into the survivors (or the less
 
 Numbering restarts at q01; round-1 buckets are cited as "round-1 qNN" to avoid collision.
 Retired round-2 buckets: q02 (generics, 4 landed: 4bfa4aa 812d9bf 94ec41c), q03 (standalone,
-5 landed: c56efdf 8201425 9dc0e4a 5b4947e 1fa4911; HeapAudit JIT gap ruled no-fix).
+5 landed: c56efdf 8201425 9dc0e4a 5b4947e 1fa4911; HeapAudit JIT gap ruled no-fix), q06
+(generics batch, 3 landed in one commit).
 
 ## Open buckets
 
@@ -21,29 +22,30 @@ bucket runs the whole procedure. Six worktrees close 13 issues.
 
 | # | Bucket | Mode | Closes | Ready |
 |---|--------|------|--------|-------|
-| q04 | BATCH: one-site lowering and diagnostic fixes (float `!=` NaN p2, bool cast, lost-count text, symbol-dump sanitize flag) | batch | 4 | now |
-| q01 members 10-12 | ownership alignment doors + pointer ternary join, one worktree | full | 3 | now |
-| q05 | enum as a first-class type (4 legs merged into one issue) | full | 1 | now |
-| q06 | BATCH: generics / name-resolution one-site fixes (alias -> generic base, generic-function origin, `if const` folder leaves) | batch | 3 | now (enum leaf after q05) |
-| q07 | investigation: `--sanitize=ownership --run` teardown flake p2 | full | 1 | now, needs a Debug build |
-| q01 member 9, q06 "not in the batch" refactor | `NamedVariable` provenance consolidation; funcptr declaring scope | full, refactors | 2 | after everything above |
+| q04 | BATCH: one-site lowering and diagnostic fixes (float `!=` NaN p2, bool cast, lost-count text, symbol-dump sanitize flag) | batch | LANDED e6f3521 (4 members + 2 fixed in place: brace-init bool field, interface/closure condition diagnostic; 1 fix round, 1 review round + 1 verification) - RETIRED | - |
+| q01 members 10-12 | ownership alignment doors + pointer ternary join, one worktree | full | LANDED 966e3d3 (2 fix rounds + 1 verification + advisor fix in place: borrowedAddressValues_ reset, global door precise-provenance narrowing) - RETIRED | - |
+| (unbucketed, filed 2026-09-04) | `p3/bool-default-argument-skips-conversion-verifier-failure` (ruling, pairs with the narrow call-arg p2), `p3/sanitizer-gated-test-legs-vacuous-in-standard-bar` LANDED 897c430 (bar is now 787), `p3/delete-of-proven-borrow-not-rejected` (one-site once align-doors lands; next batch) | - | 3 | ruling / batch |
+| q05 | enum as a first-class type (4 legs merged into one issue) | full | LANDED a078e02 (2 fix rounds + 1 verification; `__int128` -> APInt, aliased backing, redefinition diagnostic, dynamic-fold sign fixed in place) - RETIRED | - |
+| q06 | BATCH: generics / name-resolution one-site fixes (alias -> generic base, generic-function origin, `if const` folder leaves) | batch | LANDED 139d415 (3 members + 4 fixtures retargeted in place; 1 review round + advisor fix: verbatim candidate outranks the alias hop) - RETIRED | - |
+| q07 | investigation: `--sanitize=ownership --run` teardown flake p2 | full | LANDED af6814e (root cause: DIBuilder outlived the JIT-owned context under `-g`; sanitizer was incidental) - RETIRED | - |
+| q01 member 9, `p3/funcptr-signature-component-lacks-declaring-scope` (ex-q06) | `NamedVariable` provenance consolidation; funcptr declaring scope - scoped-first-at-comparison-time was measured and false-rejects two legs, do not retry | full, refactors | 2 | after everything above |
 
 Rulings block 4 more (table below). Two agents at a time (concurrency cap).
 
 ## Suggested order
 
-1. **q04** and **q07** in parallel: q04 is the cheapest close of 4 (one of them p2); q07 is an
-   investigation whose wall clock is mostly a Debug build and repeated runs, so it overlaps well.
-2. **q01 members 10-12** and **q05** in parallel: both full mode, disjoint files.
-3. **q06** after q05 (the enum leaf); the pointer-to-view member joins it if ruled by then.
+1. **q04** and **q07** in parallel - both landed 2026-09-04 (e6f3521, af6814e). Batch mode measured: 4 issues + 2 in-place fixes closed in one worktree, ~25 min wall clock from spawn to merge.
+2. **q01 members 10-12** and **q05** in parallel - both landed 2026-09-04 (966e3d3, a078e02). Full mode measured: ~2h each spawn to merge, 2 fix rounds each.
+3. **q06** landed 2026-09-04 (139d415), ~35 min spawn to merge; the pointer-to-view member still needs its ruling.
 4. Refactors last.
 
 ## Rulings needed before the marked members start
 
 | Item | Question | Recommendation in the file |
 |------|----------|----------------------------|
-| q01 `p2/unique-field-heap-array-through-move-param` | how to stop `new T[n]` adopting into `unique<T>` through a `move T*` param | RULED 2026-09-03 in principle: block `new T[n]` binding to bare `T*`; maintainer weighing blast radius (~800 sites) and the `unique T[3]` reading before it starts. Option 4 (runtime trap) is off. |
-| q06 `p3/generic-pointer-to-view-field-collapses-to-raw-pointer` | is `T*` with `T` an array view an error at instantiation, or a decay to the element pointer by design | error, consistent with LANGUAGE.md "pointer-to-array-view is not a valid type"; reuse the member-3 attribution |
+| q01 `p2/unique-field-heap-array-through-move-param` | how to stop `new T[n]` adopting into `unique<T>` through a `move T*` param | RULED 2026-09-04: raw `T* p = new T[n]` STAYS legal (C compatibility), blocking is OFF. Item moves under internal/plan/delete-form-static-analysis.md (check 4): static reject where provenance is precise + runtime trap at the core ctor/reset where it is not. ON HOLD by the maintainer the same day - no work on this area until reopened. |
+| q01 members 10-12 (fix/align-doors) | may a store of UNKNOWN-provenance pointer (nullptr local, `&static`, call result, borrow) into a clause-bearing `alignas` GLOBAL be rejected | advisor call 2026-09-04, applied in the commit: reject only when RHS provenance is precise and mismatched (fresh `new`, or a local with a known AllocAlignValue); unknown provenance keeps compiling. Field twin unchanged (clause-bearing fields must be `unique`). Maintainer may tighten later. |
+| (ex-q06) `p3/generic-pointer-to-view-field-collapses-to-raw-pointer` |  is `T*` with `T` an array view an error at instantiation, or a decay to the element pointer by design | error, consistent with LANGUAGE.md "pointer-to-array-view is not a valid type"; reuse the member-3 attribution |
 | (unbucketed) `p2/narrow-param-call-arg-skips-truncation-verifier-failure` | is implicit integer narrowing at a call legal | either answer is fine; the file leans to "legal, truncate like assignment" so `takeU8(-w)` compiles again. Verifier dump must go either way. |
 | (unbucketed) `p3/simd-scalar-return-does-not-splat` | should `return` splat a scalar into `simd<T,N>` as assignment does | yes, route through the assignment splat helper |
 
@@ -55,7 +57,7 @@ Each carries its own recorded ruling or blocker. Listed so nobody re-triages the
 |------|----------------|
 | `p2/delete-borrow-via-named-local` | depth-2 forwarding + `function<T>` indirect only; needs an interprocedural summary pass, approach B and same-function checks prohibited |
 | `p2/deref-of-moved-pointer-guard-inside-callee` | maintainer decision 2026-07-25: conditional-termination half deliberately NOT modelled; workarounds are the answer |
-| `p3/uninitialized-new-array-reads` | `init` contract, `init_capacity` and its poison fill landed; what remains is the 800-site `T* p = new T[n]` migration, blocked on the hidden-length ruling ([[raw-array-count-desugar-direction]]), and the `alloc_zeroed` optimization pending allocator measurement |
+| `p3/uninitialized-new-array-reads` | `init` contract, `init_capacity` and its poison fill landed; raw `T* p = new T[n]` stays uninitialized by the 2026-09-04 C-compatibility ruling (no migration); only the `alloc_zeroed` optimization remains, pending allocator measurement |
 | `p3/generated-code-is-roughly-twice-the-size-msvc-emits` | no root cause, investigation item; first step is a Clang-18 leg or one-function IR diff |
 | `p3/no-incremental-build-and-no-up-to-date-check` | case 1 landed; case 2 is plan-level (per-import bitcode + `llvm::Linker` plumbing) |
 | `p3/no-tls-in-core-network` | platform feature (Schannel / OpenSSL backends), not a bug |

@@ -345,8 +345,9 @@ std::string LLVMBackend::ResolveGenericTemplateBase(const std::string& base) con
 {
         if (base.empty()) return base;
         // A dotted spelling is prefixed too: "Inner.Box" names "Outer.Inner.Box" from `namespace
-        // Outer`. Template keys are recorded verbatim, so no first-component alias hop.
-        const ScopedLookupOptions opts{ .PrefixDottedNames = true, .ResolveFirstComponentAlias = false };
+        // Outer`. The first component also hops a namespace alias, so `using IN = Outer.Inner;`
+        // makes `IN.GBox<int>` name the canonical template key the way it already does for structs.
+        const ScopedLookupOptions opts{ .PrefixDottedNames = true, .ResolveFirstComponentAlias = true };
         std::string key = FirstVisibleScopedKey(base,
             [this](const std::string& c) { return IsGenericTemplateKey(c); }, opts);
         return key.empty() ? base : key;

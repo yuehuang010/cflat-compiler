@@ -972,6 +972,22 @@ namespace ScopeOuter
     }
 }
 
+// A namespace alias must reach a GENERIC template base, not just a plain struct: the template
+// key is registered as ScopeOuter.Inner.ShadowBox2 and the alias hop has to find it.
+namespace ScopeOuter { namespace Inner { struct ShadowBox2<T> { T v = default; }; } }
+using ShadowIN2 = ScopeOuter.Inner;
+// A real namespace spelled like an alias outranks the alias hop (verbatim candidate first),
+// the same order plain-struct lookup uses, so both pre-scans queue one canonical key.
+namespace ShadowRealNs { struct ShadowBox3<T> { T v = default; int tag() { return 1; } }; }
+namespace ScopeOuter { namespace Inner { struct ShadowBox3<T> { T v = default; int tag() { return 2; } }; } }
+using ShadowRealNs = ScopeOuter.Inner;
+int shadowRealNamespaceOutranksAlias() { ShadowRealNs.ShadowBox3<int> b; return b.tag(); }
+namespace ShadowOther2
+{
+    int aliasedGenericBase() { ShadowIN2.ShadowBox2<int> b; b.v = 8; return b.v + 1; }
+    int aliasedPlainStruct() { ShadowIN2.ShadowPt2 p; p.a = 4; p.b = 3; return p.a + p.b; }
+}
+
 bool testNamespaceTypeShadowing()
 {
     bool result = true;
@@ -980,6 +996,9 @@ bool testNamespaceTypeShadowing()
     result &= Test("ns_type_funcptr_pointee_visible", ScopeOuter.Inner.runShadow(ScopeOuter.Inner.fillShadow), 13);
     result &= Test("ns_alias_from_nested_namespace", ScopeOuter.Inner.Deep.aliasFromNested(), 11);
     result &= Test("ns_type_bare_from_nested", ScopeOuter.Inner.Deep.bareFromNested(), 10);
+    result &= Test("ns_alias_reaches_generic_base", ShadowOther2.aliasedGenericBase(), 9);
+    result &= Test("ns_alias_reaches_plain_struct", ShadowOther2.aliasedPlainStruct(), 7);
+    result &= Test("ns_real_namespace_outranks_alias", shadowRealNamespaceOutranksAlias(), 1);
     return result;
 }
 

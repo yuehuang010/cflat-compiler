@@ -1,5 +1,5 @@
-// 'sizeof' is deliberately NOT foldable by the forward scanner, and it is FALSE here ('int' is
-// always 4 bytes), so the interface declaration is never compiled. The scanner cannot decide the
+// 'alignof' is deliberately NOT foldable by the forward scanner, and it is FALSE here ('int'
+// aligns to 4), so the interface declaration is never compiled. The scanner cannot decide the
 // branch, so it routes 'GiUnd<int>' as a fat pointer with no method table behind it.
 //
 // An earlier version of this test asserted that a METHOD CALL is the only thing that can go wrong,
@@ -18,7 +18,7 @@
 // expect_error block has closed. The BARE FILE-SCOPE form is the one that stays armed to that point.
 expect_error("was never instantiated");
 
-if const (sizeof(int) == 8) {
+if const (alignof(int) == 8) {
     interface GiUnd<T> { T Get(); };
 }
 

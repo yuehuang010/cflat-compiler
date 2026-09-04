@@ -61,6 +61,17 @@ expect_error("'bool[]' cannot be a type argument of 'list'") {
     }
 }
 
+// A generic FUNCTION is instantiated on its own path, not through pendingInstantiations. Its
+// origin is published the same way, so the argument site named below is in THIS file.
+int gavGenericFn<T>() { return (int)sizeof(T); }
+
+expect_error("'int[]' cannot be a type argument of 'gavGenericFn': instantiating the body forms 'int[]', which is not a valid type") {
+    void gav_use_generic_function()
+    {
+        int n = gavGenericFn<int[]>();
+    }
+}
+
 extern int main()
 {
     return 0;

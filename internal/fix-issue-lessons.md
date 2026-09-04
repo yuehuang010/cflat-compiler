@@ -3166,3 +3166,18 @@ part of what they recorded.
   to master for a sanitizer-only fill; that was the acceptance check.
 - Spin-offs were re-bucketed as q04-q07 (see queue/README.md); the pre-existing
   `--sanitize=ownership --run` teardown flake surfaced there, not from any q03 change.
+
+## Record 2026-09-04: --run teardown flake was a DIBuilder use-after-free, not the sanitizer
+
+`JitRun` moves module + context into the LLJIT, which destroys them at the end of the call;
+`~LLVMBackend` deliberately `release()`s builder/module/context to leak them, but `diBuilder`
+was never covered, so with `-g` its `TypedTrackingMDRef` maps untracked freed metadata (lldb on a
+caught hang: MetadataTracking::untrack <- ~DIBuilder <- ~LLVMBackend). `--sanitize=ownership`
+implies `-g`, which is the only reason it looked sanitizer-related. Landed af6814e: drop every
+context-bound handle (DI state, `WeakVH` lists, the optimized-view cache module) before the JIT
+takes ownership. Two lessons: (1) a flake that survives `MallocScribble` and libgmalloc can still
+be a use-after-free - LLVM metadata lives in the context's bump allocator, so per-malloc guards
+never see the read; catch a hang by backgrounding runs and attaching lldb to one that outlives
+its budget. (2) `ResetForReanalysis` already stated the invariant ("nothing module-bound
+survives"); a second site that moves the module out must maintain the same invariant - a shared
+`DropDebugInfoState()` helper is the mechanical follow-up next time DI state is touched.

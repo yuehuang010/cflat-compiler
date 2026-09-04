@@ -7692,6 +7692,12 @@ public:
     // Resolve a written type spelling to the registered enum key it names (walking the enclosing
     // namespaces and one alias hop), or "" when it names no enum.
     std::string ResolveEnumTypeName(const std::string& spelled) const;
+    // Scan-time constant queries for the pre-pass `if const` folder. Both answer only when the
+    // fact is already known without emitting IR or a diagnostic; false means "undecidable here".
+    bool TryGetEnumMemberInt(const std::string& enumSpelling, const std::string& member,
+                             int64_t& out) const;
+    bool TryGetScanTimeTypeSize(const std::string& typeName, int64_t& out) const;
+    bool TryGetScanTimeIntegerCast(const std::string& typeName, int64_t value, int64_t& out) const;
     bool IsNamespace(const std::string& name) const;
     bool IsImportAlias(const std::string& name) const;
     bool IsImportAliasMember(const std::string& alias, const std::string& member) const;

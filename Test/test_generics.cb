@@ -2906,6 +2906,45 @@ int fnAliasNestedBlockLeak()
     return (int)(b.value * 2.0);   // 5
 }
 
+// Leaves the scan-time folder must decide, or neither arm's alias binds and the later
+// `FnAliasBox<...>` fails with "cannot find the type". Each returns 16777217 through the double
+// arm and 16777216 through the float one, so a wrong arm is a wrong VALUE, not a compile error.
+enum FnAliasDir : char { FnAliasFront, FnAliasBack };
+
+int fnAliasIfConstSizeofArm()
+{
+    if const (sizeof(FnAliasDir) == 1) { using FnAliasSize = double; } else { using FnAliasSize = float; }
+    FnAliasBox<FnAliasSize> b = default;
+    b.value = 16777217.0;
+    return (int)b.value;
+}
+
+// The FALSE arm of a sizeof condition: `int` is 4 bytes, so the float alias binds.
+int fnAliasIfConstSizeofElseArm()
+{
+    if const (sizeof(int) == 1) { using FnAliasSizeE = double; } else { using FnAliasSizeE = float; }
+    FnAliasBox<FnAliasSizeE> b = default;
+    b.value = 16777217.0;
+    return (int)b.value;
+}
+
+// A C-style cast truncates to the target width: (char)258 is 2, not 258.
+int fnAliasIfConstCastArm()
+{
+    if const ((char)258 == 2) { using FnAliasCast = double; } else { using FnAliasCast = float; }
+    FnAliasBox<FnAliasCast> b = default;
+    b.value = 16777217.0;
+    return (int)b.value;
+}
+
+int fnAliasIfConstEnumArm()
+{
+    if const (FnAliasDir.FnAliasBack == 1) { using FnAliasEnum = double; } else { using FnAliasEnum = float; }
+    FnAliasBox<FnAliasEnum> b = default;
+    b.value = 16777217.0;
+    return (int)b.value;
+}
+
 bool testFunctionScopeAliasAsGenericArgument()
 {
     bool result = true;
@@ -2950,6 +2989,12 @@ bool testFunctionScopeAliasAsGenericArgument()
     // An `if const` arm's alias, and a nested block's, reach the rest of the body.
     result &= Test("fn_scope_alias_if_const_taken_arm", fnAliasIfConstTakenArm(), 5);
     result &= Test("fn_scope_alias_nested_block_leak", fnAliasNestedBlockLeak(), 5);
+
+    // Scan-time folder leaves: sizeof, a truncating cast, an enum member.
+    result &= Test("fn_scope_alias_if_const_sizeof_arm", fnAliasIfConstSizeofArm(), 16777217);
+    result &= Test("fn_scope_alias_if_const_sizeof_else_arm", fnAliasIfConstSizeofElseArm(), 16777216);
+    result &= Test("fn_scope_alias_if_const_cast_arm", fnAliasIfConstCastArm(), 16777217);
+    result &= Test("fn_scope_alias_if_const_enum_arm", fnAliasIfConstEnumArm(), 16777217);
 
     int expectPlatAlias = 16777216;
     if const (__MACOS__) { expectPlatAlias = 16777217; }

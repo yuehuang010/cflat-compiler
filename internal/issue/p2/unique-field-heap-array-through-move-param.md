@@ -121,3 +121,12 @@ weigh the blast radius first. Two open questions block it:
    short form gets before the desugar is designed.
 
 Until ruled, this issue stays open and the hidden-count machinery stays; do not start option 4.
+
+## Ruling 2026-09-04: raw `new T[n]` into `T*` stays legal
+
+The 2026-09-03 "block `new T[n]` binding to bare `T*`" direction is withdrawn: `T* p = new T[n]`
+is C-compatible and must be preserved. This issue is now check 4 of
+internal/plan/delete-form-static-analysis.md: a static reject where array provenance is precise
+(option 1 / narrowed option 2 above) plus the runtime trap at the core `unique<T>` ctor / reset
+where it is not (option 4). Ruling still needed on whether the runtime trap is acceptable now
+that the static-only route is closed; the measured false positives above stand.

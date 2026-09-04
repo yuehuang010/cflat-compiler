@@ -4008,9 +4008,9 @@ bool testGiIfConstConditionForms()
 }
 
 // --- Leg 25: an UNDECIDABLE-to-the-scanner dead generic struct must not veto a live interface -
-// The scanner cannot fold 'sizeof', so this branch is undecidable to it (and dead to the main
+// The scanner cannot fold 'alignof', so this branch is undecidable to it (and dead to the main
 // pass). Registering 'GiVetoer' as a struct name here must not silently disable the interface.
-if const (sizeof(int) == 8) {
+if const (alignof(int) == 8) {
     class GiVetoer<T> { T junk = default; };
 }
 interface GiVetoer<T> { T Get(); void Set(T v); };

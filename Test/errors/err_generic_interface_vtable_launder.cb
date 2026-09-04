@@ -25,7 +25,7 @@ interface GlB { int M0(); int M1(); int M2(); int M3(); int M4(); int M5(); int 
 class GlCA : GlA { int d = default; int Get() { return d; } };
 class GlCB : GlB { int M0(){return 0;} int M1(){return 1;} int M2(){return 2;} int M3(){return 3;}
                    int M4(){return 4;} int M5(){return 5;} int M6(){return 6;} int M7(){return 7;} };
-if const (sizeof(int) == 8) {
+if const (alignof(int) == 8) {
     interface GiLaunder<T> { T Get(); };
 }
 
