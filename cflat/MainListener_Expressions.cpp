@@ -4668,6 +4668,14 @@ LLVMBackend::TypeAndValue MainListener::InferTernaryArmType(llvm::Value* value) 
 static bool TernaryJoinIsUnsigned(bool trueUnsigned, unsigned trueBits,
                                   bool falseUnsigned, unsigned falseBits)
 {
+    // C promotes every integer narrower than int to signed int before this rank check, so a
+    // mixed-sign narrow join (`cond ? (u8)255 : (i8)-1`) is a SIGNED int join.
+    if (trueBits != 0 && trueBits < 32 && falseBits != 0 && falseBits < 32
+        && trueUnsigned != falseUnsigned)
+    {
+        trueBits = falseBits = 32;
+        trueUnsigned = falseUnsigned = false;
+    }
     if (trueUnsigned == falseUnsigned) return trueUnsigned;
     return trueUnsigned ? trueBits >= falseBits : falseBits >= trueBits;
 }
@@ -4700,7 +4708,24 @@ bool MainListener::UnifyTernaryArmTypes(CFlatParser::ConditionalExpressionContex
                               size_t trueOccurrence, size_t falseOccurrence,
                               bool trueIsUnsigned, bool falseIsUnsigned) {
         auto* compiler = Compiler(ctx);
-        if (!trueValue || !falseValue || trueValue->getType() == falseValue->getType())
+        if (!trueValue || !falseValue) return true;
+
+        // C integer promotion: mixed-sign sub-int arms both become a signed i32 before the join,
+        // so `cond ? (u8)255 : (i8)-1` joins as -1, not 255. Runs before the same-type early-out
+        // because u8 and i8 arms share one LLVM i8 type.
+        if (trueValue->getType()->isIntegerTy() && falseValue->getType()->isIntegerTy()
+            && trueIsUnsigned != falseIsUnsigned)
+        {
+            unsigned tb = trueValue->getType()->getIntegerBitWidth();
+            unsigned fb = falseValue->getType()->getIntegerBitWidth();
+            if ((tb == 8 || tb == 16) && (fb == 8 || fb == 16))
+            {
+                atTrue();  trueValue  = compiler->PromoteToInt(trueValue,  trueIsUnsigned);
+                atFalse(); falseValue = compiler->PromoteToInt(falseValue, falseIsUnsigned);
+                trueIsUnsigned = falseIsUnsigned = false;
+            }
+        }
+        if (trueValue->getType() == falseValue->getType())
             return true;
 
         auto* ft = falseValue->getType();
@@ -7773,6 +7798,23 @@ llvm::Value* MainListener::LoadNamedVariableImpl(LLVMBackend::NamedVariable& nam
         return nullptr;
     }
 
+// C integer promotion for unary '-' / '~': an i8/i16/u8/u16 operand becomes a SIGNED i32
+// before the operation, so `-(u8)128` is -128 and `~(u8)128` is -129 exactly as C computes them.
+// A SIGNED narrow CONSTANT is left alone: cflat types a bare literal narrow on purpose, and the
+// constant path below already folds it into the smallest fitting signed type.
+static bool PromoteNarrowUnaryOperand(LLVMBackend* compiler, llvm::Value*& value,
+                                      LLVMBackend::NamedVariable& namedVar)
+{
+        if (value == nullptr || !value->getType()->isIntegerTy()) return false;
+        unsigned bits = value->getType()->getIntegerBitWidth();
+        if (bits != 8 && bits != 16) return false;
+        bool isUnsigned = namedVar.TypeAndValue.IsUnsignedInteger() != -1;
+        if (!isUnsigned && llvm::isa<llvm::ConstantInt>(value)) return false;
+        value = compiler->PromoteToInt(value, isUnsigned);
+        namedVar.TypeAndValue.TypeName = "i32";
+        return true;
+}
+
 llvm::Value* MainListener::TryUnaryOperatorOverload(
         llvm::Value* operand, const std::string& op,
         antlr4::ParserRuleContext* ctx) {
@@ -9001,6 +9043,11 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     namedVar.TypeAndValue = compiler->lastCallReturnType;
                     namedVar.Storage = nullptr;
                 }
+                else if (PromoteNarrowUnaryOperand(compiler, newValue, namedVar))
+                {
+                    namedVar.Primary = compiler->CreateNeg(newValue);
+                    namedVar.Storage = nullptr;
+                }
                 else
                 {
                     // Fold negation of signed integer constants into the smallest fitting type
@@ -9053,6 +9100,7 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                 }
                 else
                 {
+                    PromoteNarrowUnaryOperand(compiler, newValue, namedVar);
                     namedVar.Primary = compiler->CreateNot(newValue);
                 }
                 namedVar.Storage = nullptr;

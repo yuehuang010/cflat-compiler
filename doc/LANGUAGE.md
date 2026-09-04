@@ -130,6 +130,13 @@ not `800`. Signedness itself - `/`, `%`, the comparisons and `>>` - now follows 
 At 32 bits and wider the C rule applies unchanged: the unsigned operand wins when its width
 covers the other's, so `(i32)-1 < (u32)3` is false.
 
+Unary `-` and `~` on a sub-int operand, and a `?:` whose two arms are sub-int with DIFFERENT
+signedness, are C-exact with no narrowing back: the result is a signed `int`. So `-(u8)128` is
+`-128`, `~(u8)128` is `-129`, and `cond ? (u8)255 : (i8)-1` is `-1`. Storing the result back
+into a narrow variable truncates as C does (`u8 x = -(u8)128;` leaves `x` at `128`), and so does
+returning it from a function whose declared return type is narrower (`u8 f(u8 x) { return -x; }`
+returns `128` for `x == 128`).
+
 ### `string`
 
 `string` is a built-in value type with layout `{ i8* _ptr, i32 _len }`. String literals are automatically wrapped into a `string` when assigned to a `string` variable or passed to a `string` parameter.

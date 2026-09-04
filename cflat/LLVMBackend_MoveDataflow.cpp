@@ -1555,6 +1555,19 @@ void LLVMBackend::CreateReturnCall(llvm::Value* value, llvm::Value* returnedLoca
                 LogErrorMessage("implicit int-to-bool conversion on return - use '!= 0' to make narrowing explicit");
                 value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
             }
+            // Narrowing integer return (`u8 f(u8 x) { return -x; }`, whose operand C-promotes to
+            // i32): truncate into the declared type exactly as CreateAssignment does for a store.
+            else if (retTy->isIntegerTy() && value->getType()->isIntegerTy()
+                     && value->getType() != retTy)
+            {
+                value = CreateCast(value, retTy, !srcIsUnsigned);
+            }
+            // Backstop: anything still mismatched would be an unreadable module-verifier dump.
+            if (value->getType() != retTy)
+            {
+                LogErrorMessage("cannot return this value: its type does not match the declared "
+                                "return type of function '{}'", { FindFunctionSourceName(currentFunction) });
+            }
             builder->CreateRet(value);
         }
     }

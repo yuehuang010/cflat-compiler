@@ -659,11 +659,13 @@ extern int main()
     int signednessPassed = primitiveBinarySignednessLegs();
     int autoNarrowPassed = autoNarrowMixedSignednessLegs();
     int joinAcceptPassed = stringLiteralJoinAcceptLegs();
+    int narrowPromoPassed = narrowUnaryAndTernaryPromotionLegs();
 
     return (terPassed == 19 && ptrOpPassed == 8 && uPassed == 3
         && unsignedLiteralPassed == 8 && unsignedAcceptPassed == 7
         && chainPassed == 11 && softPassed == 1 && promoPassed == 11
-        && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5) ? 0 : 1;
+        && signednessPassed == 38 && autoNarrowPassed == 4 && joinAcceptPassed == 5
+        && narrowPromoPassed == 46) ? 0 : 1;
 }
 
 // C integer promotion for equal-width sub-int operands, plus the two literal-unsignedness
@@ -878,6 +880,112 @@ int primitiveBinarySignednessLegs()
     u8 zeroByte = 0;
     passed += Test("add u8/i32 promoted signed compare", primitiveAddU8I32Compare(zeroByte, negative), false);
     passed += Test("add u8/i32 promoted signed divide", primitiveAddU8I32Divide(zeroByte, negative), 0);
+    return passed;
+}
+
+struct NarrowPromoBox { i8 a = default; u8 b = default; i16 c = default; u16 d = default; };
+
+// A promoted i32 result returned from a NARROW declared return type must truncate exactly as
+// an assignment to that type does - these all failed module verification before the fix.
+u8  narrowRetNegU8(u8 x) { return -x; }
+u8  narrowRetNotU8(u8 x) { return ~x; }
+i8  narrowRetNegI8(i8 x) { return -x; }
+u8  narrowRetPick(bool c, u8 a, i8 b) { return c ? a : b; }
+i16 narrowRetInt() { int i = 70000; return i; }
+int narrowRetWiden(u8 x) { return x; }
+T   narrowRetNegT<T>(T x) { return -x; }
+
+// C integer promotion for unary '-' / '~' and for a mixed-sign sub-int '?:' join. Every
+// expected value here is the clang oracle for the same expression written as C.
+int narrowUnaryAndTernaryPromotionLegs()
+{
+    int passed = 0;
+    u8 b8 = 128; i8 s8 = -128; u16 b16 = 32768; i16 s16 = -32768;
+    char c8 = -128; short sh = -32768;
+
+    // unary '-' promotes to signed int: master gives 128 / -128 / -32768 / 128 / -32768.
+    passed += Test("neg u8 literal promotes to int", (int)(-(u8)128), -128);
+    passed += Test("neg u8 local promotes to int", (int)(-b8), -128);
+    passed += Test("neg i8 min local promotes to int", (int)(-s8), 128);
+    passed += Test("neg u16 literal promotes to int", (int)(-(u16)32768), -32768);
+    passed += Test("neg i16 min local promotes to int", (int)(-s16), 32768);
+    passed += Test("neg char min local promotes to int", (int)(-c8), 128);
+    passed += Test("neg short min local promotes to int", (int)(-sh), 32768);
+
+    // unary '~' promotes to signed int: master gives 127 / 127 / 32767 / 32767.
+    passed += Test("not u8 literal promotes to int", (int)(~(u8)128), -129);
+    passed += Test("not u8 local promotes to int", (int)(~b8), -129);
+    passed += Test("not u16 literal promotes to int", (int)(~(u16)32768), -32769);
+    passed += Test("not u16 local promotes to int", (int)(~b16), -32769);
+
+    // Field and array-element operands reach the same handler. Master gives -128 / 128 / 32767 / -128 / 127.
+    NarrowPromoBox box = default;
+    box.a = -128; box.b = 128; box.c = -32768; box.d = 32768;
+    passed += Test("neg i8 field promotes to int", (int)(-box.a), 128);
+    passed += Test("neg u8 field promotes to int", (int)(-box.b), -128);
+    passed += Test("not u16 field promotes to int", (int)(~box.d), -32769);
+    i8[2] narrowArr = default; narrowArr[0] = -128; narrowArr[1] = 1;
+    u8[2] byteArr = default; byteArr[0] = 128; byteArr[1] = 1;
+    passed += Test("neg i8 element promotes to int", (int)(-narrowArr[0]), 128);
+    passed += Test("not u8 element promotes to int", (int)(~byteArr[0]), -129);
+
+    // Mixed-sign narrow '?:' join is a SIGNED int join. Master gives -1 / 0 / 255 / -1 / 0 / 255.
+    passed += Test("folded mixed-sign narrow ternary add",
+        (false ? (u8)255 : (i8)-1) + (i32)-256, -257);
+    passed += Test("folded mixed-sign narrow ternary compare",
+        (false ? (u8)255 : (i8)-1) < 0, true);
+    passed += Test("folded mixed-sign narrow ternary value",
+        (int)(false ? (u8)255 : (i8)-1), -1);
+    bool runCond = false; u8 hiByte = 255; i8 negByteArm = -1;
+    passed += Test("runtime mixed-sign narrow ternary add",
+        (runCond ? hiByte : negByteArm) + (i32)-256, -257);
+    passed += Test("runtime mixed-sign narrow ternary compare",
+        (runCond ? hiByte : negByteArm) < 0, true);
+    passed += Test("runtime mixed-sign narrow ternary value",
+        (int)(runCond ? hiByte : negByteArm), -1);
+
+    // The inferred type of a promoted result is int, not the narrow operand type.
+    auto negInferred = -b8;
+    passed += Test("auto neg u8 infers int value", (int)negInferred, -128);
+    passed += Test("auto neg u8 infers int width", (int)sizeof(negInferred), 4);
+    auto notInferred = ~b8;
+    passed += Test("auto not u8 infers int value", (int)notInferred, -129);
+    auto ternInferred = runCond ? hiByte : negByteArm;
+    passed += Test("auto mixed-sign narrow ternary infers int value", (int)ternInferred, -1);
+    passed += Test("auto mixed-sign narrow ternary infers int width", (int)sizeof(ternInferred), 4);
+
+    // ACCEPT-SET: an explicit narrow destination still truncates, nesting round-trips, unary '+'
+    // and the 32-bit-and-wider operands are unchanged, and same-signedness arms keep their value.
+    u8 truncBack = -(u8)128;
+    passed += Test("neg u8 stored back into u8 truncates", (int)truncBack, 128);
+    u8 truncNotBack = ~(u8)128;
+    passed += Test("not u8 stored back into u8 truncates", (int)truncNotBack, 127);
+    i8 truncSigned = -s8;
+    passed += Test("neg i8 stored back into i8 truncates", (int)truncSigned, -128);
+    passed += Test("nested neg on i8 round-trips", (int)(-(-s8)), -128);
+    passed += Test("nested not on u8 round-trips", (int)(~(~b8)), 128);
+    passed += Test("unary plus on u8 is unchanged", (int)(+(u8)200), 200);
+    passed += Test("neg on u32 is unchanged", (i64)(-(u32)128), (i64)4294967168);
+    passed += Test("not on u32 is unchanged", (i64)(~(u32)128), (i64)4294967167);
+    passed += Test("neg on i64 is unchanged", (i64)(-(i64)-128), (i64)128);
+    passed += Test("not on i32 is unchanged", (int)(~(i32)128), -129);
+    u8 sameA = 3; u8 sameB = 4;
+    passed += Test("same-sign u8 ternary arms unchanged",
+        (runCond ? sameA : sameB) + (i32)-256, -252);
+    i16 wideArm = -1; u8 narrowArm = 255;
+    passed += Test("mixed-width mixed-sign ternary joins signed",
+        (runCond ? narrowArm : wideArm) + (i32)-256, -257);
+
+    // Narrow declared RETURN type truncates the promoted i32, the clang-exact result.
+    u8 retArg = 128; i8 retArgI8 = -128; u8 pickA = 255; i8 pickB = -1; u8 wideArg = 200;
+    passed += Test("neg u8 return truncates to u8", (int)narrowRetNegU8(retArg), 128);
+    passed += Test("not u8 return truncates to u8", (int)narrowRetNotU8(retArg), 127);
+    passed += Test("neg i8 min return truncates to i8", (int)narrowRetNegI8(retArgI8), -128);
+    passed += Test("mixed-sign ternary return truncates to u8",
+        (int)narrowRetPick(false, pickA, pickB), 255);
+    passed += Test("wide int return truncates to i16", (int)narrowRetInt(), 4464);
+    passed += Test("u8 return widens into int", narrowRetWiden(wideArg), 200);
+    passed += Test("generic neg u8 return truncates to u8", (int)narrowRetNegT<u8>(retArg), 128);
     return passed;
 }
 
