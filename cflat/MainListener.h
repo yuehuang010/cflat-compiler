@@ -3986,9 +3986,9 @@ public:
      * or mismatched one frees the block wrong and corrupts the heap. (Alignment carried by the TYPE
      * is not tagged here and escapes freely, as in C++.) Shared by the two field-store paths - `=`
      * in ParseAssignmentExpression and brace-init / `<Tag attr=...>` sugar via EmitOneFieldInit - so
-     * neither spelling can reach a mismatched free site. `fieldTV` is the destination field's
-     * declared type and `fieldAlign` its clause; `right` is the value being stored. Returns true
-     * when an error was logged.
+     * neither spelling can reach a mismatched free site. `fieldTV` is the desugared destination
+     * type, `fieldAlign` its clause, and `right` the value being stored. Returns true when an error
+     * was logged.
      */
     bool RejectFieldAllocAlignMismatch(
         const LLVMBackend::TypeAndValue& fieldTV,

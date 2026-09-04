@@ -4178,8 +4178,8 @@ private:
     // field - are not all distinguishable by name at the assignment site. Pass null at teardown,
     // where there is no incoming value.
     void EmitUniqueFieldDelete(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
-                               llvm::Function* pointeeDtor, const std::string& typeName,
-                               uint64_t allocAlign, llvm::Value* replacement = nullptr);
+                               llvm::Function* pointeeDtor,
+                               llvm::Value* replacement = nullptr);
 
     // Release a `unique` fixed-array FIELD slot by slot from the synthesized destructor, reusing
     // the very walk a `unique` array LOCAL already gets. The member builder and currentFunction

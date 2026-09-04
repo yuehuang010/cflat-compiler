@@ -1030,8 +1030,8 @@ void LLVMBackend::EmitFullDestructorOverStorage(llvm::IRBuilder<>& b, llvm::Valu
     }
 
 void LLVMBackend::EmitUniqueFieldDelete(llvm::IRBuilder<>& b, llvm::Value* fieldPtr,
-                               llvm::Function* pointeeDtor, const std::string& typeName,
-                               uint64_t allocAlign, llvm::Value* replacement)
+                               llvm::Function* pointeeDtor,
+                               llvm::Value* replacement)
 {
         auto* ptrTy = llvm::PointerType::get(*context, 0);
         auto* ptrVal = b.CreateLoad(ptrTy, fieldPtr, "uq.ptr");
@@ -1047,14 +1047,7 @@ void LLVMBackend::EmitUniqueFieldDelete(llvm::IRBuilder<>& b, llvm::Value* field
         if (pointeeDtor != nullptr)
             b.CreateCall(pointeeDtor->getFunctionType(), pointeeDtor, { ptrVal });
 
-        // An over-aligned block came from the aligned allocator, so it must be freed via
-        // __delete_aligned to match - same rule as the `delete` site and EmitOwningPtrCleanup.
-        uint64_t effAlign = allocAlign;
-        TypeAndValue tv{ .TypeName = typeName };
-        if (llvm::Type* t = GetType(tv); t != nullptr && t->isSized())
-            effAlign = std::max(effAlign, GetEffectiveAlignmentForType(typeName, t));
-        llvm::Function* del = effAlign > kDefaultNewAlign ? GetFunction("__delete_aligned")
-                                                          : GetFunction("operator delete");
+        llvm::Function* del = GetFunction("operator delete");
         if (del != nullptr)
             b.CreateCall(del->getFunctionType(), del, { ptrVal });
 
@@ -1168,8 +1161,8 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
             // never participate in the containing value's synthesized destruction.
             if (f.IsAlias)
                 continue;
-            // A remaining builtin `unique T* field` owns the pointee. Aligned fields stay on this
-            // path so their allocation alignment reaches the matching deallocator.
+            // A remaining builtin `unique T*` field owns the pointee. Core unique fields use the
+            // wrapper value's synthesized destructor instead.
             if (f.IsUnique
                 && f.Pointer && !f.ElemPointer && !f.IsArrayView && !f.IsSimd
                 && !f.IsBitfield && !f.IsPadding && f.ConstArraySize == 0)
@@ -1255,7 +1248,7 @@ llvm::Function* LLVMBackend::GetOrCreateFullDestructor(const std::string& typeNa
                 EmitUniqueArrayFieldRelease(b, fieldPtr, fieldTy,
                                             w.TypeName, w.IsIface, w.AllocAlign);
             else if (w.IsUniquePtr)
-                EmitUniqueFieldDelete(b, fieldPtr, w.Dtor, w.TypeName, w.AllocAlign);
+                EmitUniqueFieldDelete(b, fieldPtr, w.Dtor);
             else
                 // Scalar field: one call; owning fixed-array field: one call per element.
                 EmitFullDestructorOverStorage(b, fieldPtr, fieldTy, w.Dtor);

@@ -1720,8 +1720,25 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                 // block alignment to compare against.
                 const bool coreUniqueWrapperParam = !params[i].Pointer
                     && IsCoreUniqueType(params[i].TypeName);
+                const bool argIsNull = args[i].Primary != nullptr
+                    && llvm::isa<llvm::ConstantPointerNull>(args[i].Primary);
+                const bool argTypeOverAligned = [&] {
+                    if (!args[i].TypeAndValue.Pointer || args[i].TypeAndValue.ElemPointer
+                        || args[i].TypeAndValue.TypeName.empty()
+                        || args[i].TypeAndValue.IsFunctionPointer
+                        || args[i].TypeAndValue.TypeName == "__c_fn_ptr"
+                        || args[i].TypeAndValue.TypeName == "__closure_fat_ptr")
+                        return false;
+                    TypeAndValue argType{ .TypeName = args[i].TypeAndValue.TypeName };
+                    llvm::Type* type = GetType(argType);
+                    return type != nullptr && type->isSized()
+                        && GetEffectiveAlignmentForType(argType.TypeName, type)
+                            > kDefaultNewAlign;
+                }();
                 if (!beforeCall && paramsCarryAllocAlign
                     && !coreUniqueWrapperParam
+                    && !argIsNull
+                    && !argTypeOverAligned
                     && args[i].AllocAlignment != params[i].AllocAlignValue
                     && (args[i].AllocAlignment > kDefaultNewAlign
                         || params[i].AllocAlignValue > kDefaultNewAlign))

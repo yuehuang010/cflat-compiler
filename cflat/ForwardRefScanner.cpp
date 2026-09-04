@@ -476,12 +476,6 @@ std::vector<LLVMBackend::DeclTypeAndValue> ForwardRefScanner::ParseParameterType
             if (auto declarer = paramDecl->declarator())
                 if (auto directDeclarer = declarer->directDeclarator())
                     paramType.VariableName = getDirectDeclName(directDeclarer);
-            // D4: a `unique` parameter is a synthesized move parameter (mirrors the codegen copy),
-            // so the forward-declared signature agrees on the move flag.
-            if (paramType.IsUnique
-                && ((paramType.Pointer && !paramType.ElemPointer
-                && !paramType.IsArrayView) || paramType.IsInterface))
-                paramType.IsMove = true;
             // A parameter's `alignas(_, N)` allocation alignment now rides in declarationSpecifiers
             // (prefix), so ParseDeclarationSpecifiers above already recorded paramType.AllocAlignValue.
             if (paramType.IsMove && paramType.IsBond)

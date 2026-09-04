@@ -4960,6 +4960,7 @@ void consumeFlat(move alignas(0, 64) double[] buf) { }
 // (Test/errors/err_align_alloc_indirect_store.cb): its block has no aligned header.
 struct AlignedRes { i64 v = 0; };
 struct ResHolder  { alignas(0, 64) unique AlignedRes* p = nullptr; };
+alignas(0, 64) unique AlignedRes* g_aligned_res = nullptr;
 
 // Alignment carried by the pointee TYPE needs no field clause: `new` and `delete` both pick the
 // aligned pair off the static type, so it escapes into a field freely, as in C++.
@@ -5104,7 +5105,12 @@ bool testAlignas()
     result &= Test("alignas(0,64) flat double[] field base%64 over 64 rounds", flatMisaligned, 0);
     result &= Test("alignas(0,64) field churn sum",                            flatSum == 288.0, true);
 
-    // The clause on a SCALAR `unique T*` field. Churned so a mis-routed free corrupts the heap.
+    g_aligned_res = new AlignedRes();
+    result &= Test("alignas(0,64) global unique base%64", (int)(((i64)g_aligned_res.get()) & 63), 0);
+    g_aligned_res = nullptr;
+
+    // The clause on a scalar `unique T*` field desugars to core `unique<T, 64>`, whose destructor
+    // routes aligned blocks to __delete_aligned. Churned so a mis-routed free corrupts the heap.
     // Guards the store check against OVER-rejecting the three shapes that must stay legal: a
     // direct `new`, a null release, and an indirect store whose source agrees with the field.
     int scalarMisaligned = 0;
@@ -5112,18 +5118,18 @@ bool testAlignas()
     {
         ResHolder rh = default;
         rh.p = new AlignedRes();            // direct: the bare `new` inherits the field's clause
-        if ((((i64)rh.p) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+        if ((((i64)rh.p.get()) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
         rh.p = nullptr;                     // sanctioned release: frees it, must stay legal
         alignas(0, 64) AlignedRes* src = new AlignedRes();
         rh.p = src;                         // indirect: the source carries the matching clause
-        if ((((i64)rh.p) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+        if ((((i64)rh.p.get()) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
 
         // Alignment from the TYPE alone: no clause anywhere, indirect store, still 64-aligned
         // and still freed through the aligned route (recovered from the static type).
         WideHolder wh = default;
         WideRes* wsrc = new WideRes();
         wh.w = wsrc;
-        if ((((i64)wh.w) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
+        if ((((i64)wh.w.get()) & 63) != 0) scalarMisaligned = scalarMisaligned + 1;
     }
     result &= Test("alignas(0,64) scalar unique field base%64 over 16 rounds", scalarMisaligned, 0);
 

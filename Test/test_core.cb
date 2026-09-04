@@ -3420,16 +3420,34 @@ int runLocalAlignParamAccept()
     return g_raw_count_dtors;
 }
 
-unique alignas(0, 64) RawCountElem* g_local_align_wide = default;
+// An aligned `unique T*` global is core `unique<T, 64>`, so this leg uses one scalar object.
+alignas(0, 64) unique RawCountElem* g_local_align_wide = default;
 int runLocalAlignGlobalAccept()
 {
     resetRawCountState();
-    g_local_align_wide = new RawCountElem[2] alignas(0, 64);
+    g_local_align_wide = new RawCountElem();
     {
-        alignas(0, 64) RawCountElem* p;
-        p = g_local_align_wide;
+        alignas(0, 64) unique RawCountElem* p = move g_local_align_wide;
     }
+    return g_raw_count_dtors;
+}
+
+// Releasing an aligned unique global by null assignment runs the destructor through unique<T, 64>.
+int runLocalAlignGlobalRelease()
+{
+    resetRawCountState();
+    g_local_align_wide = new RawCountElem();
     g_local_align_wide = nullptr;
+    return g_raw_count_dtors;
+}
+
+// A plain unique global desugars too; on the builtin path this release leaked (0 destructors).
+unique RawCountElem* g_plain_unique_global = default;
+int runPlainUniqueGlobalRelease()
+{
+    resetRawCountState();
+    g_plain_unique_global = new RawCountElem();
+    g_plain_unique_global = nullptr;
     return g_raw_count_dtors;
 }
 
@@ -3748,6 +3766,10 @@ int testRawArrayRuntimeCount()
         runLocalAlignParamAccept(), 2);
     passed += Test("local alignas reassignment from a same-clause global",
         runLocalAlignGlobalAccept(), 1);
+    passed += Test("aligned unique global release runs the destructor",
+        runLocalAlignGlobalRelease(), 1);
+    passed += Test("plain unique global release runs the destructor",
+        runPlainUniqueGlobalRelease(), 1);
     passed += Test("local alignas reassignment from a same-clause ternary join",
         runLocalAlignTernaryAccept(1), 4);
     passed += Test("raw count inferred alignment plain new",
@@ -3860,7 +3882,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 75;
+    r = testRawArrayRuntimeCount(); passed += r; total += 77;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

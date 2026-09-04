@@ -97,15 +97,6 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
                 }
             }
 
-            // D4: a `unique` parameter is a synthesized move parameter - the callee declares the
-            // ownership sink, so passing a named unique value transfers and nulls it via the existing
-            // move machinery. Post-substitution unique params already carry IsMove (set in
-            // ParseDeclarationSpecifiers); this covers the direct `unique X*` spelling.
-            if (paramType.IsUnique
-                && ((paramType.Pointer && !paramType.ElemPointer
-                && !paramType.IsArrayView) || paramType.IsInterface))
-                paramType.IsMove = true;
-
             if (paramType.IsMove && paramType.IsBond)
                 LogErrorContext(paramDecl, std::format("parameter '{}': 'bond' and 'move' are mutually exclusive", paramType.VariableName));
 

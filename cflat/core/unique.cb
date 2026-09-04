@@ -15,9 +15,19 @@ struct unique<T, int ALIGN = 0>
     unique() { }
 
     // Takes ownership of either an interface value or a heap pointer.
-    unique(move P p)
+    if const (ALIGN > 16)
     {
-        _p = move p;
+        unique(move alignas(0, ALIGN) P p)
+        {
+            _p = move p;
+        }
+    }
+    else
+    {
+        unique(move P p)
+        {
+            _p = move p;
+        }
     }
 
     // The poison remains on the destructor so unique<Foo*> is rejected at instantiation.
@@ -66,27 +76,43 @@ struct unique<T, int ALIGN = 0>
     }
 
     // Hands ownership back out; this unique<T> becomes empty.
-    move P release()
+    if const (ALIGN > 16)
     {
-        P value = move _p;
-        _p = nullptr;
-        return move value;
-    }
-
-    // Frees the current value (if any) and takes ownership of the replacement.
-    void reset(move P p)
-    {
-        P old = move _p;
-        _p = move p;
-        if (old != nullptr && old != _p)
+        alignas(0, ALIGN) move P release()
         {
-            if const (ALIGN > 16)
+            P value = move _p;
+            _p = nullptr;
+            return move value;
+        }
+
+        // Frees the current value (if any) and takes ownership of the replacement.
+        void reset(move alignas(0, ALIGN) P p)
+        {
+            P old = move _p;
+            _p = move p;
+            if (old != nullptr && old != _p)
             {
                 alignas(0, ALIGN) P q;
                 q = old;
                 delete q;
             }
-            else
+        }
+    }
+    else
+    {
+        move P release()
+        {
+            P value = move _p;
+            _p = nullptr;
+            return move value;
+        }
+
+        // Frees the current value (if any) and takes ownership of the replacement.
+        void reset(move P p)
+        {
+            P old = move _p;
+            _p = move p;
+            if (old != nullptr && old != _p)
             {
                 delete old;
             }

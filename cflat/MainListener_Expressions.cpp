@@ -2067,6 +2067,20 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
             compiler->lastAllocAlignment = 0;
             compiler->lastCallReturnsAllocAlign = 0;
             auto right = LoadNamedVariable(rightNV);
+            bool coreUniqueAlignedDestination = operatorText == "="
+                && !namedVar.TypeAndValue.Pointer
+                && compiler->IsCoreUniqueType(namedVar.TypeAndValue.TypeName)
+                && (llvm::isa_and_nonnull<llvm::GetElementPtrInst>(destination)
+                    || llvm::isa_and_nonnull<llvm::GlobalVariable>(destination));
+            if (coreUniqueAlignedDestination
+                && RejectFieldAllocAlignMismatch(
+                    namedVar.TypeAndValue, namedVar.TypeAndValue.AllocAlignValue,
+                    rightNV, right,
+                    namedVar.FieldName.empty()
+                        ? std::string("a field")
+                        : std::format("field '{}'", namedVar.FieldName),
+                    ctx))
+                return finishStore(right);
             srcIsOwnedForCoreUnique = srcIsOwnedForCoreUnique
                 || compiler->IsMovedOutPtrValue(right);
 
@@ -3283,7 +3297,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     compiler->EmitUniqueFieldDelete(
                         *compiler->builder, destination,
                         compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
-                        namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
                         right);
                 compiler->builder->CreateStore(right, destination);
                 if (!namedVar.CallerName.empty())
@@ -4015,7 +4028,6 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, destination,
                     compiler->GetFullDestructorForDelete(namedVar.TypeAndValue.TypeName),
-                    namedVar.TypeAndValue.TypeName, namedVar.TypeAndValue.AllocAlignValue,
                     right);
 
                 // Transfer, not alias: storing a named OWNING `unique T*` local into a unique
@@ -9483,6 +9495,12 @@ bool MainListener::EmitOneFieldInit(
         llvm::Value* val = LoadNamedVariable(rightNV);
         if (!val) return false;
 
+        if (!fieldType.Pointer && compiler->IsCoreUniqueType(fieldType.TypeName)
+            && RejectFieldAllocAlignMismatch(
+                fieldType, fieldType.AllocAlignValue, rightNV, val,
+                std::format("field '{}.{}'", displayTypeName, fieldName), errCtx))
+            return false;
+
         if ((val->getType()->isPointerTy()
                 || (val->getType() == compiler->GetFatPtrType()
                     && compiler->IsCoreUniqueType(fieldType.TypeName)
@@ -9687,8 +9705,7 @@ bool MainListener::EmitOneFieldInit(
                 && fieldType.Pointer)
                 compiler->EmitUniqueFieldDelete(
                     *compiler->builder, gep,
-                    compiler->GetFullDestructorForDelete(fieldType.TypeName),
-                    fieldType.TypeName, fieldType.AllocAlignValue, val);
+                    compiler->GetFullDestructorForDelete(fieldType.TypeName), val);
             else if (fieldType.IsFatInterfaceValue()
                 && fieldType.IsUnique)
             {
@@ -9819,6 +9836,9 @@ llvm::Value* MainListener::ParseFieldDefaultInitializer(
         CFlatParser::AssignmentExpressionContext* ae,
         bool* srcIsUnsigned) {
         auto* compiler = Compiler(ae);
+        if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+            && AsDirectNew(ae) != nullptr)
+            compiler->pendingInitAllocAlign = field.AllocAlignValue;
         auto nv = ParseAssignmentExpressionNamed(ae);
         llvm::Value* val = LoadNamedVariable(nv);
         RejectRawHeapArrayIntoUniqueField(nv, field, field.VariableName, ae);
@@ -9973,15 +9993,16 @@ llvm::Value* MainListener::ParseFieldDefaultBraceInitializer(
         if (isCoreUniqueField)
         {
             std::string pointee = MangledGenericArgument(*compiler, field.TypeName);
-            // The interface spelling carries no star; keep the advice text matching what was written.
+            const bool hasAlignedWrapperType = field.AllocAlignValue != 0;
             const std::string pointeeSpelling = "unique "
                 + SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = pointee })
                 + (compiler->IsInterfaceType(pointee) ? "" : "*");
+            const std::string typeText = hasAlignedWrapperType
+                ? SpellType(*compiler, field) : pointeeSpelling;
             LogPointerBraceInitReject(list,
                 std::format("field '{}.{}'", displayStructName, field.VariableName),
-                SpellType(*compiler, LLVMBackend::TypeAndValue{ .TypeName = pointee }),
-                pointeeSpelling,
-                CanSuggestAllocation(list, field), true);
+                hasAlignedWrapperType ? field.TypeName : pointee, typeText,
+                hasAlignedWrapperType ? false : CanSuggestAllocation(list, field), true);
             return nullptr;
         }
 
@@ -10353,6 +10374,9 @@ void MainListener::EmitFieldInitializer(
                 // The FIELD's type is the context for an immediately-invoked literal in its
                 // initializer, the same way a declarator's type is.
                 fieldExpectedScope.emplace(&declExpectedType, field);
+                if (field.AllocAlignValue > LLVMBackend::kDefaultNewAlign
+                    && AsDirectNew(fi->assignmentExpression(0)) != nullptr)
+                    compiler->pendingInitAllocAlign = field.AllocAlignValue;
                 break;
             }
             auto rightNV = ParseAssignmentExpressionNamed(fi->assignmentExpression(0));

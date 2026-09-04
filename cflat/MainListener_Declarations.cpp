@@ -965,7 +965,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // declarators may still desugar to fixed arrays of unique<T>.
                 const bool uniqueArrayOk = inLocalDecl_ || inStructFieldDecl_;
                 if (hasUniqueSpecifier
-                    && (inLocalDecl_ || isParameterDecl || inStructFieldDecl_ || isReturnDecl)
+                    && (global_scope || inLocalDecl_ || isParameterDecl || inStructFieldDecl_ || isReturnDecl)
                     && (!isReturnDecl || !hasExternSpecifier)
                     && declType.TypeName != "void"
                     && !inUnionFieldDecl_
@@ -977,10 +977,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     && (declType.ArraySize == nullptr || uniqueArrayOk)
                     && declType.AliasArraySize == 0
                     && declType.ExtraArrayDims.empty()
-                    // A FIELD with an allocation-alignment clause keeps the builtin pointer
-                    // representation: its synthesized teardown reads the alignment off the
-                    // field's own declared type, a path this change does not touch.
-                    && (declType.AllocAlignValue == 0 || !inStructFieldDecl_)
                     && (declSpecs->parent == nullptr
                         || (uniqueArrayOk || !HasParameterArrayDeclarator(declSpecs))))
                 {
@@ -1004,15 +1000,6 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (isParameterDecl)
                         declType.IsMove = true;
                 }
-                // A `unique` FIELD or GLOBAL with an allocation-alignment clause stays on the
-                // builtin pointer representation, whose cleanup carries the per-allocation
-                // deallocator. Locals, parameters and return types were claimed by the desugar
-                // above (which cleared hasUniqueSpecifier), so only those two reach here.
-                if (hasUniqueSpecifier
-                    && declType.AllocAlignValue != 0
-                    && declType.Pointer && !declType.ElemPointer
-                    && !declType.IsArrayView && !declType.IsFunctionPointer)
-                    declType.IsUnique = true;
                 if (declSpec->Question())
                 {
                     if (declType.IsPrimitive())
@@ -2975,17 +2962,6 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     typeAndValue.BraceInitializer = initDecl->initializerList();
                     typeAndValue.Annotations = annotations;
 
-                    // A field's `alignas(_, N)` allocation-alignment clause now rides in
-                    // declarationSpecifiers (prefix), so ParseDeclarationSpecifiers already set
-                    // typeAndValue.AllocAlignValue; it distributes to every declarator in this group.
-                    // Preserve the raw ownership carrier for the aligned-field remnant: the
-                    // wrapper cannot carry the allocation alignment needed by its destructor.
-                    if (HasSoftDeclarationSpecifier(direct, "unique")
-                        && typeAndValue.AllocAlignValue != 0)
-                    {
-                        typeAndValue.IsUnique = true;
-                    }
-
                     // Bitfield: `int flags : 3 = 0;` - the constantExpression after ':'
                     // is the declared width in bits. Set IsBitfield + BitWidth here;
                     // the packing pass (LayoutBitfields in LLVMBackend.h) fills in
@@ -3013,21 +2989,6 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseDeclarationList(st
                     bool isCoreUniqueField = !typeAndValue.Pointer
                         && (compiler->IsCoreUniqueType(typeAndValue.TypeName)
                             || MangledBase(typeAndValue.TypeName) == "unique");
-                    // Keep error recovery for a unique union member on the builtin pointer
-                    // representation; an unresolved core wrapper is not a sized union member.
-                    if (inUnionFieldDecl_ && isCoreUniqueField)
-                    {
-                        typeAndValue.TypeName = MangledGenericArgument(
-                            *compiler, typeAndValue.TypeName);
-                        typeAndValue.Pointer = true;
-                        typeAndValue.PointerDepth = 1;
-                        typeAndValue.IsUnique = true;
-                    }
-                    else if (inUnionFieldDecl_ && spelledUnique && typeAndValue.Pointer
-                             && !typeAndValue.ElemPointer)
-                    {
-                        typeAndValue.IsUnique = true;
-                    }
                     if (typeAndValue.IsUnique || isCoreUniqueField || spelledUnique)
                         ValidateUniqueField(typeAndValue, declarator);
                     else
@@ -5315,6 +5276,9 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                                         || movedContainerSlot
                                         || (initializerOwns && !initializerIsBorrowed);
                                     ctorArg.IsOwningStruct = initializerSourceNV.IsOwningStruct;
+                                    ctorArg.AllocAlignment = initializerSourceNV.AllocAlignment;
+                                    ctorArg.TypeAndValue.AllocAlignValue =
+                                        initializerSourceNV.TypeAndValue.AllocAlignValue;
                                     // A moved container slot can retain the slot's pointer depth
                                     // witness even though its loaded LLVM value is one raw T*.
                                     // The unique constructor consumes that actual value, so present
@@ -7188,28 +7152,32 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         llvm::Value* right,
         const std::string& fieldDesc,
         antlr4::ParserRuleContext* ctx) {
-        bool rhsOverAligned = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign;
+        if (fieldAlign == 0)
+            fieldAlign = fieldTV.AllocAlignValue;
+        uint64_t rhsAllocAlign = rightNV.AllocAlignment != 0
+            ? rightNV.AllocAlignment : rightNV.TypeAndValue.AllocAlignValue;
+        bool rhsOverAligned = rhsAllocAlign > LLVMBackend::kDefaultNewAlign;
         bool fieldHasClause = fieldAlign > LLVMBackend::kDefaultNewAlign;
-        // A freshly-allocated array-view (`new T[n]...`) stored into an aligned field must carry
-        // the field's clause; a null store (IsArrayView false) is exempt.
+        // A freshly-allocated array-view (`new T[n]...`) stored into a field must carry the
+        // block alignment because the field stores only the raw buffer pointer.
         bool rhsFreshBuffer = rightNV.TypeAndValue.IsArrayView;
         bool rhsNonNullPtr  = right != nullptr && !llvm::isa<llvm::ConstantPointerNull>(right);
-        // A scalar `T*` carries no array-view marker, so an INDIRECT store (`T* t = new T();
-        // f.p = t;`) slips past the test above and the free site then trusts the field's clause
-        // against a block `operator new` allocated. Demand agreement from any non-null pointer
-        // stored into a clause-bearing scalar `unique` field: that synthesized free site is the one
-        // the user never wrote and cannot audit. A field without `unique` frees nothing on its own,
-        // so a mismatch there cannot reach compiler-emitted code - any free is hand-written, and
-        // gating here keeps such code legal. Exempt: a pointee TYPE that is itself over-aligned
-        // routes BOTH `new` and `delete` to the aligned pair off the static type (as in C++), so the
-        // clause cannot disagree there and `new T alignas(...)` has no syntax. `fieldHasClause`
-        // leads so the type lookup is skipped on the (overwhelmingly common) clause-free field.
-        bool rhsIndirectPtr = fieldHasClause && rhsNonNullPtr
-            && fieldTV.IsUnique
-            && fieldTV.Pointer && !fieldTV.IsArrayView
-            && !ElementTypeIsOverAligned(fieldTV);
-        if (!(rhsOverAligned || (fieldHasClause && (rhsFreshBuffer || rhsIndirectPtr)))
-            || fieldAlign == rightNV.AllocAlignment)
+        // Desugared unique fields still need the same source-alignment proof before the raw
+        // pointer is wrapped by unique<T, N>. Interface fields retain the legacy marker.
+        bool coreUniqueField = !fieldTV.Pointer
+            && compilerLLVM->IsCoreUniqueType(fieldTV.TypeName);
+        if (rhsNonNullPtr && (fieldTV.IsUnique || coreUniqueField))
+        {
+            LLVMBackend::TypeAndValue pointeeTV = fieldTV;
+            if (coreUniqueField)
+                pointeeTV.TypeName = MangledGenericArgument(*compilerLLVM, fieldTV.TypeName);
+            if (ElementTypeIsOverAligned(pointeeTV))
+                return false;
+        }
+        bool rhsIndirectPtr = fieldHasClause && rhsNonNullPtr && !rhsFreshBuffer;
+        if (!(((rhsFreshBuffer || fieldHasClause) && rhsOverAligned)
+              || (fieldHasClause && (rhsFreshBuffer || rhsIndirectPtr)))
+            || fieldAlign == rhsAllocAlign)
             return false;
 
         if (!fieldHasClause)
@@ -7218,7 +7186,7 @@ bool MainListener::RejectFieldAllocAlignMismatch(
                 "is a property of the allocation, not of the type, so a free through the field cannot "
                 "recover it. Declare the field 'alignas(0, {})' so the block alignment is recorded, or "
                 "over-align the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};').",
-                rightNV.AllocAlignment, fieldDesc, rightNV.AllocAlignment, rightNV.AllocAlignment));
+                rhsAllocAlign, fieldDesc, rhsAllocAlign, rhsAllocAlign));
         else if (!rhsOverAligned && rhsFreshBuffer)
             LogErrorContext(ctx, std::format(
                 "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
@@ -7240,7 +7208,7 @@ bool MainListener::RejectFieldAllocAlignMismatch(
                 "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
                 "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
                 "the correct alignment.",
-                fieldDesc, fieldAlign, rightNV.AllocAlignment));
+                fieldDesc, fieldAlign, rhsAllocAlign));
         return true;
     }
 
@@ -7868,6 +7836,8 @@ LLVMBackend::NamedVariable MainListener::FinishAssignmentExpressionNamed(
             nv.AllocAlignment = raw->AllocAlign;
             nv.IsOwning = raw->Owns;
         }
+        if (compilerLLVM->lastCallReturnsAllocAlign > 0)
+            nv.AllocAlignment = compilerLLVM->lastCallReturnsAllocAlign;
         bool exprOwned = compilerLLVM->lastCallReturnsOwned;
         if (exprOwned && NamedVarIsString(nv))
             nv.IsOwningString = true;
