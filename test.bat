@@ -279,6 +279,43 @@ if errorlevel 1 (
     )
 )
 
+REM Sanitizer pass: test_core.cb carries legs gated on `if const (__SANITIZE_OWNERSHIP__)`
+REM (init_capacity poison fill). The ordinary worker compiles without the sanitizer, so those
+REM arms fold away and never run. Compile and run the same fixture once more with
+REM --sanitize=ownership (AOT -o, not --run: the sanitizer implies -g) and report it as
+REM test_core.sanitize. The fixture raises its own expected-leg total under the gate, so a
+REM sanitized total no higher than the plain worker's means the gate did not take.
+set SAN_NAME=test_core.sanitize
+set SAN_LOG=%OUT%\results\%SAN_NAME%.log
+set SAN_EXE=%OUT%\%SAN_NAME%.exe
+set SAN_RESULT=%OUT%\results\%SAN_NAME%.result
+set SAN_PLAIN_LOG=%OUT%\results\test_core.log
+"%COMPILER%" "%SRC%\test_core.cb" -i "%LIB%" --locale-dir "%CFLAT_LOCALE_DIR%" --sanitize=ownership -o "%SAN_EXE%" --nologo %CFLAT_PLATFORM_FLAG% >"%SAN_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: sanitized test_core did not compile >"%SAN_RESULT%"
+    goto SanitizeDone
+)
+"%SAN_EXE%" >>"%SAN_LOG%" 2>&1
+if errorlevel 1 (
+    echo FAILED: sanitized test_core failed at run time >"%SAN_RESULT%"
+    goto SanitizeDone
+)
+set SAN_TOTAL=
+set SAN_PLAIN_TOTAL=
+REM Line is "<passed> / <total> tests passed." - token 3 is the expected-leg total.
+for /f "tokens=3" %%a in ('findstr /c:"tests passed." "%SAN_LOG%"') do set SAN_TOTAL=%%a
+if exist "%SAN_PLAIN_LOG%" for /f "tokens=3" %%a in ('findstr /c:"tests passed." "%SAN_PLAIN_LOG%"') do set SAN_PLAIN_TOTAL=%%a
+if not defined SAN_TOTAL (
+    echo FAILED: sanitized test_core printed no leg total >"%SAN_RESULT%"
+    goto SanitizeDone
+)
+if defined SAN_PLAIN_TOTAL if !SAN_TOTAL! leq !SAN_PLAIN_TOTAL! (
+    echo FAILED: sanitizer-gated legs did not run >"%SAN_RESULT%"
+    goto SanitizeDone
+)
+echo PASS 0.00s >"%SAN_RESULT%"
+:SanitizeDone
+
 REM CLI regression: -D global defines. Covers the attached and separated spellings, an int
 REM and a string value, later-wins ordering, defines used as ordinary values and as
 REM compile-time constants in generic code, and the reserved-name rejection.

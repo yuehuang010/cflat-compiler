@@ -362,6 +362,39 @@ else
 fi
 fi
 
+# Sanitizer pass: test_core.cb carries legs gated on `if const (__SANITIZE_OWNERSHIP__)`
+# (init_capacity poison fill). The ordinary pass compiles without the sanitizer, so those
+# arms fold away and never run. Compile and run the same fixture once more with
+# --sanitize=ownership (AOT -o, not --run: the sanitizer implies -g) and report it as
+# test_core.sanitize. The fixture also raises its own expected-leg total under the gate,
+# so a sanitized total no higher than the plain one means the gate did not take - that
+# is the non-vacuity check below.
+if [ "$RUN_MODE" -eq 0 ] && ! is_skipped test_core; then
+san_name="test_core.sanitize"
+san_log="$RES/$san_name.log"
+san_bin="$RES/$san_name.bin"
+san_t0=$(now_ms)
+read_leg_total() {
+  sed -n 's/^[0-9]* \/ \([0-9]*\) tests passed\.$/\1/p' "$1" | tail -n 1
+}
+if ! $TIMEOUT "$CFLAT" "$SRC/test_core.cb" -i "$LIB" --locale-dir "$LOCALE_DIR" \
+    --sanitize=ownership -o "$san_bin" >"$san_log" 2>&1; then
+  write_result "$san_name" "FAIL compile" "$san_t0"
+elif ! $TIMEOUT "$san_bin" </dev/null >>"$san_log" 2>&1; then
+  write_result "$san_name" "FAIL run" "$san_t0"
+else
+  san_total="$(read_leg_total "$san_log")"
+  plain_total="$(read_leg_total "$RES/test_core.log")"
+  if [ -z "$san_total" ]; then
+    write_result "$san_name" "FAIL: sanitized run printed no leg total" "$san_t0"
+  elif [ -n "$plain_total" ] && [ "$san_total" -le "$plain_total" ]; then
+    write_result "$san_name" "FAIL: sanitizer-gated legs did not run ($san_total <= $plain_total)" "$san_t0"
+  else
+    write_result "$san_name" "PASS" "$san_t0"
+  fi
+fi
+fi
+
 # CLI regression: -D global defines. Covers the attached and separated spellings, an int
 # and a string value, later-wins ordering, defines used as ordinary values and as
 # compile-time constants in generic code, and the reserved-name rejection.
