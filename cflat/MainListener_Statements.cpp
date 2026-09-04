@@ -308,6 +308,29 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 auto typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
                 llvm::Value* rawVal = typedVal.value;
                 auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
+                // An enum member (or a const global) reads back as a load from a constant global,
+                // not a ConstantInt; fold it with the same lookup `if const` uses.
+                if (!val && rawVal != nullptr && rawVal->getType()->isIntegerTy())
+                {
+                    uint64_t folded = 0;
+                    if (TryFoldConstInt(rawVal, folded, &constFoldableGlobals_))
+                    {
+                        val = llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(
+                            llvm::cast<llvm::IntegerType>(rawVal->getType()), folded, true));
+                        // The label's signedness is the DECLARED type of the global it came from
+                        // (an enum resolves to its backing type), not the load's IR type.
+                        if (auto* ld = llvm::dyn_cast<llvm::LoadInst>(rawVal))
+                            if (auto* gv = llvm::dyn_cast<llvm::GlobalVariable>(ld->getPointerOperand()))
+                            {
+                                auto nv = compiler->GetGlobalVariableNV(std::string(gv->getName()));
+                                LLVMBackend::TypeAndValue probe;
+                                probe.TypeName = compiler->ResolveFuncPtrTypeSpelling(nv.TypeAndValue.TypeName);
+                                if (probe.IsUnsignedInteger() != -1)
+                                    typedVal.isUnsigned = true;
+                            }
+                        rawVal = val;
+                    }
+                }
                 llvm::Constant* strLit = nullptr;
                 if (!val)
                 {

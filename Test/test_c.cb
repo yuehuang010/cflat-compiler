@@ -461,6 +461,43 @@ int switchHexI32(int x)
     }
 }
 
+// Enum members are compile-time constants, so they are legal case labels.
+enum SwitchDir : int { Back = -1, None = 0, Fwd = 1 };
+enum SwitchSmall : u8 { Lo = 1, Mid = 200, Hi = 255 };
+
+int switchEnumInt(int x)
+{
+    switch (x)
+    {
+        case SwitchDir.Back: return 10;
+        case SwitchDir.None: return 20;
+        case SwitchDir.Fwd: return 30;
+        default: return 0;
+    }
+}
+
+int switchEnumU8(u8 x)
+{
+    switch (x)
+    {
+        case SwitchSmall.Lo: return 1;
+        case SwitchSmall.Mid: return 2;
+        case SwitchSmall.Hi: return 3;
+        default: return 0;
+    }
+}
+
+int switchEnumScrutinee()
+{
+    SwitchDir d = SwitchDir.Back;
+    switch (d)
+    {
+        case SwitchDir.Back: return 10;
+        case SwitchDir.Fwd: return 30;
+        default: return 0;
+    }
+}
+
 int switchFallthrough(int x)
 {
     int result = 0;
@@ -785,6 +822,15 @@ extern int main(int argc, char** argv)
     result &= Test("switch_hex_i64_intmin", switchHexWide(-2147483648), 3);
     result &= Test("switch_hex_i32_pattern", switchHexI32(-1), 1);
     result &= Test("switch_hex_i64_allbits", switchHexWide(-1), 4);
+    result &= Test("switch_enum_neg",     switchEnumInt(-1), 10);
+    result &= Test("switch_enum_zero",    switchEnumInt(0), 20);
+    result &= Test("switch_enum_pos",     switchEnumInt(1), 30);
+    result &= Test("switch_enum_miss",    switchEnumInt(7), 0);
+    result &= Test("switch_enum_u8_lo",   switchEnumU8((u8)1), 1);
+    result &= Test("switch_enum_u8_mid",  switchEnumU8((u8)200), 2);
+    result &= Test("switch_enum_u8_hi",   switchEnumU8((u8)255), 3);
+    result &= Test("switch_enum_u8_miss", switchEnumU8((u8)7), 0);
+    result &= Test("switch_enum_scrut",   switchEnumScrutinee(), 10);
     result &= Test("switch_fall1",     switchFallthrough(1), 12);
     result &= Test("switch_fall2",     switchFallthrough(2), 12);
     result &= Test("switch_fall3",     switchFallthrough(3),  3);

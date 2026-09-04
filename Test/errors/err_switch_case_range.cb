@@ -1,6 +1,9 @@
 // A case label is converted into the switch operand's integer type. A label outside that
 // type's range, or two labels that convert to the same constant, must be diagnosed here -
 // silently truncating it (or handing an invalid SwitchInst to the verifier) is not acceptable.
+enum ErrDir : int { Back = -1, None = 0, Fwd = 1 };
+enum ErrDup : int { A = 5, B = 5 };
+
 extern int main()
 {
     expect_error("case label '300' does not fit the switch operand type 'i8'") {
@@ -21,6 +24,17 @@ extern int main()
     expect_error("duplicate case label '1' in switch") {
         int w = 1;
         switch (w) { case 1: return 1; case 0x1: return 2; default: return 0; }
+    }
+
+    // Enum members are constant labels, so the same range and duplicate rules apply to them.
+    expect_error("case label '-1' does not fit the switch operand type 'u8'") {
+        u8 e = 1;
+        switch (e) { case ErrDir.Back: return 1; default: return 0; }
+    }
+
+    expect_error("duplicate case label '5' in switch") {
+        int d = 5;
+        switch (d) { case ErrDup.A: return 1; case ErrDup.B: return 2; default: return 0; }
     }
 
     return 0;
