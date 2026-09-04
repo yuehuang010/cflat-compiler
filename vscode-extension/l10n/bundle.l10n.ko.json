@@ -11,7 +11,7 @@
   "{0} reloads/Register allocation term: reading spilled values back from the stack into CPU registers.The counterpart of \"spill\".": "리로드 {0}회",
   "Instructions/Machine/IR instructions in the called function that the optimizer could not fold away.Appears in a comma-separated list of what made a call expensive to inline.": "명령어",
   "Calls inside callee/Cost charged for the calls the called function itself makes.Appears in a comma-separated list of what made a call expensive to inline.": "피호출자 내부 호출",
-  "Switch lowering/Cost of turning a switch statement into jump tables and comparison chains.Appears in a comma-separated list of what made a call expensive to inline.": "스위치 문장 내림차순 처리",
+  "Switch lowering/Cost of turning a switch statement into jump tables and comparison chains.Appears in a comma-separated list of what made a call expensive to inline.": "스위치 낮추기",
   "Argument setup/Cost of preparing the arguments passed to a call.Appears in a comma-separated list of what made a call expensive to inline.": "인수 설정",
   "Indirect calls/Cost charged for calls through a function pointer, whose target is not known.Appears in a comma-separated list of what made a call expensive to inline.": "간접 호출",
   "Cold calling convention/Cost charged because the called function uses the calling convention for rarely executed code.Appears in a comma-separated list of what made a call expensive to inline.": "콜드 호출 규약",
