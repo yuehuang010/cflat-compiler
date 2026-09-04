@@ -498,10 +498,10 @@ std::string LLVMBackend::FuncPtrAbiCanonKey(const std::string& key) const
         return canon(spelling);
 }
 
-std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string& spelling) const
+std::vector<std::string> LLVMBackend::TailMatchCandidates(const std::string& spelling) const
 {
         std::vector<std::string> keys;
-        if (spelling.empty() || HasInterface(spelling)) return keys;
+        if (spelling.empty()) return keys;
         for (const auto& entry : dataStructures)
         {
             const std::string& key = entry.first;
@@ -511,11 +511,24 @@ std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string&
                 && key[key.size() - spelling.size() - 1] == '.';
             if (key != spelling && !tail) continue;
             if (HasInterface(key)) continue;
-            // The SPELLING match is made on the raw key (that is what names the struct); the
-            // recorded identity is the ABI-canonical form, so two instantiations that differ
-            // only in a scalar spelling or in signedness compare equal.
-            keys.push_back(FuncPtrAbiCanonKey(key));
+            keys.push_back(key);
         }
+        return keys;
+    }
+
+// The scoped resolver is deliberately NOT consulted: a signature records the source spelling
+// WITHOUT its declaring scope, so walking the namespace active at COMPARISON time answers for the
+// wrong scope (see the "namespace-ambiguous pointee binds" leg in Test/test_function_ptr.cb). The
+// set below guesses nothing; the recorded declaring-scope key in FuncPtrComponentOf is the only
+// sound narrowing. The SPELLING match is made on the raw key (that is what names the struct); the
+// recorded identity is the ABI-canonical form, so two instantiations that differ only in a scalar
+// spelling or in signedness compare equal.
+std::vector<std::string> LLVMBackend::FuncPtrStructCandidates(const std::string& spelling) const
+{
+        std::vector<std::string> keys;
+        if (spelling.empty() || HasInterface(spelling)) return keys;
+        for (const auto& key : TailMatchCandidates(spelling))
+            keys.push_back(FuncPtrAbiCanonKey(key));
         std::sort(keys.begin(), keys.end());
         keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
         return keys;

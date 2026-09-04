@@ -198,8 +198,7 @@ void LLVMBackend::RegisterTypeAlias(const std::string& alias, const std::string&
             aliasScopeStack_.back().typeAliases[alias] = target;
             return;
         }
-        const auto candidates = ScopedNameCandidates(alias);
-        typeAliases[candidates.empty() ? alias : candidates.front()] = target;
+        RegisterScopedName(typeAliases, alias, target);
     }
 
 void LLVMBackend::RegisterFunctionTypeAlias(const std::string& alias, const TypeAndValue& target)
@@ -209,8 +208,7 @@ void LLVMBackend::RegisterFunctionTypeAlias(const std::string& alias, const Type
             aliasScopeStack_.back().functionTypeAliases[alias] = target;
             return;
         }
-        const auto candidates = ScopedNameCandidates(alias);
-        functionTypeAliases[candidates.empty() ? alias : candidates.front()] = target;
+        RegisterScopedName(functionTypeAliases, alias, target);
     }
 
 std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
@@ -220,11 +218,7 @@ std::string LLVMBackend::ResolveTypeAlias(const std::string& name) const
             auto it = frame.typeAliases.find(name);
             if (it != frame.typeAliases.end()) return it->second;
         }
-        for (const auto& candidate : ScopedNameCandidates(name))
-        {
-            auto it = typeAliases.find(candidate);
-            if (it != typeAliases.end()) return it->second;
-        }
+        if (const std::string* found = FindFirstVisibleScoped(typeAliases, name)) return *found;
         return name;
     }
 
@@ -235,12 +229,7 @@ const LLVMBackend::TypeAndValue* LLVMBackend::FindFunctionTypeAlias(const std::s
             auto it = frame.functionTypeAliases.find(name);
             if (it != frame.functionTypeAliases.end()) return &it->second;
         }
-        for (const auto& candidate : ScopedNameCandidates(name))
-        {
-            auto it = functionTypeAliases.find(candidate);
-            if (it != functionTypeAliases.end()) return &it->second;
-        }
-        return nullptr;
+        return FindFirstVisibleScoped(functionTypeAliases, name);
     }
 
 void LLVMBackend::PushAliasScope()
@@ -287,8 +276,7 @@ void LLVMBackend::RegisterManglingAlias(const std::string& alias, const std::str
             aliasScopeStack_.back().typeAliases[alias] = target;
             return;
         }
-        const auto candidates = ScopedNameCandidates(alias);
-        manglingAliases_[candidates.empty() ? alias : candidates.front()] = target;
+        RegisterScopedName(manglingAliases_, alias, target);
     }
 
 std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
@@ -314,14 +302,11 @@ std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
                 break;
             }
             if (shadowed) { if (found) continue; return cur; }
-            for (const auto& candidate : ScopedNameCandidates(cur))
+            if (const std::string* target = FindFirstVisibleScoped(manglingAliases_, cur))
             {
-                auto it = manglingAliases_.find(candidate);
-                if (it == manglingAliases_.end()) continue;
-                if (it->second == cur) return cur;
-                cur = it->second;
+                if (*target == cur) return cur;
+                cur = *target;
                 found = true;
-                break;
             }
             if (!found) break;
         }
@@ -330,26 +315,20 @@ std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
 
 void LLVMBackend::RegisterGenericBaseAlias(const std::string& alias, const std::string& target)
 {
-        const auto candidates = ScopedNameCandidates(alias);
-        genericBaseAliases_[candidates.empty() ? alias : candidates.front()] = target;
+        RegisterScopedName(genericBaseAliases_, alias, target);
     }
 
 bool LLVMBackend::IsGenericBaseAlias(const std::string& name) const
 {
-        for (const auto& candidate : ScopedNameCandidates(name))
-            if (genericBaseAliases_.count(candidate) != 0) return true;
-        return false;
+        return FindFirstVisibleScoped(genericBaseAliases_, name) != nullptr;
     }
 
 std::string LLVMBackend::ResolveGenericBaseAlias(const std::string& base) const
 {
         // An alias TARGET is explicit and already resolved at its declaration site: returning it
         // verbatim is what stops a global `using GBox = Box;` naming NS.Box inside `namespace NS`.
-        for (const auto& candidate : ScopedNameCandidates(base))
-        {
-            auto it = genericBaseAliases_.find(candidate);
-            if (it != genericBaseAliases_.end()) return it->second;
-        }
+        if (const std::string* target = FindFirstVisibleScoped(genericBaseAliases_, base))
+            return *target;
         return ResolveGenericTemplateBase(base);
     }
 
@@ -365,19 +344,12 @@ bool LLVMBackend::IsGenericTemplateKey(const std::string& key) const
 std::string LLVMBackend::ResolveGenericTemplateBase(const std::string& base) const
 {
         if (base.empty()) return base;
-        if (!currentNamespace_.empty())
-        {
-            std::string prefix = currentNamespace_;
-            while (true)
-            {
-                if (std::string candidate = prefix + "." + base; IsGenericTemplateKey(candidate))
-                    return candidate;
-                auto dot = prefix.rfind('.');
-                if (dot == std::string::npos) break;
-                prefix = prefix.substr(0, dot);
-            }
-        }
-        return base;
+        // A dotted spelling is prefixed too: "Inner.Box" names "Outer.Inner.Box" from `namespace
+        // Outer`. Template keys are recorded verbatim, so no first-component alias hop.
+        const ScopedLookupOptions opts{ .PrefixDottedNames = true, .ResolveFirstComponentAlias = false };
+        std::string key = FirstVisibleScopedKey(base,
+            [this](const std::string& c) { return IsGenericTemplateKey(c); }, opts);
+        return key.empty() ? base : key;
     }
 
 bool LLVMBackend::AnyGenericTypeTemplateNamed(const std::string& spelledBase) const
@@ -387,18 +359,11 @@ bool LLVMBackend::AnyGenericTypeTemplateNamed(const std::string& spelledBase) co
         if (IsGenericTemplateKey(ResolveGenericTemplateBase(spelledBase))) return true;
         if (IsGenericBaseAlias(spelledBase)) return true;
         if (gts.scannedGenericStructNamesUncertain.count(spelledBase) != 0) return true;
-        if (!currentNamespace_.empty())
-        {
-            std::string prefix = currentNamespace_;
-            while (true)
-            {
-                if (gts.scannedGenericStructNamesUncertain.count(prefix + "." + spelledBase) != 0)
-                    return true;
-                auto dot = prefix.rfind('.');
-                if (dot == std::string::npos) break;
-                prefix = prefix.substr(0, dot);
-            }
-        }
+        const ScopedLookupOptions uncertainOpts{ .PrefixDottedNames = true,
+                                                 .ResolveFirstComponentAlias = false };
+        if (!FirstVisibleScopedKey(spelledBase, [this](const std::string& c) {
+                return gts.scannedGenericStructNamesUncertain.count(c) != 0; }, uncertainOpts).empty())
+            return true;
         // An imported winmd generic is a real template built elsewhere; keep whatever the shell
         // sites did with it rather than turning a Windows-only spelling into `unknown type`.
         if (IsWinrtGenericBase(spelledBase) || IsWinrtFullName(spelledBase)) return true;
@@ -421,17 +386,14 @@ std::string LLVMBackend::ResolveGenericFunctionBase(const std::string& base) con
 {
         if (base.empty() || currentNamespace_.empty()) return base;
         if (base.find('.') != std::string::npos) return base;
-        std::string prefix = currentNamespace_;
-        while (true)
-        {
-            if (std::string candidate = prefix + "." + base;
-                IsGenericFunctionKeyInNamespace(candidate, prefix))
-                return candidate;
-            auto dot = prefix.rfind('.');
-            if (dot == std::string::npos) break;
-            prefix = prefix.substr(0, dot);
-        }
-        return base;
+        // The predicate reads the candidate's own namespace prefix: only a template DECLARED in
+        // that namespace answers, so a struct method key of the same shape never does.
+        std::string key = FirstVisibleScopedKey(base, [this](const std::string& c) {
+            auto dot = c.rfind('.');
+            if (dot == std::string::npos) return false;
+            return IsGenericFunctionKeyInNamespace(c, c.substr(0, dot));
+        }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+        return key.empty() ? base : key;
     }
 
 bool LLVMBackend::IsTypeArgTypeKey(const std::string& key) const
@@ -447,16 +409,10 @@ std::string LLVMBackend::ResolveTypeArgBaseName(const std::string& base) const
 {
         if (base.empty() || currentNamespace_.empty()) return base;
         if (base.find('.') != std::string::npos) return base;
-        std::string prefix = currentNamespace_;
-        while (true)
-        {
-            if (std::string candidate = prefix + "." + base; IsTypeArgTypeKey(candidate))
-                return candidate;
-            auto dot = prefix.rfind('.');
-            if (dot == std::string::npos) break;
-            prefix = prefix.substr(0, dot);
-        }
-        return base;
+        std::string key = FirstVisibleScopedKey(base,
+            [this](const std::string& c) { return IsTypeArgTypeKey(c); },
+            ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+        return key.empty() ? base : key;
     }
 
 bool LLVMBackend::IsWinrtGenericTemplate(const std::string& fullName) const

@@ -1173,15 +1173,10 @@ inline void AppendInterfaceNameCandidates(LLVMBackend* compiler, const std::stri
     std::string resolved = compiler->ResolveInterfaceName(spelled);
     out.push_back(resolved);
     if (spelled.find('.') != std::string::npos || namespaceName.empty()) return;
-    std::string prefix = namespaceName;
-    while (true)
-    {
-        std::string candidate = prefix + "." + spelled;
-        if (candidate != resolved) out.push_back(candidate);
-        auto dot = prefix.rfind('.');
-        if (dot == std::string::npos) break;
-        prefix = prefix.substr(0, dot);
-    }
+    // Every enclosing-namespace spelling, not just the first visible one - the bare spelling is
+    // deliberately left out, it is not a name the interface could be registered under here.
+    for (const auto& candidate : compiler->ScopedNameCandidatesIn(namespaceName, spelled))
+        if (candidate != resolved && candidate != spelled) out.push_back(candidate);
 }
 
 // "path(line,col)" of a definition, used both as the IDENTITY key that tells a genuine

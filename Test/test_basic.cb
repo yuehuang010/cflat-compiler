@@ -818,6 +818,52 @@ bool testNestedUsing()
     return result;
 }
 
+// Namespace-aware TYPE lookup, one shared shadowing policy for structs, aliases and
+// function-pointer pointees. Three same-named structs on three rungs, told apart by how many
+// fields they have: the root one has three, ScopeOuter.ShadowPt2 one, ScopeOuter.Inner one two.
+struct ShadowPt2 { int a = default; int b = default; int c = default; };
+
+namespace ScopeOuter
+{
+    struct ShadowPt2 { int a = default; };
+    int outerOnly(ShadowPt2* p) { return p->a + 30; }
+
+    namespace Inner
+    {
+        struct ShadowPt2 { int a = default; int b = default; };
+        using ShadowAlias2 = ShadowPt2;   // alias DECLARED here, used from Inner.Deep below
+
+        // Bare spelling inside Inner: the innermost declaration wins, so `b` exists.
+        int innerShadow() { ShadowPt2 p; p.a = 1; p.b = 2; return p.a + p.b; }
+        // A qualified spelling bypasses the inner shadow and names ScopeOuter.ShadowPt2 - if it
+        // did not, outerOnly() would not accept the pointer and this would not compile.
+        int qualifiedBypass() { ScopeOuter.ShadowPt2 p; p.a = 4; return outerOnly(&p); }
+        // Function-pointer pointee spelled unqualified while a same-tail struct also exists at
+        // the root: the visible (inner) struct is meant, and the crossing must bind.
+        void fillShadow(ShadowPt2* p) { p->a = 6; p->b = 7; }
+        int runShadow(function<void(ShadowPt2*)> f) { ShadowPt2 q; f(&q); return q.a + q.b; }
+
+        namespace Deep
+        {
+            // An alias declared in the ENCLOSING namespace resolves from the nested one.
+            int aliasFromNested() { ShadowAlias2 p; p.a = 5; p.b = 6; return p.a + p.b; }
+            // Bare spelling from the nested namespace still walks out to Inner, not to the root.
+            int bareFromNested() { ShadowPt2 p; p.a = 9; p.b = 1; return p.a + p.b; }
+        }
+    }
+}
+
+bool testNamespaceTypeShadowing()
+{
+    bool result = true;
+    result &= Test("ns_type_inner_shadows_outer", ScopeOuter.Inner.innerShadow(), 3);
+    result &= Test("ns_type_qualified_bypasses_shadow", ScopeOuter.Inner.qualifiedBypass(), 34);
+    result &= Test("ns_type_funcptr_pointee_visible", ScopeOuter.Inner.runShadow(ScopeOuter.Inner.fillShadow), 13);
+    result &= Test("ns_alias_from_nested_namespace", ScopeOuter.Inner.Deep.aliasFromNested(), 11);
+    result &= Test("ns_type_bare_from_nested", ScopeOuter.Inner.Deep.bareFromNested(), 10);
+    return result;
+}
+
 bool testLocalUsingScoped()
 {
     // 'M' from testLocalUsing is not visible here; only 'Math' global alias is.
@@ -4062,6 +4108,7 @@ extern int main()
     total++; passed += testAliasAndStaticResolution() ? 1 : 0;
     total++; passed += testLocalUsing()                  ? 1 : 0;
     total++; passed += testLocalUsingScoped()            ? 1 : 0;
+    total++; passed += testNamespaceTypeShadowing()      ? 1 : 0;
     total++; passed += testForwardFunction()             ? 1 : 0;
     total++; passed += testMutualRecursion()             ? 1 : 0;
     total++; passed += testForwardFunctionWithStruct()   ? 1 : 0;

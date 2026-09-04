@@ -886,17 +886,26 @@ std::string LLVMBackend::ResolveNamespace(const std::string& name) const
         return it != namespaceAliasTable.end() ? it->second : name;
     }
 
-std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& name, bool forceRoot) const
+std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& name,
+        ScopedLookupOptions opts) const
 {
+        return ScopedNameCandidatesIn(currentNamespace_, name, opts);
+    }
+
+std::vector<std::string> LLVMBackend::ScopedNameCandidatesIn(const std::string& fromNamespace,
+        const std::string& name, ScopedLookupOptions opts) const
+{
+        const bool forceRoot = opts.ForceRoot;
         std::vector<std::string> candidates;
         auto add = [&](const std::string& candidate) {
             if (std::find(candidates.begin(), candidates.end(), candidate) == candidates.end())
                 candidates.push_back(candidate);
         };
 
-        if (!forceRoot && !currentNamespace_.empty() && name.find('.') == std::string::npos)
+        if (!forceRoot && !fromNamespace.empty()
+            && (opts.PrefixDottedNames || name.find('.') == std::string::npos))
         {
-            std::string prefix = currentNamespace_;
+            std::string prefix = fromNamespace;
             while (true)
             {
                 add(prefix + "." + name);
@@ -906,7 +915,7 @@ std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& na
             }
         }
 
-        if (name.find('.') != std::string::npos)
+        if (opts.ResolveFirstComponentAlias && name.find('.') != std::string::npos)
         {
             auto dot = name.find('.');
             std::string first = name.substr(0, dot);
@@ -921,8 +930,10 @@ std::vector<std::string> LLVMBackend::ScopedNameCandidates(const std::string& na
 std::string LLVMBackend::ResolveInterfaceName(const std::string& spelled) const
 {
         std::string name = ResolveTypeAlias(spelled);
-        for (const auto& candidate : ScopedNameCandidates(name))
-            if (interfaceTable.count(candidate)) return candidate;
+        if (std::string key = FirstVisibleScopedKey(name,
+                [this](const std::string& c) { return interfaceTable.count(c) != 0; });
+            !key.empty())
+            return key;
         std::string qualified = ResolveTypeAlias(ResolveQualifiedName(name));
         return interfaceTable.count(qualified) ? qualified : name;
     }
@@ -941,18 +952,11 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
         // match wins; if no qualified sibling exists the bare name resolves below.
         if (!forceRoot && !currentNamespace_.empty() && name.find('.') == std::string::npos)
         {
-            std::string prefix = currentNamespace_;
-            while (true)
-            {
-                std::string candidate = prefix + "." + name;
-                if (dataStructures.count(candidate) || interfaceTable.count(candidate)
-                    || functionTable.count(candidate) || globalNamedVariable.count(candidate))
-                    return candidate;
-                auto parentDot = prefix.rfind('.');
-                if (parentDot == std::string::npos)
-                    break;
-                prefix = prefix.substr(0, parentDot);
-            }
+            if (std::string key = FirstVisibleScopedKey(name, [this](const std::string& c) {
+                    return dataStructures.count(c) || interfaceTable.count(c)
+                        || functionTable.count(c) || globalNamedVariable.count(c); });
+                !key.empty())
+                return key;
         }
 
         if (dataStructures.count(name) || interfaceTable.count(name) || functionTable.count(name))
@@ -985,20 +989,15 @@ std::string LLVMBackend::ResolveQualifiedName(const std::string& name, bool forc
             return name;
         }
 
-        // Walk up from the (possibly expanded) prefix toward the root
-        std::string prefix = nsPrefix;
-        while (true)
-        {
-            std::string candidate = prefix + "." + lastName;
-            if (dataStructures.count(candidate) || interfaceTable.count(candidate) || functionTable.count(candidate))
-                return candidate;
-            auto parentDot = prefix.rfind('.');
-            if (parentDot == std::string::npos)
-                break;
-            prefix = prefix.substr(0, parentDot);
-        }
-
-        return name;
+        // Walk up from the (possibly expanded) prefix toward the root. The BARE last component is
+        // deliberately not a candidate here: a qualified spelling never falls back to a global of
+        // the same tail name, it stays unresolved and is reported verbatim.
+        std::string key = FirstVisibleScopedKeyIn(nsPrefix, lastName, [&](const std::string& c) {
+            if (c == lastName) return false;
+            return dataStructures.count(c) != 0 || interfaceTable.count(c) != 0
+                || functionTable.count(c) != 0;
+        }, ScopedLookupOptions{ .ResolveFirstComponentAlias = false });
+        return key.empty() ? name : key;
     }
 
 std::string LLVMBackend::GetNameOfCurrentInsertionBlock()

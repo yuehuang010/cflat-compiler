@@ -520,6 +520,21 @@ struct TypeManglingAccess;
 // LLVMBackend_EmitAndLink.cpp; only the IDE view pipeline ever supplies one.
 struct InlineCostBreakdownSink;
 
+/*
+ * Policy knobs for the scoped-name candidate walk (see LLVMBackend::ScopedNameCandidates).
+ * ForceRoot skips the enclosing-namespace walk entirely (an explicitly root-qualified spelling).
+ * PrefixDottedNames additionally prefixes a DOTTED spelling with each enclosing namespace, which
+ * is what lets "Inner.Box" name "Outer.Inner.Box" from inside `namespace Outer`.
+ * ResolveFirstComponentAlias is off for registries whose keys are recorded verbatim at the
+ * declaration site, where a dotted spelling must be taken literally, not hopped through an alias.
+ */
+struct ScopedLookupOptions
+{
+    bool ForceRoot = false;
+    bool PrefixDottedNames = false;
+    bool ResolveFirstComponentAlias = true;
+};
+
 class LLVMBackend
 {
 public:
@@ -7622,7 +7637,64 @@ public:
 
     // Candidate keys for scope-sensitive registries. The declaring scope is captured in the key at
     // registration time; lookup walks the active namespace outward and then the global scope.
-    std::vector<std::string> ScopedNameCandidates(const std::string& name, bool forceRoot = false) const;
+    std::vector<std::string> ScopedNameCandidates(const std::string& name, ScopedLookupOptions opts = {}) const;
+    // Same walk, but outward from an EXPLICITLY named namespace instead of the active one.
+    std::vector<std::string> ScopedNameCandidatesIn(const std::string& fromNamespace,
+                                                    const std::string& name,
+                                                    ScopedLookupOptions opts = {}) const;
+
+    /*
+     * The three shared operations over a scope-sensitive registry. Every namespace-aware registry
+     * goes through these so shadowing policy lives in ONE place: register under the innermost
+     * visible key, then resolve by walking the active namespace outward. A caller that needs a
+     * broader search must name TailMatchCandidates explicitly - it is the only tail-name search.
+     */
+    template <typename MapT, typename ValueT>
+    void RegisterScopedName(MapT& map, const std::string& name, ValueT&& value)
+    {
+        const auto candidates = ScopedNameCandidates(name);
+        map[candidates.empty() ? name : candidates.front()] = std::forward<ValueT>(value);
+    }
+
+    // First candidate satisfying `pred`, or "" when the name is not visible from here.
+    template <typename Pred>
+    std::string FirstVisibleScopedKey(const std::string& name, Pred pred,
+                                      ScopedLookupOptions opts = {}) const
+    {
+        for (const auto& candidate : ScopedNameCandidates(name, opts))
+            if (pred(candidate)) return candidate;
+        return {};
+    }
+
+    template <typename Pred>
+    std::string FirstVisibleScopedKeyIn(const std::string& fromNamespace, const std::string& name,
+                                        Pred pred, ScopedLookupOptions opts = {}) const
+    {
+        for (const auto& candidate : ScopedNameCandidatesIn(fromNamespace, name, opts))
+            if (pred(candidate)) return candidate;
+        return {};
+    }
+
+    // First visible entry of `map`, or nullptr.
+    template <typename MapT>
+    const typename MapT::mapped_type* FindFirstVisibleScoped(const MapT& map, const std::string& name,
+                                                             ScopedLookupOptions opts = {}) const
+    {
+        for (const auto& candidate : ScopedNameCandidates(name, opts))
+        {
+            auto it = map.find(candidate);
+            if (it != map.end()) return &it->second;
+        }
+        return nullptr;
+    }
+
+    /*
+     * DELIBERATELY BROAD: every registered struct key whose last dotted component equals the
+     * spelling, regardless of what is visible from the active namespace. Interfaces are excluded.
+     * Only for callers that WANT the ambiguity (they compare candidate sets and never pick an
+     * element). Prefer FirstVisibleScopedKey; do not hand-roll a fresh tail search.
+     */
+    std::vector<std::string> TailMatchCandidates(const std::string& spelling) const;
 
     /*
      * Resolve a base-clause / parent-list interface spelling to the name the interface is
