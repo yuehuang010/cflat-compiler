@@ -1676,6 +1676,7 @@ llvm::Function* LLVMBackend::CreateFunctionDefinition(const std::string& functio
         currentFunctionReturnTV = returnType;
         // Per-function by construction: see globalAssignBorrowOrigin_'s comment.
         globalAssignBorrowOrigin_.clear();
+        globalAssignBorrowedAddress_.clear();
 
         if (diBuilder && diFile && line > 0)
         {

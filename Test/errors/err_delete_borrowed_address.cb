@@ -1,0 +1,150 @@
+// `delete` of a pointer whose provenance is an address-of expression. `&x` borrows storage
+// another binding owns and frees, so handing that address to free() aborts at runtime
+// (native SIGABRT). The proof is recorded where the `&` value is produced and carried on the
+// binding by the declaration and '=' doors, which retire it on any other RHS.
+
+struct Node { int v = 3; };
+struct Inner { int v = 1; };
+struct Outer { Inner inner = default; };
+
+Node gnode = default;
+Node* gptr = nullptr;
+
+// The filed repro: declaration-init from the address of a stack local.
+expect_error("cannot delete 'borrowed' - the address-of expression it comes from borrows storage") {
+    int decl_init_stack_local(int argc) {
+        Node stack = default;
+        Node* borrowed = &stack;
+        delete borrowed;
+        return 0;
+    }
+}
+
+// Assignment twin of the declaration form.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int assigned_stack_local(int argc) {
+        Node stack = default;
+        Node* p = nullptr;
+        p = &stack;
+        delete p;
+        return 0;
+    }
+}
+
+// The operand IS the address-of expression - no named binding to carry the flag, so the
+// value-identity ledger is the leg that fires here.
+expect_error("cannot delete 'stack' - the address-of expression it comes from borrows storage") {
+    int delete_address_of_directly(int argc) {
+        Node stack = default;
+        delete &stack;
+        return 0;
+    }
+}
+
+// A cast severs Storage but not the value's identity, so the same proof survives `(T*)&x`.
+expect_error("cannot delete 'stack' - the address-of expression it comes from borrows storage") {
+    int delete_address_of_through_cast(int argc) {
+        Node stack = default;
+        delete (Node*)&stack;
+        return 0;
+    }
+}
+
+// Address of a GLOBAL: static storage is not a heap allocation either.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int address_of_global(int argc) {
+        Node* p = &gnode;
+        delete p;
+        return 0;
+    }
+}
+
+// Address of a FIELD: the enclosing object owns the bytes and destructs them itself.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int address_of_field(int argc) {
+        Outer o = default;
+        Inner* p = &o.inner;
+        delete p;
+        return 0;
+    }
+}
+
+// Address of an ELEMENT: one slot of an array, never an allocation base of its own.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int address_of_element(int argc) {
+        Node[3] arr = default;
+        Node* p = &arr[1];
+        delete p;
+        return 0;
+    }
+}
+
+// The `delete[_]` raw-buffer form shares the door, so it shares the proof.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int address_of_element_raw_free(int argc) {
+        int[4] arr = default;
+        int* p = &arr[0];
+        delete[_] p;
+        return 0;
+    }
+}
+
+// A COPY of a proven address-of binding carries the proof - the laundered spelling.
+expect_error("cannot delete 'q' - the address-of expression it comes from borrows storage") {
+    int copy_of_address_of(int argc) {
+        Node stack = default;
+        Node* p = &stack;
+        Node* q = p;
+        delete q;
+        return 0;
+    }
+}
+
+// A GLOBAL pointer destination: the fact lives in the per-function global ledger, since a
+// global NamedVariable is rebuilt per lookup and carries no binding flags.
+expect_error("cannot delete 'gptr' - the address-of expression it comes from borrows storage") {
+    int global_assigned_address_of(int argc) {
+        Node stack = default;
+        gptr = &stack;
+        delete gptr;
+        return 0;
+    }
+}
+
+// Rebound to `&local` on every iteration: the proof is re-asked at the delete, not cached
+// from the first pass.
+expect_error("cannot delete 'p' - the address-of expression it comes from borrows storage") {
+    int rebound_in_loop(int argc) {
+        Node* p = nullptr;
+        for (int i = 0; i < 3; i++) {
+            Node local = default;
+            p = &local;
+            delete p;
+        }
+        return 0;
+    }
+}
+
+// Sanity: the proof RETIRES on a rebind to `new`. `p` is then the sole owner of what it holds,
+// so this delete is correct (one free) - rejecting it would leak.
+void valid_address_of_then_new() {
+    Node stack = default;
+    Node* p = new Node();
+    p = &stack;
+    p = new Node();
+    delete p;
+}
+
+// Sanity: a `move` parameter owns, so deleting it is the whole point of `move`.
+void valid_delete_move_param(move Node* p) { delete p; }
+
+// Sanity: a global rebound from `new` after an address-of store retires the ledger fact too.
+void valid_global_then_new() {
+    Node stack = default;
+    gptr = &stack;
+    gptr = new Node();
+    delete gptr;
+    gptr = nullptr;
+}
+
+extern int main() { return 0; }

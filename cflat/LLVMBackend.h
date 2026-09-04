@@ -2748,6 +2748,9 @@ private:
      * per-call state, so it is NOT part of the --init cache round-trip.
      */
     std::unordered_map<const llvm::Value*, std::string> globalAssignBorrowOrigin_;
+    // Twin of globalAssignBorrowOrigin_ for `g = &x;` - an address-of RHS names no origin
+    // binding, so the fact is a plain set. Same per-function lifetime and the same rationale.
+    std::unordered_set<const llvm::Value*> globalAssignBorrowedAddress_;
     std::unordered_map<std::string, StructData> dataStructures;
 
     // Maps annotation name -> field names declared in its body (empty vector = no-arg annotation).

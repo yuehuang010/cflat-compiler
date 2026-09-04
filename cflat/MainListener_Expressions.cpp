@@ -1878,6 +1878,13 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                         compiler->globalAssignBorrowOrigin_[namedVar.Storage] = globalBorrowOrigin;
                     else
                         compiler->globalAssignBorrowOrigin_.erase(namedVar.Storage);
+                    // Address-of provenance for the same global destination (`g = &x;`). Any
+                    // other RHS retires it, exactly as the origin ledger above is retired.
+                    if (compiler->IsBorrowedAddressValue(rightNV.Primary)
+                        || rightNV.PointsToBorrowedAddress)
+                        compiler->globalAssignBorrowedAddress_.insert(namedVar.Storage);
+                    else
+                        compiler->globalAssignBorrowedAddress_.erase(namedVar.Storage);
                 }
                 // Retire the declaration-time "someone else frees this" facts about a POINTER
                 // binding that has just been pointed elsewhere - UNLESS the RHS binding proves an
@@ -1944,7 +1951,9 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     // the binding a proven borrow, any other RHS retires the fact (a stale borrow
                     // proof would be a false rejection at a later '?:' join).
                     compiler->SetPointsToBorrowedAddress(
-                        namedVar.CallerName, compiler->IsBorrowedAddressValue(rightNV.Primary));
+                        namedVar.CallerName,
+                        compiler->IsBorrowedAddressValue(rightNV.Primary)
+                            || rightNV.PointsToBorrowedAddress);
                     /*
                      * Record the borrow the RHS carries, which MarkPointerRebound above does not:
                      * it retires the declaration-time facts and re-arms only the OWNER-side proofs,
@@ -12266,6 +12275,36 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                         name, gb->second, gb->second));
                     return {};
                 }
+            }
+
+            /*
+             * Error: deleting a pointer PROVEN to hold an address-of result. The provenance is
+             * recorded where the value is PRODUCED (RegisterBorrowedAddressValue) and carried on
+             * the binding by the declaration and '=' doors, which retire it on any other RHS - so
+             * a rebind to `new` is not poisoned. Three spellings share the one proof: the named
+             * local's flag, the direct `delete &x;` whose operand value IS the address-of result,
+             * and the global destination's per-function ledger twin.
+             */
+            bool operandIsBorrowedAddress = false;
+            if (namedVar.Storage == nullptr)
+                operandIsBorrowedAddress = compiler->IsBorrowedAddressValue(namedVar.Primary);
+            else if (llvm::isa<llvm::AllocaInst>(namedVar.Storage))
+                operandIsBorrowedAddress = namedVar.PointsToBorrowedAddress;
+            else if (llvm::isa<llvm::GlobalVariable>(namedVar.Storage))
+                operandIsBorrowedAddress =
+                    compiler->globalAssignBorrowedAddress_.count(namedVar.Storage) != 0;
+            if (!namedVar.IsOwning && operandIsBorrowedAddress)
+            {
+                std::string name = namedVar.CallerName.empty()
+                    ? namedVar.TypeAndValue.VariableName : namedVar.CallerName;
+                if (name.empty()) name = "<expr>";
+                LogErrorContext(ctx, std::format(
+                    "cannot delete '{}' - the address-of expression it comes from borrows storage "
+                    "it does not own (a stack local, global, field or array element), so handing "
+                    "that address to free() corrupts the "
+                    "heap. Only a pointer from 'new' may be deleted.",
+                    name));
+                return {};
             }
 
             // Error: deleting a plain copy of an OWNING local (`T* b = c;`, `alias T* b = c;`). The

@@ -6501,8 +6501,11 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                         // Borrow provenance for the DECLARATION door: `T* p = &x;` binds an
                         // address-of result, which never owns. Carried on the binding so a later
                         // '?:' arm can be PROVEN a borrow instead of merely unproven.
+                        // A plain COPY of a binding that already proved an address-of origin
+                        // carries the proof; a `move` source sets IsOwning above and does not.
                         if (typeAndValue.Pointer && haveInitializerSourceNV
-                            && compiler->IsBorrowedAddressValue(initializerSourceNV.Primary))
+                            && (compiler->IsBorrowedAddressValue(initializerSourceNV.Primary)
+                                || initializerSourceNV.PointsToBorrowedAddress))
                             compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
                         // A channel the value-identity gate rejected is stale (a `new` from an argument
                         // list); retire it here so no later declaration or return reads it as owned.

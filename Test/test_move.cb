@@ -12614,8 +12614,62 @@ extern int main()
     passed += testSlotMoveIntoSink();
     total += 8;
 
+    passed += testAddressOfBorrowDeleteAccepts();
+    total += 6;
+
     printf("\n%d / %d tests passed.\n", passed, total);
     return passed == total ? 0 : 1;
+}
+
+/*
+ * Accept-set for the address-of borrow `delete` rejection (err_delete_borrowed_address.cb).
+ * `delete` of a pointer PROVEN to hold an `&x` result is rejected; these are the neighbouring
+ * shapes that must keep compiling AND keep freeing exactly once.
+ */
+int deleteMoveParam(move Resource* r)
+{
+    int id = r->id;
+    delete r;
+    return id;
+}
+
+int testAddressOfBorrowDeleteAccepts()
+{
+    int passed = 0;
+    dtorCount = 0;
+
+    // The address-of proof RETIRES on a rebind to `new`: `p` is then the sole owner of what it
+    // holds, so this delete is correct. Pre-fix this compiled too; the leg guards the guard.
+    {
+        Resource stackRes = default;
+        stackRes.id = 11;
+        Resource* p = new Resource();
+        p->id = 21;
+        p = &stackRes;          // p now borrows the stack local (would leak the first Resource)
+        p = new Resource();     // rebind to a fresh owner retires the borrow proof
+        p->id = 31;
+        passed += Test("addr_of_retired_by_new_value", p->id, 31);
+        delete p;
+        // Only the explicitly deleted heap Resource has been freed so far; the leaked first
+        // allocation is never destructed and `stackRes` outlives this point.
+        passed += Test("addr_of_retired_by_new_freed_once", dtorCount, 1);
+    }
+    // Scope exit destructs the stack local, and nothing double-frees the deleted heap object.
+    passed += Test("addr_of_retired_stack_local_destructed", dtorCount, 2);
+
+    // A `move` parameter OWNS, so deleting through it stays legal - the rejection must not
+    // reach a binding whose value came from a transfer rather than an `&`.
+    dtorCount = 0;
+    {
+        Resource* owned = new Resource();
+        owned->id = 41;
+        int got = deleteMoveParam(move owned);
+        passed += Test("delete_move_param_value", got, 41);
+        passed += Test("delete_move_param_freed_once", dtorCount, 1);
+    }
+    passed += Test("delete_move_param_no_double_free", dtorCount, 1);
+
+    return passed;
 }
 
 // Deliberately defined BELOW main, i.e. below its call site: cflat emits IR as it walks, so its

@@ -4346,6 +4346,7 @@ void LLVMBackend::ResetForReanalysis()
     uniqueFieldBorrowReturns_.clear();
     uniqueFieldBorrowResults_.clear();
     globalAssignBorrowOrigin_.clear();
+    globalAssignBorrowedAddress_.clear();
     rawArrayResults_.clear();
     mayReachReturnInProgress_.clear();
     joinAddressInProgress_.clear();
