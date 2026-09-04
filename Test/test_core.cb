@@ -2875,7 +2875,76 @@ class RawCountDeleteMethod
     void sink(move RawCountElem* values) { delete values; }
 };
 move RawCountElem* rawCountDeleteReturn() { return new RawCountElem[3]; }
+move RawCountElem* rawCountTempScalarReturn() { return new RawCountElem(); }
+move RawCountNestedElem* rawCountTempNestedReturn() { return new RawCountNestedElem[3]; }
+alignas(0, 64) move RawCountElem* rawCountTempAlignedReturn()
+{
+    return new RawCountElem[3];
+}
 void rawCountDeleteNestedSink(move RawCountNestedElem* values) { delete values; }
+
+int runRawCountMoveTempCompare()
+{
+    resetRawCountState();
+    if (rawCountDeleteReturn() != nullptr) { }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempDelete()
+{
+    resetRawCountState();
+    delete rawCountDeleteReturn();
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempScalar()
+{
+    resetRawCountState();
+    if (rawCountTempScalarReturn() != nullptr) { }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempNested()
+{
+    resetRawCountState();
+    g_raw_count_resource_dtors = 0;
+    if (rawCountTempNestedReturn() != nullptr) { }
+    return g_raw_count_dtors * 10 + g_raw_count_resource_dtors;
+}
+
+int runRawCountMoveTempIndirect()
+{
+    resetRawCountState();
+    function<move RawCountElem*()> maker = rawCountDeleteReturn;
+    if (maker() != nullptr) { }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempAligned()
+{
+    resetRawCountState();
+    if (rawCountTempAlignedReturn() != nullptr) { }
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempDiscard()
+{
+    resetRawCountState();
+    _ = rawCountDeleteReturn();
+    return g_raw_count_dtors;
+}
+
+int runRawCountMoveTempLoop()
+{
+    resetRawCountState();
+    int i = 0;
+    while (i < 2)
+    {
+        if (rawCountDeleteReturn() != nullptr) { }
+        i++;
+    }
+    return g_raw_count_dtors;
+}
 
 int runRawCountMoveDelete()
 {
@@ -3578,6 +3647,22 @@ int testRawArrayRuntimeCount()
         runRawCountMoveParamReassignMoveLocal(), 2);
     // Plain delete must use the move-pointer raw count; old code returns 1 instead of 3.
     // The nested resource leg similarly returns 11 instead of 33 on the pre-fix compiler.
+    passed += Test("raw count move return comparison temp",
+        runRawCountMoveTempCompare(), 3);
+    passed += Test("raw count move return delete temp",
+        runRawCountMoveTempDelete(), 3);
+    passed += Test("raw count move return scalar temp",
+        runRawCountMoveTempScalar(), 1);
+    passed += Test("raw count move return nested temp",
+        runRawCountMoveTempNested(), 33);
+    passed += Test("raw count move return indirect temp",
+        runRawCountMoveTempIndirect(), 3);
+    passed += Test("raw count move return aligned temp",
+        runRawCountMoveTempAligned(), 3);
+    passed += Test("raw count move return explicit discard temp",
+        runRawCountMoveTempDiscard(), 3);
+    passed += Test("raw count move return loop temp",
+        runRawCountMoveTempLoop(), 6);
     passed += Test("raw count explicit move delete array",
         runRawCountMoveDelete(), 3);
     passed += Test("raw count explicit move delete branch",
@@ -3708,7 +3793,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 63;
+    r = testRawArrayRuntimeCount(); passed += r; total += 71;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

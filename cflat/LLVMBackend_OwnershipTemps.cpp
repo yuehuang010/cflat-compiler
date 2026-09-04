@@ -1228,33 +1228,35 @@ void LLVMBackend::EmitConditionalOwningPtrCleanup(const NamedVariable& namedVar,
     }
 
 void LLVMBackend::EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::Value* ptrVal,
-                                          const std::string& typeName)
+                                          const std::string& typeName,
+                                          llvm::Value* rawArrayCount)
 {
         auto* dtor = GetFullDestructorForDelete(typeName);
         if (dtor == nullptr) return;
 
-        if (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr)
+        llvm::Value* count = rawArrayCount;
+        if (count == nullptr
+            && (namedVar.RawArrayLengthStorage != nullptr || namedVar.RawArrayLength != nullptr))
+            count = LoadRawArrayLength(namedVar);
+        if (count != nullptr)
         {
-            auto* count = LoadRawArrayLength(namedVar);
-            if (count != nullptr)
-            {
-                auto* arrayBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_array", builder->GetInsertBlock()->getParent());
-                auto* scalarBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_scalar", builder->GetInsertBlock()->getParent());
-                auto* doneBB = llvm::BasicBlock::Create(
-                    *context, "raw_array_dtor_done", builder->GetInsertBlock()->getParent());
-                builder->CreateCondBr(
-                    builder->CreateICmpSGE(count, builder->getInt64(0)), arrayBB, scalarBB);
-                builder->SetInsertPoint(arrayBB);
-                EmitCountedArrayDestruction(ptrVal, typeName, count);
-                builder->CreateBr(doneBB);
-                builder->SetInsertPoint(scalarBB);
-                builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
-                builder->CreateBr(doneBB);
-                builder->SetInsertPoint(doneBB);
-                return;
-            }
+            count = Upconvert(count, builder->getInt64Ty());
+            auto* arrayBB = llvm::BasicBlock::Create(
+                *context, "raw_array_dtor_array", builder->GetInsertBlock()->getParent());
+            auto* scalarBB = llvm::BasicBlock::Create(
+                *context, "raw_array_dtor_scalar", builder->GetInsertBlock()->getParent());
+            auto* doneBB = llvm::BasicBlock::Create(
+                *context, "raw_array_dtor_done", builder->GetInsertBlock()->getParent());
+            builder->CreateCondBr(
+                builder->CreateICmpSGE(count, builder->getInt64(0)), arrayBB, scalarBB);
+            builder->SetInsertPoint(arrayBB);
+            EmitCountedArrayDestruction(ptrVal, typeName, count);
+            builder->CreateBr(doneBB);
+            builder->SetInsertPoint(scalarBB);
+            builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+            builder->CreateBr(doneBB);
+            builder->SetInsertPoint(doneBB);
+            return;
         }
         builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
     }
@@ -1558,6 +1560,7 @@ const std::string* LLVMBackend::FindOwnedReturnTemp(llvm::Value* value) const
 void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
 {
         std::string typeName;
+        llvm::Value* rawArrayCount = RawArrayCountOf(value);
         uint64_t allocAlign = 0;
         if (const OwnedReturnReleaseTemp* e = FindOwnedReturnEntry(value); e != nullptr && e->IsOwningPtr)
         {
@@ -1572,7 +1575,8 @@ void LLVMBackend::RegisterOwnedPtrTemp(llvm::Value* value)
         else return;
         for (const auto& p : pendingOwnedPtrTemps)
             if (p.Value == value) return;   // idempotent: one buffer, one free
-        pendingOwnedPtrTemps.push_back({ value, typeName, allocAlign, builder->GetInsertBlock() });
+        pendingOwnedPtrTemps.push_back(
+            { value, rawArrayCount, typeName, allocAlign, builder->GetInsertBlock() });
     }
 
 bool LLVMBackend::IsOwningPtrTempValue(llvm::Value* value) const
@@ -3408,7 +3412,8 @@ void LLVMBackend::FlushOwnedStructTemps()
         }
     }
 
-void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName, uint64_t allocAlign)
+void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName,
+                                       uint64_t allocAlign, llvm::Value* rawArrayCount)
 {
         auto* ptrTy = llvm::dyn_cast<llvm::PointerType>(ptrVal->getType());
         if (ptrTy == nullptr) return;
@@ -3418,8 +3423,8 @@ void LLVMBackend::EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& t
         builder->CreateCondBr(isNull, afterBB, cleanupBB);
 
         builder->SetInsertPoint(cleanupBB);
-        if (auto* dtor = GetFullDestructorForDelete(typeName))
-            builder->CreateCall(dtor->getFunctionType(), dtor, { ptrVal });
+        NamedVariable tempVar;
+        EmitOwningPtrDestructor(tempVar, ptrVal, typeName, rawArrayCount);
 
         // Over-aligned blocks come from the aligned allocator and must be freed through
         // __delete_aligned - the same rule as EmitOwningPtrCleanup and the `delete` site.
@@ -3452,7 +3457,7 @@ void LLVMBackend::FlushOwnedPtrTemps()
             if (t.Value == nullptr || !IsInsertBlockLive()) continue;
             std::optional<llvm::DominatorTree> domTree;
             if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue; // dominance safety
-            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign);
+            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
         }
     }
 
@@ -3660,7 +3665,7 @@ void LLVMBackend::FlushOwnedTempsSince(const OwnedTempMark& mark, llvm::Value* k
             if (t.Value == nullptr || !IsInsertBlockLive()) continue;
             std::optional<llvm::DominatorTree> domTree;
             if (!OwnedTempDominatesHere(t.Block, builder->GetInsertBlock(), domTree)) continue;
-            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign);
+            EmitOwnedPtrTempFree(t.Value, t.TypeName, t.AllocAlign, t.RawArrayCount);
         }
 
         // Back on the ledger, now keyed to a dominating block: the end-of-statement flush frees

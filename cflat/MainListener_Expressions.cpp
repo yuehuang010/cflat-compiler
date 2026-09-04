@@ -12322,7 +12322,8 @@ LLVMBackend::NamedVariable MainListener::ParseDeleteExpression(CFlatParser::Dele
                 auto* contBB  = compiler->CreateBasicBlock("del_dtor_cont");
                 compiler->builder->CreateCondBr(isNull, contBB, dtorBB);
                 compiler->builder->SetInsertPoint(dtorBB);
-                compiler->EmitOwningPtrDestructor(operandNamedVar, ptrVal, typeName);
+                compiler->EmitOwningPtrDestructor(
+                    operandNamedVar, ptrVal, typeName, compiler->RawArrayCountOf(ptrVal));
                 compiler->builder->CreateBr(contBB);
                 compiler->builder->SetInsertPoint(contBB);
             }

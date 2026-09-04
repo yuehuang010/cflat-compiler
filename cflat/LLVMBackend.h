@@ -2479,6 +2479,7 @@ private:
     struct PendingOwnedPtrTemp
     {
         llvm::Value* Value;
+        llvm::Value* RawArrayCount = nullptr;
         std::string TypeName;
         uint64_t AllocAlign = 0;
         llvm::BasicBlock* Block = nullptr;
@@ -3330,7 +3331,8 @@ private:
     // Destruct an owning pointer by its raw-array count when available, or as a scalar otherwise.
     // The caller supplies a non-null-guarded pointer and handles deallocation separately.
     void EmitOwningPtrDestructor(const NamedVariable& namedVar, llvm::Value* ptrVal,
-                                 const std::string& typeName);
+                                 const std::string& typeName,
+                                 llvm::Value* rawArrayCount = nullptr);
 
     void EmitOwningPtrCleanup(const NamedVariable& namedVar, llvm::Value* replacement = nullptr);
 
@@ -3971,7 +3973,8 @@ private:
     // Free one unowned owning-pointer temp: null guard, full destructor, then the matching
     // deallocator. Value-based twin of EmitOwningPtrCleanup (which loads from a named local's
     // storage); the temp is a bare SSA pointer with no slot to load from or null out.
-    void EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName, uint64_t allocAlign);
+    void EmitOwnedPtrTempFree(llvm::Value* ptrVal, const std::string& typeName,
+                              uint64_t allocAlign, llvm::Value* rawArrayCount = nullptr);
 
     // Free every owning-pointer temp nothing adopted. Each free opens new blocks, so the insert
     // block and the dominator tree are recomputed per temp instead of hoisted out of the loop.
