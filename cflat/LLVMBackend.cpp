@@ -4540,6 +4540,7 @@ void LLVMBackend::ResetForReanalysis()
     dataValueCodeCasts_.clear();
     movedOutPtrValues_.clear();
     movedBorrowedPtrValues_.clear();
+    borrowedAddressValues_.clear();
     movedBorrowedThroughFieldValues_.clear();
     nonOwningStructJoins_.clear();
     uniqueFieldReadValues_.clear();

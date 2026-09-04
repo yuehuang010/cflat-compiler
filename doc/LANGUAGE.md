@@ -1633,9 +1633,11 @@ the wrapper frees the block through the aligned deallocator that matches the ali
 and a `unique<T, 64>` value is a different type from a `unique<T>` - it will not bind to a
 plain `unique T*` parameter. The declared clause is still inherited by a direct `new` on the
 right-hand side, so the allocation does not have to repeat it. Struct FIELDS, array ELEMENTS and
-dereferenced slots (`*pp`) are bindings for this rule too: the free site reads the slot's declared
-type, so storing an over-aligned block into a slot that carries no `alignas(0, N)` clause is
-rejected at the store. (Unclaused GLOBAL pointers are not yet checked this way.)
+dereferenced slots (`*pp`) and GLOBAL pointers are bindings for this rule too: the free site reads
+the slot's declared type, so storing an over-aligned block into a slot that carries no
+`alignas(0, N)` clause is rejected at the store, and so is storing a block whose alignment does not
+match a clause the slot does carry. The explicitly spelled `unique<T, N>` seeds a direct `new` with
+its own `N`, exactly as the `alignas(0, N) unique T*` sugar does.
 
 #### Field ownership (original form)
 
@@ -2840,6 +2842,18 @@ borrowed side into a fresh value so both arms own, or by making both arms borrow
 Box b = c ? makeBox() : other;        // error: arms differ in ownership
 Box b = c ? makeBox() : move other;   // ok - both arms own
 Box b = c ? other : other2;           // ok - both arms borrow (b borrows too)
+```
+
+The same rule applies to a POINTER join once BOTH sides are provable: one arm allocating (`new`, a
+`move` of an owner, a call returning an owning pointer) while the other is a proven borrow (`&x`, a
+pointer parameter, a local declared from one of those) leaks the allocating arm whenever it is
+taken, so it is rejected too. A `nullptr` arm allocates nothing and is not a mismatch, and a join
+whose ownership is merely unrecorded is left alone.
+
+```c
+Node* p = c ? &stack : new Node();    // error: the 'new' arm leaks when taken
+Node* p = c ? makeNode() : new Node();// ok - both arms own
+Node* p = c ? nullptr : new Node();   // ok - nothing to mismatch
 ```
 
 ### `break` and `continue`

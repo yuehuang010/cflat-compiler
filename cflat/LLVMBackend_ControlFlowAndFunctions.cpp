@@ -194,6 +194,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         currentCastOccurrence_ = 0;
         s.movedOutPtrValues   = std::move(movedOutPtrValues_);
         s.movedBorrowedPtrValues = std::move(movedBorrowedPtrValues_);
+        s.borrowedAddressValues = std::move(borrowedAddressValues_);
         s.movedBorrowedThroughFieldValues = std::move(movedBorrowedThroughFieldValues_);
         s.nonOwningStructJoins = std::move(nonOwningStructJoins_);
         s.uniqueFieldReadValues = std::move(uniqueFieldReadValues_);
@@ -225,6 +226,7 @@ LLVMBackend::BuilderState LLVMBackend::SaveBuilderState()
         dataValueCodeCasts_.clear();
         movedOutPtrValues_.clear();
         movedBorrowedPtrValues_.clear();
+        borrowedAddressValues_.clear();
         movedBorrowedThroughFieldValues_.clear();
         nonOwningStructJoins_.clear();
         uniqueFieldReadValues_.clear();
@@ -274,6 +276,7 @@ void LLVMBackend::RestoreBuilderState(const BuilderState& state)
         currentCastOccurrence_  = state.savedCastOccurrence;
         movedOutPtrValues_       = state.movedOutPtrValues;
         movedBorrowedPtrValues_  = state.movedBorrowedPtrValues;
+        borrowedAddressValues_   = state.borrowedAddressValues;
         movedBorrowedThroughFieldValues_ = state.movedBorrowedThroughFieldValues;
         nonOwningStructJoins_    = state.nonOwningStructJoins;
         uniqueFieldReadValues_   = state.uniqueFieldReadValues;

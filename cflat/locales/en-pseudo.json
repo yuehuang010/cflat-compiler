@@ -14,6 +14,12 @@
       "AliasParameterNameReuse"
     ],
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": [],
+    "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": [
+      "unique<AlignUniquePointee, 64>",
+      "64",
+      "'alignas(0, 32)'",
+      "64"
+    ],
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": [
       "--run",
       "main",
@@ -53,6 +59,10 @@
     "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": [
       "auto",
       "auto f<T>(T x)"
+    ],
+    "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": [
+      "new PtrJoinNode()",
+      "borrowed"
     ],
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": [
       "makeJoinBox()",
@@ -1447,6 +1457,7 @@
     "aliasarg0isalreadydefinedinthisscope": "alias '{0}' is already defined in this scope",
     "aliasarg0reusesthena...eparameterarg1ofarg20a53fdefc23ddef2": "alias '{0}' reuses the name of type parameter '{1}' of '{2}'",
     "alignasisnotsupporte...htheplaindeallocator2beff51adb78c9c4": "'alignas' is not supported on a 'new T[n]' stored into 'array<T>': the array frees its buffer through the plain deallocator",
+    "alignmentmismatchini...ntthevaluealreadyhas5a4ed9c3ad1bf980": "alignment mismatch initializing '{0}': the declared type allocates at {1}, but the value was allocated {2}. Allocate the value with the matching 'alignas(0, {3})' clause, or declare the receiver with the alignment the value already has.",
     "alignmentmismatchmov...hthecorrectalignmenta5e59547dcfd5ec4": "alignment mismatch moving into the 'move' parameter of '{0}': the parameter is declared 'alignas(0, {1})' but the argument was allocated 'alignas(0, {2})'. The two must agree so the callee frees with the correct alignment.",
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
@@ -1477,6 +1488,7 @@
     "arg0returntypeisonly...nericfunctionsegarg1a313355ae3c2250d": "'{0}' return type is only supported on generic functions (e.g. {1})",
     "arg0staticinitializerexecutionfailedarg1": "{0}: static initializer execution failed: {1}",
     "argumentforinterface...hasnoresolvedstorage7ebcdaffd59e5355": "argument for interface parameter '{0}' of {1} has no resolved storage",
+    "armsdifferinownershi...dmakebotharmsborrows33877404c72b56a3": "'?:' arms differ in ownership: '{0}' allocates a value the join cannot own and '{1}' is a borrow of an existing value, so the allocating arm leaks whenever it is taken. Either 'move' the borrowed side into a fresh value so both arms own, or allocate into a named owner before the '?:' and make both arms borrows.",
     "armsdifferinownershi...rmakebotharmsborrows499fceef95c57fab": "'?:' arms differ in ownership: '{0}' is an owning value and '{1}' is a borrow of an existing value. Either 'move' the borrowed side into a fresh value so both arms own, or make both arms borrows.",
     "builtinssourcenotfoundarg0": "builtins source not found: '{0}'.",
     "callthroughafunction...sitetopassthepointee5550b0e566872e76": "call through a function value: cannot pass a pointer as argument {0} - that parameter is a by-value slot and there is no implicit dereference. Write '*' at the call site to pass the pointee.",

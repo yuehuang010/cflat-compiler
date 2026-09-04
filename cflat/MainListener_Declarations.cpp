@@ -1082,6 +1082,12 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
             }
         }
 
+        // An explicitly spelled `unique<T, N>` must carry the same AllocAlignValue the
+        // `alignas(0, N) unique T*` sugar leaves behind, or only the sugar seeds the inbound
+        // allocation-alignment channel and a direct `new` on the explicit spelling is rejected.
+        if (declType.AllocAlignValue == 0)
+            declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(Compiler(), declType.TypeName);
+
         return declType;
     }
 
@@ -6492,6 +6498,12 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
                             compiler->lastOwningResult = false;
                             compiler->lastAllocAlignment = 0;
                         }
+                        // Borrow provenance for the DECLARATION door: `T* p = &x;` binds an
+                        // address-of result, which never owns. Carried on the binding so a later
+                        // '?:' arm can be PROVEN a borrow instead of merely unproven.
+                        if (typeAndValue.Pointer && haveInitializerSourceNV
+                            && compiler->IsBorrowedAddressValue(initializerSourceNV.Primary))
+                            compiler->GetOrCreateStackVariable(name).PointsToBorrowedAddress = true;
                         // A channel the value-identity gate rejected is stale (a `new` from an argument
                         // list); retire it here so no later declaration or return reads it as owned.
                         compiler->lastOwningResult = false;
@@ -7176,7 +7188,8 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         llvm::Value* right,
         const std::string& fieldDesc,
         antlr4::ParserRuleContext* ctx,
-        bool slotIsAuthoritativeHolder) {
+        bool slotIsAuthoritativeHolder,
+        const char* destNoun) {
         if (fieldAlign == 0)
             fieldAlign = fieldTV.AllocAlignValue;
         uint64_t rhsAllocAlign = rightNV.AllocAlignment != 0
@@ -7216,32 +7229,32 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         if (!fieldHasClause)
             LogErrorContext(ctx, std::format(
                 "cannot store an over-aligned buffer ('new T[n] alignas(0, {})') into {}: that alignment "
-                "is a property of the allocation, not of the type, so a free through the field cannot "
-                "recover it. Declare the field 'alignas(0, {})' so the block alignment is recorded, or "
+                "is a property of the allocation, not of the type, so a free through the {} cannot "
+                "recover it. Declare the {} 'alignas(0, {})' so the block alignment is recorded, or "
                 "over-align the ELEMENT TYPE instead ('struct alignas({}) Chunk {{ ... }};').",
-                rhsAllocAlign, fieldDesc, rhsAllocAlign, rhsAllocAlign));
+                rhsAllocAlign, fieldDesc, destNoun, destNoun, rhsAllocAlign, rhsAllocAlign));
         else if (!rhsOverAligned && rhsFreshBuffer)
             LogErrorContext(ctx, std::format(
-                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "alignment mismatch storing into {}: the {} is declared 'alignas(0, {})' but the "
                 "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
                 "Allocate it with 'new T[n] alignas(0, {})' so the free site recovers the correct alignment.",
-                fieldDesc, fieldAlign, fieldAlign));
+                fieldDesc, destNoun, fieldAlign, fieldAlign));
         else if (!rhsOverAligned)
             // Scalar `new T` takes no alignment clause, so the source must inherit the
             // field's - directly, or through an align-declared local.
             LogErrorContext(ctx, std::format(
-                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "alignment mismatch storing into {}: the {} is declared 'alignas(0, {})' but the "
                 "value was allocated without a matching allocation-alignment clause (ordinary alignment). "
-                "Store the 'new' directly into the field, or declare the source 'alignas(0, {})' so its "
+                "Store the 'new' directly into the {}, or declare the source 'alignas(0, {})' so its "
                 "'new' inherits the alignment, or over-align the pointee TYPE instead "
-                "('struct alignas({}) T {{ ... }};') and drop the field's clause.",
-                fieldDesc, fieldAlign, fieldAlign, fieldAlign));
+                "('struct alignas({}) T {{ ... }};') and drop the {}'s clause.",
+                fieldDesc, destNoun, fieldAlign, destNoun, fieldAlign, fieldAlign, destNoun));
         else
             LogErrorContext(ctx, std::format(
-                "alignment mismatch storing into {}: the field is declared 'alignas(0, {})' but the "
+                "alignment mismatch storing into {}: the {} is declared 'alignas(0, {})' but the "
                 "value was allocated 'alignas(0, {})'. The two must agree so the free site recovers "
                 "the correct alignment.",
-                fieldDesc, fieldAlign, rhsAllocAlign));
+                fieldDesc, destNoun, fieldAlign, rhsAllocAlign));
         return true;
     }
 
@@ -7671,6 +7684,54 @@ bool MainListener::RejectMixedOwnershipTernaryJoin(
             "'?:' arms differ in ownership: '{}' is an owning value and '{}' is a borrow of an "
             "existing value. Either 'move' the borrowed side into a fresh value so both arms own, "
             "or make both arms borrows.",
+            { armText(owningCtx), armText(borrowCtx) }));
+        return true;
+    }
+
+bool MainListener::RejectMixedOwnershipPointerTernaryJoin(
+        llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
+        llvm::Value* trueStorage, llvm::Value* falseStorage,
+        antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
+        antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (joined == nullptr || !joined->getType()->isPointerTy()) return false;
+        // A null arm carries no block at all: `c ? buf : nullptr` allocates nothing on either
+        // side, so it is neither an owning nor a borrowing mismatch. TernaryArmJoinsOwning scores
+        // null OWNING (it is safe to adopt), which is the opposite of what this rule needs.
+        auto isNullArm = [](llvm::Value* arm) {
+            auto* c = llvm::dyn_cast_or_null<llvm::Constant>(arm);
+            return c != nullptr && c->isNullValue();
+        };
+        if (isNullArm(trueValue) || isNullArm(falseValue)) return false;
+        bool trueOwns = compiler->TernaryArmJoinsOwning(trueValue);
+        bool falseOwns = compiler->TernaryArmJoinsOwning(falseValue);
+        if (trueOwns == falseOwns) return false;
+        // Prove the BORROW side too. TernaryArmJoinsOwning answers the owning-temp ledgers, so its
+        // `false` covers "unrecorded" as well as "borrows" - reading it as a borrow claim rejects
+        // `T* owner = new T(); c ? owner : new T();`, which the corpus relies on.
+        llvm::Value* borrowValue   = trueOwns ? falseValue   : trueValue;
+        llvm::Value* borrowStorage = trueOwns ? falseStorage : trueStorage;
+        if (!compiler->TernaryArmIsProvenBorrow(borrowValue, borrowStorage)) return false;
+        // Original source slice, not getText(): the parse tree drops whitespace, so `move x`
+        // would otherwise be quoted back at the user as 'movex'.
+        auto armText = [](antlr4::ParserRuleContext* armCtx) {
+            std::string text("?");
+            if (armCtx != nullptr && armCtx->start != nullptr && armCtx->stop != nullptr
+                && armCtx->start->getInputStream() != nullptr)
+                text = armCtx->start->getInputStream()->getText(antlr4::misc::Interval(
+                    armCtx->start->getStartIndex(), armCtx->stop->getStopIndex()));
+            else if (armCtx != nullptr)
+                text = armCtx->getText();
+            if (text.size() > 40) text = text.substr(0, 37) + "...";
+            return text;
+        };
+        antlr4::ParserRuleContext* owningCtx = trueOwns ? trueCtx : falseCtx;
+        antlr4::ParserRuleContext* borrowCtx = trueOwns ? falseCtx : trueCtx;
+        LogErrorContext(ctx, compiler->LocalizeMessage(
+            "'?:' arms differ in ownership: '{}' allocates a value the join cannot own and '{}' "
+            "is a borrow of an existing value, so the allocating arm leaks whenever it is taken. "
+            "Either 'move' the borrowed side into a fresh value so both arms own, or allocate "
+            "into a named owner before the '?:' and make both arms borrows.",
             { armText(owningCtx), armText(borrowCtx) }));
         return true;
     }

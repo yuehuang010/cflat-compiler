@@ -194,7 +194,7 @@ expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') in
     }
 }
 
-expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into an element of 'arr': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it.") {
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into an element of 'arr': that alignment is a property of the allocation, not of the type, so a free through the slot cannot recover it.") {
     void rejectAlignedIntoUnclausedElement()
     {
         alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
@@ -203,12 +203,106 @@ expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') in
     }
 }
 
-expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into the slot behind 'pp': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it.") {
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into the slot behind 'pp': that alignment is a property of the allocation, not of the type, so a free through the slot cannot recover it.") {
     void rejectAlignedIntoUnclausedDerefSlot()
     {
         alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
         AlignElem* t = default;
         AlignElem** pp = &t;
         *pp = move s;
+    }
+}
+
+// A GLOBAL slot is the fourth destination of the same store rule: it reaches the synthesized free
+// through its own declared type and passes none of the doors above (no GEP, no element access, no
+// deref). `delete[2] g` on a 64-aligned block parked in an unclaused `AlignElem* g` emitted the
+// ordinary `_operator delete` (IR-confirmed pre-fix); the store is what has to be rejected.
+AlignElem* gAlignHole;
+AlignElem* gAlignHole2;
+AlignElem* gAlignHole3;
+double* gAlignHoleD;
+namespace AlignNS { AlignElem* gSlot; }
+
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into global 'gAlignHole': that alignment is a property of the allocation, not of the type, so a free through the global cannot recover it. Declare the global 'alignas(0, 64)' so the block alignment is recorded, or over-align the ELEMENT TYPE instead ('struct alignas(64) Chunk { ... };').") {
+    void rejectAlignedIntoUnclausedGlobalMove()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        gAlignHole = move s;
+    }
+}
+
+// The plain (non-`move`) read reaches the same door.
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into global 'gAlignHole2'") {
+    void rejectAlignedIntoUnclausedGlobalPlain()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        gAlignHole2 = s;
+    }
+}
+
+// A DIRECT `new ... alignas` into an unclaused global: no local carries the clause, so this is the
+// spelling that has no source binding to blame.
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into global 'gAlignHole3'") {
+    void rejectAlignedIntoUnclausedGlobalDirect()
+    {
+        gAlignHole3 = new AlignElem[2] alignas(0, 64);
+    }
+}
+
+// A pointer-to-PRIMITIVE global takes the same door - the rule is about the block, not the pointee.
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into global 'gAlignHoleD'") {
+    void rejectAlignedIntoUnclausedGlobalPrimitive()
+    {
+        gAlignHoleD = new double[8] alignas(0, 64);
+    }
+}
+
+// A namespace-qualified global is the same slot under a second spelling.
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into global 'AlignNS.gSlot'") {
+    void rejectAlignedIntoUnclausedGlobalNamespaced()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        AlignNS.gSlot = move s;
+    }
+}
+
+// The explicitly spelled `unique<T, N>` now seeds the inbound allocation-alignment channel exactly
+// as the `alignas(0, N) unique T*` sugar does, so a bare `new` is accepted (see test_core.cb). A
+// source that carries a DIFFERENT clause must still be rejected: the seed only supplies the
+// declared alignment to a BARE `new`, it never overrides one the source already carries.
+struct AlignUniquePointee { int v = 0; };
+
+expect_error("alignment mismatch initializing 'unique<AlignUniquePointee, 64>': the declared type allocates at 64, but the value was allocated 'alignas(0, 32)'. Allocate the value with the matching 'alignas(0, 64)' clause, or declare the receiver with the alignment the value already has.") {
+    void rejectExplicitUniqueAlignMismatch()
+    {
+        alignas(0, 32) AlignUniquePointee* t = new AlignUniquePointee[1] alignas(0, 32);
+        unique<AlignUniquePointee, 64> p = move t;
+    }
+}
+
+// A clause-bearing GLOBAL is the other direction of the same door: it declares the block
+// alignment the free site will use, so a source allocated WITHOUT that clause (or with a
+// different one) would hand `__delete_aligned` an ordinarily-aligned block. Both compiled and
+// ran clean pre-fix.
+alignas(0, 64) AlignElem* gAlignDeclared;
+alignas(0, 64) AlignElem* gAlignDeclared2;
+
+// PRECISE provenance only: the source is a raw `new T[n]` binding, so its (absent) clause is
+// determinate. A store whose source alignment is UNKNOWN - a null local, a borrow, a call result -
+// is accepted instead (see test_core.cb); the door never guesses. A `new` written DIRECTLY into
+// the global inherits the declared clause, so that spelling is the sanctioned fix, not an error.
+expect_error("alignment mismatch storing into global 'gAlignDeclared': the global is declared 'alignas(0, 64)' but the value was allocated without a matching allocation-alignment clause (ordinary alignment).") {
+    void rejectUnclausedSourceIntoAlignedGlobal()
+    {
+        AlignElem* s = new AlignElem[2];
+        gAlignDeclared = move s;
+    }
+}
+
+expect_error("alignment mismatch storing into global 'gAlignDeclared2': the global is declared 'alignas(0, 64)' but the value was allocated 'alignas(0, 32)'.") {
+    void rejectMismatchedSourceIntoAlignedGlobal()
+    {
+        alignas(0, 32) AlignElem* s = new AlignElem[2] alignas(0, 32);
+        gAlignDeclared2 = move s;
     }
 }

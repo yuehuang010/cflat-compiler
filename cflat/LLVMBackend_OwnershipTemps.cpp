@@ -3217,6 +3217,33 @@ bool LLVMBackend::IsMovedOutPtrValue(llvm::Value* value) const
         return false;
     }
 
+void LLVMBackend::RegisterBorrowedAddressValue(llvm::Value* value)
+{
+        if (value == nullptr || !value->getType()->isPointerTy()) return;
+        borrowedAddressValues_.insert(value);
+    }
+
+bool LLVMBackend::IsBorrowedAddressValue(llvm::Value* value) const
+{
+        if (value == nullptr) return false;
+        return borrowedAddressValues_.count(value) != 0;
+    }
+
+bool LLVMBackend::TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* armStorage) const
+{
+        if (armValue == nullptr || !armValue->getType()->isPointerTy()) return false;
+        if (IsBorrowedAddressValue(armValue)) return true;
+        if (armStorage == nullptr) return false;
+        const NamedVariable* nv = FindVariableByStorage(armStorage);
+        if (nv == nullptr) return false;
+        // An owning binding is never the borrow side, however its arm VALUE scores in the
+        // owning-temp ledgers: `T* p = new T();` reads back as a plain load and owns all the same.
+        if (nv->IsOwning || nv->IsNewAllocated || nv->IsOwningStruct || nv->IsOwningString)
+            return false;
+        return nv->IsBorrowed || nv->IsAliasBorrow || nv->IsRangeForBorrow
+            || nv->PointsToBorrowedAddress;
+    }
+
 void LLVMBackend::RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName)
 {
         if (value == nullptr || !value->getType()->isPointerTy()) return;

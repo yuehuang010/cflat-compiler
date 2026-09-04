@@ -78,3 +78,124 @@ extern int main(int argc, char** argv)
     printf("done %d\n", other2.n->v);
     return 0;
 }
+
+// The POINTER sibling of the same rule (issue p3/mixed-owning-borrow-pointer-ternary-join-leaks-
+// new-arm). Measured pre-fix on every shape below: the allocating arm ran, no destructor fired,
+// and `leaks --atExit` reported 16 leaked bytes. Both sides must be PROVEN - the borrow arm here
+// is a local declared from `&stack`, which can never own; a `T* p = new T();` local is an owner
+// and stays accepted (Test/test_move.cb join_owner_new_value).
+struct PtrJoinNode { int v = 3; };
+move PtrJoinNode* ptrJoinMake() { return new PtrJoinNode(); }
+int ptrJoinUse(PtrJoinNode* a) { return a->v; }
+struct PtrJoinHolder { PtrJoinNode* n = nullptr; };
+
+int runPointerTernaryJoinRejects(bool c)
+{
+    PtrJoinNode stack = default;
+    PtrJoinNode* borrowed = &stack;
+
+    // (p1) filed repro: borrow arm first, `new` second.
+    expect_error("'?:' arms differ in ownership: 'new PtrJoinNode()' allocates a value the join cannot own and 'borrowed' is a borrow of an existing value, so the allocating arm leaks whenever it is taken. Either 'move' the borrowed side into a fresh value so both arms own, or allocate into a named owner before the '?:' and make both arms borrows.") {
+        PtrJoinNode* p1 = c ? borrowed : new PtrJoinNode();
+    }
+
+    // (p2) arms swapped - the rule is symmetric.
+    expect_error("'new PtrJoinNode()' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        PtrJoinNode* p2 = c ? new PtrJoinNode() : borrowed;
+    }
+
+    // (p3) a move-returning CALL is the owning side just as `new` is.
+    expect_error("'ptrJoinMake()' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        PtrJoinNode* p3 = c ? borrowed : ptrJoinMake();
+    }
+
+    // (p4) an explicit `move` of an owner is the owning side.
+    expect_error("'move owner' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        unique PtrJoinNode* owner = new PtrJoinNode();
+        PtrJoinNode* p4 = c ? move owner : borrowed;
+    }
+
+    // (p5) a direct `&stack` arm, with no intervening binding, is proven the same way.
+    expect_error("'&stack' is a borrow of an existing value") {
+        PtrJoinNode* p5 = c ? &stack : new PtrJoinNode();
+    }
+
+    // (p6) NESTED: the inner join is the mixed one and is the one reported.
+    expect_error("'new PtrJoinNode()' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        PtrJoinNode* p6 = c ? borrowed : (c ? borrowed : new PtrJoinNode());
+    }
+
+    // (p7) ARGUMENT position - rejected at the join, so every destination reports it.
+    expect_error("'new PtrJoinNode()' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        int n7 = ptrJoinUse(c ? borrowed : new PtrJoinNode());
+    }
+
+    // (p8) FIELD store destination.
+    expect_error("'new PtrJoinNode()' allocates a value the join cannot own and 'borrowed' is a borrow") {
+        PtrJoinHolder h8 = default;
+        h8.n = c ? borrowed : new PtrJoinNode();
+    }
+
+    return 0;
+}
+
+// (p9) a pointer PARAMETER is a borrow by declaration, so it proves the borrow side too.
+expect_error("'new PtrJoinNode()' allocates a value the join cannot own and 'param' is a borrow") {
+    int ptrJoinFromParam(PtrJoinNode* param, bool cc)
+    {
+        PtrJoinNode* p9 = cc ? param : new PtrJoinNode();
+        return p9->v;
+    }
+}
+
+// (p10) RETURN position: a bare-pointer return smuggled the `new` past the owning-return check
+// because the join hid it. dtor count was 0 on the allocating path pre-fix.
+PtrJoinNode gPtrJoinStack = default;
+expect_error("'new PtrJoinNode()' allocates a value the join cannot own and '&gPtrJoinStack' is a borrow") {
+    PtrJoinNode* ptrJoinPick(bool c) { return c ? &gPtrJoinStack : new PtrJoinNode(); }
+}
+
+// (p11) REASSIGNMENT destination. Test/test_move.cb used to accept this shape and assert that the
+// join merely borrowed (unique_reassign_mixed_join_*); the allocating arm leaked whenever it was
+// taken, so the leg moved here when the pointer rule was widened.
+expect_error("allocates a value the join cannot own and 'live' is a borrow of an existing value") {
+    int ptrJoinReassign(bool c)
+    {
+        unique PtrJoinNode* owner = new PtrJoinNode();
+        PtrJoinNode* live = owner;
+        PtrJoinNode* b = nullptr;
+        b = c ? ptrJoinMake() : live;
+        return b->v;
+    }
+}
+
+// (p12) a `move` of a BORROWED parameter transfers nothing, so it is the BORROW side of the join,
+// not the owning one. Test/test_move.cb used to accept this (ternary_borrowed_move_mixed_join_*)
+// and let the result borrow, which leaked the allocating arm whenever it was taken.
+expect_error("'ptrJoinMake()' allocates a value the join cannot own and 'move borrowed' is a borrow") {
+    int ptrJoinBorrowedMove(PtrJoinNode* borrowed, bool c)
+    {
+        PtrJoinNode* v = c ? move borrowed : ptrJoinMake();
+        return v->v;
+    }
+}
+
+// (p13) `unique` FIELD store destination of the borrowed-move join, and (p14) the brace-init store
+// path, which is a separate door (EmitOneFieldInit). Both used to accept and let the field own
+// whichever arm ran - on the borrow path that adopts the caller's still-live pointee.
+struct PtrJoinUniqueBox { unique PtrJoinNode* item = nullptr; };
+
+expect_error("'ptrJoinMake()' allocates a value the join cannot own and 'move borrowed' is a borrow") {
+    void ptrJoinBorrowedMoveIntoField(PtrJoinUniqueBox* box, PtrJoinNode* borrowed, bool c)
+    {
+        box->item = c ? move borrowed : ptrJoinMake();
+    }
+}
+
+expect_error("'ptrJoinMake()' allocates a value the join cannot own and 'move borrowed' is a borrow") {
+    int ptrJoinBorrowedMoveBraceInit(PtrJoinNode* borrowed, bool c)
+    {
+        PtrJoinUniqueBox box = { item = c ? move borrowed : ptrJoinMake() };
+        return box.item != nullptr ? 1 : 0;
+    }
+}

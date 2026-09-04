@@ -705,6 +705,25 @@ static std::string LegacyUniqueSubstitutionSpelling(const LLVMBackend* compiler,
     return pointee + "*";
 }
 
+/*
+ * The allocation alignment a core `unique<T, N>` DECLARES, read off its own ALIGN generic
+ * argument. The `alignas(0, N) unique T*` sugar records the same number on AllocAlignValue as it
+ * mangles the wrapper name, so the explicitly-spelled generic must fold back to the identical
+ * TypeAndValue or only the sugar seeds the inbound allocation-alignment channel. Returns 0 when
+ * the type is not a core unique, carries no second argument, or the argument is not a number.
+ */
+static uint64_t CoreUniqueDeclaredAllocAlign(const LLVMBackend* compiler,
+                                             const std::string& typeName)
+{
+    if (compiler == nullptr || !compiler->IsCoreUniqueType(typeName)) return 0;
+    std::string alignArg = MangledGenericArgument(*compiler, typeName, 1);
+    if (!alignArg.empty() && alignArg.front() == '.') alignArg.erase(0, 1);
+    if (alignArg.empty()) return 0;
+    for (char c : alignArg)
+        if (c < '0' || c > '9') return 0;
+    return std::strtoull(alignArg.c_str(), nullptr, 10);
+}
+
 // Shape the argument handed to unique<T>'s constructor: the pointer arm hands over the pointee
 // pointer, the interface arm hands over the interface VALUE (or an implementor pointer to box).
 static void ShapeCoreUniqueCtorArg(const LLVMBackend* compiler,
@@ -4047,7 +4066,8 @@ public:
         llvm::Value* right,
         const std::string& fieldDesc,
         antlr4::ParserRuleContext* ctx,
-        bool slotIsAuthoritativeHolder = false);
+        bool slotIsAuthoritativeHolder = false,
+        const char* destNoun = "field");
 
     /*
      * The local-reassignment twin of RejectFieldAllocAlignMismatch. A local whose OWN declared type
@@ -4230,6 +4250,48 @@ public:
      */
     bool RejectNonOwningStructJoinStore(llvm::Value* right, const std::string& destTypeName,
                                         const char* destKind, antlr4::ParserRuleContext* ctx);
+
+    // Name a global destination for the allocation-alignment diagnostic. A global store leaves
+    // CallerName empty on some paths, so fall back to the declarator's recorded name.
+    static std::string GlobalSlotDescription(const LLVMBackend::NamedVariable& nv)
+    {
+        const std::string& name = !nv.CallerName.empty()
+            ? nv.CallerName : nv.TypeAndValue.VariableName;
+        return name.empty() ? std::string("a global slot") : std::format("global '{}'", name);
+    }
+
+    /*
+     * The POINTER sibling of RejectMixedOwnershipTernaryJoin. One arm PROVABLY owns a fresh block
+     * (`new`, a `move` of an owner, a move-returning call) while the other is a PROVEN borrow, so
+     * the join owns nothing the receiver may free and the owning arm leaks whenever it is taken
+     * (measured: 16 bytes, no destructor, on every destination - declaration, assignment, field
+     * store, call argument, return). Both sides must be proven: an arm whose ownership is merely
+     * unrecorded (a plain `T* p = new T();` local read back by name) is NOT the borrow side.
+     */
+    bool RejectMixedOwnershipPointerTernaryJoin(
+        llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
+        llvm::Value* trueStorage, llvm::Value* falseStorage,
+        antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
+        antlr4::ParserRuleContext* ctx);
+
+    /*
+     * Is the RHS's allocation alignment PRECISE at a global store? Only a recorded alignment
+     * (AllocAlignKnown) or an OWNING fresh/raw-new binding qualifies: new-provenance flags are
+     * copied onto plain borrows (`E* b = owner;`) whose alignment is not determinate. A null
+     * literal, a proven borrow, a direct `&expr`, a parameter and a call result are unknown,
+     * and the clause-bearing direction of the global door must let those through unchallenged.
+     */
+    static bool GlobalStoreAllocAlignIsPrecise(const LLVMBackend* compiler,
+                                               const LLVMBackend::NamedVariable& rightNV,
+                                               llvm::Value* right)
+    {
+        if (right == nullptr || llvm::isa<llvm::ConstantPointerNull>(right)) return false;
+        if (rightNV.PointsToBorrowedAddress || rightNV.IsAliasBorrow) return false;
+        if (compiler->IsBorrowedAddressValue(right)) return false;
+        if (rightNV.AllocAlignKnown) return true;
+        return rightNV.IsOwning && (rightNV.TypeAndValue.IsArrayView
+            || rightNV.IsNewAllocated || rightNV.AllocatedByRawNewArray);
+    }
 
     /*
      * A '?:' whose two arms disagree on OWNERSHIP of an owning-value struct (one arm an owning

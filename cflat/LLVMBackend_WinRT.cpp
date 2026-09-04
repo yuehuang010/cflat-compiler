@@ -1754,12 +1754,28 @@ void LLVMBackend::ApplyMoveParamTransfer(const std::string& functionName,
                               SpellFunctionSymbol(*this, functionName),
                               std::format("alignas(0, {})", args[i].AllocAlignment) });
                     else
-                        LogErrorMessage(
-                            "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
-                            "'alignas(0, {})' but the argument was allocated 'alignas(0, {})'. The two must agree "
-                            "so the callee frees with the correct alignment.",
-                            { SpellFunctionSymbol(*this, functionName), std::to_string(params[i].AllocAlignValue),
-                              std::to_string(args[i].AllocAlignment) });
+                    {
+                        // A core `unique<T, N>` receiver reaches this check through its own
+                        // constructor, so naming a 'move' parameter the user never wrote is wrong.
+                        std::string calleeSpelling = SpellFunctionSymbol(*this, functionName);
+                        if (IsCoreUniqueType(functionName))
+                            LogErrorMessage(
+                                "alignment mismatch initializing '{}': the declared type allocates at {}, but the "
+                                "value was allocated {}. Allocate the value with the matching 'alignas(0, {})' "
+                                "clause, or declare the receiver with the alignment the value already has.",
+                                { calleeSpelling, std::to_string(params[i].AllocAlignValue),
+                                  args[i].AllocAlignment == 0
+                                      ? std::string("at ordinary alignment")
+                                      : std::format("'alignas(0, {})'", args[i].AllocAlignment),
+                                  std::to_string(params[i].AllocAlignValue) });
+                        else
+                            LogErrorMessage(
+                                "alignment mismatch moving into the 'move' parameter of '{}': the parameter is declared "
+                                "'alignas(0, {})' but the argument was allocated 'alignas(0, {})'. The two must agree "
+                                "so the callee frees with the correct alignment.",
+                                { calleeSpelling, std::to_string(params[i].AllocAlignValue),
+                                  std::to_string(args[i].AllocAlignment) });
+                    }
                 }
 
                 if (!beforeCall)

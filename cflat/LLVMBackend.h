@@ -48,6 +48,7 @@
 
 #pragma warning(push)
 #pragma warning(disable: 4244 4267)
+#include <llvm/ADT/DenseSet.h>    // llvm::DenseSet (identity-keyed value ledgers)
 #include <llvm/IR/CFG.h>          // llvm::pred_empty (MarkUnreachableIfNoPredecessors)
 #include <llvm/Analysis/TargetLibraryInfo.h>  // stdio-safe TLI for ELF codegen (no chk->plain fold)
 #include <llvm/IR/IRBuilder.h>
@@ -1345,6 +1346,10 @@ public:
         // (string/owning struct/closure). Zeroing is deferred to ApplyMoveParamTransfer so the
         // callee's parameter move-ness is known first. Not part of the --init cache round-trip.
         bool IsExplicitMove = false;
+        // compile-time: this POINTER binding was declared or assigned from an ADDRESS-OF value, so
+        // it provably borrows - `&x` never yields an owner. Positive provenance recorded where the
+        // binding is produced (never re-derived from IR); not part of the --init cache round-trip.
+        bool PointsToBorrowedAddress = false;
         // compile-time: the occurrence id (see currentCastOccurrence_) this argument's own value
         // was produced under, stamped when a call-argument's evaluation finishes. Lets a DEFERRED
         // gate (ArgumentIsCodeValue / ArgumentIsProvablyDataPointer, run after every sibling
@@ -2518,6 +2523,10 @@ private:
     // paths). Carried through a '?:' join whose arms are all borrowed moves or null, so the
     // laundered spelling is rejected exactly like the direct one. Retired with ownedNewTemps_.
     std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues_;
+    // Pointer values produced by ADDRESS-OF (`&x`, `&a[i]`, `&s.f`). Such a value can never own
+    // its pointee, so it is positive proof of a borrow. Live compile-time state keyed by
+    // llvm::Value identity - never part of the --init cache round-trip.
+    llvm::DenseSet<llvm::Value*> borrowedAddressValues_;
     std::vector<llvm::Value*> movedBorrowedThroughFieldValues_;
 
     // '?:' joins of an OWNING-VALUE STRUCT whose arms did not all provably own, keyed by value
@@ -3991,6 +4000,18 @@ private:
 
     bool IsMovedOutPtrValue(llvm::Value* value) const;
 
+    // Ledger a pointer value ADDRESS-OF produced (see borrowedAddressValues_).
+    void RegisterBorrowedAddressValue(llvm::Value* value);
+    bool IsBorrowedAddressValue(llvm::Value* value) const;
+    /*
+     * Positive borrow proof for one '?:' arm: the arm value is an address-of result, or it was
+     * loaded from a BINDING the front end already knows borrows (a non-move pointer parameter, an
+     * alias/range-for borrow, or a local declared from `&x`) and that binding is not itself an
+     * owner. Everything else answers false - an arm whose ownership is merely unproven must not be
+     * read as a borrow.
+     */
+    bool TernaryArmIsProvenBorrow(llvm::Value* armValue, llvm::Value* armStorage) const;
+
     // Ledger a pointer value a `move` of a BORROWED source produced (see movedBorrowedPtrValues_).
     void RegisterMovedBorrowedPtrValue(llvm::Value* value, const std::string& originName);
     // Same value, narrowed: the borrow was read out of a FIELD of that origin, so a diagnostic
@@ -4830,6 +4851,7 @@ public:
         size_t savedCastOccurrence = 0;
         std::vector<llvm::Value*> movedOutPtrValues;
         std::vector<std::pair<llvm::Value*, std::string>> movedBorrowedPtrValues;
+        llvm::DenseSet<llvm::Value*> borrowedAddressValues;
         std::vector<llvm::Value*> movedBorrowedThroughFieldValues;
         std::vector<llvm::Value*> nonOwningStructJoins;
         std::vector<std::pair<const llvm::Value*, UniqueFieldReadSource>> uniqueFieldReadValues;
@@ -7058,6 +7080,8 @@ public:
                             bool uniqueFieldViaCall = false);
 
     void SetPointsToBorrowedByValueParam(const std::string& name, bool value);
+    // Record/retire the address-of borrow provenance on a live pointer binding by name.
+    void SetPointsToBorrowedAddress(const std::string& name, bool value);
 
     /*
      * Drop a borrow that a plain '=' recorded (never a declaration-time one) when a later '='

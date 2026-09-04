@@ -470,6 +470,10 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                 }
             }
         }
+        // Mirror of the codegen copy: an explicitly spelled `unique<T, N>` folds its ALIGN
+        // generic argument back onto AllocAlignValue so both spellings register the same type.
+        if (declType.AllocAlignValue == 0)
+            declType.AllocAlignValue = CoreUniqueDeclaredAllocAlign(compiler, declType.TypeName);
         return declType;
     }
 

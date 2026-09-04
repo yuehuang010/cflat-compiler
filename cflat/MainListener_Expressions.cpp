@@ -1940,6 +1940,11 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     }
                     compiler->SetPointsToBorrowedByValueParam(
                         namedVar.CallerName, rightNV.PointsToBorrowedByValueParam);
+                    // Assignment twin of the declaration's address-of provenance: `p = &x;` makes
+                    // the binding a proven borrow, any other RHS retires the fact (a stale borrow
+                    // proof would be a false rejection at a later '?:' join).
+                    compiler->SetPointsToBorrowedAddress(
+                        namedVar.CallerName, compiler->IsBorrowedAddressValue(rightNV.Primary));
                     /*
                      * Record the borrow the RHS carries, which MarkPointerRebound above does not:
                      * it retires the declaration-time facts and re-arms only the OWNER-side proofs,
@@ -3130,7 +3135,24 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                                       destIsFixedArrayElem || namedVar.IsElementAccess
                                           ? "an element of" : "the slot behind",
                                       namedVar.CallerName),
-                    ctx);
+                    ctx, false, "slot");
+            // A GLOBAL slot is the last destination that reaches the synthesized free through its
+            // DECLARED type, and it passes none of the doors above (no GEP, no element access, no
+            // deref). Same rule, same message: an over-aligned block parked in an unclaused global
+            // is freed with the ordinary deallocator, and a clause-bearing global must be fed a
+            // matching allocation. `static` locals already reach the LOCAL door and are excluded.
+            // A global is also a plain borrow slot, so the clause-bearing direction fires only on
+            // PRECISE provenance (see GlobalStoreAllocAlignIsPrecise); unknown sources compile.
+            else if (operatorText == "=" && !destIsStructField
+                && namedVar.FieldName.empty() && !namedVar.IsElementAccess
+                && !namedVar.IsStaticLocal
+                && llvm::isa_and_nonnull<llvm::GlobalVariable>(destination)
+                && (namedVar.TypeAndValue.AllocAlignValue <= LLVMBackend::kDefaultNewAlign
+                    || GlobalStoreAllocAlignIsPrecise(compiler, rightNV, right)))
+                RejectFieldAllocAlignMismatch(
+                    namedVar.TypeAndValue, namedVar.TypeAndValue.AllocAlignValue, rightNV, right,
+                    GlobalSlotDescription(namedVar),
+                    ctx, false, "global");
 
             if (operatorText == "=" && destIsStructField
                 && !SourceIsDanglingAliasBorrow(compiler, rightNV)
@@ -5566,6 +5588,8 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
             compiler->ClearOwnedResultChannels();
             RejectMixedOwnershipTernaryJoin(trueValue, falseValue, phi,
                 expressionTrueCtx, expressionFalseCtx, ctx);
+            RejectMixedOwnershipPointerTernaryJoin(trueValue, falseValue, phi,
+                trueStorage, falseStorage, expressionTrueCtx, expressionFalseCtx, ctx);
         }
         compiler->PropagateAliasValue(trueValue, falseValue, phi);
         compiler->PropagateBondedValue(trueValue, falseValue, phi);
@@ -8942,6 +8966,10 @@ LLVMBackend::NamedVariable MainListener::ParseUnaryExpression(CFlatParser::Unary
                     namedVar.IsAliasBorrow = false;
                     namedVar.TypeAndValue.IsAlias = false;
                 }
+                // Positive borrow provenance, recorded where the value is PRODUCED: an
+                // address-of result points at storage some other binding owns, so it can never be
+                // the owning side of a '?:' join.
+                compiler->RegisterBorrowedAddressValue(namedVar.Primary);
                 // The address of an element (e.g. &a[i]) is a raw pointer to one slot, never a
                 // whole-allocation array-view. Clear the flag so it cannot bind back into a `T[]`
                 // (which would forge an offset view that overlaps the original - the escape hatch

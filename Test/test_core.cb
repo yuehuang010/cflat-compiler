@@ -2875,6 +2875,136 @@ int runRawCountJoinAligned(int choose)
     return g_raw_count_dtors;
 }
 
+// ACCEPT side of the GLOBAL store door (issue p3/alloc-alignment-unclaused-global-pointer-store-
+// unchecked). A global DECLARED `alignas(0, 64)` records the block alignment, so the store is
+// legal and the free recovers it: the IR for this function calls `__delete_aligned`, not
+// `_operator delete`. The rejection only fires on an UNCLAUSED global (err_align_alloc_mismatch).
+alignas(0, 64) RawCountElem* g_raw_count_aligned_global;
+
+int runRawCountAlignedGlobal(int choose)
+{
+    resetRawCountState();
+    g_raw_count_aligned_global = choose != 0
+        ? new RawCountElem[2] alignas(0, 64)
+        : new RawCountElem[4] alignas(0, 64);
+    g_raw_count_aligned_global[0].id = 5;
+    int seen = g_raw_count_aligned_global[0].id;
+    // Explicit count: a global slot carries no hidden `.raw_array_count`, so `delete[_]` would
+    // free the block without running the element destructors this leg counts.
+    if (choose != 0) delete[2] g_raw_count_aligned_global;
+    else delete[4] g_raw_count_aligned_global;
+    g_raw_count_aligned_global = nullptr;
+    return g_raw_count_dtors * 10 + seen;
+}
+
+// ACCEPT side of the explicit `unique<T, N>` spelling (issue p3/explicit-unique-align-spelling-
+// rejects-plain-new). The bare `new` inherits the ALIGN generic argument exactly as the
+// `alignas(0, 64) unique T*` sugar does, so both spellings allocate at 64 and free through
+// `__delete_aligned`, and the destructor runs exactly once for each.
+int runExplicitUniqueAlignDecl()
+{
+    resetRawCountState();
+    {
+        unique<RawCountElem, 64> p = new RawCountElem();
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+int runExplicitUniqueAlignAssign()
+{
+    resetRawCountState();
+    {
+        unique<RawCountElem, 64> p = default;
+        p = new RawCountElem();
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+struct ExplicitUniqueAlignBox
+{
+    unique<RawCountElem, 64> h = new RawCountElem();
+};
+
+int runExplicitUniqueAlignField()
+{
+    resetRawCountState();
+    {
+        ExplicitUniqueAlignBox box = default;
+        box.h->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+struct ExplicitUniqueAlignSlot
+{
+    unique<RawCountElem, 64> h = default;
+};
+
+int runExplicitUniqueAlignBraceInit()
+{
+    resetRawCountState();
+    {
+        ExplicitUniqueAlignSlot box = { h = new RawCountElem() };
+        box.h->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+unique<RawCountElem, 64> explicitUniqueAlignMake()
+{
+    return new RawCountElem();
+}
+
+int runExplicitUniqueAlignReturn()
+{
+    resetRawCountState();
+    {
+        unique<RawCountElem, 64> p = explicitUniqueAlignMake();
+        p->id = 7;
+    }
+    return g_raw_count_dtors;
+}
+
+// ACCEPT side of the CLAUSE-BEARING global direction. The door rejects only a PRECISE, mismatched
+// source provenance (see err_align_alloc_mismatch.cb); a null-valued local, the address of a
+// static, a call result, a borrow copy of an aligned owner and a direct `&view[i]` all carry
+// UNKNOWN provenance and must keep compiling; the two blocks are freed through their owners.
+alignas(0, 64) RawCountElem* g_raw_count_unknown_src_global;
+
+RawCountElem* rawCountUnknownSource() { return nullptr; }
+
+int runAlignedGlobalUnknownSource()
+{
+    static RawCountElem anchor = default;
+    RawCountElem* loc = nullptr;
+    g_raw_count_unknown_src_global = loc;
+    int seen = g_raw_count_unknown_src_global == nullptr ? 1 : 0;
+    g_raw_count_unknown_src_global = &anchor;
+    g_raw_count_unknown_src_global->id = 3;
+    seen = seen * 10 + anchor.id;
+    g_raw_count_unknown_src_global = rawCountUnknownSource();
+    seen = seen * 10 + (g_raw_count_unknown_src_global == nullptr ? 1 : 0);
+    // A plain copy of an aligned owner is a borrow: new-provenance flags it inherits are not
+    // a determinate alignment, so the store compiles.
+    RawCountElem* owner = new RawCountElem[2] alignas(0, 64);
+    RawCountElem* borrow = owner;
+    g_raw_count_unknown_src_global = borrow;
+    g_raw_count_unknown_src_global->id = 5;
+    seen = seen * 10 + owner[0].id;
+    g_raw_count_unknown_src_global = nullptr;
+    delete[2] owner;
+    // A direct `&view[i]` is a proven borrow even though the view carries new-provenance.
+    RawCountElem[] view = new RawCountElem[2];
+    g_raw_count_unknown_src_global = &view[1];
+    g_raw_count_unknown_src_global->id = 7;
+    seen = seen * 10 + view[1].id;
+    g_raw_count_unknown_src_global = nullptr;
+    delete[_] view;
+    return seen;
+}
+
 int runRawCountJoinView(int choose)
 {
     int count = 0;
@@ -3752,6 +3882,20 @@ int testRawArrayRuntimeCount()
         runRawCountJoinResources(1) * 100 + runRawCountJoinResources(0), 2244);
     passed += Test("raw count ternary aligned allocations",
         runRawCountJoinAligned(1) * 10 + runRawCountJoinAligned(0), 24);
+    passed += Test("raw count aligned global store both arms",
+        runRawCountAlignedGlobal(1) * 100 + runRawCountAlignedGlobal(0), 2545);
+    passed += Test("explicit unique<T,64> decl-init frees once",
+        runExplicitUniqueAlignDecl(), 1);
+    passed += Test("explicit unique<T,64> assignment frees once",
+        runExplicitUniqueAlignAssign(), 1);
+    passed += Test("explicit unique<T,64> field default frees once",
+        runExplicitUniqueAlignField(), 1);
+    passed += Test("explicit unique<T,64> brace-init frees once",
+        runExplicitUniqueAlignBraceInit(), 1);
+    passed += Test("explicit unique<T,64> move return frees once",
+        runExplicitUniqueAlignReturn(), 1);
+    passed += Test("aligned global accepts unknown-provenance sources",
+        runAlignedGlobalUnknownSource(), 13157);
     passed += Test("raw count ternary array view ranges",
         runRawCountJoinView(1) * 10 + runRawCountJoinView(0), 24);
     passed += Test("raw count move parameter direct zero and counts",
@@ -3969,7 +4113,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 81;
+    r = testRawArrayRuntimeCount(); passed += r; total += 88;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;
