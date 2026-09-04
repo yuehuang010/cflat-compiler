@@ -1,0 +1,67 @@
+// An array-view type argument ('int[]') substituted into a template body can form a type the
+// body cannot name - 'int[]' in a declaration position, or 'int[]*' from a 'T*' - and the
+// instantiation fails deep inside the template. The diagnostic belongs at the ARGUMENT, in this
+// file: before the fix it surfaced as "cannot find the type 'int[]'" carrying a line inside the
+// template body under this file's name.
+//
+// The uses live in file-scope expect_error blocks because the argument is instantiated when the
+// enclosing function is scanned for generic uses, i.e. before its first statement runs - a
+// statement-scope expectation inside the function is not armed yet at that point.
+//
+// Accept controls (a generic that never forms an invalid type, and a body whose local variable
+// is spelled like the type parameter) live in Test/test_generics.cb, asserted at runtime.
+
+import "list.cb";
+import "dictionary.cb";
+
+expect_error("'int[]' cannot be a type argument of 'list': instantiating the body forms 'int[]', which is not a valid type") {
+    void gav_use_list()
+    {
+        list<int[]> bad = default;
+    }
+}
+
+expect_error("'float[]' cannot be a type argument of 'list'") {
+    using GavAlias = list<float[]>;
+}
+
+expect_error("'char[]' cannot be a type argument of 'list'") {
+    void gav_use_new()
+    {
+        list<char[]>* bad = new list<char[]>();
+    }
+}
+
+expect_error("'double[]' cannot be a type argument of 'list'") {
+    void gav_use_sizeof()
+    {
+        int n = (int)sizeof(list<double[]>);
+    }
+}
+
+expect_error("'short[]' cannot be a type argument of 'list'") {
+    struct GavField
+    {
+        list<short[]> l = default;
+    };
+}
+
+expect_error("'long[]' cannot be a type argument of 'dictionary'") {
+    void gav_use_dictionary()
+    {
+        dictionary<int, long[]> bad = default;
+    }
+}
+
+// The INNER argument is the one named: 'list<bool[]>' is instantiated before the outer list.
+expect_error("'bool[]' cannot be a type argument of 'list'") {
+    void gav_use_nested()
+    {
+        list<list<bool[]>> bad = default;
+    }
+}
+
+extern int main()
+{
+    return 0;
+}

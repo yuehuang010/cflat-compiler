@@ -135,7 +135,25 @@ struct GenericTemplateState
         std::string templateName;
         std::vector<std::string> typeArgs;
         std::string mangledName;
+        // The USER-side site that asked for this instantiation: the file the type argument was
+        // written in and its line/column. A failure inside the template body is re-attributed here.
+        std::string originFile;
+        size_t originLine = 0;
+        size_t originColumn = 0;
     };
+
+    // The record ProcessPendingInstantiations is draining right now, when it has at least one
+    // '...[]' array-view type argument. Consulted only by the unknown-type failure path.
+    struct ActiveInstantiationOrigin
+    {
+        bool valid = false;
+        std::string templateName;
+        std::vector<std::string> viewArgs;
+        std::string file;
+        size_t line = 0;
+        size_t column = 0;
+    };
+    ActiveInstantiationOrigin activeInstantiationOrigin;
 
     std::unordered_map<std::string, CFlatParser::StructDefinitionContext*>      genericStructTemplates;
     std::unordered_map<std::string, CFlatParser::ClassDefinitionContext*>       genericClassTemplates;
@@ -2585,6 +2603,10 @@ private:
     void EmitError(std::string message, std::string sourceMessage = {}) const;
     void LogErrorMessage(std::string englishTemplate,
                          std::vector<std::string> arguments = {}) const;
+
+    // A type the template body formed only after substituting an array-view argument cannot be
+    // looked up. Re-report it at the user's argument site instead of a line inside the template.
+    bool ReportArrayViewInstantiationFailure(const std::string& formedType) const;
 
     // In batch/--check mode throws so the loop continues; otherwise exits with code 1.
     [[noreturn]] void FailCompilation(const std::string& message) const;

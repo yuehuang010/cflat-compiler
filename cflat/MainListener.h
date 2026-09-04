@@ -3065,7 +3065,15 @@ private:
     // No-op for unknown base names (e.g. an unresolved type parameter like "T").
     void QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
-                                   const std::string& mangledName);
+                                   const std::string& mangledName,
+                                   antlr4::ParserRuleContext* site = nullptr);
+
+    // Append a pending instantiation, stamping the USER-side origin: the argument site in the
+    // file being walked, or the outer record's origin when queued from inside a template body.
+    void QueuePendingInstantiation(const std::string& templateName,
+                                   const std::vector<std::string>& typeArgs,
+                                   const std::string& mangledName,
+                                   antlr4::ParserRuleContext* site = nullptr);
 
     // Resolve a type in a function-pointer signature position (return or param) the way an ordinary
     // type position resolves: apply active substitutions, and if it names a generic instantiation

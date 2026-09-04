@@ -20,6 +20,11 @@
       "int main()",
       "int main(int argc, char** argv)"
     ],
+    "arg0cannotbeatypearg...whichisnotavalidtypee3edb49144ced697": [
+      "int[]",
+      "list",
+      "int[]"
+    ],
     "arg0isagenerictypety...xpectsarg1arg2egarg3a467eacbee1a674c": [
       "MyClass",
       "1 type parameter",
@@ -1425,6 +1430,7 @@
     "arg0arg1mustbearg2or...obeexecutedinprocess28e30d1abeb98a2b": "{0}: '{1}' must be '{2}' or '{3}' to be executed in-process.",
     "arg0asanruntimedllar...sssanitizercomponent4c29a1f95801007b": "{0}: asan runtime DLL '{1}' not found under '{2}\\bin'. The import library was present but the matching runtime DLL is missing; reinstall the 'C++ AddressSanitizer' component.",
     "arg0asanruntimeimpor...ntforthismsvctoolsetc5e9e50ae7d9edfe": "{0}: asan runtime import library '{1}' not found in '{2}'. Install the 'C++ AddressSanitizer' component for this MSVC toolset.",
+    "arg0cannotbeatypearg...whichisnotavalidtypee3edb49144ced697": "'{0}' cannot be a type argument of '{1}': instantiating the body forms '{2}', which is not a valid type",
     "arg0couldnotdetecthostmachinearg1": "{0}: could not detect host machine: {1}",
     "arg0couldnotfindarg1arg2": "{0}: could not find '{1}': {2}",
     "arg0couldnotloadimportedcobjectarg1arg2": "{0}: could not load imported C object '{1}': {2}",

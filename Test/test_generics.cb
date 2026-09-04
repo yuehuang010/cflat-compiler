@@ -2328,6 +2328,28 @@ bool testTupleReturnAndDestructure()
     return (first, second);
 }
 
+// Accept control for the array-view generic-argument diagnostic: a generic whose body never
+// forms an invalid type out of T keeps taking a view argument. The methods pin the two shapes a
+// text pre-scan used to reject: a LOCAL variable spelled like the type parameter in a product,
+// and a 'T*' that only ever appears in a dead 'if const' arm.
+struct ViewBoxAccept<T>
+{
+    T item = default;
+
+    int localNamedLikeParam()
+    {
+        int T = 3;
+        int n = 2;
+        return T * n;
+    }
+
+    int deadPointerArm()
+    {
+        if const (__WINDOWS__) { T* p = nullptr; }
+        return 11;
+    }
+};
+
 bool testTupleArrayView()
 {
     bool result = true;
@@ -2348,6 +2370,16 @@ bool testTupleArrayView()
     tuple<int[], int[]> t = (v, v);
     t.item_0[1] = 7;
     result &= Test("tuple_view_field_alias", t.item_1[1], 7);
+
+    // A generic that never forms 'T*' still takes an 'int[]' argument, and the element read
+    // through its field sees the writes made through the backing array.
+    ViewBoxAccept<int[]> box = default;
+    box.item = v;
+    box.item[2] = 33;
+    result &= Test("viewbox_arg_elem_read", box.item[2], 33);
+    result &= Test("viewbox_arg_alias_backing", backing[2], 33);
+    result &= Test("viewbox_local_named_like_param", box.localNamedLikeParam(), 6);
+    result &= Test("viewbox_dead_pointer_arm", box.deadPointerArm(), 11);
 
     return result;
 }

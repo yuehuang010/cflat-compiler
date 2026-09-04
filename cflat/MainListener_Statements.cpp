@@ -128,7 +128,7 @@ void MainListener::EnsureTupleInstantiated(const std::string& mangledName) {
             return;
         if (!instantiatedGenerics.count(mangledName))
         {
-            pendingInstantiations.push_back({"tuple", it->second, mangledName});
+            QueuePendingInstantiation("tuple", it->second, mangledName);
             instantiatedGenerics.insert(mangledName);
         }
         LLVMBackend::BuilderStateGuard savedState(Compiler());

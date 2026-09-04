@@ -480,7 +480,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
                 tupleTypeArgs[mangledName] = typeArgs;
                 if (!instantiatedGenerics.count(mangledName))
                 {
-                    pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+                    QueuePendingInstantiation("tuple", typeArgs, mangledName);
                     instantiatedGenerics.insert(mangledName);
                 }
                 break;
@@ -506,7 +506,7 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
             // Queue the instantiation instead of doing it immediately
             if (!instantiatedGenerics.count(mangledName))
             {
-                pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
                 instantiatedGenerics.insert(mangledName);
             }
             break;
@@ -516,6 +516,44 @@ void MainListener::QueueInstantiateGenericType(CFlatParser::DeclarationSpecifier
 std::string MainListener::MangledGenericName(const std::string& baseName, const std::vector<std::string>& typeArgs) {
         return MangleGenericInstance(*Compiler(), baseName, typeArgs);
     }
+
+void MainListener::QueuePendingInstantiation(const std::string& templateName,
+    const std::vector<std::string>& typeArgs, const std::string& mangledName,
+    antlr4::ParserRuleContext* site)
+{
+        PendingInstantiation record{ templateName, typeArgs, mangledName };
+        const auto& active = compilerLLVM->gts.activeInstantiationOrigin;
+        if (active.valid)
+        {
+            // Queued from inside a template body: the user never wrote this site, so keep
+            // pointing at the outer argument they did write.
+            record.originFile = active.file;
+            record.originLine = active.line;
+            record.originColumn = active.column;
+        }
+        else if (site != nullptr)
+        {
+            record.originFile = sourceFileName;
+            record.originLine = site->getStart()->getLine();
+            record.originColumn = site->getStart()->getCharPositionInLine();
+        }
+        pendingInstantiations.push_back(std::move(record));
+    }
+
+namespace {
+// The drain body has early 'continue's, so the previous origin is restored by a scope guard.
+struct ActiveOriginScope
+{
+    GenericTemplateState::ActiveInstantiationOrigin* slot_;
+    GenericTemplateState::ActiveInstantiationOrigin saved_;
+    ActiveOriginScope(GenericTemplateState::ActiveInstantiationOrigin* slot,
+                      GenericTemplateState::ActiveInstantiationOrigin next)
+        : slot_(slot), saved_(std::move(*slot)) { *slot_ = std::move(next); }
+    ~ActiveOriginScope() { *slot_ = std::move(saved_); }
+    ActiveOriginScope(const ActiveOriginScope&) = delete;
+    ActiveOriginScope& operator=(const ActiveOriginScope&) = delete;
+};
+}
 
 void MainListener::ProcessPendingInstantiations() {
         while (!pendingInstantiations.empty())
@@ -531,6 +569,18 @@ void MainListener::ProcessPendingInstantiations() {
                 }
             auto pending = pendingInstantiations[pick];
             pendingInstantiations.erase(pendingInstantiations.begin() + pick);
+
+            // Publish this record's origin for the duration of its instantiation: a body type
+            // lookup that fails on a substituted array view is reported at the user's argument.
+            GenericTemplateState::ActiveInstantiationOrigin origin;
+            origin.valid = !pending.originFile.empty();
+            origin.templateName = pending.templateName;
+            origin.file = pending.originFile;
+            origin.line = pending.originLine;
+            origin.column = pending.originColumn;
+            for (const auto& arg : pending.typeArgs)
+                if (arg.size() > 2 && arg.ends_with("[]")) origin.viewArgs.push_back(arg);
+            ActiveOriginScope originScope(&compilerLLVM->gts.activeInstantiationOrigin, std::move(origin));
 
             // Now safe to instantiate
             auto structIt = genericStructTemplates.find(pending.templateName);
@@ -753,7 +803,7 @@ bool MainListener::EnsureArenaChannelInstantiated(LLVMBackend* compiler) {
         if (isSized()) return true;
         if (!genericClassTemplates.count("arena_channel")) return false;
         const std::string channelType = ArenaChannelTypeName(*compiler);
-        pendingInstantiations.push_back({"arena_channel", {"IMessage"}, channelType});
+        QueuePendingInstantiation("arena_channel", {"IMessage"}, channelType);
         instantiatedGenerics.insert(channelType);
         ProcessPendingInstantiations();
         return isSized();

@@ -295,7 +295,9 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
                     {
                         TypeAndValue displayType;
                         displayType.TypeName = resolvedTypeName;
-                        LogErrorMessage("unknown type '{}'", { SpellType(*this, displayType) });
+                        const std::string formed = SpellType(*this, displayType);
+                        if (!ReportArrayViewInstantiationFailure(formed))
+                            LogErrorMessage("unknown type '{}'", { formed });
                     }
                     type = builder->getVoidTy();
                 }

@@ -115,7 +115,7 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
             // outer instantiation's element type resolves to nothing and codegen
             // reports "unknown type '<inner>'". Recursion above queues the deepest
             // levels first, so inner types are registered before the outer.
-            QueueGenericInstantiation(innerBase, innerArgs, resolved);
+            QueueGenericInstantiation(innerBase, innerArgs, resolved, entry);
             // A qualified base is an imported winmd generic - build it through the winmd path.
             if (innerBase.find('.') != std::string::npos)
                 Compiler()->InstantiateWinrtGenericInterface(innerBase, innerArgs, resolved);
@@ -243,7 +243,8 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
 
 void MainListener::QueueGenericInstantiation(const std::string& baseName,
                                    const std::vector<std::string>& typeArgs,
-                                   const std::string& mangledName) {
+                                   const std::string& mangledName,
+                                   antlr4::ParserRuleContext* site) {
 #ifndef NDEBUG
         TypeSpelling spelling;
         if (DemangleType(*Compiler(), mangledName, spelling))
@@ -263,7 +264,7 @@ void MainListener::QueueGenericInstantiation(const std::string& baseName,
         bool isInterface = genericInterfaceTemplates.count(baseName);
         if (!isStructOrClass && !isInterface)
             return;
-        pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+        QueuePendingInstantiation(baseName, typeArgs, mangledName, site);
         instantiatedGenerics.insert(mangledName);
         // One predicate for "is this base an interface name", shared with the three scanner sites.
         if (Compiler()->IsGenericInterfaceTemplateName(baseName))
@@ -297,7 +298,7 @@ std::string MainListener::ResolveSigComponentCodegen(CFlatParser::TypeSpecifierC
             for (auto* entry : ts->genericIdentifier()->genericTypeParameters()->typeParameterList()->typeParameterEntry())
                 innerArgs.push_back(ResolveTypeArgEntry(entry));
             std::string mangled = MangledGenericName(baseName, innerArgs);
-            QueueGenericInstantiation(baseName, innerArgs, mangled);
+            QueueGenericInstantiation(baseName, innerArgs, mangled, ts);
             return mangled;
         }
         std::string name = ts->getText();
@@ -559,7 +560,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                     if (!instantiatedGenerics.count(mangledName) &&
                         (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
                     {
-                        pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+                        QueuePendingInstantiation("tuple", typeArgs, mangledName);
                         instantiatedGenerics.insert(mangledName);
                         auto* c = Compiler();
                         if (!c->GetDataStructure(mangledName).StructType)
@@ -734,7 +735,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         bool isKnownTemplate = genericStructTemplates.count(baseName) || genericClassTemplates.count(baseName);
                         if (isKnownTemplate)
                         {
-                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
                             instantiatedGenerics.insert(mangledName);
                             auto* c = Compiler();
                             if (!c->GetDataStructure(mangledName).StructType)
@@ -1791,7 +1792,7 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
             {
                 // CFlat generic: enqueue the instantiation (shell + default ctor created
                 // immediately, body emitted by the next ProcessPendingInstantiations).
-                QueueGenericInstantiation(baseName, typeArgs, mangledName);
+                QueueGenericInstantiation(baseName, typeArgs, mangledName, genParams);
             }
             // A deferred winmd generic interface (e.g. IAsyncOperationWithProgress<string,
             // HttpProgress>): instantiate the concrete thin interface + PIID on demand, exactly as

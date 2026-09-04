@@ -2764,7 +2764,7 @@ void MainListener::ParseClassDefinition(CFlatParser::ClassDefinitionContext* ctx
                     compiler->winrtSlotHResultType_[structName + "::" + m.Name] = mangled;
                     if (!instantiatedGenerics.count(mangled))
                     {
-                        pendingInstantiations.push_back({ "HResult", { arg }, mangled });
+                        QueuePendingInstantiation("HResult", { arg }, mangled);
                         instantiatedGenerics.insert(mangled);
                     }
                 }

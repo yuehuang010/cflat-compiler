@@ -844,6 +844,24 @@ void LLVMBackend::LogRawError(std::string message) const
         EmitError(std::move(message));
 }
 
+bool LLVMBackend::ReportArrayViewInstantiationFailure(const std::string& formedType) const
+{
+        const auto& origin = gts.activeInstantiationOrigin;
+        if (!origin.valid) return false;
+        // Only the substituted argument itself ('int[]') or a pointer built from it ('int[]*')
+        // belongs to the argument; anything else is an unrelated missing type in the body.
+        const std::string* view = nullptr;
+        for (const auto& arg : origin.viewArgs)
+            if (formedType == arg || formedType == arg + "*") view = &arg;
+        if (view == nullptr) return false;
+
+        ReportingFileScope scope(const_cast<LLVMBackend*>(this), origin.file, origin.line, origin.column);
+        LogErrorMessage("'{}' cannot be a type argument of '{}': instantiating the body "
+                        "forms '{}', which is not a valid type",
+                        { *view, origin.templateName, formedType });
+        return true;
+    }
+
 void LLVMBackend::EmitError(std::string message, std::string sourceMessage) const
 {
         // Speculative compile-time evaluation: swallow the diagnostic and unwind. The construct

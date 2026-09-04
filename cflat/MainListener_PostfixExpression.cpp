@@ -6750,7 +6750,7 @@ LLVMBackend::NamedVariable MainListener::ParseTupleExpression(CFlatParser::Tuple
         if (!instantiatedGenerics.count(mangledName) &&
             (genericStructTemplates.count("tuple") || genericClassTemplates.count("tuple")))
         {
-            pendingInstantiations.push_back({"tuple", typeArgs, mangledName});
+            QueuePendingInstantiation("tuple", typeArgs, mangledName);
             instantiatedGenerics.insert(mangledName);
             if (!compiler->GetDataStructure(mangledName).StructType)
             {
@@ -7680,7 +7680,7 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                         std::string mangledName = MangledGenericName(baseName, typeArgs);
                         if (!instantiatedGenerics.count(mangledName))
                         {
-                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            QueuePendingInstantiation(baseName, typeArgs, mangledName, genParams);
                             instantiatedGenerics.insert(mangledName);
                         }
                     }
@@ -7701,7 +7701,8 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                         std::string mangledName = MangledGenericName(baseName, typeArgs);
                         if (!instantiatedGenerics.count(mangledName))
                         {
-                            pendingInstantiations.push_back({baseName, typeArgs, mangledName});
+                            QueuePendingInstantiation(baseName, typeArgs, mangledName,
+                                primaryExpr->genericIdentifier()->genericTypeParameters());
                             instantiatedGenerics.insert(mangledName);
                         }
                     }
