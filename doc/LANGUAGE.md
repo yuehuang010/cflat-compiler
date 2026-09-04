@@ -2778,7 +2778,7 @@ for (int v in arr)
 ```
 
 `array<T>.init(n)` gives every element the value `default`: struct elements are constructed,
-pointer and interface slots are null, and primitive slots are zero-filled. `init_uninit(n)`
+pointer and interface slots are null, and primitive slots are zero-filled. `init_capacity(n)`
 skips the primitive zero-fill for a buffer that is overwritten in full before it is read.
 
 `new T[n]` whose destination is an `array<T>` desugars to `init(n)` - a declaration, a direct

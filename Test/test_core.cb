@@ -171,9 +171,9 @@ int testArrayNewDesugar()
     delete[_] raw;
 
     array<int> u = default;
-    u.init_uninit(4);
+    u.init_capacity(4);
     for (int i = 0; i < 4; i++) u.set(i, i * 2);
-    passed += Test("init_uninit then overwrite", u[3], 6);
+    passed += Test("init_capacity then overwrite", u[3], 6);
 
     // operator[] is an alias borrow of the live slot, so `a[i] = v` writes in place like a
     // raw T[n] subscript; the auto-deduced array<int> gets the same lvalue.

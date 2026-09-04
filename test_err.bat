@@ -71,7 +71,7 @@ for %%F in (%SRC%\errors\err_*.cb) do (
 )
 if defined GROUPFILES (
     echo === error group %~1 of %~2 ===
-    %COMPILER% --check -i %LIB% --locale-dir "%CFLAT_LOCALE_DIR%" --nologo!GROUPFILES!
+    %COMPILER% --check -i %LIB% --locale pseudo --locale-dir "%CFLAT_LOCALE_DIR%" --nologo!GROUPFILES!
     if !ERRORLEVEL! neq 0 (
         set /a ERRORS+=1
         set /a NORMAL_ERRORS+=1

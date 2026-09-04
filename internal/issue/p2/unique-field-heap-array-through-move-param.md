@@ -90,3 +90,34 @@ OR return) must be rejected statically, which also retires the "return 'move X*'
 advice in err_unique_array_view.cb:23 and the `runRawCount*` legs. Trivially destructible
 arrays (the string case) would still pass as bare pointers since `free` is count-agnostic. That
 is a language capability removal, not a fix, and needs its own ruling.
+
+## Ruling 2026-09-03 (maintainer, second pass): block `new T[n]` binding to a bare `T*`
+
+Direction chosen over the runtime trap (option 4): remove the hidden count by making a fresh
+heap array bind only to a counted destination (`array<T>`, or `move T*` / `move T[]` at a
+boundary) and rejecting the bare `T*` / `T[]` binding. Reverses the same-day "deferred, too
+large" ruling on [[raw-array-count-desugar-direction]]. NOT yet started: the maintainer wants to
+weigh the blast radius first. Two open questions block it:
+
+1. Blast radius. Same-line grep of `new T[n]` sites on master d7af90d (heuristic, by destination):
+
+   | tree | total | `T* x = new` | `T[] x = new` | `array/list<T> x = new` | reassign `x = new` | `return new` | call arg |
+   |------|-------|--------------|---------------|-------------------------|--------------------|--------------|----------|
+   | core | 178 | 93 | 53 | 0 | 18 | 0 | 1 |
+   | Test | 608 | 94 | 377 | 4 | 27 | 15 | 12 |
+   | example | 119 | 31 | 73 | 0 | 3 | 0 | 0 |
+
+   `T[]` is documented as a thin `T*` (doc/LANGUAGE.md ~451), so a rule on `T*` covers the `T[]`
+   column too: about 900 sites, 178 of them in core (string.cb 28, hpc/parallel.cb 16,
+   filesystem.cb 13, graphic/bitmap.cb 8, regex.cb 6). Returns are already rejected today
+   ("the element count is lost at the return").
+
+2. Spelling ambiguity. `unique T[3]` could read as `unique<array<T>>` (one owned block of 3) or
+   `array<unique<T>>` (3 owned scalars). Measured today: `unique Y[3] a;` is rejected ("unique
+   requires a pointer or interface type"); `unique Y* a[3];` compiles as a fixed array of three
+   unique pointers (the `array<unique<T>>` reading); `unique Y* p = new Y[3];` is rejected
+   ("unique<T> does not own arrays - use 'array<T>'"); both `array<unique<Y>>` and
+   `unique<array<Y>>` spell out and compile. The ruling must say which reading (if any) the
+   short form gets before the desugar is designed.
+
+Until ruled, this issue stays open and the hidden-count machinery stays; do not start option 4.

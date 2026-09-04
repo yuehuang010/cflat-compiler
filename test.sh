@@ -197,7 +197,7 @@ run_err() {
   local f="$1" n; n="$(basename "$f" .cb)"
   local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
   load_err_flags "$f.flags"
-  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
+  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"
@@ -213,7 +213,7 @@ run_err_warm() {
   local f="$1" n; n="$(basename "$f" .cb).warm"
   local log="$RES/$n.log" rc=0 t0; t0=$(now_ms)
   load_err_flags "$f.flags"
-  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale-dir "$LOCALE_DIR" --check \
+  $TIMEOUT "$CFLAT" "$f" -i "$LIB" --locale pseudo --locale-dir "$LOCALE_DIR" --check \
     "${ERR_FLAGS[@]}" >"$log" 2>&1 || rc=$?
   if check_err_result "$rc" "$log"; then
     write_result "$n" "PASS" "$t0"

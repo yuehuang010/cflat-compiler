@@ -129,7 +129,7 @@ explicit unsafe opt-outs used by BLAS/FFT bindings.
 
 - `array<T>.init(n)` now honors the contract: primitive elements are memset to zero after the
   `new T[n]`; struct / pointer / interface elements were already `default`. The opt-out is
-  `init_uninit(n)` (name chosen for the `_uninit` Rust precedent; not yet ruled on).
+  `init_capacity(n)` (ruled 2026-09-03; landed as `init_uninit`, renamed the same day).
 - `new T[n]` whose destination is `array<T>` desugars to `array<T>.init(n)`: decl-init, direct
   assignment, and `return` from a function declared to return `array<T>`. Per-site `alignas`
   on that `new` is rejected (the array frees through the plain deallocator).
@@ -145,4 +145,4 @@ Still open (this issue stays):
   vec follow-up in [[raw-array-count-desugar-direction]].
 - The zero-fill is an unconditional memset, not the `alloc_zeroed` allocator entry sketched
   above; that optimization is worth doing only once the recycled-block allocators are measured.
-- Debug poison fill for `init_uninit` (option 1) not started.
+- Debug poison fill for `init_capacity` (option 1) not started.

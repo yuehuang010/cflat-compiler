@@ -3112,3 +3112,27 @@ What remains is ratified ACCEPT, not unfixed bugs - the family's polarity is unk
   unfiled work, not a regression.
 - **Do not consolidate this into a "root provenance" rework.** These were separate mechanisms
   sharing one guard, and every one of them was fixed alone.
+
+## Rulings 2026-09-03: HeapAudit stays AOT-only; ternary ownership mix is an error
+
+- `--run` will NOT learn to resolve the C-backed HeapAudit module. Fixtures that self-audit run
+  through `--heap-audit` on the AOT path; the issue `p3/run-heap-audit-jit-gap` was closed with
+  no fix. Do not re-file.
+- The uninitialized-array opt-out is spelled `init_capacity(n)` (HPC escape hatch), not
+  `init_uninit`. Renamed in core/array.cb, doc/LANGUAGE.md, Test/test_core.cb the same day.
+- A mixed owning/borrow `?:` join is a compile error, not a documented leak (see the issue file).
+
+## Lesson 2026-09-03: provenance lives on NamedVariable at the producing site, never in IR sniffing
+
+Member 8 (alloc-alignment holes, 458c6a9) went four review rounds because the first fix judged a
+move's source by walking LLVM loads/stores and grepping the move expression's source text for a
+dot. Review found a regression (a `move T*` parameter shape master already rejected) and three
+residues, all because the IR shape differed from the sniffed pattern. The fix that landed was one
+`bool AllocAlignKnown` on NamedVariable set in ParseMoveExpression from facts already in scope
+there, consumed by the existing check; it closed every residue for free. Rule: a semantic check
+that inspects `llvm::LoadInst` users or `ctx->getText()` to recover a fact the front end knew is a
+review defect on sight - carry the fact on the NamedVariable / TypeAndValue from where it is
+produced (and add it to the cache round-trip only if it lives on TypeAndValue).
+
+Same round also showed the store-side must be enforced before a slot's declared type can be
+treated as proof: enforcing the drain side alone produced a false reject that master did not have.

@@ -30,7 +30,7 @@ struct array<T>
 
     // init() without the primitive zero-fill, for a buffer the caller overwrites in full
     // before reading (HPC hot paths). Element values are unspecified until written.
-    void init_uninit(int size)
+    void init_capacity(int size)
     {
         _ptr = new T[size];
         _len = size;
