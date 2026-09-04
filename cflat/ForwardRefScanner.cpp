@@ -381,6 +381,7 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                         hasExternSpecifier = true;
                 const bool uniqueArrayOk = IsLocalDeclarationSpecifiers(declSpecs);
                 if (hasUniqueSpecifier
+                    && !UniqueDeclPointeeIsUnbound(compiler, declSpecs, declType.TypeName)
                     && (isParameterDecl
                         || IsLocalDeclarationSpecifiers(declSpecs)
                         || isReturnDecl)
@@ -828,15 +829,7 @@ void ForwardRefScanner::ScanGlobalLockGroup(CFlatParser::LockFieldGroupContext* 
     }
 
 void ForwardRefScanner::RegisterRenameAlias(CFlatParser::UsingDeclarationContext* ctx) {
-        if (ctx->Identifier() == nullptr) return;  // `using "name" = T;` keys on a string literal
-        // A pointer/array suffix means the alias is not a pure rename.
-        if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
-        auto* typeSpec = ctx->typeSpecifier();
-        if (typeSpec == nullptr) return;
-        std::string target = compilerLLVM->ResolveQualifiedName(typeSpec->getText());
-        std::string alias = ctx->Identifier()->getText();
-        if (alias == target || !IsBareTypeName(target)) return;
-        compilerLLVM->RegisterManglingAlias(alias, target);
+        RegisterPureRenameAlias(compilerLLVM, ctx);
     }
 
 ForwardRefScanner::ForwardRefScanner(LLVMBackend* compiler) : compilerLLVM(compiler) {}
@@ -1470,9 +1463,67 @@ void ForwardRefScanner::ScanGenericTypeUses(antlr4::RuleContext* ctx) {
                     continue;
                 break;
             case CFlatParser::RuleFunctionDefinition:
+            {
                 // Skip generic function template definitions for the same reason.
                 if (static_cast<CFlatParser::FunctionDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
                     continue;
+                // One alias frame per body, matching the main pass (ParseFunctionDefinition), so a
+                // body-scope `using` names the same instance in both passes and dies with the body.
+                LLVMBackend::AliasScopeGuard bodyAliasScope(compilerLLVM);
+                ScanGenericTypeUses(ruleCtx);
+                continue;
+            }
+            case CFlatParser::RuleProgramDefinition:
+            {
+                LLVMBackend::AliasScopeGuard bodyAliasScope(compilerLLVM);
+                ScanGenericTypeUses(ruleCtx);
+                continue;
+            }
+            case CFlatParser::RuleIfConstDeclaration:
+            case CFlatParser::RuleIfConstMember:
+            {
+                // Declaration/member `if const`: same reason as the statement form - an alias an
+                // arm declares is confined to a frame of its own and never reaches the file map.
+                LLVMBackend::AliasScopeGuard armAliasScope(compilerLLVM);
+                ScanGenericTypeUses(ruleCtx);
+                continue;
+            }
+            case CFlatParser::RuleSelectionStatement:
+            {
+                // Statement-level `if const`: the main pass walks ONLY the taken arm and a `using`
+                // there is function-scoped, so scan that arm in the body frame, the dead arm apart.
+                auto* sel = dynamic_cast<CFlatParser::SelectionStatementContext*>(ruleCtx);
+                if (sel != nullptr && sel->If() != nullptr && sel->Const() != nullptr)
+                {
+                    int decision = ScannerDecideIfConst(sel->expression());
+                    if (decision < 0)
+                    {
+                        // Undecidable at scan time: no arm's alias may bind, so every arm scans in
+                        // a frame of its own - the main pass stays the only one that decides.
+                        LLVMBackend::AliasScopeGuard armAliasScope(compilerLLVM);
+                        ScanGenericTypeUses(ruleCtx);
+                        continue;
+                    }
+                    auto arms = sel->statement();
+                    auto* taken = decision != 0 ? (arms.empty() ? nullptr : arms[0])
+                                                : (arms.size() > 1 ? arms[1] : nullptr);
+                    auto* dead = decision != 0 ? (arms.size() > 1 ? arms[1] : nullptr)
+                                               : (arms.empty() ? nullptr : arms[0]);
+                    ScanGenericTypeUses(sel->expression());
+                    if (dead != nullptr)
+                    {
+                        LLVMBackend::AliasScopeGuard deadArmAliasScope(compilerLLVM);
+                        ScanGenericTypeUses(dead);
+                    }
+                    if (taken != nullptr) ScanGenericTypeUses(taken);
+                    continue;
+                }
+                break;
+            }
+            case CFlatParser::RuleUsingDeclaration:
+                // Position-dependent, like the main pass: only a `using` already met binds a name.
+                // At file scope PreRegisterRenameAliases has registered it order-independently.
+                RegisterRenameAlias(static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
                 break;
             case CFlatParser::RuleTypeSpecifier:
                 {

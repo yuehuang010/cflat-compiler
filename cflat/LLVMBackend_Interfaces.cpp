@@ -280,6 +280,13 @@ bool LLVMBackend::AliasInCurrentScope(const std::string& alias) const
 
 void LLVMBackend::RegisterManglingAlias(const std::string& alias, const std::string& target)
 {
+        // Inside a body the scanner has an alias frame open: the rename belongs to THAT scope, not
+        // to the file, so it never displaces (or outlives) a file-scope alias of the same name.
+        if (!aliasScopeStack_.empty())
+        {
+            aliasScopeStack_.back().typeAliases[alias] = target;
+            return;
+        }
         const auto candidates = ScopedNameCandidates(alias);
         manglingAliases_[candidates.empty() ? alias : candidates.front()] = target;
     }
@@ -290,6 +297,23 @@ std::string LLVMBackend::ResolveManglingAlias(const std::string& name) const
         for (int guard = 0; guard < 8; ++guard)
         {
             bool found = false;
+            // A body-scope `using` shadows the file-scope one of the same name: the innermost
+            // active alias frame answers first, the flat file-scope map only after them.
+            bool shadowed = false;
+            for (const auto& frame : std::ranges::reverse_view(aliasScopeStack_))
+            {
+                if (frame.functionTypeAliases.count(cur) != 0) return cur;
+                auto it = frame.typeAliases.find(cur);
+                if (it == frame.typeAliases.end()) continue;
+                shadowed = true;
+                // Not a pure rename (`using P = int*;`): opaque to the mangler, and it still
+                // shadows, so the outer binding must not be folded in its place.
+                if (!IsBareTypeName(it->second) || it->second == cur) return cur;
+                cur = it->second;
+                found = true;
+                break;
+            }
+            if (shadowed) { if (found) continue; return cur; }
             for (const auto& candidate : ScopedNameCandidates(cur))
             {
                 auto it = manglingAliases_.find(candidate);

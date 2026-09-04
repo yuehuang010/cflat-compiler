@@ -12011,6 +12011,29 @@ int desugaredUniqueAlignedOrder()
     return q->id;
 }
 
+// `unique T*` in a TEMPLATE signature: the pointee is an unbound type parameter at scan time, so
+// the desugar to unique<T> has to wait for instantiation rather than queue unique<"T">.
+struct AltResource
+{
+    int id = 0;
+    ~AltResource() { dtorCount = dtorCount + 10; }
+};
+
+int templateUniqueParamId<T>(unique T* p) { return p->id; }
+
+unique T* templateUniqueMake<T>()
+{
+    unique T* r = new T;
+    return move r;
+}
+
+int templateUniqueRoundTrip<T>(int id)
+{
+    unique T* r = templateUniqueMake<T>();
+    r->id = id;
+    return templateUniqueParamId<T>(move r);
+}
+
 int testDesugaredUniquePointerForms()
 {
     int passed = 0;
@@ -12035,6 +12058,26 @@ int testDesugaredUniquePointerForms()
     }
     passed += Test("desugared_unique_field_move_dtor", dtorCount, 1);
     passed += Test("desugared_unique_field_sizeof", (int)sizeof(DesugaredUniqueFieldHolder), 8);
+
+    // `unique T*` written in a generic signature - parameter form, return form, and both in one
+    // template. Each instantiation owns its own pointee type and destroys it exactly once.
+    dtorCount = 0;
+    passed += Test("template_unique_param_value", templateUniqueParamId<Resource>(new Resource()), 0);
+    passed += Test("template_unique_param_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    {
+        unique Resource* made = templateUniqueMake<Resource>();
+        made->id = 17;
+        passed += Test("template_unique_return_value", made->id, 17);
+    }
+    passed += Test("template_unique_return_dtor", dtorCount, 1);
+
+    dtorCount = 0;
+    passed += Test("template_unique_round_trip_resource", templateUniqueRoundTrip<Resource>(23), 23);
+    passed += Test("template_unique_round_trip_alt", templateUniqueRoundTrip<AltResource>(24), 24);
+    // Two distinct instantiations: 1 for the Resource pointee, 10 for the AltResource pointee.
+    passed += Test("template_unique_two_instantiations_dtor", dtorCount, 11);
 
     dtorCount = 0;
     desugaredFieldUserDtorCount = 0;
@@ -12608,7 +12651,7 @@ extern int main()
     total += 48;
 
     passed += testDesugaredUniquePointerForms();
-    total += 36;
+    total += 43;
 
     passed += testSlotMoveIntoSink();
     total += 8;

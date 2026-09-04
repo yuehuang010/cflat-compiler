@@ -35,6 +35,7 @@
 #include <set>
 #include <iostream>
 #include <cstdlib>
+#include <cctype>
 #include <filesystem>
 #include <map>
 #include <mutex>
@@ -424,6 +425,18 @@ namespace cflat_jit
         // that include windows.h (e.g. LspServer.cpp).
         static llvm::Error RegisterUnwindInfo(llvm::jitlink::LinkGraph& G);
     };
+}
+
+// A `using` target that is nothing but a (possibly dotted) identifier - the only shape that is a
+// PURE RENAME and so may be folded by MangleTypeArg. Anything carrying '*', '[', '<' or '(' stores
+// that structure in the alias string and is unfolded separately at GetType /
+// ParseDeclarationSpecifiers; folding it into the base would double the mangler's suffix walk.
+inline bool IsBareTypeName(const std::string& s)
+{
+    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
+    for (char c : s)
+        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '.')) return false;
+    return true;
 }
 
 // Strip surrounding quotes from an ANTLR StringLiteral token text (e.g. `"foo"` -> `foo`).
@@ -2706,10 +2719,12 @@ private:
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
     std::unordered_map<std::string, std::string> typeAliases;
-    // Pure-rename `using` aliases (`using MyInt = int;`) - alias -> bare target name. Written ONLY
-    // by ForwardRefScanner::PreRegisterRenameAliases, before either pass walks the file, and read
-    // only by MangleTypeArg. Kept out of typeAliases because that map fills in progressively as
-    // each pass reaches the `using`, which happens at different points in the two passes.
+    // FILE-scope pure-rename `using` aliases (`using MyInt = int;`) - alias -> bare target name.
+    // Written by ForwardRefScanner::PreRegisterRenameAliases before either pass walks the file, and
+    // read only by MangleTypeArg. Kept out of typeAliases because that map fills in progressively as
+    // each pass reaches the `using`, which happens at different points in the two passes. A BODY
+    // alias never lands here: it binds in the alias frame the two pre-scans open (see
+    // RegisterPureRenameAlias), so it shadows this map instead of poisoning it for the whole file.
     std::unordered_map<std::string, std::string> manglingAliases_;
     // `using IReference = Windows.Foundation.IReference;` - alias -> generic BASE name. Separate
     // from typeAliases because a base is not a type until its <...> arguments are supplied.
@@ -4858,8 +4873,9 @@ public:
     void RegisterManglingAlias(const std::string& alias, const std::string& target);
 
     // Fold a type-arg base name through the pure-rename alias chain (`using MyInt2 = MyInt;` with
-    // `using MyInt = int;` reaches "int"). The hop guard bounds a cycle; a cyclic alias is a
-    // separate error the authoritative ParseUsingDeclaration owns.
+    // `using MyInt = int;` reaches "int"). Active alias frames shadow the flat file-scope map, so
+    // a body-scope `using` folds to ITS target in both passes. The hop guard bounds a cycle; a
+    // cyclic alias is a separate error the authoritative ParseUsingDeclaration owns.
     std::string ResolveManglingAlias(const std::string& name) const;
 
     // A `using` alias that names a GENERIC BASE rather than a concrete type - e.g.

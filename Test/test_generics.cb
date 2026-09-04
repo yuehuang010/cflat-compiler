@@ -2824,6 +2824,141 @@ struct ShadowedScopedAlias<T>
     Inner inner = default;
 };
 
+// A `using` alias declared inside a FUNCTION body, used as a generic type argument. The
+// instantiation is queued before the body's statements run, so the argument must already name the
+// alias TARGET - the alias spelling itself is gone by the time the queue is drained.
+struct FnAliasBox<T> { T value = default; };
+struct FnAliasCell<T> { T slot = default; };
+struct FnAliasPair { int a = 0; int b = 0; };
+
+using FnAliasShadowed = int;
+
+// Two bodies bind the SAME alias name to DIFFERENT targets: each body must instantiate with its
+// own target, so the pair returns 6 and 5 rather than one type winning the whole file.
+int fnAliasClashInt()
+{
+    using FnAliasClash = int;
+    FnAliasBox<FnAliasClash> b = default;
+    b.value = 3;
+    return b.value * 2;
+}
+
+int fnAliasClashDouble()
+{
+    using FnAliasClash = double;
+    FnAliasBox<FnAliasClash> b = default;
+    b.value = 2.5;
+    return (int)(b.value * 2.0);
+}
+
+// A body `using` inside a GENERIC body renames the template's own parameter: the argument binds
+// through the instantiation's substitution, so each instantiation boxes its own type.
+int fnAliasGenericBody<T>(T x)
+{
+    using FnAliasParam = T;
+    FnAliasBox<FnAliasParam> b = default;
+    b.value = x;
+    return (int)b.value;
+}
+
+// A body-scope alias SHADOWS the file-scope one of the same name; the outer binding still holds
+// where no body rebinds it.
+int fnAliasShadowOuter()
+{
+    FnAliasBox<FnAliasShadowed> b = default;
+    b.value = 3;
+    return b.value * 2;
+}
+
+int fnAliasShadowInner()
+{
+    using FnAliasShadowed = double;
+    FnAliasBox<FnAliasShadowed> b = default;
+    b.value = 2.5;
+    return (int)(b.value * 2.0);
+}
+
+// A `using` in the TAKEN arm of a statement `if const` is function-scoped like any block-level
+// one: it binds for the REST of the body, and both pre-scans must name the same instantiation.
+int fnAliasIfConstTakenArm()
+{
+    if const (true) { using FnAliasArm = double; }
+    FnAliasBox<FnAliasArm> b = default;
+    b.value = 2.5;
+    return (int)(b.value * 2.0);   // 5 with double; an int box would truncate to 2 and give 4
+}
+
+// Platform arms: only the taken arm's alias binds, never the dead one.
+int fnAliasIfConstPlatformArm()
+{
+    if const (__MACOS__) { using FnAliasPlat = double; } else { using FnAliasPlat = float; }
+    FnAliasBox<FnAliasPlat> b = default;
+    b.value = 16777217.0;
+    return (int)b.value;           // double keeps 16777217; float rounds it to 16777216
+}
+
+// A plain nested block behaves the same way - no per-block alias frame.
+int fnAliasNestedBlockLeak()
+{
+    { using FnAliasBlock = double; }
+    FnAliasBox<FnAliasBlock> b = default;
+    b.value = 2.5;
+    return (int)(b.value * 2.0);   // 5
+}
+
+bool testFunctionScopeAliasAsGenericArgument()
+{
+    bool result = true;
+
+    using FnAliasInt = int;
+    FnAliasBox<FnAliasInt> boxed = default;
+    boxed.value = 5;
+    result &= Test("fn_scope_alias_generic_arg", boxed.value, 5);
+
+    // The same body-scope alias drives a SECOND generic template.
+    FnAliasCell<FnAliasInt> cell = default;
+    cell.slot = 6;
+    result &= Test("fn_scope_alias_two_generics", cell.slot + boxed.value, 11);
+
+    // An alias of a STRUCT type, not just a primitive.
+    using FnAliasStruct = FnAliasPair;
+    FnAliasBox<FnAliasStruct> pairBox = default;
+    pairBox.value.a = 3;
+    pairBox.value.b = 4;
+    result &= Test("fn_scope_alias_struct_arg", pairBox.value.a + pairBox.value.b, 7);
+
+    // An alias declared in a NESTED block.
+    {
+        using FnAliasNested = FnAliasPair;
+        FnAliasCell<FnAliasNested> inner = default;
+        inner.slot.a = 9;
+        result &= Test("fn_scope_alias_nested_block", inner.slot.a, 9);
+    }
+
+    // Same alias name, different target per body.
+    result &= Test("fn_scope_alias_clash_int", fnAliasClashInt(), 6);
+    result &= Test("fn_scope_alias_clash_double", fnAliasClashDouble(), 5);
+
+    // `using U = T;` in a generic body, once per instantiated type.
+    result &= Test("fn_scope_alias_generic_body_int", fnAliasGenericBody<int>(7), 7);
+    result &= Test("fn_scope_alias_generic_body_double", fnAliasGenericBody<double>(2.5), 2);
+
+    // File-scope alias vs the body that shadows it: innermost wins.
+    result &= Test("fn_scope_alias_file_scope", fnAliasShadowOuter(), 6);
+    result &= Test("fn_scope_alias_shadows_file", fnAliasShadowInner(), 5);
+
+    // An `if const` arm's alias, and a nested block's, reach the rest of the body.
+    result &= Test("fn_scope_alias_if_const_taken_arm", fnAliasIfConstTakenArm(), 5);
+    result &= Test("fn_scope_alias_nested_block_leak", fnAliasNestedBlockLeak(), 5);
+
+    int expectPlatAlias = 16777216;
+    if const (__MACOS__) { expectPlatAlias = 16777217; }
+    result &= Test("fn_scope_alias_if_const_platform_arm",
+                   fnAliasIfConstPlatformArm(), expectPlatAlias);
+
+    return result;
+}
+
 bool testStructScopeUsingAliases()
 {
     bool result = true;
@@ -4718,6 +4853,7 @@ extern int main()
     total++; passed += testGenericSizeof()                          ? 1 : 0;
     total++; passed += testNsgNamespacedGenericSpellings()          ? 1 : 0;
     total++; passed += testStructScopeUsingAliases()                ? 1 : 0;
+    total++; passed += testFunctionScopeAliasAsGenericArgument()    ? 1 : 0;
     total++; passed += testGenericAndDunderNameCollision()           ? 1 : 0;
     total++; passed += testPrefixManglingAndPointerCollision()       ? 1 : 0;
 

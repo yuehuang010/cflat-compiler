@@ -767,6 +767,46 @@ static bool CanDesugarUniqueTypeArg(const LLVMBackend* compiler, const std::stri
         || baseIsGenericInstantiation;
 }
 
+// True when `name` is a type PARAMETER of a generic template (function, struct or class)
+// enclosing `node` - the `T` in `int take<T>(unique T* p)` while T is still unbound.
+static bool NamesEnclosingTypeParameter(antlr4::tree::ParseTree* node, const std::string& name)
+{
+    for (auto* cur = node; cur != nullptr; cur = cur->parent)
+    {
+        CFlatParser::GenericTypeParametersContext* generic = nullptr;
+        if (auto* fn = dynamic_cast<CFlatParser::FunctionDefinitionContext*>(cur))
+            generic = fn->genericTypeParameters();
+        else if (auto* sd = dynamic_cast<CFlatParser::StructDefinitionContext*>(cur))
+            generic = sd->genericTypeParameters();
+        else if (auto* cd = dynamic_cast<CFlatParser::ClassDefinitionContext*>(cur))
+            generic = cd->genericTypeParameters();
+        if (generic == nullptr || generic->typeParameterList() == nullptr) continue;
+        for (auto* entry : generic->typeParameterList()->typeParameterEntry())
+        {
+            if (entry->valueParameterDeclaration() != nullptr || entry->typeSpecifier() == nullptr)
+                continue;
+            auto* gid = entry->typeSpecifier()->genericIdentifier();
+            if (gid != nullptr && gid->Identifier() != nullptr
+                && gid->genericTypeParameters() == nullptr
+                && gid->Identifier()->getText() == name)
+                return true;
+        }
+    }
+    return false;
+}
+
+// A `unique T*` DECLARATION (parameter, return, local, field) whose pointee still names an UNBOUND
+// template type parameter must not desugar here: the queued unique<T> would carry the literal
+// parameter name and its body would fail on `using P = T*`. Defer to instantiation, where the
+// same specifiers are re-parsed with T bound - the deferral the explicit `unique<T>` spelling gets.
+static bool UniqueDeclPointeeIsUnbound(const LLVMBackend* compiler, antlr4::tree::ParseTree* node,
+                                       const std::string& name)
+{
+    if (compiler == nullptr || name.empty()) return false;
+    if (compiler->IsKnownTypeName(name) || compiler->IsTypeArgTypeKey(name)) return false;
+    return NamesEnclosingTypeParameter(node, name);
+}
+
 // The `alias` borrow qualifier on a generic type argument is carried the same way as `unique`:
 // a leading "alias " prefix on the resolved type-arg string. It denotes a pure borrow element
 // (list<alias T*>) - behaviorally identical to a bare pointer element, but instantiated
@@ -912,16 +952,22 @@ static std::string MangleTypeArg(const LLVMBackend* compiler, const std::string&
     return MangleType(*compiler, type);
 }
 
-// A `using` target that is nothing but a (possibly dotted) identifier - the only shape that is a
-// PURE RENAME and so may be folded by MangleTypeArg. Anything carrying '*', '[', '<' or '(' stores
-// that structure in the alias string and is unfolded separately at GetType /
-// ParseDeclarationSpecifiers; folding it into the base would double the mangler's suffix walk.
-static bool IsBareTypeName(const std::string& s)
+// One `using` declaration considered as a mangling-visible PURE RENAME. Shared by the two
+// pre-scans (ForwardRefScanner::ScanGenericTypeUses and MainListener::ScanAndQueueGenericTypeUses)
+// so a body-scope alias binds to the same target in both. With an alias frame open the rename
+// lands in THAT frame, so it never displaces or outlives a file-scope alias of the same name.
+static void RegisterPureRenameAlias(LLVMBackend* compiler, CFlatParser::UsingDeclarationContext* ctx)
 {
-    if (s.empty() || !(std::isalpha((unsigned char)s[0]) || s[0] == '_')) return false;
-    for (char c : s)
-        if (!(std::isalnum((unsigned char)c) || c == '_' || c == '.')) return false;
-    return true;
+    if (compiler == nullptr || ctx == nullptr) return;
+    if (ctx->Identifier() == nullptr) return;  // `using "name" = T;` keys on a string literal
+    // A pointer/array suffix means the alias is not a pure rename.
+    if (ctx->pointer() != nullptr || ctx->arrayTypeSuffix() != nullptr) return;
+    auto* typeSpec = ctx->typeSpecifier();
+    if (typeSpec == nullptr) return;
+    std::string target = compiler->ResolveQualifiedName(typeSpec->getText());
+    std::string alias = ctx->Identifier()->getText();
+    if (alias == target || !IsBareTypeName(target)) return;
+    compiler->RegisterManglingAlias(alias, target);
 }
 
 // Namespace-resolve a type-argument string that carries a reference-kind suffix ("Item*",
@@ -5752,7 +5798,9 @@ public:
     // Recursively walk any AST subtree and queue generic instantiations found anywhere
     // (declaration specifiers, initializer expressions, etc.).
     // Skips generic template struct definition bodies (contain unbound type parameters).
-    void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx);
+    // topLevel pushes a scratch alias frame: body-scope `using` renames this pre-scan meets
+    // bind in source order and are discarded before the real walk registers them again.
+    void ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel = true);
 
     // Check if a declaration uses a generic type and queue it for instantiation if needed.
     // Instantiation is deferred to avoid interrupting code generation in the current context.

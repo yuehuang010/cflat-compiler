@@ -167,6 +167,21 @@ std::string MainListener::ResolveTypeArgEntry(CFlatParser::TypeParameterEntryCon
                 if (valueIt != activeValueSubstitutions.end())
                     return valueIt->second;
                 std::string base = Compiler(entry)->ResolveTypeArgBaseName(resolved);
+                // Fold a pure-rename `using` into the ARGUMENT, not just into the mangled name:
+                // the instantiation is queued and drained after the alias scope is gone, so a
+                // body-scope alias spelling would no longer name anything by then.
+                base = Compiler(entry)->ResolveManglingAlias(base);
+                // A body-scope `using` the mangler could not pre-register (inside a generic
+                // template, whose body names unbound parameters) is only in the scoped alias map;
+                // fold it too, but only when it renames a plain type name.
+                if (std::string aliased = Compiler(entry)->ResolveTypeAlias(base);
+                    aliased != base && IsBareTypeName(aliased))
+                    base = aliased;
+                // `using U = T;` in a generic body folds to the template's own parameter, which
+                // only names a type through the enclosing instantiation's substitutions.
+                if (auto subIt = activeTypeSubstitutions.find(base);
+                    subIt != activeTypeSubstitutions.end() && IsBareTypeName(subIt->second))
+                    base = subIt->second;
                 if (Compiler(entry)->IsTypeArgTypeKey(base)
                     || Compiler(entry)->IsKnownTypeName(base))
                     resolved = base;
@@ -966,6 +981,7 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                 // declarators may still desugar to fixed arrays of unique<T>.
                 const bool uniqueArrayOk = inLocalDecl_ || inStructFieldDecl_;
                 if (hasUniqueSpecifier
+                    && !UniqueDeclPointeeIsUnbound(Compiler(declSpecs), declSpecs, declType.TypeName)
                     && (global_scope || inLocalDecl_ || isParameterDecl || inStructFieldDecl_ || isReturnDecl)
                     && (!isReturnDecl || !hasExternSpecifier)
                     && declType.TypeName != "void"

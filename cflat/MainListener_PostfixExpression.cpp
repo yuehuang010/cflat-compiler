@@ -7608,8 +7608,12 @@ void MainListener::ProcessPlusPlus() {
         }
     }
 
-void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
+void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx, bool topLevel) {
         if (!ctx) return;
+        // Scratch frame: a body-scope `using` this pre-scan meets binds HERE, in source order, and
+        // is gone before the real walk registers it - the queued type argument still folds to it.
+        std::optional<LLVMBackend::AliasScopeGuard> scanAliasScope;
+        if (topLevel) scanAliasScope.emplace(Compiler());
         for (auto* child : ctx->children)
         {
             auto* ruleCtx = dynamic_cast<antlr4::RuleContext*>(child);
@@ -7627,6 +7631,52 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                 if (static_cast<CFlatParser::ClassDefinitionContext*>(ruleCtx)->genericTypeParameters() != nullptr)
                     continue;
                 break;
+            case CFlatParser::RuleUsingDeclaration:
+                RegisterPureRenameAlias(Compiler(),
+                                        static_cast<CFlatParser::UsingDeclarationContext*>(ruleCtx));
+                break;
+            case CFlatParser::RuleIfConstDeclaration:
+            case CFlatParser::RuleIfConstMember:
+            {
+                // Declaration/member `if const`: same reason as the statement form - an alias an
+                // arm declares is confined to a frame of its own and never reaches the file map.
+                LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
+                ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
+                continue;
+            }
+            case CFlatParser::RuleSelectionStatement:
+            {
+                // Statement-level `if const`: the main pass walks ONLY the taken arm and a `using`
+                // there is function-scoped, so scan that arm in the body frame, the dead arm apart.
+                auto* sel = dynamic_cast<CFlatParser::SelectionStatementContext*>(ruleCtx);
+                if (sel != nullptr && sel->If() != nullptr && sel->Const() != nullptr)
+                {
+                    auto folded = FoldCompileTimeInt(Compiler(), sel->expression());
+                    if (!folded.has_value())
+                    {
+                        // Undecidable at scan time: no arm's alias may bind, so every arm scans in
+                        // a frame of its own - the main pass stays the only one that decides.
+                        LLVMBackend::AliasScopeGuard armAliasScope(Compiler());
+                        ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
+                        continue;
+                    }
+                    auto arms = sel->statement();
+                    bool isTrue = *folded != 0;
+                    auto* taken = isTrue ? (arms.empty() ? nullptr : arms[0])
+                                         : (arms.size() > 1 ? arms[1] : nullptr);
+                    auto* dead = isTrue ? (arms.size() > 1 ? arms[1] : nullptr)
+                                        : (arms.empty() ? nullptr : arms[0]);
+                    ScanAndQueueGenericTypeUses(sel->expression(), /*topLevel*/ false);
+                    if (dead != nullptr)
+                    {
+                        LLVMBackend::AliasScopeGuard deadArmAliasScope(Compiler());
+                        ScanAndQueueGenericTypeUses(dead, /*topLevel*/ false);
+                    }
+                    if (taken != nullptr) ScanAndQueueGenericTypeUses(taken, /*topLevel*/ false);
+                    continue;
+                }
+                break;
+            }
             case CFlatParser::RuleDeclaration:
                 {
                     // `auto x = new T[n];` deduces array<T> (see ArmArrayNewDesugar), which names
@@ -7710,6 +7760,6 @@ void MainListener::ScanAndQueueGenericTypeUses(antlr4::RuleContext* ctx) {
                 }
             }
 
-            ScanAndQueueGenericTypeUses(ruleCtx);
+            ScanAndQueueGenericTypeUses(ruleCtx, /*topLevel*/ false);
         }
     }
