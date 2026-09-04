@@ -89,3 +89,126 @@ expect_error("alignment mismatch assigning to 'p': the local's inferred allocati
         p = q;
     }
 }
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredScalarMove()
+    {
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        AlignElem* s = new AlignElem();
+        p = move s;
+    }
+}
+
+struct UnclausedFieldMoveBox
+{
+    AlignElem* h = new AlignElem();
+};
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredFieldMove()
+    {
+        UnclausedFieldMoveBox box = default;
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        p = move box.h;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'v': the local is declared 'alignas(0, 64)' but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Allocate it with 'new T[n] alignas(0, 64)', or declare the source 'alignas(0, 64)' so its 'new' inherits the alignment, or over-align the pointee TYPE instead ('struct alignas(64) T { ... };') and drop the local's clause.") {
+    void rejectDeclaredViewOrdinary()
+    {
+        alignas(0, 64) AlignElem[] v = default;
+        AlignElem[] ordinary = new AlignElem[2];
+        v = move ordinary;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'v': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredViewOrdinary()
+    {
+        AlignElem[] v = new AlignElem[2] alignas(0, 64);
+        AlignElem[] ordinary = new AlignElem[3];
+        v = move ordinary;
+    }
+}
+
+// Provenance travels with a MOVED value, so an ordinary block reaching a believed-over-aligned
+// binding is caught through a `move` parameter, a heap struct field, an array element and a deref.
+expect_error("alignment mismatch assigning to 'p': the local is declared 'alignas(0, 64)' but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Allocate it with 'new T[n] alignas(0, 64)', or declare the source 'alignas(0, 64)' so its 'new' inherits the alignment, or over-align the pointee TYPE instead ('struct alignas(64) T { ... };') and drop the local's clause.") {
+    void rejectDeclaredFromOrdinaryMoveParam(move AlignElem* s)
+    {
+        alignas(0, 64) AlignElem* p = new AlignElem[1] alignas(0, 64);
+        p = move s;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredFromOrdinaryMoveParam(move AlignElem* s)
+    {
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        p = move s;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredHeapFieldMove()
+    {
+        UnclausedFieldMoveBox* bp = new UnclausedFieldMoveBox();
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        p = move bp->h;
+    }
+}
+
+expect_error("alignment mismatch assigning to 'p': the local's inferred allocation alignment is 64, but the value was allocated without a matching allocation-alignment clause (ordinary alignment). Declare the local 'alignas(0, 64)' to make the rule explicit, or allocate the source with 'new T[n] alignas(0, 64)'.") {
+    void rejectInferredElementMove()
+    {
+        AlignElem* s = new AlignElem();
+        AlignElem* p = new AlignElem[2] alignas(0, 64);
+        AlignElem*[3] arr = default;
+        arr[0] = move s;
+        p = move arr[0];
+    }
+}
+
+// The STORE side of the same rule. A field, an array element and a dereferenced slot are all
+// bindings for allocation alignment: the synthesized free reads the SLOT's declared type, so an
+// over-aligned block parked in an unclaused slot is released with the ordinary deallocator.
+// Rejecting the store is what makes the slot's declared alignment trustworthy on the way out.
+struct AlignHole { AlignElem* h = default; };
+
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into field 'h': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it. Declare the field 'alignas(0, 64)' so the block alignment is recorded, or over-align the ELEMENT TYPE instead ('struct alignas(64) Chunk { ... };').") {
+    void rejectAlignedIntoUnclausedField()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        AlignHole box = default;
+        box.h = move s;
+    }
+}
+
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into field 'h': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it. Declare the field 'alignas(0, 64)' so the block alignment is recorded, or over-align the ELEMENT TYPE instead ('struct alignas(64) Chunk { ... };').") {
+    void rejectAlignedIntoUnclausedHeapField()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        AlignHole* box = new AlignHole();
+        box->h = move s;
+        delete box;
+    }
+}
+
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into an element of 'arr': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it.") {
+    void rejectAlignedIntoUnclausedElement()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        AlignElem*[2] arr = default;
+        arr[0] = move s;
+    }
+}
+
+expect_error("cannot store an over-aligned buffer ('new T[n] alignas(0, 64)') into the slot behind 'pp': that alignment is a property of the allocation, not of the type, so a free through the field cannot recover it.") {
+    void rejectAlignedIntoUnclausedDerefSlot()
+    {
+        alignas(0, 64) AlignElem* s = new AlignElem[2] alignas(0, 64);
+        AlignElem* t = default;
+        AlignElem** pp = &t;
+        *pp = move s;
+    }
+}

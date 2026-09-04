@@ -2702,6 +2702,11 @@ struct RawCountFieldSlot
     ~RawCountFieldSlot() { g_raw_count_slot_dtors++; }
 };
 
+struct RawCountAlignedFieldBox
+{
+    alignas(0, 64) unique RawCountElem* h = default;
+};
+
 void resetRawCountState()
 {
     g_raw_count_dtors = 0;
@@ -3485,6 +3490,61 @@ int runRawCountInferredAlignPlainNew()
     return g_raw_count_dtors;
 }
 
+int runRawCountAlignedFieldMove()
+{
+    resetRawCountState();
+    {
+        RawCountAlignedFieldBox box = default;
+        alignas(0, 64) RawCountElem* source = new RawCountElem();
+        box.h = move source;
+        RawCountElem* p = new RawCountElem[0] alignas(0, 64);
+        delete[_] p;
+        p = move box.h;
+        rawCountAlignedSink(move p);
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountAlignedHeapFieldMove()
+{
+    resetRawCountState();
+    {
+        RawCountAlignedFieldBox* bp = new RawCountAlignedFieldBox();
+        alignas(0, 64) RawCountElem* source = new RawCountElem();
+        bp->h = move source;
+        RawCountElem* p = new RawCountElem[0] alignas(0, 64);
+        delete[_] p;
+        p = move bp->h;
+        rawCountAlignedSink(move p);
+        delete bp;
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountAlignedViewMove()
+{
+    resetRawCountState();
+    {
+        alignas(0, 64) RawCountElem[] v =
+            new RawCountElem[0] alignas(0, 64);
+        alignas(0, 64) RawCountElem[] same =
+            new RawCountElem[2] alignas(0, 64);
+        v = move same;
+    }
+    return g_raw_count_dtors;
+}
+
+int runRawCountAlignedViewDirect()
+{
+    resetRawCountState();
+    {
+        alignas(0, 64) RawCountElem[] v =
+            new RawCountElem[0] alignas(0, 64);
+        v = new RawCountElem[3];
+    }
+    return g_raw_count_dtors;
+}
+
 int testRawArrayRuntimeCount()
 {
     int passed = 0;
@@ -3582,6 +3642,10 @@ int testRawArrayRuntimeCount()
         rawCountAlignedSink(move values);
     }
     passed += Test("raw count aligned conditional cleanup", g_raw_count_dtors, 2);
+    passed += Test("raw count aligned field move", runRawCountAlignedFieldMove(), 1);
+    passed += Test("raw count aligned heap field move", runRawCountAlignedHeapFieldMove(), 1);
+    passed += Test("raw count aligned view move", runRawCountAlignedViewMove(), 2);
+    passed += Test("raw count aligned view direct new", runRawCountAlignedViewDirect(), 3);
 
     resetRawCountState();
     int moveSourceNull = 0;
@@ -3889,7 +3953,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 77;
+    r = testRawArrayRuntimeCount(); passed += r; total += 81;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

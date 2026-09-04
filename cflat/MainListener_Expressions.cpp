@@ -3043,6 +3043,19 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                 return finishStore(derefLoad());
             }
 
+            // The core `unique<T, ALIGN>` holder owns its block's alignment through the ALIGN generic
+            // argument, so its internal raw slot carries no clause and must not be judged against one.
+            // Read the owner off the destination GEP: inside unique's own methods the field access
+            // leaves OwningStructName empty.
+            auto slotOwnerIsCoreUnique = [&]() {
+                if (!namedVar.OwningStructName.empty())
+                    return compiler->IsCoreUniqueType(namedVar.OwningStructName);
+                auto* gep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
+                if (gep == nullptr) return false;
+                auto* st = llvm::dyn_cast<llvm::StructType>(gep->getSourceElementType());
+                if (st == nullptr || !st->hasName()) return false;
+                return compiler->IsCoreUniqueType(st->getName().str());
+            };
             // X4 guard: copying a named owning-value into a struct field aliases its buffer (double-free).
             // Single-index GEP excluded - those are container-internal element stores that must not be flagged.
             auto* destGep = llvm::dyn_cast_or_null<llvm::GetElementPtrInst>(destination);
@@ -3098,6 +3111,25 @@ llvm::Value* MainListener::ParseAssignmentExpression(CFlatParser::AssignmentExpr
                     namedVar.FieldName.empty()
                         ? std::string("a field")
                         : std::format("field '{}'", namedVar.FieldName),
+                    ctx,
+                    slotOwnerIsCoreUnique());
+            // An ELEMENT slot and a DEREFERENCED slot reach the same synthesized free as a field:
+            // the deallocator is chosen from the SLOT's declared type, so an over-aligned block
+            // stored here is freed with the ordinary `operator delete` (heap corruption). Same
+            // rule, same door - a slot is a binding for the allocation-alignment rule too.
+            else if (operatorText == "=" && !destIsStructField
+                && namedVar.TypeAndValue.AllocAlignValue <= LLVMBackend::kDefaultNewAlign
+                && destination != nullptr
+                && (destIsFixedArrayElem || namedVar.IsElementAccess || isDerefStorage()))
+                RejectFieldAllocAlignMismatch(
+                    namedVar.TypeAndValue, namedVar.TypeAndValue.AllocAlignValue, rightNV, right,
+                    namedVar.CallerName.empty()
+                        ? std::string(destIsFixedArrayElem || namedVar.IsElementAccess
+                                      ? "an element slot" : "a dereferenced slot")
+                        : std::format("{} '{}'",
+                                      destIsFixedArrayElem || namedVar.IsElementAccess
+                                          ? "an element of" : "the slot behind",
+                                      namedVar.CallerName),
                     ctx);
 
             if (operatorText == "=" && destIsStructField
@@ -13256,6 +13288,19 @@ LLVMBackend::NamedVariable MainListener::ParseMoveExpression(CFlatParser::MoveEx
         result.BaseType       = ptrVal ? ptrVal->getType() : nullptr;
         result.TypeAndValue   = argNV.TypeAndValue;
         result.AllocAlignment = argNV.AllocAlignment;
+        // Provenance: the moved value's allocation alignment is DETERMINATE when the source slot's
+        // is. A field / element / deref source is governed by its declared slot type; a whole
+        // binding by its tracked allocation, its own carried provenance, or a parameter clause.
+        // Deref sources are excluded: an `E**` can be filled by `&local` past every store door, so
+        // only field / element slots (whose stores RejectFieldAllocAlignMismatch checks) are proof.
+        const bool moveSourceIsCheckedSlot = argNV.IsElementAccess
+            || !argNV.FieldName.empty() || !argNV.OwningStructName.empty();
+        result.AllocAlignKnown = (!moveSourceIsWholeBinding && moveSourceIsCheckedSlot)
+            || argNV.AllocAlignKnown
+            || argNV.IsNewAllocated
+            || argNV.AllocatedByRawNewArray
+            || (argNV.TypeAndValue.IsArrayView && argNV.IsOwning)
+            || compiler->IsFunctionParameterStorage(argNV.Storage);
         result.AllocatedByRawNewArray = movedRawNewArray;
         result.RawArrayLength = movedRawArrayLength;
         // A 'move' of a BORROWED pointer parameter transfers nothing - the caller still owns the

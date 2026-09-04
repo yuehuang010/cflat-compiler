@@ -3996,7 +3996,8 @@ public:
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* right,
         const std::string& fieldDesc,
-        antlr4::ParserRuleContext* ctx);
+        antlr4::ParserRuleContext* ctx,
+        bool slotIsAuthoritativeHolder = false);
 
     /*
      * The local-reassignment twin of RejectFieldAllocAlignMismatch. A local whose OWN declared type

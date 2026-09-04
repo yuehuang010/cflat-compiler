@@ -7151,7 +7151,8 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         const LLVMBackend::NamedVariable& rightNV,
         llvm::Value* right,
         const std::string& fieldDesc,
-        antlr4::ParserRuleContext* ctx) {
+        antlr4::ParserRuleContext* ctx,
+        bool slotIsAuthoritativeHolder) {
         if (fieldAlign == 0)
             fieldAlign = fieldTV.AllocAlignValue;
         uint64_t rhsAllocAlign = rightNV.AllocAlignment != 0
@@ -7161,6 +7162,11 @@ bool MainListener::RejectFieldAllocAlignMismatch(
         // A freshly-allocated array-view (`new T[n]...`) stored into a field must carry the
         // block alignment because the field stores only the raw buffer pointer.
         bool rhsFreshBuffer = rightNV.TypeAndValue.IsArrayView;
+        // Determinate over-aligned provenance into an unclaused slot is unrecoverable (the free reads
+        // the SLOT type). Core unique<T, ALIGN> is the authority on its own raw slot, so it opts out.
+        bool rhsAlignIsKnown = rhsFreshBuffer
+            || (!slotIsAuthoritativeHolder
+                && (rightNV.AllocatedByRawNewArray || rightNV.AllocAlignKnown));
         bool rhsNonNullPtr  = right != nullptr && !llvm::isa<llvm::ConstantPointerNull>(right);
         // Desugared unique fields still need the same source-alignment proof before the raw
         // pointer is wrapped by unique<T, N>. Interface fields retain the legacy marker.
@@ -7175,9 +7181,12 @@ bool MainListener::RejectFieldAllocAlignMismatch(
                 return false;
         }
         bool rhsIndirectPtr = fieldHasClause && rhsNonNullPtr && !rhsFreshBuffer;
-        if (!(((rhsFreshBuffer || fieldHasClause) && rhsOverAligned)
+        if (!(((rhsAlignIsKnown || fieldHasClause) && rhsOverAligned)
               || (fieldHasClause && (rhsFreshBuffer || rhsIndirectPtr)))
             || fieldAlign == rhsAllocAlign)
+            return false;
+        // An unclaused slot only corrupts when it actually receives a live over-aligned block.
+        if (!fieldHasClause && !(rhsOverAligned && rhsAlignIsKnown && rhsNonNullPtr))
             return false;
 
         if (!fieldHasClause)
@@ -7220,11 +7229,14 @@ bool MainListener::RejectLocalAllocAlignMismatch(
         uint64_t localAlign = namedVar.TypeAndValue.AllocAlignValue;
         uint64_t sourceAlign = std::max(rightNV.AllocAlignment,
                                         rightNV.TypeAndValue.AllocAlignValue);
+        // Known ordinary: the RHS's alignment is DETERMINATE and ordinary - either a raw
+        // `new T[n]` binding, or a move whose source slot carried its alignment provenance.
+        bool rhsAlignIsKnown = rightNV.AllocatedByRawNewArray || rightNV.AllocAlignKnown;
         if (localAlign <= LLVMBackend::kDefaultNewAlign)
         {
             bool rhsIsKnownOrdinary = rightNV.AllocAlignment <= LLVMBackend::kDefaultNewAlign
                 && rightNV.TypeAndValue.AllocAlignValue <= LLVMBackend::kDefaultNewAlign
-                && rightNV.AllocatedByRawNewArray;
+                && rhsAlignIsKnown;
             if (namedVar.AllocAlignment > LLVMBackend::kDefaultNewAlign
                 && rhsIsKnownOrdinary && right != nullptr
                 && !llvm::isa<llvm::ConstantPointerNull>(right)
@@ -7284,7 +7296,7 @@ bool MainListener::RejectLocalAllocAlignMismatch(
         // no data to disagree with.
         bool rhsAlignKnown = rightNV.AllocAlignment > LLVMBackend::kDefaultNewAlign
             || rightNV.TypeAndValue.AllocAlignValue > LLVMBackend::kDefaultNewAlign
-            || rightNV.AllocatedByRawNewArray;
+            || rhsAlignIsKnown;
         if (!rhsAlignKnown) return false;
 
         const std::string& name = namedVar.CallerName;

@@ -1632,7 +1632,10 @@ carries the count and can be handed to a `move T*` sink), in `array<T>`, or in a
 the wrapper frees the block through the aligned deallocator that matches the aligned `new`,
 and a `unique<T, 64>` value is a different type from a `unique<T>` - it will not bind to a
 plain `unique T*` parameter. The declared clause is still inherited by a direct `new` on the
-right-hand side, so the allocation does not have to repeat it.
+right-hand side, so the allocation does not have to repeat it. Struct FIELDS, array ELEMENTS and
+dereferenced slots (`*pp`) are bindings for this rule too: the free site reads the slot's declared
+type, so storing an over-aligned block into a slot that carries no `alignas(0, N)` clause is
+rejected at the store. (Unclaused GLOBAL pointers are not yet checked this way.)
 
 #### Field ownership (original form)
 

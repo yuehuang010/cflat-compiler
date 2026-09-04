@@ -1266,6 +1266,9 @@ public:
         bool IsAdoptable = false;        // compiler-generated node already owned by its parent tree
         bool IsNewAllocated = false;     // true only for 'new'-allocated locals - enables refcount on field escape (cleared on null-source transfer)
         uint64_t AllocAlignment = 0;     // per-allocation alignment from `new T[n] alignas(N)` (>16 = over-aligned); frees via __delete_aligned
+        // The alignment above is DETERMINATE (a tracked `new`, a declared slot/parameter type),
+        // so 0 means "ordinary", not "unknown". Set by the `move` site; never cache-serialized.
+        bool AllocAlignKnown = false;
         bool IsOwningString = false;     // true when a string local owns its heap buffer - destructor called on scope exit
         bool BorrowsOwnedString = false; // true when a string local was initialized/assigned from an owning string FIELD (a non-owning alias of a heap buffer some struct still owns) - storing it into another field would double-free, so the field-store path rejects it
         // The block that established the current string-field borrow fact. A plain rebind may
