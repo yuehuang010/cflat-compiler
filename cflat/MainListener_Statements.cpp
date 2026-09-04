@@ -622,11 +622,13 @@ void MainListener::EmitReturnExpression(antlr4::ParserRuleContext* errCtx,
         {
             std::string sourceName = returnNV.CallerName.empty()
                 ? returnNV.TypeAndValue.VariableName : returnNV.CallerName;
-            if (sourceName.empty()) sourceName = "the 'new' result";
+            if (sourceName.empty()) sourceName = "from 'new'";
             else sourceName = "'" + sourceName + "'";
-            std::string elemShown = SpellType(*compiler, compiler->currentFunctionReturnTV);
+            // The suggestions name the ELEMENT type: spelling the return type here would carry
+            // its '[]' / '*' declarator into 'array<Y[]>' and 'move Y[][]'.
+            std::string elemShown = CurrentReturnBaseTypeSpelling(compiler);
             LogErrorContext(errCtx, compiler->LocalizeMessage(
-                "cannot return heap array {} as '{}': the element count is lost at the return - "
+                "cannot return the heap array {} as '{}': the element count is lost at the return - "
                 "return 'array<{}>' or 'move {}[]' (which carries the count) instead",
                 { sourceName, CurrentReturnTypeSpelling(compiler), elemShown, elemShown }));
         }

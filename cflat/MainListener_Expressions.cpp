@@ -9776,6 +9776,18 @@ bool MainListener::EmitOneFieldInit(
                 val = compiler->Upconvert(val, fieldLLVMType, rightIsUnsigned);
         }
 
+        // A 'bool' field brace-init is a truth test like the '=' and cast paths. Upconvert only
+        // widens, so without this the source bytes land raw on the one-byte i1 slot.
+        if (val != nullptr && !fieldType.Pointer && fieldType.ConstArraySize == 0
+            && !val->getType()->isIntegerTy(1)
+            && (val->getType()->isIntegerTy() || val->getType()->isFloatingPointTy()
+                || val->getType()->isPointerTy()))
+        {
+            auto* boolFieldType = compiler->GetType(fieldType);
+            if (boolFieldType != nullptr && boolFieldType->isIntegerTy(1))
+                val = compiler->CoerceToBoolCondition(val);
+        }
+
         llvm::Value* destination = nullptr;
         if (sd.IsUnion)
         {

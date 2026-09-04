@@ -6,11 +6,16 @@ expect_error("cannot return a raw pointer 'T*' as an array-view 'T[]'") {
 // A fresh heap array handed back through a bare `T*` / `T[]` return loses its element count at
 // the boundary; only `move T*` carries one, and `array<T>` owns it outright.
 import "array.cb";
-expect_error("cannot return heap array the 'new' result as 'double[]'") {
+expect_error("cannot return the heap array from 'new' as 'double[]'") {
     double[] freshView(int n) { return new double[n]; }
 }
-expect_error("cannot return heap array 'p' as 'int*'") {
+expect_error("cannot return the heap array 'p' as 'int*'") {
     int* freshPtr(int n) { int* p = new int[n]; return p; }
+}
+// The suggestions name the ELEMENT type: 'array<double>' / 'move double[]', not the return
+// type with its declarator still attached ('array<double[]>' / 'move double[][]').
+expect_error("return 'array<double>' or 'move double[]' (which carries the count) instead") {
+    double[] freshViewSuggestion(int n) { return new double[n]; }
 }
 // The sanctioned spellings stay legal: `move T[]` carries the count with the whole-allocation
 // view, `move T*` carries it on a pointer, `array<T>` owns it outright.

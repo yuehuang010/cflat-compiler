@@ -25,6 +25,25 @@ expect_error("condition must be a scalar") {
     }
 }
 
+// An INTERFACE value in a condition is the same defect, but its LLVM lowering is the internal
+// '__iface_fat_ptr' struct - the diagnostic must name the kind, never that mangled spelling.
+interface CondShape
+{
+    int area();
+};
+class CondSquare : CondShape
+{
+    int s = 3;
+    int area() { return s * s; }
+};
+expect_error("not 'interface value'") {
+    int interfaceCondition() {
+        CondSquare q;
+        CondShape v = q;
+        return v ? 1 : 0;
+    }
+}
+
 
 // Both arms `default` is accepted when the destination type is known, but here the join sits in a
 // varargs argument that supplies no destination at all, so there is nothing to take a type from.

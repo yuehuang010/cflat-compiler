@@ -18,9 +18,11 @@ bool MathClose(double actual, double expected, double tolerance)
     return Math.abs(actual - expected) <= tolerance * scale;
 }
 
+// `x != x` is the idiomatic NaN test: float '!=' is UNORDERED (fcmp une), so a NaN operand
+// compares unequal. Pre-fix this lowered to `fcmp one` and reported every NaN as "not NaN".
 bool IsNaN(double value)
 {
-    return !(value == value);
+    return value != value;
 }
 // p2 REGRESSION LEG: `main` is deliberately declared WITHOUT `extern` here. A file-scope
 // `int main()` is the program entry point by definition, so the compiler exports it
@@ -290,6 +292,15 @@ int main()
     double[1000] poissonSamples = default;
     for (int i = 0; i < 1000; i = i + 1) poissonSamples[i] = Dist.poisson_rvs(&sampleRng, 4.0);
     total++; passed += Test("poisson rvs mean", Math.abs(Stats.mean(poissonSamples, 1000) - 4.0) < 0.3, true);
+
+    // Float '!=' is unordered: any NaN operand is unequal, and '!=' agrees with '!(a == b)'.
+    double nanZero = 0.0;
+    double nanValue = nanZero / nanZero;
+    total++; passed += Test("float ne nan self", nanValue != nanValue, true);
+    total++; passed += Test("float ne nan vs one", nanValue != 1.0, true);
+    total++; passed += Test("float ne distinct literals", 1.0 != 2.0, true);
+    total++; passed += Test("float ne equal literals", 1.0 != 1.0, false);
+    total++; passed += Test("float ne agrees with not eq", (nanValue != nanValue) == !(nanValue == nanValue), true);
 
     // Invalid parameters return NaN.
     total++; passed += Test("uniform invalid", IsNaN(Dist.uniform_cdf(0.5, 2.0, 1.0)), true);

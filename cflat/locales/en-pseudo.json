@@ -326,6 +326,12 @@
       "double",
       "double"
     ],
+    "cannotreturntheheapa...rriesthecountinsteada0699340cd34f249": [
+      "from 'new'",
+      "double[]",
+      "double",
+      "double"
+    ],
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": [
       "JoinBox",
       "an owning variable",
@@ -1523,6 +1529,7 @@
     "cannotreturnarg0asaa...thanexplicitcastarg3333d4a23a24e8453": "cannot return {0} as a '{1}' value: only a named function, a '{2}' value or a non-capturing lambda converts to a function pointer - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{3}'.",
     "cannotreturnarg0asac...thanexplicitcastarg27058792fbe609be6": "cannot return {0} as a closure: only a named function, a '{1}' value or a lambda converts to a closure - a data pointer would be called as code. If the value really holds a code address, assert it with an explicit cast: '{2}'.",
     "cannotreturnheaparra...rriesthecountinstead43fbc7218e7c0530": "cannot return heap array {0} as '{1}': the element count is lost at the return - return 'array<{2}>' or 'move {3}[]' (which carries the count) instead",
+    "cannotreturntheheapa...rriesthecountinsteada0699340cd34f249": "cannot return the heap array {0} as '{1}': the element count is lost at the return - return 'array<{2}>' or 'move {3}[]' (which carries the count) instead",
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": "cannot store a '?:' that joins two borrowed '{0}' arms into {1}; the destination's destructor would free a value its existing owner still frees. Assign each arm in its own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to hand the borrow through, or write a 'copy()' method for '{2}' and copy the arm into an independent owned value.",
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",

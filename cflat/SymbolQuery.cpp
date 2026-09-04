@@ -238,6 +238,8 @@ int RunSymbolQuery(ArgParser& args, const std::string& runtimeDir, bool showProg
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
+    compiler.SetAsan(args.hasFlag("asan"));
+    compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
         symbolLocale && *symbolLocale ? symbolLocale : "en"));
@@ -1185,6 +1187,8 @@ int RunSymbolDumpQuery(ArgParser& args, const std::string& runtimeDir, bool show
     LLVMBackend compiler;
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
+    compiler.SetAsan(args.hasFlag("asan"));
+    compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
         symbolLocale && *symbolLocale ? symbolLocale : "en"));
@@ -1312,6 +1316,10 @@ int RunSymbolDumpIrQuery(ArgParser& args, const std::string& runtimeDir)
     compiler.SetRuntimeDir(runtimeDir);
     compiler.SetVerbose(args.hasFlag("verbose"));
     compiler.SetBatchMode(true);
+    // The dump must see the sanitizer-gated IR the real compile would emit, the same way the
+    // -O level already reaches --symbol-dump-opt.
+    compiler.SetAsan(args.hasFlag("asan"));
+    compiler.SetSanitizeOwnership(args.hasFlag("sanitize-ownership"));
     const char* symbolLocale = std::getenv("CFLAT_LOCALE");
     compiler.SetLocale(args.getOption("locale").value_or(
         symbolLocale && *symbolLocale ? symbolLocale : "en"));

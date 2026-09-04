@@ -722,7 +722,14 @@ llvm::Value* LLVMBackend::CoerceToBoolCondition(llvm::Value* cond)
 std::string LLVMBackend::DescribeConditionType(llvm::Type* t) const
 {
         if (auto* st = llvm::dyn_cast<llvm::StructType>(t))
-            return st->hasName() ? st->getName().str() : std::string("struct");
+        {
+            // The fat-pointer lowerings are compiler-internal names the user never wrote -
+            // name the KIND instead of leaking '__iface_fat_ptr' / '__closure_fat_ptr'.
+            if (!st->hasName()) return "struct";
+            if (st->getName() == "__iface_fat_ptr")   return "interface value";
+            if (st->getName() == "__closure_fat_ptr") return "closure value";
+            return st->getName().str();
+        }
         if (t->isArrayTy())  return "array";
         if (t->isVectorTy()) return "vector";
         return "value";

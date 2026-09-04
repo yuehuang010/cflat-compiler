@@ -39,8 +39,9 @@ struct array<T>
         if const (__SANITIZE_OWNERSHIP__)
         {
             // bool is skipped: a byte outside {0,1} makes both `b` and `!b` truthy, so a poisoned
-            // bool misbehaves silently instead of loudly. (T)3 == (T)1 holds only for bool.
-            if const (is_primitive(T) && !((T)3 == (T)1))
+            // bool misbehaves silently instead of loudly. A cast to bool is a truth test, so
+            // (T)2 == (T)1 holds for bool and for no other primitive (there is no is_bool).
+            if const (is_primitive(T) && !((T)2 == (T)1))
             {
                 if (size > 0)
                 {

@@ -432,6 +432,14 @@ class SeedCastClassUserCtor
     SeedCastClassUserCtor(int q) { p = q; }
 };
 
+// Brace-init into a 'bool' field is the third door onto the truth test (after '=' and the
+// explicit cast); 'g' pins that the neighbouring field is not clobbered by a wide store.
+struct BoolBraceInit
+{
+    bool f = default;
+    int g = 7;
+};
+
 bool testNoArgCtorFieldSeedingCasts()
 {
     bool result = true;
@@ -476,6 +484,38 @@ bool testNoArgCtorFieldSeedingCasts()
     result &= Test("seedcast_class_userctor_fptosi", u.i, 3);    // pre-fix: -1717986918
     result &= Test("seedcast_class_userctor_fptoui8", (int)u.r8, 3);
     result &= Test("seedcast_class_userctor_p", u.p, 9);
+
+    // A cast to bool is a truth test (value != 0), not a truncation to bit 0. Pre-fix every
+    // even non-zero source read false, and a double source truncated through fptosi.
+    int boolSrc = 2;
+    int boolSrcWide = 256;
+    double boolSrcF = 0.5;
+    int* boolSrcNull = nullptr;
+    bool boolImplicit = 2;
+    bool boolImplicitWide = 256;
+    bool boolImplicitF = 0.5;
+    result &= Test("boolcast_literal_2", (bool)2 ? 1 : 0, 1);              // pre-fix: 0
+    result &= Test("boolcast_literal_256", (bool)256 ? 1 : 0, 1);          // pre-fix: 0
+    result &= Test("boolcast_runtime_2", (bool)boolSrc ? 1 : 0, 1);        // pre-fix: 0
+    result &= Test("boolcast_runtime_256", (bool)boolSrcWide ? 1 : 0, 1);  // pre-fix: 0
+    result &= Test("boolcast_double_half", (bool)0.5 ? 1 : 0, 1);          // pre-fix: 0
+    result &= Test("boolcast_runtime_double_half", (bool)boolSrcF ? 1 : 0, 1);
+    result &= Test("boolcast_null_pointer", (bool)boolSrcNull ? 1 : 0, 0);
+    result &= Test("boolcast_implicit_2", boolImplicit ? 1 : 0, 1);        // pre-fix: 0
+    result &= Test("boolcast_implicit_256", boolImplicitWide ? 1 : 0, 1);  // pre-fix: 0
+    result &= Test("boolcast_implicit_double", boolImplicitF ? 1 : 0, 1);  // pre-fix: verifier error
+
+    // Brace-init is its own door: it stored the source bytes raw over the i1 slot, so '2' read
+    // back as 2 (a poisoned bool, neither true nor false) and a double stored four bytes.
+    BoolBraceInit bb2 = { f = 2 };
+    BoolBraceInit bb256 = { f = 256 };
+    BoolBraceInit bbf = { f = 0.5 };
+    BoolBraceInit bb0 = { f = 0 };
+    result &= Test("boolbrace_2", bb2.f ? 1 : 0, 1);              // pre-fix: 2 (poisoned i1)
+    result &= Test("boolbrace_256", bb256.f ? 1 : 0, 1);          // pre-fix: 0
+    result &= Test("boolbrace_double", bbf.f ? 1 : 0, 1);         // pre-fix: 0
+    result &= Test("boolbrace_zero", bb0.f ? 1 : 0, 0);
+    result &= Test("boolbrace_neighbour_intact", bbf.g, 7);       // pin: padding absorbed the wide store
     return result;
 }
 

@@ -585,7 +585,9 @@ llvm::StoreInst* LLVMBackend::CreateAssignment(llvm::Value* value, llvm::Value* 
         auto destType = explicitDestType ? explicitDestType : GetTypeFromStorage(destination);
         if (destType == builder->getInt1Ty())
         {
-            value = builder->CreateICmpNE(value, llvm::ConstantInt::get(value->getType(), 0), "tobool");
+            // Same truth test as an explicit '(bool)' cast: a float or pointer source needs its
+            // own zero, and an integer one tests non-zero rather than keeping bit 0.
+            value = CoerceToBoolCondition(value);
         }
         else
         {
@@ -854,6 +856,11 @@ llvm::Value* LLVMBackend::CreateCast(llvm::Value* value, llvm::Type* destType, b
         // ('double pi = Math.PI;') - reject before it bitcasts into garbage.
         if (destType->isIntegerTy() || destType->isFloatingPointTy())
             RejectBareFunctionValue(value);
+
+        // A cast to bool is a truth test, not a narrowing: '(bool)2' is true. Truncating to i1
+        // would keep only bit 0, so route every source shape through the condition coercion.
+        if (destType->isIntegerTy(1))
+            return CoerceToBoolCondition(value);
 
         // Integer <-> Integer
         if (srcType->isIntegerTy() && destType->isIntegerTy())
@@ -1687,12 +1694,12 @@ llvm::Value* LLVMBackend::CreateVectorOperation(Operation op, llvm::Value* left,
         case Operation::Divide:   case Operation::DivideAssignment:
             return isFloat ? builder->CreateFDiv(left, right)
                  : isUnsigned ? builder->CreateUDiv(left, right) : builder->CreateSDiv(left, right);
-        // Comparisons -> <N x i1> mask. FP uses ordered predicates (a NaN lane compares false);
-        // integers honour the operands' signedness for the relational ops.
+        // Comparisons -> <N x i1> mask. FP uses ordered predicates (a NaN lane compares false)
+        // except '!=', which is unordered like the scalar operator; integers honour signedness.
         case Operation::Equal:
             return isFloat ? builder->CreateFCmpOEQ(left, right) : builder->CreateICmpEQ(left, right);
         case Operation::NotEqual:
-            return isFloat ? builder->CreateFCmpONE(left, right) : builder->CreateICmpNE(left, right);
+            return isFloat ? builder->CreateFCmpUNE(left, right) : builder->CreateICmpNE(left, right);
         case Operation::Greater:
             return isFloat ? builder->CreateFCmpOGT(left, right)
                  : isUnsigned ? builder->CreateICmpUGT(left, right) : builder->CreateICmpSGT(left, right);
@@ -1955,7 +1962,8 @@ llvm::Value* LLVMBackend::CreateOperation(Operation op, llvm::Value* left, llvm:
             }
             case Operation::NotEqual:
             {
-                return builder->CreateFCmp(llvm::ICmpInst::FCMP_ONE, left, right);
+                // Unordered: any NaN operand is unequal, so 'x != x' detects NaN as in C.
+                return builder->CreateFCmp(llvm::ICmpInst::FCMP_UNE, left, right);
             }
             case Operation::Greater:
             {

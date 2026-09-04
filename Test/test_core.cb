@@ -186,7 +186,7 @@ int testArrayNewDesugar()
         array<double> poisonD = default;
         poisonD.init_capacity(4);
         double pv = poisonD[0];
-        passed += Test("init_capacity poison fill double is NaN", (pv == pv) ? 0 : 1, 1);
+        passed += Test("init_capacity poison fill double is NaN", pv != pv, true);
     }
 
     // operator[] is an alias borrow of the live slot, so `a[i] = v` writes in place like a
