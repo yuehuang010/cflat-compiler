@@ -852,6 +852,14 @@ LLVMBackend::DeclTypeAndValue MainListener::ParseDeclarationSpecifiers(CFlatPars
                         declType.AliasInnerDims.assign(aliasDims.begin() + 1, aliasDims.end());
                     }
                     aliasPtrDepth = PeelAliasPointerStars(typeName);  // using Handle = void* -> depth 1
+                    // An enum names a real type here: bind it to its registered (scoped) key and
+                    // record the backing spelling that carries its width and signedness.
+                    if (std::string enumKey = Compiler(declSpecs)->ResolveEnumTypeName(typeName);
+                        !enumKey.empty())
+                    {
+                        typeName = enumKey;
+                        declType.EnumBacking = Compiler(declSpecs)->GetEnumBackingType(enumKey);
+                    }
                     declType.TypeName = typeName;
                     // A type-arg string carries its REAL star count, so the depth below is a proof:
                     // `Box<C**>`'s substituted `T x` is a C**, not a C*.
@@ -1842,6 +1850,18 @@ void MainListener::ParseUsingDeclaration(CFlatParser::UsingDeclarationContext* c
                             (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
                             "using " + alias + " = " + target, {},
                             ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+            return;
+        }
+
+        // `using D = Dir;` where Dir is an enum: alias the enum's registered (scoped) key, so the
+        // alias resolves as a type and not as a namespace alias onto the member scope.
+        if (std::string enumKey = compiler->ResolveEnumTypeName(targetBase); !enumKey.empty())
+        {
+            targetBase = enumKey;
+            targetDecorated = enumKey + std::string(targetPointerDepth, '*');
+            for (uint64_t dim : targetArrayDims)
+                targetDecorated += "[" + std::to_string(dim) + "]";
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
             return;
         }
 
@@ -3221,7 +3241,7 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         // Handle enum declarations which use the enumSpecifier alternative in the grammar
         if (auto enumSpec = ctx->enumSpecifier())
         {
-            ParseEnumSpecifier(enumSpec);
+            ParseEnumSpecifier(enumSpec, namespaceName);
             return {};
         }
 
@@ -3230,61 +3250,48 @@ std::vector<std::pair<std::string, llvm::AllocaInst*>> MainListener::ParseDeclar
         return ParseDeclaration(declSpec, initDecl, namespaceName);
     }
 
-void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx) {
-        auto* compiler = Compiler(ctx);
+void MainListener::ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, const std::string& namespaceName) {
         if (!ctx) return;
+        // Codegen-pass folder for an initializer the pre-pass could not evaluate statically.
+        std::function<bool(CFlatParser::ConditionalExpressionContext*, llvm::APInt&)> dynamicEval =
+            [this](CFlatParser::ConditionalExpressionContext* cond, llvm::APInt& out) -> bool {
+                llvm::Value* v = ParseConditionalExpression(cond);
+                auto* ci = llvm::dyn_cast_or_null<llvm::ConstantInt>(v);
+                if (ci == nullptr) return false;
+                // Natural width, no extension: the caller knows the backing signedness.
+                out = ci->getValue();
+                return true;
+            };
+        auto* compiler = Compiler(ctx);
+        compiler->RegisterEnumSpecifier(ctx, namespaceName, &constFoldableGlobals_, dynamicEval);
 
-        // enum Identifier : typeSpecifier { enumeratorList }
-        auto id = ctx->Identifier();
-        std::string enumName = id ? id->getText() : "";
-        auto typeSpec = ctx->typeSpecifier();
-        std::string backingType = typeSpec ? typeSpec->getText() : "int";
-
-        // Register enum name as a namespace so members can be referenced as EnumName.Member
-        if (!enumName.empty())
-            compiler->RegisterNamespace(enumName);
-
-        long long current = 0;
-        auto list = ctx->enumeratorList();
-        if (!list) return;
-
-        for (auto enumerator : list->enumerator())
-        {
-            auto enumConst = enumerator->enumerationConstant();
-            std::string name = enumConst->getText();
-
-            long long value = current;
-            if (auto cexpr = enumerator->constantExpression())
+        // An enum is a type and its members are named constants, so index both: --symbol,
+        // hover and completion see `Dir` and `Dir.Back` the way they see a struct and its fields.
+        auto* sink = compiler->GetSymbolSink();
+        auto* id = ctx->Identifier();
+        if (sink == nullptr || id == nullptr) return;
+        std::string scoped = compiler->ResolveEnumTypeName(id->getText());
+        if (scoped.empty()) scoped = id->getText();
+        std::string backing = compiler->GetEnumBackingType(scoped);
+        if (backing.empty()) backing = "int";
+        std::vector<std::string> memberNames;
+        auto* list = ctx->enumeratorList();
+        if (list != nullptr)
+            for (auto* e : list->enumerator())
+                memberNames.push_back(e->enumerationConstant()->getText());
+        const std::string file = compiler->GetSourceFilePath();
+        sink->Register(SymbolKind::TypeAlias, scoped, file,
+                       (int)ctx->getStart()->getLine(), (int)ctx->getStart()->getCharPositionInLine(),
+                       "enum " + scoped + " : " + backing, memberNames,
+                       ExtractLeadingDoc(GetTokens(), ctx->getStart()));
+        if (list != nullptr)
+            for (auto* e : list->enumerator())
             {
-                auto cond = cexpr->conditionalExpression();
-                llvm::Value* condVal = ParseConditionalExpression(cond);
-                auto valLLVM = llvm::dyn_cast<llvm::ConstantInt>(condVal);
-                if (!valLLVM)
-                    LogErrorContext(enumerator, "enum value must be a constant integer expression");
-                value = valLLVM->getSExtValue();
+                std::string member = e->enumerationConstant()->getText();
+                sink->Register(SymbolKind::Variable, scoped + "." + member, file,
+                               (int)e->getStart()->getLine(), (int)e->getStart()->getCharPositionInLine(),
+                               backing + " " + scoped + "." + member);
             }
-
-            LLVMBackend::TypeAndValue tv;
-            // Use the enum's declared name as the type for the enumerator variable so
-            // overload resolution can consider enum type. The GetType call will resolve
-            // the enum to its backing type when emitting IR.
-            tv.TypeName = !enumName.empty() ? enumName : backingType;
-            tv.VariableName = enumName.empty() ? name : (enumName + "." + name);
-            tv.Pointer = false;
-
-            // Register the enum's backing type so GetType and overload resolution can
-            // resolve enum types to the underlying integral type.
-            if (!enumName.empty())
-                compiler->RegisterEnumBackingType(enumName, backingType);
-
-            // Create a typed constant using the backing type
-            llvm::Constant* c = compiler->CreateConstant(backingType, std::to_string(value));
-            compiler->CreateGlobalVariable(tv, c);
-            // Enum members are true compile-time constants: foldable in an `if const` condition.
-            constFoldableGlobals_.insert(tv.VariableName);
-
-            current = value + 1;
-        }
     }
 
 CFlatParser::MoveExpressionContext* MainListener::TopLevelMoveExpression(antlr4::tree::ParseTree* node) {

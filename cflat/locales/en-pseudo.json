@@ -500,6 +500,14 @@
       "a"
     ],
     "endoffile": [],
+    "enumarg0isalreadydefined": [
+      "ErrEnumDupDef"
+    ],
+    "enumvaluearg0doesnot...itthebackingtypearg126f3d97db475a557": [
+      "70000",
+      "u16"
+    ],
+    "enumvaluemustbeacons...antintegerexpression27ab0d73ff8c6d18": [],
     "extraneousinputarg0expectingarg1": [
       "'}'",
       "<EOF>"
@@ -1565,6 +1573,9 @@
     "emitwinrtthinslotcal...abuiltwinrtinterface0ca118b6d5089a98": "EmitWinrtThinSlotCall: '{0}' is not a built WinRT interface",
     "emitwinrtthinslotcallnoslotarg0onarg1": "EmitWinrtThinSlotCall: no slot '{0}' on '{1}'",
     "endoffile": "end of file",
+    "enumarg0isalreadydefined": "enum '{0}' is already defined",
+    "enumvaluearg0doesnot...itthebackingtypearg126f3d97db475a557": "enum value '{0}' does not fit the backing type '{1}'",
+    "enumvaluemustbeacons...antintegerexpression27ab0d73ff8c6d18": "enum value must be a constant integer expression",
     "extraneousinputarg0expectingarg1": "extraneous input {0} expecting {1}",
     "failedtodeploypriarg0toarg1arg2": "failed to deploy pri '{0}' to '{1}': {2}",
     "failedtodeployprisou...cearg0nolongerexistscc21702a8363e3dc": "failed to deploy pri: source '{0}' no longer exists",

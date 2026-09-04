@@ -856,6 +856,279 @@ std::string LLVMBackend::GetEnumBackingType(const std::string& enumName) const
         return it != enumBackingTypes.end() ? it->second : std::string();
     }
 
+namespace {
+
+/*
+ * Enumerator values are folded in a wide signed intermediate so a u64 maximum, an i64 minimum
+ * and an out-of-range literal are all representable before the backing-type range check runs.
+ * llvm::APInt rather than a compiler-specific 128-bit integer type, which MSVC lacks.
+ */
+constexpr unsigned kEnumEvalBits = 256;
+
+llvm::APInt EnumWide(int64_t v)
+{
+    return llvm::APInt(kEnumEvalBits, (uint64_t)v, true);
+}
+
+// Decimal spelling of the signed intermediate, for the range diagnostic.
+std::string EnumWideToString(const llvm::APInt& v)
+{
+    llvm::SmallString<64> buf;
+    v.toString(buf, 10, true);
+    return std::string(buf.c_str());
+}
+
+/*
+ * Magnitude of a plain integer literal token. Decimal / 0x / 0b, with the width suffixes and
+ * digit separators stripped. Anything else (char literal, float, string) is rejected so the
+ * caller falls back to the codegen folder rather than inventing a value.
+ */
+bool ParseEnumLiteralMagnitude(const std::string& raw, llvm::APInt& out)
+{
+    std::string t;
+    for (char c : raw) if (c != '_') t += c;
+    while (!t.empty() && (t.back() == 'u' || t.back() == 'U' || t.back() == 'l' || t.back() == 'L'))
+        t.pop_back();
+    if (t.empty()) return false;
+    int base = 10;
+    size_t i = 0;
+    if (t.size() > 2 && t[0] == '0' && (t[1] == 'x' || t[1] == 'X')) { base = 16; i = 2; }
+    else if (t.size() > 2 && t[0] == '0' && (t[1] == 'b' || t[1] == 'B')) { base = 2; i = 2; }
+    if (i >= t.size()) return false;
+    llvm::APInt v(kEnumEvalBits, 0);
+    const llvm::APInt radix(kEnumEvalBits, (uint64_t)base);
+    for (; i < t.size(); i++)
+    {
+        char c = t[i];
+        int d;
+        if (c >= '0' && c <= '9') d = c - '0';
+        else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+        else return false;
+        if (d >= base) return false;
+        bool overflow = false;
+        v = v.umul_ov(radix, overflow);
+        if (overflow) return false;
+        v = v.uadd_ov(llvm::APInt(kEnumEvalBits, (uint64_t)d), overflow);
+        if (overflow) return false;
+    }
+    // Leave room for the sign: the caller negates this magnitude in the same width.
+    if (v.isSignBitSet()) return false;
+    out = v;
+    return true;
+}
+
+void CollectEnumTerminals(antlr4::tree::ParseTree* node,
+                          std::vector<antlr4::tree::TerminalNode*>& out)
+{
+    if (auto* t = dynamic_cast<antlr4::tree::TerminalNode*>(node)) { out.push_back(t); return; }
+    for (auto* c : node->children) CollectEnumTerminals(c, out);
+}
+
+/*
+ * Fold an enumerator initializer WITHOUT codegen, so the pre-pass can register values. Covers a
+ * signed integer literal and a reference to an earlier member of the same enum - the shapes the
+ * language actually uses. Everything else returns false and defers to the codegen folder.
+ */
+bool EvalEnumeratorStatic(CFlatParser::ConditionalExpressionContext* cond,
+                          const std::string& enumName,
+                          const std::unordered_map<std::string, llvm::APInt>& prior,
+                          llvm::APInt& out)
+{
+    if (cond == nullptr) return false;
+    std::vector<antlr4::tree::TerminalNode*> toks;
+    CollectEnumTerminals(cond, toks);
+    if (toks.empty()) return false;
+    bool negate = false;
+    size_t start = 0;
+    if (toks[0]->getText() == "-" || toks[0]->getText() == "+")
+    {
+        negate = toks[0]->getText() == "-";
+        start = 1;
+    }
+    size_t n = toks.size() - start;
+    auto memberValue = [&](const std::string& name, llvm::APInt& v) {
+        auto it = prior.find(name);
+        if (it == prior.end()) return false;
+        v = it->second;
+        return true;
+    };
+    auto signApply = [&](const llvm::APInt& v) { return negate ? llvm::APInt(-v) : v; };
+    if (n == 1)
+    {
+        auto* tn = toks[start];
+        size_t type = tn->getSymbol()->getType();
+        if (type == CFlatParser::Constant)
+        {
+            llvm::APInt mag(kEnumEvalBits, 0);
+            if (!ParseEnumLiteralMagnitude(tn->getText(), mag)) return false;
+            out = signApply(mag);
+            return true;
+        }
+        if (type == CFlatParser::Identifier)
+        {
+            llvm::APInt v(kEnumEvalBits, 0);
+            if (!memberValue(tn->getText(), v)) return false;
+            out = signApply(v);
+            return true;
+        }
+        return false;
+    }
+    // `EnumName.Member` for a member declared earlier in this same enum.
+    if (n == 3 && toks[start]->getText() == enumName && toks[start + 1]->getText() == ".")
+    {
+        llvm::APInt v(kEnumEvalBits, 0);
+        if (!memberValue(toks[start + 2]->getText(), v)) return false;
+        out = signApply(v);
+        return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+void LLVMBackend::RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
+        const std::string& namespaceName,
+        std::unordered_set<std::string>* constFoldableGlobals,
+        const std::function<bool(CFlatParser::ConditionalExpressionContext*, llvm::APInt&)>& dynamicEval)
+{
+        if (ctx == nullptr) return;
+        auto* id = ctx->Identifier();
+        std::string enumName = id ? id->getText() : "";
+        auto* typeSpec = ctx->typeSpecifier();
+        std::string backingType = typeSpec ? typeSpec->getText() : "int";
+        std::string resolvedBacking = ResolveTypeAlias(backingType);
+        std::string ns = namespaceName.empty() ? currentNamespace_ : namespaceName;
+        std::string scopedName = (enumName.empty() || ns.empty()) ? enumName : ns + "." + enumName;
+
+        // Type facts go in first and unconditionally - a signature and a qualified spelling need
+        // them even when a value does not fold. Registry keeps the RESOLVED backing (`enum AB :
+        // Byte` must still read as an integer); `backingType` stays the spelling for diagnostics.
+        if (!enumName.empty())
+        {
+            RegisterNamespace(enumName);
+            if (scopedName != enumName) RegisterNamespace(scopedName);
+            RegisterEnumBackingType(scopedName, resolvedBacking);
+        }
+
+        auto* list = ctx->enumeratorList();
+        if (list == nullptr) return;
+        auto enumerators = list->enumerator();
+        if (enumerators.empty()) return;
+
+        std::string prefix = scopedName.empty() ? "" : scopedName + ".";
+        // Enum members are compile-time constants, foldable in an `if const` condition and in a
+        // case label. Recorded before the early-out: the codegen pass owns this set.
+        if (constFoldableGlobals)
+            for (auto* e : enumerators)
+                constFoldableGlobals->insert(prefix + e->enumerationConstant()->getText());
+
+        // Declaration site, so a second visit of THIS declaration (the codegen pass, a re-import)
+        // is the no-op while a second, different declaration of the same enum is a redefinition.
+        std::string site = std::to_string(ctx->getStart()->getLine()) + ":"
+            + std::to_string(ctx->getStart()->getCharPositionInLine()) + "@"
+            + ctx->getStart()->getInputStream()->getSourceName();
+        if (!scopedName.empty())
+        {
+            auto& sites = enumDeclSites_[scopedName];
+            if (sites.count(site)) return;
+            if (!sites.empty())
+            {
+                SetSourceLocation(ctx->getStart()->getLine(), ctx->getStart()->getCharPositionInLine());
+                LogErrorMessage("enum '{}' is already defined", { enumName });
+                return;
+            }
+        }
+        if (globalNamedVariable.count(prefix + enumerators[0]->enumerationConstant()->getText()))
+            return;  // members restored from the compiler cache, not from this parse
+
+        TypeAndValue probe;
+        probe.TypeName = resolvedBacking;
+        const int bits = probe.IsInteger();
+        const bool isUnsigned = probe.IsUnsignedInteger() != -1;
+
+        llvm::APInt current = EnumWide(0);
+        std::unordered_map<std::string, llvm::APInt> prior;
+        std::vector<std::pair<std::string, llvm::APInt>> members;
+        for (auto* e : enumerators)
+        {
+            std::string name = e->enumerationConstant()->getText();
+            llvm::APInt value = current;
+            if (auto* cexpr = e->constantExpression())
+            {
+                auto* cond = cexpr->conditionalExpression();
+                if (!EvalEnumeratorStatic(cond, enumName, prior, value))
+                {
+                    // Pre-pass with no folder: leave this whole enum's VALUES to codegen, which
+                    // re-visits the declaration and finds no member global registered.
+                    if (!dynamicEval) return;
+                    SetSourceLocation(e->getStart()->getLine(), e->getStart()->getCharPositionInLine());
+                    llvm::APInt folded(kEnumEvalBits, 0);
+                    if (!dynamicEval(cond, folded))
+                        LogErrorMessage("enum value must be a constant integer expression");
+                    // int-typed folds (<= 32 bits) keep their sign so `-1 - 0` under u32 is
+                    // rejected as -1; wider folds widen the way the backing type reads them.
+                    else if (folded.getBitWidth() <= 32 || !isUnsigned)
+                        value = folded.sextOrTrunc(kEnumEvalBits);
+                    else
+                        value = folded.zextOrTrunc(kEnumEvalBits);
+                }
+            }
+            if (bits > 0)
+            {
+                llvm::APInt lo = isUnsigned ? llvm::APInt(kEnumEvalBits, 0)
+                                            : llvm::APInt::getSignedMinValue(bits).sext(kEnumEvalBits);
+                llvm::APInt hi = isUnsigned ? llvm::APInt::getMaxValue(bits).zext(kEnumEvalBits)
+                                            : llvm::APInt::getSignedMaxValue(bits).sext(kEnumEvalBits);
+                if (value.slt(lo) || value.sgt(hi))
+                {
+                    SetSourceLocation(e->getStart()->getLine(), e->getStart()->getCharPositionInLine());
+                    LogErrorMessage("enum value '{}' does not fit the backing type '{}'",
+                                    { EnumWideToString(value), backingType });
+                }
+            }
+            prior[name] = value;
+            members.emplace_back(name, value);
+            current = value + 1;
+        }
+
+        for (const auto& [name, value] : members)
+        {
+            TypeAndValue tv;
+            // The enum's own name is the member's type so field/member lookup and overload
+            // resolution keep the enum identity; EnumBacking carries the width and signedness.
+            tv.TypeName = scopedName.empty() ? resolvedBacking : scopedName;
+            tv.EnumBacking = scopedName.empty() ? std::string() : resolvedBacking;
+            tv.VariableName = prefix + name;
+            tv.Pointer = false;
+
+            llvm::Constant* c = nullptr;
+            if (bits > 0)
+                c = llvm::ConstantInt::get(*context, value.trunc(bits));
+            else
+                c = CreateConstant(resolvedBacking, EnumWideToString(value));
+            CreateGlobalVariable(tv, c, false, 0, false, isUnsigned);
+        }
+        if (!scopedName.empty()) enumDeclSites_[scopedName].insert(site);
+    }
+
+std::string LLVMBackend::ResolveEnumTypeName(const std::string& spelled) const
+{
+        if (spelled.empty()) return {};
+        // Two hops at most: the written spelling, then one `using D = Dir;` alias step. Each hop
+        // walks the enclosing namespaces so a sibling enum resolves unqualified.
+        std::string cur = spelled;
+        for (int hop = 0; hop < 2; hop++)
+        {
+            for (const auto& candidate : ScopedNameCandidates(cur))
+                if (enumBackingTypes.count(candidate)) return candidate;
+            std::string aliased = ResolveTypeAlias(cur);
+            if (aliased == cur) break;
+            cur = aliased;
+        }
+        return {};
+    }
+
 bool LLVMBackend::IsNamespace(const std::string& name) const
 {
         for (const auto& frame : std::ranges::reverse_view(stackNamedVariable))

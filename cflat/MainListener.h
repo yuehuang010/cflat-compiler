@@ -3741,7 +3741,7 @@ public:
     // IconKind and each image's pixel size. Reports the offending entry index on failure.
     bool ValidateApplicationIcons(antlr4::ParserRuleContext* ctx, cflat::appres::AppInfoData& out);
 
-    void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx);
+    void ParseEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx, const std::string& namespaceName = {});
 
     // Descend a single-child expression chain from `ctx` to a top-level `move` expression, if one
     // is the entire expression. Returns null when any operator (binary, unary, sizeof, cast) sits

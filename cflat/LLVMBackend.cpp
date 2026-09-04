@@ -4451,6 +4451,7 @@ void LLVMBackend::ResetForReanalysis()
     winrtConsumedLspFile_.clear();
     programTable.clear();
     enumBackingTypes.clear();
+    enumDeclSites_.clear();
     typeAliases.clear();
     aliasScopeStack_.clear();
     aggregateAliasScopes_.clear();
@@ -6296,6 +6297,7 @@ static llvm::json::Object SerializeTav(const TAV& t)
     llvm::json::Object o;
     o["t"] = s.TypeName;
     if (!s.VariableName.empty())  o["n"]   = s.VariableName;
+    if (!s.EnumBacking.empty())   o["eb"]  = s.EnumBacking;
     if (s.Pointer)                o["p"]   = true;
     if (s.ElemPointer)            o["ep"]  = true;
     if (s.PointerDepth)           o["pd"]  = static_cast<int64_t>(s.PointerDepth);
@@ -6365,6 +6367,7 @@ static TAV DeserializeTav(const llvm::json::Object& o)
     LLVMBackend::SerializedTav s;
     if (auto v = o.getString("t"))   s.TypeName = v->str();
     if (auto v = o.getString("n"))   s.VariableName = v->str();
+    if (auto v = o.getString("eb"))  s.EnumBacking = v->str();
     if (auto v = o.getBoolean("p"))  s.Pointer = *v;
     if (auto v = o.getBoolean("ep")) s.ElemPointer = *v;
     if (auto v = o.getInteger("pd")) s.PointerDepth = static_cast<int>(*v);
@@ -7231,6 +7234,7 @@ bool LLVMBackend::LoadCoreBitcodeIfFresh(const std::string& cacheDir, const std:
     typeAliases.clear();
     manglingAliases_.clear();
     enumBackingTypes.clear();
+    enumDeclSites_.clear();
     // strConcatRegistered / stringDtorRegistered: will be set below after deserialization
     // verifies the functions are present in the bitcode.
 

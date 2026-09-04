@@ -290,6 +290,14 @@ LLVMBackend::DeclTypeAndValue ForwardRefScanner::ParseDeclarationSpecifiers(CFla
                     declType.TypeName = compiler->ResolveQualifiedName(specText);
                     // Resolve type aliases (e.g. user-defined aliases)
                     declType.TypeName = compiler->ResolveTypeAlias(declType.TypeName);
+                    // An enum names a real type here: bind it to its registered (scoped) key and
+                    // record the backing spelling that carries its width and signedness.
+                    if (std::string enumKey = compiler->ResolveEnumTypeName(declType.TypeName);
+                        !enumKey.empty())
+                    {
+                        declType.TypeName = enumKey;
+                        declType.EnumBacking = compiler->GetEnumBackingType(enumKey);
+                    }
                     // Peel an array alias's brackets (using Vec3 = float[3]) BEFORE the stars so
                     // "int*[3]" yields dims {3} over base "int*".
                     std::vector<uint64_t> aliasDims;
@@ -1690,6 +1698,18 @@ void ForwardRefScanner::ScanUsingDeclaration(CFlatParser::UsingDeclarationContex
             return;
         }
 
+        // `using D = Dir;` where Dir is an enum: alias the enum's registered (scoped) key, so the
+        // alias resolves as a type and not as a namespace alias onto the member scope.
+        if (std::string enumKey = compiler->ResolveEnumTypeName(targetBase); !enumKey.empty())
+        {
+            targetBase = enumKey;
+            targetDecorated = enumKey + std::string(targetPointerDepth, '*');
+            for (uint64_t dim : targetArrayDims)
+                targetDecorated += "[" + std::to_string(dim) + "]";
+            compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
+            return;
+        }
+
         if (compiler->IsInterfaceType(targetBase) || compiler->dataStructures.count(targetBase) > 0
             || LLVMBackend::IsPrimitiveTypeName(targetBase) || compiler->IsWinrtFullName(targetBase))
             compiler->RegisterTypeAlias(alias, targetDecorated + suffix);
@@ -2002,6 +2022,13 @@ void ForwardRefScanner::ScanExternalDeclaration(CFlatParser::ExternalDeclaration
         }
         else if (auto* lfg = ctx->lockFieldGroup())
             ScanGlobalLockGroup(lfg, namespaceName);
+        else if (auto* decl = ctx->declaration())
+        {
+            // Pre-register the enum so a signature (`int f(Dir d)`), a qualified spelling
+            // (`Ns.Dir.Back`) and a member used before this declaration all resolve.
+            if (auto* enumSpec = decl->enumSpecifier())
+                compilerLLVM->RegisterEnumSpecifier(enumSpec, namespaceName, nullptr, {});
+        }
         else if (auto expectErrDecl = ctx->expectErrorDeclaration())
         {
             // Bare-semicolon file-scope form (no inner declarations) is armed before

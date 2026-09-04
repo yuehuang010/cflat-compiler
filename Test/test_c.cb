@@ -498,6 +498,38 @@ int switchEnumScrutinee()
     }
 }
 
+// An enum is a first-class type: legal as a parameter type and as a return type, and a
+// namespace-qualified member reaches a case label from outside its namespace. Pre-fix all
+// three failed - the first two with "cannot find the type 'SwitchDir'" (the signature is
+// built by ForwardRefScanner, which never registered enums), the third with
+// "'Dir' is not a member of namespace 'SwitchNs'".
+namespace SwitchNs { enum Dir : int { Back = -1, Fwd = 1 }; }
+
+int switchEnumParam(SwitchDir d)
+{
+    switch (d)
+    {
+        case SwitchDir.Back: return 10;
+        case SwitchDir.Fwd: return 30;
+        default: return 0;
+    }
+}
+
+SwitchDir switchEnumMake()
+{
+    return SwitchDir.Fwd;
+}
+
+int switchEnumQualifiedLabel(int x)
+{
+    switch (x)
+    {
+        case SwitchNs.Dir.Back: return 11;
+        case SwitchNs.Dir.Fwd: return 31;
+        default: return 0;
+    }
+}
+
 int switchFallthrough(int x)
 {
     int result = 0;
@@ -831,6 +863,11 @@ extern int main(int argc, char** argv)
     result &= Test("switch_enum_u8_hi",   switchEnumU8((u8)255), 3);
     result &= Test("switch_enum_u8_miss", switchEnumU8((u8)7), 0);
     result &= Test("switch_enum_scrut",   switchEnumScrutinee(), 10);
+    result &= Test("switch_enum_param",   switchEnumParam(SwitchDir.Back), 10);
+    result &= Test("switch_enum_param_fwd", switchEnumParam(SwitchDir.Fwd), 30);
+    result &= Test("switch_enum_return",  (int)switchEnumMake(), 1);
+    result &= Test("switch_enum_ns_label_neg", switchEnumQualifiedLabel(-1), 11);
+    result &= Test("switch_enum_ns_label_pos", switchEnumQualifiedLabel(1), 31);
     result &= Test("switch_fall1",     switchFallthrough(1), 12);
     result &= Test("switch_fall2",     switchFallthrough(2), 12);
     result &= Test("switch_fall3",     switchFallthrough(3),  3);

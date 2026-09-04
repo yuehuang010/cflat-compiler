@@ -1214,6 +1214,15 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                 // as a global variable (enum member / namespace global) or a
                                 // function. Fall back to leaving namedVar empty so later code
                                 // can handle it (constructor calls, generic templates, ...).
+                                // An enum member: rebind the owner to the enum's registered
+                                // namespace-scoped key so `Dir.Back` reads the enclosing Dir.
+                                if (auto dot = qualifiedName.rfind('.'); dot != std::string::npos)
+                                {
+                                    std::string owner = qualifiedName.substr(0, dot);
+                                    std::string enumKey = Compiler(ctx)->ResolveEnumTypeName(owner);
+                                    if (!enumKey.empty() && enumKey != owner)
+                                        qualifiedName = enumKey + qualifiedName.substr(dot);
+                                }
                                 primaryIdentifier = qualifiedName;
                                 bool wasRealNamespace = !isFileAlias && Compiler(ctx)->IsNamespace(namespaceContext);
                                 std::string namespaceName = namespaceContext;

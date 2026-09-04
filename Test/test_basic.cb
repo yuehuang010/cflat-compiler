@@ -140,12 +140,91 @@ bool testNamedParameters()
 // Named enum - enumerators should be registered as globals.
 enum MyEnum : u8 { E_ONE = 1, E_TWO, E_THREE = 5 };
 
+// An enum is a first-class type. Pre-fix each of these failed for a different reason:
+// the widening ones read a narrow UNSIGNED member back sign-extended (u8 200 -> -56),
+// the i64/u64 ones terminated the compiler with std::out_of_range out of std::stoi,
+// the namespaced one could not be reached as `EnumNs.Facing.Back` from outside, and
+// `enumUsedBeforeDeclaration` could not see an enum declared further down the file.
+enum WideU8   : u8  { WU8_BIG = 200, WU8_MAX = 255 };
+enum WideU16  : u16 { WU16_BIG = 40000 };
+enum NarrowI8 : i8  { NI8_NEG = -1 };
+enum WideI64  : i64 { WI64_LOW = -3000000000, WI64_HIGH = 4000000000 };
+enum WideU64  : u64 { WU64_HIGH = 9223372036854775808 };
+// Backing spelled through a `using` alias: the resolved type drives width and signedness.
+using EnumByte = u8;
+enum AliasBacked : EnumByte { AB_HI = 200 };
+// Initializer the pre-pass cannot fold statically, so the codegen folder supplies it: the u64
+// maximum must widen unsigned, not sign-extend to -1.
+enum DynU64 : u64 { DU64_MAX = 18446744073709551615 - 0 };
+
+namespace EnumNs { enum Facing : int { Back = -7, Fwd = 7 }; }
+
+using FacingAlias = EnumNs.Facing;
+
+struct EnumHolder { WideU8 band = default; int amount = default; };
+
+struct EnumBox<T> { T value = default; };
+
+int enumUsedBeforeDeclaration()
+{
+    // Declared AFTER this function - resolvable only because the pre-pass registers enums.
+    return (int)LateEnum.LATE_VALUE;
+}
+
+enum LateEnum : int { LATE_VALUE = 99 };
+
+int enumAsParameter(MyEnum e) { return (int)e + 100; }
+
+MyEnum enumAsReturn() { return MyEnum.E_THREE; }
+
 bool testEnum()
 {
     bool result = true;
     result &= Test("enum_E_ONE", MyEnum.E_ONE, 1);
     result &= Test("enum_E_TWO", MyEnum.E_TWO, 2);
     result &= Test("enum_E_THREE", MyEnum.E_THREE, 5);
+
+    // Parameter / return type.
+    result &= Test("enum_param_type", enumAsParameter(MyEnum.E_TWO), 102);
+    result &= Test("enum_return_type", (int)enumAsReturn(), 5);
+
+    // A narrow unsigned base must zero-extend, a narrow signed base must sign-extend.
+    WideU8 big = WideU8.WU8_BIG;
+    WideU8 max = WideU8.WU8_MAX;
+    WideU16 wide = WideU16.WU16_BIG;
+    NarrowI8 neg = NarrowI8.NI8_NEG;
+    result &= Test("enum_u8_200_widens_unsigned", (int)big, 200);
+    result &= Test("enum_u8_255_widens_unsigned", (int)max, 255);
+    result &= Test("enum_u16_40000_widens_unsigned", (int)wide, 40000);
+    result &= Test("enum_i8_neg_widens_signed", (int)neg, -1);
+    result &= Test("enum_u8_compare_above_127", big > 100, true);
+
+    // Initializers outside the int32 range.
+    WideI64 low = WideI64.WI64_LOW;
+    WideI64 high = WideI64.WI64_HIGH;
+    WideU64 huge = WideU64.WU64_HIGH;
+    result &= Test("enum_i64_below_int32_min", (i64)low, (i64)-3000000000);
+    result &= Test("enum_i64_above_int32_max", (i64)high, (i64)4000000000);
+    result &= Test("enum_u64_two_to_the_63", (u64)huge, (u64)9223372036854775808);
+    result &= Test("enum_u64_dynamic_max", (u64)DynU64.DU64_MAX, (u64)18446744073709551615);
+    result &= Test("enum_aliased_backing_unsigned", (int)AliasBacked.AB_HI, 200);
+
+    // Namespaced enum, qualified from outside; and an alias of an enum used as a type.
+    result &= Test("enum_namespaced_qualified", (int)EnumNs.Facing.Back, -7);
+    FacingAlias aliased = EnumNs.Facing.Fwd;
+    result &= Test("enum_alias_as_type", (int)aliased, 7);
+
+    // Enum as a struct field and as a generic type argument.
+    EnumHolder holder;
+    holder.band = WideU8.WU8_BIG;
+    holder.amount = 3;
+    result &= Test("enum_struct_field_unsigned", (int)holder.band, 200);
+    EnumBox<WideU8> boxed;
+    boxed.value = WideU8.WU8_MAX;
+    result &= Test("enum_generic_argument", (int)boxed.value, 255);
+
+    // Forward reference to an enum declared later in the file.
+    result &= Test("enum_forward_reference", enumUsedBeforeDeclaration(), 99);
     return result;
 }
 
@@ -4156,6 +4235,7 @@ extern int main()
     total++; passed += testReturnBlock()                 ? 1 : 0;
     total++; passed += testAssertReturnBlock()           ? 1 : 0;
     total++; passed += testExplicitIntTypes()            ? 1 : 0;
+    total++; passed += testEnum()                        ? 1 : 0;
     total++; passed += testNegativeGlobalInit()          ? 1 : 0;
     total++; passed += testConstGlobalIsNotAMacro()      ? 1 : 0;
     total++; passed += testNullConditional()             ? 1 : 0;

@@ -37,5 +37,43 @@ extern int main()
         switch (d) { case ErrDup.A: return 1; case ErrDup.B: return 2; default: return 0; }
     }
 
+    // An enumerator is stored in the declared backing type, so a value outside that type's
+    // range is diagnosed at the declaration. Pre-fix the initializer went through std::stoi
+    // into an int32 and was silently truncated on the way into the backing type (256 -> 0,
+    // 128 -> -128, -1 -> 255).
+    expect_error("enum value '256' does not fit the backing type 'u8'") {
+        enum ErrEnumOverU8 : u8 { EO_OVER = 256 };
+    }
+
+    expect_error("enum value '128' does not fit the backing type 'i8'") {
+        enum ErrEnumOverI8 : i8 { EO_HIGH = 128 };
+    }
+
+    expect_error("enum value '-1' does not fit the backing type 'u8'") {
+        enum ErrEnumNegU8 : u8 { EO_NEG = -1 };
+    }
+
+    // Codegen-folded (non-literal) initializer keeps its int sign: not zero-extended to 255.
+    expect_error("enum value '-1' does not fit the backing type 'u8'") {
+        enum ErrEnumNegU8Dyn : u8 { EO_NEG_DYN = 0 - 1 };
+    }
+
+    // A second definition of the same enum is a redefinition, not a silently dropped no-op.
+    expect_error("enum 'ErrEnumDupDef' is already defined") {
+        enum ErrEnumDupDef : int { EDD_A = 1 };
+        enum ErrEnumDupDef : int { EDD_A = 5, EDD_B = 6 };
+    }
+
+    // A literal past every backing type is diagnosed, not truncated on the way in.
+    expect_error("does not fit the backing type 'u64'") {
+        enum ErrEnumAstro : u64 { EA_V = 10000000000000000000000000000000000000000 };
+    }
+
     return 0;
+}
+
+// File-scope form: this declaration is reached by ForwardRefScanner, not by the codegen walk,
+// so it covers the pre-pass copy of the range check.
+expect_error("enum value '70000' does not fit the backing type 'u16'") {
+    enum ErrEnumOverU16 : u16 { EO_WIDE = 70000 };
 }

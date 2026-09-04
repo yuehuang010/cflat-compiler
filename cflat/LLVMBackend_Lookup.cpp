@@ -61,7 +61,8 @@ bool LLVMBackend::IsKnownTypeName(const std::string& name) const
         if (scalars.count(name)) return true;
         std::string resolved = ResolveTypeAlias(name);
         return enumBackingTypes.count(resolved) > 0 || resolved != name
-            || HasInterface(resolved) || dataStructures.count(resolved) > 0;
+            || HasInterface(resolved) || dataStructures.count(resolved) > 0
+            || !ResolveEnumTypeName(name).empty();
     }
 
 /*
@@ -133,13 +134,17 @@ llvm::Type* LLVMBackend::GetType(const LLVMBackend::TypeAndValue& typeAndValue, 
         llvm::Type* type = nullptr;
         const auto& typeName = typeAndValue.TypeName;
 
-        // Resolve enum type names to their backing type if registered
+        // Resolve enum type names to their backing type if registered. The enum may be reached
+        // through an alias (`using D = Dir;`) or spelled unqualified from inside its namespace,
+        // so go through the scoped/alias walk rather than a bare exact-key lookup.
         std::string resolvedTypeName = typeName;
         if (!resolvedTypeName.empty())
         {
             auto it = enumBackingTypes.find(resolvedTypeName);
             if (it != enumBackingTypes.end())
                 resolvedTypeName = it->second;
+            else if (std::string enumKey = ResolveEnumTypeName(resolvedTypeName); !enumKey.empty())
+                resolvedTypeName = enumBackingTypes.at(enumKey);
         }
         // `simd<T,N>` is a builtin special form recognised by the DECLARATOR path, which records
         // it as element type + lane count. Every other position resolves a type by NAME and hands
@@ -456,6 +461,8 @@ std::string LLVMBackend::ResolveFuncPtrTypeSpelling(const std::string& typeName)
             std::string aliased = ResolveTypeAlias(cur);
             if (aliased != cur) { cur = aliased; continue; }
             if (auto e = enumBackingTypes.find(cur); e != enumBackingTypes.end()) { cur = e->second; continue; }
+            // A namespaced or aliased enum only matches through the scoped walk.
+            if (std::string k = ResolveEnumTypeName(cur); !k.empty()) { cur = enumBackingTypes.at(k); continue; }
             break;
         }
         return cur;

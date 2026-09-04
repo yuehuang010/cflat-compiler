@@ -853,6 +853,11 @@ public:
         // treated as disjoint. Never serialized; recomputed per-function from aliasScopes_.
         int NoaliasScopeId = -1;
 
+        // Set only when TypeName names a registered enum: the enum's backing type after alias
+        // resolution ("u8", "i64", ...). Empty for every other type, and always a primitive
+        // spelling so IsInteger/IsUnsignedInteger can read it directly.
+        std::string EnumBacking;
+
         std::string GuardedBy;
         // The VariableName of the struct that contains this field (e.g. "d" when this field was accessed as d->field).
         // Used to reconstruct the qualified lock name (e.g. "d.ready") for lock(this) parameter seeding.
@@ -944,18 +949,27 @@ public:
             return false;
         }
 
+        // The integral spelling this value actually lowers as. For an enum-typed value TypeName
+        // is the enum's own name (identity, needed by field/member lookup), so the width and the
+        // signedness both have to come from the declared backing type recorded here.
+        const std::string& IntegralSpelling() const
+        {
+            return EnumBacking.empty() ? TypeName : EnumBacking;
+        }
+
         int IsInteger() const
         {
-            if (TypeName == "char" || TypeName == "i8" || TypeName == "u8")
+            const std::string& t = IntegralSpelling();
+            if (t == "char" || t == "i8" || t == "u8")
                 return 8;
-            if (TypeName == "short" || TypeName == "i16" || TypeName == "u16")
+            if (t == "short" || t == "i16" || t == "u16")
                 return 16;
-            if (TypeName == "int" || TypeName == "i32" || TypeName == "u32")
+            if (t == "int" || t == "i32" || t == "u32")
                 return 32;
-            if (TypeName == "i64" || TypeName == "u64")
+            if (t == "i64" || t == "u64")
                 return 64;
             // `long`/`ulong` are target-native: 32 bits on Windows/LLP64, 64 on LP64.
-            if (TypeName == "long" || TypeName == "ulong")
+            if (t == "long" || t == "ulong")
                 return longBits_;
 
             return -1;
@@ -965,12 +979,13 @@ public:
         // C equivalents: u8=uint8_t, u16=uint16_t, u32=uint32_t, u64=uint64_t
         int IsUnsignedInteger() const
         {
-            if (TypeName == "u8")  return 8;
-            if (TypeName == "u16") return 16;
-            if (TypeName == "u32") return 32;
-            if (TypeName == "u64") return 64;
+            const std::string& t = IntegralSpelling();
+            if (t == "u8")  return 8;
+            if (t == "u16") return 16;
+            if (t == "u32") return 32;
+            if (t == "u64") return 64;
             // C's `unsigned long`: target-native width (u32 on Windows/LLP64, u64 on LP64).
-            if (TypeName == "ulong") return longBits_;
+            if (t == "ulong") return longBits_;
 
             return -1;
         }
@@ -1133,12 +1148,14 @@ public:
         uint64_t SimdLanes = 0;
         bool IsArrayView = false;
         uint64_t AllocAlignValue = 0;
+        std::string EnumBacking;
 
         static SerializedTav From(const TypeAndValue& t)
         {
             SerializedTav s;
             s.TypeName = t.TypeName;
             s.VariableName = t.VariableName;
+            s.EnumBacking = t.EnumBacking;
             s.Pointer = t.Pointer;
             s.ElemPointer = t.ElemPointer;
             s.PointerDepth = t.PointerDepth;
@@ -1191,6 +1208,7 @@ public:
             TypeAndValue t;
             t.TypeName = TypeName;
             t.VariableName = VariableName;
+            t.EnumBacking = EnumBacking;
             t.Pointer = Pointer;
             t.ElemPointer = ElemPointer;
             t.PointerDepth = PointerDepth;
@@ -2733,6 +2751,10 @@ private:
 
     std::unordered_map<std::string, ProgramData> programTable;
     std::unordered_map<std::string, std::string> enumBackingTypes;
+    // Declaration sites (file:line:col) an enum key was registered from. Both passes and a
+    // re-import replay the same site, which is the no-op; a second, different site is a
+    // redefinition. Transient per compile, never serialized.
+    std::unordered_map<std::string, std::unordered_set<std::string>> enumDeclSites_;
     std::unordered_map<std::string, std::string> typeAliases;
     // FILE-scope pure-rename `using` aliases (`using MyInt = int;`) - alias -> bare target name.
     // Written by ForwardRefScanner::PreRegisterRenameAliases before either pass walks the file, and
@@ -7629,6 +7651,23 @@ public:
     void RegisterLocalNamespaceAlias(const std::string& alias, const std::string& target);
     void RegisterEnumBackingType(const std::string& enumName, const std::string& backingType);
     std::string GetEnumBackingType(const std::string& enumName) const;
+    /*
+     * Register an enum declaration: the type facts (name -> backing type, name as a member
+     * scope) and every member's constant global. Called from BOTH passes - ForwardRefScanner so
+     * signatures, forward references and qualified spellings resolve, MainListener for the enums
+     * the pre-pass never reaches (function bodies, `if const` branches). The second call for the
+     * same enum is a no-op. `dynamicEval` folds an initializer the static evaluator cannot; it is
+     * empty in the pre-pass, which then leaves that enum's values to codegen. `dynamicEval`
+     * yields the folded constant at its own natural width; the caller widens it per signedness.
+     */
+    void RegisterEnumSpecifier(CFlatParser::EnumSpecifierContext* ctx,
+                               const std::string& namespaceName,
+                               std::unordered_set<std::string>* constFoldableGlobals,
+                               const std::function<bool(CFlatParser::ConditionalExpressionContext*,
+                                                        llvm::APInt&)>& dynamicEval);
+    // Resolve a written type spelling to the registered enum key it names (walking the enclosing
+    // namespaces and one alias hop), or "" when it names no enum.
+    std::string ResolveEnumTypeName(const std::string& spelled) const;
     bool IsNamespace(const std::string& name) const;
     bool IsImportAlias(const std::string& name) const;
     bool IsImportAliasMember(const std::string& alias, const std::string& member) const;
