@@ -3315,6 +3315,51 @@ int runRawCountMoveParamReassignMoveLocal()
     return g_raw_count_dtors;
 }
 
+void rawCountMoveParamReassignAlignedDelete(move alignas(0, 64) RawCountElem* p)
+{
+    p = new RawCountElem[2] alignas(0, 64);
+    delete p;
+}
+
+int runRawCountMoveParamReassignAlignedDelete()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignAlignedDelete(new RawCountElem[1] alignas(0, 64));
+    return g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignAlignedBranch(move alignas(0, 64) RawCountElem* p, int choose)
+{
+    if (choose != 0)
+        p = new RawCountElem[2] alignas(0, 64);
+    else
+        p = new RawCountElem[3] alignas(0, 64);
+    delete p;
+}
+
+int runRawCountMoveParamReassignAlignedBranch()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignAlignedBranch(new RawCountElem[1] alignas(0, 64), 0);
+    int zero = g_raw_count_dtors;
+    resetRawCountState();
+    rawCountMoveParamReassignAlignedBranch(new RawCountElem[1] alignas(0, 64), 1);
+    return zero * 10 + g_raw_count_dtors;
+}
+
+void rawCountMoveParamReassignAlignedForward(move alignas(0, 64) RawCountElem* p)
+{
+    p = new RawCountElem[2] alignas(0, 64);
+    rawCountAlignedSink(move p);
+}
+
+int runRawCountMoveParamReassignAlignedForward()
+{
+    resetRawCountState();
+    rawCountMoveParamReassignAlignedForward(new RawCountElem[1] alignas(0, 64));
+    return g_raw_count_dtors;
+}
+
 // Accept-set for the local `alignas(0, N)` reassignment guard: every shape below stays legal.
 int runLocalAlignAcceptSet()
 {
@@ -3645,6 +3690,13 @@ int testRawArrayRuntimeCount()
         runRawCountMoveParamReassignArrayScope(), 4);
     passed += Test("raw count move parameter reassignment from counted local",
         runRawCountMoveParamReassignMoveLocal(), 2);
+    // Clause-bearing parameters may be reassigned aligned blocks; the declared clause routes the free.
+    passed += Test("raw count aligned move parameter reassignment delete",
+        runRawCountMoveParamReassignAlignedDelete(), 2);
+    passed += Test("raw count aligned move parameter reassignment both branches",
+        runRawCountMoveParamReassignAlignedBranch(), 32);
+    passed += Test("raw count aligned move parameter reassignment forward",
+        runRawCountMoveParamReassignAlignedForward(), 2);
     // Plain delete must use the move-pointer raw count; old code returns 1 instead of 3.
     // The nested resource leg similarly returns 11 instead of 33 on the pre-fix compiler.
     passed += Test("raw count move return comparison temp",
@@ -3793,7 +3845,7 @@ extern int main()
     r = testDiscard();          passed += r; total += 6;
     r = testDirectReturnOwnership(); passed += r; total += 6;
     r = testCLongWidth();       passed += r; total += 15;
-    r = testRawArrayRuntimeCount(); passed += r; total += 71;
+    r = testRawArrayRuntimeCount(); passed += r; total += 74;
     r = testDictEnumeration();  passed += r; total += 12;
     r = testLiteralReceiverAndNullChain(); passed += r; total += 9;
     r = testDefaultAsExpression(); passed += r; total += 82;

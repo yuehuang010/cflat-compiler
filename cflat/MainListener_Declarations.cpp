@@ -7250,7 +7250,31 @@ bool MainListener::RejectLocalAllocAlignMismatch(
         llvm::Value* right,
         antlr4::ParserRuleContext* ctx) {
         uint64_t localAlign = namedVar.TypeAndValue.AllocAlignValue;
-        if (localAlign <= LLVMBackend::kDefaultNewAlign) return false;
+        uint64_t sourceAlign = std::max(rightNV.AllocAlignment,
+                                        rightNV.TypeAndValue.AllocAlignValue);
+        if (localAlign <= LLVMBackend::kDefaultNewAlign)
+        {
+            if (sourceAlign <= LLVMBackend::kDefaultNewAlign) return false;
+            // The binding already TRACKS this exact block alignment (declaration-time inference,
+            // or the inbound channel that makes a direct `new` inherit it), so its free agrees.
+            if (namedVar.AllocAlignment == sourceAlign) return false;
+            // A type-wide over-alignment selects the matching allocator/deallocator pair from
+            // the static pointee type, so it does not need per-binding allocation provenance.
+            if (right == nullptr || llvm::isa<llvm::ConstantPointerNull>(right)
+                || !right->getType()->isPointerTy()
+                || ElementTypeIsOverAligned(namedVar.TypeAndValue))
+                return false;
+
+            const std::string& name = namedVar.CallerName;
+            const std::string spelled = SpellType(*Compiler(), LLVMBackend::TypeAndValue{
+                .TypeName = namedVar.TypeAndValue.TypeName });
+            LogErrorContext(ctx, std::format(
+                "cannot assign an over-aligned block (block alignment {}) to unclaused binding '{}': "
+                "declare the binding 'alignas(0, {})' (for a parameter: 'alignas(0, {}) {}* {}', after "
+                "any 'move'), or over-align the pointee TYPE instead.",
+                sourceAlign, name, sourceAlign, sourceAlign, spelled, name));
+            return true;
+        }
         if (localAlign == rightNV.AllocAlignment) return false;
         // The tracked block alignment (AllocAlignment) is only ever populated by a `new` /
         // `move` / reassignment that ran through the alignment channel - a plain read of a

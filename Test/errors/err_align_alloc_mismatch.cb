@@ -46,3 +46,27 @@ expect_error("alignment mismatch assigning to 'narrowSink'") {
         narrowSink = src;
     }
 }
+
+expect_error("cannot assign an over-aligned block (block alignment 64) to unclaused binding 'p': declare the binding 'alignas(0, 64)' (for a parameter: 'alignas(0, 64) AlignElem* p', after any 'move'), or over-align the pointee TYPE instead.") {
+    void rejectUnclausedMoveParam(move AlignElem* p)
+    {
+        p = new AlignElem[2] alignas(0, 64);
+    }
+}
+
+expect_error("cannot assign an over-aligned block (block alignment 64) to unclaused binding 'p': declare the binding 'alignas(0, 64)' (for a parameter: 'alignas(0, 64) AlignElem* p', after any 'move'), or over-align the pointee TYPE instead.") {
+    void rejectUnclausedLocal(int choose)
+    {
+        AlignElem* p = new AlignElem[2];
+        if (choose != 0)
+            p = new AlignElem[2] alignas(0, 64);
+    }
+}
+
+expect_error("cannot assign an over-aligned block (block alignment 64) to unclaused binding 'p': declare the binding 'alignas(0, 64)' (for a parameter: 'alignas(0, 64) AlignElem* p', after any 'move'), or over-align the pointee TYPE instead.") {
+    void rejectUnclausedParamFromAlignedLocal(move AlignElem* p)
+    {
+        alignas(0, 64) AlignElem* q = new AlignElem[2] alignas(0, 64);
+        p = move q;
+    }
+}
