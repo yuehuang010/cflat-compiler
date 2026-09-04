@@ -3947,11 +3947,12 @@ struct BoxWrap
     alias UniqueBox borrow() { return this.b; }
 };
 
-// `alias` is the sanctioned pass-through for a mixed join in a RETURN slot: the borrow travels to
-// the caller instead of transferring, so the reject that fires for a plain return must not fire.
-alias UniqueBox pickBorrowedBox(UniqueBox borrowed, bool c)
+// `alias` is the sanctioned pass-through for a NON-OWNING join in a RETURN slot: the borrow travels
+// to the caller instead of transferring, so the reject that fires for a plain return must not fire.
+// (Arms that DISAGREE on ownership are rejected at the join itself, `alias` return or not.)
+alias UniqueBox pickBorrowedBox(UniqueBox borrowed, UniqueBox borrowed2, bool c)
 {
-    return c ? makeUniqueBox(7) : borrowed;
+    return c ? borrowed2 : borrowed;
 }
 
 // A plain by-value parameter READS a borrow without persisting it - no destructor of its own runs
@@ -4013,34 +4014,34 @@ int testOwningStructTernaryJoin()
 {
     int passed = 0;
 
-    // MIXED join, BORROW arm taken: nothing is freed early and the owner survives intact.
+    // Arms that DISAGREE on ownership are rejected at the join now (Test/errors/err_move.cb and
+    // Test/errors/err_ternary_mixed_ownership.cb); the prescribed fix is to `move` the borrowed
+    // side so BOTH arms own. MOVE-fixed join, moved arm taken: the receiver adopts and frees once.
     dtorCount = 0;
     {
         UniqueBox owner = makeUniqueBox(42);
         {
-            UniqueBox k = identityBool(false) ? makeUniqueBox(7) : owner;
-            passed += Test("struct_ternary_mixed_false_value", k.item->id, 42);
-            passed += Test("struct_ternary_mixed_false_no_free", dtorCount, 0);
+            UniqueBox k = identityBool(false) ? makeUniqueBox(7) : move owner;
+            passed += Test("struct_ternary_move_fix_false_value", k.item->id, 42);
+            passed += Test("struct_ternary_move_fix_false_no_free", dtorCount, 0);
         }
-        passed += Test("struct_ternary_mixed_false_no_adoption", dtorCount, 0);
-        passed += Test("struct_ternary_mixed_false_owner_alive", owner.item->id, 42);
+        passed += Test("struct_ternary_move_fix_false_adopted_freed_once", dtorCount, 1);
     }
-    passed += Test("struct_ternary_mixed_false_owner_freed_once", dtorCount, 1);
+    passed += Test("struct_ternary_move_fix_false_total", dtorCount, 1);
 
-    // MIXED join, OWNING arm taken: the receiver still only borrows, so the owner is untouched
-    // and the selected arm leaks. The point is that nothing is freed TWICE.
+    // MOVE-fixed join, CALL arm taken: the join is adopted and freed once; the untaken `move`
+    // arm's own local still frees its value at its scope exit, exactly as the all-move join does.
     dtorCount = 0;
     {
         UniqueBox owner = makeUniqueBox(42);
         {
-            UniqueBox k = identityBool(true) ? makeUniqueBox(7) : owner;
-            passed += Test("struct_ternary_mixed_true_value", k.item->id, 7);
-            passed += Test("struct_ternary_mixed_true_no_free", dtorCount, 0);
+            UniqueBox k = identityBool(true) ? makeUniqueBox(7) : move owner;
+            passed += Test("struct_ternary_move_fix_true_value", k.item->id, 7);
+            passed += Test("struct_ternary_move_fix_true_no_free", dtorCount, 0);
         }
-        passed += Test("struct_ternary_mixed_true_no_adoption", dtorCount, 0);
-        passed += Test("struct_ternary_mixed_true_owner_alive", owner.item->id, 42);
+        passed += Test("struct_ternary_move_fix_true_adopted_freed_once", dtorCount, 1);
     }
-    passed += Test("struct_ternary_mixed_true_owner_freed_once", dtorCount, 1);
+    passed += Test("struct_ternary_move_fix_true_total", dtorCount, 2);
 
     // ALL-BORROW join: neither arm owns, so the receiver borrows and the owner frees exactly once.
     dtorCount = 0;
@@ -4100,15 +4101,15 @@ int testOwningStructTernaryJoin()
     }
     passed += Test("struct_ternary_move_join_total", dtorCount, 2);
 
-    // An `alias`-returning call is a BORROW, so pairing it with a genuinely owning arm is a MIXED
-    // join. It used to score owning (every by-value owning-struct return entered the owning-return
-    // ledger regardless of `alias`) and the receiver destroyed the wrapper's live value.
+    // An `alias`-returning call is a BORROW, so a join of two of them owns nothing. The call used
+    // to score owning (every by-value owning-struct return entered the owning-return ledger
+    // regardless of `alias`), which made the receiver adopt and destroy the wrapper's live value.
     dtorCount = 0;
     {
         BoxWrap w;
         w.b = makeUniqueBox(5);
         {
-            UniqueBox k = identityBool(true) ? w.borrow() : makeUniqueBox(2);
+            UniqueBox k = identityBool(true) ? w.borrow() : w.borrow();
             passed += Test("struct_ternary_alias_arm_value", k.item->id, 5);
             passed += Test("struct_ternary_alias_arm_no_free", dtorCount, 0);
         }
@@ -4117,13 +4118,53 @@ int testOwningStructTernaryJoin()
     }
     passed += Test("struct_ternary_alias_arm_owner_freed_once", dtorCount, 1);
 
-    // The `alias` RETURN slot accepts the mixed join (the reject is gated on a non-alias return),
+    /*
+     * INDIRECT call arms (Lambda<> and function<>): an owning-value struct returned BY VALUE owns
+     * through a function pointer exactly as through a direct call, but the funcptr type carries no
+     * `move`, so the indirect door used to leave the result out of the owning-return ledger. The
+     * join then scored the call a BORROW: mixed with a direct owning call it was rejected with no
+     * accepted spelling, and a join of two indirect calls silently leaked (dtor 0).
+     */
+    dtorCount = 0;
+    {
+        Lambda<UniqueBox()> lf = () => { return makeUniqueBox(3); };
+        {
+            UniqueBox k = identityBool(true) ? lf() : makeUniqueBox(8);
+            passed += Test("struct_ternary_lambda_mixed_value", k.item->id, 3);
+            passed += Test("struct_ternary_lambda_mixed_alive", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_lambda_mixed_freed_once", dtorCount, 1);
+    }
+
+    dtorCount = 0;
+    {
+        Lambda<UniqueBox()> lf = () => { return makeUniqueBox(3); };
+        {
+            UniqueBox k = identityBool(false) ? lf() : lf();
+            passed += Test("struct_ternary_lambda_both_value", k.item->id, 3);
+            passed += Test("struct_ternary_lambda_both_alive", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_lambda_both_freed_once", dtorCount, 1);
+    }
+
+    dtorCount = 0;
+    {
+        function<UniqueBox(int)> fp = makeUniqueBox;
+        {
+            UniqueBox k = identityBool(true) ? fp(6) : makeUniqueBox(8);
+            passed += Test("struct_ternary_funcptr_mixed_value", k.item->id, 6);
+            passed += Test("struct_ternary_funcptr_mixed_alive", dtorCount, 0);
+        }
+        passed += Test("struct_ternary_funcptr_mixed_freed_once", dtorCount, 1);
+    }
+
+    // The `alias` RETURN slot accepts the non-owning join (the reject is gated on a non-alias return),
     // and its result borrows in the caller too - the owner is still freed exactly once.
     dtorCount = 0;
     {
         UniqueBox owner = makeUniqueBox(4);
         {
-            UniqueBox k = pickBorrowedBox(owner, false);
+            UniqueBox k = pickBorrowedBox(owner, owner, false);
             passed += Test("struct_ternary_alias_return_value", k.item->id, 4);
         }
         passed += Test("struct_ternary_alias_return_no_adoption", dtorCount, 0);
@@ -4153,12 +4194,12 @@ int testOwningStructTernaryJoin()
     }
     passed += Test("alias_borrow_chain_decl_owner_freed_once", dtorCount, 1);
 
-    // Same chain off a MIXED-join local (the second way to become a borrow).
+    // Same chain off an ALL-BORROW-join local (the second way to become a borrow).
     dtorCount = 0;
     {
         UniqueBox owner = makeUniqueBox(6);
         {
-            UniqueBox k = identityBool(false) ? makeUniqueBox(9) : owner;
+            UniqueBox k = identityBool(false) ? owner : owner;
             UniqueBox k2 = k;
             passed += Test("alias_borrow_join_chain_value", k2.item->id, 6);
             passed += Test("alias_borrow_join_chain_no_free", dtorCount, 0);
@@ -4386,7 +4427,7 @@ int testOwningStructTernaryJoin()
     passed += Test("alias_field_move_owning_local_total", dtorCount, 1);
 
     /*
-     * The MIXED '?:' join is the SECOND declaration site that marks a local a borrow, so the rebind
+     * The non-owning '?:' join is the SECOND declaration site that marks a local a borrow, so the rebind
      * fix has to reach it too. On the BORROW arm master ran the drop-old over the wrapper's value
      * (garbage read, then abort at teardown); the drop-old is now skipped and the borrow retires in
      * the declaration block, so the local frees exactly the value it was just handed.
@@ -4397,7 +4438,7 @@ int testOwningStructTernaryJoin()
         BoxWrap w;
         w.b = makeUniqueBox(5);
         {
-            UniqueBox k = aliasRebindTaken() ? makeUniqueBox(1) : w.borrow();
+            UniqueBox k = aliasRebindTaken() ? w.borrow() : w.borrow();
             k = makeUniqueBox(9);
             passed += Test("alias_join_rebind_value", k.item->id, 9);
             passed += Test("alias_join_rebind_no_drop_old", dtorCount, 0);
@@ -4502,25 +4543,28 @@ int testBucketAExpressionOwnership()
     {
         UniqueBox named = makeUniqueBox(1);
         passed += Test("bucket_ternary_value_temp_arm_value",
-                       bucketTakeValue(identityBool(false) ? named : makeUniqueBox(8)), 8);
+                       bucketTakeValue(identityBool(false) ? move named : makeUniqueBox(8)), 8);
         passed += Test("bucket_ternary_value_temp_arm_live", dtorCount, 1);
     }
     passed += Test("bucket_ternary_value_temp_arm_freed", dtorCount, 2);
 
     dtorCount = 0;
     {
+        // Named arm taken: the arms must agree on ownership, so both are borrows here and the
+        // by-value parameter only reads - nothing is freed until the two owners leave scope.
         UniqueBox named = makeUniqueBox(1);
+        UniqueBox named2 = makeUniqueBox(2);
         passed += Test("bucket_ternary_value_named_arm_value",
-                       bucketTakeValue(identityBool(true) ? named : makeUniqueBox(8)), 1);
+                       bucketTakeValue(identityBool(true) ? named : named2), 1);
         passed += Test("bucket_ternary_value_named_arm_live", dtorCount, 0);
     }
-    passed += Test("bucket_ternary_value_named_arm_freed", dtorCount, 1);
+    passed += Test("bucket_ternary_value_named_arm_freed", dtorCount, 2);
 
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(1);
         passed += Test("bucket_ternary_alias_temp_arm_value",
-                       bucketTakeAlias(identityBool(false) ? named : makeUniqueBox(8)), 8);
+                       bucketTakeAlias(identityBool(false) ? move named : makeUniqueBox(8)), 8);
         passed += Test("bucket_ternary_alias_temp_arm_live", dtorCount, 1);
     }
     passed += Test("bucket_ternary_alias_temp_arm_freed", dtorCount, 2);
@@ -4528,11 +4572,12 @@ int testBucketAExpressionOwnership()
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(1);
+        UniqueBox named2 = makeUniqueBox(2);
         passed += Test("bucket_ternary_alias_named_arm_value",
-                       bucketTakeAlias(identityBool(true) ? named : makeUniqueBox(8)), 1);
+                       bucketTakeAlias(identityBool(true) ? named : named2), 1);
         passed += Test("bucket_ternary_alias_named_arm_live", dtorCount, 0);
     }
-    passed += Test("bucket_ternary_alias_named_arm_freed", dtorCount, 1);
+    passed += Test("bucket_ternary_alias_named_arm_freed", dtorCount, 2);
 
     dtorCount = 0;
     {
@@ -4572,7 +4617,7 @@ int testBucketAExpressionOwnership()
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(70);
-        int got = (identityBool(false) ? named : makeUniqueBox(71)).boxId();
+        int got = (identityBool(false) ? move named : makeUniqueBox(71)).boxId();
         passed += Test("bucket_ternary_receiver_named_temp_value", got, 71);
         passed += Test("bucket_ternary_receiver_named_temp_temp_freed", dtorCount, 1);
     }
@@ -4725,7 +4770,7 @@ int testBucketAExpressionOwnership()
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(1);
-        int got = bucketTakeValue(identityBool(false) ? named
+        int got = bucketTakeValue(identityBool(false) ? move named
             : (identityBool(true) ? makeUniqueBox(10) : makeUniqueBox(11)));
         passed += Test("bucket_nested_ternary_inner_left_value", got, 10);
         passed += Test("bucket_nested_ternary_inner_left_freed_at_call", dtorCount, 1);
@@ -4735,7 +4780,7 @@ int testBucketAExpressionOwnership()
     dtorCount = 0;
     {
         UniqueBox named = makeUniqueBox(2);
-        int got = bucketTakeValue(identityBool(false) ? named
+        int got = bucketTakeValue(identityBool(false) ? move named
             : (identityBool(false) ? makeUniqueBox(20) : makeUniqueBox(21)));
         passed += Test("bucket_nested_ternary_inner_right_value", got, 21);
         passed += Test("bucket_nested_ternary_inner_right_freed_at_call", dtorCount, 1);
@@ -4744,13 +4789,17 @@ int testBucketAExpressionOwnership()
 
     dtorCount = 0;
     {
+        // Outer arm taken, and every arm of both levels is a borrow so the ownership of the two
+        // joins agrees: no temp is built at all, and each owner frees itself at scope exit.
         UniqueBox named = makeUniqueBox(3);
+        UniqueBox named30 = makeUniqueBox(30);
+        UniqueBox named31 = makeUniqueBox(31);
         int got = bucketTakeValue(identityBool(true) ? named
-            : (identityBool(true) ? makeUniqueBox(30) : makeUniqueBox(31)));
+            : (identityBool(true) ? named30 : named31));
         passed += Test("bucket_nested_ternary_outer_named_value", got, 3);
         passed += Test("bucket_nested_ternary_outer_named_no_temp_free", dtorCount, 0);
     }
-    passed += Test("bucket_nested_ternary_outer_named_freed_at_scope", dtorCount, 1);
+    passed += Test("bucket_nested_ternary_outer_named_freed_at_scope", dtorCount, 3);
 
     // A lambda BODY is not part of the argument expression it sits in: the ternary below
     // initializes a local that owns its temp, so exactly one dtor must run.
@@ -12464,7 +12513,7 @@ extern int main()
     total += 22;
 
     passed += testOwningStructTernaryJoin();
-    total += 107;
+    total += 114;
 
     passed += testBucketAExpressionOwnership();
     total += 109;

@@ -99,9 +99,9 @@ expect_error("taken from a temporary") {
     }
 }
 
-// A '?:' join of two borrowed element fields: the mixed-arm reject fires first for an
+// A '?:' join of two borrowed element fields: the both-borrow join reject fires for an
 // owning struct and diagnoses the same escape.
-expect_error("mixes an owning and a borrowed") {
+expect_error("joins two borrowed") {
     void ternaryElementStore() {
         list<Outer> fields;
         Outer left = default;  left.inner.text  = "le" + "ft";  fields.add(left);

@@ -1,0 +1,80 @@
+// A '?:' whose arms disagree on ownership of an owning-value struct is rejected: adopting the
+// join double-frees the borrow arm's owner, borrowing it leaks the owning arm's temporary.
+import "list.cb";
+import "function.cb";
+
+struct MixNode { int v = 3; };
+struct MixOwn { string name = "abc"; unique MixNode* n = new MixNode(); list<int> xs = default; };
+
+MixOwn MixMake() { MixOwn r = default; r.n->v = 7; return r; }
+void MixTake(MixOwn o) { printf("take %d\n", o.n->v); }
+
+extern int main(int argc, char** argv)
+{
+    bool h = argc > 1;
+    MixOwn other = default; other.n->v = 9;
+    MixOwn other2 = default; other2.n->v = 11;
+
+    // (a) borrow arm first, owning call second.
+    expect_error("'?:' arms differ in ownership: 'MixMake()' is an owning value and 'other' is a borrow of an existing value. Either 'move' the borrowed side into a fresh value so both arms own, or make both arms borrows.") {
+        MixOwn a = h ? other : MixMake();
+    }
+
+    // (b) owning call first, borrow arm second.
+    expect_error("'?:' arms differ in ownership: 'MixMake()' is an owning value and 'other' is a borrow of an existing value.") {
+        MixOwn b = h ? MixMake() : other;
+    }
+
+    // (c) 'default' is an owning temporary just like a call result.
+    expect_error("'?:' arms differ in ownership: 'default' is an owning value and 'other' is a borrow of an existing value.") {
+        MixOwn c = h ? other : default;
+    }
+
+    // (d) same join in ARGUMENT position - rejected at the join, so every destination reports it.
+    expect_error("'?:' arms differ in ownership: 'MixMake()' is an owning value and 'other' is a borrow of an existing value.") {
+        MixTake(h ? other : MixMake());
+    }
+
+    // (e) nested: the INNER join is the mixed one and is the one reported.
+    expect_error("'?:' arms differ in ownership: 'MixMake()' is an owning value and 'other' is a borrow of an existing value.") {
+        MixOwn d = h ? other : (h ? MixMake() : other);
+    }
+
+    // (f) The arm text is the ORIGINAL SOURCE SLICE, not the whitespace-stripped parse-tree text:
+    // a spaced borrow arm is quoted back verbatim. On e4e493a this printed '(other)' and the leg
+    // failed to raise.
+    expect_error("'( other )' is a borrow of an existing value") {
+        MixOwn wsp = h ? MixMake() : ( other );
+    }
+
+    // ACCEPT: an INDIRECT call returning an owning-value struct BY VALUE owns exactly as a direct
+    // call does, so mixing it with a direct owning call is an all-owning join, and a join of two
+    // of them is adopted and freed once. Both were rejected on e4e493a (no accepted spelling -
+    // even 'move lf()' was rejected); the both-indirect join silently leaked. Destructor counts
+    // are asserted in Test/test_move.cb testOwningStructTernaryJoin.
+    Lambda<MixOwn()> lf = () => { MixOwn r = default; r.n->v = 13; return r; };
+    MixOwn i1 = h ? lf() : MixMake();
+    printf("i1 %d\n", i1.n->v);
+    MixOwn i2 = h ? lf() : lf();
+    printf("i2 %d\n", i2.n->v);
+    function<MixOwn()> fp = MixMake;
+    MixOwn i3 = h ? fp() : MixMake();
+    printf("i3 %d\n", i3.n->v);
+    MixOwn i4 = h ? fp() : fp();
+    printf("i4 %d\n", i4.n->v);
+
+    // ACCEPT: both arms owning temporaries.
+    MixOwn e = h ? MixMake() : MixMake();
+    printf("e %d\n", e.n->v);
+
+    // ACCEPT: both arms borrows, read only.
+    MixOwn f = h ? other : other2;
+    printf("f %d\n", f.n->v);
+
+    // ACCEPT: 'move' makes the borrowed side owning, so both arms own.
+    MixOwn g = h ? move other : MixMake();
+    printf("g %d\n", g.n->v);
+
+    printf("done %d\n", other2.n->v);
+    return 0;
+}

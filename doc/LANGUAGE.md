@@ -2824,6 +2824,19 @@ Both branches must produce compatible types. The ternary is an expression, so it
 printf("sign: %s\n", (n > 0) ? "pos" : (n < 0) ? "neg" : "zero");
 ```
 
+Both branches must also AGREE ON OWNERSHIP when the result is an owning value (a struct that owns
+a resource, such as one with a `unique` field, an owning `string`, or a `list<T>`). One arm being
+an owning value or temporary (a call result, `default`, a `move`) while the other borrows an
+existing value is a compile error: adopting such a join would give the borrow arm's storage a
+second destroyer, and borrowing it would leak the owning arm. Fix it either by `move`-ing the
+borrowed side into a fresh value so both arms own, or by making both arms borrows:
+
+```c
+Box b = c ? makeBox() : other;        // error: arms differ in ownership
+Box b = c ? makeBox() : move other;   // ok - both arms own
+Box b = c ? other : other2;           // ok - both arms borrow (b borrows too)
+```
+
 ### `break` and `continue`
 
 `break` exits the nearest enclosing `while`, `for`, or `foreach` loop immediately. `continue` jumps to the loop's next iteration:

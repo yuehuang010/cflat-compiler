@@ -7606,6 +7606,39 @@ bool MainListener::RejectAliasStoreIntoField(
         return true;
     }
 
+bool MainListener::RejectMixedOwnershipTernaryJoin(
+        llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
+        antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
+        antlr4::ParserRuleContext* ctx) {
+        auto* compiler = Compiler(ctx);
+        if (joined == nullptr || !compiler->IsOwningValueStructValue(joined)) return false;
+        bool trueOwns = compiler->TernaryArmJoinsOwning(trueValue);
+        bool falseOwns = compiler->TernaryArmJoinsOwning(falseValue);
+        if (trueOwns == falseOwns) return false;
+        // Original source slice, not getText(): the parse tree drops whitespace, so `move x`
+        // would otherwise be quoted back at the user as 'movex'.
+        auto armText = [](antlr4::ParserRuleContext* armCtx) {
+            std::string text("?");
+            if (armCtx != nullptr && armCtx->start != nullptr && armCtx->stop != nullptr
+                && armCtx->start->getInputStream() != nullptr)
+                text = armCtx->start->getInputStream()->getText(antlr4::misc::Interval(
+                    armCtx->start->getStartIndex(), armCtx->stop->getStopIndex()));
+            else if (armCtx != nullptr)
+                text = armCtx->getText();
+            if (text.size() > 40) text = text.substr(0, 37) + "...";
+            return text;
+        };
+        // Fixed wording, owning arm first, so the catalog string carries no English fragments.
+        antlr4::ParserRuleContext* owningCtx = trueOwns ? trueCtx : falseCtx;
+        antlr4::ParserRuleContext* borrowCtx = trueOwns ? falseCtx : trueCtx;
+        LogErrorContext(ctx, compiler->LocalizeMessage(
+            "'?:' arms differ in ownership: '{}' is an owning value and '{}' is a borrow of an "
+            "existing value. Either 'move' the borrowed side into a fresh value so both arms own, "
+            "or make both arms borrows.",
+            { armText(owningCtx), armText(borrowCtx) }));
+        return true;
+    }
+
 bool MainListener::RejectNonOwningStructJoinStore(llvm::Value* right, const std::string& destTypeName,
                                         const char* destKind, antlr4::ParserRuleContext* ctx) {
         auto* compiler = Compiler(ctx);
@@ -7614,12 +7647,15 @@ bool MainListener::RejectNonOwningStructJoinStore(llvm::Value* right, const std:
         if (destTypeName.empty() || !compiler->IsOwningValueType(destTypeName)) return false;
         const std::string destTypeSpelling = SpellType(*compiler,
             LLVMBackend::TypeAndValue{ .TypeName = destTypeName });
-        LogErrorContext(ctx, std::format(
-            "cannot store a '?:' result that mixes an owning and a borrowed '{}' arm into {}; its "
-            "destructor would free a value another owner still frees. Assign each arm in its own "
-            "branch, declare the function 'alias' to hand the borrow through, or write a 'copy()' "
-            "method for '{}' and copy the arm into an independent owned value.",
-            destTypeSpelling, destKind, destTypeSpelling));
+        // Mixed-ownership joins are rejected at the join itself now, so what still reaches here is
+        // a join of two BORROWED arms landing in an owning destination.
+        LogErrorContext(ctx, compiler->LocalizeMessage(
+            "cannot store a '?:' that joins two borrowed '{}' arms into {}; the destination's "
+            "destructor would free a value its existing owner still frees. Assign each arm in its "
+            "own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to "
+            "hand the borrow through, or write a 'copy()' method for '{}' and copy the arm into an "
+            "independent owned value.",
+            { destTypeSpelling, destKind, destTypeSpelling }));
         return true;
     }
 

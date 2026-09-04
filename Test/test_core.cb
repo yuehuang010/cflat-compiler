@@ -1955,7 +1955,9 @@ int testDefaultAsExpression()
 
     list<int> listOther;
     listOther.add(7);
-    list<int> listResult = h ? default : listOther;
+    // Both arms must OWN: a '?:' pairing an owning 'default' with a borrowed local is rejected,
+    // so 'move' the borrowed side in.
+    list<int> listResult = h ? default : move listOther;
     passed += Test("default_ternary_generic_default", listResult.count(), 0);
 
     P2Def parenthesized = default;
@@ -1974,16 +1976,21 @@ int testDefaultAsExpression()
     g_p2_ternary_dtor = 0;
     g_p2_ternary_buffer_dtor = 0;
     {
+        // Arms must AGREE on ownership - an owning 'default' paired with a borrowed local is
+        // rejected at the join - so both arms here are borrows of live owners.
         P2TernaryOwn owningOther = default;
         owningOther.s = "owned".copy();
+        P2TernaryOwn owningEmpty = default;
         bool owningChoose = true;
-        P2TernaryOwn owningResult = owningChoose ? default : owningOther;
+        P2TernaryOwn owningResult = owningChoose ? owningEmpty : owningOther;
         passed += Test("default_ternary_owning_source_live", owningOther.s.length(), 5);
         passed += Test("default_ternary_owning_no_early_dtor", g_p2_ternary_dtor, 0);
         passed += Test("default_ternary_owning_string_value", owningResult.s.length(), 0);
         passed += Test("default_ternary_owning_struct_value", owningResult.n, 3);
     }
-    passed += Test("default_ternary_owning_destructors", g_p2_ternary_dtor, 1);
+    // Two owners now (both '?:' arms are borrows of live locals); the borrow join itself adds
+    // no destructor, and only the one owner holding a heap string frees a buffer.
+    passed += Test("default_ternary_owning_destructors", g_p2_ternary_dtor, 2);
     passed += Test("default_ternary_owning_buffers", g_p2_ternary_buffer_dtor, 1);
 
     // Both arms own, so the joined value is owned: exactly one destructor and exactly one heap

@@ -5530,7 +5530,11 @@ LLVMBackend::TypedValue MainListener::ParseTernaryBranches(
         // side-channels must be cleared too: they carry no value identity, so a declaration would
         // otherwise adopt the phi whichever arm ran and double-free the borrow arm's live pointee.
         if (compiler->PropagateTernaryOwnership(trueValue, falseValue, phi))
+        {
             compiler->ClearOwnedResultChannels();
+            RejectMixedOwnershipTernaryJoin(trueValue, falseValue, phi,
+                expressionTrueCtx, expressionFalseCtx, ctx);
+        }
         compiler->PropagateAliasValue(trueValue, falseValue, phi);
         compiler->PropagateBondedValue(trueValue, falseValue, phi);
         if (trueAlias || falseAlias) compiler->RegisterAliasValue(phi);
@@ -5951,7 +5955,11 @@ LLVMBackend::TypedValue MainListener::ParseConditionalExpression(
                 // Eager form: both arms already ran, so only the selected one can be adopted
                 // and the other leaks regardless. See PropagateTernaryOwnership.
                 if (compiler->PropagateTernaryOwnership(trueValue, falseValue, selectValue))
+                {
                     compiler->ClearOwnedResultChannels();
+                    RejectMixedOwnershipTernaryJoin(trueValue, falseValue, selectValue,
+                        expressionTrueCtx, expressionFalseCtx, ctx);
+                }
                 compiler->PropagateAliasValue(trueValue, falseValue, selectValue);
                 compiler->PropagateBondedValue(trueValue, falseValue, selectValue);
                 compiler->PropagateFatInterfaceJoin(trueValue, falseValue, selectValue);

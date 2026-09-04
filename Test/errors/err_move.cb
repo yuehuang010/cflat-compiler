@@ -415,7 +415,7 @@ expect_error("cannot store the result of 'rwPassthru' into the return value") {
     UniqueThing* rwLeakThroughReturn() { return rwPassthru(makeJoinBox().item); }
 }
 
-expect_error("mixes an owning and a borrowed 'JoinBox' arm into an owning variable") {
+expect_error("'?:' arms differ in ownership: 'makeJoinBox()' is an owning value and 'borrowed' is a borrow of an existing value.") {
     void joinIntoOwningLocal(JoinBox borrowed, bool c)
     {
         JoinBox k;
@@ -423,7 +423,7 @@ expect_error("mixes an owning and a borrowed 'JoinBox' arm into an owning variab
     }
 }
 
-expect_error("mixes an owning and a borrowed 'JoinBox' arm into a struct field") {
+expect_error("'?:' arms differ in ownership: 'makeJoinBox()' is an owning value and 'borrowed' is a borrow of an existing value.") {
     void joinIntoStructField(JoinBox borrowed, bool c)
     {
         JoinHolder h;
@@ -431,17 +431,27 @@ expect_error("mixes an owning and a borrowed 'JoinBox' arm into a struct field")
     }
 }
 
-expect_error("mixes an owning and a borrowed 'JoinBox' arm into a struct field") {
+expect_error("'?:' arms differ in ownership: 'makeJoinBox()' is an owning value and 'borrowed' is a borrow of an existing value.") {
     void joinIntoBraceInitField(JoinBox borrowed, bool c)
     {
         JoinHolder h = { box = c ? makeJoinBox() : borrowed };
     }
 }
 
-expect_error("mixes an owning and a borrowed 'JoinBox' arm into a return slot") {
+expect_error("'?:' arms differ in ownership: 'makeJoinBox()' is an owning value and 'borrowed' is a borrow of an existing value.") {
     JoinBox joinIntoReturnSlot(JoinBox borrowed, bool c)
     {
         return c ? makeJoinBox() : borrowed;
+    }
+}
+
+// Both arms BORROWS: the arms agree on ownership, so the join itself is legal, but the joined
+// value still owns nothing - storing it into an owning destination is what stays rejected.
+expect_error("joins two borrowed 'JoinBox' arms into an owning variable") {
+    void joinBothBorrowsIntoOwningLocal(JoinBox borrowedA, JoinBox borrowedB, bool c)
+    {
+        JoinBox k;
+        k = c ? borrowedA : borrowedB;
     }
 }
 
@@ -546,13 +556,14 @@ expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'ko'") {
     }
 }
 
-// The MIXED '?:' join is the SECOND declaration site that marks a local a borrow, and which arm ran
-// is not knowable, so the field spelling is rejected there too - the whole-value `move kj` already
-// was. The borrow arm double-freed on master; the owning arm is the price of not knowing.
+// A non-owning '?:' join is the SECOND declaration site that marks a local a borrow, and which arm
+// ran is not knowable, so the field spelling is rejected there too - the whole-value `move kj`
+// already was. (A join whose arms DISAGREE on ownership is rejected at the join itself, so the
+// borrow local can only come from a join whose arms are both borrows.)
 expect_error("cannot 'move' field 'JoinBox.item' out of 'alias' borrow 'kj'") {
-    void aliasJoinFieldMove(AliasWrap* w, bool c)
+    void aliasJoinFieldMove(AliasWrap* w, AliasWrap* w2, bool c)
     {
-        JoinBox kj = c ? makeJoinBox() : w->borrow();
+        JoinBox kj = c ? w->borrow() : w2->borrow();
         aliasItemSink(move kj.item);
     }
 }
@@ -735,22 +746,22 @@ expect_error("cannot reset unique<UniqueThing> 'o' from a borrow of unique field
     }
 }
 
-// A borrow that came from a mixed '?:' JOIN, laundered one statement later. The join's own reject
-// covers only a DIRECT store of the join; once it is bound to a local, this predicate is the only
-// thing standing between the borrow and a second destroyer.
+// A borrow that came from a non-owning '?:' JOIN, laundered one statement later. The join's own
+// reject covers only a DIRECT store of the join; once it is bound to a local, this predicate is the
+// only thing standing between the borrow and a second destroyer.
 expect_error("cannot store an 'alias' value 'k' into an owning variable") {
-    void joinBorrowIntoOwningLocal(JoinBox borrowed, bool c)
+    void joinBorrowIntoOwningLocal(JoinBox borrowed, JoinBox borrowed2, bool c)
     {
-        JoinBox k = c ? makeJoinBox() : borrowed;
+        JoinBox k = c ? borrowed2 : borrowed;
         JoinBox other = makeJoinBox();
         other = k;
     }
 }
 
 expect_error("cannot 'move' the 'alias' value 'k'") {
-    void joinBorrowAsMoveArgument(JoinBox borrowed, bool c)
+    void joinBorrowAsMoveArgument(JoinBox borrowed, JoinBox borrowed2, bool c)
     {
-        JoinBox k = c ? makeJoinBox() : borrowed;
+        JoinBox k = c ? borrowed2 : borrowed;
         aliasBoxSink(move k);
     }
 }

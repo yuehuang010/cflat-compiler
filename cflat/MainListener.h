@@ -4181,6 +4181,18 @@ public:
                                         const char* destKind, antlr4::ParserRuleContext* ctx);
 
     /*
+     * A '?:' whose two arms disagree on OWNERSHIP of an owning-value struct (one arm an owning
+     * value or temporary, the other a borrow of an existing value) has no safe join: adopting it
+     * double-frees the borrow arm's owner, borrowing it leaks the owning arm. Reject at the join
+     * so every destination (declaration, assignment, field, argument) reports the same thing.
+     * Returns true when an error was logged.
+     */
+    bool RejectMixedOwnershipTernaryJoin(
+        llvm::Value* trueValue, llvm::Value* falseValue, llvm::Value* joined,
+        antlr4::ParserRuleContext* trueCtx, antlr4::ParserRuleContext* falseCtx,
+        antlr4::ParserRuleContext* ctx);
+
+    /*
      * Copying a NAMED owning value into a struct field by value aliases its backing buffer, which
      * both the field's destructor and the source's owner then free (double-free). Ownership is a
      * runtime property, so the compiler can neither safely deep-copy nor auto-move; the user must

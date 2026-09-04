@@ -4216,6 +4216,19 @@ LLVMBackend::NamedVariable MainListener::ParsePostfixExpressionInner(CFlatParser
                                     returnType.IsMove = true;
                                     Compiler(ctx)->RegisterOwnedReturnTemp(result, functionName, returnType);
                                 }
+                                // A by-value owning-value struct return owns through a funcptr as through a
+                                // direct call (no `move` on the type), so ledger it; `alias` returns stay out.
+                                else if (result != nullptr
+                                    && !funcPtrTV.FuncPtrReturnAlias
+                                    && !Compiler(ctx)->lastCallReturnType.IsAlias
+                                    && !Compiler(ctx)->lastCallReturnType.Pointer
+                                    && Compiler(ctx)->lastCallReturnType.TypeName != "string"
+                                    && Compiler(ctx)->IsOwningValueType(
+                                        Compiler(ctx)->lastCallReturnType.TypeName))
+                                {
+                                    Compiler(ctx)->RegisterOwnedReturnTemp(
+                                        result, functionName, Compiler(ctx)->lastCallReturnType);
+                                }
                                 // A lambda literal's INFERRED owning sinks ride the funcptr type;
                                 // transfer the caller's source exactly as a direct call does.
                                 Compiler(ctx)->ApplyFuncPtrSinkTransfer(
