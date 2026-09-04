@@ -139,10 +139,29 @@ explicit unsafe opt-outs used by BLAS/FFT bindings.
   `arena_channel.acquire_arena` (`new page_arena<T>` single), `function.__closure_env_alloc`
   (alias); tests `makeAlignedFlat` (move), `ifaceViewFresh` (array<IShape>), `GOuter.make`.
 
+## Landed (2026-09-03): debug poison fill for init_capacity (option 1)
+
+- Gate: the existing `--sanitize=ownership` switch, cflat's "runtime safety checks on" mode.
+  Core code observes it through a new compile-time macro `__SANITIZE_OWNERSHIP__` (1/0),
+  registered next to the platform macros in `LLVMBackend::SetPlatformMacros`
+  (`cflat/LLVMBackend_MoveDataflow.cpp`) and reserved in `IsReservedMacroName`. No new CLI
+  surface; no `__DEBUG__` macro was invented.
+- `array<T>.init_capacity(n)` fills the buffer under `if const (__SANITIZE_OWNERSHIP__)` and
+  `if const (is_primitive(T))`: `0xCD` bytes for integers (MSVC debug-CRT pattern,
+  `0xCDCDCDCD` = -842150451), `0xFF` bytes for `float`/`double` (reads as NaN at both widths).
+  Float-ness is decided by `(T)0.5 != (T)0`, folded at compile time - no `is_float` intrinsic.
+- Cost: the un-gated path emits ZERO extra instructions - unoptimized IR for a probe calling
+  `init_capacity` has 0 `memset` anywhere without the flag, 1 inside `init_capacity` with it.
+- Legs in `Test/test_core.cb` (`testArrayNewDesugar`), gated on the macro, +2 to `total`.
+- Note found while testing: `x != x` on a NaN is FALSE in cflat (float `!=` lowers to an
+  ORDERED compare, C lowers it unordered). Spell a NaN check `!(x == x)`. Also
+  `--symbol-dump-opt` ignores `--sanitize=ownership`, so it cannot be used to inspect the
+  gated IR - use `-l`.
+
 Still open (this issue stays):
 - `T* p = new T[n]` into a raw pointer is unchanged: primitives stay uninitialized. About 800
   such sites (core 174, Test 526, example 119) remain; the migration to `array<T>` is the
   vec follow-up in [[raw-array-count-desugar-direction]].
 - The zero-fill is an unconditional memset, not the `alloc_zeroed` allocator entry sketched
   above; that optimization is worth doing only once the recycled-block allocators are measured.
-- Debug poison fill for `init_capacity` (option 1) not started.
+- (done 2026-09-03, see the Landed section above) Debug poison fill for `init_capacity`.

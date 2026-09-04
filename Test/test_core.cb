@@ -175,6 +175,20 @@ int testArrayNewDesugar()
     for (int i = 0; i < 4; i++) u.set(i, i * 2);
     passed += Test("init_capacity then overwrite", u[3], 6);
 
+    // Debug poison fill: --sanitize=ownership makes an init_capacity read-before-write loud.
+    // Integers get the 0xCD debug-CRT pattern, float/double a 0xFF NaN. Ungated builds are
+    // unspecified here, so the legs only run under the gate.
+    if const (__SANITIZE_OWNERSHIP__)
+    {
+        array<int> poisonI = default;
+        poisonI.init_capacity(4);
+        passed += Test("init_capacity poison fill int", poisonI[0], -842150451);
+        array<double> poisonD = default;
+        poisonD.init_capacity(4);
+        double pv = poisonD[0];
+        passed += Test("init_capacity poison fill double is NaN", (pv == pv) ? 0 : 1, 1);
+    }
+
     // operator[] is an alias borrow of the live slot, so `a[i] = v` writes in place like a
     // raw T[n] subscript; the auto-deduced array<int> gets the same lvalue.
     ap[1] = 5;
@@ -3919,6 +3933,8 @@ extern int main()
 
     r = testArray();            passed += r; total += 22;
     r = testArrayNewDesugar();  passed += r; total += 14;
+    // Two extra legs only exist under --sanitize=ownership (init_capacity poison fill).
+    if const (__SANITIZE_OWNERSHIP__) total += 2;
     r = testMemberDtor();       passed += r; total += 8;
     r = testList();             passed += r; total += 15;
     r = testListCopy();         passed += r; total += 19;

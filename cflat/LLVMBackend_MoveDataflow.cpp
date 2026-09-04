@@ -951,6 +951,10 @@ void LLVMBackend::SetPlatformMacros()
         // Target architecture: every prior target was x86; arm64 is macOS-only for now.
         SetCompileTimeMacro("__X86__",      llvm::ConstantInt::get(i32, targetArm64_ ? 0 : 1),     "int");
         SetCompileTimeMacro("__ARM64__",    llvm::ConstantInt::get(i32, targetArm64_ ? 1 : 0),     "int");
+        // --sanitize=ownership doubles as cflat's "runtime safety checks on" mode, so core
+        // libraries can gate debug-only instrumentation (array.init_capacity poison fill) on it.
+        SetCompileTimeMacro("__SANITIZE_OWNERSHIP__",
+            llvm::ConstantInt::get(i32, sanitizeOwnership_ ? 1 : 0), "int");
 
         // Command-line -D defines land last, in command-line order, so a later -D of the
         // same name wins. Reserved names were rejected in SetUserDefines, so nothing above
@@ -981,7 +985,7 @@ bool LLVMBackend::IsReservedMacroName(const std::string& name)
         static const std::unordered_set<std::string> reserved = {
             "__PLATFORM__", "__WIN64__", "__WIN32__", "__WINDOWS__",
             "__POSIX__", "__LINUX__", "__MACOS__", "__DARWIN__",
-            "__X86__", "__ARM64__",
+            "__X86__", "__ARM64__", "__SANITIZE_OWNERSHIP__",
             "__FILE__", "__LINE__", "__FUNCTION__",
         };
         return reserved.count(name) != 0;

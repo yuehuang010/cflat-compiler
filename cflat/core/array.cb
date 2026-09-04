@@ -30,10 +30,30 @@ struct array<T>
 
     // init() without the primitive zero-fill, for a buffer the caller overwrites in full
     // before reading (HPC hot paths). Element values are unspecified until written.
+    // Under --sanitize=ownership the buffer is poison-filled so a read-before-write is loud
+    // and deterministic instead of carrying a recycled block's bytes. Release pays nothing.
     void init_capacity(int size)
     {
         _ptr = new T[size];
         _len = size;
+        if const (__SANITIZE_OWNERSHIP__)
+        {
+            // bool is skipped: a byte outside {0,1} makes both `b` and `!b` truthy, so a poisoned
+            // bool misbehaves silently instead of loudly. (T)3 == (T)1 holds only for bool.
+            if const (is_primitive(T) && !((T)3 == (T)1))
+            {
+                if (size > 0)
+                {
+                    // 0xFF reads as NaN for float/double; 0xCD is the MSVC debug-CRT pattern
+                    // for integers (0xCDCDCDCD = -842150451, obvious in a dump).
+                    // (T)0.5 is 0 for every integer T and 0.5 for float/double - the
+                    // float test, folded at -O0 already, with no is_float intrinsic needed.
+                    int fill = 205;
+                    if ((T)0.5 != (T)0) fill = 255;
+                    memset((void*)_ptr, fill, (i64)size * (i64)sizeof(T));
+                }
+            }
+        }
     }
 
     // Store the value into a slot whose prior element has already been released.

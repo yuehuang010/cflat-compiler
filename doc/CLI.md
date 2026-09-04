@@ -186,8 +186,10 @@ Order matters: a later `-D` of the same name overwrites an earlier one, so
 `-DLEVEL=6 -DLEVEL=7` leaves `LEVEL` at `7`.
 
 The builtin macros (`__PLATFORM__`, `__WINDOWS__`, `__POSIX__`, `__LINUX__`, `__MACOS__`,
-`__DARWIN__`, `__WIN32__`, `__WIN64__`, `__X86__`, `__ARM64__`, `__FILE__`, `__LINE__`,
-`__FUNCTION__`) are reserved - redefining one is an error.
+`__DARWIN__`, `__WIN32__`, `__WIN64__`, `__X86__`, `__ARM64__`, `__SANITIZE_OWNERSHIP__`,
+`__FILE__`, `__LINE__`, `__FUNCTION__`) are reserved - redefining one is an error.
+`__SANITIZE_OWNERSHIP__` is 1 when `--sanitize=ownership` is on and 0 otherwise; core
+libraries use it to gate debug-only runtime checks (see `array<T>.init_capacity`).
 
 A define is an ordinary compile-time macro, so it folds in `if const` and reads as a value
 anywhere a constant is legal - including a `simd<T,N>` lane count and a generic value argument

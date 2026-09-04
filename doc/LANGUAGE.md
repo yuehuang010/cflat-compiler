@@ -2779,7 +2779,9 @@ for (int v in arr)
 
 `array<T>.init(n)` gives every element the value `default`: struct elements are constructed,
 pointer and interface slots are null, and primitive slots are zero-filled. `init_capacity(n)`
-skips the primitive zero-fill for a buffer that is overwritten in full before it is read.
+skips the primitive zero-fill for a buffer that is overwritten in full before it is read; under
+`--sanitize=ownership` that buffer is poison-filled instead (`0xCD` bytes for integers, a `0xFF`
+NaN for `float`/`double`) so a read-before-write is loud and deterministic.
 
 `new T[n]` whose destination is an `array<T>` desugars to `init(n)` - a declaration, a direct
 assignment, or a `return` from a function declared to return `array<T>`:
