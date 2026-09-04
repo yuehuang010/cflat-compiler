@@ -3134,5 +3134,35 @@ that inspects `llvm::LoadInst` users or `ctx->getText()` to recover a fact the f
 review defect on sight - carry the fact on the NamedVariable / TypeAndValue from where it is
 produced (and add it to the cache round-trip only if it lives on TypeAndValue).
 
+Recurred the same day in the switch-label fix (q03 standalone): round 3 classified a bit-pattern
+literal (`0xFFFFFFFF` folds to i32 -1) by `constExpr->getText()` and missed `case (0xFFFFFFFF):`.
+The landed form records the fact in ParseNumberConstant (flag + bits + fold width on the listener)
+and the label site compares its constant bit-for-bit against it. Two occurrences: the rule above is
+now general, not a one-off - the text form of an expression is never the provenance of its value.
+
 Same round also showed the store-side must be enforced before a slot's declared type can be
 treated as proof: enforcing the drain side alone produced a false reject that master did not have.
+
+## Record 2026-09-03: round-2 buckets q02 and q03 retired
+
+Both landed every member the same day and their index files were deleted; this is the durable
+part of what they recorded.
+
+- q02 (generics / name resolution): shared root cause of members 1-3 was the scanner queueing a
+  generic instantiation at scan time with the type spelling as written, before body-level aliases,
+  `unique T*` rewrites, or an instantiation origin existed. Landed as per-body alias frames in
+  BOTH pre-scans with the shared `FoldCompileTimeInt` deciding statement-level `if const`
+  (4bfa4aa, 5 review rounds - the taken-arm binding was the hard part), origin-carrying
+  `pendingInstantiations` (812d9bf), and the `ScopedLookupOptions` helper family (94ec41c).
+  Measured and rejected, do not retry: a token pre-scan of template bodies for `T*`-with-view
+  (false rejects on `T * n` products and dead `if const` arms); scoped-first resolution of
+  function-pointer signature components at comparison time (false-rejects the
+  "namespace-ambiguous pointee binds" leg and `ns_type_funcptr_pointee_visible`).
+- q03 (standalone): narrow promotion (c56efdf), struct ternary ownership join as an error
+  (8201425), switch labels with the bit-pattern flag recorded in ParseNumberConstant (9dc0e4a, 4
+  rounds, see the provenance lesson above), enum members as case labels via
+  `constFoldableGlobals_` (5b4947e), `init_capacity` poison fill gated on
+  `__SANITIZE_OWNERSHIP__` with bool excluded (1fa4911). The un-gated IR must stay byte-identical
+  to master for a sanitizer-only fill; that was the acceptance check.
+- Spin-offs were re-bucketed as q04-q07 (see queue/README.md); the pre-existing
+  `--sanitize=ownership --run` teardown flake surfaced there, not from any q03 change.

@@ -1,6 +1,6 @@
 ---
 name: fix-issue
-description: Fix a known issue holistically in an isolated git worktree with a delegated agent - the issue is a pointer to a problem area, so the agent enumerates coverage axes and builds a pre-fix behaviour matrix before fixing - then review with an opus code-review agent that may apply small fixes itself, loop until clean, and merge back to master as a single-parent commit. Use when the user says "fix issue X", names a file in internal/issue/, or asks to work an issue end-to-end in a worktree.
+description: Fix a known issue (or a BATCH of small unrelated ones) in an isolated git worktree with a delegated agent - a semantic issue is a pointer to a problem area, so the agent enumerates coverage axes and builds a pre-fix behaviour matrix before fixing; a batch of one-site fixes skips the matrix and ships in one round - then review with a code-review agent that may apply small fixes itself, loop until clean, and merge back to master as a single-parent commit. Use when the user says "fix issue X", "fix batch qNN", names a file in internal/issue/, or asks to work an issue end-to-end in a worktree.
 ---
 
 # Fix Issue
@@ -21,6 +21,56 @@ already holistic and review verifies rather than discovers.
 > The workflow is built on commits (branch commits, rebase, `--ff-only`) and
 > cannot work without them. Commit on the `fix/<slug>` branch freely; never
 > commit directly to `master` - `master` only ever advances by fast-forward.
+
+## Two modes - pick before Step 0
+
+The full procedure below (coverage matrix, accept-set, up to 3 alternating review rounds)
+exists because ownership, name-resolution and guard changes have shipped regressions without
+it. It costs 30-60 minutes of wall clock per issue regardless of the diff's size. Applied to a
+one-site fix it is pure overhead, and on 2026-09-03 it produced a day where 14 issues landed
+and 29 were filed - the review probes found siblings faster than the ceremony could close them.
+
+**Full mode** (default): ONE issue whose fix changes a rule - adds or widens a rejection,
+touches ownership / lifetime / alignment / move codegen, overload resolution, mangling,
+name resolution, generic instantiation, or anything every program flows through. Everything
+below applies unchanged.
+
+**Batch mode**: SEVERAL small issues in one worktree, one commit, one review round. An issue
+qualifies when ALL hold:
+
+- the fix is one site (or one site plus its documented twin), and the issue file already
+  names the site and the intended lowering / text;
+- it adds no rejection and changes no guard predicate's firing condition (a bug->error
+  conversion of an LLVM assert or verifier dump is fine; a new accept/reject rule is not);
+- it needs no ruling and touches no ownership / lifetime semantics;
+- members are disjoint (different functions or different files).
+
+Cap a batch at 4 members. Branch `fix/batch-<name>`, worktree `../cflat-fix-batch-<name>`.
+Batch-mode deltas to the steps below:
+
+- Step 2, Phase A shrinks to: verify each filed repro on the current binary, record the
+  pre/post pair per member, and for a lowering change read the `--symbol-dump-ir` of the leg.
+  No axis enumeration, no `scratch/<prefix>_matrix.md`, no accept-set. If verifying a repro
+  reveals the fix is NOT one-site (a second root cause, a rule question), the agent drops that
+  member from the batch and says so - it does not grow the batch into a full-mode fix.
+- Step 2, Phase B unchanged except every member gets at least one value leg AND, for a
+  lowering change, one IR-reading leg or a recorded `--symbol-dump-ir` line in the report: the
+  poison-fill review showed a runtime leg alone let a wrong `fcmp` predicate through.
+- Step 3: ONE review round, scoped to the changed sites and their documented twins - the
+  reviewer verifies each pre/post pair and each leg's discriminator and does NOT build a
+  neighbour-axis probe matrix. A finding that shows a member is not one-site removes that
+  member from the batch (revert its hunk, keep its issue file); it does not extend the round
+  budget. A second round only if the reviewer applied a non-trivial fix.
+- The single commit deletes every landed member's issue file; the queue bucket row goes to
+  LANDED with one hash for all of them.
+
+**Fix-in-place rule (both modes).** A defect the fix agent or reviewer finds during the work
+that would itself qualify for batch mode - a wrong predicate, a wrong message, a missed flag
+plumb, a doubled suffix in a diagnostic - is fixed in the SAME worktree and commit with one
+leg, and is never filed. Filing a one-site fix costs more than fixing it. File a finding only
+when it needs a ruling, needs its own accept-set, or has a different root cause AND more than
+one site. When filing, put the qualifying bucket in the file's first line so the queue absorbs
+it without re-triage.
 
 Args: `<issue>` (a path under `internal/issue/`, an issue slug, or a free-text
 description) and optionally a tier `sonnet` | `opus` for the fix agent.
@@ -229,7 +279,15 @@ into the main session.
 
 ## Step 3 - Review loop (max 3 rounds, alternating reviewer)
 
-After the fix agent reports success, review the diff for up to 3 rounds.
+After the fix agent reports success, review the diff for up to 3 rounds (batch mode: one
+round, scoped as described under "Two modes").
+
+**Scope the reviewer to the change's blast radius.** The neighbour-axis probe matrix is the
+right tool for a rule change and the wrong tool for a lowering or text fix: on a small fix it
+spends the round finding pre-existing siblings that then get filed, and the tracker grows
+while the fix waits. Tell the reviewer what kind of change it is reviewing and, for a small one,
+that findings outside the changed rule are to be fixed in place if one-site or reported in one
+line for the queue, not probed further.
 **Alternate the reviewer each round, starting with codex**: round 1 = codex
 CLI, round 2 = claude (opus agent), round 3 = codex CLI again.
 

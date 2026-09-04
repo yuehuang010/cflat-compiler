@@ -1,6 +1,6 @@
 # q01 - Ownership codegen: counted move pointers, slot moves, unique remnant
 
-Five items in the move / unique codegen paths. Two share a root cause (a consumer drops the
+Originally five items in the move / unique codegen paths; members 10-12 added 2026-09-03 from review spin-offs. Two share a root cause (a consumer drops the
 hidden `.raw_array_count` a `move T*` carries); the rest are the same area and the same files
 (`LLVMBackend_OwnershipTemps.cpp`, `LLVMBackend_Overloads.cpp`, `MainListener_Expressions.cpp`,
 `MainListener_Declarations.cpp`).
@@ -17,7 +17,10 @@ hidden `.raw_array_count` a `move T*` carries); the rest are the same area and t
 | 6 | `p2/move-param-reassign-drops-alloc-alignment` | LANDED 2026-09-03 `4223c66` as a REJECTION, not a record: recording alignment on the binding was unsound under conditional reassignment (3 review rounds) | `SetVariableAllocAlignment` walks only `namedVariable`; a reassigned `move T*` param loses its `alignas(0,N)` fact and is freed unaligned. Seven-line mirror of `e2c4a1e`'s `functionArgument` lookup plus legs in `Test/test_core.cb`. |
 | 7 | `p2/tracked-aligned-local-keeps-alignment-after-plain-move-in` | LANDED 2026-09-03 `e04729c` (opus round-1 review CLEAN) | decl-init-inferred aligned local receives an ordinary block via `move`; `std::max` merge keeps 64, free is aligned on both paths. Remaining direction of the alignment rule; extend `RejectLocalAllocAlignMismatch`. |
 | 8 | `p2/alloc-alignment-provenance-remaining-holes` | LANDED 458c6a9 | NamedVariable::AllocAlignKnown provenance set at the move site (field/element/tracked-new/owning-view/parameter sources); store-side door for unclaused fields, elements and deref slots; core unique<T,ALIGN> raw slot exempt as the authority. Spun off: `p3/alloc-alignment-unclaused-global-pointer-store-unchecked` (also records the `&alignedLocal` launder). |
-| 9 | `p3/consolidate-named-variable-borrow-provenance` | REFACTOR, last | fold the parallel `Borrows*` / `Bond*` / provenance field groups on `NamedVariable` into one value object; migrate owned-string + owned-element first, behaviour unchanged. |
+| 9 | `p3/consolidate-named-variable-borrow-provenance` | REFACTOR, after 10-12 | fold the parallel `Borrows*` / `Bond*` / provenance field groups on `NamedVariable` into one value object; migrate owned-string + owned-element first, behaviour unchanged. |
+| 10 | `p3/alloc-alignment-unclaused-global-pointer-store-unchecked` | READY (spin-off of member 8) | add the GLOBAL destination to the `RejectFieldAllocAlignMismatch` door in ParseAssignmentExpression; optional address-of door closes the `E** pp = &aligned` launder in the same rule. Legs in err_align_alloc_mismatch.cb + an accept leg for a declared `alignas(0,64) E*` global. |
+| 11 | `p3/explicit-unique-align-spelling-rejects-plain-new` | READY (spin-off of member 4) | seed `pendingInitAllocAlign` from the `unique<T, N>` template argument as the sugar path does (declaration + assignment doors); reword the mismatch message to name the declared type. |
+| 12 | `p3/mixed-owning-borrow-pointer-ternary-join-leaks-new-arm` | READY (ruling 2026-09-03 covers it) | extend `RejectMixedOwnershipTernaryJoin` to pointer joins where one arm is `new` / `move` / owning result and the other a borrow. Measure blast radius (`? new ` / `: new ` in Test/ and example/) and check LANGUAGE.md's pointer-join text first. |
 
 ## Shared root cause (members 1, 2, 5, 6)
 
@@ -29,7 +32,10 @@ own ruling).
 
 ## Sequencing
 
-1 then 2 (2 reuses the count argument 1's fix touches). 3 is independent and can run in parallel
+Members 10, 11, 12 ship as ONE worktree (`fix/align-doors`) in FULL mode: they are disjoint
+(assignment door / init alignment seed / ternary join) but each adds or widens a rejection, so
+each needs its accept-set; one fix agent builds all three matrices, one review loop covers the
+combined diff. 9 after they land. Original order for the record: 1 then 2 (2 reuses the count argument 1's fix touches). 3 is independent and can run in parallel
 (disjoint: `CreateOverloadedFunctionCall` argument-side move vs `ParseDeleteExpression`). 4 after
 1-3 land. 5 after 4, since 4 deletes some of the fields 5 would migrate.
 
@@ -45,5 +51,5 @@ own ruling).
 
 - `p2/delete-borrow-via-named-local` (deferred): the container-element flavour of provenance
   through a parameter; NOT a member, needs interprocedural work.
-- `p3/mixed-owning-borrow-struct-ternary-join` (deferred, needs ruling).
+- `p3/mixed-owning-borrow-pointer-ternary-join-leaks-new-arm` is member 12 (the struct join landed 8201425).
 - `internal/plan/unique-ownership.md` status record.
