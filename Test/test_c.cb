@@ -357,6 +357,110 @@ int switchNoDefault(int x)
     return result;
 }
 
+// A negative case label folds to the smallest fitting signed type, so it must be
+// sign-extended (not zero-extended) into the switch operand's width.
+int switchNegInt(int x)
+{
+    switch (x)
+    {
+        case -129: return 1;
+        default: return 0;
+    }
+}
+
+int switchNegI16(i16 x)
+{
+    switch (x)
+    {
+        case -1: return 1;
+        default: return 0;
+    }
+}
+
+int switchNegI8(i8 x)
+{
+    switch (x)
+    {
+        case -1: return 1;
+        default: return 0;
+    }
+}
+
+int switchNegI64(i64 x)
+{
+    switch (x)
+    {
+        case -1: return 1;
+        case -2147483648: return 2;
+        default: return 0;
+    }
+}
+
+// `-x` on a u8 promotes to int, so the i8-folded -128 label needs sign extension too.
+int switchNegPromoted(u8 x)
+{
+    switch (-x)
+    {
+        case -128: return 1;
+        default: return 0;
+    }
+}
+
+int switchNegExpr(int x)
+{
+    switch (x)
+    {
+        case -(1 << 7): return 1;
+        default: return 0;
+    }
+}
+
+// Unsuffixed hex in [2^31, 2^32) folds to i32 with the bit pattern kept (0xFFFFFFFF -> -1); on an
+// unsigned operand of the same width that pattern is the label, so these must match.
+int switchHexU32(u32 x)
+{
+    switch (x)
+    {
+        case 0xFFFFFFFF: return 1;
+        case 0x80000000: return 2;
+        default: return 0;
+    }
+}
+
+int switchHexU64(u64 x)
+{
+    switch (x)
+    {
+        case 0xDEADBEEFCAFEBABE: return 1;
+        case 18446744073709551615: return 2;
+        case 0xFFFFFFFF: return 3;
+        default: return 0;
+    }
+}
+
+// A 32-bit hex pattern on a wider operand is its positive value (C: 0xFFFFFFFF is 4294967295);
+// on a same-width signed operand it is the reinterpreted pattern (i32 -1).
+int switchHexWide(i64 x)
+{
+    switch (x)
+    {
+        case (0xFFFFFFFF): return 1;
+        case 0x80000000: return 2;
+        case -2147483648: return 3;
+        case 0xFFFFFFFFFFFFFFFFL: return 4;
+        default: return 0;
+    }
+}
+
+int switchHexI32(int x)
+{
+    switch (x)
+    {
+        case 0xFFFFFFFF: return 1;
+        default: return 0;
+    }
+}
+
 int switchFallthrough(int x)
 {
     int result = 0;
@@ -662,6 +766,25 @@ extern int main(int argc, char** argv)
     result &= Test("switch_break_def", switchBreak(7), 99);
     result &= Test("switch_nodef_hit", switchNoDefault(5), 5);
     result &= Test("switch_nodef_miss",switchNoDefault(9), 0);
+    result &= Test("switch_neg_int",      switchNegInt(-129), 1);
+    result &= Test("switch_neg_int_miss", switchNegInt(65407), 0);
+    result &= Test("switch_neg_i16",      switchNegI16(-1), 1);
+    result &= Test("switch_neg_i8",       switchNegI8(-1), 1);
+    result &= Test("switch_neg_i64",      switchNegI64(-1), 1);
+    result &= Test("switch_neg_i64_min",  switchNegI64(-2147483648), 2);
+    result &= Test("switch_neg_promoted", switchNegPromoted((u8)128), 1);
+    result &= Test("switch_neg_expr",     switchNegExpr(-128), 1);
+    result &= Test("switch_hex_u32_max",  switchHexU32(4294967295u), 1);
+    result &= Test("switch_hex_u32_high", switchHexU32(0x80000000u), 2);
+    result &= Test("switch_hex_u32_miss", switchHexU32(1), 0);
+    result &= Test("switch_hex_u64",      switchHexU64(0xDEADBEEFCAFEBABEu), 1);
+    result &= Test("switch_dec_u64_max",  switchHexU64(18446744073709551615u), 2);
+    result &= Test("switch_hex_u64_narrow", switchHexU64(0xFFFFFFFFu), 3);
+    result &= Test("switch_hex_i64_max32",  switchHexWide(4294967295), 1);
+    result &= Test("switch_hex_i64_bit31",  switchHexWide(2147483648), 2);
+    result &= Test("switch_hex_i64_intmin", switchHexWide(-2147483648), 3);
+    result &= Test("switch_hex_i32_pattern", switchHexI32(-1), 1);
+    result &= Test("switch_hex_i64_allbits", switchHexWide(-1), 4);
     result &= Test("switch_fall1",     switchFallthrough(1), 12);
     result &= Test("switch_fall2",     switchFallthrough(2), 12);
     result &= Test("switch_fall3",     switchFallthrough(3),  3);

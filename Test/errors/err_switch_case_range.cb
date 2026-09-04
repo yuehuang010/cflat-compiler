@@ -1,0 +1,27 @@
+// A case label is converted into the switch operand's integer type. A label outside that
+// type's range, or two labels that convert to the same constant, must be diagnosed here -
+// silently truncating it (or handing an invalid SwitchInst to the verifier) is not acceptable.
+extern int main()
+{
+    expect_error("case label '300' does not fit the switch operand type 'i8'") {
+        i8 v = 1;
+        switch (v) { case 300: return 3; default: return 0; }
+    }
+
+    expect_error("case label '-1' does not fit the switch operand type 'u32'") {
+        u32 u = 1;
+        switch (u) { case -1: return 1; default: return 0; }
+    }
+
+    expect_error("case label '-1' does not fit the switch operand type 'u8'") {
+        u8 b = 1;
+        switch (b) { case -1: return 1; default: return 0; }
+    }
+
+    expect_error("duplicate case label '1' in switch") {
+        int w = 1;
+        switch (w) { case 1: return 1; case 0x1: return 2; default: return 0; }
+    }
+
+    return 0;
+}

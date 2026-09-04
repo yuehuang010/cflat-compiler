@@ -6324,7 +6324,10 @@ public:
 
     llvm::SwitchInst* CreateSwitchInst(llvm::Value* cond, llvm::BasicBlock* defaultBlock, unsigned numCases);
 
-    llvm::ConstantInt* CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType);
+    static std::string SpellIntegerType(llvm::Type* t, bool isUnsigned);
+    llvm::APInt WidenCaseValue(llvm::ConstantInt* val, bool labelIsUnsigned);
+    bool CaseValueFits(const llvm::APInt& wide, bool labelIsUnsigned, llvm::Type* switchType, bool switchIsUnsigned);
+    llvm::ConstantInt* CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType, bool labelIsUnsigned);
 
     llvm::Function* GetOrDeclareStrcmp();
 

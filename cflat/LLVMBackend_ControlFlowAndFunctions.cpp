@@ -642,10 +642,38 @@ llvm::SwitchInst* LLVMBackend::CreateSwitchInst(llvm::Value* cond, llvm::BasicBl
         return builder->CreateSwitch(cond, defaultBlock, numCases);
     }
 
-llvm::ConstantInt* LLVMBackend::CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType)
+std::string LLVMBackend::SpellIntegerType(llvm::Type* t, bool isUnsigned)
 {
-        // getZExtValue avoids the isRepresentableByInt64 assert for constants > INT64_MAX.
-        return llvm::ConstantInt::get(llvm::cast<llvm::IntegerType>(switchType), val->getZExtValue(), false);
+        unsigned bits = t->isIntegerTy() ? llvm::cast<llvm::IntegerType>(t)->getBitWidth() : 0;
+        if (bits == 1) return "bool";
+        return std::format("{}{}", isUnsigned ? "u" : "i", bits);
+    }
+
+llvm::APInt LLVMBackend::WidenCaseValue(llvm::ConstantInt* val, bool labelIsUnsigned)
+{
+        // Common 65-bit signed domain: wide enough to hold every i64 and every u64 exactly.
+        const llvm::APInt& raw = val->getValue();
+        return labelIsUnsigned ? raw.zext(65) : raw.sext(65);
+    }
+
+bool LLVMBackend::CaseValueFits(const llvm::APInt& wide, bool labelIsUnsigned, llvm::Type* switchType, bool switchIsUnsigned)
+{
+        unsigned destBits = llvm::cast<llvm::IntegerType>(switchType)->getBitWidth();
+        // An unsigned label is a bit pattern: it fits when its bits fit the operand width, on a
+        // signed operand too (C: 0xFFFFFFFF converts to int -1). A negative label needs a signed operand.
+        if (labelIsUnsigned || switchIsUnsigned)
+            return !wide.isNegative() && wide.getActiveBits() <= destBits;
+        return wide.sge(llvm::APInt::getSignedMinValue(destBits).sext(65))
+            && wide.sle(llvm::APInt::getSignedMaxValue(destBits).sext(65));
+    }
+
+llvm::ConstantInt* LLVMBackend::CoerceCaseValue(llvm::ConstantInt* val, llvm::Type* switchType, bool labelIsUnsigned)
+{
+        // Convert through the widened value so a narrow signed label (-129 folds to i16) is
+        // sign-extended, not zero-extended, into the switch operand's width.
+        auto* destTy = llvm::cast<llvm::IntegerType>(switchType);
+        llvm::APInt wide = WidenCaseValue(val, labelIsUnsigned);
+        return llvm::cast<llvm::ConstantInt>(llvm::ConstantInt::get(destTy, wide.trunc(destTy->getBitWidth())));
     }
 
 llvm::Function* LLVMBackend::GetOrDeclareStrcmp()

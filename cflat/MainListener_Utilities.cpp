@@ -150,6 +150,7 @@ std::vector<LLVMBackend::DeclTypeAndValue> MainListener::ParseParameterTypeList(
 
 LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNumber) {
         // Support suffixes: u/U, l/L, ll/LL, f/F, d/D and floating point forms with '.' or exponent.
+        lastNumberLiteralIsBitPattern = false;
         if (rawNumber.empty())
             return 0;
 
@@ -258,10 +259,10 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             }
             if (hasU)
                 return static_cast<uint64_t>(uval);
-            else
-            {
-                return static_cast<int64_t>(uval);
-            }
+            lastNumberLiteralIsBitPattern = !negative;
+            lastNumberLiteralBits = uval;
+            lastNumberLiteralWidth = 64;
+            return static_cast<int64_t>(uval);
         }
 
         // No explicit long suffix: pick smallest reasonable signed type unless 'u' forces unsigned semantics
@@ -293,6 +294,9 @@ LLVMBackend::ConstantVariant MainListener::ParseNumberConstant(std::string rawNu
             return static_cast<int>(uval);
         // C++ rule: a hex literal past i32 range but inside u32 is unsigned; with no 'u' suffix
         // it stays i32 here, preserving the bit pattern (0xBA63E001 -> i32(-1168474111)).
+        lastNumberLiteralIsBitPattern = !negative;
+        lastNumberLiteralBits = uval;
+        lastNumberLiteralWidth = (isHex && uval <= 0xFFFFFFFFull) ? 32 : 64;
         if (isHex && uval <= 0xFFFFFFFFull)
             return static_cast<int>(static_cast<uint32_t>(uval));
         return static_cast<int64_t>(uval);

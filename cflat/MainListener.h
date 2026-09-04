@@ -2923,6 +2923,7 @@ private:
         std::string typeCaseName;                 // struct or interface name for type cases
         std::string boundVarName;                 // optional bound variable for arm-style type pointer cases
         bool isArmStyle = false;                  // true if this case uses => syntax
+        bool valueIsUnsigned = false;             // integer label came from an unsigned-typed constant
     };
 
     struct SwitchContext
@@ -5966,6 +5967,11 @@ public:
     std::vector<LLVMBackend::DeclTypeAndValue> ParseParameterTypeList(CFlatParser::ParameterTypeListContext* paramTypeList);
 
     LLVMBackend::ConstantVariant ParseNumberConstant(std::string rawNumber);
+    // Set by ParseNumberConstant: the last unsuffixed literal folded to a signed value with its bit
+    // pattern kept (hex in [2^31, 2^32), anything past INT64_MAX), and that pattern's bits.
+    bool lastNumberLiteralIsBitPattern = false;
+    uint64_t lastNumberLiteralBits = 0;
+    unsigned lastNumberLiteralWidth = 0;
 
     LLVMBackend::TypeAndValue ParseLiteralTypeAndValue(const std::string& rawNumber);
 

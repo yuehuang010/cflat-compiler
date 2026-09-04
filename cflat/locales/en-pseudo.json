@@ -335,6 +335,10 @@
       "double",
       "array<int>"
     ],
+    "caselabelarg0doesnot...witchoperandtypearg173c0ac994b6f333f": [
+      "300",
+      "i8"
+    ],
     "classarg0doesnotimpl...arg2expectedtypearg3ebaf272f95f0b03d": [
       "Untitled",
       "ITitled",
@@ -482,6 +486,9 @@
     ],
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": [
       "string"
+    ],
+    "duplicatecaselabelarg0inswitch": [
+      "1"
     ],
     "duplicatenamedargumentarg0": [
       "a"
@@ -1519,6 +1526,7 @@
     "cannotreturnthisvalu...ecabireturnaggregateaeb4fb26a401f892": "cannot return this value from extern function: it does not match the C ABI return aggregate",
     "cannotstoreathatjoin...ndependentownedvalue71d560cf28a01507": "cannot store a '?:' that joins two borrowed '{0}' arms into {1}; the destination's destructor would free a value its existing owner still frees. Assign each arm in its own branch, 'move' each arm into a fresh owned value, declare the function 'alias' to hand the borrow through, or write a 'copy()' method for '{2}' and copy the arm into an independent owned value.",
     "cannotstorenewarg0ni...heelementtypesdiffer50877848c28b7c8c": "cannot store 'new {0}[n]' into '{1}': the element types differ",
+    "caselabelarg0doesnot...witchoperandtypearg173c0ac994b6f333f": "case label '{0}' does not fit the switch operand type '{1}'",
     "cheaderimporttargeti...nshowsdkpathresolves750eacee18ce6665": "C header import targeting macOS requires an SDK: set $SDKROOT or install Xcode / Command Line Tools so 'xcrun --show-sdk-path' resolves",
     "checkparameterlistmissingtypeorclosing": "check parameter list - missing type or closing ')'?",
     "checkthefunctionsign...ntypeorparametertypee122f770d128f73e": "check the function signature - missing return type or parameter type?",
@@ -1543,6 +1551,7 @@
     "conditionmustbeascal...0compareitexplicitly2f08e69bff57b7fb": "condition must be a scalar (bool, integer, pointer or floating point), not '{0}' - compare it explicitly",
     "conflictingdeclarati...penfreadfwritefclose8541377e62fbb8dd": "conflicting declaration of extern '{0}': a function with this linkage name already exists with a different signature (e.g. in a core library such as os.windows). Rename your extern, or call the existing one (for file I/O use os.windows.fopen/fread/fwrite/fclose).",
     "crashhandlersourcenotfoundarg0": "crash handler source not found: '{0}'.",
+    "duplicatecaselabelarg0inswitch": "duplicate case label '{0}' in switch",
     "duplicatenamedargumentarg0": "duplicate named argument '{0}'",
     "emitwinmdnowinrtinte...orclassesfoundtoemit3093b6c411af1dd1": "--emit-winmd: no [winrt] interfaces or classes found to emit",
     "emitwinrtslotcallbadslotarg0onarg1": "EmitWinrtSlotCall: bad slot '{0}' on '{1}'",

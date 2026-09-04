@@ -305,7 +305,8 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                 if (ctx.isTypeSwitch)
                     LogErrorContext(labeled, "cannot mix constant cases with type cases in a switch");
 
-                llvm::Value* rawVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                auto typedVal = ParseConditionalExpression(constExpr->conditionalExpression());
+                llvm::Value* rawVal = typedVal.value;
                 auto* val = llvm::dyn_cast<llvm::ConstantInt>(rawVal);
                 llvm::Constant* strLit = nullptr;
                 if (!val)
@@ -316,7 +317,13 @@ void MainListener::CollectCasesFromStatement(CFlatParser::StatementContext* stmt
                     else
                         LogErrorContext(labeled, "case value must be a constant integer or string literal");
                 }
-                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "", "", hasArrow };
+                // An unsuffixed hex literal in [2^31, 2^32) (or a decimal past INT64_MAX) folds to a
+                // signed value keeping its bit pattern; a label that IS that literal is the unsigned pattern.
+                bool labelIsUnsigned = typedVal.isUnsigned
+                    || (val && val->isNegative() && lastNumberLiteralIsBitPattern
+                        && val->getBitWidth() == lastNumberLiteralWidth
+                        && val->getValue().getZExtValue() == lastNumberLiteralBits);
+                ctx.caseMap[labeled] = { val, strLit, compiler->CreateBasicBlock("switchCase"), false, "", "", hasArrow, labelIsUnsigned };
                 if (!hasArrow) CollectCasesFromStatement(labeled->statement(), ctx);
             }
         }
@@ -2683,7 +2690,22 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 // (A `return` inside a case leaks on that path - the same documented across-branch
                 // temp limitation that applies elsewhere.)
                 size_t pendingBefore = compiler->pendingOwnedStringTemps.size();
-                auto condVal = ParseExpression(expression);
+                // Same evaluation ParseExpression performs, but keeping the operand's signedness:
+                // case labels are converted into the operand's type and that needs its signedness.
+                llvm::Value* condVal = nullptr;
+                bool condIsUnsigned = false;
+                auto* condAssignCtx = expression->assignmentExpression();
+                if (condAssignCtx != nullptr && condAssignCtx->conditionalExpression() != nullptr)
+                {
+                    auto condTyped = ParseConditionalExpression(condAssignCtx->conditionalExpression());
+                    condVal = condTyped.value;
+                    condIsUnsigned = condTyped.isUnsigned;
+                    ProcessPlusPlus();
+                }
+                else
+                {
+                    condVal = ParseExpression(expression);
+                }
                 switchCtx.condValue = condVal;
 
                 std::vector<llvm::Value*> scrutineeTemps;
@@ -2837,11 +2859,31 @@ void MainListener::ParseStatement(CFlatParser::StatementContext* statement) {
                 else
                 {
                     auto switchInst = compiler->CreateSwitchInst(condVal, switchDefault, (unsigned)switchCtx.caseMap.size());
+                    std::map<std::string, CFlatParser::LabeledStatementContext*> seenCaseValues;
                     for (auto* labeledCtx : orderedCaseLabels)
                     {
                         auto& entry = switchCtx.caseMap.at(labeledCtx);
-                        if (entry.value)  // null value = wildcard (_) arm, handled via defaultBlock
-                            switchInst->addCase(compiler->CoerceCaseValue(entry.value, condVal->getType()), entry.block);
+                        if (!entry.value)  // null value = wildcard (_) arm, handled via defaultBlock
+                            continue;
+                        if (condVal->getType()->isIntegerTy())
+                        {
+                            auto wide = compiler->WidenCaseValue(entry.value, entry.valueIsUnsigned);
+                            if (!compiler->CaseValueFits(wide, entry.valueIsUnsigned, condVal->getType(), condIsUnsigned))
+                                LogErrorContext(labeledCtx, compiler->LocalizeMessage(
+                                    "case label '{}' does not fit the switch operand type '{}'",
+                                    { llvm::toString(wide, 10, true),
+                                      LLVMBackend::SpellIntegerType(condVal->getType(), condIsUnsigned) }));
+                        }
+                        auto* coerced = compiler->CoerceCaseValue(entry.value, condVal->getType(), entry.valueIsUnsigned);
+                        // Two labels that convert to the same operand-typed constant would make an
+                        // invalid SwitchInst, so diagnose them here instead of failing verification.
+                        std::string key = llvm::toString(coerced->getValue(), 16, false);
+                        if (seenCaseValues.count(key) > 0)
+                            LogErrorContext(labeledCtx, compiler->LocalizeMessage(
+                                "duplicate case label '{}' in switch",
+                                { llvm::toString(coerced->getValue(), 10, !condIsUnsigned) }));
+                        seenCaseValues[key] = labeledCtx;
+                        switchInst->addCase(coerced, entry.block);
                     }
                 }
 
